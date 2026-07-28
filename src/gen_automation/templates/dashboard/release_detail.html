@@ -1,0 +1,76 @@
+{% extends "dashboard/base.html" %}
+{% block content %}
+  <a class="back" href="/dashboard">← All releases</a>
+  <h1>{{ release.release_title }}</h1>
+  <p class="lede">
+    {{ release.project_name }} · current version {{ release.current_version_no }} ·
+    {{ release.assets | length }} exact raw masters
+  </p>
+  <p class="muted">
+    Ranked by {{ release.scorer_version }}. View and download links are private and expire shortly.
+  </p>
+
+  <section class="panel review-entry" aria-labelledby="review-heading">
+    <h2 id="review-heading">Human review</h2>
+    {% if review_task_id %}
+      <p>A review task already exists for this exact completed scoring run.</p>
+      <a class="primary-action" href="/dashboard/review-tasks/{{ review_task_id }}">
+        Open ranked review
+      </a>
+    {% else %}
+      <p>
+        Open a durable review task for these {{ release.assets | length }} frozen ranked assets.
+        Decisions can be revised until the task is completed or cancelled.
+      </p>
+      <form method="post" action="/dashboard/releases/{{ release.release_id }}/review-tasks">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input
+          type="hidden"
+          name="idempotency_key"
+          value="{{ create_idempotency_key }}"
+        >
+        <button class="primary-button" type="submit">Start ranked review</button>
+      </form>
+    {% endif %}
+  </section>
+
+  <ol class="asset-grid">
+    {% for asset in release.assets %}
+      <li class="asset-card">
+        <img
+          class="asset-preview"
+          src="{{ asset.view_url }}"
+          alt="Rank {{ asset.rank }} generated image"
+          width="{{ asset.width }}"
+          height="{{ asset.height }}"
+          loading="lazy"
+          decoding="async"
+        >
+        <div class="asset-body">
+          <div class="rank-line">
+            <span class="rank">#{{ asset.rank }}</span>
+            <span class="score">{{ asset.score_percent }}</span>
+          </div>
+          <dl>
+            <dt>Disposition</dt>
+            <dd>{{ asset.disposition.replace("_", " ") }}</dd>
+            <dt>Dimensions</dt>
+            <dd>{{ asset.width }} × {{ asset.height }}</dd>
+            <dt>Format</dt>
+            <dd>{{ asset.image_format }}</dd>
+            <dt>Asset</dt>
+            <dd>{{ asset.asset_id }}</dd>
+            <dt>Checksum</dt>
+            <dd>{{ asset.checksum_prefix }}…</dd>
+          </dl>
+          <ul class="notes">
+            {% for note in asset.explanation_summary %}
+              <li>{{ note }}</li>
+            {% endfor %}
+          </ul>
+          <a class="download" href="{{ asset.download_url }}">Download exact raw master</a>
+        </div>
+      </li>
+    {% endfor %}
+  </ol>
+{% endblock %}

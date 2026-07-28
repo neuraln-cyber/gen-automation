@@ -1,0 +1,17 @@
+title = "gen-automation secret scanning policy"
+
+[extend]
+useDefault = true
+
+# This deterministic scheduler fixture is not a credential. Keep the exception
+# constrained to one rule, one exact line, and one exact test file so that other
+# findings in the file continue to fail the scan.
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Known non-secret scheduler idempotency fixture"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)tests/test_salad_service\.py$''']
+regexes = ['''^\s*idempotency_key="scheduler-claim-1",\s*$''']

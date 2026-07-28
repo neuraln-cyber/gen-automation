@@ -1,0 +1,227 @@
+{% extends "dashboard/base.html" %}
+{% block content %}
+  <a class="back" href="/dashboard/releases/{{ navigation.release_id }}">
+    ← Ranked release
+  </a>
+  <h1>Review {{ release.release_title }}</h1>
+  <p class="lede">
+    Frozen release version {{ release.release_version_no }} ·
+    {{ summary.ranked_asset_count }} ranked assets ·
+    task {{ summary.state.value }}
+  </p>
+
+  <section class="panel review-summary" aria-labelledby="review-summary-heading">
+    <div>
+      <h2 id="review-summary-heading">Decision summary</h2>
+      <p class="muted">
+        Completion requires exactly {{ summary.desired_accepted_count }} accepted
+        asset{% if summary.desired_accepted_count != 1 %}s{% endif %}.
+      </p>
+    </div>
+    <dl class="count-grid">
+      <div><dt>Accepted</dt><dd>{{ summary.accepted_count }}</dd></div>
+      <div><dt>Rejected</dt><dd>{{ summary.rejected_count }}</dd></div>
+      <div><dt>Held</dt><dd>{{ summary.held_count }}</dd></div>
+      <div><dt>Undecided</dt><dd>{{ summary.undecided_count }}</dd></div>
+      <div><dt>Selected for X</dt><dd>{{ summary.x_selected_count }} / 4</dd></div>
+    </dl>
+
+    {% if summary.state.value == "open" %}
+      <div class="task-actions">
+        <form method="post" action="/dashboard/review-tasks/{{ summary.task_id }}:complete">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input
+            type="hidden"
+            name="idempotency_key"
+            value="{{ complete_idempotency_key }}"
+          >
+          <input
+            type="hidden"
+            name="expected_lock_version"
+            value="{{ summary.lock_version }}"
+          >
+          <button
+            class="primary-button"
+            type="submit"
+            {% if not can_complete %}disabled aria-describedby="completion-help"{% endif %}
+          >
+            Complete review
+          </button>
+        </form>
+        <form method="post" action="/dashboard/review-tasks/{{ summary.task_id }}:cancel">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input
+            type="hidden"
+            name="idempotency_key"
+            value="{{ cancel_idempotency_key }}"
+          >
+          <input
+            type="hidden"
+            name="expected_lock_version"
+            value="{{ summary.lock_version }}"
+          >
+          <button class="secondary-button danger" type="submit">Cancel review</button>
+        </form>
+      </div>
+      {% if not can_complete %}
+        <p class="muted" id="completion-help">
+          Complete becomes available when the accepted count is exactly
+          {{ summary.desired_accepted_count }}.
+        </p>
+      {% endif %}
+    {% else %}
+      <p class="terminal-state" role="status">
+        This task is {{ summary.state.value }} and is now read-only.
+      </p>
+    {% endif %}
+  </section>
+
+  <ol class="asset-grid review-grid">
+    {% for item in assets %}
+      <li class="asset-card">
+        <img
+          class="asset-preview"
+          src="{{ item.master.view_url }}"
+          alt="Rank {{ item.master.rank }} generated image"
+          width="{{ item.master.width }}"
+          height="{{ item.master.height }}"
+          loading="lazy"
+          decoding="async"
+        >
+        <div class="asset-body">
+          <div class="rank-line">
+            <span class="rank">#{{ item.master.rank }}</span>
+            <span class="score">{{ item.master.score_percent }}</span>
+          </div>
+          <p class="current-decision" aria-live="polite">
+            Current decision:
+            <strong>
+              {% if item.current.decision %}
+                {{ item.current.decision.value }}
+              {% else %}
+                undecided
+              {% endif %}
+            </strong>
+            {% if item.current.revision %} · revision {{ item.current.revision }}{% endif %}
+          </p>
+          <p class="current-decision">
+            X teaser:
+            <strong>{{ "selected" if item.current.selected_for_x else "not selected" }}</strong>
+          </p>
+          {% if item.current.reason_code %}
+            <p class="decision-detail">Reason: {{ item.current.reason_code }}</p>
+          {% endif %}
+          {% if item.current.note %}
+            <p class="decision-detail">Note: {{ item.current.note }}</p>
+          {% endif %}
+
+          <dl>
+            <dt>Disposition</dt>
+            <dd>{{ item.master.disposition.replace("_", " ") }}</dd>
+            <dt>Dimensions</dt>
+            <dd>{{ item.master.width }} × {{ item.master.height }}</dd>
+            <dt>Asset</dt>
+            <dd>{{ item.master.asset_id }}</dd>
+          </dl>
+
+          {% if summary.state.value == "open" %}
+            {% if item.x_selection_idempotency_key %}
+              <form
+                class="decision-form"
+                method="post"
+                action="/dashboard/review-tasks/{{ summary.task_id }}/x-selections"
+              >
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input
+                  type="hidden"
+                  name="idempotency_key"
+                  value="{{ item.x_selection_idempotency_key }}"
+                >
+                <input
+                  type="hidden"
+                  name="expected_lock_version"
+                  value="{{ summary.lock_version }}"
+                >
+                <input type="hidden" name="asset_id" value="{{ item.master.asset_id }}">
+                <input
+                  type="hidden"
+                  name="selected"
+                  value="{{ 'false' if item.current.selected_for_x else 'true' }}"
+                >
+                <button class="secondary-button" type="submit">
+                  {{ "Remove from X" if item.current.selected_for_x else "Select for X" }}
+                </button>
+              </form>
+            {% endif %}
+            <form
+              class="decision-form"
+              method="post"
+              action="/dashboard/review-tasks/{{ summary.task_id }}/decisions"
+            >
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input
+                type="hidden"
+                name="idempotency_key"
+                value="{{ item.idempotency_key }}"
+              >
+              <input
+                type="hidden"
+                name="expected_lock_version"
+                value="{{ summary.lock_version }}"
+              >
+              <input type="hidden" name="asset_id" value="{{ item.master.asset_id }}">
+
+              <label for="reason-{{ item.master.asset_id }}">Reason code (optional)</label>
+              <input
+                id="reason-{{ item.master.asset_id }}"
+                name="reason_code"
+                maxlength="100"
+                pattern="[a-z][a-z0-9_.-]{0,99}"
+                value="{{ item.current.reason_code or '' }}"
+                autocomplete="off"
+              >
+
+              <label for="note-{{ item.master.asset_id }}">Review note (optional)</label>
+              <textarea
+                id="note-{{ item.master.asset_id }}"
+                name="note"
+                maxlength="4000"
+                rows="3"
+              >{{ item.current.note or '' }}</textarea>
+
+              <fieldset>
+                <legend>Save a decision for rank {{ item.master.rank }}</legend>
+                <div class="decision-actions">
+                  <button
+                    class="decision-button accept"
+                    type="submit"
+                    name="decision"
+                    value="accept"
+                    aria-label="Accept rank {{ item.master.rank }}"
+                  >Accept</button>
+                  <button
+                    class="decision-button reject"
+                    type="submit"
+                    name="decision"
+                    value="reject"
+                    aria-label="Reject rank {{ item.master.rank }}"
+                  >Reject</button>
+                  <button
+                    class="decision-button hold"
+                    type="submit"
+                    name="decision"
+                    value="hold"
+                    aria-label="Hold rank {{ item.master.rank }}"
+                  >Hold</button>
+                </div>
+              </fieldset>
+            </form>
+          {% endif %}
+          <a class="download" href="{{ item.master.download_url }}">
+            Download exact raw master
+          </a>
+        </div>
+      </li>
+    {% endfor %}
+  </ol>
+{% endblock %}

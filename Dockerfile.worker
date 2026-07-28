@@ -1,0 +1,108 @@
+# syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+FROM golang:1.26.2-alpine@sha256:f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739500e08c86393a21b1 AS salad-queue-worker-builder
+
+ENV SALAD_QUEUE_WORKER_COMMIT=73d7a3c80a73f26339194e024cb47c8501c67f75
+
+RUN apk add --no-cache git \
+    && mkdir --parents /src \
+    && git -C /src init \
+    && git -C /src remote add origin \
+        https://github.com/SaladTechnologies/salad-cloud-job-queue-worker.git \
+    && git -C /src fetch --depth 1 origin "${SALAD_QUEUE_WORKER_COMMIT}" \
+    && git -C /src checkout --detach FETCH_HEAD \
+    && test "$(git -C /src rev-parse HEAD)" = "${SALAD_QUEUE_WORKER_COMMIT}"
+
+WORKDIR /src
+
+RUN go mod download \
+    && go mod verify \
+    && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+        -mod=readonly \
+        -trimpath \
+        -buildvcs=false \
+        -ldflags="-s -w -X github.com/saladtechnologies/salad-cloud-job-queue-worker/pkg/workers.Version=git-${SALAD_QUEUE_WORKER_COMMIT}" \
+        -o /out/salad-http-job-queue-worker \
+        ./cmd/salad-http-job-queue-worker
+
+FROM pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime@sha256:eee11b3b3872a8c838e35ef48f08b2d5def2080902c7f666831310ca1a0ef2be
+
+LABEL org.opencontainers.image.title="gen-automation-gpu-worker" \
+      org.opencontainers.image.description="Ephemeral verified ComfyUI generation worker" \
+      org.opencontainers.image.source="https://github.com/neuraln-cyber/gen-automation" \
+      org.opencontainers.image.comfyui.revision="700821e1364eaab0e8f21c538a2131719fec57bf" \
+      org.opencontainers.image.salad-queue-worker.revision="73d7a3c80a73f26339194e024cb47c8501c67f75"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    COMFYUI_COMMIT=700821e1364eaab0e8f21c538a2131719fec57bf \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONNOUSERSITE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/opt/worker/src \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        git \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+    && mkdir --parents /opt/comfyui \
+    && git -C /opt/comfyui init \
+    && git -C /opt/comfyui remote add origin https://github.com/Comfy-Org/ComfyUI.git \
+    && git -C /opt/comfyui fetch --depth 1 origin "${COMFYUI_COMMIT}" \
+    && git -C /opt/comfyui checkout --detach FETCH_HEAD \
+    && test "$(git -C /opt/comfyui rev-parse HEAD)" = "${COMFYUI_COMMIT}" \
+    && rm -rf /opt/comfyui/.git \
+    && apt-get purge --yes --auto-remove git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/worker
+
+COPY requirements.lock requirements-comfy.lock requirements-worker-base.txt ./
+
+RUN python -m pip install --only-binary=:all: --require-hashes --no-deps -r requirements.lock \
+    && python -m pip install --only-binary=:all: --require-hashes --no-deps -r requirements-comfy.lock \
+    && python -m pip check \
+    && test -x /usr/local/bin/python3.12 \
+    && test ! -L /usr/local/bin/python3.12 \
+    && python -c "import sys; assert sys.version_info[:2] == (3, 12)" \
+    && python -c "import torch, torchaudio, torchvision; assert torch.__version__.split('+')[0] == '2.11.0'; assert torchvision.__version__.split('+')[0] == '0.26.0'; assert torchaudio.__version__.split('+')[0] == '2.11.0'"
+
+COPY src ./src
+COPY --from=salad-queue-worker-builder --chmod=0555 \
+    /out/salad-http-job-queue-worker \
+    /usr/local/bin/salad-http-job-queue-worker
+
+RUN groupadd --system --gid 10001 worker \
+    && useradd \
+        --system \
+        --create-home \
+        --uid 10001 \
+        --gid worker \
+        --home-dir /home/worker \
+        --shell /usr/sbin/nologin \
+        worker \
+    && mkdir --parents \
+        /opt/comfyui/models/checkpoints \
+        /opt/comfyui/models/loras \
+        /opt/worker/runtime \
+    && chown --recursive 10001:10001 \
+        /opt/comfyui/models/checkpoints \
+        /opt/comfyui/models/loras \
+        /opt/worker/runtime
+
+ENV HOME=/home/worker
+
+USER 10001:10001
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=20s --timeout=3s --start-period=60m --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
+
+ENTRYPOINT ["python", "-m", "gen_automation.gpu_worker.main"]

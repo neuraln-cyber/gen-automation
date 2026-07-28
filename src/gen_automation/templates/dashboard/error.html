@@ -1,0 +1,8 @@
+{% extends "dashboard/base.html" %}
+{% block content %}
+  <a class="back" href="/dashboard">← All releases</a>
+  <section class="panel error" role="alert">
+    <h1>{{ heading }}</h1>
+    <p>{{ message }}</p>
+  </section>
+{% endblock %}

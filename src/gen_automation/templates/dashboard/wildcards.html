@@ -1,0 +1,105 @@
+{% extends "dashboard/base.html" %}
+{% block content %}
+  <a class="back" href="/dashboard">&larr; Ranked releases</a>
+  <h1>Prompt wildcards</h1>
+  <p class="lede">
+    Keep reusable pose and position lists here, then place tokens such as
+    <code>__poses__</code> in positive or negative release prompts.
+  </p>
+  <p class="muted">
+    Every save creates an immutable version. A release freezes the exact versions it uses,
+    so adding entries later never changes an existing generation plan.
+  </p>
+
+  {% if can_manage %}
+    <section class="panel review-entry" aria-labelledby="create-wildcard">
+      <h2 id="create-wildcard">Create or import a wildcard</h2>
+      <form class="decision-form" method="post" action="/dashboard/wildcards">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="action" value="create">
+        <label for="wildcard-name">Library name</label>
+        <input
+          id="wildcard-name"
+          name="name"
+          required
+          maxlength="80"
+          pattern="[a-z0-9]+([._/-][a-z0-9]+)*"
+          placeholder="poses/sitting"
+        >
+        <label for="wildcard-entries">One entry per line</label>
+        <textarea
+          id="wildcard-entries"
+          name="entries"
+          required
+          rows="8"
+          maxlength="524288"
+          placeholder="standing, hands on hips&#10;sitting on a chair"
+        ></textarea>
+        <button class="primary-button" type="submit">Create wildcard</button>
+      </form>
+    </section>
+  {% endif %}
+
+  {% if libraries %}
+    <ul class="release-list">
+      {% for library in libraries %}
+        <li class="release-card">
+          <p class="muted">Version {{ library.current_version_no }} &middot; {{ library.entries | length }} entries</p>
+          <h2><code>__{{ library.name }}__</code></h2>
+          <p class="muted">Digest {{ library.entries_sha256[:12] }}&hellip;</p>
+          {% if can_manage %}
+            <form class="decision-form" method="post" action="/dashboard/wildcards">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="action" value="replace">
+              <input type="hidden" name="name" value="{{ library.name }}">
+              <input
+                type="hidden"
+                name="expected_version_no"
+                value="{{ library.current_version_no }}"
+              >
+              <label for="entries-{{ library.id }}">Edit the complete file</label>
+              <textarea
+                id="entries-{{ library.id }}"
+                name="entries"
+                required
+                rows="10"
+                maxlength="524288"
+              >{{ library.entries | join("\n") }}</textarea>
+              <button class="secondary-button" type="submit">Save new version</button>
+            </form>
+            <form class="decision-form" method="post" action="/dashboard/wildcards">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="action" value="append">
+              <input type="hidden" name="name" value="{{ library.name }}">
+              <input
+                type="hidden"
+                name="expected_version_no"
+                value="{{ library.current_version_no }}"
+              >
+              <label for="append-{{ library.id }}">Append entries, one per line</label>
+              <textarea
+                id="append-{{ library.id }}"
+                name="entries"
+                required
+                rows="4"
+                maxlength="524288"
+              ></textarea>
+              <button class="secondary-button" type="submit">Append as new version</button>
+            </form>
+          {% else %}
+            <ul class="notes">
+              {% for entry in library.entries %}
+                <li>{{ entry }}</li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <section class="panel review-entry">
+      <h2>No wildcard libraries yet</h2>
+      <p class="muted">Create one above by pasting the lines from an existing wildcard text file.</p>
+    </section>
+  {% endif %}
+{% endblock %}
