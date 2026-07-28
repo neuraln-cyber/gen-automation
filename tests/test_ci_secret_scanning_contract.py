@@ -65,7 +65,7 @@ def test_secret_scan_is_fail_closed_redacted_and_bounded() -> None:
     assert "continue-on-error" not in job
 
 
-def test_secret_scanner_extends_defaults_with_only_a_narrow_fixture_exception() -> None:
+def test_secret_scanner_extends_defaults_with_only_narrow_fixture_exceptions() -> None:
     config = CONFIG_PATH.read_text(encoding="utf-8")
 
     assert "useDefault = true" in config
@@ -73,9 +73,22 @@ def test_secret_scanner_extends_defaults_with_only_a_narrow_fixture_exception() 
     assert 'id = "generic-api-key"' in config
     assert 'condition = "AND"' in config
     assert 'regexTarget = "line"' in config
-    assert "tests/test_salad_service" in config
-    assert "idempotency_key" in config
-    assert "scheduler-claim-1" in config
+    for path in (
+        "tests/test_admin_bootstrap",
+        "tests/test_compliance_api",
+        "tests/test_compliance_registry",
+        "tests/test_salad_service",
+    ):
+        assert path in config
+    for fixture in (
+        "scheduler-claim-1",
+        "subject-reaffirm-v1",
+        "subject-revoke-v2",
+        "approve-subject-v1",
+        "revoke-subject-v1",
+        "v1\\.key-1\\.corrupt",
+    ):
+        assert fixture in config
     assert "[[allowlists]]" not in config
 
 

@@ -3,15 +3,27 @@ title = "gen-automation secret scanning policy"
 [extend]
 useDefault = true
 
-# This deterministic scheduler fixture is not a credential. Keep the exception
-# constrained to one rule, one exact line, and one exact test file so that other
-# findings in the file continue to fail the scan.
+# These deterministic test fixtures are not credentials. Keep every exception
+# constrained to the generic rule, exact test files, and exact complete lines so
+# that any other finding in those files continues to fail the scan.
 [[rules]]
 id = "generic-api-key"
 
 [[rules.allowlists]]
-description = "Known non-secret scheduler idempotency fixture"
+description = "Known non-secret idempotency and corrupt-ciphertext fixtures"
 condition = "AND"
 regexTarget = "line"
-paths = ['''(^|/)tests/test_salad_service\.py$''']
-regexes = ['''^\s*idempotency_key="scheduler-claim-1",\s*$''']
+paths = [
+  '''(^|/)tests/test_admin_bootstrap\.py$''',
+  '''(^|/)tests/test_compliance_api\.py$''',
+  '''(^|/)tests/test_compliance_registry\.py$''',
+  '''(^|/)tests/test_salad_service\.py$''',
+]
+regexes = [
+  '''^\s*idempotency_key="scheduler-claim-1",\s*$''',
+  '''^\s*idempotency_key="subject-reaffirm-v1",\s*$''',
+  '''^\s*idempotency_key="subject-revoke-v2",\s*$''',
+  '''^\s*"Idempotency-Key": "approve-subject-v1",\s*$''',
+  '''^\s*"Idempotency-Key": "revoke-subject-v1",\s*$''',
+  '''^\s*user\.totp_secret_ciphertext = "v1\.key-1\.corrupt"\s+# noqa: S105\s*$''',
+]
