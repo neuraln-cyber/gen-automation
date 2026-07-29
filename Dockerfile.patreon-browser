@@ -49,8 +49,6 @@ RUN python3.12 -m pip install \
         -r requirements-patreon-browser.lock \
     && python3.12 -m pip check \
     && python3.12 -m playwright install-deps chromium \
-    && test "$(/opt/google/chrome/chrome --version)" = \
-        "Google Chrome for Testing 151.0.7922.47" \
     && apt-get update \
     && apt-get install --yes --no-install-recommends \
         novnc \

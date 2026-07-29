@@ -182,6 +182,7 @@ jobs:
                   headless=True,
                   args=("--disable-dev-shm-usage",),
               )
+              print(f"Chrome {browser.version} launched as the image runtime user")
               assert int(browser.version.split(".", 1)[0]) >= 150, browser.version
               page = browser.new_page()
               page.set_content("<title>patreon-browser-ready</title>")
