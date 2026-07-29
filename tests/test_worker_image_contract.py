@@ -123,7 +123,7 @@ def test_expected_worker_entrypoint_is_the_only_runtime_entrypoint() -> None:
     entrypoints = re.findall(r"^ENTRYPOINT\s+(.+)$", dockerfile, flags=re.MULTILINE)
 
     assert entrypoints == [
-        '["/opt/worker-venv/bin/python3.12", "-m", "gen_automation.gpu_worker.main"]'
+        '["/opt/worker-venv/bin/python", "-m", "gen_automation.gpu_worker.main"]'
     ]
     assert not re.search(r"^CMD\s+", dockerfile, flags=re.MULTILINE)
 
@@ -135,27 +135,26 @@ def test_python_dependencies_are_hash_locked_and_cuda_stack_matches_base() -> No
 
     assert "VIRTUAL_ENV=/opt/worker-venv" in dockerfile
     assert (
-        "/usr/local/bin/python3.12 -m venv "
+        "python -m venv "
         "--copies "
         "--without-pip "
         "--system-site-packages "
         "/opt/worker-venv" in dockerfile
     )
-    assert "test -x /opt/worker-venv/bin/python3.12" in dockerfile
+    assert "test -x /opt/worker-venv/bin/python" in dockerfile
     assert "sys.prefix == '/opt/worker-venv'" in dockerfile
     assert "sys.prefix != sys.base_prefix" in dockerfile
     assert (
-        "/opt/worker-venv/bin/python3.12 -m pip install --only-binary=:all: "
+        "/opt/worker-venv/bin/python -m pip install --only-binary=:all: "
         "--require-hashes --no-deps -r requirements.lock" in dockerfile
     )
     assert (
-        "/opt/worker-venv/bin/python3.12 -m pip install --only-binary=:all: "
+        "/opt/worker-venv/bin/python -m pip install --only-binary=:all: "
         "--require-hashes --no-deps -r requirements-comfy.lock" in dockerfile
     )
-    assert "/opt/worker-venv/bin/python3.12 -m pip check" in dockerfile
+    assert "/opt/worker-venv/bin/python -m pip check" in dockerfile
     assert "--break-system-packages" not in dockerfile
     assert "EXTERNALLY-MANAGED" not in dockerfile
-    assert "test -x /usr/local/bin/python3.12" in dockerfile
     assert "assert sys.version_info[:2] == (3, 12)" in dockerfile
     assert "--generate-hashes" in comfy_lock.splitlines()[4]
     assert not re.search(r"(?im)^\s*(?:-e\s+|https?://|git\+)", comfy_lock)

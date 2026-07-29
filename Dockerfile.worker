@@ -67,18 +67,18 @@ WORKDIR /opt/worker
 
 COPY requirements.lock requirements-comfy.lock requirements-worker-base.txt ./
 
-RUN test -x /usr/local/bin/python3.12 \
-    && /usr/local/bin/python3.12 -m venv \
+RUN python -c "import sys; assert sys.version_info[:2] == (3, 12)" \
+    && python -m venv \
         --copies \
         --without-pip \
         --system-site-packages \
         /opt/worker-venv \
-    && test -x /opt/worker-venv/bin/python3.12 \
-    && /opt/worker-venv/bin/python3.12 -c "import sys; assert sys.version_info[:2] == (3, 12); assert sys.prefix == '/opt/worker-venv'; assert sys.prefix != sys.base_prefix" \
-    && /opt/worker-venv/bin/python3.12 -m pip install --only-binary=:all: --require-hashes --no-deps -r requirements.lock \
-    && /opt/worker-venv/bin/python3.12 -m pip install --only-binary=:all: --require-hashes --no-deps -r requirements-comfy.lock \
-    && /opt/worker-venv/bin/python3.12 -m pip check \
-    && /opt/worker-venv/bin/python3.12 -c "import torch, torchaudio, torchvision; assert all('/opt/worker-venv/' not in module.__file__ for module in (torch, torchaudio, torchvision)); assert torch.__version__.split('+')[0] == '2.11.0'; assert torchvision.__version__.split('+')[0] == '0.26.0'; assert torchaudio.__version__.split('+')[0] == '2.11.0'"
+    && test -x /opt/worker-venv/bin/python \
+    && /opt/worker-venv/bin/python -c "import sys; assert sys.version_info[:2] == (3, 12); assert sys.prefix == '/opt/worker-venv'; assert sys.prefix != sys.base_prefix" \
+    && /opt/worker-venv/bin/python -m pip install --only-binary=:all: --require-hashes --no-deps -r requirements.lock \
+    && /opt/worker-venv/bin/python -m pip install --only-binary=:all: --require-hashes --no-deps -r requirements-comfy.lock \
+    && /opt/worker-venv/bin/python -m pip check \
+    && /opt/worker-venv/bin/python -c "import torch, torchaudio, torchvision; assert all('/opt/worker-venv/' not in module.__file__ for module in (torch, torchaudio, torchvision)); assert torch.__version__.split('+')[0] == '2.11.0'; assert torchvision.__version__.split('+')[0] == '0.26.0'; assert torchaudio.__version__.split('+')[0] == '2.11.0'"
 
 COPY src ./src
 COPY --from=salad-queue-worker-builder --chmod=0555 \
@@ -110,6 +110,6 @@ USER 10001:10001
 EXPOSE 8000
 
 HEALTHCHECK --interval=20s --timeout=3s --start-period=60m --retries=3 \
-    CMD ["/opt/worker-venv/bin/python3.12", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
+    CMD ["/opt/worker-venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
 
-ENTRYPOINT ["/opt/worker-venv/bin/python3.12", "-m", "gen_automation.gpu_worker.main"]
+ENTRYPOINT ["/opt/worker-venv/bin/python", "-m", "gen_automation.gpu_worker.main"]

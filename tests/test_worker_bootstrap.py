@@ -75,7 +75,7 @@ def _settings(**changes: object) -> WorkerRuntimeSettings:
         "artifact_bucket": "models-private",
         "checkpoint_root": Path("/models/checkpoints"),
         "lora_root": Path("/models/loras"),
-        "comfy_python": Path("/opt/worker-venv/bin/python3.12"),
+        "comfy_python": Path("/opt/worker-venv/bin/python"),
         "comfy_main": Path("/comfy/main.py"),
     }
     values.update(changes)

@@ -128,7 +128,7 @@ def _settings(content: bytes | None = None, **changes: object) -> WorkerRuntimeS
         "artifact_bucket": "models-private",
         "checkpoint_root": Path("/opt/comfyui/models/checkpoints"),
         "lora_root": Path("/opt/comfyui/models/loras"),
-        "comfy_python": Path("/opt/worker-venv/bin/python3.12"),
+        "comfy_python": Path("/opt/worker-venv/bin/python"),
         "comfy_main": Path("/opt/comfyui/main.py"),
     }
     values.update(changes)
@@ -151,7 +151,7 @@ def test_worker_runtime_settings_contain_only_verification_keys() -> None:
 def test_build_comfy_command_is_loopback_offline_and_custom_node_free() -> None:
     command = build_comfy_command(_settings())
 
-    assert command[:2] == ("/opt/worker-venv/bin/python3.12", "/opt/comfyui/main.py")
+    assert command[:2] == ("/opt/worker-venv/bin/python", "/opt/comfyui/main.py")
     assert command[command.index("--listen") + 1] == "127.0.0.1"
     assert command[command.index("--port") + 1] == "8188"
     assert command[command.index("--models-directory") + 1] == "/opt/comfyui/models"
