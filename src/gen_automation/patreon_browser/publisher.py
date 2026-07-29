@@ -15,6 +15,7 @@ from gen_automation.integrations.patreon.driver import (
 from gen_automation.patreon_browser.package import PatreonBrowserPackage
 
 _POST_URL = re.compile(r"^https://(?:www\.)?patreon\.com/posts/(?:[^/?#]+-)?([0-9]{1,20})/?$")
+_BROWSER_CHANNEL = "chrome"
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +50,7 @@ class PlaywrightPatreonPublisher:
                 async with async_playwright() as playwright:
                     context = await playwright.chromium.launch_persistent_context(
                         str(profile_path),
+                        channel=_BROWSER_CHANNEL,
                         headless=self.headless,
                         timezone_id="UTC",
                         args=("--disable-dev-shm-usage",),

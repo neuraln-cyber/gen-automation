@@ -18,6 +18,7 @@ _DISPLAY = ":99"
 _DISPLAY_SOCKET = Path("/tmp/.X11-unix/X99")  # noqa: S108 - standard Xvfb socket
 _NOVNC_ROOT = Path("/usr/share/novnc")
 _CONTAINER_LISTEN_HOST = "0.0.0.0"  # noqa: S104 - host publish is loopback-only
+_BROWSER_CHANNEL = "chrome"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -182,6 +183,7 @@ def run_bootstrap(args: argparse.Namespace) -> int:
         with sync_playwright() as playwright:
             with playwright.chromium.launch_persistent_context(
                 str(profile),
+                channel=_BROWSER_CHANNEL,
                 headless=False,
                 env=browser_env,
                 args=("--disable-dev-shm-usage",),
