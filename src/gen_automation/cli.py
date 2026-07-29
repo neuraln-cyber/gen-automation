@@ -1,32 +1,26 @@
+from __future__ import annotations
+
 import asyncio
 import getpass
 import sys
+from typing import TYPE_CHECKING
 
-from pydantic import ValidationError
+if TYPE_CHECKING:
+    from gen_automation.auth.operator_settings import AuthenticationOperatorSettings
+    from gen_automation.services.admin_bootstrap import (
+        BootstrapOwnerCommand,
+        RecoverOwnerCommand,
+    )
 
-from gen_automation.auth.operator_settings import AuthenticationOperatorSettings
-from gen_automation.auth.security import (
-    PasswordManager,
-    PasswordPolicyError,
-    TotpSecretCipher,
-    generate_totp_secret,
-    provisioning_uri,
-)
-from gen_automation.db.session import Database
-from gen_automation.services.admin_bootstrap import (
-    BootstrapOwnerCommand,
-    BootstrapOwnerError,
-    RecoverOwnerCommand,
-    bootstrap_initial_owner,
-    recover_owner,
-)
-from gen_automation.services.authentication import normalize_username
+
+class _PromptInputError(ValueError):
+    pass
 
 
 def _required_prompt(label: str) -> str:
     value = input(label).strip()
     if not value:
-        raise BootstrapOwnerError("all prompts are required")
+        raise _PromptInputError("all prompts are required")
     return value
 
 
@@ -35,6 +29,14 @@ async def _apply_owner_command(
     settings: AuthenticationOperatorSettings,
     command: BootstrapOwnerCommand | RecoverOwnerCommand,
 ) -> None:
+    from gen_automation.auth.security import PasswordManager, TotpSecretCipher
+    from gen_automation.db.session import Database
+    from gen_automation.services.admin_bootstrap import (
+        BootstrapOwnerCommand,
+        bootstrap_initial_owner,
+        recover_owner,
+    )
+
     database = Database(settings.database_url)
     try:
         keys = {
@@ -85,6 +87,22 @@ def bootstrap_owner_main() -> int:
             file=sys.stderr,
         )
         return 2
+
+    from pydantic import ValidationError
+
+    from gen_automation.auth.operator_settings import AuthenticationOperatorSettings
+    from gen_automation.auth.security import (
+        PasswordPolicyError,
+        generate_totp_secret,
+        provisioning_uri,
+    )
+    from gen_automation.services.admin_bootstrap import (
+        BootstrapOwnerCommand,
+        BootstrapOwnerError,
+        RecoverOwnerCommand,
+    )
+    from gen_automation.services.authentication import normalize_username
+
     try:
         settings = AuthenticationOperatorSettings()
     except ValidationError:
@@ -156,7 +174,7 @@ def bootstrap_owner_main() -> int:
                 second_approval_ticket=second_approval_ticket,
             )
         asyncio.run(_apply_owner_command(settings=settings, command=command))
-    except (BootstrapOwnerError, PasswordPolicyError) as error:
+    except (BootstrapOwnerError, PasswordPolicyError, _PromptInputError) as error:
         print(f"Authentication operator action failed: {error}", file=sys.stderr)
         return 1
     except Exception:
