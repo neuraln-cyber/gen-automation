@@ -13,7 +13,9 @@ import pytest
 import gen_automation.gpu_worker.main as worker_main
 from gen_automation.domain.signing import derive_public_key, encode_base64url
 from gen_automation.gpu_worker.artifacts import (
+    ArtifactBootstrapResult,
     ArtifactKind,
+    MaterializedArtifact,
     ModelArtifactSpec,
     calculate_manifest_sha256,
 )
@@ -31,6 +33,7 @@ from gen_automation.gpu_worker.main import (
     ensure_runtime_directories,
     harden_parent_process,
     stop_comfy,
+    write_verified_detector_whitelist,
 )
 from gen_automation.gpu_worker.models import WorkerEnvironment
 
@@ -148,7 +151,7 @@ def test_worker_runtime_settings_contain_only_verification_keys() -> None:
     assert settings.model_bootstrap_timeout_seconds == 3600.0
 
 
-def test_build_comfy_command_is_loopback_offline_and_custom_node_free() -> None:
+def test_build_comfy_command_is_loopback_offline_and_narrowly_whitelisted() -> None:
     command = build_comfy_command(_settings())
 
     assert command[:2] == ("/opt/worker-venv/bin/python", "/opt/comfyui/main.py")
@@ -156,10 +159,14 @@ def test_build_comfy_command_is_loopback_offline_and_custom_node_free() -> None:
     assert command[command.index("--port") + 1] == "8188"
     assert command[command.index("--models-directory") + 1] == "/opt/comfyui/models"
     assert "--disable-all-custom-nodes" in command
+    whitelist_index = command.index("--whitelist-custom-nodes")
+    assert command[whitelist_index + 1 : whitelist_index + 3] == (
+        "ComfyUI-Impact-Pack",
+        "ComfyUI-Impact-Subpack",
+    )
     assert "--disable-api-nodes" in command
     assert "--disable-metadata" in command
     assert "--enable-manager" not in command
-    assert "--whitelist-custom-nodes" not in command
 
 
 @pytest.mark.parametrize(
@@ -241,6 +248,38 @@ def test_ensure_runtime_directories_creates_private_tree(tmp_path: Path) -> None
     }
 
 
+def test_only_manifest_verified_detector_is_added_to_impact_whitelist(
+    tmp_path: Path,
+) -> None:
+    settings = _settings().model_copy(update={"comfy_runtime_root": tmp_path / "runtime"})
+    ensure_runtime_directories(settings)
+    result = ArtifactBootstrapResult(
+        version="v1",
+        manifest_sha256="a" * 64,
+        artifacts=(
+            MaterializedArtifact(
+                logical_name="face-yolov8m",
+                kind=ArtifactKind.DETECTOR,
+                target_filename="face-yolov8m.pt",
+                sha256="b" * 64,
+                size_bytes=100,
+                adopted_existing=False,
+            ),
+        ),
+    )
+
+    write_verified_detector_whitelist(settings, result)
+
+    whitelist = (
+        settings.comfy_runtime_root
+        / "user"
+        / "default"
+        / "ComfyUI-Impact-Subpack"
+        / "model-whitelist.txt"
+    )
+    assert whitelist.read_text(encoding="utf-8") == "face-yolov8m.pt\n"
+
+
 class _Body(io.BytesIO):
     pass
 
@@ -269,6 +308,7 @@ async def test_bootstrap_worker_models_materializes_verified_checkpoint(
         update={
             "checkpoint_root": checkpoint_root,
             "lora_root": lora_root,
+            "detector_root": tmp_path / "models" / "ultralytics" / "bbox",
             "comfy_runtime_root": tmp_path / "runtime",
         }
     )
@@ -300,6 +340,7 @@ async def test_bootstrap_timeout_closes_downloader_and_scrubs_credentials(
         update={
             "checkpoint_root": tmp_path / "models" / "checkpoints",
             "lora_root": tmp_path / "models" / "loras",
+            "detector_root": tmp_path / "models" / "ultralytics" / "bbox",
             "comfy_runtime_root": tmp_path / "runtime",
             "model_bootstrap_timeout_seconds": 0.01,
         }

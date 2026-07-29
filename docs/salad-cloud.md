@@ -147,12 +147,18 @@ and the ComfyUI child receives an allowlisted environment. Output images use
 controller-issued, exact-origin presigned upload grants instead of the artifact
 identity.
 
+The controller uses the same pinned manifest before submitting a queue job.
+Release checkpoints and LoRAs must match its kind, SHA-256, and S3 object ID;
+Comfy loader inputs are then rendered from the manifest `target_filename`.
+Rendered loader names and LoRA weights are checked before upload grants or a
+provider mutation are created. See `generation-workflows.md`.
+
 Runtime paths and processes:
 
 | Setting | Default |
 | --- | --- |
 | `GEN_WORKER_CHECKPOINT_ROOT`, `GEN_WORKER_LORA_ROOT` | `/opt/comfyui/models/checkpoints`, `/opt/comfyui/models/loras`. |
-| `GEN_WORKER_COMFY_MAIN`, `GEN_WORKER_COMFY_PYTHON` | `/opt/comfyui/main.py`, `/opt/worker-venv/bin/python3.12`. The dedicated virtual environment reuses the pinned base-image CUDA/PyTorch packages through system site packages while isolating the hash-locked worker and ComfyUI dependencies. |
+| `GEN_WORKER_COMFY_MAIN`, `GEN_WORKER_COMFY_PYTHON` | `/opt/comfyui/main.py`, `/opt/worker-venv/bin/python`. The dedicated virtual environment reuses the pinned base-image CUDA/PyTorch packages through system site packages while isolating the hash-locked worker and ComfyUI dependencies. |
 | `GEN_WORKER_COMFY_BASE_URL` | `http://127.0.0.1:8188`; loopback HTTP only. |
 | `GEN_WORKER_COMFY_RUNTIME_ROOT` | `/opt/worker/runtime` for input, output, temp, user data, and the local ComfyUI SQLite database. |
 | `GEN_WORKER_COMFY_EXECUTION_TIMEOUT_SECONDS` | `900`. |

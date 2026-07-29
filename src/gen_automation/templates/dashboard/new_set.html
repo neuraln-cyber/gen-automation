@@ -203,6 +203,56 @@
     </fieldset>
 
     <fieldset>
+      <legend>Hires &amp; face detailer</legend>
+      <p class="muted">
+        The base profile ignores these values. The hires profile uses the latent
+        upscale fields; the hires + detailer profile also uses the face fields.
+      </p>
+      <div class="form-grid">
+        <label>
+          Hires scale
+          <input type="number" name="hires_scale" value="{{ form_values['hires_scale'] }}" min="1" max="3" step="0.05" required>
+        </label>
+        <label>
+          Hires denoise
+          <input type="number" name="hires_denoise" value="{{ form_values['hires_denoise'] }}" min="0.05" max="1" step="0.01" required>
+        </label>
+        <label>
+          Latent upscale
+          <select name="hires_upscale_method" required>
+            {% for method in ['bislerp', 'bicubic', 'bilinear', 'nearest-exact', 'area'] %}
+              <option value="{{ method }}" {% if form_values['hires_upscale_method'] == method %}selected{% endif %}>{{ method }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Face guide size
+          <input type="number" name="detailer_guide_size" value="{{ form_values['detailer_guide_size'] }}" min="512" max="2048" step="64" required>
+        </label>
+        <label>
+          Face maximum size
+          <input type="number" name="detailer_max_size" value="{{ form_values['detailer_max_size'] }}" min="512" max="4096" step="64" required>
+        </label>
+        <label>
+          Face denoise
+          <input type="number" name="detailer_denoise" value="{{ form_values['detailer_denoise'] }}" min="0.05" max="1" step="0.01" required>
+        </label>
+        <label>
+          Face threshold
+          <input type="number" name="detailer_bbox_threshold" value="{{ form_values['detailer_bbox_threshold'] }}" min="0.1" max="0.95" step="0.01" required>
+        </label>
+        <label>
+          Face dilation
+          <input type="number" name="detailer_bbox_dilation" value="{{ form_values['detailer_bbox_dilation'] }}" min="-64" max="128" step="1" required>
+        </label>
+        <label>
+          Face crop factor
+          <input type="number" name="detailer_bbox_crop_factor" value="{{ form_values['detailer_bbox_crop_factor'] }}" min="1" max="5" step="0.1" required>
+        </label>
+      </div>
+    </fieldset>
+
+    <fieldset>
       <legend>Plan size</legend>
       <div class="form-grid">
         <label>

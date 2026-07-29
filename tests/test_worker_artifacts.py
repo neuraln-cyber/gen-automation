@@ -1,7 +1,9 @@
 import asyncio
 import hashlib
+import io
 import json
 import os
+import zipfile
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +38,14 @@ def _safetensors(
     )
     encoded_header = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
     return len(encoded_header).to_bytes(8, "little") + encoded_header + body
+
+
+def _detector_archive() -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("archive/data.pkl", b"verified-detector-metadata")
+        archive.writestr("archive/data/0", b"\x00" * 128)
+    return output.getvalue()
 
 
 def _artifact(
@@ -111,6 +121,7 @@ async def bootstrap_artifacts(
     *,
     checkpoint_root: Path,
     lora_root: Path,
+    detector_root: Path | None = None,
 ) -> ArtifactBootstrapResult:
     return await _bootstrap_artifacts(
         manifest,
@@ -118,6 +129,7 @@ async def bootstrap_artifacts(
         expected_manifest_sha256=manifest.manifest_sha256,
         checkpoint_root=checkpoint_root,
         lora_root=lora_root,
+        detector_root=detector_root,
     )
 
 
@@ -174,6 +186,37 @@ async def test_streams_verifies_and_atomically_materializes_in_deterministic_ord
     assert all(not item.adopted_existing for item in result.artifacts)
     assert all(path.suffix == ".safetensors" for path in checkpoint_root.iterdir())
     assert all(path.suffix == ".safetensors" for path in lora_root.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_materializes_a_hash_verified_detector_only_into_the_bbox_root(
+    model_roots: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    checkpoint_root, lora_root = model_roots
+    detector_root = tmp_path / "ultralytics" / "bbox"
+    detector_root.mkdir(parents=True)
+    detector_content = _detector_archive()
+    detector = _artifact(
+        detector_content,
+        logical_name="face-yolov8m",
+        kind=ArtifactKind.DETECTOR,
+        target_filename="face-yolov8m.pt",
+        source_object_id="private/detectors/face-yolov8m.pt",
+    )
+
+    result = await bootstrap_artifacts(
+        _manifest(detector),
+        FakeDownloader({detector.logical_name: detector_content}),
+        checkpoint_root=checkpoint_root.resolve(),
+        lora_root=lora_root.resolve(),
+        detector_root=detector_root.resolve(),
+    )
+
+    assert result.artifacts[0].kind == ArtifactKind.DETECTOR
+    assert (detector_root / "face-yolov8m.pt").read_bytes() == detector_content
+    assert list(checkpoint_root.iterdir()) == []
+    assert list(lora_root.iterdir()) == []
 
 
 @pytest.mark.asyncio

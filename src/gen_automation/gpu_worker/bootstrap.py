@@ -76,6 +76,7 @@ class WorkerRuntimeSettings(BaseSettings):
     model_manifest_sha256: Sha256
     checkpoint_root: Path = Path("/opt/comfyui/models/checkpoints")
     lora_root: Path = Path("/opt/comfyui/models/loras")
+    detector_root: Path = Path("/opt/comfyui/models/ultralytics/bbox")
     artifact_bucket: str
     artifact_region: str = "us-east-1"
     artifact_endpoint_url: AnyHttpUrl | None = None
@@ -144,22 +145,24 @@ class WorkerRuntimeSettings(BaseSettings):
             errors.append("production artifact storage requires HTTPS")
         if self.environment == WorkerEnvironment.PRODUCTION and self.artifact_access_key_id is None:
             errors.append("production artifact storage requires an explicit read-only identity")
-        if not _is_container_absolute_path(self.checkpoint_root) or not _is_container_absolute_path(
-            self.lora_root
+        if any(
+            not _is_container_absolute_path(path)
+            for path in (self.checkpoint_root, self.lora_root, self.detector_root)
         ):
             errors.append("model roots must be absolute")
         elif (
             self.checkpoint_root.parent != self.lora_root.parent
             or self.checkpoint_root.name != "checkpoints"
             or self.lora_root.name != "loras"
+            or self.detector_root != self.checkpoint_root.parent / "ultralytics" / "bbox"
         ):
-            errors.append("model roots must be the checkpoints and loras directories")
+            errors.append("model roots must use the fixed ComfyUI model directories")
         if (
             not _is_container_absolute_path(self.comfy_python)
             or not _is_container_absolute_path(self.comfy_main)
             or not _is_container_absolute_path(self.comfy_runtime_root)
             or self.comfy_python == self.comfy_main
-            or self.comfy_runtime_root in {self.checkpoint_root, self.lora_root}
+            or self.comfy_runtime_root in {self.checkpoint_root, self.lora_root, self.detector_root}
         ):
             errors.append("Comfy executable paths must be distinct and absolute")
         if self.worker_host not in {_WORKER_BIND_HOST, "::"}:
@@ -293,10 +296,15 @@ def load_artifact_manifest(raw_manifest: str) -> ArtifactManifest:
         ) from None
 
 
-def ensure_model_roots(checkpoint_root: Path, lora_root: Path) -> None:
+def ensure_model_roots(
+    checkpoint_root: Path,
+    lora_root: Path,
+    detector_root: Path | None = None,
+) -> None:
     """Create expected model directories and reject links/non-directories."""
 
-    for path in (checkpoint_root, lora_root):
+    roots = tuple(path for path in (checkpoint_root, lora_root, detector_root) if path is not None)
+    for path in roots:
         try:
             path.mkdir(mode=0o700, parents=True, exist_ok=True)
             metadata = path.lstat()
@@ -307,7 +315,8 @@ def ensure_model_roots(checkpoint_root: Path, lora_root: Path) -> None:
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
             raise WorkerBootstrapConfigurationError("worker bootstrap configuration is invalid")
     try:
-        if checkpoint_root.resolve(strict=True) == lora_root.resolve(strict=True):
+        resolved = [path.resolve(strict=True) for path in roots]
+        if len(set(resolved)) != len(resolved):
             raise WorkerBootstrapConfigurationError("worker bootstrap configuration is invalid")
     except (OSError, RuntimeError):
         raise WorkerBootstrapConfigurationError(

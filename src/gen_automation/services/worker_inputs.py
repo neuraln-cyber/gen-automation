@@ -63,18 +63,25 @@ class _ResolvedJobParameters:
             value = lora.model_dump(mode="json")
             value["runtime_filename"] = filename
             loras.append(value)
-        return {
+        bindings: dict[str, object] = {
             "checkpoint": checkpoint,
             "loras": loras,
             "workflow": self.workflow.model_dump(mode="json"),
             "generation": self.generation.model_dump(mode="json"),
         }
+        if runtime.detector_filename is not None:
+            bindings["detector"] = {
+                "runtime_filename": runtime.detector_filename,
+                "comfy_name": f"bbox/{runtime.detector_filename}",
+            }
+        return bindings
 
 
 @dataclass(frozen=True)
 class _RuntimeArtifactBindings:
     checkpoint_filename: str
     lora_filenames: tuple[str, ...]
+    detector_filename: str | None
 
 
 def _resolve_manifest_artifact(
@@ -117,9 +124,15 @@ def _resolve_runtime_artifacts(
         _resolve_manifest_artifact(manifest, lora, kind=ArtifactKind.LORA)
         for lora in resolved.loras
     )
+    detectors = tuple(
+        artifact for artifact in manifest.artifacts if artifact.kind == ArtifactKind.DETECTOR
+    )
+    if len(detectors) > 1:
+        raise WorkerInputError("generation supports at most one face detector")
     return _RuntimeArtifactBindings(
         checkpoint_filename=checkpoint.target_filename,
         lora_filenames=tuple(lora.target_filename for lora in loras),
+        detector_filename=detectors[0].target_filename if detectors else None,
     )
 
 
@@ -379,6 +392,8 @@ def _validate_runtime_artifact_nodes(
     runtime: _RuntimeArtifactBindings,
 ) -> None:
     checkpoints: list[str] = []
+    detectors: list[str] = []
+    detailer_count = 0
     loras: dict[str, tuple[object, object]] = {}
     for raw_node in workflow.values():
         if not isinstance(raw_node, dict):
@@ -400,6 +415,13 @@ def _validate_runtime_artifact_nodes(
                 inputs.get("strength_model"),
                 inputs.get("strength_clip"),
             )
+        elif node_class == "UltralyticsDetectorProvider":
+            detector_name = inputs.get("model_name")
+            if not isinstance(detector_name, str):
+                raise WorkerInputError("workflow artifact binding is invalid")
+            detectors.append(detector_name)
+        elif node_class == "FaceDetailer":
+            detailer_count += 1
 
     if checkpoints != [runtime.checkpoint_filename]:
         raise WorkerInputError("workflow artifact binding is invalid")
@@ -411,6 +433,13 @@ def _validate_runtime_artifact_nodes(
     for filename, weight in expected_loras.items():
         if loras[filename] != (weight, weight):
             raise WorkerInputError("workflow artifact binding is invalid")
+    if detailer_count not in {0, 1} or bool(detailer_count) != bool(detectors):
+        raise WorkerInputError("workflow detector binding is invalid")
+    expected_detector = (
+        [] if runtime.detector_filename is None else [f"bbox/{runtime.detector_filename}"]
+    )
+    if detectors and detectors != expected_detector:
+        raise WorkerInputError("workflow detector binding is invalid")
 
 
 async def _load_workflow(

@@ -20,6 +20,8 @@ PYTORCH_IMAGE = (
     "sha256:eee11b3b3872a8c838e35ef48f08b2d5def2080902c7f666831310ca1a0ef2be"
 )
 COMFYUI_COMMIT = "700821e1364eaab0e8f21c538a2131719fec57bf"
+IMPACT_PACK_COMMIT = "429d0159ad429e64d2b3916e6e7be9c22d025c3c"
+IMPACT_SUBPACK_COMMIT = "50c7b71a6a224734cc9b21963c6d1926816a97f1"
 SALAD_QUEUE_WORKER_COMMIT = "73d7a3c80a73f26339194e024cb47c8501c67f75"
 
 
@@ -102,20 +104,31 @@ def test_final_runtime_is_non_root_with_a_writable_non_root_home() -> None:
     assert dockerfile.index("USER 10001:10001") < dockerfile.index("ENTRYPOINT")
 
 
-def test_image_has_no_floating_latest_or_custom_node_manager_install() -> None:
+def test_image_has_only_exactly_pinned_custom_node_sources() -> None:
+    dockerfile = _logical_lines(_dockerfile())
     normalized = _dockerfile().casefold()
-    forbidden = (
-        "comfyui-manager",
-        "custom-node",
-        "custom_node",
-        "custom-node-manager",
-        "custom_nodes",
-        ":latest",
-        "@latest",
-    )
 
-    assert all(value not in normalized for value in forbidden)
+    assert "comfyui-manager" not in normalized
+    assert "custom-node-manager" not in normalized
+    assert ":latest" not in normalized
+    assert "@latest" not in normalized
     assert "git clone" not in normalized
+    assert f"IMPACT_PACK_COMMIT={IMPACT_PACK_COMMIT}" in dockerfile
+    assert f"IMPACT_SUBPACK_COMMIT={IMPACT_SUBPACK_COMMIT}" in dockerfile
+    assert "https://github.com/ltdrdata/ComfyUI-Impact-Pack.git" in dockerfile
+    assert "https://github.com/ltdrdata/ComfyUI-Impact-Subpack.git" in dockerfile
+    assert (
+        'test "$(git -C /opt/comfyui/custom_nodes/ComfyUI-Impact-Pack rev-parse HEAD)" '
+        '= "${IMPACT_PACK_COMMIT}"' in dockerfile
+    )
+    assert (
+        'test "$(git -C /opt/comfyui/custom_nodes/ComfyUI-Impact-Subpack rev-parse HEAD)" '
+        '= "${IMPACT_SUBPACK_COMMIT}"' in dockerfile
+    )
+    assert f'org.opencontainers.image.impact-pack.revision="{IMPACT_PACK_COMMIT}"' in dockerfile
+    assert (
+        f'org.opencontainers.image.impact-subpack.revision="{IMPACT_SUBPACK_COMMIT}"' in dockerfile
+    )
 
 
 def test_expected_worker_entrypoint_is_the_only_runtime_entrypoint() -> None:
@@ -171,6 +184,16 @@ def test_python_dependencies_are_hash_locked_and_cuda_stack_matches_base() -> No
         "all('/opt/worker-venv/' not in module.__file__ "
         "for module in (torch, torchaudio, torchvision))" in dockerfile
     )
+    for dependency in (
+        "dill==0.4.1",
+        "matplotlib==3.11.1",
+        "opencv-python-headless==4.14.0.94",
+        "piexif==1.1.3",
+        "scikit-image==0.26.0",
+        "segment-anything==1.0",
+        "ultralytics==8.4.110",
+    ):
+        assert dependency in comfy_lock
 
 
 def test_ci_builds_the_contract_dockerfile_without_pin_overrides() -> None:

@@ -90,6 +90,15 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
         "sampler": "euler",
         "scheduler": "normal",
         "outputs_per_job": "4",
+        "hires_scale": "1.75",
+        "hires_denoise": "0.4",
+        "hires_upscale_method": "bicubic",
+        "detailer_guide_size": "768",
+        "detailer_max_size": "1280",
+        "detailer_denoise": "0.3",
+        "detailer_bbox_threshold": "0.55",
+        "detailer_bbox_dilation": "12",
+        "detailer_bbox_crop_factor": "2.8",
         "planned_job_count": "3",
         "desired_accepted_count": "10",
     }
@@ -123,6 +132,9 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert releases[0].phase == ReleasePhase.READY
     assert len(jobs) == 3
     assert version.specification["generation"]["cfg"] == 6.5
+    assert version.specification["generation"]["hires_scale"] == 1.75
+    assert version.specification["generation"]["hires_upscale_method"] == "bicubic"
+    assert version.specification["generation"]["detailer_max_size"] == 1280
     assert version.specification["loras"][0]["weight"] == 0.75
     assert version.specification["wildcard_versions"][0]["name"] == "poses"
     assert {job.parameters["generation"]["prompt"].split(",")[0] for job in jobs} <= {

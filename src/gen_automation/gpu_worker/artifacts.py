@@ -6,11 +6,12 @@ import re
 import shutil
 import stat
 import tempfile
+import zipfile
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Literal, NoReturn, Protocol, cast
+from typing import Annotated, Any, Literal, NoReturn, Protocol, cast
 
 from pydantic import (
     BaseModel,
@@ -29,7 +30,7 @@ MAX_SAFETENSORS_HEADER_BYTES = 16 * 1024 * 1024
 STREAM_READ_BYTES = 1024 * 1024
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_SAFE_TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,223}\.safetensors$")
+_SAFE_TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,223}(?:\.safetensors|\.pt)$")
 _URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 _WINDOWS_RESERVED_NAMES = {
     "aux",
@@ -46,6 +47,7 @@ Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 class ArtifactKind(StrEnum):
     CHECKPOINT = "checkpoint"
+    DETECTOR = "detector"
     LORA = "lora"
 
 
@@ -112,6 +114,12 @@ class ModelArtifactSpec(BaseModel):
             raise ValueError("exactly one artifact source identifier is required")
         if self.exact_size_bytes > self.max_size_bytes:
             raise ValueError("exact artifact size exceeds its maximum")
+        suffix = Path(self.target_filename).suffix.casefold()
+        if self.kind == ArtifactKind.DETECTOR:
+            if suffix != ".pt":
+                raise ValueError("detector artifacts must use a PyTorch archive")
+        elif suffix != ".safetensors":
+            raise ValueError("model artifacts must use Safetensors")
         return self
 
 
@@ -349,6 +357,39 @@ def _validate_safetensors_header(file_object: object, file_size: int) -> None:
         raise _InvalidArtifactError
 
 
+def _validate_detector_archive(file_object: object, file_size: int) -> None:
+    if not hasattr(file_object, "seek") or not hasattr(file_object, "read"):
+        raise _InvalidArtifactError
+    reader = cast("ReadableBinaryFile", file_object)
+    reader.seek(0)
+    if reader.read(4) != b"PK\x03\x04":
+        raise _InvalidArtifactError
+    reader.seek(0)
+    try:
+        with zipfile.ZipFile(cast(Any, reader)) as archive:
+            members = archive.infolist()
+            if (
+                not members
+                or len(members) > 100_000
+                or not any(member.filename.endswith("/data.pkl") for member in members)
+            ):
+                raise _InvalidArtifactError
+            for member in members:
+                normalized = member.filename.replace("\\", "/")
+                if (
+                    not normalized
+                    or normalized.startswith("/")
+                    or any(part in {"", ".", ".."} for part in normalized.split("/"))
+                    or member.file_size < 0
+                    or member.file_size > MAX_ARTIFACT_BYTES
+                ):
+                    raise _InvalidArtifactError
+    except (OSError, ValueError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        raise _InvalidArtifactError from None
+    if file_size < 64:
+        raise _InvalidArtifactError
+
+
 class ReadableBinaryFile(Protocol):
     def seek(self, offset: int, whence: int = 0) -> int: ...
 
@@ -368,7 +409,10 @@ def _verify_open_file(
             digest.update(chunk)
         if not hmac.compare_digest(digest.hexdigest(), artifact.sha256):
             raise _InvalidArtifactError
-        _validate_safetensors_header(file_object, opened.st_size)
+        if artifact.kind == ArtifactKind.DETECTOR:
+            _validate_detector_archive(file_object, opened.st_size)
+        else:
+            _validate_safetensors_header(file_object, opened.st_size)
 
 
 def _adopt_existing(path: Path, artifact: ModelArtifactSpec) -> bool:
@@ -424,7 +468,10 @@ async def _write_download(
                 raise _InvalidArtifactError
             file_object.flush()
             os.fsync(file_object.fileno())
-            _validate_safetensors_header(file_object, total_size)
+            if artifact.kind == ArtifactKind.DETECTOR:
+                _validate_detector_archive(file_object, total_size)
+            else:
+                _validate_safetensors_header(file_object, total_size)
             opened = os.fstat(file_object.fileno())
 
         temporary_stat = temporary_path.lstat()
@@ -465,25 +512,33 @@ async def bootstrap_artifacts(
     expected_manifest_sha256: Sha256,
     checkpoint_root: Path,
     lora_root: Path,
+    detector_root: Path | None = None,
 ) -> ArtifactBootstrapResult:
-    """Materialize a verified manifest into the two explicitly supplied roots."""
+    """Materialize a verified manifest into explicitly supplied model roots."""
 
     if not hmac.compare_digest(manifest.manifest_sha256, expected_manifest_sha256):
         raise ArtifactBootstrapError("artifact bootstrap failed")
     checkpoint = _root_from_path(checkpoint_root)
     lora = _root_from_path(lora_root)
-    if checkpoint.path == lora.path or (
-        checkpoint.device == lora.device and checkpoint.inode == lora.inode
-    ):
+    has_detector = any(artifact.kind == ArtifactKind.DETECTOR for artifact in manifest.artifacts)
+    detector = _root_from_path(detector_root) if detector_root is not None else None
+    if has_detector and detector is None:
+        raise ArtifactBootstrapError("artifact bootstrap failed")
+    roots_to_compare = tuple(root for root in (checkpoint, lora, detector) if root is not None)
+    identities = {(root.device, root.inode) for root in roots_to_compare}
+    if len(identities) != len(roots_to_compare):
         raise ArtifactBootstrapError("artifact bootstrap failed")
 
     roots = {
         ArtifactKind.CHECKPOINT: checkpoint,
+        ArtifactKind.DETECTOR: detector,
         ArtifactKind.LORA: lora,
     }
     materialized: list[MaterializedArtifact] = []
     for artifact in manifest.artifacts:
         root = roots[artifact.kind]
+        if root is None:
+            raise ArtifactBootstrapError("artifact bootstrap failed")
         _validate_root_identity(root)
         destination = root.path / artifact.target_filename
         adopted = _adopt_existing(destination, artifact)

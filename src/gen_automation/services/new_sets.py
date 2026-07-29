@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -73,6 +74,21 @@ class NewSetSubmission(BaseModel):
     sampler: str = Field(min_length=1, max_length=100)
     scheduler: str = Field(min_length=1, max_length=100)
     outputs_per_job: int = Field(ge=1, le=8)
+    hires_scale: float = Field(default=1.5, ge=1.0, le=3.0)
+    hires_denoise: float = Field(default=0.35, ge=0.05, le=1.0)
+    hires_upscale_method: Literal[
+        "nearest-exact",
+        "bilinear",
+        "area",
+        "bicubic",
+        "bislerp",
+    ] = "bislerp"
+    detailer_guide_size: int = Field(default=768, ge=512, le=2048, multiple_of=64)
+    detailer_max_size: int = Field(default=1024, ge=512, le=4096, multiple_of=64)
+    detailer_denoise: float = Field(default=0.35, ge=0.05, le=1.0)
+    detailer_bbox_threshold: float = Field(default=0.5, ge=0.1, le=0.95)
+    detailer_bbox_dilation: int = Field(default=10, ge=-64, le=128)
+    detailer_bbox_crop_factor: float = Field(default=3.0, ge=1.0, le=5.0)
     planned_job_count: int = Field(ge=1, le=10_000)
     desired_accepted_count: int = Field(ge=1, le=10_000)
 
@@ -98,6 +114,8 @@ class NewSetSubmission(BaseModel):
         planned_outputs = self.planned_job_count * self.outputs_per_job
         if self.desired_accepted_count > planned_outputs:
             raise ValueError("desired accepted count exceeds the planned output count")
+        if self.detailer_max_size < self.detailer_guide_size:
+            raise ValueError("detailer maximum size must cover its guide size")
         return self
 
 
@@ -346,6 +364,15 @@ async def create_and_approve_new_set(
             sampler=command.sampler,
             scheduler=command.scheduler,
             outputs_per_job=command.outputs_per_job,
+            hires_scale=command.hires_scale,
+            hires_denoise=command.hires_denoise,
+            hires_upscale_method=command.hires_upscale_method,
+            detailer_guide_size=command.detailer_guide_size,
+            detailer_max_size=command.detailer_max_size,
+            detailer_denoise=command.detailer_denoise,
+            detailer_bbox_threshold=command.detailer_bbox_threshold,
+            detailer_bbox_dilation=command.detailer_bbox_dilation,
+            detailer_bbox_crop_factor=command.detailer_bbox_crop_factor,
         ),
         planned_job_count=command.planned_job_count,
     )

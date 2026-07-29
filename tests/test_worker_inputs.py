@@ -3,7 +3,7 @@ import hashlib
 import io
 import json
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -27,10 +27,12 @@ from gen_automation.gpu_worker.artifacts import (
     calculate_manifest_sha256,
 )
 from gen_automation.gpu_worker.models import (
+    DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES,
     GenerateEnvelope,
     UploadGrant,
     WorkerEnvironment,
     WorkerSettings,
+    validate_approved_workflow,
 )
 from gen_automation.gpu_worker.security import verify_authorization
 from gen_automation.services.assets import finalize_raw_master
@@ -47,6 +49,12 @@ SIGNING_PRIVATE_KEY = encode_base64url(bytes(range(1, 33)))
 VERIFICATION_PUBLIC_KEY = derive_public_key(SIGNING_PRIVATE_KEY)
 WORKFLOW_BODY = (
     Path(__file__).resolve().parents[1] / "workflows" / "illustrious-sdxl-base-v1.json"
+).read_bytes()
+HIRES_WORKFLOW_BODY = (
+    Path(__file__).resolve().parents[1] / "workflows" / "illustrious-sdxl-hires-v1.json"
+).read_bytes()
+DETAILER_WORKFLOW_BODY = (
+    Path(__file__).resolve().parents[1] / "workflows" / "illustrious-sdxl-hires-detailer-v1.json"
 ).read_bytes()
 UPLOAD_ORIGIN = "https://uploads.example.test"
 
@@ -293,6 +301,57 @@ async def _build(context: WorkerInputContext) -> dict[str, object]:
         return await provider.build_job_input(context.job_context)
 
 
+def _profile_context(
+    context: WorkerInputContext,
+    *,
+    workflow_body: bytes,
+    detector: bool = False,
+) -> WorkerInputContext:
+    context.store.put_for_test(
+        context.workflow_key,
+        workflow_body,
+        content_type="application/json",
+    )
+    parameters = dict(context.job_context.parameters)
+    raw_workflow = parameters["workflow"]
+    assert isinstance(raw_workflow, dict)
+    parameters["workflow"] = {
+        **raw_workflow,
+        "sha256": hashlib.sha256(workflow_body).hexdigest(),
+    }
+    job_context = SaladJobInputContext(
+        **{
+            **context.job_context.__dict__,
+            "parameters": parameters,
+            "parameters_sha256": canonical_sha256(parameters),
+        }
+    )
+    manifest = context.artifact_manifest
+    if detector:
+        checkpoint, lora = manifest.artifacts
+        face_detector = ModelArtifactSpec(
+            logical_name="face-yolov8m",
+            kind=ArtifactKind.DETECTOR,
+            source_object_id="detectors/face-yolov8m.pt",
+            sha256="c" * 64,
+            exact_size_bytes=100,
+            max_size_bytes=100,
+            target_filename="face-yolov8m.pt",
+        )
+        artifacts = (checkpoint, face_detector, lora)
+        manifest = ArtifactManifest(
+            version="v1",
+            artifacts=artifacts,
+            manifest_sha256=calculate_manifest_sha256(artifacts),
+        )
+    return replace(
+        context,
+        workflow_body=workflow_body,
+        job_context=job_context,
+        artifact_manifest=manifest,
+    )
+
+
 @pytest.mark.asyncio
 async def test_builds_signed_envelope_with_rendered_workflow_and_fresh_uploads(
     worker_input_context: WorkerInputContext,
@@ -339,6 +398,62 @@ async def test_builds_signed_envelope_with_rendered_workflow_and_fresh_uploads(
     assert [grant.output_index for grant in envelope.payload.uploads] == [0, 1]
     assert len({grant.upload_attempt_id for grant in envelope.payload.uploads}) == 2
     assert all("expires=10800" in grant.url for grant in envelope.payload.uploads)
+
+
+@pytest.mark.asyncio
+async def test_hires_profile_renders_a_core_two_pass_latent_workflow(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _profile_context(
+        worker_input_context,
+        workflow_body=HIRES_WORKFLOW_BODY,
+    )
+
+    envelope = GenerateEnvelope.model_validate(await _build(context), strict=True)
+    workflow = envelope.payload.workflow
+    upscale = workflow["10"]
+    second_pass = workflow["11"]
+    assert isinstance(upscale, dict)
+    assert isinstance(second_pass, dict)
+    assert upscale == {
+        "class_type": "LatentUpscaleBy",
+        "inputs": {
+            "samples": ["9", 0],
+            "scale_by": 1.5,
+            "upscale_method": "bislerp",
+        },
+    }
+    assert second_pass["inputs"]["latent_image"] == ["10", 0]
+    assert second_pass["inputs"]["denoise"] == 0.35
+    validate_approved_workflow(workflow, DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
+
+
+@pytest.mark.asyncio
+async def test_detailer_profile_binds_the_single_manifest_verified_face_detector(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _profile_context(
+        worker_input_context,
+        workflow_body=DETAILER_WORKFLOW_BODY,
+        detector=True,
+    )
+
+    envelope = GenerateEnvelope.model_validate(await _build(context), strict=True)
+    workflow = envelope.payload.workflow
+    detector = workflow["13"]
+    detailer = workflow["14"]
+    assert isinstance(detector, dict)
+    assert isinstance(detailer, dict)
+    assert detector == {
+        "class_type": "UltralyticsDetectorProvider",
+        "inputs": {"model_name": "bbox/face-yolov8m.pt"},
+    }
+    assert detailer["class_type"] == "FaceDetailer"
+    assert detailer["inputs"]["bbox_detector"] == ["13", 0]
+    assert detailer["inputs"]["guide_size"] == 768
+    assert detailer["inputs"]["max_size"] == 1024
+    assert detailer["inputs"]["denoise"] == 0.35
+    validate_approved_workflow(workflow, DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
 
 
 @pytest.mark.asyncio

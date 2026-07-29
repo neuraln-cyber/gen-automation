@@ -21,6 +21,7 @@ from gen_automation.gpu_worker.app import create_worker_app
 from gen_automation.gpu_worker.artifacts import (
     ArtifactBootstrapError,
     ArtifactBootstrapResult,
+    ArtifactKind,
     bootstrap_artifacts,
 )
 from gen_automation.gpu_worker.bootstrap import (
@@ -147,6 +148,47 @@ def ensure_runtime_directories(settings: WorkerRuntimeSettings) -> None:
         _runtime_directory(path)
 
 
+def write_verified_detector_whitelist(
+    settings: WorkerRuntimeSettings,
+    result: ArtifactBootstrapResult,
+) -> None:
+    """Allow only manifest-verified detector archives to use legacy Torch loading."""
+
+    detector_names = tuple(
+        artifact.target_filename
+        for artifact in result.artifacts
+        if artifact.kind == ArtifactKind.DETECTOR
+    )
+    if len(detector_names) > 1:
+        raise WorkerBootstrapConfigurationError("worker bootstrap configuration is invalid")
+    whitelist_directory = (
+        settings.comfy_runtime_root / "user" / "default" / "ComfyUI-Impact-Subpack"
+    )
+    _runtime_directory(whitelist_directory)
+    whitelist_path = whitelist_directory / "model-whitelist.txt"
+    descriptor = -1
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(whitelist_path, flags, 0o600)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError
+        content = "".join(f"{name}\n" for name in detector_names).encode()
+        with os.fdopen(descriptor, "wb", closefd=False) as whitelist_file:
+            whitelist_file.write(content)
+            whitelist_file.flush()
+            os.fsync(descriptor)
+        os.chmod(whitelist_path, 0o600)
+    except OSError:
+        raise WorkerBootstrapConfigurationError(
+            "worker bootstrap configuration is invalid"
+        ) from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _comfy_origin(settings: WorkerRuntimeSettings) -> tuple[str, int]:
     try:
         parsed: SplitResult = urlsplit(settings.comfy_base_url)
@@ -182,6 +224,9 @@ def build_comfy_command(settings: WorkerRuntimeSettings) -> tuple[str, ...]:
         str(port),
         "--disable-auto-launch",
         "--disable-all-custom-nodes",
+        "--whitelist-custom-nodes",
+        "ComfyUI-Impact-Pack",
+        "ComfyUI-Impact-Subpack",
         "--disable-api-nodes",
         "--disable-metadata",
         "--models-directory",
@@ -243,7 +288,11 @@ async def bootstrap_worker_models(
     downloader: S3ArtifactDownloader | None = None,
 ) -> ArtifactBootstrapResult:
     async with asyncio.timeout(settings.model_bootstrap_timeout_seconds):
-        ensure_model_roots(settings.checkpoint_root, settings.lora_root)
+        ensure_model_roots(
+            settings.checkpoint_root,
+            settings.lora_root,
+            settings.detector_root,
+        )
         ensure_runtime_directories(settings)
         manifest = load_artifact_manifest(settings.model_manifest_json.get_secret_value())
         resolved_downloader = downloader or build_artifact_downloader(settings)
@@ -254,6 +303,7 @@ async def bootstrap_worker_models(
                 expected_manifest_sha256=settings.model_manifest_sha256,
                 checkpoint_root=settings.checkpoint_root,
                 lora_root=settings.lora_root,
+                detector_root=settings.detector_root,
             )
         finally:
             await resolved_downloader.close()
@@ -418,7 +468,8 @@ def main() -> None:
     try:
         settings = WorkerRuntimeSettings()
         harden_parent_process(settings.environment)
-        asyncio.run(bootstrap_worker_models(settings))
+        bootstrap_result = asyncio.run(bootstrap_worker_models(settings))
+        write_verified_detector_whitelist(settings, bootstrap_result)
         executor = ComfyExecutor(
             base_url=settings.comfy_base_url,
             execution_timeout_seconds=settings.comfy_execution_timeout_seconds,

@@ -4,7 +4,8 @@
 
 `workflows/illustrious-sdxl-base-v1.json` is the production ComfyUI API
 template for the first generation profile. It uses only core, allowlisted
-ComfyUI nodes:
+ComfyUI nodes. Its SHA-256 is
+`901a50003bfb9aa17c6117a29fc1232a678dcadc19f70a895fe6edf69ccf3fca`:
 
 - `CheckpointLoaderSimple`
 - `LoraLoader`
@@ -59,5 +60,83 @@ job signing, the worker API, staged uploads, image verification, and immutable
 `masters/` promotion. A live GPU canary is still required after the real
 checkpoint, LoRAs, object store, and provider bindings are supplied.
 
-Hires-fix and detailer profiles are intentionally separate workflow versions.
-They do not change or weaken this base profile's node allowlist.
+## Hires profile
+
+`workflows/illustrious-sdxl-hires-v1.json` is a core-node-only two-pass
+Illustrious/SDXL workflow. Its SHA-256 is
+`42761a3244e8b69870bd6aed52c35d1f680d641429e2fdce1493ad837e1da547`.
+The first `KSampler` produces the normal latent, `LatentUpscaleBy` enlarges it,
+and a second `KSampler` refines it before the one final VAE decode.
+
+The New Set form freezes three simple controls into every release:
+
+- hires scale: `1.0` through `3.0`, default `1.5`;
+- second-pass denoise: `0.05` through `1.0`, default `0.35`; and
+- core latent interpolation: `bislerp` (default), `bicubic`, `bilinear`,
+  `nearest-exact`, or `area`.
+
+The base workflow ignores these values. A profile is selected by choosing its
+approved workflow in New Set; there is no runtime graph editing or automatic
+profile guessing.
+
+## Hires + face detailer profile
+
+`workflows/illustrious-sdxl-hires-detailer-v1.json` runs the same two hires
+passes, then sends the decoded batch through Impact Pack `FaceDetailer`. Its
+SHA-256 is
+`637360c7ddb681d37810bbd34edd4f3d72501b6db5a55eaacfe7e866d1469e2d`.
+The release freezes guide size, maximum size, denoise, face threshold, dilation,
+and crop factor. Defaults are deliberately conservative: `768`, `1024`,
+`0.35`, `0.5`, `10`, and `3.0`.
+
+The worker image pins:
+
+- Impact Pack commit `429d0159ad429e64d2b3916e6e7be9c22d025c3c`;
+- Impact Subpack commit `50c7b71a6a224734cc9b21963c6d1926816a97f1`;
+- every Python dependency and wheel hash in `requirements-comfy.lock`; and
+- only those two custom-node directories in ComfyUI's custom-node whitelist.
+
+The signed worker API independently permits only `FaceDetailer` and
+`UltralyticsDetectorProvider` from those packages. It does not permit arbitrary
+Impact Pack nodes.
+
+### Detector artifact
+
+The detector is not downloaded by ComfyUI, Impact Pack, or Ultralytics. Add one
+`detector` entry to the existing immutable worker artifact manifest. The entry
+must use a basename-only `.pt` target, an exact byte size, and an exact SHA-256.
+At startup the worker downloads it with the read-only object-store identity,
+verifies the digest and size, checks that it is a modern PyTorch ZIP archive,
+and materializes it only under
+`/opt/comfyui/models/ultralytics/bbox`.
+
+Exactly zero or one detector is supported. Base and hires workflows work with
+zero; the detailer workflow fails before upload grants are created unless one
+is present. Once verified, that exact target filename becomes the only entry in
+Impact Subpack's legacy-model whitelist. A detector `.pt` can contain executable
+pickle data, so its source and digest must be reviewed with the same care as
+worker code.
+
+For the first live detailer canary, provide:
+
+- the approved face detector object (normally a trusted
+  `face_yolov8m.pt`-compatible model);
+- its private object-store key, exact byte size, and SHA-256; and
+- the updated artifact-manifest JSON and manifest SHA-256.
+
+No model-host token is needed when the approved file is already in the private
+artifact bucket.
+
+## Registry onboarding
+
+Bundling a JSON template does not automatically make it selectable. Upload the
+exact template bytes to private workflow storage and create a current approved
+workflow registry record using the path's SHA-256 above. Register the base,
+hires, and hires + detailer files as three separate workflow approvals. They
+then appear in the New Set workflow selector.
+
+Upstream contracts:
+[ComfyUI custom-node whitelist](https://github.com/Comfy-Org/ComfyUI/blob/700821e1364eaab0e8f21c538a2131719fec57bf/comfy/cli_args.py),
+[Impact Pack](https://github.com/ltdrdata/ComfyUI-Impact-Pack/tree/429d0159ad429e64d2b3916e6e7be9c22d025c3c),
+and
+[Impact Subpack](https://github.com/ltdrdata/ComfyUI-Impact-Subpack/tree/50c7b71a6a224734cc9b21963c6d1926816a97f1).

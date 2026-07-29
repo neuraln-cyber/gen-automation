@@ -75,6 +75,7 @@ def _settings(**changes: object) -> WorkerRuntimeSettings:
         "artifact_bucket": "models-private",
         "checkpoint_root": Path("/models/checkpoints"),
         "lora_root": Path("/models/loras"),
+        "detector_root": Path("/models/ultralytics/bbox"),
         "comfy_python": Path("/opt/worker-venv/bin/python"),
         "comfy_main": Path("/comfy/main.py"),
     }

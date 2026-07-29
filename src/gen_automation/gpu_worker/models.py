@@ -30,11 +30,14 @@ DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES = frozenset(
         "CheckpointLoaderSimple",
         "CLIPTextEncode",
         "EmptyLatentImage",
+        "FaceDetailer",
         "KSampler",
+        "LatentUpscaleBy",
         "LoraLoader",
         "SaveImage",
         "SaveImageWebsocket",
         "VAEDecode",
+        "UltralyticsDetectorProvider",
     }
 )
 

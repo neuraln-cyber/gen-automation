@@ -55,10 +55,12 @@ Acceptance criteria:
 
 1. Pin the ComfyUI API base image and all custom-node revisions.
 2. Implement startup model-manifest download and SHA-256 verification.
-3. Build the Illustrious workflow adapter.
+3. Maintain the production base Illustrious/SDXL workflow adapter and add
+   separately versioned hires/detailer profiles.
 4. Add worker readiness, warm-up, job execution, and completion callbacks.
 5. Upload masters and metadata directly to object storage.
-6. Add synthetic smoke workflows that do not require production models.
+6. Keep the synthetic prompt-to-master contract green without production
+   models; run a separate paid live GPU canary before release.
 
 Acceptance criteria:
 
