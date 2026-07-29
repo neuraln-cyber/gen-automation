@@ -156,6 +156,12 @@ jobs:
           --file Dockerfile.semantic-gateway
           --tag gen-automation-semantic-gateway:test
           .
+      - name: Build MEGA-enabled control-plane image
+        run: >-
+          docker build
+          --file Dockerfile.mega
+          --tag gen-automation-control-plane-mega:test
+          .
       - name: Generate control-plane image SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
@@ -189,6 +195,17 @@ jobs:
           dependency-snapshot: false
           upload-artifact: false
           upload-release-assets: false
+      - name: Generate MEGA-enabled control-plane image SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: gen-automation-control-plane-mega:test
+          format: spdx-json
+          output-file: control-plane-mega.spdx.json
+          syft-version: v1.42.3
+          github-token: ""
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
       - name: Scan control-plane image SBOM
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
@@ -213,6 +230,16 @@ jobs:
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
           sbom: semantic-gateway.spdx.json
+          fail-build: true
+          severity-cutoff: critical
+          output-format: table
+          grype-version: v0.110.0
+          cache-db: false
+          only-fixed: true
+      - name: Scan MEGA-enabled control-plane image SBOM
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          sbom: control-plane-mega.spdx.json
           fail-build: true
           severity-cutoff: critical
           output-format: table

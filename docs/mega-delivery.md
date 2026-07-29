@@ -56,24 +56,25 @@ Primary documentation:
 - <https://github.com/meganz/MEGAcmd/blob/master/contrib/docs/commands/get.md>
 - <https://github.com/meganz/MEGAcmd/blob/master/contrib/docs/commands/export.md>
 
-The production controller image must install the pinned official MEGAcmd
-package and provide `mega-ls`, `mega-mkdir`, `mega-find`, `mega-put`, and
-`mega-get` on `PATH`. Record the package URL, version, and package SHA-256 in the
-deployment manifest. Do not allow MEGAcmd to auto-update inside the immutable
-container; upgrade it through the normal image canary.
+The published `control-plane-mega` image installs the pinned official MEGAcmd
+package and provides `mega-ls`, `mega-mkdir`, `mega-find`, `mega-put`, and
+`mega-get` on `PATH`. Its default package URL, version, and SHA-256 are fixed in
+`Dockerfile.mega`; CI builds, scans, and publishes that exact image. Do not
+allow MEGAcmd to auto-update inside the immutable container; upgrade it through
+the normal image canary.
 
 The repository provides a separate image target so the ordinary control plane
 does not carry the extra package:
 
 ```sh
 docker build -f Dockerfile.mega \
-  --build-arg MEGACMD_DEB_URL=https://mega.nz/linux/repo/Debian_13/amd64/megacmd_2.5.2-1.1_amd64.deb \
-  --build-arg MEGACMD_DEB_SHA256=43907f450e13e712b61c87105eeab9c3568338c36895ad6de9599a3facf43659 \
   -t gen-automation-control-plane-mega .
 ```
 
+The reviewed URL and digest may be overridden with `MEGACMD_DEB_URL` and
+`MEGACMD_DEB_SHA256` build arguments only as part of a version-update canary.
 The build accepts only HTTPS URLs below an official MEGA Linux repository and
-fails if either argument is missing, the downloaded package digest differs, or
+fails if either value is missing, the downloaded package digest differs, or
 the `.deb` metadata is not package `megacmd`, version `2.5.2-1.1`, architecture
 `amd64`. The package's post-install apt source and key are removed so the
 immutable runtime cannot silently upgrade. For repeatable/offline production

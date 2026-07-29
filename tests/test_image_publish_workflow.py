@@ -43,6 +43,8 @@ def test_all_deployable_images_are_digest_attested_without_a_mutable_tag() -> No
     assert "dockerfile: Dockerfile.worker" in workflow
     assert "image_suffix: semantic-gateway" in workflow
     assert "dockerfile: Dockerfile.semantic-gateway" in workflow
+    assert "image_suffix: control-plane-mega" in workflow
+    assert "dockerfile: Dockerfile.mega" in workflow
     assert "platforms: linux/amd64" in workflow
     assert "tags: ${{ env.IMAGE_NAME }}:sha-${{ env.SOURCE_SHA }}" in workflow
     assert "provenance: mode=max" in workflow

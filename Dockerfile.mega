@@ -21,8 +21,8 @@ COPY requirements.lock ./
 
 # Pin an official MEGA Linux repository URL and its independently recorded
 # SHA-256. The credential-bearing profile is mounted only at runtime.
-ARG MEGACMD_DEB_URL
-ARG MEGACMD_DEB_SHA256
+ARG MEGACMD_DEB_URL=https://mega.nz/linux/repo/Debian_13/amd64/megacmd_2.5.2-1.1_amd64.deb
+ARG MEGACMD_DEB_SHA256=43907f450e13e712b61c87105eeab9c3568338c36895ad6de9599a3facf43659
 RUN test -n "${MEGACMD_DEB_URL}" \
     && test -n "${MEGACMD_DEB_SHA256}" \
     && case "${MEGACMD_DEB_URL}" in \

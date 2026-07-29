@@ -37,6 +37,9 @@ jobs:
           - component: semantic-gateway
             image_suffix: semantic-gateway
             dockerfile: Dockerfile.semantic-gateway
+          - component: control-plane-mega
+            image_suffix: control-plane-mega
+            dockerfile: Dockerfile.mega
     env:
       IMAGE_NAME: ghcr.io/${{ github.repository }}/${{ matrix.image_suffix }}
       SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
