@@ -150,6 +150,12 @@ jobs:
         run: docker build --tag gen-automation-control-plane:test .
       - name: Build digest-pinned GPU worker image
         run: docker build --file Dockerfile.worker --tag gen-automation-gpu-worker:test .
+      - name: Build semantic gateway image
+        run: >-
+          docker build
+          --file Dockerfile.semantic-gateway
+          --tag gen-automation-semantic-gateway:test
+          .
       - name: Generate control-plane image SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
@@ -172,6 +178,17 @@ jobs:
           dependency-snapshot: false
           upload-artifact: false
           upload-release-assets: false
+      - name: Generate semantic gateway image SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: gen-automation-semantic-gateway:test
+          format: spdx-json
+          output-file: semantic-gateway.spdx.json
+          syft-version: v1.42.3
+          github-token: ""
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
       - name: Scan control-plane image SBOM
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
@@ -186,6 +203,16 @@ jobs:
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
           sbom: gpu-worker.spdx.json
+          fail-build: true
+          severity-cutoff: critical
+          output-format: table
+          grype-version: v0.110.0
+          cache-db: false
+          only-fixed: true
+      - name: Scan semantic gateway image SBOM
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          sbom: semantic-gateway.spdx.json
           fail-build: true
           severity-cutoff: critical
           output-format: table

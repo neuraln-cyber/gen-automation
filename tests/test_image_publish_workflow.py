@@ -35,12 +35,14 @@ def test_registry_actions_are_full_commit_pins_and_permissions_are_narrow() -> N
     assert "artifact-metadata: write" not in workflow
 
 
-def test_both_images_are_digest_attested_without_a_mutable_tag() -> None:
+def test_all_deployable_images_are_digest_attested_without_a_mutable_tag() -> None:
     workflow = _workflow()
 
     assert "image_suffix: control-plane" in workflow
     assert "image_suffix: gpu-worker" in workflow
     assert "dockerfile: Dockerfile.worker" in workflow
+    assert "image_suffix: semantic-gateway" in workflow
+    assert "dockerfile: Dockerfile.semantic-gateway" in workflow
     assert "platforms: linux/amd64" in workflow
     assert "tags: ${{ env.IMAGE_NAME }}:sha-${{ env.SOURCE_SHA }}" in workflow
     assert "provenance: mode=max" in workflow

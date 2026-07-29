@@ -34,6 +34,9 @@ jobs:
           - component: gpu-worker
             image_suffix: gpu-worker
             dockerfile: Dockerfile.worker
+          - component: semantic-gateway
+            image_suffix: semantic-gateway
+            dockerfile: Dockerfile.semantic-gateway
     env:
       IMAGE_NAME: ghcr.io/${{ github.repository }}/${{ matrix.image_suffix }}
       SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
