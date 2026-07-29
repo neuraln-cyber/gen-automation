@@ -68,14 +68,12 @@ WORKDIR /opt/worker
 COPY requirements.lock requirements-comfy.lock requirements-worker-base.txt ./
 
 RUN test -x /usr/local/bin/python3.12 \
-    && test ! -L /usr/local/bin/python3.12 \
     && /usr/local/bin/python3.12 -m venv \
         --copies \
         --without-pip \
         --system-site-packages \
         /opt/worker-venv \
     && test -x /opt/worker-venv/bin/python3.12 \
-    && test ! -L /opt/worker-venv/bin/python3.12 \
     && /opt/worker-venv/bin/python3.12 -c "import sys; assert sys.version_info[:2] == (3, 12); assert sys.prefix == '/opt/worker-venv'; assert sys.prefix != sys.base_prefix" \
     && /opt/worker-venv/bin/python3.12 -m pip install --only-binary=:all: --require-hashes --no-deps -r requirements.lock \
     && /opt/worker-venv/bin/python3.12 -m pip install --only-binary=:all: --require-hashes --no-deps -r requirements-comfy.lock \

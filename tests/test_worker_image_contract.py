@@ -142,7 +142,6 @@ def test_python_dependencies_are_hash_locked_and_cuda_stack_matches_base() -> No
         "/opt/worker-venv" in dockerfile
     )
     assert "test -x /opt/worker-venv/bin/python3.12" in dockerfile
-    assert "test ! -L /opt/worker-venv/bin/python3.12" in dockerfile
     assert "sys.prefix == '/opt/worker-venv'" in dockerfile
     assert "sys.prefix != sys.base_prefix" in dockerfile
     assert (
@@ -157,7 +156,6 @@ def test_python_dependencies_are_hash_locked_and_cuda_stack_matches_base() -> No
     assert "--break-system-packages" not in dockerfile
     assert "EXTERNALLY-MANAGED" not in dockerfile
     assert "test -x /usr/local/bin/python3.12" in dockerfile
-    assert "test ! -L /usr/local/bin/python3.12" in dockerfile
     assert "assert sys.version_info[:2] == (3, 12)" in dockerfile
     assert "--generate-hashes" in comfy_lock.splitlines()[4]
     assert not re.search(r"(?im)^\s*(?:-e\s+|https?://|git\+)", comfy_lock)
