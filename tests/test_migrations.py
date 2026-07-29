@@ -152,6 +152,7 @@ def test_foundation_migration_round_trip(
         "review_x_selections",
         "salad_deployments",
         "scoring_runs",
+        "semantic_assessments",
         "subject_approvals",
         "webhook_receipts",
         "workflow_approvals",

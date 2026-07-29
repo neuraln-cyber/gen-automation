@@ -103,14 +103,16 @@ approved.
 7. The [automatic quality runtime](quality-scoring.md) reads exact-version
    masters sequentially, stages isolated deterministic signals, and atomically
    freezes a ranked review queue.
-8. Human review records decisions without moving or altering masters.
-9. Release approval freezes destination-specific derivative recipes.
-10. The [automatic derivative runtime](derivative-rendering.md) claims one
+8. Optional [semantic anatomy QC](semantic-anatomy-qc.md) adds a pinned,
+   retry-safe VLM signal; outages remain visible for manual review.
+9. Human review records decisions without moving or altering masters.
+10. Release approval freezes destination-specific derivative recipes.
+11. The [automatic derivative runtime](derivative-rendering.md) claims one
     frozen selection at a time, renders inside a bounded child, conditionally
     writes immutable checksum-addressed outputs, and atomically registers their
     assets and lineage.
-11. Publishing adapters upload or prepare handoff packages.
-12. Reconciliation verifies remote state and the control plane records completion.
+12. Publishing adapters upload or prepare handoff packages.
+13. Reconciliation verifies remote state and the control plane records completion.
 
 ## Idempotency
 

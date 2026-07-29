@@ -172,6 +172,28 @@
         background: var(--surface-strong);
       }
       .decision-detail { color: var(--muted); overflow-wrap: anywhere; }
+      .semantic-status {
+        margin: .8rem 0;
+        padding: .7rem .8rem;
+        border: 1px solid var(--border);
+        border-radius: .5rem;
+        background: var(--surface-strong);
+      }
+      .semantic-status.severe {
+        border-color: #a75c68;
+        background: #3b2025;
+      }
+      .semantic-status p { margin: 0; }
+      .semantic-issues { margin: .45rem 0 0; padding-left: 1.2rem; color: var(--muted); }
+      .ai-excluded-heading {
+        grid-column: 1 / -1;
+        padding: 1rem 1.1rem;
+        border: 1px solid #a75c68;
+        border-radius: .75rem;
+        background: #3b2025;
+      }
+      .ai-excluded-heading h2 { margin-bottom: .25rem; }
+      .asset-card.ai-excluded { border-color: #a75c68; }
       .decision-form { display: grid; gap: .45rem; margin: 1rem 0; }
       .decision-form label, legend { color: var(--muted); font-size: .88rem; }
       .decision-form input, .decision-form textarea {

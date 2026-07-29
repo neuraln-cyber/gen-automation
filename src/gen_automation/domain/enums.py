@@ -138,6 +138,35 @@ class RankingDisposition(StrEnum):
     FLAGGED_REVIEW = "flagged_review"
 
 
+class SemanticAssessmentState(StrEnum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    RETRY_WAIT = "retry_wait"
+    COMPLETED = "completed"
+    UNAVAILABLE = "unavailable"
+
+
+class SemanticVerdict(StrEnum):
+    PASS = "pass"  # noqa: S105
+    REVIEW = "review"
+    SEVERE = "severe"
+
+
+class SemanticIssueCode(StrEnum):
+    EXTRA_FINGER = "extra_finger"
+    MISSING_FINGER = "missing_finger"
+    MALFORMED_HAND = "malformed_hand"
+    EXTRA_TOE = "extra_toe"
+    MISSING_TOE = "missing_toe"
+    MALFORMED_FOOT = "malformed_foot"
+    EXTRA_LIMB = "extra_limb"
+    MISSING_LIMB = "missing_limb"
+    DUPLICATE_BODY_PART = "duplicate_body_part"
+    IMPOSSIBLE_JOINT = "impossible_joint"
+    IMPLAUSIBLE_PROPORTION = "implausible_proportion"
+    SEVERE_FACE_DEFORMATION = "severe_face_deformation"
+
+
 class ReviewTaskState(StrEnum):
     OPEN = "open"
     COMPLETED = "completed"

@@ -1,4 +1,5 @@
 import hmac
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
@@ -58,6 +59,10 @@ from gen_automation.services.review import (
     set_review_x_selection,
     transition_review_task,
 )
+from gen_automation.services.semantic_anatomy import (
+    SemanticReviewAssessment,
+    load_semantic_review_assessments,
+)
 from gen_automation.storage.base import ObjectStore
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"], include_in_schema=False)
@@ -69,8 +74,20 @@ Session = Annotated[AsyncSession, Depends(get_session)]
 class ReviewAssetView:
     master: RankedMaster
     current: CurrentAssetDecision
+    semantic: SemanticReviewAssessment | None
+    ai_excluded: bool
     idempotency_key: str | None
     x_selection_idempotency_key: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewAssetGroups:
+    regular: tuple[ReviewAssetView, ...]
+    ai_excluded: tuple[ReviewAssetView, ...]
+
+    @property
+    def ordered(self) -> tuple[ReviewAssetView, ...]:
+        return self.regular + self.ai_excluded
 
 
 class BrowserReviewSecurityError(Exception):
@@ -306,6 +323,10 @@ async def dashboard_review_task(
             scoring_run_id=navigation.scoring_run_id,
             expires_in=min(settings.storage_presign_ttl_seconds, 900),
         )
+        semantic_assessments = await load_semantic_review_assessments(
+            session,
+            scoring_run_id=navigation.scoring_run_id,
+        )
         csrf_token = (
             _form_csrf_token(request, principal) if summary.state == ReviewTaskState.OPEN else None
         )
@@ -349,6 +370,8 @@ async def dashboard_review_task(
             review_task_id=review_task_id,
             summary=summary,
             masters=release.assets,
+            semantic_assessments=semantic_assessments,
+            severe_confidence_micros=(settings.semantic_anatomy_severe_confidence_micros),
         )
     except RankingIntegrityError:
         return _error_response(
@@ -384,7 +407,8 @@ async def dashboard_review_task(
                 "release": release,
                 "navigation": navigation,
                 "summary": summary,
-                "assets": assets,
+                "assets": assets.ordered,
+                "ai_excluded_count": len(assets.ai_excluded),
                 "csrf_token": csrf_token,
                 "complete_idempotency_key": complete_idempotency_key,
                 "cancel_idempotency_key": cancel_idempotency_key,
@@ -607,15 +631,25 @@ def _review_assets(
     review_task_id: UUID,
     summary: ReviewSummary,
     masters: tuple[RankedMaster, ...],
-) -> tuple[ReviewAssetView, ...]:
+    semantic_assessments: Mapping[UUID, SemanticReviewAssessment],
+    severe_confidence_micros: int,
+) -> ReviewAssetGroups:
     decisions = {decision.asset_id: decision for decision in summary.assets}
     if set(decisions) != {master.asset_id for master in masters}:
         raise RankingIntegrityError("review and ranking assets differ")
     is_open = summary.state == ReviewTaskState.OPEN
-    return tuple(
+    views = tuple(
         ReviewAssetView(
             master=master,
             current=decisions[master.asset_id],
+            semantic=semantic_assessments.get(master.asset_id),
+            ai_excluded=(
+                semantic_assessments[master.asset_id].is_high_confidence_severe(
+                    threshold_micros=severe_confidence_micros,
+                )
+                if master.asset_id in semantic_assessments
+                else False
+            ),
             idempotency_key=(
                 review_form_idempotency_key(
                     settings,
@@ -647,6 +681,10 @@ def _review_assets(
             ),
         )
         for master in masters
+    )
+    return ReviewAssetGroups(
+        regular=tuple(view for view in views if not view.ai_excluded),
+        ai_excluded=tuple(view for view in views if view.ai_excluded),
     )
 
 

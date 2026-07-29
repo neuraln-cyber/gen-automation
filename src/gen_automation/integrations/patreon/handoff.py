@@ -54,7 +54,8 @@ PUBLICATION_CHECKLIST: tuple[str, ...] = (
     "Confirm the Patreon creator account is classified Adult/18+ and required "
     "verification is complete.",
     "Set the intended audience/tier and schedule in Patreon's official publishing UI.",
-    "Publish or schedule in Patreon's official UI; do not use browser automation.",
+    "Publish or schedule in Patreon's official UI, using the configured signed-in "
+    "browser driver when available or the manual package fallback.",
     "Record the resulting Patreon post ID and URL for read-API/webhook reconciliation.",
 )
 

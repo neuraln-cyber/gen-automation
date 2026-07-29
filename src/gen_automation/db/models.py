@@ -58,6 +58,8 @@ from gen_automation.domain.enums import (
     ReviewTaskState,
     SaladDeploymentState,
     ScoringRunState,
+    SemanticAssessmentState,
+    SemanticVerdict,
     SpendEntryType,
 )
 
@@ -1030,6 +1032,136 @@ class AssetScore(UuidPrimaryKeyMixin, Base):
     scorer_version: Mapped[str] = mapped_column(String(100), nullable=False)
     pillow_version: Mapped[str] = mapped_column(String(50), nullable=False)
     config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    last_error_code: Mapped[str | None] = mapped_column(String(100))
+    last_error_detail: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class SemanticAssessment(UuidPrimaryKeyMixin, Base):
+    __tablename__ = "semantic_assessments"
+    __table_args__ = (
+        UniqueConstraint(
+            "scoring_run_id",
+            "asset_id",
+            "profile_sha256",
+            name="uq_semantic_assessments_run_asset_profile",
+        ),
+        ForeignKeyConstraint(
+            ["scoring_run_id", "asset_id"],
+            ["asset_scores.scoring_run_id", "asset_scores.asset_id"],
+            name="fk_semantic_assessments_score_snapshot",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("attempts >= 0", name="nonnegative_attempts"),
+        CheckConstraint("max_attempts > 0", name="positive_max_attempts"),
+        CheckConstraint("attempts <= max_attempts", name="attempts_within_limit"),
+        CheckConstraint("asset_byte_size > 0", name="positive_asset_byte_size"),
+        CheckConstraint("length(asset_sha256) = 64", name="valid_asset_sha256"),
+        CheckConstraint("length(profile_sha256) = 64", name="valid_profile_sha256"),
+        CheckConstraint("length(prompt_sha256) = 64", name="valid_prompt_sha256"),
+        CheckConstraint("length(schema_sha256) = 64", name="valid_schema_sha256"),
+        CheckConstraint(
+            "(state = 'processing' "
+            "AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL) "
+            "OR (state <> 'processing' "
+            "AND lease_owner IS NULL AND lease_expires_at IS NULL)",
+            name="lease_state",
+        ),
+        CheckConstraint(
+            "(state = 'completed' "
+            "AND verdict IS NOT NULL "
+            "AND confidence_micros IS NOT NULL "
+            "AND issues IS NOT NULL "
+            "AND response_sha256 IS NOT NULL "
+            "AND completed_at IS NOT NULL "
+            "AND last_error_code IS NULL) "
+            "OR (state = 'unavailable' "
+            "AND verdict IS NULL "
+            "AND confidence_micros IS NULL "
+            "AND issues IS NULL "
+            "AND response_sha256 IS NULL "
+            "AND completed_at IS NOT NULL "
+            "AND last_error_code IS NOT NULL) "
+            "OR (state NOT IN ('completed', 'unavailable') "
+            "AND verdict IS NULL "
+            "AND confidence_micros IS NULL "
+            "AND issues IS NULL "
+            "AND response_sha256 IS NULL "
+            "AND completed_at IS NULL)",
+            name="result_state",
+        ),
+        CheckConstraint(
+            "confidence_micros IS NULL OR confidence_micros BETWEEN 0 AND 1000000",
+            name="valid_confidence",
+        ),
+        Index(
+            "ix_semantic_assessments_claim",
+            "state",
+            "available_at",
+            "lease_expires_at",
+            "created_at",
+        ),
+    )
+
+    scoring_run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("scoring_runs.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    asset_score_id: Mapped[UUID] = mapped_column(
+        ForeignKey("asset_scores.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    asset_id: Mapped[UUID] = mapped_column(
+        ForeignKey("assets.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    asset_storage_backend: Mapped[str] = mapped_column(String(50), nullable=False)
+    asset_storage_bucket: Mapped[str] = mapped_column(String(255), nullable=False)
+    asset_object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    asset_object_version_id: Mapped[str] = mapped_column(String(1024), nullable=False)
+    asset_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    asset_content_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    asset_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    profile_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    model_revision: Mapped[str] = mapped_column(String(200), nullable=False)
+    prompt_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[SemanticAssessmentState] = mapped_column(
+        Enum(
+            SemanticAssessmentState,
+            name="semantic_assessment_state",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=11,
+        ),
+        nullable=False,
+        default=SemanticAssessmentState.PENDING,
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(200))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    verdict: Mapped[SemanticVerdict | None] = mapped_column(
+        Enum(
+            SemanticVerdict,
+            name="semantic_verdict",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=6,
+        )
+    )
+    confidence_micros: Mapped[int | None] = mapped_column(Integer)
+    issues: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON_TYPE)
+    response_sha256: Mapped[str | None] = mapped_column(String(64))
     last_error_code: Mapped[str | None] = mapped_column(String(100))
     last_error_detail: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -4060,6 +4192,49 @@ for _statement in (
         "after_create",
         _ddl(_statement).execute_if(dialect="postgresql"),
     )
+
+
+event.listen(
+    SemanticAssessment.__table__,
+    "after_create",
+    _ddl(
+        "CREATE TRIGGER semantic_assessments_guard_terminal_update "
+        "BEFORE UPDATE ON semantic_assessments "
+        "WHEN OLD.state IN ('completed', 'unavailable') "
+        "BEGIN SELECT RAISE(ABORT, 'terminal semantic assessments are immutable'); END"
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    SemanticAssessment.__table__,
+    "after_create",
+    _ddl(
+        "CREATE TRIGGER semantic_assessments_guard_delete "
+        "BEFORE DELETE ON semantic_assessments "
+        "BEGIN SELECT RAISE(ABORT, 'semantic assessments cannot be deleted'); END"
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    SemanticAssessment.__table__,
+    "after_create",
+    _ddl(
+        "CREATE OR REPLACE FUNCTION gen_automation_guard_semantic_assessment_mutation() "
+        "RETURNS trigger AS $$ BEGIN "
+        "IF TG_OP = 'DELETE' THEN "
+        "RAISE EXCEPTION 'semantic assessments cannot be deleted'; END IF; "
+        "IF OLD.state IN ('completed', 'unavailable') THEN "
+        "RAISE EXCEPTION 'terminal semantic assessments are immutable'; END IF; "
+        "RETURN NEW; END; $$ LANGUAGE plpgsql"
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    SemanticAssessment.__table__,
+    "after_create",
+    _ddl(
+        "CREATE TRIGGER semantic_assessments_guard_mutation "
+        "BEFORE UPDATE OR DELETE ON semantic_assessments FOR EACH ROW "
+        "EXECUTE FUNCTION gen_automation_guard_semantic_assessment_mutation()"
+    ).execute_if(dialect="postgresql"),
+)
 
 
 # Wildcard contents are historical release inputs.  Even lightweight

@@ -12,6 +12,7 @@ workers:
 - Deterministic, versioned generation specifications
 - Versioned Forge-style prompt wildcards with seed-reproducible expansion
 - Automated quality checks with human approval before publication
+- Optional burst semantic anatomy checks with a visible, overridable AI-excluded bucket
 - Non-destructive watermarking and platform-specific derivatives
 - An official X API transport and deterministic Patreon publishing handoff
 - Private versioned archive storage, deterministic clean Patreon handoff
@@ -35,6 +36,7 @@ deployment work. See:
 - [Object-storage contract](docs/object-storage.md)
 - [Live object-storage conformance](docs/storage-conformance.md)
 - [Deterministic derivative rendering](docs/derivative-rendering.md)
+- [Optional semantic anatomy QC](docs/semantic-anatomy-qc.md)
 - [Prompt wildcard libraries](docs/prompt-wildcards.md)
 - [New Set operator flow](docs/new-set-dashboard.md)
 - [Generation workflow profiles](docs/generation-workflows.md)

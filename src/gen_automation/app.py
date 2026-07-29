@@ -9,6 +9,9 @@ from gen_automation.api.routes.browser_authentication import (
     router as browser_authentication_router,
 )
 from gen_automation.api.routes.dashboard import router as dashboard_router
+from gen_automation.api.routes.delivery_dashboard import (
+    router as delivery_dashboard_router,
+)
 from gen_automation.api.routes.new_set_dashboard import router as new_set_dashboard_router
 from gen_automation.api.routes.salad_webhooks import router as salad_webhook_router
 from gen_automation.api.routes.wildcard_dashboard import (
@@ -24,6 +27,7 @@ from gen_automation.db import models as _models  # noqa: F401
 from gen_automation.db.session import Database
 from gen_automation.integrations.salad.client import SaladClient
 from gen_automation.integrations.salad.webhooks import SaladWebhookVerifier
+from gen_automation.integrations.semantic_vlm import SemanticVlmClient
 from gen_automation.logging import configure_logging
 from gen_automation.middleware import RequestContextMiddleware
 from gen_automation.services.admin_enrollment import AdminEnrollmentService
@@ -49,6 +53,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         object_store = build_object_store(resolved_settings)
         salad_http_client: httpx2.AsyncClient | None = None
         salad_client: SaladClient | None = None
+        semantic_http_client: httpx2.AsyncClient | None = None
+        semantic_vlm_client: SemanticVlmClient | None = None
         controller_runtime: ControllerRuntime | None = None
         runtime_secret_resolver: ConfiguredRuntimeSecretResolver | None = None
         x_oauth_provider: AwsSecretsManagerXOAuthProvider | None = None
@@ -71,6 +77,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 project=project,
                 base_url=str(resolved_settings.salad_api_base_url),
                 timeout=resolved_settings.salad_request_timeout_seconds,
+            )
+        if resolved_settings.semantic_anatomy_enabled:
+            endpoint = resolved_settings.semantic_anatomy_endpoint_url
+            revision = resolved_settings.semantic_anatomy_model_revision
+            if endpoint is None or revision is None:
+                raise RuntimeError("validated semantic anatomy settings are incomplete")
+            semantic_http_client = httpx2.AsyncClient(
+                follow_redirects=False,
+                trust_env=False,
+                limits=httpx2.Limits(max_connections=2, max_keepalive_connections=1),
+            )
+            semantic_vlm_client = SemanticVlmClient(
+                http_client=semantic_http_client,
+                endpoint_url=str(endpoint),
+                model=resolved_settings.semantic_anatomy_model,
+                model_revision=revision,
+                timeout_seconds=(resolved_settings.background_semantic_request_timeout_seconds),
             )
         app.state.database = database
         app.state.object_store = object_store
@@ -121,6 +144,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     object_store=object_store,
                     secret_resolver=runtime_secret_resolver,
                     x_oauth_provider=x_oauth_provider,
+                    semantic_vlm_client=semantic_vlm_client,
                 )
                 app.state.controller_runtime = controller_runtime
                 await controller_runtime.start()
@@ -146,10 +170,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                 await object_store.close()
                         finally:
                             try:
-                                if salad_http_client is not None:
-                                    await salad_http_client.aclose()
+                                if semantic_http_client is not None:
+                                    await semantic_http_client.aclose()
                             finally:
-                                await database.dispose()
+                                try:
+                                    if salad_http_client is not None:
+                                        await salad_http_client.aclose()
+                                finally:
+                                    await database.dispose()
 
     expose_docs = resolved_settings.environment in {
         Environment.LOCAL,
@@ -174,6 +202,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(api_router, prefix="/api/v1")
     application.include_router(browser_authentication_router)
     application.include_router(dashboard_router)
+    application.include_router(delivery_dashboard_router)
     application.include_router(new_set_dashboard_router)
     application.include_router(wildcard_dashboard_router)
     application.include_router(salad_webhook_router)

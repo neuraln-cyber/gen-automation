@@ -24,6 +24,7 @@
       <div><dt>Held</dt><dd>{{ summary.held_count }}</dd></div>
       <div><dt>Undecided</dt><dd>{{ summary.undecided_count }}</dd></div>
       <div><dt>Selected for X</dt><dd>{{ summary.x_selected_count }} / 4</dd></div>
+      <div><dt>AI excluded</dt><dd>{{ ai_excluded_count }}</dd></div>
     </dl>
 
     {% if summary.state.value == "open" %}
@@ -73,12 +74,31 @@
       <p class="terminal-state" role="status">
         This task is {{ summary.state.value }} and is now read-only.
       </p>
+      {% if summary.state.value == "completed" and principal.role.value == "owner" %}
+        <a
+          class="primary-action"
+          href="/dashboard/review-tasks/{{ summary.task_id }}/delivery"
+        >
+          Prepare outputs and destinations
+        </a>
+      {% endif %}
     {% endif %}
   </section>
 
   <ol class="asset-grid review-grid">
+    {% set bucket = namespace(started=false) %}
     {% for item in assets %}
-      <li class="asset-card">
+      {% if item.ai_excluded and not bucket.started %}
+        <li class="ai-excluded-heading" id="ai-excluded">
+          <h2>AI excluded</h2>
+          <p class="muted">
+            High-confidence severe anatomy flags are shown last. They are not deleted
+            or automatically rejected; your manual decision remains authoritative.
+          </p>
+        </li>
+        {% set bucket.started = true %}
+      {% endif %}
+      <li class="asset-card{% if item.ai_excluded %} ai-excluded{% endif %}">
         <img
           class="asset-preview"
           src="{{ item.master.view_url }}"
@@ -114,6 +134,37 @@
           {% if item.current.note %}
             <p class="decision-detail">Note: {{ item.current.note }}</p>
           {% endif %}
+
+          <div class="semantic-status{% if item.ai_excluded %} severe{% endif %}">
+            {% if item.semantic is none %}
+              <p><strong>AI anatomy check:</strong> not assessed; review manually.</p>
+            {% elif item.semantic.state.value == "completed" %}
+              <p>
+                <strong>AI anatomy check:</strong>
+                {{ item.semantic.verdict.value }}
+                {% if item.semantic.confidence_percent %}
+                  &middot; {{ item.semantic.confidence_percent }} confidence
+                {% endif %}
+              </p>
+              {% if item.semantic.issues %}
+                <ul class="semantic-issues">
+                  {% for issue in item.semantic.issues %}
+                    <li>
+                      {{ issue.code.value.replace("_", " ") }}
+                      &middot; {{ "%.1f%%"|format(issue.confidence_micros / 10000) }}
+                    </li>
+                  {% endfor %}
+                </ul>
+              {% endif %}
+            {% elif item.semantic.state.value == "unavailable" %}
+              <p><strong>AI anatomy check:</strong> unavailable; review manually.</p>
+            {% else %}
+              <p><strong>AI anatomy check:</strong> pending; review remains available.</p>
+            {% endif %}
+            {% if item.ai_excluded and item.current.decision %}
+              <p class="muted">Manual decision recorded: {{ item.current.decision.value }}.</p>
+            {% endif %}
+          </div>
 
           <dl>
             <dt>Disposition</dt>

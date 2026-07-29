@@ -197,6 +197,29 @@ class Settings(BaseSettings):
     background_quality_max_attempts: int = Field(default=3, ge=1, le=10)
     background_quality_retry_base_seconds: int = Field(default=30, ge=1, le=3600)
     background_quality_retry_max_seconds: int = Field(default=900, ge=1, le=86400)
+    semantic_anatomy_enabled: bool = False
+    semantic_anatomy_endpoint_url: AnyHttpUrl | None = None
+    semantic_anatomy_model: str = Field(
+        default="Qwen/Qwen3-VL-8B-Instruct",
+        min_length=1,
+        max_length=200,
+    )
+    semantic_anatomy_model_revision: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+    )
+    semantic_anatomy_severe_confidence_micros: int = Field(
+        default=900_000,
+        ge=0,
+        le=1_000_000,
+    )
+    background_semantic_timeout_seconds: float = Field(default=210, ge=15, le=900)
+    background_semantic_request_timeout_seconds: float = Field(default=180, ge=10, le=840)
+    background_semantic_lease_seconds: int = Field(default=300, ge=30, le=3600)
+    background_semantic_max_attempts: int = Field(default=3, ge=1, le=10)
+    background_semantic_retry_base_seconds: int = Field(default=60, ge=1, le=3600)
+    background_semantic_retry_max_seconds: int = Field(default=1800, ge=1, le=86400)
     derivative_rendering_enabled: bool = False
     background_derivative_timeout_seconds: float = Field(
         default=150,
@@ -466,6 +489,28 @@ class Settings(BaseSettings):
             < self.background_quality_analysis_timeout_seconds + 5
         ):
             errors.append("quality cycle timeout must cover isolated analysis plus cleanup")
+        if self.semantic_anatomy_enabled:
+            if not self.storage_enabled:
+                errors.append("semantic anatomy QC requires private object storage")
+            if not self.background_runtime_enabled:
+                errors.append("semantic anatomy QC requires the background runtime")
+            if not self.quality_scoring_enabled:
+                errors.append("semantic anatomy QC requires automatic quality scoring")
+            if self.semantic_anatomy_endpoint_url is None:
+                errors.append("semantic anatomy QC requires a private VLM endpoint")
+            elif protected_environment and not _is_https_url(
+                str(self.semantic_anatomy_endpoint_url)
+            ):
+                errors.append("staging and production semantic VLM endpoints require HTTPS")
+            if self.semantic_anatomy_model_revision is None:
+                errors.append("semantic anatomy QC requires a pinned model revision")
+        if self.background_semantic_retry_max_seconds < self.background_semantic_retry_base_seconds:
+            errors.append("semantic retry maximum cannot be lower than its base delay")
+        if (
+            self.background_semantic_timeout_seconds
+            < self.background_semantic_request_timeout_seconds + 10
+        ):
+            errors.append("semantic cycle timeout must cover the VLM request plus cleanup")
         if self.derivative_rendering_enabled and not self.storage_enabled:
             errors.append("automatic derivative rendering requires private object storage")
         if self.derivative_rendering_enabled and not self.background_runtime_enabled:
@@ -667,6 +712,8 @@ class Settings(BaseSettings):
                 cycle_timeouts.append(self.background_collection_timeout_seconds + 15)
             if self.storage_enabled and self.quality_scoring_enabled:
                 cycle_timeouts.append(self.background_quality_timeout_seconds + 5)
+            if self.storage_enabled and self.semantic_anatomy_enabled:
+                cycle_timeouts.append(self.background_semantic_timeout_seconds + 5)
             if self.storage_enabled and self.derivative_rendering_enabled:
                 cycle_timeouts.append(self.background_derivative_timeout_seconds + 5)
             if self.storage_enabled and self.publishing_enabled:

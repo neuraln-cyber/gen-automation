@@ -32,7 +32,9 @@ from gen_automation.domain.enums import (
 from gen_automation.gpu_worker.bootstrap import load_artifact_manifest
 from gen_automation.integrations.mega import MegaCmdClient
 from gen_automation.integrations.salad.client import SaladClient
+from gen_automation.integrations.semantic_vlm import SemanticVlmClient
 from gen_automation.quality import DEFAULT_QUALITY_CONFIG
+from gen_automation.semantic import SemanticAssessmentResult
 from gen_automation.services.budgets import ensure_budget_guard
 from gen_automation.services.collection import (
     ClaimedCollectionJob,
@@ -82,6 +84,10 @@ from gen_automation.services.salad_inbox import (
     process_salad_webhook_receipt,
 )
 from gen_automation.services.scheduling import dispatch_generation_jobs
+from gen_automation.services.semantic_anatomy import (
+    SemanticAssessmentProfile,
+    run_semantic_assessment_cycle,
+)
 from gen_automation.services.worker_inputs import SaladWorkerJobInputProvider
 from gen_automation.storage.base import ObjectStore
 
@@ -513,6 +519,7 @@ class ControllerWorkloads:
         secret_resolver: RuntimeSecretResolver | None = None,
         x_oauth_provider: XOAuthProvider | None = None,
         mega_client: MegaDeliveryClient | None = None,
+        semantic_vlm_client: SemanticVlmClient | None = None,
     ) -> None:
         self.settings = settings
         self.sessions = sessions
@@ -522,6 +529,7 @@ class ControllerWorkloads:
         self.secret_resolver = secret_resolver
         self.x_oauth_provider = x_oauth_provider
         self.mega_client = mega_client
+        self.semantic_vlm_client = semantic_vlm_client
         self._next_attempt_reconciliation: dict[UUID, float] = {}
 
     async def initialize(self) -> None:
@@ -914,6 +922,44 @@ class ControllerWorkloads:
         )
         return result.did_work
 
+    async def semantic_anatomy_once(self) -> bool:
+        client = self.semantic_vlm_client
+        revision = self.settings.semantic_anatomy_model_revision
+        if (
+            self.object_store is None
+            or client is None
+            or revision is None
+            or not self.settings.semantic_anatomy_enabled
+        ):
+            return False
+
+        async def analyze(
+            payload: bytes,
+            content_type: str,
+            sha256: str,
+        ) -> SemanticAssessmentResult:
+            return await client.assess(
+                payload,
+                content_type=content_type,
+                asset_sha256=sha256,
+            )
+
+        result = await run_semantic_assessment_cycle(
+            self.sessions,
+            self.object_store,
+            worker_id=self._worker_id("semantic-anatomy"),
+            profile=SemanticAssessmentProfile(
+                model_name=self.settings.semantic_anatomy_model,
+                model_revision=revision,
+            ),
+            analyzer=analyze,
+            max_attempts=self.settings.background_semantic_max_attempts,
+            lease_seconds=self.settings.background_semantic_lease_seconds,
+            retry_base_seconds=self.settings.background_semantic_retry_base_seconds,
+            retry_max_seconds=self.settings.background_semantic_retry_max_seconds,
+        )
+        return result.did_work
+
     async def derivative_once(self) -> bool:
         if self.object_store is None or not self.settings.derivative_rendering_enabled:
             return False
@@ -1285,6 +1331,7 @@ def build_controller_runtime(
     secret_resolver: RuntimeSecretResolver | None = None,
     x_oauth_provider: XOAuthProvider | None = None,
     mega_client: MegaDeliveryClient | None = None,
+    semantic_vlm_client: SemanticVlmClient | None = None,
 ) -> ControllerRuntime:
     instance_id = f"controller-{uuid4()}"
     resolved_mega_client = mega_client
@@ -1305,6 +1352,7 @@ def build_controller_runtime(
         secret_resolver=secret_resolver,
         x_oauth_provider=x_oauth_provider,
         mega_client=resolved_mega_client,
+        semantic_vlm_client=semantic_vlm_client,
     )
     poll = settings.background_poll_interval_seconds
     loops: list[LoopSpec] = []
@@ -1370,6 +1418,15 @@ def build_controller_runtime(
                     cycle=workloads.quality_once,
                     idle_interval_seconds=poll,
                     timeout_seconds=settings.background_quality_timeout_seconds + 5,
+                )
+            )
+        if settings.semantic_anatomy_enabled:
+            loops.append(
+                LoopSpec(
+                    name="semantic-anatomy-qc",
+                    cycle=workloads.semantic_anatomy_once,
+                    idle_interval_seconds=poll,
+                    timeout_seconds=settings.background_semantic_timeout_seconds + 5,
                 )
             )
         if settings.derivative_rendering_enabled:
