@@ -300,6 +300,22 @@ def test_patreon_profile_has_an_ssm_only_cloud_bootstrap_path() -> None:
     assert "127.0.0.1:6080/vnc.html" in runbook
 
 
+def test_owner_bootstrap_wrapper_is_tty_only_and_digest_pinned() -> None:
+    bootstrap = _text("bootstrap-owner.sh")
+    installer = _text("install.sh")
+
+    assert "[ -t 0 ] && [ -t 1 ]" in bootstrap
+    assert "gen-automation-validate-deployment" in bootstrap
+    assert "GEN_AUTOMATION_CONTROL_PLANE_MEGA_IMAGE" in bootstrap
+    assert "@sha256:[0-9a-f]{64}" in bootstrap
+    assert '--env-file "$config_root/bootstrap-owner.env"' in bootstrap
+    assert "rds-global-bundle.pem,readonly" in bootstrap
+    assert "--read-only" in bootstrap
+    assert "--cap-drop ALL" in bootstrap
+    assert "python3.12 -m gen_automation.cli bootstrap-owner" in bootstrap
+    assert "gen-automation-bootstrap-owner" in installer
+
+
 def test_patreon_browser_uses_checksum_pinned_current_chrome() -> None:
     dockerfile = (ROOT / "Dockerfile.patreon-browser").read_text(encoding="utf-8")
     publisher = (ROOT / "src" / "gen_automation" / "patreon_browser" / "publisher.py").read_text(

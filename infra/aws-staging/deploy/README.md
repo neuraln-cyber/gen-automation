@@ -61,6 +61,17 @@ AWS SSM port-forward to `127.0.0.1:6080` to complete Patreon login in the
 cloud-hosted browser. The executable sequence is in
 `docs/patreon-browser-publisher.md`; no public VNC/noVNC ingress is required.
 
+After migrations complete, run the TTY-only initial owner enrollment from a
+private interactive SSM session:
+
+```console
+sudo /usr/local/sbin/gen-automation-bootstrap-owner
+```
+
+The installer creates this wrapper alongside the Patreon bootstrap command.
+The password, one-time TOTP provisioning data, and confirmation code remain
+inside that terminal and are never accepted as command arguments.
+
 Populate the four files out-of-band. Keep external effects disabled through the
 first health, storage, MEGA, Patreon, and X canaries. The validator reads only
 the minimum non-secret deployment invariants and never sources an environment
