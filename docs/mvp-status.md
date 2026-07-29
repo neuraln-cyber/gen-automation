@@ -8,6 +8,11 @@ The AWS staging control plane is live at
 `https://gen-automation-staging.18-198-84-215.sslip.io`. Its PostgreSQL schema
 is migrated through `0015`, the initial owner is enrolled with TOTP, all four
 runtime containers are healthy, and the public HTTPS readiness canary passes.
+The live S3 conformance suite passes, including exact-version cleanup and the
+no-redirect multipart POST used by GPU workers. An encrypted RDS snapshot was
+restored into a private temporary clone; its migration revision, 46-table
+schema digest, and active-owner count matched the live database before all
+drill resources were removed. A final OpenTofu plan reports no drift.
 Application secrets were generated only on the host. External GPU allocation
 and Patreon, MEGA, and X publication effects remain disabled until their
 individual credentials and canaries are complete.
@@ -145,8 +150,7 @@ watermarked, moved, overwritten, or made public.
 ### Remaining live MVP work
 
 1. Confirm the AWS notification subscription and create the linked-account
-   budget in the management account. Complete the S3 live conformance and
-   database restore exercises.
+   budget in the management account.
 2. Upload and onboard the approved checkpoint, LoRAs, optional detector, and
    workflows; retain the emitted exact manifest and digest.
 3. Configure SaladCloud and run a zero-publication synthetic worker canary,
