@@ -1,0 +1,44 @@
+{% extends "dashboard/base.html" %}
+
+{% block content %}
+  <a class="back" href="/dashboard/new-set">&larr; New Set</a>
+  <h1>{{ release.title }}</h1>
+  <p class="lede">
+    The release is frozen and its generation plan is ready for the controller.
+  </p>
+
+  <section class="panel review-entry">
+    <h2>Release status</h2>
+    <dl>
+      <dt>Project</dt>
+      <dd>{{ release.project_slug }}</dd>
+      <dt>Set slug</dt>
+      <dd>{{ release.release_slug }}</dd>
+      <dt>Phase</dt>
+      <dd><span class="status ready">{{ release.phase.value }}</span></dd>
+      <dt>Health</dt>
+      <dd>{{ release.health.value }}</dd>
+      <dt>Generation jobs</dt>
+      <dd>{{ release.total_jobs }}</dd>
+      <dt>Planned raw outputs</dt>
+      <dd>{{ release.expected_outputs }}</dd>
+      <dt>Desired accepted images</dt>
+      <dd>{{ release.desired_accepted_count }}</dd>
+      <dt>Frozen specification</dt>
+      <dd><span class="digest">{{ release.specification_sha256 }}</span></dd>
+    </dl>
+
+    {% if release.jobs_by_state %}
+      <ul class="status-list">
+        {% for item in release.jobs_by_state %}
+          <li><span class="status">{{ item.state.value }} · {{ item.count }}</span></li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+  </section>
+
+  <p class="muted">
+    Queued jobs will start when the cloud GPU controller is enabled. Ranking and review
+    become available from the main dashboard after generation and quality scoring finish.
+  </p>
+{% endblock %}

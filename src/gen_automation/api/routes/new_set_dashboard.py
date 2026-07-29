@@ -1,0 +1,413 @@
+import hmac
+import secrets
+from pathlib import Path
+from typing import Annotated
+from uuid import UUID, uuid4
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.templating import Jinja2Templates
+from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from gen_automation.api.browser_new_set_forms import (
+    BrowserNewSetForm,
+    BrowserNewSetFormError,
+    form_key_matches,
+    new_set_csrf_token,
+    new_set_form_key,
+    read_new_set_form,
+)
+from gen_automation.api.security import (
+    ReleaseReader,
+    authentication_service,
+    require_release_manager,
+)
+from gen_automation.config import Settings
+from gen_automation.db.session import get_session
+from gen_automation.domain.enums import AdminRole
+from gen_automation.middleware import content_security_policy
+from gen_automation.services.authentication import (
+    AuthenticatedPrincipal,
+    CsrfValidationError,
+)
+from gen_automation.services.generation import GenerationPlanConflictError
+from gen_automation.services.new_sets import (
+    NewSetInputError,
+    NewSetNotFoundError,
+    NewSetOptions,
+    create_and_approve_new_set,
+    list_new_set_options,
+    load_new_set_status,
+)
+from gen_automation.services.releases import ConflictError, NotFoundError
+
+router = APIRouter(prefix="/dashboard", tags=["dashboard"], include_in_schema=False)
+templates = Jinja2Templates(directory=str(Path(__file__).parents[2] / "templates"))
+Session = Annotated[AsyncSession, Depends(get_session)]
+_MANAGER_ROLES = frozenset({AdminRole.OWNER, AdminRole.ADMIN})
+
+
+@router.get("/new-set", response_class=HTMLResponse, name="dashboard_new_set")
+async def dashboard_new_set(
+    request: Request,
+    session: Session,
+    principal: ReleaseReader,
+) -> Response:
+    if principal.role not in _MANAGER_ROLES:
+        return _error_response(
+            request,
+            principal=principal,
+            status_code=status.HTTP_403_FORBIDDEN,
+            heading="New Set is unavailable",
+            message="Your account cannot create releases.",
+        )
+    options = await list_new_set_options(session)
+    try:
+        return _new_set_response(
+            request,
+            principal=principal,
+            options=options,
+        )
+    except (CsrfValidationError, HTTPException):
+        return _error_response(
+            request,
+            principal=principal,
+            status_code=status.HTTP_403_FORBIDDEN,
+            heading="New Set could not be opened",
+            message="The browser session could not be verified. Sign in again and retry.",
+        )
+
+
+@router.post(
+    "/new-set",
+    response_class=HTMLResponse,
+    response_model=None,
+    name="dashboard_new_set_submit",
+)
+async def submit_dashboard_new_set(
+    request: Request,
+    session: Session,
+    principal: ReleaseReader,
+) -> Response:
+    if principal.role not in _MANAGER_ROLES:
+        return _error_response(
+            request,
+            principal=principal,
+            status_code=status.HTTP_403_FORBIDDEN,
+            heading="New Set was not created",
+            message="Your account cannot create releases.",
+        )
+    try:
+        form = await read_new_set_form(request)
+    except BrowserNewSetFormError as error:
+        options = await list_new_set_options(session)
+        return _new_set_response(
+            request,
+            principal=principal,
+            options=options,
+            values=error.values,
+            error_message=error.message,
+            status_code=error.status_code,
+        )
+
+    try:
+        manager = await require_release_manager(
+            request,
+            session,
+            csrf_header=form.csrf_token,
+        )
+        settings: Settings = request.app.state.settings
+        if not settings.auth_enabled and not hmac.compare_digest(
+            form.csrf_token,
+            new_set_csrf_token(settings, session_id=manager.session_id),
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="CSRF validation failed",
+            )
+        expected_key = new_set_form_key(
+            settings,
+            session_id=manager.session_id,
+            submission_id=form.submission_id,
+        )
+        if not form_key_matches(form.idempotency_key, expected_key):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="form idempotency validation failed",
+            )
+        result = await create_and_approve_new_set(
+            session,
+            command=form.command,
+            idempotency_key=form.idempotency_key,
+            actor=str(manager.user_id),
+        )
+    except HTTPException as error:
+        await session.rollback()
+        return await _submission_error(
+            request,
+            session=session,
+            principal=principal,
+            form=form,
+            status_code=error.status_code,
+            message="The browser session or form could not be verified. Reload and try again.",
+        )
+    except NewSetInputError as error:
+        await session.rollback()
+        return await _submission_error(
+            request,
+            session=session,
+            principal=principal,
+            form=form,
+            status_code=status.HTTP_409_CONFLICT,
+            message=str(error).capitalize() + ".",
+        )
+    except ConflictError as error:
+        await session.rollback()
+        return await _submission_error(
+            request,
+            session=session,
+            principal=principal,
+            form=form,
+            status_code=status.HTTP_409_CONFLICT,
+            message=_release_conflict_message(error),
+        )
+    except GenerationPlanConflictError as error:
+        await session.rollback()
+        return await _submission_error(
+            request,
+            session=session,
+            principal=principal,
+            form=form,
+            status_code=status.HTTP_409_CONFLICT,
+            message=(
+                "The release was frozen, but its generation jobs could not be approved: "
+                f"{error}. Correct the registry or wildcard issue, then submit this form again."
+            ),
+        )
+    except NotFoundError:
+        await session.rollback()
+        return await _submission_error(
+            request,
+            session=session,
+            principal=principal,
+            form=form,
+            status_code=status.HTTP_409_CONFLICT,
+            message="The default project changed while the set was being created. Try again.",
+        )
+    except (IntegrityError, ValidationError):
+        await session.rollback()
+        return await _submission_error(
+            request,
+            session=session,
+            principal=principal,
+            form=form,
+            status_code=status.HTTP_409_CONFLICT,
+            message=(
+                "The selected approvals or set name conflict with current data. "
+                "Reload the available choices and try again."
+            ),
+        )
+
+    return _secure_response(
+        request,
+        RedirectResponse(
+            url=f"/dashboard/releases/{result.release.id}/status",
+            status_code=status.HTTP_303_SEE_OTHER,
+        ),
+    )
+
+
+@router.get(
+    "/releases/{release_id}/status",
+    response_class=HTMLResponse,
+    name="dashboard_release_status",
+)
+async def dashboard_release_status(
+    release_id: UUID,
+    request: Request,
+    session: Session,
+    principal: ReleaseReader,
+) -> Response:
+    try:
+        release_status = await load_new_set_status(session, release_id=release_id)
+    except NewSetNotFoundError:
+        return _error_response(
+            request,
+            principal=principal,
+            status_code=status.HTTP_404_NOT_FOUND,
+            heading="Release not found",
+            message="The requested release does not exist.",
+        )
+    return _secure_response(
+        request,
+        templates.TemplateResponse(
+            request=request,
+            name="dashboard/new_set_status.html",
+            context={
+                "page_title": release_status.title,
+                "principal": principal,
+                "release": release_status,
+            },
+        ),
+    )
+
+
+async def _submission_error(
+    request: Request,
+    *,
+    session: AsyncSession,
+    principal: AuthenticatedPrincipal,
+    form: BrowserNewSetForm,
+    status_code: int,
+    message: str,
+) -> Response:
+    options = await list_new_set_options(session)
+    return _new_set_response(
+        request,
+        principal=principal,
+        options=options,
+        values=form.values,
+        submission_id=form.submission_id,
+        idempotency_key=form.idempotency_key,
+        error_message=message,
+        status_code=status_code,
+    )
+
+
+def _new_set_response(
+    request: Request,
+    *,
+    principal: AuthenticatedPrincipal,
+    options: NewSetOptions,
+    values: dict[str, str] | None = None,
+    submission_id: UUID | None = None,
+    idempotency_key: str | None = None,
+    error_message: str | None = None,
+    status_code: int = status.HTTP_200_OK,
+) -> Response:
+    settings: Settings = request.app.state.settings
+    resolved_submission_id = submission_id or uuid4()
+    resolved_key = idempotency_key or new_set_form_key(
+        settings,
+        session_id=principal.session_id,
+        submission_id=resolved_submission_id,
+    )
+    form_values = _default_values(options)
+    if values is not None:
+        form_values.update(
+            {
+                key: value
+                for key, value in values.items()
+                if key not in {"csrf_token", "submission_id", "idempotency_key"}
+            }
+        )
+    return _secure_response(
+        request,
+        templates.TemplateResponse(
+            request=request,
+            name="dashboard/new_set.html",
+            context={
+                "page_title": "New Set",
+                "principal": principal,
+                "options": options,
+                "form_values": form_values,
+                "csrf_token": _form_csrf_token(request, principal),
+                "submission_id": resolved_submission_id,
+                "idempotency_key": resolved_key,
+                "error_message": error_message,
+            },
+            status_code=status_code,
+        ),
+    )
+
+
+def _default_values(options: NewSetOptions) -> dict[str, str]:
+    values = {
+        "slug": "",
+        "title": "",
+        "subject_id": str(options.subjects[0].approval_id) if options.subjects else "",
+        "checkpoint_id": (str(options.checkpoints[0].approval_id) if options.checkpoints else ""),
+        "workflow_id": str(options.workflows[0].approval_id) if options.workflows else "",
+        "prompt": "",
+        "negative_prompt": "",
+        "seed": str(secrets.randbelow(2**63)),
+        "width": "1024",
+        "height": "1024",
+        "cfg": "5.0",
+        "steps": "28",
+        "sampler": "euler_ancestral",
+        "scheduler": "normal",
+        "outputs_per_job": "4",
+        "planned_job_count": "4",
+        "desired_accepted_count": "12",
+    }
+    for slot in range(1, 5):
+        values[f"lora_{slot}_id"] = ""
+        values[f"lora_{slot}_weight"] = ""
+    return values
+
+
+def _form_csrf_token(
+    request: Request,
+    principal: AuthenticatedPrincipal,
+) -> str:
+    settings: Settings = request.app.state.settings
+    if not settings.auth_enabled:
+        return new_set_csrf_token(settings, session_id=principal.session_id)
+    cookie_token = request.cookies.get(settings.auth_csrf_cookie_name)
+    if cookie_token is None:
+        raise CsrfValidationError("CSRF cookie is unavailable")
+    authentication_service(request).validate_csrf(
+        principal,
+        cookie_token=cookie_token,
+        header_token=cookie_token,
+    )
+    return cookie_token
+
+
+def _release_conflict_message(error: ConflictError) -> str:
+    detail = str(error)
+    if "wildcard" in detail.casefold():
+        return (
+            "A prompt wildcard is missing, invalid, or changed. "
+            "Update Prompt wildcards, then submit again."
+        )
+    if "slug" in detail.casefold():
+        return "That set slug is already used in this project. Choose another slug."
+    if "idempotency" in detail.casefold():
+        return "This form was already used with different values. Reload New Set and try again."
+    return "The release conflicts with current project data. Reload New Set and try again."
+
+
+def _secure_response(request: Request, response: Response) -> Response:
+    settings: Settings = request.app.state.settings
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Content-Security-Policy"] = content_security_policy(settings.environment)
+    return response
+
+
+def _error_response(
+    request: Request,
+    *,
+    principal: AuthenticatedPrincipal,
+    status_code: int,
+    heading: str,
+    message: str,
+) -> Response:
+    return _secure_response(
+        request,
+        templates.TemplateResponse(
+            request=request,
+            name="dashboard/error.html",
+            context={
+                "page_title": heading,
+                "principal": principal,
+                "heading": heading,
+                "message": message,
+            },
+            status_code=status_code,
+        ),
+    )

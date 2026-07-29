@@ -26,7 +26,8 @@
         line-height: 1.5;
       }
       a { color: var(--accent); }
-      a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible {
+      a:focus-visible, button:focus-visible, input:focus-visible,
+      select:focus-visible, textarea:focus-visible {
         outline: 3px solid var(--warn);
         outline-offset: 3px;
       }
@@ -124,7 +125,7 @@
         text-decoration: none;
         font-weight: 800;
       }
-      button, input, textarea { font: inherit; }
+      button, input, select, textarea { font: inherit; }
       button { cursor: pointer; }
       button:disabled { cursor: not-allowed; opacity: .5; }
       .primary-button, .secondary-button, .primary-action, .decision-button {
@@ -183,6 +184,51 @@
       }
       .decision-form textarea { resize: vertical; }
       .decision-form fieldset { margin: .45rem 0 0; padding: 0; border: 0; }
+      .set-form { display: grid; gap: 1rem; margin-top: 1.5rem; }
+      .set-form fieldset {
+        display: grid;
+        gap: .85rem;
+        margin: 0;
+        padding: 1rem;
+        border: 1px solid var(--border);
+        border-radius: .65rem;
+      }
+      .set-form legend { padding-inline: .35rem; font-weight: 800; color: var(--text); }
+      .set-form label { display: grid; gap: .35rem; color: var(--muted); font-size: .9rem; }
+      .set-form input, .set-form select, .set-form textarea {
+        width: 100%;
+        padding: .65rem;
+        border: 1px solid var(--border);
+        border-radius: .45rem;
+        background: #111217;
+        color: var(--text);
+      }
+      .set-form textarea { resize: vertical; }
+      .form-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr));
+        gap: .85rem;
+      }
+      .lora-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(7rem, .28fr);
+        gap: .75rem;
+      }
+      .form-error {
+        padding: .8rem 1rem;
+        border: 1px solid #934f58;
+        border-radius: .55rem;
+        background: #3b2025;
+        color: #ffd9dd;
+      }
+      .token-list { display: flex; flex-wrap: wrap; gap: .45rem; }
+      .token-list code, .digest {
+        overflow-wrap: anywhere;
+        padding: .15rem .35rem;
+        border-radius: .3rem;
+        background: var(--surface-strong);
+      }
+      .status-list { display: flex; flex-wrap: wrap; gap: .6rem; padding: 0; list-style: none; }
       .decision-button { flex: 1 1 5rem; color: #0e0d14; }
       .decision-button.accept { background: var(--good); }
       .decision-button.reject { background: #ff9898; }
@@ -200,6 +246,8 @@
       <div class="header-inner">
         <div>
           <a class="brand" href="/dashboard">Generation control</a>
+          &nbsp;&middot;&nbsp;
+          <a href="/dashboard/new-set">New Set</a>
           &nbsp;&middot;&nbsp;
           <a href="/dashboard/wildcards">Prompt wildcards</a>
         </div>

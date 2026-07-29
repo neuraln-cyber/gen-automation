@@ -36,6 +36,8 @@ deployment work. See:
 - [Live object-storage conformance](docs/storage-conformance.md)
 - [Deterministic derivative rendering](docs/derivative-rendering.md)
 - [Prompt wildcard libraries](docs/prompt-wildcards.md)
+- [New Set operator flow](docs/new-set-dashboard.md)
+- [Generation workflow profiles](docs/generation-workflows.md)
 - [X API transport contract](docs/x-api-transport.md)
 - [Patreon publishing handoff](docs/patreon-handoff.md)
 - [MEGA completed-set delivery](docs/mega-delivery.md)
