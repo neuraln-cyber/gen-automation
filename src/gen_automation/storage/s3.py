@@ -54,6 +54,7 @@ class S3ObjectStore:
         if session_token is not None and access_key_id is None:
             raise ValueError("S3 session token requires an access key pair")
         self.bucket = bucket
+        s3_config = {"addressing_style": "virtual"} if endpoint_url is None else {}
         client_arguments: dict[str, Any] = {
             "service_name": "s3",
             "region_name": region,
@@ -63,6 +64,7 @@ class S3ObjectStore:
                 retries={"mode": "standard", "max_attempts": 4},
                 connect_timeout=5,
                 read_timeout=30,
+                s3=s3_config,
             ),
         }
         if access_key_id is not None:

@@ -3,6 +3,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 from botocore.exceptions import ClientError
@@ -54,6 +55,35 @@ async def test_presigned_post_has_exact_fields_and_size_policy() -> None:
     assert ["content-length-range", 1, 12345] in policy["conditions"]
     assert {"key": "staging/job/attempt/output"} in policy["conditions"]
     assert {"Cache-Control": PRIVATE_NO_STORE_CACHE_CONTROL} in policy["conditions"]
+
+
+@pytest.mark.asyncio
+async def test_aws_presigned_urls_use_the_configured_regional_endpoint() -> None:
+    store = S3ObjectStore(
+        bucket="private-assets",
+        region="eu-central-1",
+        access_key_id="test-access-key",
+        secret_access_key="test-secret-key",  # noqa: S106
+    )
+    try:
+        upload = await store.presign_upload(
+            key="staging/job/attempt/output",
+            content_type="image/png",
+            metadata={"asset-id": "asset-1"},
+            expires_in=60,
+            max_bytes=4096,
+        )
+        download = await store.presign_download(
+            key="masters/output",
+            expires_in=60,
+            version_id="version-1",
+        )
+    finally:
+        await store.close()
+
+    expected_host = "private-assets.s3.eu-central-1.amazonaws.com"
+    assert urlsplit(upload.url).hostname == expected_host
+    assert urlsplit(download).hostname == expected_host
 
 
 @dataclass
