@@ -36,6 +36,7 @@ from gen_automation.domain.enums import (
     ReviewTaskState,
 )
 from gen_automation.domain.ids import uuid7
+from gen_automation.services.watermarks import is_registered_watermark
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _TARGET = re.compile(r"[a-z][a-z0-9_-]{0,49}")
@@ -1333,20 +1334,14 @@ async def _load_watermark_snapshot(
 ) -> dict[str, Any] | None:
     if watermark_asset_id is None:
         return None
-    release_version = await session.get(ReleaseVersion, release_version_id)
-    if release_version is None:
+    if await session.get(ReleaseVersion, release_version_id) is None:
         raise DerivativePipelineConflictError("recipe release version is unavailable")
     asset = await session.scalar(
         select(Asset).where(Asset.id == watermark_asset_id).with_for_update()
     )
     if asset is None:
         raise DerivativePipelineNotFoundError("watermark asset was not found")
-    _validate_available_asset(
-        asset,
-        expected_kind=None,
-        expected_release_id=release_version.release_id,
-        label="watermark asset",
-    )
+    _validate_registered_watermark_asset(asset)
     return {
         "asset_id": str(asset.id),
         "storage_backend": asset.storage_backend,
@@ -1363,6 +1358,35 @@ async def _load_watermark_snapshot(
         "height": _required_asset_int(asset.height, "height"),
         "byte_size": _required_asset_int(asset.byte_size, "byte size"),
     }
+
+
+def _validate_registered_watermark_asset(asset: Asset) -> None:
+    """Validate a global watermark without weakening release-owned asset checks."""
+
+    if (
+        not is_registered_watermark(asset)
+        or asset.state != AssetState.AVAILABLE
+        or not asset.storage_backend.strip()
+        or not asset.storage_bucket.strip()
+        or asset.object_key is None
+        or not asset.object_key.startswith("watermarks/")
+        or asset.object_version_id is None
+        or not asset.object_version_id.strip()
+        or asset.sha256 is None
+        or _SHA256.fullmatch(asset.sha256) is None
+        or asset.content_type != "image/png"
+        or asset.image_format != "PNG"
+        or asset.width is None
+        or asset.width <= 0
+        or asset.height is None
+        or asset.height <= 0
+        or asset.byte_size is None
+        or asset.byte_size <= 0
+        or asset.available_at is None
+    ):
+        raise DerivativePipelineConflictError(
+            "registered watermark asset is unavailable or incomplete"
+        )
 
 
 def _validate_existing_recipe(

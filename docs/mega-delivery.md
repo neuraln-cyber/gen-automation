@@ -4,8 +4,10 @@
 
 When a Patreon publication package becomes available, the controller now
 automatically mirrors that exact ZIP to MEGA. The ZIP is the deterministic
-finished set built from the clean Patreon-content derivatives. X teaser
-derivatives and X watermarks are not included.
+finished set built from exactly one clean `full` output for every accepted
+release selection. Patreon planning rejects a partial, additional, duplicated,
+or reordered content set, so the downstream MEGA ZIP cannot silently omit an
+accepted image. X teaser derivatives and X watermarks are not included.
 
 The remote path is frozen when the delivery record is created:
 

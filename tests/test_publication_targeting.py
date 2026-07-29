@@ -84,6 +84,15 @@ async def test_publication_uses_exact_selected_x_and_only_clean_patreon_inputs(
         assert [item.output.id for item in x_inputs] == list(x_ids)
         assert all(item.output.target == "x_teaser" for item in x_inputs)
 
+        with pytest.raises(PublicationInputError, match="all accepted full outputs"):
+            await _load_frozen_outputs(
+                session,
+                release_version_id=approved.release_version_id,
+                target=PublicationTarget.PATREON,
+                derivative_output_ids=(full_ids[0],),
+                public_preview_output_id=full_ids[0],
+            )
+
         patreon_inputs = await _load_frozen_outputs(
             session,
             release_version_id=approved.release_version_id,

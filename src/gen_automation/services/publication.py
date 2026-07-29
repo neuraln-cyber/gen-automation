@@ -1584,6 +1584,14 @@ async def _load_frozen_outputs(
         raise PublicationInputError(
             "Patreon intents require one explicitly attested clean public preview"
         )
+    exact_full_output_ids = await _load_exact_full_output_ids(
+        session,
+        release_version_id=release_version_id,
+    )
+    if derivative_output_ids != exact_full_output_ids:
+        raise PublicationInputError(
+            "Patreon content outputs must exactly match all accepted full outputs"
+        )
     content = tuple(
         _FrozenOutput(
             output=checked(output_id, "full"),
@@ -1596,6 +1604,54 @@ async def _load_frozen_outputs(
         role="patreon_preview",
     )
     return (*content, preview)
+
+
+async def _load_exact_full_output_ids(
+    session: AsyncSession,
+    *,
+    release_version_id: UUID,
+) -> tuple[UUID, ...]:
+    selection_ids = tuple(
+        (
+            await session.scalars(
+                select(ReleaseSelection.id)
+                .where(ReleaseSelection.release_version_id == release_version_id)
+                .order_by(ReleaseSelection.display_order)
+            )
+        ).all()
+    )
+    if not selection_ids:
+        raise PublicationConflictError("accepted release selection snapshot is unavailable")
+    rows = (
+        await session.execute(
+            select(
+                DerivativeJob.release_selection_id,
+                DerivativeOutput.id,
+            )
+            .join(
+                DerivativeOutput,
+                DerivativeOutput.derivative_job_id == DerivativeJob.id,
+            )
+            .where(
+                DerivativeJob.release_version_id == release_version_id,
+                DerivativeJob.release_selection_id.in_(selection_ids),
+                DerivativeJob.state == DerivativeJobState.SUCCEEDED,
+                DerivativeOutput.target == "full",
+            )
+        )
+    ).all()
+    by_selection: dict[UUID, UUID] = {}
+    for selection_id, output_id in rows:
+        if selection_id in by_selection:
+            raise PublicationConflictError(
+                "accepted release has more than one successful full output per image"
+            )
+        by_selection[selection_id] = output_id
+    if set(by_selection) != set(selection_ids):
+        raise PublicationConflictError(
+            "accepted release does not have one successful full output per image"
+        )
+    return tuple(by_selection[selection_id] for selection_id in selection_ids)
 
 
 def _normalize_configuration(

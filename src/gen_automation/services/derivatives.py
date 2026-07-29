@@ -391,6 +391,16 @@ class DerivativeBundle:
 
 
 @dataclass(frozen=True, slots=True)
+class VerifiedWatermark:
+    sha256: str
+    byte_size: int
+    width: int
+    height: int
+    image_format: str = "PNG"
+    content_type: str = "image/png"
+
+
+@dataclass(frozen=True, slots=True)
 class _SourceMetadata:
     sha256: str
     byte_size: int
@@ -406,6 +416,33 @@ def derivative_recipe_sha256(recipe: DerivativeRecipe) -> str:
     if not isinstance(recipe, DerivativeRecipe):
         raise DerivativeRecipeError("derivative recipe is invalid")
     return canonical_sha256(asdict(recipe))
+
+
+def verify_watermark_png(
+    watermark_png: ImageBytes,
+    *,
+    limits: DerivativeSafetyLimits | None = None,
+) -> VerifiedWatermark:
+    """Validate the exact PNG contract used by the production renderer."""
+
+    selected_limits = limits or DEFAULT_DERIVATIVE_LIMITS
+    if not isinstance(selected_limits, DerivativeSafetyLimits):
+        raise DerivativeRecipeError("derivative safety limits are invalid")
+    payload = _bounded_bytes(
+        watermark_png,
+        maximum=selected_limits.max_watermark_bytes,
+        label="watermark",
+    )
+    watermark = _decode_watermark(payload, selected_limits)
+    try:
+        return VerifiedWatermark(
+            sha256=hashlib.sha256(payload).hexdigest(),
+            byte_size=len(payload),
+            width=watermark.width,
+            height=watermark.height,
+        )
+    finally:
+        watermark.close()
 
 
 def estimate_derivative_peak_working_set_bytes(

@@ -64,6 +64,9 @@ For X:
 For Patreon:
 
 - content and public preview inputs are JPEG/PNG derivatives only;
+- paid content must exactly equal the ordered `full` output for every accepted
+  `release_selection`; partial, additional, duplicated, or reordered sets are
+  rejected before an intent can be frozen;
 - paid content and the explicitly selected public preview must both be clean
   `full` outputs; a watermarked `x_teaser` can never enter the Patreon package;
 - a named human must attest in an explicit IANA timezone that the preview has no

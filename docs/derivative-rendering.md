@@ -198,6 +198,37 @@ Database registration and lineage creation share one transaction. A retry can
 therefore observe either the complete registration or no registration; it
 cannot observe a committed derivative output without its asset and lineage.
 
+## Review handoff and watermark registry
+
+All routes below are under `/api/v1`.
+
+An OWNER onboards a reusable watermark once with multipart
+`POST /watermarks` (`release_id`, `display_name`, and PNG `file`) and a stable
+`Idempotency-Key`. The service validates the same single-frame alpha-PNG
+contract as the renderer in an isolated process, writes the bytes to the
+content-addressed `watermarks/{prefix}/{sha256}.png` key, and freezes the exact
+object version, SHA-256, dimensions, and byte size in an available registry
+asset. `GET /watermarks` lists the registered choices. The provenance release
+does not limit reuse: a later recipe may reference the same registered object,
+but the database still requires its complete immutable identity to match.
+
+After the owner has chosen up to four X images and the review is completed,
+call:
+
+```text
+POST /api/v1/review-tasks/{review_task_id}:prepare-derivatives
+Idempotency-Key: <stable command key>
+
+{"watermark_asset_id": "<registered asset UUID>", "max_attempts": 3}
+```
+
+This one idempotent action creates one clean `full` job target for every frozen
+accepted image. Only images frozen in `review_x_selections` also receive an
+`x_teaser` target, and selected images require the registered watermark.
+Reviews with no X selection omit `watermark_asset_id` and create only clean
+full outputs. Replaying the same command does not create another recipe or
+another job.
+
 ## Operator configuration
 
 Automatic execution is opt-in. Run the controller on Linux, apply the current
