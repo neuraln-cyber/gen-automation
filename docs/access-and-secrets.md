@@ -209,11 +209,12 @@ exact secret reference, ambient IAM role, and
 
 ### Patreon destination
 
-Patreon publication remains human-assisted through Patreon's official creator
-interface because its public API does not document post creation, media upload,
-editing, or scheduling. No Patreon API key is needed to build or download the
-deterministic handoff package, and no browser-automation credential should be
-created.
+Patreon publication uses Patreon's official creator interface because its public
+API does not document post creation, media upload, editing, or scheduling. No
+Patreon API key is needed to build/download the deterministic handoff package or
+to run the optional isolated browser publisher. The browser sidecar uses a
+persistent profile created by a one-time owner-controlled login; no username,
+password, token, or cookie belongs in application configuration.
 
 For later read-only reconciliation, create a Patreon API v2 client and use only:
 
@@ -236,9 +237,9 @@ it is not needed for polling a recorded post ID.
 | Webhook signing secret, optional | `GEN_AUTOMATION_PATREON_WEBHOOK_SECRET` | Required only after a verified Patreon webhook receiver is implemented. |
 
 The creator must personally classify the page Adult/18+, complete required
-verification, consent to OAuth, visually approve the public preview, and
-publish/schedule in Patreon's UI. The system records the resulting post ID/URL
-and reconciles it; it does not impersonate those owner actions.
+verification, perform the initial profile login/2FA/CAPTCHA, consent to any
+optional read-only OAuth, and visually approve the public preview. See
+`docs/patreon-browser-publisher.md` for the sidecar and manual-fallback runbook.
 
 ### MEGA completed-set destination
 

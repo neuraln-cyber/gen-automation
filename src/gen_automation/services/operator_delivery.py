@@ -561,6 +561,15 @@ def _publication_state(
             "ready",
             "Package ready for the signed-in Patreon browser driver or manual upload.",
         )
+    if (
+        intent.target == PublicationTarget.PATREON
+        and intent.state == PublicationIntentState.UNKNOWN
+    ):
+        return (
+            "unknown",
+            "The browser result is unknown. Confirm whether the Patreon post exists; "
+            "the system will not retry automatically.",
+        )
     if intent.state in {
         PublicationIntentState.PROCESSING,
     } or (

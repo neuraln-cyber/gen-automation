@@ -1,4 +1,5 @@
 from gen_automation.integrations.patreon.driver import (
+    PatreonDriverError,
     PatreonDriverOutcome,
     PatreonDriverRequest,
     PatreonDriverResult,
@@ -6,6 +7,7 @@ from gen_automation.integrations.patreon.driver import (
 )
 from gen_automation.integrations.patreon.handoff import (
     PATREON_HANDOFF_SCHEMA,
+    PATREON_MAX_ARCHIVE_BYTES,
     PATREON_MAX_BODY_BYTES,
     PATREON_MAX_DERIVATIVE_IMAGES,
     PATREON_MAX_IMAGE_BYTES,
@@ -24,9 +26,15 @@ from gen_automation.integrations.patreon.handoff import (
     PublicPreviewSafetyAttestation,
     build_patreon_handoff_package,
 )
+from gen_automation.integrations.patreon.sidecar import (
+    PATREON_BROWSER_SCHEMA,
+    PatreonSidecarDriver,
+)
 
 __all__ = [
+    "PATREON_BROWSER_SCHEMA",
     "PATREON_HANDOFF_SCHEMA",
+    "PATREON_MAX_ARCHIVE_BYTES",
     "PATREON_MAX_BODY_BYTES",
     "PATREON_MAX_DERIVATIVE_IMAGES",
     "PATREON_MAX_IMAGE_BYTES",
@@ -37,6 +45,7 @@ __all__ = [
     "PATREON_MAX_TOTAL_IMAGE_BYTES",
     "PATREON_PUBLIC_PREVIEW_ATTESTATION",
     "PUBLICATION_CHECKLIST",
+    "PatreonDriverError",
     "PatreonDriverOutcome",
     "PatreonDriverRequest",
     "PatreonDriverResult",
@@ -46,6 +55,7 @@ __all__ = [
     "PatreonPackageImage",
     "PatreonPreviewAttestationError",
     "PatreonPublicationDriver",
+    "PatreonSidecarDriver",
     "PublicPreviewSafetyAttestation",
     "build_patreon_handoff_package",
 ]

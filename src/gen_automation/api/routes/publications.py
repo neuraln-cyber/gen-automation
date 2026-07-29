@@ -52,8 +52,8 @@ from gen_automation.services.publication import (
     get_publication_guard,
     plan_publication_intent,
     presign_patreon_package_download,
+    reconcile_publication_absent,
     reconcile_publication_present,
-    reconcile_x_publication_absent,
     revoke_publication_intent,
     set_publication_guard,
 )
@@ -250,7 +250,7 @@ async def post_publication_confirm_present(
     "/publication-intents/{intent_id}:confirm-absent",
     response_model=PublicationReconciliationRead,
 )
-async def post_x_publication_confirm_absent(
+async def post_publication_confirm_absent(
     intent_id: UUID,
     command: PublicationConfirmAbsent,
     session: Session,
@@ -259,7 +259,7 @@ async def post_x_publication_confirm_absent(
     response: Response,
 ) -> PublicationReconciliationRead:
     try:
-        result = await reconcile_x_publication_absent(
+        result = await reconcile_publication_absent(
             session,
             intent_id=intent_id,
             expected_intent_digest=command.expected_intent_digest,

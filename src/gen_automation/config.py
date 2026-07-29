@@ -11,6 +11,7 @@ from pydantic import AnyHttpUrl, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from gen_automation.auth.security import SecretEncryptionError, TotpSecretCipher
+from gen_automation.domain.deliverability import PATREON_MAX_ARCHIVE_BYTES
 from gen_automation.domain.runtime_bindings import (
     WORKER_ALLOWED_UPLOAD_ORIGIN_BINDING,
     WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING,
@@ -322,6 +323,15 @@ class Settings(BaseSettings):
     background_loop_stale_after_seconds: float = Field(default=900, ge=10, le=7200)
     gpu_allocation_enabled: bool = False
     publishing_enabled: bool = False
+    patreon_browser_publishing_enabled: bool = False
+    patreon_browser_sidecar_url: AnyHttpUrl | None = None
+    patreon_browser_profile_reference: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+        max_length=64,
+    )
+    patreon_browser_shared_secret: SecretStr | None = None
+    patreon_browser_timeout_seconds: float = Field(default=240, ge=10, le=840)
     x_creator_user_id: str | None = Field(
         default=None,
         pattern=r"^[1-9][0-9]{0,18}$",
@@ -544,6 +554,32 @@ class Settings(BaseSettings):
             errors.append("publication orchestration requires private object storage")
         if self.publishing_enabled and not self.background_runtime_enabled:
             errors.append("publication orchestration requires the background runtime")
+        if (
+            self.publishing_enabled
+            and self.background_publication_max_package_bytes != PATREON_MAX_ARCHIVE_BYTES
+        ):
+            errors.append(
+                "enabled publication package capacity must equal the shared "
+                f"{PATREON_MAX_ARCHIVE_BYTES}-byte Patreon archive cap"
+            )
+        if self.patreon_browser_publishing_enabled:
+            if not self.publishing_enabled:
+                errors.append("Patreon browser publishing requires publication orchestration")
+            if self.patreon_browser_sidecar_url is None:
+                errors.append("Patreon browser publishing requires a sidecar URL")
+            if self.patreon_browser_profile_reference is None:
+                errors.append("Patreon browser publishing requires a browser profile reference")
+            shared_secret = _secret_value(self.patreon_browser_shared_secret)
+            try:
+                shared_secret_bytes = shared_secret.encode("utf-8") if shared_secret else b""
+            except UnicodeEncodeError:
+                shared_secret_bytes = b""
+            if not 32 <= len(shared_secret_bytes) <= 4096:
+                errors.append("Patreon browser publishing requires a 32-4096 byte shared secret")
+            if self.patreon_browser_timeout_seconds >= self.background_publication_timeout_seconds:
+                errors.append(
+                    "Patreon browser timeout must be lower than the publication cycle timeout"
+                )
         x_oauth_reference_configured = self.x_oauth_secret_reference is not None
         x_creator_binding_configured = self.x_creator_user_id is not None
         if x_oauth_reference_configured != x_creator_binding_configured:
@@ -576,6 +612,11 @@ class Settings(BaseSettings):
                     errors.append("MEGA profile HOME must be an absolute non-root directory")
             if not _valid_mega_remote_root(self.mega_remote_root):
                 errors.append("MEGA remote root must be a normalized absolute remote path")
+            if self.background_mega_max_package_bytes < PATREON_MAX_ARCHIVE_BYTES:
+                errors.append(
+                    "MEGA package capacity must cover the "
+                    f"{PATREON_MAX_ARCHIVE_BYTES}-byte Patreon archive contract"
+                )
         if self.background_mega_retry_max_seconds < self.background_mega_retry_base_seconds:
             errors.append("MEGA retry maximum cannot be lower than its base delay")
         if (

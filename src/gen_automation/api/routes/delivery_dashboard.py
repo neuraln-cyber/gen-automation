@@ -22,6 +22,8 @@ from gen_automation.api.browser_delivery_forms import (
     delivery_form_key,
     form_key_matches,
     read_package_download_form,
+    read_patreon_confirm_absent_form,
+    read_patreon_confirm_present_form,
     read_prepare_destination_form,
     read_prepare_output_form,
 )
@@ -52,10 +54,14 @@ from gen_automation.services.operator_delivery import (
     prepare_operator_destinations,
 )
 from gen_automation.services.publication import (
+    PUBLICATION_CONFIRM_PATREON_ABSENT_ATTESTATION,
+    PUBLICATION_CONFIRM_PRESENT_ATTESTATION,
     PublicationConflictError,
     PublicationInputError,
     PublicationNotFoundError,
     presign_patreon_package_download,
+    reconcile_publication_absent,
+    reconcile_publication_present,
 )
 from gen_automation.services.review_derivatives import (
     prepare_completed_review_derivatives,
@@ -148,6 +154,43 @@ async def dashboard_review_delivery(
         action="upload-watermark",
         parts=(str(review_task_id), str(watermark_submission_id)),
     )
+    patreon_confirmation = next(
+        (
+            destination
+            for destination in snapshot.destinations
+            if destination.key == "patreon"
+            and destination.state in {"ready", "unknown"}
+            and destination.intent_id is not None
+            and destination.intent_digest is not None
+            and destination.intent_lock_version is not None
+        ),
+        None,
+    )
+    patreon_present_key = None
+    patreon_absent_key = None
+    if patreon_confirmation is not None:
+        assert patreon_confirmation.intent_id is not None
+        assert patreon_confirmation.intent_digest is not None
+        assert patreon_confirmation.intent_lock_version is not None
+        recovery_parts = (
+            str(review_task_id),
+            str(patreon_confirmation.intent_id),
+            patreon_confirmation.intent_digest,
+            str(patreon_confirmation.intent_lock_version),
+        )
+        patreon_present_key = delivery_form_key(
+            settings,
+            session_id=principal.session_id,
+            action="patreon-confirm-present",
+            parts=recovery_parts,
+        )
+        if patreon_confirmation.state == "unknown":
+            patreon_absent_key = delivery_form_key(
+                settings,
+                session_id=principal.session_id,
+                action="patreon-confirm-absent",
+                parts=recovery_parts,
+            )
     previews = await _preview_views(request, snapshot.full_outputs)
     return _secure(
         request,
@@ -168,6 +211,10 @@ async def dashboard_review_delivery(
                 "destination_idempotency_key": destination_key,
                 "public_preview_attested_at": datetime.now(UTC).isoformat(),
                 "watermark_idempotency_key": watermark_key,
+                "patreon_present_idempotency_key": patreon_present_key,
+                "patreon_absent_idempotency_key": patreon_absent_key,
+                "patreon_present_attestation": PUBLICATION_CONFIRM_PRESENT_ATTESTATION,
+                "patreon_absent_attestation": (PUBLICATION_CONFIRM_PATREON_ABSENT_ATTESTATION),
                 "storage_available": _store(request) is not None,
                 "publishing_enabled": settings.publishing_enabled,
                 "x_configured": settings.x_oauth_secret_reference is not None,
@@ -220,6 +267,138 @@ async def dashboard_prepare_outputs(
             principal,
             status.HTTP_409_CONFLICT,
             "Outputs could not be prepared from the current review snapshot.",
+        )
+    return _redirect(review_task_id)
+
+
+@router.post(
+    "/review-tasks/{review_task_id}/delivery/patreon/{intent_id}:confirm-present",
+    response_class=HTMLResponse,
+    response_model=None,
+)
+async def dashboard_confirm_patreon_present(
+    review_task_id: UUID,
+    intent_id: UUID,
+    request: Request,
+    session: Session,
+    principal: PublicationReader,
+) -> Response:
+    try:
+        form = await read_patreon_confirm_present_form(request)
+        owner = await _verified_owner(request, session, principal, form.csrf_token)
+        await _require_review_patreon_intent(
+            session,
+            review_task_id=review_task_id,
+            intent_id=intent_id,
+        )
+        expected_key = delivery_form_key(
+            request.app.state.settings,
+            session_id=owner.session_id,
+            action="patreon-confirm-present",
+            parts=(
+                str(review_task_id),
+                str(intent_id),
+                form.expected_intent_digest,
+                str(form.expected_lock_version),
+            ),
+        )
+        if not form_key_matches(form.idempotency_key, expected_key):
+            raise BrowserDeliveryFormError(status_code=status.HTTP_400_BAD_REQUEST)
+        await reconcile_publication_present(
+            session,
+            intent_id=intent_id,
+            expected_intent_digest=form.expected_intent_digest,
+            expected_lock_version=form.expected_lock_version,
+            remote_identifier=form.remote_identifier,
+            remote_url=form.remote_url,
+            evidence=form.evidence,
+            attestation=form.attestation,
+            actor_user_id=owner.user_id,
+            actor_role=owner.role,
+            idempotency_key=form.idempotency_key,
+        )
+    except BrowserDeliveryFormError as error:
+        return _form_error(request, principal, error.status_code, error.message)
+    except HTTPException:
+        return _form_error(request, principal, status.HTTP_403_FORBIDDEN, "Request denied.")
+    except OperatorDeliveryNotFoundError:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_404_NOT_FOUND,
+            "The completed review could not be found.",
+        )
+    except (PublicationInputError, PublicationNotFoundError, PublicationConflictError):
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_409_CONFLICT,
+            "The Patreon outcome could not be confirmed from the current state.",
+        )
+    return _redirect(review_task_id)
+
+
+@router.post(
+    "/review-tasks/{review_task_id}/delivery/patreon/{intent_id}:confirm-absent",
+    response_class=HTMLResponse,
+    response_model=None,
+)
+async def dashboard_confirm_patreon_absent(
+    review_task_id: UUID,
+    intent_id: UUID,
+    request: Request,
+    session: Session,
+    principal: PublicationReader,
+) -> Response:
+    try:
+        form = await read_patreon_confirm_absent_form(request)
+        owner = await _verified_owner(request, session, principal, form.csrf_token)
+        await _require_review_patreon_intent(
+            session,
+            review_task_id=review_task_id,
+            intent_id=intent_id,
+        )
+        expected_key = delivery_form_key(
+            request.app.state.settings,
+            session_id=owner.session_id,
+            action="patreon-confirm-absent",
+            parts=(
+                str(review_task_id),
+                str(intent_id),
+                form.expected_intent_digest,
+                str(form.expected_lock_version),
+            ),
+        )
+        if not form_key_matches(form.idempotency_key, expected_key):
+            raise BrowserDeliveryFormError(status_code=status.HTTP_400_BAD_REQUEST)
+        await reconcile_publication_absent(
+            session,
+            intent_id=intent_id,
+            expected_intent_digest=form.expected_intent_digest,
+            expected_lock_version=form.expected_lock_version,
+            evidence=form.evidence,
+            attestation=form.attestation,
+            actor_user_id=owner.user_id,
+            actor_role=owner.role,
+            idempotency_key=form.idempotency_key,
+        )
+    except BrowserDeliveryFormError as error:
+        return _form_error(request, principal, error.status_code, error.message)
+    except HTTPException:
+        return _form_error(request, principal, status.HTTP_403_FORBIDDEN, "Request denied.")
+    except OperatorDeliveryNotFoundError:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_404_NOT_FOUND,
+            "The completed review could not be found.",
+        )
+    except (PublicationInputError, PublicationNotFoundError, PublicationConflictError):
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_409_CONFLICT,
+            "The Patreon outcome could not be confirmed from the current state.",
         )
     return _redirect(review_task_id)
 
@@ -395,6 +574,20 @@ async def dashboard_download_patreon_package(
         request,
         RedirectResponse(result.url, status_code=status.HTTP_303_SEE_OTHER),
     )
+
+
+async def _require_review_patreon_intent(
+    session: AsyncSession,
+    *,
+    review_task_id: UUID,
+    intent_id: UUID,
+) -> None:
+    snapshot = await load_operator_delivery(session, review_task_id=review_task_id)
+    if not any(
+        destination.key == "patreon" and destination.intent_id == intent_id
+        for destination in snapshot.destinations
+    ):
+        raise PublicationConflictError("Patreon intent does not belong to this review")
 
 
 async def _verified_owner(

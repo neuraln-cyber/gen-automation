@@ -31,6 +31,7 @@ from gen_automation.domain.enums import (
 )
 from gen_automation.gpu_worker.bootstrap import load_artifact_manifest
 from gen_automation.integrations.mega import MegaCmdClient
+from gen_automation.integrations.patreon import PatreonPublicationDriver
 from gen_automation.integrations.salad.client import SaladClient
 from gen_automation.integrations.salad.models import JSONValue
 from gen_automation.integrations.semantic_vlm import SemanticVlmClient
@@ -584,6 +585,7 @@ class ControllerWorkloads:
         x_oauth_provider: XOAuthProvider | None = None,
         mega_client: MegaDeliveryClient | None = None,
         semantic_vlm_client: SemanticVlmClient | None = None,
+        patreon_driver: PatreonPublicationDriver | None = None,
     ) -> None:
         self.settings = settings
         self.sessions = sessions
@@ -594,6 +596,7 @@ class ControllerWorkloads:
         self.x_oauth_provider = x_oauth_provider
         self.mega_client = mega_client
         self.semantic_vlm_client = semantic_vlm_client
+        self.patreon_driver = patreon_driver
         self._next_attempt_reconciliation: dict[UUID, float] = {}
 
     async def initialize(self) -> None:
@@ -1063,6 +1066,8 @@ class ControllerWorkloads:
             retry_base_seconds=self.settings.background_publication_retry_base_seconds,
             retry_max_seconds=self.settings.background_publication_retry_max_seconds,
             max_package_bytes=self.settings.background_publication_max_package_bytes,
+            patreon_driver=self.patreon_driver,
+            patreon_browser_profile_reference=(self.settings.patreon_browser_profile_reference),
         )
         return result.did_work
 
@@ -1405,6 +1410,7 @@ def build_controller_runtime(
     x_oauth_provider: XOAuthProvider | None = None,
     mega_client: MegaDeliveryClient | None = None,
     semantic_vlm_client: SemanticVlmClient | None = None,
+    patreon_driver: PatreonPublicationDriver | None = None,
 ) -> ControllerRuntime:
     instance_id = f"controller-{uuid4()}"
     resolved_mega_client = mega_client
@@ -1426,6 +1432,7 @@ def build_controller_runtime(
         x_oauth_provider=x_oauth_provider,
         mega_client=resolved_mega_client,
         semantic_vlm_client=semantic_vlm_client,
+        patreon_driver=patreon_driver,
     )
     poll = settings.background_poll_interval_seconds
     loops: list[LoopSpec] = []

@@ -171,6 +171,101 @@
               </button>
             </form>
           {% endif %}
+          {% if destination.key == "patreon" and destination.state in ["ready", "unknown"] %}
+            <div class="decision-form">
+              <h3>
+                {% if destination.state == "unknown" %}
+                  Resolve the unknown browser result
+                {% else %}
+                  Record the completed manual publish
+                {% endif %}
+              </h3>
+              <p class="muted">
+                Check Patreon first. Confirming the post here never runs the browser
+                publisher again.
+              </p>
+              <form
+                method="post"
+                action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/patreon/{{ destination.intent_id }}:confirm-present"
+              >
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input
+                  type="hidden"
+                  name="idempotency_key"
+                  value="{{ patreon_present_idempotency_key }}"
+                >
+                <input
+                  type="hidden"
+                  name="expected_intent_digest"
+                  value="{{ destination.intent_digest }}"
+                >
+                <input
+                  type="hidden"
+                  name="expected_lock_version"
+                  value="{{ destination.intent_lock_version }}"
+                >
+                <input
+                  type="hidden"
+                  name="attestation"
+                  value="{{ patreon_present_attestation }}"
+                >
+                <label>
+                  Patreon post ID
+                  <input
+                    name="remote_identifier"
+                    inputmode="numeric"
+                    pattern="[0-9]{1,20}"
+                    maxlength="20"
+                    required
+                  >
+                </label>
+                <label>
+                  Confirmed Patreon post URL
+                  <input name="remote_url" type="url" maxlength="2048" required>
+                </label>
+                <label>
+                  Evidence checked
+                  <textarea name="evidence" maxlength="20000" rows="3" required></textarea>
+                </label>
+                <button class="primary-button" type="submit">Confirm post exists</button>
+              </form>
+              {% if destination.state == "unknown" %}
+                <form
+                  method="post"
+                  action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/patreon/{{ destination.intent_id }}:confirm-absent"
+                >
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input
+                    type="hidden"
+                    name="idempotency_key"
+                    value="{{ patreon_absent_idempotency_key }}"
+                  >
+                  <input
+                    type="hidden"
+                    name="expected_intent_digest"
+                    value="{{ destination.intent_digest }}"
+                  >
+                  <input
+                    type="hidden"
+                    name="expected_lock_version"
+                    value="{{ destination.intent_lock_version }}"
+                  >
+                  <input
+                    type="hidden"
+                    name="attestation"
+                    value="{{ patreon_absent_attestation }}"
+                  >
+                  <label>
+                    Evidence the post was not created
+                    <textarea name="evidence" maxlength="20000" rows="3" required></textarea>
+                  </label>
+                  <button class="secondary-button" type="submit">
+                    Confirm absent and use manual package
+                  </button>
+                </form>
+              {% endif %}
+            </div>
+          {% endif %}
         </li>
       {% endfor %}
     </ul>
@@ -287,10 +382,10 @@
     {% endif %}
 
     <p class="muted">
-      Patreon creation remains a manual package handoff today because its public API
-      does not provide post creation. The automation boundary is ready for a later
-      browser driver using a persistent signed-in Patreon session; manual download
-      remains available as the fallback. MEGA mirrors the same immutable full-set ZIP.
+      Patreon uses the configured persistent signed-in browser publisher when it is
+      enabled. Manual package download remains the fallback, and an unknown browser
+      result must be reconciled before it becomes available. MEGA mirrors the same
+      immutable full-set ZIP.
     </p>
     {% if not mega_configured %}
       <p class="muted">MEGA will remain queued until its pre-authenticated uploader is enabled.</p>

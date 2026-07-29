@@ -49,6 +49,28 @@ PACKAGE_DOWNLOAD_FIELDS = frozenset(
         "expected_lock_version",
     }
 )
+PATREON_CONFIRM_PRESENT_FIELDS = frozenset(
+    {
+        "csrf_token",
+        "idempotency_key",
+        "expected_intent_digest",
+        "expected_lock_version",
+        "remote_identifier",
+        "remote_url",
+        "evidence",
+        "attestation",
+    }
+)
+PATREON_CONFIRM_ABSENT_FIELDS = frozenset(
+    {
+        "csrf_token",
+        "idempotency_key",
+        "expected_intent_digest",
+        "expected_lock_version",
+        "evidence",
+        "attestation",
+    }
+)
 
 
 class BrowserDeliveryFormError(ValueError):
@@ -88,6 +110,28 @@ class PackageDownloadForm:
     csrf_token: str
     expected_intent_digest: str
     expected_lock_version: int
+
+
+@dataclass(frozen=True, slots=True)
+class PatreonConfirmPresentForm:
+    csrf_token: str
+    idempotency_key: str
+    expected_intent_digest: str
+    expected_lock_version: int
+    remote_identifier: str
+    remote_url: str
+    evidence: str
+    attestation: str
+
+
+@dataclass(frozen=True, slots=True)
+class PatreonConfirmAbsentForm:
+    csrf_token: str
+    idempotency_key: str
+    expected_intent_digest: str
+    expected_lock_version: int
+    evidence: str
+    attestation: str
 
 
 async def read_prepare_output_form(request: Request) -> PrepareOutputForm:
@@ -149,6 +193,42 @@ async def read_package_download_form(request: Request) -> PackageDownloadForm:
         csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
         expected_intent_digest=digest,
         expected_lock_version=_positive_int(values["expected_lock_version"]),
+    )
+
+
+async def read_patreon_confirm_present_form(
+    request: Request,
+) -> PatreonConfirmPresentForm:
+    values = await _read_form(request, expected_fields=PATREON_CONFIRM_PRESENT_FIELDS)
+    digest, lock_version = _intent_identity(values)
+    return PatreonConfirmPresentForm(
+        csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
+        idempotency_key=_idempotency_key(values["idempotency_key"]),
+        expected_intent_digest=digest,
+        expected_lock_version=lock_version,
+        remote_identifier=_bounded_text(
+            values["remote_identifier"],
+            maximum=20,
+            required=True,
+        ),
+        remote_url=_bounded_text(values["remote_url"], maximum=2_048, required=True),
+        evidence=_bounded_text(values["evidence"], maximum=20_000, required=True),
+        attestation=_bounded_text(values["attestation"], maximum=500, required=True),
+    )
+
+
+async def read_patreon_confirm_absent_form(
+    request: Request,
+) -> PatreonConfirmAbsentForm:
+    values = await _read_form(request, expected_fields=PATREON_CONFIRM_ABSENT_FIELDS)
+    digest, lock_version = _intent_identity(values)
+    return PatreonConfirmAbsentForm(
+        csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
+        idempotency_key=_idempotency_key(values["idempotency_key"]),
+        expected_intent_digest=digest,
+        expected_lock_version=lock_version,
+        evidence=_bounded_text(values["evidence"], maximum=20_000, required=True),
+        attestation=_bounded_text(values["attestation"], maximum=500, required=True),
     )
 
 
@@ -252,6 +332,13 @@ def _tags(value: str) -> tuple[str, ...]:
     if len(tags) > 25:
         raise _bad_request()
     return tuple(tags)
+
+
+def _intent_identity(values: dict[str, str]) -> tuple[str, int]:
+    digest = values["expected_intent_digest"]
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise _bad_request()
+    return digest, _positive_int(values["expected_lock_version"])
 
 
 def _bounded_text(value: str, *, maximum: int, required: bool) -> str:

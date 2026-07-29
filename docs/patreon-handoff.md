@@ -33,8 +33,10 @@ can coexist. Invoke the builder in the bounded CPU worker with a wall-time and
 memory limit, not in the API event loop or request process.
 
 Patreon's documented public API exposes post-reading endpoints but no documented
-post-creation endpoint. The operator therefore publishes or schedules the package
-in [Patreon's official UI](https://support.patreon.com/hc/en-us/articles/115004048046-Posting-to-your-Patreon).
+post-creation endpoint. The package is therefore published or scheduled in
+[Patreon's official UI](https://support.patreon.com/hc/en-us/articles/115004048046-Posting-to-your-Patreon),
+either by the isolated signed-in browser sidecar or by the operator using the
+same deterministic ZIP.
 The [Patreon API](https://docs.patreon.com/) and signed post webhooks may reconcile
 the resulting post ID, URL, and status after the human action; they do not replace
 the human publishing step.
@@ -103,7 +105,7 @@ publication checklist. Its schema has no fields for prompts, provider credential
 storage keys, or environment data. Upstream DERIVATIVE-kind and lineage checks
 are what prevent a raw master from being supplied as an opaque image.
 
-## Operator procedure
+## Operator/manual fallback procedure
 
 1. Verify the package SHA-256.
 2. Confirm the manifest and `POST.txt`.

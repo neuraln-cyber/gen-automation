@@ -202,4 +202,4 @@ async def test_completed_review_prepares_exact_patreon_mega_and_x_destinations(
         assert "Patreon" in html
         assert "MEGA" in html
         assert "X" in html
-        assert "persistent signed-in Patreon session" in html
+        assert "persistent signed-in browser publisher" in html

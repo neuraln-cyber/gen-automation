@@ -5,8 +5,9 @@ from durable, short-lived human authorization. Its two MVP destinations are:
 
 - X: automatic static-image upload and post creation through the configured AWS
   Secrets Manager OAuth provider.
-- Patreon: deterministic ZIP generation followed by a human publish/schedule
-  action in Patreon's official creator UI.
+- Patreon: deterministic ZIP generation followed by an optional isolated,
+  signed-in browser publisher using Patreon's official creator UI. The same ZIP
+  remains available as a manual fallback.
 
 MEGA delivery is an optional automatic downstream mirror of the Patreon ZIP.
 It uses a pre-authenticated official MEGAcmd writable-folder profile, verifies
@@ -47,6 +48,8 @@ reference such as `aws-secrets-manager://...`, never a token.
 For X:
 
 - only one to four `x_teaser` derivatives may be used;
+- a future-scheduled attempt remains unavailable until its requested post time,
+  because this workflow performs the X create-post effect at that instant;
 - the ordered inputs must exactly match the owner's image selections frozen at
   review completion; omitted, additional, or reordered outputs are rejected;
 - each upload includes the adult-content metadata supported by the transport;
@@ -64,18 +67,38 @@ For X:
 For Patreon:
 
 - content and public preview inputs are JPEG/PNG derivatives only;
+- a future-scheduled post is created in Patreon's UI as soon as the frozen
+  intent is approved; the future `scheduled_at` remains part of the immutable
+  package and Patreon performs the later publication. The attempt is never
+  held until that timestamp, so the browser does not try to schedule a post at
+  an already-due instant;
 - paid content must exactly equal the ordered `full` output for every accepted
   `release_selection`; partial, additional, duplicated, or reordered sets are
   rejected before an intent can be frozen;
+- the clean full-output encoder receives a deterministic per-release byte budget
+  derived from the accepted-image count, including the duplicated public
+  preview, so a rendered set cannot discover the bounded package limit only at
+  publication time;
 - paid content and the explicitly selected public preview must both be clean
   `full` outputs; a watermarked `x_teaser` can never enter the Patreon package;
 - a named human must attest in an explicit IANA timezone that the preview has no
   nudity or sexually explicit content; the attestation must be recent;
 - the ZIP is generated deterministically, written conditionally, and an existing
   object is adopted only when version, metadata, bytes, and both hashes match;
-- the intent becomes `AWAITING_HUMAN`;
-- an OWNER/PUBLISHER downloads the signed package, publishes in Patreon's
-  official UI, and records the exact Patreon post ID and HTTPS URL.
+- when browser publication is disabled, the intent becomes `AWAITING_HUMAN` and
+  an OWNER/PUBLISHER uses the protected package download in Patreon's UI;
+- when enabled, the controller authenticates the exact package request to a
+  private sidecar. A durable sidecar idempotency record prevents a duplicate
+  delivery from creating a second post. Queue timing is not part of the
+  request identity, so restart/recovery retains the same frozen intent,
+  package digest, and sidecar idempotency key;
+- a confirmed Patreon post URL/ID completes the intent. Login, 2FA/CAPTCHA, a
+  missing tier, or a changed editor contract becomes `AWAITING_HUMAN`; an
+  uncertain post-click outcome becomes `UNKNOWN` and is never retried blindly;
+- a definite pre-submit browser failure becomes `AWAITING_HUMAN` with the
+  package available. An unknown result can be confirmed present, or confirmed
+  absent to open that same manual package without creating an attempt or
+  invoking the sidecar.
 
 ## Operator API sequence
 
@@ -90,12 +113,14 @@ noted, same-origin, CSRF, and recent authentication.
    and lock version for a bounded lifetime.
 4. `GET /publication-guard`, then OWNER-only `POST /publication-guard` — enable
    with the current epoch/lock version after deployment checks.
-5. For Patreon,
+5. For Patreon, let the configured sidecar publish the exact package. If it
+   requests operator action, use
    `POST /publication-intents/{id}/patreon-package:download`, publish in the
    official UI, then `POST /publication-intents/{id}:confirm-present`.
-6. For unknown X outcomes, investigate externally and call either
+6. For unknown X or Patreon outcomes, investigate externally and call either
    `:confirm-present` or `:confirm-absent` with evidence and the exact current
-   digest/lock.
+   digest/lock. Patreon absence switches to the manual package; X absence
+   returns to a separately approved future attempt.
 7. `POST /publication-intents/{id}:revoke` — append a revocation and stop any
    not-yet-started effect. OWNER-only guard disable is the global emergency stop.
 
@@ -114,6 +139,10 @@ GEN_AUTOMATION_BACKGROUND_PUBLICATION_LEASE_SECONDS=600
 GEN_AUTOMATION_BACKGROUND_PUBLICATION_RETRY_BASE_SECONDS=30
 GEN_AUTOMATION_BACKGROUND_PUBLICATION_RETRY_MAX_SECONDS=900
 GEN_AUTOMATION_BACKGROUND_PUBLICATION_MAX_PACKAGE_BYTES=167772160
+GEN_AUTOMATION_PATREON_BROWSER_PUBLISHING_ENABLED=false
+GEN_AUTOMATION_PATREON_BROWSER_SIDECAR_URL=http://patreon-browser:8090/v1/publish
+GEN_AUTOMATION_PATREON_BROWSER_PROFILE_REFERENCE=creator-main
+GEN_AUTOMATION_PATREON_BROWSER_TIMEOUT_SECONDS=240
 ```
 
 `PUBLISHING_ENABLED` only registers the bounded controller loop. The object
@@ -145,3 +174,14 @@ Tokens exist only in the designated Secrets Manager secret and short-lived
 process memory, never in publication tables, audits, exceptions, or logs.
 SDK clients use ambient narrow IAM and are closed during application shutdown.
 Patreon package/handoff execution remains independent of X credentials.
+
+## Patreon browser deployment
+
+The browser and signed-in profile never enter the control-plane image. Deploy
+`Dockerfile.patreon-browser` as one private sidecar with persistent encrypted
+profile and idempotency-state mounts, no public ingress, and outbound access
+limited to Patreon and its required static hosts. Generate the controller/
+sidecar authentication secret directly in the deployment secret store. The
+account owner performs the one-time login, 2FA, CAPTCHA, and account verification
+in a private headed session; routine runs are headless. See
+`docs/patreon-browser-publisher.md`.

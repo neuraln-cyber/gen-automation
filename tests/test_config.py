@@ -2,6 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from gen_automation.config import Environment, Settings
+from gen_automation.domain.deliverability import PATREON_MAX_ARCHIVE_BYTES
 from gen_automation.domain.signing import derive_public_key, encode_base64url
 
 WORKER_SIGNING_PRIVATE_KEY = encode_base64url(bytes(range(1, 33)))
@@ -470,6 +471,34 @@ def test_background_health_thresholds_and_staleness_are_ordered() -> None:
             background_collection_timeout_seconds=300,
             background_error_backoff_max_seconds=60,
             background_loop_stale_after_seconds=375,
+        )
+
+
+def test_enabled_delivery_paths_cover_the_internal_patreon_archive_cap() -> None:
+    common = {
+        "environment": Environment.TEST,
+        "background_runtime_enabled": True,
+        "storage_enabled": True,
+        "storage_bucket": "private-assets",
+        "publishing_enabled": True,
+    }
+    with pytest.raises(ValidationError, match="publication package capacity"):
+        Settings(
+            **common,  # type: ignore[arg-type]
+            background_publication_max_package_bytes=PATREON_MAX_ARCHIVE_BYTES - 1,
+        )
+    with pytest.raises(ValidationError, match="publication package capacity"):
+        Settings(
+            **common,  # type: ignore[arg-type]
+            background_publication_max_package_bytes=PATREON_MAX_ARCHIVE_BYTES + 1,
+        )
+
+    with pytest.raises(ValidationError, match="MEGA package capacity"):
+        Settings(
+            **common,  # type: ignore[arg-type]
+            mega_delivery_enabled=True,
+            mega_profile_home="/var/lib/mega-profile",
+            background_mega_max_package_bytes=PATREON_MAX_ARCHIVE_BYTES - 1,
         )
 
 

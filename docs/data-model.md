@@ -186,12 +186,14 @@ AWAITING_APPROVAL --fresh approval--> READY -> PROCESSING -> PUBLISHED
                                             +-> AWAITING_HUMAN (Patreon UI)
                                             |        `-> confirmed present -> PUBLISHED
                                             |
-                                            +-> UNKNOWN (ambiguous X create)
-                                                     |-> confirmed present -> PUBLISHED
-                                                     `-> confirmed absent -> AWAITING_APPROVAL
+                                            +-> UNKNOWN
+                                                |-> confirmed present -> PUBLISHED
+                                                |-> X absent -> AWAITING_APPROVAL
+                                                `-> Patreon absent -> AWAITING_HUMAN
 
 safe pre-post/upload retry -> READY
-definitive failure         -> FAILED
+definitive Patreon browser pre-submit failure -> AWAITING_HUMAN
+other definitive failure                    -> FAILED
 revocation/expired approval -> AWAITING_APPROVAL
 ```
 
@@ -200,6 +202,9 @@ process exit, lost lease, or failure to durably record a returned post is
 `UNKNOWN`, not failed. Confirming absence never posts and never creates an
 attempt; a new, separately approved attempt is required. Media-upload ambiguity
 is retryable because unconfirmed media IDs are discarded and never reused.
+An unknown Patreon result is also never retried. Confirming it absent opens only
+the already-built manual package handoff; it does not create another attempt or
+reuse the sidecar request identity.
 
 ## Idempotency
 

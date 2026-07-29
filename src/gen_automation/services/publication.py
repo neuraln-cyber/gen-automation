@@ -44,6 +44,7 @@ from gen_automation.domain.enums import (
     PublicationApprovalAction,
     PublicationAttemptState,
     PublicationIntentState,
+    PublicationRetryClass,
     PublicationStepKind,
     PublicationStepState,
     PublicationTarget,
@@ -53,15 +54,19 @@ from gen_automation.domain.ids import uuid7
 from gen_automation.domain.release_spec import ReleaseSpecification
 from gen_automation.integrations.patreon.handoff import (
     PATREON_MAX_BODY_BYTES,
+    PATREON_MAX_DERIVATIVE_IMAGES,
+    PATREON_MAX_IMAGE_BYTES,
     PATREON_MAX_TAG_BYTES,
     PATREON_MAX_TAGS,
     PATREON_MAX_TIER_BYTES,
     PATREON_MAX_TITLE_BYTES,
+    PATREON_MAX_TOTAL_IMAGE_BYTES,
     PATREON_PUBLIC_PREVIEW_ATTESTATION,
 )
 from gen_automation.integrations.x.client import (
     X_MAX_MEDIA_PER_POST,
     X_MAX_POST_TEXT_BYTES,
+    X_MAX_STATIC_IMAGE_BYTES,
 )
 from gen_automation.services.compliance import (
     ReleaseApprovalError,
@@ -83,6 +88,11 @@ PUBLICATION_CONFIRM_PRESENT_ATTESTATION = (
 PUBLICATION_CONFIRM_ABSENT_ATTESTATION = (
     "I manually investigated the unknown X outcome and found evidence that the "
     "post was not created. I understand this confirmation does not publish or retry it."
+)
+PUBLICATION_CONFIRM_PATREON_ABSENT_ATTESTATION = (
+    "I manually investigated the unknown Patreon outcome and found evidence that "
+    "the post was not created. I understand this confirmation does not publish or "
+    "retry it and authorizes access to the manual package handoff."
 )
 
 _PUBLISHER_ROLES = frozenset({AdminRole.OWNER, AdminRole.PUBLISHER})
@@ -564,7 +574,12 @@ async def approve_publication_intent(
     )
     _validate_frozen_input_set(intent, inputs)
     expires_at = approved_at + timedelta(seconds=normalized_approval_seconds)
-    if intent.scheduled_at is not None and _as_utc(intent.scheduled_at) >= expires_at:
+    available_at = _initial_attempt_available_at(
+        target=intent.target,
+        scheduled_at=intent.scheduled_at,
+        approved_at=approved_at,
+    )
+    if available_at >= expires_at:
         raise PublicationConflictError("approval would expire before the scheduled external effect")
     revision = (
         int(
@@ -609,10 +624,6 @@ async def approve_publication_intent(
             or 0
         )
         + 1
-    )
-    available_at = max(
-        approved_at,
-        _as_utc(intent.scheduled_at) if intent.scheduled_at is not None else approved_at,
     )
     attempt = PublicationAttempt(
         id=uuid7(),
@@ -1078,17 +1089,12 @@ async def reconcile_publication_present(
     )
     if intent is None:
         raise PublicationNotFoundError("publication intent was not found")
-    _require_expected_intent(intent, normalized_digest, normalized_lock)
     if intent.target == PublicationTarget.PATREON:
-        if intent.state != PublicationIntentState.AWAITING_HUMAN:
-            raise PublicationConflictError("Patreon handoff is not awaiting confirmation")
-        normalized_identifier, normalized_url = _validate_patreon_post_identity(
+        normalized_identifier, normalized_url = validate_patreon_post_identity(
             remote_identifier,
             remote_url,
         )
     else:
-        if intent.state != PublicationIntentState.UNKNOWN:
-            raise PublicationConflictError("X outcome is not awaiting reconciliation")
         normalized_identifier, normalized_url = _validate_x_post_identity(
             remote_identifier,
             remote_url,
@@ -1097,8 +1103,8 @@ async def reconcile_publication_present(
         {
             "schema": "publication-confirm-present/v1",
             "intent_id": str(intent.id),
-            "intent_digest": intent.intent_digest,
-            "expected_lock_version": intent.lock_version,
+            "intent_digest": normalized_digest,
+            "expected_lock_version": normalized_lock,
             "remote_identifier": normalized_identifier,
             "remote_url_sha256": canonical_sha256(normalized_url),
             "evidence_sha256": canonical_sha256(normalized_evidence),
@@ -1115,6 +1121,15 @@ async def reconcile_publication_present(
     )
     if replay is not None:
         return replay
+    _require_expected_intent(intent, normalized_digest, normalized_lock)
+    if intent.target == PublicationTarget.PATREON:
+        if intent.state not in {
+            PublicationIntentState.AWAITING_HUMAN,
+            PublicationIntentState.UNKNOWN,
+        }:
+            raise PublicationConflictError("Patreon outcome is not awaiting confirmation")
+    elif intent.state != PublicationIntentState.UNKNOWN:
+        raise PublicationConflictError("X outcome is not awaiting reconciliation")
 
     reconciliation = await _append_reconciliation(
         session,
@@ -1181,7 +1196,7 @@ async def reconcile_publication_present(
     return result
 
 
-async def reconcile_x_publication_absent(
+async def reconcile_publication_absent(
     session: AsyncSession,
     *,
     intent_id: UUID,
@@ -1194,7 +1209,7 @@ async def reconcile_x_publication_absent(
     idempotency_key: str,
     now: datetime | None = None,
 ) -> PublicationReconciliationResult:
-    """Record absence evidence only; never retry or create an X post."""
+    """Record absence evidence without retrying or creating a provider post."""
 
     recorded_at = _utc_now(now)
     normalized_key = _bounded_text(idempotency_key, "idempotency key", 200)
@@ -1206,23 +1221,25 @@ async def reconcile_x_publication_absent(
         _MAX_EVIDENCE_BYTES,
         byte_limit=True,
     )
-    if attestation != PUBLICATION_CONFIRM_ABSENT_ATTESTATION:
-        raise PublicationInputError("the exact confirmed-absent attestation is required")
     actor = await _require_publisher(session, actor_user_id, asserted_role=actor_role)
     intent = await session.scalar(
         select(PublicationIntent).where(PublicationIntent.id == intent_id).with_for_update()
     )
     if intent is None:
         raise PublicationNotFoundError("publication intent was not found")
-    _require_expected_intent(intent, normalized_digest, normalized_lock)
-    if intent.target != PublicationTarget.X or intent.state != PublicationIntentState.UNKNOWN:
-        raise PublicationConflictError("only an unknown X outcome can be confirmed absent")
+    expected_attestation = (
+        PUBLICATION_CONFIRM_PATREON_ABSENT_ATTESTATION
+        if intent.target == PublicationTarget.PATREON
+        else PUBLICATION_CONFIRM_ABSENT_ATTESTATION
+    )
+    if attestation != expected_attestation:
+        raise PublicationInputError("the exact confirmed-absent attestation is required")
     request_sha256 = canonical_sha256(
         {
             "schema": "publication-confirm-absent/v1",
             "intent_id": str(intent.id),
-            "intent_digest": intent.intent_digest,
-            "expected_lock_version": intent.lock_version,
+            "intent_digest": normalized_digest,
+            "expected_lock_version": normalized_lock,
             "evidence_sha256": canonical_sha256(normalized_evidence),
             "attestation_sha256": canonical_sha256(attestation),
             "actor_user_id": str(actor.id),
@@ -1237,6 +1254,11 @@ async def reconcile_x_publication_absent(
     )
     if replay is not None:
         return replay
+    _require_expected_intent(intent, normalized_digest, normalized_lock)
+    if intent.state != PublicationIntentState.UNKNOWN:
+        raise PublicationConflictError(
+            f"only an unknown {intent.target.value} outcome can be confirmed absent"
+        )
     reconciliation = await _append_reconciliation(
         session,
         intent=intent,
@@ -1249,12 +1271,25 @@ async def reconcile_x_publication_absent(
         recorded_at=recorded_at,
     )
     await session.flush()
-    # Deliberately create no attempt and invoke no provider. A separate, fresh
-    # approval is required to create a later logical attempt.
-    intent.state = PublicationIntentState.AWAITING_APPROVAL
+    # Deliberately create no attempt and invoke no provider. X requires a
+    # separate, fresh approval for any later logical attempt. Patreon switches
+    # the existing attempt to its immutable manual package fallback.
+    if intent.target == PublicationTarget.PATREON:
+        await _mark_patreon_confirmed_absent_handoff(
+            session,
+            intent=intent,
+            now=recorded_at,
+        )
+        intent.state = PublicationIntentState.AWAITING_HUMAN
+        intent.last_error_code = "patreon_outcome_confirmed_absent"
+        intent.last_error_detail = "Confirmed absent; manual package handoff is available."
+        audit_action = "publication.patreon_outcome_confirmed_absent"
+    else:
+        intent.state = PublicationIntentState.AWAITING_APPROVAL
+        intent.last_error_code = None
+        intent.last_error_detail = None
+        audit_action = "publication.x_outcome_confirmed_absent"
     intent.lock_version += 1
-    intent.last_error_code = None
-    intent.last_error_detail = None
     result = PublicationReconciliationResult(
         intent_id=intent.id,
         reconciliation_id=reconciliation.id,
@@ -1266,7 +1301,7 @@ async def reconcile_x_publication_absent(
     session.add(
         _audit(
             actor_id=actor.id,
-            action="publication.x_outcome_confirmed_absent",
+            action=audit_action,
             resource_id=intent.id,
             correlation_id=normalized_key,
             detail={
@@ -1278,6 +1313,7 @@ async def reconcile_x_publication_absent(
                 "attestation_sha256": reconciliation.attestation_sha256,
                 "provider_effect_performed": False,
                 "attempt_created": False,
+                "manual_package_available": intent.target == PublicationTarget.PATREON,
             },
             now=recorded_at,
         )
@@ -1294,6 +1330,15 @@ async def reconcile_x_publication_absent(
     )
     await session.commit()
     return result
+
+
+async def reconcile_x_publication_absent(
+    session: AsyncSession,
+    **kwargs: Any,
+) -> PublicationReconciliationResult:
+    """Backward-compatible alias for the target-aware reconciliation service."""
+
+    return await reconcile_publication_absent(session, **kwargs)
 
 
 async def presign_patreon_package_download(
@@ -1353,7 +1398,7 @@ async def presign_patreon_package_download(
         .order_by(PublicationApproval.revision.desc())
         .limit(1)
     )
-    if (
+    approval_authorizes = not (
         approval is None
         or latest_approval_id != approval.id
         or approval.action != PublicationApprovalAction.APPROVE
@@ -1361,7 +1406,25 @@ async def presign_patreon_package_download(
         or approval.intent_lock_version != intent.lock_version
         or approval.expires_at is None
         or _as_utc(approval.expires_at) <= requested_at
-    ):
+    )
+    reconciliation_authorizes = False
+    if not approval_authorizes and approval is not None:
+        reconciliation = await session.scalar(
+            select(PublicationReconciliation)
+            .where(PublicationReconciliation.intent_id == intent.id)
+            .order_by(PublicationReconciliation.revision.desc())
+            .limit(1)
+        )
+        reconciliation_authorizes = (
+            latest_approval_id == approval.id
+            and approval.action == PublicationApprovalAction.APPROVE
+            and approval.intent_digest == intent.intent_digest
+            and reconciliation is not None
+            and reconciliation.outcome == "confirmed_absent"
+            and reconciliation.intent_digest == intent.intent_digest
+            and reconciliation.intent_lock_version + 1 == intent.lock_version
+        )
+    if not approval_authorizes and not reconciliation_authorizes:
         raise PublicationConflictError("fresh Patreon handoff approval is unavailable")
     guard = await session.scalar(
         select(PublicationProviderGuard)
@@ -1392,6 +1455,9 @@ async def presign_patreon_package_download(
                 "manifest_sha256": package.manifest_sha256,
                 "expires_at": _canonical_datetime(expires_at),
                 "guard_epoch": guard.epoch,
+                "authorization_basis": (
+                    "active_approval" if approval_authorizes else "confirmed_absent_reconciliation"
+                ),
             },
             now=requested_at,
         )
@@ -1524,11 +1590,25 @@ async def _load_frozen_outputs(
             raise PublicationConflictError(
                 "a derivative output is stale or not a verified available derivative"
             )
-        if target == PublicationTarget.PATREON and output.asset_content_type not in {
-            "image/jpeg",
-            "image/png",
-        }:
-            raise PublicationInputError("Patreon handoff inputs must be JPEG or PNG derivatives")
+        if target == PublicationTarget.PATREON:
+            if output.asset_content_type not in {
+                "image/jpeg",
+                "image/png",
+            }:
+                raise PublicationInputError(
+                    "Patreon handoff inputs must be JPEG or PNG derivatives"
+                )
+            if output.asset_byte_size > PATREON_MAX_IMAGE_BYTES:
+                raise PublicationInputError(
+                    f"Patreon inputs must not exceed {PATREON_MAX_IMAGE_BYTES} bytes each"
+                )
+        if target == PublicationTarget.X and (
+            output.asset_content_type not in {"image/jpeg", "image/png", "image/webp"}
+            or output.asset_byte_size > X_MAX_STATIC_IMAGE_BYTES
+        ):
+            raise PublicationInputError(
+                f"X teaser outputs must not exceed {X_MAX_STATIC_IMAGE_BYTES} bytes"
+            )
         return output
 
     if target == PublicationTarget.X:
@@ -1592,6 +1672,10 @@ async def _load_frozen_outputs(
         raise PublicationInputError(
             "Patreon content outputs must exactly match all accepted full outputs"
         )
+    if len(derivative_output_ids) > PATREON_MAX_DERIVATIVE_IMAGES:
+        raise PublicationInputError(
+            f"Patreon content must not exceed {PATREON_MAX_DERIVATIVE_IMAGES} images"
+        )
     content = tuple(
         _FrozenOutput(
             output=checked(output_id, "full"),
@@ -1603,6 +1687,14 @@ async def _load_frozen_outputs(
         output=checked(public_preview_output_id, "full"),
         role="patreon_preview",
     )
+    total_image_bytes = sum(item.output.asset_byte_size for item in content) + (
+        preview.output.asset_byte_size
+    )
+    if total_image_bytes > PATREON_MAX_TOTAL_IMAGE_BYTES:
+        raise PublicationInputError(
+            "combined Patreon content and public preview exceed the "
+            f"{PATREON_MAX_TOTAL_IMAGE_BYTES}-byte package limit"
+        )
     return (*content, preview)
 
 
@@ -2031,7 +2123,55 @@ async def _mark_manual_confirmation_succeeded(
     attempt.lock_version += 1
 
 
-def _validate_patreon_post_identity(
+async def _mark_patreon_confirmed_absent_handoff(
+    session: AsyncSession,
+    *,
+    intent: PublicationIntent,
+    now: datetime,
+) -> None:
+    package_id = await session.scalar(
+        select(PublicationPackage.id).where(PublicationPackage.intent_id == intent.id)
+    )
+    if package_id is None:
+        raise PublicationConflictError("Patreon manual package is unavailable")
+    attempt = await session.scalar(
+        select(PublicationAttempt)
+        .where(PublicationAttempt.intent_id == intent.id)
+        .order_by(PublicationAttempt.attempt_no.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    if attempt is None or attempt.state != PublicationAttemptState.UNKNOWN:
+        raise PublicationConflictError("unknown Patreon attempt is unavailable")
+    step = await session.scalar(
+        select(PublicationStep)
+        .where(
+            PublicationStep.attempt_id == attempt.id,
+            PublicationStep.kind == PublicationStepKind.PATREON_HANDOFF,
+        )
+        .with_for_update()
+    )
+    if step is None or step.state != PublicationStepState.UNKNOWN or step.effect_started_at is None:
+        raise PublicationConflictError("unknown Patreon handoff step is unavailable")
+    step.state = PublicationStepState.AWAITING_HUMAN
+    step.retry_class = PublicationRetryClass.TERMINAL
+    step.retry_at = None
+    step.effect_completed_at = now
+    step.last_error_code = "patreon_outcome_confirmed_absent"
+    step.last_error_detail = "Confirmed absent; manual package handoff is available."
+    step.updated_at = now
+    step.lock_version += 1
+    attempt.state = PublicationAttemptState.AWAITING_HUMAN
+    attempt.lease_owner = None
+    attempt.lease_expires_at = None
+    attempt.retry_at = None
+    attempt.completed_at = None
+    attempt.last_error_code = "patreon_outcome_confirmed_absent"
+    attempt.last_error_detail = "Confirmed absent; manual package handoff is available."
+    attempt.lock_version += 1
+
+
+def validate_patreon_post_identity(
     remote_identifier: str,
     remote_url: str,
 ) -> tuple[str, str]:
@@ -2490,6 +2630,28 @@ def _optional_future_datetime(
     if normalized < now:
         raise PublicationInputError(f"{label} must not be in the past")
     return normalized
+
+
+def _initial_attempt_available_at(
+    *,
+    target: PublicationTarget,
+    scheduled_at: datetime | None,
+    approved_at: datetime,
+) -> datetime:
+    """Return when the provider-creation attempt may start.
+
+    Patreon owns the future schedule after its post is created, so the browser
+    handoff starts immediately after approval while retaining ``scheduled_at``
+    in the frozen package. X has no equivalent provider-side scheduler in this
+    workflow and therefore remains queued until its requested publication time.
+    """
+
+    normalized_approval = _as_utc(approved_at)
+    if target == PublicationTarget.PATREON:
+        return normalized_approval
+    if scheduled_at is None:
+        return normalized_approval
+    return max(normalized_approval, _as_utc(scheduled_at))
 
 
 def _utc_now(value: datetime | None) -> datetime:

@@ -234,7 +234,7 @@ async def test_onboarding_builds_manifest_uploads_workflow_and_replays(
                 ),
                 actor_user_id=owner_id,
                 idempotency_key="test-revoke-before-onboarding-rerun",
-                now=NOW,
+                now=first.artifact_approvals[0].approved_at,
             )
         async with database.sessions() as session:
             recovered = await onboard_artifacts(

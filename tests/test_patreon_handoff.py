@@ -13,6 +13,7 @@ from PIL import Image, PngImagePlugin
 from gen_automation.domain.canonical import canonical_json_bytes
 from gen_automation.integrations.patreon import (
     PATREON_HANDOFF_SCHEMA,
+    PATREON_MAX_ARCHIVE_BYTES,
     PATREON_MAX_BODY_BYTES,
     PATREON_MAX_DERIVATIVE_IMAGES,
     PATREON_MAX_IMAGE_BYTES,
@@ -110,6 +111,7 @@ def test_package_is_canonical_byte_deterministic_and_self_describing() -> None:
 
     assert first == second
     assert first.archive_bytes == second.archive_bytes
+    assert len(first.archive_bytes) <= PATREON_MAX_ARCHIVE_BYTES
     assert first.sha256 == hashlib.sha256(first.archive_bytes).hexdigest()
     assert first.manifest_sha256 == hashlib.sha256(first.manifest_bytes).hexdigest()
     assert first.publication_checklist == PUBLICATION_CHECKLIST

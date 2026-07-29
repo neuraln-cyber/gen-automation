@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import re
 from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Protocol, cast
 from uuid import UUID
 
@@ -35,6 +38,12 @@ from gen_automation.domain.enums import (
     PublicationTarget,
 )
 from gen_automation.domain.ids import uuid7
+from gen_automation.integrations.patreon.driver import (
+    PatreonDriverOutcome,
+    PatreonDriverRequest,
+    PatreonDriverResult,
+    PatreonPublicationDriver,
+)
 from gen_automation.integrations.patreon.handoff import (
     PatreonHandoffError,
     PatreonPackageImage,
@@ -51,8 +60,10 @@ from gen_automation.integrations.x.models import XPost, XUploadedMedia
 from gen_automation.services.publication import (
     PublicationConflictError,
     PublicationDisabledError,
+    PublicationInputError,
     require_effect_authorization,
     safe_publication_error,
+    validate_patreon_post_identity,
 )
 from gen_automation.storage.base import (
     ObjectAlreadyExistsError,
@@ -66,6 +77,8 @@ _SAFE_UNKNOWN_ERROR = "External effect outcome requires manual reconciliation."
 _PACKAGE_CONTENT_TYPE = "application/zip"
 _DEFAULT_MAX_PACKAGE_BYTES = 160 * 1024 * 1024
 _X_MEDIA_EXPIRY_MARGIN_SECONDS = 30
+_PATREON_PROFILE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_PATREON_DETAIL_CODE = re.compile(r"^[a-z][a-z0-9_]{0,99}$")
 
 
 class PublicationRuntimeError(Exception):
@@ -174,6 +187,15 @@ class _PatreonPreparedPackage:
     manifest_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class _PatreonDriverPackage:
+    intent_id: UUID
+    intent_digest: str
+    package_id: UUID
+    package_sha256: str
+    body: bytes
+
+
 async def run_publication_cycle(
     sessions: async_sessionmaker[AsyncSession],
     store: ObjectStore,
@@ -185,6 +207,8 @@ async def run_publication_cycle(
     retry_base_seconds: int,
     retry_max_seconds: int,
     max_package_bytes: int = _DEFAULT_MAX_PACKAGE_BYTES,
+    patreon_driver: PatreonPublicationDriver | None = None,
+    patreon_browser_profile_reference: str | None = None,
     now: datetime | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> PublicationCycleResult:
@@ -219,6 +243,7 @@ async def run_publication_cycle(
         5 * 1024 * 1024 * 1024,
     )
     normalized_creator_user_id = _x_creator_user_id(expected_x_creator_user_id)
+    normalized_patreon_profile = _patreon_profile_reference(patreon_browser_profile_reference)
 
     recovered = await _recover_one_expired_lease(sessions, now=cycle_at)
     if recovered:
@@ -240,6 +265,8 @@ async def run_publication_cycle(
         retry_base_seconds=normalized_retry_base,
         retry_max_seconds=normalized_retry_max,
         max_package_bytes=normalized_package_max,
+        patreon_driver=patreon_driver,
+        patreon_browser_profile_reference=normalized_patreon_profile,
         lease_seconds=normalized_lease,
         clock=effect_clock,
     )
@@ -255,11 +282,14 @@ async def _execute_claimed_attempt(
     retry_base_seconds: int,
     retry_max_seconds: int,
     max_package_bytes: int,
+    patreon_driver: PatreonPublicationDriver | None,
+    patreon_browser_profile_reference: str | None,
     lease_seconds: int,
     clock: Callable[[], datetime],
 ) -> PublicationCycleResult:
     while True:
         irreversible_x_post_request_no: int | None = None
+        irreversible_patreon_request_no: int | None = None
         snapshot_at = _clock_now(clock)
         snapshot = await _next_step_snapshot(
             sessions,
@@ -746,21 +776,179 @@ async def _execute_claimed_attempt(
                 continue
 
             if snapshot.kind == PublicationStepKind.PATREON_HANDOFF:
-                await _mark_patreon_awaiting_human(
+                if patreon_driver is None or patreon_browser_profile_reference is None:
+                    await _mark_patreon_awaiting_human(
+                        sessions,
+                        attempt_id=claimed.attempt_id,
+                        step_id=snapshot.step_id,
+                        worker_id=claimed.worker_id,
+                        lease_seconds=lease_seconds,
+                        now=_clock_now(clock),
+                    )
+                    return PublicationCycleResult(
+                        claimed_attempt=True,
+                        attempt_id=claimed.attempt_id,
+                        state=PublicationAttemptState.AWAITING_HUMAN,
+                    )
+                try:
+                    driver_package = await _load_patreon_driver_package(
+                        sessions,
+                        store,
+                        attempt_id=claimed.attempt_id,
+                        max_package_bytes=max_package_bytes,
+                    )
+                except ObjectStoreError:
+                    await _defer_before_effect(
+                        sessions,
+                        attempt_id=claimed.attempt_id,
+                        step_id=snapshot.step_id,
+                        worker_id=claimed.worker_id,
+                        error_code="patreon_browser_package_unavailable",
+                        retry_base_seconds=retry_base_seconds,
+                        retry_max_seconds=retry_max_seconds,
+                        now=_clock_now(clock),
+                    )
+                    return PublicationCycleResult(
+                        claimed_attempt=True,
+                        attempt_id=claimed.attempt_id,
+                        state=PublicationAttemptState.RETRY_WAIT,
+                        error_code="patreon_browser_package_unavailable",
+                    )
+                with TemporaryDirectory(prefix="gen-automation-patreon-") as directory:
+                    package_path = Path(directory) / "handoff.zip"
+                    await asyncio.to_thread(package_path.write_bytes, driver_package.body)
+                    await _begin_effect(
+                        sessions,
+                        attempt_id=claimed.attempt_id,
+                        step_id=snapshot.step_id,
+                        worker_id=claimed.worker_id,
+                        lease_seconds=lease_seconds,
+                        now=_clock_now(clock),
+                    )
+                    provider_request_no = await _mark_provider_request_started(
+                        sessions,
+                        attempt_id=claimed.attempt_id,
+                        step_id=snapshot.step_id,
+                        worker_id=claimed.worker_id,
+                        lease_seconds=lease_seconds,
+                        now=_clock_now(clock),
+                    )
+                    irreversible_patreon_request_no = provider_request_no
+                    try:
+                        driver_result = await patreon_driver.publish(
+                            PatreonDriverRequest(
+                                intent_id=driver_package.intent_id,
+                                intent_digest=driver_package.intent_digest,
+                                package_id=driver_package.package_id,
+                                package_path=package_path,
+                                package_sha256=driver_package.package_sha256,
+                                browser_profile_reference=(patreon_browser_profile_reference),
+                            )
+                        )
+                    except Exception:
+                        return await _mark_unknown_result(
+                            sessions,
+                            attempt_id=claimed.attempt_id,
+                            step_id=snapshot.step_id,
+                            worker_id=claimed.worker_id,
+                            error_code="patreon_browser_outcome_unknown",
+                            provider_request_no=provider_request_no,
+                            now=_clock_now(clock),
+                        )
+                if not isinstance(driver_result, PatreonDriverResult):
+                    return await _mark_unknown_result(
+                        sessions,
+                        attempt_id=claimed.attempt_id,
+                        step_id=snapshot.step_id,
+                        worker_id=claimed.worker_id,
+                        error_code="patreon_browser_protocol_unknown",
+                        provider_request_no=provider_request_no,
+                        now=_clock_now(clock),
+                    )
+                detail_code = _patreon_detail_code(driver_result.detail_code)
+                if driver_result.outcome == PatreonDriverOutcome.PUBLISHED:
+                    try:
+                        remote_identifier, remote_url = validate_patreon_post_identity(
+                            driver_result.remote_identifier or "",
+                            driver_result.remote_url or "",
+                        )
+                    except PublicationInputError:
+                        return await _mark_unknown_result(
+                            sessions,
+                            attempt_id=claimed.attempt_id,
+                            step_id=snapshot.step_id,
+                            worker_id=claimed.worker_id,
+                            error_code="patreon_browser_protocol_unknown",
+                            provider_request_no=provider_request_no,
+                            now=_clock_now(clock),
+                        )
+                    await _finish_patreon_post(
+                        sessions,
+                        attempt_id=claimed.attempt_id,
+                        step_id=snapshot.step_id,
+                        worker_id=claimed.worker_id,
+                        remote_identifier=remote_identifier,
+                        remote_url=remote_url,
+                        provider_request_no=provider_request_no,
+                        now=_clock_now(clock),
+                    )
+                    return PublicationCycleResult(
+                        claimed_attempt=True,
+                        attempt_id=claimed.attempt_id,
+                        state=PublicationAttemptState.SUCCEEDED,
+                    )
+                if driver_result.outcome == PatreonDriverOutcome.NEEDS_OPERATOR:
+                    return await _mark_patreon_needs_operator_result(
+                        sessions,
+                        attempt_id=claimed.attempt_id,
+                        step_id=snapshot.step_id,
+                        worker_id=claimed.worker_id,
+                        provider_request_no=provider_request_no,
+                        detail_code=detail_code,
+                        now=_clock_now(clock),
+                    )
+                if driver_result.outcome == PatreonDriverOutcome.UNKNOWN:
+                    return await _mark_unknown_result(
+                        sessions,
+                        attempt_id=claimed.attempt_id,
+                        step_id=snapshot.step_id,
+                        worker_id=claimed.worker_id,
+                        error_code="patreon_browser_outcome_unknown",
+                        provider_request_no=provider_request_no,
+                        now=_clock_now(clock),
+                    )
+                if driver_result.outcome == PatreonDriverOutcome.FAILED:
+                    return await _mark_patreon_needs_operator_result(
+                        sessions,
+                        attempt_id=claimed.attempt_id,
+                        step_id=snapshot.step_id,
+                        worker_id=claimed.worker_id,
+                        provider_request_no=provider_request_no,
+                        detail_code=detail_code,
+                        definite_pre_submit_failure=True,
+                        now=_clock_now(clock),
+                    )
+                return await _mark_unknown_result(
                     sessions,
                     attempt_id=claimed.attempt_id,
                     step_id=snapshot.step_id,
                     worker_id=claimed.worker_id,
-                    lease_seconds=lease_seconds,
+                    error_code="patreon_browser_protocol_unknown",
+                    provider_request_no=provider_request_no,
                     now=_clock_now(clock),
-                )
-                return PublicationCycleResult(
-                    claimed_attempt=True,
-                    attempt_id=claimed.attempt_id,
-                    state=PublicationAttemptState.AWAITING_HUMAN,
                 )
             raise PublicationRuntimeContractError("publication step kind is unsupported")
         except PublicationDisabledError:
+            if irreversible_patreon_request_no is not None:
+                return await _mark_unknown_result(
+                    sessions,
+                    attempt_id=claimed.attempt_id,
+                    step_id=snapshot.step_id,
+                    worker_id=claimed.worker_id,
+                    error_code="patreon_browser_completion_unknown",
+                    provider_request_no=irreversible_patreon_request_no,
+                    now=_clock_now(clock),
+                )
             if irreversible_x_post_request_no is not None:
                 return await _mark_unknown_result(
                     sessions,
@@ -788,6 +976,16 @@ async def _execute_claimed_attempt(
                 error_code="publication_guard_stopped",
             )
         except XCredentialUnavailableError:
+            if irreversible_patreon_request_no is not None:
+                return await _mark_unknown_result(
+                    sessions,
+                    attempt_id=claimed.attempt_id,
+                    step_id=snapshot.step_id,
+                    worker_id=claimed.worker_id,
+                    error_code="patreon_browser_completion_unknown",
+                    provider_request_no=irreversible_patreon_request_no,
+                    now=_clock_now(clock),
+                )
             if irreversible_x_post_request_no is not None:
                 return await _mark_unknown_result(
                     sessions,
@@ -815,6 +1013,16 @@ async def _execute_claimed_attempt(
                 error_code="x_credentials_unavailable",
             )
         except PublicationConflictError:
+            if irreversible_patreon_request_no is not None:
+                return await _mark_unknown_result(
+                    sessions,
+                    attempt_id=claimed.attempt_id,
+                    step_id=snapshot.step_id,
+                    worker_id=claimed.worker_id,
+                    error_code="patreon_browser_completion_unknown",
+                    provider_request_no=irreversible_patreon_request_no,
+                    now=_clock_now(clock),
+                )
             if irreversible_x_post_request_no is not None:
                 return await _mark_unknown_result(
                     sessions,
@@ -833,6 +1041,16 @@ async def _execute_claimed_attempt(
                 now=_clock_now(clock),
             )
         except (PublicationRuntimeContractError, PatreonHandoffError, ValueError):
+            if irreversible_patreon_request_no is not None:
+                return await _mark_unknown_result(
+                    sessions,
+                    attempt_id=claimed.attempt_id,
+                    step_id=snapshot.step_id,
+                    worker_id=claimed.worker_id,
+                    error_code="patreon_browser_completion_unknown",
+                    provider_request_no=irreversible_patreon_request_no,
+                    now=_clock_now(clock),
+                )
             if irreversible_x_post_request_no is not None:
                 return await _mark_unknown_result(
                     sessions,
@@ -852,6 +1070,16 @@ async def _execute_claimed_attempt(
                 now=_clock_now(clock),
             )
         except Exception:
+            if irreversible_patreon_request_no is not None:
+                return await _mark_unknown_result(
+                    sessions,
+                    attempt_id=claimed.attempt_id,
+                    step_id=snapshot.step_id,
+                    worker_id=claimed.worker_id,
+                    error_code="patreon_browser_completion_unknown",
+                    provider_request_no=irreversible_patreon_request_no,
+                    now=_clock_now(clock),
+                )
             if irreversible_x_post_request_no is not None:
                 return await _mark_unknown_result(
                     sessions,
@@ -934,7 +1162,11 @@ async def _recover_one_expired_lease(
             step is not None
             and active_request is not None
             and step.effect_completed_at is None
-            and step.kind == PublicationStepKind.X_CREATE_POST
+            and step.kind
+            in {
+                PublicationStepKind.X_CREATE_POST,
+                PublicationStepKind.PATREON_HANDOFF,
+            }
         ):
             await _append_effect_completion(
                 session,
@@ -1231,7 +1463,7 @@ async def _mark_provider_request_started(
     lease_seconds: int,
     now: datetime,
 ) -> int:
-    """Recheck authorization and durably mark the instant before an X API call."""
+    """Recheck authorization and durably mark the instant before a provider call."""
 
     async with sessions() as session:
         attempt = await session.scalar(
@@ -1253,15 +1485,16 @@ async def _mark_provider_request_started(
             .with_for_update()
         )
         if intent is None or step is None:
-            raise PublicationRuntimeContractError("X request snapshot is unavailable")
+            raise PublicationRuntimeContractError("provider request snapshot is unavailable")
         _require_execution_lease(attempt, worker_id)
         if attempt.lease_expires_at is None or _as_utc(attempt.lease_expires_at) <= now:
             raise PublicationConflictError("publication attempt lease expired")
         if step.state != PublicationStepState.PROCESSING or step.kind not in {
             PublicationStepKind.X_MEDIA_UPLOAD,
             PublicationStepKind.X_CREATE_POST,
+            PublicationStepKind.PATREON_HANDOFF,
         }:
-            raise PublicationConflictError("X provider request is not startable")
+            raise PublicationConflictError("provider request is not startable")
         latest_request_no = int(
             await session.scalar(
                 select(func.max(PublicationEffectEvent.request_no)).where(
@@ -1280,7 +1513,7 @@ async def _mark_provider_request_started(
                 )
             )
             if completed is None:
-                raise PublicationConflictError("previous X provider request outcome is unresolved")
+                raise PublicationConflictError("previous provider request outcome is unresolved")
         request_no = latest_request_no + 1
         _, guard = await require_effect_authorization(
             session,
@@ -1517,6 +1750,70 @@ async def _finish_x_post(
         await session.commit()
 
 
+async def _finish_patreon_post(
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    attempt_id: UUID,
+    step_id: UUID,
+    worker_id: str,
+    remote_identifier: str,
+    remote_url: str,
+    provider_request_no: int,
+    now: datetime,
+) -> None:
+    async with sessions() as session:
+        attempt, intent, step = await _lock_execution_rows(
+            session,
+            attempt_id=attempt_id,
+            step_id=step_id,
+        )
+        _require_execution_lease(attempt, worker_id)
+        await _append_effect_completion(
+            session,
+            step=step,
+            request_no=provider_request_no,
+            event_type="succeeded",
+            remote_identifier=remote_identifier,
+            remote_expires_at=None,
+            error_code=None,
+            now=now,
+        )
+        step.state = PublicationStepState.SUCCEEDED
+        step.retry_class = None
+        step.remote_identifier = remote_identifier
+        step.remote_url = remote_url
+        step.effect_completed_at = now
+        step.last_error_code = None
+        step.last_error_detail = None
+        step.updated_at = now
+        step.lock_version += 1
+        attempt.state = PublicationAttemptState.SUCCEEDED
+        attempt.lease_owner = None
+        attempt.lease_expires_at = None
+        attempt.retry_at = None
+        attempt.completed_at = now
+        attempt.last_error_code = None
+        attempt.last_error_detail = None
+        attempt.lock_version += 1
+        intent.state = PublicationIntentState.PUBLISHED
+        intent.completed_at = now
+        intent.last_error_code = None
+        intent.last_error_detail = None
+        session.add(
+            _runtime_audit(
+                action="publication.patreon_post_published",
+                intent_id=intent.id,
+                attempt_id=attempt.id,
+                detail={
+                    "step_id": str(step.id),
+                    "remote_identifier_sha256": canonical_sha256(remote_identifier),
+                },
+                now=now,
+            )
+        )
+        await session.commit()
+
+
 async def _prepare_patreon_package(
     sessions: async_sessionmaker[AsyncSession],
     store: ObjectStore,
@@ -1746,6 +2043,54 @@ async def _register_package(
         await session.commit()
 
 
+async def _load_patreon_driver_package(
+    sessions: async_sessionmaker[AsyncSession],
+    store: ObjectStore,
+    *,
+    attempt_id: UUID,
+    max_package_bytes: int,
+) -> _PatreonDriverPackage:
+    async with sessions() as session:
+        attempt = await session.get(PublicationAttempt, attempt_id)
+        if attempt is None:
+            raise PublicationRuntimeContractError("publication attempt is unavailable")
+        intent = await session.get(PublicationIntent, attempt.intent_id)
+        package = await session.scalar(
+            select(PublicationPackage).where(PublicationPackage.intent_id == attempt.intent_id)
+        )
+        if (
+            intent is None
+            or intent.target != PublicationTarget.PATREON
+            or package is None
+            or package.storage_backend != store.backend
+            or package.storage_bucket != store.bucket
+            or package.byte_size <= 0
+            or package.byte_size > max_package_bytes
+        ):
+            raise PublicationRuntimeContractError("Patreon browser package binding is unavailable")
+        package_id = package.id
+        package_key = package.object_key
+        package_version = package.object_version_id
+        package_sha256 = package.sha256
+        package_size = package.byte_size
+        intent_id = intent.id
+        intent_digest = intent.intent_digest
+    body = await store.read_bytes(
+        package_key,
+        max_bytes=max_package_bytes,
+        version_id=package_version,
+    )
+    if len(body) != package_size or hashlib.sha256(body).hexdigest() != package_sha256:
+        raise PublicationRuntimeContractError("Patreon browser package bytes do not match storage")
+    return _PatreonDriverPackage(
+        intent_id=intent_id,
+        intent_digest=intent_digest,
+        package_id=package_id,
+        package_sha256=package_sha256,
+        body=body,
+    )
+
+
 async def _mark_patreon_awaiting_human(
     sessions: async_sessionmaker[AsyncSession],
     *,
@@ -1802,6 +2147,91 @@ async def _mark_patreon_awaiting_human(
             )
         )
         await session.commit()
+
+
+async def _mark_patreon_needs_operator_result(
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    attempt_id: UUID,
+    step_id: UUID,
+    worker_id: str,
+    provider_request_no: int,
+    detail_code: str | None,
+    now: datetime,
+    definite_pre_submit_failure: bool = False,
+) -> PublicationCycleResult:
+    error_code = (
+        "patreon_browser_failed"
+        if definite_pre_submit_failure
+        else "patreon_browser_needs_operator"
+    )
+    safe_detail = (
+        "Patreon browser publishing failed before submit; manual package handoff is available."
+        if definite_pre_submit_failure
+        else "Patreon publishing requires operator attention."
+    )
+    audit_action = (
+        "publication.patreon_browser_failed_manual_fallback"
+        if definite_pre_submit_failure
+        else "publication.patreon_browser_needs_operator"
+    )
+    async with sessions() as session:
+        attempt, intent, step = await _lock_execution_rows(
+            session,
+            attempt_id=attempt_id,
+            step_id=step_id,
+        )
+        _require_execution_lease(attempt, worker_id)
+        await _append_effect_completion(
+            session,
+            step=step,
+            request_no=provider_request_no,
+            event_type="terminal",
+            remote_identifier=None,
+            remote_expires_at=None,
+            error_code=error_code,
+            now=now,
+        )
+        step.state = PublicationStepState.AWAITING_HUMAN
+        step.retry_class = PublicationRetryClass.TERMINAL
+        step.retry_at = None
+        step.effect_completed_at = now
+        step.last_error_code = error_code
+        step.last_error_detail = safe_detail
+        step.updated_at = now
+        step.lock_version += 1
+        attempt.state = PublicationAttemptState.AWAITING_HUMAN
+        attempt.lease_owner = None
+        attempt.lease_expires_at = None
+        attempt.retry_at = None
+        attempt.last_error_code = error_code
+        attempt.last_error_detail = safe_detail
+        attempt.lock_version += 1
+        intent.state = PublicationIntentState.AWAITING_HUMAN
+        intent.last_error_code = error_code
+        intent.last_error_detail = safe_detail
+        session.add(
+            _runtime_audit(
+                action=audit_action,
+                intent_id=intent.id,
+                attempt_id=attempt.id,
+                detail={
+                    "step_id": str(step.id),
+                    "detail_code": detail_code or "unspecified",
+                    "automatic_retry_allowed": False,
+                    "manual_package_available": True,
+                    "definite_pre_submit_failure": definite_pre_submit_failure,
+                },
+                now=now,
+            )
+        )
+        await session.commit()
+        return PublicationCycleResult(
+            claimed_attempt=True,
+            attempt_id=attempt.id,
+            state=PublicationAttemptState.AWAITING_HUMAN,
+            error_code=error_code,
+        )
 
 
 async def _schedule_retry(
@@ -2294,6 +2724,22 @@ def _x_creator_user_id(value: str | None) -> str | None:
         or not 1 <= len(value) <= 19
     ):
         raise ValueError("expected X creator user ID must contain 1 to 19 digits")
+    return value
+
+
+def _patreon_profile_reference(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or _PATREON_PROFILE_REFERENCE.fullmatch(value) is None:
+        raise ValueError("Patreon browser profile reference is invalid")
+    return value
+
+
+def _patreon_detail_code(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or _PATREON_DETAIL_CODE.fullmatch(value) is None:
+        return "invalid_sidecar_detail"
     return value
 
 

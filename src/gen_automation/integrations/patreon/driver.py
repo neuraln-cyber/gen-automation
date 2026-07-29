@@ -1,9 +1,10 @@
-"""Boundary for a future signed-in Patreon browser publisher.
+"""Boundary for the isolated signed-in Patreon browser publisher.
 
 Patreon post creation is deliberately not represented as a public-API call.
 An implementation of this protocol owns a persistent browser profile, consumes
 the already-verified handoff ZIP, and returns a bounded outcome for durable
-reconciliation. The current runtime keeps using the manual package fallback.
+reconciliation. The runtime keeps using the manual package fallback when no
+driver is configured.
 """
 
 from __future__ import annotations
@@ -13,6 +14,10 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 from uuid import UUID
+
+
+class PatreonDriverError(Exception):
+    """A browser-sidecar call did not produce a trustworthy bounded result."""
 
 
 class PatreonDriverOutcome(StrEnum):

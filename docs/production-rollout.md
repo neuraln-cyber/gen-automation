@@ -7,14 +7,15 @@ and external publishing remain disabled until their individual gates pass.
 ## Gate 1: source and supply chain
 
 - Merge only a reviewed commit for which formatting, lint, type checking,
-  migrations, coverage, secret scanning, both container builds, SBOM generation,
+  migrations, coverage, secret scanning, every container build, SBOM generation,
   and critical-vulnerability scans pass.
-- Publish the control-plane and GPU-worker images to a private registry by
-  immutable digest. Deployment manifests must use digests, never mutable tags.
-- A successful `CI` push run on `main` publishes both Linux/amd64 images to
-  GHCR under the tested commit SHA, attaches BuildKit provenance/SBOM data, and
+- Publish the control-plane, MEGA-enabled control plane, GPU worker, semantic
+  gateway, and Patreon browser images to a private registry by immutable digest.
+  Deployment manifests must use digests, never mutable tags.
+- A successful `CI` push run on `main` publishes the tested Linux/amd64 images
+  to GHCR under the commit SHA, attaches BuildKit provenance/SBOM data, and
   creates a GitHub/Sigstore attestation for each registry digest. Deployment
-  still requires selecting and recording that immutable digest explicitly.
+  still requires selecting and recording each immutable digest explicitly.
 - Record the ComfyUI commit, custom-node commits, Python lock files, renderer
   version, and container digest in the deployment change.
 - Keep staging and production GitHub environments separate and require approval
@@ -45,6 +46,9 @@ and external publishing remain disabled until their individual gates pass.
 - Register current subject, checkpoint, LoRA, and workflow approvals. A subject
   approval must contain evidence that the fictional subject is unmistakably an
   adult and that commercial adult derivative and distribution rights exist.
+- Run the artifact-onboarding plan against the exact mounted Safetensors,
+  detector, and workflow files. Record immutable S3 version IDs, sizes, SHA-256
+  digests, and the generated worker-manifest trust anchor.
 - Keep generation blocked when any approval is missing, superseded, or revoked.
 
 ## Gate 4: zero-publish staging
@@ -80,14 +84,20 @@ and external publishing remain disabled until their individual gates pass.
   decisions remain append-only and do not delete raw masters.
 - Complete the exact acceptance target, then render full-resolution and X
   teaser derivatives in a bounded CPU worker process.
+- When semantic anatomy is enabled, verify that completion waits for every
+  configured assessment to become completed or terminally unavailable. Confirm
+  a high-confidence severe acceptance requires an explicit OWNER override and
+  durable attestation.
 - Verify recipe, source, watermark, renderer, Pillow, object-version, and output
   hashes. Confirm that private metadata is absent from every derivative.
 
 ## Gate 7: destination activation
 
-- Keep Patreon human-assisted: generate a reviewed package and publish it in
-  Patreon's official creator interface. Use the read API and signed webhooks only
-  to reconcile the resulting post.
+- Bootstrap the Patreon browser profile in a private headed session, then remove
+  operator ingress and canary the isolated headless sidecar against one low-risk
+  post. Verify package authentication, durable idempotency, exact tier/public
+  preview/content ordering, confirmed post identity, and manual fallback.
+  CAPTCHA/2FA and account verification remain owner actions.
 - Enable X only after its confidential-client JSON is stored in AWS Secrets
   Manager, the exact full-ARN reference and creator ID are configured, and the
   controller has narrow ambient IAM. Canary refresh rotation and

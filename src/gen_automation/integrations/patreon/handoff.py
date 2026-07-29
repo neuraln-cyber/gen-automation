@@ -9,6 +9,18 @@ from zipfile import ZIP_STORED, ZipFile, ZipInfo
 from PIL import Image
 
 from gen_automation.domain.canonical import canonical_json_bytes
+from gen_automation.domain.deliverability import (
+    PATREON_MAX_ARCHIVE_BYTES as PATREON_MAX_ARCHIVE_BYTES,
+)
+from gen_automation.domain.deliverability import (
+    PATREON_MAX_DERIVATIVE_IMAGES as PATREON_MAX_DERIVATIVE_IMAGES,
+)
+from gen_automation.domain.deliverability import (
+    PATREON_MAX_IMAGE_BYTES as PATREON_MAX_IMAGE_BYTES,
+)
+from gen_automation.domain.deliverability import (
+    PATREON_MAX_TOTAL_IMAGE_BYTES as PATREON_MAX_TOTAL_IMAGE_BYTES,
+)
 from gen_automation.storage.images import (
     ImageVerificationError,
     VerifiedImage,
@@ -16,9 +28,6 @@ from gen_automation.storage.images import (
 )
 
 PATREON_HANDOFF_SCHEMA = "gen-automation.patreon-handoff.v1"
-PATREON_MAX_DERIVATIVE_IMAGES = 100
-PATREON_MAX_IMAGE_BYTES = 16 * 1024 * 1024
-PATREON_MAX_TOTAL_IMAGE_BYTES = 128 * 1024 * 1024
 PATREON_MAX_TITLE_BYTES = 512
 PATREON_MAX_BODY_BYTES = 128 * 1024
 PATREON_MAX_TIER_BYTES = 256
@@ -512,6 +521,10 @@ def build_patreon_handoff_package(
         *((image.archive_path, image.data) for image in packaged_derivatives),
     )
     archive_bytes = _build_archive(entries)
+    if len(archive_bytes) > PATREON_MAX_ARCHIVE_BYTES:
+        raise PatreonHandoffError(
+            f"Patreon handoff archive exceeds the {PATREON_MAX_ARCHIVE_BYTES}-byte limit"
+        )
     return PatreonHandoffPackage(
         archive_bytes=archive_bytes,
         sha256=hashlib.sha256(archive_bytes).hexdigest(),

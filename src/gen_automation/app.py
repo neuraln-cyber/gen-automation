@@ -25,6 +25,7 @@ from gen_automation.config import Environment, Settings, get_settings
 from gen_automation.controller.runtime import ControllerRuntime, build_controller_runtime
 from gen_automation.db import models as _models  # noqa: F401
 from gen_automation.db.session import Database
+from gen_automation.integrations.patreon import PatreonSidecarDriver
 from gen_automation.integrations.salad.client import SaladClient
 from gen_automation.integrations.salad.webhooks import SaladWebhookVerifier
 from gen_automation.integrations.semantic_vlm import SemanticVlmClient
@@ -55,6 +56,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         salad_client: SaladClient | None = None
         semantic_http_client: httpx2.AsyncClient | None = None
         semantic_vlm_client: SemanticVlmClient | None = None
+        patreon_http_client: httpx2.AsyncClient | None = None
+        patreon_driver: PatreonSidecarDriver | None = None
         controller_runtime: ControllerRuntime | None = None
         runtime_secret_resolver: ConfiguredRuntimeSecretResolver | None = None
         x_oauth_provider: AwsSecretsManagerXOAuthProvider | None = None
@@ -94,6 +97,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 model=resolved_settings.semantic_anatomy_model,
                 model_revision=revision,
                 timeout_seconds=(resolved_settings.background_semantic_request_timeout_seconds),
+            )
+        if resolved_settings.patreon_browser_publishing_enabled:
+            endpoint = resolved_settings.patreon_browser_sidecar_url
+            if endpoint is None:
+                raise RuntimeError("validated Patreon browser settings are incomplete")
+            shared_secret = resolved_settings.patreon_browser_shared_secret
+            if shared_secret is None:
+                raise RuntimeError("validated Patreon browser settings are incomplete")
+            patreon_http_client = httpx2.AsyncClient(
+                follow_redirects=False,
+                trust_env=False,
+                limits=httpx2.Limits(max_connections=1, max_keepalive_connections=1),
+            )
+            patreon_driver = PatreonSidecarDriver(
+                http_client=patreon_http_client,
+                endpoint_url=str(endpoint),
+                timeout_seconds=resolved_settings.patreon_browser_timeout_seconds,
+                max_package_bytes=(resolved_settings.background_publication_max_package_bytes),
+                shared_secret=shared_secret.get_secret_value(),
             )
         app.state.database = database
         app.state.object_store = object_store
@@ -145,6 +167,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     secret_resolver=runtime_secret_resolver,
                     x_oauth_provider=x_oauth_provider,
                     semantic_vlm_client=semantic_vlm_client,
+                    patreon_driver=patreon_driver,
                 )
                 app.state.controller_runtime = controller_runtime
                 await controller_runtime.start()
@@ -174,10 +197,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                     await semantic_http_client.aclose()
                             finally:
                                 try:
-                                    if salad_http_client is not None:
-                                        await salad_http_client.aclose()
+                                    if patreon_http_client is not None:
+                                        await patreon_http_client.aclose()
                                 finally:
-                                    await database.dispose()
+                                    try:
+                                        if salad_http_client is not None:
+                                            await salad_http_client.aclose()
+                                    finally:
+                                        await database.dispose()
 
     expose_docs = resolved_settings.environment in {
         Environment.LOCAL,
