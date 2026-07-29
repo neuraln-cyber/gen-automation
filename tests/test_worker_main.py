@@ -102,6 +102,7 @@ def _manifest(content: bytes) -> tuple[str, str]:
         logical_name="illustrious",
         kind=ArtifactKind.CHECKPOINT,
         source_object_id="models/illustrious.safetensors",
+        source_object_version_id="model-version-1",
         sha256=hashlib.sha256(content).hexdigest(),
         exact_size_bytes=len(content),
         max_size_bytes=len(content),
@@ -288,9 +289,15 @@ class _S3Client:
     def __init__(self, content: bytes) -> None:
         self.content = content
         self.closed = False
+        self.get_object_parameters: dict[str, str] | None = None
 
-    def get_object(self, **_parameters: str) -> dict[str, object]:
-        return {"ContentLength": len(self.content), "Body": _Body(self.content)}
+    def get_object(self, **parameters: str) -> dict[str, object]:
+        self.get_object_parameters = parameters
+        return {
+            "ContentLength": len(self.content),
+            "VersionId": parameters.get("VersionId"),
+            "Body": _Body(self.content),
+        }
 
     def close(self) -> None:
         self.closed = True
@@ -317,6 +324,11 @@ async def test_bootstrap_worker_models_materializes_verified_checkpoint(
 
     assert result.artifacts[0].sha256 == hashlib.sha256(content).hexdigest()
     assert (checkpoint_root / "illustrious.safetensors").read_bytes() == content
+    assert client.get_object_parameters == {
+        "Bucket": "models-private",
+        "Key": "models/illustrious.safetensors",
+        "VersionId": "model-version-1",
+    }
     assert client.closed
 
 

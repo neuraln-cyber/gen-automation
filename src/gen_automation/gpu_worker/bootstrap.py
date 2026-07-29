@@ -340,21 +340,26 @@ class S3ArtifactDownloader(ArtifactDownloader):
 
         body: Any | None = None
         try:
-            response = await to_thread.run_sync(
-                partial(
-                    self._client.get_object,
-                    Bucket=self._bucket,
-                    Key=artifact.source_object_id,
-                )
-            )
+            parameters = {
+                "Bucket": self._bucket,
+                "Key": artifact.source_object_id,
+            }
+            if artifact.source_object_version_id is not None:
+                parameters["VersionId"] = artifact.source_object_version_id
+            response = await to_thread.run_sync(partial(self._client.get_object, **parameters))
             if not isinstance(response, Mapping):
                 raise ArtifactBootstrapError("artifact bootstrap failed")
             content_length = response.get("ContentLength")
+            response_version_id = response.get("VersionId")
             body = response.get("Body")
             if (
                 isinstance(content_length, bool)
                 or not isinstance(content_length, int)
                 or content_length != artifact.exact_size_bytes
+                or (
+                    artifact.source_object_version_id is not None
+                    and response_version_id != artifact.source_object_version_id
+                )
                 or body is None
                 or not hasattr(body, "read")
             ):

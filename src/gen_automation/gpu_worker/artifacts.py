@@ -66,6 +66,9 @@ class ModelArtifactSpec(BaseModel):
     source_object_id: Annotated[str, StringConstraints(min_length=1, max_length=512)] | None = (
         Field(default=None, repr=False)
     )
+    source_object_version_id: (
+        Annotated[str, StringConstraints(min_length=1, max_length=1_024)] | None
+    ) = Field(default=None, repr=False)
     downloader_key: Annotated[str, StringConstraints(min_length=1, max_length=128)] | None = Field(
         default=None,
         repr=False,
@@ -96,6 +99,17 @@ class ModelArtifactSpec(BaseModel):
             raise ValueError("invalid opaque identifier")
         return value
 
+    @field_validator("source_object_version_id")
+    @classmethod
+    def validate_object_version_identifier(cls, value: str | None) -> str | None:
+        if value is not None and (
+            value != value.strip()
+            or value.casefold() == "null"
+            or any(ord(character) < 33 or ord(character) == 127 for character in value)
+        ):
+            raise ValueError("invalid opaque version identifier")
+        return value
+
     @field_validator("target_filename")
     @classmethod
     def validate_target_filename(cls, value: str) -> str:
@@ -112,6 +126,8 @@ class ModelArtifactSpec(BaseModel):
     def validate_source_and_sizes(self) -> "ModelArtifactSpec":
         if (self.source_object_id is None) == (self.downloader_key is None):
             raise ValueError("exactly one artifact source identifier is required")
+        if self.source_object_version_id is not None and self.source_object_id is None:
+            raise ValueError("artifact object version requires an object source identifier")
         if self.exact_size_bytes > self.max_size_bytes:
             raise ValueError("exact artifact size exceeds its maximum")
         suffix = Path(self.target_filename).suffix.casefold()
@@ -135,7 +151,7 @@ def _artifact_sort_key(artifact: ModelArtifactSpec) -> tuple[str, ...]:
 
 
 def _artifact_canonical_value(artifact: ModelArtifactSpec) -> dict[str, object]:
-    return {
+    value: dict[str, object] = {
         "downloader_key": artifact.downloader_key,
         "exact_size_bytes": artifact.exact_size_bytes,
         "kind": artifact.kind.value,
@@ -145,6 +161,9 @@ def _artifact_canonical_value(artifact: ModelArtifactSpec) -> dict[str, object]:
         "source_object_id": artifact.source_object_id,
         "target_filename": artifact.target_filename,
     }
+    if artifact.source_object_version_id is not None:
+        value["source_object_version_id"] = artifact.source_object_version_id
+    return value
 
 
 def canonical_manifest_bytes(artifacts: Sequence[ModelArtifactSpec]) -> bytes:
@@ -210,6 +229,50 @@ class ArtifactManifest(BaseModel):
         if not hmac.compare_digest(expected, self.manifest_sha256):
             raise ValueError("artifact manifest digest mismatch")
         return self
+
+
+def create_artifact_manifest(artifacts: Sequence[ModelArtifactSpec]) -> ArtifactManifest:
+    """Create the canonical, self-verifying worker manifest from validated entries."""
+
+    ordered = tuple(sorted(artifacts, key=_artifact_sort_key))
+    return ArtifactManifest(
+        version="v1",
+        artifacts=ordered,
+        manifest_sha256=calculate_manifest_sha256(ordered),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class LocalArtifactInspection:
+    sha256: str
+    exact_size_bytes: int
+
+
+def inspect_local_artifact(path: Path, *, kind: ArtifactKind) -> LocalArtifactInspection:
+    """Hash and format-check one regular local file using worker bootstrap rules."""
+
+    try:
+        descriptor, opened = _open_regular(path)
+    except FileNotFoundError:
+        raise ArtifactBootstrapError("artifact file is unavailable") from None
+    if opened.st_size < 10 or opened.st_size > MAX_ARTIFACT_BYTES:
+        os.close(descriptor)
+        raise ArtifactBootstrapError("artifact file size is invalid")
+    try:
+        with os.fdopen(descriptor, "rb", closefd=True) as file_object:
+            digest = hashlib.sha256()
+            while chunk := file_object.read(STREAM_READ_BYTES):
+                digest.update(chunk)
+            if kind == ArtifactKind.DETECTOR:
+                _validate_detector_archive(file_object, opened.st_size)
+            else:
+                _validate_safetensors_header(file_object, opened.st_size)
+    except _InvalidArtifactError:
+        raise ArtifactBootstrapError("artifact file format is invalid") from None
+    return LocalArtifactInspection(
+        sha256=digest.hexdigest(),
+        exact_size_bytes=opened.st_size,
+    )
 
 
 class ArtifactDownloader(Protocol):
