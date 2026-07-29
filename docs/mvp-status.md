@@ -4,14 +4,18 @@ Status date: 2026-07-29 (Europe/Sofia)
 
 ## Current conclusion
 
-The credential-free implementation work is complete in the current shared tree.
-The remaining MVP work is integration verification, deployment, account-owner
-bootstrap, and live canaries. No AWS, SaladCloud, model-hosting, X, Patreon, or
-MEGA credential is required to finish or test the source itself.
+The AWS staging control plane is live at
+`https://gen-automation-staging.18-198-84-215.sslip.io`. Its PostgreSQL schema
+is migrated through `0015`, the initial owner is enrolled with TOTP, all four
+runtime containers are healthy, and the public HTTPS readiness canary passes.
+Application secrets were generated only on the host. External GPU allocation
+and Patreon, MEGA, and X publication effects remain disabled until their
+individual credentials and canaries are complete.
 
-The system is not live yet. Final integration is accepted only when the complete
-local verification suite and GitHub Actions CI pass for the landed shared tree.
-No historical test count is used as a completion claim.
+The credential-free source implementation is complete. Final end-to-end MVP
+acceptance still requires model onboarding, one bounded GPU generation,
+semantic anatomy verification, review/derivative checks, and provider-specific
+publication canaries. No historical test count is used as a completion claim.
 
 ## Source implementation complete
 
@@ -90,6 +94,12 @@ The normal operator surface is:
 https://<control-plane-host>/dashboard
 ```
 
+The current staging login is:
+
+```text
+https://gen-automation-staging.18-198-84-215.sslip.io/login
+```
+
 It shows releases in ranked order. Authorized owners/reviewers can inspect an
 exact stored version and select the approved subset. AI-flagged images stay
 visible in a clearly separated review section; rejected or held masters remain
@@ -132,31 +142,25 @@ watermarked, moved, overwritten, or made public.
 - Wildcard editing, artifact onboarding, ranking/review, terminal anatomy gate,
   deliverability bounds, derivative rendering, and durable publication logic.
 
-### Remaining after the shared tree is integrated
+### Remaining live MVP work
 
-1. Run the complete local verification and GitHub Actions CI; publish immutable
-   image digests only after every required job passes.
-2. With short-lived AWS access, initialize the protected state backend, review
-   the OpenTofu plan/cost, and apply staging.
-3. Confirm the AWS notification subscription; verify SSM, mounts, CloudWatch,
-   both buckets, RDS isolation, S3 conformance, and database restore.
-4. Deploy Caddy and pinned application images. Generate application secrets in
-   the deployment secret store, create separate migration/runtime database
-   roles, run migrations, bootstrap the owner, and enroll TOTP.
-5. Upload and onboard the approved checkpoint, LoRAs, optional detector, and
+1. Confirm the AWS notification subscription and create the linked-account
+   budget in the management account. Complete the S3 live conformance and
+   database restore exercises.
+2. Upload and onboard the approved checkpoint, LoRAs, optional detector, and
    workflows; retain the emitted exact manifest and digest.
-6. Configure SaladCloud and run a zero-publication synthetic worker canary,
+3. Configure SaladCloud and run a zero-publication synthetic worker canary,
    followed by one bounded paid generation with one replica and scale-to-zero.
-7. Deploy the private semantic upstream and gateway, test pass/review/severe/
+4. Deploy the private semantic upstream and gateway, test pass/review/severe/
    unavailable behavior, then enable the terminal anatomy gate.
-8. Review one generated release, accept a bounded set, render its clean Patreon
+5. Review one generated release, accept a bounded set, render its clean Patreon
    outputs, and select/render only the watermarked X teasers.
-9. Bootstrap the persistent Patreon and MEGA profiles through owner-controlled
+6. Bootstrap the persistent Patreon and MEGA profiles through owner-controlled
    sessions, then run one low-risk Patreon publish and MEGA mirror canary.
    Exercise the Patreon manual ZIP fallback as part of the canary.
-10. Add the exact X secret ARN to the instance role, authorize the creator, and
+7. Add the exact X secret ARN to the instance role, authorize the creator, and
     run one approved X canary with sensitive-media handling enabled.
-11. Repeat the proven sequence with separate production resources and
+8. Repeat the proven sequence with separate production resources and
     credentials; do not promote staging secrets or profile volumes.
 
 ## Accounts and access: exact timing
