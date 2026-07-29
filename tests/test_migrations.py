@@ -2,6 +2,7 @@ import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid5
 
 import pytest
@@ -50,6 +51,50 @@ def test_postgresql_publication_effect_event_guard_closes_outer_if_once(
         "'publication request completion has no start'; "
         "END IF; RETURN NEW; END; $$ LANGUAGE plpgsql"
     ) in guard
+
+
+def test_postgresql_preview_constraint_uses_fixed_convention_name(
+    monkeypatch,
+) -> None:
+    configuration = Config("alembic.ini")
+    revision = ScriptDirectory.from_config(configuration).get_revision("20260728_0012")
+    assert revision is not None
+
+    fixed_names: list[str] = []
+    dropped: list[tuple[str, str, str]] = []
+    created: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        revision.module.op,
+        "get_bind",
+        lambda: SimpleNamespace(dialect=SimpleNamespace(name="postgresql")),
+    )
+    monkeypatch.setattr(
+        revision.module.op,
+        "f",
+        lambda name: fixed_names.append(name) or f"fixed::{name}",
+    )
+    monkeypatch.setattr(
+        revision.module.op,
+        "drop_constraint",
+        lambda name, table, *, type_: dropped.append((name, table, type_)),
+    )
+    monkeypatch.setattr(
+        revision.module.op,
+        "create_check_constraint",
+        lambda name, table, expression: created.append((name, table, expression)),
+    )
+
+    revision.module._replace_publication_preview_constraint("role = 'x_teaser'")
+
+    assert fixed_names == ["ck_publication_inputs_role_target"]
+    assert dropped == [("fixed::ck_publication_inputs_role_target", "publication_inputs", "check")]
+    assert created == [
+        (
+            "fixed::ck_publication_inputs_role_target",
+            "publication_inputs",
+            "role = 'x_teaser'",
+        )
+    ]
 
 
 def test_foundation_migration_round_trip(

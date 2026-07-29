@@ -125,13 +125,14 @@ def _replace_publication_preview_constraint(expression: str) -> None:
             )
         return
 
+    constraint_name = op.f("ck_publication_inputs_role_target")
     op.drop_constraint(
-        "ck_publication_inputs_role_target",
+        constraint_name,
         "publication_inputs",
         type_="check",
     )
     op.create_check_constraint(
-        "ck_publication_inputs_role_target",
+        constraint_name,
         "publication_inputs",
         expression,
     )
