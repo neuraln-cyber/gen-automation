@@ -48,6 +48,7 @@ from gen_automation.services.ranked_dashboard import (
     load_review_task_navigation,
 )
 from gen_automation.services.review import (
+    SEMANTIC_SEVERE_OVERRIDE_REASON_CODE,
     CurrentAssetDecision,
     ReviewConflictError,
     ReviewInputError,
@@ -60,6 +61,7 @@ from gen_automation.services.review import (
     transition_review_task,
 )
 from gen_automation.services.semantic_anatomy import (
+    SemanticAssessmentProfile,
     SemanticReviewAssessment,
     load_semantic_review_assessments,
 )
@@ -308,6 +310,7 @@ async def dashboard_review_task(
             message="Review images cannot be displayed until private storage is ready.",
         )
     settings: Settings = request.app.state.settings
+    semantic_profile = _configured_semantic_profile_sha256(settings)
     try:
         navigation = await load_review_task_navigation(
             session,
@@ -316,6 +319,8 @@ async def dashboard_review_task(
         summary = await get_review_summary(
             session,
             review_task_id=review_task_id,
+            semantic_profile_sha256=semantic_profile,
+            semantic_severe_confidence_micros=(settings.semantic_anatomy_severe_confidence_micros),
         )
         release = await load_ranked_scoring_run(
             session,
@@ -326,6 +331,7 @@ async def dashboard_review_task(
         semantic_assessments = await load_semantic_review_assessments(
             session,
             scoring_run_id=navigation.scoring_run_id,
+            profile_sha256=semantic_profile,
         )
         csrf_token = (
             _form_csrf_token(request, principal) if summary.state == ReviewTaskState.OPEN else None
@@ -409,6 +415,7 @@ async def dashboard_review_task(
                 "summary": summary,
                 "assets": assets.ordered,
                 "ai_excluded_count": len(assets.ai_excluded),
+                "semantic_override_reason_code": (SEMANTIC_SEVERE_OVERRIDE_REASON_CODE),
                 "csrf_token": csrf_token,
                 "complete_idempotency_key": complete_idempotency_key,
                 "cancel_idempotency_key": cancel_idempotency_key,
@@ -419,6 +426,7 @@ async def dashboard_review_task(
                         not asset.selected_for_x or asset.decision == ReviewDecisionValue.ACCEPT
                         for asset in summary.assets
                     )
+                    and summary.semantic_gate.completion_ready
                 ),
             },
         ),
@@ -448,6 +456,7 @@ async def dashboard_review_decision(
         return _security_error_response(request, principal)
 
     settings: Settings = request.app.state.settings
+    semantic_profile = _configured_semantic_profile_sha256(settings)
     expected_key = review_form_idempotency_key(
         settings,
         session_id=principal.session_id,
@@ -475,6 +484,8 @@ async def dashboard_review_decision(
             idempotency_key=form.idempotency_key,
             reason_code=form.reason_code,
             note=form.note,
+            semantic_profile_sha256=semantic_profile,
+            semantic_severe_confidence_micros=(settings.semantic_anatomy_severe_confidence_micros),
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         return _service_error_response(request, principal, error)
@@ -598,6 +609,7 @@ async def _dashboard_transition(
         return _security_error_response(request, principal)
 
     settings: Settings = request.app.state.settings
+    semantic_profile = _configured_semantic_profile_sha256(settings)
     expected_key = review_form_idempotency_key(
         settings,
         session_id=principal.session_id,
@@ -618,6 +630,8 @@ async def _dashboard_transition(
             changed_by_user_id=principal.user_id,
             expected_lock_version=form.expected_lock_version,
             idempotency_key=form.idempotency_key,
+            semantic_profile_sha256=semantic_profile,
+            semantic_severe_confidence_micros=(settings.semantic_anatomy_severe_confidence_micros),
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         return _service_error_response(request, principal, error)
@@ -686,6 +700,18 @@ def _review_assets(
         regular=tuple(view for view in views if not view.ai_excluded),
         ai_excluded=tuple(view for view in views if view.ai_excluded),
     )
+
+
+def _configured_semantic_profile_sha256(settings: Settings) -> str | None:
+    if not settings.semantic_anatomy_enabled:
+        return None
+    revision = settings.semantic_anatomy_model_revision
+    if revision is None:
+        raise RuntimeError("validated semantic anatomy settings are incomplete")
+    return SemanticAssessmentProfile(
+        model_name=settings.semantic_anatomy_model,
+        model_revision=revision,
+    ).profile_sha256
 
 
 def _form_csrf_token(

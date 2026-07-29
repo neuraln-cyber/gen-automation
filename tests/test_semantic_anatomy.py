@@ -53,7 +53,10 @@ from gen_automation.semantic import (
     prompt_sha256,
     schema_sha256,
 )
-from gen_automation.services.review import append_review_decision
+from gen_automation.services.review import (
+    SEMANTIC_SEVERE_OVERRIDE_REASON_CODE,
+    append_review_decision,
+)
 from gen_automation.services.semantic_anatomy import (
     SemanticAssessmentProfile,
     run_semantic_assessment_cycle,
@@ -501,3 +504,95 @@ def test_high_confidence_severe_bucket_is_last_visible_and_overridable(
     severe_card = page.text[severe_position:]
     assert 'name="asset_id"' in severe_card
     assert str(context.asset_ids[0]) in severe_card
+
+
+def test_configured_semantic_gate_blocks_api_and_guides_owner_override(
+    tmp_path: Path,
+) -> None:
+    context = asyncio.run(_seed_review_api(_settings(tmp_path / "semantic-gate.db")))
+    task_id = asyncio.run(_create_task(context))
+    asyncio.run(
+        _seed_dashboard_assessments_and_override(
+            context.settings.database_url,
+            scoring_run_id=context.scoring_run_id,
+            asset_ids=context.asset_ids,
+            task_id=task_id,
+            reviewer_id=context.users[AdminRole.REVIEWER].id,
+        )
+    )
+    enabled_settings = context.settings.model_copy(
+        update={
+            "semantic_anatomy_enabled": True,
+            "semantic_anatomy_endpoint_url": "http://semantic.internal/v1/anatomy/assess",
+            "semantic_anatomy_model": _MODEL,
+            "semantic_anatomy_model_revision": _REVISION,
+        }
+    )
+    app = create_app(enabled_settings)
+    detail_action = f"/dashboard/review-tasks/{task_id}"
+    api_action = f"/api/v1/review-tasks/{task_id}"
+    with TestClient(
+        app,
+        base_url=ORIGIN,
+        client=("192.0.2.100", 50000),
+    ) as client:
+        app.state.object_store = SameOriginReviewStore()
+        csrf = _login(client, enabled_settings, context.users[AdminRole.OWNER])
+        page = client.get(detail_action)
+        summary = client.get(api_action)
+        blocked = client.post(
+            f"{api_action}:complete",
+            json={"expected_lock_version": 2},
+            headers={
+                "Origin": ORIGIN,
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "semantic-blocked-completion",
+            },
+        )
+        override = client.post(
+            f"{api_action}/decisions",
+            json={
+                "asset_id": str(context.asset_ids[0]),
+                "decision": "accept",
+                "expected_lock_version": 2,
+                "reason_code": SEMANTIC_SEVERE_OVERRIDE_REASON_CODE,
+                "note": "Owner inspected the anatomy at full resolution.",
+            },
+            headers={
+                "Origin": ORIGIN,
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "semantic-owner-override",
+            },
+        )
+        overridden_page = client.get(detail_action)
+        completed = client.post(
+            f"{api_action}:complete",
+            json={"expected_lock_version": 3},
+            headers={
+                "Origin": ORIGIN,
+                "X-CSRF-Token": csrf,
+                "Idempotency-Key": "semantic-complete-after-override",
+            },
+        )
+
+    assert page.status_code == 200
+    assert "Anatomy checks terminal" in page.text
+    assert "Severe final-set blocks" in page.text
+    assert "Completion is blocked because an accepted high-confidence severe image" in page.text
+    assert f'value="{SEMANTIC_SEVERE_OVERRIDE_REASON_CODE}"' in page.text
+    assert summary.status_code == 200
+    assert summary.json()["semantic_gate"] == {
+        "enabled": True,
+        "ranked_asset_count": 2,
+        "terminal_count": 2,
+        "pending_count": 0,
+        "unavailable_count": 0,
+        "severe_count": 1,
+        "severe_override_count": 0,
+        "severe_blocked_count": 1,
+        "completion_ready": False,
+    }
+    assert blocked.status_code == 409
+    assert override.status_code == 201
+    assert "Owner override recorded" in overridden_page.text
+    assert completed.status_code == 200

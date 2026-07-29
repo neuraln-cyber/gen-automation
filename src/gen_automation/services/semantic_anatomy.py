@@ -499,14 +499,24 @@ async def load_semantic_review_assessments(
     session: AsyncSession,
     *,
     scoring_run_id: UUID,
+    profile_sha256: str | None = None,
 ) -> dict[UUID, SemanticReviewAssessment]:
     """Load the newest configured assessment per ranked asset without blocking review."""
 
+    predicates = [SemanticAssessment.scoring_run_id == scoring_run_id]
+    if profile_sha256 is not None:
+        if (
+            not isinstance(profile_sha256, str)
+            or len(profile_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in profile_sha256)
+        ):
+            raise ValueError("semantic profile digest is invalid")
+        predicates.append(SemanticAssessment.profile_sha256 == profile_sha256)
     rows = list(
         (
             await session.scalars(
                 select(SemanticAssessment)
-                .where(SemanticAssessment.scoring_run_id == scoring_run_id)
+                .where(*predicates)
                 .order_by(
                     SemanticAssessment.created_at.desc(),
                     SemanticAssessment.id.desc(),

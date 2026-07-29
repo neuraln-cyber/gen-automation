@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Header, HTTPException, Response, status
+from fastapi import APIRouter, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from gen_automation.api.security import (
@@ -10,17 +10,20 @@ from gen_automation.api.security import (
     ReviewReader,
     Session,
 )
+from gen_automation.config import Settings
 from gen_automation.domain.enums import ReviewDecisionValue, ReviewTaskState
 from gen_automation.services.review import (
     ReviewConflictError,
     ReviewInputError,
     ReviewNotFoundError,
+    ReviewSemanticGate,
     ReviewSummary,
     append_review_decision,
     create_review_task,
     get_review_summary,
     transition_review_task,
 )
+from gen_automation.services.semantic_anatomy import SemanticAssessmentProfile
 
 router = APIRouter(prefix="/review-tasks", tags=["review tasks"])
 IdempotencyKey = Annotated[
@@ -102,6 +105,19 @@ class CurrentAssetDecisionResponse(_AttributeResponse):
     decided_by_user_id: UUID | None
     decided_at: datetime | None
     selected_for_x: bool
+    semantic_severe_override_attested: bool
+
+
+class ReviewSemanticGateResponse(_AttributeResponse):
+    enabled: bool
+    ranked_asset_count: int
+    terminal_count: int
+    pending_count: int
+    unavailable_count: int
+    severe_count: int
+    severe_override_count: int
+    severe_blocked_count: int
+    completion_ready: bool
 
 
 class ReviewSummaryResponse(_AttributeResponse):
@@ -116,6 +132,7 @@ class ReviewSummaryResponse(_AttributeResponse):
     undecided_count: int
     x_selected_count: int
     assets: tuple[CurrentAssetDecisionResponse, ...]
+    semantic_gate: ReviewSemanticGateResponse
 
 
 @router.post(
@@ -146,13 +163,17 @@ async def post_review_task(
 @router.get("/{review_task_id}", response_model=ReviewSummaryResponse)
 async def read_review_task(
     review_task_id: UUID,
+    request: Request,
     session: Session,
     _principal: ReviewReader,
 ) -> ReviewSummaryResponse:
+    semantic_profile, semantic_threshold = _semantic_gate_configuration(request)
     try:
         result = await get_review_summary(
             session,
             review_task_id=review_task_id,
+            semantic_profile_sha256=semantic_profile,
+            semantic_severe_confidence_micros=semantic_threshold,
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         raise _http_error(error) from error
@@ -167,11 +188,13 @@ async def read_review_task(
 async def post_review_decision(
     review_task_id: UUID,
     command: AppendReviewDecisionRequest,
+    request: Request,
     session: Session,
     idempotency_key: IdempotencyKey,
     response: Response,
     principal: ReviewPrincipal,
 ) -> ReviewDecisionResponse:
+    semantic_profile, semantic_threshold = _semantic_gate_configuration(request)
     try:
         result = await append_review_decision(
             session,
@@ -183,6 +206,8 @@ async def post_review_decision(
             idempotency_key=idempotency_key,
             reason_code=command.reason_code,
             note=command.note,
+            semantic_profile_sha256=semantic_profile,
+            semantic_severe_confidence_micros=semantic_threshold,
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         raise _http_error(error) from error
@@ -197,6 +222,7 @@ async def post_review_decision(
 async def complete_review_task(
     review_task_id: UUID,
     command: ReviewTransitionRequest,
+    request: Request,
     session: Session,
     idempotency_key: IdempotencyKey,
     response: Response,
@@ -210,6 +236,7 @@ async def complete_review_task(
         idempotency_key=idempotency_key,
         response=response,
         principal=principal,
+        request=request,
     )
 
 
@@ -220,6 +247,7 @@ async def complete_review_task(
 async def cancel_review_task(
     review_task_id: UUID,
     command: ReviewTransitionRequest,
+    request: Request,
     session: Session,
     idempotency_key: IdempotencyKey,
     response: Response,
@@ -233,6 +261,7 @@ async def cancel_review_task(
         idempotency_key=idempotency_key,
         response=response,
         principal=principal,
+        request=request,
     )
 
 
@@ -245,7 +274,9 @@ async def _transition(
     idempotency_key: str,
     response: Response,
     principal: ReviewPrincipal,
+    request: Request,
 ) -> ReviewTransitionResponse:
+    semantic_profile, semantic_threshold = _semantic_gate_configuration(request)
     try:
         result = await transition_review_task(
             session,
@@ -254,6 +285,8 @@ async def _transition(
             changed_by_user_id=principal.user_id,
             expected_lock_version=command.expected_lock_version,
             idempotency_key=idempotency_key,
+            semantic_profile_sha256=semantic_profile,
+            semantic_severe_confidence_micros=semantic_threshold,
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         raise _http_error(error) from error
@@ -285,9 +318,41 @@ def _summary_response(result: ReviewSummary) -> ReviewSummaryResponse:
                 decided_by_user_id=asset.decided_by_user_id,
                 decided_at=asset.decided_at,
                 selected_for_x=asset.selected_for_x,
+                semantic_severe_override_attested=(asset.semantic_severe_override_attested),
             )
             for asset in result.assets
         ),
+        semantic_gate=_semantic_gate_response(result.semantic_gate),
+    )
+
+
+def _semantic_gate_response(result: ReviewSemanticGate) -> ReviewSemanticGateResponse:
+    return ReviewSemanticGateResponse(
+        enabled=result.enabled,
+        ranked_asset_count=result.ranked_asset_count,
+        terminal_count=result.terminal_count,
+        pending_count=result.pending_count,
+        unavailable_count=result.unavailable_count,
+        severe_count=result.severe_count,
+        severe_override_count=result.severe_override_count,
+        severe_blocked_count=result.severe_blocked_count,
+        completion_ready=result.completion_ready,
+    )
+
+
+def _semantic_gate_configuration(request: Request) -> tuple[str | None, int]:
+    settings: Settings = request.app.state.settings
+    if not settings.semantic_anatomy_enabled:
+        return None, settings.semantic_anatomy_severe_confidence_micros
+    revision = settings.semantic_anatomy_model_revision
+    if revision is None:
+        raise RuntimeError("validated semantic anatomy settings are incomplete")
+    return (
+        SemanticAssessmentProfile(
+            model_name=settings.semantic_anatomy_model,
+            model_revision=revision,
+        ).profile_sha256,
+        settings.semantic_anatomy_severe_confidence_micros,
     )
 
 

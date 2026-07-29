@@ -22,6 +22,7 @@ from gen_automation.db.models import (
     ReviewDecision,
     ReviewTask,
     ScoringRun,
+    SemanticAssessment,
 )
 from gen_automation.db.session import Database
 from gen_automation.domain.enums import (
@@ -35,9 +36,14 @@ from gen_automation.domain.enums import (
     ReviewDecisionValue,
     ReviewTaskState,
     ScoringRunState,
+    SemanticAssessmentState,
+    SemanticVerdict,
 )
+from gen_automation.semantic import prompt_sha256, schema_sha256
 from gen_automation.services.ranking_manifest import ranking_manifest_sha256
 from gen_automation.services.review import (
+    SEMANTIC_SEVERE_OVERRIDE_AUDIT_ACTION,
+    SEMANTIC_SEVERE_OVERRIDE_REASON_CODE,
     ReviewConflictError,
     ReviewNotFoundError,
     ReviewTaskResult,
@@ -46,6 +52,7 @@ from gen_automation.services.review import (
     get_review_summary,
     transition_review_task,
 )
+from gen_automation.services.semantic_anatomy import SemanticAssessmentProfile
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
 
@@ -284,6 +291,91 @@ async def _create_task(
             idempotency_key=key,
             now=NOW + timedelta(minutes=2),
         )
+
+
+async def _seed_terminal_semantic_assessments(
+    context: ReviewContext,
+    *,
+    profile: SemanticAssessmentProfile,
+) -> None:
+    async with context.database.sessions() as session:
+        scores = {
+            score.asset_id: score
+            for score in (
+                await session.scalars(
+                    select(AssetScore).where(AssetScore.scoring_run_id == context.scoring_run_id)
+                )
+            ).all()
+        }
+        assets = {
+            asset.id: asset
+            for asset in (
+                await session.scalars(select(Asset).where(Asset.id.in_(context.ranked_asset_ids)))
+            ).all()
+        }
+        for index, asset_id in enumerate(context.ranked_asset_ids):
+            score = scores[asset_id]
+            asset = assets[asset_id]
+            common = {
+                "scoring_run_id": context.scoring_run_id,
+                "asset_score_id": score.id,
+                "asset_id": asset_id,
+                "asset_storage_backend": score.asset_storage_backend,
+                "asset_storage_bucket": score.asset_storage_bucket,
+                "asset_object_key": score.asset_object_key,
+                "asset_object_version_id": score.asset_object_version_id,
+                "asset_sha256": score.asset_sha256,
+                "asset_content_type": asset.content_type,
+                "asset_byte_size": score.asset_byte_size,
+                "profile_sha256": profile.profile_sha256,
+                "model_name": profile.model_name,
+                "model_revision": profile.model_revision,
+                "prompt_sha256": prompt_sha256(),
+                "schema_sha256": schema_sha256(),
+                "attempts": 3 if index == 2 else 1,
+                "max_attempts": 3,
+                "available_at": NOW,
+                "created_at": NOW,
+                "started_at": NOW,
+                "completed_at": NOW + timedelta(minutes=3),
+            }
+            if index == 0:
+                session.add(
+                    SemanticAssessment(
+                        **common,
+                        state=SemanticAssessmentState.COMPLETED,
+                        verdict=SemanticVerdict.SEVERE,
+                        confidence_micros=960_000,
+                        issues=[
+                            {
+                                "code": "extra_limb",
+                                "confidence_micros": 980_000,
+                            }
+                        ],
+                        response_sha256="1" * 64,
+                    )
+                )
+            elif index == 1:
+                session.add(
+                    SemanticAssessment(
+                        **common,
+                        state=SemanticAssessmentState.COMPLETED,
+                        verdict=SemanticVerdict.PASS,
+                        confidence_micros=990_000,
+                        issues=[],
+                        response_sha256="2" * 64,
+                    )
+                )
+            else:
+                session.add(
+                    SemanticAssessment(
+                        **common,
+                        state=SemanticAssessmentState.UNAVAILABLE,
+                        last_error_code="semantic_service_unavailable",
+                        last_error_detail="Unavailable after bounded retries.",
+                    )
+                )
+        await session.commit()
 
 
 @pytest.mark.asyncio
@@ -664,6 +756,123 @@ async def test_completion_requires_exact_acceptance_target_and_is_terminal(
         assert stored.completed_by_user_id == review_context.reviewer_id
         assert stored.completed_at == (NOW + timedelta(minutes=8)).replace(tzinfo=None)
         assert stored.cancelled_at is None
+
+
+@pytest.mark.asyncio
+async def test_semantic_completion_gate_requires_terminal_checks_and_owner_override(
+    review_context: ReviewContext,
+) -> None:
+    task = await _create_task(review_context)
+    profile = SemanticAssessmentProfile(
+        model_name="Qwen/Qwen3-VL-8B-Instruct",
+        model_revision="pinned-test-revision",
+    )
+    async with review_context.database.sessions() as session:
+        await append_review_decision(
+            session,
+            review_task_id=task.task_id,
+            asset_id=review_context.ranked_asset_ids[0],
+            decision=ReviewDecisionValue.ACCEPT,
+            decided_by_user_id=review_context.reviewer_id,
+            expected_lock_version=1,
+            idempotency_key="semantic-accept-before-result",
+        )
+    async with review_context.database.sessions() as session:
+        await append_review_decision(
+            session,
+            review_task_id=task.task_id,
+            asset_id=review_context.ranked_asset_ids[1],
+            decision=ReviewDecisionValue.ACCEPT,
+            decided_by_user_id=review_context.reviewer_id,
+            expected_lock_version=2,
+            idempotency_key="semantic-accept-pass",
+        )
+    async with review_context.database.sessions() as session:
+        with pytest.raises(ReviewConflictError, match="not terminal"):
+            await transition_review_task(
+                session,
+                review_task_id=task.task_id,
+                target_state=ReviewTaskState.COMPLETED,
+                changed_by_user_id=review_context.reviewer_id,
+                expected_lock_version=3,
+                idempotency_key="semantic-complete-pending",
+                semantic_profile_sha256=profile.profile_sha256,
+            )
+
+    await _seed_terminal_semantic_assessments(review_context, profile=profile)
+    async with review_context.database.sessions() as session:
+        with pytest.raises(ReviewConflictError, match="owner override"):
+            await transition_review_task(
+                session,
+                review_task_id=task.task_id,
+                target_state=ReviewTaskState.COMPLETED,
+                changed_by_user_id=review_context.reviewer_id,
+                expected_lock_version=3,
+                idempotency_key="semantic-complete-severe-block",
+                semantic_profile_sha256=profile.profile_sha256,
+            )
+    async with review_context.database.sessions() as session:
+        with pytest.raises(ReviewNotFoundError, match="authorized owner"):
+            await append_review_decision(
+                session,
+                review_task_id=task.task_id,
+                asset_id=review_context.ranked_asset_ids[0],
+                decision=ReviewDecisionValue.ACCEPT,
+                decided_by_user_id=review_context.reviewer_id,
+                expected_lock_version=3,
+                idempotency_key="reviewer-cannot-override-severe",
+                reason_code=SEMANTIC_SEVERE_OVERRIDE_REASON_CODE,
+                note="Reviewer attempted an owner-only override.",
+                semantic_profile_sha256=profile.profile_sha256,
+            )
+    async with review_context.database.sessions() as session:
+        override = await append_review_decision(
+            session,
+            review_task_id=task.task_id,
+            asset_id=review_context.ranked_asset_ids[0],
+            decision=ReviewDecisionValue.ACCEPT,
+            decided_by_user_id=review_context.owner_id,
+            expected_lock_version=3,
+            idempotency_key="owner-overrides-severe",
+            reason_code=SEMANTIC_SEVERE_OVERRIDE_REASON_CODE,
+            note="Hands and limb layout were inspected at full resolution.",
+            semantic_profile_sha256=profile.profile_sha256,
+        )
+    async with review_context.database.sessions() as session:
+        summary = await get_review_summary(
+            session,
+            review_task_id=task.task_id,
+            semantic_profile_sha256=profile.profile_sha256,
+        )
+        assert summary.semantic_gate.terminal_count == 3
+        assert summary.semantic_gate.pending_count == 0
+        assert summary.semantic_gate.unavailable_count == 1
+        assert summary.semantic_gate.severe_blocked_count == 0
+        assert summary.semantic_gate.severe_override_count == 1
+        assert summary.semantic_gate.completion_ready is True
+        assert summary.assets[0].semantic_severe_override_attested is True
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(AuditEvent)
+                .where(
+                    AuditEvent.action == SEMANTIC_SEVERE_OVERRIDE_AUDIT_ACTION,
+                    AuditEvent.resource_id == override.decision_id,
+                )
+            )
+            == 1
+        )
+    async with review_context.database.sessions() as session:
+        completed = await transition_review_task(
+            session,
+            review_task_id=task.task_id,
+            target_state=ReviewTaskState.COMPLETED,
+            changed_by_user_id=review_context.owner_id,
+            expected_lock_version=4,
+            idempotency_key="semantic-complete-after-override",
+            semantic_profile_sha256=profile.profile_sha256,
+        )
+    assert completed.state == ReviewTaskState.COMPLETED
 
 
 @pytest.mark.asyncio

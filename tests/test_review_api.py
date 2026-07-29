@@ -640,6 +640,18 @@ def test_review_mutations_require_origin_csrf_and_replay_idempotently(
         "undecided_count",
         "x_selected_count",
         "assets",
+        "semantic_gate",
+    }
+    assert summary_body["semantic_gate"] == {
+        "enabled": False,
+        "ranked_asset_count": 2,
+        "terminal_count": 0,
+        "pending_count": 0,
+        "unavailable_count": 0,
+        "severe_count": 0,
+        "severe_override_count": 0,
+        "severe_blocked_count": 0,
+        "completion_ready": True,
     }
     assert summary_body["accepted_count"] == 1
     assert summary_body["undecided_count"] == 1
@@ -656,6 +668,7 @@ def test_review_mutations_require_origin_csrf_and_replay_idempotently(
         "decided_by_user_id",
         "decided_at",
         "selected_for_x",
+        "semantic_severe_override_attested",
     }
     assert all(set(asset) == safe_asset_fields for asset in summary_body["assets"])
     serialized = json.dumps(

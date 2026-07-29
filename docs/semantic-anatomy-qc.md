@@ -22,14 +22,18 @@ immutable. It never edits, rejects, quarantines, or deletes the raw master.
 Only a `severe` result at or above
 `GEN_AUTOMATION_SEMANTIC_ANATOMY_SEVERE_CONFIDENCE_MICROS` enters the clearly
 labeled **AI excluded** section at the bottom of the review page. The image stays
-visible with the same Accept, Reject, Hold, download, and X-selection controls.
-A human decision is authoritative.
+visible and the raw master is unchanged. Reject and Hold remain normal reviewer
+decisions. Accepting a high-confidence severe result requires an active OWNER,
+the exact `semantic_severe_override` reason code, and a written justification;
+the resulting profile-bound attestation is stored as a durable audit event.
 
 `review`, low-confidence `severe`, pending, and retrying results remain in normal
 rank order. If the service is unavailable or returns an invalid contract, the
 assessment retries with bounded backoff and eventually displays “unavailable;
-review manually.” There is no synthetic pass and review completion is not
-blocked.
+review manually.” There is no synthetic pass. When semantic anatomy is enabled,
+review completion waits until every ranked image has either a completed
+assessment or an explicit terminal `unavailable` result. It also blocks while an
+accepted high-confidence severe result lacks the OWNER override attestation.
 
 ## Private service contract
 
@@ -80,8 +84,10 @@ The gateway returns HTTP 200 and `application/json`:
 
 Unknown fields, issue codes, identity mismatches, malformed boxes, oversized
 responses, redirects, and non-JSON responses fail closed as unavailable review
-signals. The gateway may wrap a pinned Qwen3-VL-class model, but the model and
-revision are configuration rather than a hard dependency.
+signals. The repository includes the private gateway boundary in
+`Dockerfile.semantic-gateway`. It translates this controller contract to a
+pinned OpenAI-compatible vision-model endpoint. The upstream model and exact
+revision remain deployment configuration rather than a source-code dependency.
 
 ## Activation and live requirements
 
@@ -90,7 +96,8 @@ Source-side tests use a fake HTTP transport and need no account, key, or GPU.
 
 Live activation requires:
 
-1. a private burst/scale-to-zero endpoint implementing the contract above;
+1. the private semantic gateway plus a private burst/scale-to-zero
+   OpenAI-compatible vision-model endpoint;
 2. an exact model identifier and immutable model revision;
 3. network access from the control plane to that endpoint; and
 4. the existing PostgreSQL and exact-version object-store access used by CPU QC.

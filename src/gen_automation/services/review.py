@@ -22,6 +22,7 @@ from gen_automation.db.models import (
     ReviewTask,
     ReviewXSelection,
     ScoringRun,
+    SemanticAssessment,
 )
 from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import (
@@ -33,6 +34,8 @@ from gen_automation.domain.enums import (
     ReviewDecisionValue,
     ReviewTaskState,
     ScoringRunState,
+    SemanticAssessmentState,
+    SemanticVerdict,
 )
 from gen_automation.domain.ids import uuid7
 from gen_automation.services.ranking_manifest import (
@@ -44,6 +47,10 @@ from gen_automation.services.ranking_manifest import (
 _REASON_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_.-]{0,99}")
 _MAX_NOTE_LENGTH = 4_000
 _MAX_IDEMPOTENCY_KEY_LENGTH = 200
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+SEMANTIC_SEVERE_OVERRIDE_REASON_CODE = "semantic_severe_override"
+SEMANTIC_SEVERE_OVERRIDE_AUDIT_ACTION = "review.semantic_severe_overridden"
 
 
 class ReviewServiceError(Exception):
@@ -119,6 +126,23 @@ class CurrentAssetDecision:
     decided_by_user_id: UUID | None
     decided_at: datetime | None
     selected_for_x: bool
+    semantic_severe_override_attested: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewSemanticGate:
+    enabled: bool
+    ranked_asset_count: int
+    terminal_count: int
+    pending_count: int
+    unavailable_count: int
+    severe_count: int
+    severe_override_count: int
+    severe_blocked_count: int
+
+    @property
+    def completion_ready(self) -> bool:
+        return not self.enabled or (self.pending_count == 0 and self.severe_blocked_count == 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +158,7 @@ class ReviewSummary:
     undecided_count: int
     x_selected_count: int
     assets: tuple[CurrentAssetDecision, ...]
+    semantic_gate: ReviewSemanticGate
 
 
 async def create_review_task(
@@ -308,6 +333,8 @@ async def append_review_decision(
     idempotency_key: str,
     reason_code: str | None = None,
     note: str | None = None,
+    semantic_profile_sha256: str | None = None,
+    semantic_severe_confidence_micros: int = 900_000,
     now: datetime | None = None,
 ) -> ReviewDecisionResult:
     """Append an attributed decision revision without mutating its raw asset."""
@@ -316,6 +343,8 @@ async def append_review_decision(
     normalized_decision = _validate_decision(decision)
     normalized_reason = _normalize_reason_code(reason_code)
     normalized_note = _normalize_note(note)
+    normalized_semantic_profile = _normalize_semantic_profile_sha256(semantic_profile_sha256)
+    semantic_threshold = _validate_semantic_confidence_threshold(semantic_severe_confidence_micros)
     expected_version = _validate_lock_version(expected_lock_version)
     scope = f"review-task:{review_task_id}:append-decision"
     request_sha256 = canonical_sha256(
@@ -327,6 +356,8 @@ async def append_review_decision(
             "expected_lock_version": expected_version,
             "reason_code": normalized_reason,
             "note": normalized_note,
+            "semantic_profile_sha256": normalized_semantic_profile,
+            "semantic_severe_confidence_micros": semantic_threshold,
         }
     )
     await _require_active_reviewer(session, decided_by_user_id)
@@ -354,6 +385,29 @@ async def append_review_decision(
     )
     if ranking_id is None:
         raise ReviewConflictError("asset is not ranked in this review task")
+
+    semantic_override = False
+    if (
+        normalized_semantic_profile is not None
+        and normalized_decision == ReviewDecisionValue.ACCEPT
+    ):
+        assessment = await session.scalar(
+            select(SemanticAssessment).where(
+                SemanticAssessment.scoring_run_id == task.scoring_run_id,
+                SemanticAssessment.asset_id == asset_id,
+                SemanticAssessment.profile_sha256 == normalized_semantic_profile,
+            )
+        )
+        if _is_high_confidence_severe_assessment(
+            assessment,
+            threshold_micros=semantic_threshold,
+        ):
+            if normalized_reason != SEMANTIC_SEVERE_OVERRIDE_REASON_CODE or normalized_note is None:
+                raise ReviewConflictError(
+                    "high-confidence severe anatomy requires an explicit owner override"
+                )
+            await _require_active_owner(session, decided_by_user_id)
+            semantic_override = True
 
     claimed_task_id = await session.scalar(
         update(ReviewTask)
@@ -420,6 +474,27 @@ async def append_review_decision(
             occurred_at=decided_at,
         )
     )
+    if semantic_override:
+        session.add(
+            AuditEvent(
+                actor=_audit_actor(decided_by_user_id),
+                action=SEMANTIC_SEVERE_OVERRIDE_AUDIT_ACTION,
+                resource_type="review_decision",
+                resource_id=stored.id,
+                correlation_id=normalized_key,
+                detail={
+                    "review_task_id": str(task.id),
+                    "scoring_run_id": str(task.scoring_run_id),
+                    "asset_id": str(asset_id),
+                    "decision_revision": revision,
+                    "semantic_profile_sha256": normalized_semantic_profile,
+                    "semantic_severe_confidence_micros": semantic_threshold,
+                    "reason_code": SEMANTIC_SEVERE_OVERRIDE_REASON_CODE,
+                    "attestation": "owner reviewed and explicitly accepted severe anatomy",
+                },
+                occurred_at=decided_at,
+            )
+        )
     session.add(
         _idempotency_record(
             scope=scope,
@@ -454,12 +529,16 @@ async def transition_review_task(
     changed_by_user_id: UUID,
     expected_lock_version: int,
     idempotency_key: str,
+    semantic_profile_sha256: str | None = None,
+    semantic_severe_confidence_micros: int = 900_000,
     now: datetime | None = None,
 ) -> ReviewTransitionResult:
     """Close an open task once its exact acceptance target is satisfied, or cancel it."""
 
     normalized_key = _validate_idempotency_key(idempotency_key)
     normalized_target = _validate_terminal_state(target_state)
+    normalized_semantic_profile = _normalize_semantic_profile_sha256(semantic_profile_sha256)
+    semantic_threshold = _validate_semantic_confidence_threshold(semantic_severe_confidence_micros)
     expected_version = _validate_lock_version(expected_lock_version)
     scope = f"review-task:{review_task_id}:transition"
     request_sha256 = canonical_sha256(
@@ -468,6 +547,8 @@ async def transition_review_task(
             "target_state": normalized_target.value,
             "changed_by_user_id": str(changed_by_user_id),
             "expected_lock_version": expected_version,
+            "semantic_profile_sha256": normalized_semantic_profile,
+            "semantic_severe_confidence_micros": semantic_threshold,
         }
     )
     await _require_active_reviewer(session, changed_by_user_id)
@@ -485,12 +566,26 @@ async def transition_review_task(
         raise ReviewConflictError("review task is not open")
     if task.lock_version != expected_version:
         raise ReviewConflictError("review task lock version is stale")
-    summary = await _review_summary(session, task)
+    summary = await _review_summary(
+        session,
+        task,
+        semantic_profile_sha256=(
+            normalized_semantic_profile if normalized_target == ReviewTaskState.COMPLETED else None
+        ),
+        semantic_severe_confidence_micros=semantic_threshold,
+    )
     if (
         normalized_target == ReviewTaskState.COMPLETED
         and summary.accepted_count != task.desired_accepted_count
     ):
         raise ReviewConflictError("accepted asset count must exactly match the task target")
+    if normalized_target == ReviewTaskState.COMPLETED and summary.semantic_gate.pending_count:
+        raise ReviewConflictError("configured semantic anatomy assessments are not terminal")
+    if (
+        normalized_target == ReviewTaskState.COMPLETED
+        and summary.semantic_gate.severe_blocked_count
+    ):
+        raise ReviewConflictError("accepted severe anatomy requires an explicit owner override")
 
     changed_at = _as_utc(now or datetime.now(UTC))
     approved_release_id: UUID | None = None
@@ -571,6 +666,10 @@ async def transition_review_task(
                 "held_count": summary.held_count,
                 "undecided_count": summary.undecided_count,
                 "desired_accepted_count": task.desired_accepted_count,
+                "semantic_gate_enabled": summary.semantic_gate.enabled,
+                "semantic_terminal_count": summary.semantic_gate.terminal_count,
+                "semantic_unavailable_count": summary.semantic_gate.unavailable_count,
+                "semantic_severe_override_count": (summary.semantic_gate.severe_override_count),
                 "task_lock_version": expected_version + 1,
             },
             occurred_at=changed_at,
@@ -911,16 +1010,28 @@ async def get_review_summary(
     session: AsyncSession,
     *,
     review_task_id: UUID,
+    semantic_profile_sha256: str | None = None,
+    semantic_severe_confidence_micros: int = 900_000,
 ) -> ReviewSummary:
     task = await session.get(ReviewTask, review_task_id)
     if task is None:
         raise ReviewNotFoundError("review task was not found")
-    return await _review_summary(session, task)
+    return await _review_summary(
+        session,
+        task,
+        semantic_profile_sha256=_normalize_semantic_profile_sha256(semantic_profile_sha256),
+        semantic_severe_confidence_micros=_validate_semantic_confidence_threshold(
+            semantic_severe_confidence_micros
+        ),
+    )
 
 
 async def _review_summary(
     session: AsyncSession,
     task: ReviewTask,
+    *,
+    semantic_profile_sha256: str | None = None,
+    semantic_severe_confidence_micros: int = 900_000,
 ) -> ReviewSummary:
     await _validate_task_ranking_snapshot(session, task, recompute=True)
     latest_revisions = (
@@ -961,6 +1072,23 @@ async def _review_summary(
             )
         ).all()
     )
+    decision_ids = {decision.id for _, decision in rows if decision is not None}
+    semantic_override_profiles: dict[UUID, str] = {}
+    if decision_ids:
+        override_events = (
+            await session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.action == SEMANTIC_SEVERE_OVERRIDE_AUDIT_ACTION,
+                    AuditEvent.resource_type == "review_decision",
+                    AuditEvent.resource_id.in_(decision_ids),
+                )
+            )
+        ).all()
+        for event in override_events:
+            profile = event.detail.get("semantic_profile_sha256")
+            if isinstance(profile, str):
+                semantic_override_profiles[event.resource_id] = profile
+
     assets: list[CurrentAssetDecision] = []
     accepted = rejected = held = undecided = 0
     for ranking, decision in rows:
@@ -984,8 +1112,20 @@ async def _review_summary(
                 decided_by_user_id=(decision.decided_by_user_id if decision is not None else None),
                 decided_at=decision.decided_at if decision is not None else None,
                 selected_for_x=ranking.asset_id in x_selected_asset_ids,
+                semantic_severe_override_attested=(
+                    decision is not None
+                    and semantic_profile_sha256 is not None
+                    and semantic_override_profiles.get(decision.id) == semantic_profile_sha256
+                ),
             )
         )
+    semantic_gate = await _semantic_review_gate(
+        session,
+        task=task,
+        assets=tuple(assets),
+        semantic_profile_sha256=semantic_profile_sha256,
+        semantic_severe_confidence_micros=semantic_severe_confidence_micros,
+    )
     return ReviewSummary(
         task_id=task.id,
         state=task.state,
@@ -998,6 +1138,76 @@ async def _review_summary(
         undecided_count=undecided,
         x_selected_count=len(x_selected_asset_ids),
         assets=tuple(assets),
+        semantic_gate=semantic_gate,
+    )
+
+
+async def _semantic_review_gate(
+    session: AsyncSession,
+    *,
+    task: ReviewTask,
+    assets: tuple[CurrentAssetDecision, ...],
+    semantic_profile_sha256: str | None,
+    semantic_severe_confidence_micros: int,
+) -> ReviewSemanticGate:
+    if semantic_profile_sha256 is None:
+        return ReviewSemanticGate(
+            enabled=False,
+            ranked_asset_count=task.ranked_asset_count,
+            terminal_count=0,
+            pending_count=0,
+            unavailable_count=0,
+            severe_count=0,
+            severe_override_count=0,
+            severe_blocked_count=0,
+        )
+
+    assessments = {
+        assessment.asset_id: assessment
+        for assessment in (
+            await session.scalars(
+                select(SemanticAssessment).where(
+                    SemanticAssessment.scoring_run_id == task.scoring_run_id,
+                    SemanticAssessment.profile_sha256 == semantic_profile_sha256,
+                )
+            )
+        ).all()
+    }
+    terminal_count = unavailable_count = severe_count = 0
+    severe_override_count = severe_blocked_count = 0
+    for asset in assets:
+        assessment = assessments.get(asset.asset_id)
+        if assessment is None or assessment.state not in (
+            SemanticAssessmentState.COMPLETED,
+            SemanticAssessmentState.UNAVAILABLE,
+        ):
+            continue
+        terminal_count += 1
+        if assessment.state == SemanticAssessmentState.UNAVAILABLE:
+            unavailable_count += 1
+            continue
+        if not _is_high_confidence_severe_assessment(
+            assessment,
+            threshold_micros=semantic_severe_confidence_micros,
+        ):
+            continue
+        severe_count += 1
+        if asset.decision != ReviewDecisionValue.ACCEPT:
+            continue
+        if asset.semantic_severe_override_attested:
+            severe_override_count += 1
+        else:
+            severe_blocked_count += 1
+
+    return ReviewSemanticGate(
+        enabled=True,
+        ranked_asset_count=task.ranked_asset_count,
+        terminal_count=terminal_count,
+        pending_count=task.ranked_asset_count - terminal_count,
+        unavailable_count=unavailable_count,
+        severe_count=severe_count,
+        severe_override_count=severe_override_count,
+        severe_blocked_count=severe_blocked_count,
     )
 
 
@@ -1357,6 +1567,34 @@ def _normalize_note(value: str | None) -> str | None:
     if not normalized or len(normalized) > _MAX_NOTE_LENGTH:
         raise ReviewInputError("note must be between 1 and 4000 characters")
     return normalized
+
+
+def _normalize_semantic_profile_sha256(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _SHA256_PATTERN.fullmatch(value):
+        raise ReviewInputError("semantic_profile_sha256 must be a lowercase SHA-256 digest")
+    return value
+
+
+def _validate_semantic_confidence_threshold(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 1_000_000:
+        raise ReviewInputError("semantic severe confidence threshold must be between 0 and 1000000")
+    return value
+
+
+def _is_high_confidence_severe_assessment(
+    assessment: SemanticAssessment | None,
+    *,
+    threshold_micros: int,
+) -> bool:
+    return (
+        assessment is not None
+        and assessment.state == SemanticAssessmentState.COMPLETED
+        and assessment.verdict == SemanticVerdict.SEVERE
+        and assessment.confidence_micros is not None
+        and assessment.confidence_micros >= threshold_micros
+    )
 
 
 def _audit_actor(user_id: UUID) -> str:
