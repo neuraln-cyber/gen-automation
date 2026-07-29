@@ -34,7 +34,6 @@ nginx_image="$(env_value GEN_AUTOMATION_NGINX_IMAGE "$config_root/deploy.env")"
   --user 10002:10002 \
   --cap-drop ALL \
   --cap-add NET_BIND_SERVICE \
-  --security-opt no-new-privileges \
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,uid=10002,gid=10002,mode=1770 \
   --tmpfs /data:rw,nosuid,nodev,noexec,size=64m,uid=10002,gid=10002,mode=0700 \
   --tmpfs /config:rw,nosuid,nodev,noexec,size=16m,uid=10002,gid=10002,mode=0700 \
@@ -44,6 +43,31 @@ nginx_image="$(env_value GEN_AUTOMATION_NGINX_IMAGE "$config_root/deploy.env")"
   "$caddy_image" \
   validate --config /etc/caddy/Caddyfile --adapter caddyfile ||
   fail "Caddyfile did not validate with the immutable Caddy image"
+
+caddy_probe="gen-automation-caddy-capability-probe-$$"
+cleanup_caddy_probe() {
+  /usr/bin/docker rm --force "$caddy_probe" >/dev/null 2>&1 || true
+}
+trap cleanup_caddy_probe EXIT
+/usr/bin/docker run \
+  --detach \
+  --name "$caddy_probe" \
+  --network none \
+  --read-only \
+  --user 10002:10002 \
+  --cap-drop ALL \
+  --cap-add NET_BIND_SERVICE \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,uid=10002,gid=10002,mode=1770 \
+  --tmpfs /data:rw,nosuid,nodev,noexec,size=64m,uid=10002,gid=10002,mode=0700 \
+  --tmpfs /config:rw,nosuid,nodev,noexec,size=16m,uid=10002,gid=10002,mode=0700 \
+  --entrypoint caddy \
+  "$caddy_image" \
+  file-server --listen :81 >/dev/null
+sleep 1
+[ "$(/usr/bin/docker inspect --format '{{.State.Status}}' "$caddy_probe")" = "running" ] ||
+  fail "immutable Caddy image could not bind a privileged port as its runtime UID"
+cleanup_caddy_probe
+trap - EXIT
 
 /usr/bin/docker run \
   --rm \

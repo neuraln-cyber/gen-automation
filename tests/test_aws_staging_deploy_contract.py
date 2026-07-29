@@ -114,6 +114,7 @@ def test_loopback_nginx_request_guards_and_assertions_are_enforced() -> None:
     assert "--network none" in proxy_validator
     assert "--user 10002:10002" in proxy_validator
     assert "--cap-add NET_BIND_SERVICE" in proxy_validator
+    assert "file-server --listen :81" in proxy_validator
     assert "/data:rw,nosuid,nodev,noexec,size=64m,uid=10002,gid=10002,mode=0700" in (
         proxy_validator
     )
@@ -146,12 +147,15 @@ def test_containers_are_ordered_health_checked_and_not_privileged() -> None:
         assert "restart: unless-stopped" in service
         assert "healthcheck:" in service
         assert "cap_drop:\n      - ALL" in service
-        assert "no-new-privileges:true" in service
         assert "read_only: true" in service
         assert "privileged:" not in service
         assert "/var/run/docker.sock" not in service
         assert "/run/docker.sock" not in service
 
+    for service in (patreon, controller, ingress):
+        assert "no-new-privileges:true" in service
+    assert "no-new-privileges:true" not in caddy
+    assert "cap_add:\n      - NET_BIND_SERVICE" in caddy
     assert "patreon-browser:\n        condition: service_healthy" in controller
     assert "control-plane-mega:\n        condition: service_healthy" in ingress
     assert "ingress-guard:\n        condition: service_healthy" in caddy

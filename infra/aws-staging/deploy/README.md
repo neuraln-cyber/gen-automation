@@ -30,6 +30,13 @@ response hop limit 1, the bridged sidecar cannot obtain the instance role,
 while the host-networked control plane UID 10001 can use ambient AWS
 credentials.
 
+Caddy is pinned by digest, runs read-only as UID 10002, drops every capability
+except `NET_BIND_SERVICE`, and is blocked from IMDS. It intentionally omits
+`no-new-privileges` because that flag prevents the official Caddy binary's
+reviewed bind-service file capability from becoming effective for its non-root
+UID. The deployment preflight proves that this exact image can bind a low port
+inside an isolated network namespace before public startup.
+
 No service is privileged, no service mounts the Docker socket, and the Patreon
 sidecar receives no AWS credentials. The persistent MEGA profile and the
 Patreon Chromium/idempotency paths are the encrypted EBS mount prepared by the
