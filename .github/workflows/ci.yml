@@ -168,6 +168,26 @@ jobs:
           --file Dockerfile.patreon-browser
           --tag gen-automation-patreon-browser:test
           .
+      - name: Smoke-test Patreon Chrome runtime as non-root
+        run: |
+          docker run --rm \
+            --entrypoint python3.12 \
+            gen-automation-patreon-browser:test \
+            -c '
+          from playwright.sync_api import sync_playwright
+
+          with sync_playwright() as playwright:
+              browser = playwright.chromium.launch(
+                  channel="chrome",
+                  headless=True,
+                  args=("--disable-dev-shm-usage",),
+              )
+              assert int(browser.version.split(".", 1)[0]) >= 150, browser.version
+              page = browser.new_page()
+              page.set_content("<title>patreon-browser-ready</title>")
+              assert page.title() == "patreon-browser-ready"
+              browser.close()
+          '
       - name: Generate control-plane image SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
