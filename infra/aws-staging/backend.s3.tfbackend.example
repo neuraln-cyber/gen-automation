@@ -1,0 +1,12 @@
+# Create this dedicated state bucket before initializing the module. It must
+# have versioning, encryption, public-access blocking, and a narrow operator/
+# CI policy. Do not reuse either application bucket.
+bucket       = "replace-with-private-versioned-tofu-state-bucket"
+key          = "gen-automation/staging/opentofu.tfstate"
+region       = "eu-central-1"
+encrypt      = true
+use_lockfile = true
+
+# Authentication intentionally comes from AWS CLI/SSO ambient identity.
+# Never add access_key, secret_key, token, role session credentials, or KMS
+# plaintext to this file.

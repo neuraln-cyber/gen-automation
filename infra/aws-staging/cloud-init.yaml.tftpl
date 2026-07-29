@@ -1,0 +1,153 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+
+packages:
+  - amazon-cloudwatch-agent
+  - docker
+  - xfsprogs
+
+write_files:
+  - path: /etc/docker/daemon.json
+    owner: root:root
+    permissions: "0644"
+    content: |
+      {
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-file": "5",
+          "max-size": "20m"
+        }
+      }
+
+  - path: /opt/aws/amazon-cloudwatch-agent/etc/gen-automation.json
+    owner: root:root
+    permissions: "0644"
+    content: |
+      {
+        "agent": {
+          "metrics_collection_interval": 60,
+          "run_as_user": "root"
+        },
+        "logs": {
+          "logs_collected": {
+            "files": {
+              "collect_list": [
+                {
+                  "file_path": "/var/log/cloud-init-output.log",
+                  "log_group_name": "${log_group_name}",
+                  "log_stream_name": "{instance_id}/cloud-init",
+                  "retention_in_days": -1
+                },
+                {
+                  "file_path": "/var/log/gen-automation/*.log",
+                  "log_group_name": "${log_group_name}",
+                  "log_stream_name": "{instance_id}/runtime",
+                  "retention_in_days": -1
+                }
+              ]
+            }
+          }
+        },
+        "metrics": {
+          "namespace": "${metric_namespace}",
+          "append_dimensions": {
+            "InstanceId": "$aws:InstanceId"
+          },
+          "metrics_collected": {
+            "disk": {
+              "measurement": [
+                "used_percent"
+              ],
+              "metrics_collection_interval": 60,
+              "resources": [
+                "/",
+                "/var/lib/gen-automation/integration-profiles"
+              ]
+            },
+            "mem": {
+              "measurement": [
+                "mem_used_percent"
+              ],
+              "metrics_collection_interval": 60
+            }
+          }
+        }
+      }
+
+  - path: /etc/systemd/system/gen-automation-deploy.target
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Gen Automation deployment target
+      Wants=docker.service amazon-cloudwatch-agent.service
+      After=docker.service amazon-cloudwatch-agent.service network-online.target
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /usr/local/sbin/gen-automation-prepare-host
+    owner: root:root
+    permissions: "0750"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      install -d -o root -g root -m 0755 /opt/gen-automation
+      install -d -o root -g root -m 0700 /etc/gen-automation
+      install -d -o root -g root -m 0750 /var/lib/gen-automation
+      install -d -o root -g root -m 0750 /var/lib/gen-automation/runtime
+      install -d -o root -g root -m 0750 /var/log/gen-automation
+      touch /var/log/gen-automation/runtime.log
+      chmod 0640 /var/log/gen-automation/runtime.log
+
+      volume_by_id="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${integration_volume_id_compact}"
+      device=""
+      for attempt in $(seq 1 120); do
+        for candidate in "$volume_by_id" /dev/sdf; do
+          if [ -b "$candidate" ]; then
+            device="$candidate"
+            break 2
+          fi
+        done
+        sleep 5
+      done
+      if [ -z "$device" ]; then
+        echo "Integration profile EBS device did not appear" >&2
+        exit 1
+      fi
+
+      filesystem=$(blkid -s TYPE -o value "$device" || true)
+      if [ -z "$filesystem" ]; then
+        mkfs.xfs -L gen-automation-integrations "$device"
+      elif [ "$filesystem" != "xfs" ]; then
+        echo "Integration profile EBS device has unexpected filesystem: $filesystem" >&2
+        exit 1
+      fi
+
+      uuid=$(blkid -s UUID -o value "$device")
+      mount_path="/var/lib/gen-automation/integration-profiles"
+      install -d -o root -g root -m 0700 "$mount_path"
+      if ! grep -q "^UUID=$uuid " /etc/fstab; then
+        echo "UUID=$uuid $mount_path xfs defaults,nofail,nodev,nosuid,noexec 0 2" >> /etc/fstab
+      fi
+      mountpoint -q "$mount_path" || mount "$mount_path"
+      chown root:root "$mount_path"
+      chmod 0700 "$mount_path"
+
+      install -d -o root -g root -m 0700 "$mount_path/mega"
+      install -d -o 10001 -g 10001 -m 0700 "$mount_path/patreon-browser"
+      install -d -o 10001 -g 10001 -m 0700 "$mount_path/patreon-browser/profiles"
+      install -d -o 10001 -g 10001 -m 0700 "$mount_path/patreon-browser/state"
+
+runcmd:
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, amazon-ssm-agent.service]
+  - [systemctl, enable, --now, docker.service]
+  - [/usr/local/sbin/gen-automation-prepare-host]
+  - [/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl, -a, fetch-config, -m, ec2, -s, -c, file:/opt/aws/amazon-cloudwatch-agent/etc/gen-automation.json]
+  - [systemctl, enable, gen-automation-deploy.target]
+  - [systemctl, start, gen-automation-deploy.target]
+
+final_message: "Gen Automation staging host preparation completed."

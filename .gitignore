@@ -24,6 +24,16 @@ secrets/
 .megaCmd/
 mega-profile/
 
+# OpenTofu / Terraform local state and operator inputs
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+infra/aws-staging/backend.s3.tfbackend
+infra/aws-staging/terraform.tfvars
+
 # Runtime data
 data/
 artifacts/
