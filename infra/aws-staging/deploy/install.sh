@@ -9,6 +9,9 @@ set -euo pipefail
 source_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 deploy_root="/opt/gen-automation/deploy"
 config_root="/etc/gen-automation"
+rds_ca_url="https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem"
+rds_ca_sha256="e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3"
+rds_ca_path="$config_root/rds-global-bundle.pem"
 
 install -d -o root -g root -m 0755 "$deploy_root"
 install -d -o root -g root -m 0700 "$config_root"
@@ -40,6 +43,9 @@ install -o root -g root -m 0755 \
 install -o root -g root -m 0755 \
   "$source_dir/bootstrap-patreon-profile.sh" \
   /usr/local/sbin/gen-automation-bootstrap-patreon-profile
+install -o root -g root -m 0755 \
+  "$source_dir/bootstrap-owner.sh" \
+  /usr/local/sbin/gen-automation-bootstrap-owner
 install -o root -g root -m 0644 \
   "$source_dir/gen-automation-staging.service" \
   /etc/systemd/system/gen-automation-staging.service
@@ -50,6 +56,27 @@ install -o root -g root -m 0644 \
 for example in "$source_dir"/*.env.example; do
   install -o root -g root -m 0600 "$example" "$config_root/examples/$(basename "$example")"
 done
+
+if [ ! -f "$rds_ca_path" ] ||
+  ! printf '%s  %s\n' "$rds_ca_sha256" "$rds_ca_path" | sha256sum --check --status; then
+  temporary_rds_ca="$(mktemp)"
+  trap 'rm -f -- "$temporary_rds_ca"' EXIT
+  curl \
+    --fail \
+    --location \
+    --proto '=https' \
+    --retry 3 \
+    --retry-all-errors \
+    --silent \
+    --show-error \
+    --output "$temporary_rds_ca" \
+    "$rds_ca_url"
+  printf '%s  %s\n' "$rds_ca_sha256" "$temporary_rds_ca" | sha256sum --check --status || {
+    printf '%s\n' "Downloaded AWS RDS CA bundle failed SHA-256 verification." >&2
+    exit 1
+  }
+  install -o root -g root -m 0644 "$temporary_rds_ca" "$rds_ca_path"
+fi
 
 /usr/local/sbin/gen-automation-install-compose-plugin
 systemctl daemon-reload

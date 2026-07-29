@@ -77,6 +77,10 @@ services:
       - type: bind
         source: /var/lib/gen-automation/integration-profiles/mega
         target: /run/gen-automation/mega-profile
+      - type: bind
+        source: /etc/gen-automation/rds-global-bundle.pem
+        target: /run/gen-automation/rds-global-bundle.pem
+        read_only: true
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=1g,uid=10001,gid=10001,mode=1770
     cap_drop:
@@ -174,8 +178,6 @@ services:
       - ALL
     cap_add:
       - NET_BIND_SERVICE
-    security_opt:
-      - no-new-privileges:true
     pids_limit: 128
     healthcheck:
       test:

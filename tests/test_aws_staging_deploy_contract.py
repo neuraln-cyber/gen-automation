@@ -87,6 +87,8 @@ def test_loopback_nginx_request_guards_and_assertions_are_enforced() -> None:
     assert "location = /login" in nginx
     assert "location ^~ /api/v1/auth/" in nginx
     assert "client_max_body_size 8m" in nginx
+    for temporary_path in ("fastcgi", "proxy", "scgi", "uwsgi"):
+        assert f"{temporary_path}_temp_path /tmp/{temporary_path}" in nginx
     assert "large_client_header_buffers 4 8k" in nginx
     for timeout in (
         "client_header_timeout 10s",
@@ -111,6 +113,8 @@ def test_loopback_nginx_request_guards_and_assertions_are_enforced() -> None:
 
     assert "--network none" in proxy_validator
     assert "--user 10002:10002" in proxy_validator
+    assert "--cap-add NET_BIND_SERVICE" in proxy_validator
+    assert "file-server --listen :81" in proxy_validator
     assert "/data:rw,nosuid,nodev,noexec,size=64m,uid=10002,gid=10002,mode=0700" in (
         proxy_validator
     )
@@ -143,12 +147,15 @@ def test_containers_are_ordered_health_checked_and_not_privileged() -> None:
         assert "restart: unless-stopped" in service
         assert "healthcheck:" in service
         assert "cap_drop:\n      - ALL" in service
-        assert "no-new-privileges:true" in service
         assert "read_only: true" in service
         assert "privileged:" not in service
         assert "/var/run/docker.sock" not in service
         assert "/run/docker.sock" not in service
 
+    for service in (patreon, controller, ingress):
+        assert "no-new-privileges:true" in service
+    assert "no-new-privileges:true" not in caddy
+    assert "cap_add:\n      - NET_BIND_SERVICE" in caddy
     assert "patreon-browser:\n        condition: service_healthy" in controller
     assert "control-plane-mega:\n        condition: service_healthy" in ingress
     assert "ingress-guard:\n        condition: service_healthy" in caddy
@@ -233,6 +240,22 @@ def test_al2023_compose_plugin_is_pinned_checksum_verified_and_installed() -> No
     assert "/usr/local/lib/docker/cli-plugins/docker-compose" in validator
 
 
+def test_rds_ca_bundle_is_pinned_verified_and_mounted_read_only() -> None:
+    compose = _text("compose.yaml")
+    installer = _text("install.sh")
+    validator = _text("validate-deployment.sh")
+    controller = _service(compose, "control-plane-mega", "ingress-guard")
+
+    checksum = "e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3"
+    assert "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem" in installer
+    for text in (installer, validator):
+        assert checksum in text
+        assert "sha256sum --check --status" in text
+    assert "source: /etc/gen-automation/rds-global-bundle.pem" in controller
+    assert "target: /run/gen-automation/rds-global-bundle.pem" in controller
+    assert "read_only: true" in controller
+
+
 def test_environment_templates_contain_placeholders_not_secret_values() -> None:
     controller = _text("control-plane.env.example")
     patreon = _text("patreon-browser.env.example")
@@ -279,6 +302,22 @@ def test_patreon_profile_has_an_ssm_only_cloud_bootstrap_path() -> None:
         assert package in dockerfile
     assert "AWS-StartPortForwardingSession" in runbook
     assert "127.0.0.1:6080/vnc.html" in runbook
+
+
+def test_owner_bootstrap_wrapper_is_tty_only_and_digest_pinned() -> None:
+    bootstrap = _text("bootstrap-owner.sh")
+    installer = _text("install.sh")
+
+    assert "[ -t 0 ] && [ -t 1 ]" in bootstrap
+    assert "gen-automation-validate-deployment" in bootstrap
+    assert "GEN_AUTOMATION_CONTROL_PLANE_MEGA_IMAGE" in bootstrap
+    assert "@sha256:[0-9a-f]{64}" in bootstrap
+    assert '--env-file "$config_root/bootstrap-owner.env"' in bootstrap
+    assert "rds-global-bundle.pem,readonly" in bootstrap
+    assert "--read-only" in bootstrap
+    assert "--cap-drop ALL" in bootstrap
+    assert "python3.12 -m gen_automation.cli bootstrap-owner" in bootstrap
+    assert "gen-automation-bootstrap-owner" in installer
 
 
 def test_patreon_browser_uses_checksum_pinned_current_chrome() -> None:

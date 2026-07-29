@@ -30,6 +30,13 @@ response hop limit 1, the bridged sidecar cannot obtain the instance role,
 while the host-networked control plane UID 10001 can use ambient AWS
 credentials.
 
+Caddy is pinned by digest, runs read-only as UID 10002, drops every capability
+except `NET_BIND_SERVICE`, and is blocked from IMDS. It intentionally omits
+`no-new-privileges` because that flag prevents the official Caddy binary's
+reviewed bind-service file capability from becoming effective for its non-root
+UID. The deployment preflight proves that this exact image can bind a low port
+inside an isolated network namespace before public startup.
+
 No service is privileged, no service mounts the Docker socket, and the Patreon
 sidecar receives no AWS credentials. The persistent MEGA profile and the
 Patreon Chromium/idempotency paths are the encrypted EBS mount prepared by the
@@ -48,6 +55,10 @@ sudo chmod 0600 /etc/gen-automation/*.env
 
 `install.sh` also installs Docker Compose v5.1.2 for all users from Docker's
 official release asset and verifies its committed SHA-256 before installation.
+It downloads the official AWS RDS global CA bundle, verifies its reviewed
+SHA-256, and mounts it read-only into the control plane. PostgreSQL URLs must
+use `sslmode=verify-full` and
+`sslrootcert=/run/gen-automation/rds-global-bundle.pem`.
 It does not start the application. Re-running the installer re-verifies the
 installed plugin and downloads it only when the reviewed binary is absent.
 It also installs
@@ -56,6 +67,17 @@ the immutable images and environment files, use that one-time command with an
 AWS SSM port-forward to `127.0.0.1:6080` to complete Patreon login in the
 cloud-hosted browser. The executable sequence is in
 `docs/patreon-browser-publisher.md`; no public VNC/noVNC ingress is required.
+
+After migrations complete, run the TTY-only initial owner enrollment from a
+private interactive SSM session:
+
+```console
+sudo /usr/local/sbin/gen-automation-bootstrap-owner
+```
+
+The installer creates this wrapper alongside the Patreon bootstrap command.
+The password, one-time TOTP provisioning data, and confirmation code remain
+inside that terminal and are never accepted as command arguments.
 
 Populate the four files out-of-band. Keep external effects disabled through the
 first health, storage, MEGA, Patreon, and X canaries. The validator reads only

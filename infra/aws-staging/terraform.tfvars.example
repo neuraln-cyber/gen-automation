@@ -3,6 +3,11 @@ aws_region         = "eu-central-1"
 name_prefix        = "gen-automation-staging"
 notification_email = "operator@example.com"
 monthly_budget_usd = 100
+budget_enabled      = true
+
+# Organizations member accounts can be denied budget creation until the payer
+# enables cost management. In that case set budget_enabled = false and create
+# a management-account budget filtered to this linked account.
 
 # Leave both null for an IP-only infrastructure canary. Set both together
 # before Caddy obtains a public certificate and the dashboard uses S3 CORS.

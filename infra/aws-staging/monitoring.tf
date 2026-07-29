@@ -12,43 +12,33 @@ resource "aws_sns_topic" "alerts" {
 }
 
 data "aws_iam_policy_document" "alerts_topic" {
-  statement {
-    sid       = "AccountAdministration"
-    effect    = "Allow"
-    actions   = ["SNS:*"]
-    resources = [aws_sns_topic.alerts.arn]
+  dynamic "statement" {
+    for_each = var.budget_enabled ? [1] : []
 
-    principals {
-      type = "AWS"
-      identifiers = [
-        "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"
-      ]
-    }
-  }
+    content {
+      sid       = "BudgetsPublish"
+      effect    = "Allow"
+      actions   = ["SNS:Publish"]
+      resources = [aws_sns_topic.alerts.arn]
 
-  statement {
-    sid       = "BudgetsPublish"
-    effect    = "Allow"
-    actions   = ["SNS:Publish"]
-    resources = [aws_sns_topic.alerts.arn]
+      principals {
+        type        = "Service"
+        identifiers = ["budgets.amazonaws.com"]
+      }
 
-    principals {
-      type        = "Service"
-      identifiers = ["budgets.amazonaws.com"]
-    }
+      condition {
+        test     = "StringEquals"
+        variable = "aws:SourceAccount"
+        values   = [data.aws_caller_identity.current.account_id]
+      }
 
-    condition {
-      test     = "StringEquals"
-      variable = "aws:SourceAccount"
-      values   = [data.aws_caller_identity.current.account_id]
-    }
-
-    condition {
-      test     = "ArnLike"
-      variable = "aws:SourceArn"
-      values = [
-        "arn:${data.aws_partition.current.partition}:budgets::${data.aws_caller_identity.current.account_id}:*"
-      ]
+      condition {
+        test     = "ArnLike"
+        variable = "aws:SourceArn"
+        values = [
+          "arn:${data.aws_partition.current.partition}:budgets::${data.aws_caller_identity.current.account_id}:*"
+        ]
+      }
     }
   }
 
@@ -91,6 +81,8 @@ resource "aws_sns_topic_subscription" "operator_email" {
 }
 
 resource "aws_budgets_budget" "monthly" {
+  count = var.budget_enabled ? 1 : 0
+
   name         = "${local.name}-monthly"
   budget_type  = "COST"
   limit_amount = tostring(var.monthly_budget_usd)
