@@ -5,6 +5,7 @@ from functools import lru_cache
 from ipaddress import IPv4Network, IPv6Network, ip_network
 from pathlib import Path, PurePosixPath
 from urllib.parse import SplitResult, urlsplit
+from uuid import UUID
 
 from pydantic import AnyHttpUrl, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -364,6 +365,20 @@ class Settings(BaseSettings):
     )
     salad_max_replicas: int = Field(default=1, ge=1, le=1)
     salad_max_queued_jobs: int = Field(default=1, ge=1, le=1)
+    salad_gpu_class_ids: tuple[UUID, ...] = Field(default=(), max_length=16)
+    salad_container_cpu: int = Field(default=4, ge=1, le=16)
+    salad_container_memory_mb: int = Field(default=16 * 1024, ge=1024, le=64 * 1024)
+    salad_container_storage_bytes: int = Field(
+        default=50 * 1024 * 1024 * 1024,
+        ge=10 * 1024 * 1024 * 1024,
+        le=250 * 1024 * 1024 * 1024,
+    )
+    salad_max_hourly_cost_usd: Decimal = Field(
+        default=Decimal("1.00"),
+        gt=0,
+        le=Decimal("100.00"),
+        decimal_places=6,
+    )
     salad_daily_budget_usd: Decimal = Field(
         default=Decimal("25.00"),
         gt=0,
@@ -576,6 +591,10 @@ class Settings(BaseSettings):
         if self.gpu_allocation_enabled and not self.storage_enabled:
             errors.append("GPU allocation requires private object storage")
         if self.gpu_allocation_enabled:
+            if not self.salad_gpu_class_ids:
+                errors.append("GPU allocation requires at least one Salad GPU class ID")
+            if len(set(self.salad_gpu_class_ids)) != len(self.salad_gpu_class_ids):
+                errors.append("Salad GPU class IDs must be unique")
             if (
                 self.worker_signing_key_id is None
                 or WORKER_SIGNING_KEY_ID_PATTERN.fullmatch(self.worker_signing_key_id) is None
@@ -668,6 +687,8 @@ class Settings(BaseSettings):
                 errors.append("SaladCloud worker image must be pinned by digest")
             if self.salad_monthly_budget_usd < self.salad_daily_budget_usd:
                 errors.append("SaladCloud monthly budget cannot be lower than the daily budget")
+            if self.salad_max_hourly_cost_usd > self.salad_daily_budget_usd:
+                errors.append("SaladCloud maximum hourly cost cannot exceed the daily budget")
             minimum_provider_timeout = (
                 SALAD_DEPLOYMENT_REQUESTS_PER_CYCLE * self.salad_request_timeout_seconds
             ) + SALAD_OPERATION_TIMEOUT_MARGIN_SECONDS

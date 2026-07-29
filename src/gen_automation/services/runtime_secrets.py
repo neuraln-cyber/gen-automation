@@ -114,6 +114,17 @@ class ConfiguredRuntimeSecretResolver:
         self._closed = True
 
 
+def configured_runtime_binding_references(settings: Settings) -> dict[str, str]:
+    """Return deterministic, non-secret references for configured worker values."""
+
+    if not settings.salad_enabled:
+        return {}
+    return {
+        name: SALAD_WORKER_RUNTIME_BINDING_REFERENCES[name]
+        for name in sorted(_configured_runtime_secret_values(settings))
+    }
+
+
 def build_runtime_secret_resolver(
     settings: Settings,
 ) -> ConfiguredRuntimeSecretResolver | None:
@@ -122,6 +133,18 @@ def build_runtime_secret_resolver(
     if not settings.salad_enabled:
         return None
 
+    values = _configured_runtime_secret_values(settings)
+    protected_gpu = settings.gpu_allocation_enabled and settings.environment in {
+        Environment.STAGING,
+        Environment.PRODUCTION,
+    }
+    return ConfiguredRuntimeSecretResolver(
+        values,
+        require_complete=protected_gpu,
+    )
+
+
+def _configured_runtime_secret_values(settings: Settings) -> dict[str, SecretStr]:
     values: dict[str, SecretStr] = {
         WORKER_ENVIRONMENT_BINDING: SecretStr("production"),
     }
@@ -139,12 +162,4 @@ def build_runtime_secret_resolver(
         configured = getattr(settings, setting_name)
         if isinstance(configured, SecretStr) and configured.get_secret_value().strip():
             values[binding_name] = configured
-
-    protected_gpu = settings.gpu_allocation_enabled and settings.environment in {
-        Environment.STAGING,
-        Environment.PRODUCTION,
-    }
-    return ConfiguredRuntimeSecretResolver(
-        values,
-        require_complete=protected_gpu,
-    )
+    return values

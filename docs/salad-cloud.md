@@ -38,11 +38,16 @@ API callers must tolerate rate limits and non-JSON error responses.
 
 ## Provisioning
 
-1. Fetch organization quotas and current GPU classes/availability.
-2. Resolve desired 24 GB GPU class UUIDs dynamically rather than hardcoding them.
+1. Fetch organization quotas and current GPU classes/availability before deployment.
+2. Pin the accepted 24 GB GPU class UUIDs in
+   `GEN_AUTOMATION_SALAD_GPU_CLASS_IDS`; this makes each deployment version
+   reproducible while allowing the selection to be refreshed when availability
+   or pricing changes.
 3. Push the worker image using an immutable registry digest.
-4. Create a versioned queue through the API.
-5. Create a versioned queue-connected container group through the API.
+4. Start the controller with both `GEN_AUTOMATION_SALAD_ENABLED=true` and
+   `GEN_AUTOMATION_GPU_ALLOCATION_ENABLED=true`.
+5. Let the normal deployment reconciliation loop create the versioned queue and
+   queue-connected container group through the API.
 6. Run a paid one-job canary before enabling normal traffic.
 
 Relevant operations:
@@ -59,6 +64,34 @@ POST /organizations/{org}/projects/{project}/containers
 Queue connection is treated as immutable. A deployment that changes it creates a
 new versioned queue/group rather than mutating production in place.
 
+### Automatic deployment bootstrap
+
+On controller startup, a fully configured database automatically gets one
+current immutable `SaladDeployment` intent. Startup itself performs no provider
+API request. An identical restart reuses the same row; changing the worker
+digest, provider names, GPU classes, resource sizing, runtime-binding set, queue
+limit, replica limit, or hourly cost ceiling creates the next version and marks
+the previous version for stop. The existing deployment reconciliation loop
+performs all remote creates and stops.
+
+No deployment intent is created while GPU allocation is disabled. Disabling it
+also retains the existing fail-closed behavior that marks active deployment
+intent for stop.
+
+The non-secret provider inputs are:
+
+| Setting | Default / constraint |
+| --- | --- |
+| `GEN_AUTOMATION_SALAD_GPU_CLASS_IDS` | Required JSON array when allocation is enabled; 1–16 unique Salad GPU class UUIDs. |
+| `GEN_AUTOMATION_SALAD_CONTAINER_CPU` | `4`; 1–16 vCPU. |
+| `GEN_AUTOMATION_SALAD_CONTAINER_MEMORY_MB` | `16384`; 1024–65536 MiB. |
+| `GEN_AUTOMATION_SALAD_CONTAINER_STORAGE_BYTES` | `53687091200` (50 GiB); 10–250 GiB. |
+| `GEN_AUTOMATION_SALAD_MAX_HOURLY_COST_USD` | `1.00`; positive, at most the daily budget, with micro-dollar precision. Configure it at or above the highest selected GPU rate because durable reservations and spend accounting use this ceiling. |
+
+Low priority and image caching are fixed for the MVP. The initial replica count
+and autoscaler minimum are fixed at zero; the validated maximum replica and
+queue-length settings remain capped at one.
+
 ## Container group
 
 The initial production posture is:
@@ -67,7 +100,7 @@ The initial production posture is:
 - queue autoscaler minimum `0`, maximum `1`
 - desired queue length `1`
 - low priority
-- one or more dynamically discovered 24 GB GPU classes
+- one or more recently discovered and configuration-pinned 24 GB GPU classes
 - image caching enabled
 - startup/liveness probe `GET /health` on port `8000`
 - readiness probe `GET /ready` on port `8000`
@@ -303,4 +336,4 @@ truth.
 - Scaling from zero can be slow because ephemeral nodes may download models
   again; jobs remain queued during cold start.
 - GPU UUIDs, availability, pricing, and published base-image versions are
-  runtime discovery/configuration, not source-code constants.
+  operator-verified configuration, not source-code constants.

@@ -327,6 +327,7 @@ def test_gpu_allocation_accepts_complete_worker_security_configuration() -> None
         salad_project="project",
         salad_queue_name="generation-queue",
         salad_container_group_name="generation-workers",
+        salad_gpu_class_ids=("3c90c3cc-0d44-4b50-8888-8dd25736052a",),
         salad_webhook_secret="whsec_test",  # noqa: S106
         salad_worker_image=f"registry.example/worker@sha256:{'a' * 64}",
         worker_signing_key_id="worker-key-1",

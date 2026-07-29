@@ -32,6 +32,7 @@ from gen_automation.domain.enums import (
 from gen_automation.gpu_worker.bootstrap import load_artifact_manifest
 from gen_automation.integrations.mega import MegaCmdClient
 from gen_automation.integrations.salad.client import SaladClient
+from gen_automation.integrations.salad.models import JSONValue
 from gen_automation.integrations.semantic_vlm import SemanticVlmClient
 from gen_automation.quality import DEFAULT_QUALITY_CONFIG
 from gen_automation.semantic import SemanticAssessmentResult
@@ -63,11 +64,16 @@ from gen_automation.services.publication_runtime import (
 )
 from gen_automation.services.quality_isolation import QualityIsolationPolicy
 from gen_automation.services.quality_runtime import run_quality_cycle
-from gen_automation.services.runtime_secrets import RuntimeSecretResolver
+from gen_automation.services.runtime_secrets import (
+    RuntimeSecretResolver,
+    configured_runtime_binding_references,
+)
 from gen_automation.services.salad import (
+    SaladDeploymentConfig,
     SaladUploadIntentProvider,
     SubmissionDisposition,
     SubmissionResult,
+    create_deployment_version,
     fail_definitely_unstarted_submission,
     reconcile_generation_attempt,
     submit_prepared_attempt,
@@ -113,6 +119,64 @@ _DEPLOYMENT_WORK_STATES = (
     SaladDeploymentState.UNKNOWN,
     SaladDeploymentState.FAILED,
 )
+
+
+def salad_deployment_config_from_settings(settings: Settings) -> SaladDeploymentConfig:
+    """Build the immutable, secret-free Salad deployment intent."""
+
+    required_names = (
+        settings.salad_organization,
+        settings.salad_project,
+        settings.salad_queue_name,
+        settings.salad_container_group_name,
+        settings.salad_worker_image,
+    )
+    if (
+        not settings.salad_enabled
+        or not settings.gpu_allocation_enabled
+        or any(value is None for value in required_names)
+        or not settings.salad_gpu_class_ids
+    ):
+        raise ValueError("validated Salad GPU bootstrap settings are incomplete")
+
+    organization, project, queue, container_group, worker_image = required_names
+    assert organization is not None
+    assert project is not None
+    assert queue is not None
+    assert container_group is not None
+    assert worker_image is not None
+
+    runtime_bindings = configured_runtime_binding_references(settings)
+    provider_configuration: dict[str, JSONValue] = {
+        "container": {
+            "resources": {
+                "cpu": settings.salad_container_cpu,
+                "memory": settings.salad_container_memory_mb,
+                "storage_amount": settings.salad_container_storage_bytes,
+                "gpu_classes": [str(gpu_class_id) for gpu_class_id in settings.salad_gpu_class_ids],
+            },
+            "image_caching": True,
+        },
+        "priority": "low",
+        "replicas": 0,
+        "queue_connection": {},
+        "queue_autoscaler": {"polling_period": 30},
+        "runtime_bindings": [
+            {"name": name, "reference": reference} for name, reference in runtime_bindings.items()
+        ],
+    }
+    return SaladDeploymentConfig(
+        organization_name=organization,
+        project_name=project,
+        queue_name=queue,
+        container_group_name=container_group,
+        worker_image_digest=worker_image,
+        max_hourly_cost_microusd=int(settings.salad_max_hourly_cost_usd * 1_000_000),
+        provider_configuration=provider_configuration,
+        min_replicas=0,
+        max_replicas=settings.salad_max_replicas,
+        desired_queue_length=settings.salad_max_queued_jobs,
+    )
 
 
 class RuntimeStatus(StrEnum):
@@ -536,13 +600,22 @@ class ControllerWorkloads:
         if self.salad_client is None:
             return
         async with self.sessions() as session:
+            now = datetime.now(UTC)
             await ensure_budget_guard(
                 session,
                 provider="salad",
                 daily_limit_usd=self.settings.salad_daily_budget_usd,
                 monthly_limit_usd=self.settings.salad_monthly_budget_usd,
             )
-            await self._disable_gpu_allocations(session, now=datetime.now(UTC))
+            if self.settings.salad_enabled and self.settings.gpu_allocation_enabled:
+                await create_deployment_version(
+                    session,
+                    salad_deployment_config_from_settings(self.settings),
+                    actor=self._worker_id("bootstrap"),
+                    now=now,
+                )
+            else:
+                await self._disable_gpu_allocations(session, now=now)
             await session.commit()
 
     async def budget_once(self) -> bool:
