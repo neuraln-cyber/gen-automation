@@ -15,6 +15,7 @@ from urllib.parse import SplitResult, urlsplit
 import httpx2
 from PIL import Image, UnidentifiedImageError
 
+from gen_automation.domain.deliverability import require_comfy_workflow_deliverability
 from gen_automation.gpu_worker.models import (
     DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES,
     MAX_HARD_OUTPUT_BYTES,
@@ -214,6 +215,7 @@ class ComfyExecutor:
     def _prepare_workflow(self, workflow: JsonObject) -> tuple[bytes, tuple[str, ...]]:
         try:
             validate_approved_workflow(workflow, self._approved_node_classes)
+            require_comfy_workflow_deliverability(workflow)
         except ValueError:
             raise ComfyProtocolError("invalid Comfy workflow") from None
 

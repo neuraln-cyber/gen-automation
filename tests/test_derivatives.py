@@ -7,6 +7,12 @@ import pytest
 from PIL import Image, ImageChops, ImageDraw, PngImagePlugin
 
 from gen_automation.domain.canonical import canonical_sha256
+from gen_automation.domain.deliverability import (
+    PATREON_MAX_IMAGE_BYTES,
+    PATREON_MAX_TOTAL_IMAGE_BYTES,
+    DeliverabilityError,
+    patreon_full_output_byte_budget,
+)
 from gen_automation.services.derivatives import (
     DEFAULT_DERIVATIVE_LIMITS,
     DERIVATIVE_RENDERER_VERSION,
@@ -178,7 +184,7 @@ def test_render_is_deterministic_non_destructive_and_lineage_complete() -> None:
             assert "private prompt" not in artifact.data.decode("latin-1")
             assert "/private/workstation/path" not in artifact.data.decode("latin-1")
     assert first.artifacts[0].lineage.watermark_sha256 is None
-    assert first.artifacts[0].lineage.operations[-2] == "watermark:none"
+    assert "watermark:none" in first.artifacts[0].lineage.operations
     assert (
         first.artifacts[1].lineage.watermark_sha256
         == hashlib.sha256(original_watermark).hexdigest()
@@ -226,6 +232,129 @@ def test_default_jpeg_derivatives_are_byte_deterministic() -> None:
         artifact.sha256 for artifact in second.artifacts
     )
     assert all(artifact.image_format is OutputFormat.JPEG for artifact in first.artifacts)
+
+
+def test_x_jpeg_adapts_deterministically_to_the_media_byte_cap() -> None:
+    image = _pattern((512, 512))
+    master = _encode(image)
+    image.close()
+    recipe = replace(
+        DerivativeRecipe(),
+        x_teaser=XTeaserSpec(
+            width=512,
+            height=512,
+            encoding=JpegEncoding(quality=100),
+        ),
+    )
+    limits = replace(DEFAULT_DERIVATIVE_LIMITS, max_x_teaser_bytes=20 * 1024)
+
+    first = _artifact(
+        render_platform_derivatives(
+            master,
+            recipe=recipe,
+            targets=(DerivativeTarget.X_TEASER,),
+            limits=limits,
+        ),
+        DerivativeTarget.X_TEASER,
+    )
+    second = _artifact(
+        render_platform_derivatives(
+            master,
+            recipe=recipe,
+            targets=(DerivativeTarget.X_TEASER,),
+            limits=limits,
+        ),
+        DerivativeTarget.X_TEASER,
+    )
+
+    assert first.data == second.data
+    assert first.byte_size <= limits.max_x_teaser_bytes
+    assert (first.width, first.height) <= (512, 512)
+    assert any(operation.startswith("x-cap-") for operation in first.lineage.operations)
+
+
+@pytest.mark.parametrize("accepted_count", (1, 7, 8, 100))
+def test_patreon_full_output_budget_reserves_the_duplicate_preview(
+    accepted_count: int,
+) -> None:
+    budget = patreon_full_output_byte_budget(accepted_count)
+
+    assert budget <= PATREON_MAX_IMAGE_BYTES
+    assert (accepted_count + 1) * budget <= PATREON_MAX_TOTAL_IMAGE_BYTES
+
+
+@pytest.mark.parametrize("accepted_count", (True, 0, 101))
+def test_patreon_full_output_budget_rejects_invalid_set_sizes(
+    accepted_count: int,
+) -> None:
+    with pytest.raises(DeliverabilityError):
+        patreon_full_output_byte_budget(accepted_count)
+
+
+def test_full_jpeg_adapts_deterministically_to_the_release_byte_budget() -> None:
+    image = _pattern((512, 512))
+    master = _encode(image)
+    image.close()
+    recipe = replace(
+        DerivativeRecipe(),
+        full=FullDerivativeSpec(
+            max_width=512,
+            max_height=512,
+            encoding=JpegEncoding(quality=100),
+        ),
+    )
+    limits = replace(DEFAULT_DERIVATIVE_LIMITS, max_full_output_bytes=20 * 1024)
+
+    first = _artifact(
+        render_platform_derivatives(
+            master,
+            recipe=recipe,
+            targets=(DerivativeTarget.FULL_RESOLUTION,),
+            limits=limits,
+        ),
+        DerivativeTarget.FULL_RESOLUTION,
+    )
+    second = _artifact(
+        render_platform_derivatives(
+            master,
+            recipe=recipe,
+            targets=(DerivativeTarget.FULL_RESOLUTION,),
+            limits=limits,
+        ),
+        DerivativeTarget.FULL_RESOLUTION,
+    )
+
+    assert first.data == second.data
+    assert first.byte_size <= limits.max_full_output_bytes
+    assert (first.width, first.height) <= (512, 512)
+    assert f"full-budget-limit:{limits.max_full_output_bytes}" in first.lineage.operations
+    assert any(
+        operation.startswith(("full-budget-downscale:", "full-budget-jpeg-quality:"))
+        for operation in first.lineage.operations
+    )
+
+
+def test_full_png_fails_closed_when_it_exceeds_the_release_byte_budget() -> None:
+    image = _pattern((256, 256))
+    master = _encode(image)
+    image.close()
+    recipe = replace(
+        DerivativeRecipe(),
+        full=FullDerivativeSpec(
+            output_filename="member-full.png",
+            max_width=256,
+            max_height=256,
+            encoding=PngEncoding(compress_level=0),
+        ),
+    )
+
+    with pytest.raises(DerivativeRenderError, match="automatic lossy conversion is forbidden"):
+        render_platform_derivatives(
+            master,
+            recipe=recipe,
+            targets=(DerivativeTarget.FULL_RESOLUTION,),
+            limits=replace(DEFAULT_DERIVATIVE_LIMITS, max_full_output_bytes=20 * 1024),
+        )
 
 
 def test_exif_orientation_and_cmyk_are_normalized_and_private_metadata_removed() -> None:
@@ -556,7 +685,7 @@ def test_watermark_is_applied_only_to_x_teaser_after_censorship() -> None:
     marked_full, marked_teaser = watermarked.artifacts
     assert marked_full.data == clean_full.data
     assert marked_full.lineage.watermark_sha256 is None
-    assert marked_full.lineage.operations[-2] == "watermark:none"
+    assert "watermark:none" in marked_full.lineage.operations
     with _decoded(plain_teaser.data) as plain_image, _decoded(marked_teaser.data) as marked_image:
         difference = ImageChops.difference(plain_image, marked_image)
         try:

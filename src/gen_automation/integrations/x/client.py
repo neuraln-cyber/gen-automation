@@ -8,6 +8,7 @@ from typing import Literal, NoReturn
 
 import httpx2
 
+from gen_automation.domain.deliverability import X_STATIC_IMAGE_MAX_BYTES
 from gen_automation.integrations.x.errors import (
     XAmbiguousTimeoutError,
     XAmbiguousTransportError,
@@ -28,7 +29,7 @@ from gen_automation.integrations.x.models import (
 )
 
 X_API_BASE_URL = "https://api.x.com"
-X_MAX_STATIC_IMAGE_BYTES = 5 * 1024 * 1024
+X_MAX_STATIC_IMAGE_BYTES = X_STATIC_IMAGE_MAX_BYTES
 X_MAX_MEDIA_PER_POST = 4
 X_MAX_POST_TEXT_BYTES = 4 * 1024
 X_MAX_TIMEOUT_SECONDS = 60.0

@@ -148,11 +148,23 @@ def _unsigned_request(
                 },
                 "2": {
                     "class_type": "KSampler",
-                    "inputs": {"cfg": 5.5, "steps": 20},
+                    "inputs": {
+                        "cfg": 5.5,
+                        "steps": 20,
+                        "latent_image": ["5", 0],
+                    },
                 },
                 "3": {
+                    "class_type": "VAEDecode",
+                    "inputs": {"samples": ["2", 0]},
+                },
+                "4": {
                     "class_type": "SaveImage",
-                    "inputs": {"images": ["2", 0]},
+                    "inputs": {"images": ["3", 0]},
+                },
+                "5": {
+                    "class_type": "EmptyLatentImage",
+                    "inputs": {"width": 512, "height": 512, "batch_size": 1},
                 },
             },
             "uploads": grants,
@@ -257,7 +269,7 @@ def test_health_and_ready_do_not_expose_runtime_details() -> None:
 def test_unapproved_workflow_node_is_rejected_before_executor_submission() -> None:
     request = _unsigned_request()
     private_node_class = "ExecutePython_private_secret"
-    request["payload"]["workflow"]["4"] = {
+    request["payload"]["workflow"]["6"] = {
         "class_type": private_node_class,
         "inputs": {},
     }
@@ -271,6 +283,23 @@ def test_unapproved_workflow_node_is_rejected_before_executor_submission() -> No
     assert response.status_code == 400
     assert response.json() == {"detail": "invalid request"}
     assert private_node_class not in response.text
+    assert executor.workflows == []
+    assert uploader.uploads == []
+
+
+def test_oversized_rendered_geometry_is_rejected_before_executor_submission() -> None:
+    request = _unsigned_request()
+    request["payload"]["workflow"]["5"]["inputs"]["width"] = 16384
+    request["payload"]["workflow"]["5"]["inputs"]["height"] = 64
+    envelope = GenerateEnvelope.model_validate(request, strict=True)
+    request["signature"] = calculate_signature(envelope, TEST_PRIVATE_KEY)
+    client, executor, uploader = _client()
+
+    with client:
+        response = client.post("/jobs/generate", json=request)
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "invalid request"}
     assert executor.workflows == []
     assert uploader.uploads == []
 
@@ -470,11 +499,23 @@ def test_signed_generation_uploads_supported_image_and_returns_stable_ids(
             },
             "2": {
                 "class_type": "KSampler",
-                "inputs": {"cfg": 5.5, "steps": 20},
+                "inputs": {
+                    "cfg": 5.5,
+                    "steps": 20,
+                    "latent_image": ["5", 0],
+                },
             },
             "3": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["2", 0]},
+            },
+            "4": {
                 "class_type": "SaveImage",
-                "inputs": {"images": ["2", 0]},
+                "inputs": {"images": ["3", 0]},
+            },
+            "5": {
+                "class_type": "EmptyLatentImage",
+                "inputs": {"width": 512, "height": 512, "batch_size": 1},
             },
         }
     ]

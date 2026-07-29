@@ -11,6 +11,10 @@ from pydantic import SecretStr, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.domain.canonical import canonical_sha256
+from gen_automation.domain.deliverability import (
+    DeliverabilityError,
+    require_comfy_workflow_deliverability,
+)
 from gen_automation.domain.release_spec import (
     ArtifactSpecification,
     GenerationParameters,
@@ -529,6 +533,10 @@ class SaladWorkerJobInputProvider:
             resolved=resolved,
             runtime=runtime,
         )
+        try:
+            require_comfy_workflow_deliverability(workflow)
+        except DeliverabilityError:
+            raise WorkerInputError("rendered workflow geometry is not deliverable") from None
 
         intents = await create_raw_master_upload_intents(
             self.session,

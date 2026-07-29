@@ -28,6 +28,7 @@ from gen_automation.db.models import (
     ScoringRun,
 )
 from gen_automation.db.session import Database
+from gen_automation.domain.deliverability import patreon_full_output_byte_budget
 from gen_automation.domain.enums import (
     AdminRole,
     AssetKind,
@@ -389,6 +390,10 @@ async def test_plan_is_idempotent_and_cas_promotes_only_current_release(
         assert release.lock_version == 3
         assert len(jobs) == 2
         assert all(job.state == DerivativeJobState.REQUESTED for job in jobs)
+        assert all(
+            job.request_payload["full_output_byte_budget"] == patreon_full_output_byte_budget(2)
+            for job in jobs
+        )
 
     async with approved_context.database.sessions() as session:
         with pytest.raises(

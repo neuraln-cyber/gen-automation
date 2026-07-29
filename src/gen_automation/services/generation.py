@@ -15,6 +15,11 @@ from gen_automation.db.models import (
     ReleaseVersion,
 )
 from gen_automation.domain.canonical import canonical_sha256
+from gen_automation.domain.deliverability import (
+    MAX_ACCEPTED_IMAGES_PER_RELEASE,
+    DeliverabilityError,
+    require_generation_deliverability,
+)
 from gen_automation.domain.enums import (
     ComplianceResult,
     GenerationState,
@@ -195,6 +200,22 @@ async def approve_and_expand_generation_plan(
     try:
         approval_snapshot = await validate_release_approvals(session, specification)
     except ReleaseApprovalError as error:
+        raise GenerationPlanConflictError(str(error)) from error
+    workflow_check = approval_snapshot.checks["workflow_integrity_gate"]["workflow"]
+    workflow_node_classes = workflow_check["reviewed_node_classes"]
+    try:
+        if release.desired_accepted_count > MAX_ACCEPTED_IMAGES_PER_RELEASE:
+            raise DeliverabilityError(
+                "desired accepted count exceeds the Patreon package limit of "
+                f"{MAX_ACCEPTED_IMAGES_PER_RELEASE}"
+            )
+        require_generation_deliverability(
+            width=specification.generation.width,
+            height=specification.generation.height,
+            hires_scale=specification.generation.hires_scale,
+            workflow_node_classes=workflow_node_classes,
+        )
+    except DeliverabilityError as error:
         raise GenerationPlanConflictError(str(error)) from error
     try:
         wildcard_catalog = await load_frozen_wildcard_catalog(session, specification)

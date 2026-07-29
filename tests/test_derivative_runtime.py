@@ -22,6 +22,7 @@ from gen_automation.db.models import (
     ReleaseSelection,
     ReviewXSelection,
 )
+from gen_automation.domain.deliverability import patreon_full_output_byte_budget
 from gen_automation.domain.enums import (
     AssetKind,
     AssetState,
@@ -411,6 +412,44 @@ async def test_cycle_renders_only_clean_full_outputs_without_x_selection(
         )
         assert f"/{asset.sha256}." in asset.object_key
         assert asset.object_version_id
+
+
+@pytest.mark.asyncio
+async def test_cycle_applies_the_frozen_release_full_output_budget(
+    derivative_approved_context: ApprovedContext,
+) -> None:
+    approved = derivative_approved_context
+    prepared = await _prepare(approved)
+    seen_limits: list[DerivativeSafetyLimits] = []
+
+    async def capturing_renderer(
+        source: bytes,
+        recipe: DerivativeRecipe,
+        watermark: bytes | None,
+        targets: tuple[str, ...],
+        limits: DerivativeSafetyLimits,
+        policy: DerivativeIsolationPolicy,
+    ) -> DerivativeBundle:
+        seen_limits.append(limits)
+        return await _trusted_renderer(
+            source,
+            recipe,
+            watermark,
+            targets,
+            limits,
+            policy,
+        )
+
+    result = await _cycle(
+        prepared,
+        worker_id="derivative-controller-budget",
+        renderer=capturing_renderer,
+    )
+
+    assert result.execution is not None
+    assert result.execution.state == DerivativeJobState.SUCCEEDED
+    assert len(seen_limits) == 1
+    assert seen_limits[0].max_full_output_bytes == patreon_full_output_byte_budget(2)
 
 
 @pytest.mark.asyncio

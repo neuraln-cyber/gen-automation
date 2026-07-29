@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import hmac
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID, uuid5
@@ -23,16 +23,22 @@ from gen_automation.db.models import (
     Release,
     ReleaseSelection,
     ReleaseVersion,
+    ReviewTask,
 )
 from gen_automation.db.models import (
     DerivativeRecipe as StoredDerivativeRecipe,
 )
 from gen_automation.domain.canonical import canonical_sha256
+from gen_automation.domain.deliverability import (
+    DeliverabilityError,
+    patreon_full_output_byte_budget,
+)
 from gen_automation.domain.enums import (
     AssetKind,
     AssetState,
     DerivativeJobState,
     ReleasePhase,
+    ReviewTaskState,
 )
 from gen_automation.services.derivative_isolation import (
     DerivativeIsolationCrashError,
@@ -115,6 +121,7 @@ class DerivativeExecutionSnapshot:
     attempt_count: int
     max_attempts: int
     output_targets: tuple[str, ...]
+    full_output_byte_budget: int
     recipe_config_sha256: str
     recipe: DerivativeRecipe
     source_asset_id: UUID
@@ -330,23 +337,30 @@ async def process_claimed_derivative_job(
                 now=operation_at,
             )
             await session.rollback()
+        execution_limits = replace(
+            limits,
+            max_full_output_bytes=min(
+                limits.max_full_output_bytes,
+                snapshot.full_output_byte_budget,
+            ),
+        )
         source_bytes, watermark_bytes = await _read_inputs(
             store,
             snapshot=snapshot,
-            limits=limits,
+            limits=execution_limits,
         )
         bundle = await selected_renderer(
             source_bytes,
             snapshot.recipe,
             watermark_bytes,
             snapshot.output_targets,
-            limits,
+            execution_limits,
             selected_policy,
         )
         artifacts = _validate_rendered_bundle(
             snapshot,
             bundle=bundle,
-            limits=limits,
+            limits=execution_limits,
         )
         outputs_written = 0
         outputs_registered = 0
@@ -358,7 +372,7 @@ async def process_claimed_derivative_job(
                 key=key,
                 artifact=artifact,
                 metadata=metadata,
-                limits=limits,
+                limits=execution_limits,
             )
             outputs_written += int(written)
             registered = await _register_output(
@@ -448,6 +462,7 @@ async def _load_execution_snapshot(
                 StoredDerivativeRecipe,
                 ReleaseVersion,
                 Release,
+                ReviewTask,
             )
             .join(
                 ReleaseSelection,
@@ -462,13 +477,17 @@ async def _load_execution_snapshot(
                 ReleaseVersion.id == DerivativeJob.release_version_id,
             )
             .join(Release, Release.id == ReleaseVersion.release_id)
+            .join(
+                ReviewTask,
+                ReviewTask.id == ReleaseSelection.review_task_id,
+            )
             .where(DerivativeJob.id == claim.job_id)
             .with_for_update()
         )
     ).one_or_none()
     if row is None:
         raise DerivativeRuntimeContractError("derivative execution snapshot is unavailable")
-    job, selection, stored_recipe, release_version, release = row
+    job, selection, stored_recipe, release_version, release, review_task = row
     lease_expires_at = _as_utc(job.lease_expires_at) if job.lease_expires_at is not None else None
     if (
         job.release_selection_id != claim.release_selection_id
@@ -489,6 +508,9 @@ async def _load_execution_snapshot(
         release.phase != ReleasePhase.RENDERING
         or release.current_version_no != release_version.version_no
         or selection.release_version_id != release_version.id
+        or selection.review_task_id != review_task.id
+        or review_task.release_version_id != release_version.id
+        or review_task.state != ReviewTaskState.COMPLETED
         or stored_recipe.release_version_id != release_version.id
         or job.release_version_id != release_version.id
     ):
@@ -497,6 +519,19 @@ async def _load_execution_snapshot(
         )
     recipe_targets = _stored_targets(stored_recipe.output_targets)
     targets = _job_output_targets(job.request_payload, recipe_targets=recipe_targets)
+    full_output_byte_budget = _job_full_output_byte_budget(job.request_payload)
+    try:
+        expected_full_output_byte_budget = patreon_full_output_byte_budget(
+            review_task.desired_accepted_count
+        )
+    except DeliverabilityError:
+        raise DerivativeRuntimeContractError(
+            "completed review selection count exceeds the Patreon delivery contract"
+        ) from None
+    if full_output_byte_budget != expected_full_output_byte_budget:
+        raise DerivativeRuntimeContractError(
+            "stored derivative full-output byte budget conflicts with the completed review"
+        )
     if (
         len(recipe_targets) != stored_recipe.expected_output_count
         or len(targets) != job.expected_output_count
@@ -536,6 +571,7 @@ async def _load_execution_snapshot(
         attempt_count=job.attempt_count,
         max_attempts=job.max_attempts,
         output_targets=targets,
+        full_output_byte_budget=full_output_byte_budget,
         recipe_config_sha256=stored_recipe.config_sha256,
         recipe=recipe,
         source_asset_id=selection.asset_id,
@@ -656,7 +692,7 @@ def _validate_artifact(
     limits: DerivativeSafetyLimits,
 ) -> None:
     if (
-        not 0 < artifact.byte_size <= limits.max_output_bytes
+        not 0 < artifact.byte_size <= limits.output_byte_limit(artifact.target)
         or len(artifact.data) != artifact.byte_size
         or hashlib.sha256(artifact.data).hexdigest() != artifact.sha256
         or artifact.width <= 0
@@ -1330,6 +1366,15 @@ def _job_output_targets(
     if not set(targets).issubset(recipe_targets):
         raise DerivativeRuntimeContractError("derivative job targets exceed the approved recipe")
     return targets
+
+
+def _job_full_output_byte_budget(request_payload: object) -> int:
+    if not isinstance(request_payload, dict):
+        raise DerivativeRuntimeContractError("derivative job request is malformed")
+    value = request_payload.get("full_output_byte_budget")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise DerivativeRuntimeContractError("derivative job full-output byte budget is malformed")
+    return value
 
 
 def _recipe_from_configuration(

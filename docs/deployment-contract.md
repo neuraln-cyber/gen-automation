@@ -59,8 +59,10 @@ SHA-256 before promoting a staged output into the immutable master prefix.
   similar formats are rejected unless converted in an isolated environment.
 - Every model and LoRA has a source, licence record, checksum, approval state,
   and commercial/adult-use review.
-- Custom nodes are disabled in the first production image. Enabling one later
-  requires a separately pinned and audited image revision.
+- The only production custom nodes are the digest-pinned, allowlisted Impact
+  Pack and Impact Subpack revisions required by the approved FaceDetailer
+  workflow. Adding or changing any other custom node requires a separately
+  pinned and audited worker-image revision.
 - ComfyUI Manager and runtime installation are absent in production.
 - Images run as non-root with a read-only root filesystem where supported.
 - CI generates an SBOM, scans images and dependencies, and performs secret

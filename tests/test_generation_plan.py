@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from gen_automation.db.models import (
     ComplianceCheck,
@@ -11,6 +11,7 @@ from gen_automation.db.models import (
     Release,
     ReleaseVersion,
     SubjectApproval,
+    WorkflowApproval,
 )
 from gen_automation.db.session import Database
 from gen_automation.domain.enums import ReleasePhase
@@ -38,8 +39,9 @@ async def _create_release(
     database: Database,
     *,
     seed_approvals: bool = True,
+    payload: dict[str, object] | None = None,
 ) -> tuple[ProjectRead, ReleaseRead]:
-    payload = valid_release_payload()
+    selected_payload = payload or valid_release_payload()
     async with database.sessions() as session:
         project = await create_project(
             session,
@@ -48,11 +50,11 @@ async def _create_release(
         release = await create_release(
             session,
             project_id=project.id,
-            command=ReleaseCreate.model_validate(payload),
+            command=ReleaseCreate.model_validate(selected_payload),
             idempotency_key="create-release-for-plan",
         )
         if seed_approvals:
-            await seed_release_approvals(session, payload)
+            await seed_release_approvals(session, selected_payload)
     return project, release.response
 
 
@@ -132,6 +134,39 @@ async def test_plan_approval_fails_closed_without_server_owned_approvals(
                 release_id=release.id,
                 idempotency_key="missing-server-approval",
             )
+
+
+async def test_plan_rejects_post_hires_size_before_creating_gpu_jobs(
+    generation_database: Database,
+) -> None:
+    payload = valid_release_payload()
+    specification = payload["specification"]
+    assert isinstance(specification, dict)
+    generation = specification["generation"]
+    assert isinstance(generation, dict)
+    generation.update({"width": 2048, "height": 2048, "hires_scale": 2.0})
+    _project, release = await _create_release(generation_database, payload=payload)
+
+    async with generation_database.sessions() as session:
+        workflow = await session.scalar(select(WorkflowApproval))
+        assert workflow is not None
+        workflow.reviewed_node_classes = [
+            *workflow.reviewed_node_classes,
+            "LatentUpscaleBy",
+        ]
+        await session.commit()
+
+    async with generation_database.sessions() as session:
+        with pytest.raises(
+            GenerationPlanConflictError,
+            match=r"4096x4096.*12000000 pixels",
+        ):
+            await approve_and_expand_generation_plan(
+                session,
+                release_id=release.id,
+                idempotency_key="post-hires-too-large",
+            )
+        assert int(await session.scalar(select(func.count()).select_from(GenerationJob)) or 0) == 0
 
 
 async def test_changed_approval_evidence_fails_closed(

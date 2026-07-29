@@ -140,6 +140,9 @@ async def render_platform_derivatives_isolated(
             raise derivatives.DerivativeRecipeError("render target is invalid") from None
         if len(set(target_values)) != len(target_values):
             raise derivatives.DerivativeRecipeError("render targets must be unique")
+    expected_target_values = tuple(
+        target.value for target in derivatives.DerivativeTarget if target.value in target_values
+    )
     _assert_production_isolation_available()
     required_memory = selected_limits.max_peak_working_set_bytes + _PROCESS_MEMORY_RESERVE_BYTES
     if selected_policy.memory_limit_bytes < required_memory:
@@ -174,7 +177,7 @@ async def render_platform_derivatives_isolated(
             "serialized derivative recipe exceeds the safety limit"
         )
     request_payload = pickle.dumps(
-        (master_payload, recipe, watermark_payload, selected_limits, target_values),
+        (master_payload, recipe, watermark_payload, selected_limits, expected_target_values),
         protocol=5,
     )
     maximum_request_bytes = (
@@ -237,6 +240,7 @@ async def render_platform_derivatives_isolated(
             selected_limits,
             expected_source_sha256=hashlib.sha256(master_payload).hexdigest(),
             expected_recipe=recipe,
+            expected_target_values=expected_target_values,
         )
     finally:
         receive_connection.close()
@@ -549,6 +553,7 @@ def _decode_child_response(
     *,
     expected_source_sha256: str | None = None,
     expected_recipe: DerivativeRecipe | None = None,
+    expected_target_values: tuple[str, ...] | None = None,
 ) -> DerivativeBundle:
     from gen_automation.services import derivatives
 
@@ -587,8 +592,28 @@ def _decode_child_response(
         raise DerivativeIsolationProtocolError(
             "isolated renderer returned an unexpected recipe identity"
         )
+    if expected_target_values is None:
+        expected_targets = tuple(derivatives.DerivativeTarget)
+    else:
+        try:
+            expected_targets = tuple(
+                derivatives.DerivativeTarget(value) for value in expected_target_values
+            )
+        except ValueError:
+            raise DerivativeIsolationProtocolError(
+                "expected isolated renderer targets are invalid"
+            ) from None
+        if (
+            not expected_targets
+            or len(set(expected_targets)) != len(expected_targets)
+            or expected_targets
+            != tuple(
+                target for target in derivatives.DerivativeTarget if target in expected_targets
+            )
+        ):
+            raise DerivativeIsolationProtocolError("expected isolated renderer targets are invalid")
     artifacts_wire = bundle_wire.get("artifacts")
-    if not isinstance(artifacts_wire, list) or len(artifacts_wire) != 2:
+    if not isinstance(artifacts_wire, list) or len(artifacts_wire) != len(expected_targets):
         raise DerivativeIsolationProtocolError(
             "isolated renderer returned an invalid artifact collection"
         )
@@ -608,18 +633,24 @@ def _decode_child_response(
         raise DerivativeIsolationProtocolError(
             "isolated renderer returned invalid artifact metadata"
         ) from None
-    if tuple(artifact.target for artifact in artifacts) != (
-        derivatives.DerivativeTarget.FULL_RESOLUTION,
-        derivatives.DerivativeTarget.X_TEASER,
-    ):
+    if tuple(artifact.target for artifact in artifacts) != expected_targets:
         raise DerivativeIsolationProtocolError(
             "isolated renderer returned artifacts in an invalid order"
         )
-    if expected_recipe is not None and tuple(
-        artifact.output_filename for artifact in artifacts
-    ) != (
-        expected_recipe.full.output_filename,
-        expected_recipe.x_teaser.output_filename,
+    if expected_recipe is not None:
+        expected_filenames = tuple(
+            (
+                expected_recipe.full.output_filename
+                if target is derivatives.DerivativeTarget.FULL_RESOLUTION
+                else expected_recipe.x_teaser.output_filename
+            )
+            for target in expected_targets
+        )
+    else:
+        expected_filenames = None
+    if (
+        expected_filenames is not None
+        and tuple(artifact.output_filename for artifact in artifacts) != expected_filenames
     ):
         raise DerivativeIsolationProtocolError(
             "isolated renderer returned unexpected artifact filenames"
@@ -627,10 +658,7 @@ def _decode_child_response(
     return derivatives.DerivativeBundle(
         source_sha256=source_sha256,
         recipe_sha256=recipe_sha256,
-        artifacts=cast(
-            tuple[derivatives.RenderedDerivative, derivatives.RenderedDerivative],
-            artifacts,
-        ),
+        artifacts=cast(tuple[derivatives.RenderedDerivative, ...], artifacts),
     )
 
 
@@ -643,13 +671,15 @@ def _decode_artifact(
 ) -> Any:
     from gen_automation.services import derivatives
 
+    target = derivatives.DerivativeTarget(_text(wire.get("target")))
+    maximum_bytes = limits.output_byte_limit(target)
     try:
         data = base64.b64decode(_text(wire.get("data")), validate=True)
     except (binascii.Error, ValueError, UnicodeEncodeError):
         raise DerivativeIsolationProtocolError(
             "isolated renderer returned invalid artifact bytes"
         ) from None
-    if not 0 < len(data) <= limits.max_output_bytes:
+    if not 0 < len(data) <= maximum_bytes:
         raise DerivativeIsolationProtocolError(
             "isolated renderer returned artifact bytes outside the output limit"
         )
@@ -658,7 +688,7 @@ def _decode_artifact(
         raise DerivativeIsolationProtocolError(
             "isolated renderer returned an artifact checksum mismatch"
         )
-    byte_size = _integer(wire.get("byte_size"), minimum=1, maximum=limits.max_output_bytes)
+    byte_size = _integer(wire.get("byte_size"), minimum=1, maximum=maximum_bytes)
     if byte_size != len(data):
         raise DerivativeIsolationProtocolError(
             "isolated renderer returned an artifact size mismatch"
@@ -726,7 +756,6 @@ def _decode_artifact(
         or lineage.recipe_sha256 != expected_recipe_sha256
     ):
         raise DerivativeIsolationProtocolError("isolated renderer returned inconsistent lineage")
-    target = derivatives.DerivativeTarget(_text(wire.get("target")))
     if lineage.target is not target:
         raise DerivativeIsolationProtocolError(
             "isolated renderer returned a lineage target mismatch"

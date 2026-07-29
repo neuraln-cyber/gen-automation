@@ -10,6 +10,8 @@ from pydantic import (
     model_validator,
 )
 
+from gen_automation.domain.deliverability import MAX_ACCEPTED_IMAGES_PER_RELEASE
+
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 Slug = Annotated[
     str,
@@ -152,5 +154,5 @@ class ProjectCreate(StrictModel):
 class ReleaseCreate(StrictModel):
     slug: Slug
     title: str = Field(min_length=1, max_length=300)
-    desired_accepted_count: int = Field(ge=1, le=10000)
+    desired_accepted_count: int = Field(ge=1, le=MAX_ACCEPTED_IMAGES_PER_RELEASE)
     specification: ReleaseSpecification

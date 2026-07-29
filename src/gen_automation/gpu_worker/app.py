@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import TypeAdapter, ValidationError
 
+from gen_automation.domain.deliverability import require_comfy_workflow_deliverability
 from gen_automation.gpu_worker.models import (
     ComfyOutput,
     GenerateEnvelope,
@@ -286,6 +287,7 @@ def create_worker_app(
                 envelope.payload.workflow,
                 settings.approved_workflow_node_classes,
             )
+            require_comfy_workflow_deliverability(envelope.payload.workflow)
         except ValueError:
             raise HTTPException(status_code=400, detail="invalid request") from None
 

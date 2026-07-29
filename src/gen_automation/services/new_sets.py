@@ -16,6 +16,11 @@ from gen_automation.db.models import (
     SubjectApproval,
     WorkflowApproval,
 )
+from gen_automation.domain.deliverability import (
+    MAX_ACCEPTED_IMAGES_PER_RELEASE,
+    DeliverabilityError,
+    require_generation_deliverability,
+)
 from gen_automation.domain.enums import (
     ApprovalStatus,
     GenerationState,
@@ -90,7 +95,7 @@ class NewSetSubmission(BaseModel):
     detailer_bbox_dilation: int = Field(default=10, ge=-64, le=128)
     detailer_bbox_crop_factor: float = Field(default=3.0, ge=1.0, le=5.0)
     planned_job_count: int = Field(ge=1, le=10_000)
-    desired_accepted_count: int = Field(ge=1, le=10_000)
+    desired_accepted_count: int = Field(ge=1, le=MAX_ACCEPTED_IMAGES_PER_RELEASE)
 
     @field_validator("title", "sampler", "scheduler")
     @classmethod
@@ -310,6 +315,15 @@ async def create_and_approve_new_set(
         for selection in command.loras
     ]
     workflow = await _approved_workflow(session, command.workflow_approval_id)
+    try:
+        require_generation_deliverability(
+            width=command.width,
+            height=command.height,
+            hires_scale=command.hires_scale,
+            workflow_node_classes=workflow.reviewed_node_classes,
+        )
+    except DeliverabilityError as error:
+        raise NewSetInputError(str(error)) from error
 
     specification = ReleaseSpecification(
         subjects=[

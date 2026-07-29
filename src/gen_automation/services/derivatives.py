@@ -17,14 +17,26 @@ from PIL import (
 )
 
 from gen_automation.domain.canonical import canonical_json_bytes, canonical_sha256
+from gen_automation.domain.deliverability import (
+    MAX_PIPELINE_MASTER_HEIGHT,
+    MAX_PIPELINE_MASTER_PIXELS,
+    MAX_PIPELINE_MASTER_WIDTH,
+    PATREON_MAX_IMAGE_BYTES,
+    X_STATIC_IMAGE_MAX_BYTES,
+)
 
-DERIVATIVE_RENDERER_VERSION = "pillow-derivative-v2"
+DERIVATIVE_RENDERER_VERSION = "pillow-derivative-v4"
 RELATIVE_SCALE = 1_000_000
 SUPPORTED_MASTER_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
 _ABSOLUTE_RECIPE_DIMENSION_LIMIT = 16_384
 _PIXEL_BUFFER_BYTES = 4
 _FIXED_WORKING_SET_BYTES = 64 * 1024 * 1024
 _MAX_WATERMARK_PIXELS = 4_000_000
+_JPEG_MIN_QUALITY = 70
+_JPEG_DOWNSCALE_NUMERATOR = 3
+_JPEG_DOWNSCALE_DENOMINATOR = 4
+_FULL_JPEG_MAX_DOWNSCALE_PASSES = 16
+_X_JPEG_MAX_DOWNSCALE_PASSES = 6
 _VERSION_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _FILENAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _WINDOWS_RESERVED_NAMES = frozenset(
@@ -262,14 +274,16 @@ class DerivativeRecipe:
 class DerivativeSafetyLimits:
     max_master_bytes: int = 32 * 1024 * 1024
     max_watermark_bytes: int = 4 * 1024 * 1024
-    max_input_width: int = 8192
-    max_input_height: int = 8192
-    max_input_pixels: int = 12_000_000
+    max_input_width: int = MAX_PIPELINE_MASTER_WIDTH
+    max_input_height: int = MAX_PIPELINE_MASTER_HEIGHT
+    max_input_pixels: int = MAX_PIPELINE_MASTER_PIXELS
     max_input_aspect_ratio: int = 20
     max_output_width: int = 4096
     max_output_height: int = 4096
     max_output_pixels: int = 4096 * 4096
     max_output_bytes: int = 16 * 1024 * 1024
+    max_full_output_bytes: int = PATREON_MAX_IMAGE_BYTES
+    max_x_teaser_bytes: int = X_STATIC_IMAGE_MAX_BYTES
     max_recipe_bytes: int = 16 * 1024
     max_peak_working_set_bytes: int = 384 * 1024 * 1024
 
@@ -335,6 +349,18 @@ class DerivativeSafetyLimits:
             maximum=128 * 1024 * 1024,
         )
         _strict_int(
+            self.max_full_output_bytes,
+            "maximum full-output bytes",
+            minimum=1024,
+            maximum=PATREON_MAX_IMAGE_BYTES,
+        )
+        _strict_int(
+            self.max_x_teaser_bytes,
+            "maximum X teaser bytes",
+            minimum=1024,
+            maximum=X_STATIC_IMAGE_MAX_BYTES,
+        )
+        _strict_int(
             self.max_recipe_bytes,
             "maximum recipe bytes",
             minimum=256,
@@ -346,6 +372,13 @@ class DerivativeSafetyLimits:
             minimum=64 * 1024 * 1024,
             maximum=2 * 1024 * 1024 * 1024,
         )
+
+    def output_byte_limit(self, target: DerivativeTarget) -> int:
+        if target is DerivativeTarget.FULL_RESOLUTION:
+            return min(self.max_output_bytes, self.max_full_output_bytes)
+        if target is DerivativeTarget.X_TEASER:
+            return min(self.max_output_bytes, self.max_x_teaser_bytes)
+        raise DerivativeRecipeError("derivative target is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -410,6 +443,14 @@ class _SourceMetadata:
     normalized_width: int
     normalized_height: int
     normalization_operation: str
+
+
+@dataclass(frozen=True, slots=True)
+class _EncodedImage:
+    data: bytes
+    width: int
+    height: int
+    operations: tuple[str, ...] = ()
 
 
 def derivative_recipe_sha256(recipe: DerivativeRecipe) -> str:
@@ -1153,11 +1194,27 @@ def _build_artifact(
     limits: DerivativeSafetyLimits,
 ) -> RenderedDerivative:
     _assert_output_geometry(image.size, limits)
-    payload = _encode_image(
-        image,
-        encoding,
-        maximum_bytes=limits.max_output_bytes,
-    )
+    maximum_bytes = limits.output_byte_limit(target)
+    if target is DerivativeTarget.FULL_RESOLUTION:
+        encoded = _encode_full(
+            image,
+            encoding,
+            maximum_bytes=maximum_bytes,
+        )
+    elif target is DerivativeTarget.X_TEASER:
+        encoded = _encode_x_teaser(
+            image,
+            encoding,
+            maximum_bytes=maximum_bytes,
+        )
+    else:
+        raise DerivativeRecipeError("derivative target is invalid")
+    lineage_operations = operations
+    if encoded.operations:
+        if operations and operations[-1].startswith("encode:"):
+            lineage_operations = (*operations[:-1], *encoded.operations, operations[-1])
+        else:
+            lineage_operations = (*operations, *encoded.operations)
     lineage = DerivativeLineage(
         target=target,
         source_sha256=source.sha256,
@@ -1172,7 +1229,7 @@ def _build_artifact(
         watermark_sha256=watermark_sha256,
         renderer_version=DERIVATIVE_RENDERER_VERSION,
         pillow_version=PIL.__version__,
-        operations=operations,
+        operations=lineage_operations,
     )
     image_format = encoding.image_format
     content_type = "image/jpeg" if image_format is OutputFormat.JPEG else "image/png"
@@ -1180,18 +1237,175 @@ def _build_artifact(
     return RenderedDerivative(
         target=target,
         output_filename=output_filename,
-        data=payload,
-        sha256=hashlib.sha256(payload).hexdigest(),
-        byte_size=len(payload),
+        data=encoded.data,
+        sha256=hashlib.sha256(encoded.data).hexdigest(),
+        byte_size=len(encoded.data),
         image_format=image_format,
         content_type=content_type,
         extension=extension,
-        width=image.width,
-        height=image.height,
+        width=encoded.width,
+        height=encoded.height,
         recipe_sha256=recipe_sha256,
         lineage_sha256=canonical_sha256(asdict(lineage)),
         lineage=lineage,
     )
+
+
+def _encode_full(
+    image: Image.Image,
+    encoding: Encoding,
+    *,
+    maximum_bytes: int,
+) -> _EncodedImage:
+    budget_operation = f"full-budget-limit:{maximum_bytes}"
+    if isinstance(encoding, JpegEncoding):
+        encoded = _encode_adaptive_jpeg(
+            image,
+            encoding=encoding,
+            maximum_bytes=maximum_bytes,
+            max_downscale_passes=_FULL_JPEG_MAX_DOWNSCALE_PASSES,
+            operation_prefix="full-budget",
+            failure_message="encoded full JPEG exceeds its per-release byte budget",
+        )
+        return _EncodedImage(
+            data=encoded.data,
+            width=encoded.width,
+            height=encoded.height,
+            operations=(budget_operation, *encoded.operations),
+        )
+    payload = _try_encode_image(image, encoding, maximum_bytes=maximum_bytes)
+    if payload is None:
+        raise DerivativeRenderError(
+            "encoded full PNG exceeds its per-release output byte limit; "
+            "automatic lossy conversion is forbidden"
+        )
+    return _EncodedImage(
+        data=payload,
+        width=image.width,
+        height=image.height,
+        operations=(budget_operation,),
+    )
+
+
+def _encode_x_teaser(
+    image: Image.Image,
+    encoding: Encoding,
+    *,
+    maximum_bytes: int,
+) -> _EncodedImage:
+    if not isinstance(encoding, JpegEncoding):
+        return _EncodedImage(
+            data=_encode_image(image, encoding, maximum_bytes=maximum_bytes),
+            width=image.width,
+            height=image.height,
+        )
+
+    return _encode_adaptive_jpeg(
+        image,
+        encoding=encoding,
+        maximum_bytes=maximum_bytes,
+        max_downscale_passes=_X_JPEG_MAX_DOWNSCALE_PASSES,
+        operation_prefix="x-cap",
+        failure_message="encoded X teaser exceeds the static image byte limit",
+    )
+
+
+def _encode_adaptive_jpeg(
+    image: Image.Image,
+    *,
+    encoding: JpegEncoding,
+    maximum_bytes: int,
+    max_downscale_passes: int,
+    operation_prefix: str,
+    failure_message: str,
+) -> _EncodedImage:
+    candidate = image.copy()
+    try:
+        for downscale_pass in range(max_downscale_passes + 1):
+            encoded = _best_fitting_jpeg(
+                candidate,
+                requested_quality=encoding.quality,
+                maximum_bytes=maximum_bytes,
+            )
+            if encoded is not None:
+                payload, quality = encoded
+                operations: list[str] = []
+                if candidate.size != image.size:
+                    operations.append(
+                        f"{operation_prefix}-downscale:{candidate.width}x{candidate.height}"
+                    )
+                if quality != encoding.quality:
+                    operations.append(f"{operation_prefix}-jpeg-quality:{quality}")
+                return _EncodedImage(
+                    data=payload,
+                    width=candidate.width,
+                    height=candidate.height,
+                    operations=tuple(operations),
+                )
+            if downscale_pass == max_downscale_passes:
+                break
+            next_width = max(
+                1,
+                candidate.width * _JPEG_DOWNSCALE_NUMERATOR // _JPEG_DOWNSCALE_DENOMINATOR,
+            )
+            next_height = max(
+                1,
+                candidate.height * _JPEG_DOWNSCALE_NUMERATOR // _JPEG_DOWNSCALE_DENOMINATOR,
+            )
+            if (next_width, next_height) == candidate.size:
+                break
+            resized = candidate.resize(
+                (next_width, next_height),
+                resample=Image.Resampling.LANCZOS,
+            )
+            candidate.close()
+            candidate = resized
+    finally:
+        candidate.close()
+    raise DerivativeRenderError(failure_message)
+
+
+def _best_fitting_jpeg(
+    image: Image.Image,
+    *,
+    requested_quality: int,
+    maximum_bytes: int,
+) -> tuple[bytes, int] | None:
+    requested = _try_encode_image(
+        image,
+        JpegEncoding(quality=requested_quality),
+        maximum_bytes=maximum_bytes,
+    )
+    if requested is not None:
+        return requested, requested_quality
+    if requested_quality == _JPEG_MIN_QUALITY:
+        return None
+
+    minimum = _try_encode_image(
+        image,
+        JpegEncoding(quality=_JPEG_MIN_QUALITY),
+        maximum_bytes=maximum_bytes,
+    )
+    if minimum is None:
+        return None
+    best_payload = minimum
+    best_quality = _JPEG_MIN_QUALITY
+    lower = _JPEG_MIN_QUALITY + 1
+    upper = requested_quality - 1
+    while lower <= upper:
+        quality = (lower + upper) // 2
+        payload = _try_encode_image(
+            image,
+            JpegEncoding(quality=quality),
+            maximum_bytes=maximum_bytes,
+        )
+        if payload is None:
+            upper = quality - 1
+        else:
+            best_payload = payload
+            best_quality = quality
+            lower = quality + 1
+    return best_payload, best_quality
 
 
 def _encode_image(
@@ -1200,6 +1414,18 @@ def _encode_image(
     *,
     maximum_bytes: int,
 ) -> bytes:
+    payload = _try_encode_image(image, encoding, maximum_bytes=maximum_bytes)
+    if payload is None:
+        raise DerivativeRenderError("encoded derivative exceeds the output byte limit")
+    return payload
+
+
+def _try_encode_image(
+    image: Image.Image,
+    encoding: Encoding,
+    *,
+    maximum_bytes: int,
+) -> bytes | None:
     clean = Image.new("RGB", image.size)
     clean.paste(image)
     output = _BoundedOutput(maximum_bytes)
@@ -1223,7 +1449,7 @@ def _encode_image(
             )
         return output.getvalue()
     except _OutputLimitExceededError:
-        raise DerivativeRenderError("encoded derivative exceeds the output byte limit") from None
+        return None
     except (MemoryError, OSError, OverflowError, ValueError):
         raise DerivativeRenderError("derivative encoding failed") from None
     finally:

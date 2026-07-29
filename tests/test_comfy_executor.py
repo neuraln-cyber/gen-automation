@@ -22,9 +22,17 @@ PROMPT_ID = "57ecf4dd-a951-4e3b-a0e5-47ac72a783bf"
 
 def _workflow() -> dict[str, object]:
     return {
-        "10": {"class_type": "SaveImage", "inputs": {"images": ["5", 0]}},
-        "2": {"class_type": "SaveImageWebsocket", "inputs": {"images": ["5", 0]}},
-        "5": {"class_type": "KSampler", "inputs": {"seed": 42}},
+        "10": {"class_type": "SaveImage", "inputs": {"images": ["4", 0]}},
+        "2": {"class_type": "SaveImageWebsocket", "inputs": {"images": ["4", 0]}},
+        "3": {
+            "class_type": "EmptyLatentImage",
+            "inputs": {"width": 512, "height": 512, "batch_size": 1},
+        },
+        "4": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0]}},
+        "5": {
+            "class_type": "KSampler",
+            "inputs": {"seed": 42, "latent_image": ["3", 0]},
+        },
     }
 
 

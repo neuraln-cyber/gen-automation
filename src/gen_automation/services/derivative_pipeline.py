@@ -26,6 +26,10 @@ from gen_automation.db.models import (
     ReviewXSelection,
 )
 from gen_automation.domain.canonical import canonical_json_bytes, canonical_sha256
+from gen_automation.domain.deliverability import (
+    DeliverabilityError,
+    patreon_full_output_byte_budget,
+)
 from gen_automation.domain.enums import (
     AdminRole,
     AssetKind,
@@ -222,6 +226,10 @@ async def _create_plan_once(
             "derivative planning requires a completed review task"
         )
     selections = await _load_and_validate_selections(session, task)
+    try:
+        full_output_byte_budget = patreon_full_output_byte_budget(len(selections))
+    except DeliverabilityError as error:
+        raise DerivativePipelineConflictError(str(error)) from None
     x_selected_asset_ids = await _load_x_selected_asset_ids(
         session,
         task=task,
@@ -486,6 +494,7 @@ async def _create_plan_once(
                 selection=selection,
                 recipe=recipe,
                 output_targets=group_targets,
+                full_output_byte_budget=full_output_byte_budget,
             )
             job_request_sha256 = canonical_sha256(request_payload)
             existing = jobs_by_key.get(logical_key)
@@ -1416,6 +1425,7 @@ def _job_request_payload(
     selection: ReleaseSelection,
     recipe: DerivativeRecipe,
     output_targets: tuple[str, ...],
+    full_output_byte_budget: int,
 ) -> dict[str, Any]:
     return {
         "schema": "derivative-job-request/v1",
@@ -1426,6 +1436,7 @@ def _job_request_payload(
         "scoring_run_id": str(selection.scoring_run_id),
         "ranking_manifest_sha256": selection.ranking_manifest_sha256,
         "output_targets": list(output_targets),
+        "full_output_byte_budget": full_output_byte_budget,
         "source": {
             "asset_id": str(selection.asset_id),
             "storage_backend": selection.source_storage_backend,

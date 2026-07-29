@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 from pydantic import SecretStr
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from gen_automation.db.models import Asset, GenerationJob, Project, Release, ReleaseVersion
 from gen_automation.db.session import Database
@@ -454,6 +454,44 @@ async def test_detailer_profile_binds_the_single_manifest_verified_face_detector
     assert detailer["inputs"]["max_size"] == 1024
     assert detailer["inputs"]["denoise"] == 0.35
     validate_approved_workflow(workflow, DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("geometry_case", ("hardcoded_canvas", "chained_upscalers"))
+async def test_rejects_oversized_exact_rendered_workflow_before_upload_grants(
+    worker_input_context: WorkerInputContext,
+    geometry_case: str,
+) -> None:
+    if geometry_case == "hardcoded_canvas":
+        graph = json.loads(WORKFLOW_BODY)
+        graph["8"]["inputs"]["width"] = 16384
+        graph["8"]["inputs"]["height"] = 64
+    else:
+        graph = json.loads(HIRES_WORKFLOW_BODY)
+        graph["8"]["inputs"]["width"] = 1024
+        graph["8"]["inputs"]["height"] = 1024
+        graph["10"]["inputs"]["scale_by"] = 2.0
+        graph["10-second"] = {
+            "class_type": "LatentUpscaleBy",
+            "inputs": {
+                "samples": ["10", 0],
+                "scale_by": 2.0,
+                "upscale_method": "bislerp",
+            },
+        }
+        graph["11"]["inputs"]["latent_image"] = ["10-second", 0]
+    workflow_body = json.dumps(graph, separators=(",", ":")).encode()
+    context = _profile_context(
+        worker_input_context,
+        workflow_body=workflow_body,
+    )
+
+    with pytest.raises(WorkerInputError, match="geometry"):
+        await _build(context)
+
+    async with context.database.sessions() as session:
+        asset_count = await session.scalar(select(func.count(Asset.id)))
+    assert asset_count == 0
 
 
 @pytest.mark.asyncio

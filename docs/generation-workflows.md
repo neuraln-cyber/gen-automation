@@ -38,14 +38,19 @@ as filenames. Before creating upload grants or a Salad job, the controller:
 2. matches the checkpoint and every LoRA by artifact kind and exact SHA-256;
 3. also requires the manifest S3 object ID to equal the release storage key
    when the manifest uses an S3 source;
-4. renders the manifest `target_filename` into the Comfy graph; and
+4. renders the manifest `target_filename` into the Comfy graph;
 5. verifies that the rendered graph contains exactly one matching checkpoint
-   loader and exactly the requested LoRA loaders and weights.
+   loader and exactly the requested LoRA loaders and weights; and
+6. traces every exact rendered output path through the supported latent,
+   sampler, decode, detailer, and save nodes. Every source canvas and every
+   chained latent upscale must remain at or below `8192x8192` and 12 million
+   pixels before upload grants are created.
 
 Worker readiness already depends on successfully downloading, hashing,
 Safetensors-validating, and materializing every manifest target. Together these
 checks prevent a release from referring to a display name, stale file, or model
-that is absent from the running worker.
+that is absent from the running worker. The signed GPU worker repeats the graph
+geometry check immediately before the exact graph reaches ComfyUI.
 
 ## Registering the template
 

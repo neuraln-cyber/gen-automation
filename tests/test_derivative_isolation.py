@@ -23,6 +23,7 @@ from gen_automation.services.derivative_isolation import (
 from gen_automation.services.derivatives import (
     DEFAULT_DERIVATIVE_LIMITS,
     DerivativeRecipe,
+    DerivativeTarget,
     render_platform_derivatives,
 )
 
@@ -402,6 +403,27 @@ def test_safe_bounded_response_round_trips_a_rendered_bundle() -> None:
         DEFAULT_DERIVATIVE_LIMITS,
         expected_source_sha256=expected.source_sha256,
         expected_recipe=recipe,
+        expected_target_values=tuple(artifact.target.value for artifact in expected.artifacts),
+    )
+
+    assert decoded == expected
+
+
+def test_safe_bounded_response_accepts_the_expected_full_only_collection() -> None:
+    master = _master()
+    recipe = DerivativeRecipe()
+    expected = render_platform_derivatives(
+        master,
+        recipe=recipe,
+        targets=(DerivativeTarget.FULL_RESOLUTION,),
+    )
+
+    decoded = _decode_child_response(
+        _success_message(expected),
+        DEFAULT_DERIVATIVE_LIMITS,
+        expected_source_sha256=expected.source_sha256,
+        expected_recipe=recipe,
+        expected_target_values=(DerivativeTarget.FULL_RESOLUTION.value,),
     )
 
     assert decoded == expected
