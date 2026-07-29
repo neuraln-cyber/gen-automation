@@ -12,19 +12,22 @@ workers:
 - Deterministic, versioned generation specifications
 - Versioned Forge-style prompt wildcards with seed-reproducible expansion
 - Automated quality checks with human approval before publication
-- Optional burst semantic anatomy checks with a visible, overridable AI-excluded bucket
+- Optional burst semantic anatomy checks with completion gating and audited owner overrides
 - Non-destructive watermarking and platform-specific derivatives
-- An official X API transport and deterministic Patreon publishing handoff
+- Official X API publishing and an isolated official-UI Patreon browser publisher
 - Private versioned archive storage, deterministic clean Patreon handoff
   packages, and restart-safe verified MEGA mirroring
+- Reproducible checkpoint/LoRA/detector/workflow onboarding with exact hashes
+- Credential-free OpenTofu for the cost-efficient AWS staging substrate
 
 ## Repository status
 
 The control plane, immutable raw-master storage, signed GPU worker, SaladCloud
 orchestration, authentication/TOTP/RBAC, compliance registry, quality ranking,
 ranked dashboard, durable human review, automatic derivative rendering,
-restart-safe publication orchestration, Patreon package handoff, and concrete
-X OAuth/posting path are implemented. Live infrastructure, provider
+restart-safe publication orchestration, Patreon browser/manual publishing,
+verified MEGA delivery, and the concrete X OAuth/posting path are implemented.
+Live infrastructure, provider
 conformance, staging restore drills, and paid one-release canaries remain
 deployment work. See:
 
@@ -40,8 +43,10 @@ deployment work. See:
 - [Prompt wildcard libraries](docs/prompt-wildcards.md)
 - [New Set operator flow](docs/new-set-dashboard.md)
 - [Generation workflow profiles](docs/generation-workflows.md)
+- [Artifact and workflow onboarding](docs/artifact-onboarding.md)
 - [X API transport contract](docs/x-api-transport.md)
 - [Patreon publishing handoff](docs/patreon-handoff.md)
+- [Patreon browser publisher](docs/patreon-browser-publisher.md)
 - [MEGA completed-set delivery](docs/mega-delivery.md)
 - [Durable publication orchestration](docs/publication-orchestration.md)
 - [Deployment contract](docs/deployment-contract.md)
@@ -49,6 +54,7 @@ deployment work. See:
 - [Security and trust boundaries](docs/security.md)
 - [Platform and stack decision](docs/adr/0001-platform-and-stack.md)
 - [AWS staging destination](docs/adr/0002-aws-staging-destination.md)
+- [AWS staging provisioning runbook](docs/aws-staging-runbook.md)
 
 ## Core principles
 

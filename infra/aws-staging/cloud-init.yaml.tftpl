@@ -136,7 +136,7 @@ write_files:
       chown root:root "$mount_path"
       chmod 0700 "$mount_path"
 
-      install -d -o root -g root -m 0700 "$mount_path/mega"
+      install -d -o 10001 -g 10001 -m 0700 "$mount_path/mega"
       install -d -o 10001 -g 10001 -m 0700 "$mount_path/patreon-browser"
       install -d -o 10001 -g 10001 -m 0700 "$mount_path/patreon-browser/profiles"
       install -d -o 10001 -g 10001 -m 0700 "$mount_path/patreon-browser/state"

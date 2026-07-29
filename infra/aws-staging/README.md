@@ -41,14 +41,18 @@ Official references:
 ## Intentional deferrals
 
 - The module does not apply itself.
-- Caddy and application containers are attached later to
-  `gen-automation-deploy.target` using immutable image digests.
+- The credential-free bundle under `deploy/` later attaches Caddy, nginx, and
+  the application containers to `gen-automation-deploy.target` using immutable
+  image digests.
 - IMDSv2 is enabled with response hop limit 1. The AWS-using control-plane
   container must use host networking and bind its application listener only to
-  loopback; Caddy alone owns public ports 80/443. Patreon and any separate MEGA
-  sidecars must stay on a private Docker bridge, without AWS credentials or the
-  Docker socket, so they cannot obtain the EC2 role. MEGA work inside the
-  control-plane image may use that host-networked process.
+  loopback; Caddy alone owns public ports 80/443 and proxies through the
+  loopback nginx request guard. The two host-networked edge containers run as
+  fixed non-root UIDs whose IPv4 IMDS access is blocked by the required host
+  firewall unit. Patreon and any separate MEGA sidecars must stay on a private
+  Docker bridge, without AWS credentials or the Docker socket, so they cannot
+  obtain the EC2 role. MEGA work inside the control-plane image may use that
+  host-networked process.
 - Runtime and migration PostgreSQL roles are created in a one-off SSM session;
   the RDS master credential is never injected into the long-running app.
 - Application-generated secret values and the optional X secret JSON are
