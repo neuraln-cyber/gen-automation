@@ -152,7 +152,7 @@ Runtime paths and processes:
 | Setting | Default |
 | --- | --- |
 | `GEN_WORKER_CHECKPOINT_ROOT`, `GEN_WORKER_LORA_ROOT` | `/opt/comfyui/models/checkpoints`, `/opt/comfyui/models/loras`. |
-| `GEN_WORKER_COMFY_MAIN`, `GEN_WORKER_COMFY_PYTHON` | `/opt/comfyui/main.py`, `/usr/local/bin/python3.12` from the pinned PyTorch CPython 3.12 image. |
+| `GEN_WORKER_COMFY_MAIN`, `GEN_WORKER_COMFY_PYTHON` | `/opt/comfyui/main.py`, `/opt/worker-venv/bin/python3.12`. The dedicated virtual environment reuses the pinned base-image CUDA/PyTorch packages through system site packages while isolating the hash-locked worker and ComfyUI dependencies. |
 | `GEN_WORKER_COMFY_BASE_URL` | `http://127.0.0.1:8188`; loopback HTTP only. |
 | `GEN_WORKER_COMFY_RUNTIME_ROOT` | `/opt/worker/runtime` for input, output, temp, user data, and the local ComfyUI SQLite database. |
 | `GEN_WORKER_COMFY_EXECUTION_TIMEOUT_SECONDS` | `900`. |

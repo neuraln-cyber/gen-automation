@@ -7,6 +7,7 @@ from uuid import UUID, uuid5
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import MetaData, create_engine, inspect, select
 from sqlalchemy.exc import IntegrityError
 
@@ -23,6 +24,32 @@ def _canonical_sha256(value: object) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(serialized).hexdigest()
+
+
+def test_postgresql_publication_effect_event_guard_closes_outer_if_once(
+    monkeypatch,
+) -> None:
+    configuration = Config("alembic.ini")
+    revision = ScriptDirectory.from_config(configuration).get_revision("20260728_0010")
+    assert revision is not None
+
+    statements: list[str] = []
+    monkeypatch.setattr(
+        revision.module.op,
+        "execute",
+        lambda statement: statements.append(str(statement)),
+    )
+    revision.module._create_postgresql_guards()
+
+    guard = next(
+        statement
+        for statement in statements
+        if "gen_automation_guard_publication_effect_event()" in statement
+    )
+    assert (
+        "'publication request completion has no start'; "
+        "END IF; RETURN NEW; END; $$ LANGUAGE plpgsql"
+    ) in guard
 
 
 def test_foundation_migration_round_trip(

@@ -432,6 +432,7 @@ async def process_claimed_quality_score(
     retry_base_seconds: int,
     retry_max_seconds: int,
     analyzer: QualityAnalyzer | None = None,
+    now: datetime | None = None,
 ) -> None:
     """Read an exact immutable object, analyze it, and durably stage the result."""
 
@@ -460,6 +461,7 @@ async def process_claimed_quality_score(
                 claim=claim,
                 worker_id=worker_id,
                 analysis=analysis,
+                now=now,
             )
         return
     except UnsafeImageError:
@@ -502,6 +504,7 @@ async def process_claimed_quality_score(
             error_code=error_code,
             retry_delay_seconds=retry_delay,
             terminal=terminal_code is not None,
+            now=now,
         )
 
 

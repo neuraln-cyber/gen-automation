@@ -319,6 +319,7 @@ async def test_exact_version_and_digest_are_checked_before_parser(
         retry_base_seconds=5,
         retry_max_seconds=30,
         analyzer=analyzer,
+        now=_NOW + timedelta(seconds=2),
     )
     assert analyzer_called is False
     async with runtime_context.database.sessions() as session:
@@ -347,6 +348,7 @@ async def test_exact_version_and_digest_are_checked_before_parser(
         retry_base_seconds=5,
         retry_max_seconds=30,
         analyzer=analyzer,
+        now=_NOW + timedelta(seconds=3),
     )
     async with runtime_context.database.sessions() as session:
         score = await session.get(AssetScore, claim_two.score_id)
@@ -414,6 +416,7 @@ async def test_isolation_failures_are_sanitized_and_terminal_at_attempt_limit(
         retry_base_seconds=5,
         retry_max_seconds=30,
         analyzer=analyzer,
+        now=_NOW + timedelta(seconds=2),
     )
     async with runtime_context.database.sessions() as session:
         score = await session.get(AssetScore, claim.score_id)
@@ -450,6 +453,7 @@ async def test_corrupt_parser_outcome_is_staged_without_retry(
         retry_base_seconds=5,
         retry_max_seconds=30,
         analyzer=corrupt,
+        now=_NOW + timedelta(seconds=2),
     )
     async with runtime_context.database.sessions() as session:
         score = await session.get(AssetScore, claim.score_id)
@@ -645,6 +649,7 @@ async def test_finalizer_refuses_partial_staging(runtime_context: RuntimeContext
         retry_base_seconds=5,
         retry_max_seconds=30,
         analyzer=_direct_analyzer,
+        now=_NOW + timedelta(seconds=2),
     )
     async with runtime_context.database.sessions() as session:
         assert await finalize_ready_scoring_run(session, now=_NOW) is None

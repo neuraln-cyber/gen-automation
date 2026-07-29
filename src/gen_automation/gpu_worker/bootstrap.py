@@ -114,7 +114,7 @@ class WorkerRuntimeSettings(BaseSettings):
         max_length=128,
     )
     comfy_base_url: str = "http://127.0.0.1:8188"
-    comfy_python: Path = Path("/usr/local/bin/python3.12")
+    comfy_python: Path = Path("/opt/worker-venv/bin/python3.12")
     comfy_main: Path = Path("/opt/comfyui/main.py")
     comfy_runtime_root: Path = Path("/opt/worker/runtime")
     comfy_execution_timeout_seconds: float = Field(default=900.0, ge=30.0, le=7200.0)

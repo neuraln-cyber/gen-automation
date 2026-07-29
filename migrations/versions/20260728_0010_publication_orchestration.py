@@ -1257,7 +1257,7 @@ def _create_postgresql_guards() -> None:
         "AND started.request_no = NEW.request_no "
         "AND started.event_type = 'started' "
         "AND started.guard_epoch = NEW.guard_epoch) THEN "
-        "RAISE EXCEPTION 'publication request completion has no start'; END IF; "
+        "RAISE EXCEPTION 'publication request completion has no start'; "
         "END IF; RETURN NEW; END; $$ LANGUAGE plpgsql",
         "CREATE OR REPLACE FUNCTION gen_automation_guard_publication_provider_guard() "
         "RETURNS trigger AS $$ BEGIN "

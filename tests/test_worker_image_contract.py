@@ -122,7 +122,9 @@ def test_expected_worker_entrypoint_is_the_only_runtime_entrypoint() -> None:
     dockerfile = _dockerfile()
     entrypoints = re.findall(r"^ENTRYPOINT\s+(.+)$", dockerfile, flags=re.MULTILINE)
 
-    assert entrypoints == ['["python", "-m", "gen_automation.gpu_worker.main"]']
+    assert entrypoints == [
+        '["/opt/worker-venv/bin/python3.12", "-m", "gen_automation.gpu_worker.main"]'
+    ]
     assert not re.search(r"^CMD\s+", dockerfile, flags=re.MULTILINE)
 
 
@@ -131,15 +133,29 @@ def test_python_dependencies_are_hash_locked_and_cuda_stack_matches_base() -> No
     comfy_lock = COMFY_LOCK_PATH.read_text(encoding="utf-8")
     worker_base = WORKER_BASE_PATH.read_text(encoding="utf-8")
 
+    assert "VIRTUAL_ENV=/opt/worker-venv" in dockerfile
     assert (
-        "python -m pip install --only-binary=:all: "
+        "/usr/local/bin/python3.12 -m venv "
+        "--copies "
+        "--without-pip "
+        "--system-site-packages "
+        "/opt/worker-venv" in dockerfile
+    )
+    assert "test -x /opt/worker-venv/bin/python3.12" in dockerfile
+    assert "test ! -L /opt/worker-venv/bin/python3.12" in dockerfile
+    assert "sys.prefix == '/opt/worker-venv'" in dockerfile
+    assert "sys.prefix != sys.base_prefix" in dockerfile
+    assert (
+        "/opt/worker-venv/bin/python3.12 -m pip install --only-binary=:all: "
         "--require-hashes --no-deps -r requirements.lock" in dockerfile
     )
     assert (
-        "python -m pip install --only-binary=:all: "
+        "/opt/worker-venv/bin/python3.12 -m pip install --only-binary=:all: "
         "--require-hashes --no-deps -r requirements-comfy.lock" in dockerfile
     )
-    assert "python -m pip check" in dockerfile
+    assert "/opt/worker-venv/bin/python3.12 -m pip check" in dockerfile
+    assert "--break-system-packages" not in dockerfile
+    assert "EXTERNALLY-MANAGED" not in dockerfile
     assert "test -x /usr/local/bin/python3.12" in dockerfile
     assert "test ! -L /usr/local/bin/python3.12" in dockerfile
     assert "assert sys.version_info[:2] == (3, 12)" in dockerfile
@@ -154,6 +170,10 @@ def test_python_dependencies_are_hash_locked_and_cuda_stack_matches_base() -> No
     assert "assert torch.__version__.split('+')[0] == '2.11.0'" in dockerfile
     assert "assert torchvision.__version__.split('+')[0] == '0.26.0'" in dockerfile
     assert "assert torchaudio.__version__.split('+')[0] == '2.11.0'" in dockerfile
+    assert (
+        "all('/opt/worker-venv/' not in module.__file__ "
+        "for module in (torch, torchaudio, torchvision))" in dockerfile
+    )
 
 
 def test_ci_builds_the_contract_dockerfile_without_pin_overrides() -> None:
