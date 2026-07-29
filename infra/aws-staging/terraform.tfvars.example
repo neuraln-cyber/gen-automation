@@ -1,0 +1,31 @@
+# Non-secret example values. Copy to terraform.tfvars (gitignored) and edit.
+aws_region         = "eu-central-1"
+name_prefix        = "gen-automation-staging"
+notification_email = "operator@example.com"
+monthly_budget_usd = 100
+
+# Leave both null for an IP-only infrastructure canary. Set both together
+# before Caddy obtains a public certificate and the dashboard uses S3 CORS.
+route53_zone_id = null
+hostname        = null
+
+# Reference an existing complete secret only after its JSON has been created
+# outside OpenTofu. Never put the X OAuth JSON or token values in tfvars.
+x_oauth_secret_arn = null
+
+# Defaults implement ADR 0002. These explicit examples make cost-affecting
+# changes visible during review.
+instance_type                  = "t3a.medium"
+root_volume_gib                = 40
+integration_profile_volume_gib = 8
+db_instance_class              = "db.t4g.micro"
+db_allocated_storage_gib       = 20
+postgres_engine_version        = "17.10"
+db_deletion_protection         = true
+db_skip_final_snapshot         = false
+
+http_ingress_cidrs = ["0.0.0.0/0"]
+
+tags = {
+  Owner = "creator"
+}

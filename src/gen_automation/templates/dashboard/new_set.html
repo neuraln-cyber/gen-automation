@@ -1,0 +1,280 @@
+{% extends "dashboard/base.html" %}
+
+{% block content %}
+  <a class="back" href="/dashboard">&larr; Ranked releases</a>
+  <h1>New Set</h1>
+  <p class="lede">
+    Choose approved inputs, freeze the set, and queue all generation jobs in one step.
+  </p>
+
+  {% if error_message %}
+    <div class="form-error" role="alert">{{ error_message }}</div>
+  {% endif %}
+
+  {% if not options.ready %}
+    <section class="panel review-entry">
+      <h2>Approvals required</h2>
+      <p class="muted">
+        New Set needs at least one current adult fictional subject, checkpoint, and
+        workflow profile. Add the missing approval records before submitting.
+      </p>
+    </section>
+  {% endif %}
+
+  <form class="set-form" method="post" action="/dashboard/new-set" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="submission_id" value="{{ submission_id }}">
+    <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+
+    <fieldset>
+      <legend>Set identity</legend>
+      <div class="form-grid">
+        <label>
+          Set title
+          <input
+            type="text"
+            name="title"
+            value="{{ form_values['title'] }}"
+            minlength="1"
+            maxlength="300"
+            placeholder="Character name · July set"
+            required
+          >
+        </label>
+        <label>
+          Set slug
+          <input
+            type="text"
+            name="slug"
+            value="{{ form_values['slug'] }}"
+            minlength="1"
+            maxlength="80"
+            pattern="[a-z0-9]+(?:-[a-z0-9]+)*"
+            placeholder="character-july-set"
+            required
+          >
+        </label>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Approved inputs</legend>
+      <div class="form-grid">
+        <label>
+          Adult fictional subject
+          <select name="subject_id" required>
+            {% if not options.subjects %}<option value="">No approved subjects</option>{% endif %}
+            {% for subject in options.subjects %}
+              <option
+                value="{{ subject.approval_id }}"
+                {% if form_values['subject_id'] == subject.approval_id|string %}selected{% endif %}
+              >{{ subject.name }} · age {{ subject.canonical_age }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Checkpoint
+          <select name="checkpoint_id" required>
+            {% if not options.checkpoints %}<option value="">No approved checkpoints</option>{% endif %}
+            {% for checkpoint in options.checkpoints %}
+              <option
+                value="{{ checkpoint.approval_id }}"
+                {% if form_values['checkpoint_id'] == checkpoint.approval_id|string %}selected{% endif %}
+              >{{ checkpoint.name }} · {{ checkpoint.sha256[:12] }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Workflow profile
+          <select name="workflow_id" required>
+            {% if not options.workflows %}<option value="">No approved workflows</option>{% endif %}
+            {% for workflow in options.workflows %}
+              <option
+                value="{{ workflow.approval_id }}"
+                {% if form_values['workflow_id'] == workflow.approval_id|string %}selected{% endif %}
+              >{{ workflow.name }} · v{{ workflow.version }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
+
+      <p class="muted">Optional LoRAs are applied in slot order. Leave both fields blank to skip a slot.</p>
+      {% for slot in range(1, 5) %}
+        <div class="lora-row">
+          <label>
+            LoRA {{ slot }}
+            <select name="lora_{{ slot }}_id">
+              <option value="">None</option>
+              {% for lora in options.loras %}
+                <option
+                  value="{{ lora.approval_id }}"
+                  {% if form_values['lora_' ~ slot ~ '_id'] == lora.approval_id|string %}selected{% endif %}
+                >{{ lora.name }} · {{ lora.sha256[:12] }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>
+            Weight
+            <input
+              type="number"
+              name="lora_{{ slot }}_weight"
+              value="{{ form_values['lora_' ~ slot ~ '_weight'] }}"
+              min="-2"
+              max="2"
+              step="0.05"
+              placeholder="0.8"
+            >
+          </label>
+        </div>
+      {% endfor %}
+    </fieldset>
+
+    <fieldset>
+      <legend>Prompts</legend>
+      <label>
+        Prompt
+        <textarea
+          name="prompt"
+          rows="7"
+          maxlength="20000"
+          spellcheck="false"
+          placeholder="masterpiece, __poses__, ..."
+          required
+        >{{ form_values['prompt'] }}</textarea>
+      </label>
+      <label>
+        Negative prompt
+        <textarea
+          name="negative_prompt"
+          rows="4"
+          maxlength="20000"
+          spellcheck="false"
+        >{{ form_values['negative_prompt'] }}</textarea>
+      </label>
+      {% if options.wildcards %}
+        <div>
+          <p class="muted">Current wildcard tokens (their exact versions freeze with this set):</p>
+          <div class="token-list">
+            {% for wildcard in options.wildcards %}
+              <code>__{{ wildcard.name }}__ · v{{ wildcard.version_no }} · {{ wildcard.entry_count }}</code>
+            {% endfor %}
+          </div>
+        </div>
+      {% else %}
+        <p class="muted">
+          No prompt wildcards exist yet.
+          <a href="/dashboard/wildcards">Add a wildcard library</a>.
+        </p>
+      {% endif %}
+    </fieldset>
+
+    <fieldset>
+      <legend>Generation settings</legend>
+      <div class="form-grid">
+        <label>
+          Seed
+          <input type="number" name="seed" value="{{ form_values['seed'] }}" min="0" max="9223372036854775807" required>
+        </label>
+        <label>
+          Width
+          <input type="number" name="width" value="{{ form_values['width'] }}" min="512" max="4096" step="64" required>
+        </label>
+        <label>
+          Height
+          <input type="number" name="height" value="{{ form_values['height'] }}" min="512" max="4096" step="64" required>
+        </label>
+        <label>
+          CFG
+          <input type="number" name="cfg" value="{{ form_values['cfg'] }}" min="0" max="30" step="0.1" required>
+        </label>
+        <label>
+          Steps
+          <input type="number" name="steps" value="{{ form_values['steps'] }}" min="1" max="200" required>
+        </label>
+        <label>
+          Sampler
+          <input type="text" name="sampler" value="{{ form_values['sampler'] }}" maxlength="100" required>
+        </label>
+        <label>
+          Scheduler
+          <input type="text" name="scheduler" value="{{ form_values['scheduler'] }}" maxlength="100" required>
+        </label>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Hires &amp; face detailer</legend>
+      <p class="muted">
+        The base profile ignores these values. The hires profile uses the latent
+        upscale fields; the hires + detailer profile also uses the face fields.
+      </p>
+      <div class="form-grid">
+        <label>
+          Hires scale
+          <input type="number" name="hires_scale" value="{{ form_values['hires_scale'] }}" min="1" max="3" step="0.05" required>
+        </label>
+        <label>
+          Hires denoise
+          <input type="number" name="hires_denoise" value="{{ form_values['hires_denoise'] }}" min="0.05" max="1" step="0.01" required>
+        </label>
+        <label>
+          Latent upscale
+          <select name="hires_upscale_method" required>
+            {% for method in ['bislerp', 'bicubic', 'bilinear', 'nearest-exact', 'area'] %}
+              <option value="{{ method }}" {% if form_values['hires_upscale_method'] == method %}selected{% endif %}>{{ method }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Face guide size
+          <input type="number" name="detailer_guide_size" value="{{ form_values['detailer_guide_size'] }}" min="512" max="2048" step="64" required>
+        </label>
+        <label>
+          Face maximum size
+          <input type="number" name="detailer_max_size" value="{{ form_values['detailer_max_size'] }}" min="512" max="4096" step="64" required>
+        </label>
+        <label>
+          Face denoise
+          <input type="number" name="detailer_denoise" value="{{ form_values['detailer_denoise'] }}" min="0.05" max="1" step="0.01" required>
+        </label>
+        <label>
+          Face threshold
+          <input type="number" name="detailer_bbox_threshold" value="{{ form_values['detailer_bbox_threshold'] }}" min="0.1" max="0.95" step="0.01" required>
+        </label>
+        <label>
+          Face dilation
+          <input type="number" name="detailer_bbox_dilation" value="{{ form_values['detailer_bbox_dilation'] }}" min="-64" max="128" step="1" required>
+        </label>
+        <label>
+          Face crop factor
+          <input type="number" name="detailer_bbox_crop_factor" value="{{ form_values['detailer_bbox_crop_factor'] }}" min="1" max="5" step="0.1" required>
+        </label>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Plan size</legend>
+      <div class="form-grid">
+        <label>
+          Outputs per job
+          <input type="number" name="outputs_per_job" value="{{ form_values['outputs_per_job'] }}" min="1" max="8" required>
+        </label>
+        <label>
+          Planned jobs
+          <input type="number" name="planned_job_count" value="{{ form_values['planned_job_count'] }}" min="1" max="10000" required>
+        </label>
+        <label>
+          Desired accepted images
+          <input type="number" name="desired_accepted_count" value="{{ form_values['desired_accepted_count'] }}" min="1" max="100" required>
+        </label>
+      </div>
+      <p class="muted">
+        Desired accepted images cannot exceed planned jobs × outputs per job.
+      </p>
+    </fieldset>
+
+    <button class="primary-button" type="submit" {% if not options.ready %}disabled{% endif %}>
+      Create, freeze &amp; queue
+    </button>
+  </form>
+{% endblock %}

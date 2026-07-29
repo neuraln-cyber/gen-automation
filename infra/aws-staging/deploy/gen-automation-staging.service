@@ -1,0 +1,28 @@
+[Unit]
+Description=Gen Automation AWS staging containers
+Documentation=file:/opt/gen-automation/deploy/README.md
+Requires=docker.service gen-automation-imds-egress.service
+After=docker.service gen-automation-imds-egress.service network-online.target
+Wants=network-online.target
+PartOf=gen-automation-deploy.target
+RequiresMountsFor=/var/lib/gen-automation/integration-profiles
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/gen-automation/deploy
+Environment=COMPOSE_PROJECT_NAME=gen-automation-staging
+ExecStartPre=/usr/local/libexec/gen-automation-validate-deployment
+ExecStartPre=/usr/bin/docker compose --env-file /etc/gen-automation/deploy.env -f /opt/gen-automation/deploy/compose.yaml config --quiet
+ExecStartPre=/usr/bin/docker compose --env-file /etc/gen-automation/deploy.env -f /opt/gen-automation/deploy/compose.yaml pull --quiet
+ExecStartPre=/usr/local/libexec/gen-automation-validate-proxy-images
+ExecStart=/usr/bin/docker compose --env-file /etc/gen-automation/deploy.env -f /opt/gen-automation/deploy/compose.yaml up --remove-orphans
+ExecStop=/usr/bin/docker compose --env-file /etc/gen-automation/deploy.env -f /opt/gen-automation/deploy/compose.yaml down --timeout 30
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=900
+TimeoutStopSec=120
+
+[Install]
+WantedBy=gen-automation-deploy.target

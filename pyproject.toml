@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gen-automation"
+version = "0.1.0"
+description = "Cloud-native image generation, review, and publishing automation"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "alembic>=1.16,<2",
+  "argon2-cffi>=25.1,<26",
+  "boto3>=1.39,<2",
+  "cryptography>=49,<50",
+  "fastapi>=0.140,<1",
+  "httpx2>=2.7,<3",
+  "jinja2>=3.1,<4",
+  "pillow>=11.3,<13",
+  "psycopg[binary,pool]>=3.2,<4",
+  "pydantic-settings>=2.10,<3",
+  "python-multipart>=0.0.18,<1",
+  "sqlalchemy[asyncio]>=2.0.41,<3",
+  "structlog>=25.4,<26",
+  "svix>=1.98,<2",
+  "uvicorn[standard]>=0.40,<1",
+]
+
+[project.scripts]
+gen-automation-auth = "gen_automation.cli:bootstrap_owner_main"
+gen-automation-artifacts = "gen_automation.artifact_onboarding_cli:artifact_onboarding_main"
+gen-automation-storage-conformance = "gen_automation.storage_conformance_cli:storage_conformance_main"
+
+[project.optional-dependencies]
+dev = [
+  "aiosqlite>=0.21,<1",
+  "mypy>=1.16,<2",
+  "pip-tools>=7.5,<8",
+  "pytest>=8.4,<10",
+  "pytest-asyncio>=1.0,<2",
+  "pytest-cov>=6.2,<8",
+  "ruff>=0.12,<1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+gen_automation = ["templates/auth/*.html", "templates/dashboard/*.html"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["gen_automation"]
+
+[tool.coverage.report]
+fail_under = 75
+show_missing = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "ASYNC", "S", "RUF"]
+ignore = ["S101"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+packages = ["gen_automation"]
+
+[[tool.mypy.overrides]]
+module = ["structlog.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["boto3.*", "botocore.*"]
+ignore_missing_imports = true

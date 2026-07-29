@@ -1,0 +1,82 @@
+# syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+FROM python:3.12-slim@sha256:cab2dbf575e971934a81e4622f5aba17aa7929719bd7e31033a3a83b97fd0464 AS chrome-for-testing
+
+ADD --checksum=sha256:14ac03a67e154e3f8bbc57e03ef03315fda8fedff8e045eee8b31500283a33f4 \
+    https://storage.googleapis.com/chrome-for-testing-public/151.0.7922.47/linux64/chrome-linux64.zip \
+    /tmp/chrome-linux64.zip
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends unzip \
+    && mkdir -p /opt/google \
+    && unzip -q /tmp/chrome-linux64.zip -d /opt/google \
+    && mv /opt/google/chrome-linux64 /opt/google/chrome \
+    && rm -rf /var/lib/apt/lists/* /tmp/chrome-linux64.zip
+
+FROM python:3.12-slim@sha256:cab2dbf575e971934a81e4622f5aba17aa7929719bd7e31033a3a83b97fd0464
+
+LABEL org.opencontainers.image.title="gen-automation-patreon-browser" \
+      org.opencontainers.image.description="Isolated official-UI Patreon publisher" \
+      org.opencontainers.image.source="https://github.com/neuraln-cyber/gen-automation" \
+      org.opencontainers.image.chrome-for-testing.version="151.0.7922.47"
+
+ENV HOME=/home/app \
+    PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONNOUSERSITE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src \
+    GEN_AUTOMATION_PATREON_BROWSER_PROFILE_ROOT=/profiles \
+    GEN_AUTOMATION_PATREON_BROWSER_SPOOL_ROOT=/var/lib/patreon-browser \
+    GEN_AUTOMATION_PATREON_BROWSER_STATE_PATH=/state/idempotency.sqlite3
+
+WORKDIR /app
+
+COPY --from=chrome-for-testing /opt/google/chrome /opt/google/chrome
+COPY requirements.lock requirements-patreon-browser.lock ./
+
+RUN python3.12 -m pip install \
+        --only-binary=:all: \
+        --require-hashes \
+        --no-deps \
+        -r requirements.lock \
+    && python3.12 -m pip install \
+        --only-binary=:all: \
+        --require-hashes \
+        --no-deps \
+        -r requirements-patreon-browser.lock \
+    && python3.12 -m pip check \
+    && python3.12 -m playwright install-deps chromium \
+    && apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        novnc \
+        websockify \
+        x11vnc \
+        xvfb \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 app \
+    && useradd \
+        --system \
+        --create-home \
+        --uid 10001 \
+        --gid app \
+        --home-dir /home/app \
+        --shell /usr/sbin/nologin \
+        app \
+    && mkdir -p /profiles /state /var/lib/patreon-browser \
+    && chown -R app:app /profiles /state /var/lib/patreon-browser
+
+COPY src ./src
+
+USER 10001:10001
+
+VOLUME ["/profiles", "/state"]
+
+EXPOSE 8090
+
+HEALTHCHECK --interval=20s --timeout=3s --start-period=15s --retries=3 \
+    CMD ["python3.12", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health/live', timeout=2).read()"]
+
+CMD ["python3.12", "-m", "uvicorn", "gen_automation.patreon_browser.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8090", "--no-proxy-headers", "--no-access-log", "--no-server-header", "--no-date-header"]

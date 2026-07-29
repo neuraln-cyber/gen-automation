@@ -1,0 +1,2 @@
+# Browser dependency lives only in the isolated Patreon sidecar image.
+playwright==1.61.0

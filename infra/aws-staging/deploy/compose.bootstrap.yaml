@@ -1,0 +1,44 @@
+name: gen-automation-staging
+
+services:
+  patreon-browser-bootstrap:
+    profiles:
+      - bootstrap
+    image: "${GEN_AUTOMATION_PATREON_BROWSER_IMAGE:?set a repository@sha256:64-hex digest}"
+    user: "10001:10001"
+    init: true
+    read_only: true
+    restart: "no"
+    env_file:
+      - /etc/gen-automation/patreon-browser.env
+    command:
+      - python3.12
+      - -m
+      - gen_automation.patreon_browser.bootstrap
+      - --listen-host
+      - "0.0.0.0"
+      - --listen-port
+      - "6080"
+    networks:
+      - patreon-bootstrap-egress
+    ports:
+      - "127.0.0.1:6080:6080/tcp"
+    volumes:
+      - type: bind
+        source: /var/lib/gen-automation/integration-profiles/patreon-browser/profiles
+        target: /profiles
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=1g,uid=10001,gid=10001,mode=1770
+      - /home/app:rw,nosuid,nodev,noexec,size=128m,uid=10001,gid=10001,mode=0700
+    shm_size: "1gb"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+
+networks:
+  patreon-bootstrap-egress:
+    name: gen-automation-patreon-bootstrap-egress
+    driver: bridge
+    attachable: false

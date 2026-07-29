@@ -1,0 +1,198 @@
+name: gen-automation-staging
+
+services:
+  patreon-browser:
+    image: "${GEN_AUTOMATION_PATREON_BROWSER_IMAGE:?set a repository@sha256:64-hex digest}"
+    user: "10001:10001"
+    init: true
+    read_only: true
+    restart: unless-stopped
+    stop_grace_period: 45s
+    env_file:
+      - /etc/gen-automation/patreon-browser.env
+    networks:
+      - patreon-egress
+    ports:
+      - "127.0.0.1:8090:8090/tcp"
+    volumes:
+      - type: bind
+        source: /var/lib/gen-automation/integration-profiles/patreon-browser/profiles
+        target: /profiles
+      - type: bind
+        source: /var/lib/gen-automation/integration-profiles/patreon-browser/state
+        target: /state
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=1g,uid=10001,gid=10001,mode=1770
+      - /var/lib/patreon-browser:rw,nosuid,nodev,noexec,size=512m,uid=10001,gid=10001,mode=0700
+    shm_size: "1gb"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    healthcheck:
+      test:
+        - CMD
+        - python3.12
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8090/health/live', timeout=2).read()
+      interval: 20s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+
+  control-plane-mega:
+    image: "${GEN_AUTOMATION_CONTROL_PLANE_MEGA_IMAGE:?set a repository@sha256:64-hex digest}"
+    user: "10001:10001"
+    init: true
+    read_only: true
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 60s
+    env_file:
+      - /etc/gen-automation/control-plane.env
+    environment:
+      GEN_AUTOMATION_MEGA_PROFILE_HOME: /run/gen-automation/mega-profile
+      GEN_AUTOMATION_PATREON_BROWSER_SIDECAR_URL: http://127.0.0.1:8090/v1/publish
+    depends_on:
+      patreon-browser:
+        condition: service_healthy
+        restart: true
+    command:
+      - python3.12
+      - -m
+      - uvicorn
+      - gen_automation.app:app
+      - --host
+      - "127.0.0.1"
+      - --port
+      - "8000"
+      - --no-proxy-headers
+      - --no-access-log
+      - --no-server-header
+      - --no-date-header
+    volumes:
+      - type: bind
+        source: /var/lib/gen-automation/integration-profiles/mega
+        target: /run/gen-automation/mega-profile
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=1g,uid=10001,gid=10001,mode=1770
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    healthcheck:
+      test:
+        - CMD
+        - python3.12
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen(
+              'http://127.0.0.1:8000/api/v1/health/ready',
+              timeout=3,
+          ).read()
+      interval: 20s
+      timeout: 5s
+      start_period: 45s
+      retries: 10
+
+  ingress-guard:
+    image: "${GEN_AUTOMATION_NGINX_IMAGE:?set a repository@sha256:64-hex digest}"
+    user: "10003:10003"
+    init: true
+    read_only: true
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      control-plane-mega:
+        condition: service_healthy
+        restart: true
+    entrypoint:
+      - nginx
+    command:
+      - -g
+      - daemon off;
+      - -c
+      - /etc/nginx/nginx.conf
+    volumes:
+      - type: bind
+        source: /opt/gen-automation/deploy/nginx.conf
+        target: /etc/nginx/nginx.conf
+        read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=128m,uid=10003,gid=10003,mode=1770
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    healthcheck:
+      test:
+        - CMD
+        - nginx
+        - -t
+        - -c
+        - /etc/nginx/nginx.conf
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  caddy:
+    image: "${GEN_AUTOMATION_CADDY_IMAGE:?set a repository@sha256:64-hex digest}"
+    user: "10002:10002"
+    init: true
+    read_only: true
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 30s
+    env_file:
+      - /etc/gen-automation/caddy.env
+    depends_on:
+      ingress-guard:
+        condition: service_healthy
+        restart: true
+    volumes:
+      - type: bind
+        source: /opt/gen-automation/deploy/Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+      - type: bind
+        source: /var/lib/gen-automation/caddy/data
+        target: /data
+      - type: bind
+        source: /var/lib/gen-automation/caddy/config
+        target: /config
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m,uid=10002,gid=10002,mode=1770
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    healthcheck:
+      test:
+        - CMD
+        - caddy
+        - validate
+        - --config
+        - /etc/caddy/Caddyfile
+        - --adapter
+        - caddyfile
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+networks:
+  patreon-egress:
+    name: gen-automation-patreon-egress
+    driver: bridge
+    attachable: false

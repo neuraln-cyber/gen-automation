@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ page_title }} · Generation control</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #111217;
+        --surface: #1b1d25;
+        --text: #f5f6fa;
+        --muted: #aeb4c5;
+        --accent: #9d8cff;
+        --danger: #ff9f9f;
+        --border: #363a49;
+        --focus: #ffcf70;
+      }
+      * { box-sizing: border-box; }
+      body {
+        min-height: 100vh;
+        margin: 0;
+        display: grid;
+        place-items: center;
+        padding: 1rem;
+        background: var(--bg);
+        color: var(--text);
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        line-height: 1.5;
+      }
+      main {
+        width: min(100%, 28rem);
+        padding: clamp(1.25rem, 5vw, 2rem);
+        border: 1px solid var(--border);
+        border-radius: 1rem;
+        background: var(--surface);
+      }
+      h1 { margin: 0 0 .4rem; line-height: 1.2; }
+      p { color: var(--muted); }
+      .error {
+        padding: .75rem;
+        border: 1px solid var(--danger);
+        border-radius: .55rem;
+        color: var(--danger);
+      }
+      form { display: grid; gap: 1rem; margin-top: 1.5rem; }
+      label { display: block; margin-bottom: .3rem; font-weight: 700; }
+      input, button {
+        width: 100%;
+        min-height: 2.8rem;
+        border: 1px solid var(--border);
+        border-radius: .55rem;
+        font: inherit;
+      }
+      input {
+        padding: .6rem .7rem;
+        background: var(--bg);
+        color: var(--text);
+      }
+      input:focus-visible, button:focus-visible {
+        outline: 3px solid var(--focus);
+        outline-offset: 2px;
+      }
+      button {
+        border-color: var(--accent);
+        background: var(--accent);
+        color: #0e0d14;
+        font-weight: 800;
+        cursor: pointer;
+      }
+      .hint { margin: .3rem 0 0; font-size: .875rem; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Operator sign in</h1>
+      <p>Use your administrative account and current authenticator code.</p>
+      {% if failed %}
+        <p class="error" role="alert">
+          Sign-in failed. Check your credentials and verification code.
+        </p>
+      {% endif %}
+      <form method="post" action="/login" accept-charset="UTF-8">
+        <div>
+          <label for="username">Username</label>
+          <input
+            id="username"
+            name="username"
+            type="text"
+            autocomplete="username"
+            autocapitalize="none"
+            spellcheck="false"
+            maxlength="200"
+            required
+          >
+        </div>
+        <div>
+          <label for="password">Password</label>
+          <input
+            id="password"
+            name="password"
+            type="password"
+            autocomplete="current-password"
+            maxlength="1024"
+            required
+          >
+        </div>
+        <div>
+          <label for="totp_code">Verification code</label>
+          <input
+            id="totp_code"
+            name="totp_code"
+            type="text"
+            inputmode="numeric"
+            pattern="[0-9]{6}"
+            minlength="6"
+            maxlength="6"
+            autocomplete="one-time-code"
+            aria-describedby="totp-hint"
+            required
+          >
+          <p class="hint" id="totp-hint">Enter the six-digit code from your authenticator.</p>
+        </div>
+        <button type="submit">Sign in</button>
+      </form>
+    </main>
+  </body>
+</html>

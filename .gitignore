@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv*/
+dist/
+build/
+*.egg-info/
+
+# JavaScript assets
+node_modules/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+.megaCmd/
+mega-profile/
+
+# OpenTofu / Terraform local state and operator inputs
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+infra/aws-staging/backend.s3.tfbackend
+infra/aws-staging/terraform.tfvars
+
+# Runtime data
+data/
+artifacts/
+*.db
+*.sqlite
+*.sqlite3
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

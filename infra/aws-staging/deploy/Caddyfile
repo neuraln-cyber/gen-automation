@@ -1,0 +1,48 @@
+{
+	admin off
+	email {$GEN_AUTOMATION_ACME_EMAIL}
+	servers {
+		protocols h1 h2
+		timeouts {
+			read_header 10s
+			read_body 30s
+			write 60s
+			idle 2m
+		}
+		max_header_size 32KB
+	}
+}
+
+{$GEN_AUTOMATION_HOSTNAME} {
+	encode zstd gzip
+
+	# Discard client-supplied forwarding data before constructing one trusted
+	# hop for the loopback ingress guard.
+	request_header -Forwarded
+	request_header -X-Forwarded-For
+	request_header -X-Forwarded-Host
+	request_header -X-Forwarded-Proto
+	request_header -X-Real-IP
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "same-origin"
+	}
+
+	reverse_proxy 127.0.0.1:8080 {
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Real-IP {remote_host}
+		health_uri /api/v1/health/live
+		health_interval 30s
+		health_timeout 3s
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

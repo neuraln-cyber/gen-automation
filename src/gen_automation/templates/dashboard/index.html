@@ -1,0 +1,31 @@
+{% extends "dashboard/base.html" %}
+{% block content %}
+  <h1>Ranked releases</h1>
+  <p class="lede">Open a completed ranking to inspect sorted images and download exact raw masters.</p>
+
+  {% if releases %}
+    <ul class="release-list">
+      {% for release in releases %}
+        <li class="release-card">
+          <p class="muted">{{ release.project_name }} · version {{ release.current_version_no }}</p>
+          <h2>{{ release.title }}</h2>
+          <p>{{ release.phase.replace("_", " ") }} · {{ release.health }}</p>
+          {% if release.ranking_is_complete %}
+            <span class="status ready">{{ release.ranked_asset_count }} ranked masters</span><br>
+            <a href="/dashboard/releases/{{ release.id }}">Open ranking</a>
+          {% elif release.completed_scoring_run_id %}
+            <span class="status">Ranking needs attention</span><br>
+            <a href="/dashboard/releases/{{ release.id }}">View status</a>
+          {% else %}
+            <span class="status">Ranking not ready</span>
+          {% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <section class="panel">
+      <h2>No releases yet</h2>
+      <p class="muted">Releases will appear here after they are created.</p>
+    </section>
+  {% endif %}
+{% endblock %}

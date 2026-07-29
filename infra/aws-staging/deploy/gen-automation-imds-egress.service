@@ -1,0 +1,11 @@
+[Unit]
+Description=Block AWS IMDS for host-networked public proxy containers
+Documentation=file:/opt/gen-automation/deploy/README.md
+Requires=docker.service
+After=docker.service
+Before=gen-automation-staging.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/gen-automation-install-imds-egress-rules
+RemainAfterExit=yes
