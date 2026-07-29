@@ -152,7 +152,7 @@ def test_python_dependencies_are_hash_locked_and_cuda_stack_matches_base() -> No
         "/opt/worker-venv/bin/python -m pip install --only-binary=:all: "
         "--require-hashes --no-deps -r requirements-comfy.lock" in dockerfile
     )
-    assert "/opt/worker-venv/bin/python -m pip check" in dockerfile
+    assert "pip check" not in dockerfile
     assert "--break-system-packages" not in dockerfile
     assert "EXTERNALLY-MANAGED" not in dockerfile
     assert "assert sys.version_info[:2] == (3, 12)" in dockerfile
