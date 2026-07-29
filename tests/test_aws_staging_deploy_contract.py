@@ -283,22 +283,18 @@ def test_patreon_profile_has_an_ssm_only_cloud_bootstrap_path() -> None:
 
 def test_patreon_browser_uses_checksum_pinned_current_chrome() -> None:
     dockerfile = (ROOT / "Dockerfile.patreon-browser").read_text(encoding="utf-8")
-    publisher = (
-        ROOT / "src" / "gen_automation" / "patreon_browser" / "publisher.py"
-    ).read_text(encoding="utf-8")
-    bootstrap = (
-        ROOT / "src" / "gen_automation" / "patreon_browser" / "bootstrap.py"
-    ).read_text(encoding="utf-8")
+    publisher = (ROOT / "src" / "gen_automation" / "patreon_browser" / "publisher.py").read_text(
+        encoding="utf-8"
+    )
+    bootstrap = (ROOT / "src" / "gen_automation" / "patreon_browser" / "bootstrap.py").read_text(
+        encoding="utf-8"
+    )
 
     assert (
         "ADD --checksum="
-        "sha256:14ac03a67e154e3f8bbc57e03ef03315fda8fedff8e045eee8b31500283a33f4"
-        in dockerfile
+        "sha256:14ac03a67e154e3f8bbc57e03ef03315fda8fedff8e045eee8b31500283a33f4" in dockerfile
     )
-    assert (
-        "chrome-for-testing-public/151.0.7922.47/linux64/chrome-linux64.zip"
-        in dockerfile
-    )
+    assert "chrome-for-testing-public/151.0.7922.47/linux64/chrome-linux64.zip" in dockerfile
     assert "playwright install-deps chromium" in dockerfile
     assert "playwright install --with-deps chromium" not in dockerfile
     assert publisher.count("channel=_BROWSER_CHANNEL") == 1
