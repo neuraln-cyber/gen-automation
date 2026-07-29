@@ -87,6 +87,8 @@ def test_loopback_nginx_request_guards_and_assertions_are_enforced() -> None:
     assert "location = /login" in nginx
     assert "location ^~ /api/v1/auth/" in nginx
     assert "client_max_body_size 8m" in nginx
+    for temporary_path in ("fastcgi", "proxy", "scgi", "uwsgi"):
+        assert f"{temporary_path}_temp_path /tmp/{temporary_path}" in nginx
     assert "large_client_header_buffers 4 8k" in nginx
     for timeout in (
         "client_header_timeout 10s",
@@ -111,6 +113,7 @@ def test_loopback_nginx_request_guards_and_assertions_are_enforced() -> None:
 
     assert "--network none" in proxy_validator
     assert "--user 10002:10002" in proxy_validator
+    assert "--cap-add NET_BIND_SERVICE" in proxy_validator
     assert "/data:rw,nosuid,nodev,noexec,size=64m,uid=10002,gid=10002,mode=0700" in (
         proxy_validator
     )

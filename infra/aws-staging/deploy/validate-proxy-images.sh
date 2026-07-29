@@ -33,6 +33,7 @@ nginx_image="$(env_value GEN_AUTOMATION_NGINX_IMAGE "$config_root/deploy.env")"
   --read-only \
   --user 10002:10002 \
   --cap-drop ALL \
+  --cap-add NET_BIND_SERVICE \
   --security-opt no-new-privileges \
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,uid=10002,gid=10002,mode=1770 \
   --tmpfs /data:rw,nosuid,nodev,noexec,size=64m,uid=10002,gid=10002,mode=0700 \
