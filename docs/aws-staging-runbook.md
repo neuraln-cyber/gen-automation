@@ -58,6 +58,11 @@ Confirm the plan contains exactly:
 - no secret value, private key, password, token, or application environment
   document in plan output.
 
+When staging is an AWS Organizations member account, set
+`budget_enabled = false` and create the budget in the management account with
+a linked-account filter for staging. Budget SNS topics cannot be cross-account;
+use a management-account topic or direct email notification.
+
 Do not apply until this review and a cost estimate are approved. Plan files can
 contain sensitive infrastructure data and are gitignored; delete them securely
 after use.

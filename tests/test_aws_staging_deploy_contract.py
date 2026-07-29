@@ -233,6 +233,22 @@ def test_al2023_compose_plugin_is_pinned_checksum_verified_and_installed() -> No
     assert "/usr/local/lib/docker/cli-plugins/docker-compose" in validator
 
 
+def test_rds_ca_bundle_is_pinned_verified_and_mounted_read_only() -> None:
+    compose = _text("compose.yaml")
+    installer = _text("install.sh")
+    validator = _text("validate-deployment.sh")
+    controller = _service(compose, "control-plane-mega", "ingress-guard")
+
+    checksum = "e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3"
+    assert "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem" in installer
+    for text in (installer, validator):
+        assert checksum in text
+        assert "sha256sum --check --status" in text
+    assert "source: /etc/gen-automation/rds-global-bundle.pem" in controller
+    assert "target: /run/gen-automation/rds-global-bundle.pem" in controller
+    assert "read_only: true" in controller
+
+
 def test_environment_templates_contain_placeholders_not_secret_values() -> None:
     controller = _text("control-plane.env.example")
     patreon = _text("patreon-browser.env.example")

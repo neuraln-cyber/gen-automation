@@ -57,6 +57,7 @@ def test_aws_staging_has_no_ssh_or_secret_value_resources() -> None:
     assert "secret_access_key" not in cloud_init.casefold()
     assert "gen-automation-deploy.target" in cloud_init
     assert 'mount_path="/var/lib/gen-automation/integration-profiles"' in cloud_init
+    assert 'mkfs.xfs -L genauto-int "$device"' in cloud_init
     assert 'install -d -o 10001 -g 10001 -m 0700 "$mount_path/mega"' in cloud_init
     assert '"$mount_path/patreon-browser/profiles"' in cloud_init
     assert '"$mount_path/patreon-browser/state"' in cloud_init
@@ -76,6 +77,8 @@ def test_aws_staging_examples_and_state_safety_are_non_secret() -> None:
     assert "refresh_token" not in tfvars
     assert "client_secret" not in tfvars
     assert "x_oauth_secret_arn = null" in tfvars
+    assert "budget_enabled" in tfvars
+    assert "count = var.budget_enabled ? 1 : 0" in _terraform_source()
     assert "infra/aws-staging/backend.s3.tfbackend" in gitignore
     assert "infra/aws-staging/terraform.tfvars" in gitignore
     assert "*.tfstate" in gitignore

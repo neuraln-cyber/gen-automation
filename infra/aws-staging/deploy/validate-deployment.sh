@@ -6,6 +6,8 @@ profile_root="/var/lib/gen-automation/integration-profiles"
 compose_plugin="/usr/local/lib/docker/cli-plugins/docker-compose"
 compose_version="5.1.2"
 compose_sha256="c372e512a36e67716b0b3a1264ccdc461dec7a7beff601b81f7c5fb008e3511e"
+rds_ca_path="$config_root/rds-global-bundle.pem"
+rds_ca_sha256="e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3"
 
 fail() {
   printf '%s\n' "deployment validation failed: $*" >&2
@@ -53,6 +55,9 @@ installed_compose_version="$(/usr/bin/docker compose version --short 2>/dev/null
 installed_compose_version="${installed_compose_version#v}"
 [ "$installed_compose_version" = "$compose_version" ] ||
   fail "Docker Compose plugin must be version $compose_version"
+[ -f "$rds_ca_path" ] || fail "missing pinned AWS RDS CA bundle"
+printf '%s  %s\n' "$rds_ca_sha256" "$rds_ca_path" | sha256sum --check --status ||
+  fail "AWS RDS CA bundle checksum does not match the reviewed pin"
 
 for directory in \
   "$profile_root/mega" \

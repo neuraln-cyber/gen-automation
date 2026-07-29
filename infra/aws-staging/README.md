@@ -20,6 +20,10 @@ profile and idempotency SQLite state.
 - the `.tf` files: networking, storage, RDS, IAM, compute, DNS, monitoring,
   alarms, budget, and outputs.
 
+For an AWS Organizations member account, set `budget_enabled = false`. Create
+the monthly budget in the management account with a linked-account filter for
+the staging account; AWS Budgets does not support cross-account SNS topics.
+
 Use the operational sequence and acceptance gates in
 [the AWS staging runbook](../../docs/aws-staging-runbook.md).
 

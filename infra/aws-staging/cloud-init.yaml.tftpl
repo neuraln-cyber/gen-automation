@@ -120,7 +120,7 @@ write_files:
 
       filesystem=$(blkid -s TYPE -o value "$device" || true)
       if [ -z "$filesystem" ]; then
-        mkfs.xfs -L gen-automation-integrations "$device"
+        mkfs.xfs -L genauto-int "$device"
       elif [ "$filesystem" != "xfs" ]; then
         echo "Integration profile EBS device has unexpected filesystem: $filesystem" >&2
         exit 1

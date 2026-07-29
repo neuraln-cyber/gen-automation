@@ -48,6 +48,10 @@ sudo chmod 0600 /etc/gen-automation/*.env
 
 `install.sh` also installs Docker Compose v5.1.2 for all users from Docker's
 official release asset and verifies its committed SHA-256 before installation.
+It downloads the official AWS RDS global CA bundle, verifies its reviewed
+SHA-256, and mounts it read-only into the control plane. PostgreSQL URLs must
+use `sslmode=verify-full` and
+`sslrootcert=/run/gen-automation/rds-global-bundle.pem`.
 It does not start the application. Re-running the installer re-verifies the
 installed plugin and downloads it only when the reviewed binary is absent.
 It also installs

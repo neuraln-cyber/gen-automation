@@ -193,6 +193,12 @@ variable "monthly_budget_usd" {
   }
 }
 
+variable "budget_enabled" {
+  description = "Create the AWS budget in this account. Set false for an Organizations member account and create the linked-account budget in the management account instead."
+  type        = bool
+  default     = true
+}
+
 variable "log_retention_days" {
   description = "CloudWatch application/bootstrap log retention."
   type        = number
