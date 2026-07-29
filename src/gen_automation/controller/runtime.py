@@ -29,6 +29,7 @@ from gen_automation.domain.enums import (
     GenerationState,
     SaladDeploymentState,
 )
+from gen_automation.gpu_worker.bootstrap import load_artifact_manifest
 from gen_automation.integrations.mega import MegaCmdClient
 from gen_automation.integrations.salad.client import SaladClient
 from gen_automation.quality import DEFAULT_QUALITY_CONFIG
@@ -976,8 +977,16 @@ class ControllerWorkloads:
             raise RuntimeError("Salad submission dependencies are unavailable")
         signing_key_id = self.settings.worker_signing_key_id
         signing_private_key = self.settings.worker_signing_private_key
-        if signing_key_id is None or signing_private_key is None:
+        manifest_json = self.settings.salad_worker_model_manifest_json
+        manifest_sha256 = self.settings.salad_worker_model_manifest_sha256
+        if (
+            signing_key_id is None
+            or signing_private_key is None
+            or manifest_json is None
+            or manifest_sha256 is None
+        ):
             raise RuntimeError("worker signing configuration is unavailable")
+        artifact_manifest = load_artifact_manifest(manifest_json.get_secret_value())
 
         async with self.sessions() as session:
             reservation_microusd = await session.scalar(
@@ -995,6 +1004,8 @@ class ControllerWorkloads:
                 store=self.object_store,
                 signing_key_id=signing_key_id,
                 signing_private_key=signing_private_key,
+                artifact_manifest=artifact_manifest,
+                artifact_manifest_sha256=manifest_sha256.get_secret_value(),
                 signature_ttl_seconds=self.settings.worker_signature_ttl_seconds,
                 upload_grant_ttl_seconds=self.settings.worker_upload_grant_ttl_seconds,
                 max_upload_bytes=self.settings.storage_max_image_bytes,

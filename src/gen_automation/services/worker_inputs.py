@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import json
 import math
 import time
@@ -17,6 +18,11 @@ from gen_automation.domain.release_spec import (
     WorkflowSpecification,
 )
 from gen_automation.domain.signing import SigningMaterialError, validate_private_key
+from gen_automation.gpu_worker.artifacts import (
+    ArtifactKind,
+    ArtifactManifest,
+    ModelArtifactSpec,
+)
 from gen_automation.gpu_worker.models import (
     KEY_ID_PATTERN,
     GenerateEnvelope,
@@ -33,6 +39,8 @@ MAX_ENVELOPE_BYTES = 256 * 1024
 MAX_JSON_DEPTH = 64
 MAX_JSON_ITEMS = 50_000
 MIN_POST_ACCEPTANCE_UPLOAD_SECONDS = 3600
+MAX_RUNTIME_LORAS = 4
+LORA_CHAIN_NODE_CLASS = "GenAutomationLoraChain"
 type UploadContentType = Literal["image/png", "image/jpeg", "image/webp"]
 
 
@@ -47,13 +55,72 @@ class _ResolvedJobParameters:
     workflow: WorkflowSpecification
     generation: GenerationParameters
 
-    def bindings(self) -> dict[str, object]:
+    def bindings(self, runtime: "_RuntimeArtifactBindings") -> dict[str, object]:
+        checkpoint = self.checkpoint.model_dump(mode="json")
+        checkpoint["runtime_filename"] = runtime.checkpoint_filename
+        loras: list[dict[str, object]] = []
+        for lora, filename in zip(self.loras, runtime.lora_filenames, strict=True):
+            value = lora.model_dump(mode="json")
+            value["runtime_filename"] = filename
+            loras.append(value)
         return {
-            "checkpoint": self.checkpoint.model_dump(mode="json"),
-            "loras": [lora.model_dump(mode="json") for lora in self.loras],
+            "checkpoint": checkpoint,
+            "loras": loras,
             "workflow": self.workflow.model_dump(mode="json"),
             "generation": self.generation.model_dump(mode="json"),
         }
+
+
+@dataclass(frozen=True)
+class _RuntimeArtifactBindings:
+    checkpoint_filename: str
+    lora_filenames: tuple[str, ...]
+
+
+def _resolve_manifest_artifact(
+    manifest: ArtifactManifest,
+    specification: ArtifactSpecification,
+    *,
+    kind: ArtifactKind,
+) -> ModelArtifactSpec:
+    matches = tuple(
+        artifact
+        for artifact in manifest.artifacts
+        if artifact.kind == kind and artifact.sha256 == specification.sha256
+    )
+    if len(matches) != 1:
+        raise WorkerInputError("generation artifacts do not match the worker manifest")
+    artifact = matches[0]
+    if (
+        artifact.source_object_id is not None
+        and artifact.source_object_id != specification.storage_key
+    ):
+        raise WorkerInputError("generation artifacts do not match the worker manifest")
+    return artifact
+
+
+def _resolve_runtime_artifacts(
+    resolved: _ResolvedJobParameters,
+    manifest: ArtifactManifest,
+) -> _RuntimeArtifactBindings:
+    if len(resolved.loras) > MAX_RUNTIME_LORAS:
+        raise WorkerInputError("generation supports at most four LoRAs")
+    if len({lora.sha256 for lora in resolved.loras}) != len(resolved.loras):
+        raise WorkerInputError("generation artifacts do not match the worker manifest")
+
+    checkpoint = _resolve_manifest_artifact(
+        manifest,
+        resolved.checkpoint,
+        kind=ArtifactKind.CHECKPOINT,
+    )
+    loras = tuple(
+        _resolve_manifest_artifact(manifest, lora, kind=ArtifactKind.LORA)
+        for lora in resolved.loras
+    )
+    return _RuntimeArtifactBindings(
+        checkpoint_filename=checkpoint.target_filename,
+        lora_filenames=tuple(lora.target_filename for lora in loras),
+    )
 
 
 def _require_mapping(value: object) -> Mapping[str, Any]:
@@ -176,6 +243,176 @@ def _render_workflow(value: object, bindings: Mapping[str, object]) -> object:
     return value
 
 
+def _require_comfy_link(value: object, *, output_index: int) -> tuple[str, int]:
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or not isinstance(value[0], str)
+        or not value[0]
+        or isinstance(value[1], bool)
+        or value[1] != output_index
+    ):
+        raise WorkerInputError("workflow LoRA chain is invalid")
+    return value[0], output_index
+
+
+def _replace_chain_references(
+    value: object,
+    *,
+    chain_node_id: str,
+    model_source: tuple[str, int],
+    clip_source: tuple[str, int],
+) -> object:
+    if isinstance(value, list):
+        if value and value[0] == chain_node_id:
+            if len(value) != 2 or isinstance(value[1], bool):
+                raise WorkerInputError("workflow LoRA chain is invalid")
+            if value[1] == 0:
+                return list(model_source)
+            if value[1] == 1:
+                return list(clip_source)
+            raise WorkerInputError("workflow LoRA chain is invalid")
+        return [
+            _replace_chain_references(
+                item,
+                chain_node_id=chain_node_id,
+                model_source=model_source,
+                clip_source=clip_source,
+            )
+            for item in value
+        ]
+    if isinstance(value, dict):
+        return {
+            key: _replace_chain_references(
+                item,
+                chain_node_id=chain_node_id,
+                model_source=model_source,
+                clip_source=clip_source,
+            )
+            for key, item in value.items()
+        }
+    return value
+
+
+def _expand_bounded_lora_chain(
+    workflow: dict[str, object],
+    *,
+    resolved: _ResolvedJobParameters,
+    runtime: _RuntimeArtifactBindings,
+) -> dict[str, object]:
+    directives = [
+        (node_id, node)
+        for node_id, node in workflow.items()
+        if isinstance(node, dict) and node.get("class_type") == LORA_CHAIN_NODE_CLASS
+    ]
+    if not directives:
+        return workflow
+    if len(directives) != 1:
+        raise WorkerInputError("workflow LoRA chain is invalid")
+
+    chain_node_id, directive = directives[0]
+    inputs = directive.get("inputs")
+    if not isinstance(inputs, dict) or set(inputs) != {"model", "clip"}:
+        raise WorkerInputError("workflow LoRA chain is invalid")
+    model_source = _require_comfy_link(inputs["model"], output_index=0)
+    clip_source = _require_comfy_link(inputs["clip"], output_index=1)
+    if model_source[0] != clip_source[0]:
+        raise WorkerInputError("workflow LoRA chain is invalid")
+    checkpoint_node = workflow.get(model_source[0])
+    if (
+        not isinstance(checkpoint_node, dict)
+        or checkpoint_node.get("class_type") != "CheckpointLoaderSimple"
+    ):
+        raise WorkerInputError("workflow LoRA chain is invalid")
+
+    without_directive = {
+        node_id: node for node_id, node in workflow.items() if node_id != chain_node_id
+    }
+    generated_ids = tuple(
+        f"{chain_node_id}-lora-{index}" for index in range(1, len(resolved.loras) + 1)
+    )
+    if any(node_id in without_directive for node_id in generated_ids):
+        raise WorkerInputError("workflow LoRA chain is invalid")
+
+    terminal_model = model_source
+    terminal_clip = clip_source
+    if generated_ids:
+        terminal_model = (generated_ids[-1], 0)
+        terminal_clip = (generated_ids[-1], 1)
+    rendered = {
+        node_id: _replace_chain_references(
+            node,
+            chain_node_id=chain_node_id,
+            model_source=terminal_model,
+            clip_source=terminal_clip,
+        )
+        for node_id, node in without_directive.items()
+    }
+
+    previous_model = model_source
+    previous_clip = clip_source
+    for node_id, lora, filename in zip(
+        generated_ids,
+        resolved.loras,
+        runtime.lora_filenames,
+        strict=True,
+    ):
+        rendered[node_id] = {
+            "class_type": "LoraLoader",
+            "inputs": {
+                "model": list(previous_model),
+                "clip": list(previous_clip),
+                "lora_name": filename,
+                "strength_model": lora.weight,
+                "strength_clip": lora.weight,
+            },
+        }
+        previous_model = (node_id, 0)
+        previous_clip = (node_id, 1)
+    return rendered
+
+
+def _validate_runtime_artifact_nodes(
+    workflow: dict[str, object],
+    *,
+    resolved: _ResolvedJobParameters,
+    runtime: _RuntimeArtifactBindings,
+) -> None:
+    checkpoints: list[str] = []
+    loras: dict[str, tuple[object, object]] = {}
+    for raw_node in workflow.values():
+        if not isinstance(raw_node, dict):
+            raise WorkerInputError("workflow template is invalid")
+        node_class = raw_node.get("class_type")
+        inputs = raw_node.get("inputs")
+        if not isinstance(inputs, dict):
+            raise WorkerInputError("workflow template is invalid")
+        if node_class == "CheckpointLoaderSimple":
+            checkpoint_name = inputs.get("ckpt_name")
+            if not isinstance(checkpoint_name, str):
+                raise WorkerInputError("workflow artifact binding is invalid")
+            checkpoints.append(checkpoint_name)
+        elif node_class == "LoraLoader":
+            lora_name = inputs.get("lora_name")
+            if not isinstance(lora_name, str) or lora_name in loras:
+                raise WorkerInputError("workflow artifact binding is invalid")
+            loras[lora_name] = (
+                inputs.get("strength_model"),
+                inputs.get("strength_clip"),
+            )
+
+    if checkpoints != [runtime.checkpoint_filename]:
+        raise WorkerInputError("workflow artifact binding is invalid")
+    expected_loras = dict(
+        zip(runtime.lora_filenames, (lora.weight for lora in resolved.loras), strict=True)
+    )
+    if set(loras) != set(expected_loras):
+        raise WorkerInputError("workflow artifact binding is invalid")
+    for filename, weight in expected_loras.items():
+        if loras[filename] != (weight, weight):
+            raise WorkerInputError("workflow artifact binding is invalid")
+
+
 async def _load_workflow(
     store: ObjectStore,
     *,
@@ -209,6 +446,8 @@ class SaladWorkerJobInputProvider:
     store: ObjectStore
     signing_key_id: str
     signing_private_key: SecretStr
+    artifact_manifest: ArtifactManifest
+    artifact_manifest_sha256: str
     signature_ttl_seconds: int = 7200
     upload_grant_ttl_seconds: int = 10800
     upload_content_type: UploadContentType = "image/png"
@@ -224,6 +463,11 @@ class SaladWorkerJobInputProvider:
             validate_private_key(self.signing_private_key.get_secret_value())
         except SigningMaterialError:
             raise ValueError("worker signing private key is invalid") from None
+        if not hmac.compare_digest(
+            self.artifact_manifest.manifest_sha256,
+            self.artifact_manifest_sha256,
+        ):
+            raise ValueError("worker artifact manifest trust anchor does not match")
         if not 5 <= self.signature_ttl_seconds <= 7200:
             raise ValueError("worker signature TTL must be between 5 and 7200 seconds")
         if (
@@ -239,11 +483,22 @@ class SaladWorkerJobInputProvider:
 
     async def build_job_input(self, context: SaladJobInputContext) -> dict[str, object]:
         resolved = _resolve_job_parameters(context)
+        runtime = _resolve_runtime_artifacts(resolved, self.artifact_manifest)
         workflow = await _load_workflow(
             self.store,
             specification=resolved.workflow,
-            bindings=resolved.bindings(),
+            bindings=resolved.bindings(runtime),
             max_bytes=self.max_workflow_bytes,
+        )
+        workflow = _expand_bounded_lora_chain(
+            workflow,
+            resolved=resolved,
+            runtime=runtime,
+        )
+        _validate_runtime_artifact_nodes(
+            workflow,
+            resolved=resolved,
+            runtime=runtime,
         )
 
         intents = await create_raw_master_upload_intents(

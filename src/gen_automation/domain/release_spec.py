@@ -85,6 +85,7 @@ class GenerationParameters(StrictModel):
     width: int = Field(ge=512, le=4096, multiple_of=64)
     height: int = Field(ge=512, le=4096, multiple_of=64)
     steps: int = Field(ge=1, le=200)
+    cfg: float = Field(default=5.0, ge=0.0, le=30.0)
     sampler: str = Field(min_length=1, max_length=100)
     scheduler: str = Field(min_length=1, max_length=100)
     outputs_per_job: int = Field(default=4, ge=1, le=8)
@@ -105,7 +106,7 @@ class ReleaseSpecification(StrictModel):
     schema_version: int = Field(default=1, ge=1, le=1)
     subjects: list[SubjectSpecification] = Field(min_length=1, max_length=20)
     checkpoint: ArtifactSpecification
-    loras: list[LoraSpecification] = Field(default_factory=list, max_length=32)
+    loras: list[LoraSpecification] = Field(default_factory=list, max_length=4)
     workflow: WorkflowSpecification
     generation: GenerationParameters
     planned_job_count: int = Field(ge=1, le=10000)
