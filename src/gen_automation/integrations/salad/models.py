@@ -297,18 +297,20 @@ def parse_gpu_class(data: JSONObject) -> SaladGpuClass:
         _required_str(price, "price", f"{context}.prices[{index}]")
         for index, price in enumerate(price_objects)
     )
+    # The live API may omit the legacy resource-bound fields. Discovery only
+    # requires the stable class identity, name, demand flag, and prices.
     return SaladGpuClass(
         id=_required_uuid(data, "id", context),
         name=_required_str(data, "name", context),
         prices=prices,
-        gpu_count=_required_int(data, "gpu_count", context),
+        gpu_count=_optional_int(data, "gpu_count", context, default=1),
         is_high_demand=_required_bool(data, "is_high_demand", context),
-        max_ram=_required_int(data, "max_ram", context),
-        max_storage=_required_int(data, "max_storage", context),
-        max_vcpu=_required_int(data, "max_vcpu", context),
-        min_ram=_required_int(data, "min_ram", context),
-        min_storage=_required_int(data, "min_storage", context),
-        min_vcpu=_required_int(data, "min_vcpu", context),
+        max_ram=_optional_int(data, "max_ram", context),
+        max_storage=_optional_int(data, "max_storage", context),
+        max_vcpu=_optional_int(data, "max_vcpu", context),
+        min_ram=_optional_int(data, "min_ram", context),
+        min_storage=_optional_int(data, "min_storage", context),
+        min_vcpu=_optional_int(data, "min_vcpu", context),
         raw=data,
     )
 
