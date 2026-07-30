@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 import pytest
 from pydantic import ValidationError
 
@@ -33,4 +35,47 @@ def test_release_full_set_is_bounded_by_patreon_package_capacity() -> None:
 
     payload["desired_accepted_count"] = MAX_ACCEPTED_IMAGES_PER_RELEASE + 1
     with pytest.raises(ValidationError, match="less than or equal to 100"):
+        ReleaseCreate.model_validate(payload)
+
+
+def test_generation_dimensions_accept_latent_multiples_of_eight() -> None:
+    payload = valid_release_payload()
+    generation = payload["specification"]["generation"]  # type: ignore[index]
+    generation["width"] = 1144
+    generation["height"] = 1480
+
+    parsed = ReleaseCreate.model_validate(payload)
+    assert parsed.specification.generation.width == 1144
+    assert parsed.specification.generation.height == 1480
+
+    generation["width"] = 1150
+    with pytest.raises(ValidationError, match="multiple of 8"):
+        ReleaseCreate.model_validate(payload)
+
+
+def test_release_supports_up_to_eight_loras() -> None:
+    payload = valid_release_payload()
+    checkpoint = payload["specification"]["checkpoint"]  # type: ignore[index]
+    loras: list[dict[str, object]] = []
+    for index in range(8):
+        lora = deepcopy(checkpoint)
+        lora.update(
+            {
+                "name": f"LoRA {index + 1}",
+                "storage_key": f"models/lora-{index + 1}.safetensors",
+                "sha256": f"{index + 1:x}" * 64,
+                "weight": 0.5,
+            }
+        )
+        loras.append(lora)
+    payload["specification"]["loras"] = loras  # type: ignore[index]
+
+    assert len(ReleaseCreate.model_validate(payload).specification.loras) == 8
+
+    ninth = deepcopy(loras[0])
+    ninth["name"] = "LoRA 9"
+    ninth["storage_key"] = "models/lora-9.safetensors"
+    ninth["sha256"] = "9" * 64
+    loras.append(ninth)
+    with pytest.raises(ValidationError, match="at most 8"):
         ReleaseCreate.model_validate(payload)

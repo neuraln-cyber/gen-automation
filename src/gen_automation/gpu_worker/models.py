@@ -28,6 +28,7 @@ OUTPUT_NODE_CLASSES = frozenset({"SaveImage", "SaveImageWebsocket"})
 DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES = frozenset(
     {
         "CheckpointLoaderSimple",
+        "CLIPSetLastLayer",
         "CLIPTextEncode",
         "EmptyLatentImage",
         "FaceDetailer",

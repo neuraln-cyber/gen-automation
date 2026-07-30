@@ -108,64 +108,10 @@
     }
   },
   "10": {
-    "class_type": "LatentUpscaleBy",
-    "inputs": {
-      "samples": [
-        "9",
-        0
-      ],
-      "scale_by": {
-        "$gen": "generation.hires_scale"
-      },
-      "upscale_method": {
-        "$gen": "generation.hires_upscale_method"
-      }
-    }
-  },
-  "11": {
-    "class_type": "KSampler",
-    "inputs": {
-      "cfg": {
-        "$gen": "generation.cfg"
-      },
-      "denoise": {
-        "$gen": "generation.hires_denoise"
-      },
-      "latent_image": [
-        "10",
-        0
-      ],
-      "model": [
-        "2",
-        0
-      ],
-      "negative": [
-        "7",
-        0
-      ],
-      "positive": [
-        "6",
-        0
-      ],
-      "sampler_name": {
-        "$gen": "generation.sampler"
-      },
-      "scheduler": {
-        "$gen": "generation.scheduler"
-      },
-      "seed": {
-        "$gen": "generation.seed"
-      },
-      "steps": {
-        "$gen": "generation.steps"
-      }
-    }
-  },
-  "12": {
     "class_type": "VAEDecode",
     "inputs": {
       "samples": [
-        "11",
+        "9",
         0
       ],
       "vae": [
@@ -243,7 +189,7 @@
       },
       "guide_size_for": true,
       "image": [
-        "12",
+        "10",
         0
       ],
       "max_size": {
@@ -290,7 +236,7 @@
   "15": {
     "class_type": "SaveImage",
     "inputs": {
-      "filename_prefix": "gen-automation-hires-detailer",
+      "filename_prefix": "gen-automation-base-detailer",
       "images": [
         "14",
         0

@@ -329,33 +329,51 @@ def _default_values(options: NewSetOptions) -> dict[str, str]:
         "title": "",
         "subject_id": str(options.subjects[0].approval_id) if options.subjects else "",
         "checkpoint_id": (str(options.checkpoints[0].approval_id) if options.checkpoints else ""),
-        "workflow_id": str(options.workflows[0].approval_id) if options.workflows else "",
+        "workflow_id": _preferred_workflow_id(options),
         "prompt": "",
         "negative_prompt": "",
+        "detailer_prompt": "",
+        "detailer_negative_prompt": "",
         "seed": str(secrets.randbelow(2**63)),
-        "width": "1024",
-        "height": "1024",
-        "cfg": "5.0",
-        "steps": "28",
+        "width": "1144",
+        "height": "1480",
+        "cfg": "6.0",
+        "steps": "30",
         "sampler": "euler_ancestral",
-        "scheduler": "normal",
-        "outputs_per_job": "4",
+        "scheduler": "karras",
+        "clip_skip": "2",
+        "outputs_per_job": "1",
         "hires_scale": "1.5",
         "hires_denoise": "0.35",
         "hires_upscale_method": "bislerp",
         "detailer_guide_size": "768",
         "detailer_max_size": "1024",
-        "detailer_denoise": "0.35",
-        "detailer_bbox_threshold": "0.5",
-        "detailer_bbox_dilation": "10",
+        "detailer_denoise": "0.4",
+        "detailer_bbox_threshold": "0.3",
+        "detailer_bbox_dilation": "4",
         "detailer_bbox_crop_factor": "3.0",
+        "detailer_feather": "4",
         "planned_job_count": "4",
-        "desired_accepted_count": "12",
+        "desired_accepted_count": "4",
     }
-    for slot in range(1, 5):
+    for slot in range(1, 9):
         values[f"lora_{slot}_id"] = ""
         values[f"lora_{slot}_weight"] = ""
     return values
+
+
+def _preferred_workflow_id(options: NewSetOptions) -> str:
+    if not options.workflows:
+        return ""
+    preferred = next(
+        (
+            workflow
+            for workflow in options.workflows
+            if workflow.name.casefold() == "illustrious base detailer"
+        ),
+        options.workflows[0],
+    )
+    return str(preferred.approval_id)
 
 
 def _form_csrf_token(

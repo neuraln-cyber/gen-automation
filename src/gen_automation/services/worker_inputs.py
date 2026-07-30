@@ -43,7 +43,7 @@ MAX_ENVELOPE_BYTES = 256 * 1024
 MAX_JSON_DEPTH = 64
 MAX_JSON_ITEMS = 50_000
 MIN_POST_ACCEPTANCE_UPLOAD_SECONDS = 3600
-MAX_RUNTIME_LORAS = 4
+MAX_RUNTIME_LORAS = 8
 LORA_CHAIN_NODE_CLASS = "GenAutomationLoraChain"
 type UploadContentType = Literal["image/png", "image/jpeg", "image/webp"]
 
@@ -67,11 +67,17 @@ class _ResolvedJobParameters:
             value = lora.model_dump(mode="json")
             value["runtime_filename"] = filename
             loras.append(value)
+        generation = self.generation.model_dump(mode="json")
+        generation["clip_stop_at_layer"] = -self.generation.clip_skip
+        generation["detailer_prompt"] = self.generation.detailer_prompt or self.generation.prompt
+        generation["detailer_negative_prompt"] = (
+            self.generation.detailer_negative_prompt or self.generation.negative_prompt
+        )
         bindings: dict[str, object] = {
             "checkpoint": checkpoint,
             "loras": loras,
             "workflow": self.workflow.model_dump(mode="json"),
-            "generation": self.generation.model_dump(mode="json"),
+            "generation": generation,
         }
         if runtime.detector_filename is not None:
             bindings["detector"] = {
@@ -115,7 +121,7 @@ def _resolve_runtime_artifacts(
     manifest: ArtifactManifest,
 ) -> _RuntimeArtifactBindings:
     if len(resolved.loras) > MAX_RUNTIME_LORAS:
-        raise WorkerInputError("generation supports at most four LoRAs")
+        raise WorkerInputError("generation supports at most eight LoRAs")
     if len({lora.sha256 for lora in resolved.loras}) != len(resolved.loras):
         raise WorkerInputError("generation artifacts do not match the worker manifest")
 

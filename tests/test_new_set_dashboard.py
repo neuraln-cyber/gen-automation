@@ -63,6 +63,19 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert "Portrait Style" in page.text
     assert "production-v1" in page.text
     assert "__poses__" in page.text
+    assert 'name="width" value="1144"' in page.text
+    assert 'name="height" value="1480"' in page.text
+    assert 'name="cfg" value="6.0"' in page.text
+    assert 'name="steps" value="30"' in page.text
+    assert 'name="scheduler" value="karras"' in page.text
+    assert 'name="clip_skip" value="2"' in page.text
+    assert 'name="detailer_denoise" value="0.4"' in page.text
+    assert 'name="detailer_bbox_threshold" value="0.3"' in page.text
+    assert 'name="detailer_bbox_dilation" value="4"' in page.text
+    assert 'name="detailer_feather" value="4"' in page.text
+    assert 'name="outputs_per_job" value="1"' in page.text
+    assert 'name="planned_job_count" value="4"' in page.text
+    assert 'name="desired_accepted_count" value="4"' in page.text
     form = {
         "csrf_token": _hidden_value(page.text, "csrf_token"),
         "submission_id": _hidden_value(page.text, "submission_id"),
@@ -80,8 +93,18 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
         "lora_3_weight": "",
         "lora_4_id": "",
         "lora_4_weight": "",
+        "lora_5_id": "",
+        "lora_5_weight": "",
+        "lora_6_id": "",
+        "lora_6_weight": "",
+        "lora_7_id": "",
+        "lora_7_weight": "",
+        "lora_8_id": "",
+        "lora_8_weight": "",
         "prompt": "__poses__, detailed portrait",
         "negative_prompt": "low quality",
+        "detailer_prompt": "expressive face",
+        "detailer_negative_prompt": "closed eyes",
         "seed": "1234",
         "width": "1024",
         "height": "1024",
@@ -89,6 +112,7 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
         "steps": "30",
         "sampler": "euler",
         "scheduler": "normal",
+        "clip_skip": "2",
         "outputs_per_job": "4",
         "hires_scale": "1.75",
         "hires_denoise": "0.4",
@@ -99,6 +123,7 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
         "detailer_bbox_threshold": "0.55",
         "detailer_bbox_dilation": "12",
         "detailer_bbox_crop_factor": "2.8",
+        "detailer_feather": "4",
         "planned_job_count": "3",
         "desired_accepted_count": "10",
     }
@@ -135,6 +160,10 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert version.specification["generation"]["hires_scale"] == 1.75
     assert version.specification["generation"]["hires_upscale_method"] == "bicubic"
     assert version.specification["generation"]["detailer_max_size"] == 1280
+    assert version.specification["generation"]["detailer_prompt"] == "expressive face"
+    assert version.specification["generation"]["detailer_negative_prompt"] == "closed eyes"
+    assert version.specification["generation"]["clip_skip"] == 2
+    assert version.specification["generation"]["detailer_feather"] == 4
     assert version.specification["loras"][0]["weight"] == 0.75
     assert version.specification["wildcard_versions"][0]["name"] == "poses"
     assert {job.parameters["generation"]["prompt"].split(",")[0] for job in jobs} <= {

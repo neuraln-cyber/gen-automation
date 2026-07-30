@@ -99,7 +99,7 @@
       </div>
 
       <p class="muted">Optional LoRAs are applied in slot order. Leave both fields blank to skip a slot.</p>
-      {% for slot in range(1, 5) %}
+      {% for slot in range(1, 9) %}
         <div class="lora-row">
           <label>
             LoRA {{ slot }}
@@ -151,6 +151,26 @@
           spellcheck="false"
         >{{ form_values['negative_prompt'] }}</textarea>
       </label>
+      <label>
+        Face detailer prompt
+        <textarea
+          name="detailer_prompt"
+          rows="3"
+          maxlength="20000"
+          spellcheck="false"
+          placeholder="sexy, expressive"
+        >{{ form_values['detailer_prompt'] }}</textarea>
+      </label>
+      <label>
+        Face detailer negative prompt
+        <textarea
+          name="detailer_negative_prompt"
+          rows="3"
+          maxlength="20000"
+          spellcheck="false"
+          placeholder="closed eyes"
+        >{{ form_values['detailer_negative_prompt'] }}</textarea>
+      </label>
       {% if options.wildcards %}
         <div>
           <p class="muted">Current wildcard tokens (their exact versions freeze with this set):</p>
@@ -177,11 +197,11 @@
         </label>
         <label>
           Width
-          <input type="number" name="width" value="{{ form_values['width'] }}" min="512" max="4096" step="64" required>
+          <input type="number" name="width" value="{{ form_values['width'] }}" min="512" max="4096" step="8" required>
         </label>
         <label>
           Height
-          <input type="number" name="height" value="{{ form_values['height'] }}" min="512" max="4096" step="64" required>
+          <input type="number" name="height" value="{{ form_values['height'] }}" min="512" max="4096" step="8" required>
         </label>
         <label>
           CFG
@@ -199,14 +219,18 @@
           Scheduler
           <input type="text" name="scheduler" value="{{ form_values['scheduler'] }}" maxlength="100" required>
         </label>
+        <label>
+          Clip skip
+          <input type="number" name="clip_skip" value="{{ form_values['clip_skip'] }}" min="1" max="12" step="1" required>
+        </label>
       </div>
     </fieldset>
 
     <fieldset>
       <legend>Hires &amp; face detailer</legend>
       <p class="muted">
-        The base profile ignores these values. The hires profile uses the latent
-        upscale fields; the hires + detailer profile also uses the face fields.
+        The base profile ignores these values. Base + detailer uses only the face
+        fields; hires uses only the latent upscale fields; hires + detailer uses both.
       </p>
       <div class="form-grid">
         <label>
@@ -248,6 +272,10 @@
         <label>
           Face crop factor
           <input type="number" name="detailer_bbox_crop_factor" value="{{ form_values['detailer_bbox_crop_factor'] }}" min="1" max="5" step="0.1" required>
+        </label>
+        <label>
+          Face mask feather
+          <input type="number" name="detailer_feather" value="{{ form_values['detailer_feather'] }}" min="0" max="128" step="1" required>
         </label>
       </div>
     </fieldset>

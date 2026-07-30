@@ -29,7 +29,7 @@ from gen_automation.storage.memory import MemoryObjectStore
 
 NOW = datetime(2026, 7, 29, 10, 0, tzinfo=UTC)
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-BASE_WORKFLOW_SHA256 = "901a50003bfb9aa17c6117a29fc1232a678dcadc19f70a895fe6edf69ccf3fca"
+BASE_WORKFLOW_SHA256 = "1d099e8ed6a73ddf30cce4b8a5970aa17de16377fd248f5a654a32f65fba9834"
 BASE_WORKFLOW_KEY = f"workflows/by-sha256/{BASE_WORKFLOW_SHA256}.json"
 
 
