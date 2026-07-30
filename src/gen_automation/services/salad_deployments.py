@@ -56,6 +56,7 @@ _RUNTIME_BINDINGS_KEY = "runtime_bindings"
 _WORKER_QUEUE_PATH = "/jobs/generate"
 _WORKER_PORT = 8000
 _WORKER_RESTART_POLICY = "on_failure"
+_SALAD_DEFAULT_SHM_SIZE = 64
 _RUNTIME_REFRESH_CONVERGENCE_TIMEOUT_SECONDS = 60.0
 _RUNTIME_REFRESH_POLL_SECONDS = 1.0
 _WORKER_STARTUP_PROBE: JSONObject = {
@@ -1380,8 +1381,19 @@ def _group_configuration_drift(
     for key, expected_value in desired_container.items():
         if key == "image":
             continue
+        observed_value = container.get(key)
+        if (
+            key == "resources"
+            and isinstance(observed_value, dict)
+            and observed_value.get("shm_size") == _SALAD_DEFAULT_SHM_SIZE
+        ):
+            observed_value = {
+                resource_key: resource_value
+                for resource_key, resource_value in observed_value.items()
+                if resource_key != "shm_size"
+            }
         if not _matches_worker_contract(
-            container.get(key),
+            observed_value,
             expected_value,
             allow_null_extensions=True,
         ):
