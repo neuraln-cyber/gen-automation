@@ -69,6 +69,10 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert 'name="steps" value="30"' in page.text
     assert 'name="scheduler" value="karras"' in page.text
     assert 'name="clip_skip" value="2"' in page.text
+    assert 'name="detailer_prompt"' in page.text
+    assert ">sexy, expressive, </textarea>" in page.text
+    assert 'name="detailer_negative_prompt"' in page.text
+    assert ">closed eyes, </textarea>" in page.text
     assert 'name="detailer_denoise" value="0.4"' in page.text
     assert 'name="detailer_bbox_threshold" value="0.3"' in page.text
     assert 'name="detailer_bbox_dilation" value="4"' in page.text

@@ -78,6 +78,8 @@ def _job_parameters(
             "seed": seed,
             "prompt": resolved_prompts.prompt,
             "negative_prompt": resolved_prompts.negative_prompt,
+            "detailer_prompt": resolved_prompts.detailer_prompt,
+            "detailer_negative_prompt": resolved_prompts.detailer_negative_prompt,
         }
     ).model_dump(mode="json")
     return {
