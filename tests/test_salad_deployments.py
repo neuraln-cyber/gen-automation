@@ -1648,6 +1648,27 @@ def test_group_configuration_drift_variants(
     assert _group_configuration_drift(unpersisted_deployment(), group) == expected
 
 
+def test_group_configuration_accepts_only_salad_default_shm_size() -> None:
+    default_group = make_group(remote_names()[1], remote_names()[0])
+    default_container = default_group.raw["container"]
+    assert isinstance(default_container, dict)
+    default_resources = default_container["resources"]
+    assert isinstance(default_resources, dict)
+    default_resources["shm_size"] = 64
+    assert _group_configuration_drift(unpersisted_deployment(), default_group) is None
+
+    changed_group = make_group(remote_names()[1], remote_names()[0])
+    changed_container = changed_group.raw["container"]
+    assert isinstance(changed_container, dict)
+    changed_resources = changed_container["resources"]
+    assert isinstance(changed_resources, dict)
+    changed_resources["shm_size"] = 128
+    assert (
+        _group_configuration_drift(unpersisted_deployment(), changed_group)
+        == "provider_container_contract_drift"
+    )
+
+
 @pytest.mark.asyncio
 async def test_rate_limit_is_deferred_but_definitive_rejection_fails(
     deployment_context: DeploymentContext,
