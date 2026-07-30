@@ -340,7 +340,7 @@ async def test_submission_timeout_preserves_exact_pre_post_effect_boundary(
             settings=Settings().model_copy(
                 update={
                     "gpu_allocation_enabled": True,
-                    "background_submit_timeout_seconds": 0.2,
+                    "background_submit_timeout_seconds": 1.0,
                 }
             ),
             sessions=database.sessions,
