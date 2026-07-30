@@ -34,7 +34,7 @@ from gen_automation.middleware import RequestContextMiddleware
 from gen_automation.services.admin_enrollment import AdminEnrollmentService
 from gen_automation.services.authentication import AuthenticationService
 from gen_automation.services.runtime_secrets import (
-    ConfiguredRuntimeSecretResolver,
+    RuntimeSecretResolver,
     build_runtime_secret_resolver,
 )
 from gen_automation.services.x_oauth import (
@@ -59,7 +59,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         patreon_http_client: httpx2.AsyncClient | None = None
         patreon_driver: PatreonSidecarDriver | None = None
         controller_runtime: ControllerRuntime | None = None
-        runtime_secret_resolver: ConfiguredRuntimeSecretResolver | None = None
+        runtime_secret_resolver: RuntimeSecretResolver | None = None
         x_oauth_provider: AwsSecretsManagerXOAuthProvider | None = None
         authentication_service: AuthenticationService | None = None
         admin_enrollment_service: AdminEnrollmentService | None = None

@@ -14,10 +14,8 @@ from gen_automation.auth.security import SecretEncryptionError, TotpSecretCipher
 from gen_automation.domain.deliverability import PATREON_MAX_ARCHIVE_BYTES
 from gen_automation.domain.runtime_bindings import (
     WORKER_ALLOWED_UPLOAD_ORIGIN_BINDING,
-    WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING,
     WORKER_ARTIFACT_BUCKET_BINDING,
     WORKER_ARTIFACT_REGION_BINDING,
-    WORKER_ARTIFACT_SECRET_ACCESS_KEY_BINDING,
     WORKER_MODEL_MANIFEST_JSON_BINDING,
     WORKER_MODEL_MANIFEST_SHA256_BINDING,
 )
@@ -33,6 +31,10 @@ SALAD_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,61}[a-z0-9]$")
 SALAD_WORKER_IMAGE_PATTERN = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
 WORKER_SIGNING_KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 WORKER_ARTIFACT_BUCKET_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,254}$")
+AWS_IAM_ROLE_ARN_PATTERN = (
+    r"^arn:(?:aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/"
+    r"[A-Za-z0-9+=,.@_/-]{1,512}$"
+)
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 X_OAUTH_SECRET_REFERENCE_PATTERN = (
     r"^aws-secrets-manager://arn:(?:aws|aws-us-gov|aws-cn):secretsmanager:"  # noqa: S105
@@ -364,6 +366,11 @@ class Settings(BaseSettings):
     salad_worker_artifact_bucket: SecretStr | None = None
     salad_worker_artifact_region: SecretStr | None = None
     salad_worker_artifact_endpoint_url: SecretStr | None = None
+    salad_worker_artifact_role_arn: str | None = Field(
+        default=None,
+        pattern=AWS_IAM_ROLE_ARN_PATTERN,
+        max_length=600,
+    )
     salad_worker_artifact_access_key_id: SecretStr | None = None
     salad_worker_artifact_secret_access_key: SecretStr | None = None
     salad_worker_artifact_session_token: SecretStr | None = None
@@ -660,10 +667,6 @@ class Settings(BaseSettings):
                 WORKER_MODEL_MANIFEST_SHA256_BINDING: (self.salad_worker_model_manifest_sha256),
                 WORKER_ARTIFACT_BUCKET_BINDING: self.salad_worker_artifact_bucket,
                 WORKER_ARTIFACT_REGION_BINDING: self.salad_worker_artifact_region,
-                WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING: (self.salad_worker_artifact_access_key_id),
-                WORKER_ARTIFACT_SECRET_ACCESS_KEY_BINDING: (
-                    self.salad_worker_artifact_secret_access_key
-                ),
             }
             missing_runtime_values = [
                 name
@@ -674,6 +677,11 @@ class Settings(BaseSettings):
                 errors.append(
                     "staging and production GPU allocation requires complete "
                     "Salad worker runtime bindings: " + ", ".join(sorted(missing_runtime_values))
+                )
+            if protected_environment and self.salad_worker_artifact_role_arn is None:
+                errors.append(
+                    "staging and production GPU allocation requires a Salad worker "
+                    "artifact reader role ARN"
                 )
         self._validate_worker_runtime_values(errors)
         if self.salad_enabled:
@@ -864,10 +872,28 @@ class Settings(BaseSettings):
 
         artifact_access_key = _secret_value(self.salad_worker_artifact_access_key_id)
         artifact_secret_key = _secret_value(self.salad_worker_artifact_secret_access_key)
+        artifact_session_token = _secret_value(self.salad_worker_artifact_session_token)
         if (artifact_access_key is None) != (artifact_secret_key is None):
             errors.append("Salad worker artifact access key and secret must be provided together")
-        if self.salad_worker_artifact_session_token is not None and artifact_access_key is None:
+        if artifact_session_token is not None and artifact_access_key is None:
             errors.append("Salad worker artifact session token requires an access key")
+        if self.salad_worker_artifact_role_arn is not None and any(
+            value is not None
+            for value in (
+                artifact_access_key,
+                artifact_secret_key,
+                artifact_session_token,
+            )
+        ):
+            errors.append(
+                "Salad worker artifact reader role cannot be combined with configured "
+                "artifact credentials"
+            )
+        if self.salad_worker_artifact_role_arn is not None and artifact_endpoint is not None:
+            errors.append(
+                "Salad worker artifact reader role cannot be combined with a custom "
+                "artifact endpoint"
+            )
 
     @property
     def worker_verification_public_key(self) -> str | None:

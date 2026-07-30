@@ -24,6 +24,60 @@ resource "aws_iam_role_policy_attachment" "ssm" {
   policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+data "aws_iam_policy_document" "salad_worker_artifact_reader_assume" {
+  count = local.salad_worker_artifact_role_enabled ? 1 : 0
+
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "AWS"
+      identifiers = [aws_iam_role.control_plane.arn]
+    }
+  }
+}
+
+resource "aws_iam_role" "salad_worker_artifact_reader" {
+  count = local.salad_worker_artifact_role_enabled ? 1 : 0
+
+  name                 = "${local.name}-salad-artifact-reader"
+  assume_role_policy   = data.aws_iam_policy_document.salad_worker_artifact_reader_assume[0].json
+  max_session_duration = 3600
+
+  tags = {
+    Name = "${local.name}-salad-artifact-reader"
+  }
+}
+
+data "aws_iam_policy_document" "salad_worker_artifact_reader" {
+  count = local.salad_worker_artifact_role_enabled ? 1 : 0
+
+  dynamic "statement" {
+    for_each = var.salad_worker_artifact_object_versions
+
+    content {
+      sid       = "ReadPinnedArtifact${substr(sha256(statement.key), 0, 16)}"
+      actions   = ["s3:GetObjectVersion"]
+      resources = ["${aws_s3_bucket.models.arn}/${statement.key}"]
+
+      condition {
+        test     = "StringEquals"
+        variable = "s3:VersionId"
+        values   = [statement.value]
+      }
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "salad_worker_artifact_reader" {
+  count = local.salad_worker_artifact_role_enabled ? 1 : 0
+
+  name   = "${local.name}-pinned-artifacts"
+  role   = aws_iam_role.salad_worker_artifact_reader[0].id
+  policy = data.aws_iam_policy_document.salad_worker_artifact_reader[0].json
+}
+
 data "aws_iam_policy_document" "runtime" {
   statement {
     sid = "AssetBucketMetadata"
@@ -56,15 +110,6 @@ data "aws_iam_policy_document" "runtime" {
   }
 
   statement {
-    sid = "ModelObjects"
-    actions = [
-      "s3:GetObject",
-      "s3:GetObjectVersion",
-    ]
-    resources = ["${aws_s3_bucket.models.arn}/*"]
-  }
-
-  statement {
     sid = "RdsManagedMasterSecretRead"
     actions = [
       "secretsmanager:DescribeSecret",
@@ -85,6 +130,16 @@ data "aws_iam_policy_document" "runtime" {
         "secretsmanager:UpdateSecretVersionStage",
       ]
       resources = [statement.value]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = local.salad_worker_artifact_role_enabled ? [1] : []
+
+    content {
+      sid       = "AssumeSaladArtifactReader"
+      actions   = ["sts:AssumeRole"]
+      resources = [aws_iam_role.salad_worker_artifact_reader[0].arn]
     }
   }
 }

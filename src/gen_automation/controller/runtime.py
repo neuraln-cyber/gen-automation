@@ -82,6 +82,7 @@ from gen_automation.services.salad import (
 from gen_automation.services.salad_deployments import (
     provision_deployment_step,
     reconcile_deployment,
+    refresh_container_group_runtime,
 )
 from gen_automation.services.salad_inbox import (
     ClaimedSaladWebhook,
@@ -1113,15 +1114,15 @@ class ControllerWorkloads:
         artifact_manifest = load_artifact_manifest(manifest_json.get_secret_value())
 
         async with self.sessions() as session:
-            reservation_microusd = await session.scalar(
-                select(SaladDeployment.max_hourly_cost_microusd)
+            deployment = await session.scalar(
+                select(SaladDeployment)
                 .join(
                     GenerationAttempt,
                     GenerationAttempt.salad_deployment_id == SaladDeployment.id,
                 )
                 .where(GenerationAttempt.id == event.aggregate_id)
             )
-            if reservation_microusd is None:
+            if deployment is None:
                 raise RuntimeError("generation attempt deployment is unavailable")
             input_provider = SaladWorkerJobInputProvider(
                 session=session,
@@ -1134,13 +1135,18 @@ class ControllerWorkloads:
                 upload_grant_ttl_seconds=self.settings.worker_upload_grant_ttl_seconds,
                 max_upload_bytes=self.settings.storage_max_image_bytes,
             )
+            await refresh_container_group_runtime(
+                deployment,
+                self.salad_client,
+                self.secret_resolver,
+            )
             return await submit_prepared_attempt(
                 session,
                 self.salad_client,
                 cast(SaladUploadIntentProvider, input_provider),
                 generation_attempt_id=event.aggregate_id,
                 webhook_url=(f"{str(self.settings.public_base_url).rstrip('/')}/webhooks/salad"),
-                reservation_microusd=int(reservation_microusd),
+                reservation_microusd=deployment.max_hourly_cost_microusd,
                 provider_post_started=progress.mark_provider_post_started,
             )
 

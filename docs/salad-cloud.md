@@ -167,8 +167,7 @@ Artifact-source settings:
 | --- | --- |
 | `GEN_WORKER_ARTIFACT_REGION` | `us-east-1`. |
 | `GEN_WORKER_ARTIFACT_ENDPOINT_URL` | Provider HTTPS S3 endpoint; production rejects an HTTP endpoint. Omit for AWS default resolution. |
-| `GEN_WORKER_ARTIFACT_ACCESS_KEY_ID`, `GEN_WORKER_ARTIFACT_SECRET_ACCESS_KEY` | Required together in a production Salad worker and restricted to `GetObject` on approved model objects. Prefer short-lived staging session credentials. |
-| `GEN_WORKER_ARTIFACT_SESSION_TOKEN` | Optional session token; valid only with the explicit key pair. |
+| `GEN_WORKER_ARTIFACT_ACCESS_KEY_ID`, `GEN_WORKER_ARTIFACT_SECRET_ACCESS_KEY`, `GEN_WORKER_ARTIFACT_SESSION_TOKEN` | Required as one indivisible short-lived set in a production Salad worker. In AWS, the controller mints these from `GEN_AUTOMATION_SALAD_WORKER_ARTIFACT_ROLE_ARN`; configured static keys and a custom endpoint are rejected in role mode. |
 | `GEN_WORKER_ARTIFACT_CONNECT_TIMEOUT_SECONDS`, `GEN_WORKER_ARTIFACT_READ_TIMEOUT_SECONDS` | `10` and `120`; bounded S3 bootstrap network timeouts. |
 | `GEN_WORKER_MODEL_BOOTSTRAP_TIMEOUT_SECONDS` | `3600`; hard wall-time cap for the complete verified model bootstrap so a stalled cold start cannot spend indefinitely. |
 
