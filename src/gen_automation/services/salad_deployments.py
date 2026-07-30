@@ -1054,9 +1054,9 @@ async def refresh_container_group_runtime(
             {"container": container},
         )
         _validate_runtime_group(deployment, updated)
-        if updated.version <= preflight.version:
+        if updated.version < preflight.version:
             raise SaladDeploymentValidationError("container group runtime update was not accepted")
-        target_version = updated.version
+        target_version = max(preflight.version + 1, updated.version)
         async with asyncio.timeout(convergence_timeout_seconds):
             while True:
                 observed = await client.get_container_group(deployment.container_group_name)

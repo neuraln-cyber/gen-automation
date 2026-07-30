@@ -692,6 +692,44 @@ async def test_refresh_waits_for_pending_group_version_to_apply() -> None:
 
 
 @pytest.mark.asyncio
+async def test_refresh_accepts_provider_patch_response_before_version_increment() -> None:
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    preflight = make_group(deployment.container_group_name, deployment.queue_name)
+    accepted = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        pending_change=True,
+    )
+    applied = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        version=2,
+    )
+    client = FakeClient()
+    client.groups[deployment.container_group_name] = applied
+    client.get_group_results = [preflight, accepted, applied]
+    client.update_group_result = accepted
+
+    result = await refresh_container_group_runtime(
+        deployment,
+        client,
+        FakeResolver({WORKER_MODEL_MANIFEST_JSON_BINDING: LIVE_VALUE}),
+        convergence_timeout_seconds=1,
+        poll_interval_seconds=0,
+    )
+
+    assert result is applied
+    assert [call[0] for call in client.calls] == [
+        "get_group",
+        "update_group",
+        "get_group",
+        "get_group",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_refresh_fails_closed_when_pending_group_never_applies() -> None:
     deployment = unpersisted_deployment(provider_configuration(with_binding=True))
     deployment.provider_container_group_id = str(GROUP_ID)
