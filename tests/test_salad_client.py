@@ -21,6 +21,7 @@ from gen_automation.integrations.salad import (
 API_KEY = "salad-test-token"
 JOB_ID = UUID("50150edd-e182-47b5-a754-2d2a04d6ee31")
 GPU_ID = UUID("3c90c3cc-0d44-4b50-8888-8dd25736052a")
+LIVE_GPU_ID = UUID("a5db5c50-cbcb-4596-ae80-6a0c8090d80f")
 GROUP_ID = UUID("ab3a4591-efc3-46c0-b06a-3d820c0ec100")
 QUEUE_ID = UUID("7dcd6922-50e9-4d56-89b5-91cde26f0211")
 
@@ -169,7 +170,17 @@ async def test_discovery_operations_return_typed_results() -> None:
                             "min_ram": 1024,
                             "min_storage": 1_000_000,
                             "min_vcpu": 1,
-                        }
+                        },
+                        {
+                            "gpu_class_type": "community",
+                            "id": str(LIVE_GPU_ID),
+                            "name": "RTX 3090 (24 GB)",
+                            "prices": [
+                                {"price": "0.25", "priority": "high"},
+                                {"price": "0.143", "priority": "low"},
+                            ],
+                            "is_high_demand": False,
+                        },
                     ]
                 },
             )
@@ -209,6 +220,11 @@ async def test_discovery_operations_return_typed_results() -> None:
     assert gpu_classes[0].id == GPU_ID
     assert gpu_classes[0].name == "RTX 4090"
     assert gpu_classes[0].prices == ("0.22", "0.18")
+    assert gpu_classes[1].id == LIVE_GPU_ID
+    assert gpu_classes[1].name == "RTX 3090 (24 GB)"
+    assert gpu_classes[1].prices == ("0.25", "0.143")
+    assert gpu_classes[1].gpu_count == 1
+    assert gpu_classes[1].max_ram == 0
     assert availability.available_gpu_batch == 4
     assert availability.available_gpu_high == 1
 
