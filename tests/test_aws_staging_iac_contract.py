@@ -44,13 +44,6 @@ def test_aws_staging_has_no_ssh_or_secret_value_resources() -> None:
     assert re.search(r"http_put_response_hop_limit\s*=\s*2", source) is None
     assert "aws_secretsmanager_secret_version" not in source
     assert "secret_string" not in source
-    assert (
-        '"s3:PutObject"'
-        not in source.split('sid = "ModelObjects"', maxsplit=1)[1].split(
-            "resources",
-            maxsplit=1,
-        )[0]
-    )
     assert "GEN_AUTOMATION_" not in cloud_init
     assert "password" not in cloud_init.casefold()
     assert "private_key" not in cloud_init.casefold()
@@ -94,3 +87,42 @@ def test_aws_staging_examples_and_state_safety_are_non_secret() -> None:
     )
     assert "never use host networking for them" in runbook
     assert "prevents a bridged sidecar from obtaining the EC2 instance role" in runbook
+
+
+def test_salad_artifact_reader_is_disabled_and_exact_version_only() -> None:
+    source = _terraform_source()
+    variables = (INFRA / "variables.tf").read_text(encoding="utf-8")
+    tfvars = (INFRA / "terraform.tfvars.example").read_text(encoding="utf-8")
+    reader_policy = source.split(
+        'data "aws_iam_policy_document" "salad_worker_artifact_reader" {',
+        maxsplit=1,
+    )[1].split(
+        'resource "aws_iam_role_policy" "salad_worker_artifact_reader" {',
+        maxsplit=1,
+    )[0]
+    control_policy = source.split(
+        'data "aws_iam_policy_document" "runtime" {',
+        maxsplit=1,
+    )[1].split(
+        'resource "aws_iam_role_policy" "runtime" {',
+        maxsplit=1,
+    )[0]
+
+    assert 'variable "salad_worker_artifact_object_versions"' in variables
+    assert re.search(
+        r'variable "salad_worker_artifact_object_versions"\s*\{.*?default\s*=\s*\{\}',
+        variables,
+        re.DOTALL,
+    )
+    assert "salad_worker_artifact_object_versions = {" in tfvars
+    assert "length(var.salad_worker_artifact_object_versions) > 0" in source
+    assert "max_session_duration = 3600" in source
+    assert "identifiers = [aws_iam_role.control_plane.arn]" in source
+    assert 'actions   = ["s3:GetObjectVersion"]' in reader_policy
+    assert 'variable = "s3:VersionId"' in reader_policy
+    assert "statement.value" in reader_policy
+    assert re.search(r'"s3:(?:GetObject|ListBucket|PutObject|DeleteObject)"', reader_policy) is None
+    assert 'sid       = "AssumeSaladArtifactReader"' in control_policy
+    assert 'actions   = ["sts:AssumeRole"]' in control_policy
+    assert "aws_iam_role.salad_worker_artifact_reader[0].arn" in control_policy
+    assert '"${aws_s3_bucket.models.arn}/*"' not in control_policy

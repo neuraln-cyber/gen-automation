@@ -18,6 +18,12 @@ hostname        = null
 # outside OpenTofu. Never put the X OAuth JSON or token values in tfvars.
 x_oauth_secret_arn = null
 
+# Empty is disabled by default. After artifact onboarding, map only the exact
+# immutable S3 object versions present in the signed worker manifest.
+salad_worker_artifact_object_versions = {
+  # "worker/checkpoints/example-sha256.safetensors" = "opaque-s3-version-id"
+}
+
 # Defaults implement ADR 0002. These explicit examples make cost-affecting
 # changes visible during review.
 instance_type                  = "t3a.medium"

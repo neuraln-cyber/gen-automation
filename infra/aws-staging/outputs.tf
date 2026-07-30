@@ -28,6 +28,11 @@ output "model_bucket_name" {
   value       = aws_s3_bucket.models.id
 }
 
+output "salad_worker_artifact_role_arn" {
+  description = "Optional one-hour STS reader role for exact model-artifact versions."
+  value       = try(aws_iam_role.salad_worker_artifact_reader[0].arn, null)
+}
+
 output "database_endpoint" {
   description = "Private PostgreSQL endpoint; it is reachable only from the control-plane SG."
   value       = aws_db_instance.postgresql.address

@@ -55,6 +55,7 @@ from gen_automation.services.salad_deployments import (
     deterministic_provider_name,
     provision_deployment_step,
     reconcile_deployment,
+    refresh_container_group_runtime,
 )
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
@@ -135,6 +136,7 @@ def make_group(
     replicas: int = 0,
     running: int = 0,
     pending_change: bool = False,
+    version: int = 1,
     image: str = IMAGE_DIGEST,
     start_time: datetime | None = NOW,
     finish_time: datetime | None = None,
@@ -143,7 +145,15 @@ def make_group(
     raw: dict[str, JSONValue] = {
         "id": str(group_id),
         "name": name,
-        "container": {"image": image},
+        "container": {
+            "image": image,
+            "resources": {
+                "cpu": 4,
+                "memory": 16384,
+                "gpu_classes": ["gpu-class"],
+            },
+            "image_caching": True,
+        },
         "queue_connection": {
             "queue_name": queue_name,
             "path": "/jobs/generate",
@@ -168,7 +178,7 @@ def make_group(
         display_name=name,
         replicas=replicas,
         pending_change=pending_change,
-        version=1,
+        version=version,
         current_state=SaladContainerGroupState(
             description=status,
             allocating_count=0,
@@ -190,11 +200,15 @@ class FakeClient:
         self.groups: dict[str, SaladContainerGroup] = {}
         self.create_queue_error: Exception | None = None
         self.create_group_error: Exception | None = None
+        self.update_group_error: Exception | None = None
         self.stop_error: Exception | None = None
         self.get_queue_error: Exception | None = None
         self.get_group_error: Exception | None = None
+        self.get_group_results: list[SaladContainerGroup] = []
+        self.update_group_result: SaladContainerGroup | None = None
         self.created_queue_names: list[str] = []
         self.created_group_payloads: list[dict[str, JSONValue]] = []
+        self.updated_group_patches: list[dict[str, JSONValue]] = []
         self.stop_names: list[str] = []
         self.calls: list[tuple[str, str]] = []
 
@@ -249,6 +263,24 @@ class FakeClient:
         self.calls.append(("get_group", container_group_name))
         if self.get_group_error is not None:
             raise self.get_group_error
+        if self.get_group_results:
+            return self.get_group_results.pop(0)
+        try:
+            return self.groups[container_group_name]
+        except KeyError:
+            raise api_error(404) from None
+
+    async def update_container_group(
+        self,
+        container_group_name: str,
+        patch: Mapping[str, JSONValue],
+    ) -> SaladContainerGroup:
+        self.calls.append(("update_group", container_group_name))
+        self.updated_group_patches.append(dict(patch))
+        if self.update_group_error is not None:
+            raise self.update_group_error
+        if self.update_group_result is not None:
+            return self.update_group_result
         try:
             return self.groups[container_group_name]
         except KeyError:
@@ -269,6 +301,9 @@ class FakeResolver(RuntimeSecretResolver):
     async def resolve_many(self, bindings: Mapping[str, str]) -> Mapping[str, str]:
         self.requests.append(tuple(bindings))
         return {name: self.values[name] for name in bindings if name in self.values}
+
+    async def aclose(self) -> None:
+        return None
 
 
 @dataclass(frozen=True)
@@ -568,6 +603,119 @@ async def test_runtime_binding_requires_resolver_and_complete_resolution() -> No
     resolver = FakeResolver({})
     with pytest.raises(SaladDeploymentValidationError, match="could not be resolved"):
         await _container_group_payload(deployment, resolver)
+
+
+@pytest.mark.asyncio
+async def test_refresh_container_group_runtime_injects_only_resolved_ephemeral_values() -> None:
+    configuration = provider_configuration(with_binding=True)
+    container_configuration = configuration["container"]
+    assert isinstance(container_configuration, dict)
+    container_configuration["image_caching"] = True
+    deployment = unpersisted_deployment(configuration)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    client = FakeClient()
+    preflight = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+    )
+    applied = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        version=2,
+    )
+    client.groups[deployment.container_group_name] = applied
+    client.get_group_results = [preflight, applied]
+    client.update_group_result = applied
+    resolver = FakeResolver({WORKER_MODEL_MANIFEST_JSON_BINDING: LIVE_VALUE})
+
+    group = await refresh_container_group_runtime(deployment, client, resolver)
+
+    assert group.id == GROUP_ID
+    assert client.updated_group_patches == [
+        {
+            "container": {
+                "image": IMAGE_DIGEST,
+                "resources": {
+                    "cpu": 4,
+                    "memory": 16384,
+                    "gpu_classes": ["gpu-class"],
+                },
+                "image_caching": True,
+                "environment_variables": {
+                    WORKER_MODEL_MANIFEST_JSON_BINDING: LIVE_VALUE,
+                },
+            }
+        }
+    ]
+    assert LIVE_VALUE not in repr(deployment.provider_configuration)
+    assert resolver.requests == [(WORKER_MODEL_MANIFEST_JSON_BINDING,)]
+
+
+@pytest.mark.asyncio
+async def test_refresh_waits_for_pending_group_version_to_apply() -> None:
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    preflight = make_group(deployment.container_group_name, deployment.queue_name)
+    pending = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        pending_change=True,
+        version=2,
+    )
+    applied = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        version=2,
+    )
+    client = FakeClient()
+    client.groups[deployment.container_group_name] = applied
+    client.get_group_results = [preflight, pending, applied]
+    client.update_group_result = pending
+
+    result = await refresh_container_group_runtime(
+        deployment,
+        client,
+        FakeResolver({WORKER_MODEL_MANIFEST_JSON_BINDING: LIVE_VALUE}),
+        convergence_timeout_seconds=1,
+        poll_interval_seconds=0,
+    )
+
+    assert result is applied
+    assert [call[0] for call in client.calls] == [
+        "get_group",
+        "update_group",
+        "get_group",
+        "get_group",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_refresh_fails_closed_when_pending_group_never_applies() -> None:
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    preflight = make_group(deployment.container_group_name, deployment.queue_name)
+    pending = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        pending_change=True,
+        version=2,
+    )
+    client = FakeClient()
+    client.groups[deployment.container_group_name] = pending
+    client.get_group_results = [preflight]
+    client.update_group_result = pending
+
+    with pytest.raises(SaladDeploymentValidationError, match="did not converge"):
+        await refresh_container_group_runtime(
+            deployment,
+            client,
+            FakeResolver({WORKER_MODEL_MANIFEST_JSON_BINDING: LIVE_VALUE}),
+            convergence_timeout_seconds=0.01,
+            poll_interval_seconds=0.001,
+        )
 
 
 def test_naive_controller_timestamp_is_rejected() -> None:

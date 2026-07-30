@@ -96,8 +96,8 @@ S3 client and are represented as redacted `SecretStr` settings.
 
 | Identity | Minimum access | Implemented runtime names | When |
 | --- | --- | --- | --- |
-| Model uploader | Put approved Safetensors objects and read them back for hash verification. No asset-bucket access. This is an operator-only identity. | Use the storage provider's one-off tooling; no application environment name. | Model onboarding. Revoke or disable afterward. |
-| Salad GPU bootstrap | `GetObject` only for the exact approved checkpoint/LoRA object IDs or narrowly approved model prefix. No bucket list, write, delete, asset/archive read, or database access. Prefer temporary credentials. | Control-plane secret store: `GEN_AUTOMATION_SALAD_WORKER_ARTIFACT_BUCKET`, `_REGION`, optional `_ENDPOINT_URL`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY`, optional `_SESSION_TOKEN`. The resolver supplies the corresponding `GEN_WORKER_ARTIFACT_*` values only while creating the worker group. | GPU canary. |
+| Model uploader | Put approved Safetensors objects and read their exact versions back for hash verification. No asset-bucket access. This is an operator-only temporary identity; the control-plane role has no broad model-object read. | Use operator-scoped temporary credentials with only the exact plan keys; no application environment name. | Model onboarding. Revoke or disable afterward. |
+| Salad GPU bootstrap | `GetObjectVersion` only for each exact key and S3 VersionId in `salad_worker_artifact_object_versions`. No bucket list, unversioned read, write, delete, asset/archive read, or database access. | `GEN_AUTOMATION_SALAD_WORKER_ARTIFACT_BUCKET`, `_REGION`, and the nonsecret `_ROLE_ARN`. The controller uses its ambient EC2 identity to assume that role and supplies `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY`, and `_SESSION_TOKEN` to the worker as one temporary set. Custom endpoints and configured long-lived keys are rejected in role mode. | Immediately before group creation and each queue submission. |
 
 Also inject:
 
@@ -109,6 +109,12 @@ Also inject:
 The manifest contains opaque object IDs, exact sizes, filenames, and SHA-256
 values. Model source, license, commercial-use permission, adult-use permission,
 and hashes must be approved before adding an object to it.
+
+The STS session is capped at one hour. The controller rotates it immediately
+before enqueueing and waits for Salad to apply the new container-group version.
+An allocation delayed beyond that hour cannot be refreshed inside an already
+started container; bootstrap fails closed and the job must retry through the
+controller so a new session is installed before the next enqueue.
 
 ### SaladCloud
 

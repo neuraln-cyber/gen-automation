@@ -31,8 +31,10 @@ worker artifact bucket. This keeps memory use and cloud egress predictable.
 - Run all database migrations and create an active owner account.
 - Enable object versioning on private workflow storage. Runtime workflow reads
   require an exact version and ETag.
-- Give the one-off job read/write access to workflow storage and read access to
-  the worker artifact bucket.
+- Give the one-off job operator-scoped temporary read/write access only to the
+  exact workflow and worker-artifact keys in the plan. The runtime
+  control-plane role deliberately has no broad model-object read and must not be
+  reused for onboarding.
 - Put credentials only in the existing environment/secret bindings. The CLI
   accepts paths, never credentials.
 
@@ -62,6 +64,12 @@ GEN_AUTOMATION_SALAD_WORKER_ARTIFACT_SESSION_TOKEN
 When explicit keys are omitted, the normal cloud role/SDK credential chain is
 used. Do not place secrets in the plan, command line, generated manifest, or
 terminal transcript.
+
+After onboarding, copy every exact worker-artifact key and returned non-null S3
+VersionId into the OpenTofu
+`salad_worker_artifact_object_versions` map. Applying that map creates the
+disabled-by-default Salad reader role; copy its nonsecret output ARN to
+`GEN_AUTOMATION_SALAD_WORKER_ARTIFACT_ROLE_ARN`.
 
 ## Upload the large files
 

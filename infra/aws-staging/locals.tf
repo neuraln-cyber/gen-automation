@@ -9,6 +9,7 @@ locals {
   model_bucket_name = lower(
     "${var.name_prefix}-${data.aws_caller_identity.current.account_id}-${var.aws_region}-models"
   )
+  salad_worker_artifact_role_enabled = length(var.salad_worker_artifact_object_versions) > 0
 
   alert_topic_name = "${local.name}-alerts"
   log_group_name   = "/gen-automation/staging"

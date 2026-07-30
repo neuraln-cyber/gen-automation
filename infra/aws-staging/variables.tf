@@ -172,6 +172,26 @@ variable "x_oauth_secret_arn" {
   }
 }
 
+variable "salad_worker_artifact_object_versions" {
+  description = "Exact model-bucket object keys and immutable S3 VersionIds readable by Salad workers. Empty disables the reader role."
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition = alltrue([
+      for object_key, version_id in var.salad_worker_artifact_object_versions :
+      can(regex("^worker/(checkpoints|loras|detectors)/[A-Za-z0-9][A-Za-z0-9._/-]*$", object_key))
+      && !strcontains(object_key, "..")
+      && !strcontains(object_key, "//")
+      && !endswith(object_key, "/")
+      && trimspace(version_id) != ""
+      && version_id != "null"
+      && length(version_id) <= 1024
+    ])
+    error_message = "Artifact entries must use worker/checkpoints, worker/loras, or worker/detectors keys and non-null immutable VersionIds."
+  }
+}
+
 variable "notification_email" {
   description = "Operator email for the SNS alarm and monthly budget subscription."
   type        = string

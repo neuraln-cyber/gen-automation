@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Mapping
 from copy import deepcopy
@@ -55,6 +56,8 @@ _RUNTIME_BINDINGS_KEY = "runtime_bindings"
 _WORKER_QUEUE_PATH = "/jobs/generate"
 _WORKER_PORT = 8000
 _WORKER_RESTART_POLICY = "on_failure"
+_RUNTIME_REFRESH_CONVERGENCE_TIMEOUT_SECONDS = 60.0
+_RUNTIME_REFRESH_POLL_SECONDS = 1.0
 _WORKER_STARTUP_PROBE: JSONObject = {
     "http": {
         "headers": [],
@@ -171,6 +174,12 @@ class SaladDeploymentClient(Protocol):
     async def get_container_group(
         self,
         container_group_name: str,
+    ) -> SaladContainerGroup: ...
+
+    async def update_container_group(
+        self,
+        container_group_name: str,
+        patch: Mapping[str, JSONValue],
     ) -> SaladContainerGroup: ...
 
     async def stop_container_group(self, container_group_name: str) -> None: ...
@@ -1002,6 +1011,82 @@ async def _container_group_payload(
     return cast(JSONObject, configuration)
 
 
+async def refresh_container_group_runtime(
+    deployment: SaladDeployment,
+    client: SaladDeploymentClient,
+    resolver: RuntimeSecretResolver | None,
+    *,
+    convergence_timeout_seconds: float = _RUNTIME_REFRESH_CONVERGENCE_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = _RUNTIME_REFRESH_POLL_SECONDS,
+) -> SaladContainerGroup:
+    """Replace an existing group's ephemeral bindings immediately before submission."""
+
+    if deployment.provider_container_group_id is None:
+        raise SaladDeploymentValidationError("container group is not provisioned")
+    if (
+        not deployment.is_current
+        or deployment.state != SaladDeploymentState.ACTIVE
+        or deployment.desired_state != DesiredDeploymentState.ACTIVE
+    ):
+        raise SaladDeploymentValidationError("deployment is not active")
+    try:
+        preflight = await client.get_container_group(deployment.container_group_name)
+    except Exception:
+        raise SaladDeploymentValidationError(
+            "container group preflight could not be verified"
+        ) from None
+    _validate_runtime_group(deployment, preflight)
+    if preflight.pending_change:
+        raise SaladDeploymentValidationError("container group has a pending change")
+
+    payload = await _container_group_payload(deployment, resolver)
+    container = payload.get("container")
+    if not isinstance(container, dict):
+        raise SaladDeploymentValidationError("provider configuration.container is required")
+    environment = container.get("environment_variables")
+    if not isinstance(environment, dict) or not environment:
+        raise SaladDeploymentValidationError("runtime binding could not be resolved")
+    try:
+        updated = await client.update_container_group(
+            deployment.container_group_name,
+            {"container": container},
+        )
+        _validate_runtime_group(deployment, updated)
+        if updated.version <= preflight.version:
+            raise SaladDeploymentValidationError("container group runtime update was not accepted")
+        target_version = updated.version
+        async with asyncio.timeout(convergence_timeout_seconds):
+            while True:
+                observed = await client.get_container_group(deployment.container_group_name)
+                _validate_runtime_group(deployment, observed)
+                if observed.version >= target_version and not observed.pending_change:
+                    return observed
+                await asyncio.sleep(poll_interval_seconds)
+    except SaladDeploymentValidationError:
+        raise
+    except TimeoutError:
+        raise SaladDeploymentValidationError(
+            "container group runtime update did not converge"
+        ) from None
+    except Exception:
+        raise SaladDeploymentValidationError("container group runtime update failed") from None
+
+
+def _validate_runtime_group(
+    deployment: SaladDeployment,
+    group: SaladContainerGroup,
+) -> None:
+    if (
+        group.name != deployment.container_group_name
+        or str(group.id) != deployment.provider_container_group_id
+    ):
+        raise SaladDeploymentValidationError("container group identity does not match deployment")
+    if _group_configuration_drift(deployment, group) is not None:
+        raise SaladDeploymentValidationError(
+            "container group configuration does not match deployment"
+        )
+
+
 def _parse_runtime_bindings(value: object) -> tuple[_RuntimeBinding, ...]:
     if not isinstance(value, list):
         raise SaladDeploymentValidationError("runtime_bindings must be an array")
@@ -1288,6 +1373,18 @@ def _group_configuration_drift(
     container = raw.get("container")
     if not isinstance(container, dict) or container.get("image") != deployment.worker_image_digest:
         return "provider_image_drift"
+    desired_container = deployment.provider_configuration.get("container")
+    if not isinstance(desired_container, dict):
+        return "provider_container_contract_drift"
+    for key, expected_value in desired_container.items():
+        if key == "image":
+            continue
+        if not _matches_worker_contract(
+            container.get(key),
+            expected_value,
+            allow_null_extensions=True,
+        ):
+            return "provider_container_contract_drift"
     queue_connection = raw.get("queue_connection")
     if (
         not isinstance(queue_connection, dict)

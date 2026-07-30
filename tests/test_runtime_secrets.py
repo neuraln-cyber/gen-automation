@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -14,17 +15,16 @@ from gen_automation.controller.runtime import (
     RuntimeStatus,
 )
 from gen_automation.domain.runtime_bindings import (
-    SALAD_WORKER_REQUIRED_RUNTIME_BINDINGS,
-    SALAD_WORKER_RUNTIME_BINDING_REFERENCES,
     WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING,
-    WORKER_ARTIFACT_ENDPOINT_URL_BINDING,
     WORKER_ARTIFACT_SESSION_TOKEN_BINDING,
 )
 from gen_automation.domain.signing import encode_base64url
 from gen_automation.services.runtime_secrets import (
+    AwsAssumeRoleRuntimeSecretResolver,
     ConfiguredRuntimeSecretResolver,
     RuntimeSecretResolutionError,
     build_runtime_secret_resolver,
+    configured_runtime_binding_references,
 )
 
 SESSION_SECRET = encode_base64url(bytes(range(32)))
@@ -34,6 +34,7 @@ RUNTIME_ACCESS_KEY = "runtime-test-access-key"
 RUNTIME_SECRET_KEY = "runtime-test-secret-key"  # noqa: S105
 RUNTIME_SESSION_TOKEN = "runtime-test-session-token"  # noqa: S105
 RUNTIME_MANIFEST = '{"artifacts":[],"manifest_sha256":"' + ("0" * 64) + '"}'
+RUNTIME_ROLE_ARN = "arn:aws:iam::123456789012:role/gen-automation-staging-salad-artifact-reader"
 
 
 def _protected_gpu_values() -> dict[str, object]:
@@ -70,15 +71,7 @@ def _protected_gpu_values() -> dict[str, object]:
         "salad_worker_model_manifest_sha256": "0" * 64,
         "salad_worker_artifact_bucket": "model-artifacts",
         "salad_worker_artifact_region": "us-east-1",
-        "salad_worker_artifact_access_key_id": RUNTIME_ACCESS_KEY,
-        "salad_worker_artifact_secret_access_key": RUNTIME_SECRET_KEY,
-    }
-
-
-def _required_binding_references() -> dict[str, str]:
-    return {
-        name: SALAD_WORKER_RUNTIME_BINDING_REFERENCES[name]
-        for name in SALAD_WORKER_REQUIRED_RUNTIME_BINDINGS
+        "salad_worker_artifact_role_arn": RUNTIME_ROLE_ARN,
     }
 
 
@@ -91,11 +84,11 @@ def test_protected_gpu_configuration_requires_complete_runtime_values(
 ) -> None:
     values = _protected_gpu_values()
     values["environment"] = environment
-    values["salad_worker_artifact_secret_access_key"] = None
+    values["salad_worker_artifact_role_arn"] = None
 
     with pytest.raises(
         ValidationError,
-        match="requires complete Salad worker runtime bindings",
+        match="requires a Salad worker artifact reader role ARN",
     ):
         Settings(**values)  # type: ignore[arg-type]
 
@@ -171,6 +164,46 @@ def test_runtime_value_validation_fails_closed(
         Settings(**values)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "salad_worker_artifact_access_key_id",
+        "salad_worker_artifact_secret_access_key",
+        "salad_worker_artifact_session_token",
+        "salad_worker_artifact_endpoint_url",
+    ],
+)
+def test_artifact_reader_role_rejects_static_credentials_and_custom_endpoints(
+    field: str,
+) -> None:
+    values = _protected_gpu_values()
+    values[field] = "https://artifacts.example.test" if field.endswith("url") else "configured"
+
+    with pytest.raises(ValidationError, match="reader role cannot be combined"):
+        Settings(**values)  # type: ignore[arg-type]
+
+
+class FakeStsClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.closed = False
+
+    def assume_role(self, **kwargs: object) -> Mapping[str, object]:
+        self.calls.append(dict(kwargs))
+        call_no = len(self.calls)
+        return {
+            "Credentials": {
+                "AccessKeyId": f"{RUNTIME_ACCESS_KEY}-{call_no}",
+                "SecretAccessKey": f"{RUNTIME_SECRET_KEY}-{call_no}",
+                "SessionToken": f"{RUNTIME_SESSION_TOKEN}-{call_no}",
+                "Expiration": datetime.now(UTC) + timedelta(hours=1),
+            }
+        }
+
+    def close(self) -> None:
+        self.closed = True
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "environment",
@@ -182,56 +215,43 @@ async def test_configured_resolver_resolves_only_the_complete_allowlisted_set(
     values = _protected_gpu_values()
     values["environment"] = environment
     settings = Settings(**values)  # type: ignore[arg-type]
-    resolver = build_runtime_secret_resolver(settings)
-    assert resolver is not None
+    sts_client = FakeStsClient()
+    resolver = build_runtime_secret_resolver(settings, sts_client=sts_client)
+    assert isinstance(resolver, AwsAssumeRoleRuntimeSecretResolver)
+    bindings = configured_runtime_binding_references(settings)
 
-    resolved = await resolver.resolve_many(_required_binding_references())
+    first = await resolver.resolve_many(bindings)
+    second = await resolver.resolve_many(bindings)
 
-    assert set(resolved) == SALAD_WORKER_REQUIRED_RUNTIME_BINDINGS
-    assert resolved[WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING] == RUNTIME_ACCESS_KEY
+    assert set(first) == set(bindings)
+    assert WORKER_ARTIFACT_SESSION_TOKEN_BINDING in first
+    assert first[WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING] == f"{RUNTIME_ACCESS_KEY}-1"
+    assert second[WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING] == f"{RUNTIME_ACCESS_KEY}-2"
+    assert len(sts_client.calls) == 2
+    assert all(call["RoleArn"] == RUNTIME_ROLE_ARN for call in sts_client.calls)
+    assert all(call["DurationSeconds"] == 3600 for call in sts_client.calls)
     assert RUNTIME_ACCESS_KEY not in repr(resolver)
     assert RUNTIME_SECRET_KEY not in repr(resolver)
 
 
 @pytest.mark.asyncio
-async def test_configured_optional_values_must_have_matching_durable_bindings() -> None:
-    values = _protected_gpu_values()
-    values["salad_worker_artifact_endpoint_url"] = "https://artifacts.example.test"
-    values["salad_worker_artifact_session_token"] = RUNTIME_SESSION_TOKEN
-    settings = Settings(**values)  # type: ignore[arg-type]
-    resolver = build_runtime_secret_resolver(settings)
-    assert resolver is not None
-
-    with pytest.raises(RuntimeSecretResolutionError, match="set is incomplete"):
-        await resolver.resolve_many(_required_binding_references())
-
-    bindings = _required_binding_references()
-    for name in (
-        WORKER_ARTIFACT_ENDPOINT_URL_BINDING,
-        WORKER_ARTIFACT_SESSION_TOKEN_BINDING,
-    ):
-        bindings[name] = SALAD_WORKER_RUNTIME_BINDING_REFERENCES[name]
-    resolved = await resolver.resolve_many(bindings)
-    assert set(resolved) == set(bindings)
-
-
-@pytest.mark.asyncio
 async def test_resolver_rejects_unknown_mismatched_and_incomplete_bindings() -> None:
     settings = Settings(**_protected_gpu_values())  # type: ignore[arg-type]
-    resolver = build_runtime_secret_resolver(settings)
+    resolver = build_runtime_secret_resolver(settings, sts_client=FakeStsClient())
     assert resolver is not None
+    bindings = configured_runtime_binding_references(settings)
 
     with pytest.raises(RuntimeSecretResolutionError, match="not allowed"):
         await resolver.resolve_many(
             {"GEN_WORKER_UNREVIEWED_SECRET": "deployment-config://unreviewed"}
         )
 
-    mismatched = _required_binding_references()
+    mismatched = dict(bindings)
     mismatched[WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING] = "deployment-config://salad-worker/different"
     with pytest.raises(RuntimeSecretResolutionError, match="reference is invalid"):
         await resolver.resolve_many(mismatched)
 
-    incomplete = _required_binding_references()
+    incomplete = dict(bindings)
     incomplete.pop(WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING)
     with pytest.raises(RuntimeSecretResolutionError, match="set is incomplete"):
         await resolver.resolve_many(incomplete)
@@ -240,7 +260,7 @@ async def test_resolver_rejects_unknown_mismatched_and_incomplete_bindings() -> 
 @pytest.mark.asyncio
 async def test_resolver_errors_repr_and_config_serialization_redact_values() -> None:
     settings = Settings(**_protected_gpu_values())  # type: ignore[arg-type]
-    resolver = build_runtime_secret_resolver(settings)
+    resolver = build_runtime_secret_resolver(settings, sts_client=FakeStsClient())
     assert resolver is not None
 
     with pytest.raises(RuntimeSecretResolutionError) as captured:
@@ -259,6 +279,27 @@ async def test_resolver_errors_repr_and_config_serialization_redact_values() -> 
     assert RUNTIME_ACCESS_KEY not in rendered
     assert RUNTIME_SECRET_KEY not in rendered
     assert RUNTIME_MANIFEST not in rendered
+
+
+@pytest.mark.asyncio
+async def test_assume_role_response_requires_all_three_fresh_credentials() -> None:
+    class IncompleteStsClient(FakeStsClient):
+        def assume_role(self, **kwargs: object) -> Mapping[str, object]:
+            del kwargs
+            return {
+                "Credentials": {
+                    "AccessKeyId": RUNTIME_ACCESS_KEY,
+                    "SecretAccessKey": RUNTIME_SECRET_KEY,
+                    "Expiration": datetime.now(UTC) + timedelta(hours=1),
+                }
+            }
+
+    settings = Settings(**_protected_gpu_values())  # type: ignore[arg-type]
+    resolver = build_runtime_secret_resolver(settings, sts_client=IncompleteStsClient())
+    assert resolver is not None
+
+    with pytest.raises(RuntimeSecretResolutionError, match="could not be resolved"):
+        await resolver.resolve_many(configured_runtime_binding_references(settings))
 
 
 @pytest.mark.asyncio
