@@ -16,7 +16,7 @@ _FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
 _MAX_FORM_BODY_BYTES = 128 * 1024
 _FORM_KEY = re.compile(r"web-new-set-[0-9a-f]{64}")
 _HEX = frozenset("0123456789abcdefABCDEF")
-_LORA_SLOTS = range(1, 5)
+_LORA_SLOTS = range(1, 9)
 _FIELDS = frozenset(
     {
         "csrf_token",
@@ -29,6 +29,8 @@ _FIELDS = frozenset(
         "workflow_id",
         "prompt",
         "negative_prompt",
+        "detailer_prompt",
+        "detailer_negative_prompt",
         "seed",
         "width",
         "height",
@@ -36,6 +38,7 @@ _FIELDS = frozenset(
         "steps",
         "sampler",
         "scheduler",
+        "clip_skip",
         "outputs_per_job",
         "hires_scale",
         "hires_denoise",
@@ -46,6 +49,7 @@ _FIELDS = frozenset(
         "detailer_bbox_threshold",
         "detailer_bbox_dilation",
         "detailer_bbox_crop_factor",
+        "detailer_feather",
         "planned_job_count",
         "desired_accepted_count",
         *(f"lora_{slot}_id" for slot in _LORA_SLOTS),
@@ -111,6 +115,8 @@ async def read_new_set_form(request: Request) -> BrowserNewSetForm:
             workflow_approval_id=_uuid(values["workflow_id"], label="Workflow profile"),
             prompt=values["prompt"],
             negative_prompt=values["negative_prompt"],
+            detailer_prompt=values["detailer_prompt"],
+            detailer_negative_prompt=values["detailer_negative_prompt"],
             seed=_integer(values["seed"], label="Seed"),
             width=_integer(values["width"], label="Width"),
             height=_integer(values["height"], label="Height"),
@@ -118,6 +124,7 @@ async def read_new_set_form(request: Request) -> BrowserNewSetForm:
             steps=_integer(values["steps"], label="Steps"),
             sampler=values["sampler"],
             scheduler=values["scheduler"],
+            clip_skip=_integer(values["clip_skip"], label="Clip skip"),
             outputs_per_job=_integer(values["outputs_per_job"], label="Outputs per job"),
             hires_scale=_float(values["hires_scale"], label="Hires scale"),
             hires_denoise=_float(values["hires_denoise"], label="Hires denoise"),
@@ -145,6 +152,10 @@ async def read_new_set_form(request: Request) -> BrowserNewSetForm:
             detailer_bbox_crop_factor=_float(
                 values["detailer_bbox_crop_factor"],
                 label="Detailer crop factor",
+            ),
+            detailer_feather=_integer(
+                values["detailer_feather"],
+                label="Detailer feather",
             ),
             planned_job_count=_integer(values["planned_job_count"], label="Planned jobs"),
             desired_accepted_count=_integer(
@@ -322,6 +333,8 @@ def _validation_message(error: ValidationError) -> str:
         "loras": "LoRAs",
         "prompt": "Prompt",
         "negative_prompt": "Negative prompt",
+        "detailer_prompt": "Detailer prompt",
+        "detailer_negative_prompt": "Detailer negative prompt",
         "seed": "Seed",
         "width": "Width",
         "height": "Height",
@@ -329,6 +342,7 @@ def _validation_message(error: ValidationError) -> str:
         "steps": "Steps",
         "sampler": "Sampler",
         "scheduler": "Scheduler",
+        "clip_skip": "Clip skip",
         "outputs_per_job": "Outputs per job",
         "hires_scale": "Hires scale",
         "hires_denoise": "Hires denoise",
@@ -339,6 +353,7 @@ def _validation_message(error: ValidationError) -> str:
         "detailer_bbox_threshold": "Detailer face threshold",
         "detailer_bbox_dilation": "Detailer face dilation",
         "detailer_bbox_crop_factor": "Detailer crop factor",
+        "detailer_feather": "Detailer feather",
         "planned_job_count": "Planned jobs",
         "desired_accepted_count": "Desired accepted images",
     }

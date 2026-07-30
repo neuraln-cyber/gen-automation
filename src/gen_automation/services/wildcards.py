@@ -83,6 +83,8 @@ class FrozenWildcardCatalog:
 class ResolvedWildcardPrompts:
     prompt: str
     negative_prompt: str
+    detailer_prompt: str
+    detailer_negative_prompt: str
     evidence: dict[str, object]
 
 
@@ -348,10 +350,7 @@ async def freeze_release_wildcards(
     """Resolve current heads once and return the exact immutable release manifest."""
 
     provided = {reference.name: reference for reference in specification.wildcard_versions}
-    initial_names = set(
-        extract_wildcard_names(specification.generation.prompt)
-        + extract_wildcard_names(specification.generation.negative_prompt)
-    )
+    initial_names = _generation_wildcard_names(specification)
     if not initial_names:
         if provided:
             raise WildcardInputError("release contains unused wildcard version references")
@@ -387,10 +386,7 @@ async def load_frozen_wildcard_catalog(
     specification: ReleaseSpecification,
 ) -> FrozenWildcardCatalog:
     references = specification.wildcard_versions
-    initial_names = set(
-        extract_wildcard_names(specification.generation.prompt)
-        + extract_wildcard_names(specification.generation.negative_prompt)
-    )
+    initial_names = _generation_wildcard_names(specification)
     if not initial_names:
         if references:
             raise WildcardConflictError("frozen release has unused wildcard references")
@@ -546,24 +542,61 @@ def resolve_wildcard_prompts(
         field_name="negative_prompt",
         selections=selections,
     )
+    detailer_prompt = _expand_text(
+        specification.generation.detailer_prompt,
+        catalog=catalog.by_name,
+        seed=seed,
+        field_name="detailer_prompt",
+        selections=selections,
+    )
+    detailer_negative_prompt = _expand_text(
+        specification.generation.detailer_negative_prompt,
+        catalog=catalog.by_name,
+        seed=seed,
+        field_name="detailer_negative_prompt",
+        selections=selections,
+    )
     references = [reference.model_dump(mode="json") for reference in catalog.references]
     evidence: dict[str, object] = {
         "schema_version": 1,
         "seed": seed,
         "source_prompt": specification.generation.prompt,
         "source_negative_prompt": specification.generation.negative_prompt,
+        "source_detailer_prompt": specification.generation.detailer_prompt,
+        "source_detailer_negative_prompt": specification.generation.detailer_negative_prompt,
         "source_prompt_sha256": _text_sha256(specification.generation.prompt),
         "source_negative_prompt_sha256": _text_sha256(specification.generation.negative_prompt),
+        "source_detailer_prompt_sha256": _text_sha256(specification.generation.detailer_prompt),
+        "source_detailer_negative_prompt_sha256": _text_sha256(
+            specification.generation.detailer_negative_prompt
+        ),
         "resolved_prompt_sha256": _text_sha256(prompt),
         "resolved_negative_prompt_sha256": _text_sha256(negative_prompt),
+        "resolved_detailer_prompt_sha256": _text_sha256(detailer_prompt),
+        "resolved_detailer_negative_prompt_sha256": _text_sha256(detailer_negative_prompt),
         "wildcard_versions": references,
         "selections": selections,
     }
     return ResolvedWildcardPrompts(
         prompt=prompt,
         negative_prompt=negative_prompt,
+        detailer_prompt=detailer_prompt,
+        detailer_negative_prompt=detailer_negative_prompt,
         evidence=evidence,
     )
+
+
+def _generation_wildcard_names(specification: ReleaseSpecification) -> set[str]:
+    generation = specification.generation
+    names: set[str] = set()
+    for text in (
+        generation.prompt,
+        generation.negative_prompt,
+        generation.detailer_prompt,
+        generation.detailer_negative_prompt,
+    ):
+        names.update(extract_wildcard_names(text))
+    return names
 
 
 def _expand_text(

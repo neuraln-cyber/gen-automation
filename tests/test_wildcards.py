@@ -272,6 +272,10 @@ def test_release_freezes_nested_wildcards_and_jobs_store_resolution_evidence(
     ).json()
     payload = valid_release_payload()
     payload["specification"]["generation"]["prompt"] = "portrait, __locations__"  # type: ignore[index]
+    payload["specification"]["generation"]["detailer_prompt"] = "face, __poses__"  # type: ignore[index]
+    payload["specification"]["generation"]["detailer_negative_prompt"] = (  # type: ignore[index]
+        "avoid, __locations__"
+    )
     created = client.post(
         f"/api/v1/projects/{project['id']}/releases",
         json=payload,
@@ -330,11 +334,20 @@ def test_release_freezes_nested_wildcards_and_jobs_store_resolution_evidence(
         generation = parameters["generation"]
         evidence = parameters["prompt_resolution"]
         assert "__" not in generation["prompt"]
+        assert "__" not in generation["detailer_prompt"]
+        assert "__" not in generation["detailer_negative_prompt"]
         assert evidence["source_prompt"] == "portrait, __locations__"
+        assert evidence["source_detailer_prompt"] == "face, __poses__"
+        assert evidence["source_detailer_negative_prompt"] == "avoid, __locations__"
         assert len(evidence["wildcard_versions"]) == 2
         assert {selection["name"] for selection in evidence["selections"]} == {
             "poses",
             "locations",
+        }
+        assert {selection["field"] for selection in evidence["selections"]} >= {
+            "prompt",
+            "detailer_prompt",
+            "detailer_negative_prompt",
         }
 
 

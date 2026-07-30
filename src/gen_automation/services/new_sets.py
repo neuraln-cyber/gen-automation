@@ -67,17 +67,20 @@ class NewSetSubmission(BaseModel):
     title: str = Field(min_length=1, max_length=300)
     subject_approval_id: UUID
     checkpoint_approval_id: UUID
-    loras: tuple[NewSetLoraSelection, ...] = Field(default=(), max_length=4)
+    loras: tuple[NewSetLoraSelection, ...] = Field(default=(), max_length=8)
     workflow_approval_id: UUID
     prompt: str = Field(min_length=1, max_length=20_000)
     negative_prompt: str = Field(default="", max_length=20_000)
+    detailer_prompt: str = Field(default="", max_length=20_000)
+    detailer_negative_prompt: str = Field(default="", max_length=20_000)
     seed: int = Field(ge=0, le=(2**63) - 1)
-    width: int = Field(ge=512, le=4096, multiple_of=64)
-    height: int = Field(ge=512, le=4096, multiple_of=64)
+    width: int = Field(ge=512, le=4096, multiple_of=8)
+    height: int = Field(ge=512, le=4096, multiple_of=8)
     cfg: float = Field(default=5.0, ge=0.0, le=30.0)
     steps: int = Field(ge=1, le=200)
     sampler: str = Field(min_length=1, max_length=100)
     scheduler: str = Field(min_length=1, max_length=100)
+    clip_skip: int = Field(default=2, ge=1, le=12)
     outputs_per_job: int = Field(ge=1, le=8)
     hires_scale: float = Field(default=1.5, ge=1.0, le=3.0)
     hires_denoise: float = Field(default=0.35, ge=0.05, le=1.0)
@@ -94,6 +97,7 @@ class NewSetSubmission(BaseModel):
     detailer_bbox_threshold: float = Field(default=0.5, ge=0.1, le=0.95)
     detailer_bbox_dilation: int = Field(default=10, ge=-64, le=128)
     detailer_bbox_crop_factor: float = Field(default=3.0, ge=1.0, le=5.0)
+    detailer_feather: int = Field(default=4, ge=0, le=128)
     planned_job_count: int = Field(ge=1, le=10_000)
     desired_accepted_count: int = Field(ge=1, le=MAX_ACCEPTED_IMAGES_PER_RELEASE)
 
@@ -370,6 +374,8 @@ async def create_and_approve_new_set(
         generation=GenerationParameters(
             prompt=command.prompt,
             negative_prompt=command.negative_prompt,
+            detailer_prompt=command.detailer_prompt,
+            detailer_negative_prompt=command.detailer_negative_prompt,
             seed=command.seed,
             width=command.width,
             height=command.height,
@@ -377,6 +383,7 @@ async def create_and_approve_new_set(
             cfg=command.cfg,
             sampler=command.sampler,
             scheduler=command.scheduler,
+            clip_skip=command.clip_skip,
             outputs_per_job=command.outputs_per_job,
             hires_scale=command.hires_scale,
             hires_denoise=command.hires_denoise,
@@ -387,6 +394,7 @@ async def create_and_approve_new_set(
             detailer_bbox_threshold=command.detailer_bbox_threshold,
             detailer_bbox_dilation=command.detailer_bbox_dilation,
             detailer_bbox_crop_factor=command.detailer_bbox_crop_factor,
+            detailer_feather=command.detailer_feather,
         ),
         planned_job_count=command.planned_job_count,
     )

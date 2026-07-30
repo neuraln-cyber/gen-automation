@@ -56,6 +56,9 @@ HIRES_WORKFLOW_BODY = (
 DETAILER_WORKFLOW_BODY = (
     Path(__file__).resolve().parents[1] / "workflows" / "illustrious-sdxl-hires-detailer-v1.json"
 ).read_bytes()
+BASE_DETAILER_WORKFLOW_BODY = (
+    Path(__file__).resolve().parents[1] / "workflows" / "illustrious-sdxl-base-detailer-v1.json"
+).read_bytes()
 UPLOAD_ORIGIN = "https://uploads.example.test"
 
 
@@ -220,12 +223,16 @@ async def worker_input_context(tmp_path: Path) -> AsyncIterator[WorkerInputConte
         "generation": {
             "prompt": "private test prompt",
             "negative_prompt": "bad anatomy",
+            "detailer_prompt": "expressive face",
+            "detailer_negative_prompt": "closed eyes",
             "seed": 42,
             "width": 1024,
             "height": 1024,
             "steps": 28,
             "sampler": "euler",
             "scheduler": "normal",
+            "clip_skip": 2,
+            "detailer_feather": 4,
             "outputs_per_job": 2,
         },
     }
@@ -373,10 +380,12 @@ async def test_builds_signed_envelope_with_rendered_workflow_and_fresh_uploads(
     )
     checkpoint_node = envelope.payload.workflow["1"]
     prompt_node = envelope.payload.workflow["6"]
+    clip_skip_node = envelope.payload.workflow["3"]
     sampler_node = envelope.payload.workflow["9"]
     lora_node = envelope.payload.workflow["2-lora-1"]
     assert isinstance(checkpoint_node, dict)
     assert isinstance(prompt_node, dict)
+    assert isinstance(clip_skip_node, dict)
     assert isinstance(sampler_node, dict)
     assert isinstance(lora_node, dict)
     checkpoint_inputs = checkpoint_node["inputs"]
@@ -389,6 +398,14 @@ async def test_builds_signed_envelope_with_rendered_workflow_and_fresh_uploads(
     assert isinstance(lora_inputs, dict)
     assert checkpoint_inputs["ckpt_name"] == "illustrious-runtime.safetensors"
     assert prompt_inputs["text"] == "private test prompt"
+    assert prompt_inputs["clip"] == ["3", 0]
+    assert clip_skip_node == {
+        "class_type": "CLIPSetLastLayer",
+        "inputs": {
+            "clip": ["2-lora-1", 1],
+            "stop_at_clip_layer": -2,
+        },
+    }
     assert sampler_inputs["seed"] == 42
     assert sampler_inputs["cfg"] == 5.0
     assert sampler_inputs["model"] == ["2-lora-1", 0]
@@ -398,6 +415,68 @@ async def test_builds_signed_envelope_with_rendered_workflow_and_fresh_uploads(
     assert [grant.output_index for grant in envelope.payload.uploads] == [0, 1]
     assert len({grant.upload_attempt_id for grant in envelope.payload.uploads}) == 2
     assert all("expires=10800" in grant.url for grant in envelope.payload.uploads)
+
+
+@pytest.mark.asyncio
+async def test_runtime_expands_eight_ordered_loras(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    parameters = dict(worker_input_context.job_context.parameters)
+    lora_parameters: list[dict[str, object]] = []
+    lora_artifacts: list[ModelArtifactSpec] = []
+    for index in range(1, 9):
+        digest = f"{index:x}" * 64
+        storage_key = f"loras/style-{index}.safetensors"
+        target_filename = f"style-{index}-runtime.safetensors"
+        lora_parameters.append(
+            {
+                "name": f"style-{index}.safetensors",
+                "source_url": f"https://models.example/lora-{index}",
+                "storage_key": storage_key,
+                "sha256": digest,
+                "license_url": f"https://models.example/lora-{index}-license",
+                "commercial_use_approved": True,
+                "adult_use_approved": True,
+                "weight": index / 10,
+            }
+        )
+        lora_artifacts.append(
+            ModelArtifactSpec(
+                logical_name=f"style-{index}",
+                kind=ArtifactKind.LORA,
+                source_object_id=storage_key,
+                sha256=digest,
+                exact_size_bytes=100,
+                max_size_bytes=100,
+                target_filename=target_filename,
+            )
+        )
+    parameters["loras"] = lora_parameters
+    job_context = SaladJobInputContext(
+        **{
+            **worker_input_context.job_context.__dict__,
+            "parameters": parameters,
+            "parameters_sha256": canonical_sha256(parameters),
+        }
+    )
+    checkpoint = worker_input_context.artifact_manifest.artifacts[0]
+    artifacts = (checkpoint, *lora_artifacts)
+    manifest = ArtifactManifest(
+        version="v1",
+        artifacts=artifacts,
+        manifest_sha256=calculate_manifest_sha256(artifacts),
+    )
+    context = replace(
+        worker_input_context,
+        job_context=job_context,
+        artifact_manifest=manifest,
+    )
+
+    envelope = GenerateEnvelope.model_validate(await _build(context), strict=True)
+    workflow = envelope.payload.workflow
+    assert all(f"2-lora-{index}" in workflow for index in range(1, 9))
+    assert workflow["9"]["inputs"]["model"] == ["2-lora-8", 0]
+    assert workflow["3"]["inputs"]["clip"] == ["2-lora-8", 1]
 
 
 @pytest.mark.asyncio
@@ -453,7 +532,71 @@ async def test_detailer_profile_binds_the_single_manifest_verified_face_detector
     assert detailer["inputs"]["guide_size"] == 768
     assert detailer["inputs"]["max_size"] == 1024
     assert detailer["inputs"]["denoise"] == 0.35
+    assert detailer["inputs"]["feather"] == 4
+    assert detailer["inputs"]["positive"] == ["16", 0]
+    assert detailer["inputs"]["negative"] == ["17", 0]
+    assert workflow["16"]["inputs"]["text"] == "expressive face"
+    assert workflow["17"]["inputs"]["text"] == "closed eyes"
     validate_approved_workflow(workflow, DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
+
+
+@pytest.mark.asyncio
+async def test_base_detailer_profile_skips_hires_refinement(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _profile_context(
+        worker_input_context,
+        workflow_body=BASE_DETAILER_WORKFLOW_BODY,
+        detector=True,
+    )
+
+    envelope = GenerateEnvelope.model_validate(await _build(context), strict=True)
+    workflow = envelope.payload.workflow
+    assert not any(
+        isinstance(node, dict) and node.get("class_type") == "LatentUpscaleBy"
+        for node in workflow.values()
+    )
+    assert workflow["10"]["class_type"] == "VAEDecode"
+    assert workflow["14"]["inputs"]["image"] == ["10", 0]
+    validate_approved_workflow(workflow, DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
+
+
+@pytest.mark.asyncio
+async def test_legacy_generation_parameters_receive_detailer_and_clip_defaults(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    parameters = dict(worker_input_context.job_context.parameters)
+    generation = dict(parameters["generation"])  # type: ignore[arg-type]
+    for field_name in (
+        "clip_skip",
+        "detailer_prompt",
+        "detailer_negative_prompt",
+        "detailer_feather",
+    ):
+        generation.pop(field_name)
+    parameters["generation"] = generation
+    legacy_context = replace(
+        worker_input_context,
+        job_context=SaladJobInputContext(
+            **{
+                **worker_input_context.job_context.__dict__,
+                "parameters": parameters,
+                "parameters_sha256": canonical_sha256(parameters),
+            }
+        ),
+    )
+    context = _profile_context(
+        legacy_context,
+        workflow_body=BASE_DETAILER_WORKFLOW_BODY,
+        detector=True,
+    )
+
+    envelope = GenerateEnvelope.model_validate(await _build(context), strict=True)
+    workflow = envelope.payload.workflow
+    assert workflow["3"]["inputs"]["stop_at_clip_layer"] == -2
+    assert workflow["16"]["inputs"]["text"] == "private test prompt"
+    assert workflow["17"]["inputs"]["text"] == "bad anatomy"
+    assert workflow["14"]["inputs"]["feather"] == 4
 
 
 @pytest.mark.asyncio

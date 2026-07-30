@@ -5,10 +5,11 @@
 `workflows/illustrious-sdxl-base-v1.json` is the production ComfyUI API
 template for the first generation profile. It uses only core, allowlisted
 ComfyUI nodes. Its SHA-256 is
-`901a50003bfb9aa17c6117a29fc1232a678dcadc19f70a895fe6edf69ccf3fca`:
+`1d099e8ed6a73ddf30cce4b8a5970aa17de16377fd248f5a654a32f65fba9834`:
 
 - `CheckpointLoaderSimple`
 - `LoraLoader`
+- `CLIPSetLastLayer`
 - `CLIPTextEncode`
 - `EmptyLatentImage`
 - `KSampler`
@@ -16,16 +17,21 @@ ComfyUI nodes. Its SHA-256 is
 - `SaveImage`
 
 The release specification supplies the positive and negative prompts, seed,
-width, height, steps, CFG, sampler, scheduler, and output count. CFG defaults
-to `5.0` and is bounded to `0.0` through `30.0`. The output count becomes the
-latent batch size, so one job produces the exact number of upload grants and
-masters declared by `outputs_per_job`.
+width, height, steps, CFG, sampler, scheduler, Clip skip, and output count. CFG is
+bounded to `0.0` through `30.0`; the New Set preset uses `6.0`. The output count
+becomes the latent batch size, so one job produces the exact number of upload
+grants and masters declared by `outputs_per_job`.
+
+Clip skip defaults to `2`; the controller binds that as
+`CLIPSetLastLayer.stop_at_clip_layer=-2` after the complete LoRA CLIP chain.
+Source canvas dimensions may use any multiple of eight within `512` through
+`4096`, subject to the unchanged downstream pixel limits.
 
 The template contains one internal `GenAutomationLoraChain` marker. The control
 plane removes this marker before signing the worker request and expands it into
-zero through four standard `LoraLoader` nodes in release order. Each LoRA's
+zero through eight standard `LoraLoader` nodes in release order. Each LoRA's
 configured weight is applied to both model and CLIP. This is a deliberately
-narrow transform, not a general graph-editing language. More than four LoRAs,
+narrow transform, not a general graph-editing language. More than eight LoRAs,
 multiple markers, malformed links, generated-node collisions, or loader nodes
 that do not match the release fail before provider submission.
 
@@ -69,7 +75,7 @@ checkpoint, LoRAs, object store, and provider bindings are supplied.
 
 `workflows/illustrious-sdxl-hires-v1.json` is a core-node-only two-pass
 Illustrious/SDXL workflow. Its SHA-256 is
-`42761a3244e8b69870bd6aed52c35d1f680d641429e2fdce1493ad837e1da547`.
+`207992e773506c2d199a7e1037d8d677ecde44353582032d953d4b0fe1410152`.
 The first `KSampler` produces the normal latent, `LatentUpscaleBy` enlarges it,
 and a second `KSampler` refines it before the one final VAE decode.
 
@@ -84,15 +90,30 @@ The base workflow ignores these values. A profile is selected by choosing its
 approved workflow in New Set; there is no runtime graph editing or automatic
 profile guessing.
 
+## Base + face detailer profile
+
+`workflows/illustrious-sdxl-base-detailer-v1.json` decodes the first sampling
+pass directly into Impact Pack `FaceDetailer`; it does not upscale or run a
+second sampler. Its SHA-256 is
+`0cbfadda4e4ca9d915253f22b62010e6f78a38bb9ab052caff5c29ab0a1303fd`.
+This is the closest bundled match for a Forge generation that uses ADetailer
+without Hires fix.
+
+The detailer profiles encode their own positive and negative prompts using the
+post-LoRA, Clip-skip-adjusted CLIP. They also freeze `feather` (default `4`) as
+the closest available control to ADetailer's mask blur. A blank detailer prompt
+inherits its corresponding main prompt, preserving the previous profile
+behavior while allowing either conditioning to be overridden independently.
+
 ## Hires + face detailer profile
 
 `workflows/illustrious-sdxl-hires-detailer-v1.json` runs the same two hires
 passes, then sends the decoded batch through Impact Pack `FaceDetailer`. Its
 SHA-256 is
-`637360c7ddb681d37810bbd34edd4f3d72501b6db5a55eaacfe7e866d1469e2d`.
+`d0b9a01f848632ca6f5c0635f4f10e3bd0c5255fd827c7b6f88caf17de865a20`.
 The release freezes guide size, maximum size, denoise, face threshold, dilation,
-and crop factor. Defaults are deliberately conservative: `768`, `1024`,
-`0.35`, `0.5`, `10`, and `3.0`.
+crop factor, and feather. The New Set preset values are `768`, `1024`, `0.4`,
+`0.3`, `4`, `3.0`, and `4`.
 
 The worker image pins:
 
@@ -116,7 +137,7 @@ and materializes it only under
 `/opt/comfyui/models/ultralytics/bbox`.
 
 Exactly zero or one detector is supported. Base and hires workflows work with
-zero; the detailer workflow fails before upload grants are created unless one
+zero; either detailer workflow fails before upload grants are created unless one
 is present. Once verified, that exact target filename becomes the only entry in
 Impact Subpack's legacy-model whitelist. A detector `.pt` can contain executable
 pickle data, so its source and digest must be reviewed with the same care as
@@ -124,8 +145,8 @@ worker code.
 
 For the first live detailer canary, provide:
 
-- the approved face detector object (normally a trusted
-  `face_yolov8m.pt`-compatible model);
+- the approved face detector object (the current preset uses the pinned
+  `face_yolov8n.pt` model);
 - its private object-store key, exact byte size, and SHA-256; and
 - the updated artifact-manifest JSON and manifest SHA-256.
 
@@ -137,7 +158,8 @@ artifact bucket.
 Bundling a JSON template does not automatically make it selectable. Upload the
 exact template bytes to private workflow storage and create a current approved
 workflow registry record using the path's SHA-256 above. Register the base,
-hires, and hires + detailer files as three separate workflow approvals. They
+base + detailer, hires, and hires + detailer files as four separate workflow
+approvals. They
 then appear in the New Set workflow selector.
 
 Upstream contracts:
