@@ -66,12 +66,13 @@ _WORKER_STARTUP_PROBE: JSONObject = {
         "scheme": "http",
     },
     "initial_delay_seconds": 0,
-    "period_seconds": 10,
+    "period_seconds": 120,
     "timeout_seconds": 5,
     "success_threshold": 1,
-    # Model artifacts are downloaded before the HTTP server starts. Allow one
-    # hour before Salad reallocates a healthy but cold worker.
-    "failure_threshold": 360,
+    # Model artifacts are downloaded before the HTTP server starts. Salad's
+    # live API caps this threshold at 20 and the period at 120 seconds, giving
+    # a roughly 40-minute cold-start window before reallocation.
+    "failure_threshold": 20,
 }
 _WORKER_READINESS_PROBE: JSONObject = {
     "http": {

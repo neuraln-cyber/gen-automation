@@ -72,10 +72,10 @@ STARTUP_PROBE: dict[str, JSONValue] = {
         "scheme": "http",
     },
     "initial_delay_seconds": 0,
-    "period_seconds": 10,
+    "period_seconds": 120,
     "timeout_seconds": 5,
     "success_threshold": 1,
-    "failure_threshold": 360,
+    "failure_threshold": 20,
 }
 READINESS_PROBE: dict[str, JSONValue] = {
     "http": {
