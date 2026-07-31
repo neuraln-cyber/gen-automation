@@ -1774,6 +1774,13 @@ def test_group_configuration_drift_variants(
     assert _group_configuration_drift(unpersisted_deployment(), group) == expected
 
 
+def test_group_configuration_allows_omitted_write_only_autoscaler() -> None:
+    group = make_group(remote_names()[1], remote_names()[0])
+    group.raw.pop("queue_autoscaler")
+
+    assert _group_configuration_drift(unpersisted_deployment(), group) is None
+
+
 def test_group_configuration_accepts_only_salad_default_shm_size() -> None:
     default_group = make_group(remote_names()[1], remote_names()[0])
     default_container = default_group.raw["container"]

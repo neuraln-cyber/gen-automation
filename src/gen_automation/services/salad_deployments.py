@@ -1431,14 +1431,17 @@ def _group_configuration_drift(
         ):
             return f"provider_{probe_name}_drift"
     autoscaler = raw.get("queue_autoscaler")
-    if not isinstance(autoscaler, dict):
+    # Salad accepts ``queue_autoscaler`` when a group is created, but the
+    # container-group read representation can omit this write-only object.
+    # Validate it when present; absence alone is not evidence of drift.
+    if autoscaler is not None and not isinstance(autoscaler, dict):
         return "provider_autoscaler_drift"
     expected = {
         "min_replicas": 0,
         "max_replicas": 1,
         "desired_queue_length": 1,
     }
-    if any(
+    if autoscaler is not None and any(
         not isinstance(autoscaler.get(key), int)
         or isinstance(autoscaler.get(key), bool)
         or autoscaler.get(key) != value
