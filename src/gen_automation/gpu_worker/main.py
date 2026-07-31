@@ -470,10 +470,7 @@ def _safe_startup_error_message(error: BaseException) -> str:
 def _startup_failure(stage: str, error: BaseException | None = None) -> NoReturn:
     detail = f"GPU worker startup failed: stage={stage}"
     if error is not None:
-        detail += (
-            f" exception={type(error).__name__}"
-            f" message={_safe_startup_error_message(error)}"
-        )
+        detail += f" exception={type(error).__name__} message={_safe_startup_error_message(error)}"
     print(detail, file=sys.stderr, flush=True)
     raise SystemExit(78)
 

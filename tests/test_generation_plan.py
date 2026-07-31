@@ -109,9 +109,7 @@ async def test_plan_expansion_is_deterministic_and_revalidated(
     assert all(job.parameters["schema_version"] == 2 for job in jobs)
     assert all(len(job.parameters["output_generations"]) == 4 for job in jobs)
     assert sorted(
-        output["seed"]
-        for job in jobs
-        for output in job.parameters["output_generations"]
+        output["seed"] for job in jobs for output in job.parameters["output_generations"]
     ) == list(range(1234, 1246))
     assert all(
         output["outputs_per_job"] == 1

@@ -485,14 +485,20 @@ async def test_one_provider_job_renders_independent_prompt_branches(
     assert "private test prompt" in prompt_texts
     assert "second independently expanded wildcard prompt" in prompt_texts
     assert {42, 43} <= sampler_seeds
-    assert sum(
-        isinstance(node, dict) and node.get("class_type") == "FaceDetailer"
-        for node in workflow.values()
-    ) == 2
-    assert sum(
-        isinstance(node, dict) and node.get("class_type") == "UltralyticsDetectorProvider"
-        for node in workflow.values()
-    ) == 1
+    assert (
+        sum(
+            isinstance(node, dict) and node.get("class_type") == "FaceDetailer"
+            for node in workflow.values()
+        )
+        == 2
+    )
+    assert (
+        sum(
+            isinstance(node, dict) and node.get("class_type") == "UltralyticsDetectorProvider"
+            for node in workflow.values()
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio

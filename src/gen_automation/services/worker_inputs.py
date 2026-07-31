@@ -108,8 +108,7 @@ class _ResolvedJobParameters:
         runtime: "_RuntimeArtifactBindings",
     ) -> tuple[dict[str, object], ...]:
         return tuple(
-            self.bindings(runtime, generation=generation)
-            for generation in self.output_generations
+            self.bindings(runtime, generation=generation) for generation in self.output_generations
         )
 
 
@@ -599,14 +598,10 @@ def _validate_runtime_artifact_nodes(
     allowed_detailer_counts = {0, 1}
     if resolved.output_generations:
         allowed_detailer_counts.add(len(resolved.output_generations))
-    if (
-        detailer_count not in allowed_detailer_counts
-        or bool(detailer_count) != bool(detectors)
-    ):
+    if detailer_count not in allowed_detailer_counts or bool(detailer_count) != bool(detectors):
         raise WorkerInputError("workflow detector binding is invalid")
-    if (
-        len(resolved.output_generations) > 1
-        and output_node_count != len(resolved.output_generations)
+    if len(resolved.output_generations) > 1 and output_node_count != len(
+        resolved.output_generations
     ):
         raise WorkerInputError("workflow output count is invalid")
     expected_detector = (
