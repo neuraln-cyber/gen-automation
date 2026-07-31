@@ -1172,6 +1172,94 @@ async def test_stopped_desire_only_invokes_stop_and_requires_observed_confirmati
 
 
 @pytest.mark.asyncio
+async def test_draining_stop_converges_when_idle_provider_status_is_empty(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(
+        deployment_context,
+        desired_state=DesiredDeploymentState.STOPPED,
+    )
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.groups[group_name] = make_group(group_name, queue_name, status="")
+
+    async with deployment_context.database.sessions() as session:
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+        deployment.state = SaladDeploymentState.DRAINING
+        await session.commit()
+
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=NOW + timedelta(minutes=1),
+        )
+        await session.commit()
+
+    assert result.action == DeploymentAction.STOPPED
+    assert result.state == SaladDeploymentState.STOPPED
+    assert client.stop_names == []
+
+
+@pytest.mark.asyncio
+async def test_initially_idle_active_deployment_still_requests_provider_stop(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(
+        deployment_context,
+        desired_state=DesiredDeploymentState.STOPPED,
+    )
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.groups[group_name] = make_group(group_name, queue_name, status="")
+
+    async with deployment_context.database.sessions() as session:
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=NOW + timedelta(minutes=1),
+        )
+        await session.commit()
+
+    assert result.action == DeploymentAction.STOP_REQUESTED
+    assert result.state == SaladDeploymentState.DRAINING
+    assert client.stop_names == [group_name]
+
+
+@pytest.mark.asyncio
+async def test_draining_group_with_running_status_still_requests_provider_stop(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(
+        deployment_context,
+        desired_state=DesiredDeploymentState.STOPPED,
+    )
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.groups[group_name] = make_group(group_name, queue_name, status="running")
+
+    async with deployment_context.database.sessions() as session:
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+        deployment.state = SaladDeploymentState.DRAINING
+        await session.commit()
+
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=NOW + timedelta(minutes=1),
+        )
+        await session.commit()
+
+    assert result.action == DeploymentAction.STOP_REQUESTED
+    assert result.state == SaladDeploymentState.DRAINING
+    assert client.stop_names == [group_name]
+
+
+@pytest.mark.asyncio
 async def test_stop_still_executes_when_status_read_fails(
     deployment_context: DeploymentContext,
 ) -> None:

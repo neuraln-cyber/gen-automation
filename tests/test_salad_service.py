@@ -3,13 +3,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.db.models import (
+    Asset,
     GenerationAttempt,
     GenerationJob,
     OutboxEvent,
@@ -21,6 +22,8 @@ from gen_automation.db.models import (
 from gen_automation.db.session import Database
 from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import (
+    AssetKind,
+    AssetState,
     DesiredDeploymentState,
     GenerationAttemptState,
     GenerationState,
@@ -234,6 +237,7 @@ def remote_job(
     metadata: JSONObject,
     update_time: datetime,
     job_id: UUID = REMOTE_JOB_ID,
+    output: JSONValue | None = None,
 ) -> SaladQueueJob:
     return SaladQueueJob(
         id=job_id,
@@ -244,7 +248,7 @@ def remote_job(
         update_time=update_time,
         metadata=metadata,
         webhook="https://controller.example.test/webhooks/salad",
-        output={"private": "provider output is not persisted"},
+        output=output or {"private": "provider output is not persisted"},
     )
 
 
@@ -261,6 +265,44 @@ async def prepared_attempt(
     )
     await session.commit()
     return prepared.generation_attempt_id
+
+
+async def expected_worker_outputs(
+    session: AsyncSession,
+    context: SeededContext,
+) -> list[JSONObject]:
+    job = await session.get(GenerationJob, context.job_id)
+    assert job is not None
+    version = await session.get(ReleaseVersion, job.release_version_id)
+    assert version is not None
+    outputs: list[JSONObject] = []
+    for output_index in range(job.expected_output_count):
+        upload_attempt_id = uuid4()
+        asset = Asset(
+            release_id=version.release_id,
+            generation_job_id=job.id,
+            output_index=output_index,
+            kind=AssetKind.RAW_MASTER,
+            state=AssetState.UPLOADING,
+            storage_backend="memory",
+            storage_bucket="test-assets",
+            staging_object_key=f"staging/{job.id}/{output_index}",
+            asset_metadata={
+                "declared_content_type": "image/png",
+                "upload_attempt_id": str(upload_attempt_id),
+            },
+        )
+        session.add(asset)
+        await session.flush()
+        outputs.append(
+            {
+                "asset_id": str(asset.id),
+                "upload_attempt_id": str(upload_attempt_id),
+                "output_index": output_index,
+                "status": "uploaded",
+            }
+        )
+    return outputs
 
 
 def test_deployment_config_hash_is_canonical_and_enforces_one_replica() -> None:
@@ -1054,10 +1096,18 @@ async def test_unknown_submission_reconciles_by_metadata_then_get_and_ignores_re
             now=NOW + timedelta(minutes=2),
         )
 
+        worker_outputs = await expected_worker_outputs(session, context)
         succeeded = remote_job(
             status=SaladJobStatus.SUCCEEDED,
             metadata=metadata,
             update_time=NOW + timedelta(minutes=3),
+            output={
+                "version": "v1",
+                "job_id": str(context.job_id),
+                "attempt_id": str(attempt_id),
+                "status": "succeeded",
+                "outputs": worker_outputs,
+            },
         )
         get_client = FakeSaladClient(get_result=succeeded)
         fetched = await reconcile_generation_attempt(
@@ -1109,3 +1159,58 @@ async def test_unknown_submission_reconciles_by_metadata_then_get_and_ignores_re
     assert final_attempt.reservation_released_at is not None
     assert final_job is not None
     assert final_job.state == GenerationState.COLLECTING
+
+
+@pytest.mark.asyncio
+async def test_succeeded_provider_job_with_invalid_worker_output_retries(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+
+        result = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(
+                get_result=remote_job(
+                    status=SaladJobStatus.SUCCEEDED,
+                    metadata=metadata,
+                    update_time=NOW + timedelta(minutes=1),
+                    output={"detail": "invalid request"},
+                )
+            ),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=2),
+        )
+        await session.commit()
+        failed_attempt = await session.get(GenerationAttempt, attempt_id)
+        retrying_job = await session.get(GenerationJob, context.job_id)
+
+    assert result.observation.attempt_state == GenerationAttemptState.FAILED
+    assert result.observation.generation_job_state == GenerationState.RETRY_WAIT
+    assert failed_attempt is not None
+    assert failed_attempt.provider_state == SaladJobStatus.SUCCEEDED.value
+    assert failed_attempt.error_code == "salad_worker_output_invalid"
+    assert failed_attempt.reservation_released_at is not None
+    assert failed_attempt.response_metadata["worker_output_valid"] is False
+    assert "invalid request" not in repr(failed_attempt.response_metadata)
+    assert retrying_job is not None
+    assert retrying_job.state == GenerationState.RETRY_WAIT
+    assert retrying_job.last_error_code == "salad_worker_output_invalid"

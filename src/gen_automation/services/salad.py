@@ -8,10 +8,12 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.db.models import (
+    Asset,
     AuditEvent,
     GenerationAttempt,
     GenerationJob,
@@ -21,12 +23,14 @@ from gen_automation.db.models import (
 )
 from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import (
+    AssetKind,
     DesiredDeploymentState,
     GenerationAttemptState,
     GenerationState,
     SaladDeploymentState,
 )
 from gen_automation.domain.ids import uuid7
+from gen_automation.gpu_worker.models import GenerateResponse
 from gen_automation.integrations.salad.errors import (
     SaladAPIError,
     SaladProtocolError,
@@ -924,13 +928,26 @@ async def apply_salad_job_observation(
     last_observed_at = (
         _stored_as_utc(attempt.last_observed_at) if attempt.last_observed_at is not None else None
     )
-    target_state = _attempt_state(remote_job.status)
     if (
         attempt.state != GenerationAttemptState.UNKNOWN
         and last_observed_at is not None
         and provider_update_time <= last_observed_at
     ):
         return _observation_result(attempt, job, applied=False, stale=True)
+
+    worker_output_valid: bool | None = None
+    if remote_job.status == SaladJobStatus.SUCCEEDED:
+        worker_output_valid = await _valid_worker_success_output(
+            session,
+            attempt=attempt,
+            job=job,
+            output=remote_job.output,
+        )
+    target_state = (
+        GenerationAttemptState.FAILED
+        if worker_output_valid is False
+        else _attempt_state(remote_job.status)
+    )
 
     if attempt.state in _TERMINAL_ATTEMPT_STATES:
         if attempt.state != target_state:
@@ -959,9 +976,14 @@ async def apply_salad_job_observation(
         "provider_create_time": _as_utc(remote_job.create_time).isoformat(),
         "provider_update_time": provider_update_time.isoformat(),
         "event_count": len(remote_job.events),
+        **({"worker_output_valid": worker_output_valid} if worker_output_valid is not None else {}),
     }
-    attempt.error_code = None
-    attempt.error_detail = None
+    attempt.error_code = "salad_worker_output_invalid" if worker_output_valid is False else None
+    attempt.error_detail = (
+        "Salad reported success without a valid worker output contract."
+        if worker_output_valid is False
+        else None
+    )
     attempt.unknown_since = None
     attempt.submitted_at = attempt.submitted_at or _as_utc(remote_job.create_time)
     attempt.state = target_state
@@ -975,10 +997,16 @@ async def apply_salad_job_observation(
         job.state = _job_state_for_observation(job, target_state)
         job.retry_at = None
         job.last_error_code = (
-            "salad_job_failed" if target_state == GenerationAttemptState.FAILED else None
+            ("salad_worker_output_invalid" if worker_output_valid is False else "salad_job_failed")
+            if target_state == GenerationAttemptState.FAILED
+            else None
         )
         job.last_error_detail = (
-            "Salad reported a failed queue job."
+            (
+                "Salad reported success without a valid worker output contract."
+                if worker_output_valid is False
+                else "Salad reported a failed queue job."
+            )
             if target_state == GenerationAttemptState.FAILED
             else None
         )
@@ -991,6 +1019,11 @@ async def apply_salad_job_observation(
             detail={
                 "provider_external_id": remote_id,
                 "provider_status": remote_job.status.value,
+                **(
+                    {"worker_output_valid": worker_output_valid}
+                    if worker_output_valid is not None
+                    else {}
+                ),
             },
             occurred_at=controller_time,
         )
@@ -1008,6 +1041,50 @@ async def apply_salad_job_observation(
         )
     await session.flush()
     return _observation_result(attempt, job, applied=True, stale=False)
+
+
+async def _valid_worker_success_output(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    output: JSONValue,
+) -> bool:
+    try:
+        response = GenerateResponse.model_validate(output, strict=True)
+    except (TypeError, ValueError, ValidationError):
+        return False
+    if response.job_id != str(job.id) or response.attempt_id != str(attempt.id):
+        return False
+    if len(response.outputs) != job.expected_output_count:
+        return False
+    if [item.output_index for item in response.outputs] != list(range(job.expected_output_count)):
+        return False
+
+    assets = list(
+        (
+            await session.scalars(
+                select(Asset)
+                .where(
+                    Asset.generation_job_id == job.id,
+                    Asset.kind == AssetKind.RAW_MASTER,
+                )
+                .order_by(Asset.output_index)
+            )
+        ).all()
+    )
+    if len(assets) != job.expected_output_count:
+        return False
+    for response_output, asset in zip(response.outputs, assets, strict=True):
+        upload_attempt_id = asset.asset_metadata.get("upload_attempt_id")
+        if (
+            asset.output_index != response_output.output_index
+            or response_output.asset_id != str(asset.id)
+            or not isinstance(upload_attempt_id, str)
+            or response_output.upload_attempt_id != upload_attempt_id
+        ):
+            return False
+    return True
 
 
 async def reconcile_generation_attempt(
