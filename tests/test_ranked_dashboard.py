@@ -498,9 +498,19 @@ def test_dashboard_requires_authentication_before_loading_private_state(
         client=("192.0.2.55", 50000),
     ) as client:
         app.state.object_store = store
-        response = client.get(f"/dashboard/releases/{RELEASE_ID}")
+        response = client.get(
+            f"/dashboard/releases/{RELEASE_ID}",
+            follow_redirects=False,
+        )
+        login = client.get(f"/dashboard/releases/{RELEASE_ID}")
 
-    assert response.status_code == 401
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+    assert response.headers["cache-control"] == "no-store"
+    assert login.status_code == 200
+    assert login.url.path == "/login"
+    assert [redirect.status_code for redirect in login.history] == [303]
+    assert "Operator sign in" in login.text
     assert store.calls == []
     assert "frozen/private-master" not in response.text
     assert "exact-version" not in response.text
