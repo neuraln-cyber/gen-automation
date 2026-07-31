@@ -106,6 +106,16 @@ async def test_plan_expansion_is_deterministic_and_revalidated(
         1236,
     ]
     assert all(job.expected_output_count == 4 for job in jobs)
+    assert all(job.parameters["schema_version"] == 2 for job in jobs)
+    assert all(len(job.parameters["output_generations"]) == 4 for job in jobs)
+    assert sorted(
+        output["seed"] for job in jobs for output in job.parameters["output_generations"]
+    ) == list(range(1234, 1246))
+    assert all(
+        output["outputs_per_job"] == 1
+        for job in jobs
+        for output in job.parameters["output_generations"]
+    )
     assert all(len(job.parameters["approval_snapshot_sha256"]) == 64 for job in jobs)
     assert {check.check_type for check in checks} == {
         "adult_subject_gate",

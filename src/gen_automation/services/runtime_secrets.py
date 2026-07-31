@@ -53,6 +53,9 @@ class StsClient(Protocol):
     def close(self) -> None: ...
 
 
+_ARTIFACT_READER_SESSION_DURATION_SECONDS = 10_800
+
+
 _SETTINGS_BINDINGS = {
     WORKER_ALLOWED_UPLOAD_ORIGIN_BINDING: "salad_worker_allowed_upload_origin",
     WORKER_MODEL_MANIFEST_JSON_BINDING: "salad_worker_model_manifest_json",
@@ -130,7 +133,7 @@ class ConfiguredRuntimeSecretResolver:
 
 
 class AwsAssumeRoleRuntimeSecretResolver:
-    """Resolve worker artifact credentials from a fresh, one-hour STS lease."""
+    """Resolve worker artifact credentials from a fresh, three-hour STS lease."""
 
     __slots__ = ("_closed", "_require_complete", "_role_arn", "_sts_client", "_values")
 
@@ -208,7 +211,7 @@ class AwsAssumeRoleRuntimeSecretResolver:
                 self._sts_client.assume_role,
                 RoleArn=self._role_arn,
                 RoleSessionName=f"gen-automation-salad-{uuid4().hex[:20]}",
-                DurationSeconds=3600,
+                DurationSeconds=_ARTIFACT_READER_SESSION_DURATION_SECONDS,
             )
             raw_credentials = response.get("Credentials")
             if not isinstance(raw_credentials, Mapping):

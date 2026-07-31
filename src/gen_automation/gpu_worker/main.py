@@ -452,8 +452,26 @@ async def serve_worker(
     return child_exit_event.is_set()
 
 
-def _startup_failure() -> NoReturn:
-    print("GPU worker startup failed", file=sys.stderr)
+def _safe_startup_error_message(error: BaseException) -> str:
+    if isinstance(error, ValidationError):
+        details = []
+        for item in error.errors(
+            include_url=False,
+            include_context=False,
+            include_input=False,
+        ):
+            location = ".".join(str(part) for part in item["loc"])
+            message = str(item["msg"])
+            details.append(f"{location}: {message}" if location else message)
+        return "; ".join(details) or "validation failed"
+    return " ".join(str(error).split()) or "no detail"
+
+
+def _startup_failure(stage: str, error: BaseException | None = None) -> NoReturn:
+    detail = f"GPU worker startup failed: stage={stage}"
+    if error is not None:
+        detail += f" exception={type(error).__name__} message={_safe_startup_error_message(error)}"
+    print(detail, file=sys.stderr, flush=True)
     raise SystemExit(78)
 
 
@@ -465,11 +483,16 @@ def main() -> None:
     worker_host = ""
     worker_port = 0
     worker_log_level = ""
+    startup_stage = "runtime_settings"
     try:
         settings = WorkerRuntimeSettings()
+        startup_stage = "process_hardening"
         harden_parent_process(settings.environment)
+        startup_stage = "model_bootstrap"
         bootstrap_result = asyncio.run(bootstrap_worker_models(settings))
+        startup_stage = "detector_whitelist"
         write_verified_detector_whitelist(settings, bootstrap_result)
+        startup_stage = "executor_initialization"
         executor = ComfyExecutor(
             base_url=settings.comfy_base_url,
             execution_timeout_seconds=settings.comfy_execution_timeout_seconds,
@@ -477,8 +500,11 @@ def main() -> None:
             max_total_output_bytes=settings.max_total_output_bytes,
             approved_node_classes=settings.approved_workflow_node_classes,
         )
+        startup_stage = "comfy_start"
         process = start_comfy(settings)
+        startup_stage = "queue_worker_start"
         queue_process = start_salad_queue_worker(settings)
+        startup_stage = "worker_settings"
         worker_settings = settings.to_worker_settings()
         worker_host = settings.worker_host
         worker_port = settings.worker_port
@@ -493,14 +519,14 @@ def main() -> None:
         TimeoutError,
         ValidationError,
         WorkerBootstrapConfigurationError,
-    ):
+    ) as error:
         if executor is not None:
             executor.close()
         if process is not None:
             stop_comfy(process)
         if queue_process is not None:
             stop_comfy(queue_process)
-        _startup_failure()
+        _startup_failure(startup_stage, error)
 
     assert process is not None
     assert executor is not None
@@ -525,7 +551,7 @@ def main() -> None:
         stop_comfy(process)
 
     if child_exited:
-        _startup_failure()
+        _startup_failure("managed_child_monitor")
 
 
 if __name__ == "__main__":
