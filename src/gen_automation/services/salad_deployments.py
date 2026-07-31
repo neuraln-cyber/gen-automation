@@ -705,7 +705,20 @@ async def _request_stop(
         deployment.observed_replicas = current_replicas
         deployment.ready_replicas = group.current_state.running_count
         deployment.last_observed_at = observed_at
-    if group is not None and group.status.strip().lower() == "stopped":
+    stop_converged = False
+    if group is not None:
+        state = group.current_state
+        stop_converged = (
+            deployment.state == SaladDeploymentState.DRAINING
+            and not group.status.strip()
+            and not group.pending_change
+            and group.replicas == 0
+            and state.allocating_count == 0
+            and state.creating_count == 0
+            and state.running_count == 0
+            and state.stopping_count == 0
+        )
+    if group is not None and (group.status.strip().lower() == "stopped" or stop_converged):
         return await _confirm_provider_group_stopped(
             session,
             deployment,

@@ -702,21 +702,23 @@ async def _apply_provider_state(
             attempt.error_detail = None
             _set_job_state(job, state=GenerationState.RUNNING)
     elif status == SaladJobStatus.SUCCEEDED:
-        attempt_changed = attempt_changed or (attempt.state != GenerationAttemptState.SUCCEEDED)
-        attempt.state = GenerationAttemptState.SUCCEEDED
+        attempt_changed = attempt_changed or (attempt.state != GenerationAttemptState.UNKNOWN)
+        attempt.state = GenerationAttemptState.UNKNOWN
         attempt.submitted_at = attempt.submitted_at or observed_at
-        attempt.completed_at = observed_at
-        attempt.unknown_since = None
-        attempt.error_code = None
-        attempt.error_detail = None
-        _set_job_state(job, state=GenerationState.COLLECTING)
-        attempt_changed = (
-            await _release_reservation(
-                session,
-                attempt=attempt,
-                released_at=processed_at,
-            )
-            or attempt_changed
+        attempt.completed_at = None
+        attempt.unknown_since = attempt.unknown_since or processed_at
+        attempt.error_code = "salad_worker_output_unverified"
+        attempt.error_detail = (
+            "Salad reported success; the worker output contract requires provider reconciliation."
+        )
+        _set_job_state(
+            job,
+            state=GenerationState.UNKNOWN,
+            error_code="salad_worker_output_unverified",
+            error_detail=(
+                "Salad reported success; the worker output contract "
+                "requires provider reconciliation."
+            ),
         )
     elif status == SaladJobStatus.FAILED:
         attempt_changed = attempt_changed or (attempt.state != GenerationAttemptState.FAILED)
@@ -768,7 +770,7 @@ async def _apply_provider_state(
 
     if attempt_changed:
         attempt.lock_version += 1
-    if was_unknown:
+    if was_unknown and attempt.state != GenerationAttemptState.UNKNOWN:
         _audit(
             session,
             receipt=receipt,

@@ -343,7 +343,7 @@ async def test_unmatched_receipt_retries_then_late_matches_without_content_use(
         assert "signed_upload_url" not in serialized_audits
 
 
-async def test_signed_success_reconciles_unknown_and_releases_reservation(
+async def test_signed_success_requires_output_reconciliation_and_holds_reservation(
     database: Database,
 ) -> None:
     context = await _seed(
@@ -375,22 +375,23 @@ async def test_signed_success_reconciles_unknown_and_releases_reservation(
         )
 
     assert result.disposition == InboxDisposition.APPLIED
-    assert result.attempt_state == GenerationAttemptState.SUCCEEDED
-    assert result.job_state == GenerationState.COLLECTING
+    assert result.attempt_state == GenerationAttemptState.UNKNOWN
+    assert result.job_state == GenerationState.UNKNOWN
 
     async with database.sessions() as session:
         attempt = await session.get(GenerationAttempt, context.attempt_id)
         actions = set(await session.scalars(select(AuditEvent.action)))
         assert attempt is not None
-        assert attempt.unknown_since is None
-        assert attempt.completed_at == NOW.replace(tzinfo=None)
-        assert attempt.reservation_released_at is not None
-        assert "salad.webhook.reconciled_unknown" in actions
-        assert "provider_budget.reservation_released" in actions
+        assert attempt.unknown_since is not None
+        assert attempt.completed_at is None
+        assert attempt.error_code == "salad_worker_output_unverified"
+        assert attempt.reservation_released_at is None
+        assert "salad.webhook.reconciled_unknown" not in actions
+        assert "provider_budget.reservation_released" not in actions
         guard_state = await session.scalar(
             select(ProviderBudgetGuard.state).where(ProviderBudgetGuard.provider == "salad")
         )
-        assert guard_state == BudgetState.OPEN
+        assert guard_state == BudgetState.BLOCKED
 
 
 @pytest.mark.parametrize(
