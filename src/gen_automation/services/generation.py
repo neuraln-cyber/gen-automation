@@ -67,23 +67,40 @@ def _job_parameters(
     wildcard_catalog: FrozenWildcardCatalog,
     ordinal: int,
 ) -> dict[str, object]:
-    seed = (specification.generation.seed + ordinal) % (2**63)
-    resolved_prompts = resolve_wildcard_prompts(
-        specification,
-        wildcard_catalog,
-        seed=seed,
-    )
-    generation = specification.generation.model_copy(
-        update={
-            "seed": seed,
-            "prompt": resolved_prompts.prompt,
-            "negative_prompt": resolved_prompts.negative_prompt,
-            "detailer_prompt": resolved_prompts.detailer_prompt,
-            "detailer_negative_prompt": resolved_prompts.detailer_negative_prompt,
-        }
-    ).model_dump(mode="json")
+    output_generations: list[dict[str, object]] = []
+    output_prompt_resolutions: list[dict[str, object]] = []
+    for output_index in range(specification.generation.outputs_per_job):
+        # Keep output zero compatible with the historical per-job seed while
+        # assigning every output a deterministic, non-overlapping seed.  A
+        # separate seed also makes wildcard selection independent per image.
+        seed = (
+            specification.generation.seed
+            + ordinal
+            + (output_index * specification.planned_job_count)
+        ) % (2**63)
+        resolved_prompts = resolve_wildcard_prompts(
+            specification,
+            wildcard_catalog,
+            seed=seed,
+        )
+        output_generations.append(
+            specification.generation.model_copy(
+                update={
+                    "seed": seed,
+                    "prompt": resolved_prompts.prompt,
+                    "negative_prompt": resolved_prompts.negative_prompt,
+                    "detailer_prompt": resolved_prompts.detailer_prompt,
+                    "detailer_negative_prompt": resolved_prompts.detailer_negative_prompt,
+                    "outputs_per_job": 1,
+                }
+            ).model_dump(mode="json")
+        )
+        output_prompt_resolutions.append(resolved_prompts.evidence)
+
+    generation = dict(output_generations[0])
+    generation["outputs_per_job"] = specification.generation.outputs_per_job
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "release_version_id": str(release_version.id),
         "release_specification_sha256": release_version.specification_sha256,
         "approval_snapshot_sha256": approval_snapshot.sha256,
@@ -100,7 +117,9 @@ def _job_parameters(
         "loras": [lora.model_dump(mode="json") for lora in specification.loras],
         "workflow": specification.workflow.model_dump(mode="json"),
         "generation": generation,
-        "prompt_resolution": resolved_prompts.evidence,
+        "prompt_resolution": output_prompt_resolutions[0],
+        "output_generations": output_generations,
+        "output_prompt_resolutions": output_prompt_resolutions,
     }
 
 

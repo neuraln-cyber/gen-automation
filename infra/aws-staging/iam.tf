@@ -43,7 +43,7 @@ resource "aws_iam_role" "salad_worker_artifact_reader" {
 
   name                 = "${local.name}-salad-artifact-reader"
   assume_role_policy   = data.aws_iam_policy_document.salad_worker_artifact_reader_assume[0].json
-  max_session_duration = 3600
+  max_session_duration = 10800
 
   tags = {
     Name = "${local.name}-salad-artifact-reader"

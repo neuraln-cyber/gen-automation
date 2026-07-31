@@ -139,6 +139,51 @@ def _settings(content: bytes | None = None, **changes: object) -> WorkerRuntimeS
     return WorkerRuntimeSettings.model_validate(values)
 
 
+def test_main_reports_validation_stage_without_secret_input(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sensitive_input = os.urandom(16).hex()
+    values = _settings().model_dump()
+    values["artifact_connect_timeout_seconds"] = sensitive_input
+
+    def invalid_runtime_settings() -> WorkerRuntimeSettings:
+        return WorkerRuntimeSettings.model_validate(values)
+
+    monkeypatch.setattr(worker_main, "WorkerRuntimeSettings", invalid_runtime_settings)
+
+    with pytest.raises(SystemExit) as raised:
+        worker_main.main()
+
+    stderr = capsys.readouterr().err
+    assert raised.value.code == 78
+    assert "stage=runtime_settings" in stderr
+    assert "exception=ValidationError" in stderr
+    assert "message=artifact_connect_timeout_seconds:" in stderr
+    assert sensitive_input not in stderr
+
+
+def test_main_reports_model_bootstrap_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def fail_bootstrap(_settings: WorkerRuntimeSettings) -> ArtifactBootstrapResult:
+        raise worker_main.ArtifactBootstrapError("artifact bootstrap failed")
+
+    monkeypatch.setattr(worker_main, "WorkerRuntimeSettings", _settings)
+    monkeypatch.setattr(worker_main, "harden_parent_process", lambda _environment: None)
+    monkeypatch.setattr(worker_main, "bootstrap_worker_models", fail_bootstrap)
+
+    with pytest.raises(SystemExit) as raised:
+        worker_main.main()
+
+    stderr = capsys.readouterr().err
+    assert raised.value.code == 78
+    assert "stage=model_bootstrap" in stderr
+    assert "exception=ArtifactBootstrapError" in stderr
+    assert "message=artifact bootstrap failed" in stderr
+
+
 def test_worker_runtime_settings_contain_only_verification_keys() -> None:
     settings = _settings()
     worker_settings = settings.to_worker_settings()

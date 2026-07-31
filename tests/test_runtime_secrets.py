@@ -229,7 +229,7 @@ async def test_configured_resolver_resolves_only_the_complete_allowlisted_set(
     assert second[WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING] == f"{RUNTIME_ACCESS_KEY}-2"
     assert len(sts_client.calls) == 2
     assert all(call["RoleArn"] == RUNTIME_ROLE_ARN for call in sts_client.calls)
-    assert all(call["DurationSeconds"] == 3600 for call in sts_client.calls)
+    assert all(call["DurationSeconds"] == 10_800 for call in sts_client.calls)
     assert RUNTIME_ACCESS_KEY not in repr(resolver)
     assert RUNTIME_SECRET_KEY not in repr(resolver)
 

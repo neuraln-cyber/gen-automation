@@ -38,9 +38,11 @@ The GPU worker therefore receives the fully resolved prompt. It does not read
 mutable wildcard files and cannot silently change the meaning of an already
 approved release.
 
-Wildcard selection happens once per generation job. For a different wildcard
-draw on every generated image, configure the plan with `outputs_per_job=1`;
-multiple outputs from one job intentionally share that job's resolved prompt.
+Wildcard selection happens once per planned output. A job with
+`outputs_per_job=4` stores four independently resolved prompt variants and the
+worker renders them as four `batch_size=1` branches inside one provider job.
+This preserves one queue submission while giving every image its own wildcard
+draw and deterministic seed.
 
 ## API
 

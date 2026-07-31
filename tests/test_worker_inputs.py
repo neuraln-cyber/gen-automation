@@ -418,6 +418,84 @@ async def test_builds_signed_envelope_with_rendered_workflow_and_fresh_uploads(
 
 
 @pytest.mark.asyncio
+async def test_one_provider_job_renders_independent_prompt_branches(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _profile_context(
+        worker_input_context,
+        workflow_body=DETAILER_WORKFLOW_BODY,
+        detector=True,
+    )
+    parameters = dict(context.job_context.parameters)
+    generation = dict(parameters["generation"])  # type: ignore[arg-type]
+    first = {**generation, "outputs_per_job": 1}
+    second = {
+        **first,
+        "prompt": "second independently expanded wildcard prompt",
+        "detailer_prompt": "second face prompt",
+        "seed": 43,
+    }
+    parameters.update(
+        {
+            "schema_version": 2,
+            "output_generations": [first, second],
+            "output_prompt_resolutions": [{"seed": 42}, {"seed": 43}],
+        }
+    )
+    context = replace(
+        context,
+        job_context=SaladJobInputContext(
+            **{
+                **context.job_context.__dict__,
+                "parameters": parameters,
+                "parameters_sha256": canonical_sha256(parameters),
+            }
+        ),
+    )
+
+    envelope = GenerateEnvelope.model_validate(await _build(context), strict=True)
+    workflow = envelope.payload.workflow
+    output_nodes = {
+        node_id: node
+        for node_id, node in workflow.items()
+        if isinstance(node, dict) and node.get("class_type") == "SaveImage"
+    }
+    latent_nodes = [
+        node
+        for node in workflow.values()
+        if isinstance(node, dict) and node.get("class_type") == "EmptyLatentImage"
+    ]
+    prompt_texts = {
+        node["inputs"]["text"]
+        for node in workflow.values()
+        if isinstance(node, dict)
+        and node.get("class_type") == "CLIPTextEncode"
+        and isinstance(node.get("inputs"), dict)
+    }
+    sampler_seeds = {
+        node["inputs"]["seed"]
+        for node in workflow.values()
+        if isinstance(node, dict)
+        and node.get("class_type") == "KSampler"
+        and isinstance(node.get("inputs"), dict)
+    }
+
+    assert len(output_nodes) == 2
+    assert all(node["inputs"]["batch_size"] == 1 for node in latent_nodes)
+    assert "private test prompt" in prompt_texts
+    assert "second independently expanded wildcard prompt" in prompt_texts
+    assert {42, 43} <= sampler_seeds
+    assert sum(
+        isinstance(node, dict) and node.get("class_type") == "FaceDetailer"
+        for node in workflow.values()
+    ) == 2
+    assert sum(
+        isinstance(node, dict) and node.get("class_type") == "UltralyticsDetectorProvider"
+        for node in workflow.values()
+    ) == 1
+
+
+@pytest.mark.asyncio
 async def test_runtime_expands_eight_ordered_loras(
     worker_input_context: WorkerInputContext,
 ) -> None:

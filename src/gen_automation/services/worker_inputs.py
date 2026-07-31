@@ -45,6 +45,14 @@ MAX_JSON_ITEMS = 50_000
 MIN_POST_ACCEPTANCE_UPLOAD_SECONDS = 3600
 MAX_RUNTIME_LORAS = 8
 LORA_CHAIN_NODE_CLASS = "GenAutomationLoraChain"
+MULTI_PROMPT_SHARED_NODE_CLASSES = frozenset(
+    {
+        "CheckpointLoaderSimple",
+        LORA_CHAIN_NODE_CLASS,
+        "CLIPSetLastLayer",
+        "UltralyticsDetectorProvider",
+    }
+)
 type UploadContentType = Literal["image/png", "image/jpeg", "image/webp"]
 
 
@@ -58,8 +66,14 @@ class _ResolvedJobParameters:
     loras: tuple[LoraSpecification, ...]
     workflow: WorkflowSpecification
     generation: GenerationParameters
+    output_generations: tuple[GenerationParameters, ...] = ()
 
-    def bindings(self, runtime: "_RuntimeArtifactBindings") -> dict[str, object]:
+    def bindings(
+        self,
+        runtime: "_RuntimeArtifactBindings",
+        *,
+        generation: GenerationParameters | None = None,
+    ) -> dict[str, object]:
         checkpoint = self.checkpoint.model_dump(mode="json")
         checkpoint["runtime_filename"] = runtime.checkpoint_filename
         loras: list[dict[str, object]] = []
@@ -67,17 +81,20 @@ class _ResolvedJobParameters:
             value = lora.model_dump(mode="json")
             value["runtime_filename"] = filename
             loras.append(value)
-        generation = self.generation.model_dump(mode="json")
-        generation["clip_stop_at_layer"] = -self.generation.clip_skip
-        generation["detailer_prompt"] = self.generation.detailer_prompt or self.generation.prompt
-        generation["detailer_negative_prompt"] = (
-            self.generation.detailer_negative_prompt or self.generation.negative_prompt
+        selected_generation = generation or self.generation
+        generation_binding = selected_generation.model_dump(mode="json")
+        generation_binding["clip_stop_at_layer"] = -selected_generation.clip_skip
+        generation_binding["detailer_prompt"] = (
+            selected_generation.detailer_prompt or selected_generation.prompt
+        )
+        generation_binding["detailer_negative_prompt"] = (
+            selected_generation.detailer_negative_prompt or selected_generation.negative_prompt
         )
         bindings: dict[str, object] = {
             "checkpoint": checkpoint,
             "loras": loras,
             "workflow": self.workflow.model_dump(mode="json"),
-            "generation": generation,
+            "generation": generation_binding,
         }
         if runtime.detector_filename is not None:
             bindings["detector"] = {
@@ -85,6 +102,15 @@ class _ResolvedJobParameters:
                 "comfy_name": f"bbox/{runtime.detector_filename}",
             }
         return bindings
+
+    def output_bindings(
+        self,
+        runtime: "_RuntimeArtifactBindings",
+    ) -> tuple[dict[str, object], ...]:
+        return tuple(
+            self.bindings(runtime, generation=generation)
+            for generation in self.output_generations
+        )
 
 
 @dataclass(frozen=True)
@@ -156,7 +182,8 @@ def _resolve_job_parameters(context: SaladJobInputContext) -> _ResolvedJobParame
     parameters = _require_mapping(context.parameters)
     if canonical_sha256(dict(parameters)) != context.parameters_sha256:
         raise WorkerInputError("generation parameter integrity check failed")
-    if parameters.get("schema_version") != 1:
+    schema_version = parameters.get("schema_version")
+    if schema_version not in {1, 2}:
         raise WorkerInputError("generation parameter schema is unsupported")
     if parameters.get("release_version_id") != str(context.release_version_id):
         raise WorkerInputError("generation parameter identity check failed")
@@ -169,15 +196,55 @@ def _resolve_job_parameters(context: SaladJobInputContext) -> _ResolvedJobParame
         loras = tuple(LoraSpecification.model_validate(item) for item in loras_raw)
         workflow = WorkflowSpecification.model_validate(parameters.get("workflow"))
         generation = GenerationParameters.model_validate(parameters.get("generation"))
+        output_generations: tuple[GenerationParameters, ...] = ()
+        if schema_version == 2:
+            raw_output_generations = parameters.get("output_generations")
+            if (
+                not isinstance(raw_output_generations, list)
+                or len(raw_output_generations) != context.expected_output_count
+            ):
+                raise WorkerInputError("generation output parameters are invalid")
+            output_generations = tuple(
+                GenerationParameters.model_validate(item) for item in raw_output_generations
+            )
     except ValidationError:
         raise WorkerInputError("generation parameters are invalid") from None
     if generation.outputs_per_job != context.expected_output_count:
         raise WorkerInputError("generation output count is inconsistent")
+    if output_generations:
+        if any(item.outputs_per_job != 1 for item in output_generations):
+            raise WorkerInputError("generation output parameters are invalid")
+        base = generation.model_dump(mode="json")
+        first = output_generations[0].model_dump(mode="json")
+        if {**first, "outputs_per_job": generation.outputs_per_job} != base:
+            raise WorkerInputError("generation output parameters are inconsistent")
+        varying_fields = {
+            "prompt",
+            "negative_prompt",
+            "detailer_prompt",
+            "detailer_negative_prompt",
+            "seed",
+            "outputs_per_job",
+        }
+        static_base = {key: value for key, value in base.items() if key not in varying_fields}
+        if any(
+            {
+                key: value
+                for key, value in item.model_dump(mode="json").items()
+                if key not in varying_fields
+            }
+            != static_base
+            for item in output_generations
+        ):
+            raise WorkerInputError("generation output parameters are inconsistent")
+        if len({item.seed for item in output_generations}) != len(output_generations):
+            raise WorkerInputError("generation output seeds are inconsistent")
     return _ResolvedJobParameters(
         checkpoint=checkpoint,
         loras=loras,
         workflow=workflow,
         generation=generation,
+        output_generations=output_generations,
     )
 
 
@@ -264,6 +331,89 @@ def _render_workflow(value: object, bindings: Mapping[str, object]) -> object:
             return _resolve_binding(value["$gen"], bindings)
         return {key: _render_workflow(item, bindings) for key, item in value.items()}
     return value
+
+
+def _rewrite_branch_links(
+    value: object,
+    *,
+    branch_node_ids: frozenset[str],
+    prefix: str,
+) -> object:
+    if isinstance(value, list):
+        if (
+            len(value) == 2
+            and isinstance(value[0], str)
+            and value[0] in branch_node_ids
+            and isinstance(value[1], int)
+            and not isinstance(value[1], bool)
+        ):
+            return [f"{prefix}{value[0]}", value[1]]
+        return [
+            _rewrite_branch_links(item, branch_node_ids=branch_node_ids, prefix=prefix)
+            for item in value
+        ]
+    if isinstance(value, dict):
+        return {
+            key: _rewrite_branch_links(item, branch_node_ids=branch_node_ids, prefix=prefix)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _render_multi_prompt_workflow(
+    template: dict[str, object],
+    output_bindings: tuple[Mapping[str, object], ...],
+) -> dict[str, object]:
+    if len(output_bindings) < 2:
+        raise WorkerInputError("multi-prompt workflow requires multiple outputs")
+    rendered_outputs: list[dict[str, object]] = []
+    for bindings in output_bindings:
+        rendered = _render_workflow(template, bindings)
+        if not isinstance(rendered, dict) or set(rendered) != set(template):
+            raise WorkerInputError("workflow template is invalid")
+        rendered_outputs.append(rendered)
+
+    shared_node_ids = frozenset(
+        node_id
+        for node_id, raw_node in template.items()
+        if isinstance(raw_node, dict)
+        and raw_node.get("class_type") in MULTI_PROMPT_SHARED_NODE_CLASSES
+    )
+    branch_node_ids = frozenset(set(template) - shared_node_ids)
+    if not shared_node_ids or not branch_node_ids:
+        raise WorkerInputError("workflow template cannot be expanded for multiple prompts")
+
+    result: dict[str, object] = {}
+    first = rendered_outputs[0]
+    for node_id in sorted(shared_node_ids):
+        node = first[node_id]
+        if any(rendered[node_id] != node for rendered in rendered_outputs[1:]):
+            raise WorkerInputError("shared workflow bindings differ between outputs")
+        result[node_id] = node
+
+    for output_index, rendered in enumerate(rendered_outputs):
+        prefix = f"output-{output_index:02d}-"
+        for node_id in sorted(branch_node_ids):
+            rendered_node_id = f"{prefix}{node_id}"
+            if len(rendered_node_id) > 128 or rendered_node_id in result:
+                raise WorkerInputError("workflow template cannot be expanded for multiple prompts")
+            node = _rewrite_branch_links(
+                rendered[node_id],
+                branch_node_ids=branch_node_ids,
+                prefix=prefix,
+            )
+            if (
+                isinstance(node, dict)
+                and node.get("class_type") == "SaveImage"
+                and isinstance(node.get("inputs"), dict)
+            ):
+                inputs = dict(node["inputs"])
+                filename_prefix = inputs.get("filename_prefix")
+                if isinstance(filename_prefix, str):
+                    inputs["filename_prefix"] = f"{filename_prefix}-output-{output_index:02d}"
+                node = {**node, "inputs": inputs}
+            result[rendered_node_id] = node
+    return result
 
 
 def _require_comfy_link(value: object, *, output_index: int) -> tuple[str, int]:
@@ -404,6 +554,7 @@ def _validate_runtime_artifact_nodes(
     checkpoints: list[str] = []
     detectors: list[str] = []
     detailer_count = 0
+    output_node_count = 0
     loras: dict[str, tuple[object, object]] = {}
     for raw_node in workflow.values():
         if not isinstance(raw_node, dict):
@@ -432,6 +583,8 @@ def _validate_runtime_artifact_nodes(
             detectors.append(detector_name)
         elif node_class == "FaceDetailer":
             detailer_count += 1
+        elif node_class in {"SaveImage", "SaveImageWebsocket"}:
+            output_node_count += 1
 
     if checkpoints != [runtime.checkpoint_filename]:
         raise WorkerInputError("workflow artifact binding is invalid")
@@ -443,8 +596,19 @@ def _validate_runtime_artifact_nodes(
     for filename, weight in expected_loras.items():
         if loras[filename] != (weight, weight):
             raise WorkerInputError("workflow artifact binding is invalid")
-    if detailer_count not in {0, 1} or bool(detailer_count) != bool(detectors):
+    allowed_detailer_counts = {0, 1}
+    if resolved.output_generations:
+        allowed_detailer_counts.add(len(resolved.output_generations))
+    if (
+        detailer_count not in allowed_detailer_counts
+        or bool(detailer_count) != bool(detectors)
+    ):
         raise WorkerInputError("workflow detector binding is invalid")
+    if (
+        len(resolved.output_generations) > 1
+        and output_node_count != len(resolved.output_generations)
+    ):
+        raise WorkerInputError("workflow output count is invalid")
     expected_detector = (
         [] if runtime.detector_filename is None else [f"bbox/{runtime.detector_filename}"]
     )
@@ -457,6 +621,7 @@ async def _load_workflow(
     *,
     specification: WorkflowSpecification,
     bindings: Mapping[str, object],
+    output_bindings: tuple[Mapping[str, object], ...] = (),
     max_bytes: int,
 ) -> dict[str, object]:
     try:
@@ -473,7 +638,12 @@ async def _load_workflow(
         raise WorkerInputError("workflow template is unavailable") from None
     if hashlib.sha256(raw).hexdigest() != specification.sha256:
         raise WorkerInputError("workflow template integrity check failed")
-    rendered = _render_workflow(_parse_workflow_template(raw), bindings)
+    template = _parse_workflow_template(raw)
+    rendered = (
+        _render_multi_prompt_workflow(template, output_bindings)
+        if len(output_bindings) > 1
+        else _render_workflow(template, bindings)
+    )
     if not isinstance(rendered, dict):
         raise WorkerInputError("workflow template is invalid")
     return rendered
@@ -527,6 +697,7 @@ class SaladWorkerJobInputProvider:
             self.store,
             specification=resolved.workflow,
             bindings=resolved.bindings(runtime),
+            output_bindings=resolved.output_bindings(runtime),
             max_bytes=self.max_workflow_bytes,
         )
         workflow = _expand_bounded_lora_chain(

@@ -110,9 +110,9 @@ The manifest contains opaque object IDs, exact sizes, filenames, and SHA-256
 values. Model source, license, commercial-use permission, adult-use permission,
 and hashes must be approved before adding an object to it.
 
-The STS session is capped at one hour. The controller rotates it immediately
+The STS session is capped at three hours. The controller rotates it immediately
 before enqueueing and waits for Salad to apply the new container-group version.
-An allocation delayed beyond that hour cannot be refreshed inside an already
+An allocation delayed beyond that window cannot be refreshed inside an already
 started container; bootstrap fails closed and the job must retry through the
 controller so a new session is installed before the next enqueue.
 
