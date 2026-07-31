@@ -2,7 +2,10 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx2
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.responses import RedirectResponse, Response
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from gen_automation.api.router import api_router
 from gen_automation.api.routes.browser_authentication import (
@@ -42,6 +45,28 @@ from gen_automation.services.x_oauth import (
     build_aws_secrets_manager_x_oauth_provider,
 )
 from gen_automation.storage.s3 import build_object_store
+
+
+async def _browser_authentication_exception_handler(
+    request: Request,
+    error: Exception,
+) -> Response:
+    if not isinstance(error, StarletteHTTPException):
+        raise error
+    path = request.url.path
+    if (
+        request.method in {"GET", "HEAD"}
+        and (path == "/dashboard" or path.startswith("/dashboard/"))
+        and error.status_code == status.HTTP_401_UNAUTHORIZED
+        and error.detail == "authentication required"
+    ):
+        response = RedirectResponse(
+            url="/login",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    return await http_exception_handler(request, error)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -225,6 +250,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.x_oauth_provider = None
     application.state.authentication_service = None
     application.state.admin_enrollment_service = None
+    application.add_exception_handler(
+        StarletteHTTPException,
+        _browser_authentication_exception_handler,
+    )
     application.add_middleware(RequestContextMiddleware)
     application.include_router(api_router, prefix="/api/v1")
     application.include_router(browser_authentication_router)
