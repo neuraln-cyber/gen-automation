@@ -210,6 +210,8 @@ class WorkflowOption:
     approval_id: UUID
     name: str
     version: str
+    has_hires_pass: bool
+    has_face_detailer: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,6 +373,8 @@ async def list_new_set_options(session: AsyncSession) -> NewSetOptions:
             approval_id=row.id,
             name=row.name,
             version=row.version,
+            has_hires_pass="LatentUpscaleBy" in row.reviewed_node_classes,
+            has_face_detailer="FaceDetailer" in row.reviewed_node_classes,
         )
         for row in (
             await session.scalars(

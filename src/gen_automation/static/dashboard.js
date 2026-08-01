@@ -949,8 +949,9 @@
         "scheduler",
         "clip_skip",
       ]),
-      hires: safeFields(value.hires, ["scale", "denoise", "upscale_method"]),
+      hires: safeFields(value.hires, ["enabled", "scale", "denoise", "upscale_method"]),
       detailer: safeFields(value.detailer, [
+        "enabled",
         "guide_size",
         "max_size",
         "denoise",
@@ -1196,19 +1197,43 @@
       "No LoRAs",
     );
 
-    const refinementSection = addSection(body, "Hires & face detailer");
-    addGrid(refinementSection, [
-      ["Hires scale", details.hires.scale],
-      ["Hires denoise", details.hires.denoise],
-      ["Upscale method", details.hires.upscale_method],
-      ["Detailer guide size", details.detailer.guide_size],
-      ["Detailer max size", details.detailer.max_size],
-      ["Detailer denoise", details.detailer.denoise],
-      ["BBox threshold", details.detailer.bbox_threshold],
-      ["BBox dilation", details.detailer.bbox_dilation],
-      ["BBox crop factor", details.detailer.bbox_crop_factor],
-      ["Feather", details.detailer.feather],
+    const upscalerEnabled = details.hires.enabled === true;
+    const upscalerKnown = typeof details.hires.enabled === "boolean";
+    const detailerEnabled = details.detailer.enabled === true;
+    const detailerKnown = typeof details.detailer.enabled === "boolean";
+    const refinementSection = addSection(
+      body,
+      upscalerEnabled ? "Hires & face detailer" : "Face detailer",
+    );
+    const refinementRows = [[
+      "Full-image upscaler",
+      upscalerKnown
+        ? (upscalerEnabled ? "On" : "Off - no upscale node in workflow")
+        : "Workflow evidence unavailable",
+    ]];
+    if (upscalerEnabled) {
+      refinementRows.push(
+        ["Hires scale", details.hires.scale],
+        ["Hires denoise", details.hires.denoise],
+        ["Upscale method", details.hires.upscale_method],
+      );
+    }
+    refinementRows.push([
+      "Face detailer",
+      detailerKnown ? (detailerEnabled ? "On" : "Off") : "Workflow evidence unavailable",
     ]);
+    if (detailerEnabled) {
+      refinementRows.push(
+        ["Detailer guide size", details.detailer.guide_size],
+        ["Detailer max size", details.detailer.max_size],
+        ["Detailer denoise", details.detailer.denoise],
+        ["BBox threshold", details.detailer.bbox_threshold],
+        ["BBox dilation", details.detailer.bbox_dilation],
+        ["BBox crop factor", details.detailer.bbox_crop_factor],
+        ["Feather", details.detailer.feather],
+      );
+    }
+    addGrid(refinementSection, refinementRows);
 
     if (details.wildcards.versions.length > 0 || details.wildcards.selections.length > 0) {
       const wildcardSection = addSection(body, "Wildcard evidence");
@@ -1531,8 +1556,72 @@
     schedule(1500);
   }
 
+  const initializeWorkflowRefinement = () => {
+    const workflow = document.querySelector("[data-workflow-profile]");
+    const status = document.querySelector("[data-workflow-refinement-status]");
+    if (!(workflow instanceof HTMLSelectElement) || !(status instanceof HTMLElement)) return;
+    const hiresSettings = Array.from(document.querySelectorAll("[data-hires-setting]"));
+    const toggleControl = document.querySelector("[data-upscaler-control]");
+    const toggle = document.querySelector("[data-upscaler-toggle]");
+    const toggleLabel = document.querySelector("[data-upscaler-toggle-label]");
+    const toggleDescription = document.querySelector("[data-upscaler-toggle-description]");
+    const workflowOptions = Array.from(workflow.options).filter(
+      (option) => ["true", "false"].includes(option.dataset.upscalerEnabled),
+    );
+    const canToggle = ["true", "false"].every((value) => (
+      workflowOptions.some((option) => option.dataset.upscalerEnabled === value)
+    ));
+
+    const render = () => {
+      const selected = workflow.selectedOptions.item(0);
+      const upscalerEnabled = selected?.dataset.upscalerEnabled === "true";
+      const detailerEnabled = selected?.dataset.detailerEnabled === "true";
+      status.textContent = upscalerEnabled
+        ? `Full-image upscaler: On.${detailerEnabled ? " Face detailer: On." : " Face detailer: Off."}`
+        : `Full-image upscaler: Off - this workflow has no upscale node.${detailerEnabled ? " Face detailer remains on." : " Face detailer is also off."}`;
+      hiresSettings.forEach((field) => {
+        field.hidden = !upscalerEnabled;
+      });
+      if (toggle instanceof HTMLInputElement) {
+        toggle.checked = upscalerEnabled;
+        toggle.disabled = !canToggle;
+      }
+      if (toggleLabel instanceof HTMLElement) {
+        toggleLabel.textContent = upscalerEnabled ? "On" : "Off";
+      }
+      if (toggleDescription instanceof HTMLElement) {
+        toggleDescription.textContent = upscalerEnabled
+          ? "Runs the hires workflow; scale, denoise, and upscale method apply."
+          : "Base dimensions only - no upscale node or second sampler pass.";
+      }
+    };
+
+    if (toggleControl instanceof HTMLElement) toggleControl.hidden = false;
+    workflow.addEventListener("change", render);
+    if (toggle instanceof HTMLInputElement) {
+      toggle.addEventListener("change", () => {
+        const desired = toggle.checked ? "true" : "false";
+        const current = workflow.selectedOptions.item(0);
+        const matching = workflowOptions.filter(
+          (option) => !option.disabled && option.dataset.upscalerEnabled === desired,
+        );
+        const replacement = matching.find(
+          (option) => option.dataset.detailerEnabled === current?.dataset.detailerEnabled,
+        ) || matching[0];
+        if (!replacement) {
+          render();
+          return;
+        }
+        workflow.value = replacement.value;
+        workflow.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+    }
+    render();
+  };
+
   initializeLoraPicker();
   initializeAutomationBuilder();
+  initializeWorkflowRefinement();
   initializeBulkReview();
   initializeGenerationDetails();
   initializeGenerationProgress();

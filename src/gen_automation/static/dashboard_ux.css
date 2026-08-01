@@ -499,6 +499,30 @@ body.asset-viewer-open { overflow: hidden; }
 .asset-viewer-download { margin-left: .5rem; }
 .asset-viewer-settings[hidden] + .asset-viewer-download { margin-left: auto; }
 
+.upscaler-toggle-field {
+  align-content: start;
+  padding: .85rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, .1));
+  border-radius: .85rem;
+  background: rgba(255, 255, 255, .025);
+}
+
+.upscaler-toggle-control {
+  display: flex;
+  align-items: center;
+  gap: .65rem;
+  min-height: 2.35rem;
+}
+
+.upscaler-toggle-control input {
+  width: 1.25rem;
+  height: 1.25rem;
+  margin: 0;
+  accent-color: var(--accent, #b8a5ff);
+}
+
+.upscaler-toggle-field small { color: var(--muted); line-height: 1.45; }
+
 @media (max-width: 680px) {
   .workflow-rail { grid-template-columns: 1fr 1fr; }
   .generation-progress .panel-heading { flex-direction: row; align-items: center; }
