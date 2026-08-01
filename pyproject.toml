@@ -47,7 +47,11 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-gen_automation = ["templates/auth/*.html", "templates/dashboard/*.html"]
+gen_automation = [
+  "static/*.js",
+  "templates/auth/*.html",
+  "templates/dashboard/*.html",
+]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"

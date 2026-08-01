@@ -619,14 +619,14 @@ def test_ranked_dashboard_orders_assets_and_signs_exact_frozen_versions(
     assert "1536" in detail.text
     assert "Download exact raw master" in detail.text
     assert "Quality state: scored" in detail.text
-    assert "<script" not in detail.text
+    assert '<script src="/static/dashboard.js" defer></script>' in detail.text
     assert "hidden-object-secret" not in detail.text
     assert "frozen/private-master" not in detail.text
     assert "current/mutated" not in detail.text
     assert "exact-version" not in detail.text
     assert "default-src &#39;none&#39;" not in detail.text
     assert "no-store" in detail.headers["cache-control"]
-    assert "script-src 'none'" in detail.headers["content-security-policy"]
+    assert "script-src 'self'" in detail.headers["content-security-policy"]
     assert "img-src 'self' https: http:" in detail.headers["content-security-policy"]
 
     expected_frozen = {

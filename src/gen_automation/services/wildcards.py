@@ -15,6 +15,7 @@ from gen_automation.db.models import (
 )
 from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.release_spec import (
+    GenerationParameters,
     ReleaseSpecification,
     WildcardVersionReference,
 )
@@ -526,31 +527,33 @@ def resolve_wildcard_prompts(
     catalog: FrozenWildcardCatalog,
     *,
     seed: int,
+    generation: GenerationParameters | None = None,
 ) -> ResolvedWildcardPrompts:
+    selected_generation = generation or specification.generation
     selections: list[dict[str, object]] = []
     prompt = _expand_text(
-        specification.generation.prompt,
+        selected_generation.prompt,
         catalog=catalog.by_name,
         seed=seed,
         field_name="prompt",
         selections=selections,
     )
     negative_prompt = _expand_text(
-        specification.generation.negative_prompt,
+        selected_generation.negative_prompt,
         catalog=catalog.by_name,
         seed=seed,
         field_name="negative_prompt",
         selections=selections,
     )
     detailer_prompt = _expand_text(
-        specification.generation.detailer_prompt,
+        selected_generation.detailer_prompt,
         catalog=catalog.by_name,
         seed=seed,
         field_name="detailer_prompt",
         selections=selections,
     )
     detailer_negative_prompt = _expand_text(
-        specification.generation.detailer_negative_prompt,
+        selected_generation.detailer_negative_prompt,
         catalog=catalog.by_name,
         seed=seed,
         field_name="detailer_negative_prompt",
@@ -560,15 +563,15 @@ def resolve_wildcard_prompts(
     evidence: dict[str, object] = {
         "schema_version": 1,
         "seed": seed,
-        "source_prompt": specification.generation.prompt,
-        "source_negative_prompt": specification.generation.negative_prompt,
-        "source_detailer_prompt": specification.generation.detailer_prompt,
-        "source_detailer_negative_prompt": specification.generation.detailer_negative_prompt,
-        "source_prompt_sha256": _text_sha256(specification.generation.prompt),
-        "source_negative_prompt_sha256": _text_sha256(specification.generation.negative_prompt),
-        "source_detailer_prompt_sha256": _text_sha256(specification.generation.detailer_prompt),
+        "source_prompt": selected_generation.prompt,
+        "source_negative_prompt": selected_generation.negative_prompt,
+        "source_detailer_prompt": selected_generation.detailer_prompt,
+        "source_detailer_negative_prompt": selected_generation.detailer_negative_prompt,
+        "source_prompt_sha256": _text_sha256(selected_generation.prompt),
+        "source_negative_prompt_sha256": _text_sha256(selected_generation.negative_prompt),
+        "source_detailer_prompt_sha256": _text_sha256(selected_generation.detailer_prompt),
         "source_detailer_negative_prompt_sha256": _text_sha256(
-            specification.generation.detailer_negative_prompt
+            selected_generation.detailer_negative_prompt
         ),
         "resolved_prompt_sha256": _text_sha256(prompt),
         "resolved_negative_prompt_sha256": _text_sha256(negative_prompt),
@@ -587,15 +590,16 @@ def resolve_wildcard_prompts(
 
 
 def _generation_wildcard_names(specification: ReleaseSpecification) -> set[str]:
-    generation = specification.generation
     names: set[str] = set()
-    for text in (
-        generation.prompt,
-        generation.negative_prompt,
-        generation.detailer_prompt,
-        generation.detailer_negative_prompt,
-    ):
-        names.update(extract_wildcard_names(text))
+    for batch in specification.ordered_generation_batches:
+        generation = batch.generation
+        for text in (
+            generation.prompt,
+            generation.negative_prompt,
+            generation.detailer_prompt,
+            generation.detailer_negative_prompt,
+        ):
+            names.update(extract_wildcard_names(text))
     return names
 
 

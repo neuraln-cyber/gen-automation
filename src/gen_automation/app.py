@@ -1,11 +1,13 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx2
 from fastapi import FastAPI, Request, status
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import RedirectResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.staticfiles import StaticFiles
 
 from gen_automation.api.router import api_router
 from gen_automation.api.routes.browser_authentication import (
@@ -255,6 +257,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _browser_authentication_exception_handler,
     )
     application.add_middleware(RequestContextMiddleware)
+    application.mount(
+        "/static",
+        StaticFiles(directory=Path(__file__).parent / "static"),
+        name="static",
+    )
     application.include_router(api_router, prefix="/api/v1")
     application.include_router(browser_authentication_router)
     application.include_router(dashboard_router)

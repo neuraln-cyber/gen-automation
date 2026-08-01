@@ -1,4 +1,5 @@
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -31,6 +32,7 @@ from gen_automation.domain.enums import (
     AssetState,
     OutboxStatus,
     ReleasePhase,
+    ReviewBulkAction,
     ReviewDecisionValue,
     ReviewTaskState,
     ScoringRunState,
@@ -47,6 +49,7 @@ from gen_automation.services.ranking_manifest import (
 _REASON_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_.-]{0,99}")
 _MAX_NOTE_LENGTH = 4_000
 _MAX_IDEMPOTENCY_KEY_LENGTH = 200
+_MAX_BULK_ASSET_COUNT = 500
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 SEMANTIC_SEVERE_OVERRIDE_REASON_CODE = "semantic_severe_override"
@@ -111,6 +114,17 @@ class ReviewXSelectionResult:
     asset_id: UUID
     selected: bool
     selected_count: int
+    replayed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewBulkActionResult:
+    task_id: UUID
+    action: ReviewBulkAction
+    asset_ids: tuple[UUID, ...]
+    changed_count: int
+    x_selected_count: int
+    task_lock_version: int
     replayed: bool
 
 
@@ -518,6 +532,337 @@ async def append_review_decision(
         if replay is not None:
             return replay
         raise ReviewConflictError("decision was appended concurrently") from error
+    return result
+
+
+async def apply_bulk_review_action(
+    session: AsyncSession,
+    *,
+    review_task_id: UUID,
+    asset_ids: Sequence[UUID],
+    action: ReviewBulkAction,
+    changed_by_user_id: UUID,
+    expected_lock_version: int,
+    idempotency_key: str,
+    reason_code: str | None = None,
+    note: str | None = None,
+    semantic_profile_sha256: str | None = None,
+    semantic_severe_confidence_micros: int = 900_000,
+    now: datetime | None = None,
+) -> ReviewBulkActionResult:
+    """Apply one atomic review action to a bounded set of ranked assets."""
+
+    normalized_key = _validate_idempotency_key(idempotency_key)
+    normalized_action = _validate_bulk_action(action)
+    normalized_asset_ids = _normalize_bulk_asset_ids(asset_ids)
+    normalized_reason = _normalize_reason_code(reason_code)
+    normalized_note = _normalize_note(note)
+    normalized_semantic_profile = _normalize_semantic_profile_sha256(semantic_profile_sha256)
+    semantic_threshold = _validate_semantic_confidence_threshold(semantic_severe_confidence_micros)
+    expected_version = _validate_lock_version(expected_lock_version)
+    decision_actions = {
+        ReviewBulkAction.ACCEPT,
+        ReviewBulkAction.REJECT,
+        ReviewBulkAction.HOLD,
+    }
+    if normalized_action not in decision_actions and (
+        normalized_reason is not None or normalized_note is not None
+    ):
+        raise ReviewInputError("reason_code and note are only valid for review decisions")
+
+    scope = f"review-task:{review_task_id}:bulk-action"
+    request_sha256 = canonical_sha256(
+        {
+            "review_task_id": str(review_task_id),
+            "asset_ids": [str(asset_id) for asset_id in normalized_asset_ids],
+            "action": normalized_action.value,
+            "changed_by_user_id": str(changed_by_user_id),
+            "expected_lock_version": expected_version,
+            "reason_code": normalized_reason,
+            "note": normalized_note,
+            "semantic_profile_sha256": normalized_semantic_profile,
+            "semantic_severe_confidence_micros": semantic_threshold,
+        }
+    )
+    if normalized_action in decision_actions:
+        await _require_active_reviewer(session, changed_by_user_id)
+    else:
+        await _require_active_owner(session, changed_by_user_id)
+    replay = await _bulk_action_idempotency_replay(
+        session,
+        scope=scope,
+        idempotency_key=normalized_key,
+        request_sha256=request_sha256,
+    )
+    if replay is not None:
+        return replay
+
+    task = await _load_task_locked(session, review_task_id)
+    if task.state != ReviewTaskState.OPEN:
+        raise ReviewConflictError("review task is not open")
+    if task.lock_version != expected_version:
+        raise ReviewConflictError("review task lock version is stale")
+    await _validate_task_ranking_snapshot(session, task, recompute=False)
+
+    ranked_asset_ids = set(
+        (
+            await session.scalars(
+                select(AssetRanking.asset_id).where(
+                    AssetRanking.scoring_run_id == task.scoring_run_id,
+                    AssetRanking.asset_id.in_(normalized_asset_ids),
+                )
+            )
+        ).all()
+    )
+    if ranked_asset_ids != set(normalized_asset_ids):
+        raise ReviewNotFoundError("one or more ranked review assets were not found")
+
+    changed_at = _as_utc(now or datetime.now(UTC))
+    changed_count = 0
+    x_selected_count: int
+    severe_override_asset_ids: set[UUID] = set()
+
+    if normalized_action in decision_actions:
+        decision = ReviewDecisionValue(normalized_action.value)
+        if normalized_semantic_profile is not None and decision == ReviewDecisionValue.ACCEPT:
+            assessments = (
+                await session.scalars(
+                    select(SemanticAssessment).where(
+                        SemanticAssessment.scoring_run_id == task.scoring_run_id,
+                        SemanticAssessment.asset_id.in_(normalized_asset_ids),
+                        SemanticAssessment.profile_sha256 == normalized_semantic_profile,
+                    )
+                )
+            ).all()
+            severe_override_asset_ids = {
+                assessment.asset_id
+                for assessment in assessments
+                if _is_high_confidence_severe_assessment(
+                    assessment,
+                    threshold_micros=semantic_threshold,
+                )
+            }
+            if severe_override_asset_ids:
+                if (
+                    normalized_reason != SEMANTIC_SEVERE_OVERRIDE_REASON_CODE
+                    or normalized_note is None
+                ):
+                    raise ReviewConflictError(
+                        "high-confidence severe anatomy requires an explicit owner override"
+                    )
+                await _require_active_owner(session, changed_by_user_id)
+
+        latest_revisions = (
+            select(
+                ReviewDecision.asset_id.label("asset_id"),
+                func.max(ReviewDecision.revision).label("revision"),
+            )
+            .where(
+                ReviewDecision.review_task_id == task.id,
+                ReviewDecision.asset_id.in_(normalized_asset_ids),
+            )
+            .group_by(ReviewDecision.asset_id)
+            .subquery()
+        )
+        prior_rows = (
+            await session.scalars(
+                select(ReviewDecision)
+                .join(
+                    latest_revisions,
+                    and_(
+                        latest_revisions.c.asset_id == ReviewDecision.asset_id,
+                        latest_revisions.c.revision == ReviewDecision.revision,
+                    ),
+                )
+                .where(ReviewDecision.review_task_id == task.id)
+                .with_for_update()
+            )
+        ).all()
+        priors = {prior.asset_id: prior for prior in prior_rows}
+        await _claim_review_task_version(
+            session,
+            task=task,
+            expected_lock_version=expected_version,
+        )
+        for asset_id in normalized_asset_ids:
+            prior = priors.get(asset_id)
+            revision = 1 if prior is None else prior.revision + 1
+            stored = ReviewDecision(
+                id=uuid7(),
+                review_task_id=task.id,
+                scoring_run_id=task.scoring_run_id,
+                asset_id=asset_id,
+                revision=revision,
+                decision=decision,
+                reason_code=normalized_reason,
+                note=normalized_note,
+                decided_by_user_id=changed_by_user_id,
+                decided_at=changed_at,
+                supersedes_revision=prior.revision if prior is not None else None,
+                supersedes_decision_id=prior.id if prior is not None else None,
+            )
+            session.add(stored)
+            session.add(
+                AuditEvent(
+                    actor=_audit_actor(changed_by_user_id),
+                    action="review.decision_appended",
+                    resource_type="review_decision",
+                    resource_id=stored.id,
+                    correlation_id=normalized_key,
+                    detail={
+                        "review_task_id": str(task.id),
+                        "asset_id": str(asset_id),
+                        "revision": revision,
+                        "decision": decision.value,
+                        "reason_code": normalized_reason,
+                        "note_present": normalized_note is not None,
+                        "supersedes_decision_id": str(prior.id) if prior is not None else None,
+                        "task_lock_version": expected_version + 1,
+                        "bulk_action": True,
+                    },
+                    occurred_at=changed_at,
+                )
+            )
+            if asset_id in severe_override_asset_ids:
+                session.add(
+                    AuditEvent(
+                        actor=_audit_actor(changed_by_user_id),
+                        action=SEMANTIC_SEVERE_OVERRIDE_AUDIT_ACTION,
+                        resource_type="review_decision",
+                        resource_id=stored.id,
+                        correlation_id=normalized_key,
+                        detail={
+                            "review_task_id": str(task.id),
+                            "scoring_run_id": str(task.scoring_run_id),
+                            "asset_id": str(asset_id),
+                            "decision_revision": revision,
+                            "semantic_profile_sha256": normalized_semantic_profile,
+                            "semantic_severe_confidence_micros": semantic_threshold,
+                            "reason_code": SEMANTIC_SEVERE_OVERRIDE_REASON_CODE,
+                            "attestation": (
+                                "owner reviewed and explicitly accepted severe anatomy"
+                            ),
+                            "bulk_action": True,
+                        },
+                        occurred_at=changed_at,
+                    )
+                )
+        changed_count = len(normalized_asset_ids)
+        task_lock_version = expected_version + 1
+        x_selected_count = await _review_x_selected_count(session, task.id)
+    else:
+        selected_rows = (
+            await session.scalars(
+                select(ReviewXSelection)
+                .where(ReviewXSelection.review_task_id == task.id)
+                .with_for_update()
+            )
+        ).all()
+        selected_by_asset = {row.asset_id: row for row in selected_rows}
+        if normalized_action == ReviewBulkAction.X_ADD:
+            changed_asset_ids = tuple(
+                asset_id for asset_id in normalized_asset_ids if asset_id not in selected_by_asset
+            )
+            if len(selected_rows) + len(changed_asset_ids) > 4:
+                raise ReviewConflictError("at most four images can be selected for one X post")
+        else:
+            changed_asset_ids = tuple(
+                asset_id for asset_id in normalized_asset_ids if asset_id in selected_by_asset
+            )
+
+        await _claim_review_task_version(
+            session,
+            task=task,
+            expected_lock_version=expected_version,
+        )
+        if changed_asset_ids:
+            for asset_id in changed_asset_ids:
+                if normalized_action == ReviewBulkAction.X_ADD:
+                    session.add(
+                        ReviewXSelection(
+                            id=uuid7(),
+                            review_task_id=task.id,
+                            asset_id=asset_id,
+                            selected_by_user_id=changed_by_user_id,
+                            selected_at=changed_at,
+                        )
+                    )
+                else:
+                    await session.delete(selected_by_asset[asset_id])
+                session.add(
+                    AuditEvent(
+                        actor=_audit_actor(changed_by_user_id),
+                        action=(
+                            "review.x_selected"
+                            if normalized_action == ReviewBulkAction.X_ADD
+                            else "review.x_unselected"
+                        ),
+                        resource_type="review_task",
+                        resource_id=task.id,
+                        correlation_id=normalized_key,
+                        detail={
+                            "asset_id": str(asset_id),
+                            "selected": normalized_action == ReviewBulkAction.X_ADD,
+                            "bulk_action": True,
+                        },
+                        occurred_at=changed_at,
+                    )
+                )
+        changed_count = len(changed_asset_ids)
+        task_lock_version = expected_version + 1
+        x_selected_count = len(selected_rows) + (
+            changed_count if normalized_action == ReviewBulkAction.X_ADD else -changed_count
+        )
+
+    result = ReviewBulkActionResult(
+        task_id=task.id,
+        action=normalized_action,
+        asset_ids=normalized_asset_ids,
+        changed_count=changed_count,
+        x_selected_count=x_selected_count,
+        task_lock_version=task_lock_version,
+        replayed=False,
+    )
+    session.add(
+        AuditEvent(
+            actor=_audit_actor(changed_by_user_id),
+            action="review.bulk_action_applied",
+            resource_type="review_task",
+            resource_id=task.id,
+            correlation_id=normalized_key,
+            detail={
+                "action": normalized_action.value,
+                "requested_asset_count": len(normalized_asset_ids),
+                "changed_count": changed_count,
+                "x_selected_count": x_selected_count,
+                "task_lock_version": task_lock_version,
+            },
+            occurred_at=changed_at,
+        )
+    )
+    session.add(
+        _idempotency_record(
+            scope=scope,
+            key=normalized_key,
+            request_sha256=request_sha256,
+            status=200,
+            body=_bulk_action_response_body(result),
+            created_at=changed_at,
+        )
+    )
+    try:
+        await session.commit()
+    except IntegrityError as error:
+        await session.rollback()
+        replay = await _bulk_action_idempotency_replay(
+            session,
+            scope=scope,
+            idempotency_key=normalized_key,
+            request_sha256=request_sha256,
+        )
+        if replay is not None:
+            return replay
+        raise ReviewConflictError("bulk review action changed concurrently") from error
     return result
 
 
@@ -1251,6 +1596,37 @@ async def _load_task_locked(
     return task
 
 
+async def _claim_review_task_version(
+    session: AsyncSession,
+    *,
+    task: ReviewTask,
+    expected_lock_version: int,
+) -> None:
+    claimed_task_id = await session.scalar(
+        update(ReviewTask)
+        .where(
+            ReviewTask.id == task.id,
+            ReviewTask.state == ReviewTaskState.OPEN,
+            ReviewTask.lock_version == expected_lock_version,
+        )
+        .values(lock_version=expected_lock_version + 1)
+        .returning(ReviewTask.id)
+    )
+    if claimed_task_id is None:
+        raise ReviewConflictError("review task was changed concurrently")
+
+
+async def _review_x_selected_count(session: AsyncSession, review_task_id: UUID) -> int:
+    return int(
+        await session.scalar(
+            select(func.count())
+            .select_from(ReviewXSelection)
+            .where(ReviewXSelection.review_task_id == review_task_id)
+        )
+        or 0
+    )
+
+
 async def _require_active_reviewer(
     session: AsyncSession,
     user_id: UUID,
@@ -1330,6 +1706,56 @@ async def _decision_idempotency_replay(
     return _decision_result(
         decision,
         task_lock_version=task_lock_version,
+        replayed=True,
+    )
+
+
+async def _bulk_action_idempotency_replay(
+    session: AsyncSession,
+    *,
+    scope: str,
+    idempotency_key: str,
+    request_sha256: str,
+) -> ReviewBulkActionResult | None:
+    record = await _load_idempotency_record(
+        session,
+        scope=scope,
+        key=idempotency_key,
+        request_sha256=request_sha256,
+    )
+    if record is None:
+        return None
+    body = record.response_body
+    task_id = _response_uuid(body, "task_id", "bulk review action")
+    if await session.get(ReviewTask, task_id) is None:
+        raise ReviewConflictError("idempotency record references a missing review task")
+    try:
+        action = ReviewBulkAction(str(body["action"]))
+        raw_asset_ids = body["asset_ids"]
+        if not isinstance(raw_asset_ids, list):
+            raise ValueError
+        asset_ids = _normalize_bulk_asset_ids(tuple(UUID(str(value)) for value in raw_asset_ids))
+    except (KeyError, TypeError, ValueError):
+        raise ReviewConflictError("bulk review action idempotency record is invalid") from None
+    return ReviewBulkActionResult(
+        task_id=task_id,
+        action=action,
+        asset_ids=asset_ids,
+        changed_count=_response_nonnegative_int(
+            body,
+            "changed_count",
+            "bulk review action",
+        ),
+        x_selected_count=_response_nonnegative_int(
+            body,
+            "x_selected_count",
+            "bulk review action",
+        ),
+        task_lock_version=_response_positive_int(
+            body,
+            "task_lock_version",
+            "bulk review action",
+        ),
         replayed=True,
     )
 
@@ -1474,6 +1900,18 @@ def _decision_response_body(result: ReviewDecisionResult) -> dict[str, Any]:
     }
 
 
+def _bulk_action_response_body(result: ReviewBulkActionResult) -> dict[str, Any]:
+    return {
+        "schema": "review-bulk-action-result/v1",
+        "task_id": str(result.task_id),
+        "action": result.action.value,
+        "asset_ids": [str(asset_id) for asset_id in result.asset_ids],
+        "changed_count": result.changed_count,
+        "x_selected_count": result.x_selected_count,
+        "task_lock_version": result.task_lock_version,
+    }
+
+
 def _transition_response_body(result: ReviewTransitionResult) -> dict[str, Any]:
     return {
         "schema": "review-transition-result/v1",
@@ -1539,6 +1977,26 @@ def _validate_decision(value: ReviewDecisionValue) -> ReviewDecisionValue:
         return ReviewDecisionValue(value)
     except ValueError:
         raise ReviewInputError("decision must be accept, reject, or hold") from None
+
+
+def _validate_bulk_action(value: ReviewBulkAction) -> ReviewBulkAction:
+    try:
+        return ReviewBulkAction(value)
+    except ValueError:
+        raise ReviewInputError("bulk action is invalid") from None
+
+
+def _normalize_bulk_asset_ids(values: Sequence[UUID]) -> tuple[UUID, ...]:
+    if isinstance(values, (str, bytes)) or not 1 <= len(values) <= _MAX_BULK_ASSET_COUNT:
+        raise ReviewInputError("asset_ids must contain between 1 and 500 assets")
+    normalized: list[UUID] = []
+    for value in values:
+        if not isinstance(value, UUID):
+            raise ReviewInputError("asset_ids must contain UUID values")
+        normalized.append(value)
+    if len(set(normalized)) != len(normalized):
+        raise ReviewInputError("asset_ids must not contain duplicates")
+    return tuple(sorted(normalized, key=str))
 
 
 def _validate_terminal_state(value: ReviewTaskState) -> ReviewTaskState:

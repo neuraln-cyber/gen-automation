@@ -8,11 +8,12 @@ from uuid import UUID
 from fastapi import Request, status
 
 from gen_automation.config import Settings
-from gen_automation.domain.enums import ReviewDecisionValue
+from gen_automation.domain.enums import ReviewBulkAction, ReviewDecisionValue
 
 _FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
 _MAX_FORM_BODY_BYTES = 64 * 1024
 _MAX_LOCK_VERSION = 2_147_483_647
+_MAX_BULK_ASSET_COUNT = 500
 _FORM_KEY = re.compile(r"web-review-[0-9a-f]{64}")
 _HEX = frozenset("0123456789abcdefABCDEF")
 
@@ -36,6 +37,17 @@ X_SELECTION_FIELDS = frozenset(
         "expected_lock_version",
         "asset_id",
         "selected",
+    }
+)
+BULK_ACTION_FIELDS = frozenset(
+    {
+        "csrf_token",
+        "idempotency_key",
+        "expected_lock_version",
+        "asset_id",
+        "action",
+        "reason_code",
+        "note",
     }
 )
 
@@ -73,6 +85,17 @@ class XSelectionForm:
     expected_lock_version: int
     asset_id: UUID
     selected: bool
+
+
+@dataclass(frozen=True, slots=True)
+class BulkActionForm:
+    csrf_token: str
+    idempotency_key: str
+    expected_lock_version: int
+    asset_ids: tuple[UUID, ...]
+    action: ReviewBulkAction
+    reason_code: str | None
+    note: str | None
 
 
 async def read_create_form(request: Request) -> tuple[str, str]:
@@ -138,6 +161,48 @@ async def read_x_selection_form(request: Request) -> XSelectionForm:
     )
 
 
+async def read_bulk_action_form(request: Request) -> BulkActionForm:
+    parsed = await _read_form_values(
+        request,
+        max_num_fields=len(BULK_ACTION_FIELDS) + _MAX_BULK_ASSET_COUNT - 1,
+    )
+    if set(parsed) != BULK_ACTION_FIELDS:
+        raise _bad_request()
+    single_fields = BULK_ACTION_FIELDS - {"asset_id"}
+    if any(len(parsed[field]) != 1 for field in single_fields):
+        raise _bad_request()
+    raw_asset_ids = parsed["asset_id"]
+    if not 1 <= len(raw_asset_ids) <= _MAX_BULK_ASSET_COUNT:
+        raise _bad_request()
+    try:
+        asset_ids = tuple(UUID(value) for value in raw_asset_ids)
+        action = ReviewBulkAction(parsed["action"][0])
+    except ValueError:
+        raise _bad_request() from None
+    if any(
+        str(asset_id) != value.lower()
+        for asset_id, value in zip(asset_ids, raw_asset_ids, strict=True)
+    ):
+        raise _bad_request()
+    if len(set(asset_ids)) != len(asset_ids):
+        raise _bad_request()
+    reason_code = parsed["reason_code"][0] or None
+    note = parsed["note"][0] or None
+    if reason_code is not None and len(reason_code) > 100:
+        raise _bad_request()
+    if note is not None and len(note) > 4_000:
+        raise _bad_request()
+    return BulkActionForm(
+        csrf_token=_bounded_nonempty(parsed["csrf_token"][0], maximum=200),
+        idempotency_key=_idempotency_key(parsed["idempotency_key"][0]),
+        expected_lock_version=_lock_version(parsed["expected_lock_version"][0]),
+        asset_ids=asset_ids,
+        action=action,
+        reason_code=reason_code,
+        note=note,
+    )
+
+
 def review_form_idempotency_key(
     settings: Settings,
     *,
@@ -163,6 +228,17 @@ async def _read_form(
     *,
     expected_fields: frozenset[str],
 ) -> dict[str, str]:
+    parsed = await _read_form_values(request, max_num_fields=len(expected_fields))
+    if set(parsed) != expected_fields or any(len(parsed[field]) != 1 for field in expected_fields):
+        raise _bad_request()
+    return {field: parsed[field][0] for field in expected_fields}
+
+
+async def _read_form_values(
+    request: Request,
+    *,
+    max_num_fields: int,
+) -> dict[str, list[str]]:
     content_type = request.headers.get("content-type", "")
     if content_type.partition(";")[0].strip().lower() != _FORM_CONTENT_TYPE:
         raise BrowserReviewFormError(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE)
@@ -195,13 +271,11 @@ async def _read_form(
             strict_parsing=True,
             encoding="utf-8",
             errors="strict",
-            max_num_fields=len(expected_fields),
+            max_num_fields=max_num_fields,
         )
     except (UnicodeDecodeError, ValueError):
         raise _bad_request() from None
-    if set(parsed) != expected_fields or any(len(parsed[field]) != 1 for field in expected_fields):
-        raise _bad_request()
-    return {field: parsed[field][0] for field in expected_fields}
+    return parsed
 
 
 def _valid_percent_encoding(value: str) -> bool:

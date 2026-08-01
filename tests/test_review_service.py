@@ -21,6 +21,7 @@ from gen_automation.db.models import (
     ReleaseVersion,
     ReviewDecision,
     ReviewTask,
+    ReviewXSelection,
     ScoringRun,
     SemanticAssessment,
 )
@@ -33,6 +34,7 @@ from gen_automation.domain.enums import (
     GenerationState,
     RankingDisposition,
     ReleasePhase,
+    ReviewBulkAction,
     ReviewDecisionValue,
     ReviewTaskState,
     ScoringRunState,
@@ -48,6 +50,7 @@ from gen_automation.services.review import (
     ReviewNotFoundError,
     ReviewTaskResult,
     append_review_decision,
+    apply_bulk_review_action,
     create_review_task,
     get_review_summary,
     transition_review_task,
@@ -629,6 +632,308 @@ async def test_decisions_are_revisioned_idempotent_and_preserve_raw_master(
             raw_after.byte_size,
             raw_after.asset_metadata,
         ) == raw_snapshot
+
+
+@pytest.mark.asyncio
+async def test_bulk_decisions_are_atomic_idempotent_and_preserve_raw_masters(
+    review_context: ReviewContext,
+) -> None:
+    task = await _create_task(review_context)
+    first, second, third = review_context.ranked_asset_ids
+
+    async with review_context.database.sessions() as session:
+        accepted = await apply_bulk_review_action(
+            session,
+            review_task_id=task.task_id,
+            asset_ids=(second, first),
+            action=ReviewBulkAction.ACCEPT,
+            changed_by_user_id=review_context.reviewer_id,
+            expected_lock_version=1,
+            idempotency_key="bulk-accept-two",
+            reason_code="manual_qc_pass",
+            now=NOW + timedelta(minutes=3),
+        )
+    assert accepted.asset_ids == (first, second)
+    assert accepted.changed_count == 2
+    assert accepted.task_lock_version == 2
+
+    async with review_context.database.sessions() as session:
+        replay = await apply_bulk_review_action(
+            session,
+            review_task_id=task.task_id,
+            asset_ids=(first, second),
+            action=ReviewBulkAction.ACCEPT,
+            changed_by_user_id=review_context.reviewer_id,
+            expected_lock_version=1,
+            idempotency_key="bulk-accept-two",
+            reason_code="manual_qc_pass",
+            now=NOW + timedelta(minutes=4),
+        )
+    assert replay.replayed is True
+    assert replay.task_lock_version == 2
+
+    async with review_context.database.sessions() as session:
+        held = await apply_bulk_review_action(
+            session,
+            review_task_id=task.task_id,
+            asset_ids=(third, first),
+            action=ReviewBulkAction.HOLD,
+            changed_by_user_id=review_context.second_reviewer_id,
+            expected_lock_version=2,
+            idempotency_key="bulk-hold-two",
+            reason_code="needs_detail_check",
+            note="Inspect selected images again.",
+            now=NOW + timedelta(minutes=5),
+        )
+    assert held.changed_count == 2
+    assert held.task_lock_version == 3
+
+    async with review_context.database.sessions() as session:
+        rejected = await apply_bulk_review_action(
+            session,
+            review_task_id=task.task_id,
+            asset_ids=(second, third),
+            action=ReviewBulkAction.REJECT,
+            changed_by_user_id=review_context.reviewer_id,
+            expected_lock_version=3,
+            idempotency_key="bulk-reject-two",
+            reason_code="manual_reject",
+            now=NOW + timedelta(minutes=6),
+        )
+    assert rejected.changed_count == 2
+    assert rejected.task_lock_version == 4
+
+    async with review_context.database.sessions() as session:
+        with pytest.raises(ReviewConflictError, match="stale"):
+            await apply_bulk_review_action(
+                session,
+                review_task_id=task.task_id,
+                asset_ids=(first,),
+                action=ReviewBulkAction.ACCEPT,
+                changed_by_user_id=review_context.reviewer_id,
+                expected_lock_version=3,
+                idempotency_key="bulk-stale",
+            )
+
+    async with review_context.database.sessions() as session:
+        summary = await get_review_summary(session, review_task_id=task.task_id)
+        assert summary.lock_version == 4
+        assert [asset.decision for asset in summary.assets] == [
+            ReviewDecisionValue.HOLD,
+            ReviewDecisionValue.REJECT,
+            ReviewDecisionValue.REJECT,
+        ]
+        assert [asset.revision for asset in summary.assets] == [2, 2, 2]
+        raw_assets = (
+            await session.scalars(
+                select(Asset).where(Asset.id.in_(review_context.ranked_asset_ids))
+            )
+        ).all()
+        assert len(raw_assets) == 3
+        assert all(asset.state == AssetState.AVAILABLE for asset in raw_assets)
+        assert all(asset.kind == AssetKind.RAW_MASTER for asset in raw_assets)
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(IdempotencyRecord)
+                .where(IdempotencyRecord.scope == f"review-task:{task.task_id}:bulk-action")
+            )
+            == 3
+        )
+
+
+@pytest.mark.asyncio
+async def test_bulk_x_selection_is_owner_only_bounded_and_revision_locked(
+    review_context: ReviewContext,
+) -> None:
+    task = await _create_task(review_context)
+    first, second, third = review_context.ranked_asset_ids
+
+    async with review_context.database.sessions() as session:
+        selected = await apply_bulk_review_action(
+            session,
+            review_task_id=task.task_id,
+            asset_ids=(third, first, second),
+            action=ReviewBulkAction.X_ADD,
+            changed_by_user_id=review_context.owner_id,
+            expected_lock_version=1,
+            idempotency_key="bulk-x-add",
+            now=NOW + timedelta(minutes=3),
+        )
+    assert selected.changed_count == 3
+    assert selected.x_selected_count == 3
+    assert selected.task_lock_version == 2
+
+    async with review_context.database.sessions() as session:
+        replay = await apply_bulk_review_action(
+            session,
+            review_task_id=task.task_id,
+            asset_ids=(first, second, third),
+            action=ReviewBulkAction.X_ADD,
+            changed_by_user_id=review_context.owner_id,
+            expected_lock_version=1,
+            idempotency_key="bulk-x-add",
+        )
+    assert replay.replayed is True
+    assert replay.x_selected_count == 3
+
+    async with review_context.database.sessions() as session:
+        with pytest.raises(ReviewNotFoundError, match="authorized owner"):
+            await apply_bulk_review_action(
+                session,
+                review_task_id=task.task_id,
+                asset_ids=(first,),
+                action=ReviewBulkAction.X_REMOVE,
+                changed_by_user_id=review_context.reviewer_id,
+                expected_lock_version=2,
+                idempotency_key="reviewer-bulk-x-remove",
+            )
+
+    async with review_context.database.sessions() as session:
+        removed = await apply_bulk_review_action(
+            session,
+            review_task_id=task.task_id,
+            asset_ids=(first, third),
+            action=ReviewBulkAction.X_REMOVE,
+            changed_by_user_id=review_context.owner_id,
+            expected_lock_version=2,
+            idempotency_key="bulk-x-remove",
+            now=NOW + timedelta(minutes=4),
+        )
+    assert removed.changed_count == 2
+    assert removed.x_selected_count == 1
+    assert removed.task_lock_version == 3
+
+    async with review_context.database.sessions() as session:
+        no_change = await apply_bulk_review_action(
+            session,
+            review_task_id=task.task_id,
+            asset_ids=(first, third),
+            action=ReviewBulkAction.X_REMOVE,
+            changed_by_user_id=review_context.owner_id,
+            expected_lock_version=3,
+            idempotency_key="bulk-x-remove-noop",
+        )
+        selected_rows = (
+            await session.scalars(
+                select(ReviewXSelection).where(ReviewXSelection.review_task_id == task.task_id)
+            )
+        ).all()
+    assert no_change.changed_count == 0
+    assert no_change.x_selected_count == 1
+    assert no_change.task_lock_version == 4
+    assert [row.asset_id for row in selected_rows] == [second]
+
+
+@pytest.mark.asyncio
+async def test_bulk_x_selection_rejects_a_fifth_image_atomically(
+    review_context: ReviewContext,
+) -> None:
+    task = await _create_task(review_context, key="create-x-capacity-review-task")
+    first, second, third = review_context.ranked_asset_ids
+    extra_asset_id = UUID("10000000-0000-4000-8000-000000000005")
+
+    async with review_context.database.sessions() as session:
+        job_id = await session.scalar(
+            select(GenerationJob.id).where(
+                GenerationJob.release_version_id == review_context.release_version_id
+            )
+        )
+        assert job_id is not None
+        session.add(
+            _raw_asset(
+                asset_id=extra_asset_id,
+                release_id=review_context.release_id,
+                job_id=job_id,
+                output_index=4,
+            )
+        )
+        await session.flush()
+        session.add_all(
+            ReviewXSelection(
+                id=uuid4(),
+                review_task_id=task.task_id,
+                asset_id=asset_id,
+                selected_by_user_id=review_context.owner_id,
+                selected_at=NOW,
+            )
+            for asset_id in (
+                second,
+                third,
+                review_context.unranked_asset_id,
+                extra_asset_id,
+            )
+        )
+        await session.commit()
+
+    async with review_context.database.sessions() as session:
+        with pytest.raises(ReviewConflictError, match="at most four images"):
+            await apply_bulk_review_action(
+                session,
+                review_task_id=task.task_id,
+                asset_ids=(first,),
+                action=ReviewBulkAction.X_ADD,
+                changed_by_user_id=review_context.owner_id,
+                expected_lock_version=1,
+                idempotency_key="bulk-x-fifth",
+            )
+
+    async with review_context.database.sessions() as session:
+        summary = await get_review_summary(session, review_task_id=task.task_id)
+        assert summary.lock_version == 1
+        assert summary.x_selected_count == 4
+
+
+@pytest.mark.asyncio
+async def test_bulk_accept_preserves_semantic_owner_override_gate(
+    review_context: ReviewContext,
+) -> None:
+    task = await _create_task(review_context)
+    profile = SemanticAssessmentProfile(
+        model_name="Qwen/Qwen3-VL-8B-Instruct",
+        model_revision="pinned-bulk-test-revision",
+    )
+    await _seed_terminal_semantic_assessments(review_context, profile=profile)
+    selected = review_context.ranked_asset_ids[:2]
+
+    async with review_context.database.sessions() as session:
+        with pytest.raises(ReviewConflictError, match="owner override"):
+            await apply_bulk_review_action(
+                session,
+                review_task_id=task.task_id,
+                asset_ids=selected,
+                action=ReviewBulkAction.ACCEPT,
+                changed_by_user_id=review_context.reviewer_id,
+                expected_lock_version=1,
+                idempotency_key="bulk-severe-without-override",
+                semantic_profile_sha256=profile.profile_sha256,
+            )
+
+    async with review_context.database.sessions() as session:
+        accepted = await apply_bulk_review_action(
+            session,
+            review_task_id=task.task_id,
+            asset_ids=selected,
+            action=ReviewBulkAction.ACCEPT,
+            changed_by_user_id=review_context.owner_id,
+            expected_lock_version=1,
+            idempotency_key="bulk-severe-owner-override",
+            reason_code=SEMANTIC_SEVERE_OVERRIDE_REASON_CODE,
+            note="Owner inspected every selected image at full resolution.",
+            semantic_profile_sha256=profile.profile_sha256,
+        )
+    assert accepted.changed_count == 2
+    assert accepted.task_lock_version == 2
+
+    async with review_context.database.sessions() as session:
+        summary = await get_review_summary(
+            session,
+            review_task_id=task.task_id,
+            semantic_profile_sha256=profile.profile_sha256,
+        )
+        assert summary.semantic_gate.severe_override_count == 1
+        assert summary.semantic_gate.severe_blocked_count == 0
+        assert summary.assets[0].semantic_severe_override_attested is True
 
 
 @pytest.mark.asyncio
