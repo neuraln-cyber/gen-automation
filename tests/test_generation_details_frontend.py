@@ -52,10 +52,10 @@ def test_generation_settings_distinguish_inactive_hires_values_from_an_upscale_p
         encoding="utf-8"
     )
 
-    assert 'const upscalerEnabled = details.hires.enabled === true' in script
+    assert "const upscalerEnabled = details.hires.enabled === true" in script
     assert '"Full-image upscaler"' in script
     assert '"Off - no upscale node in workflow"' in script
-    assert 'if (upscalerEnabled)' in script
+    assert "if (upscalerEnabled)" in script
 
 
 def test_generation_form_explains_and_hides_inactive_hires_controls() -> None:
@@ -73,6 +73,6 @@ def test_generation_form_explains_and_hides_inactive_hires_controls() -> None:
     assert 'role="switch"' in template
     assert "initializeWorkflowRefinement" in script
     assert "this workflow has no upscale node" in script
-    assert 'option.dataset.upscalerEnabled === desired' in script
+    assert "option.dataset.upscalerEnabled === desired" in script
     assert 'workflow.dispatchEvent(new Event("change", { bubbles: true }))' in script
     assert "no upscale node or second sampler pass" in script

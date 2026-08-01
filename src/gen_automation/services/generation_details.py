@@ -312,9 +312,7 @@ def _response_payload(
         },
         "detailer": {
             "enabled": (
-                None
-                if workflow_node_classes is None
-                else "FaceDetailer" in workflow_node_classes
+                None if workflow_node_classes is None else "FaceDetailer" in workflow_node_classes
             ),
             "guide_size": generation.detailer_guide_size,
             "max_size": generation.detailer_max_size,
