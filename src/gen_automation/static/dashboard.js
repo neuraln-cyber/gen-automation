@@ -1561,6 +1561,23 @@
     const status = document.querySelector("[data-workflow-refinement-status]");
     if (!(workflow instanceof HTMLSelectElement) || !(status instanceof HTMLElement)) return;
     const hiresSettings = Array.from(document.querySelectorAll("[data-hires-setting]"));
+    const detailerPresetControl = document.querySelector("[data-detailer-preset-control]");
+    const detailerPresetState = document.querySelector("[data-detailer-preset-state]");
+    const a1111SampleDetailerPreset = Object.freeze({
+      detailer_prompt: "sexy, expressive, ",
+      detailer_negative_prompt: "closed eyes, ",
+      detailer_guide_size: "768",
+      detailer_max_size: "1536",
+      detailer_denoise: "0.4",
+      detailer_bbox_threshold: "0.3",
+      detailer_bbox_dilation: "4",
+      detailer_bbox_crop_factor: "1.5",
+      detailer_feather: "4",
+    });
+    const detailerPresetFields = Object.entries(a1111SampleDetailerPreset).map(([name, value]) => ({
+      field: document.querySelector(`[name="${name}"]`),
+      value,
+    }));
     const toggleControl = document.querySelector("[data-upscaler-control]");
     const toggle = document.querySelector("[data-upscaler-toggle]");
     const toggleLabel = document.querySelector("[data-upscaler-toggle-label]");
@@ -1576,6 +1593,10 @@
       const selected = workflow.selectedOptions.item(0);
       const upscalerEnabled = selected?.dataset.upscalerEnabled === "true";
       const detailerEnabled = selected?.dataset.detailerEnabled === "true";
+      const presetMatches = detailerPresetFields.every(({ field, value }) => (
+        (field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement)
+        && field.value === value
+      ));
       status.textContent = upscalerEnabled
         ? `Full-image upscaler: On.${detailerEnabled ? " Face detailer: On." : " Face detailer: Off."}`
         : `Full-image upscaler: Off - this workflow has no upscale node.${detailerEnabled ? " Face detailer remains on." : " Face detailer is also off."}`;
@@ -1593,6 +1614,14 @@
         toggleDescription.textContent = upscalerEnabled
           ? "Runs the hires workflow; scale, denoise, and upscale method apply."
           : "Base dimensions only - no upscale node or second sampler pass.";
+      }
+      if (detailerPresetControl instanceof HTMLButtonElement) {
+        detailerPresetControl.disabled = !detailerEnabled;
+      }
+      if (detailerPresetState instanceof HTMLElement) {
+        detailerPresetState.textContent = detailerEnabled
+          ? (presetMatches ? "Attached A1111 sample" : "Custom")
+          : "Unavailable for this workflow";
       }
     };
 
@@ -1616,6 +1645,22 @@
         workflow.dispatchEvent(new Event("change", { bubbles: true }));
       });
     }
+    if (detailerPresetControl instanceof HTMLButtonElement) {
+      detailerPresetControl.addEventListener("click", () => {
+        const selected = workflow.selectedOptions.item(0);
+        if (selected?.dataset.detailerEnabled !== "true") return;
+        detailerPresetFields.forEach(({ field, value }) => {
+          if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement)) return;
+          field.value = value;
+          field.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        render();
+      });
+    }
+    detailerPresetFields.forEach(({ field }) => {
+      if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement)) return;
+      field.addEventListener("input", render);
+    });
     render();
   };
 
