@@ -1561,6 +1561,16 @@
     const status = document.querySelector("[data-workflow-refinement-status]");
     if (!(workflow instanceof HTMLSelectElement) || !(status instanceof HTMLElement)) return;
     const hiresSettings = Array.from(document.querySelectorAll("[data-hires-setting]"));
+    const toggleControl = document.querySelector("[data-upscaler-control]");
+    const toggle = document.querySelector("[data-upscaler-toggle]");
+    const toggleLabel = document.querySelector("[data-upscaler-toggle-label]");
+    const toggleDescription = document.querySelector("[data-upscaler-toggle-description]");
+    const workflowOptions = Array.from(workflow.options).filter(
+      (option) => ["true", "false"].includes(option.dataset.upscalerEnabled),
+    );
+    const canToggle = ["true", "false"].every((value) => (
+      workflowOptions.some((option) => option.dataset.upscalerEnabled === value)
+    ));
 
     const render = () => {
       const selected = workflow.selectedOptions.item(0);
@@ -1572,9 +1582,40 @@
       hiresSettings.forEach((field) => {
         field.hidden = !upscalerEnabled;
       });
+      if (toggle instanceof HTMLInputElement) {
+        toggle.checked = upscalerEnabled;
+        toggle.disabled = !canToggle;
+      }
+      if (toggleLabel instanceof HTMLElement) {
+        toggleLabel.textContent = upscalerEnabled ? "On" : "Off";
+      }
+      if (toggleDescription instanceof HTMLElement) {
+        toggleDescription.textContent = upscalerEnabled
+          ? "Runs the hires workflow; scale, denoise, and upscale method apply."
+          : "Base dimensions only - no upscale node or second sampler pass.";
+      }
     };
 
+    if (toggleControl instanceof HTMLElement) toggleControl.hidden = false;
     workflow.addEventListener("change", render);
+    if (toggle instanceof HTMLInputElement) {
+      toggle.addEventListener("change", () => {
+        const desired = toggle.checked ? "true" : "false";
+        const current = workflow.selectedOptions.item(0);
+        const matching = workflowOptions.filter(
+          (option) => !option.disabled && option.dataset.upscalerEnabled === desired,
+        );
+        const replacement = matching.find(
+          (option) => option.dataset.detailerEnabled === current?.dataset.detailerEnabled,
+        ) || matching[0];
+        if (!replacement) {
+          render();
+          return;
+        }
+        workflow.value = replacement.value;
+        workflow.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+    }
     render();
   };
 

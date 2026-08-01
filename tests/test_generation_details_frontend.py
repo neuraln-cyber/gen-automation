@@ -69,5 +69,10 @@ def test_generation_form_explains_and_hides_inactive_hires_controls() -> None:
     assert "data-upscaler-enabled" in template
     assert "data-workflow-refinement-status" in template
     assert template.count("data-hires-setting") == 3
+    assert "data-upscaler-toggle" in template
+    assert 'role="switch"' in template
     assert "initializeWorkflowRefinement" in script
     assert "this workflow has no upscale node" in script
+    assert 'option.dataset.upscalerEnabled === desired' in script
+    assert 'workflow.dispatchEvent(new Event("change", { bubbles: true }))' in script
+    assert "no upscale node or second sampler pass" in script

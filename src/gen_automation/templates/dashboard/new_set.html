@@ -255,6 +255,21 @@
                 {% endfor %}
               </select>
             </label>
+            <label class="upscaler-toggle-field" data-upscaler-control hidden>
+              Full-image upscaler / hires.fix
+              <span class="upscaler-toggle-control">
+                <input
+                  type="checkbox"
+                  role="switch"
+                  data-upscaler-toggle
+                  aria-describedby="upscaler-toggle-description"
+                >
+                <strong data-upscaler-toggle-label>Off</strong>
+              </span>
+              <small id="upscaler-toggle-description" data-upscaler-toggle-description>
+                Off uses the base workflow with no upscale node.
+              </small>
+            </label>
           </div>
 
           <details class="form-disclosure">
