@@ -374,6 +374,32 @@
             </div>
           </details>
 
+          <details
+            class="generation-details"
+            data-generation-details
+            data-generation-details-url="/dashboard/assets/{{ item.master.asset_id }}/generation-details"
+          >
+            <summary>Generation settings</summary>
+            <div class="generation-details-body" data-generation-details-body>
+              <p
+                class="generation-details-status"
+                data-generation-details-status
+                role="status"
+              >
+                Open this section to load the exact settings for this image.
+              </p>
+              <a
+                class="generation-details-fallback"
+                href="/dashboard/assets/{{ item.master.asset_id }}/generation-details"
+                data-generation-details-fallback
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Open sanitized settings JSON
+              </a>
+            </div>
+          </details>
+
           {% if summary.state.value == "open" %}
             {% if item.x_selection_idempotency_key %}
               <form
