@@ -45,3 +45,29 @@ def test_generation_prompts_are_keyboard_scrollable_and_contextually_labeled() -
         encoding="utf-8"
     )
     assert ".generation-prompt-text:focus-visible" in styles
+
+
+def test_generation_settings_distinguish_inactive_hires_values_from_an_upscale_pass() -> None:
+    script = (ROOT / "src" / "gen_automation" / "static" / "dashboard.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'const upscalerEnabled = details.hires.enabled === true' in script
+    assert '"Full-image upscaler"' in script
+    assert '"Off - no upscale node in workflow"' in script
+    assert 'if (upscalerEnabled)' in script
+
+
+def test_generation_form_explains_and_hides_inactive_hires_controls() -> None:
+    template = (
+        ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "new_set.html"
+    ).read_text(encoding="utf-8")
+    script = (ROOT / "src" / "gen_automation" / "static" / "dashboard.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "data-upscaler-enabled" in template
+    assert "data-workflow-refinement-status" in template
+    assert template.count("data-hires-setting") == 3
+    assert "initializeWorkflowRefinement" in script
+    assert "this workflow has no upscale node" in script

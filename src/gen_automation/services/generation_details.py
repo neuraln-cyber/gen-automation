@@ -7,7 +7,7 @@ from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, ValidationError, 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from gen_automation.db.models import Asset, GenerationJob, ReleaseVersion
+from gen_automation.db.models import Asset, GenerationJob, ReleaseVersion, WorkflowApproval
 from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import AssetKind, AssetState
 from gen_automation.domain.release_spec import (
@@ -228,12 +228,25 @@ async def load_generation_details(
             return None
         generation = parameters.output_generations[asset.output_index]
         resolution = parameters.output_prompt_resolutions[asset.output_index]
+        workflow_node_classes = await session.scalar(
+            select(WorkflowApproval.reviewed_node_classes)
+            .where(WorkflowApproval.workflow_sha256 == parameters.workflow.sha256)
+            .order_by(WorkflowApproval.approval_version.desc(), WorkflowApproval.id.desc())
+            .limit(1)
+        )
+        reviewed_node_classes = (
+            tuple(workflow_node_classes)
+            if isinstance(workflow_node_classes, list)
+            and all(isinstance(item, str) for item in workflow_node_classes)
+            else None
+        )
         return _response_payload(
             asset=asset,
             job=job,
             parameters=parameters,
             generation=generation,
             resolution=resolution,
+            workflow_node_classes=reviewed_node_classes,
         )
     except (TypeError, ValueError, ValidationError):
         return None
@@ -246,6 +259,7 @@ def _response_payload(
     parameters: _GenerationJobParametersV2,
     generation: GenerationParameters,
     resolution: _PromptResolution,
+    workflow_node_classes: tuple[str, ...] | None,
 ) -> dict[str, object]:
     assert asset.output_index is not None
     assert asset.width is not None
@@ -287,11 +301,21 @@ def _response_payload(
             "clip_skip": generation.clip_skip,
         },
         "hires": {
+            "enabled": (
+                None
+                if workflow_node_classes is None
+                else "LatentUpscaleBy" in workflow_node_classes
+            ),
             "scale": generation.hires_scale,
             "denoise": generation.hires_denoise,
             "upscale_method": generation.hires_upscale_method,
         },
         "detailer": {
+            "enabled": (
+                None
+                if workflow_node_classes is None
+                else "FaceDetailer" in workflow_node_classes
+            ),
             "guide_size": generation.detailer_guide_size,
             "max_size": generation.detailer_max_size,
             "denoise": generation.detailer_denoise,

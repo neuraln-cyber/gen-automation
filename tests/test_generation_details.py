@@ -6,9 +6,23 @@ from uuid import UUID
 
 from fastapi.testclient import TestClient
 
-from gen_automation.db.models import Asset, GenerationJob, Project, Release, ReleaseVersion
+from gen_automation.db.models import (
+    AdminUser,
+    Asset,
+    GenerationJob,
+    Project,
+    Release,
+    ReleaseVersion,
+    WorkflowApproval,
+)
 from gen_automation.domain.canonical import canonical_sha256
-from gen_automation.domain.enums import AssetKind, AssetState, GenerationState
+from gen_automation.domain.enums import (
+    AdminRole,
+    ApprovalStatus,
+    AssetKind,
+    AssetState,
+    GenerationState,
+)
 from gen_automation.domain.release_spec import GenerationParameters
 
 PROJECT_ID = UUID("00000000-0000-4000-8000-000000000701")
@@ -18,6 +32,8 @@ JOB_ID = UUID("00000000-0000-4000-8000-000000000704")
 ASSET_ID = UUID("00000000-0000-4000-8000-000000000705")
 WILDCARD_LIBRARY_ID = UUID("00000000-0000-4000-8000-000000000706")
 WILDCARD_VERSION_ID = UUID("00000000-0000-4000-8000-000000000707")
+ADMIN_USER_ID = UUID("00000000-0000-4000-8000-000000000708")
+WORKFLOW_APPROVAL_ID = UUID("00000000-0000-4000-8000-000000000709")
 RELEASE_SPECIFICATION_SHA256 = "a" * 64
 APPROVAL_SNAPSHOT_SHA256 = "b" * 64
 ASSET_SHA256 = "c" * 64
@@ -185,6 +201,32 @@ async def _seed_generation_details(client: TestClient) -> None:
     parameters = _job_parameters()
     database = client.app.state.database
     async with database.sessions() as session:
+        now = datetime(2026, 8, 1, tzinfo=UTC)
+        user = AdminUser(
+            id=ADMIN_USER_ID,
+            username_normalized="metadata-owner",
+            display_name="Metadata owner",
+            password_hash="test-only-password-hash",  # noqa: S106
+            role=AdminRole.OWNER,
+            is_active=True,
+            password_changed_at=now,
+        )
+        workflow_evidence = {"source": "generation-details-test"}
+        workflow = WorkflowApproval(
+            id=WORKFLOW_APPROVAL_ID,
+            workflow_sha256="4" * 64,
+            name="Illustrious hires detailer",
+            version="v1",
+            object_key="private/workflows/hires-detailer.json",
+            reviewed_node_classes=["KSampler", "LatentUpscaleBy", "FaceDetailer"],
+            evidence=workflow_evidence,
+            evidence_sha256=canonical_sha256(workflow_evidence),
+            status=ApprovalStatus.APPROVED,
+            is_current=True,
+            approval_version=1,
+            approved_by_user_id=ADMIN_USER_ID,
+            approved_at=now,
+        )
         project = Project(id=PROJECT_ID, slug="metadata", name="Metadata")
         release = Release(
             id=RELEASE_ID,
@@ -200,7 +242,7 @@ async def _seed_generation_details(client: TestClient) -> None:
             specification={"schema_version": 2},
             specification_sha256=RELEASE_SPECIFICATION_SHA256,
             created_by="test",
-            created_at=datetime(2026, 8, 1, tzinfo=UTC),
+            created_at=now,
         )
         job = GenerationJob(
             id=JOB_ID,
@@ -231,7 +273,7 @@ async def _seed_generation_details(client: TestClient) -> None:
             byte_size=2_000_000,
             asset_metadata={"upload_attempt_id": "private-upload-attempt"},
         )
-        session.add_all([project, release, version, job, asset])
+        session.add_all([user, workflow, project, release, version, job, asset])
         await session.commit()
 
 
@@ -246,6 +288,18 @@ async def _replace_job_parameters(
         assert job is not None
         job.parameters = parameters
         job.parameters_sha256 = digest or canonical_sha256(parameters)
+        await session.commit()
+
+
+async def _replace_workflow_node_classes(
+    client: TestClient,
+    node_classes: list[str],
+) -> None:
+    database = client.app.state.database
+    async with database.sessions() as session:
+        workflow = await session.get(WorkflowApproval, WORKFLOW_APPROVAL_ID)
+        assert workflow is not None
+        workflow.reviewed_node_classes = node_classes
         await session.commit()
 
 
@@ -280,6 +334,8 @@ def test_generation_details_selects_exact_output_and_returns_only_safe_fields(
     assert payload["available"] is True
     assert payload["output"] == {"index": 1}
     assert payload["sampling"]["seed"] == str(MAX_SEED)
+    assert payload["hires"]["enabled"] is True
+    assert payload["detailer"]["enabled"] is True
     assert payload["prompts"]["positive"]["source"] == "portrait, __poses__"
     assert payload["prompts"]["positive"]["resolved"] == "portrait, sitting"
     assert payload["prompts"]["detailer_positive"] == {
@@ -315,6 +371,19 @@ def test_generation_details_selects_exact_output_and_returns_only_safe_fields(
         "asset_metadata",
     ):
         assert forbidden not in serialized
+
+
+def test_generation_details_reports_base_detailer_without_upscaler(
+    client: TestClient,
+) -> None:
+    client.portal.call(_seed_generation_details, client)
+    client.portal.call(_replace_workflow_node_classes, client, ["KSampler", "FaceDetailer"])
+
+    response = client.get(f"/dashboard/assets/{ASSET_ID}/generation-details")
+
+    assert response.status_code == 200
+    assert response.json()["hires"]["enabled"] is False
+    assert response.json()["detailer"]["enabled"] is True
 
 
 def test_generation_details_fail_soft_for_legacy_malformed_and_tampered_data(

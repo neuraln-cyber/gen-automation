@@ -243,11 +243,13 @@
             </label>
             <label>
               Workflow profile
-              <select name="workflow_id" required>
+              <select name="workflow_id" data-workflow-profile required>
                 {% if not options.workflows %}<option value="">No approved workflows</option>{% endif %}
                 {% for workflow in options.workflows %}
                   <option
                     value="{{ workflow.approval_id }}"
+                    data-upscaler-enabled="{{ 'true' if workflow.has_hires_pass else 'false' }}"
+                    data-detailer-enabled="{{ 'true' if workflow.has_face_detailer else 'false' }}"
                     {% if form_values['workflow_id'] == workflow.approval_id|string %}selected{% endif %}
                   >{{ workflow.name }} &middot; v{{ workflow.version }}</option>
                 {% endfor %}
@@ -417,15 +419,16 @@
           <details class="form-disclosure">
             <summary>Hires fix &amp; face detailer <span>Advanced</span></summary>
             <div class="disclosure-body form-grid">
-              <label>
+              <p class="muted full-width" data-workflow-refinement-status aria-live="polite"></p>
+              <label data-hires-setting>
                 Hires scale
                 <input type="number" name="hires_scale" value="{{ form_values['hires_scale'] }}" min="1" max="3" step="0.05" required>
               </label>
-              <label>
+              <label data-hires-setting>
                 Hires denoise
                 <input type="number" name="hires_denoise" value="{{ form_values['hires_denoise'] }}" min="0.05" max="1" step="0.01" required>
               </label>
-              <label>
+              <label data-hires-setting>
                 Latent upscale
                 <select name="hires_upscale_method" required>
                   {% for method in ['bislerp', 'bicubic', 'bilinear', 'nearest-exact', 'area'] %}
