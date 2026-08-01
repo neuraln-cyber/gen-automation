@@ -29,10 +29,17 @@
     </div>
   </div>
 
+  <nav class="workflow-rail" aria-label="Automation workflow">
+    <span><strong>1</strong> Generate</span>
+    <span><strong>2</strong> Rank</span>
+    <span><strong>3</strong> Review</span>
+    <span><strong>4</strong> Deliver</span>
+  </nav>
+
   <div class="section-heading">
     <div>
-      <h2>Ranked releases</h2>
-      <p class="muted">Open a completed ranking to review or download exact raw masters.</p>
+      <h2>Automations</h2>
+      <p class="muted">Continue exactly where each run is in the workflow.</p>
     </div>
   </div>
 
@@ -59,7 +66,10 @@
                 View status &rarr;
               </a>
             {% else %}
-              <span class="status pending">Ranking not ready</span>
+              <span class="status {{ release.phase }}">{{ release.phase.replace("_", " ") }}</span>
+              <a class="release-card-link" href="/dashboard/releases/{{ release.id }}/status">
+                View progress &rarr;
+              </a>
             {% endif %}
           </div>
         </li>

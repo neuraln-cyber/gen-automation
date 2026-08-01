@@ -5,7 +5,7 @@ from typing import Annotated
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
@@ -40,6 +40,7 @@ from gen_automation.services.new_sets import (
     create_and_approve_new_set,
     list_new_set_options,
     load_new_set_status,
+    new_set_progress_payload,
 )
 from gen_automation.services.releases import ConflictError, NotFoundError
 
@@ -251,6 +252,34 @@ async def dashboard_release_status(
                 "release": release_status,
             },
         ),
+    )
+
+
+@router.get(
+    "/releases/{release_id}/progress",
+    response_class=JSONResponse,
+    response_model=None,
+    name="dashboard_release_progress",
+)
+async def dashboard_release_progress(
+    release_id: UUID,
+    request: Request,
+    session: Session,
+    _principal: ReleaseReader,
+) -> Response:
+    try:
+        release_status = await load_new_set_status(session, release_id=release_id)
+    except NewSetNotFoundError:
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"detail": "release not found"},
+            ),
+        )
+    return _secure_response(
+        request,
+        JSONResponse(content=new_set_progress_payload(release_status)),
     )
 
 

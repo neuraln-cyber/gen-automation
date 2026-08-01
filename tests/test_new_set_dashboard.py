@@ -24,6 +24,34 @@ def test_dashboard_javascript_is_packaged_and_served(client: TestClient) -> None
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/javascript")
     assert "initializeAutomationBuilder" in response.text
+    assert "initializeLoraPicker" in response.text
+    assert "syncCanonicalSlots" in response.text
+    assert "gen-automation:lora-stack:v1" in response.text
+
+
+def test_new_set_builder_frontend_keeps_batch_edits_safe_and_actionable(
+    client: TestClient,
+) -> None:
+    script = client.get("/static/dashboard.js")
+    stylesheet = client.get("/static/dashboard_ux.css")
+
+    assert script.status_code == 200
+    assert "const maximumProviderJobs = 10_000" in script.text
+    assert "const tooManyJobs = totalJobs > maximumProviderJobs" in script.text
+    assert "|| tooManyJobs" in script.text
+    assert 'form.addEventListener("invalid"' in script.text
+    assert 'row.classList.remove("is-collapsed")' in script.text
+    assert "row.contains(lastPrompt)" in script.text
+    assert "const suffix = end < target.value.length" in script.text
+    assert "`${prefix}${token}${suffix}`" in script.text
+    assert "const wildcardPattern = /__([a-z0-9]+(?:[._/-][a-z0-9]+)*)__/g;" in script.text
+    assert "const wildcardPattern = /__([a-z0-9]+(?:[._/-][a-z0-9]+)*)__/gi;" not in script.text
+    assert "if (prompt.value === previousDefaultPrompt)" in script.text
+
+    assert stylesheet.status_code == 200
+    assert ".batch-card-actions button { min-width: 2.75rem; min-height: 2.75rem; }" in (
+        stylesheet.text
+    )
 
 
 def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) -> None:
@@ -40,7 +68,17 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
             "commercial_use_approved": True,
             "adult_use_approved": True,
             "weight": 0.75,
-        }
+        },
+        {
+            "name": "Texture Style",
+            "source_url": "https://example.com/texture-style",
+            "storage_key": "models/texture-style.safetensors",
+            "sha256": "c" * 64,
+            "license_url": "https://example.com/texture-style-license",
+            "commercial_use_approved": True,
+            "adult_use_approved": True,
+            "weight": 0.4,
+        },
     ]
     database = client.app.state.database
     assert client.portal is not None
@@ -61,7 +99,7 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     options = client.portal.call(seed_and_read_options)
     assert len(options.subjects) == 1
     assert len(options.checkpoints) == 1
-    assert len(options.loras) == 1
+    assert len(options.loras) == 2
     assert len(options.workflows) == 1
 
     page = client.get("/dashboard/new-set")
@@ -89,6 +127,18 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert 'name="planned_job_count" value="1"' in page.text
     assert 'name="batch_plan"' in page.text
     assert 'id="batch-row-template"' in page.text
+    assert 'id="lora-selection-template"' in page.text
+    assert "data-lora-picker" in page.text
+    assert "data-lora-search" in page.text
+    assert "data-lora-catalog" in page.text
+    assert "data-lora-selected" in page.text
+    assert "data-lora-save-preset" in page.text
+    assert "data-lora-load-preset" in page.text
+    assert page.text.count("data-lora-option\n") == 2
+    assert page.text.count("data-lora-native-slot>") == 8
+    for slot in range(1, 9):
+        assert page.text.count(f'name="lora_{slot}_id"') == 1
+        assert page.text.count(f'name="lora_{slot}_weight"') == 1
     assert 'class="mobile-queue-dock"' in page.text
     assert 'name="desired_accepted_count" value="4"' in page.text
     form = {
@@ -102,8 +152,8 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
         "workflow_id": str(options.workflows[0].approval_id),
         "lora_1_id": str(options.loras[0].approval_id),
         "lora_1_weight": "0.75",
-        "lora_2_id": "",
-        "lora_2_weight": "",
+        "lora_2_id": str(options.loras[1].approval_id),
+        "lora_2_weight": "0.4",
         "lora_3_id": "",
         "lora_3_weight": "",
         "lora_4_id": "",
@@ -179,7 +229,10 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert version.specification["generation"]["detailer_negative_prompt"] == "closed eyes"
     assert version.specification["generation"]["clip_skip"] == 2
     assert version.specification["generation"]["detailer_feather"] == 4
-    assert version.specification["loras"][0]["weight"] == 0.75
+    assert [(lora["name"], lora["weight"]) for lora in version.specification["loras"]] == [
+        ("Portrait Style", 0.75),
+        ("Texture Style", 0.4),
+    ]
     assert version.specification["wildcard_versions"][0]["name"] == "poses"
     assert {job.parameters["generation"]["prompt"].split(",")[0] for job in jobs} <= {
         "standing portrait",
@@ -192,3 +245,36 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert "Generation jobs" in status_page.text
     assert ">3<" in status_page.text
     assert "queued" in status_page.text
+    assert "0 / 12 images" in status_page.text
+    assert "data-generation-progress" in status_page.text
+    assert "data-progress-bar" in status_page.text
+
+    progress = client.get(first.headers["location"].replace("/status", "/progress"))
+    assert progress.status_code == 200
+    assert "no-store" in progress.headers["cache-control"]
+    assert progress.json() == {
+        "schema_version": 1,
+        "release_id": str(releases[0].id),
+        "phase": "ready",
+        "health": "healthy",
+        "stage": {
+            "key": "queued",
+            "step": 1,
+            "step_count": 5,
+            "label": "Queued",
+            "detail": "Generation jobs are queued for cloud GPU capacity.",
+        },
+        "images": {"generated": 0, "expected": 12, "percent": 0.0},
+        "jobs": {
+            "completed": 0,
+            "total": 3,
+            "active": 0,
+            "failed": 0,
+            "states": {"queued": 3},
+        },
+        "scoring": None,
+        "error": None,
+        "ready_for_review": False,
+        "next_url": None,
+        "poll_after_ms": 3000,
+    }

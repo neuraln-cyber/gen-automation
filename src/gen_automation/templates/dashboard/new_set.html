@@ -103,10 +103,18 @@
 
           <div class="batch-queue" id="batch-list" aria-live="polite"></div>
 
+          <div class="batch-queue-footer">
+            <button class="secondary-button" type="button" data-add-batch>+ Add another batch</button>
+            <span class="muted">The queue runs from top to bottom.</span>
+          </div>
+
           <div class="wildcard-insert-panel">
             <div>
-              <strong>Insert a wildcard</strong>
-              <p class="muted">Tap a token to insert it into the last focused batch prompt.</p>
+              <strong>Wildcard shortcuts</strong>
+              <p class="muted">
+                Use the picker inside a batch for precise placement, or tap a shortcut
+                after focusing a prompt.
+              </p>
             </div>
             {% if options.wildcards %}
               <div class="token-list" aria-label="Available wildcard tokens">
@@ -248,37 +256,116 @@
           </div>
 
           <details class="form-disclosure">
-            <summary>LoRA stack <span>Optional &middot; up to 8</span></summary>
+            <summary>
+              LoRA stack
+              <span data-lora-summary>Optional &middot; up to 8</span>
+            </summary>
             <div class="disclosure-body">
-              <p class="muted">LoRAs are applied in slot order with the exact weights below.</p>
-              {% for slot in range(1, 9) %}
-                <div class="lora-row">
+              <p class="muted">
+                LoRAs are applied from top to bottom with the exact weights shown.
+              </p>
+
+              <section class="lora-picker" data-lora-picker data-max-selections="8" hidden>
+                <div class="lora-picker-toolbar">
                   <label>
-                    LoRA {{ slot }}
-                    <select name="lora_{{ slot }}_id">
-                      <option value="">None</option>
-                      {% for lora in options.loras %}
-                        <option
-                          value="{{ lora.approval_id }}"
-                          {% if form_values['lora_' ~ slot ~ '_id'] == lora.approval_id|string %}selected{% endif %}
-                        >{{ lora.name }} &middot; {{ lora.sha256[:12] }}</option>
-                      {% endfor %}
-                    </select>
-                  </label>
-                  <label>
-                    Weight
+                    Find a LoRA
                     <input
-                      type="number"
-                      name="lora_{{ slot }}_weight"
-                      value="{{ form_values['lora_' ~ slot ~ '_weight'] }}"
-                      min="-2"
-                      max="2"
-                      step="0.05"
-                      placeholder="0.8"
+                      type="search"
+                      placeholder="Search by name or hash"
+                      autocomplete="off"
+                      spellcheck="false"
+                      data-lora-search
                     >
                   </label>
+                  <div class="lora-picker-status">
+                    <output data-lora-selection-count aria-live="polite">0 of 8 selected</output>
+                    <button class="secondary-button" type="button" data-lora-clear disabled>
+                      Clear stack
+                    </button>
+                  </div>
                 </div>
-              {% endfor %}
+
+                {% if options.loras %}
+                  <ul class="lora-catalog" data-lora-catalog aria-label="Available LoRAs">
+                    {% for lora in options.loras %}
+                      <li>
+                        <button
+                          class="lora-option"
+                          type="button"
+                          data-lora-option
+                          data-lora-id="{{ lora.approval_id }}"
+                          data-lora-name="{{ lora.name }}"
+                          data-lora-sha256="{{ lora.sha256 }}"
+                          aria-pressed="false"
+                        >
+                          <span class="lora-option-copy">
+                            <strong>{{ lora.name }}</strong>
+                            <small>{{ lora.sha256[:12] }}</small>
+                          </span>
+                          <span class="lora-option-action" data-lora-option-action>Add</span>
+                        </button>
+                      </li>
+                    {% endfor %}
+                  </ul>
+                  <p class="lora-catalog-empty muted" data-lora-catalog-empty hidden>
+                    No LoRAs match this search.
+                  </p>
+                {% else %}
+                  <p class="muted">No approved LoRAs are available yet.</p>
+                {% endif %}
+
+                <div class="lora-stack-heading">
+                  <div>
+                    <h3>Selected stack</h3>
+                    <p class="muted">Drag on desktop or use the arrow buttons to set order.</p>
+                  </div>
+                  <div class="lora-preset-actions" aria-label="Saved LoRA stack">
+                    <button class="secondary-button" type="button" data-lora-save-preset disabled>
+                      Save stack
+                    </button>
+                    <button class="secondary-button" type="button" data-lora-load-preset disabled>
+                      Load saved
+                    </button>
+                  </div>
+                </div>
+                <ol class="lora-selected-list" data-lora-selected aria-live="polite"></ol>
+                <p class="lora-stack-empty muted" data-lora-stack-empty>
+                  No LoRAs selected. Add one from the catalog above.
+                </p>
+                <p class="lora-feedback" data-lora-feedback role="status" aria-live="polite"></p>
+              </section>
+
+              <div class="lora-native-slots" data-lora-native-slots>
+                {% for slot in range(1, 9) %}
+                  <div class="lora-row" data-lora-native-slot>
+                    <label>
+                      LoRA {{ slot }}
+                      <select name="lora_{{ slot }}_id" data-lora-native-id>
+                        <option value="">None</option>
+                        {% for lora in options.loras %}
+                          <option
+                            value="{{ lora.approval_id }}"
+                            {% if form_values['lora_' ~ slot ~ '_id'] == lora.approval_id|string %}selected{% endif %}
+                          >{{ lora.name }} &middot; {{ lora.sha256[:12] }}</option>
+                        {% endfor %}
+                      </select>
+                    </label>
+                    <label>
+                      Weight
+                      <input
+                        type="number"
+                        name="lora_{{ slot }}_weight"
+                        value="{{ form_values['lora_' ~ slot ~ '_weight'] }}"
+                        min="-2"
+                        max="2"
+                        step="0.05"
+                        placeholder="0.8"
+                        data-lora-native-weight
+                      >
+                    </label>
+                  </div>
+                {% endfor %}
+              </div>
             </div>
           </details>
         </fieldset>
@@ -448,11 +535,13 @@
         <div>
           <span class="batch-order" data-batch-number>Batch 1</span>
           <strong data-batch-heading>Untitled batch</strong>
+          <span class="batch-meta" data-batch-meta>4 images &middot; 1 GPU job</span>
         </div>
         <div class="batch-card-actions" aria-label="Batch order and duplication">
           <button type="button" data-batch-action="up" aria-label="Move batch up">&uarr;</button>
           <button type="button" data-batch-action="down" aria-label="Move batch down">&darr;</button>
           <button type="button" data-batch-action="duplicate">Duplicate</button>
+          <button type="button" data-batch-action="collapse" aria-expanded="true">Collapse</button>
           <button class="danger" type="button" data-batch-action="remove">Remove</button>
         </div>
       </header>
@@ -467,17 +556,30 @@
             <input type="number" min="1" max="80000" value="4" inputmode="numeric" data-batch-field="image_count" required>
           </label>
         </div>
-        <label>
-          Prompt structure
-          <textarea
-            rows="6"
-            maxlength="20000"
-            spellcheck="false"
-            placeholder="masterpiece, best quality, 1girl, character name, __sfw__"
-            data-batch-field="prompt"
-            required
-          ></textarea>
-        </label>
+        <div class="batch-prompt-heading">
+          <strong>Prompt structure</strong>
+          {% if options.wildcards %}
+            <label class="batch-wildcard-picker">
+              <span class="visually-hidden">Insert wildcard into this batch</span>
+              <select data-batch-wildcard aria-label="Insert wildcard into this batch">
+                <option value="">+ Insert wildcard</option>
+                {% for wildcard in options.wildcards %}
+                  <option value="__{{ wildcard.name }}__">__{{ wildcard.name }}__ ({{ wildcard.entry_count }})</option>
+                {% endfor %}
+              </select>
+            </label>
+          {% endif %}
+        </div>
+        <textarea
+          rows="6"
+          maxlength="20000"
+          spellcheck="false"
+          aria-label="Prompt structure"
+          placeholder="masterpiece, best quality, 1girl, character name, __sfw__"
+          data-batch-field="prompt"
+          required
+        ></textarea>
+        <div class="batch-wildcard-summary" data-batch-wildcard-summary aria-live="polite"></div>
         <details class="batch-overrides">
           <summary>Batch-specific overrides <span>Optional</span></summary>
           <div class="disclosure-body">
@@ -503,5 +605,34 @@
         </details>
       </div>
     </article>
+  </template>
+
+  <template id="lora-selection-template">
+    <li class="lora-selection" data-lora-selection>
+      <span class="lora-drag-handle" draggable="true" aria-hidden="true">&#8942;&#8942;</span>
+      <span class="lora-selection-position" data-lora-position>1</span>
+      <span class="lora-selection-copy">
+        <strong data-lora-selected-name></strong>
+        <code data-lora-selected-sha256></code>
+      </span>
+      <label class="lora-selection-weight">
+        Weight
+        <input
+          type="number"
+          min="-2"
+          max="2"
+          step="0.05"
+          inputmode="decimal"
+          value="1"
+          data-lora-visible-weight
+          required
+        >
+      </label>
+      <span class="lora-selection-actions" role="group" aria-label="LoRA order and removal">
+        <button type="button" data-lora-selection-action="up" aria-label="Move LoRA up">&uarr;</button>
+        <button type="button" data-lora-selection-action="down" aria-label="Move LoRA down">&darr;</button>
+        <button class="danger" type="button" data-lora-selection-action="remove" aria-label="Remove LoRA">Remove</button>
+      </span>
+    </li>
   </template>
 {% endblock %}

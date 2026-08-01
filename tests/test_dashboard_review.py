@@ -602,7 +602,7 @@ def test_review_dashboard_exposes_progressive_bulk_controls(tmp_path: Path) -> N
     assert bulk_form.fields["expected_lock_version"] == "1"
     assert page.text.count('form="bulk-action-form"') == len(context.asset_ids)
     assert "Accept selected" in page.text
-    assert "Reject / exclude" in page.text
+    assert "Exclude selected" in page.text
     assert "Hold selected" in page.text
     assert "Add to X" in page.text
     assert "Remove from X" in page.text
@@ -684,7 +684,8 @@ def test_browser_review_decisions_lock_replay_actor_and_exact_completion(
         assert "form-action 'self'" in page.headers["content-security-policy"]
         assert "script-src 'self'" in page.headers["content-security-policy"]
         assert '<script src="/static/dashboard.js" defer></script>' in page.text
-        assert "<link" not in page.text.lower()
+        assert '<link rel="stylesheet" href="/static/dashboard_ux.css">' in page.text
+        assert '<script src="/static/asset_viewer.js" defer></script>' in page.text
         image_sources = re.findall(r'<img[^>]+src="([^"]+)"', page.text)
         assert image_sources
         assert all(urlsplit(source).netloc == "testserver" for source in image_sources)
