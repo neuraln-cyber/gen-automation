@@ -1,44 +1,160 @@
 {% extends "dashboard/base.html" %}
 
 {% block content %}
-  <a class="back" href="/dashboard/new-set">&larr; New Set</a>
-  <h1>{{ release.title }}</h1>
-  <p class="lede">
-    The release is frozen and its generation plan is ready for the controller.
-  </p>
+  <a class="back" href="/dashboard">&larr; Automation library</a>
+  <section class="page-header" aria-labelledby="page-heading">
+    <div class="page-header-row">
+      <div class="page-header-copy">
+        <p class="page-kicker">Live generation</p>
+        <h1 id="page-heading">{{ release.title }}</h1>
+        <p class="lede">
+          Follow this run from the GPU queue through quality scoring. This page updates
+          automatically while you keep it open.
+        </p>
+      </div>
+      <span
+        class="status {{ release.stage.key.value }}"
+        data-progress-stage-badge
+      >{{ release.stage.label }}</span>
+    </div>
+  </section>
 
-  <section class="panel review-entry">
-    <h2>Release status</h2>
+  <section
+    class="panel panel-accent generation-progress"
+    aria-labelledby="generation-progress-heading"
+    data-generation-progress
+    data-progress-url="/dashboard/releases/{{ release.release_id }}/progress"
+    data-progress-stage="{{ release.stage.key.value }}"
+  >
+    <div class="panel-heading">
+      <div>
+        <span class="workflow-label">Step {{ release.stage.step }} of {{ release.stage.step_count }}</span>
+        <h2 id="generation-progress-heading" data-progress-stage-label>
+          {{ release.stage.label }}
+        </h2>
+      </div>
+      <strong class="generation-progress-count" data-progress-image-count>
+        {{ release.images.generated }} / {{ release.images.expected }} images
+      </strong>
+    </div>
+
+    <progress
+      class="generation-progress-bar"
+      value="{{ release.images.generated }}"
+      max="{{ release.images.expected if release.images.expected > 0 else 1 }}"
+      aria-label="Verified images generated"
+      data-progress-bar
+    >{{ release.images.percent }}%</progress>
+    <p class="muted generation-progress-detail" role="status" aria-live="polite" data-progress-detail>
+      {{ release.stage.detail }}
+    </p>
+
+    <ol class="pipeline-steps" aria-label="Generation pipeline">
+      <li
+        class="pipeline-step{% if release.stage.step > 1 %} completed{% elif release.stage.step == 1 %} active{% endif %}"
+        data-pipeline-stage="queued"
+        {% if release.stage.step == 1 %}aria-current="step"{% endif %}
+      >Queued</li>
+      <li
+        class="pipeline-step{% if release.stage.step > 2 %} completed{% elif release.stage.step == 2 %} active{% endif %}"
+        data-pipeline-stage="gpu_starting"
+        {% if release.stage.step == 2 %}aria-current="step"{% endif %}
+      >GPU starting</li>
+      <li
+        class="pipeline-step{% if release.stage.step > 3 %} completed{% elif release.stage.step == 3 %} active{% endif %}"
+        data-pipeline-stage="generating"
+        {% if release.stage.step == 3 %}aria-current="step"{% endif %}
+      >Generating</li>
+      <li
+        class="pipeline-step{% if release.stage.step > 4 %} completed{% elif release.stage.step == 4 %} active{% endif %}"
+        data-pipeline-stage="scoring"
+        {% if release.stage.step == 4 %}aria-current="step"{% endif %}
+      >Scoring</li>
+      <li
+        class="pipeline-step{% if release.stage.step == 5 %} active{% endif %}"
+        data-pipeline-stage="review"
+        {% if release.stage.step == 5 %}aria-current="step"{% endif %}
+      >Review</li>
+    </ol>
+
+    <dl class="generation-progress-stats">
+      <div>
+        <dt>GPU jobs</dt>
+        <dd data-progress-job-count>{{ release.jobs.completed }} / {{ release.jobs.total }} complete</dd>
+      </div>
+      <div>
+        <dt>Active jobs</dt>
+        <dd data-progress-active-jobs>{{ release.jobs.active }}</dd>
+      </div>
+      <div>
+        <dt>Quality scoring</dt>
+        <dd data-progress-scoring-count>
+          {% if release.scoring %}
+            {{ release.scoring.completed }} / {{ release.scoring.total }}
+          {% else %}
+            Not started
+          {% endif %}
+        </dd>
+      </div>
+      <div>
+        <dt>Final-set target</dt>
+        <dd>
+          {{ release.desired_accepted_count }}
+          {{ "image" if release.desired_accepted_count == 1 else "images" }}
+        </dd>
+      </div>
+    </dl>
+
+    <div
+      class="form-error generation-progress-error"
+      role="alert"
+      data-progress-error
+      {% if not release.error %}hidden{% endif %}
+    >{% if release.error %}{{ release.error.message }}{% endif %}</div>
+
+    <a
+      class="primary-action generation-progress-next"
+      href="{{ release.next_url or '#' }}"
+      data-progress-next
+      {% if not release.ready_for_review %}hidden{% endif %}
+    >Open ranked images</a>
+  </section>
+
+  <section class="panel review-entry" aria-labelledby="run-details-heading">
+    <div class="panel-heading">
+      <div>
+        <h2 id="run-details-heading">Run details</h2>
+        <p class="muted">Durable controller state for this frozen generation plan.</p>
+      </div>
+      <span class="status {{ release.health.value }}">{{ release.health.value }}</span>
+    </div>
     <dl>
       <dt>Project</dt>
       <dd>{{ release.project_slug }}</dd>
       <dt>Set slug</dt>
       <dd>{{ release.release_slug }}</dd>
-      <dt>Phase</dt>
-      <dd><span class="status ready">{{ release.phase.value }}</span></dd>
-      <dt>Health</dt>
-      <dd>{{ release.health.value }}</dd>
+      <dt>Release phase</dt>
+      <dd data-progress-release-phase>{{ release.phase.value.replace("_", " ") }}</dd>
       <dt>Generation jobs</dt>
       <dd>{{ release.total_jobs }}</dd>
       <dt>Planned raw outputs</dt>
       <dd>{{ release.expected_outputs }}</dd>
-      <dt>Desired accepted images</dt>
-      <dd>{{ release.desired_accepted_count }}</dd>
       <dt>Frozen specification</dt>
       <dd><span class="digest">{{ release.specification_sha256 }}</span></dd>
     </dl>
 
     {% if release.jobs_by_state %}
-      <ul class="status-list">
+      <ul class="status-list" data-progress-job-states aria-label="Generation job states">
         {% for item in release.jobs_by_state %}
-          <li><span class="status">{{ item.state.value }} · {{ item.count }}</span></li>
+          <li><span class="status {{ item.state.value }}">{{ item.state.value.replace("_", " ") }} &middot; {{ item.count }}</span></li>
         {% endfor %}
       </ul>
     {% endif %}
   </section>
 
-  <p class="muted">
-    Queued jobs will start when the cloud GPU controller is enabled. Ranking and review
-    become available from the main dashboard after generation and quality scoring finish.
-  </p>
+  <noscript>
+    <p class="muted">
+      Automatic updates require JavaScript. Refresh this page to see current progress.
+    </p>
+  </noscript>
 {% endblock %}

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Literal
 from uuid import UUID
 
@@ -8,11 +9,16 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.db.models import (
+    Asset,
+    AssetRanking,
+    AssetScore,
+    GenerationAttempt,
     GenerationJob,
     ModelArtifactApproval,
     Project,
     Release,
     ReleaseVersion,
+    ScoringRun,
     SubjectApproval,
     WorkflowApproval,
 )
@@ -23,10 +29,14 @@ from gen_automation.domain.deliverability import (
 )
 from gen_automation.domain.enums import (
     ApprovalStatus,
+    AssetKind,
+    AssetState,
+    GenerationAttemptState,
     GenerationState,
     ModelArtifactKind,
     ReleasePhase,
     ResourceHealth,
+    ScoringRunState,
 )
 from gen_automation.domain.release_spec import (
     ArtifactSpecification,
@@ -52,6 +62,17 @@ class NewSetInputError(ValueError):
 
 class NewSetNotFoundError(LookupError):
     pass
+
+
+class GenerationProgressStage(StrEnum):
+    QUEUED = "queued"
+    GPU_STARTING = "gpu_starting"
+    GENERATING = "generating"
+    SCORING = "scoring"
+    REVIEW = "review"
+    PAUSED = "paused"
+    CANCELLED = "cancelled"
+    ERROR = "error"
 
 
 class NewSetLoraSelection(BaseModel):
@@ -227,6 +248,45 @@ class GenerationStateCount:
 
 
 @dataclass(frozen=True, slots=True)
+class GenerationProgressStageView:
+    key: GenerationProgressStage
+    step: int
+    step_count: int
+    label: str
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationImageProgress:
+    generated: int
+    expected: int
+    percent: float
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationJobProgress:
+    completed: int
+    total: int
+    active: int
+    failed: int
+    states: dict[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationScoringProgress:
+    completed: int
+    total: int
+    percent: float
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationProgressError:
+    code: str
+    message: str
+    retryable: bool
+
+
+@dataclass(frozen=True, slots=True)
 class NewSetStatus:
     release_id: UUID
     project_slug: str
@@ -239,6 +299,14 @@ class NewSetStatus:
     total_jobs: int
     expected_outputs: int
     jobs_by_state: tuple[GenerationStateCount, ...]
+    stage: GenerationProgressStageView
+    images: GenerationImageProgress
+    jobs: GenerationJobProgress
+    scoring: GenerationScoringProgress | None
+    error: GenerationProgressError | None
+    ready_for_review: bool
+    next_url: str | None
+    poll_after_ms: int
 
 
 async def list_new_set_options(session: AsyncSession) -> NewSetOptions:
@@ -546,6 +614,127 @@ async def load_new_set_status(
             .order_by(GenerationJob.state)
         )
     ).all()
+    state_counts = {state: int(count) for state, count, _outputs in state_rows}
+    total_jobs = sum(state_counts.values())
+    expected_outputs = sum(int(outputs or 0) for _state, _count, outputs in state_rows)
+    generated_outputs = int(
+        await session.scalar(
+            select(func.count(Asset.id))
+            .join(GenerationJob, GenerationJob.id == Asset.generation_job_id)
+            .where(
+                GenerationJob.release_version_id == version.id,
+                Asset.release_id == release.id,
+                Asset.kind == AssetKind.RAW_MASTER,
+                Asset.state == AssetState.AVAILABLE,
+            )
+        )
+        or 0
+    )
+    active_attempt_rows = (
+        await session.execute(
+            select(
+                GenerationAttempt.state,
+                func.count(GenerationAttempt.id),
+            )
+            .join(GenerationJob, GenerationJob.id == GenerationAttempt.job_id)
+            .where(
+                GenerationJob.release_version_id == version.id,
+                GenerationAttempt.state.in_(
+                    (
+                        GenerationAttemptState.CREATED,
+                        GenerationAttemptState.SUBMITTING,
+                        GenerationAttemptState.SUBMITTED,
+                        GenerationAttemptState.RUNNING,
+                        GenerationAttemptState.UNKNOWN,
+                        GenerationAttemptState.CANCEL_REQUESTED,
+                    )
+                ),
+            )
+            .group_by(GenerationAttempt.state)
+        )
+    ).all()
+    attempt_counts = {state: int(count) for state, count in active_attempt_rows}
+
+    scoring_run = await session.scalar(
+        select(ScoringRun)
+        .where(ScoringRun.release_version_id == version.id)
+        .order_by(ScoringRun.created_at.desc(), ScoringRun.id.desc())
+        .limit(1)
+    )
+    scoring_progress: GenerationScoringProgress | None = None
+    ranking_count = 0
+    if scoring_run is not None:
+        if scoring_run.state == ScoringRunState.COMPLETED:
+            scored_outputs = scoring_run.asset_count
+        else:
+            scored_outputs = int(
+                await session.scalar(
+                    select(func.count(AssetScore.id)).where(
+                        AssetScore.scoring_run_id == scoring_run.id,
+                        AssetScore.completed_at.is_not(None),
+                    )
+                )
+                or 0
+            )
+        scoring_progress = GenerationScoringProgress(
+            completed=scored_outputs,
+            total=scoring_run.asset_count,
+            percent=_progress_percent(scored_outputs, scoring_run.asset_count),
+        )
+        if scoring_run.state == ScoringRunState.COMPLETED:
+            ranking_count = int(
+                await session.scalar(
+                    select(func.count(AssetRanking.id)).where(
+                        AssetRanking.scoring_run_id == scoring_run.id
+                    )
+                )
+                or 0
+            )
+
+    completed_jobs = state_counts.get(GenerationState.SUCCEEDED, 0)
+    failed_jobs = sum(
+        state_counts.get(state, 0)
+        for state in (
+            GenerationState.FAILED,
+            GenerationState.DEAD_LETTER,
+            GenerationState.CANCELLED,
+        )
+    )
+    active_jobs = sum(
+        state_counts.get(state, 0)
+        for state in (
+            GenerationState.CLAIMED,
+            GenerationState.SUBMITTING,
+            GenerationState.RUNNING,
+            GenerationState.COLLECTING,
+            GenerationState.VERIFYING,
+            GenerationState.UNKNOWN,
+            GenerationState.CANCEL_REQUESTED,
+        )
+    )
+    ready_for_review = bool(
+        scoring_run is not None
+        and scoring_run.state == ScoringRunState.COMPLETED
+        and ranking_count == scoring_run.asset_count
+    )
+    stage, progress_error = _generation_progress_stage(
+        release=release,
+        state_counts=state_counts,
+        attempt_counts=attempt_counts,
+        generated_outputs=generated_outputs,
+        expected_outputs=expected_outputs,
+        scoring_run=scoring_run,
+        scoring_progress=scoring_progress,
+        ranking_count=ranking_count,
+        ready_for_review=ready_for_review,
+        failed_jobs=failed_jobs,
+    )
+    if stage.key == GenerationProgressStage.SCORING and scoring_progress is None:
+        scoring_progress = GenerationScoringProgress(
+            completed=0,
+            total=generated_outputs,
+            percent=0.0,
+        )
     return NewSetStatus(
         release_id=release.id,
         project_slug=project.slug,
@@ -555,13 +744,298 @@ async def load_new_set_status(
         health=release.health,
         desired_accepted_count=release.desired_accepted_count,
         specification_sha256=version.specification_sha256,
-        total_jobs=sum(int(count) for _state, count, _outputs in state_rows),
-        expected_outputs=sum(int(outputs or 0) for _state, _count, outputs in state_rows),
+        total_jobs=total_jobs,
+        expected_outputs=expected_outputs,
         jobs_by_state=tuple(
             GenerationStateCount(state=state, count=int(count))
             for state, count, _outputs in state_rows
         ),
+        stage=stage,
+        images=GenerationImageProgress(
+            generated=generated_outputs,
+            expected=expected_outputs,
+            percent=_progress_percent(generated_outputs, expected_outputs),
+        ),
+        jobs=GenerationJobProgress(
+            completed=completed_jobs,
+            total=total_jobs,
+            active=active_jobs,
+            failed=failed_jobs,
+            states={state.value: count for state, count in state_counts.items()},
+        ),
+        scoring=scoring_progress,
+        error=progress_error,
+        ready_for_review=ready_for_review,
+        next_url=(f"/dashboard/releases/{release.id}" if ready_for_review else None),
+        poll_after_ms=_poll_after_ms(stage.key),
     )
+
+
+def new_set_progress_payload(progress: NewSetStatus) -> dict[str, object]:
+    scoring: dict[str, object] | None = None
+    if progress.scoring is not None:
+        scoring = {
+            "completed": progress.scoring.completed,
+            "total": progress.scoring.total,
+            "percent": progress.scoring.percent,
+        }
+    error: dict[str, object] | None = None
+    if progress.error is not None:
+        error = {
+            "code": progress.error.code,
+            "message": progress.error.message,
+            "retryable": progress.error.retryable,
+        }
+    return {
+        "schema_version": 1,
+        "release_id": str(progress.release_id),
+        "phase": progress.phase.value,
+        "health": progress.health.value,
+        "stage": {
+            "key": progress.stage.key.value,
+            "step": progress.stage.step,
+            "step_count": progress.stage.step_count,
+            "label": progress.stage.label,
+            "detail": progress.stage.detail,
+        },
+        "images": {
+            "generated": progress.images.generated,
+            "expected": progress.images.expected,
+            "percent": progress.images.percent,
+        },
+        "jobs": {
+            "completed": progress.jobs.completed,
+            "total": progress.jobs.total,
+            "active": progress.jobs.active,
+            "failed": progress.jobs.failed,
+            "states": progress.jobs.states,
+        },
+        "scoring": scoring,
+        "error": error,
+        "ready_for_review": progress.ready_for_review,
+        "next_url": progress.next_url,
+        "poll_after_ms": progress.poll_after_ms,
+    }
+
+
+def _generation_progress_stage(
+    *,
+    release: Release,
+    state_counts: dict[GenerationState, int],
+    attempt_counts: dict[GenerationAttemptState, int],
+    generated_outputs: int,
+    expected_outputs: int,
+    scoring_run: ScoringRun | None,
+    scoring_progress: GenerationScoringProgress | None,
+    ranking_count: int,
+    ready_for_review: bool,
+    failed_jobs: int,
+) -> tuple[GenerationProgressStageView, GenerationProgressError | None]:
+    if release.phase == ReleasePhase.CANCELLED:
+        return (
+            _stage(
+                GenerationProgressStage.CANCELLED,
+                step=_generation_step(state_counts, scoring_run),
+                label="Run cancelled",
+                detail=(
+                    f"{generated_outputs} of {expected_outputs} verified raw masters "
+                    "were completed."
+                ),
+            ),
+            GenerationProgressError(
+                code="release_cancelled",
+                message="This generation run was cancelled.",
+                retryable=False,
+            ),
+        )
+    if ready_for_review:
+        return (
+            _stage(
+                GenerationProgressStage.REVIEW,
+                step=5,
+                label="Ready for review",
+                detail=f"All {ranking_count} images are ranked and ready to inspect.",
+            ),
+            None,
+        )
+    if release.phase == ReleasePhase.PAUSED:
+        return (
+            _stage(
+                GenerationProgressStage.PAUSED,
+                step=_generation_step(state_counts, scoring_run),
+                label="Run paused",
+                detail=(
+                    f"Progress is saved at {generated_outputs} of {expected_outputs} "
+                    "verified images."
+                ),
+            ),
+            None,
+        )
+    if scoring_run is not None and scoring_run.state == ScoringRunState.COMPLETED:
+        return (
+            _stage(
+                GenerationProgressStage.ERROR,
+                step=4,
+                label="Ranking needs attention",
+                detail="Quality scoring finished, but the ranked snapshot is incomplete.",
+            ),
+            GenerationProgressError(
+                code="ranking_incomplete",
+                message="The completed ranking needs operator attention.",
+                retryable=False,
+            ),
+        )
+    if release.health == ResourceHealth.BLOCKED or failed_jobs:
+        return (
+            _stage(
+                GenerationProgressStage.ERROR,
+                step=_generation_step(state_counts, scoring_run),
+                label="Generation needs attention",
+                detail=(
+                    f"{generated_outputs} of {expected_outputs} verified raw masters are safe."
+                ),
+            ),
+            GenerationProgressError(
+                code="generation_failed" if failed_jobs else "release_blocked",
+                message="One or more generation jobs need operator attention.",
+                retryable=False,
+            ),
+        )
+    if release.phase == ReleasePhase.REVIEWING or scoring_run is not None:
+        scored = scoring_progress.completed if scoring_progress is not None else 0
+        total = scoring_progress.total if scoring_progress is not None else generated_outputs
+        return (
+            _stage(
+                GenerationProgressStage.SCORING,
+                step=4,
+                label="Scoring image quality",
+                detail=f"{scored} of {total} images have completed quality scoring.",
+            ),
+            None,
+        )
+
+    generating_states = (
+        GenerationState.COLLECTING,
+        GenerationState.VERIFYING,
+        GenerationState.SUCCEEDED,
+    )
+    if (
+        attempt_counts.get(GenerationAttemptState.RUNNING, 0)
+        or generated_outputs
+        or any(state_counts.get(state, 0) for state in generating_states)
+    ):
+        return (
+            _stage(
+                GenerationProgressStage.GENERATING,
+                step=3,
+                label="Generating images",
+                detail=(
+                    f"{generated_outputs} of {expected_outputs} verified raw masters are ready."
+                ),
+            ),
+            None,
+        )
+
+    starting_attempt_states = (
+        GenerationAttemptState.CREATED,
+        GenerationAttemptState.SUBMITTING,
+        GenerationAttemptState.SUBMITTED,
+        GenerationAttemptState.UNKNOWN,
+        GenerationAttemptState.CANCEL_REQUESTED,
+    )
+    starting_job_states = (
+        GenerationState.CLAIMED,
+        GenerationState.SUBMITTING,
+        GenerationState.RUNNING,
+        GenerationState.UNKNOWN,
+        GenerationState.CANCEL_REQUESTED,
+    )
+    if any(attempt_counts.get(state, 0) for state in starting_attempt_states) or any(
+        state_counts.get(state, 0) for state in starting_job_states
+    ):
+        return (
+            _stage(
+                GenerationProgressStage.GPU_STARTING,
+                step=2,
+                label="GPU worker starting",
+                detail="The cloud GPU job is accepted and its worker is starting.",
+            ),
+            None,
+        )
+
+    retrying = state_counts.get(GenerationState.RETRY_WAIT, 0)
+    detail = (
+        f"Waiting to retry {retrying} GPU job{'s' if retrying != 1 else ''}."
+        if retrying
+        else "Generation jobs are queued for cloud GPU capacity."
+    )
+    return (
+        _stage(
+            GenerationProgressStage.QUEUED,
+            step=1,
+            label="Queued",
+            detail=detail,
+        ),
+        None,
+    )
+
+
+def _stage(
+    key: GenerationProgressStage,
+    *,
+    step: int,
+    label: str,
+    detail: str,
+) -> GenerationProgressStageView:
+    return GenerationProgressStageView(
+        key=key,
+        step=step,
+        step_count=5,
+        label=label,
+        detail=detail,
+    )
+
+
+def _generation_step(
+    state_counts: dict[GenerationState, int],
+    scoring_run: ScoringRun | None,
+) -> int:
+    if scoring_run is not None:
+        return 4
+    if any(
+        state_counts.get(state, 0)
+        for state in (
+            GenerationState.RUNNING,
+            GenerationState.COLLECTING,
+            GenerationState.VERIFYING,
+            GenerationState.SUCCEEDED,
+        )
+    ):
+        return 3
+    if any(
+        state_counts.get(state, 0)
+        for state in (
+            GenerationState.CLAIMED,
+            GenerationState.SUBMITTING,
+            GenerationState.UNKNOWN,
+        )
+    ):
+        return 2
+    return 1
+
+
+def _progress_percent(completed: int, total: int) -> float:
+    if total <= 0:
+        return 0.0
+    return round(min(max(completed, 0), total) * 100 / total, 1)
+
+
+def _poll_after_ms(stage: GenerationProgressStage) -> int:
+    if stage in {GenerationProgressStage.REVIEW, GenerationProgressStage.CANCELLED}:
+        return 0
+    if stage in {GenerationProgressStage.ERROR, GenerationProgressStage.PAUSED}:
+        return 10_000
+    return 3_000
 
 
 async def _default_project(

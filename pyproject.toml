@@ -48,6 +48,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 gen_automation = [
+  "static/*.css",
   "static/*.js",
   "templates/auth/*.html",
   "templates/dashboard/*.html",
