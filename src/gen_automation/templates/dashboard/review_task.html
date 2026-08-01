@@ -319,6 +319,12 @@
               <span class="decision-chip">Revision {{ item.current.revision }}</span>
             {% endif %}
           </div>
+          <details class="review-card-details"{% if item.ai_excluded %} open{% endif %}>
+            <summary>
+              Details &amp; settings
+              <span>{{ "Review recommended" if item.ai_excluded else "Optional" }}</span>
+            </summary>
+            <div class="review-card-details-body">
           {% if item.master.explanation_summary %}
             <details class="quality-details">
               <summary>Why this image ranked #{{ item.master.rank }}</summary>
@@ -446,6 +452,8 @@
               </a>
             </div>
           </details>
+            </div>
+          </details>
 
           {% if summary.state.value == "open" %}
             {% if item.x_selection_idempotency_key %}
@@ -473,12 +481,16 @@
                   name="selected"
                   value="{{ 'false' if item.current.selected_for_x else 'true' }}"
                 >
-                <button
-                  class="secondary-button x-toggle{% if item.current.selected_for_x %} selected{% endif %}"
-                  type="submit"
-                >
-                  {{ "Remove from X" if item.current.selected_for_x else "Select as X teaser" }}
-                </button>
+                {% if decision_value == "accept" or item.current.selected_for_x %}
+                  <button
+                    class="secondary-button x-toggle{% if item.current.selected_for_x %} selected{% endif %}"
+                    type="submit"
+                  >
+                    {{ "Remove from X" if item.current.selected_for_x else "Select as X teaser" }}
+                  </button>
+                {% else %}
+                  <p class="decision-help">Keep this image before selecting it as an X teaser.</p>
+                {% endif %}
               </form>
             {% endif %}
             <form

@@ -12,9 +12,9 @@
   </p>
 
   {% if can_manage %}
-    <section class="panel review-entry" aria-labelledby="create-wildcard">
-      <h2 id="create-wildcard">Create or import a wildcard</h2>
-      <form class="decision-form" method="post" action="/dashboard/wildcards">
+    <details class="panel review-entry wildcard-create"{% if not libraries %} open{% endif %}>
+      <summary id="create-wildcard">Create or import a wildcard</summary>
+      <form class="decision-form wildcard-form" method="post" action="/dashboard/wildcards">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="action" value="create">
         <label for="wildcard-name">Library name</label>
@@ -35,57 +35,68 @@
           maxlength="524288"
           placeholder="standing, hands on hips&#10;sitting on a chair"
         ></textarea>
-        <button class="primary-button" type="submit">Create wildcard</button>
+        <div class="wildcard-form-actions">
+          <button class="secondary-button file-button" type="button" data-wildcard-file-button data-wildcard-file-input-id="wildcard-create-file" hidden>Load .txt file</button>
+          <input id="wildcard-create-file" type="file" accept=".txt,text/plain" data-wildcard-file-input data-wildcard-file-target="wildcard-entries" hidden>
+          <button class="primary-button" type="submit">Create wildcard</button>
+        </div>
       </form>
-    </section>
+    </details>
   {% endif %}
 
   {% if libraries %}
-    <ul class="release-list">
+    <section class="library-toolbar wildcard-toolbar" data-wildcard-library-tools aria-label="Find a wildcard library" hidden>
+      <label class="library-search">
+        <span class="visually-hidden">Search wildcard libraries</span>
+        <input type="search" placeholder="Search wildcard libraries" data-wildcard-search>
+      </label>
+      <output class="library-filter-status muted" data-wildcard-filter-status aria-live="polite"></output>
+    </section>
+    <ul class="release-list" data-wildcard-library-list>
       {% for library in libraries %}
-        <li class="release-card">
+        <li class="release-card wildcard-card" data-wildcard-card data-wildcard-search-text="{{ library.name }}">
           <p class="muted">Version {{ library.current_version_no }} &middot; {{ library.entries | length }} entries</p>
-          <h2><code>__{{ library.name }}__</code></h2>
+          <div class="wildcard-token-row">
+            <h2><code>__{{ library.name }}__</code></h2>
+            <button class="secondary-button compact-action" type="button" data-copy-text="__{{ library.name }}__" hidden>Copy token</button>
+          </div>
           <p class="muted">Digest {{ library.entries_sha256[:12] }}&hellip;</p>
           {% if can_manage %}
-            <form class="decision-form" method="post" action="/dashboard/wildcards">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-              <input type="hidden" name="action" value="replace">
-              <input type="hidden" name="name" value="{{ library.name }}">
-              <input
-                type="hidden"
-                name="expected_version_no"
-                value="{{ library.current_version_no }}"
-              >
-              <label for="entries-{{ library.id }}">Edit the complete file</label>
-              <textarea
-                id="entries-{{ library.id }}"
-                name="entries"
-                required
-                rows="10"
-                maxlength="524288"
-              >{{ library.entries | join("\n") }}</textarea>
-              <button class="secondary-button" type="submit">Save new version</button>
-            </form>
-            <form class="decision-form" method="post" action="/dashboard/wildcards">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-              <input type="hidden" name="action" value="append">
-              <input type="hidden" name="name" value="{{ library.name }}">
-              <input
-                type="hidden"
-                name="expected_version_no"
-                value="{{ library.current_version_no }}"
-              >
-              <label for="append-{{ library.id }}">Append entries, one per line</label>
-              <textarea
-                id="append-{{ library.id }}"
-                name="entries"
-                required
-                rows="4"
-                maxlength="524288"
-              ></textarea>
-              <button class="secondary-button" type="submit">Append as new version</button>
-            </form>
+            <details class="form-disclosure wildcard-editor">
+              <summary>Update library <span>Append or replace</span></summary>
+              <div class="disclosure-body">
+                <form class="decision-form wildcard-form" method="post" action="/dashboard/wildcards">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="action" value="append">
+                  <input type="hidden" name="name" value="{{ library.name }}">
+                  <input type="hidden" name="expected_version_no" value="{{ library.current_version_no }}">
+                  <label for="append-{{ library.id }}">Append entries, one per line</label>
+                  <textarea id="append-{{ library.id }}" name="entries" required rows="5" maxlength="524288"></textarea>
+                  <div class="wildcard-form-actions">
+                    <button class="secondary-button file-button" type="button" data-wildcard-file-button data-wildcard-file-input-id="append-file-{{ library.id }}" hidden>Load .txt file</button>
+                    <input id="append-file-{{ library.id }}" type="file" accept=".txt,text/plain" data-wildcard-file-input data-wildcard-file-target="append-{{ library.id }}" hidden>
+                    <button class="primary-button" type="submit">Append entries</button>
+                  </div>
+                </form>
+                <details class="compact-disclosure wildcard-replace">
+                  <summary>Replace or download the complete file</summary>
+                  <form class="decision-form wildcard-form" method="post" action="/dashboard/wildcards">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="action" value="replace">
+                    <input type="hidden" name="name" value="{{ library.name }}">
+                    <input type="hidden" name="expected_version_no" value="{{ library.current_version_no }}">
+                    <label for="entries-{{ library.id }}">Complete file</label>
+                    <textarea id="entries-{{ library.id }}" name="entries" required rows="10" maxlength="524288">{{ library.entries | join("\n") }}</textarea>
+                    <div class="wildcard-form-actions">
+                      <button class="secondary-button" type="button" data-wildcard-download data-wildcard-download-target="entries-{{ library.id }}" data-wildcard-download-name="{{ library.name }}.txt" hidden>Download .txt</button>
+                      <button class="secondary-button file-button" type="button" data-wildcard-file-button data-wildcard-file-input-id="replace-file-{{ library.id }}" hidden>Load .txt file</button>
+                      <input id="replace-file-{{ library.id }}" type="file" accept=".txt,text/plain" data-wildcard-file-input data-wildcard-file-target="entries-{{ library.id }}" hidden>
+                      <button class="secondary-button" type="submit">Save replacement</button>
+                    </div>
+                  </form>
+                </details>
+              </div>
+            </details>
           {% else %}
             <ul class="notes">
               {% for entry in library.entries %}
@@ -96,6 +107,10 @@
         </li>
       {% endfor %}
     </ul>
+    <section class="panel library-empty-filter" data-wildcard-filter-empty hidden>
+      <h2>No matching wildcard libraries</h2>
+      <p class="muted">Try a different search.</p>
+    </section>
   {% else %}
     <section class="panel review-entry">
       <h2>No wildcard libraries yet</h2>

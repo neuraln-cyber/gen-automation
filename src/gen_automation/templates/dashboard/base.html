@@ -1266,7 +1266,7 @@
     </style>
     <link rel="stylesheet" href="/static/dashboard_ux.css">
   </head>
-  <body>
+  <body data-automation-storage-scope="{{ principal.user_id }}">
     <a class="skip-link" href="#main-content">Skip to main content</a>
     <header class="app-header">
       <div class="header-inner">
@@ -1278,9 +1278,21 @@
           </span>
         </a>
         <nav class="primary-nav" aria-label="Primary navigation">
-          <a class="nav-link" href="/dashboard">Library</a>
-          <a class="nav-link primary-nav-action" href="/dashboard/new-set">New automation</a>
-          <a class="nav-link" href="/dashboard/wildcards">Wildcards</a>
+          <a
+            class="nav-link"
+            href="/dashboard"
+            {% if request.url.path == "/dashboard" or request.url.path.startswith("/dashboard/releases/") or request.url.path.startswith("/dashboard/review-tasks/") %}aria-current="page"{% endif %}
+          >Library</a>
+          <a
+            class="nav-link primary-nav-action"
+            href="/dashboard/new-set"
+            {% if request.url.path.startswith("/dashboard/new-set") %}aria-current="page"{% endif %}
+          >New automation</a>
+          <a
+            class="nav-link"
+            href="/dashboard/wildcards"
+            {% if request.url.path.startswith("/dashboard/wildcards") %}aria-current="page"{% endif %}
+          >Wildcards</a>
         </nav>
         <div class="operator" title="Signed in as {{ principal.display_name }}">
           <span class="operator-avatar" aria-hidden="true">

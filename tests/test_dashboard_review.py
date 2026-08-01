@@ -23,7 +23,7 @@ from gen_automation.db.models import (
 )
 from gen_automation.db.session import Database
 from gen_automation.domain.enums import AdminRole, ReviewTaskState
-from gen_automation.middleware import content_security_policy
+from gen_automation.middleware import asset_connection_source, content_security_policy
 from gen_automation.services.review import create_review_task
 from gen_automation.storage.base import ObjectMetadata, PresignedUpload
 from tests.test_review_api import (
@@ -330,6 +330,59 @@ def test_csp_allows_http_images_only_in_local_and_test() -> None:
     )
     assert test_sources == ["'self'", "https:", "http:"]
     assert production_sources == ["'self'", "https:"]
+
+
+def test_csp_allows_dashboard_to_fetch_clean_asset_copies() -> None:
+    default_connect_sources = (
+        content_security_policy(Environment.PRODUCTION)
+        .split("connect-src ", maxsplit=1)[1]
+        .split(";", maxsplit=1)[0]
+        .split()
+    )
+    test_connect_sources = (
+        content_security_policy(
+            Environment.TEST,
+            asset_connect_source="http://assets.test:9000",
+        )
+        .split("connect-src ", maxsplit=1)[1]
+        .split(";", maxsplit=1)[0]
+        .split()
+    )
+    production_connect_sources = (
+        content_security_policy(
+            Environment.PRODUCTION,
+            asset_connect_source="https://private-assets.s3.eu-central-1.amazonaws.com",
+        )
+        .split("connect-src ", maxsplit=1)[1]
+        .split(";", maxsplit=1)[0]
+        .split()
+    )
+    assert default_connect_sources == ["'self'"]
+    assert test_connect_sources == ["'self'", "http://assets.test:9000"]
+    assert production_connect_sources == [
+        "'self'",
+        "https://private-assets.s3.eu-central-1.amazonaws.com",
+    ]
+
+
+def test_asset_connection_source_is_restricted_to_the_configured_origin(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path / "csp-origin.sqlite3").model_copy(
+        update={
+            "storage_enabled": True,
+            "storage_bucket": "private-assets",
+            "storage_region": "eu-central-1",
+        }
+    )
+    assert asset_connection_source(settings) == (
+        "https://private-assets.s3.eu-central-1.amazonaws.com"
+    )
+
+    custom_endpoint = settings.model_copy(
+        update={"storage_endpoint_url": "https://objects.example.test:9443/private"}
+    )
+    assert asset_connection_source(custom_endpoint) == "https://objects.example.test:9443"
 
 
 @pytest.mark.parametrize(

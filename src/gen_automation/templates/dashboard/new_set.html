@@ -6,11 +6,10 @@
     <div class="page-header-row">
       <div class="page-header-copy">
         <p class="page-kicker">New automation</p>
-        <h1>Build a generation run</h1>
+        <h1>Queue image batches</h1>
         <p class="lede">
-          Chain prompt structures and wildcard batches in one ordered run. The system
-          freezes every input, splits the work into efficient GPU jobs, and sends the
-          finished images into ranking and review.
+          Choose the model and image settings once, then line up as many prompt and
+          wildcard batches as you need. They run in order and arrive together for review.
         </p>
       </div>
       <a class="secondary-button" href="/dashboard/wildcards">Manage wildcards</a>
@@ -37,6 +36,7 @@
     action="/dashboard/new-set"
     autocomplete="off"
     data-automation-form
+    data-server-error="{{ 'true' if error_message else 'false' }}"
   >
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <input type="hidden" name="submission_id" value="{{ submission_id }}">
@@ -45,17 +45,17 @@
 
     <div class="automation-layout">
       <div class="automation-main">
-        <fieldset class="step-panel">
+        <fieldset class="step-panel automation-identity-panel">
           <legend class="visually-hidden">Automation identity</legend>
           <div class="step-heading">
             <span class="step-number" aria-hidden="true">1</span>
             <div>
-              <h2>Name this run</h2>
-              <p class="muted">Use a title you will recognize later in ranking and delivery.</p>
+              <h2>Name the run</h2>
+              <p class="muted">Use a title you will recognize later in the library.</p>
             </div>
           </div>
-          <div class="form-grid">
-            <label>
+          <div class="automation-title-row">
+            <label class="automation-title-field">
               Run title
               <input
                 type="text"
@@ -68,154 +68,63 @@
                 required
               >
             </label>
-            <label>
-              URL slug
-              <input
-                type="text"
-                name="slug"
-                value="{{ form_values['slug'] }}"
-                minlength="1"
-                maxlength="80"
-                pattern="[a-z0-9]+(?:-[a-z0-9]+)*"
-                placeholder="tsunade-august-set"
-                data-slug-input
-                required
-              >
-            </label>
+            <details class="compact-disclosure automation-name-advanced">
+              <summary>Advanced naming</summary>
+              <label>
+                URL slug
+                <input
+                  type="text"
+                  name="slug"
+                  value="{{ form_values['slug'] }}"
+                  minlength="1"
+                  maxlength="80"
+                  pattern="[a-z0-9]+(?:-[a-z0-9]+)*"
+                  placeholder="tsunade-august-set"
+                  data-slug-input
+                  required
+                >
+              </label>
+            </details>
           </div>
         </fieldset>
 
-        <fieldset class="step-panel batch-builder-panel" id="batch-builder" hidden>
-          <legend class="visually-hidden">Batch queue</legend>
-          <div class="section-heading">
-            <div class="step-heading">
-              <span class="step-number" aria-hidden="true">2</span>
-              <div>
-                <h2>Build the batch queue</h2>
-                <p class="muted">
-                  Every card runs in order and can use a different prompt structure,
-                  wildcard, image count, or seed.
-                </p>
-              </div>
-            </div>
-            <button class="secondary-button" type="button" data-add-batch>+ Add batch</button>
-          </div>
-
-          <div class="batch-queue" id="batch-list" aria-live="polite"></div>
-
-          <div class="batch-queue-footer">
-            <button class="secondary-button" type="button" data-add-batch>+ Add another batch</button>
-            <span class="muted">The queue runs from top to bottom.</span>
-          </div>
-
-          <div class="wildcard-insert-panel">
-            <div>
-              <strong>Wildcard shortcuts</strong>
-              <p class="muted">
-                Use the picker inside a batch for precise placement, or tap a shortcut
-                after focusing a prompt.
-              </p>
-            </div>
-            {% if options.wildcards %}
-              <div class="token-list" aria-label="Available wildcard tokens">
-                {% for wildcard in options.wildcards %}
-                  <button
-                    class="wildcard-token"
-                    type="button"
-                    data-wildcard-token="__{{ wildcard.name }}__"
-                    title="Version {{ wildcard.version_no }} with {{ wildcard.entry_count }} entries"
-                  >
-                    __{{ wildcard.name }}__
-                    <small>{{ wildcard.entry_count }}</small>
-                  </button>
-                {% endfor %}
-              </div>
-            {% else %}
-              <p class="muted">
-                No wildcard libraries exist yet.
-                <a href="/dashboard/wildcards">Add one now</a>.
-              </p>
-            {% endif %}
-          </div>
-        </fieldset>
-
-        <noscript>
-          <section class="panel">
-            <h2>Single-batch mode</h2>
-            <p class="muted">
-              JavaScript is unavailable, so this form will queue one prompt structure using
-              the shared prompt and plan-size fields below.
-            </p>
-          </section>
-        </noscript>
-
-        <fieldset class="step-panel">
-          <legend class="visually-hidden">Shared prompt defaults</legend>
-          <div class="step-heading">
-            <span class="step-number" aria-hidden="true">3</span>
-            <div>
-              <h2>Set shared prompt defaults</h2>
-              <p class="muted">
-                New batches copy these values. A batch can override them without affecting
-                the rest of the queue.
-              </p>
-            </div>
-          </div>
-          <label>
-            Default prompt structure
-            <textarea
-              name="prompt"
-              rows="7"
-              maxlength="20000"
-              spellcheck="false"
-              placeholder="masterpiece, best quality, 1girl, character name, __sfw__"
-              data-default-prompt
-              required
-            >{{ form_values['prompt'] }}</textarea>
-          </label>
-          <label>
-            Default negative prompt
-            <textarea
-              name="negative_prompt"
-              rows="4"
-              maxlength="20000"
-              spellcheck="false"
-              data-default-negative
-            >{{ form_values['negative_prompt'] }}</textarea>
-          </label>
-          <div class="form-grid">
-            <label>
-              Default face-detailer prompt
-              <textarea
-                name="detailer_prompt"
-                rows="3"
-                maxlength="20000"
-                spellcheck="false"
-                data-default-detailer
-              >{{ form_values['detailer_prompt'] }}</textarea>
-            </label>
-            <label>
-              Default face-detailer negative
-              <textarea
-                name="detailer_negative_prompt"
-                rows="3"
-                maxlength="20000"
-                spellcheck="false"
-                data-default-detailer-negative
-              >{{ form_values['detailer_negative_prompt'] }}</textarea>
-            </label>
-          </div>
-        </fieldset>
-
-        <fieldset class="step-panel">
+        <fieldset class="step-panel automation-profile-panel">
           <legend class="visually-hidden">Approved generation inputs</legend>
           <div class="step-heading">
-            <span class="step-number" aria-hidden="true">4</span>
+            <span class="step-number" aria-hidden="true">2</span>
             <div>
-              <h2>Choose the generation profile</h2>
-              <p class="muted">These approved model inputs are shared by every queued batch.</p>
+              <h2>Set the generation profile</h2>
+              <p class="muted">These model and style choices are shared by every queued batch.</p>
             </div>
           </div>
+          <section class="settings-preset-bar" data-automation-presets aria-labelledby="settings-presets-heading">
+            <div class="settings-preset-copy">
+              <strong id="settings-presets-heading">Settings presets</strong>
+              <span>Saved on this device</span>
+            </div>
+            <label class="settings-preset-select">
+              <span class="visually-hidden">Saved settings preset</span>
+              <select data-automation-preset-select aria-label="Saved settings preset">
+                <option value="">No saved presets</option>
+              </select>
+            </label>
+            <button class="secondary-button" type="button" data-automation-preset-load disabled>Load</button>
+            <details class="settings-preset-manage">
+              <summary>Manage</summary>
+              <div class="settings-preset-manage-body">
+                <label class="settings-preset-name">
+                  <span class="visually-hidden">New preset name</span>
+                  <input type="text" maxlength="80" placeholder="Preset name" data-automation-preset-name>
+                </label>
+                <button class="secondary-button" type="button" data-automation-preset-save>Save current</button>
+                <button class="secondary-button" type="button" data-automation-preset-export>Export</button>
+                <button class="secondary-button" type="button" data-automation-preset-import>Import</button>
+                <input type="file" accept="application/json,.json" data-automation-preset-import-file hidden>
+                <button class="text-button danger" type="button" data-automation-preset-delete disabled>Delete</button>
+              </div>
+            </details>
+            <output class="settings-preset-status" data-automation-preset-status aria-live="polite"></output>
+          </section>
           <div class="form-grid">
             <label>
               Adult fictional subject
@@ -224,6 +133,8 @@
                 {% for subject in options.subjects %}
                   <option
                     value="{{ subject.approval_id }}"
+                    data-subject-name="{{ subject.name }}"
+                    data-subject-slug="{{ subject.slug }}"
                     {% if form_values['subject_id'] == subject.approval_id|string %}selected{% endif %}
                   >{{ subject.name }} &middot; age {{ subject.canonical_age }}</option>
                 {% endfor %}
@@ -236,6 +147,8 @@
                 {% for checkpoint in options.checkpoints %}
                   <option
                     value="{{ checkpoint.approval_id }}"
+                    data-checkpoint-name="{{ checkpoint.name }}"
+                    data-checkpoint-sha256="{{ checkpoint.sha256 }}"
                     {% if form_values['checkpoint_id'] == checkpoint.approval_id|string %}selected{% endif %}
                   >{{ checkpoint.name }} &middot; {{ checkpoint.sha256[:12] }}</option>
                 {% endfor %}
@@ -248,6 +161,9 @@
                 {% for workflow in options.workflows %}
                   <option
                     value="{{ workflow.approval_id }}"
+                    data-workflow-name="{{ workflow.name }}"
+                    data-workflow-version="{{ workflow.version }}"
+                    data-workflow-sha256="{{ workflow.sha256 }}"
                     data-upscaler-enabled="{{ 'true' if workflow.has_hires_pass else 'false' }}"
                     data-detailer-enabled="{{ 'true' if workflow.has_face_detailer else 'false' }}"
                     {% if form_values['workflow_id'] == workflow.approval_id|string %}selected{% endif %}
@@ -336,14 +252,6 @@
                     <h3>Selected stack</h3>
                     <p class="muted">Drag on desktop or use the arrow buttons to set order.</p>
                   </div>
-                  <div class="lora-preset-actions" aria-label="Saved LoRA stack">
-                    <button class="secondary-button" type="button" data-lora-save-preset disabled>
-                      Save stack
-                    </button>
-                    <button class="secondary-button" type="button" data-lora-load-preset disabled>
-                      Load saved
-                    </button>
-                  </div>
                 </div>
                 <ol class="lora-selected-list" data-lora-selected aria-live="polite"></ol>
                 <p class="lora-stack-empty muted" data-lora-stack-empty>
@@ -387,20 +295,23 @@
           </details>
         </fieldset>
 
-        <fieldset class="step-panel">
+        <fieldset class="step-panel automation-settings-panel">
           <legend class="visually-hidden">Generation settings</legend>
           <div class="step-heading">
-            <span class="step-number" aria-hidden="true">5</span>
+            <span class="step-number" aria-hidden="true">3</span>
             <div>
-              <h2>Confirm output settings</h2>
-              <p class="muted">The defaults are tuned for the current Illustrious workflow.</p>
+              <h2>Set image quality</h2>
+              <p class="muted">The visible controls cover normal use; detailed tuning stays below.</p>
             </div>
           </div>
           <div class="form-grid">
-            <label>
-              Base seed
-              <input type="number" name="seed" value="{{ form_values['seed'] }}" min="0" max="9223372036854775807" data-default-seed required>
-            </label>
+            <div class="seed-control">
+              <label>
+                Base seed
+                <input type="number" name="seed" value="{{ form_values['seed'] }}" min="0" max="9223372036854775807" data-default-seed required>
+              </label>
+              <button class="secondary-button" type="button" data-random-seed>New random seed</button>
+            </div>
             <label>
               Width
               <input type="number" name="width" value="{{ form_values['width'] }}" min="512" max="4096" step="8" required>
@@ -417,19 +328,25 @@
               CFG
               <input type="number" name="cfg" value="{{ form_values['cfg'] }}" min="0" max="30" step="0.1" required>
             </label>
-            <label>
-              Clip skip
-              <input type="number" name="clip_skip" value="{{ form_values['clip_skip'] }}" min="1" max="12" step="1" required>
-            </label>
-            <label>
-              Sampler
-              <input type="text" name="sampler" value="{{ form_values['sampler'] }}" maxlength="100" required>
-            </label>
-            <label>
-              Scheduler
-              <input type="text" name="scheduler" value="{{ form_values['scheduler'] }}" maxlength="100" required>
-            </label>
           </div>
+
+          <details class="form-disclosure">
+            <summary>Sampler and CLIP <span>Advanced</span></summary>
+            <div class="disclosure-body form-grid">
+              <label>
+                Clip skip
+                <input type="number" name="clip_skip" value="{{ form_values['clip_skip'] }}" min="1" max="12" step="1" required>
+              </label>
+              <label>
+                Sampler
+                <input type="text" name="sampler" value="{{ form_values['sampler'] }}" maxlength="100" required>
+              </label>
+              <label>
+                Scheduler
+                <input type="text" name="scheduler" value="{{ form_values['scheduler'] }}" maxlength="100" required>
+              </label>
+            </div>
+          </details>
 
           <details class="form-disclosure">
             <summary>Hires fix &amp; face detailer <span>Advanced</span></summary>
@@ -497,16 +414,109 @@
           </details>
         </fieldset>
 
-        <fieldset class="step-panel legacy-plan-size">
-          <legend class="visually-hidden">Queue size</legend>
-          <div class="step-heading">
-            <span class="step-number" aria-hidden="true">6</span>
-            <div>
-              <h2>Set the queue target</h2>
-              <p class="muted">Batch cards control the exact generated total.</p>
+        <details class="step-panel form-disclosure automation-defaults-panel">
+          <summary>
+            Prompt and face defaults
+            <span>Applied to new batches</span>
+          </summary>
+          <div class="disclosure-body">
+            <p class="muted">
+              Keep common negative and face-detailer prompts here. Each batch can override
+              them without changing the rest of the queue.
+            </p>
+            <label>
+              Starting prompt for new batches
+              <textarea
+                name="prompt"
+                rows="7"
+                maxlength="20000"
+                spellcheck="false"
+                placeholder="masterpiece, best quality, 1girl, character name, __sfw__"
+                data-default-prompt
+                required
+              >{{ form_values['prompt'] }}</textarea>
+            </label>
+            <label>
+              Default negative prompt
+              <textarea
+                name="negative_prompt"
+                rows="4"
+                maxlength="20000"
+                spellcheck="false"
+                data-default-negative
+              >{{ form_values['negative_prompt'] }}</textarea>
+            </label>
+            <div class="form-grid">
+              <label>
+                Default face-detailer prompt
+                <textarea
+                  name="detailer_prompt"
+                  rows="3"
+                  maxlength="20000"
+                  spellcheck="false"
+                  data-default-detailer
+                >{{ form_values['detailer_prompt'] }}</textarea>
+              </label>
+              <label>
+                Default face-detailer negative
+                <textarea
+                  name="detailer_negative_prompt"
+                  rows="3"
+                  maxlength="20000"
+                  spellcheck="false"
+                  data-default-detailer-negative
+                >{{ form_values['detailer_negative_prompt'] }}</textarea>
+              </label>
             </div>
           </div>
-          <div class="form-grid">
+        </details>
+
+        <fieldset class="step-panel batch-builder-panel automation-batches-panel" id="batch-builder" hidden>
+          <legend class="visually-hidden">Batch queue</legend>
+          <div class="section-heading">
+            <div class="step-heading">
+              <span class="step-number" aria-hidden="true">4</span>
+              <div>
+                <h2>Queue prompt batches</h2>
+                <p class="muted">
+                  Every card runs in order and can use a different prompt structure,
+                  wildcard, image count, or seed.
+                </p>
+              </div>
+            </div>
+            <div class="batch-queue-heading-actions">
+              <button class="secondary-button compact-action" type="button" data-collapse-batches>Collapse all</button>
+              <button class="primary-button compact-action" type="button" data-add-batch>+ Add batch</button>
+            </div>
+          </div>
+
+          <div
+            class="batch-queue"
+            id="batch-list"
+            aria-live="polite"
+            aria-relevant="additions removals"
+          ></div>
+
+          <div class="batch-queue-footer">
+            <button class="secondary-button" type="button" data-add-batch>+ Add another batch</button>
+            <span class="muted">The queue runs from top to bottom.</span>
+          </div>
+        </fieldset>
+
+        <noscript>
+          <section class="panel">
+            <h2>Single-batch mode</h2>
+            <p class="muted">
+              JavaScript is unavailable, so this form will queue one prompt structure using
+              the shared prompt and plan-size fields below.
+            </p>
+          </section>
+        </noscript>
+
+        <details class="step-panel form-disclosure legacy-plan-size automation-target-panel">
+          <summary>GPU job sizing <span>Advanced</span></summary>
+          <div class="disclosure-body">
+            <div class="form-grid">
             <label>
               Images per GPU job
               <input type="number" name="outputs_per_job" value="{{ form_values['outputs_per_job'] }}" min="1" max="8" data-outputs-per-job required>
@@ -515,16 +525,13 @@
               Planned GPU jobs
               <input type="number" name="planned_job_count" value="{{ form_values['planned_job_count'] }}" min="1" max="10000" data-planned-job-count required>
             </label>
-            <label>
-              Images wanted in final set
-              <input type="number" name="desired_accepted_count" value="{{ form_values['desired_accepted_count'] }}" min="1" max="100" data-desired-count required>
-            </label>
+            </div>
+            <p class="muted">
+              Images per job controls cloud-GPU efficiency. Batch cards still control the
+              exact generated total.
+            </p>
           </div>
-          <p class="muted">
-            The final-set target may be smaller than the generated total so ranking can reject
-            weaker images. Raw masters remain archived even when excluded from delivery.
-          </p>
-        </fieldset>
+        </details>
       </div>
 
       <aside class="automation-sidebar" aria-label="Run summary">
@@ -540,6 +547,26 @@
           <p class="summary-note" id="summary-note">
             Add a prompt and image count to prepare this automation.
           </p>
+          <div class="automation-final-target">
+            <label>
+              Keep best
+              <input
+                type="number"
+                name="desired_accepted_count"
+                value="{{ form_values['desired_accepted_count'] }}"
+                min="1"
+                max="100"
+                data-desired-count
+                required
+              >
+              <span>images in the final set</span>
+            </label>
+            <button class="text-button" type="button" data-match-queue-target>Match queue</button>
+          </div>
+          <div class="automation-draft-row">
+            <span data-automation-draft-status>Draft autosaves on this device.</span>
+            <button class="text-button" type="button" data-automation-draft-clear>Clear draft</button>
+          </div>
           <button class="primary-button queue-submit" type="submit" {% if not options.ready %}disabled{% endif %}>
             Queue automation
           </button>
@@ -552,7 +579,7 @@
       <div class="mobile-queue-dock" aria-label="Queue automation">
         <div>
           <strong><span data-mobile-summary-images>0</span> images</strong>
-          <span><span data-mobile-summary-jobs>0</span> GPU jobs</span>
+          <span><span data-mobile-summary-jobs>0</span> GPU jobs &middot; keep best <span data-mobile-summary-target>0</span></span>
         </div>
         <button class="primary-button queue-submit" type="submit" {% if not options.ready %}disabled{% endif %}>
           Queue automation

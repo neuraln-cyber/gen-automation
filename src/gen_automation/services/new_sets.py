@@ -210,6 +210,7 @@ class WorkflowOption:
     approval_id: UUID
     name: str
     version: str
+    sha256: str
     has_hires_pass: bool
     has_face_detailer: bool
 
@@ -373,6 +374,7 @@ async def list_new_set_options(session: AsyncSession) -> NewSetOptions:
             approval_id=row.id,
             name=row.name,
             version=row.version,
+            sha256=row.workflow_sha256,
             has_hires_pass="LatentUpscaleBy" in row.reviewed_node_classes,
             has_face_detailer="FaceDetailer" in row.reviewed_node_classes,
         )

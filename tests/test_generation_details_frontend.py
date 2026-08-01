@@ -30,6 +30,64 @@ def test_generation_settings_renderer_keeps_server_values_out_of_html_sinks() ->
     assert "eval(" not in script
 
 
+def test_generation_details_offer_forge_copy_reuse_and_clean_export_context() -> None:
+    script = (ROOT / "src" / "gen_automation" / "static" / "dashboard.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "forgeStyleImageInfo" in script
+    assert "Copy Forge-style info" in script
+    assert "Negative prompt:" in script
+    assert "Schedule type:" in script
+    assert "ADetailer model: face_yolov8n.pt" in script
+    assert "Lora hashes:" in script
+    assert "displayValue(lora.sha256).slice(0, 12)" in script
+    assert "Use in new automation" in script
+    assert "window.sessionStorage.setItem(" in script
+    assert 'window.location.assign("/dashboard/new-set")' in script
+    assert "batch_prompt: preferredPromptText(details.prompts.positive)" in script
+    assert "PENDING_IMAGE_PROFILE_KEY" in script
+    assert "Download clean image" not in script
+    assert "without embedded prompt or workflow metadata" in script
+
+
+def test_generation_form_has_named_device_local_settings_presets() -> None:
+    template = (
+        ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "new_set.html"
+    ).read_text(encoding="utf-8")
+    script = (ROOT / "src" / "gen_automation" / "static" / "dashboard.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "data-automation-presets" in template
+    assert "Saved on this device" in template
+    assert "data-automation-preset-save" in template
+    assert "data-automation-preset-load" in template
+    assert "data-automation-preset-delete" in template
+    assert "AUTOMATION_PRESET_STORAGE_KEY" in script
+    assert "collectAutomationProfile" in script
+    assert "applyAutomationProfile" in script
+    assert "initializeAutomationPresets" in script
+    assert "initializeAutomationLayout" not in script
+    identity = template.index("automation-identity-panel")
+    profile = template.index("automation-profile-panel")
+    settings = template.index("automation-settings-panel")
+    batches = template.index("automation-batches-panel")
+    assert identity < profile < settings < batches
+    assert "consumePendingImageProfile" in script
+    assert "loaded with changes needed" in script
+    assert "is not currently approved" in script
+    assert "is not currently available" in script
+    assert "firstInvalidPresetControl" in script
+    preset_fields = script.split("AUTOMATION_PRESET_FIELDS", maxsplit=1)[1].split(
+        "]);", maxsplit=1
+    )[0]
+    assert '"seed"' not in preset_fields
+    assert '"desired_accepted_count"' not in preset_fields
+    assert "scopedStorageKey" in script
+    assert "draft.submission_id !== submittedDraftId" in script
+
+
 def test_generation_prompts_are_keyboard_scrollable_and_contextually_labeled() -> None:
     script = (ROOT / "src" / "gen_automation" / "static" / "dashboard.js").read_text(
         encoding="utf-8"
@@ -77,6 +135,8 @@ def test_generation_form_explains_and_hides_inactive_hires_controls() -> None:
     assert "option.dataset.upscalerEnabled === desired" in script
     assert 'workflow.dispatchEvent(new Event("change", { bubbles: true }))' in script
     assert "no upscale node or second sampler pass" in script
+    assert "normalizeHiddenHiresValues" in script
+    assert "Face maximum size must be at least the face guide size." in script
 
 
 def test_generation_form_offers_an_unnamed_attached_a1111_sample_preset() -> None:

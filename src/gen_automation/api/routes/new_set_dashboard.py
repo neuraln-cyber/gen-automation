@@ -214,7 +214,7 @@ async def submit_dashboard_new_set(
     return _secure_response(
         request,
         RedirectResponse(
-            url=f"/dashboard/releases/{result.release.id}/status",
+            url=(f"/dashboard/releases/{result.release.id}/status?draft={form.submission_id}"),
             status_code=status.HTTP_303_SEE_OTHER,
         ),
     )
@@ -241,6 +241,11 @@ async def dashboard_release_status(
             heading="Release not found",
             message="The requested release does not exist.",
         )
+    submitted_draft_id = request.query_params.get("draft", "")
+    try:
+        submitted_draft_id = str(UUID(submitted_draft_id))
+    except ValueError:
+        submitted_draft_id = ""
     return _secure_response(
         request,
         templates.TemplateResponse(
@@ -250,6 +255,7 @@ async def dashboard_release_status(
                 "page_title": release_status.title,
                 "principal": principal,
                 "release": release_status,
+                "submitted_draft_id": submitted_draft_id,
             },
         ),
     )
@@ -377,11 +383,11 @@ def _default_values(options: NewSetOptions) -> dict[str, str]:
         "hires_denoise": "0.35",
         "hires_upscale_method": "bislerp",
         "detailer_guide_size": "768",
-        "detailer_max_size": "1024",
+        "detailer_max_size": "1536",
         "detailer_denoise": "0.4",
         "detailer_bbox_threshold": "0.3",
         "detailer_bbox_dilation": "4",
-        "detailer_bbox_crop_factor": "3.0",
+        "detailer_bbox_crop_factor": "1.5",
         "detailer_feather": "4",
         "planned_job_count": "1",
         "desired_accepted_count": "4",

@@ -25,6 +25,7 @@
     data-generation-progress
     data-progress-url="/dashboard/releases/{{ release.release_id }}/progress"
     data-progress-stage="{{ release.stage.key.value }}"
+    data-submitted-draft-id="{{ submitted_draft_id }}"
   >
     <div class="panel-heading">
       <div>
@@ -120,37 +121,39 @@
     >Open ranked images</a>
   </section>
 
-  <section class="panel review-entry" aria-labelledby="run-details-heading">
-    <div class="panel-heading">
+  <details class="panel review-entry technical-disclosure">
+    <summary class="panel-heading">
       <div>
         <h2 id="run-details-heading">Run details</h2>
-        <p class="muted">Durable controller state for this frozen generation plan.</p>
+        <p class="muted">Technical identifiers and frozen plan state.</p>
       </div>
       <span class="status {{ release.health.value }}">{{ release.health.value }}</span>
-    </div>
-    <dl>
-      <dt>Project</dt>
-      <dd>{{ release.project_slug }}</dd>
-      <dt>Set slug</dt>
-      <dd>{{ release.release_slug }}</dd>
-      <dt>Release phase</dt>
-      <dd data-progress-release-phase>{{ release.phase.value.replace("_", " ") }}</dd>
-      <dt>Generation jobs</dt>
-      <dd>{{ release.total_jobs }}</dd>
-      <dt>Planned raw outputs</dt>
-      <dd>{{ release.expected_outputs }}</dd>
-      <dt>Frozen specification</dt>
-      <dd><span class="digest">{{ release.specification_sha256 }}</span></dd>
-    </dl>
+    </summary>
+    <div class="technical-disclosure-body">
+      <dl>
+        <dt>Project</dt>
+        <dd>{{ release.project_slug }}</dd>
+        <dt>Set slug</dt>
+        <dd>{{ release.release_slug }}</dd>
+        <dt>Release phase</dt>
+        <dd data-progress-release-phase>{{ release.phase.value.replace("_", " ") }}</dd>
+        <dt>Generation jobs</dt>
+        <dd>{{ release.total_jobs }}</dd>
+        <dt>Planned raw outputs</dt>
+        <dd>{{ release.expected_outputs }}</dd>
+        <dt>Frozen specification</dt>
+        <dd><span class="digest">{{ release.specification_sha256 }}</span></dd>
+      </dl>
 
-    {% if release.jobs_by_state %}
-      <ul class="status-list" data-progress-job-states aria-label="Generation job states">
-        {% for item in release.jobs_by_state %}
-          <li><span class="status {{ item.state.value }}">{{ item.state.value.replace("_", " ") }} &middot; {{ item.count }}</span></li>
-        {% endfor %}
-      </ul>
-    {% endif %}
-  </section>
+      {% if release.jobs_by_state %}
+        <ul class="status-list" data-progress-job-states aria-label="Generation job states">
+          {% for item in release.jobs_by_state %}
+            <li><span class="status {{ item.state.value }}">{{ item.state.value.replace("_", " ") }} &middot; {{ item.count }}</span></li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+    </div>
+  </details>
 
   <noscript>
     <p class="muted">

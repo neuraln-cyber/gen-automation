@@ -26,7 +26,7 @@ def test_dashboard_javascript_is_packaged_and_served(client: TestClient) -> None
     assert "initializeAutomationBuilder" in response.text
     assert "initializeLoraPicker" in response.text
     assert "syncCanonicalSlots" in response.text
-    assert "gen-automation:lora-stack:v1" in response.text
+    assert "gen-automation:generation-presets:v1" in response.text
 
 
 def test_new_set_builder_frontend_keeps_batch_edits_safe_and_actionable(
@@ -47,6 +47,14 @@ def test_new_set_builder_frontend_keeps_batch_edits_safe_and_actionable(
     assert "const wildcardPattern = /__([a-z0-9]+(?:[._/-][a-z0-9]+)*)__/g;" in script.text
     assert "const wildcardPattern = /__([a-z0-9]+(?:[._/-][a-z0-9]+)*)__/gi;" not in script.text
     assert "if (prompt.value === previousDefaultPrompt)" in script.text
+    assert "AUTOMATION_DRAFT_STORAGE_KEY" in script.text
+    assert "restoreAutomationDraft" in script.text
+    assert "clearAutomationDraftAfterQueue" in script.text
+    assert "knownWildcards" in script.text
+    assert "Unknown wildcard:" in script.text
+    assert "targetFollowsQueue" in script.text
+    assert "pairedWorkflow" in script.text
+    assert 'event.target.closest("details")' in script.text
 
     assert stylesheet.status_code == 200
     assert ".batch-card-actions button { min-width: 2.75rem; min-height: 2.75rem; }" in (
@@ -123,6 +131,8 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert 'name="detailer_bbox_threshold" value="0.3"' in page.text
     assert 'name="detailer_bbox_dilation" value="4"' in page.text
     assert 'name="detailer_feather" value="4"' in page.text
+    assert 'name="detailer_max_size" value="1536"' in page.text
+    assert 'name="detailer_bbox_crop_factor" value="1.5"' in page.text
     assert 'name="outputs_per_job" value="4"' in page.text
     assert 'name="planned_job_count" value="1"' in page.text
     assert 'name="batch_plan"' in page.text
@@ -132,15 +142,25 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert "data-lora-search" in page.text
     assert "data-lora-catalog" in page.text
     assert "data-lora-selected" in page.text
-    assert "data-lora-save-preset" in page.text
-    assert "data-lora-load-preset" in page.text
+    assert "data-automation-presets" in page.text
+    assert "data-automation-preset-select" in page.text
+    assert "data-automation-preset-load" in page.text
+    assert "data-automation-preset-save" in page.text
+    assert "data-automation-preset-delete" in page.text
+    assert "data-automation-preset-export" in page.text
+    assert "data-automation-preset-import" in page.text
+    assert "data-automation-draft-status" in page.text
+    assert "data-automation-storage-scope" in page.text
+    assert "data-match-queue-target" in page.text
+    assert "data-random-seed" in page.text
+    assert "Saved on this device" in page.text
     assert page.text.count("data-lora-option\n") == 2
     assert page.text.count("data-lora-native-slot>") == 8
     for slot in range(1, 9):
         assert page.text.count(f'name="lora_{slot}_id"') == 1
         assert page.text.count(f'name="lora_{slot}_weight"') == 1
     assert 'class="mobile-queue-dock"' in page.text
-    assert 'name="desired_accepted_count" value="4"' in page.text
+    assert re.search(r'name="desired_accepted_count"\s+value="4"', page.text)
     form = {
         "csrf_token": _hidden_value(page.text, "csrf_token"),
         "submission_id": _hidden_value(page.text, "submission_id"),
@@ -199,7 +219,7 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert first.status_code == 303
     assert replay.status_code == 303
     assert first.headers["location"] == replay.headers["location"]
-    assert first.headers["location"].endswith("/status")
+    assert "/status?draft=" in first.headers["location"]
 
     async def read_created_state() -> tuple[
         list[Project], list[Release], ReleaseVersion, list[GenerationJob]
@@ -247,6 +267,7 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert "queued" in status_page.text
     assert "0 / 12 images" in status_page.text
     assert "data-generation-progress" in status_page.text
+    assert f'data-submitted-draft-id="{form["submission_id"]}"' in status_page.text
     assert "data-progress-bar" in status_page.text
 
     progress = client.get(first.headers["location"].replace("/status", "/progress"))
