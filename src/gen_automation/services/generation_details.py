@@ -152,9 +152,11 @@ class _GenerationJobParametersV2(_FrozenModel):
             strict=True,
         ):
             snapshot = generation.model_dump(mode="json")
-            if generation.outputs_per_job != 1 or {
-                key: value for key, value in snapshot.items() if key not in varying
-            } != static_base:
+            if (
+                generation.outputs_per_job != 1
+                or {key: value for key, value in snapshot.items() if key not in varying}
+                != static_base
+            ):
                 raise ValueError("generation output snapshots are inconsistent")
             if not _resolution_matches_generation(resolution, generation):
                 raise ValueError("prompt resolution does not match its generated output")

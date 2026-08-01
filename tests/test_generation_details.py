@@ -296,9 +296,7 @@ def test_generation_details_selects_exact_output_and_returns_only_safe_fields(
     ]
     assert payload["wildcards"]["selections"][0]["entry_index"] == 1
     assert payload["batch"]["name"] == "Second prompt structure"
-    assert payload["integrity"]["job_parameters_sha256"] == canonical_sha256(
-        _job_parameters()
-    )
+    assert payload["integrity"]["job_parameters_sha256"] == canonical_sha256(_job_parameters())
 
     serialized = response.text
     for forbidden in (
