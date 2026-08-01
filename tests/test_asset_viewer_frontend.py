@@ -72,5 +72,5 @@ def test_review_filter_hides_empty_ai_excluded_separator() -> None:
 
     assert "updateExcludedHeadings" in script
     assert 'document.querySelectorAll(".ai-excluded-heading")' in script
-    assert 'grid.querySelectorAll(\'.asset-card[data-ai-excluded="true"]\')' in script
+    assert "grid.querySelectorAll('.asset-card[data-ai-excluded=\"true\"]')" in script
     assert "heading.hidden = !hasVisibleExcluded" in script
