@@ -1,21 +1,30 @@
 {% extends "dashboard/base.html" %}
 {% block content %}
   <a class="back" href="/dashboard/review-tasks/{{ delivery.review_task_id }}">
-    ← Completed review
+    &larr; Completed review
   </a>
-  <h1>Deliver {{ delivery.release_title }}</h1>
-  <p class="lede">
-    Review {{ delivery.review_state.value }} · release {{ delivery.release_phase.value }}
-  </p>
-
-  <section class="panel review-summary" aria-labelledby="outputs-heading">
-    <div>
-      <h2 id="outputs-heading">1. Prepare outputs</h2>
-      <p class="muted">
-        Every accepted image gets one clean full output. Only the
-        {{ delivery.x_selected_count }} image{% if delivery.x_selected_count != 1 %}s{% endif %}
-        selected for X get a watermarked teaser.
+  <section class="page-header" aria-labelledby="page-heading">
+    <div class="page-header-copy">
+      <p class="page-kicker">Delivery workspace</p>
+      <h1 id="page-heading">Deliver {{ delivery.release_title }}</h1>
+      <p class="lede">
+        Review {{ delivery.review_state.value }} &middot;
+        release {{ delivery.release_phase.value }}
       </p>
+    </div>
+  </section>
+
+  <section class="panel review-summary step-panel panel-accent" aria-labelledby="outputs-heading">
+    <div class="step-heading">
+      <span class="step-number" aria-hidden="true">1</span>
+      <div>
+        <h2 id="outputs-heading">Prepare exact outputs</h2>
+        <p class="muted">
+          Every accepted image gets one clean full output. Only the
+          {{ delivery.x_selected_count }} image{% if delivery.x_selected_count != 1 %}s{% endif %}
+          selected for X get a watermarked teaser.
+        </p>
+      </div>
     </div>
     <dl class="count-grid">
       <div>
@@ -133,18 +142,21 @@
     </section>
   {% endif %}
 
-  <section class="panel review-entry" aria-labelledby="destinations-heading">
-    <div>
-      <h2 id="destinations-heading">2. Prepare destinations</h2>
-      <p class="muted">
-        One action freezes the exact clean Patreon set, queues its automatic MEGA
-        mirror, and queues only the selected X teasers.
-      </p>
+  <section class="panel review-entry step-panel" aria-labelledby="destinations-heading">
+    <div class="step-heading">
+      <span class="step-number" aria-hidden="true">2</span>
+      <div>
+        <h2 id="destinations-heading">Prepare destinations</h2>
+        <p class="muted">
+          One action freezes the exact clean Patreon set, queues its automatic MEGA
+          mirror, and queues only the selected X teasers.
+        </p>
+      </div>
     </div>
 
     <ul class="release-list">
       {% for destination in delivery.destinations %}
-        <li class="release-card">
+        <li class="release-card" data-destination="{{ destination.key }}">
           <h2>{{ destination.label }}</h2>
           <span class="status {{ destination.state }}">
             {{ destination.state.replace("_", " ") }}

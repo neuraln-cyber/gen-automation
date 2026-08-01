@@ -179,6 +179,14 @@ class ReviewDecisionValue(StrEnum):
     HOLD = "hold"
 
 
+class ReviewBulkAction(StrEnum):
+    ACCEPT = "accept"
+    REJECT = "reject"
+    HOLD = "hold"
+    X_ADD = "x_add"
+    X_REMOVE = "x_remove"
+
+
 class DerivativeJobState(StrEnum):
     REQUESTED = "requested"
     CLAIMED = "claimed"

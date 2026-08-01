@@ -11,15 +11,20 @@ from gen_automation.config import Environment, Settings
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
-def content_security_policy(environment: Environment) -> str:
+def content_security_policy(
+    environment: Environment,
+    *,
+    allow_same_origin_scripts: bool = False,
+) -> str:
     image_sources = "'self' https:"
     if environment in {Environment.LOCAL, Environment.TEST}:
         image_sources = f"{image_sources} http:"
+    script_sources = "'self'" if allow_same_origin_scripts else "'none'"
     return (
         "default-src 'self'; base-uri 'none'; connect-src 'self'; "
         "font-src 'self'; form-action 'self'; frame-ancestors 'none'; "
         f"img-src {image_sources}; object-src 'none'; "
-        "script-src 'none'; style-src 'self' 'unsafe-inline'"
+        f"script-src {script_sources}; style-src 'self' 'unsafe-inline'"
     )
 
 
@@ -53,7 +58,12 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
         response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
         settings: Settings = request.app.state.settings
-        response.headers["Content-Security-Policy"] = content_security_policy(settings.environment)
+        response.headers["Content-Security-Policy"] = content_security_policy(
+            settings.environment,
+            allow_same_origin_scripts=(
+                request.url.path == "/dashboard" or request.url.path.startswith("/dashboard/")
+            ),
+        )
         response.headers["Permissions-Policy"] = (
             "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
         )

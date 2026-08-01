@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from gen_automation.api.browser_review_forms import (
     BrowserReviewFormError,
     form_key_matches,
+    read_bulk_action_form,
     read_create_form,
     read_decision_form,
     read_transition_form,
@@ -28,7 +29,12 @@ from gen_automation.api.security import (
 )
 from gen_automation.config import Settings
 from gen_automation.db.session import get_session
-from gen_automation.domain.enums import AdminRole, ReviewDecisionValue, ReviewTaskState
+from gen_automation.domain.enums import (
+    AdminRole,
+    ReviewBulkAction,
+    ReviewDecisionValue,
+    ReviewTaskState,
+)
 from gen_automation.middleware import content_security_policy
 from gen_automation.services.authentication import (
     AuthenticatedPrincipal,
@@ -55,6 +61,7 @@ from gen_automation.services.review import (
     ReviewNotFoundError,
     ReviewSummary,
     append_review_decision,
+    apply_bulk_review_action,
     create_review_task,
     get_review_summary,
     set_review_x_selection,
@@ -389,6 +396,7 @@ async def dashboard_review_task(
         )
     complete_idempotency_key = None
     cancel_idempotency_key = None
+    bulk_action_idempotency_key = None
     if summary.state == ReviewTaskState.OPEN:
         complete_idempotency_key = review_form_idempotency_key(
             settings,
@@ -400,6 +408,12 @@ async def dashboard_review_task(
             settings,
             session_id=principal.session_id,
             action="cancel",
+            parts=(str(review_task_id), str(summary.lock_version)),
+        )
+        bulk_action_idempotency_key = review_form_idempotency_key(
+            settings,
+            session_id=principal.session_id,
+            action="bulk-action",
             parts=(str(review_task_id), str(summary.lock_version)),
         )
     return _secure_response(
@@ -419,6 +433,7 @@ async def dashboard_review_task(
                 "csrf_token": csrf_token,
                 "complete_idempotency_key": complete_idempotency_key,
                 "cancel_idempotency_key": cancel_idempotency_key,
+                "bulk_action_idempotency_key": bulk_action_idempotency_key,
                 "can_complete": (
                     summary.state == ReviewTaskState.OPEN
                     and summary.accepted_count == summary.desired_accepted_count
@@ -480,6 +495,61 @@ async def dashboard_review_decision(
             asset_id=form.asset_id,
             decision=form.decision,
             decided_by_user_id=principal.user_id,
+            expected_lock_version=form.expected_lock_version,
+            idempotency_key=form.idempotency_key,
+            reason_code=form.reason_code,
+            note=form.note,
+            semantic_profile_sha256=semantic_profile,
+            semantic_severe_confidence_micros=(settings.semantic_anatomy_severe_confidence_micros),
+        )
+    except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
+        return _service_error_response(request, principal, error)
+    return _review_redirect(request, review_task_id)
+
+
+@router.post(
+    "/review-tasks/{review_task_id}/bulk-actions",
+    response_class=HTMLResponse,
+    response_model=None,
+    name="dashboard_bulk_review_action",
+)
+async def dashboard_bulk_review_action(
+    review_task_id: UUID,
+    request: Request,
+    session: Session,
+    principal: ReviewReader,
+) -> Response:
+    origin_error = _origin_error_response(request, principal)
+    if origin_error is not None:
+        return origin_error
+    try:
+        form = await read_bulk_action_form(request)
+    except BrowserReviewFormError as error:
+        return _invalid_form_response(request, principal, error.status_code)
+    if not _valid_form_csrf(request, principal, form.csrf_token):
+        return _security_error_response(request, principal)
+    if form.action in {ReviewBulkAction.X_ADD, ReviewBulkAction.X_REMOVE} and (
+        principal.role != AdminRole.OWNER
+    ):
+        return _security_error_response(request, principal)
+
+    settings: Settings = request.app.state.settings
+    expected_key = review_form_idempotency_key(
+        settings,
+        session_id=principal.session_id,
+        action="bulk-action",
+        parts=(str(review_task_id), str(form.expected_lock_version)),
+    )
+    if not form_key_matches(form.idempotency_key, expected_key):
+        return _invalid_form_response(request, principal, status.HTTP_400_BAD_REQUEST)
+    semantic_profile = _configured_semantic_profile_sha256(settings)
+    try:
+        await apply_bulk_review_action(
+            session,
+            review_task_id=review_task_id,
+            asset_ids=form.asset_ids,
+            action=form.action,
+            changed_by_user_id=principal.user_id,
             expected_lock_version=form.expected_lock_version,
             idempotency_key=form.idempotency_key,
             reason_code=form.reason_code,
@@ -855,12 +925,25 @@ def _service_error_response(
             heading="Review change was not saved",
             message="The requested review resource was not found.",
         )
+    conflict_message = str(error)
+    if conflict_message == "at most four images can be selected for one X post":
+        heading = "Too many images for X"
+        message = "An X post can use at most four images. Deselect an image and try again."
+    elif conflict_message == "high-confidence severe anatomy requires an explicit owner override":
+        heading = "Individual review required"
+        message = (
+            "AI-excluded images need individual owner review and an explicit override before "
+            "acceptance."
+        )
+    else:
+        heading = "Review changed"
+        message = "This review changed before the form was submitted. Reload it and try again."
     return _review_action_error(
         request,
         principal,
         status_code=status.HTTP_409_CONFLICT,
-        heading="Review changed",
-        message="This review changed before the form was submitted. Reload it and try again.",
+        heading=heading,
+        message=message,
     )
 
 

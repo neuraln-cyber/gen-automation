@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import math
 import re
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from gen_automation.config import Settings
 from gen_automation.services.new_sets import NewSetLoraSelection, NewSetSubmission
 
 _FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
-_MAX_FORM_BODY_BYTES = 128 * 1024
+_MAX_FORM_BODY_BYTES = 512 * 1024
 _FORM_KEY = re.compile(r"web-new-set-[0-9a-f]{64}")
 _HEX = frozenset("0123456789abcdefABCDEF")
 _LORA_SLOTS = range(1, 9)
@@ -56,6 +57,7 @@ _FIELDS = frozenset(
         *(f"lora_{slot}_weight" for slot in _LORA_SLOTS),
     }
 )
+_OPTIONAL_FIELDS = frozenset({"batch_plan"})
 
 
 class BrowserNewSetFormError(ValueError):
@@ -117,6 +119,7 @@ async def read_new_set_form(request: Request) -> BrowserNewSetForm:
             negative_prompt=values["negative_prompt"],
             detailer_prompt=values["detailer_prompt"],
             detailer_negative_prompt=values["detailer_negative_prompt"],
+            batches=_decode_batch_plan(values.get("batch_plan", "")),
             seed=_integer(values["seed"], label="Seed"),
             width=_integer(values["width"], label="Width"),
             height=_integer(values["height"], label="Height"),
@@ -266,13 +269,48 @@ async def _read_form(request: Request) -> dict[str, str]:
             strict_parsing=True,
             encoding="utf-8",
             errors="strict",
-            max_num_fields=len(_FIELDS),
+            max_num_fields=len(_FIELDS | _OPTIONAL_FIELDS),
         )
     except (UnicodeDecodeError, ValueError):
         raise _bad_request("The submitted form fields were invalid.") from None
-    if set(parsed) != _FIELDS or any(len(parsed[field]) != 1 for field in _FIELDS):
+    submitted_fields = set(parsed)
+    if (
+        not _FIELDS.issubset(submitted_fields)
+        or not submitted_fields.issubset(_FIELDS | _OPTIONAL_FIELDS)
+        or any(len(items) != 1 for items in parsed.values())
+    ):
         raise _bad_request("The submitted form fields were invalid.")
-    return {field: parsed[field][0] for field in _FIELDS}
+    return {field: items[0] for field, items in parsed.items()}
+
+
+def _decode_batch_plan(value: str) -> object:
+    if not value:
+        return ()
+    if len(value) > 400_000:
+        raise _unprocessable("Batch queue is too large.")
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate object key")
+            result[key] = item
+        return result
+
+    def reject_constant(_value: str) -> None:
+        raise ValueError("non-finite number")
+
+    try:
+        decoded = json.loads(
+            value,
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (TypeError, ValueError):
+        raise _unprocessable("Batch queue is not valid JSON.") from None
+    if not isinstance(decoded, list) or not 1 <= len(decoded) <= 50:
+        raise _unprocessable("Batch queue must contain between 1 and 50 batches.")
+    return decoded
 
 
 def _valid_percent_encoding(value: str) -> bool:
@@ -335,6 +373,7 @@ def _validation_message(error: ValidationError) -> str:
         "negative_prompt": "Negative prompt",
         "detailer_prompt": "Detailer prompt",
         "detailer_negative_prompt": "Detailer negative prompt",
+        "batches": "Batch queue",
         "seed": "Seed",
         "width": "Width",
         "height": "Height",

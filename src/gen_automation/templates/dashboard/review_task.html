@@ -1,22 +1,31 @@
 {% extends "dashboard/base.html" %}
 {% block content %}
   <a class="back" href="/dashboard/releases/{{ navigation.release_id }}">
-    ← Ranked release
+    &larr; Ranked release
   </a>
-  <h1>Review {{ release.release_title }}</h1>
-  <p class="lede">
-    Frozen release version {{ release.release_version_no }} ·
-    {{ summary.ranked_asset_count }} ranked assets ·
-    task {{ summary.state.value }}
-  </p>
+  <section class="page-header" aria-labelledby="page-heading">
+    <div class="page-header-copy">
+      <p class="page-kicker">Final set review</p>
+      <h1 id="page-heading">{{ release.release_title }}</h1>
+      <p class="lede">
+        Frozen release version {{ release.release_version_no }} &middot;
+        {{ summary.ranked_asset_count }} ranked assets &middot;
+        task {{ summary.state.value }}
+      </p>
+    </div>
+  </section>
 
   <section class="panel review-summary" aria-labelledby="review-summary-heading">
-    <div>
-      <h2 id="review-summary-heading">Decision summary</h2>
-      <p class="muted">
-        Completion requires exactly {{ summary.desired_accepted_count }} accepted
-        asset{% if summary.desired_accepted_count != 1 %}s{% endif %}.
-      </p>
+    <div class="panel-heading">
+      <div>
+        <span class="workflow-label">Review progress</span>
+        <h2 id="review-summary-heading">Build your final set</h2>
+        <p class="muted">
+          Completion requires exactly {{ summary.desired_accepted_count }} accepted
+          asset{% if summary.desired_accepted_count != 1 %}s{% endif %}.
+        </p>
+      </div>
+      <span class="status {{ summary.state.value }}">{{ summary.state.value }}</span>
     </div>
     <dl class="count-grid">
       <div><dt>Accepted</dt><dd>{{ summary.accepted_count }}</dd></div>
@@ -40,9 +49,39 @@
       {% endif %}
     </dl>
 
-    {% if summary.state.value == "open" %}
+    {% if summary.state.value != "open" %}
+      <p class="terminal-state" role="status">
+        This task is {{ summary.state.value }} and is now read-only.
+      </p>
+      {% if summary.state.value == "completed" and principal.role.value == "owner" %}
+        <a
+          class="primary-action"
+          href="/dashboard/review-tasks/{{ summary.task_id }}/delivery"
+        >
+          Prepare outputs and destinations
+        </a>
+      {% endif %}
+    {% endif %}
+  </section>
+
+  {% if summary.state.value == "open" %}
+    <aside
+      class="review-command-bar"
+      aria-label="Review completion controls"
+      data-review-command-bar
+      data-review-task-id="{{ summary.task_id }}"
+      data-lock-version="{{ summary.lock_version }}"
+    >
+      <div class="review-command-copy">
+        <strong>{{ summary.accepted_count }} / {{ summary.desired_accepted_count }} accepted</strong>
+        <span>{{ summary.undecided_count }} still undecided</span>
+      </div>
       <div class="task-actions">
-        <form method="post" action="/dashboard/review-tasks/{{ summary.task_id }}:complete">
+        <form
+          method="post"
+          action="/dashboard/review-tasks/{{ summary.task_id }}:complete"
+          data-review-complete-form
+        >
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input
             type="hidden"
@@ -62,7 +101,11 @@
             Complete review
           </button>
         </form>
-        <form method="post" action="/dashboard/review-tasks/{{ summary.task_id }}:cancel">
+        <form
+          method="post"
+          action="/dashboard/review-tasks/{{ summary.task_id }}:cancel"
+          data-review-cancel-form
+        >
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input
             type="hidden"
@@ -74,39 +117,113 @@
             name="expected_lock_version"
             value="{{ summary.lock_version }}"
           >
-          <button class="secondary-button danger" type="submit">Cancel review</button>
+          <button class="secondary-button danger" type="submit">Cancel</button>
         </form>
       </div>
-      {% if not can_complete %}
-        <p class="muted" id="completion-help">
-          {% if summary.semantic_gate.pending_count %}
-            Completion is blocked until all {{ summary.ranked_asset_count }} configured
-            anatomy checks finish or become explicitly unavailable after bounded retries.
-          {% elif summary.semantic_gate.severe_blocked_count %}
-            Completion is blocked because an accepted high-confidence severe image needs
-            an explicit owner override reason and attestation.
-          {% else %}
-            Complete becomes available when the accepted count is exactly
-            {{ summary.desired_accepted_count }}.
-          {% endif %}
-        </p>
-      {% endif %}
-    {% else %}
-      <p class="terminal-state" role="status">
-        This task is {{ summary.state.value }} and is now read-only.
+    </aside>
+    {% if not can_complete %}
+      <p class="muted" id="completion-help">
+        {% if summary.semantic_gate.pending_count %}
+          Completion is blocked until all {{ summary.ranked_asset_count }} configured
+          anatomy checks finish or become explicitly unavailable after bounded retries.
+        {% elif summary.semantic_gate.severe_blocked_count %}
+          Completion is blocked because an accepted high-confidence severe image needs
+          an explicit owner override reason and attestation.
+        {% else %}
+          Complete becomes available when the accepted count is exactly
+          {{ summary.desired_accepted_count }}.
+        {% endif %}
       </p>
-      {% if summary.state.value == "completed" and principal.role.value == "owner" %}
-        <a
-          class="primary-action"
-          href="/dashboard/review-tasks/{{ summary.task_id }}/delivery"
-        >
-          Prepare outputs and destinations
-        </a>
-      {% endif %}
     {% endif %}
-  </section>
 
-  <ol class="asset-grid review-grid">
+    <form
+      id="bulk-action-form"
+      class="bulk-toolbar"
+      method="post"
+      action="/dashboard/review-tasks/{{ summary.task_id }}/bulk-actions"
+      data-bulk-action-form
+      data-x-selected-count="{{ summary.x_selected_count }}"
+      data-x-capacity="4"
+    >
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input
+        type="hidden"
+        name="idempotency_key"
+        value="{{ bulk_action_idempotency_key }}"
+      >
+      <input
+        type="hidden"
+        name="expected_lock_version"
+        value="{{ summary.lock_version }}"
+      >
+      <input type="hidden" name="reason_code" value="">
+      <input type="hidden" name="note" value="">
+      <div class="bulk-toolbar-copy">
+        <strong>Selected image actions</strong>
+        <span data-selected-count>Select one or more image cards below.</span>
+      </div>
+      <div class="bulk-selection-controls" data-review-selection-controls hidden>
+        <button class="secondary-button" type="button" data-select-all>Select visible</button>
+        <button class="secondary-button" type="button" data-clear-selection>Clear</button>
+      </div>
+      <div class="bulk-actions">
+        <button class="secondary-button bulk-accept" type="submit" name="action" value="accept">
+          Accept selected
+        </button>
+        <button class="secondary-button bulk-reject" type="submit" name="action" value="reject">
+          Reject / exclude
+        </button>
+        <button class="secondary-button bulk-hold" type="submit" name="action" value="hold">
+          Hold selected
+        </button>
+        {% if principal.role.value == "owner" %}
+          <button class="secondary-button bulk-x" type="submit" name="action" value="x_add">
+            Add to X
+          </button>
+          <button class="secondary-button bulk-x" type="submit" name="action" value="x_remove">
+            Remove from X
+          </button>
+        {% endif %}
+      </div>
+      <p
+        class="bulk-selection-status"
+        id="bulk-selection-status"
+        data-bulk-selection-status
+        role="status"
+        hidden
+      ></p>
+    </form>
+  {% endif %}
+
+  <div class="section-heading" id="review-images">
+    <div>
+      <h2>Ranked images</h2>
+      <p class="muted">
+        Use the one-tap decisions on each card. Reject excludes an image from the final
+        set without deleting its raw master.
+      </p>
+    </div>
+    {% if ai_excluded_count %}
+      <a class="secondary-button" href="#ai-excluded">Jump to AI excluded</a>
+    {% endif %}
+  </div>
+  {% if summary.state.value == "open" %}
+    <nav class="review-filter-bar" aria-label="Filter ranked images" data-review-tools hidden>
+      <span>Show</span>
+      <button class="filter-chip active" type="button" data-review-filter="all" aria-pressed="true">All</button>
+      <button class="filter-chip" type="button" data-review-filter="undecided" aria-pressed="false">Undecided</button>
+      <button class="filter-chip" type="button" data-review-filter="accept" aria-pressed="false">Accepted</button>
+      <button class="filter-chip" type="button" data-review-filter="reject" aria-pressed="false">Rejected</button>
+      <button class="filter-chip" type="button" data-review-filter="hold" aria-pressed="false">Held</button>
+      <button class="filter-chip" type="button" data-review-filter="x" aria-pressed="false">Selected for X</button>
+    </nav>
+  {% endif %}
+
+  <ol
+    class="asset-grid review-grid"
+    data-review-grid
+    data-review-task-id="{{ summary.task_id }}"
+  >
     {% set bucket = namespace(started=false) %}
     {% for item in assets %}
       {% if item.ai_excluded and not bucket.started %}
@@ -125,35 +242,63 @@
         </li>
         {% set bucket.started = true %}
       {% endif %}
-      <li class="asset-card{% if item.ai_excluded %} ai-excluded{% endif %}">
-        <img
-          class="asset-preview"
-          src="{{ item.master.view_url }}"
-          alt="Rank {{ item.master.rank }} generated image"
-          width="{{ item.master.width }}"
-          height="{{ item.master.height }}"
-          loading="lazy"
-          decoding="async"
-        >
+      {% set decision_value = item.current.decision.value if item.current.decision else "undecided" %}
+      <li
+        id="asset-{{ item.master.asset_id }}"
+        class="asset-card decision-{{ decision_value }}{% if item.ai_excluded %} ai-excluded{% endif %}"
+        data-review-asset
+        data-asset-id="{{ item.master.asset_id }}"
+        data-rank="{{ item.master.rank }}"
+        data-decision="{{ decision_value }}"
+        data-selected-for-x="{{ 'true' if item.current.selected_for_x else 'false' }}"
+        {% if item.ai_excluded %}data-ai-excluded="true"{% endif %}
+      >
+        <div class="asset-media">
+          {% if summary.state.value == "open" %}
+            <label class="asset-select">
+              <input
+                type="checkbox"
+                name="asset_id"
+                value="{{ item.master.asset_id }}"
+                form="bulk-action-form"
+                data-asset-select
+                aria-label="Select rank {{ item.master.rank }} for a bulk action"
+              >
+              <span>Select</span>
+            </label>
+          {% endif %}
+          <img
+            class="asset-preview"
+            src="{{ item.master.view_url }}"
+            alt="Rank {{ item.master.rank }} generated image"
+            width="{{ item.master.width }}"
+            height="{{ item.master.height }}"
+            loading="lazy"
+            decoding="async"
+          >
+          <span class="asset-rank-badge">#{{ item.master.rank }}</span>
+          <span class="asset-rank-badge asset-score-badge">
+            {{ item.master.score_percent }}
+          </span>
+        </div>
         <div class="asset-body">
           <div class="rank-line">
-            <span class="rank">#{{ item.master.rank }}</span>
+            <span class="rank">Rank {{ item.master.rank }}</span>
             <span class="score">{{ item.master.score_percent }}</span>
           </div>
-          <p class="current-decision" aria-live="polite">
-            Current decision:
-            <strong>
-              {% if item.current.decision %}
-                {{ item.current.decision.value }}
-              {% else %}
-                undecided
-              {% endif %}
-            </strong>
-            {% if item.current.revision %} · revision {{ item.current.revision }}{% endif %}
-          </p>
-          <p class="current-decision">
-            X teaser:
-            <strong>{{ "selected" if item.current.selected_for_x else "not selected" }}</strong>
+          <div class="card-status-row" aria-live="polite">
+            <span class="decision-chip {{ decision_value }}">
+              {{ decision_value }}
+            </span>
+            <span class="decision-chip{% if item.current.selected_for_x %} x-selected{% endif %}">
+              X: {{ "selected" if item.current.selected_for_x else "not selected" }}
+            </span>
+            {% if item.current.revision %}
+              <span class="decision-chip">Revision {{ item.current.revision }}</span>
+            {% endif %}
+          </div>
+          <p class="visually-hidden">
+            Current decision: <strong>{{ decision_value }}</strong>
           </p>
           {% if item.current.reason_code %}
             <p class="decision-detail">Reason: {{ item.current.reason_code }}</p>
@@ -215,14 +360,19 @@
             {% endif %}
           </div>
 
-          <dl>
-            <dt>Disposition</dt>
-            <dd>{{ item.master.disposition.replace("_", " ") }}</dd>
-            <dt>Dimensions</dt>
-            <dd>{{ item.master.width }} × {{ item.master.height }}</dd>
-            <dt>Asset</dt>
-            <dd>{{ item.master.asset_id }}</dd>
-          </dl>
+          <details class="decision-details">
+            <summary>Image details</summary>
+            <div class="decision-fields">
+              <dl>
+                <dt>Disposition</dt>
+                <dd>{{ item.master.disposition.replace("_", " ") }}</dd>
+                <dt>Dimensions</dt>
+                <dd>{{ item.master.width }} &times; {{ item.master.height }}</dd>
+                <dt>Asset</dt>
+                <dd>{{ item.master.asset_id }}</dd>
+              </dl>
+            </div>
+          </details>
 
           {% if summary.state.value == "open" %}
             {% if item.x_selection_idempotency_key %}
@@ -230,6 +380,8 @@
                 class="decision-form"
                 method="post"
                 action="/dashboard/review-tasks/{{ summary.task_id }}/x-selections"
+                data-x-selection-form
+                data-asset-id="{{ item.master.asset_id }}"
               >
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <input
@@ -248,8 +400,11 @@
                   name="selected"
                   value="{{ 'false' if item.current.selected_for_x else 'true' }}"
                 >
-                <button class="secondary-button" type="submit">
-                  {{ "Remove from X" if item.current.selected_for_x else "Select for X" }}
+                <button
+                  class="secondary-button x-toggle{% if item.current.selected_for_x %} selected{% endif %}"
+                  type="submit"
+                >
+                  {{ "Remove from X" if item.current.selected_for_x else "Select as X teaser" }}
                 </button>
               </form>
             {% endif %}
@@ -257,6 +412,8 @@
               class="decision-form"
               method="post"
               action="/dashboard/review-tasks/{{ summary.task_id }}/decisions"
+              data-review-decision-form
+              data-asset-id="{{ item.master.asset_id }}"
             >
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <input
@@ -277,38 +434,12 @@
                   name="reason_code"
                   value="{{ semantic_override_reason_code }}"
                 >
-                <p class="decision-detail">
-                  <strong>Owner override:</strong>
-                  accepting records your attestation. A specific reason is required below.
-                </p>
-              {% else %}
-                <label for="reason-{{ item.master.asset_id }}">Reason code (optional)</label>
-                <input
-                  id="reason-{{ item.master.asset_id }}"
-                  name="reason_code"
-                  maxlength="100"
-                  pattern="[a-z][a-z0-9_.-]{0,99}"
-                  value="{{ item.current.reason_code or '' }}"
-                  autocomplete="off"
-                >
               {% endif %}
 
-              <label for="note-{{ item.master.asset_id }}">
-                {% if summary.semantic_gate.enabled and item.ai_excluded and principal.role.value == "owner" %}
-                  Owner override reason (required to accept)
-                {% else %}
-                  Review note (optional)
-                {% endif %}
-              </label>
-              <textarea
-                id="note-{{ item.master.asset_id }}"
-                name="note"
-                maxlength="4000"
-                rows="3"
-              >{{ item.current.note or '' }}</textarea>
-
               <fieldset>
-                <legend>Save a decision for rank {{ item.master.rank }}</legend>
+                <legend class="visually-hidden">
+                  Save a decision for rank {{ item.master.rank }}
+                </legend>
                 <div class="decision-actions">
                   <button
                     class="decision-button accept"
@@ -316,6 +447,7 @@
                     name="decision"
                     value="accept"
                     aria-label="Accept rank {{ item.master.rank }}"
+                    data-decision="accept"
                     {% if summary.semantic_gate.enabled and item.ai_excluded and principal.role.value != "owner" %}
                       disabled
                       aria-describedby="severe-owner-only-{{ item.master.asset_id }}"
@@ -327,6 +459,7 @@
                     name="decision"
                     value="reject"
                     aria-label="Reject rank {{ item.master.rank }}"
+                    data-decision="reject"
                   >Reject</button>
                   <button
                     class="decision-button hold"
@@ -334,12 +467,62 @@
                     name="decision"
                     value="hold"
                     aria-label="Hold rank {{ item.master.rank }}"
+                    data-decision="hold"
                   >Hold</button>
                 </div>
               </fieldset>
+
+              <details
+                class="decision-details"
+                {% if summary.semantic_gate.enabled and item.ai_excluded and principal.role.value == "owner" %}open{% endif %}
+              >
+                <summary>
+                  {% if summary.semantic_gate.enabled and item.ai_excluded and principal.role.value == "owner" %}
+                    Required owner override reason
+                  {% else %}
+                    Add reason or note (optional)
+                  {% endif %}
+                </summary>
+                <div class="decision-fields">
+                  {% if summary.semantic_gate.enabled and item.ai_excluded and principal.role.value == "owner" %}
+                    <p class="decision-detail">
+                      <strong>Owner override:</strong>
+                      accepting records your attestation. A specific reason is required.
+                    </p>
+                  {% else %}
+                    <label for="reason-{{ item.master.asset_id }}">Reason code</label>
+                    <input
+                      id="reason-{{ item.master.asset_id }}"
+                      name="reason_code"
+                      maxlength="100"
+                      pattern="[a-z][a-z0-9_.-]{0,99}"
+                      value="{{ item.current.reason_code or '' }}"
+                      autocomplete="off"
+                    >
+                  {% endif %}
+
+                  <label for="note-{{ item.master.asset_id }}">
+                    {% if summary.semantic_gate.enabled and item.ai_excluded and principal.role.value == "owner" %}
+                      Owner override reason
+                    {% else %}
+                      Review note
+                    {% endif %}
+                  </label>
+                  <textarea
+                    id="note-{{ item.master.asset_id }}"
+                    name="note"
+                    maxlength="4000"
+                    rows="3"
+                  >{{ item.current.note or '' }}</textarea>
+                </div>
+              </details>
               {% if summary.semantic_gate.enabled and item.ai_excluded and principal.role.value != "owner" %}
                 <p class="muted" id="severe-owner-only-{{ item.master.asset_id }}">
                   Only an owner can override and accept this high-confidence severe result.
+                </p>
+              {% else %}
+                <p class="decision-help">
+                  Accept keeps it, reject excludes it, and hold leaves it for another pass.
                 </p>
               {% endif %}
             </form>

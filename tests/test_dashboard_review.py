@@ -580,6 +580,83 @@ def test_owner_selects_and_removes_specific_x_image_from_review_dashboard(
     assert asyncio.run(_x_selected_assets(context, task_id=task_id)) == ()
 
 
+def test_review_dashboard_exposes_progressive_bulk_controls(tmp_path: Path) -> None:
+    context = asyncio.run(_seed_review_api(_settings(tmp_path / "browser-bulk-ui.db")))
+    task_id = asyncio.run(_create_task(context))
+    app = create_app(context.settings)
+    detail_action = f"/dashboard/review-tasks/{task_id}"
+    bulk_action = f"{detail_action}/bulk-actions"
+
+    with TestClient(
+        app,
+        base_url=ORIGIN,
+        client=("192.0.2.96", 50000),
+    ) as client:
+        app.state.object_store = SameOriginReviewStore()
+        _login(client, context.settings, context.users[AdminRole.OWNER])
+        page = client.get(detail_action)
+
+    assert page.status_code == 200
+    bulk_form = _one_form(page.text, bulk_action)
+    assert _FORM_KEY.fullmatch(bulk_form.fields["idempotency_key"])
+    assert bulk_form.fields["expected_lock_version"] == "1"
+    assert page.text.count('form="bulk-action-form"') == len(context.asset_ids)
+    assert "Accept selected" in page.text
+    assert "Reject / exclude" in page.text
+    assert "Hold selected" in page.text
+    assert "Add to X" in page.text
+    assert "Remove from X" in page.text
+    assert "data-review-asset" in page.text
+    assert 'data-x-selected-count="0"' in page.text
+    assert 'data-x-capacity="4"' in page.text
+    assert "data-bulk-selection-status" in page.text
+
+
+def test_browser_bulk_review_action_applies_repeated_selected_assets(tmp_path: Path) -> None:
+    context = asyncio.run(_seed_review_api(_settings(tmp_path / "browser-bulk-submit.db")))
+    task_id = asyncio.run(_create_task(context))
+    app = create_app(context.settings)
+    detail_action = f"/dashboard/review-tasks/{task_id}"
+    bulk_action = f"{detail_action}/bulk-actions"
+
+    with TestClient(
+        app,
+        base_url=ORIGIN,
+        client=("192.0.2.97", 50000),
+    ) as client:
+        app.state.object_store = SameOriginReviewStore()
+        _login(client, context.settings, context.users[AdminRole.OWNER])
+        page = client.get(detail_action)
+        bulk_form = _one_form(page.text, bulk_action)
+        form_data: dict[str, str | list[str]] = {
+            **bulk_form.fields,
+            "asset_id": [str(asset_id) for asset_id in context.asset_ids],
+            "action": "reject",
+            "reason_code": "manual_reject",
+            "note": "Excluded from the set; immutable raw masters retained.",
+        }
+        rejected = client.post(
+            bulk_action,
+            data=form_data,
+            headers=_FORM_HEADERS,
+            follow_redirects=False,
+        )
+        replay = client.post(
+            bulk_action,
+            data=form_data,
+            headers=_FORM_HEADERS,
+            follow_redirects=False,
+        )
+        summary = client.get(f"/api/v1/review-tasks/{task_id}")
+
+    assert rejected.status_code == 303
+    assert replay.status_code == 303
+    assert rejected.headers["location"] == detail_action
+    assert summary.status_code == 200
+    assert summary.json()["rejected_count"] == len(context.asset_ids)
+    assert summary.json()["lock_version"] == 2
+
+
 def test_browser_review_decisions_lock_replay_actor_and_exact_completion(
     tmp_path: Path,
 ) -> None:
@@ -605,8 +682,8 @@ def test_browser_review_decisions_lock_replay_actor_and_exact_completion(
 
         assert page.status_code == 200
         assert "form-action 'self'" in page.headers["content-security-policy"]
-        assert "script-src 'none'" in page.headers["content-security-policy"]
-        assert "<script" not in page.text.lower()
+        assert "script-src 'self'" in page.headers["content-security-policy"]
+        assert '<script src="/static/dashboard.js" defer></script>' in page.text
         assert "<link" not in page.text.lower()
         image_sources = re.findall(r'<img[^>]+src="([^"]+)"', page.text)
         assert image_sources

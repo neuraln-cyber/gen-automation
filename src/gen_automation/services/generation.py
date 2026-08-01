@@ -26,7 +26,7 @@ from gen_automation.domain.enums import (
     ReleasePhase,
     ResourceHealth,
 )
-from gen_automation.domain.release_spec import ReleaseSpecification
+from gen_automation.domain.release_spec import GenerationParameters, ReleaseSpecification
 from gen_automation.schemas import GenerationPlanRead
 from gen_automation.services.compliance import (
     ReleaseApprovalError,
@@ -59,32 +59,88 @@ class GenerationPlanResult:
     replayed: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _PlannedGenerationJob:
+    ordinal: int
+    batch_index: int
+    batch_name: str
+    batch_image_offset: int
+    batch_image_count: int
+    generation: GenerationParameters
+    expected_output_count: int
+    output_seeds: tuple[int, ...]
+    include_batch_metadata: bool
+
+
+def _planned_generation_jobs(
+    specification: ReleaseSpecification,
+) -> tuple[_PlannedGenerationJob, ...]:
+    if not specification.generation_batches:
+        generation = specification.generation
+        return tuple(
+            _PlannedGenerationJob(
+                ordinal=ordinal,
+                batch_index=0,
+                batch_name="Default batch",
+                batch_image_offset=ordinal * generation.outputs_per_job,
+                batch_image_count=(specification.planned_job_count * generation.outputs_per_job),
+                generation=generation,
+                expected_output_count=generation.outputs_per_job,
+                output_seeds=tuple(
+                    (generation.seed + ordinal + (output_index * specification.planned_job_count))
+                    % (2**63)
+                    for output_index in range(generation.outputs_per_job)
+                ),
+                include_batch_metadata=False,
+            )
+            for ordinal in range(specification.planned_job_count)
+        )
+
+    plans: list[_PlannedGenerationJob] = []
+    ordinal = 0
+    for batch_index, batch in enumerate(specification.generation_batches):
+        outputs_per_job = batch.generation.outputs_per_job
+        for image_offset in range(0, batch.image_count, outputs_per_job):
+            output_count = min(outputs_per_job, batch.image_count - image_offset)
+            plans.append(
+                _PlannedGenerationJob(
+                    ordinal=ordinal,
+                    batch_index=batch_index,
+                    batch_name=batch.name,
+                    batch_image_offset=image_offset,
+                    batch_image_count=batch.image_count,
+                    generation=batch.generation,
+                    expected_output_count=output_count,
+                    output_seeds=tuple(
+                        (batch.generation.seed + image_offset + output_index) % (2**63)
+                        for output_index in range(output_count)
+                    ),
+                    include_batch_metadata=True,
+                )
+            )
+            ordinal += 1
+    return tuple(plans)
+
+
 def _job_parameters(
     *,
     release_version: ReleaseVersion,
     specification: ReleaseSpecification,
     approval_snapshot: ReleaseApprovalSnapshot,
     wildcard_catalog: FrozenWildcardCatalog,
-    ordinal: int,
+    plan: _PlannedGenerationJob,
 ) -> dict[str, object]:
     output_generations: list[dict[str, object]] = []
     output_prompt_resolutions: list[dict[str, object]] = []
-    for output_index in range(specification.generation.outputs_per_job):
-        # Keep output zero compatible with the historical per-job seed while
-        # assigning every output a deterministic, non-overlapping seed.  A
-        # separate seed also makes wildcard selection independent per image.
-        seed = (
-            specification.generation.seed
-            + ordinal
-            + (output_index * specification.planned_job_count)
-        ) % (2**63)
+    for seed in plan.output_seeds:
         resolved_prompts = resolve_wildcard_prompts(
             specification,
             wildcard_catalog,
             seed=seed,
+            generation=plan.generation,
         )
         output_generations.append(
-            specification.generation.model_copy(
+            plan.generation.model_copy(
                 update={
                     "seed": seed,
                     "prompt": resolved_prompts.prompt,
@@ -98,13 +154,13 @@ def _job_parameters(
         output_prompt_resolutions.append(resolved_prompts.evidence)
 
     generation = dict(output_generations[0])
-    generation["outputs_per_job"] = specification.generation.outputs_per_job
-    return {
+    generation["outputs_per_job"] = plan.expected_output_count
+    parameters: dict[str, object] = {
         "schema_version": 2,
         "release_version_id": str(release_version.id),
         "release_specification_sha256": release_version.specification_sha256,
         "approval_snapshot_sha256": approval_snapshot.sha256,
-        "ordinal": ordinal,
+        "ordinal": plan.ordinal,
         "subjects": [
             {
                 "name": subject.name,
@@ -121,6 +177,14 @@ def _job_parameters(
         "output_generations": output_generations,
         "output_prompt_resolutions": output_prompt_resolutions,
     }
+    if plan.include_batch_metadata:
+        parameters["batch"] = {
+            "index": plan.batch_index,
+            "name": plan.batch_name,
+            "image_offset": plan.batch_image_offset,
+            "image_count": plan.batch_image_count,
+        }
+    return parameters
 
 
 async def _record_compliance_checks(
@@ -230,12 +294,13 @@ async def approve_and_expand_generation_plan(
                 "desired accepted count exceeds the Patreon package limit of "
                 f"{MAX_ACCEPTED_IMAGES_PER_RELEASE}"
             )
-        require_generation_deliverability(
-            width=specification.generation.width,
-            height=specification.generation.height,
-            hires_scale=specification.generation.hires_scale,
-            workflow_node_classes=workflow_node_classes,
-        )
+        for batch in specification.ordered_generation_batches:
+            require_generation_deliverability(
+                width=batch.generation.width,
+                height=batch.generation.height,
+                hires_scale=batch.generation.hires_scale,
+                workflow_node_classes=workflow_node_classes,
+            )
     except DeliverabilityError as error:
         raise GenerationPlanConflictError(str(error)) from error
     try:
@@ -264,26 +329,37 @@ async def approve_and_expand_generation_plan(
     )
     jobs_by_key = {job.logical_key: job for job in existing_jobs}
     created_count = 0
-    for ordinal in range(specification.planned_job_count):
-        logical_key = canonical_sha256(
-            {
-                "release_version_id": str(version.id),
-                "ordinal": ordinal,
-            }
+    planned_jobs = _planned_generation_jobs(specification)
+    if len(planned_jobs) != specification.planned_job_count:
+        raise GenerationPlanConflictError(
+            "generation batch expansion conflicts with the frozen release plan"
         )
+    for plan in planned_jobs:
+        logical_identity: dict[str, object] = {
+            "release_version_id": str(version.id),
+            "ordinal": plan.ordinal,
+        }
+        if plan.include_batch_metadata:
+            logical_identity.update(
+                {
+                    "batch_index": plan.batch_index,
+                    "batch_image_offset": plan.batch_image_offset,
+                }
+            )
+        logical_key = canonical_sha256(logical_identity)
         parameters = _job_parameters(
             release_version=version,
             specification=specification,
             approval_snapshot=approval_snapshot,
             wildcard_catalog=wildcard_catalog,
-            ordinal=ordinal,
+            plan=plan,
         )
         parameters_sha256 = canonical_sha256(parameters)
         existing_job = jobs_by_key.get(logical_key)
         if existing_job is not None:
             if (
                 existing_job.parameters_sha256 != parameters_sha256
-                or existing_job.expected_output_count != specification.generation.outputs_per_job
+                or existing_job.expected_output_count != plan.expected_output_count
             ):
                 raise GenerationPlanConflictError(
                     "existing generation job conflicts with the frozen plan"
@@ -298,7 +374,7 @@ async def approve_and_expand_generation_plan(
                 provider="salad",
                 state=GenerationState.QUEUED,
                 priority=100,
-                expected_output_count=specification.generation.outputs_per_job,
+                expected_output_count=plan.expected_output_count,
                 attempt_count=0,
                 max_attempts=3,
                 lock_version=1,

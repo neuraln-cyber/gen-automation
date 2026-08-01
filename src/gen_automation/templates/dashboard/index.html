@@ -1,31 +1,79 @@
 {% extends "dashboard/base.html" %}
 {% block content %}
-  <h1>Ranked releases</h1>
-  <p class="lede">Open a completed ranking to inspect sorted images and download exact raw masters.</p>
+  <section class="page-header" aria-labelledby="page-heading">
+    <div class="page-header-row">
+      <div class="page-header-copy">
+        <p class="page-kicker">Automation library</p>
+        <h1 id="page-heading">Your generation workspace</h1>
+        <p class="lede">
+          Start a set, follow its progress, review the strongest images, and prepare
+          every destination from one place.
+        </p>
+      </div>
+      <a class="primary-action" href="/dashboard/new-set">Create a new automation</a>
+    </div>
+  </section>
+
+  <div class="overview-strip" aria-label="Workspace overview">
+    <div class="overview-item">
+      <span>Releases in workspace</span>
+      <strong>{{ releases | length }}</strong>
+    </div>
+    <div class="overview-item">
+      <span>Workflow</span>
+      <strong>Generate &rarr; rank &rarr; review</strong>
+    </div>
+    <div class="overview-item">
+      <span>Delivery</span>
+      <strong>Patreon, MEGA &amp; X</strong>
+    </div>
+  </div>
+
+  <div class="section-heading">
+    <div>
+      <h2>Ranked releases</h2>
+      <p class="muted">Open a completed ranking to review or download exact raw masters.</p>
+    </div>
+  </div>
 
   {% if releases %}
-    <ul class="release-list">
+    <ul class="release-list" data-release-list>
       {% for release in releases %}
-        <li class="release-card">
-          <p class="muted">{{ release.project_name }} · version {{ release.current_version_no }}</p>
+        <li class="release-card" data-release-id="{{ release.id }}">
+          <p class="release-meta">
+            {{ release.project_name }} &middot; version {{ release.current_version_no }}
+          </p>
           <h2>{{ release.title }}</h2>
-          <p>{{ release.phase.replace("_", " ") }} · {{ release.health }}</p>
-          {% if release.ranking_is_complete %}
-            <span class="status ready">{{ release.ranked_asset_count }} ranked masters</span><br>
-            <a href="/dashboard/releases/{{ release.id }}">Open ranking</a>
-          {% elif release.completed_scoring_run_id %}
-            <span class="status">Ranking needs attention</span><br>
-            <a href="/dashboard/releases/{{ release.id }}">View status</a>
-          {% else %}
-            <span class="status">Ranking not ready</span>
-          {% endif %}
+          <p class="muted">
+            {{ release.phase.replace("_", " ") }} &middot; {{ release.health }}
+          </p>
+          <div class="release-card-footer">
+            {% if release.ranking_is_complete %}
+              <span class="status ready">{{ release.ranked_asset_count }} ranked masters</span>
+              <a class="release-card-link" href="/dashboard/releases/{{ release.id }}">
+                Review &rarr;
+              </a>
+            {% elif release.completed_scoring_run_id %}
+              <span class="status unknown">Ranking needs attention</span>
+              <a class="release-card-link" href="/dashboard/releases/{{ release.id }}">
+                View status &rarr;
+              </a>
+            {% else %}
+              <span class="status pending">Ranking not ready</span>
+            {% endif %}
+          </div>
         </li>
       {% endfor %}
     </ul>
   {% else %}
-    <section class="panel">
-      <h2>No releases yet</h2>
-      <p class="muted">Releases will appear here after they are created.</p>
+    <section class="panel panel-accent">
+      <span class="workflow-label">Ready when you are</span>
+      <h2>Create your first automated set</h2>
+      <p class="muted">
+        Configure the prompt and output count once. The pipeline will generate, rank,
+        and organize the results for review.
+      </p>
+      <a class="primary-action" href="/dashboard/new-set">Build a set</a>
     </section>
   {% endif %}
 {% endblock %}

@@ -334,6 +334,7 @@ def _default_values(options: NewSetOptions) -> dict[str, str]:
         "negative_prompt": "",
         "detailer_prompt": "sexy, expressive, ",
         "detailer_negative_prompt": "closed eyes, ",
+        "batch_plan": "",
         "seed": str(secrets.randbelow(2**63)),
         "width": "1144",
         "height": "1480",
@@ -342,7 +343,7 @@ def _default_values(options: NewSetOptions) -> dict[str, str]:
         "sampler": "euler_ancestral",
         "scheduler": "karras",
         "clip_skip": "2",
-        "outputs_per_job": "1",
+        "outputs_per_job": "4",
         "hires_scale": "1.5",
         "hires_denoise": "0.35",
         "hires_upscale_method": "bislerp",
@@ -353,7 +354,7 @@ def _default_values(options: NewSetOptions) -> dict[str, str]:
         "detailer_bbox_dilation": "4",
         "detailer_bbox_crop_factor": "3.0",
         "detailer_feather": "4",
-        "planned_job_count": "4",
+        "planned_job_count": "1",
         "desired_accepted_count": "4",
     }
     for slot in range(1, 9):

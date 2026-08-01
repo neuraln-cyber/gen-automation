@@ -30,6 +30,7 @@ from gen_automation.domain.enums import (
 )
 from gen_automation.domain.release_spec import (
     ArtifactSpecification,
+    GenerationBatchSpecification,
     GenerationParameters,
     LoraSpecification,
     ProjectCreate,
@@ -60,6 +61,32 @@ class NewSetLoraSelection(BaseModel):
     weight: float = Field(ge=-2.0, le=2.0)
 
 
+class NewSetBatchSubmission(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str = Field(min_length=1, max_length=100)
+    image_count: int = Field(ge=1, le=80_000)
+    prompt: str = Field(min_length=1, max_length=20_000)
+    negative_prompt: str | None = Field(default=None, max_length=20_000)
+    detailer_prompt: str | None = Field(default=None, max_length=20_000)
+    detailer_negative_prompt: str | None = Field(default=None, max_length=20_000)
+    seed: int | None = Field(default=None, ge=0, le=(2**63) - 1)
+
+    @field_validator("name")
+    @classmethod
+    def require_trimmed_name(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("batch name must be trimmed")
+        return value
+
+    @field_validator("prompt")
+    @classmethod
+    def require_visible_prompt(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("batch prompt must not be blank")
+        return value
+
+
 class NewSetSubmission(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -69,10 +96,11 @@ class NewSetSubmission(BaseModel):
     checkpoint_approval_id: UUID
     loras: tuple[NewSetLoraSelection, ...] = Field(default=(), max_length=8)
     workflow_approval_id: UUID
-    prompt: str = Field(min_length=1, max_length=20_000)
+    prompt: str = Field(default="", max_length=20_000)
     negative_prompt: str = Field(default="", max_length=20_000)
     detailer_prompt: str = Field(default="", max_length=20_000)
     detailer_negative_prompt: str = Field(default="", max_length=20_000)
+    batches: tuple[NewSetBatchSubmission, ...] = Field(default=(), max_length=50)
     seed: int = Field(ge=0, le=(2**63) - 1)
     width: int = Field(ge=512, le=4096, multiple_of=8)
     height: int = Field(ge=512, le=4096, multiple_of=8)
@@ -108,24 +136,37 @@ class NewSetSubmission(BaseModel):
             raise ValueError("value must be trimmed")
         return value
 
-    @field_validator("prompt")
-    @classmethod
-    def require_visible_prompt(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("prompt must not be blank")
-        return value
-
     @model_validator(mode="after")
     def validate_plan(self) -> "NewSetSubmission":
         lora_ids = [selection.approval_id for selection in self.loras]
         if len(lora_ids) != len(set(lora_ids)):
             raise ValueError("a LoRA can be selected only once")
-        planned_outputs = self.planned_job_count * self.outputs_per_job
+        batch_names = [batch.name.casefold() for batch in self.batches]
+        if len(batch_names) != len(set(batch_names)):
+            raise ValueError("batch names must be unique")
+        if not self.batches and not self.prompt.strip():
+            raise ValueError("prompt must not be blank")
+        if self.effective_planned_job_count > 10_000:
+            raise ValueError("generation plan supports at most 10000 provider jobs")
+        planned_outputs = (
+            sum(batch.image_count for batch in self.batches)
+            if self.batches
+            else self.planned_job_count * self.outputs_per_job
+        )
         if self.desired_accepted_count > planned_outputs:
             raise ValueError("desired accepted count exceeds the planned output count")
         if self.detailer_max_size < self.detailer_guide_size:
             raise ValueError("detailer maximum size must cover its guide size")
         return self
+
+    @property
+    def effective_planned_job_count(self) -> int:
+        if not self.batches:
+            return self.planned_job_count
+        return sum(
+            (batch.image_count + self.outputs_per_job - 1) // self.outputs_per_job
+            for batch in self.batches
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,7 +370,73 @@ async def create_and_approve_new_set(
     except DeliverabilityError as error:
         raise NewSetInputError(str(error)) from error
 
+    base_generation = GenerationParameters(
+        prompt=(command.prompt if command.prompt.strip() else command.batches[0].prompt),
+        negative_prompt=command.negative_prompt,
+        detailer_prompt=command.detailer_prompt,
+        detailer_negative_prompt=command.detailer_negative_prompt,
+        seed=command.seed,
+        width=command.width,
+        height=command.height,
+        steps=command.steps,
+        cfg=command.cfg,
+        sampler=command.sampler,
+        scheduler=command.scheduler,
+        clip_skip=command.clip_skip,
+        outputs_per_job=command.outputs_per_job,
+        hires_scale=command.hires_scale,
+        hires_denoise=command.hires_denoise,
+        hires_upscale_method=command.hires_upscale_method,
+        detailer_guide_size=command.detailer_guide_size,
+        detailer_max_size=command.detailer_max_size,
+        detailer_denoise=command.detailer_denoise,
+        detailer_bbox_threshold=command.detailer_bbox_threshold,
+        detailer_bbox_dilation=command.detailer_bbox_dilation,
+        detailer_bbox_crop_factor=command.detailer_bbox_crop_factor,
+        detailer_feather=command.detailer_feather,
+    )
+    generation_batches: list[GenerationBatchSpecification] = []
+    implicit_seed_offset = 0
+    for batch in command.batches:
+        batch_seed = (
+            batch.seed
+            if batch.seed is not None
+            else (command.seed + implicit_seed_offset) % (2**63)
+        )
+        generation_batches.append(
+            GenerationBatchSpecification(
+                name=batch.name,
+                image_count=batch.image_count,
+                generation=base_generation.model_copy(
+                    update={
+                        "prompt": batch.prompt,
+                        "negative_prompt": (
+                            command.negative_prompt
+                            if batch.negative_prompt is None
+                            else batch.negative_prompt
+                        ),
+                        "detailer_prompt": (
+                            command.detailer_prompt
+                            if batch.detailer_prompt is None
+                            else batch.detailer_prompt
+                        ),
+                        "detailer_negative_prompt": (
+                            command.detailer_negative_prompt
+                            if batch.detailer_negative_prompt is None
+                            else batch.detailer_negative_prompt
+                        ),
+                        "seed": batch_seed,
+                    }
+                ),
+            )
+        )
+        implicit_seed_offset += batch.image_count
+    selected_generation = (
+        generation_batches[0].generation if generation_batches else base_generation
+    )
+
     specification = ReleaseSpecification(
+        schema_version=2 if generation_batches else 1,
         subjects=[
             SubjectSpecification(
                 name=subject.display_name,
@@ -371,32 +478,9 @@ async def create_and_approve_new_set(
             object_key=workflow.object_key,
             sha256=workflow.workflow_sha256,
         ),
-        generation=GenerationParameters(
-            prompt=command.prompt,
-            negative_prompt=command.negative_prompt,
-            detailer_prompt=command.detailer_prompt,
-            detailer_negative_prompt=command.detailer_negative_prompt,
-            seed=command.seed,
-            width=command.width,
-            height=command.height,
-            steps=command.steps,
-            cfg=command.cfg,
-            sampler=command.sampler,
-            scheduler=command.scheduler,
-            clip_skip=command.clip_skip,
-            outputs_per_job=command.outputs_per_job,
-            hires_scale=command.hires_scale,
-            hires_denoise=command.hires_denoise,
-            hires_upscale_method=command.hires_upscale_method,
-            detailer_guide_size=command.detailer_guide_size,
-            detailer_max_size=command.detailer_max_size,
-            detailer_denoise=command.detailer_denoise,
-            detailer_bbox_threshold=command.detailer_bbox_threshold,
-            detailer_bbox_dilation=command.detailer_bbox_dilation,
-            detailer_bbox_crop_factor=command.detailer_bbox_crop_factor,
-            detailer_feather=command.detailer_feather,
-        ),
-        planned_job_count=command.planned_job_count,
+        generation=selected_generation,
+        planned_job_count=command.effective_planned_job_count,
+        generation_batches=generation_batches,
     )
     project = await _default_project(
         session,

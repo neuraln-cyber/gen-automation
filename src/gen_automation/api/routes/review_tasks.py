@@ -11,14 +11,21 @@ from gen_automation.api.security import (
     Session,
 )
 from gen_automation.config import Settings
-from gen_automation.domain.enums import ReviewDecisionValue, ReviewTaskState
+from gen_automation.domain.enums import (
+    AdminRole,
+    ReviewBulkAction,
+    ReviewDecisionValue,
+    ReviewTaskState,
+)
 from gen_automation.services.review import (
+    ReviewBulkActionResult,
     ReviewConflictError,
     ReviewInputError,
     ReviewNotFoundError,
     ReviewSemanticGate,
     ReviewSummary,
     append_review_decision,
+    apply_bulk_review_action,
     create_review_task,
     get_review_summary,
     transition_review_task,
@@ -53,6 +60,14 @@ class AppendReviewDecisionRequest(_StrictRequest):
     note: str | None = Field(default=None, max_length=4_000)
 
 
+class BulkReviewActionRequest(_StrictRequest):
+    asset_ids: tuple[UUID, ...] = Field(min_length=1, max_length=500)
+    action: ReviewBulkAction
+    expected_lock_version: int = Field(gt=0, le=2_147_483_647)
+    reason_code: str | None = Field(default=None, max_length=100)
+    note: str | None = Field(default=None, max_length=4_000)
+
+
 class ReviewTransitionRequest(_StrictRequest):
     expected_lock_version: int = Field(gt=0, le=2_147_483_647)
 
@@ -82,6 +97,16 @@ class ReviewDecisionResponse(_AttributeResponse):
     note: str | None
     decided_by_user_id: UUID
     supersedes_decision_id: UUID | None
+    task_lock_version: int
+    replayed: bool
+
+
+class ReviewBulkActionResponse(_AttributeResponse):
+    task_id: UUID
+    action: ReviewBulkAction
+    asset_ids: tuple[UUID, ...]
+    changed_count: int
+    x_selected_count: int
     task_lock_version: int
     replayed: bool
 
@@ -213,6 +238,44 @@ async def post_review_decision(
         raise _http_error(error) from error
     _set_replay_response(response, replayed=result.replayed, created=True)
     return ReviewDecisionResponse.model_validate(result)
+
+
+@router.post(
+    "/{review_task_id}/bulk-actions",
+    response_model=ReviewBulkActionResponse,
+)
+async def post_bulk_review_action(
+    review_task_id: UUID,
+    command: BulkReviewActionRequest,
+    request: Request,
+    session: Session,
+    idempotency_key: IdempotencyKey,
+    response: Response,
+    principal: ReviewPrincipal,
+) -> ReviewBulkActionResponse:
+    if command.action in {ReviewBulkAction.X_ADD, ReviewBulkAction.X_REMOVE} and (
+        principal.role != AdminRole.OWNER
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="permission denied")
+    semantic_profile, semantic_threshold = _semantic_gate_configuration(request)
+    try:
+        result: ReviewBulkActionResult = await apply_bulk_review_action(
+            session,
+            review_task_id=review_task_id,
+            asset_ids=command.asset_ids,
+            action=command.action,
+            changed_by_user_id=principal.user_id,
+            expected_lock_version=command.expected_lock_version,
+            idempotency_key=idempotency_key,
+            reason_code=command.reason_code,
+            note=command.note,
+            semantic_profile_sha256=semantic_profile,
+            semantic_severe_confidence_micros=semantic_threshold,
+        )
+    except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
+        raise _http_error(error) from error
+    _set_replay_response(response, replayed=result.replayed, created=False)
+    return ReviewBulkActionResponse.model_validate(result)
 
 
 @router.post(

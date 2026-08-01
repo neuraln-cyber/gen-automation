@@ -118,6 +118,25 @@ class GenerationParameters(StrictModel):
         return self
 
 
+class GenerationBatchSpecification(StrictModel):
+    """One ordered prompt segment within a release generation plan."""
+
+    name: str = Field(min_length=1, max_length=100)
+    image_count: int = Field(ge=1, le=80_000)
+    generation: GenerationParameters
+
+    @model_validator(mode="after")
+    def require_trimmed_name(self) -> "GenerationBatchSpecification":
+        if self.name != self.name.strip():
+            raise ValueError("generation batch name must be trimmed")
+        return self
+
+    @property
+    def planned_job_count(self) -> int:
+        outputs_per_job = self.generation.outputs_per_job
+        return (self.image_count + outputs_per_job - 1) // outputs_per_job
+
+
 class WildcardVersionReference(StrictModel):
     """An immutable wildcard-library version frozen into a release."""
 
@@ -130,24 +149,58 @@ class WildcardVersionReference(StrictModel):
 
 
 class ReleaseSpecification(StrictModel):
-    schema_version: int = Field(default=1, ge=1, le=1)
+    schema_version: int = Field(default=1, ge=1, le=2)
     subjects: list[SubjectSpecification] = Field(min_length=1, max_length=20)
     checkpoint: ArtifactSpecification
     loras: list[LoraSpecification] = Field(default_factory=list, max_length=8)
     workflow: WorkflowSpecification
     generation: GenerationParameters
     planned_job_count: int = Field(ge=1, le=10000)
+    generation_batches: list[GenerationBatchSpecification] = Field(
+        default_factory=list,
+        max_length=50,
+        exclude_if=lambda value: not value,
+    )
     wildcard_versions: list[WildcardVersionReference] = Field(
         default_factory=list,
         max_length=64,
     )
 
     @model_validator(mode="after")
-    def require_unique_wildcard_names(self) -> "ReleaseSpecification":
+    def validate_release_plan(self) -> "ReleaseSpecification":
         names = [reference.name for reference in self.wildcard_versions]
         if len(names) != len(set(names)):
             raise ValueError("wildcard version names must be unique")
+        if self.schema_version == 1:
+            if self.generation_batches:
+                raise ValueError(
+                    "generation batches require release specification schema version 2"
+                )
+            return self
+        if not self.generation_batches:
+            raise ValueError("release specification schema version 2 requires generation batches")
+
+        batch_names = [batch.name.casefold() for batch in self.generation_batches]
+        if len(batch_names) != len(set(batch_names)):
+            raise ValueError("generation batch names must be unique")
+        if self.generation != self.generation_batches[0].generation:
+            raise ValueError("top-level generation must match the first generation batch")
+        planned_jobs = sum(batch.planned_job_count for batch in self.generation_batches)
+        if planned_jobs != self.planned_job_count:
+            raise ValueError("planned job count must match the generation batch plan")
         return self
+
+    @property
+    def ordered_generation_batches(self) -> tuple[GenerationBatchSpecification, ...]:
+        if self.generation_batches:
+            return tuple(self.generation_batches)
+        return (
+            GenerationBatchSpecification(
+                name="Default batch",
+                image_count=self.planned_job_count * self.generation.outputs_per_job,
+                generation=self.generation,
+            ),
+        )
 
 
 class ProjectCreate(StrictModel):

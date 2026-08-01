@@ -18,6 +18,14 @@ def _hidden_value(page: str, name: str) -> str:
     return match.group(1)
 
 
+def test_dashboard_javascript_is_packaged_and_served(client: TestClient) -> None:
+    response = client.get("/static/dashboard.js")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/javascript")
+    assert "initializeAutomationBuilder" in response.text
+
+
 def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) -> None:
     payload = deepcopy(valid_release_payload())
     specification = payload["specification"]
@@ -77,8 +85,11 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert 'name="detailer_bbox_threshold" value="0.3"' in page.text
     assert 'name="detailer_bbox_dilation" value="4"' in page.text
     assert 'name="detailer_feather" value="4"' in page.text
-    assert 'name="outputs_per_job" value="1"' in page.text
-    assert 'name="planned_job_count" value="4"' in page.text
+    assert 'name="outputs_per_job" value="4"' in page.text
+    assert 'name="planned_job_count" value="1"' in page.text
+    assert 'name="batch_plan"' in page.text
+    assert 'id="batch-row-template"' in page.text
+    assert 'class="mobile-queue-dock"' in page.text
     assert 'name="desired_accepted_count" value="4"' in page.text
     form = {
         "csrf_token": _hidden_value(page.text, "csrf_token"),

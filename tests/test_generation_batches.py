@@ -1,0 +1,350 @@
+import json
+import re
+from collections.abc import AsyncIterator
+from copy import deepcopy
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
+from sqlalchemy import select
+
+from gen_automation.db.models import GenerationJob, ReleaseVersion
+from gen_automation.db.session import Database
+from gen_automation.domain.release_spec import ProjectCreate, ReleaseCreate, ReleaseSpecification
+from gen_automation.domain.wildcards import WildcardCreate
+from gen_automation.services.generation import approve_and_expand_generation_plan
+from gen_automation.services.new_sets import (
+    NewSetBatchSubmission,
+    NewSetSubmission,
+    create_and_approve_new_set,
+    list_new_set_options,
+)
+from gen_automation.services.releases import create_project, create_release
+from gen_automation.services.wildcards import create_wildcard_library
+from tests.factories import seed_release_approvals, valid_release_payload
+
+
+def test_batch_submission_preserves_a_64_bit_seed_from_json_text() -> None:
+    seed = (2**63) - 1
+
+    batch = NewSetBatchSubmission.model_validate(
+        {
+            "name": "Exact seed",
+            "image_count": 4,
+            "prompt": "masterpiece, __sfw__",
+            "seed": str(seed),
+        }
+    )
+
+    assert batch.seed == seed
+
+
+@pytest.fixture
+async def batch_database(tmp_path: Path) -> AsyncIterator[Database]:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'generation-batches.db').as_posix()}")
+    await database.create_schema()
+    try:
+        yield database
+    finally:
+        await database.dispose()
+
+
+def _batch_release_payload() -> dict[str, object]:
+    payload = deepcopy(valid_release_payload())
+    payload["desired_accepted_count"] = 8
+    specification = payload["specification"]
+    assert isinstance(specification, dict)
+    first_generation = specification["generation"]
+    assert isinstance(first_generation, dict)
+    first_generation.update(
+        {
+            "prompt": "first prompt structure, __first-poses__",
+            "seed": 100,
+            "outputs_per_job": 4,
+        }
+    )
+    second_generation = deepcopy(first_generation)
+    second_generation.update({"prompt": "second prompt structure, __second-poses__", "seed": 200})
+    specification.update(
+        {
+            "schema_version": 2,
+            "planned_job_count": 3,
+            "generation_batches": [
+                {
+                    "name": "First five",
+                    "image_count": 5,
+                    "generation": deepcopy(first_generation),
+                },
+                {
+                    "name": "Next three",
+                    "image_count": 3,
+                    "generation": second_generation,
+                },
+            ],
+        }
+    )
+    return payload
+
+
+def test_batch_specification_requires_an_exact_provider_job_count() -> None:
+    payload = _batch_release_payload()
+    specification = payload["specification"]
+    assert isinstance(specification, dict)
+    parsed = ReleaseSpecification.model_validate(specification)
+
+    assert parsed.planned_job_count == 3
+    assert [batch.image_count for batch in parsed.generation_batches] == [5, 3]
+
+    specification["planned_job_count"] = 2
+    with pytest.raises(ValidationError, match="planned job count"):
+        ReleaseSpecification.model_validate(specification)
+
+
+def test_legacy_specification_serialization_does_not_add_an_empty_batch_field() -> None:
+    specification = ReleaseSpecification.model_validate(valid_release_payload()["specification"])
+
+    assert "generation_batches" not in specification.model_dump(mode="json")
+
+
+def test_new_set_batch_submission_derives_job_count_and_allows_overproduction() -> None:
+    common = {
+        "slug": "overnight-chain",
+        "title": "Overnight chain",
+        "subject_approval_id": "10000000-0000-4000-8000-000000000001",
+        "checkpoint_approval_id": "20000000-0000-4000-8000-000000000002",
+        "workflow_approval_id": "30000000-0000-4000-8000-000000000003",
+        "prompt": "",
+        "negative_prompt": "low quality",
+        "seed": 1234,
+        "width": 1024,
+        "height": 1024,
+        "steps": 30,
+        "sampler": "euler_ancestral",
+        "scheduler": "karras",
+        "outputs_per_job": 4,
+        "planned_job_count": 1,
+        "desired_accepted_count": 100,
+    }
+    command = NewSetSubmission.model_validate(
+        {
+            **common,
+            "batches": [
+                {"name": "NSFW", "image_count": 20, "prompt": "__nsfw__"},
+                {"name": "NNSFW", "image_count": 100, "prompt": "__nnsfw__"},
+            ],
+        }
+    )
+
+    assert command.effective_planned_job_count == 30
+    assert sum(batch.image_count for batch in command.batches) == 120
+
+
+async def test_generation_batches_split_exact_counts_and_keep_ordered_prompt_metadata(
+    batch_database: Database,
+) -> None:
+    payload = _batch_release_payload()
+    async with batch_database.sessions() as session:
+        await create_wildcard_library(
+            session,
+            command=WildcardCreate(name="first-poses", entries=["standing", "seated"]),
+            actor="fixture-owner",
+        )
+        await create_wildcard_library(
+            session,
+            command=WildcardCreate(name="second-poses", entries=["indoors", "outdoors"]),
+            actor="fixture-owner",
+        )
+        project = await create_project(session, ProjectCreate(slug="main", name="Main"))
+        result = await create_release(
+            session,
+            project_id=project.id,
+            command=ReleaseCreate.model_validate(payload),
+            idempotency_key="create-batch-release",
+        )
+        await seed_release_approvals(session, payload)
+
+    async with batch_database.sessions() as session:
+        plan = await approve_and_expand_generation_plan(
+            session,
+            release_id=result.response.id,
+            idempotency_key="approve-batch-release",
+        )
+        jobs = list(
+            (
+                await session.scalars(
+                    select(GenerationJob).where(
+                        GenerationJob.release_version_id == plan.response.release_version_id
+                    )
+                )
+            ).all()
+        )
+
+    jobs.sort(key=lambda job: int(job.parameters["ordinal"]))
+    assert plan.response.total_jobs == 3
+    assert [job.expected_output_count for job in jobs] == [4, 1, 3]
+    assert [job.parameters["batch"]["name"] for job in jobs] == [
+        "First five",
+        "First five",
+        "Next three",
+    ]
+    assert [job.parameters["batch"]["image_offset"] for job in jobs] == [0, 4, 0]
+    assert all(
+        job.parameters["generation"]["prompt"].startswith("first prompt structure, ")
+        for job in jobs[:2]
+    )
+    assert jobs[2].parameters["generation"]["prompt"].startswith("second prompt structure, ")
+    assert all("__" not in job.parameters["generation"]["prompt"] for job in jobs)
+    assert [output["seed"] for job in jobs for output in job.parameters["output_generations"]] == [
+        100,
+        101,
+        102,
+        103,
+        104,
+        200,
+        201,
+        202,
+    ]
+
+
+async def test_new_set_service_freezes_a_batch_queue_with_inherited_prompt_settings(
+    batch_database: Database,
+) -> None:
+    payload = valid_release_payload()
+    async with batch_database.sessions() as session:
+        await seed_release_approvals(session, payload)
+        options = await list_new_set_options(session)
+        command = NewSetSubmission(
+            slug="queued-set",
+            title="Queued set",
+            subject_approval_id=options.subjects[0].approval_id,
+            checkpoint_approval_id=options.checkpoints[0].approval_id,
+            workflow_approval_id=options.workflows[0].approval_id,
+            prompt="",
+            negative_prompt="shared negative",
+            detailer_prompt="shared detailer",
+            detailer_negative_prompt="shared detailer negative",
+            batches=(
+                {
+                    "name": "Five images",
+                    "image_count": 5,
+                    "prompt": "first queue prompt",
+                },
+                {
+                    "name": "Three images",
+                    "image_count": 3,
+                    "prompt": "second queue prompt",
+                    "negative_prompt": "",
+                },
+            ),
+            seed=100,
+            width=1024,
+            height=1024,
+            cfg=6,
+            steps=30,
+            sampler="euler_ancestral",
+            scheduler="karras",
+            outputs_per_job=4,
+            planned_job_count=1,
+            desired_accepted_count=8,
+        )
+        result = await create_and_approve_new_set(
+            session,
+            command=command,
+            idempotency_key="new-set-batch-queue",
+            actor="fixture-owner",
+        )
+
+    async with batch_database.sessions() as session:
+        version = await session.scalar(
+            select(ReleaseVersion).where(ReleaseVersion.release_id == result.release.id)
+        )
+        assert version is not None
+        jobs = list(
+            (
+                await session.scalars(
+                    select(GenerationJob).where(GenerationJob.release_version_id == version.id)
+                )
+            ).all()
+        )
+
+    frozen_batches = version.specification["generation_batches"]
+    assert version.specification["schema_version"] == 2
+    assert version.specification["planned_job_count"] == 3
+    assert frozen_batches[0]["generation"]["negative_prompt"] == "shared negative"
+    assert frozen_batches[1]["generation"]["negative_prompt"] == ""
+    assert frozen_batches[0]["generation"]["seed"] == 100
+    assert frozen_batches[1]["generation"]["seed"] == 105
+    assert sorted(job.expected_output_count for job in jobs) == [1, 3, 4]
+
+
+def test_browser_new_set_accepts_the_optional_batch_plan_json_field(
+    client: TestClient,
+) -> None:
+    database = client.app.state.database
+    assert client.portal is not None
+
+    async def seed_and_options() -> object:
+        async with database.sessions() as session:
+            await seed_release_approvals(session, valid_release_payload())
+            return await list_new_set_options(session)
+
+    options = client.portal.call(seed_and_options)
+    page = client.get("/dashboard/new-set")
+
+    def hidden(name: str) -> str:
+        match = re.search(
+            rf'<input type="hidden" name="{name}" value="([^"]+)">',
+            page.text,
+        )
+        assert match is not None
+        return match.group(1)
+
+    form = {
+        "csrf_token": hidden("csrf_token"),
+        "submission_id": hidden("submission_id"),
+        "idempotency_key": hidden("idempotency_key"),
+        "slug": "browser-batch-queue",
+        "title": "Browser batch queue",
+        "subject_id": str(options.subjects[0].approval_id),
+        "checkpoint_id": str(options.checkpoints[0].approval_id),
+        "workflow_id": str(options.workflows[0].approval_id),
+        "prompt": "",
+        "negative_prompt": "shared negative",
+        "detailer_prompt": "shared detailer",
+        "detailer_negative_prompt": "shared detailer negative",
+        "seed": "100",
+        "width": "1024",
+        "height": "1024",
+        "cfg": "6",
+        "steps": "30",
+        "sampler": "euler_ancestral",
+        "scheduler": "karras",
+        "clip_skip": "2",
+        "outputs_per_job": "4",
+        "hires_scale": "1.5",
+        "hires_denoise": "0.35",
+        "hires_upscale_method": "bislerp",
+        "detailer_guide_size": "768",
+        "detailer_max_size": "1024",
+        "detailer_denoise": "0.4",
+        "detailer_bbox_threshold": "0.3",
+        "detailer_bbox_dilation": "4",
+        "detailer_bbox_crop_factor": "3",
+        "detailer_feather": "4",
+        "planned_job_count": "1",
+        "desired_accepted_count": "8",
+        "batch_plan": json.dumps(
+            [
+                {"name": "Five images", "image_count": 5, "prompt": "first"},
+                {"name": "Three images", "image_count": 3, "prompt": "second"},
+            ]
+        ),
+    }
+    for slot in range(1, 9):
+        form[f"lora_{slot}_id"] = ""
+        form[f"lora_{slot}_weight"] = ""
+
+    response = client.post("/dashboard/new-set", data=form, follow_redirects=False)
+
+    assert response.status_code == 303

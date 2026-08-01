@@ -700,6 +700,105 @@ def test_review_mutations_require_origin_csrf_and_replay_idempotently(
     assert completed_replay.headers["idempotency-replayed"] == "true"
 
 
+def test_bulk_review_action_api_supports_decisions_and_owner_x_selection(
+    tmp_path: Path,
+) -> None:
+    context = asyncio.run(_seed_review_api(_settings(tmp_path / "bulk-actions.db")))
+    app = create_app(context.settings)
+    with TestClient(
+        app,
+        base_url=ORIGIN,
+        client=("192.0.2.96", 50000),
+    ) as client:
+        reviewer_csrf = _login(
+            client,
+            context.settings,
+            context.users[AdminRole.REVIEWER],
+        )
+        created = client.post(
+            "/api/v1/review-tasks",
+            json={"scoring_run_id": str(context.scoring_run_id)},
+            headers=_mutation_headers(reviewer_csrf, "bulk-create-task"),
+        )
+        task_id = created.json()["task_id"]
+        action_url = f"/api/v1/review-tasks/{task_id}/bulk-actions"
+        command = {
+            "asset_ids": [str(asset_id) for asset_id in context.asset_ids],
+            "action": "hold",
+            "expected_lock_version": 1,
+            "reason_code": "needs_detail_check",
+            "note": "Review both images again.",
+        }
+        held = client.post(
+            action_url,
+            json=command,
+            headers=_mutation_headers(reviewer_csrf, "bulk-hold-api"),
+        )
+        held_replay = client.post(
+            action_url,
+            json=command,
+            headers=_mutation_headers(reviewer_csrf, "bulk-hold-api"),
+        )
+        reviewer_x = client.post(
+            action_url,
+            json={
+                "asset_ids": [str(context.asset_ids[0])],
+                "action": "x_add",
+                "expected_lock_version": 2,
+            },
+            headers=_mutation_headers(reviewer_csrf, "reviewer-x-add"),
+        )
+        stale = client.post(
+            action_url,
+            json={
+                "asset_ids": [str(context.asset_ids[0])],
+                "action": "reject",
+                "expected_lock_version": 1,
+            },
+            headers=_mutation_headers(reviewer_csrf, "stale-bulk-api"),
+        )
+
+        owner_csrf = _login(client, context.settings, context.users[AdminRole.OWNER])
+        selected = client.post(
+            action_url,
+            json={
+                "asset_ids": [str(asset_id) for asset_id in context.asset_ids],
+                "action": "x_add",
+                "expected_lock_version": 2,
+            },
+            headers=_mutation_headers(owner_csrf, "owner-x-add"),
+        )
+
+    assert held.status_code == 200
+    assert held.headers["idempotency-replayed"] == "false"
+    held_body = held.json()
+    assert held_body == {
+        "task_id": task_id,
+        "action": "hold",
+        "asset_ids": sorted(str(asset_id) for asset_id in context.asset_ids),
+        "changed_count": 2,
+        "x_selected_count": 0,
+        "task_lock_version": 2,
+        "replayed": False,
+    }
+    assert held_replay.status_code == 200
+    assert held_replay.headers["idempotency-replayed"] == "true"
+    assert held_replay.json() == {**held_body, "replayed": True}
+    assert reviewer_x.status_code == 403
+    assert reviewer_x.json() == {"detail": "permission denied"}
+    assert stale.status_code == 409
+    assert selected.status_code == 200
+    assert selected.json() == {
+        "task_id": task_id,
+        "action": "x_add",
+        "asset_ids": sorted(str(asset_id) for asset_id in context.asset_ids),
+        "changed_count": 2,
+        "x_selected_count": 2,
+        "task_lock_version": 3,
+        "replayed": False,
+    }
+
+
 def test_review_cancel_and_typed_not_found_errors(
     tmp_path: Path,
 ) -> None:
