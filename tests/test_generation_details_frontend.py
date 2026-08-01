@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -76,3 +77,32 @@ def test_generation_form_explains_and_hides_inactive_hires_controls() -> None:
     assert "option.dataset.upscalerEnabled === desired" in script
     assert 'workflow.dispatchEvent(new Event("change", { bubbles: true }))' in script
     assert "no upscale node or second sampler pass" in script
+
+
+def test_generation_form_offers_an_unnamed_attached_a1111_sample_preset() -> None:
+    template = (
+        ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "new_set.html"
+    ).read_text(encoding="utf-8")
+    script = (ROOT / "src" / "gen_automation" / "static" / "dashboard.js").read_text(
+        encoding="utf-8"
+    )
+
+    control = re.search(r"<button\b[^>]*data-detailer-preset-control[^>]*>", template)
+    assert control is not None
+    assert "name=" not in control.group(0)
+    assert "Apply attached A1111 sample preset" in template
+    assert "Matches the attached A1111 sample metadata" in template
+    assert "crop factor approximates ADetailer padding semantics" in template
+    assert "does not apply full-image upscaling" in template
+    assert 'detailer_prompt: "sexy, expressive, "' in script
+    assert 'detailer_negative_prompt: "closed eyes, "' in script
+    assert 'detailer_guide_size: "768"' in script
+    assert 'detailer_max_size: "1536"' in script
+    assert 'detailer_denoise: "0.4"' in script
+    assert 'detailer_bbox_threshold: "0.3"' in script
+    assert 'detailer_bbox_dilation: "4"' in script
+    assert 'detailer_bbox_crop_factor: "1.5"' in script
+    assert 'detailer_feather: "4"' in script
+    assert "detailerPresetControl.disabled = !detailerEnabled" in script
+    assert 'field.addEventListener("input", render)' in script
+    assert '"Attached A1111 sample" : "Custom"' in script

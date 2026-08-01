@@ -435,6 +435,20 @@
             <summary>Hires fix &amp; face detailer <span>Advanced</span></summary>
             <div class="disclosure-body form-grid">
               <p class="muted full-width" data-workflow-refinement-status aria-live="polite"></p>
+              <div data-detailer-preset-panel>
+                <button
+                  class="secondary-button"
+                  type="button"
+                  data-detailer-preset-control
+                  aria-describedby="a1111-sample-detailer-preset-description"
+                >Apply attached A1111 sample preset</button>
+                <p class="muted" id="a1111-sample-detailer-preset-description">
+                  Matches the attached A1111 sample metadata; FaceDetailer crop factor approximates ADetailer padding semantics. It affects only the face pass and does not apply full-image upscaling.
+                </p>
+                <p class="muted" aria-live="polite">
+                  Detailer tuning: <strong data-detailer-preset-state>Custom</strong>
+                </p>
+              </div>
               <label data-hires-setting>
                 Hires scale
                 <input type="number" name="hires_scale" value="{{ form_values['hires_scale'] }}" min="1" max="3" step="0.05" required>
