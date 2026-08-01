@@ -103,6 +103,31 @@
               <li>{{ note }}</li>
             {% endfor %}
           </ul>
+          <details
+            class="generation-details"
+            data-generation-details
+            data-generation-details-url="/dashboard/assets/{{ asset.asset_id }}/generation-details"
+          >
+            <summary>Generation settings</summary>
+            <div class="generation-details-body" data-generation-details-body>
+              <p
+                class="generation-details-status"
+                data-generation-details-status
+                role="status"
+              >
+                Open this section to load the exact settings for this image.
+              </p>
+              <a
+                class="generation-details-fallback"
+                href="/dashboard/assets/{{ asset.asset_id }}/generation-details"
+                data-generation-details-fallback
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Open sanitized settings JSON
+              </a>
+            </div>
+          </details>
           <a class="download" href="{{ asset.download_url }}">Download exact raw master</a>
         </div>
       </li>

@@ -6,7 +6,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -39,6 +39,11 @@ from gen_automation.middleware import content_security_policy
 from gen_automation.services.authentication import (
     AuthenticatedPrincipal,
     CsrfValidationError,
+)
+from gen_automation.services.generation_details import (
+    GenerationDetailsNotFoundError,
+    load_generation_details,
+    unavailable_generation_details,
 )
 from gen_automation.services.ranked_dashboard import (
     RankedMaster,
@@ -108,6 +113,34 @@ def _secure_response(request: Request, response: Response) -> Response:
     settings: Settings = request.app.state.settings
     response.headers["Content-Security-Policy"] = content_security_policy(settings.environment)
     return response
+
+
+@router.get(
+    "/assets/{asset_id}/generation-details",
+    response_class=JSONResponse,
+    response_model=None,
+    name="dashboard_asset_generation_details",
+)
+async def dashboard_asset_generation_details(
+    asset_id: UUID,
+    request: Request,
+    session: Session,
+    _principal: RawMasterReader,
+) -> Response:
+    try:
+        details = await load_generation_details(session, asset_id=asset_id)
+    except GenerationDetailsNotFoundError:
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content=unavailable_generation_details(),
+            ),
+        )
+    return _secure_response(
+        request,
+        JSONResponse(content=details or unavailable_generation_details()),
+    )
 
 
 @router.get("", response_class=HTMLResponse, name="dashboard_index")
