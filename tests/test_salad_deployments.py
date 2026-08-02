@@ -1747,13 +1747,13 @@ async def test_reconciliation_repairs_missing_autoscaler_before_activation(
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_uses_start_action_for_stopped_active_group(
+async def test_reconciliation_uses_status_to_start_stopped_active_group(
     deployment_context: DeploymentContext,
 ) -> None:
     await make_fully_provisioned(deployment_context)
     client = FakeClient()
     queue_name, group_name = remote_names()
-    client.queues[queue_name] = make_queue(queue_name, group_name=group_name)
+    client.queues[queue_name] = make_queue(queue_name)
     group = make_group(
         group_name,
         queue_name,
@@ -1781,14 +1781,16 @@ async def test_reconciliation_uses_start_action_for_stopped_active_group(
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_blocks_unrepairable_missing_queue_membership(
+async def test_reconciliation_accepts_live_readback_without_autostart_or_queue_membership(
     deployment_context: DeploymentContext,
 ) -> None:
     await make_fully_provisioned(deployment_context)
     client = FakeClient()
     queue_name, group_name = remote_names()
     client.queues[queue_name] = make_queue(queue_name)
-    client.groups[group_name] = make_group(group_name, queue_name, status="running")
+    group = make_group(group_name, queue_name, status="running")
+    group.raw["autostart_policy"] = False
+    client.groups[group_name] = group
 
     async with deployment_context.database.sessions() as session:
         result = await reconcile_deployment(
@@ -1800,8 +1802,8 @@ async def test_reconciliation_blocks_unrepairable_missing_queue_membership(
         await session.commit()
 
     assert result.action == DeploymentAction.RECONCILED
-    assert result.state == SaladDeploymentState.DEGRADED
-    assert result.error_code == "provider_queue_binding_drift"
+    assert result.state == SaladDeploymentState.ACTIVE
+    assert result.error_code is None
     assert client.start_names == []
     assert client.updated_group_patches == []
 
@@ -1889,10 +1891,6 @@ def group_with_configuration_override(
             "provider_autoscaler_drift",
         ),
         (
-            group_with_configuration_override("autostart_policy", False),
-            "provider_autostart_policy_drift",
-        ),
-        (
             group_with_configuration_override("priority", "high"),
             "provider_priority_drift",
         ),
@@ -1922,6 +1920,13 @@ def test_group_configuration_rejects_omitted_autoscaler() -> None:
     )
 
 
+def test_group_configuration_ignores_autostart_policy_readback() -> None:
+    group = make_group(remote_names()[1], remote_names()[0])
+    group.raw["autostart_policy"] = False
+
+    assert _group_configuration_drift(unpersisted_deployment(), group) is None
+
+
 def test_group_configuration_uses_deployment_autoscaler_values() -> None:
     deployment = unpersisted_deployment()
     deployment.max_replicas = 3
@@ -1940,16 +1945,13 @@ def test_group_configuration_uses_deployment_autoscaler_values() -> None:
     assert _group_configuration_drift(deployment, group) is None
 
 
-def test_remote_drift_requires_exact_queue_group_membership() -> None:
+def test_remote_drift_ignores_queue_group_membership_readback() -> None:
     deployment = unpersisted_deployment()
     deployment.provider_queue_id = str(QUEUE_ID)
     deployment.provider_container_group_id = str(GROUP_ID)
     group = make_group(deployment.container_group_name, deployment.queue_name)
 
-    assert (
-        _remote_drift_code(deployment, make_queue(deployment.queue_name), group)
-        == "provider_queue_binding_drift"
-    )
+    assert _remote_drift_code(deployment, make_queue(deployment.queue_name), group) is None
     assert (
         _remote_drift_code(
             deployment,
@@ -1960,7 +1962,7 @@ def test_remote_drift_requires_exact_queue_group_membership() -> None:
             ),
             group,
         )
-        == "provider_queue_binding_drift"
+        is None
     )
     assert (
         _remote_drift_code(
