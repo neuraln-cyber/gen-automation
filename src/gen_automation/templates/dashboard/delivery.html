@@ -160,6 +160,80 @@
       </div>
     </div>
 
+    <div class="review-entry" aria-labelledby="publication-switch-heading">
+      <div class="panel-heading">
+        <div>
+          <h3 id="publication-switch-heading">Publication switch</h3>
+          <p class="muted">
+            This global switch is stopped by default. Enabling it allows every
+            currently approved publication intent to run, not only this release.
+          </p>
+        </div>
+        <span class="status {{ 'ready' if delivery.publishing_guard_enabled else 'stopped' }}">
+          {{ 'enabled' if delivery.publishing_guard_enabled else 'stopped' }}
+        </span>
+      </div>
+      {% if delivery.publishing_guard_changed_at %}
+        <p class="muted">
+          Last changed
+          <time datetime="{{ delivery.publishing_guard_changed_at.isoformat() }}">
+            {{ delivery.publishing_guard_changed_at.isoformat() }}
+          </time>
+        </p>
+      {% endif %}
+      {% if delivery.publishing_guard_epoch is none %}
+        <p class="form-error">
+          The durable publication switch is unavailable. Keep publication stopped and
+          contact the operator.
+        </p>
+      {% elif guard_target_enabled and not publishing_enabled %}
+        <p class="form-error">
+          Publication workers are disabled. Enable the publishing runtime before
+          opening the global switch.
+        </p>
+      {% elif guard_idempotency_key %}
+        <form
+          class="decision-form"
+          method="post"
+          action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:publication-guard"
+        >
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="idempotency_key" value="{{ guard_idempotency_key }}">
+          <input type="hidden" name="submission_id" value="{{ guard_submission_id }}">
+          <input
+            type="hidden"
+            name="enabled"
+            value="{{ 'true' if guard_target_enabled else 'false' }}"
+          >
+          <input
+            type="hidden"
+            name="expected_epoch"
+            value="{{ delivery.publishing_guard_epoch }}"
+          >
+          <input
+            type="hidden"
+            name="expected_lock_version"
+            value="{{ delivery.publishing_guard_lock_version }}"
+          >
+          <label>
+            Audit reason
+            <input
+              name="reason"
+              maxlength="500"
+              value="{{ 'Enable approved delivery intents from review ' if guard_target_enabled else 'Stop publication from review ' }}{{ delivery.review_task_id }}"
+              required
+            >
+          </label>
+          <button
+            class="{{ 'primary-button' if guard_target_enabled else 'secondary-button stop-button' }}"
+            type="submit"
+          >
+            {{ 'Enable publication' if guard_target_enabled else 'Stop publication' }}
+          </button>
+        </form>
+      {% endif %}
+    </div>
+
     <ul class="release-list">
       {% for destination in delivery.destinations %}
         <li class="release-card" data-destination="{{ destination.key }}">

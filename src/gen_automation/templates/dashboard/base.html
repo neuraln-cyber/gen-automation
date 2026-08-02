@@ -339,7 +339,7 @@
         background: var(--danger-soft);
         color: var(--danger);
       }
-      .status.queued, .status.pending, .status.preparing {
+      .status.queued, .status.pending, .status.preparing, .status.stopped {
         border-color: rgba(251, 191, 119, .25);
         background: var(--warn-soft);
         color: var(--warn);
@@ -448,6 +448,16 @@
         text-decoration: none;
       }
       .secondary-button:hover, .download:hover { background: var(--surface-hover); color: var(--text); }
+      .stop-button {
+        border-color: rgba(253, 164, 175, .38);
+        background: var(--danger-soft);
+        color: var(--danger);
+      }
+      .stop-button:hover {
+        border-color: rgba(253, 164, 175, .58);
+        background: rgba(251, 113, 133, .2);
+        color: var(--danger);
+      }
       .download { display: flex; width: 100%; margin-top: .75rem; }
       .danger { color: var(--danger); }
 

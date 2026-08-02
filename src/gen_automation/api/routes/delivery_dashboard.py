@@ -26,6 +26,7 @@ from gen_automation.api.browser_delivery_forms import (
     read_patreon_confirm_present_form,
     read_prepare_destination_form,
     read_prepare_output_form,
+    read_publication_guard_form,
 )
 from gen_automation.api.security import (
     PublicationReader,
@@ -62,6 +63,7 @@ from gen_automation.services.publication import (
     presign_patreon_package_download,
     reconcile_publication_absent,
     reconcile_publication_present,
+    set_publication_guard,
 )
 from gen_automation.services.review_derivatives import (
     prepare_completed_review_derivatives,
@@ -136,6 +138,7 @@ async def dashboard_review_delivery(
     output_submission_id = uuid4()
     destination_submission_id = uuid4()
     watermark_submission_id = uuid4()
+    guard_submission_id = uuid4()
     output_key = delivery_form_key(
         settings,
         session_id=principal.session_id,
@@ -154,6 +157,24 @@ async def dashboard_review_delivery(
         action="upload-watermark",
         parts=(str(review_task_id), str(watermark_submission_id)),
     )
+    guard_target_enabled = not snapshot.publishing_guard_enabled
+    guard_key = None
+    if (
+        snapshot.publishing_guard_epoch is not None
+        and snapshot.publishing_guard_lock_version is not None
+    ):
+        guard_key = delivery_form_key(
+            settings,
+            session_id=principal.session_id,
+            action="publication-guard",
+            parts=(
+                str(review_task_id),
+                str(guard_submission_id),
+                str(snapshot.publishing_guard_epoch),
+                str(snapshot.publishing_guard_lock_version),
+                "enabled" if guard_target_enabled else "stopped",
+            ),
+        )
     patreon_confirmation = next(
         (
             destination
@@ -207,10 +228,13 @@ async def dashboard_review_delivery(
                 "output_submission_id": output_submission_id,
                 "destination_submission_id": destination_submission_id,
                 "watermark_submission_id": watermark_submission_id,
+                "guard_submission_id": guard_submission_id,
                 "output_idempotency_key": output_key,
                 "destination_idempotency_key": destination_key,
                 "public_preview_attested_at": datetime.now(UTC).isoformat(),
                 "watermark_idempotency_key": watermark_key,
+                "guard_idempotency_key": guard_key,
+                "guard_target_enabled": guard_target_enabled,
                 "patreon_present_idempotency_key": patreon_present_key,
                 "patreon_absent_idempotency_key": patreon_absent_key,
                 "patreon_present_attestation": PUBLICATION_CONFIRM_PRESENT_ATTESTATION,
@@ -222,6 +246,88 @@ async def dashboard_review_delivery(
             },
         ),
     )
+
+
+@router.post(
+    "/review-tasks/{review_task_id}/delivery:publication-guard",
+    response_class=HTMLResponse,
+    response_model=None,
+)
+async def dashboard_change_publication_guard(
+    review_task_id: UUID,
+    request: Request,
+    session: Session,
+    principal: PublicationReader,
+) -> Response:
+    try:
+        form = await read_publication_guard_form(request)
+        owner = await _verified_owner(request, session, principal, form.csrf_token)
+        await load_operator_delivery(session, review_task_id=review_task_id)
+        expected_key = delivery_form_key(
+            request.app.state.settings,
+            session_id=owner.session_id,
+            action="publication-guard",
+            parts=(
+                str(review_task_id),
+                str(form.submission_id),
+                str(form.expected_epoch),
+                str(form.expected_lock_version),
+                "enabled" if form.enabled else "stopped",
+            ),
+        )
+        if not form_key_matches(form.idempotency_key, expected_key):
+            raise BrowserDeliveryFormError(status_code=status.HTTP_400_BAD_REQUEST)
+        if form.enabled and not request.app.state.settings.publishing_enabled:
+            raise BrowserDeliveryFormError(
+                status_code=status.HTTP_409_CONFLICT,
+                message=(
+                    "Publication workers are disabled. Enable the publishing runtime "
+                    "before opening the global publication switch."
+                ),
+            )
+        await set_publication_guard(
+            session,
+            enabled=form.enabled,
+            expected_epoch=form.expected_epoch,
+            expected_lock_version=form.expected_lock_version,
+            reason=form.reason,
+            actor_user_id=owner.user_id,
+            actor_role=owner.role,
+            idempotency_key=form.idempotency_key,
+        )
+    except BrowserDeliveryFormError as error:
+        return _form_error(request, principal, error.status_code, error.message)
+    except HTTPException as error:
+        if error.status_code == status.HTTP_401_UNAUTHORIZED:
+            return _form_error(
+                request,
+                principal,
+                status.HTTP_401_UNAUTHORIZED,
+                "Sign in again before changing the publication switch.",
+            )
+        return _form_error(request, principal, status.HTTP_403_FORBIDDEN, "Request denied.")
+    except OperatorDeliveryNotFoundError:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_404_NOT_FOUND,
+            "The completed review could not be found.",
+        )
+    except PublicationInputError as error:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            str(error),
+        )
+    except PublicationConflictError:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_409_CONFLICT,
+            "The publication switch changed in another session. Reload and try again.",
+        )
+    return _redirect(review_task_id)
 
 
 @router.post(

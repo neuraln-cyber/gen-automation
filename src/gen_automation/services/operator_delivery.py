@@ -117,6 +117,9 @@ class OperatorDeliverySnapshot:
     full_outputs: tuple[DeliveryOutput, ...]
     x_outputs: tuple[DeliveryOutput, ...]
     publishing_guard_enabled: bool
+    publishing_guard_epoch: int | None
+    publishing_guard_lock_version: int | None
+    publishing_guard_changed_at: datetime | None
     destinations: tuple[DestinationState, ...]
 
     @property
@@ -238,8 +241,14 @@ async def load_operator_delivery(
     try:
         guard = await get_publication_guard(session)
         guard_enabled = guard.enabled
+        guard_epoch = guard.epoch
+        guard_lock_version = guard.lock_version
+        guard_changed_at = guard.changed_at
     except PublicationDisabledError:
         guard_enabled = False
+        guard_epoch = None
+        guard_lock_version = None
+        guard_changed_at = None
     destinations = await _destination_states(
         session,
         release_id=release.id,
@@ -258,6 +267,9 @@ async def load_operator_delivery(
         full_outputs=full_outputs,
         x_outputs=x_outputs,
         publishing_guard_enabled=guard_enabled,
+        publishing_guard_epoch=guard_epoch,
+        publishing_guard_lock_version=guard_lock_version,
+        publishing_guard_changed_at=guard_changed_at,
         destinations=destinations,
     )
 
