@@ -91,7 +91,9 @@ def test_deployment_config_is_deterministic_secret_free_and_scale_to_zero() -> N
             "gpu_classes": [str(GPU_CLASS_ID)],
         },
         "image_caching": True,
+        "priority": "low",
     }
+    assert "priority" not in first.provider_configuration
     assert "test-key" not in str(first.provider_configuration)
     assert "whsec_test" not in str(first.provider_configuration)
 

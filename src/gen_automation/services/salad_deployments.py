@@ -138,6 +138,8 @@ class DeploymentAction(StrEnum):
     QUEUE_ADOPTED = "queue_adopted"
     GROUP_CREATED = "group_created"
     GROUP_ADOPTED = "group_adopted"
+    AUTOSCALER_REPAIR_REQUESTED = "autoscaler_repair_requested"
+    START_REQUESTED = "start_requested"
     RECONCILED = "reconciled"
     STOP_REQUESTED = "stop_requested"
     STOPPED = "stopped"
@@ -183,6 +185,8 @@ class SaladDeploymentClient(Protocol):
         container_group_name: str,
         patch: Mapping[str, JSONValue],
     ) -> SaladContainerGroup: ...
+
+    async def start_container_group(self, container_group_name: str) -> None: ...
 
     async def stop_container_group(self, container_group_name: str) -> None: ...
 
@@ -519,6 +523,19 @@ async def _reconcile_locked(
             error_code=stop_result.error_code,
         )
 
+    if drift_code is not None and not group.pending_change:
+        repair_result = await _request_active_contract_repair(
+            session,
+            deployment,
+            client,
+            group,
+            drift_code=drift_code,
+            observed_at=observed_at,
+            metered_microusd=metered,
+        )
+        if repair_result is not None:
+            return repair_result
+
     unhealthy_status = group.status.strip().lower() in {"failed", "stopped"}
     if drift_code is not None or group.pending_change or unhealthy_status:
         deployment.state = SaladDeploymentState.DEGRADED
@@ -551,6 +568,111 @@ async def _reconcile_locked(
         metered_microusd=metered,
         error_code=deployment.last_error_code,
     )
+
+
+async def _request_active_contract_repair(
+    session: AsyncSession,
+    deployment: SaladDeployment,
+    client: SaladDeploymentClient,
+    group: SaladContainerGroup,
+    *,
+    drift_code: str,
+    observed_at: datetime,
+    metered_microusd: int,
+) -> DeploymentResult | None:
+    """Repair only provider fields with documented, unambiguous mutations.
+
+    Queue membership is provider-derived and autostart/priority are not fields
+    in Salad's container-group PATCH contract. A missing autoscaler can be
+    restored directly; a stopped active group can be started through its
+    dedicated action. All other drift remains degraded and blocks dispatch.
+    """
+
+    if drift_code == "provider_autoscaler_drift":
+        patch: JSONObject = {"queue_autoscaler": _desired_queue_autoscaler(deployment)}
+        try:
+            updated = await client.update_container_group(
+                deployment.container_group_name,
+                patch,
+            )
+        except (SaladAPIError, SaladProtocolError, SaladTransportError) as error:
+            return await _handle_mutation_error(
+                session,
+                deployment,
+                error,
+                code_prefix="autoscaler_repair",
+                observed_at=observed_at,
+            )
+        if (
+            updated.name != deployment.container_group_name
+            or str(updated.id) != deployment.provider_container_group_id
+        ):
+            return await _mark_unknown(
+                session,
+                deployment,
+                error_code="autoscaler_repair_response_mismatch",
+                observed_at=observed_at,
+            )
+        deployment.state = SaladDeploymentState.PROVISIONING
+        deployment.last_error_code = "provider_autoscaler_repair_pending"
+        deployment.last_error_detail = "Provider queue autoscaler repair is awaiting read-back."
+        deployment.reconcile_after = observed_at + _RECONCILE_DELAY
+        _touch(deployment)
+        _audit(
+            session,
+            deployment,
+            action="salad_deployment.autoscaler_repair_requested",
+            detail={"container_group_name": deployment.container_group_name},
+            occurred_at=observed_at,
+        )
+        await session.flush()
+        return _result(
+            deployment,
+            DeploymentAction.AUTOSCALER_REPAIR_REQUESTED,
+            metered_microusd=metered_microusd,
+            error_code=deployment.last_error_code,
+        )
+
+    stopped = group.status.strip().lower() == "stopped"
+    if (
+        drift_code
+        in {
+            "provider_autostart_policy_drift",
+            "provider_queue_binding_drift",
+        }
+        and stopped
+    ):
+        try:
+            await client.start_container_group(deployment.container_group_name)
+        except (SaladAPIError, SaladProtocolError, SaladTransportError) as error:
+            return await _handle_mutation_error(
+                session,
+                deployment,
+                error,
+                code_prefix="group_start",
+                observed_at=observed_at,
+            )
+        deployment.state = SaladDeploymentState.PROVISIONING
+        deployment.last_error_code = "provider_start_pending"
+        deployment.last_error_detail = "Provider container group start is awaiting read-back."
+        deployment.reconcile_after = observed_at + _RECONCILE_DELAY
+        _touch(deployment)
+        _audit(
+            session,
+            deployment,
+            action="salad_deployment.start_requested",
+            detail={"container_group_name": deployment.container_group_name},
+            occurred_at=observed_at,
+        )
+        await session.flush()
+        return _result(
+            deployment,
+            DeploymentAction.START_REQUESTED,
+            metered_microusd=metered_microusd,
+            error_code=deployment.last_error_code,
+        )
+
+    return None
 
 
 async def _budget_allows_provider_work(
@@ -938,9 +1060,23 @@ async def _container_group_payload(
     ):
         raise SaladDeploymentValidationError("provider configuration.container is required")
     container = cast(JSONObject, deepcopy(container_value))
+    # Salad's write contract places priority inside ``container`` even though
+    # the read representation exposes the effective value at group level.
+    # Normalize legacy persisted configurations without sending an ignored
+    # top-level field back to the provider.
+    legacy_priority = configuration.pop("priority", None)
+    configured_priority = container.get("priority")
+    if legacy_priority is not None and configured_priority is not None:
+        if legacy_priority != configured_priority:
+            raise SaladDeploymentValidationError("container priority conflicts")
+    elif legacy_priority is not None:
+        configured_priority = legacy_priority
+        container["priority"] = legacy_priority
     configured_image = container.get("image")
     if configured_image is not None and configured_image != deployment.worker_image_digest:
         raise SaladDeploymentValidationError("container image must match the immutable digest")
+    if configured_priority not in {"high", "medium", "low", "batch"}:
+        raise SaladDeploymentValidationError("container priority is invalid")
 
     queue_connection_value = configuration.get("queue_connection")
     if not isinstance(queue_connection_value, dict):
@@ -1377,7 +1513,16 @@ def _remote_drift_code(
         or str(group.id) != deployment.provider_container_group_id
     ):
         return "provider_group_identity_drift"
-    return _group_configuration_drift(deployment, group)
+    group_drift = _group_configuration_drift(deployment, group)
+    if group_drift is not None:
+        return group_drift
+    if not any(
+        item.get("name") == deployment.container_group_name
+        and str(item.get("id")) == deployment.provider_container_group_id
+        for item in queue.container_groups
+    ):
+        return "provider_queue_binding_drift"
+    return None
 
 
 def _group_configuration_drift(
@@ -1392,7 +1537,7 @@ def _group_configuration_drift(
     if not isinstance(desired_container, dict):
         return "provider_container_contract_drift"
     for key, expected_value in desired_container.items():
-        if key == "image":
+        if key in {"image", "priority"}:
             continue
         observed_value = container.get(key)
         if (
@@ -1431,26 +1576,34 @@ def _group_configuration_drift(
         ):
             return f"provider_{probe_name}_drift"
     autoscaler = raw.get("queue_autoscaler")
-    # Salad accepts ``queue_autoscaler`` when a group is created, but the
-    # container-group read representation can omit this write-only object.
-    # Validate it when present; absence alone is not evidence of drift.
-    if autoscaler is not None and not isinstance(autoscaler, dict):
-        return "provider_autoscaler_drift"
-    expected = {
-        "min_replicas": 0,
-        "max_replicas": 1,
-        "desired_queue_length": 1,
-    }
-    if autoscaler is not None and any(
-        not isinstance(autoscaler.get(key), int)
-        or isinstance(autoscaler.get(key), bool)
-        or autoscaler.get(key) != value
-        for key, value in expected.items()
+    expected_autoscaler = _desired_queue_autoscaler(deployment)
+    if not isinstance(autoscaler, dict) or not _matches_worker_contract(
+        autoscaler,
+        expected_autoscaler,
+        allow_null_extensions=True,
     ):
         return "provider_autoscaler_drift"
+    if raw.get("autostart_policy") is not True:
+        return "provider_autostart_policy_drift"
+    desired_priority = desired_container.get("priority")
+    if desired_priority is None:
+        # Support drift checks for deployment rows written before priority was
+        # moved into the provider's nested container contract.
+        desired_priority = deployment.provider_configuration.get("priority")
+    if raw.get("priority") != desired_priority:
+        return "provider_priority_drift"
     if group.replicas > deployment.max_replicas:
         return "provider_replica_limit_drift"
     return None
+
+
+def _desired_queue_autoscaler(deployment: SaladDeployment) -> JSONObject:
+    configured = deployment.provider_configuration.get("queue_autoscaler")
+    desired = deepcopy(configured) if isinstance(configured, dict) else {}
+    desired["min_replicas"] = deployment.min_replicas
+    desired["max_replicas"] = deployment.max_replicas
+    desired["desired_queue_length"] = deployment.desired_queue_length
+    return cast(JSONObject, desired)
 
 
 async def _handle_read_error(
