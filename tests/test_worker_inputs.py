@@ -502,6 +502,94 @@ async def test_one_provider_job_renders_independent_prompt_branches(
 
 
 @pytest.mark.asyncio
+async def test_one_provider_job_renders_twenty_five_detailer_branches(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _profile_context(
+        worker_input_context,
+        workflow_body=BASE_DETAILER_WORKFLOW_BODY,
+        detector=True,
+    )
+    parameters = dict(context.job_context.parameters)
+    generation = dict(parameters["generation"])  # type: ignore[arg-type]
+    outputs = [
+        {
+            **generation,
+            "prompt": (
+                "private test prompt"
+                if output_index == 0
+                else f"independently resolved prompt {output_index + 1}"
+            ),
+            "seed": 42 + output_index,
+            "outputs_per_job": 1,
+        }
+        for output_index in range(25)
+    ]
+    parameters.update(
+        {
+            "schema_version": 2,
+            "generation": {**outputs[0], "outputs_per_job": 25},
+            "output_generations": outputs,
+            "output_prompt_resolutions": [
+                {"seed": 42 + output_index} for output_index in range(25)
+            ],
+        }
+    )
+    parameters_sha256 = canonical_sha256(parameters)
+    async with context.database.sessions() as session:
+        job = await session.get(GenerationJob, context.job_context.generation_job_id)
+        assert job is not None
+        job.expected_output_count = 25
+        job.parameters = parameters
+        job.parameters_sha256 = parameters_sha256
+        await session.commit()
+    context = replace(
+        context,
+        job_context=SaladJobInputContext(
+            **{
+                **context.job_context.__dict__,
+                "expected_output_count": 25,
+                "parameters": parameters,
+                "parameters_sha256": parameters_sha256,
+            }
+        ),
+    )
+
+    envelope = GenerateEnvelope.model_validate(await _build(context), strict=True)
+    workflow = envelope.payload.workflow
+
+    assert [grant.output_index for grant in envelope.payload.uploads] == list(range(25))
+    assert (
+        sum(
+            isinstance(node, dict) and node.get("class_type") == "SaveImage"
+            for node in workflow.values()
+        )
+        == 25
+    )
+    assert (
+        sum(
+            isinstance(node, dict) and node.get("class_type") == "FaceDetailer"
+            for node in workflow.values()
+        )
+        == 25
+    )
+    assert (
+        sum(
+            isinstance(node, dict) and node.get("class_type") == "UltralyticsDetectorProvider"
+            for node in workflow.values()
+        )
+        == 1
+    )
+    latent_nodes = [
+        node
+        for node in workflow.values()
+        if isinstance(node, dict) and node.get("class_type") == "EmptyLatentImage"
+    ]
+    assert len(latent_nodes) == 25
+    assert all(node["inputs"]["batch_size"] == 1 for node in latent_nodes)
+
+
+@pytest.mark.asyncio
 async def test_runtime_expands_eight_ordered_loras(
     worker_input_context: WorkerInputContext,
 ) -> None:

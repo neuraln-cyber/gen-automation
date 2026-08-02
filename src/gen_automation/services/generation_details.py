@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from gen_automation.db.models import Asset, GenerationJob, ReleaseVersion, WorkflowApproval
 from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import AssetKind, AssetState
+from gen_automation.domain.generation_limits import MAX_OUTPUTS_PER_GENERATION_JOB
 from gen_automation.domain.release_spec import (
     ArtifactSpecification,
     GenerationParameters,
@@ -119,8 +120,14 @@ class _GenerationJobParametersV2(_FrozenModel):
     workflow: WorkflowSpecification
     generation: GenerationParameters
     prompt_resolution: _PromptResolution
-    output_generations: list[GenerationParameters] = Field(min_length=1, max_length=8)
-    output_prompt_resolutions: list[_PromptResolution] = Field(min_length=1, max_length=8)
+    output_generations: list[GenerationParameters] = Field(
+        min_length=1,
+        max_length=MAX_OUTPUTS_PER_GENERATION_JOB,
+    )
+    output_prompt_resolutions: list[_PromptResolution] = Field(
+        min_length=1,
+        max_length=MAX_OUTPUTS_PER_GENERATION_JOB,
+    )
     batch: _BatchSnapshot | None = None
 
     @model_validator(mode="after")

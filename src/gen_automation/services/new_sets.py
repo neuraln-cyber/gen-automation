@@ -38,6 +38,7 @@ from gen_automation.domain.enums import (
     ResourceHealth,
     ScoringRunState,
 )
+from gen_automation.domain.generation_limits import MAX_OUTPUTS_PER_GENERATION_JOB
 from gen_automation.domain.release_spec import (
     ArtifactSpecification,
     GenerationBatchSpecification,
@@ -130,7 +131,7 @@ class NewSetSubmission(BaseModel):
     sampler: str = Field(min_length=1, max_length=100)
     scheduler: str = Field(min_length=1, max_length=100)
     clip_skip: int = Field(default=2, ge=1, le=12)
-    outputs_per_job: int = Field(ge=1, le=8)
+    outputs_per_job: int = Field(ge=1, le=MAX_OUTPUTS_PER_GENERATION_JOB)
     hires_scale: float = Field(default=1.5, ge=1.0, le=3.0)
     hires_denoise: float = Field(default=0.35, ge=0.05, le=1.0)
     hires_upscale_method: Literal[

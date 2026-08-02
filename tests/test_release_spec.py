@@ -53,6 +53,20 @@ def test_generation_dimensions_accept_latent_multiples_of_eight() -> None:
         ReleaseCreate.model_validate(payload)
 
 
+def test_generation_job_accepts_twenty_five_outputs_and_rejects_twenty_six() -> None:
+    payload = valid_release_payload()
+    generation = payload["specification"]["generation"]  # type: ignore[index]
+    generation["outputs_per_job"] = 25
+    payload["specification"]["planned_job_count"] = 1  # type: ignore[index]
+
+    parsed = ReleaseCreate.model_validate(payload)
+    assert parsed.specification.generation.outputs_per_job == 25
+
+    generation["outputs_per_job"] = 26
+    with pytest.raises(ValidationError, match="less than or equal to 25"):
+        ReleaseCreate.model_validate(payload)
+
+
 def test_release_supports_up_to_eight_loras() -> None:
     payload = valid_release_payload()
     checkpoint = payload["specification"]["checkpoint"]  # type: ignore[index]

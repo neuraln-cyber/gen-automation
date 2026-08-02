@@ -140,6 +140,37 @@ def test_new_set_batch_submission_derives_job_count_and_allows_overproduction() 
     assert sum(batch.image_count for batch in command.batches) == 120
 
 
+def test_new_set_submission_accepts_one_twenty_five_image_provider_job() -> None:
+    command = NewSetSubmission.model_validate(
+        {
+            "slug": "one-job-twenty-five",
+            "title": "One job, twenty-five images",
+            "subject_approval_id": "10000000-0000-4000-8000-000000000001",
+            "checkpoint_approval_id": "20000000-0000-4000-8000-000000000002",
+            "workflow_approval_id": "30000000-0000-4000-8000-000000000003",
+            "negative_prompt": "low quality",
+            "seed": 500,
+            "width": 1144,
+            "height": 1480,
+            "steps": 30,
+            "sampler": "euler_ancestral",
+            "scheduler": "karras",
+            "outputs_per_job": 25,
+            "planned_job_count": 1,
+            "desired_accepted_count": 25,
+            "batches": [
+                {
+                    "name": "One provider job",
+                    "image_count": 25,
+                    "prompt": "portrait, __sfw__",
+                }
+            ],
+        }
+    )
+
+    assert command.effective_planned_job_count == 1
+
+
 async def test_generation_batches_split_exact_counts_and_keep_ordered_prompt_metadata(
     batch_database: Database,
 ) -> None:
@@ -205,6 +236,82 @@ async def test_generation_batches_split_exact_counts_and_keep_ordered_prompt_met
         201,
         202,
     ]
+
+
+async def test_twenty_five_image_batch_expands_to_one_provider_job(
+    batch_database: Database,
+) -> None:
+    payload = deepcopy(valid_release_payload())
+    payload["desired_accepted_count"] = 25
+    specification = payload["specification"]
+    assert isinstance(specification, dict)
+    generation = specification["generation"]
+    assert isinstance(generation, dict)
+    generation.update(
+        {
+            "prompt": "portrait, __sfw__",
+            "seed": 500,
+            "outputs_per_job": 25,
+        }
+    )
+    specification.update(
+        {
+            "schema_version": 2,
+            "planned_job_count": 1,
+            "generation_batches": [
+                {
+                    "name": "One provider job",
+                    "image_count": 25,
+                    "generation": deepcopy(generation),
+                }
+            ],
+        }
+    )
+
+    async with batch_database.sessions() as session:
+        await create_wildcard_library(
+            session,
+            command=WildcardCreate(name="sfw", entries=["standing", "seated", "walking"]),
+            actor="fixture-owner",
+        )
+        project = await create_project(session, ProjectCreate(slug="one-job", name="One job"))
+        result = await create_release(
+            session,
+            project_id=project.id,
+            command=ReleaseCreate.model_validate(payload),
+            idempotency_key="create-one-job-release",
+        )
+        await seed_release_approvals(session, payload)
+
+    async with batch_database.sessions() as session:
+        plan = await approve_and_expand_generation_plan(
+            session,
+            release_id=result.response.id,
+            idempotency_key="approve-one-job-release",
+        )
+        jobs = list(
+            (
+                await session.scalars(
+                    select(GenerationJob).where(
+                        GenerationJob.release_version_id == plan.response.release_version_id
+                    )
+                )
+            ).all()
+        )
+
+    assert plan.response.total_jobs == 1
+    assert len(jobs) == 1
+    job = jobs[0]
+    outputs = job.parameters["output_generations"]
+    resolutions = job.parameters["output_prompt_resolutions"]
+    assert job.expected_output_count == 25
+    assert job.parameters["generation"]["outputs_per_job"] == 25
+    assert len(outputs) == 25
+    assert len(resolutions) == 25
+    assert [output["seed"] for output in outputs] == list(range(500, 525))
+    assert [resolution["seed"] for resolution in resolutions] == list(range(500, 525))
+    assert all(output["outputs_per_job"] == 1 for output in outputs)
+    assert all("__sfw__" not in output["prompt"] for output in outputs)
 
 
 async def test_new_set_service_freezes_a_batch_queue_with_inherited_prompt_settings(

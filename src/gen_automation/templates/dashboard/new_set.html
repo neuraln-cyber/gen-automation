@@ -519,7 +519,7 @@
             <div class="form-grid">
             <label>
               Images per GPU job
-              <input type="number" name="outputs_per_job" value="{{ form_values['outputs_per_job'] }}" min="1" max="8" data-outputs-per-job required>
+              <input type="number" name="outputs_per_job" value="{{ form_values['outputs_per_job'] }}" min="1" max="{{ max_outputs_per_generation_job }}" data-outputs-per-job required>
             </label>
             <label class="legacy-job-count">
               Planned GPU jobs

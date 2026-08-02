@@ -16,6 +16,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from pydantic import AnyHttpUrl, Field, SecretStr, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from gen_automation.domain.generation_limits import MAX_OUTPUTS_PER_GENERATION_JOB
 from gen_automation.gpu_worker.artifacts import (
     STREAM_READ_BYTES,
     ArtifactBootstrapError,
@@ -93,7 +94,7 @@ class WorkerRuntimeSettings(BaseSettings):
     max_body_bytes: int = Field(default=256 * 1024, ge=1024, le=1024 * 1024)
     max_signature_ttl_seconds: int = Field(default=7200, ge=5, le=7200)
     clock_skew_seconds: int = Field(default=15, ge=0, le=60)
-    max_outputs: int = Field(default=8, ge=1, le=32)
+    max_outputs: int = Field(default=MAX_OUTPUTS_PER_GENERATION_JOB, ge=1, le=32)
     max_output_bytes: int = Field(
         default=25 * 1024 * 1024,
         ge=1024,
@@ -118,7 +119,7 @@ class WorkerRuntimeSettings(BaseSettings):
     comfy_python: Path = Path("/opt/worker-venv/bin/python")
     comfy_main: Path = Path("/opt/comfyui/main.py")
     comfy_runtime_root: Path = Path("/opt/worker/runtime")
-    comfy_execution_timeout_seconds: float = Field(default=900.0, ge=30.0, le=7200.0)
+    comfy_execution_timeout_seconds: float = Field(default=3600.0, ge=30.0, le=7200.0)
     salad_queue_worker_enabled: bool = True
     salad_queue_worker_path: Path = Path("/usr/local/bin/salad-http-job-queue-worker")
     salad_queue_worker_log_level: str = "error"
