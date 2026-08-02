@@ -968,6 +968,7 @@ class ControllerWorkloads:
                         verification_lease_seconds=(
                             self.settings.storage_verification_lease_seconds
                         ),
+                        upload_grant_ttl_seconds=(self.settings.worker_upload_grant_ttl_seconds),
                     )
         except asyncio.CancelledError:
             await self._defer_collection_lease(job, worker_id=worker_id)

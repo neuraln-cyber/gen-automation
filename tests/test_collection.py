@@ -7,10 +7,25 @@ from uuid import UUID
 
 import pytest
 from PIL import Image
+from sqlalchemy import select
 
-from gen_automation.db.models import GenerationJob, Project, Release, ReleaseVersion
+from gen_automation.db.models import (
+    Asset,
+    GenerationAttempt,
+    GenerationJob,
+    Project,
+    Release,
+    ReleaseVersion,
+    SaladDeployment,
+)
 from gen_automation.db.session import Database
-from gen_automation.domain.enums import GenerationState, ReleasePhase, ResourceHealth
+from gen_automation.domain.enums import (
+    AssetState,
+    GenerationAttemptState,
+    GenerationState,
+    ReleasePhase,
+    ResourceHealth,
+)
 from gen_automation.services.assets import UploadIntent, create_raw_master_upload_intents
 from gen_automation.services.collection import (
     claim_collection_jobs,
@@ -88,6 +103,38 @@ async def collection_context(tmp_path: Path) -> AsyncIterator[CollectionContext]
             expected_output_count=2,
         )
         session.add(job)
+        await session.flush()
+        deployment = SaladDeployment(
+            version_no=1,
+            config_sha256="d" * 64,
+            provider_configuration={},
+            worker_image_digest="registry.example.test/worker@sha256:" + "e" * 64,
+            organization_name="test-org",
+            project_name="test-project",
+            queue_name="test-queue",
+            container_group_name="test-group",
+            max_hourly_cost_microusd=1_000_000,
+        )
+        session.add(deployment)
+        await session.flush()
+        session.add(
+            GenerationAttempt(
+                job_id=job.id,
+                salad_deployment_id=deployment.id,
+                attempt_no=1,
+                provider="salad",
+                provider_external_id="provider-job-1",
+                submission_key="f" * 64,
+                request_sha256="1" * 64,
+                state=GenerationAttemptState.SUCCEEDED,
+                worker_image_digest=deployment.worker_image_digest,
+                request_metadata={},
+                submit_started_at=NOW,
+                submitted_at=NOW,
+                completed_at=NOW,
+                created_at=NOW,
+            )
+        )
         await session.commit()
         intents = await create_raw_master_upload_intents(
             session,
@@ -164,6 +211,46 @@ async def test_collection_defers_when_an_upload_is_not_visible(
     assert result.state == GenerationState.COLLECTING
     assert result.retry_at == NOW + timedelta(seconds=30)
     assert result.error_code == "master_not_ready"
+
+
+@pytest.mark.asyncio
+async def test_collection_blocks_after_missing_upload_grant_expires(
+    collection_context: CollectionContext,
+) -> None:
+    _stage(collection_context.store, collection_context.intents[0], _png("red"))
+    expired_at = NOW + timedelta(seconds=3630)
+    await _claim(collection_context, now=expired_at)
+
+    async with collection_context.database.sessions() as session:
+        result = await collect_generation_job(
+            session,
+            collection_context.store,
+            job_id=collection_context.job_id,
+            worker_id="collector-1",
+            max_image_bytes=1_000_000,
+            upload_grant_ttl_seconds=3600,
+            now=expired_at,
+        )
+        release = await session.get(Release, collection_context.release_id)
+        assets = list(
+            (
+                await session.scalars(
+                    select(Asset)
+                    .where(Asset.generation_job_id == collection_context.job_id)
+                    .order_by(Asset.output_index)
+                )
+            ).all()
+        )
+
+    assert result.state == GenerationState.DEAD_LETTER
+    assert result.retry_at is None
+    assert result.error_code == "master_upload_expired"
+    assert release is not None
+    assert release.health == ResourceHealth.BLOCKED
+    assert [asset.state for asset in assets] == [
+        AssetState.AVAILABLE,
+        AssetState.UPLOADING,
+    ]
 
 
 @pytest.mark.asyncio
