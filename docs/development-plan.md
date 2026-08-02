@@ -42,8 +42,9 @@ Acceptance criteria:
    verification.
 5. [Complete] Add conditional immutable promotion, retry adoption, verification
    leases, audit events, and staging cleanup tracking.
-6. [Pending provider selection] Run the storage conformance suite against the
-   production S3-compatible service and configure lifecycle rules.
+6. [Staging conformance complete; production/lifecycle confirmation pending]
+   Run the storage conformance suite against the production S3-compatible
+   service and configure lifecycle rules.
 
 Acceptance criteria:
 
@@ -53,6 +54,9 @@ Acceptance criteria:
 
 ## Phase 3 — GPU worker
 
+Status: the approved staging model/workflow set is onboarded, and live workers
+have produced registered private masters.
+
 1. Pin the ComfyUI API base image and all custom-node revisions.
 2. Implement startup model-manifest download and SHA-256 verification.
 3. Maintain the production base Illustrious/SDXL workflow adapter and add
@@ -60,7 +64,8 @@ Acceptance criteria:
 4. Add worker readiness, warm-up, job execution, and completion callbacks.
 5. Upload masters and metadata directly to object storage.
 6. Keep the synthetic prompt-to-master contract green without production
-   models; run a separate paid live GPU canary before release.
+   models. The paid staging canary is complete; repeat it for production or a
+   materially changed artifact/workflow revision.
 
 Acceptance criteria:
 
@@ -70,6 +75,10 @@ Acceptance criteria:
 - Interrupted jobs are retried without duplicating masters.
 
 ## Phase 4 — SaladCloud orchestration
+
+Status: live Salad queue submission and GPU generation have been exercised in
+staging. Scale-to-zero closure, final bill reconciliation, and production
+readiness remain separate acceptance checks.
 
 1. Implement SaladCloud authentication and API client.
 2. Create or update the worker container group from versioned configuration.

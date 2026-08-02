@@ -71,6 +71,17 @@ PATREON_CONFIRM_ABSENT_FIELDS = frozenset(
         "attestation",
     }
 )
+PUBLICATION_GUARD_FIELDS = frozenset(
+    {
+        "csrf_token",
+        "idempotency_key",
+        "submission_id",
+        "enabled",
+        "expected_epoch",
+        "expected_lock_version",
+        "reason",
+    }
+)
 
 
 class BrowserDeliveryFormError(ValueError):
@@ -132,6 +143,17 @@ class PatreonConfirmAbsentForm:
     expected_lock_version: int
     evidence: str
     attestation: str
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationGuardForm:
+    csrf_token: str
+    idempotency_key: str
+    submission_id: UUID
+    enabled: bool
+    expected_epoch: int
+    expected_lock_version: int
+    reason: str
 
 
 async def read_prepare_output_form(request: Request) -> PrepareOutputForm:
@@ -229,6 +251,21 @@ async def read_patreon_confirm_absent_form(
         expected_lock_version=lock_version,
         evidence=_bounded_text(values["evidence"], maximum=20_000, required=True),
         attestation=_bounded_text(values["attestation"], maximum=500, required=True),
+    )
+
+
+async def read_publication_guard_form(request: Request) -> PublicationGuardForm:
+    values = await _read_form(request, expected_fields=PUBLICATION_GUARD_FIELDS)
+    if values["enabled"] not in {"true", "false"}:
+        raise _bad_request()
+    return PublicationGuardForm(
+        csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
+        idempotency_key=_idempotency_key(values["idempotency_key"]),
+        submission_id=_uuid(values["submission_id"]),
+        enabled=values["enabled"] == "true",
+        expected_epoch=_positive_int(values["expected_epoch"]),
+        expected_lock_version=_positive_int(values["expected_lock_version"]),
+        reason=_bounded_text(values["reason"], maximum=500, required=True),
     )
 
 

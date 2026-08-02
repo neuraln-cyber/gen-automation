@@ -1,6 +1,6 @@
 # MVP status and deployment handoff
 
-Status date: 2026-07-29 (Europe/Sofia)
+Status date: 2026-08-02 (Europe/Sofia)
 
 ## Current conclusion
 
@@ -13,14 +13,16 @@ no-redirect multipart POST used by GPU workers. An encrypted RDS snapshot was
 restored into a private temporary clone; its migration revision, 46-table
 schema digest, and active-owner count matched the live database before all
 drill resources were removed. A final OpenTofu plan reports no drift.
-Application secrets were generated only on the host. External GPU allocation
-and Patreon, MEGA, and X publication effects remain disabled until their
-individual credentials and canaries are complete.
+Application secrets were generated only on the host. The approved checkpoint,
+LoRAs, detector, and workflows are onboarded with exact identities, and live
+SaladCloud generation has produced registered private masters. Patreon, MEGA,
+and X publication effects remain disabled until their individual credentials
+and canaries are complete.
 
 The credential-free source implementation is complete. Final end-to-end MVP
-acceptance still requires model onboarding, one bounded GPU generation,
-semantic anatomy verification, review/derivative checks, and provider-specific
-publication canaries. No historical test count is used as a completion claim.
+acceptance still requires semantic anatomy verification, review/derivative
+checks, and provider-specific publication canaries. No historical test count is
+used as a completion claim.
 
 ## Source implementation complete
 
@@ -151,21 +153,17 @@ watermarked, moved, overwritten, or made public.
 
 1. Confirm the AWS notification subscription and create the linked-account
    budget in the management account.
-2. Upload and onboard the approved checkpoint, LoRAs, optional detector, and
-   workflows; retain the emitted exact manifest and digest.
-3. Configure SaladCloud and run a zero-publication synthetic worker canary,
-   followed by one bounded paid generation with one replica and scale-to-zero.
-4. Deploy the private semantic upstream and gateway, test pass/review/severe/
+2. Deploy the private semantic upstream and gateway, test pass/review/severe/
    unavailable behavior, then enable the terminal anatomy gate.
-5. Review one generated release, accept a bounded set, render its clean Patreon
+3. Review one generated release, accept a bounded set, render its clean Patreon
    outputs, and select/render only the watermarked X teasers.
-6. Bootstrap the persistent Patreon and MEGA profiles through owner-controlled
+4. Bootstrap the persistent Patreon and MEGA profiles through owner-controlled
    sessions, then run one low-risk Patreon publish and MEGA mirror canary.
    Exercise the Patreon manual ZIP fallback as part of the canary.
-7. Add the exact X secret ARN to the instance role, authorize the creator, and
-    run one approved X canary with sensitive-media handling enabled.
-8. Repeat the proven sequence with separate production resources and
-    credentials; do not promote staging secrets or profile volumes.
+5. Add the exact X secret ARN to the instance role, authorize the creator, and
+   run one approved X canary with sensitive-media handling enabled.
+6. Repeat the proven sequence with separate production resources and
+   credentials; do not promote staging secrets or profile volumes.
 
 ## Accounts and access: exact timing
 
@@ -181,8 +179,8 @@ resource identifiers or confirmation here.
 | In the first AWS plan | Alarm/budget notification email; approved monthly budget; optional non-secret name/tag choices | `notification_email` is required by the module. Review the plan and estimated spend before apply. After apply, the owner must accept the SNS email subscription; a budget alarm is notification, not a hard stop. |
 | Before public HTTPS and provider callbacks | Either an existing Route53 public hosted-zone ID plus the intended lowercase hostname, or access to create the equivalent record at the external DNS provider | Route53 inputs may remain null for an IP-only infrastructure canary, but DNS must point to the EIP before Caddy obtains a public certificate, the dashboard uses its final origin, or Salad callbacks are enabled. No DNS credential is needed by the running application. |
 | Immediately after AWS apply | SSM access through the deployed operator role | Verify the host and encrypted profile mounts, create separate PostgreSQL migration/runtime roles from the RDS-managed bootstrap secret, run migrations, test backup/restore, and deploy the pinned images. No RDS master password is requested from the user or stored in OpenTofu. |
-| Before model onboarding and the first GPU job | Exact checkpoint/LoRA/detector files or their approved object versions; SHA-256 values; source/license/commercial/adult-use evidence; a temporary model-uploader identity | Upload only to the private model bucket, verify metadata, run the onboarding plan against the migrated database and both buckets, and produce the immutable worker manifest/digest. Disable the uploader's write access afterward. |
-| Immediately before the Salad zero-publish canary | SaladCloud organization/project, dedicated automation API key, webhook signing secret, payment authorization/billing limits, queue/group names, and the immutable worker image digest; provider-managed GHCR pull access if that image is private | Create/reconcile the queue and worker group, verify callbacks and signed jobs, cap replicas at one for the paid canary, and scale to zero afterward. The worker receives only narrowly scoped model-artifact read access and signed asset-upload grants, never asset-bucket or database credentials. |
+| Completed for staging; repeat before onboarding new artifact revisions or the first production GPU job | Exact checkpoint/LoRA/detector files or their approved object versions; SHA-256 values; source/license/commercial/adult-use evidence; a temporary model-uploader identity | Upload only to the private model bucket, verify metadata, run the onboarding plan against the migrated database and both buckets, and produce the immutable worker manifest/digest. Disable the uploader's write access afterward. |
+| Completed for staging generation; repeat before a new or production Salad canary | SaladCloud organization/project, dedicated automation API key, webhook signing secret, payment authorization/billing limits, queue/group names, and the immutable worker image digest; provider-managed GHCR pull access if that image is private | Create/reconcile the queue and worker group, verify callbacks and signed jobs, cap replicas at one for the paid canary, and scale to zero afterward. The worker receives only narrowly scoped model-artifact read access and signed asset-upload grants, never asset-bucket or database credentials. |
 | Before enabling semantic anatomy QC | Private OpenAI-compatible vision-model endpoint, exact model identifier and immutable revision, private network route, and an upstream API key only if that model server requires one | Deploy the pinned upstream plus `Dockerfile.semantic-gateway`, configure the same model/revision on both sides, run semantic canaries, then set `GEN_AUTOMATION_SEMANTIC_ANATOMY_ENABLED=true`. The controller-to-gateway contract itself requires no API key and must not be exposed publicly without a separate authenticated boundary. |
 | After AWS exists, before the X canary | X developer Project/App, confidential client ID/secret, creator refresh token, exact numeric creator user ID, account authorization for `tweet.read tweet.write users.read media.write offline.access`, API billing cap, and sensitive-media configuration | Create one AWS Secrets Manager JSON secret outside OpenTofu. Re-plan with only its complete ARN as `x_oauth_secret_arn` so IAM is limited to that secret, configure the same non-secret ARN reference and creator ID in the app, then run one freshly approved canary. |
 | After the Patreon sidecar and encrypted profile/state mounts exist | Existing Adult/18+ Patreon creator account, completed identity/age checks, exact tier/tag choices, and one owner-controlled headed Chromium login with password/2FA/CAPTCHA | Persist only the signed-in Chromium profile under `/profiles` and idempotency SQLite state under `/state`. Generate the controller/sidecar shared secret in the deployment secret store; it is not a Patreon credential. No Patreon API key is required. If login expires, UI selectors change, or the result is ambiguous, the intent needs operator reconciliation and the manual package remains available. |

@@ -27,9 +27,10 @@ orchestration, authentication/TOTP/RBAC, compliance registry, quality ranking,
 ranked dashboard, durable human review, automatic derivative rendering,
 restart-safe publication orchestration, Patreon browser/manual publishing,
 verified MEGA delivery, and the concrete X OAuth/posting path are implemented.
-Live infrastructure, provider
-conformance, staging restore drills, and paid one-release canaries remain
-deployment work. See:
+AWS staging, live S3 conformance, the RDS restore drill, exact checkpoint/LoRA/
+detector/workflow onboarding, and bounded live SaladCloud generation are
+complete. Semantic-anatomy, review/derivative, Patreon, MEGA, and X destination
+canaries remain deployment work. See:
 
 - [MVP status and deployment handoff](docs/mvp-status.md)
 - [Development plan](docs/development-plan.md)
@@ -102,9 +103,11 @@ publisher roles cannot obtain raw-master URLs.
 ## GPU worker deployment
 
 The GPU worker is a separate, ephemeral Salad container. Its `GEN_WORKER_*`
-configuration and credentials are not needed for local control-plane development;
-they are created and injected only when the staging GPU deployment is ready for
-its paid canary.
+configuration and credentials are deployment-injected and are not needed for
+local control-plane development. The approved staging artifact manifest is
+onboarded, and live SaladCloud generation has produced registered private
+masters; production and materially changed artifact revisions still require
+their own bounded canary.
 
 The image starts pinned ComfyUI from `/opt/comfyui`, materializes approved
 checkpoints and LoRAs from a private read-only S3-compatible artifact source, and

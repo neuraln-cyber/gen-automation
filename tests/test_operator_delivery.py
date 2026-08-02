@@ -1,14 +1,23 @@
 # ruff: noqa: F811
 
 from datetime import UTC, datetime
-from uuid import uuid4
+from urllib.parse import urlencode
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import FastAPI
 from sqlalchemy import select
 from starlette.requests import Request
 
-from gen_automation.api.routes.delivery_dashboard import dashboard_review_delivery
+from gen_automation.api.browser_delivery_forms import (
+    delivery_csrf_token,
+    delivery_form_key,
+)
+from gen_automation.api.routes import delivery_dashboard as delivery_routes
+from gen_automation.api.routes.delivery_dashboard import (
+    dashboard_change_publication_guard,
+    dashboard_review_delivery,
+)
 from gen_automation.config import Environment, Settings
 from gen_automation.db.models import (
     PublicationAttempt,
@@ -29,13 +38,258 @@ from gen_automation.services.operator_delivery import (
     load_operator_delivery,
     prepare_operator_destinations,
 )
-from gen_automation.services.publication import set_publication_guard
+from gen_automation.services.publication import get_publication_guard, set_publication_guard
 from tests.factories import seed_release_approvals, valid_release_payload
 from tests.test_derivative_pipeline import ApprovedContext
 from tests.test_derivative_pipeline import (
     approved_context as derivative_approved_context,  # noqa: F401
 )
 from tests.test_derivative_runtime import _cycle, _prepare
+
+
+def _owner_principal(owner_id: UUID) -> AuthenticatedPrincipal:
+    now = datetime.now(UTC)
+    return AuthenticatedPrincipal(
+        session_id=uuid4(),
+        user_id=owner_id,
+        username="derivative-owner",
+        display_name="Derivative Owner",
+        role=AdminRole.OWNER,
+        csrf_sha256="a" * 64,
+        expires_at=now,
+        idle_expires_at=now,
+        reauthenticated_at=now,
+        mfa_verified_at=now,
+    )
+
+
+def _publication_guard_request(
+    app: FastAPI,
+    *,
+    review_task_id: UUID,
+    fields: dict[str, str],
+) -> Request:
+    body = urlencode(fields).encode()
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": f"/dashboard/review-tasks/{review_task_id}/delivery:publication-guard",
+            "headers": [
+                (b"content-type", b"application/x-www-form-urlencoded"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+            "app": app,
+        },
+        receive,
+    )
+
+
+def _publication_guard_fields(
+    settings: Settings,
+    principal: AuthenticatedPrincipal,
+    *,
+    review_task_id: UUID,
+    enabled: bool,
+    epoch: int,
+    lock_version: int,
+    submission_id: UUID | None = None,
+) -> dict[str, str]:
+    submission = submission_id or uuid4()
+    enabled_value = "true" if enabled else "false"
+    return {
+        "csrf_token": delivery_csrf_token(settings, session_id=principal.session_id),
+        "idempotency_key": delivery_form_key(
+            settings,
+            session_id=principal.session_id,
+            action="publication-guard",
+            parts=(
+                str(review_task_id),
+                str(submission),
+                str(epoch),
+                str(lock_version),
+                "enabled" if enabled else "stopped",
+            ),
+        ),
+        "submission_id": str(submission),
+        "enabled": enabled_value,
+        "expected_epoch": str(epoch),
+        "expected_lock_version": str(lock_version),
+        "reason": "Focused browser publication guard test",
+    }
+
+
+@pytest.mark.asyncio
+async def test_owner_can_toggle_publication_guard_from_delivery_dashboard(
+    derivative_approved_context: ApprovedContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    approved = derivative_approved_context
+    settings = Settings(
+        environment=Environment.TEST,
+        auth_enabled=False,
+        auth_development_bypass_enabled=True,
+    )
+    settings.publishing_enabled = True
+    app = FastAPI()
+    app.state.settings = settings
+    principal = _owner_principal(approved.owner_id)
+
+    async def verified_owner(*_args: object, **_kwargs: object) -> AuthenticatedPrincipal:
+        return principal
+
+    monkeypatch.setattr(delivery_routes, "require_publication_owner", verified_owner)
+
+    async with approved.database.sessions() as session:
+        initial = await get_publication_guard(session)
+        fields = _publication_guard_fields(
+            settings,
+            principal,
+            review_task_id=approved.review_task_id,
+            enabled=True,
+            epoch=initial.epoch,
+            lock_version=initial.lock_version,
+        )
+        response = await dashboard_change_publication_guard(
+            approved.review_task_id,
+            _publication_guard_request(
+                app,
+                review_task_id=approved.review_task_id,
+                fields=fields,
+            ),
+            session,
+            principal,
+        )
+        assert response.status_code == 303
+        assert response.headers["location"].endswith(f"/{approved.review_task_id}/delivery")
+
+        changed = await get_publication_guard(session)
+        assert changed.enabled
+        assert changed.epoch == initial.epoch + 1
+        assert changed.lock_version == initial.lock_version + 1
+
+        replay = await dashboard_change_publication_guard(
+            approved.review_task_id,
+            _publication_guard_request(
+                app,
+                review_task_id=approved.review_task_id,
+                fields=fields,
+            ),
+            session,
+            principal,
+        )
+        assert replay.status_code == 303
+        replayed_state = await get_publication_guard(session)
+        assert replayed_state.epoch == changed.epoch
+        assert replayed_state.lock_version == changed.lock_version
+
+        stale_fields = _publication_guard_fields(
+            settings,
+            principal,
+            review_task_id=approved.review_task_id,
+            enabled=False,
+            epoch=initial.epoch,
+            lock_version=initial.lock_version,
+        )
+        stale = await dashboard_change_publication_guard(
+            approved.review_task_id,
+            _publication_guard_request(
+                app,
+                review_task_id=approved.review_task_id,
+                fields=stale_fields,
+            ),
+            session,
+            principal,
+        )
+        assert stale.status_code == 409
+        assert b"changed in another session" in stale.body
+        unchanged = await get_publication_guard(session)
+        assert unchanged.enabled
+        assert unchanged.epoch == changed.epoch
+
+
+@pytest.mark.asyncio
+async def test_dashboard_blocks_enable_when_workers_are_disabled_but_allows_stop(
+    derivative_approved_context: ApprovedContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    approved = derivative_approved_context
+    settings = Settings(
+        environment=Environment.TEST,
+        auth_enabled=False,
+        auth_development_bypass_enabled=True,
+    )
+    app = FastAPI()
+    app.state.settings = settings
+    principal = _owner_principal(approved.owner_id)
+
+    async def verified_owner(*_args: object, **_kwargs: object) -> AuthenticatedPrincipal:
+        return principal
+
+    monkeypatch.setattr(delivery_routes, "require_publication_owner", verified_owner)
+
+    async with approved.database.sessions() as session:
+        initial = await get_publication_guard(session)
+        blocked_fields = _publication_guard_fields(
+            settings,
+            principal,
+            review_task_id=approved.review_task_id,
+            enabled=True,
+            epoch=initial.epoch,
+            lock_version=initial.lock_version,
+        )
+        blocked = await dashboard_change_publication_guard(
+            approved.review_task_id,
+            _publication_guard_request(
+                app,
+                review_task_id=approved.review_task_id,
+                fields=blocked_fields,
+            ),
+            session,
+            principal,
+        )
+        assert blocked.status_code == 409
+        assert b"Publication workers are disabled" in blocked.body
+        still_stopped = await get_publication_guard(session)
+        assert not still_stopped.enabled
+        assert still_stopped.epoch == initial.epoch
+
+        enabled = await set_publication_guard(
+            session,
+            enabled=True,
+            expected_epoch=initial.epoch,
+            expected_lock_version=initial.lock_version,
+            reason="Prepare the emergency-stop dashboard path",
+            actor_user_id=approved.owner_id,
+            actor_role=AdminRole.OWNER,
+            idempotency_key="operator-delivery-enable-before-browser-stop",
+        )
+        stop_fields = _publication_guard_fields(
+            settings,
+            principal,
+            review_task_id=approved.review_task_id,
+            enabled=False,
+            epoch=enabled.epoch,
+            lock_version=enabled.lock_version,
+        )
+        stopped = await dashboard_change_publication_guard(
+            approved.review_task_id,
+            _publication_guard_request(
+                app,
+                review_task_id=approved.review_task_id,
+                fields=stop_fields,
+            ),
+            session,
+            principal,
+        )
+        assert stopped.status_code == 303
+        final = await get_publication_guard(session)
+        assert not final.enabled
+        assert final.epoch == enabled.epoch + 1
 
 
 @pytest.mark.asyncio
@@ -77,6 +331,9 @@ async def test_completed_review_prepares_exact_patreon_mega_and_x_destinations(
             review_task_id=approved.review_task_id,
         )
         assert before.progress.ready_for_destinations
+        assert before.publishing_guard_epoch == guard.epoch
+        assert before.publishing_guard_lock_version == guard.lock_version
+        assert before.publishing_guard_changed_at == guard.changed_at
         assert [output.display_order for output in before.full_outputs] == [1, 2]
         assert len(before.x_outputs) == 1
 
@@ -202,4 +459,6 @@ async def test_completed_review_prepares_exact_patreon_mega_and_x_destinations(
         assert "Patreon" in html
         assert "MEGA" in html
         assert "X" in html
+        assert "Stop publication" in html
+        assert "status ready" in html
         assert "persistent signed-in browser publisher" in html
