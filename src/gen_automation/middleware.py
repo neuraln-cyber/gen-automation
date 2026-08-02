@@ -1,5 +1,6 @@
 import re
 from collections.abc import Awaitable, Callable
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import structlog
@@ -9,19 +10,46 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from gen_automation.config import Environment, Settings
 
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+CSP_CONNECT_SOURCE_PATTERN = re.compile(r"^https?://[A-Za-z0-9.-]+(?::[0-9]{1,5})?$")
+
+
+def asset_connection_source(settings: Settings) -> str | None:
+    if not settings.storage_enabled:
+        return None
+    if settings.storage_endpoint_url is not None:
+        endpoint = urlsplit(str(settings.storage_endpoint_url))
+        source = f"{endpoint.scheme}://{endpoint.netloc}"
+        return source if CSP_CONNECT_SOURCE_PATTERN.fullmatch(source) else None
+    if not settings.storage_bucket:
+        return None
+    region = settings.storage_region
+    aws_suffix = "amazonaws.com.cn" if region.startswith("cn-") else "amazonaws.com"
+    host = (
+        f"{settings.storage_bucket}.s3.{aws_suffix}"
+        if region == "us-east-1"
+        else f"{settings.storage_bucket}.s3.{region}.{aws_suffix}"
+    )
+    source = f"https://{host}"
+    return source if CSP_CONNECT_SOURCE_PATTERN.fullmatch(source) else None
 
 
 def content_security_policy(
     environment: Environment,
     *,
     allow_same_origin_scripts: bool = False,
+    asset_connect_source: str | None = None,
 ) -> str:
     image_sources = "'self' https:"
+    connect_sources = "'self'"
     if environment in {Environment.LOCAL, Environment.TEST}:
         image_sources = f"{image_sources} http:"
+    if asset_connect_source is not None:
+        if CSP_CONNECT_SOURCE_PATTERN.fullmatch(asset_connect_source) is None:
+            raise ValueError("invalid CSP asset connection source")
+        connect_sources = f"{connect_sources} {asset_connect_source}"
     script_sources = "'self'" if allow_same_origin_scripts else "'none'"
     return (
-        "default-src 'self'; base-uri 'none'; connect-src 'self'; "
+        f"default-src 'self'; base-uri 'none'; connect-src {connect_sources}; "
         "font-src 'self'; form-action 'self'; frame-ancestors 'none'; "
         f"img-src {image_sources}; object-src 'none'; "
         f"script-src {script_sources}; style-src 'self' 'unsafe-inline'"
@@ -62,6 +90,11 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
             settings.environment,
             allow_same_origin_scripts=(
                 request.url.path == "/dashboard" or request.url.path.startswith("/dashboard/")
+            ),
+            asset_connect_source=(
+                asset_connection_source(settings)
+                if request.url.path == "/dashboard" or request.url.path.startswith("/dashboard/")
+                else None
             ),
         )
         response.headers["Permissions-Policy"] = (

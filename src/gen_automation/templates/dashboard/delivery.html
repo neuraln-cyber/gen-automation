@@ -14,7 +14,13 @@
     </div>
   </section>
 
-  <section class="panel review-summary step-panel panel-accent" aria-labelledby="outputs-heading">
+  <section
+    class="panel review-summary step-panel panel-accent"
+    aria-labelledby="outputs-heading"
+    {% if delivery.progress.planned and not delivery.progress.ready_for_destinations %}
+      data-delivery-auto-refresh="8000"
+    {% endif %}
+  >
     <div class="step-heading">
       <span class="step-number" aria-hidden="true">1</span>
       <div>
@@ -97,8 +103,8 @@
     {% elif delivery.progress.ready_for_destinations %}
       <p class="terminal-state" role="status">All exact outputs are ready.</p>
     {% else %}
-      <p class="terminal-state" role="status">
-        Rendering is in progress. Refresh this page to update the counts.
+      <p class="terminal-state" role="status" data-delivery-refresh-status>
+        Rendering is in progress. This page updates automatically.
       </p>
     {% endif %}
   </section>

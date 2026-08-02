@@ -17,6 +17,358 @@
 
   const optionalText = (value) => value.trim() === "" ? null : value;
 
+  const AUTOMATION_PRESET_STORAGE_KEY = "gen-automation:generation-presets:v1";
+  const AUTOMATION_DRAFT_STORAGE_KEY = "gen-automation:automation-draft:v1";
+  const AUTOMATION_DRAFT_SUBMISSION_KEY = "gen-automation:automation-draft-submission:v1";
+  const PENDING_IMAGE_PROFILE_KEY = "gen-automation:reuse-image-settings:v1";
+  const scopedStorageKey = (key) => {
+    const scope = document.body?.dataset.automationStorageScope?.trim() || "unknown-user";
+    return `${key}:${scope}`;
+  };
+  const AUTOMATION_PRESET_FIELDS = Object.freeze([
+    "subject_id",
+    "checkpoint_id",
+    "workflow_id",
+    "negative_prompt",
+    "detailer_prompt",
+    "detailer_negative_prompt",
+    "width",
+    "height",
+    "cfg",
+    "steps",
+    "sampler",
+    "scheduler",
+    "clip_skip",
+    "outputs_per_job",
+    "hires_scale",
+    "hires_denoise",
+    "hires_upscale_method",
+    "detailer_guide_size",
+    "detailer_max_size",
+    "detailer_denoise",
+    "detailer_bbox_threshold",
+    "detailer_bbox_dilation",
+    "detailer_bbox_crop_factor",
+    "detailer_feather",
+  ]);
+
+  const namedControl = (form, name) => form.querySelector(`[name="${name}"]`);
+
+  const readStoredAutomationPresets = () => {
+    try {
+      const raw = window.localStorage.getItem(scopedStorageKey(AUTOMATION_PRESET_STORAGE_KEY));
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter((item) => (
+        item && typeof item === "object"
+        && typeof item.id === "string"
+        && typeof item.name === "string"
+        && item.profile && typeof item.profile === "object"
+      )).slice(0, 30);
+    } catch (_error) {
+      return [];
+    }
+  };
+
+  const writeStoredAutomationPresets = (presets) => {
+    window.localStorage.setItem(
+      scopedStorageKey(AUTOMATION_PRESET_STORAGE_KEY),
+      JSON.stringify(presets),
+    );
+  };
+
+  const collectAutomationProfile = (form) => {
+    const fields = {};
+    AUTOMATION_PRESET_FIELDS.forEach((name) => {
+      const control = namedControl(form, name);
+      if (control instanceof HTMLInputElement
+          || control instanceof HTMLTextAreaElement
+          || control instanceof HTMLSelectElement) {
+        fields[name] = control.value;
+      }
+    });
+    const loras = Array.from(form.querySelectorAll("[data-lora-native-slot]")).flatMap((slot) => {
+      const idControl = slot.querySelector("[data-lora-native-id]");
+      const weightControl = slot.querySelector("[data-lora-native-weight]");
+      if (!(idControl instanceof HTMLSelectElement) || !idControl.value) return [];
+      const catalogOption = Array.from(form.querySelectorAll("[data-lora-option]")).find(
+        (option) => option.dataset.loraId === idControl.value,
+      );
+      return [{
+        approval_id: idControl.value,
+        name: catalogOption?.dataset.loraName || "",
+        sha256: catalogOption?.dataset.loraSha256 || "",
+        weight: weightControl instanceof HTMLInputElement ? weightControl.value : "1",
+      }];
+    });
+    const subject = namedControl(form, "subject_id")?.selectedOptions?.item(0);
+    const checkpoint = namedControl(form, "checkpoint_id")?.selectedOptions?.item(0);
+    const workflow = namedControl(form, "workflow_id")?.selectedOptions?.item(0);
+    return {
+      schema_version: 1,
+      fields,
+      loras,
+      matches: {
+        subject_name: subject?.dataset.subjectName || "",
+        subject_slug: subject?.dataset.subjectSlug || "",
+        checkpoint_name: checkpoint?.dataset.checkpointName || "",
+        checkpoint_sha256: checkpoint?.dataset.checkpointSha256 || "",
+        workflow_name: workflow?.dataset.workflowName || "",
+        workflow_version: workflow?.dataset.workflowVersion || "",
+        workflow_sha256: workflow?.dataset.workflowSha256 || "",
+      },
+    };
+  };
+
+  const resolveLoraStack = (form, requested) => {
+    if (!Array.isArray(requested)) return { missing: [], selections: [] };
+    const options = Array.from(form.querySelectorAll("[data-lora-option]"));
+    const seen = new Set();
+    const missing = [];
+    const selections = [];
+    requested.slice(0, 8).forEach((item, index) => {
+      if (!item || typeof item !== "object") {
+        missing.push(`LoRA ${index + 1} has invalid saved data.`);
+        return;
+      }
+      const approvalId = typeof item.approval_id === "string" ? item.approval_id : "";
+      const sha256 = typeof item.sha256 === "string" ? item.sha256.toLowerCase() : "";
+      const name = typeof item.name === "string" ? item.name : "";
+      let option = sha256
+        ? options.find(
+          (candidate) => (candidate.dataset.loraSha256 || "").toLowerCase() === sha256,
+        )
+        : null;
+      if (!option && approvalId) {
+        option = options.find((candidate) => candidate.dataset.loraId === approvalId);
+      }
+      if (!option && name) {
+        option = options.find((candidate) => candidate.dataset.loraName === name);
+      }
+      const id = option?.dataset.loraId || "";
+      const weight = String(item.weight ?? "1");
+      const numericWeight = Number(weight);
+      const label = name || (sha256 ? sha256.slice(0, 12) : `LoRA ${index + 1}`);
+      if (!id) {
+        missing.push(`${label} is not currently available.`);
+        return;
+      }
+      if (sha256 && (option.dataset.loraSha256 || "").toLowerCase() !== sha256) {
+        missing.push(`${label} exact version is unavailable; the current approved version was substituted.`);
+      }
+      if (seen.has(id)) {
+        missing.push(`${label} is duplicated in the saved stack.`);
+        return;
+      }
+      if (!weight.trim() || !Number.isFinite(numericWeight)
+          || numericWeight < -2 || numericWeight > 2) {
+        missing.push(`${label} has an invalid saved weight.`);
+        return;
+      }
+      seen.add(id);
+      selections.push({ id, weight });
+    });
+    return { missing, selections };
+  };
+
+  const applyAutomationProfile = (form, profile) => {
+    if (!profile || typeof profile !== "object") return { applied: false, missing: [] };
+    form.dataset.applyingAutomationProfile = "true";
+    const fields = profile.fields && typeof profile.fields === "object" ? profile.fields : {};
+    const missing = [];
+    const matchedSelects = new Set(["subject_id", "checkpoint_id", "workflow_id"]);
+    AUTOMATION_PRESET_FIELDS.forEach((name) => {
+      if (matchedSelects.has(name)) return;
+      const value = fields[name];
+      const control = namedControl(form, name);
+      if (typeof value !== "string") return;
+      if (!(control instanceof HTMLInputElement)
+          && !(control instanceof HTMLTextAreaElement)
+          && !(control instanceof HTMLSelectElement)) return;
+      if (control instanceof HTMLSelectElement
+          && !Array.from(control.options).some((option) => option.value === value)) {
+        missing.push(`Saved ${name.replaceAll("_", " ")} value is unavailable.`);
+        return;
+      }
+      control.value = value;
+    });
+
+    const matches = profile.matches && typeof profile.matches === "object" ? profile.matches : {};
+    const matchRequiredSelect = (name, matchers, description) => {
+      const control = namedControl(form, name);
+      if (!(control instanceof HTMLSelectElement)) return;
+      let option = null;
+      matchers.some((matcher) => {
+        option = Array.from(control.options).find(matcher) || null;
+        return option !== null;
+      });
+      if (option) {
+        control.value = option.value;
+        return;
+      }
+      control.value = "";
+      missing.push(`${description} is not currently approved.`);
+    };
+    const subjectName = typeof matches.subject_name === "string" ? matches.subject_name : "";
+    const subjectSlug = typeof matches.subject_slug === "string" ? matches.subject_slug : "";
+    const subjectId = typeof fields.subject_id === "string" ? fields.subject_id : "";
+    if (subjectName || subjectSlug || subjectId) {
+      matchRequiredSelect(
+        "subject_id",
+        [
+          (option) => Boolean(subjectId && option.value === subjectId),
+          (option) => Boolean(subjectSlug && option.dataset.subjectSlug === subjectSlug),
+          (option) => Boolean(subjectName && option.dataset.subjectName === subjectName),
+        ],
+        subjectName ? `Subject ${subjectName}` : "Saved subject",
+      );
+    }
+    const checkpointSha256 = typeof matches.checkpoint_sha256 === "string"
+      ? matches.checkpoint_sha256.toLowerCase()
+      : "";
+    const checkpointId = typeof fields.checkpoint_id === "string" ? fields.checkpoint_id : "";
+    if (checkpointSha256 || checkpointId) {
+      const checkpointName = typeof matches.checkpoint_name === "string"
+        ? matches.checkpoint_name
+        : "Saved checkpoint";
+      matchRequiredSelect(
+        "checkpoint_id",
+        [
+          (option) => Boolean(checkpointId && option.value === checkpointId),
+          (option) => Boolean(checkpointSha256
+            && (option.dataset.checkpointSha256 || "").toLowerCase() === checkpointSha256),
+        ],
+        `Checkpoint ${checkpointName}`,
+      );
+    }
+    const workflowName = typeof matches.workflow_name === "string" ? matches.workflow_name : "";
+    const workflowVersion = typeof matches.workflow_version === "string"
+      ? matches.workflow_version
+      : "";
+    const workflowSha256 = typeof matches.workflow_sha256 === "string"
+      ? matches.workflow_sha256.toLowerCase()
+      : "";
+    const workflowId = typeof fields.workflow_id === "string" ? fields.workflow_id : "";
+    if (workflowName || workflowSha256 || workflowId) {
+      matchRequiredSelect(
+        "workflow_id",
+        [
+          (option) => Boolean(workflowId && option.value === workflowId),
+          (option) => Boolean(workflowSha256
+            && (option.dataset.workflowSha256 || "").toLowerCase() === workflowSha256),
+          (option) => Boolean(workflowName && option.dataset.workflowName === workflowName
+            && (!workflowVersion || option.dataset.workflowVersion === workflowVersion)),
+        ],
+        workflowName
+          ? `Workflow ${workflowName}${workflowVersion ? ` v${workflowVersion}` : ""}`
+          : "Saved workflow",
+      );
+    }
+
+    if (typeof profile.batch_prompt === "string") {
+      const prompt = namedControl(form, "prompt");
+      if (prompt instanceof HTMLTextAreaElement) prompt.value = profile.batch_prompt;
+    }
+    if (typeof profile.seed === "string") {
+      const seed = namedControl(form, "seed");
+      if (seed instanceof HTMLInputElement) seed.value = profile.seed;
+    }
+
+    const loraResolution = resolveLoraStack(form, profile.loras);
+    const loras = loraResolution.selections;
+    missing.push(...loraResolution.missing);
+    const slots = Array.from(form.querySelectorAll("[data-lora-native-slot]"));
+    slots.forEach((slot, index) => {
+      const idControl = slot.querySelector("[data-lora-native-id]");
+      const weightControl = slot.querySelector("[data-lora-native-weight]");
+      if (idControl instanceof HTMLSelectElement) idControl.value = loras[index]?.id || "";
+      if (weightControl instanceof HTMLInputElement) weightControl.value = loras[index]?.weight || "";
+    });
+    window.dispatchEvent(new CustomEvent("gen-automation:apply-lora-stack", {
+      detail: { selections: loras },
+    }));
+    form.querySelectorAll("input, textarea, select").forEach((control) => {
+      control.dispatchEvent(new Event("input", { bubbles: true }));
+      if (control instanceof HTMLSelectElement) {
+        control.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    });
+    delete form.dataset.applyingAutomationProfile;
+    return { applied: true, missing };
+  };
+
+  function consumePendingImageProfile() {
+    const form = document.querySelector("[data-automation-form]");
+    if (!form) return false;
+    try {
+      const raw = window.sessionStorage.getItem(scopedStorageKey(PENDING_IMAGE_PROFILE_KEY));
+      if (!raw) return false;
+      window.sessionStorage.removeItem(scopedStorageKey(PENDING_IMAGE_PROFILE_KEY));
+      const payload = JSON.parse(raw);
+      const result = applyAutomationProfile(form, payload);
+      if (result.applied) {
+        form.dataset.importedImageSettings = "true";
+        form.dataset.profileImportWarning = result.missing.join(" ");
+        return true;
+      }
+    } catch (_error) {
+      try {
+        window.sessionStorage.removeItem(scopedStorageKey(PENDING_IMAGE_PROFILE_KEY));
+      } catch (_storageError) {
+        // Reusing settings is optional when session storage is unavailable.
+      }
+    }
+    return false;
+  }
+
+  const readStoredAutomationDraft = () => {
+    try {
+      const raw = window.localStorage.getItem(scopedStorageKey(AUTOMATION_DRAFT_STORAGE_KEY));
+      if (!raw) return null;
+      const draft = JSON.parse(raw);
+      if (!draft || draft.schema_version !== 1 || !Array.isArray(draft.batch_plan)) return null;
+      return draft;
+    } catch (_error) {
+      return null;
+    }
+  };
+
+  function restoreAutomationDraft() {
+    const form = document.querySelector("[data-automation-form]");
+    const planData = document.querySelector("#batch-plan-data");
+    if (!form || !(planData instanceof HTMLTextAreaElement)) return false;
+    if (form.dataset.serverError === "true") {
+      try {
+        window.sessionStorage.removeItem(scopedStorageKey(AUTOMATION_DRAFT_SUBMISSION_KEY));
+      } catch (_error) {
+        // Storage availability must not replace the server-returned form values.
+      }
+      return false;
+    }
+    const draft = readStoredAutomationDraft();
+    if (!draft) return false;
+    const setTextControl = (name, value) => {
+      const control = namedControl(form, name);
+      if (typeof value !== "string") return;
+      if (control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement) {
+        control.value = value;
+      }
+    };
+    setTextControl("title", draft.title);
+    setTextControl("slug", draft.slug);
+    setTextControl("seed", draft.seed);
+    setTextControl("desired_accepted_count", draft.desired_accepted_count);
+    const result = applyAutomationProfile(form, draft.profile);
+    planData.value = JSON.stringify(draft.batch_plan.slice(0, 50));
+    form.dataset.automationDraftRestored = "true";
+    if (typeof draft.target_follows_queue === "boolean") {
+      form.dataset.restoredTargetFollowsQueue = String(draft.target_follows_queue);
+    }
+    form.dataset.profileImportWarning = result.missing.join(" ");
+    return true;
+  }
+
   function initializeLoraPicker() {
     const form = document.querySelector("[data-automation-form]");
     const picker = document.querySelector("[data-lora-picker]");
@@ -37,13 +389,10 @@
     const summary = document.querySelector("[data-lora-summary]");
     const feedback = picker.querySelector("[data-lora-feedback]");
     const clearButton = picker.querySelector("[data-lora-clear]");
-    const savePresetButton = picker.querySelector("[data-lora-save-preset]");
-    const loadPresetButton = picker.querySelector("[data-lora-load-preset]");
     const maximum = Math.min(
       nativeSlots.length,
       Math.max(1, integerValue(picker.dataset.maxSelections, nativeSlots.length)),
     );
-    const presetStorageKey = "gen-automation:lora-stack:v1";
     const optionById = new Map(
       catalogOptions.map((button) => [button.dataset.loraId, button]),
     );
@@ -64,34 +413,6 @@
         && parsed <= 2;
     };
 
-    const storedPreset = () => {
-      try {
-        const raw = window.localStorage.getItem(presetStorageKey);
-        if (!raw) return [];
-        const parsed = JSON.parse(raw);
-        if (!Array.isArray(parsed)) return [];
-        const seen = new Set();
-        return parsed.slice(0, maximum).flatMap((item) => {
-          if (!item || typeof item !== "object") return [];
-          const id = typeof item.approval_id === "string" ? item.approval_id : "";
-          const weight = String(item.weight ?? "");
-          if (!optionById.has(id) || seen.has(id) || !validWeight(weight)) return [];
-          seen.add(id);
-          return [{ id, weight }];
-        });
-      } catch (_error) {
-        return [];
-      }
-    };
-
-    const updatePresetAvailability = () => {
-      if (savePresetButton) {
-        savePresetButton.disabled = selections.length === 0
-          || selections.some((item) => !validWeight(item.weight));
-      }
-      if (loadPresetButton) loadPresetButton.disabled = storedPreset().length === 0;
-    };
-
     const syncCanonicalSlots = () => {
       nativeSlots.forEach((slot, index) => {
         const idControl = slot.querySelector("[data-lora-native-id]");
@@ -100,7 +421,6 @@
         if (idControl) idControl.value = selection ? selection.id : "";
         if (weightControl) weightControl.value = selection ? selection.weight : "";
       });
-      updatePresetAvailability();
     };
 
     const selectedName = (id) => {
@@ -173,6 +493,7 @@
       if (clearButton) clearButton.disabled = selections.length === 0;
       syncCanonicalSlots();
       updateCatalogFilter();
+      form.dispatchEvent(new CustomEvent("gen-automation:profile-changed"));
     };
 
     const removeSelection = (id, announce = true) => {
@@ -232,37 +553,6 @@
         selections = [];
         renderSelections();
         setFeedback("LoRA stack cleared.");
-      });
-    }
-
-    if (savePresetButton) {
-      savePresetButton.addEventListener("click", () => {
-        try {
-          window.localStorage.setItem(
-            presetStorageKey,
-            JSON.stringify(
-              selections.map((item) => ({ approval_id: item.id, weight: item.weight })),
-            ),
-          );
-          updatePresetAvailability();
-          setFeedback("LoRA stack saved in this browser.", "success");
-        } catch (_error) {
-          setFeedback("This browser could not save the LoRA stack.", "warning");
-        }
-      });
-    }
-
-    if (loadPresetButton) {
-      loadPresetButton.addEventListener("click", () => {
-        const saved = storedPreset();
-        if (saved.length === 0) {
-          updatePresetAvailability();
-          setFeedback("The saved stack is no longer available.", "warning");
-          return;
-        }
-        selections = saved;
-        renderSelections();
-        setFeedback("Saved LoRA stack loaded.", "success");
       });
     }
 
@@ -352,6 +642,21 @@
       });
     });
 
+    window.addEventListener("gen-automation:apply-lora-stack", (event) => {
+      const requested = event.detail?.selections;
+      if (!Array.isArray(requested)) return;
+      const seen = new Set();
+      selections = requested.slice(0, maximum).flatMap((item) => {
+        const id = item && typeof item.id === "string" ? item.id : "";
+        const weight = String(item?.weight ?? "1");
+        if (!optionById.has(id) || seen.has(id) || !validWeight(weight)) return [];
+        seen.add(id);
+        return [{ id, weight }];
+      });
+      renderSelections();
+      setFeedback("Generation preset LoRA stack applied.", "success");
+    });
+
     form.addEventListener("submit", syncCanonicalSlots, { capture: true });
   }
 
@@ -364,14 +669,19 @@
     if (!form || !builder || !list || !template || !planData) return;
 
     const addButtons = Array.from(form.querySelectorAll("[data-add-batch]"));
+    const collapseAllButton = form.querySelector("[data-collapse-batches]");
     const outputsPerJob = form.querySelector("[data-outputs-per-job]");
     const plannedJobCount = form.querySelector("[data-planned-job-count]");
     const desiredCount = form.querySelector("[data-desired-count]");
+    const matchQueueTarget = form.querySelector("[data-match-queue-target]");
+    const randomSeedButton = form.querySelector("[data-random-seed]");
     const defaultPrompt = form.querySelector("[data-default-prompt]");
     const defaultNegative = form.querySelector("[data-default-negative]");
     const defaultDetailer = form.querySelector("[data-default-detailer]");
     const defaultDetailerNegative = form.querySelector("[data-default-detailer-negative]");
     const defaultSeed = form.querySelector("[data-default-seed]");
+    const detailerGuideSize = namedControl(form, "detailer_guide_size");
+    const detailerMaxSize = namedControl(form, "detailer_max_size");
     const titleInput = form.querySelector("[data-title-input]");
     const slugInput = form.querySelector("[data-slug-input]");
     const submitButtons = Array.from(form.querySelectorAll(".queue-submit"));
@@ -380,6 +690,10 @@
     let lastPrompt = null;
     let slugWasEdited = Boolean(slugInput && slugInput.value.trim());
     let previousDefaultPrompt = defaultPrompt ? defaultPrompt.value : "";
+    let targetFollowsQueue = typeof form.dataset.restoredTargetFollowsQueue === "string"
+      ? form.dataset.restoredTargetFollowsQueue === "true"
+      : Boolean(desiredCount && !planData.value.trim());
+    delete form.dataset.restoredTargetFollowsQueue;
 
     builder.hidden = false;
     document.documentElement.classList.add("dashboard-enhanced");
@@ -403,6 +717,14 @@
 
     const batchRows = () => Array.from(list.querySelectorAll("[data-batch-row]"));
     const wildcardPattern = /__([a-z0-9]+(?:[._/-][a-z0-9]+)*)__/g;
+    const knownWildcards = new Set(
+      Array.from(template.content.querySelectorAll("[data-batch-wildcard] option")).flatMap(
+        (option) => {
+          const match = /^__([a-z0-9]+(?:[._/-][a-z0-9]+)*)__$/.exec(option.value);
+          return match ? [match[1]] : [];
+        },
+      ),
+    );
 
     const insertToken = (target, token) => {
       const start = target.selectionStart ?? target.value.length;
@@ -455,15 +777,42 @@
       return row;
     };
 
+    const unknownWildcardNames = (value) => Array.from(
+      new Set(
+        Array.from(String(value).matchAll(wildcardPattern), (match) => match[1])
+          .filter((name) => !knownWildcards.has(name)),
+      ),
+    );
+
+    const applyWildcardValidity = (control) => {
+      if (!(control instanceof HTMLInputElement)
+          && !(control instanceof HTMLTextAreaElement)) return false;
+      const unknownWildcards = unknownWildcardNames(control.value);
+      control.setCustomValidity(
+        unknownWildcards.length > 0
+          ? `Unknown wildcard: ${unknownWildcards.map((name) => `__${name}__`).join(", ")}.`
+          : "",
+      );
+      return unknownWildcards.length > 0;
+    };
+
     const setBatchValidity = () => {
       const rows = batchRows();
       const names = new Map();
+      let hasUnknownWildcard = false;
+      [defaultPrompt, defaultNegative, defaultDetailer, defaultDetailerNegative].forEach((control) => {
+        hasUnknownWildcard = applyWildcardValidity(control) || hasUnknownWildcard;
+      });
       rows.forEach((row) => {
         const nameInput = field(row, "name");
         const key = nameInput.value.trim().toLowerCase();
         const duplicate = key && names.has(key);
         nameInput.setCustomValidity(duplicate ? "Batch labels must be unique." : "");
         if (key && !duplicate) names.set(key, row);
+        ["prompt", "negative_prompt", "detailer_prompt", "detailer_negative_prompt"]
+          .forEach((name) => {
+            hasUnknownWildcard = applyWildcardValidity(field(row, name)) || hasUnknownWildcard;
+          });
       });
       const totalImages = rows.reduce(
         (total, row) => total + Math.max(0, integerValue(field(row, "image_count").value)),
@@ -475,6 +824,19 @@
           target > totalImages ? "The final-set target cannot exceed generated images." : "",
         );
       }
+      let invalidDetailerSize = false;
+      if (detailerGuideSize instanceof HTMLInputElement
+          && detailerMaxSize instanceof HTMLInputElement) {
+        const guideSize = integerValue(detailerGuideSize.value);
+        const maxSize = integerValue(detailerMaxSize.value);
+        invalidDetailerSize = guideSize > 0 && maxSize > 0 && maxSize < guideSize;
+        detailerMaxSize.setCustomValidity(
+          invalidDetailerSize
+            ? "Face maximum size must be at least the face guide size."
+            : "",
+        );
+      }
+      return { hasUnknownWildcard, invalidDetailerSize };
     };
 
     const updateBuilder = () => {
@@ -504,8 +866,10 @@
           wildcardSummary.replaceChildren(
             ...uniqueWildcards.map((wildcard) => {
               const chip = document.createElement("span");
-              chip.className = "batch-wildcard-chip";
+              const known = knownWildcards.has(wildcard);
+              chip.className = `batch-wildcard-chip${known ? "" : " invalid"}`;
               chip.textContent = `__${wildcard}__`;
+              if (!known) chip.title = "This wildcard library does not exist.";
               return chip;
             }),
           );
@@ -516,7 +880,13 @@
         row.querySelector('[data-batch-action="remove"]').disabled = rows.length === 1;
       });
       if (plannedJobCount) plannedJobCount.value = Math.max(1, totalJobs);
+      if (desiredCount && targetFollowsQueue
+          && form.dataset.applyingAutomationProfile !== "true") {
+        desiredCount.value = String(Math.max(1, Math.min(100, totalImages)));
+      }
+      form.dataset.targetFollowsQueue = String(targetFollowsQueue);
       addButtons.forEach((button) => { button.disabled = rows.length >= 50; });
+      planData.value = JSON.stringify(rows.map(readRow));
 
       const batchesSummary = document.querySelector("#summary-batches");
       const imagesSummary = document.querySelector("#summary-images");
@@ -524,6 +894,7 @@
       const targetSummary = document.querySelector("#summary-target");
       const mobileImageSummaries = document.querySelectorAll("[data-mobile-summary-images]");
       const mobileJobSummaries = document.querySelectorAll("[data-mobile-summary-jobs]");
+      const mobileTargetSummaries = document.querySelectorAll("[data-mobile-summary-target]");
       const note = document.querySelector("#summary-note");
       if (batchesSummary) batchesSummary.textContent = String(rows.length);
       if (imagesSummary) imagesSummary.textContent = totalImages.toLocaleString();
@@ -531,8 +902,12 @@
       if (targetSummary) targetSummary.textContent = String(integerValue(desiredCount && desiredCount.value));
       mobileImageSummaries.forEach((item) => { item.textContent = totalImages.toLocaleString(); });
       mobileJobSummaries.forEach((item) => { item.textContent = totalJobs.toLocaleString(); });
+      mobileTargetSummaries.forEach((item) => {
+        item.textContent = String(integerValue(desiredCount && desiredCount.value));
+      });
 
-      setBatchValidity();
+      const validity = setBatchValidity();
+      const unknownWildcard = validity.hasUnknownWildcard;
       const missingPrompt = rows.some((row) => !field(row, "prompt").value.trim());
       const tooManyJobs = totalJobs > maximumProviderJobs;
       const targetTooLarge = desiredCount && integerValue(desiredCount.value) > totalImages;
@@ -540,11 +915,17 @@
         if (missingPrompt) {
           note.textContent = "Every batch needs a prompt structure before this run can start.";
           note.className = "summary-note warning";
+        } else if (unknownWildcard) {
+          note.textContent = "Fix the unknown wildcard highlighted in the batch queue.";
+          note.className = "summary-note warning";
         } else if (tooManyJobs) {
           note.textContent = `Reduce the queue to ${maximumProviderJobs.toLocaleString()} GPU jobs or fewer.`;
           note.className = "summary-note warning";
         } else if (targetTooLarge) {
           note.textContent = "Reduce the final-set target or generate more images.";
+          note.className = "summary-note warning";
+        } else if (validity.invalidDetailerSize) {
+          note.textContent = "Face maximum size must be at least the guide size.";
           note.className = "summary-note warning";
         } else {
           note.textContent = `${totalImages.toLocaleString()} images will run as ${totalJobs.toLocaleString()} efficient GPU jobs.`;
@@ -554,10 +935,13 @@
       submitButtons.forEach((button) => {
         button.disabled = serverDisabled
           || missingPrompt
+          || unknownWildcard
           || tooManyJobs
           || Boolean(targetTooLarge)
+          || validity.invalidDetailerSize
           || totalImages < 1;
       });
+      form.dispatchEvent(new CustomEvent("gen-automation:builder-updated"));
     };
 
     let initialBatches = [];
@@ -589,6 +973,22 @@
       field(row, "name").focus();
       row.scrollIntoView({ behavior: "smooth", block: "center" });
     }));
+
+    if (collapseAllButton instanceof HTMLButtonElement) {
+      collapseAllButton.addEventListener("click", () => {
+        const rows = batchRows();
+        const collapse = rows.some((row) => !row.classList.contains("is-collapsed"));
+        rows.forEach((row) => {
+          row.classList.toggle("is-collapsed", collapse);
+          const button = row.querySelector('[data-batch-action="collapse"]');
+          if (button) {
+            button.setAttribute("aria-expanded", String(!collapse));
+            button.textContent = collapse ? "Expand" : "Collapse";
+          }
+        });
+        collapseAllButton.textContent = collapse ? "Expand all" : "Collapse all";
+      });
+    }
 
     list.addEventListener("change", (event) => {
       if (!event.target.matches("[data-batch-wildcard]")) return;
@@ -639,7 +1039,33 @@
     });
 
     outputsPerJob && outputsPerJob.addEventListener("input", updateBuilder);
-    desiredCount && desiredCount.addEventListener("input", updateBuilder);
+    [defaultNegative, defaultDetailer, defaultDetailerNegative].forEach((control) => {
+      if (control instanceof HTMLTextAreaElement) control.addEventListener("input", updateBuilder);
+    });
+    [detailerGuideSize, detailerMaxSize].forEach((control) => {
+      if (control instanceof HTMLInputElement) control.addEventListener("input", updateBuilder);
+    });
+    desiredCount && desiredCount.addEventListener("input", () => {
+      targetFollowsQueue = false;
+      updateBuilder();
+    });
+    if (matchQueueTarget instanceof HTMLButtonElement) {
+      matchQueueTarget.addEventListener("click", () => {
+        targetFollowsQueue = true;
+        updateBuilder();
+        desiredCount.focus();
+      });
+    }
+    if (randomSeedButton instanceof HTMLButtonElement && defaultSeed instanceof HTMLInputElement) {
+      randomSeedButton.addEventListener("click", () => {
+        const values = new Uint32Array(2);
+        window.crypto.getRandomValues(values);
+        const seed = ((BigInt(values[0] & 0x7fffffff) << 32n) | BigInt(values[1])).toString();
+        defaultSeed.value = seed;
+        defaultSeed.dispatchEvent(new Event("input", { bubbles: true }));
+        defaultSeed.focus();
+      });
+    }
     defaultPrompt && defaultPrompt.addEventListener("input", () => {
       const rows = batchRows();
       rows.forEach((row) => {
@@ -657,26 +1083,46 @@
     });
 
     form.addEventListener("invalid", (event) => {
-      const row = event.target.closest("[data-batch-row]");
-      if (!row || !row.classList.contains("is-collapsed")) return;
-      row.classList.remove("is-collapsed");
-      const collapseButton = row.querySelector('[data-batch-action="collapse"]');
-      if (collapseButton) {
-        collapseButton.setAttribute("aria-expanded", "true");
-        collapseButton.textContent = "Collapse";
+      let disclosure = event.target.closest("details");
+      while (disclosure) {
+        disclosure.open = true;
+        disclosure = disclosure.parentElement?.closest("details") || null;
       }
+      const row = event.target.closest("[data-batch-row]");
+      if (row && row.classList.contains("is-collapsed")) {
+        row.classList.remove("is-collapsed");
+        const collapseButton = row.querySelector('[data-batch-action="collapse"]');
+        if (collapseButton) {
+          collapseButton.setAttribute("aria-expanded", "true");
+          collapseButton.textContent = "Collapse";
+        }
+      }
+      window.requestAnimationFrame(() => event.target.scrollIntoView({ block: "center" }));
     }, true);
 
     form.addEventListener("submit", (event) => {
       setBatchValidity();
+      const plan = batchRows().map(readRow);
+      if (defaultPrompt && !defaultPrompt.value.trim() && plan[0]) {
+        defaultPrompt.value = plan[0].prompt;
+      }
       if (!form.checkValidity()) {
         event.preventDefault();
         form.reportValidity();
         return;
       }
-      const plan = batchRows().map(readRow);
+      try {
+        const submissionId = namedControl(form, "submission_id");
+        if (submissionId instanceof HTMLInputElement && submissionId.value) {
+          window.sessionStorage.setItem(
+            scopedStorageKey(AUTOMATION_DRAFT_SUBMISSION_KEY),
+            submissionId.value,
+          );
+        }
+      } catch (_error) {
+        // Draft cleanup is optional; queueing must continue when storage is blocked.
+      }
       planData.value = JSON.stringify(plan);
-      if (defaultPrompt && !defaultPrompt.value.trim()) defaultPrompt.value = plan[0].prompt;
       if (plannedJobCount) {
         const perJob = Math.max(1, integerValue(outputsPerJob && outputsPerJob.value, 1));
         plannedJobCount.value = plan.reduce(
@@ -691,6 +1137,464 @@
     });
 
     updateBuilder();
+  }
+
+  function initializeAutomationDraft() {
+    const form = document.querySelector("[data-automation-form]");
+    const planData = document.querySelector("#batch-plan-data");
+    const status = document.querySelector("[data-automation-draft-status]");
+    const clearButton = document.querySelector("[data-automation-draft-clear]");
+    if (!form || !(planData instanceof HTMLTextAreaElement)) return;
+    let timer = null;
+
+    const setStatus = (message, tone = "") => {
+      if (!(status instanceof HTMLElement)) return;
+      status.textContent = message;
+      status.className = `automation-draft-status${tone ? ` ${tone}` : ""}`;
+    };
+
+    const save = () => {
+      timer = null;
+      try {
+        const batchPlan = JSON.parse(planData.value || "[]");
+        if (!Array.isArray(batchPlan)) throw new Error("invalid batch plan");
+        const title = namedControl(form, "title");
+        const slug = namedControl(form, "slug");
+        const seed = namedControl(form, "seed");
+        const desiredCount = namedControl(form, "desired_accepted_count");
+        const submissionId = namedControl(form, "submission_id");
+        window.localStorage.setItem(scopedStorageKey(AUTOMATION_DRAFT_STORAGE_KEY), JSON.stringify({
+          schema_version: 1,
+          saved_at: new Date().toISOString(),
+          title: title instanceof HTMLInputElement ? title.value : "",
+          slug: slug instanceof HTMLInputElement ? slug.value : "",
+          seed: seed instanceof HTMLInputElement ? seed.value : "",
+          desired_accepted_count: desiredCount instanceof HTMLInputElement
+            ? desiredCount.value
+            : "",
+          submission_id: submissionId instanceof HTMLInputElement ? submissionId.value : "",
+          target_follows_queue: form.dataset.targetFollowsQueue === "true",
+          profile: collectAutomationProfile(form),
+          batch_plan: batchPlan.slice(0, 50),
+        }));
+        setStatus("Draft saved on this device.", "success");
+      } catch (_error) {
+        setStatus("Draft could not be saved in this browser.", "warning");
+      }
+    };
+
+    const schedule = () => {
+      if (timer !== null) window.clearTimeout(timer);
+      setStatus("Saving draft...");
+      timer = window.setTimeout(save, 500);
+    };
+
+    form.addEventListener("input", schedule);
+    form.addEventListener("change", schedule);
+    form.addEventListener("gen-automation:builder-updated", schedule);
+    form.addEventListener("gen-automation:profile-changed", schedule);
+    if (form.dataset.automationDraftRestored === "true") {
+      setStatus("Draft restored from this device.", "success");
+    }
+
+    if (clearButton instanceof HTMLButtonElement) {
+      clearButton.addEventListener("click", () => {
+        if (timer !== null) window.clearTimeout(timer);
+        timer = null;
+        try {
+          window.localStorage.removeItem(scopedStorageKey(AUTOMATION_DRAFT_STORAGE_KEY));
+          setStatus("Saved draft cleared; the current form is unchanged.", "success");
+        } catch (_error) {
+          setStatus("Draft storage is unavailable in this browser.", "warning");
+        }
+      });
+    }
+  }
+
+  const clearAutomationDraftAfterQueue = () => {
+    const progress = document.querySelector("[data-generation-progress]");
+    if (!(progress instanceof HTMLElement)) return;
+    const submittedDraftId = progress.dataset.submittedDraftId || "";
+    if (!submittedDraftId) return;
+    try {
+      const submissionKey = scopedStorageKey(AUTOMATION_DRAFT_SUBMISSION_KEY);
+      if (window.sessionStorage.getItem(submissionKey) !== submittedDraftId) return;
+      const draft = readStoredAutomationDraft();
+      window.sessionStorage.removeItem(submissionKey);
+      if (!draft || draft.submission_id !== submittedDraftId) return;
+      window.localStorage.removeItem(scopedStorageKey(AUTOMATION_DRAFT_STORAGE_KEY));
+    } catch (_error) {
+      // A private-browser storage failure does not affect the queued run.
+    }
+  };
+
+  function initializeDeliveryAutoRefresh() {
+    const panel = document.querySelector("[data-delivery-auto-refresh]");
+    if (!(panel instanceof HTMLElement)) return;
+    const status = panel.querySelector("[data-delivery-refresh-status]");
+    const delay = Math.min(
+      30000,
+      Math.max(5000, integerValue(panel.dataset.deliveryAutoRefresh, 8000)),
+    );
+    let timer = null;
+    const schedule = () => {
+      if (timer !== null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        if (document.visibilityState === "hidden") {
+          schedule();
+          return;
+        }
+        if (status instanceof HTMLElement) status.textContent = "Checking output progress...";
+        window.location.reload();
+      }, delay);
+    };
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") schedule();
+    });
+    schedule();
+  }
+
+  function initializeAutomationPresets() {
+    const form = document.querySelector("[data-automation-form]");
+    const manager = document.querySelector("[data-automation-presets]");
+    if (!form || !manager) return;
+    const select = manager.querySelector("[data-automation-preset-select]");
+    const nameInput = manager.querySelector("[data-automation-preset-name]");
+    const saveButton = manager.querySelector("[data-automation-preset-save]");
+    const loadButton = manager.querySelector("[data-automation-preset-load]");
+    const deleteButton = manager.querySelector("[data-automation-preset-delete]");
+    const exportButton = manager.querySelector("[data-automation-preset-export]");
+    const importButton = manager.querySelector("[data-automation-preset-import]");
+    const importFile = manager.querySelector("[data-automation-preset-import-file]");
+    const status = manager.querySelector("[data-automation-preset-status]");
+    if (!(select instanceof HTMLSelectElement)
+        || !(nameInput instanceof HTMLInputElement)
+        || !(saveButton instanceof HTMLButtonElement)
+        || !(loadButton instanceof HTMLButtonElement)
+        || !(deleteButton instanceof HTMLButtonElement)) return;
+
+    let presets = readStoredAutomationPresets();
+    const setStatus = (message, tone = "") => {
+      if (!(status instanceof HTMLElement)) return;
+      status.textContent = message;
+      status.className = `settings-preset-status${tone ? ` ${tone}` : ""}`;
+    };
+    const firstInvalidPresetControl = () => {
+      const controls = AUTOMATION_PRESET_FIELDS
+        .map((name) => namedControl(form, name))
+        .filter((control) => (
+          control instanceof HTMLInputElement
+          || control instanceof HTMLTextAreaElement
+          || control instanceof HTMLSelectElement
+        ));
+      const visibleLoraWeights = Array.from(
+        form.querySelectorAll("[data-lora-visible-weight]"),
+      );
+      const loraWeights = visibleLoraWeights.length > 0
+        ? visibleLoraWeights
+        : Array.from(form.querySelectorAll("[data-lora-native-weight]"));
+      return [...controls, ...loraWeights].find((control) => !control.checkValidity());
+    };
+    const render = (selectedId = select.value) => {
+      select.replaceChildren();
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = presets.length === 0 ? "No saved presets" : "Choose a preset";
+      select.append(placeholder);
+      presets.forEach((preset) => {
+        const option = document.createElement("option");
+        option.value = preset.id;
+        option.textContent = preset.name;
+        select.append(option);
+      });
+      select.value = presets.some((preset) => preset.id === selectedId) ? selectedId : "";
+      loadButton.disabled = !select.value;
+      deleteButton.disabled = !select.value;
+    };
+
+    select.addEventListener("change", () => {
+      loadButton.disabled = !select.value;
+      deleteButton.disabled = !select.value;
+      const selected = presets.find((preset) => preset.id === select.value);
+      if (selected) nameInput.value = selected.name;
+    });
+    saveButton.addEventListener("click", () => {
+      const name = nameInput.value.trim();
+      if (!name) {
+        nameInput.focus();
+        setStatus("Enter a preset name first.", "warning");
+        return;
+      }
+      const invalidControl = firstInvalidPresetControl();
+      if (invalidControl) {
+        const disclosure = invalidControl.closest("details");
+        if (disclosure) disclosure.open = true;
+        invalidControl.focus();
+        invalidControl.reportValidity();
+        setStatus("Fix the highlighted setting before saving this preset.", "warning");
+        return;
+      }
+      const existing = presets.find((preset) => preset.name.toLowerCase() === name.toLowerCase());
+      const id = existing?.id || `${slugify(name) || "preset"}-${Date.now().toString(36)}`;
+      const saved = {
+        id,
+        name,
+        profile: collectAutomationProfile(form),
+        updated_at: new Date().toISOString(),
+      };
+      presets = [saved, ...presets.filter((preset) => preset.id !== id)].slice(0, 30);
+      try {
+        writeStoredAutomationPresets(presets);
+        render(id);
+        setStatus(existing ? "Preset updated." : "Preset saved.", "success");
+      } catch (_error) {
+        setStatus("This browser could not save the preset.", "warning");
+      }
+    });
+    loadButton.addEventListener("click", () => {
+      const preset = presets.find((item) => item.id === select.value);
+      if (!preset) {
+        setStatus("That preset is no longer available.", "warning");
+        return;
+      }
+      const result = applyAutomationProfile(form, preset.profile);
+      if (!result.applied) {
+        setStatus("That preset contains invalid saved data.", "warning");
+        return;
+      }
+      const invalidControl = firstInvalidPresetControl();
+      if (invalidControl) {
+        let disclosure = invalidControl.closest("details");
+        while (disclosure) {
+          disclosure.open = true;
+          disclosure = disclosure.parentElement?.closest("details") || null;
+        }
+        invalidControl.focus();
+        invalidControl.reportValidity();
+        setStatus(`${preset.name} loaded, but one or more saved values need correction.`, "warning");
+        return;
+      }
+      if (result.missing.length > 0) {
+        setStatus(
+          `${preset.name} loaded with changes needed: ${result.missing.join(" ")}`,
+          "warning",
+        );
+        return;
+      }
+      setStatus(`${preset.name} loaded.`, "success");
+    });
+    deleteButton.addEventListener("click", () => {
+      const preset = presets.find((item) => item.id === select.value);
+      if (!preset) return;
+      presets = presets.filter((item) => item.id !== preset.id);
+      try {
+        writeStoredAutomationPresets(presets);
+        nameInput.value = "";
+        render();
+        setStatus(`${preset.name} deleted.`);
+      } catch (_error) {
+        setStatus("This browser could not delete the preset.", "warning");
+      }
+    });
+    if (exportButton instanceof HTMLButtonElement) {
+      exportButton.addEventListener("click", () => {
+        if (presets.length === 0) {
+          setStatus("Save a preset before exporting.", "warning");
+          return;
+        }
+        const blob = new Blob([JSON.stringify({
+          schema_version: 1,
+          exported_at: new Date().toISOString(),
+          presets,
+        }, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "generation-settings-presets.json";
+        link.hidden = true;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 0);
+        setStatus(`${presets.length} preset${presets.length === 1 ? "" : "s"} exported.`, "success");
+      });
+    }
+    if (importButton instanceof HTMLButtonElement && importFile instanceof HTMLInputElement) {
+      importButton.addEventListener("click", () => importFile.click());
+      importFile.addEventListener("change", async () => {
+        const file = importFile.files?.item(0);
+        importFile.value = "";
+        if (!file) return;
+        try {
+          const payload = JSON.parse(await file.text());
+          const requested = Array.isArray(payload) ? payload : payload?.presets;
+          if (!Array.isArray(requested)) throw new Error("invalid preset export");
+          const imported = requested.filter((item) => (
+            item && typeof item === "object"
+            && typeof item.id === "string"
+            && typeof item.name === "string"
+            && item.profile && typeof item.profile === "object"
+          )).slice(0, 30);
+          if (imported.length === 0) throw new Error("empty preset export");
+          const importedIds = new Set(imported.map((item) => item.id));
+          const importedNames = new Set(imported.map((item) => item.name.toLowerCase()));
+          presets = [
+            ...imported,
+            ...presets.filter(
+              (item) => !importedIds.has(item.id) && !importedNames.has(item.name.toLowerCase()),
+            ),
+          ].slice(0, 30);
+          writeStoredAutomationPresets(presets);
+          render(imported[0].id);
+          setStatus(`${imported.length} preset${imported.length === 1 ? "" : "s"} imported.`, "success");
+        } catch (_error) {
+          setStatus("Choose a valid generation preset export.", "warning");
+        }
+      });
+    }
+
+    render();
+    if (form.dataset.importedImageSettings === "true") {
+      const warning = form.dataset.profileImportWarning || "";
+      setStatus(
+        warning
+          ? `Image settings loaded with changes needed: ${warning}`
+          : "Image settings loaded. Name and save them if you want a reusable preset.",
+        warning ? "warning" : "success",
+      );
+    }
+  }
+
+  function initializeReleaseLibrary() {
+    const toolbar = document.querySelector("[data-release-library]");
+    const cards = Array.from(document.querySelectorAll("[data-release-card]"));
+    if (!toolbar || cards.length === 0) return;
+    const search = toolbar.querySelector("[data-release-search]");
+    const filters = Array.from(toolbar.querySelectorAll("[data-release-filter]"));
+    const status = toolbar.querySelector("[data-release-filter-status]");
+    const empty = document.querySelector("[data-release-filter-empty]");
+    let activeFilter = "all";
+    toolbar.hidden = false;
+
+    const render = () => {
+      const query = search instanceof HTMLInputElement ? search.value.trim().toLowerCase() : "";
+      let visible = 0;
+      cards.forEach((card) => {
+        const filterMatches = activeFilter === "all" || card.dataset.releaseStatus === activeFilter;
+        const searchText = (card.dataset.releaseSearchText || "").toLowerCase();
+        const matches = filterMatches && (!query || searchText.includes(query));
+        card.hidden = !matches;
+        if (matches) visible += 1;
+      });
+      if (status instanceof HTMLOutputElement) {
+        status.textContent = `${visible} automation${visible === 1 ? "" : "s"} shown`;
+      }
+      if (empty instanceof HTMLElement) empty.hidden = visible !== 0;
+    };
+
+    filters.forEach((button) => {
+      button.addEventListener("click", () => {
+        activeFilter = button.dataset.releaseFilter || "all";
+        filters.forEach((candidate) => {
+          const selected = candidate === button;
+          candidate.classList.toggle("active", selected);
+          candidate.setAttribute("aria-pressed", String(selected));
+        });
+        render();
+      });
+    });
+    if (search instanceof HTMLInputElement) search.addEventListener("input", render);
+    render();
+  }
+
+  function initializeWildcardLibraryTools() {
+    const toolbar = document.querySelector("[data-wildcard-library-tools]");
+    const cards = Array.from(document.querySelectorAll("[data-wildcard-card]"));
+    const search = document.querySelector("[data-wildcard-search]");
+    const status = document.querySelector("[data-wildcard-filter-status]");
+    const empty = document.querySelector("[data-wildcard-filter-empty]");
+
+    const render = () => {
+      if (!(search instanceof HTMLInputElement)) return;
+      const query = search.value.trim().toLowerCase();
+      let visible = 0;
+      cards.forEach((card) => {
+        const matches = !query || (card.dataset.wildcardSearchText || "").toLowerCase().includes(query);
+        card.hidden = !matches;
+        if (matches) visible += 1;
+      });
+      if (status instanceof HTMLOutputElement) {
+        status.textContent = `${visible} librar${visible === 1 ? "y" : "ies"} shown`;
+      }
+      if (empty instanceof HTMLElement) empty.hidden = visible !== 0;
+    };
+    if (search instanceof HTMLInputElement) {
+      if (toolbar instanceof HTMLElement) toolbar.hidden = false;
+      search.addEventListener("input", render);
+      render();
+    }
+
+    document.querySelectorAll("[data-copy-text]").forEach((button) => {
+      button.hidden = false;
+      button.addEventListener("click", async () => {
+        const value = button.dataset.copyText || "";
+        const label = button.textContent;
+        try {
+          await navigator.clipboard.writeText(value);
+          button.textContent = "Copied";
+        } catch (_error) {
+          const fallback = document.createElement("textarea");
+          fallback.value = value;
+          fallback.setAttribute("readonly", "");
+          fallback.style.position = "fixed";
+          fallback.style.opacity = "0";
+          document.body.append(fallback);
+          fallback.select();
+          document.execCommand("copy");
+          fallback.remove();
+          button.textContent = "Copied";
+        }
+        window.setTimeout(() => { button.textContent = label; }, 1200);
+      });
+    });
+
+    document.querySelectorAll("[data-wildcard-file-button]").forEach((button) => {
+      button.hidden = false;
+      button.addEventListener("click", () => {
+        const input = document.getElementById(button.dataset.wildcardFileInputId || "");
+        if (input instanceof HTMLInputElement && input.type === "file") input.click();
+      });
+    });
+
+    document.querySelectorAll("[data-wildcard-file-input]").forEach((input) => {
+      input.addEventListener("change", async () => {
+        const file = input.files?.item(0);
+        const target = document.getElementById(input.dataset.wildcardFileTarget || "");
+        input.value = "";
+        if (!file || !(target instanceof HTMLTextAreaElement)) return;
+        target.value = (await file.text()).replace(/\r\n/g, "\n");
+        target.dispatchEvent(new Event("input", { bubbles: true }));
+        target.focus();
+      });
+    });
+
+    document.querySelectorAll("[data-wildcard-download]").forEach((button) => {
+      button.hidden = false;
+      button.addEventListener("click", () => {
+        const target = document.getElementById(button.dataset.wildcardDownloadTarget || "");
+        if (!(target instanceof HTMLTextAreaElement)) return;
+        const blob = new Blob([target.value], { type: "text/plain;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = button.dataset.wildcardDownloadName || "wildcard.txt";
+        link.hidden = true;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      });
+    });
   }
 
   function initializeBulkReview() {
@@ -746,6 +1650,7 @@
         .map((checkbox) => checkbox.closest(".asset-card"))
         .filter(Boolean);
       const hasSevereSelection = selectedCards.some((card) => card.dataset.aiExcluded === "true");
+      const hasUnacceptedSelection = selectedCards.some((card) => card.dataset.decision !== "accept");
       const selectedForX = selectedCards.filter((card) => card.dataset.selectedForX === "true").length;
       const netNewForX = selected - selectedForX;
       const remainingXSlots = Math.max(0, xCapacity - currentXCount);
@@ -753,7 +1658,10 @@
 
       if (acceptButton) acceptButton.disabled = selected === 0 || hasSevereSelection;
       if (xAddButton) {
-        xAddButton.disabled = selected === 0 || netNewForX === 0 || exceedsXCapacity;
+        xAddButton.disabled = selected === 0
+          || netNewForX === 0
+          || exceedsXCapacity
+          || hasUnacceptedSelection;
       }
       if (xRemoveButton) xRemoveButton.disabled = selectedForX === 0;
 
@@ -766,6 +1674,9 @@
           messages.push(
             `Only ${remainingXSlots} X slot${remainingXSlots === 1 ? " remains" : "s remain"}; deselect ${netNewForX - remainingXSlots}.`,
           );
+        }
+        if (hasUnacceptedSelection) {
+          messages.push("Keep every selected image before adding it to X.");
         }
         selectionStatus.hidden = messages.length === 0;
         selectionStatus.textContent = messages.join(" ");
@@ -1125,6 +2036,129 @@
     parent.append(list);
   };
 
+  const preferredPromptText = (prompt) => {
+    if (!prompt || typeof prompt !== "object") return "";
+    if (typeof prompt.source === "string") return prompt.source;
+    return typeof prompt.resolved === "string" ? prompt.resolved : "";
+  };
+
+  const forgeStyleImageInfo = (details) => {
+    const positive = details.prompts.positive?.resolved || "";
+    const negative = details.prompts.negative?.resolved || "";
+    const loraTags = details.loras.map((lora) => (
+      `<lora:${displayValue(lora.name)}:${displayValue(lora.weight)}>`
+    ));
+    const positiveWithLoras = positive.includes("<lora:")
+      ? positive
+      : [positive, loraTags.join(" ")].filter(Boolean).join(" ");
+    const sampling = [
+      `Steps: ${displayValue(details.sampling.steps)}`,
+      `Sampler: ${displayValue(details.sampling.sampler)}`,
+      `Schedule type: ${displayValue(details.sampling.scheduler)}`,
+      `CFG scale: ${displayValue(details.sampling.cfg)}`,
+      `Seed: ${displayValue(details.sampling.seed)}`,
+      `Size: ${displayValue(details.sampling.width)}x${displayValue(details.sampling.height)}`,
+      `Model hash: ${displayValue(details.checkpoint.sha256).slice(0, 10)}`,
+      `Model: ${displayValue(details.checkpoint.name)}`,
+      `Clip skip: ${displayValue(details.sampling.clip_skip)}`,
+    ];
+    if (details.hires.enabled === true) {
+      sampling.push(
+        `Hires upscale: ${displayValue(details.hires.scale)}`,
+        `Denoising strength: ${displayValue(details.hires.denoise)}`,
+        `Hires upscaler: ${displayValue(details.hires.upscale_method)}`,
+      );
+    }
+    if (details.detailer.enabled === true) {
+      sampling.push(
+        "ADetailer model: face_yolov8n.pt",
+        `ADetailer prompt: ${details.prompts.detailer_positive?.resolved || ""}`,
+        `ADetailer negative prompt: ${details.prompts.detailer_negative?.resolved || ""}`,
+        `ADetailer confidence: ${displayValue(details.detailer.bbox_threshold)}`,
+        `ADetailer dilate erode: ${displayValue(details.detailer.bbox_dilation)}`,
+        `ADetailer mask blur: ${displayValue(details.detailer.feather)}`,
+        `ADetailer denoising strength: ${displayValue(details.detailer.denoise)}`,
+      );
+    }
+    const loras = details.loras.map((lora) => (
+      `${displayValue(lora.name)}: ${displayValue(lora.sha256).slice(0, 12)}`
+    ));
+    if (loras.length > 0) sampling.push(`Lora hashes: "${loras.join(", ")}"`);
+    return [
+      positiveWithLoras,
+      `Negative prompt: ${negative}`,
+      sampling.join(", "),
+    ].join("\n");
+  };
+
+  const automationProfileFromDetails = (details) => {
+    const fields = {};
+    const assign = (name, value) => {
+      if (hasDisplayValue(value)) fields[name] = String(value);
+    };
+    assign("negative_prompt", preferredPromptText(details.prompts.negative));
+    assign("detailer_prompt", preferredPromptText(details.prompts.detailer_positive));
+    assign("detailer_negative_prompt", preferredPromptText(details.prompts.detailer_negative));
+    ["width", "height", "cfg", "steps", "sampler", "scheduler", "clip_skip"].forEach((name) => {
+      assign(name, details.sampling[name]);
+    });
+    if (details.hires.enabled === true) {
+      assign("hires_scale", details.hires.scale);
+      assign("hires_denoise", details.hires.denoise);
+      assign("hires_upscale_method", details.hires.upscale_method);
+    }
+    if (details.detailer.enabled === true) {
+      assign("detailer_guide_size", details.detailer.guide_size);
+      assign("detailer_max_size", details.detailer.max_size);
+      assign("detailer_denoise", details.detailer.denoise);
+      assign("detailer_bbox_threshold", details.detailer.bbox_threshold);
+      assign("detailer_bbox_dilation", details.detailer.bbox_dilation);
+      assign("detailer_bbox_crop_factor", details.detailer.bbox_crop_factor);
+      assign("detailer_feather", details.detailer.feather);
+    }
+    return {
+      schema_version: 1,
+      fields,
+      seed: hasDisplayValue(details.sampling.seed) ? String(details.sampling.seed) : "",
+      batch_prompt: preferredPromptText(details.prompts.positive),
+      loras: details.loras.map((lora) => ({
+        name: typeof lora.name === "string" ? lora.name : "",
+        sha256: typeof lora.sha256 === "string" ? lora.sha256 : "",
+        weight: hasDisplayValue(lora.weight) ? String(lora.weight) : "1",
+      })),
+      matches: {
+        subject_name: details.subjects[0]?.name || "",
+        checkpoint_name: details.checkpoint.name || "",
+        checkpoint_sha256: details.checkpoint.sha256 || "",
+        workflow_name: details.workflow.name || "",
+        workflow_version: hasDisplayValue(details.workflow.version)
+          ? String(details.workflow.version)
+          : "",
+        workflow_sha256: details.workflow.sha256 || "",
+      },
+    };
+  };
+
+  const reuseImageSettingsButton = (details) => {
+    const label = "Use in new automation";
+    const button = createNode("button", "secondary-button generation-copy-button", label);
+    button.type = "button";
+    button.addEventListener("click", () => {
+      try {
+        window.sessionStorage.setItem(
+          scopedStorageKey(PENDING_IMAGE_PROFILE_KEY),
+          JSON.stringify(automationProfileFromDetails(details)),
+        );
+        button.textContent = "Opening automation…";
+        window.location.assign("/dashboard/new-set");
+      } catch (_error) {
+        button.textContent = "Could not reuse settings";
+        window.setTimeout(() => { button.textContent = label; }, 1800);
+      }
+    });
+    return button;
+  };
+
   function renderGenerationDetails(panel, details) {
     const body = panel.querySelector("[data-generation-details-body]");
     if (!body) return;
@@ -1135,7 +2169,14 @@
     const actions = createNode("div", "generation-details-actions");
     const serialized = JSON.stringify(details, null, 2);
     actions.append(copyButton("Copy all settings JSON", serialized));
+    actions.append(copyButton("Copy Forge-style info", forgeStyleImageInfo(details)));
+    actions.append(reuseImageSettingsButton(details));
     body.append(actions);
+    body.append(createNode(
+      "p",
+      "generation-details-status",
+      "Automation masters are stored without embedded prompt or workflow metadata; exact settings remain available here.",
+    ));
 
     const runSection = addSection(body, "Image run");
     const outputIndex = details.output.index;
@@ -1585,14 +2626,43 @@
     const workflowOptions = Array.from(workflow.options).filter(
       (option) => ["true", "false"].includes(option.dataset.upscalerEnabled),
     );
-    const canToggle = ["true", "false"].every((value) => (
-      workflowOptions.some((option) => option.dataset.upscalerEnabled === value)
-    ));
+    const hiresFallbackValues = Object.freeze({
+      hires_scale: "1",
+      hires_denoise: "0.35",
+      hires_upscale_method: "bislerp",
+    });
+    const normalizeHiddenHiresValues = () => {
+      Object.entries(hiresFallbackValues).forEach(([name, fallback]) => {
+        const control = namedControl(workflow.form, name);
+        if (!(control instanceof HTMLInputElement)
+            && !(control instanceof HTMLSelectElement)) return;
+        if (!control.value || !control.checkValidity()) control.value = fallback;
+      });
+    };
+    const workflowFamily = (option) => (option?.dataset.workflowName || "")
+      .toLowerCase()
+      .replace(/\b(base|hires|highres|upscale|upscaler)\b/g, " ")
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+    const pairedWorkflow = (current, desired) => {
+      const family = workflowFamily(current);
+      if (!family) return null;
+      return workflowOptions.find((option) => (
+        !option.disabled
+        && option !== current
+        && option.dataset.upscalerEnabled === desired
+        && option.dataset.detailerEnabled === current?.dataset.detailerEnabled
+        && option.dataset.workflowVersion === current?.dataset.workflowVersion
+        && workflowFamily(option) === family
+      )) || null;
+    };
 
     const render = () => {
       const selected = workflow.selectedOptions.item(0);
       const upscalerEnabled = selected?.dataset.upscalerEnabled === "true";
       const detailerEnabled = selected?.dataset.detailerEnabled === "true";
+      const pair = pairedWorkflow(selected, upscalerEnabled ? "false" : "true");
+      if (!upscalerEnabled) normalizeHiddenHiresValues();
       const presetMatches = detailerPresetFields.every(({ field, value }) => (
         (field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement)
         && field.value === value
@@ -1605,15 +2675,17 @@
       });
       if (toggle instanceof HTMLInputElement) {
         toggle.checked = upscalerEnabled;
-        toggle.disabled = !canToggle;
+        toggle.disabled = !pair;
       }
       if (toggleLabel instanceof HTMLElement) {
         toggleLabel.textContent = upscalerEnabled ? "On" : "Off";
       }
       if (toggleDescription instanceof HTMLElement) {
-        toggleDescription.textContent = upscalerEnabled
-          ? "Runs the hires workflow; scale, denoise, and upscale method apply."
-          : "Base dimensions only - no upscale node or second sampler pass.";
+        toggleDescription.textContent = pair
+          ? (upscalerEnabled
+            ? "Runs the paired hires workflow; scale, denoise, and upscale method apply."
+            : "Base dimensions only - no upscale node or second sampler pass.")
+          : "Choose a named workflow above; no matching base/hires pair is available.";
       }
       if (detailerPresetControl instanceof HTMLButtonElement) {
         detailerPresetControl.disabled = !detailerEnabled;
@@ -1631,12 +2703,7 @@
       toggle.addEventListener("change", () => {
         const desired = toggle.checked ? "true" : "false";
         const current = workflow.selectedOptions.item(0);
-        const matching = workflowOptions.filter(
-          (option) => !option.disabled && option.dataset.upscalerEnabled === desired,
-        );
-        const replacement = matching.find(
-          (option) => option.dataset.detailerEnabled === current?.dataset.detailerEnabled,
-        ) || matching[0];
+        const replacement = pairedWorkflow(current, desired);
         if (!replacement) {
           render();
           return;
@@ -1664,10 +2731,18 @@
     render();
   };
 
+  const reusedImageSettings = consumePendingImageProfile();
+  if (!reusedImageSettings) restoreAutomationDraft();
   initializeLoraPicker();
   initializeAutomationBuilder();
   initializeWorkflowRefinement();
+  initializeAutomationPresets();
+  initializeAutomationDraft();
+  initializeReleaseLibrary();
+  initializeWildcardLibraryTools();
   initializeBulkReview();
   initializeGenerationDetails();
+  clearAutomationDraftAfterQueue();
   initializeGenerationProgress();
+  initializeDeliveryAutoRefresh();
 })();

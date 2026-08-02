@@ -14,27 +14,45 @@
     </div>
   </section>
 
-  <div class="overview-strip" aria-label="Workspace overview">
+  {% set attention_phases = ("paused", "cancelled") %}
+  {% set delivery_phases = ("approved", "rendering", "ready_to_publish", "publishing") %}
+  {% set counts = namespace(active=0, ready=0, delivery=0, attention=0, delivered=0) %}
+  {% for release in releases %}
+    {% if release.health != "healthy" or release.phase in attention_phases or (release.completed_scoring_run_id and not release.ranking_is_complete) %}
+      {% set counts.attention = counts.attention + 1 %}
+    {% elif release.phase == "published" %}
+      {% set counts.delivered = counts.delivered + 1 %}
+    {% elif release.phase in delivery_phases %}
+      {% set counts.delivery = counts.delivery + 1 %}
+    {% elif release.ranking_is_complete %}
+      {% set counts.ready = counts.ready + 1 %}
+    {% else %}
+      {% set counts.active = counts.active + 1 %}
+    {% endif %}
+  {% endfor %}
+
+  <div class="overview-strip workspace-status-strip" aria-label="Workspace status">
     <div class="overview-item">
-      <span>Releases in workspace</span>
-      <strong>{{ releases | length }}</strong>
+      <span>Active</span>
+      <strong>{{ counts.active }}</strong>
     </div>
     <div class="overview-item">
-      <span>Workflow</span>
-      <strong>Generate &rarr; rank &rarr; review</strong>
+      <span>Ready to review</span>
+      <strong>{{ counts.ready }}</strong>
     </div>
     <div class="overview-item">
-      <span>Delivery</span>
-      <strong>Patreon, MEGA &amp; X</strong>
+      <span>In delivery</span>
+      <strong>{{ counts.delivery }}</strong>
+    </div>
+    <div class="overview-item">
+      <span>Needs attention</span>
+      <strong>{{ counts.attention }}</strong>
+    </div>
+    <div class="overview-item">
+      <span>Delivered</span>
+      <strong>{{ counts.delivered }}</strong>
     </div>
   </div>
-
-  <nav class="workflow-rail" aria-label="Automation workflow">
-    <span><strong>1</strong> Generate</span>
-    <span><strong>2</strong> Rank</span>
-    <span><strong>3</strong> Review</span>
-    <span><strong>4</strong> Deliver</span>
-  </nav>
 
   <div class="section-heading">
     <div>
@@ -44,9 +62,41 @@
   </div>
 
   {% if releases %}
+    <section class="library-toolbar" data-release-library aria-label="Filter automations" hidden>
+      <label class="library-search">
+        <span class="visually-hidden">Search automations</span>
+        <input type="search" placeholder="Search runs or projects" data-release-search>
+      </label>
+      <div class="library-filter-chips" role="group" aria-label="Automation status">
+        <button class="filter-chip active" type="button" data-release-filter="all" aria-pressed="true">All <span>{{ releases | length }}</span></button>
+        <button class="filter-chip" type="button" data-release-filter="active" aria-pressed="false">Active <span>{{ counts.active }}</span></button>
+        <button class="filter-chip" type="button" data-release-filter="ready" aria-pressed="false">Ready <span>{{ counts.ready }}</span></button>
+        <button class="filter-chip" type="button" data-release-filter="delivery" aria-pressed="false">Delivery <span>{{ counts.delivery }}</span></button>
+        <button class="filter-chip" type="button" data-release-filter="attention" aria-pressed="false">Attention <span>{{ counts.attention }}</span></button>
+        <button class="filter-chip" type="button" data-release-filter="delivered" aria-pressed="false">Delivered <span>{{ counts.delivered }}</span></button>
+      </div>
+      <output class="library-filter-status muted" data-release-filter-status aria-live="polite"></output>
+    </section>
     <ul class="release-list" data-release-list>
       {% for release in releases %}
-        <li class="release-card" data-release-id="{{ release.id }}">
+        {% if release.health != "healthy" or release.phase in attention_phases or (release.completed_scoring_run_id and not release.ranking_is_complete) %}
+          {% set release_status = "attention" %}
+        {% elif release.phase == "published" %}
+          {% set release_status = "delivered" %}
+        {% elif release.phase in delivery_phases %}
+          {% set release_status = "delivery" %}
+        {% elif release.ranking_is_complete %}
+          {% set release_status = "ready" %}
+        {% else %}
+          {% set release_status = "active" %}
+        {% endif %}
+        <li
+          class="release-card"
+          data-release-id="{{ release.id }}"
+          data-release-card
+          data-release-status="{{ release_status }}"
+          data-release-search-text="{{ release.title }} {{ release.project_name }} {{ release.phase }}"
+        >
           <p class="release-meta">
             {{ release.project_name }} &middot; version {{ release.current_version_no }}
           </p>
@@ -55,15 +105,35 @@
             {{ release.phase.replace("_", " ") }} &middot; {{ release.health }}
           </p>
           <div class="release-card-footer">
-            {% if release.ranking_is_complete %}
+            {% if release_status == "attention" %}
+              <span class="status unknown">
+                {% if release.phase == "paused" %}
+                  Paused
+                {% elif release.phase == "cancelled" %}
+                  Cancelled
+                {% elif release.completed_scoring_run_id and not release.ranking_is_complete %}
+                  Ranking needs attention
+                {% else %}
+                  Needs attention
+                {% endif %}
+              </span>
+              <a class="release-card-link" href="/dashboard/releases/{{ release.id }}/status">
+                View status &rarr;
+              </a>
+            {% elif release_status == "delivered" %}
+              <span class="status ready">Delivered</span>
+              <a class="release-card-link" href="/dashboard/releases/{{ release.id }}">
+                Open set &rarr;
+              </a>
+            {% elif release_status == "delivery" %}
+              <span class="status {{ release.phase }}">{{ release.phase.replace("_", " ") }}</span>
+              <a class="release-card-link" href="/dashboard/releases/{{ release.id }}">
+                Continue set &rarr;
+              </a>
+            {% elif release_status == "ready" %}
               <span class="status ready">{{ release.ranked_asset_count }} ranked masters</span>
               <a class="release-card-link" href="/dashboard/releases/{{ release.id }}">
                 Review &rarr;
-              </a>
-            {% elif release.completed_scoring_run_id %}
-              <span class="status unknown">Ranking needs attention</span>
-              <a class="release-card-link" href="/dashboard/releases/{{ release.id }}">
-                View status &rarr;
               </a>
             {% else %}
               <span class="status {{ release.phase }}">{{ release.phase.replace("_", " ") }}</span>
@@ -75,6 +145,10 @@
         </li>
       {% endfor %}
     </ul>
+    <section class="panel library-empty-filter" data-release-filter-empty hidden>
+      <h2>No matching automations</h2>
+      <p class="muted">Try a different search or status filter.</p>
+    </section>
   {% else %}
     <section class="panel panel-accent">
       <span class="workflow-label">Ready when you are</span>

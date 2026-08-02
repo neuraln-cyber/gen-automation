@@ -142,7 +142,7 @@ async def list_dashboard_releases(
                     (ReleaseVersion.release_id == Release.id)
                     & (ReleaseVersion.version_no == Release.current_version_no),
                 )
-                .order_by(Project.slug, Release.updated_at.desc(), Release.id)
+                .order_by(Release.updated_at.desc(), Release.id)
                 .limit(limit)
             )
         ).all()

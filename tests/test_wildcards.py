@@ -57,6 +57,10 @@ def test_operator_can_version_and_append_wildcard_entries(client: TestClient) ->
     dashboard = client.get("/dashboard/wildcards")
     assert dashboard.status_code == 200
     assert "__poses__" in dashboard.text
+    assert "data-wildcard-search" in dashboard.text
+    assert 'data-copy-text="__poses__"' in dashboard.text
+    assert "data-wildcard-file-input" in dashboard.text
+    assert "data-wildcard-download" in dashboard.text
 
 
 def test_wildcard_api_lists_reads_replaces_and_rejects_a_stale_editor(
