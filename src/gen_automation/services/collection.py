@@ -5,10 +5,18 @@ from uuid import UUID
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from gen_automation.db.models import Asset, AuditEvent, GenerationJob, Release, ReleaseVersion
+from gen_automation.db.models import (
+    Asset,
+    AuditEvent,
+    GenerationAttempt,
+    GenerationJob,
+    Release,
+    ReleaseVersion,
+)
 from gen_automation.domain.enums import (
     AssetKind,
     AssetState,
+    GenerationAttemptState,
     GenerationState,
     ReleasePhase,
     ResourceHealth,
@@ -243,11 +251,14 @@ async def collect_generation_job(
     max_image_bytes: int,
     retry_delay_seconds: int = 30,
     verification_lease_seconds: int = 900,
+    upload_grant_ttl_seconds: int = 10800,
     now: datetime | None = None,
 ) -> CollectionResult:
     processed_at = _as_utc(now or datetime.now(UTC))
     if retry_delay_seconds <= 0 or retry_delay_seconds > 3600:
         raise ValueError("retry_delay_seconds must be between 1 and 3600")
+    if upload_grant_ttl_seconds < 3600 or upload_grant_ttl_seconds > 14400:
+        raise ValueError("upload_grant_ttl_seconds must be between 3600 and 14400")
     job = await session.scalar(
         select(GenerationJob).where(GenerationJob.id == job_id).with_for_update()
     )
@@ -278,6 +289,27 @@ async def collect_generation_job(
             now=processed_at,
         )
     asset_ids = [asset.id for asset in assets]
+    upload_grant_started_at = await session.scalar(
+        select(
+            func.max(
+                func.coalesce(
+                    GenerationAttempt.submit_started_at,
+                    GenerationAttempt.submitted_at,
+                )
+            )
+        ).where(
+            GenerationAttempt.job_id == job.id,
+            GenerationAttempt.state == GenerationAttemptState.SUCCEEDED,
+        )
+    )
+    # submit_started_at is durably recorded immediately before upload grants are
+    # issued. One collection interval avoids expiring slightly ahead of the URL.
+    upload_deadline = (
+        _as_utc(upload_grant_started_at)
+        + timedelta(seconds=upload_grant_ttl_seconds + retry_delay_seconds)
+        if upload_grant_started_at is not None
+        else None
+    )
     await session.rollback()
 
     finalized = 0
@@ -292,7 +324,25 @@ async def collect_generation_job(
                 actor=worker_id,
             )
             finalized += int(not result.replayed)
-    except (UploadNotReadyError, AssetBusyError, AssetStorageUnavailableError):
+    except UploadNotReadyError:
+        await session.rollback()
+        if upload_deadline is not None and processed_at >= upload_deadline:
+            return await _fail_closed(
+                session,
+                job_id=job_id,
+                worker_id=worker_id,
+                error_code="master_upload_expired",
+                now=processed_at,
+            )
+        return await _reschedule(
+            session,
+            job_id=job_id,
+            worker_id=worker_id,
+            retry_at=processed_at + timedelta(seconds=retry_delay_seconds),
+            error_code="master_not_ready",
+            now=processed_at,
+        )
+    except (AssetBusyError, AssetStorageUnavailableError):
         await session.rollback()
         return await _reschedule(
             session,
