@@ -24,6 +24,7 @@ from gen_automation.domain.enums import (
     GenerationState,
 )
 from gen_automation.domain.release_spec import GenerationParameters
+from gen_automation.services.generation_details import _GenerationJobParametersV2
 
 PROJECT_ID = UUID("00000000-0000-4000-8000-000000000701")
 RELEASE_ID = UUID("00000000-0000-4000-8000-000000000702")
@@ -195,6 +196,47 @@ def _job_parameters() -> dict[str, Any]:
             "image_count": 100,
         },
     }
+
+
+def test_generation_details_accept_twenty_five_output_snapshots() -> None:
+    parameters = _job_parameters()
+    base = GenerationParameters.model_validate(parameters["output_generations"][0])
+    outputs: list[dict[str, Any]] = []
+    resolutions: list[dict[str, Any]] = []
+    for output_index in range(25):
+        entry_index = output_index % 2
+        prompt = "portrait, standing" if entry_index == 0 else "portrait, sitting"
+        generation = base.model_copy(
+            update={"prompt": prompt, "seed": 100 + output_index}
+        ).model_dump(mode="json")
+        outputs.append(generation)
+        resolutions.append(
+            _prompt_resolution(
+                seed=100 + output_index,
+                resolved_prompt=prompt,
+                entry_index=entry_index,
+            )
+        )
+    parameters.update(
+        {
+            "generation": {**outputs[0], "outputs_per_job": 25},
+            "prompt_resolution": resolutions[0],
+            "output_generations": outputs,
+            "output_prompt_resolutions": resolutions,
+            "batch": {
+                "index": 0,
+                "name": "One provider job",
+                "image_offset": 0,
+                "image_count": 25,
+            },
+        }
+    )
+
+    parsed = _GenerationJobParametersV2.model_validate(parameters)
+
+    assert len(parsed.output_generations) == 25
+    assert parsed.generation.outputs_per_job == 25
+    assert parsed.output_generations[-1].seed == 124
 
 
 async def _seed_generation_details(client: TestClient) -> None:

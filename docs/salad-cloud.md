@@ -193,7 +193,7 @@ Runtime paths and processes:
 | `GEN_WORKER_COMFY_MAIN`, `GEN_WORKER_COMFY_PYTHON` | `/opt/comfyui/main.py`, `/opt/worker-venv/bin/python`. The dedicated virtual environment reuses the pinned base-image CUDA/PyTorch packages through system site packages while isolating the hash-locked worker and ComfyUI dependencies. |
 | `GEN_WORKER_COMFY_BASE_URL` | `http://127.0.0.1:8188`; loopback HTTP only. |
 | `GEN_WORKER_COMFY_RUNTIME_ROOT` | `/opt/worker/runtime` for input, output, temp, user data, and the local ComfyUI SQLite database. |
-| `GEN_WORKER_COMFY_EXECUTION_TIMEOUT_SECONDS` | `900`. |
+| `GEN_WORKER_COMFY_EXECUTION_TIMEOUT_SECONDS` | `3600`; covers a bounded 25-image graph with face detailing. |
 | `GEN_WORKER_SALAD_QUEUE_WORKER_ENABLED` | `true`; required for Salad queue deployments. |
 | `GEN_WORKER_SALAD_QUEUE_WORKER_PATH` | `/usr/local/bin/salad-http-job-queue-worker`. |
 | `GEN_WORKER_SALAD_QUEUE_WORKER_LOG_LEVEL` | `error`. |
@@ -205,7 +205,7 @@ Security/resource limits:
 | Settings | Purpose |
 | --- | --- |
 | `GEN_WORKER_MAX_BODY_BYTES`, `GEN_WORKER_MAX_SIGNATURE_TTL_SECONDS`, `GEN_WORKER_CLOCK_SKEW_SECONDS` | Bound signed queue requests and authorization time windows. |
-| `GEN_WORKER_MAX_OUTPUTS`, `GEN_WORKER_MAX_OUTPUT_BYTES`, `GEN_WORKER_MAX_TOTAL_OUTPUT_BYTES` | Bound output count, individual bytes, and aggregate bytes. |
+| `GEN_WORKER_MAX_OUTPUTS`, `GEN_WORKER_MAX_OUTPUT_BYTES`, `GEN_WORKER_MAX_TOTAL_OUTPUT_BYTES` | Bound output count, individual bytes, and aggregate bytes. The worker defaults to 25 outputs per provider job and retains a hard ceiling of 32. |
 | `GEN_WORKER_MAX_IMAGE_DIMENSION`, `GEN_WORKER_MAX_IMAGE_PIXELS` | Bound decoded output geometry. |
 | `GEN_WORKER_MAX_REPLAY_ENTRIES` | Bounds the in-process duplicate receipt cache. |
 | `GEN_WORKER_UPLOAD_TIMEOUT_SECONDS`, `GEN_WORKER_READINESS_TIMEOUT_SECONDS` | Bound presigned uploads and readiness checks. |

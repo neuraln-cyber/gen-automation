@@ -123,6 +123,8 @@ def test_runtime_settings_reuse_worker_security_boundary() -> None:
     assert WORKER_SIGNING_PRIVATE_KEY not in worker.model_dump_json()
     assert worker.approved_workflow_node_classes == settings.approved_workflow_node_classes
     assert worker.readiness_timeout_seconds == settings.readiness_timeout_seconds
+    assert worker.max_outputs == 25
+    assert settings.comfy_execution_timeout_seconds == 3600.0
 
 
 def test_runtime_settings_require_https_storage_in_production() -> None:

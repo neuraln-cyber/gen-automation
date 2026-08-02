@@ -27,6 +27,7 @@ from gen_automation.api.security import (
 from gen_automation.config import Settings
 from gen_automation.db.session import get_session
 from gen_automation.domain.enums import AdminRole
+from gen_automation.domain.generation_limits import MAX_OUTPUTS_PER_GENERATION_JOB
 from gen_automation.middleware import content_security_policy
 from gen_automation.services.authentication import (
     AuthenticatedPrincipal,
@@ -352,6 +353,7 @@ def _new_set_response(
                 "submission_id": resolved_submission_id,
                 "idempotency_key": resolved_key,
                 "error_message": error_message,
+                "max_outputs_per_generation_job": MAX_OUTPUTS_PER_GENERATION_JOB,
             },
             status_code=status_code,
         ),

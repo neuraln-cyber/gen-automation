@@ -12,6 +12,7 @@ from pydantic import (
     model_validator,
 )
 
+from gen_automation.domain.generation_limits import MAX_OUTPUTS_PER_GENERATION_JOB
 from gen_automation.domain.signing import SigningMaterialError, validate_public_key
 
 MAX_HARD_BODY_BYTES = 1024 * 1024
@@ -101,7 +102,11 @@ class WorkerSettings(BaseModel):
     max_body_bytes: int = Field(default=256 * 1024, ge=1024, le=MAX_HARD_BODY_BYTES)
     max_signature_ttl_seconds: int = Field(default=7200, ge=5, le=7200)
     clock_skew_seconds: int = Field(default=15, ge=0, le=60)
-    max_outputs: int = Field(default=8, ge=1, le=MAX_HARD_OUTPUTS)
+    max_outputs: int = Field(
+        default=MAX_OUTPUTS_PER_GENERATION_JOB,
+        ge=1,
+        le=MAX_HARD_OUTPUTS,
+    )
     max_output_bytes: int = Field(
         default=25 * 1024 * 1024,
         ge=1024,

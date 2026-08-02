@@ -134,6 +134,7 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert 'name="detailer_max_size" value="1536"' in page.text
     assert 'name="detailer_bbox_crop_factor" value="1.5"' in page.text
     assert 'name="outputs_per_job" value="4"' in page.text
+    assert re.search(r'name="outputs_per_job"[^>]+max="25"', page.text)
     assert 'name="planned_job_count" value="1"' in page.text
     assert 'name="batch_plan"' in page.text
     assert 'id="batch-row-template"' in page.text
