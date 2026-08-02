@@ -523,7 +523,7 @@ async def _reconcile_locked(
             error_code=stop_result.error_code,
         )
 
-    if drift_code is not None and not group.pending_change:
+    if not group.pending_change:
         repair_result = await _request_active_contract_repair(
             session,
             deployment,
@@ -576,16 +576,15 @@ async def _request_active_contract_repair(
     client: SaladDeploymentClient,
     group: SaladContainerGroup,
     *,
-    drift_code: str,
+    drift_code: str | None,
     observed_at: datetime,
     metered_microusd: int,
 ) -> DeploymentResult | None:
     """Repair only provider fields with documented, unambiguous mutations.
 
-    Queue membership is provider-derived and autostart/priority are not fields
-    in Salad's container-group PATCH contract. A missing autoscaler can be
-    restored directly; a stopped active group can be started through its
-    dedicated action. All other drift remains degraded and blocks dispatch.
+    A missing autoscaler can be restored directly. A stopped group whose
+    configuration otherwise matches can be started through its dedicated
+    action. All other drift remains degraded and blocks dispatch.
     """
 
     if drift_code == "provider_autoscaler_drift":
@@ -633,15 +632,7 @@ async def _request_active_contract_repair(
             error_code=deployment.last_error_code,
         )
 
-    stopped = group.status.strip().lower() == "stopped"
-    if (
-        drift_code
-        in {
-            "provider_autostart_policy_drift",
-            "provider_queue_binding_drift",
-        }
-        and stopped
-    ):
+    if drift_code is None and group.status.strip().lower() == "stopped":
         try:
             await client.start_container_group(deployment.container_group_name)
         except (SaladAPIError, SaladProtocolError, SaladTransportError) as error:
@@ -1513,16 +1504,7 @@ def _remote_drift_code(
         or str(group.id) != deployment.provider_container_group_id
     ):
         return "provider_group_identity_drift"
-    group_drift = _group_configuration_drift(deployment, group)
-    if group_drift is not None:
-        return group_drift
-    if not any(
-        item.get("name") == deployment.container_group_name
-        and str(item.get("id")) == deployment.provider_container_group_id
-        for item in queue.container_groups
-    ):
-        return "provider_queue_binding_drift"
-    return None
+    return _group_configuration_drift(deployment, group)
 
 
 def _group_configuration_drift(
@@ -1583,8 +1565,6 @@ def _group_configuration_drift(
         allow_null_extensions=True,
     ):
         return "provider_autoscaler_drift"
-    if raw.get("autostart_policy") is not True:
-        return "provider_autostart_policy_drift"
     desired_priority = desired_container.get("priority")
     if desired_priority is None:
         # Support drift checks for deployment rows written before priority was
