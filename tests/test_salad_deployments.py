@@ -51,6 +51,7 @@ from gen_automation.services.salad_deployments import (
     _container_group_payload,
     _group_configuration_drift,
     _parse_runtime_bindings,
+    _remote_drift_code,
     _validate_local_deployment,
     deterministic_provider_name,
     provision_deployment_step,
@@ -114,14 +115,23 @@ def api_error(status_code: int) -> SaladAPIError:
     )
 
 
-def make_queue(name: str, *, queue_id: UUID = QUEUE_ID, length: int = 0) -> SaladQueue:
+def make_queue(
+    name: str,
+    *,
+    queue_id: UUID = QUEUE_ID,
+    length: int = 0,
+    group_name: str | None = None,
+    group_id: UUID = GROUP_ID,
+) -> SaladQueue:
     return SaladQueue(
         id=queue_id,
         name=name,
         display_name=name,
         description=None,
         current_queue_length=length,
-        container_groups=(),
+        container_groups=(
+            ({"id": str(group_id), "name": group_name},) if group_name is not None else ()
+        ),
         create_time=NOW,
         update_time=NOW,
     )
@@ -152,8 +162,11 @@ def make_group(
                 "memory": 16384,
                 "gpu_classes": ["gpu-class"],
             },
+            "priority": "low",
             "image_caching": True,
         },
+        "autostart_policy": True,
+        "priority": "low",
         "queue_connection": {
             "queue_name": queue_name,
             "path": "/jobs/generate",
@@ -169,6 +182,7 @@ def make_group(
                 "min_replicas": 0,
                 "max_replicas": 1,
                 "desired_queue_length": 1,
+                "polling_period": 30,
             }
         ),
     }
@@ -201,6 +215,7 @@ class FakeClient:
         self.create_queue_error: Exception | None = None
         self.create_group_error: Exception | None = None
         self.update_group_error: Exception | None = None
+        self.start_error: Exception | None = None
         self.stop_error: Exception | None = None
         self.get_queue_error: Exception | None = None
         self.get_group_error: Exception | None = None
@@ -209,6 +224,7 @@ class FakeClient:
         self.created_queue_names: list[str] = []
         self.created_group_payloads: list[dict[str, JSONValue]] = []
         self.updated_group_patches: list[dict[str, JSONValue]] = []
+        self.start_names: list[str] = []
         self.stop_names: list[str] = []
         self.calls: list[tuple[str, str]] = []
 
@@ -257,6 +273,15 @@ class FakeClient:
         assert isinstance(image, str)
         group = make_group(name, queue_name, image=image)
         self.groups[name] = group
+        queue = self.queues.get(queue_name)
+        if queue is not None:
+            self.queues[queue_name] = make_queue(
+                queue_name,
+                queue_id=queue.id,
+                length=queue.current_queue_length,
+                group_name=name,
+                group_id=group.id,
+            )
         return group
 
     async def get_container_group(self, container_group_name: str) -> SaladContainerGroup:
@@ -292,6 +317,12 @@ class FakeClient:
         if self.stop_error is not None:
             raise self.stop_error
 
+    async def start_container_group(self, container_group_name: str) -> None:
+        self.calls.append(("start_group", container_group_name))
+        self.start_names.append(container_group_name)
+        if self.start_error is not None:
+            raise self.start_error
+
 
 class FakeResolver(RuntimeSecretResolver):
     def __init__(self, values: Mapping[str, str]) -> None:
@@ -320,9 +351,9 @@ def provider_configuration(*, with_binding: bool = False) -> dict[str, object]:
                 "memory": 16384,
                 "gpu_classes": ["gpu-class"],
             },
+            "priority": "low",
         },
         "replicas": 0,
-        "priority": "low",
         "queue_connection": {},
         "queue_autoscaler": {"polling_period": 30},
     }
@@ -641,6 +672,7 @@ async def test_refresh_container_group_runtime_injects_only_resolved_ephemeral_v
                     "memory": 16384,
                     "gpu_classes": ["gpu-class"],
                 },
+                "priority": "low",
                 "image_caching": True,
                 "environment_variables": {
                     WORKER_MODEL_MANIFEST_JSON_BINDING: LIVE_VALUE,
@@ -844,6 +876,7 @@ async def test_provisioning_commits_queue_before_group_and_resolves_values_just_
         payload = client.created_group_payloads[0]
         assert payload["name"] == remote_names()[1]
         assert payload["replicas"] == 0
+        assert "priority" not in payload
         assert payload["autostart_policy"] is True
         assert payload["restart_policy"] == "on_failure"
         assert payload["startup_probe"] == STARTUP_PROBE
@@ -863,6 +896,7 @@ async def test_provisioning_commits_queue_before_group_and_resolves_values_just_
         container = payload["container"]
         assert isinstance(container, dict)
         assert container["image"] == IMAGE_DIGEST
+        assert container["priority"] == "low"
         assert container["environment_variables"] == {
             WORKER_MODEL_MANIFEST_JSON_BINDING: LIVE_VALUE
         }
@@ -938,7 +972,7 @@ async def test_existing_group_is_adopted_after_persisted_queue_verification(
 ) -> None:
     client = FakeClient()
     queue_name, group_name = remote_names()
-    client.queues[queue_name] = make_queue(queue_name)
+    client.queues[queue_name] = make_queue(queue_name, group_name=group_name)
     client.groups[group_name] = make_group(group_name, queue_name)
     async with deployment_context.database.sessions() as session:
         deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
@@ -1381,7 +1415,7 @@ async def test_reconcile_records_conservative_idempotent_runtime_interval(
     )
     client = FakeClient()
     queue_name, group_name = remote_names()
-    client.queues[queue_name] = make_queue(queue_name, length=2)
+    client.queues[queue_name] = make_queue(queue_name, length=2, group_name=group_name)
     client.groups[group_name] = make_group(
         group_name,
         queue_name,
@@ -1428,7 +1462,7 @@ async def test_runtime_metering_error_fails_closed_and_stops_provider(
     )
     client = FakeClient()
     queue_name, group_name = remote_names()
-    client.queues[queue_name] = make_queue(queue_name)
+    client.queues[queue_name] = make_queue(queue_name, group_name=group_name)
     client.groups[group_name] = make_group(group_name, queue_name, running=1)
 
     async def fail_metering(*args: object, **kwargs: object) -> object:
@@ -1465,7 +1499,7 @@ async def test_runtime_metering_splits_at_utc_day_boundary(
     )
     client = FakeClient()
     queue_name, group_name = remote_names()
-    client.queues[queue_name] = make_queue(queue_name)
+    client.queues[queue_name] = make_queue(queue_name, group_name=group_name)
     client.groups[group_name] = make_group(group_name, queue_name, status="running")
 
     async with deployment_context.database.sessions() as session:
@@ -1500,7 +1534,7 @@ async def test_runtime_spend_engages_budget_kill_switch_and_provider_stop(
     )
     client = FakeClient()
     queue_name, group_name = remote_names()
-    client.queues[queue_name] = make_queue(queue_name)
+    client.queues[queue_name] = make_queue(queue_name, group_name=group_name)
     client.groups[group_name] = make_group(group_name, queue_name, running=1)
     async with deployment_context.database.sessions() as session:
         guard = await session.scalar(
@@ -1675,6 +1709,103 @@ async def test_reconciliation_detects_immutable_image_drift(
     assert result.error_code == "provider_image_drift"
 
 
+@pytest.mark.asyncio
+async def test_reconciliation_repairs_missing_autoscaler_before_activation(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(deployment_context)
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.queues[queue_name] = make_queue(queue_name, group_name=group_name)
+    group = make_group(group_name, queue_name)
+    group.raw.pop("queue_autoscaler")
+    client.groups[group_name] = group
+
+    async with deployment_context.database.sessions() as session:
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=NOW + timedelta(minutes=1),
+        )
+        await session.commit()
+
+    assert result.action == DeploymentAction.AUTOSCALER_REPAIR_REQUESTED
+    assert result.state == SaladDeploymentState.PROVISIONING
+    assert result.error_code == "provider_autoscaler_repair_pending"
+    assert client.updated_group_patches == [
+        {
+            "queue_autoscaler": {
+                "polling_period": 30,
+                "min_replicas": 0,
+                "max_replicas": 1,
+                "desired_queue_length": 1,
+            }
+        }
+    ]
+    assert client.start_names == []
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_uses_start_action_for_stopped_active_group(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(deployment_context)
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.queues[queue_name] = make_queue(queue_name, group_name=group_name)
+    group = make_group(
+        group_name,
+        queue_name,
+        status="stopped",
+        start_time=None,
+        finish_time=NOW,
+    )
+    group.raw["autostart_policy"] = False
+    client.groups[group_name] = group
+
+    async with deployment_context.database.sessions() as session:
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=NOW + timedelta(minutes=1),
+        )
+        await session.commit()
+
+    assert result.action == DeploymentAction.START_REQUESTED
+    assert result.state == SaladDeploymentState.PROVISIONING
+    assert result.error_code == "provider_start_pending"
+    assert client.start_names == [group_name]
+    assert client.updated_group_patches == []
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_blocks_unrepairable_missing_queue_membership(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(deployment_context)
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.queues[queue_name] = make_queue(queue_name)
+    client.groups[group_name] = make_group(group_name, queue_name, status="running")
+
+    async with deployment_context.database.sessions() as session:
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=NOW + timedelta(minutes=1),
+        )
+        await session.commit()
+
+    assert result.action == DeploymentAction.RECONCILED
+    assert result.state == SaladDeploymentState.DEGRADED
+    assert result.error_code == "provider_queue_binding_drift"
+    assert client.start_names == []
+    assert client.updated_group_patches == []
+
+
 def group_with_configuration_override(
     key: str,
     value: JSONValue,
@@ -1758,6 +1889,14 @@ def group_with_configuration_override(
             "provider_autoscaler_drift",
         ),
         (
+            group_with_configuration_override("autostart_policy", False),
+            "provider_autostart_policy_drift",
+        ),
+        (
+            group_with_configuration_override("priority", "high"),
+            "provider_priority_drift",
+        ),
+        (
             make_group(
                 remote_names()[1],
                 remote_names()[0],
@@ -1774,11 +1913,66 @@ def test_group_configuration_drift_variants(
     assert _group_configuration_drift(unpersisted_deployment(), group) == expected
 
 
-def test_group_configuration_allows_omitted_write_only_autoscaler() -> None:
+def test_group_configuration_rejects_omitted_autoscaler() -> None:
     group = make_group(remote_names()[1], remote_names()[0])
     group.raw.pop("queue_autoscaler")
 
-    assert _group_configuration_drift(unpersisted_deployment(), group) is None
+    assert (
+        _group_configuration_drift(unpersisted_deployment(), group) == "provider_autoscaler_drift"
+    )
+
+
+def test_group_configuration_uses_deployment_autoscaler_values() -> None:
+    deployment = unpersisted_deployment()
+    deployment.max_replicas = 3
+    deployment.desired_queue_length = 2
+    group = make_group(
+        remote_names()[1],
+        remote_names()[0],
+        autoscaler={
+            "min_replicas": 0,
+            "max_replicas": 3,
+            "desired_queue_length": 2,
+            "polling_period": 30,
+        },
+    )
+
+    assert _group_configuration_drift(deployment, group) is None
+
+
+def test_remote_drift_requires_exact_queue_group_membership() -> None:
+    deployment = unpersisted_deployment()
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    group = make_group(deployment.container_group_name, deployment.queue_name)
+
+    assert (
+        _remote_drift_code(deployment, make_queue(deployment.queue_name), group)
+        == "provider_queue_binding_drift"
+    )
+    assert (
+        _remote_drift_code(
+            deployment,
+            make_queue(
+                deployment.queue_name,
+                group_name=deployment.container_group_name,
+                group_id=uuid4(),
+            ),
+            group,
+        )
+        == "provider_queue_binding_drift"
+    )
+    assert (
+        _remote_drift_code(
+            deployment,
+            make_queue(
+                deployment.queue_name,
+                group_name=deployment.container_group_name,
+            ),
+            group,
+        )
+        is None
+    )
 
 
 def test_group_configuration_accepts_only_salad_default_shm_size() -> None:
