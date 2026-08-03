@@ -675,6 +675,9 @@
     const desiredCount = form.querySelector("[data-desired-count]");
     const matchQueueTarget = form.querySelector("[data-match-queue-target]");
     const randomSeedButton = form.querySelector("[data-random-seed]");
+    const batchSequenceInput = form.querySelector("[data-batch-sequence-input]");
+    const batchSequenceApply = form.querySelector("[data-batch-sequence-apply]");
+    const batchSequenceStatus = form.querySelector("[data-batch-sequence-status]");
     const defaultPrompt = form.querySelector("[data-default-prompt]");
     const defaultNegative = form.querySelector("[data-default-negative]");
     const defaultDetailer = form.querySelector("[data-default-detailer]");
@@ -725,6 +728,55 @@
         },
       ),
     );
+    const firstWildcardPattern = /__([a-z0-9]+(?:[._/-][a-z0-9]+)*)__/;
+
+    const promptForSequenceWildcard = (wildcard) => {
+      const token = `__${wildcard}__`;
+      const startingPrompt = defaultPrompt ? defaultPrompt.value : "";
+      if (firstWildcardPattern.test(startingPrompt)) {
+        return startingPrompt.replace(firstWildcardPattern, token);
+      }
+      return [startingPrompt.trim(), token].filter(Boolean).join(", ");
+    };
+
+    const parseBatchSequence = () => {
+      if (!(batchSequenceInput instanceof HTMLTextAreaElement)) return [];
+      const lines = batchSequenceInput.value
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      if (lines.length === 0) throw new Error("Enter at least one wildcard batch.");
+      if (lines.length > 50) throw new Error("A queue can contain at most 50 batches.");
+
+      const labelCounts = new Map();
+      return lines.map((line, index) => {
+        const parts = line.split(/\s+/);
+        if (parts.length !== 2) {
+          throw new Error(`Line ${index + 1} must use: image-count wildcard-name.`);
+        }
+        const imageCount = /^[1-9][0-9]*$/.test(parts[0])
+          ? integerValue(parts[0], 0)
+          : 0;
+        const wildcard = parts[1];
+        if (imageCount < 1 || imageCount > 80_000) {
+          throw new Error(`Line ${index + 1} image count must be between 1 and 80,000.`);
+        }
+        if (!knownWildcards.has(wildcard)) {
+          throw new Error(`Line ${index + 1} uses unknown wildcard __${wildcard}__.`);
+        }
+        const occurrence = (labelCounts.get(wildcard) || 0) + 1;
+        labelCounts.set(wildcard, occurrence);
+        return {
+          name: occurrence === 1 ? wildcard : `${wildcard} ${occurrence}`,
+          image_count: imageCount,
+          prompt: promptForSequenceWildcard(wildcard),
+          negative_prompt: null,
+          detailer_prompt: null,
+          detailer_negative_prompt: null,
+          seed: null,
+        };
+      });
+    };
 
     const insertToken = (target, token) => {
       const start = target.selectionStart ?? target.value.length;
@@ -967,6 +1019,43 @@
       }];
     }
     initialBatches.forEach((batch) => addBatch(batch));
+
+    if (batchSequenceApply instanceof HTMLButtonElement
+        && batchSequenceInput instanceof HTMLTextAreaElement) {
+      batchSequenceApply.addEventListener("click", () => {
+        try {
+          const batches = parseBatchSequence();
+          list.replaceChildren();
+          lastPrompt = null;
+          batches.forEach((batch) => addBatch(batch));
+          batchRows().forEach((row) => {
+            row.classList.add("is-collapsed");
+            const collapseButton = row.querySelector('[data-batch-action="collapse"]');
+            if (collapseButton) {
+              collapseButton.setAttribute("aria-expanded", "false");
+              collapseButton.textContent = "Expand";
+            }
+          });
+          if (collapseAllButton instanceof HTMLButtonElement) {
+            collapseAllButton.textContent = "Expand all";
+          }
+          updateBuilder();
+          if (batchSequenceStatus instanceof HTMLOutputElement) {
+            const total = batches.reduce((sum, batch) => sum + batch.image_count, 0);
+            batchSequenceStatus.classList.remove("error");
+            batchSequenceStatus.textContent = `${batches.length} batches and ${total.toLocaleString()} images queued in this order.`;
+          }
+        } catch (error) {
+          if (batchSequenceStatus instanceof HTMLOutputElement) {
+            batchSequenceStatus.classList.add("error");
+            batchSequenceStatus.textContent = error instanceof Error
+              ? error.message
+              : "The wildcard batch list is invalid.";
+          }
+          batchSequenceInput.focus();
+        }
+      });
+    }
 
     addButtons.forEach((button) => button.addEventListener("click", () => {
       const row = addBatch(newBatchDefaults());
@@ -1679,6 +1768,57 @@
     });
     if (search instanceof HTMLInputElement) search.addEventListener("input", render);
     render();
+  }
+
+  function initializeAssetSorting() {
+    document.querySelectorAll("[data-asset-sort-controls]").forEach((controls) => {
+      const targetId = controls.dataset.assetSortTarget || "";
+      const grid = document.getElementById(targetId);
+      if (!(grid instanceof HTMLOListElement)) return;
+      const cards = Array.from(grid.querySelectorAll(".asset-card"));
+      const buttons = Array.from(controls.querySelectorAll("[data-asset-sort]"));
+      const status = controls.querySelector("[data-asset-sort-status]");
+      if (cards.length === 0 || buttons.length === 0) return;
+
+      const numberFrom = (card, name) => {
+        const value = Number.parseInt(card.dataset[name] || "0", 10);
+        return Number.isFinite(value) ? value : 0;
+      };
+      const compareQuality = (left, right) => (
+        numberFrom(left, "qualityOrder") - numberFrom(right, "qualityOrder")
+      );
+      const compareGeneration = (left, right) => (
+        numberFrom(left, "batchIndex") - numberFrom(right, "batchIndex")
+        || numberFrom(left, "batchImageNumber") - numberFrom(right, "batchImageNumber")
+        || compareQuality(left, right)
+      );
+
+      const render = (order) => {
+        const compare = order === "generation" ? compareGeneration : compareQuality;
+        const regular = cards.filter((card) => card.dataset.aiExcluded !== "true").sort(compare);
+        const excluded = cards.filter((card) => card.dataset.aiExcluded === "true").sort(compare);
+        const excludedHeadings = Array.from(grid.querySelectorAll(".ai-excluded-heading"));
+        regular.forEach((card) => grid.append(card));
+        excludedHeadings.forEach((heading) => grid.append(heading));
+        excluded.forEach((card) => grid.append(card));
+        buttons.forEach((button) => {
+          const selected = button.dataset.assetSort === order;
+          button.classList.toggle("active", selected);
+          button.setAttribute("aria-pressed", String(selected));
+        });
+        if (status instanceof HTMLOutputElement) {
+          status.textContent = order === "generation"
+            ? "Batch order, then image number"
+            : "Highest quality first";
+        }
+      };
+
+      buttons.forEach((button) => {
+        button.addEventListener("click", () => render(button.dataset.assetSort || "quality"));
+      });
+      controls.hidden = false;
+      render("quality");
+    });
   }
 
   function initializeWildcardLibraryTools() {
@@ -2913,6 +3053,7 @@
   initializeAutomationPresets();
   initializeAutomationDraft();
   initializeReleaseLibrary();
+  initializeAssetSorting();
   initializeWildcardLibraryTools();
   initializeBulkReview();
   initializeGenerationDetails();

@@ -238,8 +238,25 @@
       {% endif %}
     </nav>
   {% endif %}
+  <nav
+    class="asset-sort-bar"
+    aria-label="Sort review images"
+    data-asset-sort-controls
+    data-asset-sort-target="review-masters"
+    hidden
+  >
+    <span>Order</span>
+    <button class="filter-chip active" type="button" data-asset-sort="quality" aria-pressed="true">
+      Quality rank
+    </button>
+    <button class="filter-chip" type="button" data-asset-sort="generation" aria-pressed="false">
+      Generation queue
+    </button>
+    <output data-asset-sort-status aria-live="polite"></output>
+  </nav>
 
   <ol
+    id="review-masters"
     class="asset-grid review-grid"
     data-asset-grid
     data-review-grid
@@ -271,6 +288,9 @@
         data-asset-id="{{ item.master.asset_id }}"
         data-rank="{{ item.master.rank }}"
         data-score="{{ item.master.score_percent }}"
+        data-quality-order="{{ loop.index }}"
+        data-batch-index="{{ item.master.batch_index }}"
+        data-batch-image-number="{{ item.master.batch_image_number }}"
         data-decision="{{ decision_value }}"
         data-selected-for-x="{{ 'true' if item.current.selected_for_x else 'false' }}"
         {% if item.ai_excluded %}data-ai-excluded="true"{% endif %}
@@ -309,6 +329,9 @@
             <span class="score">{{ item.master.score_percent }}</span>
           </div>
           <div class="card-status-row" aria-live="polite">
+            <span class="decision-chip batch-chip">
+              {{ item.master.batch_name }} &middot; image {{ item.master.batch_image_number }}
+            </span>
             <span class="decision-chip {{ decision_value }}">
               {{ decision_value }}
             </span>

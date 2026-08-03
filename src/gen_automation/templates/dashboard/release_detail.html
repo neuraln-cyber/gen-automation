@@ -65,9 +65,33 @@
     <span class="status ready">{{ release.assets | length }} images</span>
   </div>
 
+  <nav
+    class="asset-sort-bar"
+    aria-label="Sort raw masters"
+    data-asset-sort-controls
+    data-asset-sort-target="ranked-masters"
+    hidden
+  >
+    <span>Order</span>
+    <button class="filter-chip active" type="button" data-asset-sort="quality" aria-pressed="true">
+      Quality rank
+    </button>
+    <button class="filter-chip" type="button" data-asset-sort="generation" aria-pressed="false">
+      Generation queue
+    </button>
+    <output data-asset-sort-status aria-live="polite"></output>
+  </nav>
+
   <ol class="asset-grid" id="ranked-masters" data-asset-grid>
     {% for asset in release.assets %}
-      <li class="asset-card" data-asset-id="{{ asset.asset_id }}" data-rank="{{ asset.rank }}">
+      <li
+        class="asset-card"
+        data-asset-id="{{ asset.asset_id }}"
+        data-rank="{{ asset.rank }}"
+        data-quality-order="{{ loop.index }}"
+        data-batch-index="{{ asset.batch_index }}"
+        data-batch-image-number="{{ asset.batch_image_number }}"
+      >
         <div class="asset-media">
           <img
             class="asset-preview"
@@ -86,6 +110,7 @@
             <span class="rank">Rank {{ asset.rank }}</span>
             <span class="score">{{ asset.score_percent }}</span>
           </div>
+          <p class="batch-origin">{{ asset.batch_name }} &middot; image {{ asset.batch_image_number }}</p>
           <dl>
             <dt>Disposition</dt>
             <dd>{{ asset.disposition.replace("_", " ") }}</dd>

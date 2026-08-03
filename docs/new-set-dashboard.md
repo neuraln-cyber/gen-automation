@@ -10,6 +10,10 @@ The browser presents this as a settings-first builder. Operators choose one
 shared generation profile and image-quality configuration, then queue up to 50
 ordered batch cards. Every batch has its own label, image count, prompt and
 wildcards, optional negative/detailer overrides, and optional starting seed.
+For large sets, **Build a large wildcard queue quickly** accepts one compact
+`image-count wildcard-name` line per stage. For example, `50 sfw`, `100 nnsfw`,
+`50 nsfw`, `20 oral`, `100 reworked`, and `20 group` creates all six batch cards
+in exactly that order while copying the shared starting prompt into each one.
 The queue summary continuously shows total images, GPU jobs, and the final-set
 target before submission. The visible **Keep best** target follows the queue by
 default (up to the supported 100-image final set) and becomes independent after
@@ -37,7 +41,11 @@ the sharper A1111 comparison preset.
 
 One submission creates the default `main` project when the database has no
 projects, creates and freezes the release specification, revalidates all
-server-owned approvals, and expands the deterministic generation jobs. The
+server-owned approvals, and expands the deterministic generation jobs. The GPU
+scheduler uses the frozen job ordinal after priority, so equal-priority jobs are
+submitted in queue order rather than database insertion order. Ranked master
+and review screens can switch between quality ranking and original generation
+order; generation order uses the frozen batch index and image number. The
 browser command is CSRF-protected and carries a signed idempotency key, so a
 retry of the same form does not duplicate the release or jobs.
 

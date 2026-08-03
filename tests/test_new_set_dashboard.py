@@ -52,6 +52,9 @@ def test_new_set_builder_frontend_keeps_batch_edits_safe_and_actionable(
     assert "clearAutomationDraftAfterQueue" in script.text
     assert "knownWildcards" in script.text
     assert "Unknown wildcard:" in script.text
+    assert "parseBatchSequence" in script.text
+    assert "promptForSequenceWildcard" in script.text
+    assert "lines.length > 50" in script.text
     assert "targetFollowsQueue" in script.text
     assert "pairedWorkflow" in script.text
     assert 'event.target.closest("details")' in script.text
@@ -138,6 +141,10 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert 'name="planned_job_count" value="1"' in page.text
     assert 'name="batch_plan"' in page.text
     assert 'id="batch-row-template"' in page.text
+    assert "data-batch-sequence-input" in page.text
+    assert "data-batch-sequence-apply" in page.text
+    assert "50 sfw" in page.text
+    assert "100 nnsfw" in page.text
     assert 'id="lora-selection-template"' in page.text
     assert "data-lora-picker" in page.text
     assert "data-lora-search" in page.text
