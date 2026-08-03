@@ -105,6 +105,11 @@ done
   fail "control-plane and semantic gateway model identifiers must match"
 [ "$(env_value GEN_AUTOMATION_SEMANTIC_ANATOMY_MODEL_REVISION "$config_root/control-plane.env")" = "$(env_value GEN_AUTOMATION_SEMANTIC_GATEWAY_MODEL_REVISION "$config_root/semantic-gateway.env")" ] ||
   fail "control-plane and semantic gateway model revisions must match"
+semantic_upstream="$(env_value GEN_AUTOMATION_SEMANTIC_GATEWAY_UPSTREAM_CHAT_COMPLETIONS_URL "$config_root/semantic-gateway.env")"
+[[ "$semantic_upstream" =~ ^https://api[.]runpod[.]ai/v2/[A-Za-z0-9_-]+/openai/v1/chat/completions$ ]] ||
+  fail "semantic gateway upstream must be one exact official RunPod endpoint"
+[ -n "$(env_value GEN_AUTOMATION_SEMANTIC_GATEWAY_UPSTREAM_API_KEY "$config_root/semantic-gateway.env")" ] ||
+  fail "semantic gateway RunPod API key must be configured"
 [ "$(env_value GEN_AUTOMATION_INGRESS_RATE_LIMIT_CONFIGURED "$config_root/control-plane.env")" = "true" ] ||
   fail "control-plane must assert the validated nginx rate limit"
 [ "$(env_value GEN_AUTOMATION_INGRESS_REQUEST_GUARDS_CONFIGURED "$config_root/control-plane.env")" = "true" ] ||

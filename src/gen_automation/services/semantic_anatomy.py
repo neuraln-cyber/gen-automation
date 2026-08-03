@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import and_, exists, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -163,14 +163,43 @@ async def ensure_semantic_assessment(
     session: AsyncSession,
     *,
     profile: SemanticAssessmentProfile,
+    max_assessments_per_profile: int,
+    asset_allowlist: Collection[UUID],
     max_attempts: int,
     now: datetime | None = None,
 ) -> bool:
     """Create one assessment job for a frozen, CPU-ranked raw master."""
 
+    assessment_limit = _assessment_limit(max_assessments_per_profile)
+    allowed_asset_ids = _asset_allowlist(asset_allowlist)
     _max_attempts(max_attempts)
+    if assessment_limit == 0:
+        return False
     created_at = _as_utc(now or datetime.now(UTC))
     profile_digest = profile.profile_sha256
+
+    # Serialize assessment creation before counting. Without a stable row lock,
+    # two controller replicas could both observe room beneath the cap and create
+    # different assessment rows, exceeding the configured hard limit.
+    creation_guard = await session.scalar(
+        select(ScoringRun.id)
+        .where(ScoringRun.state == ScoringRunState.COMPLETED)
+        .order_by(ScoringRun.completed_at, ScoringRun.id)
+        .limit(1)
+        .with_for_update()
+    )
+    if creation_guard is None:
+        await session.rollback()
+        return False
+    existing_count = await session.scalar(
+        select(func.count(SemanticAssessment.id)).where(
+            SemanticAssessment.profile_sha256 == profile_digest
+        )
+    )
+    if existing_count is None or existing_count >= assessment_limit:
+        await session.rollback()
+        return False
+
     assessment_exists = exists(
         select(SemanticAssessment.id).where(
             SemanticAssessment.scoring_run_id == AssetScore.scoring_run_id,
@@ -178,25 +207,29 @@ async def ensure_semantic_assessment(
             SemanticAssessment.profile_sha256 == profile_digest,
         )
     )
+    candidate = (
+        select(AssetScore, Asset)
+        .join(ScoringRun, ScoringRun.id == AssetScore.scoring_run_id)
+        .join(
+            AssetRanking,
+            (AssetRanking.scoring_run_id == AssetScore.scoring_run_id)
+            & (AssetRanking.asset_id == AssetScore.asset_id),
+        )
+        .join(Asset, Asset.id == AssetScore.asset_id)
+        .where(
+            ScoringRun.state == ScoringRunState.COMPLETED,
+            AssetScore.state.in_(_RANKABLE_SCORE_STATES),
+            AssetScore.completed_at.is_not(None),
+            Asset.kind == AssetKind.RAW_MASTER,
+            Asset.state == AssetState.AVAILABLE,
+            ~assessment_exists,
+        )
+    )
+    if allowed_asset_ids:
+        candidate = candidate.where(AssetScore.asset_id.in_(allowed_asset_ids))
     row = (
         await session.execute(
-            select(AssetScore, Asset)
-            .join(ScoringRun, ScoringRun.id == AssetScore.scoring_run_id)
-            .join(
-                AssetRanking,
-                (AssetRanking.scoring_run_id == AssetScore.scoring_run_id)
-                & (AssetRanking.asset_id == AssetScore.asset_id),
-            )
-            .join(Asset, Asset.id == AssetScore.asset_id)
-            .where(
-                ScoringRun.state == ScoringRunState.COMPLETED,
-                AssetScore.state.in_(_RANKABLE_SCORE_STATES),
-                AssetScore.completed_at.is_not(None),
-                Asset.kind == AssetKind.RAW_MASTER,
-                Asset.state == AssetState.AVAILABLE,
-                ~assessment_exists,
-            )
-            .order_by(ScoringRun.completed_at, AssetRanking.rank, AssetScore.id)
+            candidate.order_by(ScoringRun.completed_at, AssetRanking.rank, AssetScore.id)
             .limit(1)
             .with_for_update(skip_locked=True)
         )
@@ -442,6 +475,8 @@ async def run_semantic_assessment_cycle(
     worker_id: str,
     profile: SemanticAssessmentProfile,
     analyzer: SemanticAnalyzer,
+    max_assessments_per_profile: int,
+    asset_allowlist: Collection[UUID],
     max_attempts: int,
     lease_seconds: int,
     retry_base_seconds: int,
@@ -465,6 +500,8 @@ async def run_semantic_assessment_cycle(
         created = await ensure_semantic_assessment(
             session,
             profile=profile,
+            max_assessments_per_profile=max_assessments_per_profile,
+            asset_allowlist=asset_allowlist,
             max_attempts=max_attempts,
             now=cycle_at,
         )
@@ -783,6 +820,21 @@ def _max_attempts(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 10:
         raise ValueError("semantic max attempts must be between 1 and 10")
     return value
+
+
+def _assessment_limit(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 10_000:
+        raise ValueError("semantic per-profile assessment limit must be between 0 and 10000")
+    return value
+
+
+def _asset_allowlist(value: Collection[UUID]) -> tuple[UUID, ...]:
+    if isinstance(value, (str, bytes)):
+        raise ValueError("semantic asset allowlist must contain UUID values")
+    normalized = tuple(value)
+    if len(normalized) > 10_000 or any(not isinstance(asset_id, UUID) for asset_id in normalized):
+        raise ValueError("semantic asset allowlist must contain at most 10000 UUID values")
+    return tuple(dict.fromkeys(normalized))
 
 
 def _confidence_threshold(value: object) -> int:

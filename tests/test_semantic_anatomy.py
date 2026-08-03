@@ -331,6 +331,8 @@ async def test_unavailable_semantic_service_retries_then_keeps_master_for_review
         worker_id="semantic:test",
         profile=profile,
         analyzer=unavailable,
+        max_assessments_per_profile=1,
+        asset_allowlist=(),
         max_attempts=2,
         lease_seconds=120,
         retry_base_seconds=5,
@@ -352,6 +354,8 @@ async def test_unavailable_semantic_service_retries_then_keeps_master_for_review
         worker_id="semantic:test",
         profile=profile,
         analyzer=unavailable,
+        max_assessments_per_profile=0,
+        asset_allowlist=(),
         max_attempts=2,
         lease_seconds=120,
         retry_base_seconds=5,
@@ -371,6 +375,222 @@ async def test_unavailable_semantic_service_retries_then_keeps_master_for_review
         assert asset is not None
         assert asset.state == AssetState.AVAILABLE
         assert semantic_runtime_context.store.objects
+
+
+async def _add_ranked_asset(
+    context: SemanticRuntimeContext,
+    *,
+    output_index: int,
+    rank: int,
+) -> UUID:
+    payload = f"exact-semantic-master-{output_index}".encode()
+    object_key = f"masters/exact-{output_index}.png"
+    context.store.put_for_test(object_key, payload)
+    stored = context.store.objects[object_key]
+    async with context.database.sessions() as session:
+        original = await session.get(Asset, context.asset_id)
+        assert original is not None
+        assert original.generation_job_id is not None
+        job = await session.get(GenerationJob, original.generation_job_id)
+        assert job is not None
+        asset = Asset(
+            release_id=original.release_id,
+            generation_job_id=job.id,
+            output_index=output_index,
+            kind=AssetKind.RAW_MASTER,
+            state=AssetState.AVAILABLE,
+            storage_backend=context.store.backend,
+            storage_bucket=context.store.bucket,
+            object_key=object_key,
+            object_version_id=stored.version_id,
+            sha256=hashlib.sha256(payload).hexdigest(),
+            content_type="image/png",
+            image_format="PNG",
+            width=64,
+            height=64,
+            byte_size=len(payload),
+            asset_metadata={},
+            available_at=_NOW,
+        )
+        session.add(asset)
+        await session.flush()
+        run = ScoringRun(
+            release_version_id=job.release_version_id,
+            configuration={"quality": f"fixture-{output_index}"},
+            config_sha256="7" * 64,
+            input_manifest_sha256="8" * 64,
+            ranking_manifest_sha256=None,
+            scorer_version="fixture",
+            pillow_version="12.0.0",
+            state=ScoringRunState.RUNNING,
+            asset_count=1,
+            max_attempts=3,
+            created_at=_NOW + timedelta(seconds=1),
+            started_at=_NOW + timedelta(seconds=1),
+            completed_at=None,
+        )
+        session.add(run)
+        await session.flush()
+        score = AssetScore(
+            scoring_run_id=run.id,
+            asset_id=asset.id,
+            asset_storage_backend=asset.storage_backend,
+            asset_storage_bucket=asset.storage_bucket,
+            asset_sha256=asset.sha256,
+            asset_object_key=asset.object_key,
+            asset_object_version_id=asset.object_version_id,
+            asset_byte_size=asset.byte_size,
+            asset_image_format=asset.image_format,
+            asset_width=asset.width,
+            asset_height=asset.height,
+            state=AssetScoreState.FLAGGED_CORRUPT,
+            attempts=1,
+            max_attempts=3,
+            available_at=_NOW,
+            aggregate_score_micros=400_000,
+            signal_detail={"classification": "fixture"},
+            scorer_version=run.scorer_version,
+            pillow_version=run.pillow_version,
+            config_sha256=run.config_sha256,
+            completed_at=_NOW + timedelta(seconds=1),
+            created_at=_NOW,
+        )
+        session.add(score)
+        await session.flush()
+        session.add(
+            AssetRanking(
+                scoring_run_id=run.id,
+                asset_score_id=score.id,
+                asset_id=asset.id,
+                rank=rank,
+                aggregate_score_micros=400_000,
+                disposition=RankingDisposition.FLAGGED_REVIEW,
+                explanation={"fixture": True},
+                is_duplicate_representative=False,
+                scorer_version=run.scorer_version,
+                pillow_version=run.pillow_version,
+                config_sha256=run.config_sha256,
+                frozen_at=_NOW + timedelta(seconds=1),
+            )
+        )
+        await session.flush()
+        run.ranking_manifest_sha256 = "9" * 64
+        run.state = ScoringRunState.COMPLETED
+        run.completed_at = _NOW + timedelta(seconds=2)
+        await session.commit()
+        return asset.id
+
+
+async def _passing_assessment(
+    _payload: bytes,
+    _content_type: str,
+    _sha256: str,
+) -> SemanticAssessmentResult:
+    return SemanticAssessmentResult(
+        verdict=SemanticVerdict.PASS,
+        confidence_micros=990_000,
+        issues=(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_zero_assessment_limit_schedules_no_new_rows(
+    semantic_runtime_context: SemanticRuntimeContext,
+) -> None:
+    result = await run_semantic_assessment_cycle(
+        semantic_runtime_context.database.sessions,
+        semantic_runtime_context.store,
+        worker_id="semantic:zero-limit",
+        profile=SemanticAssessmentProfile(model_name=_MODEL, model_revision=_REVISION),
+        analyzer=_passing_assessment,
+        max_assessments_per_profile=0,
+        asset_allowlist=(),
+        max_attempts=2,
+        lease_seconds=120,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+        now=_NOW + timedelta(minutes=1),
+    )
+
+    assert not result.did_work
+    async with semantic_runtime_context.database.sessions() as session:
+        assert list((await session.scalars(select(SemanticAssessment))).all()) == []
+
+
+@pytest.mark.asyncio
+async def test_profile_assessment_limit_counts_all_existing_rows(
+    semantic_runtime_context: SemanticRuntimeContext,
+) -> None:
+    await _add_ranked_asset(semantic_runtime_context, output_index=1, rank=1)
+    profile = SemanticAssessmentProfile(model_name=_MODEL, model_revision=_REVISION)
+    first = await run_semantic_assessment_cycle(
+        semantic_runtime_context.database.sessions,
+        semantic_runtime_context.store,
+        worker_id="semantic:hard-limit",
+        profile=profile,
+        analyzer=_passing_assessment,
+        max_assessments_per_profile=1,
+        asset_allowlist=(),
+        max_attempts=2,
+        lease_seconds=120,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+        now=_NOW + timedelta(minutes=1),
+    )
+    second = await run_semantic_assessment_cycle(
+        semantic_runtime_context.database.sessions,
+        semantic_runtime_context.store,
+        worker_id="semantic:hard-limit",
+        profile=profile,
+        analyzer=_passing_assessment,
+        max_assessments_per_profile=1,
+        asset_allowlist=(),
+        max_attempts=2,
+        lease_seconds=120,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+        now=_NOW + timedelta(minutes=2),
+    )
+
+    assert first.created_assessment
+    assert first.processed_assessment
+    assert not second.did_work
+    async with semantic_runtime_context.database.sessions() as session:
+        assessments = list((await session.scalars(select(SemanticAssessment))).all())
+        assert len(assessments) == 1
+        assert assessments[0].state == SemanticAssessmentState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_asset_allowlist_restricts_new_assessment_selection(
+    semantic_runtime_context: SemanticRuntimeContext,
+) -> None:
+    allowed_asset_id = await _add_ranked_asset(
+        semantic_runtime_context,
+        output_index=1,
+        rank=1,
+    )
+    result = await run_semantic_assessment_cycle(
+        semantic_runtime_context.database.sessions,
+        semantic_runtime_context.store,
+        worker_id="semantic:allowlist",
+        profile=SemanticAssessmentProfile(model_name=_MODEL, model_revision=_REVISION),
+        analyzer=_passing_assessment,
+        max_assessments_per_profile=1,
+        asset_allowlist=(allowed_asset_id,),
+        max_attempts=2,
+        lease_seconds=120,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+        now=_NOW + timedelta(minutes=1),
+    )
+
+    assert result.created_assessment
+    assert result.processed_assessment
+    async with semantic_runtime_context.database.sessions() as session:
+        assessment = await session.scalar(select(SemanticAssessment))
+        assert assessment is not None
+        assert assessment.asset_id == allowed_asset_id
 
 
 async def _seed_dashboard_assessments_and_override(

@@ -138,7 +138,16 @@ GEN_AUTOMATION_SEMANTIC_ANATOMY_MODE=shadow
 GEN_AUTOMATION_SEMANTIC_ANATOMY_ENDPOINT_URL=https://<private-service>/v1/anatomy/assess
 GEN_AUTOMATION_SEMANTIC_ANATOMY_MODEL=Qwen/Qwen3-VL-8B-Instruct
 GEN_AUTOMATION_SEMANTIC_ANATOMY_MODEL_REVISION=<immutable revision>
+GEN_AUTOMATION_SEMANTIC_ANATOMY_MAX_ASSESSMENTS_PER_PROFILE=<positive hard limit>
+GEN_AUTOMATION_SEMANTIC_ANATOMY_ASSET_ALLOWLIST='["<exact asset UUID>"]'
 ```
+
+The default per-profile limit is `0`, so disabled or partially configured anatomy QC
+cannot create billable assessments. Enabling the feature requires a positive limit.
+Every assessment row for the model/revision profile counts toward that cap, including
+completed, unavailable, and retrying rows. When the UUID allowlist is non-empty, only
+those exact raw-master assets can receive new assessment rows; already-created rows
+may still finish or retry after the allowlist or limit changes.
 
 No credential is required by the application contract. Put the endpoint on a
 private network or add authentication at the private gateway/ingress boundary

@@ -185,7 +185,16 @@ def test_protected_network_boundary_requires_ingress_guards() -> None:
 
 
 def test_semantic_anatomy_defaults_to_non_blocking_shadow_mode() -> None:
-    assert Settings().semantic_anatomy_mode == SemanticEnforcementMode.SHADOW
+    settings = Settings()
+
+    assert settings.semantic_anatomy_mode == SemanticEnforcementMode.SHADOW
+    assert settings.semantic_anatomy_max_assessments_per_profile == 0
+    assert settings.semantic_anatomy_asset_allowlist == ()
+
+
+def test_enabled_semantic_anatomy_requires_positive_assessment_limit() -> None:
+    with pytest.raises(ValidationError, match="positive per-profile assessment limit"):
+        Settings(semantic_anatomy_enabled=True)
 
 
 def test_protected_semantic_endpoint_allows_only_exact_loopback_gateway() -> None:
@@ -205,6 +214,7 @@ def test_protected_semantic_endpoint_allows_only_exact_loopback_gateway() -> Non
         "background_runtime_enabled": True,
         "quality_scoring_enabled": True,
         "semantic_anatomy_enabled": True,
+        "semantic_anatomy_max_assessments_per_profile": 1,
         "semantic_anatomy_model_revision": "60595ebc30ec8e3b1d3b9e65d4943ca011c0006a",
     }
     settings = Settings(
@@ -226,6 +236,13 @@ def test_protected_semantic_endpoint_allows_only_exact_loopback_gateway() -> Non
                 **common,  # type: ignore[arg-type]
                 semantic_anatomy_endpoint_url=unsafe_url,
             )
+
+    with pytest.raises(ValidationError, match="semantic lease must exceed"):
+        Settings(
+            **common,  # type: ignore[arg-type]
+            semantic_anatomy_endpoint_url="http://127.0.0.1:8091/v1/anatomy/assess",
+            background_semantic_lease_seconds=210,
+        )
 
 
 @pytest.mark.parametrize(

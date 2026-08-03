@@ -266,6 +266,22 @@ resource "aws_iam_role_policy" "runtime" {
   policy = data.aws_iam_policy_document.runtime.json
 }
 
+data "aws_iam_policy_document" "runpod_inference_key_read" {
+  statement {
+    sid       = "ReadRunPodInferenceKey"
+    actions   = ["ssm:GetParameter"]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${local.name}/runpod/inference-api-key",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "runpod_inference_key_read" {
+  name   = "${local.name}-runpod-inference-key-read"
+  role   = aws_iam_role.control_plane.id
+  policy = data.aws_iam_policy_document.runpod_inference_key_read.json
+}
+
 data "aws_iam_policy_document" "cloudwatch" {
   statement {
     sid = "WriteExactLogGroup"

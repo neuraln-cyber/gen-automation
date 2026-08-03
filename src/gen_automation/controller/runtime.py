@@ -1044,6 +1044,10 @@ class ControllerWorkloads:
                 model_revision=revision,
             ),
             analyzer=analyze,
+            max_assessments_per_profile=(
+                self.settings.semantic_anatomy_max_assessments_per_profile
+            ),
+            asset_allowlist=self.settings.semantic_anatomy_asset_allowlist,
             max_attempts=self.settings.background_semantic_max_attempts,
             lease_seconds=self.settings.background_semantic_lease_seconds,
             retry_base_seconds=self.settings.background_semantic_retry_base_seconds,

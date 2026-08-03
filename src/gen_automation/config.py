@@ -241,6 +241,15 @@ class Settings(BaseSettings):
         min_length=1,
         max_length=200,
     )
+    semantic_anatomy_max_assessments_per_profile: int = Field(
+        default=0,
+        ge=0,
+        le=10_000,
+    )
+    semantic_anatomy_asset_allowlist: tuple[UUID, ...] = Field(
+        default=(),
+        max_length=10_000,
+    )
     semantic_anatomy_severe_confidence_micros: int = Field(
         default=900_000,
         ge=0,
@@ -571,6 +580,10 @@ class Settings(BaseSettings):
                 )
             if self.semantic_anatomy_model_revision is None:
                 errors.append("semantic anatomy QC requires a pinned model revision")
+            if self.semantic_anatomy_max_assessments_per_profile <= 0:
+                errors.append(
+                    "semantic anatomy QC requires a positive per-profile assessment limit"
+                )
         if self.background_semantic_retry_max_seconds < self.background_semantic_retry_base_seconds:
             errors.append("semantic retry maximum cannot be lower than its base delay")
         if (
@@ -578,6 +591,12 @@ class Settings(BaseSettings):
             < self.background_semantic_request_timeout_seconds + 10
         ):
             errors.append("semantic cycle timeout must cover the VLM request plus cleanup")
+        if (
+            self.semantic_anatomy_enabled
+            and self.background_semantic_lease_seconds
+            <= self.background_semantic_timeout_seconds
+        ):
+            errors.append("semantic lease must exceed the semantic cycle timeout")
         if self.derivative_rendering_enabled and not self.storage_enabled:
             errors.append("automatic derivative rendering requires private object storage")
         if self.derivative_rendering_enabled and not self.background_runtime_enabled:

@@ -81,6 +81,8 @@ async def feedback_context(
         worker_id="semantic:feedback-test",
         profile=_PROFILE,
         analyzer=assess,
+        max_assessments_per_profile=1,
+        asset_allowlist=(),
         max_attempts=2,
         lease_seconds=120,
         retry_base_seconds=5,
