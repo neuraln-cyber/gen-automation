@@ -51,16 +51,18 @@ def test_publication_routes_apply_recent_auth_only_to_external_effects() -> None
             PublicationMutationPrincipal
         )
     for route in recent_routes:
-        assert get_type_hints(route, include_extras=True)["principal"] == (
-            PublicationPrincipal
-        )
-    assert get_type_hints(
-        publications.post_global_publication_guard,
-        include_extras=True,
-    )["principal"] == PublicationMutationOwner
-    assert get_type_hints(derivatives.post_watermark, include_extras=True)[
-        "principal"
-    ] == PublicationMutationOwner
+        assert get_type_hints(route, include_extras=True)["principal"] == (PublicationPrincipal)
+    assert (
+        get_type_hints(
+            publications.post_global_publication_guard,
+            include_extras=True,
+        )["principal"]
+        == PublicationMutationOwner
+    )
+    assert (
+        get_type_hints(derivatives.post_watermark, include_extras=True)["principal"]
+        == PublicationMutationOwner
+    )
 
 
 @pytest.mark.asyncio
@@ -121,4 +123,3 @@ async def test_publication_guard_requires_recent_auth_only_when_enabling(
 
     assert result.enabled is enabled
     assert calls == recent_auth_calls
-

@@ -20,14 +20,12 @@ def test_github_deploy_identity_is_optional_keyless_and_main_only() -> None:
     repository = variables.split('variable "github_actions_repository" {', maxsplit=1)[1].split(
         'variable "github_actions_repository_owner_id" {', maxsplit=1
     )[0]
-    owner_id = variables.split(
-        'variable "github_actions_repository_owner_id" {', maxsplit=1
-    )[1].split('variable "github_actions_repository_id" {', maxsplit=1)[0]
-    repository_id = variables.split(
-        'variable "github_actions_repository_id" {', maxsplit=1
-    )[1].split(
-        'variable "github_actions_oidc_provider_arn" {', maxsplit=1
-    )[0]
+    owner_id = variables.split('variable "github_actions_repository_owner_id" {', maxsplit=1)[
+        1
+    ].split('variable "github_actions_repository_id" {', maxsplit=1)[0]
+    repository_id = variables.split('variable "github_actions_repository_id" {', maxsplit=1)[
+        1
+    ].split('variable "github_actions_oidc_provider_arn" {', maxsplit=1)[0]
     assume = iam.split(
         'data "aws_iam_policy_document" "github_actions_deploy_assume" {',
         maxsplit=1,
@@ -40,26 +38,29 @@ def test_github_deploy_identity_is_optional_keyless_and_main_only() -> None:
     assert "must be a positive integer" in owner_id
     assert re.search(r"default\s*=\s*1314605368", repository_id)
     assert "must be a positive integer" in repository_id
-    assert """github_actions_deploy_subject = format(
+    assert (
+        """github_actions_deploy_subject = format(
     "repo:%s@%d/%s@%d:ref:refs/heads/main",
     local.github_actions_repository_parts[0],
     var.github_actions_repository_owner_id,
     local.github_actions_repository_parts[1],
     var.github_actions_repository_id,
-  )""" in locals_tf
+  )"""
+        in locals_tf
+    )
     assert 'actions = ["sts:AssumeRoleWithWebIdentity"]' in assume
     assert 'variable = "token.actions.githubusercontent.com:aud"' in assume
     assert 'values   = ["sts.amazonaws.com"]' in assume
     assert 'variable = "token.actions.githubusercontent.com:sub"' in assume
     assert "local.github_actions_deploy_subject" in assume
     assert 'variable = "token.actions.githubusercontent.com:repository"' in assume
-    assert 'values   = [var.github_actions_repository]' in assume
+    assert "values   = [var.github_actions_repository]" in assume
     assert 'variable = "token.actions.githubusercontent.com:repository_owner_id"' in assume
-    assert 'values   = [tostring(var.github_actions_repository_owner_id)]' in assume
+    assert "values   = [tostring(var.github_actions_repository_owner_id)]" in assume
     assert 'variable = "token.actions.githubusercontent.com:repository_id"' in assume
-    assert 'values   = [tostring(var.github_actions_repository_id)]' in assume
+    assert "values   = [tostring(var.github_actions_repository_id)]" in assume
     assert 'variable = "token.actions.githubusercontent.com:workflow"' in assume
-    assert 'values   = [local.github_actions_deploy_workflow]' in assume
+    assert "values   = [local.github_actions_deploy_workflow]" in assume
     assert 'variable = "token.actions.githubusercontent.com:ref"' in assume
     assert 'values   = ["refs/heads/main"]' in assume
     assert 'github_actions_deploy_workflow = "Deploy staging control plane"' in locals_tf
@@ -125,17 +126,12 @@ def test_github_deploy_outputs_examples_and_runbook_are_explicit() -> None:
     assert 'output "github_actions_deploy_role_arn"' in outputs
     assert 'output "github_actions_oidc_provider_arn"' in outputs
     assert re.search(r"github_actions_deploy_enabled\s*=\s*true", tfvars)
-    assert re.search(
-        r'github_actions_repository\s*=\s*"neuraln-cyber/gen-automation"', tfvars
-    )
+    assert re.search(r'github_actions_repository\s*=\s*"neuraln-cyber/gen-automation"', tfvars)
     assert re.search(r"github_actions_repository_owner_id\s*=\s*310034173", tfvars)
     assert re.search(r"github_actions_repository_id\s*=\s*1314605368", tfvars)
     assert re.search(r"github_actions_oidc_provider_arn\s*=\s*null", tfvars)
     assert "never create AWS access keys for GitHub" in readme
-    assert (
-        "repo:neuraln-cyber@310034173/gen-automation@1314605368:"
-        "ref:refs/heads/main"
-    ) in runbook
+    assert ("repo:neuraln-cyber@310034173/gen-automation@1314605368:ref:refs/heads/main") in runbook
     assert "the independent exact name claim `neuraln-cyber/gen-automation`" in runbook
     assert "repo:neuraln-cyber/gen-automation:ref:refs/heads/main" not in runbook
     assert "without an AWS browser login or stored AWS keys" in runbook

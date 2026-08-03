@@ -46,8 +46,7 @@ def test_staging_rollout_uses_short_lived_oidc_and_ssm_without_user_keys() -> No
     assert "packages: read" in workflow
     assert "packages: write" not in workflow
     assert (
-        "aws-actions/configure-aws-credentials@"
-        "acca2b1b2070338fb9fd1ca27ecee81d687e58e5"
+        "aws-actions/configure-aws-credentials@acca2b1b2070338fb9fd1ca27ecee81d687e58e5"
     ) in workflow
     assert "role-to-assume: ${{ vars.AWS_STAGING_DEPLOY_ROLE_ARN }}" in workflow
     assert 'allowed-account-ids: "861912887470"' in workflow
@@ -70,7 +69,7 @@ def test_publication_exports_its_exact_ci_source_for_nested_workflow_run() -> No
     assert "record-staging-source:" in publication
     assert "needs: publish" in publication
     assert "SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}" in publication
-    assert 'printf \'%s\\n\' "$SOURCE_SHA"' in publication
+    assert "printf '%s\\n' \"$SOURCE_SHA\"" in publication
     assert "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" in publication
     assert "name: staging-deploy-source" in publication
     assert "retention-days: 1" in publication
@@ -103,8 +102,8 @@ def test_host_updater_is_locked_atomic_validated_and_rolls_back() -> None:
 def test_ssm_command_contains_only_public_immutable_coordinates() -> None:
     workflow = _workflow()
 
-    command_block = workflow.split('command = (', maxsplit=1)[1].split(
-        'print(json.dumps', maxsplit=1
+    command_block = workflow.split("command = (", maxsplit=1)[1].split(
+        "print(json.dumps", maxsplit=1
     )[0]
     assert "gen-automation-update-control-plane" in command_block
     assert "--image" in command_block
