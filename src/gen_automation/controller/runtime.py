@@ -162,7 +162,10 @@ def salad_deployment_config_from_settings(settings: Settings) -> SaladDeployment
         },
         "replicas": 0,
         "queue_connection": {},
-        "queue_autoscaler": {"polling_period": 30},
+        # SaladCloud supports a minimum 15-second queue polling period. Use it
+        # so scale-to-zero workers notice the first queued image job as soon as
+        # the provider allows, without keeping a GPU replica running while idle.
+        "queue_autoscaler": {"polling_period": 15},
         "runtime_bindings": [
             {"name": name, "reference": reference} for name, reference in runtime_bindings.items()
         ],

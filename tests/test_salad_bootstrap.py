@@ -83,6 +83,7 @@ def test_deployment_config_is_deterministic_secret_free_and_scale_to_zero() -> N
     assert first.desired_queue_length == 1
     assert first.max_hourly_cost_microusd == 350_000
     assert first.provider_configuration["replicas"] == 0
+    assert first.provider_configuration["queue_autoscaler"] == {"polling_period": 15}
     assert first.provider_configuration["container"] == {
         "resources": {
             "cpu": 6,

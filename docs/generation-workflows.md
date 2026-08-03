@@ -53,9 +53,11 @@ as filenames. Before creating upload grants or a Salad job, the controller:
    pixels before upload grants are created.
 
 Worker readiness already depends on successfully downloading, hashing,
-Safetensors-validating, and materializing every manifest target. Together these
-checks prevent a release from referring to a display name, stale file, or model
-that is absent from the running worker. The signed GPU worker repeats the graph
+Safetensors-validating, and materializing every manifest target. Missing
+targets download with a bounded concurrency of four after aggregate free space
+is reserved; result ordering and validation remain manifest-deterministic.
+Together these checks prevent a release from referring to a display name, stale
+file, or model that is absent from the running worker. The signed GPU worker repeats the graph
 geometry check immediately before the exact graph reaches ComfyUI.
 
 ## Registering the template

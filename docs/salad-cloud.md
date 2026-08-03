@@ -99,6 +99,7 @@ The initial production posture is:
 - `replicas: 0`
 - queue autoscaler minimum `0`, maximum `1`
 - desired queue length `1`
+- queue polling every `15` seconds (the provider minimum)
 - low priority
 - one or more recently discovered and configuration-pinned 24 GB GPU classes
 - image caching enabled
