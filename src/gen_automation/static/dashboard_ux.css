@@ -224,6 +224,27 @@
   font-size: .88rem;
 }
 
+.batch-prompt-editor {
+  display: grid;
+  gap: .45rem;
+}
+
+.batch-negative-prompt-editor {
+  padding-top: .2rem;
+  border-top: 1px solid rgba(255, 255, 255, .07);
+}
+
+.batch-prompt-editor > textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+.batch-prompt-editor > small {
+  margin-top: -.2rem;
+  color: var(--muted, #a9abc2);
+  font-size: .72rem;
+}
+
 .batch-wildcard-picker { display: block !important; width: min(100%, 14rem); }
 .batch-wildcard-picker select { min-height: 2.35rem !important; padding: .42rem .55rem !important; }
 .batch-wildcard-summary { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: -.35rem; }

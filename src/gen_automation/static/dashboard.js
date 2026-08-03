@@ -693,6 +693,7 @@
     let lastPrompt = null;
     let slugWasEdited = Boolean(slugInput && slugInput.value.trim());
     let previousDefaultPrompt = defaultPrompt ? defaultPrompt.value : "";
+    let previousDefaultNegative = defaultNegative ? defaultNegative.value : "";
     let targetFollowsQueue = typeof form.dataset.restoredTargetFollowsQueue === "string"
       ? form.dataset.restoredTargetFollowsQueue === "true"
       : Boolean(desiredCount && !planData.value.trim());
@@ -770,7 +771,7 @@
           name: occurrence === 1 ? wildcard : `${wildcard} ${occurrence}`,
           image_count: imageCount,
           prompt: promptForSequenceWildcard(wildcard),
-          negative_prompt: null,
+          negative_prompt: defaultNegative ? defaultNegative.value : "",
           detailer_prompt: null,
           detailer_negative_prompt: null,
           seed: null,
@@ -808,7 +809,7 @@
       name: nextUniqueName(`Batch ${batchRows().length + 1}`),
       image_count: Math.max(1, integerValue(outputsPerJob && outputsPerJob.value, 4)),
       prompt: defaultPrompt ? defaultPrompt.value : "",
-      negative_prompt: null,
+      negative_prompt: defaultNegative ? defaultNegative.value : "",
       detailer_prompt: null,
       detailer_negative_prompt: null,
       seed: null,
@@ -820,7 +821,8 @@
       field(row, "name").value = batch.name || nextUniqueName("Batch");
       field(row, "image_count").value = Math.max(1, integerValue(batch.image_count, 1));
       field(row, "prompt").value = batch.prompt || "";
-      field(row, "negative_prompt").value = batch.negative_prompt ?? "";
+      field(row, "negative_prompt").value = batch.negative_prompt
+        ?? (defaultNegative ? defaultNegative.value : "");
       field(row, "detailer_prompt").value = batch.detailer_prompt ?? "";
       field(row, "detailer_negative_prompt").value = batch.detailer_negative_prompt ?? "";
       field(row, "seed").value = batch.seed ?? "";
@@ -903,10 +905,11 @@
         totalJobs += Math.ceil(imageCount / perJob);
         row.querySelector("[data-batch-number]").textContent = `Batch ${index + 1}`;
         row.querySelector("[data-batch-heading]").textContent = name;
-        const wildcardNames = Array.from(
-          field(row, "prompt").value.matchAll(wildcardPattern),
-          (match) => match[1],
-        );
+        const wildcardNames = ["prompt", "negative_prompt"].flatMap((promptField) =>
+          Array.from(
+            field(row, promptField).value.matchAll(wildcardPattern),
+            (match) => match[1],
+          ));
         const uniqueWildcards = Array.from(new Set(wildcardNames));
         const meta = row.querySelector("[data-batch-meta]");
         const wildcardSummary = row.querySelector("[data-batch-wildcard-summary]");
@@ -1012,7 +1015,7 @@
         name: "Batch 1",
         image_count: perJob * jobs,
         prompt: defaultPrompt ? defaultPrompt.value : "",
-        negative_prompt: null,
+        negative_prompt: defaultNegative ? defaultNegative.value : "",
         detailer_prompt: null,
         detailer_negative_prompt: null,
         seed: null,
@@ -1084,12 +1087,15 @@
       const token = event.target.value;
       if (!token) return;
       const row = event.target.closest("[data-batch-row]");
-      insertToken(field(row, "prompt"), token);
+      const targetName = event.target.dataset.batchWildcardTarget || "prompt";
+      insertToken(field(row, targetName), token);
       event.target.value = "";
     });
 
     list.addEventListener("focusin", (event) => {
-      if (event.target.matches('[data-batch-field="prompt"]')) lastPrompt = event.target;
+      if (event.target.matches(
+        '[data-batch-field="prompt"], [data-batch-field="negative_prompt"]',
+      )) lastPrompt = event.target;
     });
 
     list.addEventListener("input", updateBuilder);
@@ -1128,7 +1134,7 @@
     });
 
     outputsPerJob && outputsPerJob.addEventListener("input", updateBuilder);
-    [defaultNegative, defaultDetailer, defaultDetailerNegative].forEach((control) => {
+    [defaultDetailer, defaultDetailerNegative].forEach((control) => {
       if (control instanceof HTMLTextAreaElement) control.addEventListener("input", updateBuilder);
     });
     [detailerGuideSize, detailerMaxSize].forEach((control) => {
@@ -1162,6 +1168,17 @@
         if (prompt.value === previousDefaultPrompt) prompt.value = defaultPrompt.value;
       });
       previousDefaultPrompt = defaultPrompt.value;
+      updateBuilder();
+    });
+    defaultNegative && defaultNegative.addEventListener("input", () => {
+      const rows = batchRows();
+      rows.forEach((row) => {
+        const negativePrompt = field(row, "negative_prompt");
+        if (negativePrompt.value === previousDefaultNegative) {
+          negativePrompt.value = defaultNegative.value;
+        }
+      });
+      previousDefaultNegative = defaultNegative.value;
       updateBuilder();
     });
     titleInput && titleInput.addEventListener("input", () => {
