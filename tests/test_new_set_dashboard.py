@@ -141,6 +141,15 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert 'name="planned_job_count" value="1"' in page.text
     assert 'name="batch_plan"' in page.text
     assert 'id="batch-row-template"' in page.text
+    batch_template = page.text.split('<template id="batch-row-template">', maxsplit=1)[1]
+    overrides = batch_template.index('<details class="batch-overrides">')
+    negative_editor = batch_template.index('data-batch-field="negative_prompt"')
+    assert negative_editor < overrides
+    assert 'aria-label="Positive prompt"' in batch_template
+    assert 'aria-label="Negative prompt"' in batch_template
+    assert 'data-batch-wildcard-target="prompt"' in batch_template
+    assert 'data-batch-wildcard-target="negative_prompt"' in batch_template
+    assert "Starts with the shared negative prompt" in batch_template
     assert "data-batch-sequence-input" in page.text
     assert "data-batch-sequence-apply" in page.text
     assert "50 sfw" in page.text

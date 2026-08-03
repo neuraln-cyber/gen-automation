@@ -641,12 +641,46 @@
             <input type="number" min="1" max="80000" value="4" inputmode="numeric" data-batch-field="image_count" required>
           </label>
         </div>
-        <div class="batch-prompt-heading">
-          <strong>Prompt structure</strong>
+        <div class="batch-prompt-editor">
+          <div class="batch-prompt-heading">
+            <strong>Positive prompt</strong>
+            {% if options.wildcards %}
+              <label class="batch-wildcard-picker">
+                <span class="visually-hidden">Insert wildcard into this batch's positive prompt</span>
+                <select
+                  data-batch-wildcard
+                  data-batch-wildcard-target="prompt"
+                  aria-label="Insert wildcard into this batch's positive prompt"
+                >
+                  <option value="">+ Insert wildcard</option>
+                  {% for wildcard in options.wildcards %}
+                    <option value="__{{ wildcard.name }}__">__{{ wildcard.name }}__ ({{ wildcard.entry_count }})</option>
+                  {% endfor %}
+                </select>
+              </label>
+            {% endif %}
+          </div>
+          <textarea
+            rows="6"
+            maxlength="20000"
+            spellcheck="false"
+            aria-label="Positive prompt"
+            placeholder="masterpiece, best quality, 1girl, character name, __sfw__"
+            data-batch-field="prompt"
+            required
+          ></textarea>
+        </div>
+        <div class="batch-prompt-editor batch-negative-prompt-editor">
+          <div class="batch-prompt-heading">
+            <strong>Negative prompt</strong>
           {% if options.wildcards %}
             <label class="batch-wildcard-picker">
-              <span class="visually-hidden">Insert wildcard into this batch</span>
-              <select data-batch-wildcard aria-label="Insert wildcard into this batch">
+              <span class="visually-hidden">Insert wildcard into this batch's negative prompt</span>
+              <select
+                data-batch-wildcard
+                data-batch-wildcard-target="negative_prompt"
+                aria-label="Insert wildcard into this batch's negative prompt"
+              >
                 <option value="">+ Insert wildcard</option>
                 {% for wildcard in options.wildcards %}
                   <option value="__{{ wildcard.name }}__">__{{ wildcard.name }}__ ({{ wildcard.entry_count }})</option>
@@ -654,24 +688,21 @@
               </select>
             </label>
           {% endif %}
+          </div>
+          <textarea
+            rows="4"
+            maxlength="20000"
+            spellcheck="false"
+            aria-label="Negative prompt"
+            placeholder="bad quality, worst quality, bad anatomy, watermark"
+            data-batch-field="negative_prompt"
+          ></textarea>
+          <small>Starts with the shared negative prompt; edit it freely for this batch.</small>
         </div>
-        <textarea
-          rows="6"
-          maxlength="20000"
-          spellcheck="false"
-          aria-label="Prompt structure"
-          placeholder="masterpiece, best quality, 1girl, character name, __sfw__"
-          data-batch-field="prompt"
-          required
-        ></textarea>
         <div class="batch-wildcard-summary" data-batch-wildcard-summary aria-live="polite"></div>
         <details class="batch-overrides">
           <summary>Batch-specific overrides <span>Optional</span></summary>
           <div class="disclosure-body">
-            <label>
-              Negative prompt override
-              <textarea rows="3" maxlength="20000" spellcheck="false" placeholder="Leave blank to inherit the shared default" data-batch-field="negative_prompt"></textarea>
-            </label>
             <div class="form-grid">
               <label>
                 Face-detailer prompt override

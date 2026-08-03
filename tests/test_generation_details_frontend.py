@@ -88,6 +88,25 @@ def test_generation_form_has_named_device_local_settings_presets() -> None:
     assert "draft.submission_id !== submittedDraftId" in script
 
 
+def test_batch_negative_prompt_is_visible_editable_and_tracks_shared_defaults() -> None:
+    template = (
+        ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "new_set.html"
+    ).read_text(encoding="utf-8")
+    script = (ROOT / "src" / "gen_automation" / "static" / "dashboard.js").read_text(
+        encoding="utf-8"
+    )
+
+    batch_template = template.split('<template id="batch-row-template">', maxsplit=1)[1]
+    assert batch_template.index('data-batch-field="negative_prompt"') < batch_template.index(
+        '<details class="batch-overrides">'
+    )
+    assert 'aria-label="Negative prompt"' in batch_template
+    assert 'data-batch-wildcard-target="negative_prompt"' in batch_template
+    assert 'event.target.dataset.batchWildcardTarget || "prompt"' in script
+    assert 'previousDefaultNegative = defaultNegative ? defaultNegative.value : ""' in script
+    assert "negativePrompt.value === previousDefaultNegative" in script
+
+
 def test_generation_prompts_are_keyboard_scrollable_and_contextually_labeled() -> None:
     script = (ROOT / "src" / "gen_automation" / "static" / "dashboard.js").read_text(
         encoding="utf-8"
