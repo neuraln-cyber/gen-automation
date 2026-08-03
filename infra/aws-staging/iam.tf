@@ -10,6 +10,122 @@ data "aws_iam_policy_document" "ec2_assume_role" {
   }
 }
 
+resource "aws_iam_openid_connect_provider" "github_actions" {
+  count = local.github_actions_manages_oidc_provider ? 1 : 0
+
+  url            = "https://token.actions.githubusercontent.com"
+  client_id_list = ["sts.amazonaws.com"]
+
+  tags = {
+    Name = "${local.name}-github-actions"
+  }
+}
+
+data "aws_iam_openid_connect_provider" "github_actions_existing" {
+  count = local.github_actions_uses_existing_oidc_provider ? 1 : 0
+  arn   = var.github_actions_oidc_provider_arn
+}
+
+data "aws_iam_policy_document" "github_actions_deploy_assume" {
+  count = var.github_actions_deploy_enabled ? 1 : 0
+
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [local.github_actions_oidc_provider_arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:sub"
+      values   = [local.github_actions_deploy_subject]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:repository"
+      values   = [var.github_actions_repository]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:repository_owner_id"
+      values   = [tostring(var.github_actions_repository_owner_id)]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:repository_id"
+      values   = [tostring(var.github_actions_repository_id)]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:workflow"
+      values   = [local.github_actions_deploy_workflow]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:ref"
+      values   = ["refs/heads/main"]
+    }
+  }
+}
+
+resource "aws_iam_role" "github_actions_deploy" {
+  count = var.github_actions_deploy_enabled ? 1 : 0
+
+  name                 = "${local.name}-github-deploy"
+  assume_role_policy   = data.aws_iam_policy_document.github_actions_deploy_assume[0].json
+  max_session_duration = 3600
+
+  tags = {
+    Name = "${local.name}-github-deploy"
+  }
+}
+
+data "aws_iam_policy_document" "github_actions_deploy" {
+  count = var.github_actions_deploy_enabled ? 1 : 0
+
+  statement {
+    sid     = "SendExactStagingDeployCommand"
+    effect  = "Allow"
+    actions = ["ssm:SendCommand"]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}::document/AWS-RunShellScript",
+      aws_instance.control_plane.arn,
+    ]
+  }
+
+  # This Run Command API does not support resource-level IAM permissions. The
+  # trust policy above and SendCommand statement still bind command creation to
+  # this repository's main branch, the exact instance, and one AWS document.
+  statement {
+    sid       = "ReadSubmittedCommand"
+    effect    = "Allow"
+    actions   = ["ssm:GetCommandInvocation"]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "github_actions_deploy" {
+  count = var.github_actions_deploy_enabled ? 1 : 0
+
+  name   = "${local.name}-exact-ssm-deploy"
+  role   = aws_iam_role.github_actions_deploy[0].id
+  policy = data.aws_iam_policy_document.github_actions_deploy[0].json
+}
+
 resource "aws_iam_role" "control_plane" {
   name               = "${local.name}-control-plane"
   assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json

@@ -110,3 +110,46 @@ curl --fail http://127.0.0.1:8090/health/live
 To deploy a reviewed digest update, replace only the affected immutable image
 reference and restart the unit. Roll back by restoring the previous digest and
 restarting again.
+
+Routine control-plane updates do not require an operator AWS login. After the
+one-time GitHub OIDC role and repository variables are configured, a successful
+`Publish immutable images` run for the current tip of `main` triggers
+`.github/workflows/deploy-staging.yml`. That workflow resolves the published
+`control-plane-mega` digest, verifies its exact source-revision label, exchanges
+GitHub's short-lived OIDC identity for the staging role, and invokes only this
+root-owned host command through SSM:
+
+```shell
+sudo /usr/local/sbin/gen-automation-update-control-plane \
+  --image ghcr.io/neuraln-cyber/gen-automation/control-plane-mega@sha256:<64-hex> \
+  --revision <40-hex-main-revision>
+```
+
+The command accepts no credentials. It serializes updates with `flock`, pulls
+and verifies the immutable linux/amd64 image and revision label, atomically
+changes only `GEN_AUTOMATION_CONTROL_PLANE_MEGA_IMAGE`, validates Compose,
+restarts the staging unit, and waits for local readiness. Any failed validation
+or readiness check restores the previous environment atomically and restarts
+the previous image. It never runs database migrations or changes external-
+effect settings.
+
+Set these non-secret GitHub repository variables once:
+
+- `AWS_STAGING_DEPLOY_ROLE_ARN`: the OIDC role trusted only for this repository's
+  immutable owner ID `310034173`, immutable repository ID `1314605368`, exact
+  `neuraln-cyber/gen-automation` name claim, deployment workflow, and `main`
+  branch;
+- `AWS_STAGING_INSTANCE_ID`: the staging EC2 instance ID.
+
+The role needs only `ssm:SendCommand` for that instance and the
+`AWS-RunShellScript` document, plus the read APIs required to poll its own
+command. Do not configure IAM-user access keys as repository secrets. The
+instance continues to pull with its existing host-side registry access; no
+registry token, application secret, or integration credential is placed in SSM
+command text.
+
+Before enabling the repository variables, verify the host can pull the current
+immutable `control-plane-mega` digest as root. The package may be public, or the
+host may retain a dedicated read-only GHCR credential; do not rely on a
+developer's short-lived interactive login. The updater performs the same pull
+as a bounded preflight and makes no deployment change if registry access fails.

@@ -196,6 +196,7 @@
           class="decision-form"
           method="post"
           action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:publication-guard"
+          {% if guard_target_enabled %}data-requires-recent-auth{% endif %}
         >
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="idempotency_key" value="{{ guard_idempotency_key }}">
@@ -279,6 +280,7 @@
               <form
                 method="post"
                 action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/patreon/{{ destination.intent_id }}:confirm-present"
+                data-requires-recent-auth
               >
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <input
@@ -325,6 +327,7 @@
                 <form
                   method="post"
                   action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/patreon/{{ destination.intent_id }}:confirm-absent"
+                  data-requires-recent-auth
                 >
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                   <input
@@ -381,6 +384,7 @@
         class="set-form"
         method="post"
         action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:prepare-destinations"
+        data-requires-recent-auth
       >
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input
@@ -483,4 +487,50 @@
       <p class="muted">MEGA will remain queued until its pre-authenticated uploader is enabled.</p>
     {% endif %}
   </section>
+
+  <dialog
+    class="reauth-dialog"
+    data-delivery-reauth-dialog
+    aria-labelledby="reauth-heading"
+    aria-describedby="reauth-description"
+  >
+    <form class="reauth-form" data-delivery-reauth-form>
+      <p class="page-kicker">Quick security check</p>
+      <h2 id="reauth-heading">Confirm this publishing action</h2>
+      <p id="reauth-description" class="muted">
+        Enter your password once more. Add your six-digit authentication code when MFA
+        is enabled; the action resumes automatically.
+      </p>
+      <label>
+        Password
+        <input
+          name="password"
+          type="password"
+          autocomplete="current-password"
+          required
+          data-delivery-reauth-password
+        >
+      </label>
+      <label>
+        Authentication code <span class="muted">(when enabled)</span>
+        <input
+          name="totp_code"
+          inputmode="numeric"
+          autocomplete="one-time-code"
+          pattern="[0-9]{6}"
+          maxlength="6"
+          data-delivery-reauth-totp
+        >
+      </label>
+      <p class="form-error" role="alert" hidden data-delivery-reauth-error></p>
+      <div class="reauth-actions">
+        <button class="secondary-button" type="button" data-delivery-reauth-cancel>
+          Cancel
+        </button>
+        <button class="primary-button" type="submit" data-delivery-reauth-submit>
+          Confirm and continue
+        </button>
+      </div>
+    </form>
+  </dialog>
 {% endblock %}

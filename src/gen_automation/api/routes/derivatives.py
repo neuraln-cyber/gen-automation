@@ -16,7 +16,7 @@ from fastapi import (
 from pydantic import BaseModel, ConfigDict, Field
 
 from gen_automation.api.security import (
-    PublicationOwner,
+    PublicationMutationOwner,
     PublicationReader,
     ReviewPrincipal,
     Session,
@@ -101,7 +101,7 @@ async def post_watermark(
     display_name: Annotated[str, Form(min_length=1, max_length=100)],
     file: Annotated[UploadFile, File()],
     session: Session,
-    principal: PublicationOwner,
+    principal: PublicationMutationOwner,
     idempotency_key: IdempotencyKey,
     response: Response,
 ) -> WatermarkResponse:

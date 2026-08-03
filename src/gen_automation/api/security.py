@@ -260,12 +260,12 @@ async def require_publication_reader(
     return principal
 
 
-async def require_publication_principal(
+async def require_publication_mutation_principal(
     request: Request,
     session: Session,
     csrf_header: CsrfHeader = None,
 ) -> AuthenticatedPrincipal:
-    """Require a recently authenticated owner/publisher for publication mutations."""
+    """Require an authenticated publisher and CSRF proof for a mutation."""
 
     principal = await require_authenticated_principal(request, session)
     _require_permission(principal, Permission.PUBLISH)
@@ -284,6 +284,24 @@ async def require_publication_principal(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="CSRF validation failed",
             ) from error
+    return principal
+
+
+async def require_publication_principal(
+    request: Request,
+    session: Session,
+    csrf_header: CsrfHeader = None,
+) -> AuthenticatedPrincipal:
+    """Require a recently authenticated owner/publisher for an external effect."""
+
+    principal = await require_publication_mutation_principal(
+        request,
+        session,
+        csrf_header,
+    )
+    settings: Settings = request.app.state.settings
+    if settings.auth_enabled:
+        service = authentication_service(request)
         try:
             service.require_recent_authentication(principal)
         except RecentAuthenticationRequiredError as error:
@@ -291,6 +309,24 @@ async def require_publication_principal(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="recent authentication required",
             ) from error
+    return principal
+
+
+async def require_publication_mutation_owner(
+    request: Request,
+    session: Session,
+    csrf_header: CsrfHeader = None,
+) -> AuthenticatedPrincipal:
+    principal = await require_publication_mutation_principal(
+        request,
+        session,
+        csrf_header,
+    )
+    if principal.role != AdminRole.OWNER:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="owner role required",
+        )
     return principal
 
 
@@ -485,6 +521,14 @@ UserManager = Annotated[
 ComplianceManager = Annotated[
     AuthenticatedPrincipal,
     Depends(require_compliance_manager),
+]
+PublicationMutationPrincipal = Annotated[
+    AuthenticatedPrincipal,
+    Depends(require_publication_mutation_principal),
+]
+PublicationMutationOwner = Annotated[
+    AuthenticatedPrincipal,
+    Depends(require_publication_mutation_owner),
 ]
 PublicationPrincipal = Annotated[
     AuthenticatedPrincipal,

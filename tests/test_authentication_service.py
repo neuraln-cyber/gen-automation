@@ -78,6 +78,22 @@ def _service(
     )
 
 
+def test_authentication_policy_accepts_bounded_single_owner_session() -> None:
+    policy = AuthenticationPolicy(
+        require_totp=True,
+        session_absolute_seconds=90 * 86400,
+        session_idle_seconds=30 * 86400,
+        recent_auth_seconds=3600,
+        login_window_seconds=300,
+        login_max_failures=3,
+        login_lockout_seconds=300,
+    )
+
+    assert policy.session_absolute_seconds == 90 * 86400
+    assert policy.session_idle_seconds == 30 * 86400
+    assert policy.recent_auth_seconds == 3600
+
+
 def _totp_code(secret: str, at: datetime) -> str:
     counter = int(at.timestamp()) // 30
     digest = hmac.new(

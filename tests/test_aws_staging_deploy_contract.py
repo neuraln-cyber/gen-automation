@@ -280,6 +280,14 @@ def test_environment_templates_contain_placeholders_not_secret_values() -> None:
     assert "GEN_AUTOMATION_PATREON_BROWSER_MAX_PACKAGE_BYTES=167772160" in patreon
 
 
+def test_single_owner_staging_session_is_persistent_but_step_up_stays_short() -> None:
+    controller = _text("control-plane.env.example")
+
+    assert "GEN_AUTOMATION_AUTH_SESSION_ABSOLUTE_SECONDS=7776000" in controller
+    assert "GEN_AUTOMATION_AUTH_SESSION_IDLE_SECONDS=2592000" in controller
+    assert "GEN_AUTOMATION_AUTH_RECENT_AUTH_SECONDS=3600" in controller
+
+
 def test_patreon_profile_has_an_ssm_only_cloud_bootstrap_path() -> None:
     bootstrap_compose = _text("compose.bootstrap.yaml")
     bootstrap_command = _text("bootstrap-patreon-profile.sh")

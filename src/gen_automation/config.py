@@ -164,8 +164,8 @@ class Settings(BaseSettings):
     auth_require_totp: bool = True
     auth_totp_active_key_id: str | None = None
     auth_totp_encryption_keys: dict[str, SecretStr] = Field(default_factory=dict)
-    auth_session_absolute_seconds: int = Field(default=12 * 60 * 60, ge=900, le=7 * 86400)
-    auth_session_idle_seconds: int = Field(default=30 * 60, ge=300, le=86400)
+    auth_session_absolute_seconds: int = Field(default=12 * 60 * 60, ge=900, le=90 * 86400)
+    auth_session_idle_seconds: int = Field(default=30 * 60, ge=300, le=30 * 86400)
     auth_recent_auth_seconds: int = Field(default=10 * 60, ge=60, le=3600)
     auth_login_window_seconds: int = Field(default=15 * 60, ge=60, le=3600)
     auth_login_max_failures: int = Field(default=5, ge=3, le=20)

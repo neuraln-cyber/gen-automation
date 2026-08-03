@@ -10,6 +10,26 @@ locals {
     "${var.name_prefix}-${data.aws_caller_identity.current.account_id}-${var.aws_region}-models"
   )
   salad_worker_artifact_role_enabled = length(var.salad_worker_artifact_object_versions) > 0
+  github_actions_manages_oidc_provider = (
+    var.github_actions_deploy_enabled && var.github_actions_oidc_provider_arn == null
+  )
+  github_actions_uses_existing_oidc_provider = (
+    var.github_actions_deploy_enabled && var.github_actions_oidc_provider_arn != null
+  )
+  github_actions_repository_parts = split("/", var.github_actions_repository)
+  github_actions_deploy_subject = format(
+    "repo:%s@%d/%s@%d:ref:refs/heads/main",
+    local.github_actions_repository_parts[0],
+    var.github_actions_repository_owner_id,
+    local.github_actions_repository_parts[1],
+    var.github_actions_repository_id,
+  )
+  github_actions_deploy_workflow = "Deploy staging control plane"
+  github_actions_oidc_provider_arn = var.github_actions_deploy_enabled ? (
+    var.github_actions_oidc_provider_arn != null
+    ? var.github_actions_oidc_provider_arn
+    : try(aws_iam_openid_connect_provider.github_actions[0].arn, null)
+  ) : null
 
   alert_topic_name = "${local.name}-alerts"
   log_group_name   = "/gen-automation/staging"
@@ -30,5 +50,34 @@ check "route53_inputs" {
       || (var.route53_zone_id != null && var.hostname != null)
     )
     error_message = "route53_zone_id and hostname must be supplied together or both omitted."
+  }
+}
+
+check "github_actions_oidc_provider_account" {
+  assert {
+    condition = (
+      var.github_actions_oidc_provider_arn == null
+      || var.github_actions_oidc_provider_arn == "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/token.actions.githubusercontent.com"
+    )
+    error_message = "github_actions_oidc_provider_arn must identify GitHub's OIDC provider in this AWS account."
+  }
+}
+
+check "github_actions_existing_oidc_provider_configuration" {
+  assert {
+    condition = !local.github_actions_uses_existing_oidc_provider || (
+      contains(
+        [
+          "token.actions.githubusercontent.com",
+          "https://token.actions.githubusercontent.com",
+        ],
+        trimsuffix(try(data.aws_iam_openid_connect_provider.github_actions_existing[0].url, ""), "/"),
+      )
+      && contains(
+        try(data.aws_iam_openid_connect_provider.github_actions_existing[0].client_id_list, []),
+        "sts.amazonaws.com",
+      )
+    )
+    error_message = "The existing GitHub OIDC provider must use token.actions.githubusercontent.com and allow the sts.amazonaws.com audience."
   }
 }

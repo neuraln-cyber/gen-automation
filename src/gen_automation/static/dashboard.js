@@ -1254,6 +1254,180 @@
     schedule();
   }
 
+  function initializeDeliveryReauthentication() {
+    const dialog = document.querySelector("[data-delivery-reauth-dialog]");
+    const reauthenticationForm = document.querySelector("[data-delivery-reauth-form]");
+    if (!(dialog instanceof HTMLDialogElement)
+        || !(reauthenticationForm instanceof HTMLFormElement)
+        || typeof dialog.showModal !== "function") return;
+
+    const protectedForms = Array.from(
+      document.querySelectorAll("form[data-requires-recent-auth]"),
+    ).filter((form) => form instanceof HTMLFormElement);
+    if (!protectedForms.length) return;
+
+    const password = reauthenticationForm.querySelector("[data-delivery-reauth-password]");
+    const totp = reauthenticationForm.querySelector("[data-delivery-reauth-totp]");
+    const error = reauthenticationForm.querySelector("[data-delivery-reauth-error]");
+    const cancel = reauthenticationForm.querySelector("[data-delivery-reauth-cancel]");
+    const confirm = reauthenticationForm.querySelector("[data-delivery-reauth-submit]");
+    if (!(password instanceof HTMLInputElement)
+        || !(totp instanceof HTMLInputElement)
+        || !(error instanceof HTMLElement)
+        || !(cancel instanceof HTMLButtonElement)
+        || !(confirm instanceof HTMLButtonElement)) return;
+
+    let pendingForm = null;
+    let pendingSubmitter = null;
+
+    const clearCredentials = () => {
+      password.value = "";
+      totp.value = "";
+    };
+    const clearError = () => {
+      error.hidden = true;
+      error.textContent = "";
+    };
+    const resetPendingAction = () => {
+      pendingForm = null;
+      pendingSubmitter = null;
+      clearCredentials();
+      clearError();
+    };
+    const csrfTokenFor = (form) => {
+      const control = form.querySelector('input[name="csrf_token"]');
+      return control instanceof HTMLInputElement ? control.value : "";
+    };
+    const nativeSubmit = (form) => {
+      HTMLFormElement.prototype.submit.call(form);
+    };
+
+    const sendAction = async (form, submitter = null) => {
+      const body = new URLSearchParams();
+      const formData = new FormData(form);
+      for (const [name, value] of formData.entries()) {
+        if (typeof value !== "string") {
+          nativeSubmit(form);
+          return;
+        }
+        body.append(name, value);
+      }
+      if (submitter instanceof HTMLButtonElement && submitter.name) {
+        body.append(submitter.name, submitter.value);
+      }
+
+      form.setAttribute("aria-busy", "true");
+      if (submitter instanceof HTMLButtonElement) submitter.disabled = true;
+      try {
+        const response = await fetch(form.action, {
+          method: "POST",
+          credentials: "same-origin",
+          redirect: "follow",
+          headers: {
+            Accept: "text/html",
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+          },
+          body,
+        });
+        if (response.status === 401) {
+          pendingForm = form;
+          pendingSubmitter = submitter;
+          clearCredentials();
+          clearError();
+          dialog.showModal();
+          window.setTimeout(() => password.focus(), 0);
+          return;
+        }
+        if (response.ok && response.redirected) {
+          window.location.assign(response.url);
+          return;
+        }
+        nativeSubmit(form);
+      } catch (_error) {
+        nativeSubmit(form);
+      } finally {
+        form.removeAttribute("aria-busy");
+        if (submitter instanceof HTMLButtonElement) submitter.disabled = false;
+      }
+    };
+
+    protectedForms.forEach((form) => {
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const submitter = event.submitter instanceof HTMLButtonElement
+          ? event.submitter
+          : null;
+        void sendAction(form, submitter);
+      });
+    });
+
+    const cancelReauthentication = () => {
+      resetPendingAction();
+      if (dialog.open) dialog.close();
+    };
+    cancel.addEventListener("click", cancelReauthentication);
+    dialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      cancelReauthentication();
+    });
+
+    reauthenticationForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!(pendingForm instanceof HTMLFormElement)) {
+        cancelReauthentication();
+        return;
+      }
+      const actionForm = pendingForm;
+      const actionSubmitter = pendingSubmitter;
+      const csrfToken = csrfTokenFor(actionForm);
+      if (!csrfToken) {
+        error.textContent = "This page is out of date. Reload it and try again.";
+        error.hidden = false;
+        return;
+      }
+
+      clearError();
+      confirm.disabled = true;
+      reauthenticationForm.setAttribute("aria-busy", "true");
+      try {
+        const response = await fetch("/api/v1/auth/reauthenticate", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "X-CSRF-Token": csrfToken,
+          },
+          body: JSON.stringify({
+            password: password.value,
+            totp_code: optionalText(totp.value),
+          }),
+        });
+        clearCredentials();
+        if (!response.ok) {
+          error.textContent = response.status === 401
+            ? "Those details were not accepted, or your session expired. Try again or sign in anew."
+            : "Confirmation is temporarily unavailable. Please try again.";
+          error.hidden = false;
+          password.focus();
+          return;
+        }
+        pendingForm = null;
+        pendingSubmitter = null;
+        dialog.close();
+        await sendAction(actionForm, actionSubmitter);
+      } catch (_error) {
+        clearCredentials();
+        error.textContent = "The connection was interrupted. Please try again.";
+        error.hidden = false;
+        password.focus();
+      } finally {
+        confirm.disabled = false;
+        reauthenticationForm.removeAttribute("aria-busy");
+      }
+    });
+  }
+
   function initializeAutomationPresets() {
     const form = document.querySelector("[data-automation-form]");
     const manager = document.querySelector("[data-automation-presets]");
@@ -2744,5 +2918,6 @@
   initializeGenerationDetails();
   clearAutomationDraftAfterQueue();
   initializeGenerationProgress();
+  initializeDeliveryReauthentication();
   initializeDeliveryAutoRefresh();
 })();
