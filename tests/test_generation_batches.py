@@ -140,6 +140,46 @@ def test_new_set_batch_submission_derives_job_count_and_allows_overproduction() 
     assert sum(batch.image_count for batch in command.batches) == 120
 
 
+def test_large_wildcard_queue_preserves_stage_order_and_derives_all_jobs() -> None:
+    ordered_batches = (
+        ("SFW", 50, "__sfw__"),
+        ("NNSFW", 100, "__nnsfw__"),
+        ("NSFW", 50, "__nsfw__"),
+        ("Oral", 20, "__oral__"),
+        ("Reworked", 100, "__reworked__"),
+        ("Group", 20, "__group__"),
+    )
+    command = NewSetSubmission.model_validate(
+        {
+            "slug": "large-ordered-queue",
+            "title": "Large ordered queue",
+            "subject_approval_id": "10000000-0000-4000-8000-000000000001",
+            "checkpoint_approval_id": "20000000-0000-4000-8000-000000000002",
+            "workflow_approval_id": "30000000-0000-4000-8000-000000000003",
+            "prompt": "",
+            "negative_prompt": "low quality",
+            "seed": 1234,
+            "width": 1024,
+            "height": 1024,
+            "steps": 30,
+            "sampler": "euler_ancestral",
+            "scheduler": "karras",
+            "outputs_per_job": 4,
+            "planned_job_count": 1,
+            "desired_accepted_count": 100,
+            "batches": [
+                {"name": name, "image_count": count, "prompt": prompt}
+                for name, count, prompt in ordered_batches
+            ],
+        }
+    )
+
+    assert command.effective_planned_job_count == 86
+    assert [batch.name for batch in command.batches] == [item[0] for item in ordered_batches]
+    assert [batch.image_count for batch in command.batches] == [item[1] for item in ordered_batches]
+    assert sum(batch.image_count for batch in command.batches) == 340
+
+
 def test_new_set_submission_accepts_one_twenty_five_image_provider_job() -> None:
     command = NewSetSubmission.model_validate(
         {

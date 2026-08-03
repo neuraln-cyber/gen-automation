@@ -490,6 +490,32 @@
             </div>
           </div>
 
+          <details class="compact-disclosure batch-sequence-builder" data-batch-sequence-builder>
+            <summary>Build a large wildcard queue quickly</summary>
+            <div class="disclosure-body">
+              <p class="muted">
+                Enter one batch per line as <code>image count</code> followed by the
+                wildcard name. Lines stay in this exact order. The current starting prompt
+                is copied to every batch and its first wildcard token is replaced.
+              </p>
+              <label>
+                Ordered wildcard batches
+                <textarea
+                  rows="6"
+                  spellcheck="false"
+                  placeholder="50 sfw&#10;100 nnsfw&#10;50 nsfw&#10;20 oral&#10;100 reworked&#10;20 group"
+                  data-batch-sequence-input
+                ></textarea>
+              </label>
+              <div class="batch-sequence-actions">
+                <button class="secondary-button" type="button" data-batch-sequence-apply>
+                  Replace queue with these batches
+                </button>
+                <output data-batch-sequence-status aria-live="polite"></output>
+              </div>
+            </div>
+          </details>
+
           <div
             class="batch-queue"
             id="batch-list"

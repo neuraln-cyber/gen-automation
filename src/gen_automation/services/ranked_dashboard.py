@@ -98,6 +98,9 @@ class RankedMaster:
     view_url: str
     download_url: str
     download_name: str
+    batch_index: int
+    batch_name: str
+    batch_image_number: int
 
 
 @dataclass(frozen=True)
@@ -372,7 +375,7 @@ async def _load_ranked_snapshot(
     if run.completed_at is None:
         raise RankingUnavailableError("the scoring run has no completion timestamp")
     result = await session.execute(
-        select(AssetRanking, AssetScore, Asset)
+        select(AssetRanking, AssetScore, Asset, GenerationJob)
         .join(
             AssetScore,
             (AssetScore.id == AssetRanking.asset_score_id)
@@ -392,12 +395,13 @@ async def _load_ranked_snapshot(
         )
         .order_by(AssetRanking.rank)
     )
-    rows = [(ranking, score, asset) for ranking, score, asset in result.all()]
+    ranked_rows = list(result.all())
+    rows = [(ranking, score, asset) for ranking, score, asset, _job in ranked_rows]
     _validate_ranked_rows(rows, run=run, store=store)
 
     signed_assets: list[RankedMaster] = []
     try:
-        for row_batch in batched(rows, _MAX_SIGNING_CONCURRENCY):
+        for row_batch in batched(ranked_rows, _MAX_SIGNING_CONCURRENCY):
             signed_assets.extend(
                 await asyncio.gather(
                     *(
@@ -406,9 +410,11 @@ async def _load_ranked_snapshot(
                             release_slug=release.slug,
                             ranking=ranking,
                             score=score,
+                            asset=asset,
+                            job=job,
                             expires_in=expires_in,
                         )
-                        for ranking, score, _asset in row_batch
+                        for ranking, score, asset, job in row_batch
                     )
                 )
             )
@@ -513,6 +519,8 @@ async def _sign_ranked_master(
     release_slug: str,
     ranking: AssetRanking,
     score: AssetScore,
+    asset: Asset,
+    job: GenerationJob,
     expires_in: int,
 ) -> RankedMaster:
     download_name = _download_name(
@@ -537,6 +545,7 @@ async def _sign_ranked_master(
     _validate_signed_url(view_url)
     _validate_signed_url(download_url)
     explanation = dict(ranking.explanation)
+    batch_index, batch_name, batch_image_number = _generation_position(job, asset)
     return RankedMaster(
         asset_id=ranking.asset_id,
         rank=ranking.rank,
@@ -553,7 +562,39 @@ async def _sign_ranked_master(
         view_url=view_url,
         download_url=download_url,
         download_name=download_name,
+        batch_index=batch_index,
+        batch_name=batch_name,
+        batch_image_number=batch_image_number,
     )
+
+
+def _generation_position(job: GenerationJob, asset: Asset) -> tuple[int, str, int]:
+    """Return stable, human-facing generation queue metadata for a raw master."""
+
+    parameters = job.parameters if isinstance(job.parameters, dict) else {}
+    ordinal = _nonnegative_int(parameters.get("ordinal"), default=0)
+    batch_index = ordinal
+    batch_name = f"Batch {batch_index + 1}"
+    image_offset = 0
+
+    batch = parameters.get("batch")
+    if isinstance(batch, dict):
+        batch_index = _nonnegative_int(batch.get("index"), default=batch_index)
+        raw_name = batch.get("name")
+        if isinstance(raw_name, str) and raw_name.strip():
+            batch_name = raw_name.strip()[:120]
+        else:
+            batch_name = f"Batch {batch_index + 1}"
+        image_offset = _nonnegative_int(batch.get("image_offset"), default=0)
+
+    output_index = _nonnegative_int(asset.output_index, default=0)
+    return batch_index, batch_name, image_offset + output_index + 1
+
+
+def _nonnegative_int(value: object, *, default: int) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return default
 
 
 def _download_name(

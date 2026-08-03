@@ -188,6 +188,37 @@ async def test_dispatch_prepares_stable_outbox_work_up_to_capacity(
 
 
 @pytest.mark.asyncio
+async def test_dispatch_preserves_frozen_generation_queue_order_for_equal_priority_jobs(
+    scheduling_context: SchedulingContext,
+) -> None:
+    ordinals = (2, 0, 1)
+    async with scheduling_context.database.sessions() as session:
+        for job_id, ordinal in zip(scheduling_context.job_ids, ordinals, strict=True):
+            job = await session.get(GenerationJob, job_id)
+            assert job is not None
+            parameters = {**job.parameters, "ordinal": ordinal}
+            job.parameters = parameters
+            job.parameters_sha256 = canonical_sha256(parameters)
+            job.priority = 100
+        await session.commit()
+
+    async with scheduling_context.database.sessions() as session:
+        result = await dispatch_generation_jobs(
+            session,
+            salad_deployment_id=scheduling_context.deployment_id,
+            gpu_allocation_enabled=True,
+            max_inflight=3,
+            now=NOW,
+        )
+
+    assert [item.generation_job_id for item in result.dispatched] == [
+        scheduling_context.job_ids[1],
+        scheduling_context.job_ids[2],
+        scheduling_context.job_ids[0],
+    ]
+
+
+@pytest.mark.asyncio
 async def test_dispatch_respects_existing_inflight_capacity(
     scheduling_context: SchedulingContext,
 ) -> None:

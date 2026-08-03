@@ -619,6 +619,10 @@ def test_ranked_dashboard_orders_assets_and_signs_exact_frozen_versions(
     assert "1536" in detail.text
     assert "Download exact raw master" in detail.text
     assert "Quality state: scored" in detail.text
+    assert 'data-asset-sort="generation"' in detail.text
+    assert 'data-batch-image-number="2"' in detail.text
+    assert 'data-batch-image-number="1"' in detail.text
+    assert "Batch 1 &middot; image 2" in detail.text
     assert '<script src="/static/dashboard.js" defer></script>' in detail.text
     assert "hidden-object-secret" not in detail.text
     assert "frozen/private-master" not in detail.text

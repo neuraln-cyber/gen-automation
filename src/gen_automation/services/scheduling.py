@@ -255,6 +255,7 @@ async def dispatch_generation_jobs(
                 .order_by(
                     GenerationJob.priority,
                     GenerationJob.created_at,
+                    GenerationJob.parameters["ordinal"].as_integer(),
                     GenerationJob.id,
                 )
                 .limit(dispatch_count)

@@ -178,6 +178,35 @@
 
 .batch-card.is-collapsed .batch-card-header { border-bottom: 0; }
 .batch-card.is-collapsed .batch-card-body { display: none; }
+
+.batch-sequence-builder {
+  margin: 0 0 1rem;
+  border-color: rgba(184, 165, 255, .25);
+  background: rgba(148, 121, 255, .045);
+}
+
+.batch-sequence-builder textarea {
+  width: 100%;
+  min-height: 9.5rem;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.batch-sequence-actions {
+  display: flex;
+  align-items: center;
+  gap: .75rem;
+  margin-top: .7rem;
+  flex-wrap: wrap;
+}
+
+.batch-sequence-actions output {
+  color: var(--muted-strong, #c7c8d8);
+  font-size: .78rem;
+}
+
+.batch-sequence-actions output.error { color: var(--danger, #fda4af); }
+
 .batch-queue-footer {
   display: flex;
   align-items: center;
@@ -370,6 +399,43 @@
   border-color: rgba(253, 164, 175, .65);
   background: rgba(127, 29, 29, .38);
   color: var(--danger, #fda4af);
+}
+
+.asset-sort-bar {
+  display: flex;
+  align-items: center;
+  gap: .45rem;
+  margin: 0 0 1rem;
+  padding: .55rem .65rem;
+  overflow-x: auto;
+  border: 1px solid var(--border, rgba(255, 255, 255, .1));
+  border-radius: .75rem;
+  background: rgba(255, 255, 255, .025);
+  white-space: nowrap;
+}
+
+.asset-sort-bar > span {
+  color: var(--muted, #a9abc2);
+  font-size: .76rem;
+  font-weight: 750;
+}
+
+.asset-sort-bar output {
+  margin-left: auto;
+  color: var(--muted, #a9abc2);
+  font-size: .74rem;
+}
+
+.batch-origin {
+  margin: .1rem 0 .65rem;
+  color: var(--accent, #b8a5ff);
+  font-size: .76rem;
+  font-weight: 700;
+}
+
+.decision-chip.batch-chip {
+  border-color: rgba(184, 165, 255, .25);
+  color: var(--accent, #b8a5ff);
 }
 
 .seed-control {
@@ -874,6 +940,9 @@ body.asset-viewer-open { overflow: hidden; }
   .pipeline-step { overflow: hidden; font-size: .68rem; text-overflow: ellipsis; white-space: nowrap; }
   .batch-card-actions button { min-width: 2.75rem; min-height: 2.75rem; }
   .batch-queue-footer, .batch-prompt-heading { align-items: stretch; flex-direction: column; }
+  .batch-sequence-actions { align-items: stretch; flex-direction: column; }
+  .batch-sequence-actions .secondary-button { width: 100%; }
+  .asset-sort-bar output { display: none; }
   .batch-wildcard-picker { width: 100%; }
   .automation-title-row { grid-template-columns: minmax(0, 1fr); }
   .automation-name-advanced { width: 100%; }
