@@ -12,6 +12,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from gen_automation.auth.security import SecretEncryptionError, TotpSecretCipher
 from gen_automation.domain.deliverability import PATREON_MAX_ARCHIVE_BYTES
+from gen_automation.domain.enums import SemanticEnforcementMode
 from gen_automation.domain.runtime_bindings import (
     WORKER_ALLOWED_UPLOAD_ORIGIN_BINDING,
     WORKER_ARTIFACT_BUCKET_BINDING,
@@ -95,6 +96,32 @@ def _is_https_origin(value: str) -> bool:
 def _is_https_url(value: str) -> bool:
     parsed = _split_https_url(value)
     return parsed is not None and not parsed.query
+
+
+def _is_protected_semantic_endpoint_url(value: str) -> bool:
+    """Allow public TLS or the one host-local gateway route used in staging.
+
+    The loopback exception is intentionally exact: it cannot name a DNS host,
+    carry credentials, change ports, or address any other local service.
+    """
+
+    if _is_https_url(value):
+        return True
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() == "http"
+        and parsed.hostname == "127.0.0.1"
+        and parsed.port == 8091
+        and parsed.path == "/v1/anatomy/assess"
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+    )
 
 
 def _parse_trusted_proxy_cidrs(
@@ -202,6 +229,7 @@ class Settings(BaseSettings):
     background_quality_retry_base_seconds: int = Field(default=30, ge=1, le=3600)
     background_quality_retry_max_seconds: int = Field(default=900, ge=1, le=86400)
     semantic_anatomy_enabled: bool = False
+    semantic_anatomy_mode: SemanticEnforcementMode = SemanticEnforcementMode.SHADOW
     semantic_anatomy_endpoint_url: AnyHttpUrl | None = None
     semantic_anatomy_model: str = Field(
         default="Qwen/Qwen3-VL-8B-Instruct",
@@ -534,10 +562,13 @@ class Settings(BaseSettings):
                 errors.append("semantic anatomy QC requires automatic quality scoring")
             if self.semantic_anatomy_endpoint_url is None:
                 errors.append("semantic anatomy QC requires a private VLM endpoint")
-            elif protected_environment and not _is_https_url(
+            elif protected_environment and not _is_protected_semantic_endpoint_url(
                 str(self.semantic_anatomy_endpoint_url)
             ):
-                errors.append("staging and production semantic VLM endpoints require HTTPS")
+                errors.append(
+                    "staging and production semantic VLM endpoints require HTTPS or the "
+                    "exact loopback semantic-gateway endpoint"
+                )
             if self.semantic_anatomy_model_revision is None:
                 errors.append("semantic anatomy QC requires a pinned model revision")
         if self.background_semantic_retry_max_seconds < self.background_semantic_retry_base_seconds:

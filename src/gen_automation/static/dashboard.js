@@ -2090,7 +2090,7 @@
           const matches = filter === "all"
             || card.dataset.decision === filter
             || (filter === "x" && card.dataset.selectedForX === "true")
-            || (filter === "ai" && card.dataset.aiExcluded === "true");
+            || (filter === "semantic" && card.dataset.semanticFlagged === "true");
           card.hidden = !matches;
         });
         updateExcludedHeadings();

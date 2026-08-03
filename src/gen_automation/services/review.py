@@ -37,6 +37,7 @@ from gen_automation.domain.enums import (
     ReviewTaskState,
     ScoringRunState,
     SemanticAssessmentState,
+    SemanticEnforcementMode,
     SemanticVerdict,
 )
 from gen_automation.domain.ids import uuid7
@@ -146,6 +147,7 @@ class CurrentAssetDecision:
 @dataclass(frozen=True, slots=True)
 class ReviewSemanticGate:
     enabled: bool
+    mode: SemanticEnforcementMode
     ranked_asset_count: int
     terminal_count: int
     pending_count: int
@@ -156,7 +158,11 @@ class ReviewSemanticGate:
 
     @property
     def completion_ready(self) -> bool:
-        return not self.enabled or (self.pending_count == 0 and self.severe_blocked_count == 0)
+        return (
+            not self.enabled
+            or self.mode != SemanticEnforcementMode.ENFORCE
+            or (self.pending_count == 0 and self.severe_blocked_count == 0)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,6 +355,7 @@ async def append_review_decision(
     note: str | None = None,
     semantic_profile_sha256: str | None = None,
     semantic_severe_confidence_micros: int = 900_000,
+    semantic_enforcement_mode: SemanticEnforcementMode = SemanticEnforcementMode.ENFORCE,
     now: datetime | None = None,
 ) -> ReviewDecisionResult:
     """Append an attributed decision revision without mutating its raw asset."""
@@ -359,6 +366,7 @@ async def append_review_decision(
     normalized_note = _normalize_note(note)
     normalized_semantic_profile = _normalize_semantic_profile_sha256(semantic_profile_sha256)
     semantic_threshold = _validate_semantic_confidence_threshold(semantic_severe_confidence_micros)
+    semantic_mode = _validate_semantic_enforcement_mode(semantic_enforcement_mode)
     expected_version = _validate_lock_version(expected_lock_version)
     scope = f"review-task:{review_task_id}:append-decision"
     request_sha256 = canonical_sha256(
@@ -372,6 +380,7 @@ async def append_review_decision(
             "note": normalized_note,
             "semantic_profile_sha256": normalized_semantic_profile,
             "semantic_severe_confidence_micros": semantic_threshold,
+            "semantic_enforcement_mode": semantic_mode.value,
         }
     )
     await _require_active_reviewer(session, decided_by_user_id)
@@ -402,7 +411,8 @@ async def append_review_decision(
 
     semantic_override = False
     if (
-        normalized_semantic_profile is not None
+        semantic_mode == SemanticEnforcementMode.ENFORCE
+        and normalized_semantic_profile is not None
         and normalized_decision == ReviewDecisionValue.ACCEPT
     ):
         assessment = await session.scalar(
@@ -548,6 +558,7 @@ async def apply_bulk_review_action(
     note: str | None = None,
     semantic_profile_sha256: str | None = None,
     semantic_severe_confidence_micros: int = 900_000,
+    semantic_enforcement_mode: SemanticEnforcementMode = SemanticEnforcementMode.ENFORCE,
     now: datetime | None = None,
 ) -> ReviewBulkActionResult:
     """Apply one atomic review action to a bounded set of ranked assets."""
@@ -559,6 +570,7 @@ async def apply_bulk_review_action(
     normalized_note = _normalize_note(note)
     normalized_semantic_profile = _normalize_semantic_profile_sha256(semantic_profile_sha256)
     semantic_threshold = _validate_semantic_confidence_threshold(semantic_severe_confidence_micros)
+    semantic_mode = _validate_semantic_enforcement_mode(semantic_enforcement_mode)
     expected_version = _validate_lock_version(expected_lock_version)
     decision_actions = {
         ReviewBulkAction.ACCEPT,
@@ -582,6 +594,7 @@ async def apply_bulk_review_action(
             "note": normalized_note,
             "semantic_profile_sha256": normalized_semantic_profile,
             "semantic_severe_confidence_micros": semantic_threshold,
+            "semantic_enforcement_mode": semantic_mode.value,
         }
     )
     if normalized_action in decision_actions:
@@ -624,7 +637,11 @@ async def apply_bulk_review_action(
 
     if normalized_action in decision_actions:
         decision = ReviewDecisionValue(normalized_action.value)
-        if normalized_semantic_profile is not None and decision == ReviewDecisionValue.ACCEPT:
+        if (
+            semantic_mode == SemanticEnforcementMode.ENFORCE
+            and normalized_semantic_profile is not None
+            and decision == ReviewDecisionValue.ACCEPT
+        ):
             assessments = (
                 await session.scalars(
                     select(SemanticAssessment).where(
@@ -876,6 +893,7 @@ async def transition_review_task(
     idempotency_key: str,
     semantic_profile_sha256: str | None = None,
     semantic_severe_confidence_micros: int = 900_000,
+    semantic_enforcement_mode: SemanticEnforcementMode = SemanticEnforcementMode.ENFORCE,
     now: datetime | None = None,
 ) -> ReviewTransitionResult:
     """Close an open task once its exact acceptance target is satisfied, or cancel it."""
@@ -884,6 +902,7 @@ async def transition_review_task(
     normalized_target = _validate_terminal_state(target_state)
     normalized_semantic_profile = _normalize_semantic_profile_sha256(semantic_profile_sha256)
     semantic_threshold = _validate_semantic_confidence_threshold(semantic_severe_confidence_micros)
+    semantic_mode = _validate_semantic_enforcement_mode(semantic_enforcement_mode)
     expected_version = _validate_lock_version(expected_lock_version)
     scope = f"review-task:{review_task_id}:transition"
     request_sha256 = canonical_sha256(
@@ -894,6 +913,7 @@ async def transition_review_task(
             "expected_lock_version": expected_version,
             "semantic_profile_sha256": normalized_semantic_profile,
             "semantic_severe_confidence_micros": semantic_threshold,
+            "semantic_enforcement_mode": semantic_mode.value,
         }
     )
     await _require_active_reviewer(session, changed_by_user_id)
@@ -918,16 +938,22 @@ async def transition_review_task(
             normalized_semantic_profile if normalized_target == ReviewTaskState.COMPLETED else None
         ),
         semantic_severe_confidence_micros=semantic_threshold,
+        semantic_enforcement_mode=semantic_mode,
     )
     if (
         normalized_target == ReviewTaskState.COMPLETED
         and summary.accepted_count != task.desired_accepted_count
     ):
         raise ReviewConflictError("accepted asset count must exactly match the task target")
-    if normalized_target == ReviewTaskState.COMPLETED and summary.semantic_gate.pending_count:
+    if (
+        normalized_target == ReviewTaskState.COMPLETED
+        and semantic_mode == SemanticEnforcementMode.ENFORCE
+        and summary.semantic_gate.pending_count
+    ):
         raise ReviewConflictError("configured semantic anatomy assessments are not terminal")
     if (
         normalized_target == ReviewTaskState.COMPLETED
+        and semantic_mode == SemanticEnforcementMode.ENFORCE
         and summary.semantic_gate.severe_blocked_count
     ):
         raise ReviewConflictError("accepted severe anatomy requires an explicit owner override")
@@ -1357,6 +1383,7 @@ async def get_review_summary(
     review_task_id: UUID,
     semantic_profile_sha256: str | None = None,
     semantic_severe_confidence_micros: int = 900_000,
+    semantic_enforcement_mode: SemanticEnforcementMode = SemanticEnforcementMode.ENFORCE,
 ) -> ReviewSummary:
     task = await session.get(ReviewTask, review_task_id)
     if task is None:
@@ -1368,6 +1395,9 @@ async def get_review_summary(
         semantic_severe_confidence_micros=_validate_semantic_confidence_threshold(
             semantic_severe_confidence_micros
         ),
+        semantic_enforcement_mode=_validate_semantic_enforcement_mode(
+            semantic_enforcement_mode
+        ),
     )
 
 
@@ -1377,6 +1407,7 @@ async def _review_summary(
     *,
     semantic_profile_sha256: str | None = None,
     semantic_severe_confidence_micros: int = 900_000,
+    semantic_enforcement_mode: SemanticEnforcementMode = SemanticEnforcementMode.ENFORCE,
 ) -> ReviewSummary:
     await _validate_task_ranking_snapshot(session, task, recompute=True)
     latest_revisions = (
@@ -1470,6 +1501,7 @@ async def _review_summary(
         assets=tuple(assets),
         semantic_profile_sha256=semantic_profile_sha256,
         semantic_severe_confidence_micros=semantic_severe_confidence_micros,
+        semantic_enforcement_mode=semantic_enforcement_mode,
     )
     return ReviewSummary(
         task_id=task.id,
@@ -1494,10 +1526,12 @@ async def _semantic_review_gate(
     assets: tuple[CurrentAssetDecision, ...],
     semantic_profile_sha256: str | None,
     semantic_severe_confidence_micros: int,
+    semantic_enforcement_mode: SemanticEnforcementMode,
 ) -> ReviewSemanticGate:
     if semantic_profile_sha256 is None:
         return ReviewSemanticGate(
             enabled=False,
+            mode=semantic_enforcement_mode,
             ranked_asset_count=task.ranked_asset_count,
             terminal_count=0,
             pending_count=0,
@@ -1546,6 +1580,7 @@ async def _semantic_review_gate(
 
     return ReviewSemanticGate(
         enabled=True,
+        mode=semantic_enforcement_mode,
         ranked_asset_count=task.ranked_asset_count,
         terminal_count=terminal_count,
         pending_count=task.ranked_asset_count - terminal_count,
@@ -1984,6 +2019,15 @@ def _validate_bulk_action(value: ReviewBulkAction) -> ReviewBulkAction:
         return ReviewBulkAction(value)
     except ValueError:
         raise ReviewInputError("bulk action is invalid") from None
+
+
+def _validate_semantic_enforcement_mode(
+    value: SemanticEnforcementMode,
+) -> SemanticEnforcementMode:
+    try:
+        return SemanticEnforcementMode(value)
+    except ValueError:
+        raise ReviewInputError("semantic enforcement mode is invalid") from None
 
 
 def _normalize_bulk_asset_ids(values: Sequence[UUID]) -> tuple[UUID, ...]:

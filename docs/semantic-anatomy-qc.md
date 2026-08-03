@@ -19,7 +19,17 @@ immutable. It never edits, rejects, quarantines, or deletes the raw master.
 
 ## Review behavior
 
-Only a `severe` result at or above
+Anatomy assessment has three explicit operating modes:
+
+- `shadow` (the default) records and displays predictions for calibration. It
+  never reorders images, prevents a decision, or blocks completion.
+- `assist` highlights predictions for the owner while keeping every human
+  decision and completion action authoritative.
+- `enforce` enables the strict severe-result override and completion gates
+  described below. Move to this mode only after owner-labelled calibration is
+  ready and its validation metrics are acceptable.
+
+In `enforce` mode only, a `severe` result at or above
 `GEN_AUTOMATION_SEMANTIC_ANATOMY_SEVERE_CONFIDENCE_MICROS` enters the clearly
 labeled **AI excluded** section at the bottom of the review page. The image stays
 visible and the raw master is unchanged. Reject and Hold remain normal reviewer
@@ -30,10 +40,28 @@ the resulting profile-bound attestation is stored as a durable audit event.
 `review`, low-confidence `severe`, pending, and retrying results remain in normal
 rank order. If the service is unavailable or returns an invalid contract, the
 assessment retries with bounded backoff and eventually displays “unavailable;
-review manually.” There is no synthetic pass. When semantic anatomy is enabled,
-review completion waits until every ranked image has either a completed
-assessment or an explicit terminal `unavailable` result. It also blocks while an
-accepted high-confidence severe result lacks the OWNER override attestation.
+review manually.” There is no synthetic pass. In `enforce` mode, review
+completion waits until every ranked image has either a completed assessment or
+an explicit terminal `unavailable` result. It also blocks while an accepted
+high-confidence severe result lacks the OWNER override attestation.
+
+## Owner feedback and calibration
+
+For each completed assessment, the owner can record one immutable label:
+`anatomy_good`, `anatomy_defect`, or `unjudgeable`. Defect labels can include a
+bounded issue code and an optional note. The system binds that label to the
+exact asset, assessment response, model revision, prompt/schema profile, and
+owner. A repeated identical submission is idempotent; a different replacement
+is rejected so calibration history cannot be silently rewritten.
+
+Calibration uses only these explicit anatomy labels. Generic Accept, Exclude,
+and Hold decisions are deliberately not treated as training data because they
+can reflect style, composition, duplication, or publishing choices unrelated
+to anatomy. Threshold reports are deterministic and versioned. Enforcement is
+not considered calibration-ready until there are at least 100 judged examples,
+including at least 20 good and 20 defective examples. The first learning stage
+adjusts the severe-confidence threshold; a later fine-tune can use the same
+immutable dataset once it is large and balanced enough.
 
 ## Private service contract
 
@@ -106,6 +134,7 @@ Set:
 
 ```text
 GEN_AUTOMATION_SEMANTIC_ANATOMY_ENABLED=true
+GEN_AUTOMATION_SEMANTIC_ANATOMY_MODE=shadow
 GEN_AUTOMATION_SEMANTIC_ANATOMY_ENDPOINT_URL=https://<private-service>/v1/anatomy/assess
 GEN_AUTOMATION_SEMANTIC_ANATOMY_MODEL=Qwen/Qwen3-VL-8B-Instruct
 GEN_AUTOMATION_SEMANTIC_ANATOMY_MODEL_REVISION=<immutable revision>

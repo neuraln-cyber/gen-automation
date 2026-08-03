@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from gen_automation.api.browser_review_forms import (
     BrowserReviewFormError,
     form_key_matches,
+    read_anatomy_feedback_form,
     read_bulk_action_form,
     read_create_form,
     read_decision_form,
@@ -27,6 +28,7 @@ from gen_automation.api.security import (
     authentication_service,
     require_same_origin,
 )
+from gen_automation.api.semantic_feedback import semantic_feedback_target_belongs_to_review
 from gen_automation.config import Settings
 from gen_automation.db.session import get_session
 from gen_automation.domain.enums import (
@@ -34,6 +36,8 @@ from gen_automation.domain.enums import (
     ReviewBulkAction,
     ReviewDecisionValue,
     ReviewTaskState,
+    SemanticEnforcementMode,
+    SemanticIssueCode,
 )
 from gen_automation.middleware import content_security_policy
 from gen_automation.services.authentication import (
@@ -77,6 +81,19 @@ from gen_automation.services.semantic_anatomy import (
     SemanticReviewAssessment,
     load_semantic_review_assessments,
 )
+from gen_automation.services.semantic_feedback import (
+    DEFAULT_CALIBRATION_MINIMUM_SAMPLES,
+    SemanticAnatomyFeedbackResult,
+    SemanticCalibrationArtifactResult,
+    SemanticFeedbackAssessmentNotReadyError,
+    SemanticFeedbackConflictError,
+    SemanticFeedbackNotFoundError,
+    SemanticFeedbackValidationError,
+    load_latest_semantic_calibration_artifact,
+    load_semantic_anatomy_feedback,
+    record_semantic_anatomy_feedback,
+    refresh_semantic_calibration_artifact,
+)
 from gen_automation.storage.base import ObjectStore
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"], include_in_schema=False)
@@ -89,6 +106,8 @@ class ReviewAssetView:
     master: RankedMaster
     current: CurrentAssetDecision
     semantic: SemanticReviewAssessment | None
+    semantic_feedback: SemanticAnatomyFeedbackResult | None
+    semantic_flagged: bool
     ai_excluded: bool
     idempotency_key: str | None
     x_selection_idempotency_key: str | None
@@ -351,6 +370,7 @@ async def dashboard_review_task(
         )
     settings: Settings = request.app.state.settings
     semantic_profile = _configured_semantic_profile_sha256(settings)
+    semantic_mode = _semantic_mode(settings)
     try:
         navigation = await load_review_task_navigation(
             session,
@@ -361,6 +381,7 @@ async def dashboard_review_task(
             review_task_id=review_task_id,
             semantic_profile_sha256=semantic_profile,
             semantic_severe_confidence_micros=(settings.semantic_anatomy_severe_confidence_micros),
+            semantic_enforcement_mode=settings.semantic_anatomy_mode,
         )
         release = await load_ranked_scoring_run(
             session,
@@ -373,6 +394,21 @@ async def dashboard_review_task(
             scoring_run_id=navigation.scoring_run_id,
             profile_sha256=semantic_profile,
         )
+        semantic_feedback: dict[UUID, SemanticAnatomyFeedbackResult] = {}
+        semantic_calibration: SemanticCalibrationArtifactResult | None = None
+        if principal.role == AdminRole.OWNER:
+            semantic_feedback = await load_semantic_anatomy_feedback(
+                session,
+                assessment_ids=tuple(
+                    assessment.assessment_id for assessment in semantic_assessments.values()
+                ),
+                user_id=principal.user_id,
+            )
+            if semantic_profile is not None:
+                semantic_calibration = await load_latest_semantic_calibration_artifact(
+                    session,
+                    profile_sha256=semantic_profile,
+                )
         csrf_token = (
             _form_csrf_token(request, principal) if summary.state == ReviewTaskState.OPEN else None
         )
@@ -417,6 +453,8 @@ async def dashboard_review_task(
             summary=summary,
             masters=release.assets,
             semantic_assessments=semantic_assessments,
+            semantic_feedback=semantic_feedback,
+            semantic_mode=semantic_mode,
             severe_confidence_micros=(settings.semantic_anatomy_severe_confidence_micros),
         )
     except RankingIntegrityError:
@@ -462,7 +500,14 @@ async def dashboard_review_task(
                 "summary": summary,
                 "assets": assets.ordered,
                 "ai_excluded_count": len(assets.ai_excluded),
+                "semantic_flagged_count": sum(asset.semantic_flagged for asset in assets.ordered),
                 "semantic_override_reason_code": (SEMANTIC_SEVERE_OVERRIDE_REASON_CODE),
+                "semantic_issue_codes": tuple(SemanticIssueCode),
+                "semantic_mode": semantic_mode,
+                "semantic_calibration": semantic_calibration,
+                "semantic_calibration_minimum_samples": (
+                    DEFAULT_CALIBRATION_MINIMUM_SAMPLES
+                ),
                 "csrf_token": csrf_token,
                 "complete_idempotency_key": complete_idempotency_key,
                 "cancel_idempotency_key": cancel_idempotency_key,
@@ -534,9 +579,75 @@ async def dashboard_review_decision(
             note=form.note,
             semantic_profile_sha256=semantic_profile,
             semantic_severe_confidence_micros=(settings.semantic_anatomy_severe_confidence_micros),
+            semantic_enforcement_mode=settings.semantic_anatomy_mode,
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         return _service_error_response(request, principal, error)
+    return _review_redirect(request, review_task_id)
+
+
+@router.post(
+    "/review-tasks/{review_task_id}/anatomy-feedback",
+    response_class=HTMLResponse,
+    response_model=None,
+    name="dashboard_anatomy_feedback",
+)
+async def dashboard_anatomy_feedback(
+    review_task_id: UUID,
+    request: Request,
+    session: Session,
+    principal: ReviewReader,
+) -> Response:
+    origin_error = _origin_error_response(request, principal)
+    if origin_error is not None:
+        return origin_error
+    if principal.role != AdminRole.OWNER:
+        return _security_error_response(request, principal)
+    try:
+        form = await read_anatomy_feedback_form(request)
+    except BrowserReviewFormError as error:
+        return _invalid_form_response(request, principal, error.status_code)
+    if not _valid_form_csrf(request, principal, form.csrf_token):
+        return _security_error_response(request, principal)
+
+    settings: Settings = request.app.state.settings
+    semantic_profile = _configured_semantic_profile_sha256(settings)
+    if semantic_profile is None or not await semantic_feedback_target_belongs_to_review(
+        session,
+        review_task_id=review_task_id,
+        assessment_id=form.assessment_id,
+        profile_sha256=semantic_profile,
+    ):
+        return _review_action_error(
+            request,
+            principal,
+            status_code=status.HTTP_404_NOT_FOUND,
+            heading="Anatomy feedback was not saved",
+            message="This assessment is not part of the current review.",
+        )
+    try:
+        await record_semantic_anatomy_feedback(
+            session,
+            assessment_id=form.assessment_id,
+            user_id=principal.user_id,
+            ground_truth=form.ground_truth,
+            issue_code=form.issue_code,
+            note=form.note,
+        )
+        await refresh_semantic_calibration_artifact(
+            session,
+            profile_sha256=semantic_profile,
+            created_by_user_id=principal.user_id,
+        )
+        await session.commit()
+    except (
+        SemanticFeedbackAssessmentNotReadyError,
+        SemanticFeedbackConflictError,
+        SemanticFeedbackNotFoundError,
+        SemanticFeedbackValidationError,
+    ) as error:
+        await session.rollback()
+        return _feedback_service_error_response(request, principal, error)
     return _review_redirect(request, review_task_id)
 
 
@@ -589,6 +700,7 @@ async def dashboard_bulk_review_action(
             note=form.note,
             semantic_profile_sha256=semantic_profile,
             semantic_severe_confidence_micros=(settings.semantic_anatomy_severe_confidence_micros),
+            semantic_enforcement_mode=settings.semantic_anatomy_mode,
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         return _service_error_response(request, principal, error)
@@ -735,6 +847,7 @@ async def _dashboard_transition(
             idempotency_key=form.idempotency_key,
             semantic_profile_sha256=semantic_profile,
             semantic_severe_confidence_micros=(settings.semantic_anatomy_severe_confidence_micros),
+            semantic_enforcement_mode=settings.semantic_anatomy_mode,
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         return _service_error_response(request, principal, error)
@@ -749,23 +862,36 @@ def _review_assets(
     summary: ReviewSummary,
     masters: tuple[RankedMaster, ...],
     semantic_assessments: Mapping[UUID, SemanticReviewAssessment],
+    semantic_feedback: Mapping[UUID, SemanticAnatomyFeedbackResult],
+    semantic_mode: str,
     severe_confidence_micros: int,
 ) -> ReviewAssetGroups:
     decisions = {decision.asset_id: decision for decision in summary.assets}
     if set(decisions) != {master.asset_id for master in masters}:
         raise RankingIntegrityError("review and ranking assets differ")
     is_open = summary.state == ReviewTaskState.OPEN
+    def is_flagged(master: RankedMaster) -> bool:
+        assessment = semantic_assessments.get(master.asset_id)
+        return bool(
+            assessment
+            and assessment.is_high_confidence_severe(
+                threshold_micros=severe_confidence_micros,
+            )
+        )
+
     views = tuple(
         ReviewAssetView(
             master=master,
             current=decisions[master.asset_id],
             semantic=semantic_assessments.get(master.asset_id),
-            ai_excluded=(
-                semantic_assessments[master.asset_id].is_high_confidence_severe(
-                    threshold_micros=severe_confidence_micros,
-                )
+            semantic_feedback=(
+                semantic_feedback.get(semantic_assessments[master.asset_id].assessment_id)
                 if master.asset_id in semantic_assessments
-                else False
+                else None
+            ),
+            semantic_flagged=is_flagged(master),
+            ai_excluded=(
+                semantic_mode == SemanticEnforcementMode.ENFORCE.value and is_flagged(master)
             ),
             idempotency_key=(
                 review_form_idempotency_key(
@@ -815,6 +941,12 @@ def _configured_semantic_profile_sha256(settings: Settings) -> str | None:
         model_name=settings.semantic_anatomy_model,
         model_revision=revision,
     ).profile_sha256
+
+
+def _semantic_mode(settings: Settings) -> str:
+    if not settings.semantic_anatomy_enabled:
+        return "off"
+    return settings.semantic_anatomy_mode.value
 
 
 def _form_csrf_token(
@@ -976,6 +1108,37 @@ def _service_error_response(
         principal,
         status_code=status.HTTP_409_CONFLICT,
         heading=heading,
+        message=message,
+    )
+
+
+def _feedback_service_error_response(
+    request: Request,
+    principal: AuthenticatedPrincipal,
+    error: (
+        SemanticFeedbackAssessmentNotReadyError
+        | SemanticFeedbackConflictError
+        | SemanticFeedbackNotFoundError
+        | SemanticFeedbackValidationError
+    ),
+) -> Response:
+    if isinstance(error, SemanticFeedbackNotFoundError):
+        status_code = status.HTTP_404_NOT_FOUND
+        message = "The anatomy assessment no longer exists. Reload the review."
+    elif isinstance(error, SemanticFeedbackValidationError):
+        status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+        message = "That anatomy label is not valid for this assessment."
+    elif isinstance(error, SemanticFeedbackAssessmentNotReadyError):
+        status_code = status.HTTP_409_CONFLICT
+        message = "The anatomy assessment is not ready for feedback yet."
+    else:
+        status_code = status.HTTP_409_CONFLICT
+        message = "A different immutable label is already saved for this assessment."
+    return _review_action_error(
+        request,
+        principal,
+        status_code=status_code,
+        heading="Anatomy feedback was not saved",
         message=message,
     )
 

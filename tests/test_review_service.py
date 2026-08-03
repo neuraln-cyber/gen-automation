@@ -39,6 +39,7 @@ from gen_automation.domain.enums import (
     ReviewTaskState,
     ScoringRunState,
     SemanticAssessmentState,
+    SemanticEnforcementMode,
     SemanticVerdict,
 )
 from gen_automation.semantic import prompt_sha256, schema_sha256
@@ -934,6 +935,61 @@ async def test_bulk_accept_preserves_semantic_owner_override_gate(
         assert summary.semantic_gate.severe_override_count == 1
         assert summary.semantic_gate.severe_blocked_count == 0
         assert summary.assets[0].semantic_severe_override_attested is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    (SemanticEnforcementMode.SHADOW, SemanticEnforcementMode.ASSIST),
+)
+async def test_non_enforcing_semantic_modes_never_block_owner_decisions_or_completion(
+    review_context: ReviewContext,
+    mode: SemanticEnforcementMode,
+) -> None:
+    task = await _create_task(review_context)
+    profile = SemanticAssessmentProfile(
+        model_name="Qwen/Qwen3-VL-8B-Instruct",
+        model_revision=f"pinned-{mode.value}-mode-revision",
+    )
+
+    for offset, asset_id in enumerate(review_context.ranked_asset_ids[:2]):
+        async with review_context.database.sessions() as session:
+            await append_review_decision(
+                session,
+                review_task_id=task.task_id,
+                asset_id=asset_id,
+                decision=ReviewDecisionValue.ACCEPT,
+                decided_by_user_id=review_context.reviewer_id,
+                expected_lock_version=offset + 1,
+                idempotency_key=f"{mode.value}-accept-{offset}",
+                semantic_profile_sha256=profile.profile_sha256,
+                semantic_enforcement_mode=mode,
+            )
+
+    async with review_context.database.sessions() as session:
+        summary = await get_review_summary(
+            session,
+            review_task_id=task.task_id,
+            semantic_profile_sha256=profile.profile_sha256,
+            semantic_enforcement_mode=mode,
+        )
+        assert summary.semantic_gate.enabled is True
+        assert summary.semantic_gate.mode == mode
+        assert summary.semantic_gate.pending_count == len(review_context.ranked_asset_ids)
+        assert summary.semantic_gate.completion_ready is True
+
+    async with review_context.database.sessions() as session:
+        completed = await transition_review_task(
+            session,
+            review_task_id=task.task_id,
+            target_state=ReviewTaskState.COMPLETED,
+            changed_by_user_id=review_context.reviewer_id,
+            expected_lock_version=3,
+            idempotency_key=f"{mode.value}-complete-with-pending-assessments",
+            semantic_profile_sha256=profile.profile_sha256,
+            semantic_enforcement_mode=mode,
+        )
+    assert completed.state == ReviewTaskState.COMPLETED
 
 
 @pytest.mark.asyncio

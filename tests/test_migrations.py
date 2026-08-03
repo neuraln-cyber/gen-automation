@@ -9,7 +9,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import MetaData, create_engine, inspect, select
+from sqlalchemy import MetaData, create_engine, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
 _LEGACY_DEPLOYMENT_NAMESPACE = UUID("ed71d302-4781-4ddc-949b-3b0c1c75f95a")
@@ -152,7 +152,9 @@ def test_foundation_migration_round_trip(
         "review_x_selections",
         "salad_deployments",
         "scoring_runs",
+        "semantic_anatomy_feedback",
         "semantic_assessments",
+        "semantic_calibration_artifacts",
         "subject_approvals",
         "webhook_receipts",
         "workflow_approvals",
@@ -160,6 +162,23 @@ def test_foundation_migration_round_trip(
         "wildcard_library_versions",
     }
     assert set(inspect(engine).get_table_names()) == expected_tables
+    with engine.connect() as connection:
+        trigger_names = set(
+            connection.execute(
+                text(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'trigger' AND name LIKE 'semantic_%'"
+                )
+            ).scalars()
+        )
+    assert {
+        "semantic_assessments_guard_terminal_update",
+        "semantic_assessments_guard_delete",
+        "semantic_anatomy_feedback_immutable_update",
+        "semantic_anatomy_feedback_immutable_delete",
+        "semantic_calibration_artifacts_immutable_update",
+        "semantic_calibration_artifacts_immutable_delete",
+    } <= trigger_names
     engine.dispose()
 
     command.check(configuration)

@@ -126,6 +126,7 @@ class SemanticAssessmentCycleResult:
 
 @dataclass(frozen=True, slots=True)
 class SemanticReviewAssessment:
+    assessment_id: UUID
     asset_id: UUID
     state: SemanticAssessmentState
     verdict: SemanticVerdict | None
@@ -687,6 +688,7 @@ def _review_assessment(assessment: SemanticAssessment) -> SemanticReviewAssessme
             issues = ()
             error_code = "stored_semantic_assessment_invalid"
     return SemanticReviewAssessment(
+        assessment_id=assessment.id,
         asset_id=assessment.asset_id,
         state=state,
         verdict=verdict,

@@ -43,6 +43,39 @@ services:
       start_period: 20s
       retries: 5
 
+  semantic-gateway:
+    image: "${GEN_AUTOMATION_SEMANTIC_GATEWAY_IMAGE:?set a repository@sha256:64-hex digest}"
+    user: "10001:10001"
+    init: true
+    read_only: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    env_file:
+      - /etc/gen-automation/semantic-gateway.env
+    networks:
+      - semantic-egress
+    ports:
+      - "127.0.0.1:8091:8080/tcp"
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=1770
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    healthcheck:
+      test:
+        - CMD
+        - python3.12
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8080/health/ready', timeout=2).read()
+      interval: 20s
+      timeout: 3s
+      start_period: 15s
+      retries: 5
+
   control-plane-mega:
     image: "${GEN_AUTOMATION_CONTROL_PLANE_MEGA_IMAGE:?set a repository@sha256:64-hex digest}"
     user: "10001:10001"
@@ -56,8 +89,12 @@ services:
     environment:
       GEN_AUTOMATION_MEGA_PROFILE_HOME: /run/gen-automation/mega-profile
       GEN_AUTOMATION_PATREON_BROWSER_SIDECAR_URL: http://127.0.0.1:8090/v1/publish
+      GEN_AUTOMATION_SEMANTIC_ANATOMY_ENDPOINT_URL: http://127.0.0.1:8091/v1/anatomy/assess
     depends_on:
       patreon-browser:
+        condition: service_healthy
+        restart: true
+      semantic-gateway:
         condition: service_healthy
         restart: true
     command:
@@ -196,5 +233,9 @@ services:
 networks:
   patreon-egress:
     name: gen-automation-patreon-egress
+    driver: bridge
+    attachable: false
+  semantic-egress:
+    name: gen-automation-semantic-egress
     driver: bridge
     attachable: false

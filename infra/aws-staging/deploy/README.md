@@ -4,11 +4,12 @@ This directory is a credential-free deployment bundle for the single staging
 EC2 host. It does not build images, create secrets, authenticate MEGA or
 Patreon, run database migrations, or enable external effects.
 
-The four image references are supplied through `/etc/gen-automation/deploy.env`
+The five image references are supplied through `/etc/gen-automation/deploy.env`
 and must be immutable `repository@sha256:<64 lowercase hex>` references:
 
 - the control-plane image containing the pinned official MEGAcmd build;
 - the Patreon browser sidecar image;
+- the bounded semantic anatomy gateway image;
 - a reviewed official nginx image; and
 - a reviewed official Caddy image.
 
@@ -25,8 +26,9 @@ The control plane, nginx, and Caddy use host networking. Uvicorn binds only
 binding public ports 80/443. Caddy and nginx run as dedicated host UIDs 10002
 and 10003. A required persistent systemd oneshot installs and verifies OUTPUT
 owner rules rejecting their traffic to IPv4 IMDS. The Patreon sidecar stays on
-a Docker bridge and publishes port 8090 only on host loopback. With EC2 IMDSv2
-response hop limit 1, the bridged sidecar cannot obtain the instance role,
+a Docker bridge and publishes port 8090 only on host loopback. The semantic
+gateway uses a separate bridge and publishes port 8091 only on host loopback.
+With EC2 IMDSv2 response hop limit 1, neither bridged sidecar can obtain the instance role,
 while the host-networked control plane UID 10001 can use ambient AWS
 credentials.
 
@@ -49,6 +51,7 @@ sudo ./install.sh
 sudo cp /etc/gen-automation/examples/deploy.env.example /etc/gen-automation/deploy.env
 sudo cp /etc/gen-automation/examples/control-plane.env.example /etc/gen-automation/control-plane.env
 sudo cp /etc/gen-automation/examples/patreon-browser.env.example /etc/gen-automation/patreon-browser.env
+sudo cp /etc/gen-automation/examples/semantic-gateway.env.example /etc/gen-automation/semantic-gateway.env
 sudo cp /etc/gen-automation/examples/caddy.env.example /etc/gen-automation/caddy.env
 sudo chmod 0600 /etc/gen-automation/*.env
 ```
@@ -79,7 +82,7 @@ The installer creates this wrapper alongside the Patreon bootstrap command.
 The password, one-time TOTP provisioning data, and confirmation code remain
 inside that terminal and are never accepted as command arguments.
 
-Populate the four files out-of-band. Keep external effects disabled through the
+Populate the five files out-of-band. Keep external effects disabled through the
 first health, storage, MEGA, Patreon, and X canaries. The validator reads only
 the minimum non-secret deployment invariants and never sources an environment
 file. The systemd unit validates inputs, renders Compose, pulls the four exact
@@ -105,6 +108,7 @@ docker compose \
 curl --fail http://127.0.0.1:8000/api/v1/health/ready
 curl --fail http://127.0.0.1:8080/api/v1/health/ready
 curl --fail http://127.0.0.1:8090/health/live
+curl --fail http://127.0.0.1:8091/health/ready
 ```
 
 To deploy a reviewed digest update, replace only the affected immutable image

@@ -8,7 +8,12 @@ from uuid import UUID
 from fastapi import Request, status
 
 from gen_automation.config import Settings
-from gen_automation.domain.enums import ReviewBulkAction, ReviewDecisionValue
+from gen_automation.domain.enums import (
+    ReviewBulkAction,
+    ReviewDecisionValue,
+    SemanticGroundTruth,
+    SemanticIssueCode,
+)
 
 _FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
 _MAX_FORM_BODY_BYTES = 64 * 1024
@@ -47,6 +52,15 @@ BULK_ACTION_FIELDS = frozenset(
         "asset_id",
         "action",
         "reason_code",
+        "note",
+    }
+)
+ANATOMY_FEEDBACK_FIELDS = frozenset(
+    {
+        "csrf_token",
+        "assessment_id",
+        "ground_truth",
+        "issue_code",
         "note",
     }
 )
@@ -95,6 +109,15 @@ class BulkActionForm:
     asset_ids: tuple[UUID, ...]
     action: ReviewBulkAction
     reason_code: str | None
+    note: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AnatomyFeedbackForm:
+    csrf_token: str
+    assessment_id: UUID
+    ground_truth: SemanticGroundTruth
+    issue_code: SemanticIssueCode | None
     note: str | None
 
 
@@ -199,6 +222,30 @@ async def read_bulk_action_form(request: Request) -> BulkActionForm:
         asset_ids=asset_ids,
         action=action,
         reason_code=reason_code,
+        note=note,
+    )
+
+
+async def read_anatomy_feedback_form(request: Request) -> AnatomyFeedbackForm:
+    values = await _read_form(request, expected_fields=ANATOMY_FEEDBACK_FIELDS)
+    try:
+        assessment_id = UUID(values["assessment_id"])
+        ground_truth = SemanticGroundTruth(values["ground_truth"])
+        issue_code = SemanticIssueCode(values["issue_code"]) if values["issue_code"] else None
+    except ValueError:
+        raise _bad_request() from None
+    if str(assessment_id) != values["assessment_id"].lower():
+        raise _bad_request()
+    note = values["note"].strip() or None
+    if note is not None and len(note) > 1_000:
+        raise _bad_request()
+    if ground_truth != SemanticGroundTruth.ANATOMY_DEFECT:
+        issue_code = None
+    return AnatomyFeedbackForm(
+        csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
+        assessment_id=assessment_id,
+        ground_truth=ground_truth,
+        issue_code=issue_code,
         note=note,
     )
 

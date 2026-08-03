@@ -15,6 +15,49 @@
     </div>
   </section>
 
+  <aside
+    class="anatomy-mode-banner mode-{{ semantic_mode }}"
+    data-semantic-mode="{{ semantic_mode }}"
+    aria-label="Anatomy automation mode"
+  >
+    <div>
+      <span class="anatomy-mode-label">Anatomy AI</span>
+      <strong>{{ semantic_mode | upper }}</strong>
+    </div>
+    <p>
+      {% if semantic_mode == "shadow" %}
+        Predictions are visible for calibration only. They do not move, exclude, or block images.
+      {% elif semantic_mode == "assist" %}
+        Predictions highlight images for your review; your decisions remain authoritative.
+      {% elif semantic_mode == "enforce" %}
+        High-confidence severe flags can block final-set completion until an owner reviews them.
+      {% else %}
+        Automated anatomy assessment is off; review images manually.
+      {% endif %}
+    </p>
+    {% if semantic_calibration %}
+      <div class="anatomy-calibration-progress" role="status">
+        <span>
+          Calibration labels:
+          <strong>
+            {{ semantic_calibration.sample_count }} / {{ semantic_calibration_minimum_samples }}
+          </strong>
+        </span>
+        {% if semantic_calibration.ready_for_enforcement %}
+          <span class="ready">Ready for enforcement review</span>
+        {% else %}
+          <span>Collecting owner labels in shadow mode</span>
+        {% endif %}
+        {% if semantic_calibration.recommended_threshold_micros is not none %}
+          <span>
+            Suggested severe threshold:
+            {{ "%.1f%%"|format(semantic_calibration.recommended_threshold_micros / 10000) }}
+          </span>
+        {% endif %}
+      </div>
+    {% endif %}
+  </aside>
+
   <section class="panel review-summary" aria-labelledby="review-summary-heading">
     <div class="panel-heading">
       <div>
@@ -48,7 +91,10 @@
         <dd>{{ [summary.desired_accepted_count - summary.accepted_count, 0] | max }}</dd>
       </div>
       <div><dt>Selected for X</dt><dd>{{ summary.x_selected_count }} / 4</dd></div>
-      <div><dt>AI excluded</dt><dd>{{ ai_excluded_count }}</dd></div>
+      <div>
+        <dt>{{ "AI excluded" if semantic_mode == "enforce" else "AI flagged" }}</dt>
+        <dd>{{ semantic_flagged_count }}</dd>
+      </div>
     </dl>
     {% if summary.semantic_gate.enabled %}
       <details class="review-insights">
@@ -242,8 +288,8 @@
       <button class="filter-chip" type="button" data-review-filter="reject" aria-pressed="false">Excluded <span>{{ summary.rejected_count }}</span></button>
       <button class="filter-chip" type="button" data-review-filter="hold" aria-pressed="false">Held <span>{{ summary.held_count }}</span></button>
       <button class="filter-chip" type="button" data-review-filter="x" aria-pressed="false">For X <span>{{ summary.x_selected_count }}</span></button>
-      {% if ai_excluded_count %}
-        <button class="filter-chip" type="button" data-review-filter="ai" aria-pressed="false">AI flagged <span>{{ ai_excluded_count }}</span></button>
+      {% if semantic_flagged_count %}
+        <button class="filter-chip" type="button" data-review-filter="semantic" aria-pressed="false">AI flagged <span>{{ semantic_flagged_count }}</span></button>
       {% endif %}
     </nav>
   {% endif %}
@@ -292,7 +338,7 @@
       {% set decision_value = item.current.decision.value if item.current.decision else "undecided" %}
       <li
         id="asset-{{ item.master.asset_id }}"
-        class="asset-card decision-{{ decision_value }}{% if item.ai_excluded %} ai-excluded{% endif %}"
+        class="asset-card decision-{{ decision_value }}{% if item.semantic_flagged %} semantic-flagged{% endif %}{% if item.ai_excluded %} ai-excluded{% endif %}"
         data-review-asset
         data-asset-id="{{ item.master.asset_id }}"
         data-rank="{{ item.master.rank }}"
@@ -302,6 +348,7 @@
         data-batch-image-number="{{ item.master.batch_image_number }}"
         data-decision="{{ decision_value }}"
         data-selected-for-x="{{ 'true' if item.current.selected_for_x else 'false' }}"
+        {% if item.semantic_flagged %}data-semantic-flagged="true"{% endif %}
         {% if item.ai_excluded %}data-ai-excluded="true"{% endif %}
       >
         <div class="asset-media">
@@ -351,10 +398,10 @@
               <span class="decision-chip">Revision {{ item.current.revision }}</span>
             {% endif %}
           </div>
-          <details class="review-card-details"{% if item.ai_excluded %} open{% endif %}>
+          <details class="review-card-details"{% if item.semantic_flagged %} open{% endif %}>
             <summary>
               Details &amp; settings
-              <span>{{ "Review recommended" if item.ai_excluded else "Optional" }}</span>
+              <span>{{ "Review recommended" if item.semantic_flagged else "Optional" }}</span>
             </summary>
             <div class="review-card-details-body">
           {% if item.master.explanation_summary %}
@@ -377,7 +424,7 @@
             <p class="decision-detail">Note: {{ item.current.note }}</p>
           {% endif %}
 
-          <details class="semantic-details{% if item.ai_excluded %} severe{% endif %}" {% if item.ai_excluded %}open{% endif %}>
+          <details class="semantic-details{% if item.semantic_flagged %} severe{% endif %}" {% if item.semantic_flagged %}open{% endif %}>
             <summary>
               <span>
                 Anatomy check:
@@ -389,9 +436,9 @@
                   {{ item.semantic.state.value }}
                 {% endif %}
               </span>
-              <span>{{ "Review recommended" if item.ai_excluded else "Details" }}</span>
+              <span>{{ "Review recommended" if item.semantic_flagged else "Details" }}</span>
             </summary>
-            <div class="semantic-status{% if item.ai_excluded %} severe{% endif %}">
+            <div class="semantic-status{% if item.semantic_flagged %} severe{% endif %}">
             {% if item.semantic is none %}
               {% if summary.semantic_gate.enabled %}
                 <p>
@@ -410,14 +457,14 @@
                 {% endif %}
               </p>
               {% if item.semantic.issues %}
-                <ul class="semantic-issues">
+                <div class="semantic-issue-chips" aria-label="Detected anatomy issues">
                   {% for issue in item.semantic.issues %}
-                    <li>
+                    <span class="semantic-issue-chip">
                       {{ issue.code.value.replace("_", " ") }}
-                      &middot; {{ "%.1f%%"|format(issue.confidence_micros / 10000) }}
-                    </li>
+                      <small>{{ "%.1f%%"|format(issue.confidence_micros / 10000) }}</small>
+                    </span>
                   {% endfor %}
-                </ul>
+                </div>
               {% endif %}
             {% elif item.semantic.state.value == "unavailable" %}
               <p>
@@ -443,6 +490,130 @@
               <p class="muted">Manual decision recorded: {{ item.current.decision.value }}.</p>
             {% endif %}
             </div>
+
+            {% if item.semantic and item.semantic.state.value == "completed" %}
+              <details class="semantic-assessment-meta">
+                <summary>Assessment details</summary>
+                <dl>
+                  <dt>Model</dt>
+                  <dd>{{ item.semantic.model_name }}</dd>
+                  <dt>Revision</dt>
+                  <dd>{{ item.semantic.model_revision }}</dd>
+                  <dt>Assessment</dt>
+                  <dd>{{ item.semantic.assessment_id }}</dd>
+                  {% if item.semantic.completed_at %}
+                    <dt>Completed</dt>
+                    <dd>{{ item.semantic.completed_at }}</dd>
+                  {% endif %}
+                </dl>
+              </details>
+
+              <section class="anatomy-feedback" aria-label="Anatomy calibration feedback">
+                <div class="anatomy-feedback-heading">
+                  <div>
+                    <strong>Your anatomy check</strong>
+                    <p>
+                      {% if item.semantic.verdict.value == "pass" %}
+                        Good confirms the AI pass; Defect marks the pass as incorrect.
+                      {% else %}
+                        Defect confirms the AI flag; Good marks the flag as incorrect.
+                      {% endif %}
+                    </p>
+                  </div>
+                  <span class="anatomy-feedback-mode">{{ semantic_mode }}</span>
+                </div>
+
+                {% if item.semantic_feedback %}
+                  <div
+                    class="anatomy-feedback-saved agreement-{{ item.semantic_feedback.agreement.value }}"
+                    data-anatomy-feedback-saved
+                    role="status"
+                  >
+                    <strong>
+                      Saved:
+                      {% if item.semantic_feedback.ground_truth.value == "anatomy_good" %}
+                        good anatomy
+                      {% elif item.semantic_feedback.ground_truth.value == "anatomy_defect" %}
+                        defect
+                      {% else %}
+                        unsure
+                      {% endif %}
+                    </strong>
+                    <span>
+                      AI prediction {{ item.semantic_feedback.agreement.value }}
+                      {% if item.semantic_feedback.issue_code %}
+                        &middot; {{ item.semantic_feedback.issue_code.value.replace("_", " ") }}
+                      {% endif %}
+                    </span>
+                  </div>
+                {% elif summary.state.value == "open" and principal.role.value == "owner" %}
+                  <form
+                    class="anatomy-feedback-form"
+                    method="post"
+                    action="/dashboard/review-tasks/{{ summary.task_id }}/anatomy-feedback"
+                    data-anatomy-feedback-form
+                  >
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="assessment_id" value="{{ item.semantic.assessment_id }}">
+                    <div class="anatomy-feedback-actions" role="group" aria-label="Rate visible anatomy">
+                      <button
+                        class="anatomy-feedback-button good"
+                        type="submit"
+                        name="ground_truth"
+                        value="anatomy_good"
+                      >
+                        <span>Good anatomy</span>
+                        <small>{{ "AI correct" if item.semantic.verdict.value == "pass" else "Flag incorrect" }}</small>
+                      </button>
+                      <button
+                        class="anatomy-feedback-button defect"
+                        type="submit"
+                        name="ground_truth"
+                        value="anatomy_defect"
+                      >
+                        <span>Defect</span>
+                        <small>{{ "AI incorrect" if item.semantic.verdict.value == "pass" else "Flag correct" }}</small>
+                      </button>
+                      <button
+                        class="anatomy-feedback-button unsure"
+                        type="submit"
+                        name="ground_truth"
+                        value="unjudgeable"
+                      >
+                        <span>Unsure</span>
+                        <small>Skip calibration</small>
+                      </button>
+                    </div>
+                    <details class="anatomy-feedback-details">
+                      <summary>Optional defect type or note</summary>
+                      <div>
+                        <label for="feedback-issue-{{ item.semantic.assessment_id }}">
+                          Defect type (used only with Defect)
+                        </label>
+                        <select id="feedback-issue-{{ item.semantic.assessment_id }}" name="issue_code">
+                          <option value="">Not specified</option>
+                          {% for issue_code in semantic_issue_codes %}
+                            <option value="{{ issue_code.value }}">
+                              {{ issue_code.value.replace("_", " ") }}
+                            </option>
+                          {% endfor %}
+                        </select>
+                        <label for="feedback-note-{{ item.semantic.assessment_id }}">Calibration note</label>
+                        <textarea
+                          id="feedback-note-{{ item.semantic.assessment_id }}"
+                          name="note"
+                          maxlength="1000"
+                          rows="2"
+                          placeholder="Optional: what looked right or wrong?"
+                        ></textarea>
+                      </div>
+                    </details>
+                  </form>
+                {% elif principal.role.value != "owner" %}
+                  <p class="anatomy-feedback-readonly">Only the owner can save calibration labels.</p>
+                {% endif %}
+              </section>
+            {% endif %}
           </details>
 
           <details class="decision-details">

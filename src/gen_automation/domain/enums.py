@@ -167,6 +167,24 @@ class SemanticIssueCode(StrEnum):
     SEVERE_FACE_DEFORMATION = "severe_face_deformation"
 
 
+class SemanticEnforcementMode(StrEnum):
+    SHADOW = "shadow"
+    ASSIST = "assist"
+    ENFORCE = "enforce"
+
+
+class SemanticFeedbackAgreement(StrEnum):
+    CORRECT = "correct"
+    INCORRECT = "incorrect"
+    UNSURE = "unsure"
+
+
+class SemanticGroundTruth(StrEnum):
+    ANATOMY_GOOD = "anatomy_good"
+    ANATOMY_DEFECT = "anatomy_defect"
+    UNJUDGEABLE = "unjudgeable"
+
+
 class ReviewTaskState(StrEnum):
     OPEN = "open"
     COMPLETED = "completed"

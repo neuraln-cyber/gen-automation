@@ -59,6 +59,9 @@ from gen_automation.domain.enums import (
     SaladDeploymentState,
     ScoringRunState,
     SemanticAssessmentState,
+    SemanticFeedbackAgreement,
+    SemanticGroundTruth,
+    SemanticIssueCode,
     SemanticVerdict,
     SpendEntryType,
 )
@@ -1048,6 +1051,13 @@ class SemanticAssessment(UuidPrimaryKeyMixin, Base):
             "profile_sha256",
             name="uq_semantic_assessments_run_asset_profile",
         ),
+        Index(
+            "uq_semantic_assessments_feedback_identity",
+            "id",
+            "asset_id",
+            "profile_sha256",
+            unique=True,
+        ),
         ForeignKeyConstraint(
             ["scoring_run_id", "asset_id"],
             ["asset_scores.scoring_run_id", "asset_scores.asset_id"],
@@ -1167,6 +1177,139 @@ class SemanticAssessment(UuidPrimaryKeyMixin, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class SemanticAnatomyFeedback(UuidPrimaryKeyMixin, Base):
+    __tablename__ = "semantic_anatomy_feedback"
+    __table_args__ = (
+        UniqueConstraint(
+            "semantic_assessment_id",
+            "feedback_by_user_id",
+            name="uq_semantic_anatomy_feedback_assessment_user",
+        ),
+        ForeignKeyConstraint(
+            ["semantic_assessment_id", "asset_id", "profile_sha256"],
+            [
+                "semantic_assessments.id",
+                "semantic_assessments.asset_id",
+                "semantic_assessments.profile_sha256",
+            ],
+            name="fk_semantic_anatomy_feedback_assessment_identity",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "ground_truth = 'anatomy_defect' OR issue_code IS NULL",
+            name="issue_requires_defect",
+        ),
+        CheckConstraint(
+            "(ground_truth = 'unjudgeable' AND agreement = 'unsure') "
+            "OR (ground_truth <> 'unjudgeable' AND agreement <> 'unsure')",
+            name="unjudgeable_agreement",
+        ),
+        CheckConstraint(
+            "note IS NULL OR length(trim(note)) > 0",
+            name="nonempty_note",
+        ),
+        Index(
+            "ix_semantic_anatomy_feedback_profile_created",
+            "profile_sha256",
+            "created_at",
+        ),
+    )
+
+    semantic_assessment_id: Mapped[UUID] = mapped_column(nullable=False)
+    asset_id: Mapped[UUID] = mapped_column(
+        ForeignKey("assets.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    profile_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    feedback_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    agreement: Mapped[SemanticFeedbackAgreement] = mapped_column(
+        Enum(
+            SemanticFeedbackAgreement,
+            name="semantic_feedback_agreement",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=9,
+        ),
+        nullable=False,
+    )
+    ground_truth: Mapped[SemanticGroundTruth] = mapped_column(
+        Enum(
+            SemanticGroundTruth,
+            name="semantic_ground_truth",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=14,
+        ),
+        nullable=False,
+    )
+    issue_code: Mapped[SemanticIssueCode | None] = mapped_column(
+        Enum(
+            SemanticIssueCode,
+            name="semantic_issue_code",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=23,
+        )
+    )
+    note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SemanticCalibrationArtifact(UuidPrimaryKeyMixin, Base):
+    __tablename__ = "semantic_calibration_artifacts"
+    __table_args__ = (
+        UniqueConstraint(
+            "profile_sha256",
+            "version",
+            name="uq_semantic_calibration_artifacts_profile_version",
+        ),
+        UniqueConstraint(
+            "profile_sha256",
+            "report_sha256",
+            name="uq_semantic_calibration_artifacts_profile_report",
+        ),
+        CheckConstraint("version > 0", name="positive_version"),
+        CheckConstraint("sample_count >= 0", name="nonnegative_sample_count"),
+        CheckConstraint("length(profile_sha256) = 64", name="valid_profile_sha256"),
+        CheckConstraint("length(dataset_sha256) = 64", name="valid_dataset_sha256"),
+        CheckConstraint("length(report_sha256) = 64", name="valid_report_sha256"),
+        CheckConstraint(
+            "recommended_threshold_micros IS NULL "
+            "OR recommended_threshold_micros BETWEEN 0 AND 1000000",
+            name="valid_recommended_threshold",
+        ),
+        Index(
+            "ix_semantic_calibration_artifacts_profile_created",
+            "profile_sha256",
+            "created_at",
+        ),
+    )
+
+    profile_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    calibration_schema_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    dataset_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    recommended_threshold_micros: Mapped[int | None] = mapped_column(Integer)
+    ready_for_enforcement: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    report: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, nullable=False)
+    report_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class AssetRanking(UuidPrimaryKeyMixin, Base):
@@ -4251,6 +4394,56 @@ event.listen(
         "EXECUTE FUNCTION gen_automation_guard_semantic_assessment_mutation()"
     ).execute_if(dialect="postgresql"),
 )
+
+
+for _immutable_table, _table_name, _label in (
+    (
+        SemanticAnatomyFeedback.__table__,
+        "semantic_anatomy_feedback",
+        "semantic anatomy feedback",
+    ),
+    (
+        SemanticCalibrationArtifact.__table__,
+        "semantic_calibration_artifacts",
+        "semantic calibration artifacts",
+    ),
+):
+    event.listen(
+        _immutable_table,
+        "after_create",
+        _ddl(
+            f"CREATE TRIGGER {_table_name}_immutable_update "
+            f"BEFORE UPDATE ON {_table_name} BEGIN "
+            f"SELECT RAISE(ABORT, '{_label} are append-only'); END"
+        ).execute_if(dialect="sqlite"),
+    )
+    event.listen(
+        _immutable_table,
+        "after_create",
+        _ddl(
+            f"CREATE TRIGGER {_table_name}_immutable_delete "
+            f"BEFORE DELETE ON {_table_name} BEGIN "
+            f"SELECT RAISE(ABORT, '{_label} are append-only'); END"
+        ).execute_if(dialect="sqlite"),
+    )
+    event.listen(
+        _immutable_table,
+        "after_create",
+        _ddl(
+            f"CREATE OR REPLACE FUNCTION gen_automation_guard_{_table_name}_mutation() "
+            "RETURNS trigger AS $$ BEGIN "
+            f"RAISE EXCEPTION '{_label} are append-only'; END; $$ LANGUAGE plpgsql"
+        ).execute_if(dialect="postgresql"),
+    )
+    event.listen(
+        _immutable_table,
+        "after_create",
+        _ddl(
+            f"CREATE TRIGGER {_table_name}_guard_mutation "
+            f"BEFORE UPDATE OR DELETE ON {_table_name} FOR EACH ROW "
+            f"EXECUTE FUNCTION gen_automation_guard_{_table_name}_mutation()"
+        ).execute_if(dialect="postgresql"),
+    )
 
 
 # Wildcard contents are historical release inputs.  Even lightweight

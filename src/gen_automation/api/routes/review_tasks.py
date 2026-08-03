@@ -10,12 +10,17 @@ from gen_automation.api.security import (
     ReviewReader,
     Session,
 )
+from gen_automation.api.semantic_feedback import semantic_feedback_target_belongs_to_review
 from gen_automation.config import Settings
 from gen_automation.domain.enums import (
     AdminRole,
     ReviewBulkAction,
     ReviewDecisionValue,
     ReviewTaskState,
+    SemanticEnforcementMode,
+    SemanticFeedbackAgreement,
+    SemanticGroundTruth,
+    SemanticIssueCode,
 )
 from gen_automation.services.review import (
     ReviewBulkActionResult,
@@ -31,6 +36,15 @@ from gen_automation.services.review import (
     transition_review_task,
 )
 from gen_automation.services.semantic_anatomy import SemanticAssessmentProfile
+from gen_automation.services.semantic_feedback import (
+    SemanticAnatomyFeedbackResult,
+    SemanticFeedbackAssessmentNotReadyError,
+    SemanticFeedbackConflictError,
+    SemanticFeedbackNotFoundError,
+    SemanticFeedbackValidationError,
+    record_semantic_anatomy_feedback,
+    refresh_semantic_calibration_artifact,
+)
 
 router = APIRouter(prefix="/review-tasks", tags=["review tasks"])
 IdempotencyKey = Annotated[
@@ -70,6 +84,13 @@ class BulkReviewActionRequest(_StrictRequest):
 
 class ReviewTransitionRequest(_StrictRequest):
     expected_lock_version: int = Field(gt=0, le=2_147_483_647)
+
+
+class SemanticAnatomyFeedbackRequest(_StrictRequest):
+    assessment_id: UUID
+    ground_truth: SemanticGroundTruth
+    issue_code: SemanticIssueCode | None = None
+    note: str | None = Field(default=None, max_length=1_000)
 
 
 class _AttributeResponse(BaseModel):
@@ -119,6 +140,19 @@ class ReviewTransitionResponse(_AttributeResponse):
     replayed: bool
 
 
+class SemanticAnatomyFeedbackResponse(_AttributeResponse):
+    feedback_id: UUID
+    assessment_id: UUID
+    asset_id: UUID
+    user_id: UUID
+    agreement: SemanticFeedbackAgreement
+    ground_truth: SemanticGroundTruth
+    issue_code: SemanticIssueCode | None
+    note: str | None
+    created_at: datetime
+    created: bool
+
+
 class CurrentAssetDecisionResponse(_AttributeResponse):
     asset_id: UUID
     rank: int
@@ -135,6 +169,7 @@ class CurrentAssetDecisionResponse(_AttributeResponse):
 
 class ReviewSemanticGateResponse(_AttributeResponse):
     enabled: bool
+    mode: SemanticEnforcementMode
     ranked_asset_count: int
     terminal_count: int
     pending_count: int
@@ -192,13 +227,14 @@ async def read_review_task(
     session: Session,
     _principal: ReviewReader,
 ) -> ReviewSummaryResponse:
-    semantic_profile, semantic_threshold = _semantic_gate_configuration(request)
+    semantic_profile, semantic_threshold, semantic_mode = _semantic_gate_configuration(request)
     try:
         result = await get_review_summary(
             session,
             review_task_id=review_task_id,
             semantic_profile_sha256=semantic_profile,
             semantic_severe_confidence_micros=semantic_threshold,
+            semantic_enforcement_mode=semantic_mode,
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         raise _http_error(error) from error
@@ -219,7 +255,7 @@ async def post_review_decision(
     response: Response,
     principal: ReviewPrincipal,
 ) -> ReviewDecisionResponse:
-    semantic_profile, semantic_threshold = _semantic_gate_configuration(request)
+    semantic_profile, semantic_threshold, semantic_mode = _semantic_gate_configuration(request)
     try:
         result = await append_review_decision(
             session,
@@ -233,11 +269,66 @@ async def post_review_decision(
             note=command.note,
             semantic_profile_sha256=semantic_profile,
             semantic_severe_confidence_micros=semantic_threshold,
+            semantic_enforcement_mode=semantic_mode,
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         raise _http_error(error) from error
     _set_replay_response(response, replayed=result.replayed, created=True)
     return ReviewDecisionResponse.model_validate(result)
+
+
+@router.post(
+    "/{review_task_id}/anatomy-feedback",
+    response_model=SemanticAnatomyFeedbackResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def post_semantic_anatomy_feedback(
+    review_task_id: UUID,
+    command: SemanticAnatomyFeedbackRequest,
+    request: Request,
+    session: Session,
+    response: Response,
+    principal: ReviewPrincipal,
+) -> SemanticAnatomyFeedbackResponse:
+    if principal.role != AdminRole.OWNER:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="owner role required")
+    semantic_profile, _semantic_threshold, _semantic_mode = _semantic_gate_configuration(request)
+    if semantic_profile is None or not await semantic_feedback_target_belongs_to_review(
+        session,
+        review_task_id=review_task_id,
+        assessment_id=command.assessment_id,
+        profile_sha256=semantic_profile,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="semantic assessment was not found for this review",
+        )
+    try:
+        result: SemanticAnatomyFeedbackResult = await record_semantic_anatomy_feedback(
+            session,
+            assessment_id=command.assessment_id,
+            user_id=principal.user_id,
+            ground_truth=command.ground_truth,
+            issue_code=command.issue_code,
+            note=command.note,
+        )
+        await refresh_semantic_calibration_artifact(
+            session,
+            profile_sha256=semantic_profile,
+            created_by_user_id=principal.user_id,
+        )
+        await session.commit()
+    except (
+        SemanticFeedbackAssessmentNotReadyError,
+        SemanticFeedbackConflictError,
+        SemanticFeedbackNotFoundError,
+        SemanticFeedbackValidationError,
+    ) as error:
+        await session.rollback()
+        raise _semantic_feedback_http_error(error) from error
+    if not result.created:
+        response.status_code = status.HTTP_200_OK
+    return SemanticAnatomyFeedbackResponse.model_validate(result)
 
 
 @router.post(
@@ -257,7 +348,7 @@ async def post_bulk_review_action(
         principal.role != AdminRole.OWNER
     ):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="permission denied")
-    semantic_profile, semantic_threshold = _semantic_gate_configuration(request)
+    semantic_profile, semantic_threshold, semantic_mode = _semantic_gate_configuration(request)
     try:
         result: ReviewBulkActionResult = await apply_bulk_review_action(
             session,
@@ -271,6 +362,7 @@ async def post_bulk_review_action(
             note=command.note,
             semantic_profile_sha256=semantic_profile,
             semantic_severe_confidence_micros=semantic_threshold,
+            semantic_enforcement_mode=semantic_mode,
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         raise _http_error(error) from error
@@ -339,7 +431,7 @@ async def _transition(
     principal: ReviewPrincipal,
     request: Request,
 ) -> ReviewTransitionResponse:
-    semantic_profile, semantic_threshold = _semantic_gate_configuration(request)
+    semantic_profile, semantic_threshold, semantic_mode = _semantic_gate_configuration(request)
     try:
         result = await transition_review_task(
             session,
@@ -350,6 +442,7 @@ async def _transition(
             idempotency_key=idempotency_key,
             semantic_profile_sha256=semantic_profile,
             semantic_severe_confidence_micros=semantic_threshold,
+            semantic_enforcement_mode=semantic_mode,
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         raise _http_error(error) from error
@@ -392,6 +485,7 @@ def _summary_response(result: ReviewSummary) -> ReviewSummaryResponse:
 def _semantic_gate_response(result: ReviewSemanticGate) -> ReviewSemanticGateResponse:
     return ReviewSemanticGateResponse(
         enabled=result.enabled,
+        mode=result.mode,
         ranked_asset_count=result.ranked_asset_count,
         terminal_count=result.terminal_count,
         pending_count=result.pending_count,
@@ -403,10 +497,16 @@ def _semantic_gate_response(result: ReviewSemanticGate) -> ReviewSemanticGateRes
     )
 
 
-def _semantic_gate_configuration(request: Request) -> tuple[str | None, int]:
+def _semantic_gate_configuration(
+    request: Request,
+) -> tuple[str | None, int, SemanticEnforcementMode]:
     settings: Settings = request.app.state.settings
     if not settings.semantic_anatomy_enabled:
-        return None, settings.semantic_anatomy_severe_confidence_micros
+        return (
+            None,
+            settings.semantic_anatomy_severe_confidence_micros,
+            settings.semantic_anatomy_mode,
+        )
     revision = settings.semantic_anatomy_model_revision
     if revision is None:
         raise RuntimeError("validated semantic anatomy settings are incomplete")
@@ -416,6 +516,7 @@ def _semantic_gate_configuration(request: Request) -> tuple[str | None, int]:
             model_revision=revision,
         ).profile_sha256,
         settings.semantic_anatomy_severe_confidence_micros,
+        settings.semantic_anatomy_mode,
     )
 
 
@@ -446,4 +547,33 @@ def _http_error(
     return HTTPException(
         status_code=status.HTTP_409_CONFLICT,
         detail="review request conflicts with current state",
+    )
+
+
+def _semantic_feedback_http_error(
+    error: (
+        SemanticFeedbackAssessmentNotReadyError
+        | SemanticFeedbackConflictError
+        | SemanticFeedbackNotFoundError
+        | SemanticFeedbackValidationError
+    ),
+) -> HTTPException:
+    if isinstance(error, SemanticFeedbackNotFoundError):
+        return HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="semantic assessment was not found",
+        )
+    if isinstance(error, SemanticFeedbackValidationError):
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="semantic anatomy feedback is invalid",
+        )
+    if isinstance(error, SemanticFeedbackAssessmentNotReadyError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="semantic assessment is not ready for feedback",
+        )
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="different semantic anatomy feedback is already recorded",
     )

@@ -3,6 +3,7 @@ from pydantic import ValidationError
 
 from gen_automation.config import Environment, Settings
 from gen_automation.domain.deliverability import PATREON_MAX_ARCHIVE_BYTES
+from gen_automation.domain.enums import SemanticEnforcementMode
 from gen_automation.domain.signing import derive_public_key, encode_base64url
 
 WORKER_SIGNING_PRIVATE_KEY = encode_base64url(bytes(range(1, 33)))
@@ -181,6 +182,50 @@ def test_protected_network_boundary_requires_ingress_guards() -> None:
             trusted_proxy_cidrs=TRUSTED_PROXY_CIDRS,
             ingress_rate_limit_configured=True,
         )
+
+
+def test_semantic_anatomy_defaults_to_non_blocking_shadow_mode() -> None:
+    assert Settings().semantic_anatomy_mode == SemanticEnforcementMode.SHADOW
+
+
+def test_protected_semantic_endpoint_allows_only_exact_loopback_gateway() -> None:
+    common = {
+        "environment": Environment.STAGING,
+        "database_url": "postgresql+psycopg://user:pass@db/example",
+        "public_base_url": "https://studio.example.com",
+        "session_secret": SESSION_SECRET,
+        "auth_enabled": True,
+        "auth_totp_active_key_id": "totp-key-1",
+        "auth_totp_encryption_keys": {"totp-key-1": TOTP_ENCRYPTION_KEY},
+        "trusted_proxy_cidrs": TRUSTED_PROXY_CIDRS,
+        "ingress_rate_limit_configured": True,
+        "ingress_request_guards_configured": True,
+        "storage_enabled": True,
+        "storage_bucket": "private-assets",
+        "background_runtime_enabled": True,
+        "quality_scoring_enabled": True,
+        "semantic_anatomy_enabled": True,
+        "semantic_anatomy_model_revision": "60595ebc30ec8e3b1d3b9e65d4943ca011c0006a",
+    }
+    settings = Settings(
+        **common,  # type: ignore[arg-type]
+        semantic_anatomy_endpoint_url="http://127.0.0.1:8091/v1/anatomy/assess",
+    )
+    assert str(settings.semantic_anatomy_endpoint_url) == (
+        "http://127.0.0.1:8091/v1/anatomy/assess"
+    )
+
+    for unsafe_url in (
+        "http://localhost:8091/v1/anatomy/assess",
+        "http://127.0.0.1:8092/v1/anatomy/assess",
+        "http://127.0.0.1:8091/health/ready",
+        "http://127.0.0.1:8091/v1/anatomy/assess?redirect=true",
+    ):
+        with pytest.raises(ValidationError, match="exact loopback"):
+            Settings(
+                **common,  # type: ignore[arg-type]
+                semantic_anatomy_endpoint_url=unsafe_url,
+            )
 
 
 @pytest.mark.parametrize(

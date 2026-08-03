@@ -44,7 +44,7 @@ require_service_directory() {
     fail "$path must have mode 0700"
 }
 
-for file in deploy.env control-plane.env patreon-browser.env caddy.env; do
+for file in deploy.env control-plane.env patreon-browser.env semantic-gateway.env caddy.env; do
   require_private_root_file "$config_root/$file"
 done
 
@@ -85,6 +85,7 @@ done
 for image_key in \
   GEN_AUTOMATION_CONTROL_PLANE_MEGA_IMAGE \
   GEN_AUTOMATION_PATREON_BROWSER_IMAGE \
+  GEN_AUTOMATION_SEMANTIC_GATEWAY_IMAGE \
   GEN_AUTOMATION_NGINX_IMAGE \
   GEN_AUTOMATION_CADDY_IMAGE; do
   image="$(env_value "$image_key" "$config_root/deploy.env")"
@@ -98,6 +99,12 @@ done
   fail "control-plane publication package cap must be exactly 167772160 bytes"
 [ "$(env_value GEN_AUTOMATION_PATREON_BROWSER_SIDECAR_URL "$config_root/control-plane.env")" = "http://127.0.0.1:8090/v1/publish" ] ||
   fail "control-plane Patreon sidecar URL must remain loopback-only"
+[ "$(env_value GEN_AUTOMATION_SEMANTIC_ANATOMY_ENDPOINT_URL "$config_root/control-plane.env")" = "http://127.0.0.1:8091/v1/anatomy/assess" ] ||
+  fail "control-plane semantic gateway URL must remain loopback-only"
+[ "$(env_value GEN_AUTOMATION_SEMANTIC_ANATOMY_MODEL "$config_root/control-plane.env")" = "$(env_value GEN_AUTOMATION_SEMANTIC_GATEWAY_MODEL "$config_root/semantic-gateway.env")" ] ||
+  fail "control-plane and semantic gateway model identifiers must match"
+[ "$(env_value GEN_AUTOMATION_SEMANTIC_ANATOMY_MODEL_REVISION "$config_root/control-plane.env")" = "$(env_value GEN_AUTOMATION_SEMANTIC_GATEWAY_MODEL_REVISION "$config_root/semantic-gateway.env")" ] ||
+  fail "control-plane and semantic gateway model revisions must match"
 [ "$(env_value GEN_AUTOMATION_INGRESS_RATE_LIMIT_CONFIGURED "$config_root/control-plane.env")" = "true" ] ||
   fail "control-plane must assert the validated nginx rate limit"
 [ "$(env_value GEN_AUTOMATION_INGRESS_REQUEST_GUARDS_CONFIGURED "$config_root/control-plane.env")" = "true" ] ||

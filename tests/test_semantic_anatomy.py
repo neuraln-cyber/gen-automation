@@ -37,6 +37,7 @@ from gen_automation.domain.enums import (
     ReviewDecisionValue,
     ScoringRunState,
     SemanticAssessmentState,
+    SemanticEnforcementMode,
     SemanticIssueCode,
     SemanticVerdict,
 )
@@ -473,6 +474,15 @@ def test_high_confidence_severe_bucket_is_last_visible_and_overridable(
     tmp_path: Path,
 ) -> None:
     context = asyncio.run(_seed_review_api(_settings(tmp_path / "semantic-dashboard.db")))
+    enforced_settings = context.settings.model_copy(
+        update={
+            "semantic_anatomy_enabled": True,
+            "semantic_anatomy_mode": SemanticEnforcementMode.ENFORCE,
+            "semantic_anatomy_endpoint_url": "http://semantic.internal/v1/anatomy/assess",
+            "semantic_anatomy_model": _MODEL,
+            "semantic_anatomy_model_revision": _REVISION,
+        }
+    )
     task_id = asyncio.run(_create_task(context))
     asyncio.run(
         _seed_dashboard_assessments_and_override(
@@ -483,7 +493,7 @@ def test_high_confidence_severe_bucket_is_last_visible_and_overridable(
             reviewer_id=context.users[AdminRole.REVIEWER].id,
         )
     )
-    app = create_app(context.settings)
+    app = create_app(enforced_settings)
     action = f"/dashboard/review-tasks/{task_id}"
     with TestClient(
         app,
@@ -491,7 +501,7 @@ def test_high_confidence_severe_bucket_is_last_visible_and_overridable(
         client=("192.0.2.99", 50000),
     ) as client:
         app.state.object_store = SameOriginReviewStore()
-        _login(client, context.settings, context.users[AdminRole.REVIEWER])
+        _login(client, enforced_settings, context.users[AdminRole.REVIEWER])
         page = client.get(action)
 
     assert page.status_code == 200
@@ -523,6 +533,7 @@ def test_configured_semantic_gate_blocks_api_and_guides_owner_override(
     enabled_settings = context.settings.model_copy(
         update={
             "semantic_anatomy_enabled": True,
+            "semantic_anatomy_mode": SemanticEnforcementMode.ENFORCE,
             "semantic_anatomy_endpoint_url": "http://semantic.internal/v1/anatomy/assess",
             "semantic_anatomy_model": _MODEL,
             "semantic_anatomy_model_revision": _REVISION,
@@ -583,6 +594,7 @@ def test_configured_semantic_gate_blocks_api_and_guides_owner_override(
     assert summary.status_code == 200
     assert summary.json()["semantic_gate"] == {
         "enabled": True,
+        "mode": "enforce",
         "ranked_asset_count": 2,
         "terminal_count": 2,
         "pending_count": 0,

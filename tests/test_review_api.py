@@ -644,6 +644,7 @@ def test_review_mutations_require_origin_csrf_and_replay_idempotently(
     }
     assert summary_body["semantic_gate"] == {
         "enabled": False,
+        "mode": "shadow",
         "ranked_asset_count": 2,
         "terminal_count": 0,
         "pending_count": 0,

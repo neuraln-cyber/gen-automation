@@ -24,6 +24,7 @@ def test_staging_images_are_runtime_required_immutable_digests() -> None:
     for key in (
         "GEN_AUTOMATION_CONTROL_PLANE_MEGA_IMAGE",
         "GEN_AUTOMATION_PATREON_BROWSER_IMAGE",
+        "GEN_AUTOMATION_SEMANTIC_GATEWAY_IMAGE",
         "GEN_AUTOMATION_NGINX_IMAGE",
         "GEN_AUTOMATION_CADDY_IMAGE",
     ):
@@ -41,7 +42,8 @@ def test_imds_network_boundary_and_loopback_ingress_are_explicit() -> None:
     nginx = _text("nginx.conf")
     controller = _service(compose, "control-plane-mega", "ingress-guard")
     ingress = _service(compose, "ingress-guard", "caddy")
-    patreon = _service(compose, "patreon-browser", "control-plane-mega")
+    patreon = _service(compose, "patreon-browser", "semantic-gateway")
+    semantic = _service(compose, "semantic-gateway", "control-plane-mega")
 
     assert "network_mode: host" in controller
     assert '\n      - --host\n      - "127.0.0.1"' in controller
@@ -59,6 +61,14 @@ def test_imds_network_boundary_and_loopback_ingress_are_explicit() -> None:
     assert "target: /state" in patreon
     assert "AWS_ACCESS_KEY" not in patreon
     assert "AWS_SECRET" not in patreon
+
+    assert "network_mode:" not in semantic
+    assert "semantic-egress" in semantic
+    assert '"127.0.0.1:8091:8080/tcp"' in semantic
+    assert "AWS_ACCESS_KEY" not in semantic
+    assert "AWS_SECRET" not in semantic
+    assert "/var/run/docker.sock" not in semantic
+    assert "http://127.0.0.1:8091/v1/anatomy/assess" in controller
 
     assert 'user: "10003:10003"' in ingress
     assert "network_mode: host" in ingress
@@ -140,10 +150,11 @@ def test_containers_are_ordered_health_checked_and_not_privileged() -> None:
     compose = _text("compose.yaml")
     controller = _service(compose, "control-plane-mega", "ingress-guard")
     ingress = _service(compose, "ingress-guard", "caddy")
-    patreon = _service(compose, "patreon-browser", "control-plane-mega")
+    patreon = _service(compose, "patreon-browser", "semantic-gateway")
+    semantic = _service(compose, "semantic-gateway", "control-plane-mega")
     caddy = _service(compose, "caddy", "patreon-egress")
 
-    for service in (patreon, controller, ingress, caddy):
+    for service in (patreon, semantic, controller, ingress, caddy):
         assert "restart: unless-stopped" in service
         assert "healthcheck:" in service
         assert "cap_drop:\n      - ALL" in service
@@ -152,11 +163,12 @@ def test_containers_are_ordered_health_checked_and_not_privileged() -> None:
         assert "/var/run/docker.sock" not in service
         assert "/run/docker.sock" not in service
 
-    for service in (patreon, controller, ingress):
+    for service in (patreon, semantic, controller, ingress):
         assert "no-new-privileges:true" in service
     assert "no-new-privileges:true" not in caddy
     assert "cap_add:\n      - NET_BIND_SERVICE" in caddy
     assert "patreon-browser:\n        condition: service_healthy" in controller
+    assert "semantic-gateway:\n        condition: service_healthy" in controller
     assert "control-plane-mega:\n        condition: service_healthy" in ingress
     assert "ingress-guard:\n        condition: service_healthy" in caddy
     assert "restart: true" in controller
@@ -259,6 +271,7 @@ def test_rds_ca_bundle_is_pinned_verified_and_mounted_read_only() -> None:
 def test_environment_templates_contain_placeholders_not_secret_values() -> None:
     controller = _text("control-plane.env.example")
     patreon = _text("patreon-browser.env.example")
+    semantic = _text("semantic-gateway.env.example")
     caddy = _text("caddy.env.example")
 
     for key in (
@@ -272,12 +285,25 @@ def test_environment_templates_contain_placeholders_not_secret_values() -> None:
     ):
         assert re.search(rf"(?m)^{key}=$", controller)
     assert re.search(r"(?m)^GEN_AUTOMATION_PATREON_BROWSER_SHARED_SECRET=$", patreon)
+    assert re.search(
+        r"(?m)^GEN_AUTOMATION_SEMANTIC_GATEWAY_UPSTREAM_API_KEY=$",
+        semantic,
+    )
+    assert re.search(
+        r"(?m)^GEN_AUTOMATION_SEMANTIC_GATEWAY_UPSTREAM_CHAT_COMPLETIONS_URL=$",
+        semantic,
+    )
     assert re.search(r"(?m)^GEN_AUTOMATION_HOSTNAME=$", caddy)
     assert "GEN_AUTOMATION_STORAGE_ACCESS_KEY_ID=" not in controller
     assert "GEN_AUTOMATION_STORAGE_SECRET_ACCESS_KEY=" not in controller
     assert "GEN_AUTOMATION_STORAGE_SESSION_TOKEN=" not in controller
     assert "GEN_AUTOMATION_BACKGROUND_PUBLICATION_MAX_PACKAGE_BYTES=167772160" in controller
     assert "GEN_AUTOMATION_PATREON_BROWSER_MAX_PACKAGE_BYTES=167772160" in patreon
+    assert "GEN_AUTOMATION_SEMANTIC_ANATOMY_MODE=shadow" in controller
+    assert (
+        "GEN_AUTOMATION_SEMANTIC_ANATOMY_ENDPOINT_URL="
+        "http://127.0.0.1:8091/v1/anatomy/assess" in controller
+    )
 
 
 def test_single_owner_staging_session_is_persistent_but_step_up_stays_short() -> None:
