@@ -78,6 +78,16 @@ output "control_plane_role_arn" {
   value       = aws_iam_role.control_plane.arn
 }
 
+output "github_actions_deploy_role_arn" {
+  description = "Optional short-lived GitHub Actions role for exact main-branch SSM deployments."
+  value       = try(aws_iam_role.github_actions_deploy[0].arn, null)
+}
+
+output "github_actions_oidc_provider_arn" {
+  description = "GitHub Actions OIDC provider used by the optional staging deploy role."
+  value       = local.github_actions_oidc_provider_arn
+}
+
 output "cloudwatch_log_group_name" {
   description = "Bootstrap and runtime CloudWatch log group."
   value       = aws_cloudwatch_log_group.staging.name

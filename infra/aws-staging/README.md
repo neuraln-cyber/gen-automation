@@ -11,6 +11,26 @@ disk, and private single-AZ RDS PostgreSQL 17.10 on `db.t4g.micro`. The private
 disk keeps MEGAcmd state separate from the Patreon browser's signed-in Chromium
 profile and idempotency SQLite state.
 
+Set `github_actions_deploy_enabled = true` to add a keyless deployment identity
+for `neuraln-cyber/gen-automation`. Its trust policy accepts GitHub OIDC tokens
+only when the immutable owner ID is `310034173`, the immutable repository ID is
+`1314605368`, the independent repository-name claim is exactly
+`neuraln-cyber/gen-automation`, and the token comes from the
+`Deploy staging control plane` workflow on `refs/heads/main`. Its permissions
+can run `AWS-RunShellScript` only on this module's exact control-plane instance.
+The customized GitHub subject must be exactly
+`repo:neuraln-cyber@310034173/gen-automation@1314605368:ref:refs/heads/main`.
+It cannot plan or apply the
+infrastructure, read application secrets, access buckets, or assume the EC2
+runtime role. The deployment role uses short-lived web-identity credentials;
+never create AWS access keys for GitHub.
+
+An AWS account can have only one IAM OIDC provider for GitHub. Leave
+`github_actions_oidc_provider_arn = null` when this state should create it. If
+the account already has one, set that variable to its exact ARN instead; the
+module references it and verifies the GitHub issuer and `sts.amazonaws.com`
+audience before creating the role.
+
 ## Files
 
 - `backend.s3.tfbackend.example`: partial, non-secret S3 backend configuration.
@@ -59,6 +79,9 @@ Official references:
   host-networked process.
 - Runtime and migration PostgreSQL roles are created in a one-off SSM session;
   the RDS master credential is never injected into the long-running app.
+- The optional GitHub OIDC role is for reviewed main-branch application
+  deployments only. Infrastructure plans and applies still require the
+  separately authenticated infrastructure operator.
 - Application-generated secret values and the optional X secret JSON are
   created outside IaC so plaintext cannot enter plan files or state.
 - The one-time MEGAcmd and Patreon Chromium logins happen only after the

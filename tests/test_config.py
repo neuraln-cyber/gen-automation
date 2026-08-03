@@ -80,6 +80,39 @@ def test_enabled_authentication_requires_keys_and_bounded_sessions() -> None:
         )
 
 
+def test_enabled_authentication_accepts_bounded_single_owner_session() -> None:
+    settings = Settings(
+        environment=Environment.TEST,
+        auth_enabled=True,
+        session_secret=SESSION_SECRET,
+        auth_totp_active_key_id="totp-key-1",
+        auth_totp_encryption_keys={"totp-key-1": TOTP_ENCRYPTION_KEY},
+        auth_session_absolute_seconds=90 * 86400,
+        auth_session_idle_seconds=30 * 86400,
+        auth_recent_auth_seconds=3600,
+    )
+
+    assert settings.auth_session_absolute_seconds == 90 * 86400
+    assert settings.auth_session_idle_seconds == 30 * 86400
+    assert settings.auth_recent_auth_seconds == 3600
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("auth_session_absolute_seconds", 90 * 86400 + 1),
+        ("auth_session_idle_seconds", 30 * 86400 + 1),
+        ("auth_recent_auth_seconds", 3601),
+    ),
+)
+def test_authentication_rejects_session_values_above_single_owner_bounds(
+    field: str,
+    value: int,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(**{field: value})
+
+
 def test_administrator_enrollment_expiry_is_bounded() -> None:
     assert Settings().auth_enrollment_invite_ttl_seconds == 86400
     with pytest.raises(ValidationError):

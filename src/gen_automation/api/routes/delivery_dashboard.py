@@ -31,6 +31,7 @@ from gen_automation.api.browser_delivery_forms import (
 from gen_automation.api.security import (
     PublicationReader,
     authentication_service,
+    require_publication_mutation_owner,
     require_publication_owner,
 )
 from gen_automation.config import Settings
@@ -261,7 +262,11 @@ async def dashboard_change_publication_guard(
 ) -> Response:
     try:
         form = await read_publication_guard_form(request)
-        owner = await _verified_owner(request, session, principal, form.csrf_token)
+        owner = await (
+            _verified_owner(request, session, principal, form.csrf_token)
+            if form.enabled
+            else _verified_mutation_owner(request, session, principal, form.csrf_token)
+        )
         await load_operator_delivery(session, review_task_id=review_task_id)
         expected_key = delivery_form_key(
             request.app.state.settings,
@@ -303,7 +308,7 @@ async def dashboard_change_publication_guard(
                 request,
                 principal,
                 status.HTTP_401_UNAUTHORIZED,
-                "Sign in again before changing the publication switch.",
+                "Confirm your password and authentication code before enabling publication.",
             )
         return _form_error(request, principal, status.HTTP_403_FORBIDDEN, "Request denied.")
     except OperatorDeliveryNotFoundError:
@@ -343,7 +348,7 @@ async def dashboard_prepare_outputs(
 ) -> Response:
     try:
         form = await read_prepare_output_form(request)
-        owner = await _verified_owner(request, session, principal, form.csrf_token)
+        owner = await _verified_mutation_owner(request, session, principal, form.csrf_token)
         expected_key = delivery_form_key(
             request.app.state.settings,
             session_id=owner.session_id,
@@ -425,8 +430,8 @@ async def dashboard_confirm_patreon_present(
         )
     except BrowserDeliveryFormError as error:
         return _form_error(request, principal, error.status_code, error.message)
-    except HTTPException:
-        return _form_error(request, principal, status.HTTP_403_FORBIDDEN, "Request denied.")
+    except HTTPException as error:
+        return _owner_http_error(request, principal, error)
     except OperatorDeliveryNotFoundError:
         return _form_error(
             request,
@@ -490,8 +495,8 @@ async def dashboard_confirm_patreon_absent(
         )
     except BrowserDeliveryFormError as error:
         return _form_error(request, principal, error.status_code, error.message)
-    except HTTPException:
-        return _form_error(request, principal, status.HTTP_403_FORBIDDEN, "Request denied.")
+    except HTTPException as error:
+        return _owner_http_error(request, principal, error)
     except OperatorDeliveryNotFoundError:
         return _form_error(
             request,
@@ -552,8 +557,8 @@ async def dashboard_prepare_destinations(
         )
     except BrowserDeliveryFormError as error:
         return _form_error(request, principal, error.status_code, error.message)
-    except HTTPException:
-        return _form_error(request, principal, status.HTTP_403_FORBIDDEN, "Request denied.")
+    except HTTPException as error:
+        return _owner_http_error(request, principal, error)
     except OperatorDeliveryInputError as error:
         return _form_error(
             request,
@@ -593,7 +598,7 @@ async def dashboard_upload_watermark(
     try:
         values, payload = await _read_watermark_form(request)
         csrf_token, idempotency_key, submission_id, display_name = values
-        owner = await _verified_owner(request, session, principal, csrf_token)
+        owner = await _verified_mutation_owner(request, session, principal, csrf_token)
         expected_key = delivery_form_key(
             request.app.state.settings,
             session_id=owner.session_id,
@@ -654,7 +659,7 @@ async def dashboard_download_patreon_package(
         )
     try:
         form = await read_package_download_form(request)
-        owner = await _verified_owner(request, session, principal, form.csrf_token)
+        owner = await _verified_mutation_owner(request, session, principal, form.csrf_token)
         result = await presign_patreon_package_download(
             session,
             store,
@@ -712,6 +717,43 @@ async def _verified_owner(
     ):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     return owner
+
+
+async def _verified_mutation_owner(
+    request: Request,
+    session: AsyncSession,
+    principal: AuthenticatedPrincipal,
+    csrf_token: str,
+) -> AuthenticatedPrincipal:
+    if principal.role != AdminRole.OWNER:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    owner = await require_publication_mutation_owner(
+        request,
+        session,
+        csrf_header=csrf_token,
+    )
+    settings: Settings = request.app.state.settings
+    if not settings.auth_enabled and not hmac.compare_digest(
+        csrf_token,
+        delivery_csrf_token(settings, session_id=owner.session_id),
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    return owner
+
+
+def _owner_http_error(
+    request: Request,
+    principal: AuthenticatedPrincipal,
+    error: HTTPException,
+) -> Response:
+    if error.status_code == status.HTTP_401_UNAUTHORIZED:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_401_UNAUTHORIZED,
+            "Confirm your password and authentication code, then retry this action.",
+        )
+    return _form_error(request, principal, status.HTTP_403_FORBIDDEN, "Request denied.")
 
 
 def _csrf_token(

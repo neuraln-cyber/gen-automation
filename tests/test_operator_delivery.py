@@ -138,11 +138,28 @@ async def test_owner_can_toggle_publication_guard_from_delivery_dashboard(
     app = FastAPI()
     app.state.settings = settings
     principal = _owner_principal(approved.owner_id)
+    recent_auth_calls = 0
+    mutation_auth_calls = 0
 
     async def verified_owner(*_args: object, **_kwargs: object) -> AuthenticatedPrincipal:
+        nonlocal recent_auth_calls
+        recent_auth_calls += 1
+        return principal
+
+    async def verified_mutation_owner(
+        *_args: object,
+        **_kwargs: object,
+    ) -> AuthenticatedPrincipal:
+        nonlocal mutation_auth_calls
+        mutation_auth_calls += 1
         return principal
 
     monkeypatch.setattr(delivery_routes, "require_publication_owner", verified_owner)
+    monkeypatch.setattr(
+        delivery_routes,
+        "require_publication_mutation_owner",
+        verified_mutation_owner,
+    )
 
     async with approved.database.sessions() as session:
         initial = await get_publication_guard(session)
@@ -210,6 +227,8 @@ async def test_owner_can_toggle_publication_guard_from_delivery_dashboard(
         unchanged = await get_publication_guard(session)
         assert unchanged.enabled
         assert unchanged.epoch == changed.epoch
+        assert recent_auth_calls == 2
+        assert mutation_auth_calls == 1
 
 
 @pytest.mark.asyncio
@@ -226,11 +245,28 @@ async def test_dashboard_blocks_enable_when_workers_are_disabled_but_allows_stop
     app = FastAPI()
     app.state.settings = settings
     principal = _owner_principal(approved.owner_id)
+    recent_auth_calls = 0
+    mutation_auth_calls = 0
 
     async def verified_owner(*_args: object, **_kwargs: object) -> AuthenticatedPrincipal:
+        nonlocal recent_auth_calls
+        recent_auth_calls += 1
+        return principal
+
+    async def verified_mutation_owner(
+        *_args: object,
+        **_kwargs: object,
+    ) -> AuthenticatedPrincipal:
+        nonlocal mutation_auth_calls
+        mutation_auth_calls += 1
         return principal
 
     monkeypatch.setattr(delivery_routes, "require_publication_owner", verified_owner)
+    monkeypatch.setattr(
+        delivery_routes,
+        "require_publication_mutation_owner",
+        verified_mutation_owner,
+    )
 
     async with approved.database.sessions() as session:
         initial = await get_publication_guard(session)
@@ -290,6 +326,8 @@ async def test_dashboard_blocks_enable_when_workers_are_disabled_but_allows_stop
         final = await get_publication_guard(session)
         assert not final.enabled
         assert final.epoch == enabled.epoch + 1
+        assert recent_auth_calls == 1
+        assert mutation_auth_calls == 1
 
 
 @pytest.mark.asyncio

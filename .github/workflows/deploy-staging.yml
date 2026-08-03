@@ -1,0 +1,237 @@
+name: Deploy staging control plane
+
+on:
+  workflow_run:
+    workflows: ["Publish immutable images"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  packages: read
+  id-token: write
+
+concurrency:
+  group: deploy-staging-control-plane
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Roll out immutable control plane
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      AWS_REGION: eu-central-1
+      AWS_STAGING_INSTANCE_ID: ${{ vars.AWS_STAGING_INSTANCE_ID }}
+      IMAGE_REPOSITORY: ghcr.io/neuraln-cyber/gen-automation/control-plane-mega
+      PUBLISH_RUN_ID: ${{ github.event.workflow_run.id }}
+    steps:
+      # This is a second-level workflow_run event (CI -> publish -> deploy), so
+      # do not infer the built revision from this run's head_sha. The exact SHA
+      # is carried by the completed publication run's bounded metadata artifact.
+      - name: Read the exact source revision from the publication run
+        id: publication_metadata
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$PUBLISH_RUN_ID" =~ ^[0-9]+$ ]]
+          artifact_count="$(
+            gh api \
+              --header 'Accept: application/vnd.github+json' \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${PUBLISH_RUN_ID}/artifacts" \
+              --jq '[.artifacts[] | select(.name == "staging-deploy-source")] | length'
+          )"
+          if [ "$artifact_count" = "0" ]; then
+            printf '%s\n' "The publication run did not publish a staging image; nothing will deploy."
+            printf '%s\n' "available=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [ "$artifact_count" = "1" ] || {
+            printf '%s\n' "Publication run contains ambiguous staging metadata artifacts." >&2
+            exit 1
+          }
+          metadata_dir="$RUNNER_TEMP/staging-deploy-source"
+          mkdir --parents "$metadata_dir"
+          gh run download "$PUBLISH_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name staging-deploy-source \
+            --dir "$metadata_dir"
+          source_revision="$(tr -d '\r\n' <"$metadata_dir/staging-source-revision")"
+          [[ "$source_revision" =~ ^[0-9a-f]{40}$ ]] || {
+            printf '%s\n' "Publication metadata does not contain a full lowercase Git SHA." >&2
+            exit 1
+          }
+          printf 'SOURCE_REVISION=%s\n' "$source_revision" >>"$GITHUB_ENV"
+          printf '%s\n' "available=true" >>"$GITHUB_OUTPUT"
+
+      - name: Require the published revision to remain the tip of main
+        id: main_gate
+        if: steps.publication_metadata.outputs.available == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] || {
+            printf '%s\n' "The publication source revision is not a full lowercase Git SHA." >&2
+            exit 1
+          }
+          latest_main="$(
+            gh api \
+              --header 'Accept: application/vnd.github+json' \
+              "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" \
+              --jq '.object.sha'
+          )"
+          if [ "$SOURCE_REVISION" != "$latest_main" ]; then
+            printf '%s\n' "A newer main revision exists; this stale publication will not deploy."
+            printf '%s\n' "deploy=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf '%s\n' "deploy=true" >>"$GITHUB_OUTPUT"
+
+      - name: Resolve and verify the published immutable image
+        if: steps.main_gate.outputs.deploy == 'true'
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$GHCR_TOKEN" |
+            docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin >/dev/null
+          image_tag="${IMAGE_REPOSITORY}:sha-${SOURCE_REVISION}"
+          manifest_json="$(
+            docker buildx imagetools inspect \
+              "$image_tag" \
+              --format '{{json .Manifest}}'
+          )"
+          image_json="$(
+            docker buildx imagetools inspect \
+              "$image_tag" \
+              --format '{{json .Image}}'
+          )"
+          image_digest="$(
+            MANIFEST_JSON="$manifest_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["MANIFEST_JSON"])["digest"])'
+          )"
+          image_revision="$(
+            IMAGE_JSON="$image_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.revision"])'
+          )"
+          [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            printf '%s\n' "Registry did not return a valid immutable digest." >&2
+            exit 1
+          }
+          [ "$image_revision" = "$SOURCE_REVISION" ] || {
+            printf '%s\n' "Published image revision label does not match its workflow source." >&2
+            exit 1
+          }
+          printf 'IMAGE_REF=%s@%s\n' "$IMAGE_REPOSITORY" "$image_digest" >>"$GITHUB_ENV"
+
+      - name: Validate non-secret deployment coordinates
+        if: steps.main_gate.outputs.deploy == 'true'
+        shell: bash
+        env:
+          AWS_STAGING_DEPLOY_ROLE_ARN: ${{ vars.AWS_STAGING_DEPLOY_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          [[ "$AWS_STAGING_DEPLOY_ROLE_ARN" =~ ^arn:aws:iam::861912887470:role/[A-Za-z0-9+=,.@_/-]+$ ]] || {
+            printf '%s\n' "AWS_STAGING_DEPLOY_ROLE_ARN is missing or outside the staging account." >&2
+            exit 1
+          }
+          [[ "$AWS_STAGING_INSTANCE_ID" =~ ^i-[0-9a-f]{8,17}$ ]] || {
+            printf '%s\n' "AWS_STAGING_INSTANCE_ID is missing or invalid." >&2
+            exit 1
+          }
+
+      - name: Exchange GitHub OIDC identity for the staging deploy role
+        if: steps.main_gate.outputs.deploy == 'true'
+        uses: aws-actions/configure-aws-credentials@acca2b1b2070338fb9fd1ca27ecee81d687e58e5 # v6.1.2
+        with:
+          role-to-assume: ${{ vars.AWS_STAGING_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+          allowed-account-ids: "861912887470"
+          role-duration-seconds: 3600
+          role-session-name: gen-automation-staging-${{ github.run_id }}
+
+      - name: Roll out through AWS Systems Manager
+        if: steps.main_gate.outputs.deploy == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_REF" =~ ^ghcr\.io/neuraln-cyber/gen-automation/control-plane-mega@sha256:[0-9a-f]{64}$ ]]
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+
+          latest_main="$(
+            gh api \
+              --header 'Accept: application/vnd.github+json' \
+              "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" \
+              --jq '.object.sha'
+          )"
+          if [ "$SOURCE_REVISION" != "$latest_main" ]; then
+            printf '%s\n' "A newer main revision appeared before submission; this rollout is now a no-op."
+            exit 0
+          fi
+
+          parameters_file="$RUNNER_TEMP/ssm-parameters.json"
+          SSM_IMAGE_REF="$IMAGE_REF" \
+          SSM_SOURCE_REVISION="$SOURCE_REVISION" \
+            python3 -c '
+          import json
+          import os
+          import shlex
+
+          image = os.environ["SSM_IMAGE_REF"]
+          revision = os.environ["SSM_SOURCE_REVISION"]
+          command = (
+              "sudo /usr/local/sbin/gen-automation-update-control-plane"
+              f" --image {shlex.quote(image)} --revision {shlex.quote(revision)}"
+          )
+          print(json.dumps({"commands": [command]}))
+          ' >"$parameters_file"
+
+          command_id="$(
+            aws ssm send-command \
+              --region "$AWS_REGION" \
+              --instance-ids "$AWS_STAGING_INSTANCE_ID" \
+              --document-name AWS-RunShellScript \
+              --comment "Immutable control-plane rollout for ${SOURCE_REVISION}" \
+              --timeout-seconds 2100 \
+              --parameters "file://${parameters_file}" \
+              --query 'Command.CommandId' \
+              --output text
+          )"
+
+          final_status=""
+          for _ in $(seq 1 420); do
+            final_status="$(
+              aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$command_id" \
+                --instance-id "$AWS_STAGING_INSTANCE_ID" \
+                --query 'Status' \
+                --output text 2>/dev/null || true
+            )"
+            case "$final_status" in
+              Success|Cancelled|TimedOut|Failed|Cancelling) break ;;
+            esac
+            sleep 5
+          done
+
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$command_id" \
+            --instance-id "$AWS_STAGING_INSTANCE_ID" \
+            --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
+            --output json
+          [ "$final_status" = "Success" ] || {
+            printf '%s\n' "SSM rollout finished with status: ${final_status:-unknown}" >&2
+            exit 1
+          }

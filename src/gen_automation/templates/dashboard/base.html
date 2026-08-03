@@ -967,6 +967,39 @@
         background: var(--danger-soft);
         color: #ffd7dc;
       }
+      .reauth-dialog {
+        width: min(calc(100vw - 2rem), 30rem);
+        max-height: calc(100dvh - 2rem);
+        overflow: auto;
+        padding: 0;
+        border: 1px solid var(--border-strong);
+        border-radius: 1.1rem;
+        background: var(--surface);
+        color: var(--text);
+        box-shadow: var(--shadow-lg);
+      }
+      .reauth-dialog::backdrop {
+        background: rgba(5, 5, 10, .78);
+        backdrop-filter: blur(5px);
+      }
+      .reauth-form {
+        display: grid;
+        gap: .9rem;
+        margin: 0;
+        padding: clamp(1.15rem, 4vw, 1.6rem);
+      }
+      .reauth-form h2, .reauth-form p { margin: 0; }
+      .reauth-form label { display: grid; gap: .42rem; }
+      .reauth-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: .65rem;
+        margin-top: .2rem;
+      }
+      @media (max-width: 480px) {
+        .reauth-actions { display: grid; grid-template-columns: 1fr; }
+        .reauth-actions button { width: 100%; }
+      }
       .token-list { display: flex; flex-wrap: wrap; gap: .45rem; }
       .token-list code, .digest {
         overflow-wrap: anywhere;

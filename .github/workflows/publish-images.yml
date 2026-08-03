@@ -83,3 +83,29 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
           create-storage-record: false
+
+  record-staging-source:
+    name: Record the exact published source revision
+    needs: publish
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Write non-secret deployment metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          printf '%s\n' "$SOURCE_SHA" >"$RUNNER_TEMP/staging-source-revision"
+      - name: Upload deployment metadata for the follow-on workflow
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staging-deploy-source
+          path: ${{ runner.temp }}/staging-source-revision
+          if-no-files-found: error
+          retention-days: 1

@@ -15,6 +15,17 @@ The operator identity needs permission to plan/apply the resources in this
 module, plus `iam:PassRole` for the exact created EC2 role. AWS account payment,
 Route53 domain ownership, and service quotas are owner actions.
 
+For routine application deployments without repeated AWS sign-in, set
+`github_actions_deploy_enabled = true`. Keep the reviewed default
+`github_actions_repository = "neuraln-cyber/gen-automation"`, immutable owner ID
+`310034173`, and immutable repository ID `1314605368`. The repository's GitHub
+OIDC subject template must include those immutable IDs and emit exactly
+`repo:neuraln-cyber@310034173/gen-automation@1314605368:ref:refs/heads/main`.
+If this AWS account already has the GitHub IAM OIDC provider, set
+`github_actions_oidc_provider_arn` to that exact ARN; otherwise leave it null so
+this state manages the provider. This is a one-time infrastructure apply. It
+does not create an IAM user or any long-lived AWS access key.
+
 Create a separate private S3 state bucket before initializing this module:
 
 - enable versioning and default server-side encryption;
@@ -53,6 +64,9 @@ Confirm the plan contains exactly:
 - two distinct versioned, encrypted, public-blocked S3 buckets;
 - exact-bucket IAM plus SSM, exact CloudWatch log group, RDS secret read, and
   optional exact X-secret rotation access;
+- when enabled, one GitHub OIDC provider (or an explicit reference to the
+  existing provider) and one main-branch deploy role whose `ssm:SendCommand`
+  access is limited to `AWS-RunShellScript` on the exact control-plane instance;
 - optional Route53 A record only when zone ID and hostname are both set;
 - CloudWatch EC2/RDS alarms, SNS email, and monthly budget; and
 - no secret value, private key, password, token, or application environment
@@ -104,6 +118,31 @@ Verify RDS has no public address, is in the two-subnet DB subnet group, accepts
 RDS-managed Secrets Manager secret. Perform a snapshot/restore drill before
 calling staging recoverable.
 
+### Keyless application deployment handoff
+
+After the one-time apply, record the non-secret
+`github_actions_deploy_role_arn` and `control_plane_instance_id` outputs as
+GitHub Actions repository variables. A reviewed workflow on `main` can then
+exchange its GitHub OIDC token for short-lived AWS credentials and deploy over
+SSM without an AWS browser login or stored AWS keys.
+
+The role trust requires `aud = sts.amazonaws.com`, the exact immutable subject
+`repo:neuraln-cyber@310034173/gen-automation@1314605368:ref:refs/heads/main`,
+the independent exact name claim `neuraln-cyber/gen-automation`, both immutable
+numeric ID claims, the `Deploy staging control plane` workflow name, and
+`refs/heads/main`. Its policy can create
+commands only through the AWS-owned `AWS-RunShellScript` document on this one
+instance. `GetCommandInvocation` uses `Resource = "*"` because that Systems
+Manager API does not support resource-level IAM permissions; it does not grant
+permission to create a command. The role cannot run OpenTofu, cancel unrelated
+commands, read Secrets Manager, access S3, or assume the EC2 runtime role.
+
+Keep command parameters free of passwords, tokens, and populated environment
+files because SSM command text is audit-visible. The workflow should invoke
+only the reviewed, root-owned host deployment helper with immutable image
+digests and then wait for its health-checked result. Infrastructure plans and
+applies remain a separate, explicitly authenticated operator action.
+
 ## 4. Database and application handoff
 
 Use the RDS-managed bootstrap secret only from a bounded one-off SSM operation
@@ -146,6 +185,15 @@ controller process. Configure the app:
   `/var/lib/gen-automation/integration-profiles/patreon-browser/state` to
   `/state` in the UID/GID 10001 Patreon browser sidecar; and
 - leave GPU allocation and external publication effects disabled.
+
+The committed staging environment example uses the bounded single-owner
+session profile: a 90-day absolute lifetime, a sliding 30-day idle lifetime,
+and a 1-hour recent-authentication window for sensitive actions. Authentication
+still uses password, TOTP, CSRF protection, opaque server-side sessions, and
+login throttling. Apply this profile only to the owner's private device, log out
+when deliberately ending a session, and revoke sessions if that device is lost.
+Existing sessions retain the expiry established when they were created, so sign
+in once after changing these values to receive the longer bounded session.
 
 Before activation, point the final DNS name at the EIP. The committed nginx
 guards are validated against the pulled image before the protected application

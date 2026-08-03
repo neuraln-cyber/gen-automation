@@ -24,6 +24,17 @@ salad_worker_artifact_object_versions = {
   # "worker/checkpoints/example-sha256.safetensors" = "opaque-s3-version-id"
 }
 
+# Exchange GitHub's main-branch OIDC token for a short-lived, exact-instance
+# SSM deploy role. This avoids AWS access keys and routine AWS browser logins.
+github_actions_deploy_enabled            = true
+github_actions_repository                = "neuraln-cyber/gen-automation"
+github_actions_repository_owner_id       = 310034173
+github_actions_repository_id             = 1314605368
+
+# Leave null when this module should create the account's GitHub OIDC provider.
+# If one already exists, set its exact ARN to reference and validate it instead.
+github_actions_oidc_provider_arn = null
+
 # Defaults implement ADR 0002. These explicit examples make cost-affecting
 # changes visible during review.
 instance_type                  = "t3a.medium"

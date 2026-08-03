@@ -5,10 +5,12 @@ from fastapi import APIRouter, Header, HTTPException, Request, Response, status
 from sqlalchemy import select
 
 from gen_automation.api.security import (
-    PublicationOwner,
+    PublicationMutationOwner,
+    PublicationMutationPrincipal,
     PublicationPrincipal,
     PublicationReader,
     Session,
+    require_recent_principal,
 )
 from gen_automation.db.models import (
     PublicationAttempt,
@@ -79,7 +81,7 @@ IdempotencyKey = Annotated[
 async def post_publication_intent(
     command: PublicationIntentCreate,
     session: Session,
-    principal: PublicationPrincipal,
+    principal: PublicationMutationPrincipal,
     idempotency_key: IdempotencyKey,
     response: Response,
 ) -> PublicationIntentMutationRead:
@@ -185,7 +187,7 @@ async def post_publication_revocation(
     intent_id: UUID,
     command: PublicationRevocationCreate,
     session: Session,
-    principal: PublicationPrincipal,
+    principal: PublicationMutationPrincipal,
     idempotency_key: IdempotencyKey,
     response: Response,
 ) -> PublicationRevocationRead:
@@ -289,7 +291,7 @@ async def post_patreon_package_download(
     command: PatreonPackageDownloadCreate,
     request: Request,
     session: Session,
-    principal: PublicationPrincipal,
+    principal: PublicationMutationPrincipal,
 ) -> PatreonPackageDownloadRead:
     store = cast(ObjectStore | None, request.app.state.object_store)
     if store is None:
@@ -338,11 +340,14 @@ async def get_global_publication_guard(
 )
 async def post_global_publication_guard(
     command: PublicationGuardChange,
+    request: Request,
     session: Session,
-    principal: PublicationOwner,
+    principal: PublicationMutationOwner,
     idempotency_key: IdempotencyKey,
     response: Response,
 ) -> PublicationGuardRead:
+    if command.enabled:
+        principal = await require_recent_principal(request, principal)
     try:
         result = await set_publication_guard(
             session,

@@ -192,6 +192,72 @@ variable "salad_worker_artifact_object_versions" {
   }
 }
 
+variable "github_actions_deploy_enabled" {
+  description = "Create a short-lived GitHub Actions OIDC role for main-branch deployments to the staging control plane."
+  type        = bool
+  default     = false
+}
+
+variable "github_actions_repository" {
+  description = "Exact GitHub owner/repository allowed to deploy from refs/heads/main."
+  type        = string
+  default     = "neuraln-cyber/gen-automation"
+
+  validation {
+    condition = can(regex(
+      "^[A-Za-z0-9][A-Za-z0-9_.-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$",
+      var.github_actions_repository,
+    ))
+    error_message = "github_actions_repository must be an exact GitHub owner/repository name without wildcards."
+  }
+}
+
+variable "github_actions_repository_owner_id" {
+  description = "Immutable numeric GitHub account ID for the repository owner used in the customized OIDC subject."
+  type        = number
+  default     = 310034173
+
+  validation {
+    condition = (
+      var.github_actions_repository_owner_id > 0
+      && floor(var.github_actions_repository_owner_id) == var.github_actions_repository_owner_id
+    )
+    error_message = "github_actions_repository_owner_id must be a positive integer."
+  }
+}
+
+variable "github_actions_repository_id" {
+  description = "Immutable numeric GitHub repository ID used in the customized OIDC subject."
+  type        = number
+  default     = 1314605368
+
+  validation {
+    condition = (
+      var.github_actions_repository_id > 0
+      && floor(var.github_actions_repository_id) == var.github_actions_repository_id
+    )
+    error_message = "github_actions_repository_id must be a positive integer."
+  }
+}
+
+variable "github_actions_oidc_provider_arn" {
+  description = "Optional existing IAM OIDC provider ARN for token.actions.githubusercontent.com. Leave null to manage one in this module when deployment is enabled."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = (
+      var.github_actions_oidc_provider_arn == null
+      || can(regex(
+        "^arn:[^:]+:iam::[0-9]{12}:oidc-provider/token\\.actions\\.githubusercontent\\.com$",
+        var.github_actions_oidc_provider_arn,
+      ))
+    )
+    error_message = "github_actions_oidc_provider_arn must be the complete IAM ARN for token.actions.githubusercontent.com."
+  }
+}
+
 variable "notification_email" {
   description = "Operator email for the SNS alarm and monthly budget subscription."
   type        = string

@@ -46,6 +46,9 @@ install -o root -g root -m 0755 \
 install -o root -g root -m 0755 \
   "$source_dir/bootstrap-owner.sh" \
   /usr/local/sbin/gen-automation-bootstrap-owner
+install -o root -g root -m 0755 \
+  "$source_dir/update-control-plane.sh" \
+  /usr/local/sbin/gen-automation-update-control-plane
 install -o root -g root -m 0644 \
   "$source_dir/gen-automation-staging.service" \
   /etc/systemd/system/gen-automation-staging.service

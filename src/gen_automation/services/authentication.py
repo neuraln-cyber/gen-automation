@@ -66,11 +66,11 @@ class AuthenticationPolicy:
     login_lockout_seconds: int
 
     def __post_init__(self) -> None:
-        if not 900 <= self.session_absolute_seconds <= 7 * 86400:
+        if not 900 <= self.session_absolute_seconds <= 90 * 86400:
             raise ValueError("absolute session duration is invalid")
-        if not 300 <= self.session_idle_seconds <= self.session_absolute_seconds:
+        if not 300 <= self.session_idle_seconds <= min(30 * 86400, self.session_absolute_seconds):
             raise ValueError("idle session duration is invalid")
-        if not 60 <= self.recent_auth_seconds <= self.session_idle_seconds:
+        if not 60 <= self.recent_auth_seconds <= min(3600, self.session_idle_seconds):
             raise ValueError("recent authentication duration is invalid")
         if not 60 <= self.login_window_seconds <= 3600:
             raise ValueError("login window is invalid")
