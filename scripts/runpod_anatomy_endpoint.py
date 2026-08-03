@@ -21,8 +21,7 @@ RUNPOD_API_ROOT = "https://rest.runpod.io/v1"
 MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 MODEL_REVISION = "60595ebc30ec8e3b1d3b9e65d4943ca011c0006a"
 WORKER_IMAGE = (
-    "runpod/worker-v1-vllm@"
-    "sha256:cda7e80957d736e82b8c040eee69e0b6a7fd9d0fa6c7c74ef247d79b89bf9cab"
+    "runpod/worker-v1-vllm@sha256:cda7e80957d736e82b8c040eee69e0b6a7fd9d0fa6c7c74ef247d79b89bf9cab"
 )
 TEMPLATE_NAME = "gen-automation-anatomy-qwen3-vl-8b-v1"
 ENDPOINT_NAME = "gen-automation-anatomy-staging"

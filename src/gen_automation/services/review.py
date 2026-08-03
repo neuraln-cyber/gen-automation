@@ -1395,9 +1395,7 @@ async def get_review_summary(
         semantic_severe_confidence_micros=_validate_semantic_confidence_threshold(
             semantic_severe_confidence_micros
         ),
-        semantic_enforcement_mode=_validate_semantic_enforcement_mode(
-            semantic_enforcement_mode
-        ),
+        semantic_enforcement_mode=_validate_semantic_enforcement_mode(semantic_enforcement_mode),
     )
 
 

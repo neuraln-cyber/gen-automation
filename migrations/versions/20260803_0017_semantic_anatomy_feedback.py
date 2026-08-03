@@ -9,11 +9,14 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects import postgresql
 
 revision: str = "20260803_0017"
 down_revision: str | None = "20260803_0016"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
+
+json_type = sa.JSON().with_variant(postgresql.JSONB(), "postgresql")
 
 
 semantic_feedback_agreement = sa.Enum(
@@ -135,7 +138,7 @@ def upgrade() -> None:
         sa.Column("sample_count", sa.Integer(), nullable=False),
         sa.Column("recommended_threshold_micros", sa.Integer(), nullable=True),
         sa.Column("ready_for_enforcement", sa.Boolean(), nullable=False),
-        sa.Column("report", sa.JSON(), nullable=False),
+        sa.Column("report", json_type, nullable=False),
         sa.Column("report_sha256", sa.String(length=64), nullable=False),
         sa.Column("created_by_user_id", sa.Uuid(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
@@ -168,9 +171,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["created_by_user_id"],
             ["admin_users.id"],
-            name=op.f(
-                "fk_semantic_calibration_artifacts_created_by_user_id_admin_users"
-            ),
+            name=op.f("fk_semantic_calibration_artifacts_created_by_user_id_admin_users"),
             ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_semantic_calibration_artifacts")),
@@ -278,8 +279,4 @@ def _drop_immutability_guards() -> None:
     if dialect == "postgresql":
         for table in tables:
             op.execute(sa.text(f"DROP TRIGGER IF EXISTS {table}_guard_mutation ON {table}"))
-            op.execute(
-                sa.text(
-                    f"DROP FUNCTION IF EXISTS gen_automation_guard_{table}_mutation()"
-                )
-            )
+            op.execute(sa.text(f"DROP FUNCTION IF EXISTS gen_automation_guard_{table}_mutation()"))

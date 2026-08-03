@@ -238,9 +238,7 @@ async def test_calibration_sweeps_thresholds_and_versions_immutable_artifacts(
         assert report_one.recommended_threshold_micros == 950_000
         assert report_one.ready_for_enforcement
         at_950 = next(
-            item
-            for item in report_one.threshold_sweep
-            if item.threshold_micros == 950_000
+            item for item in report_one.threshold_sweep if item.threshold_micros == 950_000
         )
         assert (at_950.true_positive, at_950.false_positive) == (1, 1)
 

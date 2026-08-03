@@ -236,9 +236,7 @@ async def record_semantic_anatomy_feedback(
         or assessment.confidence_micros is None
         or assessment.response_sha256 is None
     ):
-        raise SemanticFeedbackAssessmentNotReadyError(
-            "semantic assessment is not completed"
-        )
+        raise SemanticFeedbackAssessmentNotReadyError("semantic assessment is not completed")
     derived_agreement = agreement_for_ground_truth(assessment.verdict, normalized_truth)
     if agreement is not None and _agreement(agreement) != derived_agreement:
         raise SemanticFeedbackValidationError(
@@ -314,10 +312,7 @@ async def load_semantic_anatomy_feedback(
             )
         )
     ).all()
-    return {
-        row.semantic_assessment_id: _feedback_result(row, created=False)
-        for row in rows
-    }
+    return {row.semantic_assessment_id: _feedback_result(row, created=False) for row in rows}
 
 
 async def build_semantic_calibration_report(
@@ -363,17 +358,13 @@ async def build_semantic_calibration_report(
             "samples": [sample.identity_wire() for sample in samples],
         }
     )
-    good_count = sum(
-        sample.ground_truth == SemanticGroundTruth.ANATOMY_GOOD for sample in samples
-    )
+    good_count = sum(sample.ground_truth == SemanticGroundTruth.ANATOMY_GOOD for sample in samples)
     defect_count = sum(
         sample.ground_truth == SemanticGroundTruth.ANATOMY_DEFECT for sample in samples
     )
     unjudgeable_count = len(samples) - good_count - defect_count
     labeled = tuple(
-        sample
-        for sample in samples
-        if sample.ground_truth != SemanticGroundTruth.UNJUDGEABLE
+        sample for sample in samples if sample.ground_truth != SemanticGroundTruth.UNJUDGEABLE
     )
     thresholds = list(range(0, 1_000_001, threshold_step_micros))
     if thresholds[-1] != 1_000_000:
@@ -690,9 +681,7 @@ def _note(value: str | None) -> str | None:
 
 def _sha256(value: str, *, label: str) -> str:
     normalized = value.strip().lower()
-    invalid_character = any(
-        character not in "0123456789abcdef" for character in normalized
-    )
+    invalid_character = any(character not in "0123456789abcdef" for character in normalized)
     if len(normalized) != 64 or invalid_character:
         raise SemanticFeedbackValidationError(f"{label} must be a lowercase SHA-256 digest")
     return normalized

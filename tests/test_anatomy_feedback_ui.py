@@ -231,9 +231,9 @@ def test_dashboard_feedback_is_owner_only_and_ignores_issue_for_good_label(
 
 def test_anatomy_feedback_template_is_quick_responsive_and_explicit() -> None:
     root = Path(__file__).parents[1]
-    template = (
-        root / "src/gen_automation/templates/dashboard/review_task.html"
-    ).read_text(encoding="utf-8")
+    template = (root / "src/gen_automation/templates/dashboard/review_task.html").read_text(
+        encoding="utf-8"
+    )
     css = (root / "src/gen_automation/static/dashboard_ux.css").read_text(encoding="utf-8")
 
     assert 'data-semantic-mode="{{ semantic_mode }}"' in template
@@ -248,7 +248,7 @@ def test_anatomy_feedback_template_is_quick_responsive_and_explicit() -> None:
     assert "Flag correct" in template
     assert "semantic-issue-chip" in template
     assert "Assessment details" in template
-    assert "principal.role.value == \"owner\"" in template
+    assert 'principal.role.value == "owner"' in template
     assert "@media (max-width: 680px)" in css
     assert ".anatomy-feedback-actions { grid-template-columns: 1fr; }" in css
     assert "min-height: 3.2rem" in css

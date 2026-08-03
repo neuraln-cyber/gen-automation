@@ -10,6 +10,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import MetaData, create_engine, inspect, select, text
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 
 _LEGACY_DEPLOYMENT_NAMESPACE = UUID("ed71d302-4781-4ddc-949b-3b0c1c75f95a")
@@ -95,6 +96,16 @@ def test_postgresql_preview_constraint_uses_fixed_convention_name(
             "role = 'x_teaser'",
         )
     ]
+
+
+def test_semantic_feedback_report_uses_jsonb_on_postgresql() -> None:
+    configuration = Config("alembic.ini")
+    revision = ScriptDirectory.from_config(configuration).get_revision("20260803_0017")
+    assert revision is not None
+
+    report_type = revision.module.json_type.dialect_impl(postgresql.dialect())
+
+    assert isinstance(report_type, postgresql.JSONB)
 
 
 def test_foundation_migration_round_trip(

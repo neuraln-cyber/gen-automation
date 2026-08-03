@@ -505,9 +505,7 @@ async def dashboard_review_task(
                 "semantic_issue_codes": tuple(SemanticIssueCode),
                 "semantic_mode": semantic_mode,
                 "semantic_calibration": semantic_calibration,
-                "semantic_calibration_minimum_samples": (
-                    DEFAULT_CALIBRATION_MINIMUM_SAMPLES
-                ),
+                "semantic_calibration_minimum_samples": (DEFAULT_CALIBRATION_MINIMUM_SAMPLES),
                 "csrf_token": csrf_token,
                 "complete_idempotency_key": complete_idempotency_key,
                 "cancel_idempotency_key": cancel_idempotency_key,
@@ -870,6 +868,7 @@ def _review_assets(
     if set(decisions) != {master.asset_id for master in masters}:
         raise RankingIntegrityError("review and ranking assets differ")
     is_open = summary.state == ReviewTaskState.OPEN
+
     def is_flagged(master: RankedMaster) -> bool:
         assessment = semantic_assessments.get(master.asset_id)
         return bool(
