@@ -115,6 +115,26 @@ class FakeDownloader:
             yield content[offset : offset + self.chunk_size]
 
 
+@dataclass
+class CoordinatedDownloader:
+    blobs: dict[str, bytes]
+    expected_concurrency: int
+    active: int = 0
+    peak: int = 0
+    all_started: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def stream(self, artifact: ModelArtifactSpec) -> AsyncIterator[bytes]:
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        if self.active >= self.expected_concurrency:
+            self.all_started.set()
+        try:
+            await asyncio.wait_for(self.all_started.wait(), timeout=1)
+            yield self.blobs[artifact.logical_name]
+        finally:
+            self.active -= 1
+
+
 async def bootstrap_artifacts(
     manifest: ArtifactManifest,
     downloader: ArtifactDownloader,
@@ -186,6 +206,56 @@ async def test_streams_verifies_and_atomically_materializes_in_deterministic_ord
     assert all(not item.adopted_existing for item in result.artifacts)
     assert all(path.suffix == ".safetensors" for path in checkpoint_root.iterdir())
     assert all(path.suffix == ".safetensors" for path in lora_root.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_downloads_independent_model_artifacts_concurrently(
+    model_roots: tuple[Path, Path],
+) -> None:
+    checkpoint_root, lora_root = model_roots
+    contents = (
+        _safetensors(body=b"\x01"),
+        _safetensors(body=b"\x02"),
+        _safetensors(body=b"\x03"),
+    )
+    artifacts = (
+        _artifact(contents[0]),
+        _artifact(
+            contents[1],
+            logical_name="style-one",
+            kind=ArtifactKind.LORA,
+            target_filename="style-one.safetensors",
+            source_object_id="private/models/style-one",
+        ),
+        _artifact(
+            contents[2],
+            logical_name="style-two",
+            kind=ArtifactKind.LORA,
+            target_filename="style-two.safetensors",
+            source_object_id="private/models/style-two",
+        ),
+    )
+    downloader = CoordinatedDownloader(
+        blobs={
+            artifact.logical_name: content
+            for artifact, content in zip(artifacts, contents, strict=True)
+        },
+        expected_concurrency=len(artifacts),
+    )
+
+    result = await bootstrap_artifacts(
+        _manifest(*artifacts),
+        downloader,
+        checkpoint_root=checkpoint_root.resolve(),
+        lora_root=lora_root.resolve(),
+    )
+
+    assert downloader.peak == len(artifacts)
+    assert [item.logical_name for item in result.artifacts] == [
+        "illustrious-xl",
+        "style-one",
+        "style-two",
+    ]
 
 
 @pytest.mark.asyncio

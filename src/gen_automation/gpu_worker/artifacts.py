@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -28,6 +29,7 @@ MAX_TOTAL_ARTIFACT_BYTES = 64 * 1024 * 1024 * 1024
 MIN_FREE_SPACE_MARGIN_BYTES = 64 * 1024 * 1024
 MAX_SAFETENSORS_HEADER_BYTES = 16 * 1024 * 1024
 STREAM_READ_BYTES = 1024 * 1024
+MAX_PARALLEL_ARTIFACT_DOWNLOADS = 4
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SAFE_TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,223}(?:\.safetensors|\.pt)$")
@@ -597,7 +599,9 @@ async def bootstrap_artifacts(
         ArtifactKind.DETECTOR: detector,
         ArtifactKind.LORA: lora,
     }
-    materialized: list[MaterializedArtifact] = []
+    prepared: list[tuple[ModelArtifactSpec, _Root, Path, bool]] = []
+    required_bytes_by_device: dict[int, int] = {}
+    root_by_device: dict[int, _Root] = {}
     for artifact in manifest.artifacts:
         root = roots[artifact.kind]
         if root is None:
@@ -606,31 +610,65 @@ async def bootstrap_artifacts(
         destination = root.path / artifact.target_filename
         adopted = _adopt_existing(destination, artifact)
         if not adopted:
-            try:
-                free_bytes = shutil.disk_usage(root.path).free
-            except OSError:
-                raise ArtifactBootstrapError("artifact bootstrap failed") from None
-            if free_bytes < artifact.exact_size_bytes + MIN_FREE_SPACE_MARGIN_BYTES:
-                raise ArtifactBootstrapError("artifact bootstrap failed")
+            required_bytes_by_device[root.device] = (
+                required_bytes_by_device.get(root.device, 0) + artifact.exact_size_bytes
+            )
+            root_by_device.setdefault(root.device, root)
+        prepared.append((artifact, root, destination, adopted))
+
+    # Account for all concurrent transfers up front. The model roots normally
+    # share one ephemeral disk, so checking each file independently could
+    # overcommit it once downloads overlap.
+    for device, required_bytes in required_bytes_by_device.items():
+        try:
+            free_bytes = shutil.disk_usage(root_by_device[device].path).free
+        except OSError:
+            raise ArtifactBootstrapError("artifact bootstrap failed") from None
+        if free_bytes < required_bytes + MIN_FREE_SPACE_MARGIN_BYTES:
+            raise ArtifactBootstrapError("artifact bootstrap failed")
+
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_ARTIFACT_DOWNLOADS)
+
+    async def download_missing(
+        artifact: ModelArtifactSpec,
+        root: _Root,
+        destination: Path,
+    ) -> None:
+        async with semaphore:
             await _write_download(
                 artifact=artifact,
                 downloader=downloader,
                 root=root,
                 destination=destination,
             )
-        materialized.append(
-            MaterializedArtifact(
-                logical_name=artifact.logical_name,
-                kind=artifact.kind,
-                target_filename=artifact.target_filename,
-                sha256=artifact.sha256,
-                size_bytes=artifact.exact_size_bytes,
-                adopted_existing=adopted,
-            )
+
+    downloads = [
+        asyncio.create_task(download_missing(artifact, root, destination))
+        for artifact, root, destination, adopted in prepared
+        if not adopted
+    ]
+    try:
+        await asyncio.gather(*downloads)
+    except BaseException:
+        for download in downloads:
+            download.cancel()
+        await asyncio.gather(*downloads, return_exceptions=True)
+        raise
+
+    materialized = tuple(
+        MaterializedArtifact(
+            logical_name=artifact.logical_name,
+            kind=artifact.kind,
+            target_filename=artifact.target_filename,
+            sha256=artifact.sha256,
+            size_bytes=artifact.exact_size_bytes,
+            adopted_existing=adopted,
         )
+        for artifact, _root, _destination, adopted in prepared
+    )
 
     return ArtifactBootstrapResult(
         version="v1",
         manifest_sha256=manifest.manifest_sha256,
-        artifacts=tuple(materialized),
+        artifacts=materialized,
     )
