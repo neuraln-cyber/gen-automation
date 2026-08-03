@@ -83,9 +83,7 @@ def test_apply_journals_before_api_calls_and_verifies_readback(
         calls.append(("list", path))
         return []
 
-    def fake_post(
-        _api_key: str, path: str, _payload: dict[str, Any]
-    ) -> dict[str, Any]:
+    def fake_post(_api_key: str, path: str, _payload: dict[str, Any]) -> dict[str, Any]:
         persisted = json.loads(state_file.read_text(encoding="utf-8"))
         resource_name = "template" if path == "/templates" else "endpoint"
         assert persisted["resources"][resource_name]["phase"] == "creating"
@@ -139,9 +137,7 @@ def test_apply_resumes_ambiguous_endpoint_creation_without_duplicate_post(
             return []
         return [endpoint] if endpoint_visible else []
 
-    def fake_post(
-        _api_key: str, path: str, _payload: dict[str, Any]
-    ) -> dict[str, Any]:
+    def fake_post(_api_key: str, path: str, _payload: dict[str, Any]) -> dict[str, Any]:
         nonlocal endpoint_posts
         if path == "/templates":
             return template
@@ -254,9 +250,7 @@ def test_definitive_create_rejection_does_not_grant_resource_ownership(
 
     monkeypatch.setattr(module, "_list", lambda _key, _path: [])
 
-    def reject_create(
-        _api_key: str, path: str, _payload: dict[str, Any]
-    ) -> dict[str, Any]:
+    def reject_create(_api_key: str, path: str, _payload: dict[str, Any]) -> dict[str, Any]:
         raise module.RunPodHTTPError("POST", path, 400, "invalid request")
 
     monkeypatch.setattr(module, "_post", reject_create)
@@ -286,9 +280,7 @@ def test_retry_rejection_preserves_and_reconciles_prior_ambiguous_attempt(
             return []
         return [endpoint] if endpoint_visible else []
 
-    def fake_post(
-        _api_key: str, path: str, _payload: dict[str, Any]
-    ) -> dict[str, Any]:
+    def fake_post(_api_key: str, path: str, _payload: dict[str, Any]) -> dict[str, Any]:
         nonlocal endpoint_posts, endpoint_visible
         if path == "/templates":
             return template
@@ -320,10 +312,7 @@ def test_retry_rejection_preserves_and_reconciles_prior_ambiguous_attempt(
     assert state["status"] == "ready"
     assert endpoint_posts == 2
     assert state["resources"]["endpoint"]["create_attempted"] is True
-    assert (
-        state["resources"]["endpoint"]["origin"]
-        == "reconciled-after-retry-rejection"
-    )
+    assert state["resources"]["endpoint"]["origin"] == "reconciled-after-retry-rejection"
 
 
 def test_documented_endpoint_readback_normalization_is_accepted() -> None:
@@ -365,9 +354,7 @@ def test_destroy_verifies_targets_deletes_endpoint_first_and_is_idempotent(
         resource = remote["template" if path.startswith("/templates") else "endpoint"]
         return [resource] if resource is not None else []
 
-    def fake_post(
-        _api_key: str, path: str, _payload: dict[str, Any]
-    ) -> dict[str, Any]:
+    def fake_post(_api_key: str, path: str, _payload: dict[str, Any]) -> dict[str, Any]:
         name = "template" if path == "/templates" else "endpoint"
         resource = _remote_template(module) if name == "template" else _remote_endpoint(module)
         remote[name] = resource

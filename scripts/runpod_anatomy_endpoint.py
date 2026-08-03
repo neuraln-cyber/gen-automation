@@ -31,9 +31,7 @@ STATE_SCHEMA = "gen-automation/runpod-anatomy-state/v2"
 
 class RunPodHTTPError(RuntimeError):
     def __init__(self, method: str, path: str, status_code: int, detail: str) -> None:
-        super().__init__(
-            f"RunPod API rejected {method} {path}: HTTP {status_code}: {detail}"
-        )
+        super().__init__(f"RunPod API rejected {method} {path}: HTTP {status_code}: {detail}")
         self.status_code = status_code
 
 
@@ -163,9 +161,7 @@ def _post(api_key: str, path: str, payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _get(
-    api_key: str, path: str, *, allow_not_found: bool = False
-) -> dict[str, Any] | None:
+def _get(api_key: str, path: str, *, allow_not_found: bool = False) -> dict[str, Any] | None:
     result = _request(api_key, path, method="GET", allow_not_found=allow_not_found)
     if result is None and allow_not_found:
         return None
@@ -250,9 +246,7 @@ def _mismatches(kind: str, actual: dict[str, Any], template_id: str | None) -> l
         "scalerType",
         "scalerValue",
     )
-    mismatches = [
-        field for field in required_fields if actual.get(field) != expected[field]
-    ]
+    mismatches = [field for field in required_fields if actual.get(field) != expected[field]]
     if "minCudaVersion" in actual and actual["minCudaVersion"] != expected["minCudaVersion"]:
         mismatches.append("minCudaVersion")
     if _endpoint_template_id(actual) != template_id:
@@ -271,9 +265,7 @@ def _mismatches(kind: str, actual: dict[str, Any], template_id: str | None) -> l
 def _verify(kind: str, actual: dict[str, Any], template_id: str | None = None) -> None:
     mismatches = _mismatches(kind, actual, template_id)
     if mismatches:
-        raise RuntimeError(
-            f"RunPod {kind} does not match the pinned plan: {', '.join(mismatches)}"
-        )
+        raise RuntimeError(f"RunPod {kind} does not match the pinned plan: {', '.join(mismatches)}")
 
 
 def _verify_identity(
@@ -303,18 +295,14 @@ def _verify_identity(
         raise RuntimeError("RunPod endpoint identity does not match this journal")
 
 
-def _read(
-    api_key: str, kind: str, resource_id: str
-) -> dict[str, Any] | None:
+def _read(api_key: str, kind: str, resource_id: str) -> dict[str, Any] | None:
     path = _id_path(kind, resource_id)
     if kind == "template":
         path += "?includeEndpointBoundTemplates=true"
     return _get(api_key, path, allow_not_found=True)
 
 
-def _reconcile(
-    api_key: str, kind: str, template_id: str | None = None
-) -> dict[str, Any] | None:
+def _reconcile(api_key: str, kind: str, template_id: str | None = None) -> dict[str, Any] | None:
     if kind == "template":
         items = _list(api_key, "/templates?includeEndpointBoundTemplates=true")
         candidates = [item for item in items if item.get("name") == TEMPLATE_NAME]
@@ -325,8 +313,7 @@ def _reconcile(
         candidates = [
             item
             for item in items
-            if item.get("name") == ENDPOINT_NAME
-            and _endpoint_template_id(item) == template_id
+            if item.get("name") == ENDPOINT_NAME and _endpoint_template_id(item) == template_id
         ]
     if not candidates:
         return None
@@ -447,15 +434,11 @@ def _checkpoint_resource(
     resource_id: str,
     origin: str,
 ) -> None:
-    _resource(journal, kind).update(
-        {"id": resource_id, "phase": "created", "origin": origin}
-    )
+    _resource(journal, kind).update({"id": resource_id, "phase": "created", "origin": origin})
     _write_journal(state_file, journal)
 
 
-def _record_error(
-    journal: dict[str, Any], state_file: Path, error: Exception, status: str
-) -> None:
+def _record_error(journal: dict[str, Any], state_file: Path, error: Exception, status: str) -> None:
     journal["status"] = status
     journal["last_error"] = {
         "at": _now(),
@@ -509,9 +492,7 @@ def _ensure(
             )
             _write_journal(state_file, journal)  # durable before POST
             payload = (
-                template_payload()
-                if kind == "template"
-                else endpoint_payload(template_id or "")
+                template_payload() if kind == "template" else endpoint_payload(template_id or "")
             )
             path = "/templates" if kind == "template" else "/endpoints"
             try:
@@ -541,9 +522,7 @@ def _ensure(
                             raise create_error
                         origin = "reconciled-after-retry-rejection"
                     else:
-                        resource.update(
-                            {"phase": "create_rejected", "create_attempted": False}
-                        )
+                        resource.update({"phase": "create_rejected", "create_attempted": False})
                         _write_journal(state_file, journal)
                         raise create_error
                 if actual is None:
@@ -635,14 +614,10 @@ def apply_plan(
         )
     api_key = _api_key()
     with _state_lock(state_file):
-        return _apply_plan_locked(
-            api_key=api_key, state_file=state_file, retry_create=retry_create
-        )
+        return _apply_plan_locked(api_key=api_key, state_file=state_file, retry_create=retry_create)
 
 
-def _apply_plan_locked(
-    *, api_key: str, state_file: Path, retry_create: bool
-) -> dict[str, Any]:
+def _apply_plan_locked(*, api_key: str, state_file: Path, retry_create: bool) -> dict[str, Any]:
     if state_file.exists():
         journal = _load_journal(state_file)
         status = str(journal.get("status", ""))
@@ -655,9 +630,7 @@ def _apply_plan_locked(
         journal = _new_journal()
     _write_journal(state_file, journal)  # first durable checkpoint before any API call
     try:
-        template_id = _ensure(
-            api_key, journal, state_file, "template", retry_create=retry_create
-        )
+        template_id = _ensure(api_key, journal, state_file, "template", retry_create=retry_create)
         endpoint_id = _ensure(
             api_key,
             journal,
@@ -743,9 +716,7 @@ def _destroy_one(
     desired = journal["desired"].get(kind)
     if not isinstance(desired, dict):
         raise RuntimeError(f"journal has no desired {kind} plan")
-    _verify_identity(
-        kind, actual, template_id, desired
-    )  # never delete an unrelated target
+    _verify_identity(kind, actual, template_id, desired)  # never delete an unrelated target
     resource["phase"] = "delete_pending"
     _write_journal(state_file, journal)  # durable before DELETE
     try:
@@ -761,14 +732,10 @@ def _destroy_one(
 
 def destroy_plan(*, state_file: Path, acknowledge_destroy: bool) -> dict[str, Any]:
     with _state_lock(state_file):
-        return _destroy_plan_locked(
-            state_file=state_file, acknowledge_destroy=acknowledge_destroy
-        )
+        return _destroy_plan_locked(state_file=state_file, acknowledge_destroy=acknowledge_destroy)
 
 
-def _destroy_plan_locked(
-    *, state_file: Path, acknowledge_destroy: bool
-) -> dict[str, Any]:
+def _destroy_plan_locked(*, state_file: Path, acknowledge_destroy: bool) -> dict[str, Any]:
     if not state_file.exists():
         raise RuntimeError(f"RunPod state file does not exist: {state_file}")
     journal = _load_journal(state_file, require_current_plan=False)

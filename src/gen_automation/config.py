@@ -593,8 +593,7 @@ class Settings(BaseSettings):
             errors.append("semantic cycle timeout must cover the VLM request plus cleanup")
         if (
             self.semantic_anatomy_enabled
-            and self.background_semantic_lease_seconds
-            <= self.background_semantic_timeout_seconds
+            and self.background_semantic_lease_seconds <= self.background_semantic_timeout_seconds
         ):
             errors.append("semantic lease must exceed the semantic cycle timeout")
         if self.derivative_rendering_enabled and not self.storage_enabled:
