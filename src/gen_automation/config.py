@@ -381,7 +381,11 @@ class Settings(BaseSettings):
         le=1024 * 1024,
     )
     salad_max_replicas: int = Field(default=1, ge=1, le=1)
-    salad_max_queued_jobs: int = Field(default=1, ge=1, le=1)
+    # Keep one running job plus two pending jobs in the local/provider pipeline.
+    # That small FIFO runway prevents scale-to-zero gaps between ordered batches
+    # without over-reserving the single-GPU budget or letting signed jobs wait
+    # unnecessarily long in Salad.
+    salad_max_queued_jobs: int = Field(default=3, ge=1, le=100)
     salad_gpu_class_ids: tuple[UUID, ...] = Field(default=(), max_length=16)
     salad_container_cpu: int = Field(default=4, ge=1, le=16)
     salad_container_memory_mb: int = Field(default=16 * 1024, ge=1024, le=64 * 1024)

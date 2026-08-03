@@ -462,6 +462,7 @@ def test_salad_accepts_a_complete_fail_closed_test_configuration() -> None:
     )
 
     assert settings.salad_max_replicas == 1
+    assert settings.salad_max_queued_jobs == 3
 
 
 def test_salad_deployment_timeout_covers_full_three_request_provisioning_chain() -> None:

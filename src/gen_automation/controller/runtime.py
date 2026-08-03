@@ -112,6 +112,13 @@ _RECONCILABLE_ATTEMPT_STATES = (
     GenerationAttemptState.RUNNING,
     GenerationAttemptState.CANCEL_REQUESTED,
 )
+_RUNTIME_REFRESH_BLOCKING_ATTEMPT_STATES = (
+    GenerationAttemptState.SUBMITTING,
+    GenerationAttemptState.SUBMITTED,
+    GenerationAttemptState.RUNNING,
+    GenerationAttemptState.UNKNOWN,
+    GenerationAttemptState.CANCEL_REQUESTED,
+)
 _DEPLOYMENT_WORK_STATES = (
     SaladDeploymentState.PLANNED,
     SaladDeploymentState.PROVISIONING,
@@ -180,7 +187,10 @@ def salad_deployment_config_from_settings(settings: Settings) -> SaladDeployment
         provider_configuration=provider_configuration,
         min_replicas=0,
         max_replicas=settings.salad_max_replicas,
-        desired_queue_length=settings.salad_max_queued_jobs,
+        # This is the provider's per-replica autoscaling target, not the
+        # controller's bounded prefetch runway. One queued job should be enough
+        # to keep the single allowed replica allocated.
+        desired_queue_length=1,
     )
 
 
@@ -1118,6 +1128,11 @@ class ControllerWorkloads:
         artifact_manifest = load_artifact_manifest(manifest_json.get_secret_value())
 
         async with self.sessions() as session:
+            # Keep the established guard -> deployment/attempt lock order used
+            # by every mutating Salad transaction. This also serializes the
+            # idle-boundary decision without introducing a cross-controller
+            # deadlock.
+            await self._lock_budget_guard(session)
             deployment = await session.scalar(
                 select(SaladDeployment)
                 .join(
@@ -1125,6 +1140,11 @@ class ControllerWorkloads:
                     GenerationAttempt.salad_deployment_id == SaladDeployment.id,
                 )
                 .where(GenerationAttempt.id == event.aggregate_id)
+                # Serialize the idle-to-active runtime refresh boundary across
+                # controller instances. The submission transaction commits its
+                # durable SUBMITTING marker before the provider POST, allowing
+                # the next event to observe warm work and skip the rollout.
+                .with_for_update(of=SaladDeployment)
             )
             if deployment is None:
                 raise RuntimeError("generation attempt deployment is unavailable")
@@ -1139,11 +1159,37 @@ class ControllerWorkloads:
                 upload_grant_ttl_seconds=self.settings.worker_upload_grant_ttl_seconds,
                 max_upload_bytes=self.settings.storage_max_image_bytes,
             )
-            await refresh_container_group_runtime(
-                deployment,
-                self.salad_client,
-                self.secret_resolver,
+            active_attempt_id = await session.scalar(
+                select(GenerationAttempt.id)
+                .where(
+                    GenerationAttempt.salad_deployment_id == deployment.id,
+                    GenerationAttempt.state.in_(_RUNTIME_REFRESH_BLOCKING_ATTEMPT_STATES),
+                )
+                .limit(1)
             )
+            if active_attempt_id is None:
+                # Bootstrap credentials are refreshed only at an idle-to-active
+                # boundary. PATCHing the container environment creates a Salad
+                # version and restarts every replica, so doing this per batch
+                # defeats warm GPU/model reuse. Subsequent ordered jobs reuse
+                # the running deployment while any durable provider work exists.
+                logger.info(
+                    "salad_runtime_refresh_at_work_boundary",
+                    salad_deployment_id=str(deployment.id),
+                    generation_attempt_id=str(event.aggregate_id),
+                )
+                await refresh_container_group_runtime(
+                    deployment,
+                    self.salad_client,
+                    self.secret_resolver,
+                )
+            else:
+                logger.debug(
+                    "salad_runtime_reused_for_batch",
+                    salad_deployment_id=str(deployment.id),
+                    generation_attempt_id=str(event.aggregate_id),
+                    active_generation_attempt_id=str(active_attempt_id),
+                )
             return await submit_prepared_attempt(
                 session,
                 self.salad_client,

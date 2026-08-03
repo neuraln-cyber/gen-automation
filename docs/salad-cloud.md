@@ -69,8 +69,8 @@ new versioned queue/group rather than mutating production in place.
 On controller startup, a fully configured database automatically gets one
 current immutable `SaladDeployment` intent. Startup itself performs no provider
 API request. An identical restart reuses the same row; changing the worker
-digest, provider names, GPU classes, resource sizing, runtime-binding set, queue
-limit, replica limit, or hourly cost ceiling creates the next version and marks
+digest, provider names, GPU classes, resource sizing, runtime-binding set,
+replica limit, or hourly cost ceiling creates the next version and marks
 the previous version for stop. The existing deployment reconciliation loop
 performs all remote creates and stops.
 
@@ -86,11 +86,14 @@ The non-secret provider inputs are:
 | `GEN_AUTOMATION_SALAD_CONTAINER_CPU` | `4`; 1–16 vCPU. |
 | `GEN_AUTOMATION_SALAD_CONTAINER_MEMORY_MB` | `16384`; 1024–65536 MiB. |
 | `GEN_AUTOMATION_SALAD_CONTAINER_STORAGE_BYTES` | `53687091200` (50 GiB); 10–250 GiB. |
+| `GEN_AUTOMATION_SALAD_MAX_QUEUED_JOBS` | `3`; 1-100. This is the controller's ordered prefetch window: one running job plus two pending jobs by default. It does not increase the replica ceiling or the provider autoscaling target. |
 | `GEN_AUTOMATION_SALAD_MAX_HOURLY_COST_USD` | `1.00`; positive, at most the daily budget, with micro-dollar precision. Configure it at or above the highest selected GPU rate because durable reservations and spend accounting use this ceiling. |
 
 Low priority and image caching are fixed for the MVP. The initial replica count
-and autoscaler minimum are fixed at zero; the validated maximum replica and
-queue-length settings remain capped at one.
+and autoscaler minimum are fixed at zero, and the validated maximum remains one
+GPU replica. The controller prefetches an ordered runway of jobs so that queue
+depth stays non-zero while a multi-batch set is active; after the final queued
+job, the same deployment still scales back to zero normally.
 
 ## Container group
 
@@ -98,7 +101,7 @@ The initial production posture is:
 
 - `replicas: 0`
 - queue autoscaler minimum `0`, maximum `1`
-- desired queue length `1`
+- desired queue length `1`; the independent controller prefetch window is `3`
 - queue polling every `15` seconds (the provider minimum)
 - low priority
 - one or more recently discovered and configuration-pinned 24 GB GPU classes
@@ -220,8 +223,10 @@ stage. Create the dedicated model-read identity, controller signing key and work
 public-key set, manifest
 secret, and Salad runtime bindings only for staging deployment. Runtime bindings
 store secret references, never live values, in the durable deployment
-configuration; the resolver supplies values only while creating the Salad
-container group.
+configuration. The resolver supplies values while creating the Salad container
+group and once at each idle-to-active work boundary. It does not rotate the
+environment between batches because an environment update creates a new
+provider version and restarts the warm GPU replica.
 
 ### Runtime secret resolver
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import cast
@@ -12,6 +12,7 @@ from uuid import UUID
 import pytest
 from sqlalchemy import func, select
 
+import gen_automation.controller.runtime as controller_runtime
 from gen_automation.config import Settings
 from gen_automation.controller.runtime import ControllerWorkloads, _SubmissionProgress
 from gen_automation.db.models import (
@@ -34,6 +35,8 @@ from gen_automation.domain.enums import (
     OutboxStatus,
     SaladDeploymentState,
 )
+from gen_automation.domain.signing import encode_base64url
+from gen_automation.gpu_worker.artifacts import ArtifactManifest
 from gen_automation.integrations.salad.client import SaladClient
 from gen_automation.integrations.salad.models import (
     JSONValue,
@@ -42,14 +45,25 @@ from gen_automation.integrations.salad.models import (
     SaladQueue,
 )
 from gen_automation.services.budgets import ensure_budget_guard, reserve_attempt_budget
-from gen_automation.services.outbox import SALAD_JOB_SUBMIT_TOPIC
-from gen_automation.services.salad import prepare_generation_attempt
+from gen_automation.services.outbox import (
+    GENERATION_ATTEMPT_AGGREGATE,
+    SALAD_JOB_SUBMIT_TOPIC,
+    ClaimedOutboxEvent,
+)
+from gen_automation.services.salad import (
+    MutationEffect,
+    SubmissionDisposition,
+    SubmissionResult,
+    prepare_generation_attempt,
+)
 from gen_automation.services.salad_deployments import deterministic_provider_name
 from gen_automation.storage.base import ObjectStore
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
 CONFIG_SHA256 = "a" * 64
 IMAGE_DIGEST = "registry.example.test/worker@sha256:" + "b" * 64
+WORKER_SIGNING_PRIVATE_KEY = encode_base64url(bytes(range(1, 33)))
+RUNTIME_MANIFEST = '{"artifacts":[],"manifest_sha256":"' + ("0" * 64) + '"}'
 QUEUE_ID = UUID("3d59eff3-8f46-4743-ab42-c5bdd56a04ca")
 GROUP_ID = UUID("e1f35986-d00a-44d0-a0c6-59dda919b07b")
 
@@ -320,6 +334,141 @@ async def _seed_submission_database(database: Database) -> SubmissionContext:
             attempt_id=prepared.generation_attempt_id,
             job_id=job.id,
         )
+
+
+@pytest.mark.asyncio
+async def test_submit_refreshes_runtime_only_at_same_deployment_idle_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'runtime-refresh.db').as_posix()}")
+    await database.create_schema()
+    try:
+        first = await _seed_submission_database(database)
+        async with database.sessions() as session:
+            deployment = await session.scalar(select(SaladDeployment))
+            first_job = await session.get(GenerationJob, first.job_id)
+            first_attempt = await session.get(GenerationAttempt, first.attempt_id)
+            assert deployment is not None
+            assert first_job is not None
+            assert first_attempt is not None
+
+            second_job = GenerationJob(
+                release_version_id=first_job.release_version_id,
+                logical_key="e" * 64,
+                parameters={"seed": 2},
+                parameters_sha256=canonical_sha256({"seed": 2}),
+                provider="salad",
+                state=GenerationState.QUEUED,
+                expected_output_count=1,
+            )
+            session.add(second_job)
+            await session.flush()
+            second = await prepare_generation_attempt(
+                session,
+                generation_job_id=second_job.id,
+                salad_deployment_id=deployment.id,
+                idempotency_key="runtime-refresh-second-attempt",
+                now=NOW,
+            )
+            first_job.state = GenerationState.SUBMITTING
+            first_attempt.state = GenerationAttemptState.SUBMITTING
+            await session.commit()
+            deployment_id = deployment.id
+
+        refreshes: list[UUID] = []
+        submissions: list[UUID] = []
+
+        async def fake_refresh(
+            deployment: SaladDeployment,
+            client: object,
+            resolver: object,
+        ) -> SaladContainerGroup:
+            del client, resolver
+            refreshes.append(deployment.id)
+            return cast(SaladContainerGroup, object())
+
+        async def fake_submit(
+            *args: object,
+            generation_attempt_id: UUID,
+            **kwargs: object,
+        ) -> SubmissionResult:
+            del args, kwargs
+            submissions.append(generation_attempt_id)
+            return SubmissionResult(
+                generation_attempt_id=generation_attempt_id,
+                attempt_state=GenerationAttemptState.CREATED,
+                generation_job_state=GenerationState.CLAIMED,
+                disposition=SubmissionDisposition.SUBMITTED,
+                mutation_effect=MutationEffect.CONFIRMED,
+                provider_external_id="provider-job",
+            )
+
+        monkeypatch.setattr(
+            controller_runtime,
+            "refresh_container_group_runtime",
+            fake_refresh,
+        )
+        artifact_manifest = ArtifactManifest.model_construct(
+            version="v1",
+            artifacts=(),
+            manifest_sha256="0" * 64,
+        )
+        monkeypatch.setattr(
+            controller_runtime,
+            "load_artifact_manifest",
+            lambda _raw: artifact_manifest,
+        )
+        monkeypatch.setattr(controller_runtime, "submit_prepared_attempt", fake_submit)
+        workloads = ControllerWorkloads(
+            settings=Settings(
+                worker_signing_key_id="worker-key-1",
+                worker_signing_private_key=WORKER_SIGNING_PRIVATE_KEY,
+                salad_worker_model_manifest_json=RUNTIME_MANIFEST,
+                salad_worker_model_manifest_sha256="0" * 64,
+            ),
+            sessions=database.sessions,
+            instance_id="controller-runtime-refresh-test",
+            salad_client=cast(SaladClient, object()),
+            object_store=cast(ObjectStore, object()),
+        )
+        event = ClaimedOutboxEvent(
+            id=second.outbox_event_id,
+            topic=SALAD_JOB_SUBMIT_TOPIC,
+            dedupe_key=f"{SALAD_JOB_SUBMIT_TOPIC}:{second.generation_attempt_id}",
+            correlation_id=str(second.generation_attempt_id),
+            aggregate_type=GENERATION_ATTEMPT_AGGREGATE,
+            aggregate_id=second.generation_attempt_id,
+            payload={"generation_attempt_id": str(second.generation_attempt_id)},
+            attempt=1,
+            max_attempts=3,
+            lease_expires_at=NOW + timedelta(minutes=5),
+        )
+
+        # A durable provider attempt on this deployment means the model-bearing
+        # worker is already warming/running; changing its environment here would
+        # create a new Salad version and restart it between ordered batches.
+        await workloads._submit_event(event, progress=_SubmissionProgress())
+        assert refreshes == []
+        assert submissions == [second.generation_attempt_id]
+
+        async with database.sessions() as session:
+            first_attempt = await session.get(GenerationAttempt, first.attempt_id)
+            assert first_attempt is not None
+            first_attempt.state = GenerationAttemptState.FAILED
+            first_attempt.completed_at = NOW
+            await session.commit()
+
+        # With no other active provider attempt, this is the idle-to-active
+        # boundary where refreshing short-lived bootstrap credentials is safe.
+        await workloads._submit_event(event, progress=_SubmissionProgress())
+        assert refreshes == [deployment_id]
+        assert submissions == [
+            second.generation_attempt_id,
+            second.generation_attempt_id,
+        ]
+    finally:
+        await database.dispose()
 
 
 @pytest.mark.asyncio

@@ -75,11 +75,18 @@ def test_deployment_config_is_deterministic_secret_free_and_scale_to_zero() -> N
 
     first = salad_deployment_config_from_settings(settings)
     second = salad_deployment_config_from_settings(settings)
+    prefetched = salad_deployment_config_from_settings(
+        settings.model_copy(update={"salad_max_queued_jobs": 5})
+    )
 
     assert first == second
     assert first.config_sha256 == second.config_sha256
+    assert prefetched == first
+    assert prefetched.config_sha256 == first.config_sha256
+    assert prefetched.desired_queue_length == 1
     assert first.min_replicas == 0
     assert first.max_replicas == 1
+    assert settings.salad_max_queued_jobs == 3
     assert first.desired_queue_length == 1
     assert first.max_hourly_cost_microusd == 350_000
     assert first.provider_configuration["replicas"] == 0
