@@ -1,4 +1,5 @@
 import hashlib
+import json
 import stat
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -9,6 +10,9 @@ from zipfile import ZIP_STORED, ZipFile, ZipInfo
 from PIL import Image
 
 from gen_automation.domain.canonical import canonical_json_bytes
+from gen_automation.domain.deliverability import (
+    MAX_ACCEPTED_IMAGES_PER_RELEASE,
+)
 from gen_automation.domain.deliverability import (
     PATREON_MAX_ARCHIVE_BYTES as PATREON_MAX_ARCHIVE_BYTES,
 )
@@ -28,6 +32,8 @@ from gen_automation.storage.images import (
 )
 
 PATREON_HANDOFF_SCHEMA = "gen-automation.patreon-handoff.v1"
+PATREON_SET_MANIFEST_SCHEMA = "gen-automation.patreon-set-manifest.v1"
+PATREON_PART_MANIFEST_SCHEMA = "gen-automation.patreon-handoff-part.v1"
 PATREON_MAX_TITLE_BYTES = 512
 PATREON_MAX_BODY_BYTES = 128 * 1024
 PATREON_MAX_TIER_BYTES = 256
@@ -112,6 +118,37 @@ class PatreonHandoffPackage:
     manifest_sha256: str
     ordered_filenames: tuple[str, ...]
     publication_checklist: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PatreonSetImageRecord:
+    """Verified immutable image identity used by the release-wide manifest."""
+
+    ordinal: int
+    sha256: str
+    byte_size: int
+    width: int
+    height: int
+    image_format: str
+    content_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class PatreonHandoffPackagePart:
+    """One deterministic ZIP in a release-wide multipart handoff."""
+
+    archive_bytes: bytes
+    sha256: str
+    set_manifest_bytes: bytes
+    set_manifest_sha256: str
+    part_manifest_bytes: bytes
+    part_manifest_sha256: str
+    ordered_filenames: tuple[str, ...]
+    publication_checklist: tuple[str, ...]
+    part_number: int
+    part_count: int
+    first_ordinal: int
+    last_ordinal: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +418,312 @@ def _build_archive(entries: Sequence[tuple[str, bytes]]) -> bytes:
         for path, data in entries:
             archive.writestr(_zip_info(path), data)
     return output.getvalue()
+
+
+def _set_image_manifest_record(
+    record: PatreonSetImageRecord,
+    *,
+    preview: bool,
+) -> dict[str, str | int]:
+    label = "public preview" if preview else f"approved derivative {record.ordinal}"
+    if not isinstance(record, PatreonSetImageRecord):
+        raise PatreonHandoffError(f"{label} manifest record is invalid")
+    if (
+        isinstance(record.ordinal, bool)
+        or not isinstance(record.ordinal, int)
+        or record.ordinal < (0 if preview else 1)
+        or (preview and record.ordinal != 0)
+        or not isinstance(record.sha256, str)
+        or len(record.sha256) != 64
+        or any(character not in "0123456789abcdef" for character in record.sha256)
+        or isinstance(record.byte_size, bool)
+        or not 1 <= record.byte_size <= PATREON_MAX_IMAGE_BYTES
+        or isinstance(record.width, bool)
+        or not isinstance(record.width, int)
+        or record.width <= 0
+        or isinstance(record.height, bool)
+        or not isinstance(record.height, int)
+        or record.height <= 0
+        or record.image_format not in _FORMAT_EXTENSIONS
+    ):
+        raise PatreonHandoffError(f"{label} manifest record is invalid")
+    expected_content_type = {
+        "JPEG": "image/jpeg",
+        "PNG": "image/png",
+        "WEBP": "image/webp",
+    }[record.image_format]
+    if record.content_type != expected_content_type:
+        raise PatreonHandoffError(f"{label} manifest record is invalid")
+    extension = {
+        "JPEG": "jpg",
+        "PNG": "png",
+        "WEBP": "webp",
+    }[record.image_format]
+    path = (
+        f"public-preview/preview.{extension}"
+        if preview
+        else f"content/{record.ordinal:03d}.{extension}"
+    )
+    result: dict[str, str | int] = {
+        "path": path,
+        "sha256": record.sha256,
+        "byte_size": record.byte_size,
+        "width": record.width,
+        "height": record.height,
+        "format": record.image_format,
+        "content_type": record.content_type,
+    }
+    if not preview:
+        result = {"ordinal": record.ordinal, **result}
+    return result
+
+
+def build_patreon_set_manifest(
+    *,
+    approved_derivatives: Sequence[PatreonSetImageRecord],
+    public_preview: PatreonSetImageRecord,
+    title: str,
+    body: str,
+    tier: str,
+    tags: Sequence[str],
+    scheduled_at: datetime | None,
+    public_preview_attestation: PublicPreviewSafetyAttestation | None,
+) -> tuple[bytes, str]:
+    """Build the one canonical ordered manifest shared by every archive part."""
+
+    if public_preview_attestation is None or public_preview_attestation.safe_for_public is not True:
+        raise PatreonPreviewAttestationError(
+            "an affirmative human public-preview safety attestation is required"
+        )
+    if isinstance(approved_derivatives, (str, bytes)):
+        raise PatreonHandoffError("approved_derivatives must be a sequence of records")
+    records = tuple(approved_derivatives)
+    if not 1 <= len(records) <= MAX_ACCEPTED_IMAGES_PER_RELEASE:
+        raise PatreonHandoffError(
+            "approved derivatives must contain between 1 and "
+            f"{MAX_ACCEPTED_IMAGES_PER_RELEASE} images"
+        )
+    if tuple(record.ordinal for record in records) != tuple(range(1, len(records) + 1)):
+        raise PatreonHandoffError("approved derivative manifest ordinals must be contiguous")
+
+    canonical_title = _bounded_text(
+        title,
+        label="title",
+        max_bytes=PATREON_MAX_TITLE_BYTES,
+        allow_empty=False,
+        allow_newlines=False,
+    )
+    canonical_body = _bounded_text(
+        body,
+        label="body",
+        max_bytes=PATREON_MAX_BODY_BYTES,
+        allow_empty=True,
+        allow_newlines=True,
+    )
+    canonical_tier = _bounded_text(
+        tier,
+        label="tier",
+        max_bytes=PATREON_MAX_TIER_BYTES,
+        allow_empty=False,
+        allow_newlines=False,
+    )
+    canonical_tags = _canonical_tags(tags)
+    canonical_schedule = (
+        _canonical_datetime(scheduled_at, "scheduled_at") if scheduled_at is not None else None
+    )
+    attested_by = _bounded_text(
+        public_preview_attestation.attested_by,
+        label="public preview attester",
+        max_bytes=PATREON_MAX_ATTESTER_BYTES,
+        allow_empty=False,
+        allow_newlines=False,
+    )
+    attested_at = _canonical_datetime(
+        public_preview_attestation.attested_at,
+        "public preview attestation time",
+    )
+    part_count = (len(records) + PATREON_MAX_DERIVATIVE_IMAGES - 1) // (
+        PATREON_MAX_DERIVATIVE_IMAGES
+    )
+    preview_record = _set_image_manifest_record(public_preview, preview=True)
+    manifest: dict[str, object] = {
+        "schema": PATREON_SET_MANIFEST_SCHEMA,
+        "publication_mode": "human_official_ui",
+        "reconciliation_mode": "read_api_and_signed_webhooks_only",
+        "archive_parts": {
+            "count": part_count,
+            "max_derivatives_per_part": PATREON_MAX_DERIVATIVE_IMAGES,
+        },
+        "post": {
+            "title": canonical_title,
+            "body": canonical_body,
+            "tier": canonical_tier,
+            "tags": list(canonical_tags),
+            "scheduled_at": canonical_schedule,
+        },
+        "public_preview": {
+            **preview_record,
+            "human_safety_attestation": {
+                "safe_for_public": True,
+                "attested_by": attested_by,
+                "attested_at": attested_at,
+                "statement": PATREON_PUBLIC_PREVIEW_ATTESTATION,
+            },
+        },
+        "approved_derivatives": [
+            _set_image_manifest_record(record, preview=False) for record in records
+        ],
+        "publication_checklist": list(PUBLICATION_CHECKLIST),
+    }
+    manifest_bytes = canonical_json_bytes(manifest)
+    return manifest_bytes, hashlib.sha256(manifest_bytes).hexdigest()
+
+
+def build_patreon_handoff_package_part(
+    *,
+    approved_derivatives: Sequence[PatreonPackageImage],
+    public_preview: PatreonPackageImage,
+    set_manifest_bytes: bytes,
+    part_number: int,
+) -> PatreonHandoffPackagePart:
+    """Build one bounded archive whose content is anchored to the set manifest."""
+
+    if not isinstance(set_manifest_bytes, bytes):
+        raise PatreonHandoffError("set manifest must be immutable bytes")
+    try:
+        set_manifest = json.loads(set_manifest_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PatreonHandoffError("set manifest is invalid") from error
+    if (
+        not isinstance(set_manifest, dict)
+        or set_manifest.get("schema") != PATREON_SET_MANIFEST_SCHEMA
+        or canonical_json_bytes(set_manifest) != set_manifest_bytes
+    ):
+        raise PatreonHandoffError("set manifest is invalid")
+    raw_parts = set_manifest.get("archive_parts")
+    raw_records = set_manifest.get("approved_derivatives")
+    raw_preview = set_manifest.get("public_preview")
+    post = set_manifest.get("post")
+    if (
+        not isinstance(raw_parts, dict)
+        or not isinstance(raw_records, list)
+        or not isinstance(raw_preview, dict)
+        or not isinstance(post, dict)
+    ):
+        raise PatreonHandoffError("set manifest is invalid")
+    part_count = raw_parts.get("count")
+    if (
+        isinstance(part_number, bool)
+        or not isinstance(part_number, int)
+        or isinstance(part_count, bool)
+        or not isinstance(part_count, int)
+        or not 1 <= part_number <= part_count
+    ):
+        raise PatreonHandoffError("archive part identity is invalid")
+    first_ordinal = (part_number - 1) * PATREON_MAX_DERIVATIVE_IMAGES + 1
+    expected_records = raw_records[
+        first_ordinal - 1 : first_ordinal - 1 + PATREON_MAX_DERIVATIVE_IMAGES
+    ]
+    derivatives = tuple(approved_derivatives)
+    if not derivatives or len(derivatives) != len(expected_records):
+        raise PatreonHandoffError("archive part image count does not match the set manifest")
+    packaged_derivatives = tuple(
+        _package_image(
+            image,
+            archive_path_prefix="content",
+            ordinal=first_ordinal + index,
+            label=f"approved derivative {first_ordinal + index}",
+        )
+        for index, image in enumerate(derivatives)
+    )
+    packaged_preview = _package_image(
+        public_preview,
+        archive_path_prefix="public-preview",
+        ordinal=None,
+        label="public preview",
+    )
+    actual_records = [
+        {"ordinal": first_ordinal + index, **image.manifest_record()}
+        for index, image in enumerate(packaged_derivatives)
+    ]
+    preview_record = packaged_preview.manifest_record()
+    expected_preview_record = {
+        key: value for key, value in raw_preview.items() if key != "human_safety_attestation"
+    }
+    if actual_records != expected_records or preview_record != expected_preview_record:
+        raise PatreonImageValidationError(
+            "archive part bytes do not match the release-wide manifest"
+        )
+    total_image_bytes = sum(len(image.data) for image in packaged_derivatives) + len(
+        packaged_preview.data
+    )
+    if total_image_bytes > PATREON_MAX_TOTAL_IMAGE_BYTES:
+        raise PatreonImageValidationError(
+            "archive part images exceed the aggregate image-byte limit"
+        )
+
+    title = post.get("title")
+    body = post.get("body")
+    tier = post.get("tier")
+    tags = post.get("tags")
+    scheduled_at = post.get("scheduled_at")
+    if (
+        not isinstance(title, str)
+        or not isinstance(body, str)
+        or not isinstance(tier, str)
+        or not isinstance(tags, list)
+        or not all(isinstance(tag, str) for tag in tags)
+        or (scheduled_at is not None and not isinstance(scheduled_at, str))
+    ):
+        raise PatreonHandoffError("set manifest post metadata is invalid")
+    checklist_bytes = _publication_checklist_bytes()
+    post_document_bytes = _post_document_bytes(
+        title=title,
+        body=body,
+        tier=tier,
+        tags=tuple(tags),
+        scheduled_at=scheduled_at,
+    )
+    set_manifest_sha256 = hashlib.sha256(set_manifest_bytes).hexdigest()
+    last_ordinal = first_ordinal + len(packaged_derivatives) - 1
+    part_manifest: dict[str, object] = {
+        "schema": PATREON_PART_MANIFEST_SCHEMA,
+        "set_manifest_sha256": set_manifest_sha256,
+        "part_number": part_number,
+        "part_count": part_count,
+        "first_ordinal": first_ordinal,
+        "last_ordinal": last_ordinal,
+        "approved_derivatives": actual_records,
+        "public_preview": preview_record,
+    }
+    part_manifest_bytes = canonical_json_bytes(part_manifest)
+    entries: tuple[tuple[str, bytes], ...] = (
+        ("set-manifest.json", set_manifest_bytes),
+        ("part-manifest.json", part_manifest_bytes),
+        ("PUBLICATION_CHECKLIST.md", checklist_bytes),
+        ("POST.txt", post_document_bytes),
+        (packaged_preview.archive_path, packaged_preview.data),
+        *((image.archive_path, image.data) for image in packaged_derivatives),
+    )
+    archive_bytes = _build_archive(entries)
+    if len(archive_bytes) > PATREON_MAX_ARCHIVE_BYTES:
+        raise PatreonHandoffError(
+            f"Patreon handoff archive exceeds the {PATREON_MAX_ARCHIVE_BYTES}-byte limit"
+        )
+    return PatreonHandoffPackagePart(
+        archive_bytes=archive_bytes,
+        sha256=hashlib.sha256(archive_bytes).hexdigest(),
+        set_manifest_bytes=set_manifest_bytes,
+        set_manifest_sha256=set_manifest_sha256,
+        part_manifest_bytes=part_manifest_bytes,
+        part_manifest_sha256=hashlib.sha256(part_manifest_bytes).hexdigest(),
+        ordered_filenames=tuple(path for path, _data in entries),
+        publication_checklist=PUBLICATION_CHECKLIST,
+        part_number=part_number,
+        part_count=part_count,
+        first_ordinal=first_ordinal,
+        last_ordinal=last_ordinal,
+    )
 
 
 def build_patreon_handoff_package(

@@ -34,7 +34,10 @@ def test_release_full_set_is_bounded_by_patreon_package_capacity() -> None:
     )
 
     payload["desired_accepted_count"] = MAX_ACCEPTED_IMAGES_PER_RELEASE + 1
-    with pytest.raises(ValidationError, match="less than or equal to 100"):
+    with pytest.raises(
+        ValidationError,
+        match=rf"less than or equal to {MAX_ACCEPTED_IMAGES_PER_RELEASE}",
+    ):
         ReleaseCreate.model_validate(payload)
 
 

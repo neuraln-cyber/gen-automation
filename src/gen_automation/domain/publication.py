@@ -9,6 +9,10 @@ from pydantic import (
     StringConstraints,
 )
 
+from gen_automation.domain.deliverability import (
+    MAX_ACCEPTED_IMAGES_PER_RELEASE,
+    PATREON_MAX_ARCHIVE_PARTS,
+)
 from gen_automation.domain.enums import (
     PublicationAttemptState,
     PublicationIntentState,
@@ -28,7 +32,10 @@ class PublicationIntentCreate(StrictPublicationModel):
     release_version_id: UUID
     target: PublicationTarget
     configuration: dict[str, Any]
-    derivative_output_ids: list[UUID] = Field(min_length=1, max_length=100)
+    derivative_output_ids: list[UUID] = Field(
+        min_length=1,
+        max_length=MAX_ACCEPTED_IMAGES_PER_RELEASE,
+    )
     scheduled_at: datetime | None = None
     credential_reference: str | None = Field(default=None, max_length=500)
     public_preview_output_id: UUID | None = None
@@ -83,6 +90,7 @@ class PatreonPackageDownloadCreate(StrictPublicationModel):
     expected_intent_digest: Sha256
     expected_lock_version: int = Field(ge=1)
     expires_in_seconds: int = Field(default=300, ge=30, le=900)
+    part_number: int = Field(default=1, ge=1, le=PATREON_MAX_ARCHIVE_PARTS)
 
 
 class PublicationIntentMutationRead(StrictPublicationModel):
@@ -145,6 +153,10 @@ class PatreonPackageDownloadRead(StrictPublicationModel):
     manifest_sha256: Sha256
     byte_size: int
     expires_at: datetime
+    part_number: int
+    part_count: int
+    first_ordinal: int
+    last_ordinal: int
 
 
 class PublicationInputRead(StrictPublicationModel):
@@ -196,6 +208,10 @@ class PublicationAttemptRead(StrictPublicationModel):
 
 class PublicationPackageRead(StrictPublicationModel):
     id: UUID
+    part_number: int
+    part_count: int
+    first_ordinal: int
+    last_ordinal: int
     sha256: Sha256
     manifest_sha256: Sha256
     byte_size: int
@@ -226,3 +242,4 @@ class PublicationIntentRead(StrictPublicationModel):
     inputs: list[PublicationInputRead]
     attempts: list[PublicationAttemptRead]
     package: PublicationPackageRead | None
+    packages: list[PublicationPackageRead]

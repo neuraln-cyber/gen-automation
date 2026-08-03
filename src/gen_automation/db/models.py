@@ -2697,7 +2697,11 @@ class PublicationEffectEvent(UuidPrimaryKeyMixin, Base):
 class PublicationPackage(UuidPrimaryKeyMixin, Base):
     __tablename__ = "publication_packages"
     __table_args__ = (
-        UniqueConstraint("intent_id", name="uq_publication_packages_intent"),
+        UniqueConstraint(
+            "intent_id",
+            "part_number",
+            name="uq_publication_packages_intent_part",
+        ),
         UniqueConstraint(
             "storage_backend",
             "storage_bucket",
@@ -2708,6 +2712,14 @@ class PublicationPackage(UuidPrimaryKeyMixin, Base):
         CheckConstraint("length(sha256) = 64", name="valid_sha256"),
         CheckConstraint("length(manifest_sha256) = 64", name="valid_manifest_sha256"),
         CheckConstraint("byte_size > 0", name="positive_byte_size"),
+        CheckConstraint(
+            "part_number > 0 AND part_count > 0 AND part_number <= part_count",
+            name="valid_part_identity",
+        ),
+        CheckConstraint(
+            "first_ordinal > 0 AND last_ordinal >= first_ordinal",
+            name="valid_ordinal_range",
+        ),
         CheckConstraint(
             "length(trim(storage_backend)) > 0 "
             "AND length(trim(storage_bucket)) > 0 "
@@ -2723,6 +2735,10 @@ class PublicationPackage(UuidPrimaryKeyMixin, Base):
         nullable=False,
         index=True,
     )
+    part_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    part_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    first_ordinal: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    last_ordinal: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     storage_backend: Mapped[str] = mapped_column(String(50), nullable=False)
     storage_bucket: Mapped[str] = mapped_column(String(255), nullable=False)
     object_key: Mapped[str] = mapped_column(String(1024), nullable=False)

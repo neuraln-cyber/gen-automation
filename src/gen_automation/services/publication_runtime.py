@@ -29,6 +29,7 @@ from gen_automation.db.models import (
     PublicationStep,
 )
 from gen_automation.domain.canonical import canonical_sha256
+from gen_automation.domain.deliverability import PATREON_MAX_DERIVATIVE_IMAGES
 from gen_automation.domain.enums import (
     PublicationAttemptState,
     PublicationIntentState,
@@ -47,8 +48,10 @@ from gen_automation.integrations.patreon.driver import (
 from gen_automation.integrations.patreon.handoff import (
     PatreonHandoffError,
     PatreonPackageImage,
+    PatreonSetImageRecord,
     PublicPreviewSafetyAttestation,
-    build_patreon_handoff_package,
+    build_patreon_handoff_package_part,
+    build_patreon_set_manifest,
 )
 from gen_automation.integrations.x.errors import (
     XAmbiguousError,
@@ -185,6 +188,37 @@ class _PatreonPreparedPackage:
     archive_bytes: bytes
     sha256: str
     manifest_sha256: str
+    part_manifest_sha256: str
+    part_number: int
+    part_count: int
+    first_ordinal: int
+    last_ordinal: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PatreonPackagePlan:
+    content_inputs: tuple[PublicationInput, ...]
+    preview_input: PublicationInput
+    title: str
+    body: str
+    tier: str
+    tags: tuple[str, ...]
+    scheduled_at: datetime | None
+    preview_attestation: PublicPreviewSafetyAttestation
+    set_manifest_bytes: bytes
+    set_manifest_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PatreonStoredPackage:
+    metadata: ObjectMetadata
+    sha256: str
+    manifest_sha256: str
+    part_manifest_sha256: str
+    part_number: int
+    part_count: int
+    first_ordinal: int
+    last_ordinal: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -712,11 +746,9 @@ async def _execute_claimed_attempt(
                 )
 
             if snapshot.kind == PublicationStepKind.PATREON_PACKAGE:
-                prepared = await _prepare_patreon_package(
+                plan = await _prepare_patreon_package_plan(
                     sessions,
-                    store,
                     attempt_id=claimed.attempt_id,
-                    max_package_bytes=max_package_bytes,
                 )
                 effect_at = _clock_now(clock)
                 context = await _begin_effect(
@@ -728,22 +760,21 @@ async def _execute_claimed_attempt(
                     now=effect_at,
                 )
                 try:
-                    metadata = await _write_or_adopt_package(
+                    stored_packages = await _build_write_or_adopt_packages(
                         store,
+                        plan=plan,
                         intent_id=context.intent_id,
                         intent_digest=await _intent_digest(
                             sessions,
                             context.intent_id,
                         ),
-                        prepared=prepared,
                         max_package_bytes=max_package_bytes,
                     )
-                    await _register_package(
+                    await _register_packages(
                         sessions,
                         store,
                         context=context,
-                        prepared=prepared,
-                        metadata=metadata,
+                        stored_packages=stored_packages,
                         worker_id=claimed.worker_id,
                         now=_clock_now(clock),
                     )
@@ -776,7 +807,15 @@ async def _execute_claimed_attempt(
                 continue
 
             if snapshot.kind == PublicationStepKind.PATREON_HANDOFF:
-                if patreon_driver is None or patreon_browser_profile_reference is None:
+                package_part_count = await _patreon_package_part_count(
+                    sessions,
+                    attempt_id=claimed.attempt_id,
+                )
+                if (
+                    patreon_driver is None
+                    or patreon_browser_profile_reference is None
+                    or package_part_count > 1
+                ):
                     await _mark_patreon_awaiting_human(
                         sessions,
                         attempt_id=claimed.attempt_id,
@@ -1814,13 +1853,11 @@ async def _finish_patreon_post(
         await session.commit()
 
 
-async def _prepare_patreon_package(
+async def _prepare_patreon_package_plan(
     sessions: async_sessionmaker[AsyncSession],
-    store: ObjectStore,
     *,
     attempt_id: UUID,
-    max_package_bytes: int,
-) -> _PatreonPreparedPackage:
+) -> _PatreonPackagePlan:
     async with sessions() as session:
         attempt = await session.get(PublicationAttempt, attempt_id)
         if attempt is None:
@@ -1849,11 +1886,6 @@ async def _prepare_patreon_package(
         raise PublicationRuntimeContractError("Patreon input roles are invalid")
     if any(item.asset_content_type not in {"image/jpeg", "image/png"} for item in inputs):
         raise PublicationRuntimeContractError("Patreon package inputs must be JPEG or PNG")
-    content_bytes = await asyncio.gather(
-        *(_read_exact_input(store, item) for item in content_inputs)
-    )
-    preview_bytes = await _read_exact_input(store, preview_inputs[0])
-
     title = configuration.get("title")
     body = configuration.get("body")
     tier = configuration.get("tier")
@@ -1866,42 +1898,118 @@ async def _prepare_patreon_package(
         or not all(isinstance(tag, str) for tag in tags)
     ):
         raise PublicationRuntimeContractError("Patreon configuration is invalid")
-    approved = tuple(
-        PatreonPackageImage(
-            filename=f"content-{index:03d}{_image_extension(item.asset_content_type)}",
-            data=data,
-        )
-        for index, (item, data) in enumerate(
-            zip(content_inputs, content_bytes, strict=True),
-            start=1,
-        )
+    attestation = PublicPreviewSafetyAttestation(
+        safe_for_public=True,
+        attested_by=attester_name,
+        attested_at=_as_utc(attested_at),
     )
-    preview = PatreonPackageImage(
-        filename=f"public-preview{_image_extension(preview_inputs[0].asset_content_type)}",
-        data=preview_bytes,
+    content_records = tuple(
+        _patreon_set_image_record(item, ordinal=index)
+        for index, item in enumerate(content_inputs, start=1)
     )
-    package = await asyncio.to_thread(
-        build_patreon_handoff_package,
-        approved_derivatives=approved,
-        public_preview=preview,
+    preview_record = _patreon_set_image_record(preview_inputs[0], ordinal=0)
+    manifest_bytes, manifest_sha256 = await asyncio.to_thread(
+        build_patreon_set_manifest,
+        approved_derivatives=content_records,
+        public_preview=preview_record,
         title=title,
         body=body,
         tier=tier,
         tags=cast(list[str], tags),
         scheduled_at=(_as_utc(scheduled_at) if scheduled_at is not None else None),
-        public_preview_attestation=PublicPreviewSafetyAttestation(
-            safe_for_public=True,
-            attested_by=attester_name,
-            attested_at=_as_utc(attested_at),
-        ),
+        public_preview_attestation=attestation,
     )
-    if len(package.archive_bytes) > max_package_bytes:
-        raise PublicationRuntimeContractError("Patreon package exceeds its byte limit")
-    return _PatreonPreparedPackage(
-        archive_bytes=package.archive_bytes,
-        sha256=package.sha256,
-        manifest_sha256=package.manifest_sha256,
+    return _PatreonPackagePlan(
+        content_inputs=tuple(content_inputs),
+        preview_input=preview_inputs[0],
+        title=title,
+        body=body,
+        tier=tier,
+        tags=tuple(cast(list[str], tags)),
+        scheduled_at=(_as_utc(scheduled_at) if scheduled_at is not None else None),
+        preview_attestation=attestation,
+        set_manifest_bytes=manifest_bytes,
+        set_manifest_sha256=manifest_sha256,
     )
+
+
+async def _build_write_or_adopt_packages(
+    store: ObjectStore,
+    *,
+    plan: _PatreonPackagePlan,
+    intent_id: UUID,
+    intent_digest: str,
+    max_package_bytes: int,
+) -> tuple[_PatreonStoredPackage, ...]:
+    preview_bytes = await _read_exact_input(store, plan.preview_input)
+    preview = PatreonPackageImage(
+        filename=(f"public-preview{_image_extension(plan.preview_input.asset_content_type)}"),
+        data=preview_bytes,
+    )
+    part_count = (
+        len(plan.content_inputs) + PATREON_MAX_DERIVATIVE_IMAGES - 1
+    ) // PATREON_MAX_DERIVATIVE_IMAGES
+    stored: list[_PatreonStoredPackage] = []
+    for part_index, offset in enumerate(
+        range(0, len(plan.content_inputs), PATREON_MAX_DERIVATIVE_IMAGES),
+        start=1,
+    ):
+        part_inputs = plan.content_inputs[offset : offset + PATREON_MAX_DERIVATIVE_IMAGES]
+        part_bytes = await asyncio.gather(*(_read_exact_input(store, item) for item in part_inputs))
+        approved = tuple(
+            PatreonPackageImage(
+                filename=(
+                    f"content-{offset + index:03d}{_image_extension(item.asset_content_type)}"
+                ),
+                data=data,
+            )
+            for index, (item, data) in enumerate(
+                zip(part_inputs, part_bytes, strict=True),
+                start=1,
+            )
+        )
+        package = await asyncio.to_thread(
+            build_patreon_handoff_package_part,
+            approved_derivatives=approved,
+            public_preview=preview,
+            set_manifest_bytes=plan.set_manifest_bytes,
+            part_number=part_index,
+        )
+        if package.part_count != part_count or len(package.archive_bytes) > max_package_bytes:
+            raise PublicationRuntimeContractError("Patreon package part exceeds its frozen bounds")
+        prepared = _PatreonPreparedPackage(
+            archive_bytes=package.archive_bytes,
+            sha256=package.sha256,
+            manifest_sha256=package.set_manifest_sha256,
+            part_manifest_sha256=package.part_manifest_sha256,
+            part_number=package.part_number,
+            part_count=package.part_count,
+            first_ordinal=package.first_ordinal,
+            last_ordinal=package.last_ordinal,
+        )
+        metadata = await _write_or_adopt_package(
+            store,
+            intent_id=intent_id,
+            intent_digest=intent_digest,
+            prepared=prepared,
+            max_package_bytes=max_package_bytes,
+        )
+        stored.append(
+            _PatreonStoredPackage(
+                metadata=metadata,
+                sha256=prepared.sha256,
+                manifest_sha256=prepared.manifest_sha256,
+                part_manifest_sha256=prepared.part_manifest_sha256,
+                part_number=prepared.part_number,
+                part_count=prepared.part_count,
+                first_ordinal=prepared.first_ordinal,
+                last_ordinal=prepared.last_ordinal,
+            )
+        )
+        del part_bytes, approved, package, prepared
+    if len(stored) != part_count:
+        raise PublicationRuntimeContractError("Patreon package set is incomplete")
+    return tuple(stored)
 
 
 async def _write_or_adopt_package(
@@ -1912,11 +2020,17 @@ async def _write_or_adopt_package(
     prepared: _PatreonPreparedPackage,
     max_package_bytes: int,
 ) -> ObjectMetadata:
-    key = f"publication-packages/{intent_id}/{prepared.sha256}.zip"
+    part_label = f"part-{prepared.part_number:03d}-of-{prepared.part_count:03d}"
+    key = f"publication-packages/{intent_id}/{part_label}/{prepared.sha256}.zip"
     expected_metadata = {
         "sha256": prepared.sha256,
         "intent-digest": intent_digest,
         "manifest-sha256": prepared.manifest_sha256,
+        "part-manifest-sha256": prepared.part_manifest_sha256,
+        "part-number": str(prepared.part_number),
+        "part-count": str(prepared.part_count),
+        "first-ordinal": str(prepared.first_ordinal),
+        "last-ordinal": str(prepared.last_ordinal),
         "publication-intent-id": str(intent_id),
     }
     try:
@@ -1958,20 +2072,27 @@ async def _write_or_adopt_package(
     return metadata
 
 
-async def _register_package(
+async def _register_packages(
     sessions: async_sessionmaker[AsyncSession],
     store: ObjectStore,
     *,
     context: _EffectContext,
-    prepared: _PatreonPreparedPackage,
-    metadata: ObjectMetadata,
+    stored_packages: tuple[_PatreonStoredPackage, ...],
     worker_id: str,
     now: datetime,
 ) -> None:
-    if metadata.version_id is None:
+    if not stored_packages or any(item.metadata.version_id is None for item in stored_packages):
         raise PublicationRuntimeContractError(
-            "package storage did not return an immutable version ID"
+            "package storage did not return complete immutable version IDs"
         )
+    expected_part_count = len(stored_packages)
+    if (
+        tuple(item.part_number for item in stored_packages)
+        != tuple(range(1, expected_part_count + 1))
+        or any(item.part_count != expected_part_count for item in stored_packages)
+        or len({item.manifest_sha256 for item in stored_packages}) != 1
+    ):
+        raise PublicationRuntimeContractError("Patreon package set is inconsistent")
     async with sessions() as session:
         attempt, intent, step = await _lock_execution_rows(
             session,
@@ -1979,47 +2100,72 @@ async def _register_package(
             step_id=context.step_id,
         )
         _require_execution_lease(attempt, worker_id)
-        package = await session.scalar(
-            select(PublicationPackage).where(PublicationPackage.intent_id == intent.id)
+        existing = tuple(
+            (
+                await session.scalars(
+                    select(PublicationPackage)
+                    .where(PublicationPackage.intent_id == intent.id)
+                    .order_by(PublicationPackage.part_number)
+                )
+            ).all()
         )
-        if package is None:
-            package = PublicationPackage(
-                id=uuid7(),
-                intent_id=intent.id,
-                storage_backend=store.backend,
-                storage_bucket=store.bucket,
-                object_key=metadata.key,
-                object_version_id=metadata.version_id,
-                sha256=prepared.sha256,
-                manifest_sha256=prepared.manifest_sha256,
-                byte_size=metadata.byte_size,
-                content_type=_PACKAGE_CONTENT_TYPE,
-                created_at=now,
-            )
-            session.add(package)
-            try:
-                await session.flush()
-            except IntegrityError as error:
-                await session.rollback()
+        by_part = {package.part_number: package for package in existing}
+        packages: list[PublicationPackage] = []
+        for stored in stored_packages:
+            metadata = stored.metadata
+            assert metadata.version_id is not None
+            package = by_part.get(stored.part_number)
+            if package is None:
+                package = PublicationPackage(
+                    id=uuid7(),
+                    intent_id=intent.id,
+                    part_number=stored.part_number,
+                    part_count=stored.part_count,
+                    first_ordinal=stored.first_ordinal,
+                    last_ordinal=stored.last_ordinal,
+                    storage_backend=store.backend,
+                    storage_bucket=store.bucket,
+                    object_key=metadata.key,
+                    object_version_id=metadata.version_id,
+                    sha256=stored.sha256,
+                    manifest_sha256=stored.manifest_sha256,
+                    byte_size=metadata.byte_size,
+                    content_type=_PACKAGE_CONTENT_TYPE,
+                    created_at=now,
+                )
+                session.add(package)
+            elif (
+                package.part_count != stored.part_count
+                or package.first_ordinal != stored.first_ordinal
+                or package.last_ordinal != stored.last_ordinal
+                or package.storage_backend != store.backend
+                or package.storage_bucket != store.bucket
+                or package.object_key != metadata.key
+                or package.object_version_id != metadata.version_id
+                or package.sha256 != stored.sha256
+                or package.manifest_sha256 != stored.manifest_sha256
+                or package.byte_size != metadata.byte_size
+                or package.content_type != _PACKAGE_CONTENT_TYPE
+            ):
                 raise PublicationRuntimeContractError(
-                    "Patreon package was registered concurrently"
-                ) from error
-        elif (
-            package.storage_backend != store.backend
-            or package.storage_bucket != store.bucket
-            or package.object_key != metadata.key
-            or package.object_version_id != metadata.version_id
-            or package.sha256 != prepared.sha256
-            or package.manifest_sha256 != prepared.manifest_sha256
-            or package.byte_size != metadata.byte_size
-            or package.content_type != _PACKAGE_CONTENT_TYPE
-        ):
+                    "registered Patreon package part conflicts with storage"
+                )
+            packages.append(package)
+        if set(by_part) - {item.part_number for item in stored_packages}:
             raise PublicationRuntimeContractError(
-                "registered Patreon package conflicts with storage"
+                "registered Patreon package set has unexpected parts"
             )
+        try:
+            await session.flush()
+        except IntegrityError as error:
+            await session.rollback()
+            raise PublicationRuntimeContractError(
+                "Patreon package set was registered concurrently"
+            ) from error
+        first_package = packages[0]
         step.state = PublicationStepState.SUCCEEDED
         step.retry_class = None
-        step.package_id = package.id
+        step.package_id = first_package.id
         step.effect_completed_at = now
         step.last_error_code = None
         step.last_error_detail = None
@@ -2027,20 +2173,42 @@ async def _register_package(
         step.lock_version += 1
         session.add(
             _runtime_audit(
-                action="publication.patreon_package_ready",
+                action="publication.patreon_package_set_ready",
                 intent_id=intent.id,
                 attempt_id=attempt.id,
                 detail={
                     "step_id": str(step.id),
-                    "package_id": str(package.id),
-                    "package_sha256": prepared.sha256,
-                    "manifest_sha256": prepared.manifest_sha256,
-                    "byte_size": metadata.byte_size,
+                    "first_package_id": str(first_package.id),
+                    "part_count": len(packages),
+                    "manifest_sha256": stored_packages[0].manifest_sha256,
+                    "total_byte_size": sum(item.metadata.byte_size for item in stored_packages),
                 },
                 now=now,
             )
         )
         await session.commit()
+
+
+async def _patreon_package_part_count(
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    attempt_id: UUID,
+) -> int:
+    async with sessions() as session:
+        attempt = await session.get(PublicationAttempt, attempt_id)
+        if attempt is None:
+            raise PublicationRuntimeContractError("publication attempt is unavailable")
+        count = int(
+            await session.scalar(
+                select(func.count(PublicationPackage.id)).where(
+                    PublicationPackage.intent_id == attempt.intent_id
+                )
+            )
+            or 0
+        )
+    if count < 1:
+        raise PublicationRuntimeContractError("Patreon package set is unavailable")
+    return count
 
 
 async def _load_patreon_driver_package(
@@ -2056,7 +2224,11 @@ async def _load_patreon_driver_package(
             raise PublicationRuntimeContractError("publication attempt is unavailable")
         intent = await session.get(PublicationIntent, attempt.intent_id)
         package = await session.scalar(
-            select(PublicationPackage).where(PublicationPackage.intent_id == attempt.intent_id)
+            select(PublicationPackage).where(
+                PublicationPackage.intent_id == attempt.intent_id,
+                PublicationPackage.part_number == 1,
+                PublicationPackage.part_count == 1,
+            )
         )
         if (
             intent is None
@@ -2118,7 +2290,10 @@ async def _mark_patreon_awaiting_human(
         )
         _require_execution_lease(attempt, worker_id)
         package_id = await session.scalar(
-            select(PublicationPackage.id).where(PublicationPackage.intent_id == intent.id)
+            select(PublicationPackage.id).where(
+                PublicationPackage.intent_id == intent.id,
+                PublicationPackage.part_number == 1,
+            )
         )
         if package_id is None:
             raise PublicationRuntimeContractError("Patreon package is unavailable")
@@ -2692,6 +2867,28 @@ def _runtime_audit(
         correlation_id=f"publication-attempt:{attempt_id}",
         detail=detail,
         occurred_at=now,
+    )
+
+
+def _patreon_set_image_record(
+    item: PublicationInput,
+    *,
+    ordinal: int,
+) -> PatreonSetImageRecord:
+    if item.asset_content_type == "image/jpeg":
+        image_format = "JPEG"
+    elif item.asset_content_type == "image/png":
+        image_format = "PNG"
+    else:
+        raise PublicationRuntimeContractError("Patreon handoff input is not JPEG or PNG")
+    return PatreonSetImageRecord(
+        ordinal=ordinal,
+        sha256=item.asset_sha256,
+        byte_size=item.asset_byte_size,
+        width=item.asset_width,
+        height=item.asset_height,
+        image_format=image_format,
+        content_type=item.asset_content_type,
     )
 
 

@@ -937,7 +937,8 @@
       if (plannedJobCount) plannedJobCount.value = Math.max(1, totalJobs);
       if (desiredCount && targetFollowsQueue
           && form.dataset.applyingAutomationProfile !== "true") {
-        desiredCount.value = String(Math.max(1, Math.min(100, totalImages)));
+        const maximumAccepted = Math.max(1, integerValue(desiredCount.max, 500));
+        desiredCount.value = String(Math.max(1, Math.min(maximumAccepted, totalImages)));
       }
       form.dataset.targetFollowsQueue = String(targetFollowsQueue);
       addButtons.forEach((button) => { button.disabled = rows.length >= 50; });
@@ -1943,6 +1944,8 @@
     const selectionStatus = form.querySelector("[data-bulk-selection-status]");
     const currentXCount = Math.max(0, integerValue(form.dataset.xSelectedCount, 0));
     const xCapacity = Math.max(1, integerValue(form.dataset.xCapacity, 4));
+    const reviewTarget = Math.max(1, integerValue(form.dataset.reviewTarget, 1));
+    const acceptedCount = Math.max(0, integerValue(form.dataset.acceptedCount, 0));
     let lastClickedCheckbox = null;
     document.querySelectorAll("[data-review-selection-controls], [data-review-tools]").forEach((item) => {
       item.hidden = false;
@@ -2037,6 +2040,26 @@
         checkboxes.forEach((checkbox) => {
           const card = checkbox.closest(".asset-card");
           if (!card || !card.hidden) checkbox.checked = true;
+        });
+        updateSelection();
+      });
+    });
+    document.querySelectorAll("[data-select-to-target]").forEach((button) => {
+      button.addEventListener("click", () => {
+        checkboxes.forEach((checkbox) => { checkbox.checked = false; });
+        let remaining = Math.max(0, reviewTarget - acceptedCount);
+        checkboxes.forEach((checkbox) => {
+          if (remaining === 0) return;
+          const card = checkbox.closest(".asset-card");
+          if (
+            card
+            && !card.hidden
+            && card.dataset.decision === "undecided"
+            && card.dataset.aiExcluded !== "true"
+          ) {
+            checkbox.checked = true;
+            remaining -= 1;
+          }
         });
         updateSelection();
       });

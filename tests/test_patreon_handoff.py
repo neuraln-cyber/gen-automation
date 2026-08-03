@@ -23,11 +23,15 @@ from gen_automation.integrations.patreon import (
     PUBLICATION_CHECKLIST,
     PatreonHandoffError,
     PatreonHandoffPackage,
+    PatreonHandoffPackagePart,
     PatreonImageValidationError,
     PatreonPackageImage,
     PatreonPreviewAttestationError,
+    PatreonSetImageRecord,
     PublicPreviewSafetyAttestation,
     build_patreon_handoff_package,
+    build_patreon_handoff_package_part,
+    build_patreon_set_manifest,
 )
 
 ATTESTATION = PublicPreviewSafetyAttestation(
@@ -103,6 +107,78 @@ def build_package(
         scheduled_at=scheduled_at,
         public_preview_attestation=attestation,
     )
+
+
+def test_large_set_is_split_deterministically_with_one_ordered_manifest() -> None:
+    derivative_bytes = encoded_image(color="red")
+    preview_bytes = encoded_image(color="green")
+    derivative_sha256 = hashlib.sha256(derivative_bytes).hexdigest()
+    preview_sha256 = hashlib.sha256(preview_bytes).hexdigest()
+    records = tuple(
+        PatreonSetImageRecord(
+            ordinal=ordinal,
+            sha256=derivative_sha256,
+            byte_size=len(derivative_bytes),
+            width=32,
+            height=24,
+            image_format="PNG",
+            content_type="image/png",
+        )
+        for ordinal in range(1, 206)
+    )
+    preview_record = PatreonSetImageRecord(
+        ordinal=0,
+        sha256=preview_sha256,
+        byte_size=len(preview_bytes),
+        width=32,
+        height=24,
+        image_format="PNG",
+        content_type="image/png",
+    )
+    set_manifest_bytes, set_manifest_sha256 = build_patreon_set_manifest(
+        approved_derivatives=records,
+        public_preview=preview_record,
+        title="Large release",
+        body="One ordered set.",
+        tier="Supporter",
+        tags=("Anime",),
+        scheduled_at=SCHEDULE,
+        public_preview_attestation=ATTESTATION,
+    )
+    image = PatreonPackageImage("approved.png", derivative_bytes)
+    preview = PatreonPackageImage("preview.png", preview_bytes)
+
+    def build(part_number: int, count: int) -> PatreonHandoffPackagePart:
+        return build_patreon_handoff_package_part(
+            approved_derivatives=(image,) * count,
+            public_preview=preview,
+            set_manifest_bytes=set_manifest_bytes,
+            part_number=part_number,
+        )
+
+    parts = (build(1, 100), build(2, 100), build(3, 5))
+    duplicate = build(2, 100)
+
+    assert tuple((part.first_ordinal, part.last_ordinal) for part in parts) == (
+        (1, 100),
+        (101, 200),
+        (201, 205),
+    )
+    assert all(part.part_count == 3 for part in parts)
+    assert all(part.set_manifest_bytes == set_manifest_bytes for part in parts)
+    assert all(part.set_manifest_sha256 == set_manifest_sha256 for part in parts)
+    assert duplicate.archive_bytes == parts[1].archive_bytes
+    assert duplicate.sha256 == parts[1].sha256
+
+    manifest = json.loads(set_manifest_bytes)
+    assert [record["ordinal"] for record in manifest["approved_derivatives"]] == list(range(1, 206))
+    for part in parts:
+        with ZipFile(BytesIO(part.archive_bytes)) as archive:
+            assert archive.read("set-manifest.json") == set_manifest_bytes
+            part_manifest = json.loads(archive.read("part-manifest.json"))
+            assert part_manifest["set_manifest_sha256"] == set_manifest_sha256
+            assert part_manifest["first_ordinal"] == part.first_ordinal
+            assert part_manifest["last_ordinal"] == part.last_ordinal
 
 
 def test_package_is_canonical_byte_deterministic_and_self_describing() -> None:

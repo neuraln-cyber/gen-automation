@@ -1,6 +1,6 @@
 # Patreon human-publishing handoff
 
-`gen_automation.integrations.patreon` builds a deterministic ZIP from
+`gen_automation.integrations.patreon` builds a deterministic archive set from
 already-approved publication derivatives. It does not create Patreon posts, call
 provider APIs, store credentials, or use browser automation.
 
@@ -27,10 +27,11 @@ caller-supplied post text or visible image pixels, so the caller must supply onl
 reviewed publication content.
 
 Pillow verification and ZIP construction are synchronous and can consume
-substantial transient memory. The 128 MiB aggregate image cap is an input bound,
-not a process-memory bound: decoded pixels, base objects, and the resulting ZIP
-can coexist. Invoke the builder in the bounded CPU worker with a wall-time and
-memory limit, not in the API event loop or request process.
+substantial transient memory. Each archive part is built independently with at
+most 100 images and a 128 MiB aggregate image cap, so a 500-image release does
+not require every image and ZIP to coexist in memory. Invoke the builder in the
+bounded CPU worker with a wall-time and memory limit, not in the API event loop
+or request process.
 
 Patreon's documented public API exposes post-reading endpoints but no documented
 post-creation endpoint. The package is therefore published or scheduled in
@@ -43,7 +44,7 @@ the human publishing step.
 
 ## Required input
 
-- One to 100 already-approved JPEG or PNG derivative images.
+- One to 500 already-approved JPEG or PNG derivative images.
 - A separately designated public-preview JPEG or PNG.
 - Title, body, tier/audience, tags, and an optional timezone-aware schedule.
 - An affirmative, identified, timestamped human public-preview attestation.
@@ -60,9 +61,12 @@ the operator's final visual review under Patreon's
 
 ## Safety limits
 
-- Maximum 100 paid-content derivatives.
+- Maximum 500 paid-content derivatives in one ordered release.
+- Maximum 100 paid-content derivatives per archive part. Larger releases are
+  split into deterministic parts numbered from one.
 - Maximum 16 MiB per image, including the public preview.
-- Maximum 128 MiB across all image inputs.
+- Maximum 128 MiB across one archive part's image inputs, including its copy of
+  the public preview.
 - The production publication orchestrator accepts JPEG and PNG only. The
   lower-level deterministic builder can also validate static WebP for isolated
   library use, but WebP is rejected before an MVP Patreon intent is frozen.
@@ -78,20 +82,27 @@ never enter the manifest or ZIP.
 
 ## Deterministic output
 
-The returned immutable value contains:
+The multipart builder returns one canonical set manifest plus immutable archive
+parts. Every part contains the exact same `set-manifest.json`, whose SHA-256 is
+also bound into that part's `part-manifest.json`. The set manifest lists all
+accepted derivatives with contiguous global ordinals, so ordering remains
+unambiguous across archive boundaries.
+
+Each returned archive part contains:
 
 - ZIP bytes and their SHA-256;
-- canonical `manifest.json` bytes and their SHA-256;
+- canonical set and part manifest bytes and their SHA-256 values;
 - the exact ordered archive filenames; and
 - the publication checklist.
 
 The archive contains, in order:
 
-1. `manifest.json`
-2. `PUBLICATION_CHECKLIST.md`
-3. `POST.txt`
-4. `public-preview/preview.<format>`
-5. ordered `content/NNN.<format>` files
+1. `set-manifest.json`
+2. `part-manifest.json`
+3. `PUBLICATION_CHECKLIST.md`
+4. `POST.txt`
+5. `public-preview/preview.<format>`
+6. ordered `content/NNN.<format>` files using global release ordinals
 
 ZIP entries use a fixed 1980-01-01 timestamp, stored/no-compression encoding,
 Unix regular-file mode `0644`, no extra fields, no comments, and deterministic
@@ -99,7 +110,7 @@ ordering. Images are already compressed, so stored ZIP entries also avoid
 compressor-version variance. Identical logical inputs produce identical package
 bytes and hashes.
 
-`manifest.json` records canonical post metadata, image dimensions/formats/sizes
+`set-manifest.json` records canonical post metadata, image dimensions/formats/sizes
 and hashes, the human attestation, supporting-file hashes, and the fixed
 publication checklist. Its schema has no fields for prompts, provider credentials,
 storage keys, or environment data. Upstream DERIVATIVE-kind and lineage checks
@@ -107,11 +118,14 @@ are what prevent a raw master from being supplied as an opaque image.
 
 ## Operator/manual fallback procedure
 
-1. Verify the package SHA-256.
-2. Confirm the manifest and `POST.txt`.
-3. Visually re-check the designated public preview.
-4. Upload `content/` only as member-facing content.
-5. Use `public-preview/` only on the public preview surface.
-6. Confirm the Adult/18+ creator classification, intended tier, and schedule.
-7. Publish or schedule in Patreon's official UI.
-8. Record the resulting post ID and URL for read-API/webhook reconciliation.
+1. Download every numbered part and verify each package SHA-256.
+2. Confirm every part contains the same `set-manifest.json`, then confirm the
+   part ranges cover that manifest once, in order, without gaps or overlap.
+3. Confirm the manifests and `POST.txt`.
+4. Visually re-check the designated public preview.
+5. Upload each part's `content/` only as member-facing content, following the
+   global ordinal order.
+6. Use `public-preview/` only on the public preview surface.
+7. Confirm the Adult/18+ creator classification, intended tier, and schedule.
+8. Publish or schedule in Patreon's official UI.
+9. Record the resulting post ID and URL for read-API/webhook reconciliation.

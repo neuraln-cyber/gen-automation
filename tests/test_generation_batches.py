@@ -166,7 +166,7 @@ def test_large_wildcard_queue_preserves_stage_order_and_derives_all_jobs() -> No
             "scheduler": "karras",
             "outputs_per_job": 4,
             "planned_job_count": 1,
-            "desired_accepted_count": 100,
+            "desired_accepted_count": 300,
             "batches": [
                 {"name": name, "image_count": count, "prompt": prompt}
                 for name, count, prompt in ordered_batches
@@ -175,6 +175,7 @@ def test_large_wildcard_queue_preserves_stage_order_and_derives_all_jobs() -> No
     )
 
     assert command.effective_planned_job_count == 86
+    assert command.desired_accepted_count == 300
     assert [batch.name for batch in command.batches] == [item[0] for item in ordered_batches]
     assert [batch.image_count for batch in command.batches] == [item[1] for item in ordered_batches]
     assert sum(batch.image_count for batch in command.batches) == 340

@@ -291,7 +291,7 @@ async def approve_and_expand_generation_plan(
     try:
         if release.desired_accepted_count > MAX_ACCEPTED_IMAGES_PER_RELEASE:
             raise DeliverabilityError(
-                "desired accepted count exceeds the Patreon package limit of "
+                "desired accepted count exceeds the final-set limit of "
                 f"{MAX_ACCEPTED_IMAGES_PER_RELEASE}"
             )
         for batch in specification.ordered_generation_batches:

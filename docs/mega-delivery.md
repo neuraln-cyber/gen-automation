@@ -3,8 +3,8 @@
 ## Result
 
 When a Patreon publication package becomes available, the controller now
-automatically mirrors that exact ZIP to MEGA. The ZIP is the deterministic
-finished set built from exactly one clean `full` output for every accepted
+automatically mirrors every exact archive part to MEGA. The archive set is the
+deterministic finished set built from exactly one clean `full` output for every accepted
 release selection. Patreon planning rejects a partial, additional, duplicated,
 or reordered content set, so the downstream MEGA ZIP cannot silently omit an
 accepted image. X teaser derivatives and X watermarks are not included.
@@ -12,10 +12,11 @@ accepted image. X teaser derivatives and X watermarks are not included.
 The remote path is frozen when the delivery record is created:
 
 ```text
-<remote-root>/<project-slug>/<release-slug>/<package-id>/<package-sha256>.zip
+<remote-root>/<project-slug>/<release-slug>/<intent-id>/part-NNN-of-NNN-<package-sha256>.zip
 ```
 
-The SHA-256 filename makes response-loss recovery safe. Before every upload,
+The intent folder, zero-padded part identity, and SHA-256 filename make ordering
+and response-loss recovery safe. Before every upload,
 the controller looks for that exact path. If it exists, the controller
 downloads the node by its opaque handle and verifies both byte length and
 SHA-256. It adopts a match and does not upload again. After a new upload it
@@ -23,7 +24,7 @@ performs the same download verification before recording success.
 
 The durable database reference contains:
 
-- the immutable Patreon package ID;
+- the immutable Patreon package ID and deterministic part identity;
 - the MEGA remote path and opaque node handle;
 - expected SHA-256 and byte length;
 - attempt, lease, completion and verification timestamps;

@@ -244,6 +244,7 @@
           </span>
           <p class="muted">{{ destination.detail }}</p>
           {% if destination.key == "patreon" and destination.state == "ready" %}
+            {% for package_part in destination.package_parts %}
             <form
               method="post"
               action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/patreon/{{ destination.intent_id }}:download"
@@ -259,10 +260,13 @@
                 name="expected_lock_version"
                 value="{{ destination.intent_lock_version }}"
               >
+              <input type="hidden" name="part_number" value="{{ package_part.part_number }}">
               <button class="secondary-button" type="submit">
-                Download Patreon package
+                Download part {{ package_part.part_number }} / {{ package_part.part_count }}
+                (images {{ package_part.first_ordinal }}–{{ package_part.last_ordinal }})
               </button>
             </form>
+            {% endfor %}
           {% endif %}
           {% if destination.key == "patreon" and destination.state in ["ready", "unknown"] %}
             <div class="decision-form">

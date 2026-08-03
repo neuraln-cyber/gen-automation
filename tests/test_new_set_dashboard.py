@@ -178,6 +178,7 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
         assert page.text.count(f'name="lora_{slot}_weight"') == 1
     assert 'class="mobile-queue-dock"' in page.text
     assert re.search(r'name="desired_accepted_count"\s+value="4"', page.text)
+    assert re.search(r'name="desired_accepted_count"[\s\S]{0,160}max="500"', page.text)
     form = {
         "csrf_token": _hidden_value(page.text, "csrf_token"),
         "submission_id": _hidden_value(page.text, "submission_id"),

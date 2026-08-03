@@ -5,11 +5,20 @@ from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal
 from typing import Literal
 
-MAX_ACCEPTED_IMAGES_PER_RELEASE = 100
+# One final set may contain every usable image from a large unattended generation
+# queue.  Keep this aligned with the review bulk-action ceiling so an owner can
+# still operate on the complete set in one command.
+MAX_ACCEPTED_IMAGES_PER_RELEASE = 500
 MAX_PIPELINE_MASTER_WIDTH = 8192
 MAX_PIPELINE_MASTER_HEIGHT = 8192
 MAX_PIPELINE_MASTER_PIXELS = 12_000_000
-PATREON_MAX_DERIVATIVE_IMAGES = MAX_ACCEPTED_IMAGES_PER_RELEASE
+# Archive limits are intentionally independent from the release limit.  Large
+# releases are partitioned into deterministic handoff archives while retaining
+# one release-wide ordered manifest.
+PATREON_MAX_DERIVATIVE_IMAGES = 100
+PATREON_MAX_ARCHIVE_PARTS = (
+    MAX_ACCEPTED_IMAGES_PER_RELEASE + PATREON_MAX_DERIVATIVE_IMAGES - 1
+) // PATREON_MAX_DERIVATIVE_IMAGES
 PATREON_MAX_IMAGE_BYTES = 16 * 1024 * 1024
 PATREON_MAX_TOTAL_IMAGE_BYTES = 128 * 1024 * 1024
 PATREON_MAX_ARCHIVE_BYTES = 160 * 1024 * 1024
@@ -49,20 +58,30 @@ class _ComfyGeometry:
 
 
 def patreon_full_output_byte_budget(accepted_image_count: int) -> int:
-    """Return the per-image cap that reserves one duplicate public preview."""
+    """Return the per-image cap for the largest deterministic archive part.
+
+    Every archive part contains at most ``PATREON_MAX_DERIVATIVE_IMAGES`` paid
+    images and one duplicate clean public preview.  The release-wide count is
+    validated here, but it must not shrink every derivative as though all 500
+    images were placed in one ZIP.
+    """
 
     if (
         isinstance(accepted_image_count, bool)
         or not isinstance(accepted_image_count, int)
-        or not 1 <= accepted_image_count <= PATREON_MAX_DERIVATIVE_IMAGES
+        or not 1 <= accepted_image_count <= MAX_ACCEPTED_IMAGES_PER_RELEASE
     ):
         raise DeliverabilityError(
             "Patreon full-output budgeting requires between 1 and "
-            f"{PATREON_MAX_DERIVATIVE_IMAGES} accepted images"
+            f"{MAX_ACCEPTED_IMAGES_PER_RELEASE} accepted images"
         )
+    images_in_largest_part = min(
+        accepted_image_count,
+        PATREON_MAX_DERIVATIVE_IMAGES,
+    )
     return min(
         PATREON_MAX_IMAGE_BYTES,
-        PATREON_MAX_TOTAL_IMAGE_BYTES // (accepted_image_count + 1),
+        PATREON_MAX_TOTAL_IMAGE_BYTES // (images_in_largest_part + 1),
     )
 
 

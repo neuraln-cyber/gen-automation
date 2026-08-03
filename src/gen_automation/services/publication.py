@@ -36,6 +36,10 @@ from gen_automation.db.models import (
     ReviewXSelection,
 )
 from gen_automation.domain.canonical import canonical_json_bytes, canonical_sha256
+from gen_automation.domain.deliverability import (
+    MAX_ACCEPTED_IMAGES_PER_RELEASE,
+    PATREON_MAX_ARCHIVE_PARTS,
+)
 from gen_automation.domain.enums import (
     AdminRole,
     AssetKind,
@@ -202,6 +206,10 @@ class PatreonPackageDownloadResult:
     manifest_sha256: str
     byte_size: int
     expires_at: datetime
+    part_number: int
+    part_count: int
+    first_ordinal: int
+    last_ordinal: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1351,6 +1359,7 @@ async def presign_patreon_package_download(
     actor_user_id: UUID,
     actor_role: AdminRole | str,
     expires_in_seconds: int = 300,
+    part_number: int = 1,
     now: datetime | None = None,
 ) -> PatreonPackageDownloadResult:
     requested_at = _utc_now(now)
@@ -1365,6 +1374,12 @@ async def presign_patreon_package_download(
         "download expiry seconds",
         30,
         900,
+    )
+    normalized_part_number = _bounded_int(
+        part_number,
+        "package part number",
+        1,
+        PATREON_MAX_ARCHIVE_PARTS,
     )
     actor = await _require_publisher(
         session,
@@ -1434,7 +1449,10 @@ async def presign_patreon_package_download(
     if guard is None or not guard.enabled:
         raise PublicationDisabledError("publication is stopped")
     package = await session.scalar(
-        select(PublicationPackage).where(PublicationPackage.intent_id == intent.id)
+        select(PublicationPackage).where(
+            PublicationPackage.intent_id == intent.id,
+            PublicationPackage.part_number == normalized_part_number,
+        )
     )
     if package is None:
         raise PublicationConflictError("Patreon package is unavailable")
@@ -1453,6 +1471,8 @@ async def presign_patreon_package_download(
                 "package_id": str(package.id),
                 "package_sha256": package.sha256,
                 "manifest_sha256": package.manifest_sha256,
+                "part_number": package.part_number,
+                "part_count": package.part_count,
                 "expires_at": _canonical_datetime(expires_at),
                 "guard_epoch": guard.epoch,
                 "authorization_basis": (
@@ -1478,17 +1498,27 @@ async def presign_patreon_package_download(
         key=package.object_key,
         version_id=package.object_version_id,
         expires_in=normalized_expiry,
-        download_name=f"patreon-handoff-{intent.id}.zip",
+        download_name=(
+            f"patreon-handoff-{intent.id}-part-"
+            f"{package.part_number:03d}-of-{package.part_count:03d}.zip"
+        ),
     )
     return PatreonPackageDownloadResult(
         intent_id=intent.id,
         package_id=package.id,
         url=url,
-        filename=f"patreon-handoff-{intent.id}.zip",
+        filename=(
+            f"patreon-handoff-{intent.id}-part-"
+            f"{package.part_number:03d}-of-{package.part_count:03d}.zip"
+        ),
         sha256=package.sha256,
         manifest_sha256=package.manifest_sha256,
         byte_size=package.byte_size,
         expires_at=expires_at,
+        part_number=package.part_number,
+        part_count=package.part_count,
+        first_ordinal=package.first_ordinal,
+        last_ordinal=package.last_ordinal,
     )
 
 
@@ -1672,9 +1702,9 @@ async def _load_frozen_outputs(
         raise PublicationInputError(
             "Patreon content outputs must exactly match all accepted full outputs"
         )
-    if len(derivative_output_ids) > PATREON_MAX_DERIVATIVE_IMAGES:
+    if len(derivative_output_ids) > MAX_ACCEPTED_IMAGES_PER_RELEASE:
         raise PublicationInputError(
-            f"Patreon content must not exceed {PATREON_MAX_DERIVATIVE_IMAGES} images"
+            f"Patreon content must not exceed {MAX_ACCEPTED_IMAGES_PER_RELEASE} images"
         )
     content = tuple(
         _FrozenOutput(
@@ -1687,14 +1717,16 @@ async def _load_frozen_outputs(
         output=checked(public_preview_output_id, "full"),
         role="patreon_preview",
     )
-    total_image_bytes = sum(item.output.asset_byte_size for item in content) + (
-        preview.output.asset_byte_size
-    )
-    if total_image_bytes > PATREON_MAX_TOTAL_IMAGE_BYTES:
-        raise PublicationInputError(
-            "combined Patreon content and public preview exceed the "
-            f"{PATREON_MAX_TOTAL_IMAGE_BYTES}-byte package limit"
+    for offset in range(0, len(content), PATREON_MAX_DERIVATIVE_IMAGES):
+        part = content[offset : offset + PATREON_MAX_DERIVATIVE_IMAGES]
+        part_image_bytes = sum(item.output.asset_byte_size for item in part) + (
+            preview.output.asset_byte_size
         )
+        if part_image_bytes > PATREON_MAX_TOTAL_IMAGE_BYTES:
+            raise PublicationInputError(
+                "combined Patreon content and public preview exceed the "
+                f"{PATREON_MAX_TOTAL_IMAGE_BYTES}-byte archive-part limit"
+            )
     return (*content, preview)
 
 
@@ -2130,7 +2162,10 @@ async def _mark_patreon_confirmed_absent_handoff(
     now: datetime,
 ) -> None:
     package_id = await session.scalar(
-        select(PublicationPackage.id).where(PublicationPackage.intent_id == intent.id)
+        select(PublicationPackage.id).where(
+            PublicationPackage.intent_id == intent.id,
+            PublicationPackage.part_number == 1,
+        )
     )
     if package_id is None:
         raise PublicationConflictError("Patreon manual package is unavailable")

@@ -43,6 +43,10 @@
       <div><dt>Excluded</dt><dd>{{ summary.rejected_count }}</dd></div>
       <div><dt>Held</dt><dd>{{ summary.held_count }}</dd></div>
       <div><dt>Undecided</dt><dd>{{ summary.undecided_count }}</dd></div>
+      <div>
+        <dt>Still needed</dt>
+        <dd>{{ [summary.desired_accepted_count - summary.accepted_count, 0] | max }}</dd>
+      </div>
       <div><dt>Selected for X</dt><dd>{{ summary.x_selected_count }} / 4</dd></div>
       <div><dt>AI excluded</dt><dd>{{ ai_excluded_count }}</dd></div>
     </dl>
@@ -160,6 +164,8 @@
       data-bulk-action-form
       data-x-selected-count="{{ summary.x_selected_count }}"
       data-x-capacity="4"
+      data-review-target="{{ summary.desired_accepted_count }}"
+      data-accepted-count="{{ summary.accepted_count }}"
     >
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <input
@@ -180,6 +186,9 @@
       </div>
       <div class="bulk-selection-controls" data-review-selection-controls hidden>
         <button class="secondary-button" type="button" data-select-all>Select visible</button>
+        <button class="secondary-button" type="button" data-select-to-target>
+          Select enough undecided to fill target
+        </button>
         <button class="secondary-button" type="button" data-clear-selection>Clear</button>
         <button class="secondary-button" type="button" data-clear-hidden-selection>Clear hidden</button>
       </div>

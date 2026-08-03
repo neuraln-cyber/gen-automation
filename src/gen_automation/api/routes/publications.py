@@ -309,6 +309,7 @@ async def post_patreon_package_download(
             actor_user_id=principal.user_id,
             actor_role=principal.role,
             expires_in_seconds=command.expires_in_seconds,
+            part_number=command.part_number,
         )
     except (
         PublicationInputError,
@@ -443,9 +444,31 @@ async def _intent_read(
                 ],
             )
         )
-    package = await session.scalar(
-        select(PublicationPackage).where(PublicationPackage.intent_id == intent.id)
+    packages = list(
+        (
+            await session.scalars(
+                select(PublicationPackage)
+                .where(PublicationPackage.intent_id == intent.id)
+                .order_by(PublicationPackage.part_number)
+            )
+        ).all()
     )
+    package = packages[0] if packages else None
+
+    def package_read(item: PublicationPackage) -> PublicationPackageRead:
+        return PublicationPackageRead(
+            id=item.id,
+            part_number=item.part_number,
+            part_count=item.part_count,
+            first_ordinal=item.first_ordinal,
+            last_ordinal=item.last_ordinal,
+            sha256=item.sha256,
+            manifest_sha256=item.manifest_sha256,
+            byte_size=item.byte_size,
+            content_type=item.content_type,
+            created_at=item.created_at,
+        )
+
     return PublicationIntentRead(
         id=intent.id,
         release_id=intent.release_id,
@@ -483,18 +506,8 @@ async def _intent_read(
             for item in inputs
         ],
         attempts=attempt_reads,
-        package=(
-            PublicationPackageRead(
-                id=package.id,
-                sha256=package.sha256,
-                manifest_sha256=package.manifest_sha256,
-                byte_size=package.byte_size,
-                content_type=package.content_type,
-                created_at=package.created_at,
-            )
-            if package is not None
-            else None
-        ),
+        package=(package_read(package) if package is not None else None),
+        packages=[package_read(item) for item in packages],
     )
 
 
@@ -577,6 +590,10 @@ def _package_download_read(
         manifest_sha256=result.manifest_sha256,
         byte_size=result.byte_size,
         expires_at=result.expires_at,
+        part_number=result.part_number,
+        part_count=result.part_count,
+        first_ordinal=result.first_ordinal,
+        last_ordinal=result.last_ordinal,
     )
 
 

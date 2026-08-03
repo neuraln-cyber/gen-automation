@@ -122,7 +122,12 @@ async def ensure_next_mega_delivery(
             .join(Release, Release.id == PublicationIntent.release_id)
             .join(Project, Project.id == Release.project_id)
             .where(~delivery_exists)
-            .order_by(PublicationPackage.created_at, PublicationPackage.id)
+            .order_by(
+                PublicationPackage.created_at,
+                PublicationPackage.intent_id,
+                PublicationPackage.part_number,
+                PublicationPackage.id,
+            )
             .limit(1)
             .with_for_update(skip_locked=True)
         )
@@ -135,7 +140,9 @@ async def ensure_next_mega_delivery(
         normalized_root,
         project_slug=project_slug,
         release_slug=release_slug,
-        package_id=package.id,
+        intent_id=package.intent_id,
+        part_number=package.part_number,
+        part_count=package.part_count,
         sha256=package.sha256,
     )
     delivery = MegaDelivery(
@@ -523,7 +530,9 @@ def _package_remote_path(
     *,
     project_slug: str,
     release_slug: str,
-    package_id: UUID,
+    intent_id: UUID,
+    part_number: int,
+    part_count: int,
     sha256: str,
 ) -> str:
     if len(sha256) != 64:
@@ -532,14 +541,16 @@ def _package_remote_path(
         int(sha256, 16)
     except ValueError:
         raise MegaDeliveryContractError("Patreon package checksum is invalid") from None
+    if not 1 <= part_number <= part_count:
+        raise MegaDeliveryContractError("Patreon package part identity is invalid")
     parts = [
         part
         for part in (
             remote_root.strip("/"),
             project_slug,
             release_slug,
-            str(package_id),
-            f"{sha256}.zip",
+            str(intent_id),
+            f"part-{part_number:03d}-of-{part_count:03d}-{sha256}.zip",
         )
         if part
     ]

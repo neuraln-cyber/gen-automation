@@ -669,6 +669,7 @@ async def dashboard_download_patreon_package(
             actor_user_id=owner.user_id,
             actor_role=owner.role,
             expires_in_seconds=300,
+            part_number=form.part_number,
         )
     except BrowserDeliveryFormError as error:
         return _form_error(request, principal, error.status_code, error.message)

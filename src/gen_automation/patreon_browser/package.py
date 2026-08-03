@@ -23,7 +23,9 @@ from gen_automation.integrations.patreon.handoff import (
     PATREON_MAX_TAGS,
     PATREON_MAX_TIER_BYTES,
     PATREON_MAX_TITLE_BYTES,
+    PATREON_PART_MANIFEST_SCHEMA,
     PATREON_PUBLIC_PREVIEW_ATTESTATION,
+    PATREON_SET_MANIFEST_SCHEMA,
 )
 from gen_automation.storage.images import (
     FORMAT_CONTENT_TYPES,
@@ -87,14 +89,39 @@ def load_patreon_browser_package(
                 raise PatreonBrowserPackageError("Patreon handoff file count is invalid")
             by_name = _validated_entries(infos, max_package_bytes=max_package_bytes)
             manifest_info = by_name.get("manifest.json")
-            if manifest_info is None or manifest_info.file_size > _MAX_MANIFEST_BYTES:
-                raise PatreonBrowserPackageError("Patreon handoff manifest is unavailable")
-            manifest_bytes = archive.read(manifest_info)
-            manifest = _manifest(manifest_bytes)
-            post = _post(manifest)
-            content_records, preview_record = _image_records(manifest)
+            if manifest_info is not None:
+                if manifest_info.file_size > _MAX_MANIFEST_BYTES:
+                    raise PatreonBrowserPackageError("Patreon handoff manifest is unavailable")
+                manifest = _manifest(archive.read(manifest_info))
+                post = _post(manifest)
+                content_records, preview_record = _image_records(manifest)
+                manifest_names = {"manifest.json"}
+            else:
+                set_info = by_name.get("set-manifest.json")
+                part_info = by_name.get("part-manifest.json")
+                if (
+                    set_info is None
+                    or part_info is None
+                    or set_info.file_size > _MAX_MANIFEST_BYTES
+                    or part_info.file_size > _MAX_MANIFEST_BYTES
+                ):
+                    raise PatreonBrowserPackageError("Patreon handoff manifest is unavailable")
+                set_manifest = _canonical_manifest(
+                    archive.read(set_info),
+                    schema=PATREON_SET_MANIFEST_SCHEMA,
+                )
+                part_manifest = _canonical_manifest(
+                    archive.read(part_info),
+                    schema=PATREON_PART_MANIFEST_SCHEMA,
+                )
+                post = _post(set_manifest)
+                content_records, preview_record = _multipart_image_records(
+                    set_manifest,
+                    part_manifest,
+                )
+                manifest_names = {"set-manifest.json", "part-manifest.json"}
             expected_names = {
-                "manifest.json",
+                *manifest_names,
                 "PUBLICATION_CHECKLIST.md",
                 "POST.txt",
                 *(record["path"] for record in content_records),
@@ -161,19 +188,82 @@ def _validated_entries(
 
 
 def _manifest(value: bytes) -> dict[str, object]:
-    decoded = json.loads(value)
-    if not isinstance(decoded, dict) or decoded.get("schema") != PATREON_HANDOFF_SCHEMA:
-        raise PatreonBrowserPackageError("Patreon handoff manifest schema is invalid")
+    decoded = _canonical_manifest(value, schema=PATREON_HANDOFF_SCHEMA)
     if decoded.get("publication_mode") != "human_official_ui":
         raise PatreonBrowserPackageError("Patreon handoff publication mode is invalid")
     if decoded.get("reconciliation_mode") != "read_api_and_signed_webhooks_only":
         raise PatreonBrowserPackageError("Patreon handoff reconciliation mode is invalid")
+    return decoded
+
+
+def _canonical_manifest(value: bytes, *, schema: str) -> dict[str, object]:
+    decoded = json.loads(value)
+    if not isinstance(decoded, dict) or decoded.get("schema") != schema:
+        raise PatreonBrowserPackageError("Patreon handoff manifest schema is invalid")
     try:
         if canonical_json_bytes(decoded) != value:
             raise PatreonBrowserPackageError("Patreon handoff manifest is not canonical")
     except (TypeError, ValueError) as error:
         raise PatreonBrowserPackageError("Patreon handoff manifest is not canonical") from error
     return cast(dict[str, object], decoded)
+
+
+def _multipart_image_records(
+    set_manifest: dict[str, object],
+    part_manifest: dict[str, object],
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    if (
+        set_manifest.get("publication_mode") != "human_official_ui"
+        or set_manifest.get("reconciliation_mode") != "read_api_and_signed_webhooks_only"
+    ):
+        raise PatreonBrowserPackageError("Patreon set manifest mode is invalid")
+    expected_digest = hashlib.sha256(canonical_json_bytes(set_manifest)).hexdigest()
+    raw_records = set_manifest.get("approved_derivatives")
+    set_preview = set_manifest.get("public_preview")
+    part_records = part_manifest.get("approved_derivatives")
+    part_preview = part_manifest.get("public_preview")
+    part_number = part_manifest.get("part_number")
+    part_count = part_manifest.get("part_count")
+    first_ordinal = part_manifest.get("first_ordinal")
+    last_ordinal = part_manifest.get("last_ordinal")
+    if (
+        part_manifest.get("set_manifest_sha256") != expected_digest
+        or not isinstance(raw_records, list)
+        or not isinstance(set_preview, dict)
+        or not isinstance(part_records, list)
+        or not isinstance(part_preview, dict)
+        or isinstance(part_number, bool)
+        or not isinstance(part_number, int)
+        or isinstance(part_count, bool)
+        or not isinstance(part_count, int)
+        or not 1 <= part_number <= part_count
+        or isinstance(first_ordinal, bool)
+        or not isinstance(first_ordinal, int)
+        or isinstance(last_ordinal, bool)
+        or not isinstance(last_ordinal, int)
+        or not 1 <= first_ordinal <= last_ordinal
+        or last_ordinal - first_ordinal + 1 != len(part_records)
+        or raw_records[first_ordinal - 1 : last_ordinal] != part_records
+    ):
+        raise PatreonBrowserPackageError("Patreon archive part manifest is invalid")
+    expected_preview = {
+        key: value for key, value in set_preview.items() if key != "human_safety_attestation"
+    }
+    if part_preview != expected_preview:
+        raise PatreonBrowserPackageError("Patreon archive preview identity is invalid")
+    preview = {
+        **part_preview,
+        "human_safety_attestation": set_preview.get("human_safety_attestation"),
+    }
+    manifest: dict[str, object] = {
+        "approved_derivatives": part_records,
+        "public_preview": preview,
+    }
+    records, validated_preview = _image_records(
+        manifest,
+        first_ordinal=first_ordinal,
+    )
+    return records, validated_preview
 
 
 def _post(manifest: dict[str, object]) -> _Post:
@@ -305,6 +395,8 @@ def _validate_canonical_timestamp(value: object, *, label: str) -> None:
 
 def _image_records(
     manifest: dict[str, object],
+    *,
+    first_ordinal: int = 1,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     content = manifest.get("approved_derivatives")
     preview = manifest.get("public_preview")
@@ -320,7 +412,7 @@ def _image_records(
     _validate_attestation(attestation)
     records = cast(list[dict[str, object]], content)
     total_image_bytes = 0
-    for index, record in enumerate(records, start=1):
+    for index, record in enumerate(records, start=first_ordinal):
         if record.get("ordinal") != index:
             raise PatreonBrowserPackageError("Patreon content ordering is invalid")
         total_image_bytes += _validate_image_record(

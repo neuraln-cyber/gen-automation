@@ -25,9 +25,12 @@ from gen_automation.integrations.patreon import (
     PatreonDriverRequest,
     PatreonDriverResult,
     PatreonPackageImage,
+    PatreonSetImageRecord,
     PatreonSidecarDriver,
     PublicPreviewSafetyAttestation,
     build_patreon_handoff_package,
+    build_patreon_handoff_package_part,
+    build_patreon_set_manifest,
 )
 from gen_automation.integrations.patreon.sidecar import (
     PATREON_BROWSER_SIGNATURE_HEADER,
@@ -74,6 +77,50 @@ def _handoff() -> bytes:
             attested_by="owner",
             attested_at=datetime(2026, 7, 29, tzinfo=UTC),
         ),
+    ).archive_bytes
+
+
+def _multipart_handoff_part_two() -> bytes:
+    image_bytes = _png((1, 2, 3))
+    preview_bytes = _png((4, 5, 6))
+    image_record = {
+        "sha256": hashlib.sha256(image_bytes).hexdigest(),
+        "byte_size": len(image_bytes),
+        "width": 8,
+        "height": 8,
+        "image_format": "PNG",
+        "content_type": "image/png",
+    }
+    records = tuple(
+        PatreonSetImageRecord(ordinal=ordinal, **image_record) for ordinal in range(1, 102)
+    )
+    manifest, _manifest_sha256 = build_patreon_set_manifest(
+        approved_derivatives=records,
+        public_preview=PatreonSetImageRecord(
+            ordinal=0,
+            sha256=hashlib.sha256(preview_bytes).hexdigest(),
+            byte_size=len(preview_bytes),
+            width=8,
+            height=8,
+            image_format="PNG",
+            content_type="image/png",
+        ),
+        title="Fixture set",
+        body="Fixture body",
+        tier="Paid members",
+        tags=("fixture",),
+        scheduled_at=None,
+        public_preview_attestation=PublicPreviewSafetyAttestation(
+            safe_for_public=True,
+            attested_by="owner",
+            attested_at=datetime(2026, 7, 29, tzinfo=UTC),
+        ),
+    )
+    return build_patreon_handoff_package_part(
+        approved_derivatives=(PatreonPackageImage("image.png", image_bytes),),
+        public_preview=PatreonPackageImage("preview.png", preview_bytes),
+        set_manifest_bytes=manifest,
+        part_number=2,
     ).archive_bytes
 
 
@@ -625,6 +672,24 @@ def test_browser_package_rejects_noncanonical_or_unverified_inputs(
             tmp_path / f"extract-{kind}",
             max_package_bytes=1024 * 1024,
         )
+
+
+def test_browser_package_accepts_global_ordinals_in_a_later_archive_part(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "part-002.zip"
+    archive_path.write_bytes(_multipart_handoff_part_two())
+
+    package = load_patreon_browser_package(
+        archive_path,
+        tmp_path / "extract-part-002",
+        max_package_bytes=1024 * 1024,
+    )
+
+    assert len(package.content_paths) == 1
+    assert package.content_paths[0].read_bytes() == _png((1, 2, 3))
+    assert package.public_preview_path.read_bytes() == _png((4, 5, 6))
+    assert package.title == "Fixture set"
 
 
 def test_patreon_browser_controller_configuration_requires_shared_secret() -> None:

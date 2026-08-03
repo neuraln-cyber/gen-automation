@@ -189,6 +189,11 @@ async def test_x_post_ambiguity_is_unknown_and_never_retried(
 
     monkeypatch.setattr(publication_runtime, "_recover_one_expired_lease", no_recovery)
     monkeypatch.setattr(publication_runtime, "_claim_one_attempt", claim_once)
+    monkeypatch.setattr(
+        publication_runtime,
+        "_patreon_package_part_count",
+        lambda *_args, **_kwargs: _async_value(1),
+    )
     monkeypatch.setattr(publication_runtime, "_next_step_snapshot", snapshot)
     monkeypatch.setattr(publication_runtime, "_load_x_media_ids", media_ids)
     monkeypatch.setattr(publication_runtime, "_begin_effect", snapshot)
@@ -335,6 +340,11 @@ async def test_patreon_browser_outcomes_are_terminal_and_never_retried(
 
     monkeypatch.setattr(publication_runtime, "_recover_one_expired_lease", no_recovery)
     monkeypatch.setattr(publication_runtime, "_claim_one_attempt", claim_once)
+    monkeypatch.setattr(
+        publication_runtime,
+        "_patreon_package_part_count",
+        lambda *_args, **_kwargs: _async_value(1),
+    )
     monkeypatch.setattr(
         publication_runtime,
         "_next_step_snapshot",

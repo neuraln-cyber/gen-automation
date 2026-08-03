@@ -58,7 +58,7 @@ used as a completion claim.
   accepted high-confidence severe result requires an authenticated OWNER,
   `semantic_severe_override`, and a written audited justification.
 - Dynamic deliverability enforcement across generation, review, derivatives,
-  and publication: at most 100 accepted images, post-hires masters bounded to
+  and publication: at most 500 accepted images, post-hires masters bounded to
   8192 by 8192 and 12 million pixels, and X outputs deterministically adapted to
   the 5 MiB image ceiling through bounded JPEG quality/downscaling.
 - Durable human decisions, clean unwatermarked member/Patreon derivatives, and
@@ -76,7 +76,7 @@ used as a completion claim.
   deterministic ZIP download and manual official-UI handoff remain available
   as the fallback.
 - A pinned MEGAcmd-enabled controller image and restart-safe automatic mirror of
-  the exact clean Patreon ZIP. Success requires a verification download with
+  every exact clean Patreon archive part. Success requires a verification download with
   matching byte length and SHA-256; the private asset bucket remains the source
   of truth.
 - Reproducible AWS staging OpenTofu under `infra/aws-staging`: default
@@ -127,14 +127,17 @@ derivatives/{release_id}/{release_version_id}/{job_id}/
   {target}/{output_sha256}.{extension}
 ```
 
-The deterministic full-set ZIP is private:
+The deterministic full-set archive parts are private:
 
 ```text
-publication-packages/{publication_intent_id}/{sha256}.zip
+publication-packages/{publication_intent_id}/part-NNN-of-NNN/{sha256}.zip
 ```
 
-That same exact ZIP can be published through the Patreon browser sidecar,
-downloaded for the manual fallback, and mirrored to MEGA. Raw masters are never
+Each exact archive can be downloaded for the Patreon manual fallback and is
+mirrored to MEGA. Every part carries the same release-wide ordered manifest.
+Single-part sets can also be published through the Patreon browser sidecar; a
+multipart set waits for the operator so the official UI is not driven with an
+incomplete subset. Raw masters are never
 watermarked, moved, overwritten, or made public.
 
 ## No-access work versus live MVP work

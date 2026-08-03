@@ -34,7 +34,7 @@ class QualityConfig:
     max_pixels: int = 32_000_000
     max_aspect_ratio_micros: int = 20 * MICROS
     thumbnail_size: int = 64
-    max_batch_size: int = 256
+    max_batch_size: int = 500
     near_duplicate_hamming_threshold: int = 6
 
     exposure_target_micros: int = 500_000

@@ -16,7 +16,7 @@ For large sets, **Build a large wildcard queue quickly** accepts one compact
 in exactly that order while copying the shared starting prompt into each one.
 The queue summary continuously shows total images, GPU jobs, and the final-set
 target before submission. The visible **Keep best** target follows the queue by
-default (up to the supported 100-image final set) and becomes independent after
+default (up to the supported 500-image final set) and becomes independent after
 the operator edits it. Unknown wildcard tokens are rejected in the batch card
 before submission.
 

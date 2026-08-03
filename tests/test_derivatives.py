@@ -273,17 +273,18 @@ def test_x_jpeg_adapts_deterministically_to_the_media_byte_cap() -> None:
     assert any(operation.startswith("x-cap-") for operation in first.lineage.operations)
 
 
-@pytest.mark.parametrize("accepted_count", (1, 7, 8, 100))
+@pytest.mark.parametrize("accepted_count", (1, 7, 8, 100, 400, 500))
 def test_patreon_full_output_budget_reserves_the_duplicate_preview(
     accepted_count: int,
 ) -> None:
     budget = patreon_full_output_byte_budget(accepted_count)
 
     assert budget <= PATREON_MAX_IMAGE_BYTES
-    assert (accepted_count + 1) * budget <= PATREON_MAX_TOTAL_IMAGE_BYTES
+    images_in_largest_part = min(accepted_count, 100)
+    assert (images_in_largest_part + 1) * budget <= PATREON_MAX_TOTAL_IMAGE_BYTES
 
 
-@pytest.mark.parametrize("accepted_count", (True, 0, 101))
+@pytest.mark.parametrize("accepted_count", (True, 0, 501))
 def test_patreon_full_output_budget_rejects_invalid_set_sizes(
     accepted_count: int,
 ) -> None:

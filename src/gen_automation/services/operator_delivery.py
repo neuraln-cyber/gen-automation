@@ -102,6 +102,16 @@ class DestinationState:
     intent_digest: str | None = None
     intent_lock_version: int | None = None
     package_id: UUID | None = None
+    package_parts: tuple[DeliveryPackagePart, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryPackagePart:
+    package_id: UUID
+    part_number: int
+    part_count: int
+    first_ordinal: int
+    last_ordinal: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -542,13 +552,20 @@ async def _publication_destination(
         .order_by(PublicationAttempt.attempt_no.desc())
         .limit(1)
     )
-    package = (
-        await session.scalar(
-            select(PublicationPackage).where(PublicationPackage.intent_id == intent.id)
+    packages = (
+        tuple(
+            (
+                await session.scalars(
+                    select(PublicationPackage)
+                    .where(PublicationPackage.intent_id == intent.id)
+                    .order_by(PublicationPackage.part_number)
+                )
+            ).all()
         )
         if intent.target == PublicationTarget.PATREON
-        else None
+        else ()
     )
+    package = packages[0] if packages else None
     state, detail = _publication_state(intent, attempt)
     return DestinationState(
         key=key,
@@ -559,6 +576,16 @@ async def _publication_destination(
         intent_digest=intent.intent_digest,
         intent_lock_version=intent.lock_version,
         package_id=package.id if package is not None else None,
+        package_parts=tuple(
+            DeliveryPackagePart(
+                package_id=item.id,
+                part_number=item.part_number,
+                part_count=item.part_count,
+                first_ordinal=item.first_ordinal,
+                last_ordinal=item.last_ordinal,
+            )
+            for item in packages
+        ),
     )
 
 
@@ -615,10 +642,16 @@ async def _mega_destination(
             state="not_prepared",
             detail="MEGA mirrors the exact Patreon full-set package.",
         )
-    package = await session.scalar(
-        select(PublicationPackage).where(PublicationPackage.intent_id == patreon_intent.id)
+    packages = tuple(
+        (
+            await session.scalars(
+                select(PublicationPackage)
+                .where(PublicationPackage.intent_id == patreon_intent.id)
+                .order_by(PublicationPackage.part_number)
+            )
+        ).all()
     )
-    if package is None:
+    if not packages:
         return DestinationState(
             key="mega",
             label="MEGA",
@@ -626,38 +659,43 @@ async def _mega_destination(
             detail="Waiting for the exact full-set package.",
             intent_id=patreon_intent.id,
         )
-    delivery = await session.scalar(
-        select(MegaDelivery)
-        .join(
-            PublicationPackage,
-            PublicationPackage.id == MegaDelivery.publication_package_id,
-        )
-        .join(
-            PublicationIntent,
-            PublicationIntent.id == PublicationPackage.intent_id,
-        )
-        .where(
-            PublicationIntent.release_id == release_id,
-            MegaDelivery.publication_package_id == package.id,
-        )
-        .order_by(MegaDelivery.created_at.desc(), MegaDelivery.id.desc())
-        .limit(1)
+    deliveries = tuple(
+        (
+            await session.scalars(
+                select(MegaDelivery)
+                .join(
+                    PublicationPackage,
+                    PublicationPackage.id == MegaDelivery.publication_package_id,
+                )
+                .join(
+                    PublicationIntent,
+                    PublicationIntent.id == PublicationPackage.intent_id,
+                )
+                .where(
+                    PublicationIntent.release_id == release_id,
+                    MegaDelivery.publication_package_id.in_(tuple(item.id for item in packages)),
+                )
+                .order_by(MegaDelivery.created_at, MegaDelivery.id)
+            )
+        ).all()
     )
-    if delivery is None:
+    first_package = packages[0]
+    if len(deliveries) < len(packages):
         return DestinationState(
             key="mega",
             label="MEGA",
             state="queued",
-            detail="Package ready; waiting for the MEGA mirror worker.",
+            detail=(f"Package set ready; {len(deliveries)} / {len(packages)} MEGA parts queued."),
             intent_id=patreon_intent.id,
-            package_id=package.id,
+            package_id=first_package.id,
         )
-    if delivery.state == MegaDeliveryState.SUCCEEDED:
-        state, detail = "published", f"Full set uploaded to {delivery.remote_path}."
-    elif delivery.state == MegaDeliveryState.CLAIMED:
-        state, detail = "running", "MEGA upload and checksum verification are running."
-    elif delivery.state == MegaDeliveryState.FAILED:
+    if all(delivery.state == MegaDeliveryState.SUCCEEDED for delivery in deliveries):
+        state = "published"
+        detail = f"All {len(deliveries)} full-set package parts are verified on MEGA."
+    elif any(delivery.state == MegaDeliveryState.FAILED for delivery in deliveries):
         state, detail = "failed", "MEGA delivery needs operator attention."
+    elif any(delivery.state == MegaDeliveryState.CLAIMED for delivery in deliveries):
+        state, detail = "running", "MEGA upload and checksum verification are running."
     else:
         state, detail = "queued", "MEGA delivery is queued."
     return DestinationState(
@@ -666,7 +704,7 @@ async def _mega_destination(
         state=state,
         detail=detail,
         intent_id=patreon_intent.id,
-        package_id=package.id,
+        package_id=first_package.id,
     )
 
 

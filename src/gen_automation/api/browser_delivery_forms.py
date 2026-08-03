@@ -47,6 +47,7 @@ PACKAGE_DOWNLOAD_FIELDS = frozenset(
         "csrf_token",
         "expected_intent_digest",
         "expected_lock_version",
+        "part_number",
     }
 )
 PATREON_CONFIRM_PRESENT_FIELDS = frozenset(
@@ -121,6 +122,7 @@ class PackageDownloadForm:
     csrf_token: str
     expected_intent_digest: str
     expected_lock_version: int
+    part_number: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +217,7 @@ async def read_package_download_form(request: Request) -> PackageDownloadForm:
         csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
         expected_intent_digest=digest,
         expected_lock_version=_positive_int(values["expected_lock_version"]),
+        part_number=_positive_int(values["part_number"]),
     )
 
 
