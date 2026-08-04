@@ -57,6 +57,7 @@ class SaladQueue:
 
 @dataclass(frozen=True)
 class SaladContainerGroupState:
+    status: str
     description: str
     allocating_count: int
     creating_count: int
@@ -81,8 +82,8 @@ class SaladContainerGroup:
 
     @property
     def status(self) -> str:
-        """Expose Salad's free-form current-state description."""
-        return self.current_state.description
+        """Expose Salad's documented current-state lifecycle status."""
+        return self.current_state.status
 
 
 @dataclass(frozen=True)
@@ -268,6 +269,7 @@ def parse_container_group(data: JSONObject) -> SaladContainerGroup:
         "current_state.instance_status_counts",
     )
     state = SaladContainerGroupState(
+        status=_required_str(state_data, "status", "current_state"),
         description=_required_str(state_data, "description", "current_state"),
         allocating_count=_optional_int(counts_data, "allocating_count", "instance status counts"),
         creating_count=_optional_int(counts_data, "creating_count", "instance status counts"),

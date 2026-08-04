@@ -71,7 +71,8 @@ def container_group_payload() -> JSONObject:
         "pending_change": False,
         "version": 3,
         "current_state": {
-            "description": "stopped",
+            "status": "stopped",
+            "description": "",
             "instance_status_counts": {
                 "allocating_count": 0,
                 "creating_count": 0,

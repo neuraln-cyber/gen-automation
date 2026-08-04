@@ -194,6 +194,7 @@ def make_group(
         pending_change=pending_change,
         version=version,
         current_state=SaladContainerGroupState(
+            status=status,
             description=status,
             allocating_count=0,
             creating_count=0,

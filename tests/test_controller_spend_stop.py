@@ -167,6 +167,7 @@ def _group(name: str, queue_name: str) -> SaladContainerGroup:
         pending_change=False,
         version=1,
         current_state=SaladContainerGroupState(
+            status="running",
             description="running",
             allocating_count=0,
             creating_count=0,
