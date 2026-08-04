@@ -3,7 +3,7 @@
 FROM golang:1.26.2-alpine@sha256:f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739500e08c86393a21b1 AS salad-queue-worker-builder
 
 ENV SALAD_QUEUE_WORKER_COMMIT=73d7a3c80a73f26339194e024cb47c8501c67f75 \
-    SALAD_QUEUE_WORKER_PATCH_SHA256=540cd81fccd3bb1a56018897f4d8b5a99a87bafe6703aa7cd0edb364cb82c4f6
+    SALAD_QUEUE_WORKER_PATCH_SHA256=a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae
 
 RUN apk add --no-cache git \
     && mkdir --parents /src \
@@ -46,7 +46,7 @@ LABEL org.opencontainers.image.title="gen-automation-gpu-worker" \
       org.opencontainers.image.impact-pack.revision="429d0159ad429e64d2b3916e6e7be9c22d025c3c" \
       org.opencontainers.image.impact-subpack.revision="50c7b71a6a224734cc9b21963c6d1926816a97f1" \
       org.opencontainers.image.salad-queue-worker.revision="73d7a3c80a73f26339194e024cb47c8501c67f75" \
-      org.opencontainers.image.salad-queue-worker.patch-sha256="540cd81fccd3bb1a56018897f4d8b5a99a87bafe6703aa7cd0edb364cb82c4f6"
+      org.opencontainers.image.salad-queue-worker.patch-sha256="a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     COMFYUI_COMMIT=700821e1364eaab0e8f21c538a2131719fec57bf \
