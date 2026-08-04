@@ -10,13 +10,21 @@ from sqlalchemy.exc import DatabaseError
 
 from gen_automation.db.models import (
     AdminUser,
+    AssetRanking,
+    AssetScore,
+    ScoringRun,
     SemanticAnatomyFeedback,
     SemanticAssessment,
     SemanticCalibrationArtifact,
 )
 from gen_automation.db.session import Database
+from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import (
     AdminRole,
+    AssetScoreState,
+    RankingDisposition,
+    ScoringRunState,
+    SemanticAssessmentState,
     SemanticFeedbackAgreement,
     SemanticGroundTruth,
     SemanticIssueCode,
@@ -28,6 +36,7 @@ from gen_automation.services.semantic_anatomy import (
     run_semantic_assessment_cycle,
 )
 from gen_automation.services.semantic_feedback import (
+    SEMANTIC_CALIBRATION_SCHEMA_VERSION,
     SemanticFeedbackConflictError,
     SemanticFeedbackValidationError,
     agreement_for_ground_truth,
@@ -53,6 +62,125 @@ class FeedbackContext:
     database: Database
     assessment_id: UUID
     owner_ids: tuple[UUID, UUID, UUID]
+
+
+async def _add_cross_run_assessment(
+    context: FeedbackContext,
+    *,
+    run_number: int,
+    profile_sha256: str | None = None,
+    verdict: SemanticVerdict = SemanticVerdict.SEVERE,
+    confidence_micros: int = 960_000,
+) -> UUID:
+    async with context.database.sessions() as session:
+        original = await session.get(SemanticAssessment, context.assessment_id)
+        assert original is not None
+        original_score = await session.get(AssetScore, original.asset_score_id)
+        original_run = await session.get(ScoringRun, original.scoring_run_id)
+        assert original_score is not None
+        assert original_run is not None
+        run = ScoringRun(
+            release_version_id=original_run.release_version_id,
+            configuration={"calibration_dedupe_run": run_number},
+            config_sha256=f"{run_number:064x}",
+            input_manifest_sha256=f"{run_number + 100:064x}",
+            ranking_manifest_sha256=None,
+            scorer_version=original_run.scorer_version,
+            pillow_version=original_run.pillow_version,
+            state=ScoringRunState.RUNNING,
+            asset_count=1,
+            max_attempts=3,
+            created_at=_NOW + timedelta(hours=run_number),
+            started_at=_NOW + timedelta(hours=run_number),
+            completed_at=None,
+        )
+        session.add(run)
+        await session.flush()
+        score = AssetScore(
+            scoring_run_id=run.id,
+            asset_id=original.asset_id,
+            asset_storage_backend=original_score.asset_storage_backend,
+            asset_storage_bucket=original_score.asset_storage_bucket,
+            asset_sha256=original_score.asset_sha256,
+            asset_object_key=original_score.asset_object_key,
+            asset_object_version_id=original_score.asset_object_version_id,
+            asset_byte_size=original_score.asset_byte_size,
+            asset_image_format=original_score.asset_image_format,
+            asset_width=original_score.asset_width,
+            asset_height=original_score.asset_height,
+            state=AssetScoreState.FLAGGED_CORRUPT,
+            attempts=1,
+            max_attempts=3,
+            available_at=_NOW,
+            aggregate_score_micros=original_score.aggregate_score_micros,
+            signal_detail={"classification": "calibration-dedupe-fixture"},
+            scorer_version=run.scorer_version,
+            pillow_version=run.pillow_version,
+            config_sha256=run.config_sha256,
+            completed_at=_NOW + timedelta(hours=run_number, seconds=1),
+            created_at=run.created_at,
+        )
+        session.add(score)
+        await session.flush()
+        session.add(
+            AssetRanking(
+                scoring_run_id=run.id,
+                asset_score_id=score.id,
+                asset_id=original.asset_id,
+                rank=1,
+                aggregate_score_micros=score.aggregate_score_micros,
+                disposition=RankingDisposition.FLAGGED_REVIEW,
+                explanation={"fixture": True},
+                is_duplicate_representative=False,
+                scorer_version=run.scorer_version,
+                pillow_version=run.pillow_version,
+                config_sha256=run.config_sha256,
+                frozen_at=_NOW + timedelta(hours=run_number, seconds=1),
+            )
+        )
+        await session.flush()
+        run.ranking_manifest_sha256 = f"{run_number + 200:064x}"
+        run.state = ScoringRunState.COMPLETED
+        run.completed_at = _NOW + timedelta(hours=run_number, seconds=1)
+        await session.flush()
+        response = {
+            "verdict": verdict.value,
+            "confidence_micros": confidence_micros,
+            "run_number": run_number,
+        }
+        assessment = SemanticAssessment(
+            scoring_run_id=run.id,
+            asset_score_id=score.id,
+            asset_id=original.asset_id,
+            asset_storage_backend=original.asset_storage_backend,
+            asset_storage_bucket=original.asset_storage_bucket,
+            asset_object_key=original.asset_object_key,
+            asset_object_version_id=original.asset_object_version_id,
+            asset_sha256=original.asset_sha256,
+            asset_content_type=original.asset_content_type,
+            asset_byte_size=original.asset_byte_size,
+            profile_sha256=profile_sha256 or original.profile_sha256,
+            model_name=original.model_name,
+            model_revision=original.model_revision,
+            prompt_sha256=original.prompt_sha256,
+            schema_sha256=original.schema_sha256,
+            state=SemanticAssessmentState.COMPLETED,
+            attempts=1,
+            max_attempts=3,
+            available_at=run.created_at,
+            verdict=verdict,
+            confidence_micros=confidence_micros,
+            issues=[],
+            response_sha256=canonical_sha256(response),
+            created_at=run.created_at,
+            started_at=run.started_at,
+            completed_at=run.completed_at,
+        )
+        session.add(assessment)
+        await session.flush()
+        assessment_id = assessment.id
+        await session.commit()
+        return assessment_id
 
 
 @pytest.fixture
@@ -202,6 +330,185 @@ async def test_feedback_is_assessment_bound_idempotent_and_immutable(
                     SemanticAnatomyFeedback.id == first.feedback_id
                 )
             )
+
+
+@pytest.mark.asyncio
+async def test_calibration_deduplicates_cross_run_owner_labels_by_earliest_feedback(
+    feedback_context: FeedbackContext,
+) -> None:
+    duplicate_assessment_id = await _add_cross_run_assessment(
+        feedback_context,
+        run_number=1,
+    )
+    async with feedback_context.database.sessions() as session:
+        # Insert in reverse chronological order to prove insertion order is irrelevant.
+        await record_semantic_anatomy_feedback(
+            session,
+            assessment_id=feedback_context.assessment_id,
+            user_id=feedback_context.owner_ids[0],
+            ground_truth=SemanticGroundTruth.ANATOMY_GOOD,
+            now=_NOW + timedelta(minutes=10),
+        )
+        await record_semantic_anatomy_feedback(
+            session,
+            assessment_id=duplicate_assessment_id,
+            user_id=feedback_context.owner_ids[0],
+            ground_truth=SemanticGroundTruth.ANATOMY_DEFECT,
+            issue_code=SemanticIssueCode.EXTRA_FINGER,
+            now=_NOW + timedelta(minutes=5),
+        )
+
+        report = await build_semantic_calibration_report(
+            session,
+            profile_sha256=_PROFILE.profile_sha256,
+        )
+        repeated = await build_semantic_calibration_report(
+            session,
+            profile_sha256=_PROFILE.profile_sha256,
+        )
+
+    assert report.feedback_count == 1
+    assert report.anatomy_good_count == 0
+    assert report.anatomy_defect_count == 1
+    assert report.dataset_sha256 == repeated.dataset_sha256
+    assert report.to_wire()["schema_version"] == SEMANTIC_CALIBRATION_SCHEMA_VERSION
+    assert SEMANTIC_CALIBRATION_SCHEMA_VERSION == "semantic-anatomy-calibration/v2"
+
+
+@pytest.mark.asyncio
+async def test_calibration_keeps_different_owners_independent_after_deduplication(
+    feedback_context: FeedbackContext,
+) -> None:
+    duplicate_assessment_id = await _add_cross_run_assessment(
+        feedback_context,
+        run_number=2,
+    )
+    async with feedback_context.database.sessions() as session:
+        await record_semantic_anatomy_feedback(
+            session,
+            assessment_id=feedback_context.assessment_id,
+            user_id=feedback_context.owner_ids[0],
+            ground_truth=SemanticGroundTruth.ANATOMY_GOOD,
+            now=_NOW + timedelta(minutes=1),
+        )
+        await record_semantic_anatomy_feedback(
+            session,
+            assessment_id=duplicate_assessment_id,
+            user_id=feedback_context.owner_ids[0],
+            ground_truth=SemanticGroundTruth.ANATOMY_DEFECT,
+            issue_code=SemanticIssueCode.EXTRA_FINGER,
+            now=_NOW + timedelta(minutes=2),
+        )
+        await record_semantic_anatomy_feedback(
+            session,
+            assessment_id=duplicate_assessment_id,
+            user_id=feedback_context.owner_ids[1],
+            ground_truth=SemanticGroundTruth.ANATOMY_DEFECT,
+            issue_code=SemanticIssueCode.EXTRA_FINGER,
+            now=_NOW + timedelta(minutes=3),
+        )
+        report = await build_semantic_calibration_report(
+            session,
+            profile_sha256=_PROFILE.profile_sha256,
+        )
+
+    assert report.feedback_count == 2
+    assert report.anatomy_good_count == 1
+    assert report.anatomy_defect_count == 1
+
+
+@pytest.mark.asyncio
+async def test_calibration_deduplication_is_scoped_to_one_profile(
+    feedback_context: FeedbackContext,
+) -> None:
+    other_profile = "f" * 64
+    other_assessment_id = await _add_cross_run_assessment(
+        feedback_context,
+        run_number=3,
+        profile_sha256=other_profile,
+    )
+    async with feedback_context.database.sessions() as session:
+        await record_semantic_anatomy_feedback(
+            session,
+            assessment_id=feedback_context.assessment_id,
+            user_id=feedback_context.owner_ids[0],
+            ground_truth=SemanticGroundTruth.ANATOMY_GOOD,
+            now=_NOW + timedelta(minutes=1),
+        )
+        await record_semantic_anatomy_feedback(
+            session,
+            assessment_id=other_assessment_id,
+            user_id=feedback_context.owner_ids[0],
+            ground_truth=SemanticGroundTruth.ANATOMY_DEFECT,
+            issue_code=SemanticIssueCode.EXTRA_FINGER,
+            now=_NOW + timedelta(minutes=2),
+        )
+        original_report = await build_semantic_calibration_report(
+            session,
+            profile_sha256=_PROFILE.profile_sha256,
+        )
+        other_report = await build_semantic_calibration_report(
+            session,
+            profile_sha256=other_profile,
+        )
+
+    assert original_report.feedback_count == 1
+    assert original_report.anatomy_good_count == 1
+    assert other_report.feedback_count == 1
+    assert other_report.anatomy_defect_count == 1
+
+
+@pytest.mark.asyncio
+async def test_calibration_uses_feedback_id_as_equal_timestamp_tiebreak(
+    feedback_context: FeedbackContext,
+) -> None:
+    duplicate_assessment_id = await _add_cross_run_assessment(
+        feedback_context,
+        run_number=4,
+    )
+    async with feedback_context.database.sessions() as session:
+        original = await session.get(SemanticAssessment, feedback_context.assessment_id)
+        duplicate = await session.get(SemanticAssessment, duplicate_assessment_id)
+        assert original is not None
+        assert duplicate is not None
+        timestamp = _NOW + timedelta(minutes=1)
+        session.add_all(
+            (
+                SemanticAnatomyFeedback(
+                    id=UUID(int=2),
+                    semantic_assessment_id=original.id,
+                    asset_id=original.asset_id,
+                    profile_sha256=original.profile_sha256,
+                    feedback_by_user_id=feedback_context.owner_ids[0],
+                    agreement=SemanticFeedbackAgreement.INCORRECT,
+                    ground_truth=SemanticGroundTruth.ANATOMY_GOOD,
+                    issue_code=None,
+                    note=None,
+                    created_at=timestamp,
+                ),
+                SemanticAnatomyFeedback(
+                    id=UUID(int=1),
+                    semantic_assessment_id=duplicate.id,
+                    asset_id=duplicate.asset_id,
+                    profile_sha256=duplicate.profile_sha256,
+                    feedback_by_user_id=feedback_context.owner_ids[0],
+                    agreement=SemanticFeedbackAgreement.CORRECT,
+                    ground_truth=SemanticGroundTruth.ANATOMY_DEFECT,
+                    issue_code=SemanticIssueCode.EXTRA_FINGER,
+                    note=None,
+                    created_at=timestamp,
+                ),
+            )
+        )
+        await session.flush()
+        report = await build_semantic_calibration_report(
+            session,
+            profile_sha256=_PROFILE.profile_sha256,
+        )
+
+    assert report.feedback_count == 1
+    assert report.anatomy_good_count == 0
+    assert report.anatomy_defect_count == 1
 
 
 @pytest.mark.asyncio

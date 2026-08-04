@@ -481,6 +481,85 @@ async def _add_ranked_asset(
         return asset.id
 
 
+async def _add_ranked_repeat(
+    context: SemanticRuntimeContext,
+    *,
+    asset_id: UUID,
+    rank: int,
+) -> UUID:
+    async with context.database.sessions() as session:
+        asset = await session.get(Asset, asset_id)
+        assert asset is not None
+        assert asset.generation_job_id is not None
+        job = await session.get(GenerationJob, asset.generation_job_id)
+        assert job is not None
+        run = ScoringRun(
+            release_version_id=job.release_version_id,
+            configuration={"quality": "repeat-fixture"},
+            config_sha256="a" * 64,
+            input_manifest_sha256="b" * 64,
+            ranking_manifest_sha256=None,
+            scorer_version="fixture",
+            pillow_version="12.0.0",
+            state=ScoringRunState.RUNNING,
+            asset_count=1,
+            max_attempts=3,
+            created_at=_NOW + timedelta(seconds=1),
+            started_at=_NOW + timedelta(seconds=1),
+            completed_at=None,
+        )
+        session.add(run)
+        await session.flush()
+        score = AssetScore(
+            scoring_run_id=run.id,
+            asset_id=asset.id,
+            asset_storage_backend=asset.storage_backend,
+            asset_storage_bucket=asset.storage_bucket,
+            asset_sha256=asset.sha256,
+            asset_object_key=asset.object_key,
+            asset_object_version_id=asset.object_version_id,
+            asset_byte_size=asset.byte_size,
+            asset_image_format=asset.image_format,
+            asset_width=asset.width,
+            asset_height=asset.height,
+            state=AssetScoreState.FLAGGED_CORRUPT,
+            attempts=1,
+            max_attempts=3,
+            available_at=_NOW,
+            aggregate_score_micros=450_000,
+            signal_detail={"classification": "repeat-fixture"},
+            scorer_version=run.scorer_version,
+            pillow_version=run.pillow_version,
+            config_sha256=run.config_sha256,
+            completed_at=_NOW + timedelta(seconds=1),
+            created_at=_NOW,
+        )
+        session.add(score)
+        await session.flush()
+        session.add(
+            AssetRanking(
+                scoring_run_id=run.id,
+                asset_score_id=score.id,
+                asset_id=asset.id,
+                rank=rank,
+                aggregate_score_micros=450_000,
+                disposition=RankingDisposition.FLAGGED_REVIEW,
+                explanation={"fixture": True},
+                is_duplicate_representative=False,
+                scorer_version=run.scorer_version,
+                pillow_version=run.pillow_version,
+                config_sha256=run.config_sha256,
+                frozen_at=_NOW + timedelta(seconds=1),
+            )
+        )
+        await session.flush()
+        run.ranking_manifest_sha256 = "c" * 64
+        run.state = ScoringRunState.COMPLETED
+        run.completed_at = _NOW + timedelta(milliseconds=1500)
+        await session.commit()
+        return run.id
+
+
 async def _passing_assessment(
     _payload: bytes,
     _content_type: str,
@@ -559,6 +638,81 @@ async def test_profile_assessment_limit_counts_all_existing_rows(
         assessments = list((await session.scalars(select(SemanticAssessment))).all())
         assert len(assessments) == 1
         assert assessments[0].state == SemanticAssessmentState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_unassessed_asset_precedes_cross_run_repeat_with_one_cap_slot(
+    semantic_runtime_context: SemanticRuntimeContext,
+) -> None:
+    profile = SemanticAssessmentProfile(model_name=_MODEL, model_revision=_REVISION)
+    first = await run_semantic_assessment_cycle(
+        semantic_runtime_context.database.sessions,
+        semantic_runtime_context.store,
+        worker_id="semantic:asset-priority",
+        profile=profile,
+        analyzer=_passing_assessment,
+        max_assessments_per_profile=1,
+        asset_allowlist=(),
+        max_attempts=2,
+        lease_seconds=120,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+        now=_NOW + timedelta(minutes=1),
+    )
+    assert first.created_assessment
+    assert first.processed_assessment
+
+    repeated_run_id = await _add_ranked_repeat(
+        semantic_runtime_context,
+        asset_id=semantic_runtime_context.asset_id,
+        rank=1,
+    )
+    unassessed_asset_id = await _add_ranked_asset(
+        semantic_runtime_context,
+        output_index=2,
+        rank=1,
+    )
+    second = await run_semantic_assessment_cycle(
+        semantic_runtime_context.database.sessions,
+        semantic_runtime_context.store,
+        worker_id="semantic:asset-priority",
+        profile=profile,
+        analyzer=_passing_assessment,
+        max_assessments_per_profile=2,
+        asset_allowlist=(),
+        max_attempts=2,
+        lease_seconds=120,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+        now=_NOW + timedelta(minutes=2),
+    )
+    assert second.created_assessment
+    assert second.processed_assessment
+
+    capped = await run_semantic_assessment_cycle(
+        semantic_runtime_context.database.sessions,
+        semantic_runtime_context.store,
+        worker_id="semantic:asset-priority",
+        profile=profile,
+        analyzer=_passing_assessment,
+        max_assessments_per_profile=2,
+        asset_allowlist=(),
+        max_attempts=2,
+        lease_seconds=120,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+        now=_NOW + timedelta(minutes=3),
+    )
+    assert not capped.did_work
+
+    async with semantic_runtime_context.database.sessions() as session:
+        assessments = list((await session.scalars(select(SemanticAssessment))).all())
+        assert len(assessments) == 2
+        assert {assessment.asset_id for assessment in assessments} == {
+            semantic_runtime_context.asset_id,
+            unassessed_asset_id,
+        }
+        assert all(assessment.scoring_run_id != repeated_run_id for assessment in assessments)
 
 
 @pytest.mark.asyncio

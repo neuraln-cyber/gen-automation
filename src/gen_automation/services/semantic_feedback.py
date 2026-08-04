@@ -25,7 +25,7 @@ from gen_automation.domain.enums import (
     SemanticVerdict,
 )
 
-SEMANTIC_CALIBRATION_SCHEMA_VERSION = "semantic-anatomy-calibration/v1"
+SEMANTIC_CALIBRATION_SCHEMA_VERSION = "semantic-anatomy-calibration/v2"
 DEFAULT_CALIBRATION_MINIMUM_SAMPLES = 100
 DEFAULT_CALIBRATION_MINIMUM_PER_CLASS = 20
 DEFAULT_CALIBRATION_THRESHOLD_STEP_MICROS = 50_000
@@ -342,6 +342,7 @@ async def build_semantic_calibration_report(
             )
             .where(
                 SemanticAnatomyFeedback.profile_sha256 == profile_digest,
+                SemanticAssessment.profile_sha256 == profile_digest,
                 SemanticAssessment.state == SemanticAssessmentState.COMPLETED,
             )
             .order_by(
@@ -350,7 +351,11 @@ async def build_semantic_calibration_report(
             )
         )
     ).all()
-    samples = tuple(_calibration_sample(feedback, assessment) for feedback, assessment in rows)
+    ordered_rows = tuple((feedback, assessment) for feedback, assessment in rows)
+    samples = tuple(
+        _calibration_sample(feedback, assessment)
+        for feedback, assessment in _deduplicate_calibration_rows(ordered_rows)
+    )
     dataset_digest = canonical_sha256(
         {
             "schema_version": SEMANTIC_CALIBRATION_SCHEMA_VERSION,
@@ -497,6 +502,22 @@ async def refresh_semantic_calibration_artifact(
         created_by_user_id=created_by_user_id,
         now=now,
     )
+
+
+def _deduplicate_calibration_rows(
+    rows: tuple[tuple[SemanticAnatomyFeedback, SemanticAssessment], ...],
+) -> tuple[tuple[SemanticAnatomyFeedback, SemanticAssessment], ...]:
+    """Keep the earliest profile-scoped label for each asset and owner."""
+
+    deduplicated: list[tuple[SemanticAnatomyFeedback, SemanticAssessment]] = []
+    seen: set[tuple[UUID, UUID]] = set()
+    for feedback, assessment in rows:
+        identity = (feedback.asset_id, feedback.feedback_by_user_id)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduplicated.append((feedback, assessment))
+    return tuple(deduplicated)
 
 
 def _calibration_sample(

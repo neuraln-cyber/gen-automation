@@ -207,6 +207,13 @@ async def ensure_semantic_assessment(
             SemanticAssessment.profile_sha256 == profile_digest,
         )
     )
+    completed_assessment_exists = exists(
+        select(SemanticAssessment.id).where(
+            SemanticAssessment.asset_id == AssetScore.asset_id,
+            SemanticAssessment.profile_sha256 == profile_digest,
+            SemanticAssessment.state == SemanticAssessmentState.COMPLETED,
+        )
+    )
     candidate = (
         select(AssetScore, Asset)
         .join(ScoringRun, ScoringRun.id == AssetScore.scoring_run_id)
@@ -229,7 +236,12 @@ async def ensure_semantic_assessment(
         candidate = candidate.where(AssetScore.asset_id.in_(allowed_asset_ids))
     row = (
         await session.execute(
-            candidate.order_by(ScoringRun.completed_at, AssetRanking.rank, AssetScore.id)
+            candidate.order_by(
+                completed_assessment_exists.asc(),
+                ScoringRun.completed_at,
+                AssetRanking.rank,
+                AssetScore.id,
+            )
             .limit(1)
             .with_for_update(skip_locked=True)
         )
