@@ -21,7 +21,7 @@ COPY patches/salad-queue-worker/strict-http-status.patch /tmp/strict-http-status
 RUN printf '%s  %s\n' \
         "${SALAD_QUEUE_WORKER_PATCH_SHA256}" \
         /tmp/strict-http-status.patch \
-        | sha256sum --check - \
+        | sha256sum -c - \
     && git apply --check /tmp/strict-http-status.patch \
     && git apply /tmp/strict-http-status.patch \
     && git diff --check

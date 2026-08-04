@@ -104,7 +104,7 @@ def test_salad_queue_worker_accepts_only_2xx_job_responses() -> None:
         "COPY patches/salad-queue-worker/strict-http-status.patch "
         "/tmp/strict-http-status.patch" in dockerfile
     )
-    assert "sha256sum --check -" in dockerfile
+    assert "sha256sum -c -" in dockerfile
     assert "git apply --check /tmp/strict-http-status.patch" in dockerfile
     assert "git apply /tmp/strict-http-status.patch" in dockerfile
     assert "go test -mod=readonly ./cmd/salad-http-job-queue-worker" in dockerfile
