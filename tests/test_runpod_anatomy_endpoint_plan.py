@@ -325,6 +325,93 @@ def test_documented_endpoint_readback_normalization_is_accepted() -> None:
     module._verify("endpoint", endpoint, "template-1")
 
 
+@pytest.mark.parametrize("omit_fields", [False, True])
+def test_live_endpoint_readback_omissions_are_accepted_when_gpu_shape_is_exact(
+    omit_fields: bool,
+) -> None:
+    module = _module()
+    endpoint = _remote_endpoint(module)
+    if omit_fields:
+        endpoint.pop("computeType")
+        endpoint.pop("dataCenterIds")
+    else:
+        endpoint.update({"computeType": None, "dataCenterIds": None})
+    endpoint.update({"networkVolumeId": "", "version": 1})
+
+    module._verify("endpoint", endpoint, "template-1")
+
+
+def test_omitted_compute_type_requires_exact_nonempty_gpu_evidence() -> None:
+    module = _module()
+    endpoint = _remote_endpoint(module)
+    endpoint.update(
+        {
+            "computeType": None,
+            "dataCenterIds": None,
+            "gpuTypeIds": [],
+        }
+    )
+
+    mismatches = module._mismatches("endpoint", endpoint, "template-1")
+
+    assert "computeType" in mismatches
+    assert "gpuTypeIds" in mismatches
+    assert "dataCenterIds" in mismatches
+
+
+def test_omitted_compute_type_rejects_cpu_specific_readback_fields() -> None:
+    module = _module()
+    endpoint = _remote_endpoint(module)
+    endpoint.update(
+        {
+            "computeType": None,
+            "dataCenterIds": None,
+            "cpuFlavorIds": ["cpu3c-1-4"],
+        }
+    )
+
+    mismatches = module._mismatches("endpoint", endpoint, "template-1")
+
+    assert "computeType" in mismatches
+    assert "dataCenterIds" in mismatches
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("workersMin", 1),
+        ("workersMax", 2),
+        ("idleTimeout", 30),
+        ("templateId", "unrelated-template"),
+        ("gpuCount", 2),
+        ("gpuTypeIds", ["NVIDIA H100 PCIe"]),
+        ("networkVolumeId", "network-volume-1"),
+    ],
+)
+def test_data_center_readback_omission_does_not_hide_endpoint_drift(
+    field: str,
+    value: Any,
+) -> None:
+    module = _module()
+    endpoint = _remote_endpoint(module)
+    endpoint["dataCenterIds"] = None
+    endpoint[field] = value
+
+    mismatches = module._mismatches("endpoint", endpoint, "template-1")
+
+    expected_mismatch = "templateId" if field == "templateId" else field
+    assert expected_mismatch in mismatches
+    assert "dataCenterIds" in mismatches
+
+
+def test_explicit_data_center_drift_is_rejected() -> None:
+    module = _module()
+    endpoint = _remote_endpoint(module)
+    endpoint["dataCenterIds"] = ["US-KS-2"]
+
+    assert "dataCenterIds" in module._mismatches("endpoint", endpoint, "template-1")
+
+
 def test_documented_template_readback_normalization_is_accepted() -> None:
     module = _module()
     template = _remote_template(module)

@@ -213,6 +213,26 @@ def _endpoint_template_id(actual: dict[str, Any]) -> str | None:
     return None
 
 
+def _endpoint_compute_type_matches(actual: dict[str, Any], expected: dict[str, Any]) -> bool:
+    """Accept an omitted compute type only when the GPU shape proves it."""
+
+    actual_compute_type = actual.get("computeType")
+    if actual_compute_type == expected["computeType"]:
+        return True
+    if actual_compute_type is not None:
+        return False
+    cpu_fields = [
+        field for field in actual if isinstance(field, str) and field.casefold().startswith("cpu")
+    ]
+    expected_gpu_types = expected["gpuTypeIds"]
+    return (
+        bool(expected_gpu_types)
+        and actual.get("gpuCount") == expected["gpuCount"]
+        and _strings(actual.get("gpuTypeIds")) == expected_gpu_types
+        and not cpu_fields
+    )
+
+
 def _template_field_matches(field: str, actual: dict[str, Any], expected: dict[str, Any]) -> bool:
     """Compare a template field after RunPod's lossless readback normalization."""
 
@@ -255,7 +275,6 @@ def _mismatches(kind: str, actual: dict[str, Any], template_id: str | None) -> l
     expected = endpoint_payload(template_id)
     required_fields = (
         "name",
-        "computeType",
         "gpuCount",
         "workersMin",
         "workersMax",
@@ -265,18 +284,33 @@ def _mismatches(kind: str, actual: dict[str, Any], template_id: str | None) -> l
         "scalerValue",
     )
     mismatches = [field for field in required_fields if actual.get(field) != expected[field]]
+    if not _endpoint_compute_type_matches(actual, expected):
+        mismatches.append("computeType")
     if "minCudaVersion" in actual and actual["minCudaVersion"] != expected["minCudaVersion"]:
         mismatches.append("minCudaVersion")
     if _endpoint_template_id(actual) != template_id:
         mismatches.append("templateId")
     if _strings(actual.get("gpuTypeIds")) != expected["gpuTypeIds"]:
         mismatches.append("gpuTypeIds")
-    for field in ("allowedCudaVersions", "dataCenterIds"):
-        if set(_strings(actual.get(field)) or []) != set(expected[field]):
-            mismatches.append(field)
+    if set(_strings(actual.get("allowedCudaVersions")) or []) != set(
+        expected["allowedCudaVersions"]
+    ):
+        mismatches.append("allowedCudaVersions")
     # RunPod's v1 endpoint read response currently omits flashboot.
     if "flashboot" in actual and actual["flashboot"] != expected["flashboot"]:
         mismatches.append("flashboot")
+    if actual.get("networkVolumeId") not in (None, ""):
+        mismatches.append("networkVolumeId")
+    actual_data_centers = actual.get("dataCenterIds")
+    if actual_data_centers is None:
+        # RunPod's live v1 read response may omit this create-time allowlist.
+        # Treat that as its documented all-datacenter/readback-omission shape
+        # only after every independently observable safety and cost control
+        # has matched the pinned endpoint plan.
+        if mismatches:
+            mismatches.append("dataCenterIds")
+    elif set(_strings(actual_data_centers) or []) != set(expected["dataCenterIds"]):
+        mismatches.append("dataCenterIds")
     return mismatches
 
 
