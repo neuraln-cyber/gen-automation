@@ -36,6 +36,21 @@ def test_staging_images_are_runtime_required_immutable_digests() -> None:
     assert ":latest" not in compose
 
 
+def test_staging_salad_prefetch_runway_is_pinned_to_three_jobs() -> None:
+    controller = _text("control-plane.env.example")
+    validator = _text("validate-deployment.sh")
+
+    assert re.search(
+        r"(?m)^GEN_AUTOMATION_SALAD_MAX_QUEUED_JOBS=3$",
+        controller,
+    )
+    assert (
+        '[ "$(env_value GEN_AUTOMATION_SALAD_MAX_QUEUED_JOBS '
+        '"$config_root/control-plane.env")" = "3" ] ||' in validator
+    )
+    assert "prefetch must be exactly 3" in validator
+
+
 def test_imds_network_boundary_and_loopback_ingress_are_explicit() -> None:
     compose = _text("compose.yaml")
     caddyfile = _text("Caddyfile")
