@@ -325,6 +325,45 @@ def test_documented_endpoint_readback_normalization_is_accepted() -> None:
     module._verify("endpoint", endpoint, "template-1")
 
 
+def test_documented_template_readback_normalization_is_accepted() -> None:
+    module = _module()
+    template = _remote_template(module)
+    template.update(
+        {
+            "dockerEntrypoint": None,
+            "dockerStartCmd": None,
+            "ports": None,
+            "isPublic": None,
+            "volumeInGb": None,
+            "volumeMountPath": "/workspace",
+        }
+    )
+
+    module._verify("template", template)
+
+
+def test_template_readback_normalization_does_not_hide_effective_drift() -> None:
+    module = _module()
+    template = _remote_template(module)
+    template.update(
+        {
+            "dockerEntrypoint": ["/bin/custom-entrypoint"],
+            "ports": ["8080/http"],
+            "isPublic": True,
+            "volumeInGb": 10,
+            "volumeMountPath": "/workspace",
+        }
+    )
+
+    mismatches = module._mismatches("template", template, None)
+
+    assert "dockerEntrypoint" in mismatches
+    assert "ports" in mismatches
+    assert "isPublic" in mismatches
+    assert "volumeInGb" in mismatches
+    assert "volumeMountPath" in mismatches
+
+
 def test_state_lock_prevents_concurrent_apply(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

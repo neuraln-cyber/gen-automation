@@ -213,6 +213,24 @@ def _endpoint_template_id(actual: dict[str, Any]) -> str | None:
     return None
 
 
+def _template_field_matches(field: str, actual: dict[str, Any], expected: dict[str, Any]) -> bool:
+    """Compare a template field after RunPod's lossless readback normalization."""
+
+    actual_value = actual.get(field)
+    expected_value = expected[field]
+    if field in ("dockerEntrypoint", "dockerStartCmd", "ports"):
+        return actual_value == expected_value or (expected_value == [] and actual_value is None)
+    if field == "isPublic":
+        return actual_value == expected_value or (expected_value is False and actual_value is None)
+    if field == "volumeInGb":
+        return actual_value == expected_value or (expected_value == 0 and actual_value is None)
+    if field == "volumeMountPath" and expected["volumeInGb"] == 0:
+        # RunPod returns its default mount path even when no volume exists. The
+        # path has no effect unless a positive volume size is attached.
+        return actual.get("volumeInGb") in (None, 0)
+    return actual_value == expected_value
+
+
 def _mismatches(kind: str, actual: dict[str, Any], template_id: str | None) -> list[str]:
     if kind == "template":
         expected = template_payload()
@@ -231,7 +249,7 @@ def _mismatches(kind: str, actual: dict[str, Any], template_id: str | None) -> l
             "volumeInGb",
             "volumeMountPath",
         )
-        return [field for field in fields if actual.get(field) != expected[field]]
+        return [field for field in fields if not _template_field_matches(field, actual, expected)]
     if not template_id:
         raise RuntimeError("template ID is required to verify an endpoint")
     expected = endpoint_payload(template_id)
