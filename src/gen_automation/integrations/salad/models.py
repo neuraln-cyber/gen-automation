@@ -270,7 +270,7 @@ def parse_container_group(data: JSONObject) -> SaladContainerGroup:
     )
     state = SaladContainerGroupState(
         status=_required_str(state_data, "status", "current_state"),
-        description=_required_str(state_data, "description", "current_state"),
+        description=_optional_str(state_data, "description", "current_state") or "",
         allocating_count=_optional_int(counts_data, "allocating_count", "instance status counts"),
         creating_count=_optional_int(counts_data, "creating_count", "instance status counts"),
         running_count=_optional_int(counts_data, "running_count", "instance status counts"),

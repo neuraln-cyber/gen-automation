@@ -72,7 +72,6 @@ def container_group_payload() -> JSONObject:
         "version": 3,
         "current_state": {
             "status": "stopped",
-            "description": "",
             "instance_status_counts": {
                 "allocating_count": 0,
                 "creating_count": 0,
@@ -269,6 +268,7 @@ async def test_queue_and_container_group_mutations_use_documented_methods() -> N
     assert queue.id == QUEUE_ID
     assert group.id == GROUP_ID
     assert updated.status == "stopped"
+    assert updated.current_state.description == ""
     assert calls == [
         (
             "POST",
