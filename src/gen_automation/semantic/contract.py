@@ -9,14 +9,20 @@ from gen_automation.domain.enums import SemanticIssueCode, SemanticVerdict
 
 SEMANTIC_SCHEMA_VERSION = "semantic-anatomy-assessment/v1"
 MAX_SEMANTIC_ISSUES = 20
+ANATOMY_IMAGE_NORMALIZATION_VERSION = "semantic-anatomy-image-normalization/v1"
+ANATOMY_IMAGE_MAX_LONG_EDGE = 1536
 
-ANATOMY_ASSESSMENT_PROMPT = """\
+ANATOMY_ASSESSMENT_PROMPT = f"""\
 Inspect only visible anatomy and rendering integrity. Ignore sexual content, clothing, identity,
 and artistic style. Look for obvious extra or missing fingers, toes, or limbs; malformed hands or
 feet; duplicated body parts; impossible joints; implausible body proportions; and severe face
 deformation. Do not penalize foreshortening, occlusion, stylization, or anatomy that is uncertain.
 Use pass when no listed defect is visible, review when evidence is uncertain or moderate, and
-severe only for an obvious defect. Return only the requested structured result."""
+severe only for an obvious defect. Input normalization version
+{ANATOMY_IMAGE_NORMALIZATION_VERSION} preserves images with a long edge of
+{ANATOMY_IMAGE_MAX_LONG_EDGE} pixels or less; larger images are resized without cropping to that
+maximum long edge using deterministic high-quality Lanczos resampling and supplied as PNG. Return
+only the requested structured result."""
 
 ANATOMY_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",

@@ -12,8 +12,15 @@ It performs four fail-closed checks before inference:
    fixed prompt, fixed schema, and both fixed hashes;
 3. requires the request's model and immutable revision to equal this
    deployment's configuration; and
-4. asks the upstream model for strict JSON-schema output, validates the result,
+4. preserves images at or below a 1536-pixel long edge and resizes larger
+   images without cropping to a temporary PNG analysis copy; and
+5. asks the upstream model for strict JSON-schema output, validates the result,
    and returns the identity-bound envelope expected by `SemanticVlmClient`.
+
+The resize keeps large Illustrious masters within Qwen3-VL's visual-token
+budget. It never changes the stored master. The prompt includes the
+normalization version and geometry, so its digest—and therefore the assessment
+profile—changes whenever this preprocessing contract changes.
 
 Invalid input receives a bounded 4xx response. Transport failures and transient
 upstream failures receive 503; malformed or unexpected upstream responses
@@ -89,6 +96,13 @@ manifest and image/launch configuration.
   external readiness on the model server's own readiness probe.
 - Requests are deterministic and keyed by `Idempotency-Key`, but the gateway
   stores no result cache. Provider queues may safely retry the same request.
+
+AWS staging uses five total controller attempts with backoff bounded at 30,
+60, 120, and 120 seconds. This tolerates a scale-to-zero cold start while
+keeping latency and spend finite. The cap limits assessment rows rather than
+provider calls, so one row can still produce as many as five billable requests.
+Existing terminal rows are immutable and are never reopened by changing the
+retry configuration.
 
 No cloud account, GPU allocation, model-download credential, or provider API
 key is needed to build and test this gateway. Those are live deployment inputs.

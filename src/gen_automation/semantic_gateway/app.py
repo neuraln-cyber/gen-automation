@@ -4,8 +4,10 @@ import base64
 import binascii
 import copy
 import hashlib
+import io
 import json
 import re
+import warnings
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -13,6 +15,7 @@ from typing import Any
 import httpx2
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from PIL import Image, UnidentifiedImageError
 from pydantic import (
     AnyHttpUrl,
     BaseModel,
@@ -28,6 +31,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from gen_automation.domain.enums import SemanticIssueCode, SemanticVerdict
 from gen_automation.semantic import (
     ANATOMY_ASSESSMENT_PROMPT,
+    ANATOMY_IMAGE_MAX_LONG_EDGE,
     ANATOMY_OUTPUT_SCHEMA,
     MAX_SEMANTIC_ISSUES,
     SEMANTIC_SCHEMA_VERSION,
@@ -187,6 +191,10 @@ class _UpstreamProtocolError(Exception):
     pass
 
 
+class _ImageNormalizationError(Exception):
+    pass
+
+
 def create_app(
     settings: SemanticGatewaySettings | None = None,
     *,
@@ -239,12 +247,19 @@ def create_app(
             settings=resolved,
         )
         try:
+            upstream_content_type, upstream_image = _normalize_image_for_upstream(
+                image,
+                content_type=contract.image.content_type,
+            )
             envelope = await _request_assessment(
                 http_client,
                 settings=resolved,
                 contract=contract,
-                encoded_image=contract.image.base64,
+                encoded_image=base64.b64encode(upstream_image).decode("ascii"),
+                image_content_type=upstream_content_type,
             )
+        except _ImageNormalizationError as error:
+            raise HTTPException(status_code=422, detail="invalid image payload") from error
         except _UpstreamUnavailableError as error:
             raise HTTPException(status_code=503, detail="semantic model unavailable") from error
         except _UpstreamProtocolError as error:
@@ -325,6 +340,54 @@ async def _validated_request(
     return contract, image
 
 
+def _normalize_image_for_upstream(image: bytes, *, content_type: str) -> tuple[str, bytes]:
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(image)) as source:
+                source.load()
+                width, height = source.size
+                if width <= 0 or height <= 0:
+                    raise _ImageNormalizationError
+                if max(width, height) <= ANATOMY_IMAGE_MAX_LONG_EDGE:
+                    return content_type, image
+
+                if width >= height:
+                    normalized_size = (
+                        ANATOMY_IMAGE_MAX_LONG_EDGE,
+                        max(
+                            1,
+                            (height * ANATOMY_IMAGE_MAX_LONG_EDGE + width // 2) // width,
+                        ),
+                    )
+                else:
+                    normalized_size = (
+                        max(
+                            1,
+                            (width * ANATOMY_IMAGE_MAX_LONG_EDGE + height // 2) // height,
+                        ),
+                        ANATOMY_IMAGE_MAX_LONG_EDGE,
+                    )
+
+                has_alpha = source.mode in {"RGBA", "LA"} or (
+                    source.mode == "P" and "transparency" in source.info
+                )
+                with source.convert("RGBA" if has_alpha else "RGB") as converted:
+                    with converted.resize(
+                        normalized_size,
+                        resample=Image.Resampling.LANCZOS,
+                    ) as normalized:
+                        output = io.BytesIO()
+                        normalized.save(output, format="PNG", optimize=False, compress_level=6)
+                        return "image/png", output.getvalue()
+    except _ImageNormalizationError:
+        raise
+    except (Image.DecompressionBombWarning, Image.DecompressionBombError) as error:
+        raise _ImageNormalizationError from error
+    except (OSError, SyntaxError, UnidentifiedImageError, ValueError) as error:
+        raise _ImageNormalizationError from error
+
+
 async def _read_bounded_body(request: Request, *, max_bytes: int) -> bytes:
     declared_length = request.headers.get("content-length")
     if declared_length is not None:
@@ -353,6 +416,7 @@ async def _request_assessment(
     settings: SemanticGatewaySettings,
     contract: _AssessmentRequest,
     encoded_image: str,
+    image_content_type: str,
 ) -> _AssessmentEnvelope:
     bound_schema = copy.deepcopy(ANATOMY_OUTPUT_SCHEMA)
     properties = bound_schema["properties"]
@@ -377,9 +441,7 @@ async def _request_assessment(
                 "content": [
                     {
                         "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{contract.image.content_type};base64,{encoded_image}"
-                        },
+                        "image_url": {"url": f"data:{image_content_type};base64,{encoded_image}"},
                     },
                     {"type": "text", "text": contract.task.prompt},
                     {

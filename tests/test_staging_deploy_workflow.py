@@ -144,9 +144,9 @@ def test_semantic_gateway_activation_is_pinned_bounded_atomic_and_reversible() -
     assert "GEN_AUTOMATION_SEMANTIC_ANATOMY_SEVERE_CONFIDENCE_MICROS=900000" in activator
     for seconds in (600, 630, 660, 720):
         assert str(seconds) in activator
-    assert "GEN_AUTOMATION_BACKGROUND_SEMANTIC_MAX_ATTEMPTS=1" in activator
-    assert "GEN_AUTOMATION_BACKGROUND_SEMANTIC_RETRY_BASE_SECONDS=60" in activator
-    assert "GEN_AUTOMATION_BACKGROUND_SEMANTIC_RETRY_MAX_SECONDS=1800" in activator
+    assert "GEN_AUTOMATION_BACKGROUND_SEMANTIC_MAX_ATTEMPTS=5" in activator
+    assert "GEN_AUTOMATION_BACKGROUND_SEMANTIC_RETRY_BASE_SECONDS=30" in activator
+    assert "GEN_AUTOMATION_BACKGROUND_SEMANTIC_RETRY_MAX_SECONDS=120" in activator
     assert "create_backup" in activator
     assert "restore_previous_deployment" in activator
     assert 'rm -f -- "${paths[$index]}"' in activator

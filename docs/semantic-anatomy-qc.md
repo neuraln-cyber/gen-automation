@@ -16,6 +16,12 @@ It records `pass`, `review`, or `severe`, normalized confidence, optional
 normalized boxes, the pinned model/revision, and SHA-256 digests of the exact
 assessment prompt and output schema. A completed or unavailable assessment is
 immutable. It never edits, rejects, quarantines, or deletes the raw master.
+Before inference, the gateway validates the exact raw-master digest. Images
+larger than a 1536-pixel long edge are then resized without cropping to a
+temporary PNG analysis copy. Smaller images pass through unchanged. The source
+asset is never mutated or replaced, and the versioned normalization statement
+is part of the prompt/profile digest so preprocessing changes create a distinct
+auditable assessment profile.
 
 ## Review behavior
 
@@ -140,6 +146,9 @@ GEN_AUTOMATION_SEMANTIC_ANATOMY_MODEL=Qwen/Qwen3-VL-8B-Instruct
 GEN_AUTOMATION_SEMANTIC_ANATOMY_MODEL_REVISION=<immutable revision>
 GEN_AUTOMATION_SEMANTIC_ANATOMY_MAX_ASSESSMENTS_PER_PROFILE=<positive hard limit>
 GEN_AUTOMATION_SEMANTIC_ANATOMY_ASSET_ALLOWLIST='["<exact asset UUID>"]'
+GEN_AUTOMATION_BACKGROUND_SEMANTIC_MAX_ATTEMPTS=5
+GEN_AUTOMATION_BACKGROUND_SEMANTIC_RETRY_BASE_SECONDS=30
+GEN_AUTOMATION_BACKGROUND_SEMANTIC_RETRY_MAX_SECONDS=120
 ```
 
 The default per-profile limit is `0`, so disabled or partially configured anatomy QC
@@ -148,6 +157,13 @@ Every assessment row for the model/revision profile counts toward that cap, incl
 completed, unavailable, and retrying rows. When the UUID allowlist is non-empty, only
 those exact raw-master assets can receive new assessment rows; already-created rows
 may still finish or retry after the allowlist or limit changes.
+
+The staging cold-start policy makes at most five total attempts: the initial
+request plus four retries. Retry delays are bounded at 30, 60, 120, and 120
+seconds. Every provider call may be billable, so keep the per-profile cap and
+exact UUID allowlist small while calibrating. Terminal `completed` and
+`unavailable` rows remain immutable; retry settings apply only when a new
+assessment row is created.
 
 No credential is required by the application contract. Put the endpoint on a
 private network or add authentication at the private gateway/ingress boundary

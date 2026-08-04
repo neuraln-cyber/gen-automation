@@ -258,9 +258,9 @@ class Settings(BaseSettings):
     background_semantic_timeout_seconds: float = Field(default=210, ge=15, le=900)
     background_semantic_request_timeout_seconds: float = Field(default=180, ge=10, le=840)
     background_semantic_lease_seconds: int = Field(default=300, ge=30, le=3600)
-    background_semantic_max_attempts: int = Field(default=3, ge=1, le=10)
-    background_semantic_retry_base_seconds: int = Field(default=60, ge=1, le=3600)
-    background_semantic_retry_max_seconds: int = Field(default=1800, ge=1, le=86400)
+    background_semantic_max_attempts: int = Field(default=5, ge=1, le=10)
+    background_semantic_retry_base_seconds: int = Field(default=30, ge=1, le=3600)
+    background_semantic_retry_max_seconds: int = Field(default=120, ge=1, le=86400)
     derivative_rendering_enabled: bool = False
     background_derivative_timeout_seconds: float = Field(
         default=150,

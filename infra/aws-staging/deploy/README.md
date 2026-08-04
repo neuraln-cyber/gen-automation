@@ -65,7 +65,11 @@ use `sslmode=verify-full` and
 It does not start the application. Re-running the installer re-verifies the
 installed plugin and downloads it only when the reviewed binary is absent.
 It also installs
-`/usr/local/sbin/gen-automation-bootstrap-patreon-profile`. After configuring
+`/usr/local/sbin/gen-automation-bootstrap-patreon-profile` and the atomic
+`/usr/local/sbin/gen-automation-activate-semantic-gateway` command. The semantic
+activator installs the private gateway with anatomy disabled, a zero assessment
+cap, and the bounded staging cold-start policy of five total attempts with
+30-to-120-second backoff. After configuring
 the immutable images and environment files, use that one-time command with an
 AWS SSM port-forward to `127.0.0.1:6080` to complete Patreon login in the
 cloud-hosted browser. The executable sequence is in

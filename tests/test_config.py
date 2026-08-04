@@ -13,6 +13,14 @@ SESSION_SECRET = encode_base64url(bytes(range(32, 64)))
 TRUSTED_PROXY_CIDRS = ("10.20.30.0/24",)
 
 
+def test_semantic_retry_defaults_cover_scale_to_zero_cold_start() -> None:
+    settings = Settings()
+
+    assert settings.background_semantic_max_attempts == 5
+    assert settings.background_semantic_retry_base_seconds == 30
+    assert settings.background_semantic_retry_max_seconds == 120
+
+
 def test_production_configuration_fails_closed() -> None:
     with pytest.raises(ValidationError):
         Settings(environment=Environment.PRODUCTION)
