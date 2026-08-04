@@ -22,8 +22,8 @@ RUN printf '%s  %s\n' \
         "${SALAD_QUEUE_WORKER_PATCH_SHA256}" \
         /tmp/strict-http-status.patch \
         | sha256sum -c - \
-    && git apply --check /tmp/strict-http-status.patch \
-    && git apply /tmp/strict-http-status.patch \
+    && git apply --unidiff-zero --check /tmp/strict-http-status.patch \
+    && git apply --unidiff-zero /tmp/strict-http-status.patch \
     && git diff --check
 
 RUN go mod download \
