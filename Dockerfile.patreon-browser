@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-FROM python:3.12-slim@sha256:cab2dbf575e971934a81e4622f5aba17aa7929719bd7e31033a3a83b97fd0464 AS chrome-for-testing
+FROM python:3.14-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6 AS chrome-for-testing
 
 ADD --checksum=sha256:08254455dc5154fefa0165dc1dea16e496c8298f98c14d89bf38463810d21649 \
     https://storage.googleapis.com/chrome-for-testing-public/151.0.7922.72/linux64/chrome-linux64.zip \
@@ -13,7 +13,7 @@ RUN apt-get update \
     && mv /opt/google/chrome-linux64 /opt/google/chrome \
     && rm -rf /var/lib/apt/lists/* /tmp/chrome-linux64.zip
 
-FROM python:3.12-slim@sha256:cab2dbf575e971934a81e4622f5aba17aa7929719bd7e31033a3a83b97fd0464
+FROM python:3.14-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6
 
 LABEL org.opencontainers.image.title="gen-automation-patreon-browser" \
       org.opencontainers.image.description="Isolated official-UI Patreon publisher" \
