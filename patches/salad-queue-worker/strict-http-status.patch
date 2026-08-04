@@ -1,0 +1,100 @@
+diff --git a/cmd/salad-http-job-queue-worker/main.go b/cmd/salad-http-job-queue-worker/main.go
+index 6b81879..956c5dc 100644
+--- a/cmd/salad-http-job-queue-worker/main.go
++++ b/cmd/salad-http-job-queue-worker/main.go
+@@ -82,2 +82 @@ func executeJob(ctx context.Context, job jobs.HTTPJob) ([]byte, error) {
+-	if resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests ||
+-		(resp.StatusCode >= 500 && resp.StatusCode <= 599) {
++	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+diff --git a/cmd/salad-http-job-queue-worker/main_test.go b/cmd/salad-http-job-queue-worker/main_test.go
+new file mode 100644
+index 0000000..42feaa9
+--- /dev/null
++++ b/cmd/salad-http-job-queue-worker/main_test.go
+@@ -0,0 +1,78 @@
++package main
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++
++	"github.com/saladtechnologies/salad-cloud-job-queue-worker/pkg/jobs"
++)
++
++type roundTripFunc func(*http.Request) (*http.Response, error)
++
++func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
++	return f(request)
++}
++
++func TestExecuteJobAcceptsOnlySuccessfulHTTPResponses(t *testing.T) {
++	originalClient := http.DefaultClient
++	t.Cleanup(func() {
++		http.DefaultClient = originalClient
++	})
++
++	tests := []struct {
++		name       string
++		statusCode int
++		wantError  bool
++	}{
++		{name: "ok", statusCode: http.StatusOK},
++		{name: "created", statusCode: http.StatusCreated},
++		{name: "no content", statusCode: http.StatusNoContent},
++		{name: "last successful status", statusCode: 299},
++		{name: "redirect", statusCode: http.StatusMultipleChoices, wantError: true},
++		{name: "bad request", statusCode: http.StatusBadRequest, wantError: true},
++		{name: "unauthorized", statusCode: http.StatusUnauthorized, wantError: true},
++		{name: "request timeout", statusCode: http.StatusRequestTimeout, wantError: true},
++		{name: "rate limited", statusCode: http.StatusTooManyRequests, wantError: true},
++		{name: "server error", statusCode: http.StatusInternalServerError, wantError: true},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			responseBody := fmt.Sprintf("sensitive response body for %d", test.statusCode)
++			http.DefaultClient = &http.Client{
++				Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
++					return &http.Response{
++						StatusCode: test.statusCode,
++						Header:     make(http.Header),
++						Body:       io.NopCloser(strings.NewReader(responseBody)),
++						Request:    request,
++					}, nil
++				}),
++			}
++
++			output, err := executeJob(context.Background(), jobs.HTTPJob{
++				JobId:        "strict-status-test",
++				RequestMethod: http.MethodPost,
++				RequestURL:    "http://worker.internal/jobs/generate",
++				RequestBody:   []byte(`{"input":"bounded"}`),
++			})
++			if test.wantError {
++				if err == nil {
++					t.Fatal("expected non-2xx response to fail")
++				}
++				if output != nil {
++					t.Fatalf("expected no output for non-2xx response, got %q", output)
++				}
++				if !strings.Contains(err.Error(), fmt.Sprint(test.statusCode)) {
++					t.Fatalf("expected error to identify status code, got %q", err)
++				}
++				if strings.Contains(err.Error(), responseBody) {
++					t.Fatal("error leaked response body")
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("expected 2xx response to succeed: %v", err)
++			}
++			if string(output) != responseBody {
++				t.Fatalf("unexpected output %q", output)
++			}
++		})
++	}
++}

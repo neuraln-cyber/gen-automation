@@ -165,7 +165,7 @@ def salad_deployment_config_from_settings(settings: Settings) -> SaladDeployment
                 "gpu_classes": [str(gpu_class_id) for gpu_class_id in settings.salad_gpu_class_ids],
             },
             "image_caching": True,
-            "priority": "low",
+            "priority": settings.salad_container_priority.value,
         },
         "replicas": 0,
         "queue_connection": {},
@@ -948,6 +948,7 @@ class ControllerWorkloads:
                     generation_attempt_id=attempt.id,
                     max_list_pages=2,
                     list_page_size=100,
+                    attempt_watchdog_seconds=self.settings.salad_attempt_watchdog_seconds,
                 )
                 return True
 

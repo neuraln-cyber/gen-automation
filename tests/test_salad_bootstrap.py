@@ -78,12 +78,23 @@ def test_deployment_config_is_deterministic_secret_free_and_scale_to_zero() -> N
     prefetched = salad_deployment_config_from_settings(
         settings.model_copy(update={"salad_max_queued_jobs": 5})
     )
+    high_priority = salad_deployment_config_from_settings(
+        _settings(
+            salad_container_cpu=6,
+            salad_container_memory_mb=24 * 1024,
+            salad_container_storage_bytes=60 * 1024 * 1024 * 1024,
+            salad_container_priority="high",
+        )
+    )
 
     assert first == second
     assert first.config_sha256 == second.config_sha256
     assert prefetched == first
     assert prefetched.config_sha256 == first.config_sha256
     assert prefetched.desired_queue_length == 1
+    assert high_priority != first
+    assert high_priority.config_sha256 != first.config_sha256
+    assert high_priority.provider_configuration["container"]["priority"] == "high"
     assert first.min_replicas == 0
     assert first.max_replicas == 1
     assert settings.salad_max_queued_jobs == 3

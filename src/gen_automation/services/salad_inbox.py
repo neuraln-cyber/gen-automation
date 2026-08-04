@@ -21,6 +21,10 @@ from gen_automation.domain.enums import (
 )
 from gen_automation.integrations.salad.models import SaladJobStatus
 from gen_automation.services.budgets import release_attempt_reservation
+from gen_automation.services.salad import (
+    SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE,
+    SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE,
+)
 
 _TERMINAL_ATTEMPT_STATES = frozenset(
     {
@@ -676,6 +680,10 @@ async def _apply_provider_state(
 ) -> bool:
     previous_attempt_state = attempt.state
     was_unknown = previous_attempt_state == GenerationAttemptState.UNKNOWN
+    watchdog_cancel_requested = (
+        previous_attempt_state == GenerationAttemptState.CANCEL_REQUESTED
+        and attempt.error_code == SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
+    )
     attempt_changed = attempt.provider_state != status.value or (
         attempt.last_observed_at is None or _as_utc(attempt.last_observed_at) != observed_at
     )
@@ -735,6 +743,41 @@ async def _apply_provider_state(
                 retry_at=processed_at + timedelta(seconds=retry_delay_seconds),
                 error_code="provider_job_failed",
                 error_detail="Salad reported a definitive failed job.",
+            )
+        else:
+            _set_job_state(
+                job,
+                state=GenerationState.DEAD_LETTER,
+                error_code="generation_attempts_exhausted",
+                error_detail="The generation attempt limit was exhausted.",
+            )
+        attempt_changed = (
+            await _release_reservation(
+                session,
+                attempt=attempt,
+                released_at=processed_at,
+            )
+            or attempt_changed
+        )
+    elif watchdog_cancel_requested:
+        attempt_changed = attempt_changed or (attempt.state != GenerationAttemptState.FAILED)
+        attempt.state = GenerationAttemptState.FAILED
+        attempt.completed_at = observed_at
+        attempt.unknown_since = None
+        attempt.error_code = SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE
+        attempt.error_detail = (
+            "The Salad attempt exceeded its runtime envelope and was cancelled for retry."
+        )
+        effective_attempt_count = max(job.attempt_count, attempt.attempt_no)
+        if effective_attempt_count < job.max_attempts:
+            _set_job_state(
+                job,
+                state=GenerationState.RETRY_WAIT,
+                retry_at=processed_at + timedelta(seconds=retry_delay_seconds),
+                error_code=SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE,
+                error_detail=(
+                    "The Salad attempt exceeded its runtime envelope and was cancelled for retry."
+                ),
             )
         else:
             _set_job_state(

@@ -57,6 +57,9 @@ from gen_automation.services.outbox import (
 _PROVIDER = "salad"
 _IMAGE_DIGEST_PATTERN = r".+@sha256:[0-9a-f]{64}"
 _DEFINITIVE_REJECTION_STATUS_CODES = frozenset({400, 401, 403, 404, 422})
+SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE = "salad_attempt_watchdog_cancel_requested"
+SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE = "salad_attempt_watchdog_expired"
+_SALAD_ATTEMPT_WATCHDOG_CANCEL_UNAVAILABLE_ERROR_CODE = "salad_attempt_watchdog_cancel_unavailable"
 _SECRET_KEY_MARKERS = frozenset(
     {
         "secret",
@@ -265,6 +268,8 @@ class SaladQueueClient(Protocol):
         page: int = 1,
         page_size: int = 50,
     ) -> SaladQueueJobPage: ...
+
+    async def cancel_job(self, queue_name: str, job_id: UUID | str) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -943,9 +948,14 @@ async def apply_salad_job_observation(
             job=job,
             output=remote_job.output,
         )
+    watchdog_cancelled = (
+        remote_job.status == SaladJobStatus.CANCELLED
+        and attempt.state == GenerationAttemptState.CANCEL_REQUESTED
+        and attempt.error_code == SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
+    )
     target_state = (
         GenerationAttemptState.FAILED
-        if worker_output_valid is False
+        if worker_output_valid is False or watchdog_cancelled
         else _attempt_state(remote_job.status)
     )
 
@@ -978,11 +988,19 @@ async def apply_salad_job_observation(
         "event_count": len(remote_job.events),
         **({"worker_output_valid": worker_output_valid} if worker_output_valid is not None else {}),
     }
-    attempt.error_code = "salad_worker_output_invalid" if worker_output_valid is False else None
+    attempt.error_code = (
+        "salad_worker_output_invalid"
+        if worker_output_valid is False
+        else (SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE if watchdog_cancelled else None)
+    )
     attempt.error_detail = (
         "Salad reported success without a valid worker output contract."
         if worker_output_valid is False
-        else None
+        else (
+            "The Salad attempt exceeded its runtime envelope and was cancelled for retry."
+            if watchdog_cancelled
+            else None
+        )
     )
     attempt.unknown_since = None
     attempt.submitted_at = attempt.submitted_at or _as_utc(remote_job.create_time)
@@ -997,7 +1015,15 @@ async def apply_salad_job_observation(
         job.state = _job_state_for_observation(job, target_state)
         job.retry_at = None
         job.last_error_code = (
-            ("salad_worker_output_invalid" if worker_output_valid is False else "salad_job_failed")
+            (
+                "salad_worker_output_invalid"
+                if worker_output_valid is False
+                else (
+                    SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE
+                    if watchdog_cancelled
+                    else "salad_job_failed"
+                )
+            )
             if target_state == GenerationAttemptState.FAILED
             else None
         )
@@ -1005,7 +1031,11 @@ async def apply_salad_job_observation(
             (
                 "Salad reported success without a valid worker output contract."
                 if worker_output_valid is False
-                else "Salad reported a failed queue job."
+                else (
+                    "The Salad attempt exceeded its runtime envelope and was cancelled for retry."
+                    if watchdog_cancelled
+                    else "Salad reported a failed queue job."
+                )
             )
             if target_state == GenerationAttemptState.FAILED
             else None
@@ -1094,6 +1124,7 @@ async def reconcile_generation_attempt(
     generation_attempt_id: UUID,
     max_list_pages: int = 5,
     list_page_size: int = 100,
+    attempt_watchdog_seconds: int | None = None,
     now: datetime | None = None,
 ) -> ReconciliationResult:
     """Resolve a provider job by ID, or by stable metadata after an unknown POST."""
@@ -1103,6 +1134,8 @@ async def reconcile_generation_attempt(
         raise SaladServiceValidationError("max_list_pages must be between 1 and 100")
     if list_page_size <= 0 or list_page_size > 100:
         raise SaladServiceValidationError("list_page_size must be between 1 and 100")
+    if attempt_watchdog_seconds is not None and attempt_watchdog_seconds <= 0:
+        raise SaladServiceValidationError("attempt_watchdog_seconds must be positive")
 
     attempt, job, deployment = await _load_attempt_context(
         session,
@@ -1221,6 +1254,85 @@ async def reconcile_generation_attempt(
             source=source,
             matched=False,
             error_code="salad_reconciliation_unavailable",
+        )
+
+    if _attempt_watchdog_is_due(
+        attempt,
+        remote_job=remote_job,
+        reconciled_at=reconciled_at,
+        timeout_seconds=attempt_watchdog_seconds,
+    ):
+        assert attempt_watchdog_seconds is not None
+        try:
+            await client.cancel_job(deployment.queue_name, remote_job.id)
+        except SaladAPIError as error:
+            attempt, job, _ = await _load_attempt_context(
+                session,
+                generation_attempt_id,
+                lock=True,
+            )
+            _note_watchdog_cancel_error(
+                session,
+                attempt=attempt,
+                status_code=error.status_code,
+                occurred_at=reconciled_at,
+            )
+            await session.commit()
+            return ReconciliationResult(
+                observation=_observation_result(attempt, job, applied=False, stale=False),
+                source=source,
+                matched=True,
+                error_code=_SALAD_ATTEMPT_WATCHDOG_CANCEL_UNAVAILABLE_ERROR_CODE,
+            )
+        except (SaladTransportError, SaladProtocolError):
+            attempt, job, _ = await _load_attempt_context(
+                session,
+                generation_attempt_id,
+                lock=True,
+            )
+            _note_watchdog_cancel_error(
+                session,
+                attempt=attempt,
+                status_code=None,
+                occurred_at=reconciled_at,
+            )
+            await session.commit()
+            return ReconciliationResult(
+                observation=_observation_result(attempt, job, applied=False, stale=False),
+                source=source,
+                matched=True,
+                error_code=_SALAD_ATTEMPT_WATCHDOG_CANCEL_UNAVAILABLE_ERROR_CODE,
+            )
+
+        attempt, job, _ = await _load_attempt_context(
+            session,
+            generation_attempt_id,
+            lock=True,
+        )
+        applied = _mark_watchdog_cancel_requested(
+            session,
+            attempt=attempt,
+            job=job,
+            remote_job=remote_job,
+            occurred_at=reconciled_at,
+            timeout_seconds=attempt_watchdog_seconds,
+        )
+        await session.commit()
+        return ReconciliationResult(
+            observation=_observation_result(
+                attempt,
+                job,
+                applied=applied,
+                stale=False,
+            ),
+            source=source,
+            matched=True,
+            error_code=(
+                SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
+                if attempt.state == GenerationAttemptState.CANCEL_REQUESTED
+                and attempt.error_code == SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
+                else None
+            ),
         )
 
     observation = await apply_salad_job_observation(
@@ -1539,6 +1651,125 @@ def _note_reconciliation_error(
             action="generation_attempt.reconciliation_deferred",
             attempt=attempt,
             detail={"error_code": error_code},
+            occurred_at=occurred_at,
+        )
+    )
+
+
+def _attempt_watchdog_is_due(
+    attempt: GenerationAttempt,
+    *,
+    remote_job: SaladQueueJob,
+    reconciled_at: datetime,
+    timeout_seconds: int | None,
+) -> bool:
+    if timeout_seconds is None or remote_job.status not in {
+        SaladJobStatus.PENDING,
+        SaladJobStatus.RUNNING,
+    }:
+        return False
+    if attempt.state in _TERMINAL_ATTEMPT_STATES:
+        return False
+    if attempt.state == GenerationAttemptState.CANCEL_REQUESTED:
+        if attempt.error_code != SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE:
+            return False
+    elif attempt.state not in {
+        GenerationAttemptState.SUBMITTED,
+        GenerationAttemptState.RUNNING,
+        GenerationAttemptState.UNKNOWN,
+    }:
+        return False
+
+    envelope_started_at = (
+        attempt.submit_started_at or attempt.submitted_at or remote_job.create_time
+    )
+    return reconciled_at >= _stored_as_utc(envelope_started_at) + timedelta(seconds=timeout_seconds)
+
+
+def _mark_watchdog_cancel_requested(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    remote_job: SaladQueueJob,
+    occurred_at: datetime,
+    timeout_seconds: int,
+) -> bool:
+    if attempt.state in _TERMINAL_ATTEMPT_STATES:
+        return False
+    if (
+        attempt.state == GenerationAttemptState.CANCEL_REQUESTED
+        and attempt.error_code != SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
+    ):
+        return False
+
+    remote_id = str(remote_job.id)
+    if attempt.provider_external_id is not None and attempt.provider_external_id != remote_id:
+        raise SaladServiceConflictError("Salad watchdog found another provider job ID")
+    if (
+        attempt.state == GenerationAttemptState.CANCEL_REQUESTED
+        and attempt.error_code == SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
+    ):
+        return False
+
+    provider_update_time = _as_utc(remote_job.update_time)
+    attempt.provider_external_id = remote_id
+    attempt.provider_state = remote_job.status.value
+    attempt.submitted_at = attempt.submitted_at or _as_utc(remote_job.create_time)
+    if attempt.last_observed_at is None or provider_update_time > _stored_as_utc(
+        attempt.last_observed_at
+    ):
+        attempt.last_observed_at = provider_update_time
+    attempt.response_metadata = {
+        "provider_status": remote_job.status.value,
+        "provider_create_time": _as_utc(remote_job.create_time).isoformat(),
+        "provider_update_time": provider_update_time.isoformat(),
+        "event_count": len(remote_job.events),
+        "watchdog_timeout_seconds": timeout_seconds,
+    }
+    attempt.state = GenerationAttemptState.CANCEL_REQUESTED
+    attempt.error_code = SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
+    attempt.error_detail = (
+        "The Salad attempt exceeded its runtime envelope; cancellation was requested."
+    )
+    attempt.unknown_since = None
+    attempt.lock_version += 1
+    session.add(
+        _audit(
+            action="generation_attempt.watchdog_cancel_requested",
+            attempt=attempt,
+            detail={
+                "provider_external_id": remote_id,
+                "provider_status": remote_job.status.value,
+                "timeout_seconds": timeout_seconds,
+            },
+            occurred_at=occurred_at,
+        )
+    )
+    return True
+
+
+def _note_watchdog_cancel_error(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    status_code: int | None,
+    occurred_at: datetime,
+) -> None:
+    if attempt.state in _TERMINAL_ATTEMPT_STATES:
+        return
+    if attempt.error_code != SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE:
+        attempt.error_code = _SALAD_ATTEMPT_WATCHDOG_CANCEL_UNAVAILABLE_ERROR_CODE
+        attempt.error_detail = "Salad attempt cancellation is temporarily unavailable."
+        attempt.lock_version += 1
+    session.add(
+        _audit(
+            action="generation_attempt.watchdog_cancel_deferred",
+            attempt=attempt,
+            detail={
+                "error_code": _SALAD_ATTEMPT_WATCHDOG_CANCEL_UNAVAILABLE_ERROR_CODE,
+                **({"provider_status_code": status_code} if status_code is not None else {}),
+            },
             occurred_at=occurred_at,
         )
     )

@@ -86,14 +86,24 @@ The non-secret provider inputs are:
 | `GEN_AUTOMATION_SALAD_CONTAINER_CPU` | `4`; 1–16 vCPU. |
 | `GEN_AUTOMATION_SALAD_CONTAINER_MEMORY_MB` | `16384`; 1024–65536 MiB. |
 | `GEN_AUTOMATION_SALAD_CONTAINER_STORAGE_BYTES` | `53687091200` (50 GiB); 10–250 GiB. |
+| `GEN_AUTOMATION_SALAD_CONTAINER_PRIORITY` | `low` by default for backward compatibility; one of `high`, `medium`, `low`, or `batch`. Staging pins `high` to reduce scarce-capacity allocation delays. |
 | `GEN_AUTOMATION_SALAD_MAX_QUEUED_JOBS` | `3`; 1-100. This is the controller's ordered prefetch window: one running job plus two pending jobs by default. It does not increase the replica ceiling or the provider autoscaling target. |
+| `GEN_AUTOMATION_SALAD_ATTEMPT_WATCHDOG_SECONDS` | `6300` (105 minutes). Active attempts at or beyond this age are cancelled and retried only after Salad confirms cancellation. It must expire at least 300 seconds before the worker signature TTL. |
 | `GEN_AUTOMATION_SALAD_MAX_HOURLY_COST_USD` | `1.00`; positive, at most the daily budget, with micro-dollar precision. Configure it at or above the highest selected GPU rate because durable reservations and spend accounting use this ceiling. |
+| Staging Salad budget envelope | Pins maximum hourly cost to `$0.35`, daily spend to `$5.00`, and monthly spend to `$25.00`. This leaves room for three full `$0.35` attempt reservations while retaining bounded hard stops. |
 
-Low priority and image caching are fixed for the MVP. The initial replica count
-and autoscaler minimum are fixed at zero, and the validated maximum remains one
+Image caching remains fixed for the MVP. Container priority is explicit per
+deployment version. The initial replica count and autoscaler minimum are fixed
+at zero, and the validated maximum remains one
 GPU replica. The controller prefetches an ordered runway of jobs so that queue
 depth stays non-zero while a multi-batch set is active; after the final queued
 job, the same deployment still scales back to zero normally.
+
+The staging budget values are ceilings rather than prepaid spend. Raising them
+does not add replicas, disable scale-to-zero, or create idle GPU cost. The
+single-replica maximum and zero-replica idle state remain unchanged; the larger
+envelope only prevents valid prefetched attempts from being rejected while an
+earlier reservation is still active.
 
 ## Container group
 
@@ -103,7 +113,7 @@ The initial production posture is:
 - queue autoscaler minimum `0`, maximum `1`
 - desired queue length `1`; the independent controller prefetch window is `3`
 - queue polling every `15` seconds (the provider minimum)
-- low priority
+- configured container priority (`high` in staging)
 - one or more recently discovered and configuration-pinned 24 GB GPU classes
 - image caching enabled
 - startup/liveness probe `GET /health` on port `8000`

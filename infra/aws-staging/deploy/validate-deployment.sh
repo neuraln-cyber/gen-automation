@@ -97,8 +97,18 @@ done
   fail "Patreon browser package cap must be exactly 167772160 bytes"
 [ "$(env_value GEN_AUTOMATION_BACKGROUND_PUBLICATION_MAX_PACKAGE_BYTES "$config_root/control-plane.env")" = "167772160" ] ||
   fail "control-plane publication package cap must be exactly 167772160 bytes"
+[ "$(env_value GEN_AUTOMATION_SALAD_CONTAINER_PRIORITY "$config_root/control-plane.env")" = "high" ] ||
+  fail "control-plane Salad container priority must be exactly high"
 [ "$(env_value GEN_AUTOMATION_SALAD_MAX_QUEUED_JOBS "$config_root/control-plane.env")" = "3" ] ||
   fail "control-plane Salad queued-job prefetch must be exactly 3"
+[ "$(env_value GEN_AUTOMATION_SALAD_MAX_HOURLY_COST_USD "$config_root/control-plane.env")" = "0.35" ] ||
+  fail "control-plane Salad maximum hourly cost must be exactly 0.35 USD"
+[ "$(env_value GEN_AUTOMATION_SALAD_DAILY_BUDGET_USD "$config_root/control-plane.env")" = "5.00" ] ||
+  fail "control-plane Salad daily budget must be exactly 5.00 USD"
+[ "$(env_value GEN_AUTOMATION_SALAD_MONTHLY_BUDGET_USD "$config_root/control-plane.env")" = "25.00" ] ||
+  fail "control-plane Salad monthly budget must be exactly 25.00 USD"
+[ "$(env_value GEN_AUTOMATION_SALAD_ATTEMPT_WATCHDOG_SECONDS "$config_root/control-plane.env")" = "6300" ] ||
+  fail "control-plane Salad attempt watchdog must be exactly 6300 seconds"
 [ "$(env_value GEN_AUTOMATION_PATREON_BROWSER_SIDECAR_URL "$config_root/control-plane.env")" = "http://127.0.0.1:8090/v1/publish" ] ||
   fail "control-plane Patreon sidecar URL must remain loopback-only"
 [ "$(env_value GEN_AUTOMATION_SEMANTIC_ANATOMY_ENDPOINT_URL "$config_root/control-plane.env")" = "http://127.0.0.1:8091/v1/anatomy/assess" ] ||

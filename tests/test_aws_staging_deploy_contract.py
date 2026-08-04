@@ -1,4 +1,5 @@
 import re
+from decimal import Decimal
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +50,59 @@ def test_staging_salad_prefetch_runway_is_pinned_to_three_jobs() -> None:
         '"$config_root/control-plane.env")" = "3" ] ||' in validator
     )
     assert "prefetch must be exactly 3" in validator
+
+
+def test_staging_salad_container_priority_is_pinned_high() -> None:
+    controller = _text("control-plane.env.example")
+    validator = _text("validate-deployment.sh")
+
+    assert re.search(
+        r"(?m)^GEN_AUTOMATION_SALAD_CONTAINER_PRIORITY=high$",
+        controller,
+    )
+    assert (
+        '[ "$(env_value GEN_AUTOMATION_SALAD_CONTAINER_PRIORITY '
+        '"$config_root/control-plane.env")" = "high" ] ||' in validator
+    )
+    assert "container priority must be exactly high" in validator
+
+
+def test_staging_salad_budget_supports_three_bounded_high_priority_reservations() -> None:
+    controller = _text("control-plane.env.example")
+    validator = _text("validate-deployment.sh")
+
+    expected = {
+        "GEN_AUTOMATION_SALAD_MAX_HOURLY_COST_USD": "0.35",
+        "GEN_AUTOMATION_SALAD_DAILY_BUDGET_USD": "5.00",
+        "GEN_AUTOMATION_SALAD_MONTHLY_BUDGET_USD": "25.00",
+    }
+    for name, value in expected.items():
+        assert re.search(rf"(?m)^{name}={re.escape(value)}$", controller)
+        assert (
+            f'[ "$(env_value {name} "$config_root/control-plane.env")" = "{value}" ] ||'
+            in validator
+        )
+    assert Decimal(expected["GEN_AUTOMATION_SALAD_MAX_HOURLY_COST_USD"]) * 3 <= Decimal(
+        expected["GEN_AUTOMATION_SALAD_DAILY_BUDGET_USD"]
+    )
+    assert Decimal(expected["GEN_AUTOMATION_SALAD_DAILY_BUDGET_USD"]) <= Decimal(
+        expected["GEN_AUTOMATION_SALAD_MONTHLY_BUDGET_USD"]
+    )
+
+
+def test_staging_salad_attempt_watchdog_is_pinned_before_signature_expiry() -> None:
+    controller = _text("control-plane.env.example")
+    validator = _text("validate-deployment.sh")
+
+    assert re.search(
+        r"(?m)^GEN_AUTOMATION_SALAD_ATTEMPT_WATCHDOG_SECONDS=6300$",
+        controller,
+    )
+    assert (
+        '[ "$(env_value GEN_AUTOMATION_SALAD_ATTEMPT_WATCHDOG_SECONDS '
+        '"$config_root/control-plane.env")" = "6300" ] ||' in validator
+    )
+    assert "attempt watchdog must be exactly 6300 seconds" in validator
 
 
 def test_imds_network_boundary_and_loopback_ingress_are_explicit() -> None:

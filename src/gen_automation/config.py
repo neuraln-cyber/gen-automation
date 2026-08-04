@@ -45,6 +45,7 @@ X_OAUTH_SECRET_REFERENCE_PATTERN = (
 SALAD_DEPLOYMENT_REQUESTS_PER_CYCLE = 3
 SALAD_RECONCILIATION_REQUESTS_PER_CYCLE = 2
 SALAD_OPERATION_TIMEOUT_MARGIN_SECONDS = 5
+SALAD_ATTEMPT_WATCHDOG_SIGNATURE_MARGIN_SECONDS = 300
 BACKGROUND_MAX_DELAY_JITTER_MULTIPLIER = 1.2
 MAX_TRUSTED_PROXY_CIDRS = 64
 
@@ -56,6 +57,13 @@ class Environment(StrEnum):
     TEST = "test"
     STAGING = "staging"
     PRODUCTION = "production"
+
+
+class SaladContainerPriority(StrEnum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    BATCH = "batch"
 
 
 def _secret_value(value: SecretStr | None) -> str | None:
@@ -396,6 +404,7 @@ class Settings(BaseSettings):
     worker_signing_key_id: str | None = None
     worker_signing_private_key: SecretStr | None = None
     worker_signature_ttl_seconds: int = Field(default=7200, ge=5, le=7200)
+    salad_attempt_watchdog_seconds: int = Field(default=105 * 60, ge=60, le=6900)
     worker_upload_grant_ttl_seconds: int = Field(default=10800, ge=3600, le=14400)
     salad_worker_allowed_upload_origin: SecretStr | None = None
     salad_worker_model_manifest_json: SecretStr | None = None
@@ -417,6 +426,7 @@ class Settings(BaseSettings):
         ge=1024,
         le=1024 * 1024,
     )
+    salad_container_priority: SaladContainerPriority = SaladContainerPriority.LOW
     salad_max_replicas: int = Field(default=1, ge=1, le=1)
     # Keep one running job plus two pending jobs in the local/provider pipeline.
     # That small FIFO runway prevents scale-to-zero gaps between ordered batches
@@ -713,6 +723,16 @@ class Settings(BaseSettings):
             if self.worker_upload_grant_ttl_seconds < self.worker_signature_ttl_seconds + 3600:
                 errors.append(
                     "worker upload grant TTL must cover signature TTL plus execution time"
+                )
+            if (
+                self.salad_attempt_watchdog_seconds
+                > self.worker_signature_ttl_seconds
+                - SALAD_ATTEMPT_WATCHDOG_SIGNATURE_MARGIN_SECONDS
+            ):
+                errors.append(
+                    "Salad attempt watchdog must expire at least "
+                    f"{SALAD_ATTEMPT_WATCHDOG_SIGNATURE_MARGIN_SECONDS} seconds before "
+                    "the worker signature TTL"
                 )
             runtime_values = {
                 WORKER_ALLOWED_UPLOAD_ORIGIN_BINDING: (self.salad_worker_allowed_upload_origin),

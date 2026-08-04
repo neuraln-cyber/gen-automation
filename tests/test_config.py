@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from gen_automation.config import Environment, Settings
+from gen_automation.config import Environment, SaladContainerPriority, Settings
 from gen_automation.domain.deliverability import PATREON_MAX_ARCHIVE_BYTES
 from gen_automation.domain.enums import SemanticEnforcementMode
 from gen_automation.domain.signing import derive_public_key, encode_base64url
@@ -441,6 +441,7 @@ def test_gpu_allocation_accepts_complete_worker_security_configuration() -> None
 
     assert settings.gpu_allocation_enabled is True
     assert settings.worker_verification_public_key == WORKER_VERIFICATION_PUBLIC_KEY
+    assert settings.salad_attempt_watchdog_seconds == 105 * 60
 
 
 @pytest.mark.parametrize(
@@ -497,6 +498,30 @@ def test_gpu_allocation_rejects_upload_grants_that_expire_during_execution() -> 
         )
 
 
+def test_gpu_allocation_requires_watchdog_margin_before_signature_expiry() -> None:
+    with pytest.raises(ValidationError, match="watchdog must expire at least 300 seconds"):
+        Settings(
+            environment=Environment.TEST,
+            gpu_allocation_enabled=True,
+            storage_enabled=True,
+            storage_bucket="private-assets",
+            salad_enabled=True,
+            salad_api_key="test-key",
+            salad_organization="organization",
+            salad_project="project",
+            salad_queue_name="generation-queue",
+            salad_container_group_name="generation-workers",
+            salad_gpu_class_ids=("3c90c3cc-0d44-4b50-8888-8dd25736052a",),
+            salad_webhook_secret="whsec_test",  # noqa: S106
+            salad_worker_image=f"registry.example/worker@sha256:{'a' * 64}",
+            worker_signing_key_id="worker-key-1",
+            worker_signing_private_key=WORKER_SIGNING_PRIVATE_KEY,
+            worker_signature_ttl_seconds=6500,
+            salad_attempt_watchdog_seconds=6300,
+            session_secret="test-session-secret-with-more-than-32-characters",  # noqa: S106
+        )
+
+
 def test_salad_requires_digest_pinned_worker_and_budget_ordering() -> None:
     with pytest.raises(ValidationError, match="pinned by digest"):
         Settings(
@@ -533,6 +558,19 @@ def test_salad_accepts_a_complete_fail_closed_test_configuration() -> None:
 
     assert settings.salad_max_replicas == 1
     assert settings.salad_max_queued_jobs == 3
+    assert settings.salad_container_priority == SaladContainerPriority.LOW
+
+
+@pytest.mark.parametrize("priority", tuple(SaladContainerPriority))
+def test_salad_accepts_each_provider_container_priority(
+    priority: SaladContainerPriority,
+) -> None:
+    assert Settings(salad_container_priority=priority.value).salad_container_priority == priority
+
+
+def test_salad_rejects_unknown_container_priority() -> None:
+    with pytest.raises(ValidationError, match="salad_container_priority"):
+        Settings(salad_container_priority="urgent")  # type: ignore[arg-type]
 
 
 def test_salad_deployment_timeout_covers_full_three_request_provisioning_chain() -> None:

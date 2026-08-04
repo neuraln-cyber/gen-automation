@@ -1,3 +1,4 @@
+import hashlib
 import re
 from pathlib import Path
 
@@ -7,6 +8,7 @@ CI_PATH = ROOT / ".github" / "workflows" / "ci.yml"
 COMFY_INPUT_PATH = ROOT / "requirements-comfy.in"
 COMFY_LOCK_PATH = ROOT / "requirements-comfy.lock"
 WORKER_BASE_PATH = ROOT / "requirements-worker-base.txt"
+SALAD_QUEUE_WORKER_PATCH_PATH = ROOT / "patches" / "salad-queue-worker" / "strict-http-status.patch"
 
 DOCKERFILE_FRONTEND = (
     "docker/dockerfile:1.7.1@"
@@ -23,6 +25,7 @@ COMFYUI_COMMIT = "700821e1364eaab0e8f21c538a2131719fec57bf"
 IMPACT_PACK_COMMIT = "429d0159ad429e64d2b3916e6e7be9c22d025c3c"
 IMPACT_SUBPACK_COMMIT = "50c7b71a6a224734cc9b21963c6d1926816a97f1"
 SALAD_QUEUE_WORKER_COMMIT = "73d7a3c80a73f26339194e024cb47c8501c67f75"
+SALAD_QUEUE_WORKER_PATCH_SHA256 = "540cd81fccd3bb1a56018897f4d8b5a99a87bafe6703aa7cd0edb364cb82c4f6"
 
 
 def _dockerfile() -> str:
@@ -87,6 +90,34 @@ def test_salad_queue_worker_is_built_from_the_exact_commit_and_copied() -> None:
     assert (
         f'org.opencontainers.image.salad-queue-worker.revision="{SALAD_QUEUE_WORKER_COMMIT}"'
         in dockerfile
+    )
+
+
+def test_salad_queue_worker_accepts_only_2xx_job_responses() -> None:
+    dockerfile = _logical_lines(_dockerfile())
+    patch = SALAD_QUEUE_WORKER_PATCH_PATH.read_bytes()
+    patch_text = patch.decode("utf-8")
+
+    assert hashlib.sha256(patch).hexdigest() == SALAD_QUEUE_WORKER_PATCH_SHA256
+    assert f"SALAD_QUEUE_WORKER_PATCH_SHA256={SALAD_QUEUE_WORKER_PATCH_SHA256}" in dockerfile
+    assert (
+        "COPY patches/salad-queue-worker/strict-http-status.patch "
+        "/tmp/strict-http-status.patch" in dockerfile
+    )
+    assert "sha256sum --check -" in dockerfile
+    assert "git apply --check /tmp/strict-http-status.patch" in dockerfile
+    assert "git apply /tmp/strict-http-status.patch" in dockerfile
+    assert "go test -mod=readonly ./cmd/salad-http-job-queue-worker" in dockerfile
+    assert (
+        f'org.opencontainers.image.salad-queue-worker.patch-sha256="'
+        f'{SALAD_QUEUE_WORKER_PATCH_SHA256}"' in dockerfile
+    )
+    assert (
+        "+\tif resp.StatusCode < http.StatusOK || "
+        "resp.StatusCode >= http.StatusMultipleChoices {" in patch_text
+    )
+    assert 'name: "unauthorized", statusCode: http.StatusUnauthorized, wantError: true' in (
+        patch_text
     )
 
 
