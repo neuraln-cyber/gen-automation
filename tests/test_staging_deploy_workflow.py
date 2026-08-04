@@ -14,6 +14,10 @@ def _updater() -> str:
     return (DEPLOY / "update-control-plane.sh").read_text(encoding="utf-8")
 
 
+def _semantic_activator() -> str:
+    return (DEPLOY / "activate-semantic-gateway.sh").read_text(encoding="utf-8")
+
+
 def test_staging_rollout_follows_only_successful_immutable_publication() -> None:
     workflow = _workflow()
 
@@ -118,3 +122,36 @@ def test_ssm_command_contains_only_public_immutable_coordinates() -> None:
         "DATABASE",
     ):
         assert prohibited not in command_block.upper()
+
+
+def test_semantic_gateway_activation_is_pinned_bounded_atomic_and_reversible() -> None:
+    activator = _semantic_activator()
+    installer = (DEPLOY / "install.sh").read_text(encoding="utf-8")
+
+    assert "raw.githubusercontent.com/neuraln-cyber/gen-automation/$source_revision" in activator
+    assert 'allowed_repository="ghcr.io/neuraln-cyber/gen-automation/semantic-gateway"' in activator
+    assert "semantic-gateway@sha256:[0-9a-f]{64}" in activator
+    assert "org.opencontainers.image.revision" in activator
+    assert 'architecture" = "amd64' in activator
+    assert 'operating_system" = "linux' in activator
+    assert "aws ssm get-parameter" in activator
+    assert "--with-decryption" in activator
+    assert '>"$key_output" 2>/dev/null' in activator
+    assert "GEN_AUTOMATION_SEMANTIC_ANATOMY_ENABLED=false" in activator
+    assert "GEN_AUTOMATION_SEMANTIC_ANATOMY_MODE=shadow" in activator
+    assert "GEN_AUTOMATION_SEMANTIC_ANATOMY_MAX_ASSESSMENTS_PER_PROFILE=0" in activator
+    assert "GEN_AUTOMATION_SEMANTIC_ANATOMY_ASSET_ALLOWLIST=[]" in activator
+    assert "GEN_AUTOMATION_SEMANTIC_ANATOMY_SEVERE_CONFIDENCE_MICROS=900000" in activator
+    for seconds in (600, 630, 660, 720):
+        assert str(seconds) in activator
+    assert "GEN_AUTOMATION_BACKGROUND_SEMANTIC_MAX_ATTEMPTS=1" in activator
+    assert "GEN_AUTOMATION_BACKGROUND_SEMANTIC_RETRY_BASE_SECONDS=60" in activator
+    assert "GEN_AUTOMATION_BACKGROUND_SEMANTIC_RETRY_MAX_SECONDS=1800" in activator
+    assert "create_backup" in activator
+    assert "restore_previous_deployment" in activator
+    assert 'rm -f -- "${paths[$index]}"' in activator
+    assert activator.count('systemctl restart --no-block "$service_name"') == 2
+    assert "config --quiet" in activator
+    assert "http://127.0.0.1:8091/health/ready" in activator
+    assert "http://127.0.0.1:8000/api/v1/health/ready" in activator
+    assert "gen-automation-activate-semantic-gateway" in installer
