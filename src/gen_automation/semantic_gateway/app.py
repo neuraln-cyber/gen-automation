@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import copy
@@ -15,7 +16,7 @@ from typing import Any
 import httpx2
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import (
     AnyHttpUrl,
     BaseModel,
@@ -32,6 +33,7 @@ from gen_automation.domain.enums import SemanticIssueCode, SemanticVerdict
 from gen_automation.semantic import (
     ANATOMY_ASSESSMENT_PROMPT,
     ANATOMY_IMAGE_MAX_LONG_EDGE,
+    ANATOMY_IMAGE_MAX_SOURCE_PIXELS,
     ANATOMY_OUTPUT_SCHEMA,
     MAX_SEMANTIC_ISSUES,
     SEMANTIC_SCHEMA_VERSION,
@@ -42,6 +44,11 @@ from gen_automation.semantic import (
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _SHA256 = re.compile(_SHA256_PATTERN)
 _SUPPORTED_IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
+_IMAGE_FORMAT_CONTENT_TYPES = {
+    "JPEG": "image/jpeg",
+    "PNG": "image/png",
+    "WEBP": "image/webp",
+}
 _ABSOLUTE_MAX_IMAGE_BYTES = 64 * 1024 * 1024
 _REQUEST_OVERHEAD_BYTES = 256 * 1024
 
@@ -214,6 +221,7 @@ def create_app(
         follow_redirects=False,
         trust_env=False,
     )
+    normalization_slots = asyncio.Semaphore(1)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -247,10 +255,12 @@ def create_app(
             settings=resolved,
         )
         try:
-            upstream_content_type, upstream_image = _normalize_image_for_upstream(
-                image,
-                content_type=contract.image.content_type,
-            )
+            async with normalization_slots:
+                upstream_content_type, upstream_image = await asyncio.to_thread(
+                    _normalize_image_for_upstream,
+                    image,
+                    content_type=contract.image.content_type,
+                )
             envelope = await _request_assessment(
                 http_client,
                 settings=resolved,
@@ -345,41 +355,52 @@ def _normalize_image_for_upstream(image: bytes, *, content_type: str) -> tuple[s
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(io.BytesIO(image)) as source:
-                source.load()
                 width, height = source.size
-                if width <= 0 or height <= 0:
+                if width <= 0 or height <= 0 or width * height > ANATOMY_IMAGE_MAX_SOURCE_PIXELS:
                     raise _ImageNormalizationError
-                if max(width, height) <= ANATOMY_IMAGE_MAX_LONG_EDGE:
+                expected_content_type = _IMAGE_FORMAT_CONTENT_TYPES.get(source.format or "")
+                if expected_content_type != content_type:
+                    raise _ImageNormalizationError
+                orientation = source.getexif().get(274, 1)
+                if not isinstance(orientation, int) or not 1 <= orientation <= 8:
+                    raise _ImageNormalizationError
+                source.load()
+                if orientation == 1 and max(width, height) <= ANATOMY_IMAGE_MAX_LONG_EDGE:
                     return content_type, image
 
-                if width >= height:
-                    normalized_size = (
-                        ANATOMY_IMAGE_MAX_LONG_EDGE,
-                        max(
-                            1,
-                            (height * ANATOMY_IMAGE_MAX_LONG_EDGE + width // 2) // width,
-                        ),
-                    )
-                else:
-                    normalized_size = (
-                        max(
-                            1,
-                            (width * ANATOMY_IMAGE_MAX_LONG_EDGE + height // 2) // height,
-                        ),
-                        ANATOMY_IMAGE_MAX_LONG_EDGE,
-                    )
+                with ImageOps.exif_transpose(source) as oriented:
+                    width, height = oriented.size
+                    if max(width, height) > ANATOMY_IMAGE_MAX_LONG_EDGE:
+                        if width >= height:
+                            normalized_size = (
+                                ANATOMY_IMAGE_MAX_LONG_EDGE,
+                                max(
+                                    1,
+                                    (height * ANATOMY_IMAGE_MAX_LONG_EDGE + width // 2) // width,
+                                ),
+                            )
+                        else:
+                            normalized_size = (
+                                max(
+                                    1,
+                                    (width * ANATOMY_IMAGE_MAX_LONG_EDGE + height // 2) // height,
+                                ),
+                                ANATOMY_IMAGE_MAX_LONG_EDGE,
+                            )
+                    else:
+                        normalized_size = oriented.size
 
-                has_alpha = source.mode in {"RGBA", "LA"} or (
-                    source.mode == "P" and "transparency" in source.info
-                )
-                with source.convert("RGBA" if has_alpha else "RGB") as converted:
-                    with converted.resize(
-                        normalized_size,
-                        resample=Image.Resampling.LANCZOS,
-                    ) as normalized:
-                        output = io.BytesIO()
-                        normalized.save(output, format="PNG", optimize=False, compress_level=6)
-                        return "image/png", output.getvalue()
+                    has_alpha = oriented.mode in {"RGBA", "LA"} or (
+                        oriented.mode == "P" and "transparency" in oriented.info
+                    )
+                    with oriented.convert("RGBA" if has_alpha else "RGB") as converted:
+                        with converted.resize(
+                            normalized_size,
+                            resample=Image.Resampling.LANCZOS,
+                        ) as normalized:
+                            output = io.BytesIO()
+                            normalized.save(output, format="PNG", optimize=False, compress_level=6)
+                            return "image/png", output.getvalue()
     except _ImageNormalizationError:
         raise
     except (Image.DecompressionBombWarning, Image.DecompressionBombError) as error:

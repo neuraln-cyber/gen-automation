@@ -12,8 +12,10 @@ It performs four fail-closed checks before inference:
    fixed prompt, fixed schema, and both fixed hashes;
 3. requires the request's model and immutable revision to equal this
    deployment's configuration; and
-4. preserves images at or below a 1536-pixel long edge and resizes larger
-   images without cropping to a temporary PNG analysis copy; and
+4. requires the declared JPEG/PNG/WebP MIME to match the decoded format,
+   rejects rasters above 8,388,608 pixels, applies EXIF orientation, preserves
+   correctly oriented images at or below a 1536-pixel long edge, and serializes
+   larger-image resizing to a temporary PNG analysis copy; and
 5. asks the upstream model for strict JSON-schema output, validates the result,
    and returns the identity-bound envelope expected by `SemanticVlmClient`.
 

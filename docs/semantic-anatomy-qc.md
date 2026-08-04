@@ -16,12 +16,14 @@ It records `pass`, `review`, or `severe`, normalized confidence, optional
 normalized boxes, the pinned model/revision, and SHA-256 digests of the exact
 assessment prompt and output schema. A completed or unavailable assessment is
 immutable. It never edits, rejects, quarantines, or deletes the raw master.
-Before inference, the gateway validates the exact raw-master digest. Images
-larger than a 1536-pixel long edge are then resized without cropping to a
-temporary PNG analysis copy. Smaller images pass through unchanged. The source
-asset is never mutated or replaced, and the versioned normalization statement
-is part of the prompt/profile digest so preprocessing changes create a distinct
-auditable assessment profile.
+Before inference, the gateway validates the exact raw-master digest, declared
+JPEG/PNG/WebP type, and an 8,388,608-pixel source bound. It applies EXIF
+orientation, then resizes images larger than a 1536-pixel long edge without
+cropping to a temporary PNG analysis copy. Correctly oriented smaller images
+pass through unchanged. Normalization is serialized to bound peak memory. The
+source asset is never mutated or replaced, and the versioned normalization
+statement is part of the prompt/profile digest so preprocessing changes create
+a distinct auditable assessment profile.
 
 ## Review behavior
 

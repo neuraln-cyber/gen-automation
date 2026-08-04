@@ -2,8 +2,8 @@
 
 FROM python:3.12-slim@sha256:cab2dbf575e971934a81e4622f5aba17aa7929719bd7e31033a3a83b97fd0464 AS chrome-for-testing
 
-ADD --checksum=sha256:14ac03a67e154e3f8bbc57e03ef03315fda8fedff8e045eee8b31500283a33f4 \
-    https://storage.googleapis.com/chrome-for-testing-public/151.0.7922.47/linux64/chrome-linux64.zip \
+ADD --checksum=sha256:08254455dc5154fefa0165dc1dea16e496c8298f98c14d89bf38463810d21649 \
+    https://storage.googleapis.com/chrome-for-testing-public/151.0.7922.72/linux64/chrome-linux64.zip \
     /tmp/chrome-linux64.zip
 
 RUN apt-get update \
@@ -18,7 +18,7 @@ FROM python:3.12-slim@sha256:cab2dbf575e971934a81e4622f5aba17aa7929719bd7e31033a
 LABEL org.opencontainers.image.title="gen-automation-patreon-browser" \
       org.opencontainers.image.description="Isolated official-UI Patreon publisher" \
       org.opencontainers.image.source="https://github.com/neuraln-cyber/gen-automation" \
-      org.opencontainers.image.chrome-for-testing.version="151.0.7922.47"
+      org.opencontainers.image.chrome-for-testing.version="151.0.7922.72"
 
 ENV HOME=/home/app \
     PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin \

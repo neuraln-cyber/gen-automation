@@ -4,6 +4,8 @@ import base64
 import hashlib
 import io
 import json
+import struct
+import zlib
 from collections.abc import Callable
 
 import httpx2
@@ -15,6 +17,7 @@ from gen_automation.integrations.semantic_vlm import SemanticVlmClient
 from gen_automation.semantic import (
     ANATOMY_ASSESSMENT_PROMPT,
     ANATOMY_IMAGE_MAX_LONG_EDGE,
+    ANATOMY_IMAGE_MAX_SOURCE_PIXELS,
     ANATOMY_IMAGE_NORMALIZATION_VERSION,
     ANATOMY_OUTPUT_SCHEMA,
     SEMANTIC_SCHEMA_VERSION,
@@ -46,7 +49,11 @@ def _settings(**updates: object) -> SemanticGatewaySettings:
     return SemanticGatewaySettings.model_validate(values)
 
 
-def _gateway_body(payload: bytes) -> tuple[dict[str, object], str]:
+def _gateway_body(
+    payload: bytes,
+    *,
+    content_type: str = "image/png",
+) -> tuple[dict[str, object], str]:
     digest = hashlib.sha256(payload).hexdigest()
     request_id = hashlib.sha256(
         (f"{digest}:{_MODEL}:{_REVISION}:{prompt_sha256()}:{schema_sha256()}").encode()
@@ -58,7 +65,7 @@ def _gateway_body(payload: bytes) -> tuple[dict[str, object], str]:
             "model": _MODEL,
             "model_revision": _REVISION,
             "image": {
-                "content_type": "image/png",
+                "content_type": content_type,
                 "sha256": digest,
                 "base64": base64.b64encode(payload).decode("ascii"),
             },
@@ -71,6 +78,28 @@ def _gateway_body(payload: bytes) -> tuple[dict[str, object], str]:
         },
         request_id,
     )
+
+
+def _jpeg_bytes(*, width: int, height: int, orientation: int) -> bytes:
+    output = io.BytesIO()
+    exif = Image.Exif()
+    exif[274] = orientation
+    with Image.new("RGB", (width, height), color=(223, 127, 31)) as image:
+        image.save(output, format="JPEG", quality=90, exif=exif)
+    return output.getvalue()
+
+
+def _oversized_png_header() -> bytes:
+    side = int(ANATOMY_IMAGE_MAX_SOURCE_PIXELS**0.5) + 1
+    ihdr = struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0)
+    ihdr_chunk = (
+        struct.pack(">I", len(ihdr))
+        + b"IHDR"
+        + ihdr
+        + struct.pack(">I", zlib.crc32(b"IHDR" + ihdr))
+    )
+    iend_chunk = struct.pack(">I", 0) + b"IEND" + struct.pack(">I", zlib.crc32(b"IEND"))
+    return b"\x89PNG\r\n\x1a\n" + ihdr_chunk + iend_chunk
 
 
 def _completion_response(request: httpx2.Request) -> httpx2.Response:
@@ -240,9 +269,86 @@ async def test_gateway_rejects_malformed_image_before_upstream() -> None:
     assert upstream_calls == 0
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "content_type"),
+    [
+        (_png_bytes(), "image/jpeg"),
+        (_oversized_png_header(), "image/png"),
+    ],
+)
+async def test_gateway_rejects_format_mismatch_and_excessive_pixels_before_upstream(
+    payload: bytes,
+    content_type: str,
+) -> None:
+    upstream_calls = 0
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        return _completion_response(request)
+
+    body, request_id = _gateway_body(payload, content_type=content_type)
+    async with (
+        httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as upstream_client,
+        httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(
+                app=create_app(_settings(), upstream_client=upstream_client)
+            ),
+            base_url="http://semantic-gateway.internal",
+        ) as gateway_client,
+    ):
+        response = await gateway_client.post(
+            "/v1/anatomy/assess",
+            headers={"Idempotency-Key": request_id},
+            json=body,
+        )
+
+    assert response.status_code == 422
+    assert upstream_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_applies_exif_orientation_before_resizing() -> None:
+    payload = _jpeg_bytes(width=2000, height=1000, orientation=6)
+    upstream_requests: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        upstream_requests.append(request)
+        return _completion_response(request)
+
+    body, request_id = _gateway_body(payload, content_type="image/jpeg")
+    async with (
+        httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as upstream_client,
+        httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(
+                app=create_app(_settings(), upstream_client=upstream_client)
+            ),
+            base_url="http://semantic-gateway.internal",
+        ) as gateway_client,
+    ):
+        response = await gateway_client.post(
+            "/v1/anatomy/assess",
+            headers={"Idempotency-Key": request_id},
+            json=body,
+        )
+
+    assert response.status_code == 200
+    upstream_body = json.loads(upstream_requests[0].content)
+    image_url = upstream_body["messages"][0]["content"][0]["image_url"]["url"]
+    normalized_bytes = base64.b64decode(
+        image_url.removeprefix("data:image/png;base64,"),
+        validate=True,
+    )
+    with Image.open(io.BytesIO(normalized_bytes)) as normalized:
+        assert normalized.size == (768, ANATOMY_IMAGE_MAX_LONG_EDGE)
+        assert normalized.getexif().get(274) is None
+
+
 def test_anatomy_prompt_versions_image_normalization_profile() -> None:
     assert ANATOMY_IMAGE_NORMALIZATION_VERSION in ANATOMY_ASSESSMENT_PROMPT
     assert str(ANATOMY_IMAGE_MAX_LONG_EDGE) in ANATOMY_ASSESSMENT_PROMPT
+    assert str(ANATOMY_IMAGE_MAX_SOURCE_PIXELS) in ANATOMY_ASSESSMENT_PROMPT
 
 
 @pytest.mark.asyncio

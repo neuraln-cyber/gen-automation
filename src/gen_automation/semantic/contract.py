@@ -9,8 +9,9 @@ from gen_automation.domain.enums import SemanticIssueCode, SemanticVerdict
 
 SEMANTIC_SCHEMA_VERSION = "semantic-anatomy-assessment/v1"
 MAX_SEMANTIC_ISSUES = 20
-ANATOMY_IMAGE_NORMALIZATION_VERSION = "semantic-anatomy-image-normalization/v1"
+ANATOMY_IMAGE_NORMALIZATION_VERSION = "semantic-anatomy-image-normalization/v2"
 ANATOMY_IMAGE_MAX_LONG_EDGE = 1536
+ANATOMY_IMAGE_MAX_SOURCE_PIXELS = 8_388_608
 
 ANATOMY_ASSESSMENT_PROMPT = f"""\
 Inspect only visible anatomy and rendering integrity. Ignore sexual content, clothing, identity,
@@ -19,10 +20,11 @@ feet; duplicated body parts; impossible joints; implausible body proportions; an
 deformation. Do not penalize foreshortening, occlusion, stylization, or anatomy that is uncertain.
 Use pass when no listed defect is visible, review when evidence is uncertain or moderate, and
 severe only for an obvious defect. Input normalization version
-{ANATOMY_IMAGE_NORMALIZATION_VERSION} preserves images with a long edge of
-{ANATOMY_IMAGE_MAX_LONG_EDGE} pixels or less; larger images are resized without cropping to that
-maximum long edge using deterministic high-quality Lanczos resampling and supplied as PNG. Return
-only the requested structured result."""
+{ANATOMY_IMAGE_NORMALIZATION_VERSION} accepts matching JPEG, PNG, or WebP rasters up to
+{ANATOMY_IMAGE_MAX_SOURCE_PIXELS} pixels, applies EXIF orientation, and preserves correctly
+oriented images with a long edge of {ANATOMY_IMAGE_MAX_LONG_EDGE} pixels or less. Other accepted
+images are resized without cropping to that maximum long edge using deterministic high-quality
+Lanczos resampling and supplied as PNG. Return only the requested structured result."""
 
 ANATOMY_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
