@@ -202,6 +202,33 @@ wait_for_activation() {
   return 1
 }
 
+managed_gateway_owns_loopback_port() {
+  local container_id
+  local published_port
+
+  systemctl is-active --quiet "$service_name" || return 1
+  container_id="$(
+    /usr/bin/docker compose \
+      --env-file "$deploy_env" \
+      -f "$compose_file" \
+      ps --status running --quiet semantic-gateway 2>/dev/null || true
+  )"
+  [ -n "$container_id" ] || return 1
+  [ "$(printf '%s\n' "$container_id" | sed '/^$/d' | wc -l)" -eq 1 ] || return 1
+  published_port="$(
+    /usr/bin/docker port "$container_id" 8080/tcp 2>/dev/null || true
+  )"
+  [ "$published_port" = "127.0.0.1:8091" ]
+}
+
+assert_loopback_gateway_port_available_or_managed() {
+  if ! ss -H -ltn 'sport = :8091' | grep --quiet .; then
+    return 0
+  fi
+  managed_gateway_owns_loopback_port ||
+    fail "loopback gateway port 8091 is used outside the managed semantic gateway"
+}
+
 restore_previous_deployment() {
   local rollback_status=0
   local index
@@ -288,9 +315,7 @@ for command in aws curl flock ss timeout; do
 done
 [ -f "$deploy_env" ] || fail "missing $deploy_env"
 [ -f "$controller_env" ] || fail "missing $controller_env"
-if ss -H -ltn 'sport = :8091' | grep --quiet .; then
-  fail "loopback gateway port 8091 is already in use"
-fi
+assert_loopback_gateway_port_available_or_managed
 
 exec 9>"$lock_file"
 flock --exclusive --wait 120 9 || fail "another deployment update holds the activation lock"
@@ -367,9 +392,7 @@ done
 [ "$(env_value GEN_AUTOMATION_SEMANTIC_GATEWAY_IMAGE "$work_dir/deploy.env")" = "$image" ] ||
   fail "prepared deploy environment does not contain the requested image"
 
-if ss -H -ltn 'sport = :8091' | grep --quiet .; then
-  fail "loopback gateway port 8091 became unavailable during activation preparation"
-fi
+assert_loopback_gateway_port_available_or_managed
 systemctl is-active --quiet "$service_name" && service_was_active=1
 create_backup
 rollback_armed=1

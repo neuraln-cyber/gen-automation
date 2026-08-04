@@ -154,4 +154,11 @@ def test_semantic_gateway_activation_is_pinned_bounded_atomic_and_reversible() -
     assert "config --quiet" in activator
     assert "http://127.0.0.1:8091/health/ready" in activator
     assert "http://127.0.0.1:8000/api/v1/health/ready" in activator
+    assert "managed_gateway_owns_loopback_port" in activator
+    assert activator.count("assert_loopback_gateway_port_available_or_managed") == 3
+    assert "ps --status running --quiet semantic-gateway" in activator
+    assert 'docker port "$container_id" 8080/tcp' in activator
+    assert '[ "$published_port" = "127.0.0.1:8091" ]' in activator
+    assert "used outside the managed semantic gateway" in activator
+    assert "loopback gateway port 8091 is already in use" not in activator
     assert "gen-automation-activate-semantic-gateway" in installer
