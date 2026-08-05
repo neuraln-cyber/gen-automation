@@ -168,6 +168,9 @@ def test_foundation_migration_round_trip(
         "semantic_anatomy_feedback",
         "semantic_assessments",
         "semantic_calibration_artifacts",
+        "semantic_learning_policies",
+        "semantic_model_promotions",
+        "semantic_training_runs",
         "subject_approvals",
         "webhook_receipts",
         "workflow_approvals",
@@ -191,6 +194,10 @@ def test_foundation_migration_round_trip(
         "semantic_anatomy_feedback_immutable_delete",
         "semantic_calibration_artifacts_immutable_update",
         "semantic_calibration_artifacts_immutable_delete",
+        "semantic_model_promotions_immutable_update",
+        "semantic_model_promotions_immutable_delete",
+        "semantic_training_runs_guard_terminal_update",
+        "semantic_training_runs_guard_delete",
     } <= trigger_names
     engine.dispose()
 

@@ -1341,6 +1341,13 @@
             href="/dashboard/wildcards"
             {% if request.url.path.startswith("/dashboard/wildcards") %}aria-current="page"{% endif %}
           >Wildcards</a>
+          {% if principal.role.value == "owner" %}
+            <a
+              class="nav-link"
+              href="/dashboard/anatomy-learning"
+              {% if request.url.path.startswith("/dashboard/anatomy-learning") %}aria-current="page"{% endif %}
+            >Anatomy learning</a>
+          {% endif %}
         </nav>
         <div class="operator" title="Signed in as {{ principal.display_name }}">
           <span class="operator-avatar" aria-hidden="true">

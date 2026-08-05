@@ -653,6 +653,14 @@
                 Anatomy: {{ item.current.reason_code.replace("_", " ") }} &middot; provisional
               </span>
             {% endif %}
+            {% if item.semantic_meta_advisory %}
+              <span
+                class="decision-chip anatomy-personalized"
+                data-semantic-meta-advisory="{{ item.semantic_meta_advisory.triage.value }}"
+              >
+                Personalized: {{ item.semantic_meta_advisory.label }}
+              </span>
+            {% endif %}
           </div>
           <details class="review-card-details"{% if item.semantic_flagged %} open{% endif %}>
             <summary>
@@ -753,6 +761,24 @@
                 <strong>AI anatomy check:</strong>
                 {{ item.semantic.state.value.replace("_", " ") }}; review manually.
               </p>
+            {% endif %}
+            {% if item.semantic_meta_advisory %}
+              <div class="semantic-personalized-advisory">
+                <p>
+                  <strong>Learned advisory:</strong>
+                  {{ item.semantic_meta_advisory.label }}
+                  &middot; {{ item.semantic_meta_advisory.probability_percent }} learned defect
+                  probability
+                </p>
+                <p class="muted">
+                  Learned from your completed owner labels. Advisory only: the original VLM
+                  verdict and calibrated anatomy gate above remain authoritative.
+                </p>
+                <p class="muted">
+                  Model {{ item.semantic_meta_advisory.model_artifact_sha256[:12] }}
+                  &middot; dataset {{ item.semantic_meta_advisory.training_dataset_sha256[:12] }}
+                </p>
+              </div>
             {% endif %}
             {% if
               summary.semantic_gate.enabled

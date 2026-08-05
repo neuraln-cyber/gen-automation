@@ -63,6 +63,9 @@ from gen_automation.domain.enums import (
     SemanticFeedbackAgreement,
     SemanticGroundTruth,
     SemanticIssueCode,
+    SemanticPromotionDecision,
+    SemanticTrainingKind,
+    SemanticTrainingState,
     SemanticVerdict,
     SpendEntryType,
 )
@@ -1381,6 +1384,241 @@ class SemanticCalibrationArtifact(UuidPrimaryKeyMixin, Base):
         ForeignKey("admin_users.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SemanticLearningPolicy(Base):
+    __tablename__ = "semantic_learning_policies"
+    __table_args__ = (
+        CheckConstraint("minimum_new_labels_for_retrain > 0", name="positive_retrain_delta"),
+        CheckConstraint("lock_version > 0", name="positive_lock_version"),
+        CheckConstraint(
+            "max_visual_run_microusd BETWEEN 1 AND 25000000",
+            name="bounded_visual_run_cost",
+        ),
+    )
+
+    owner_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    learning_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    auto_train_meta: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    auto_train_visual: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    auto_promote_validated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    max_visual_run_microusd: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=10_000_000,
+    )
+    minimum_new_labels_for_retrain: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=50,
+    )
+    lock_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SemanticTrainingRun(UuidPrimaryKeyMixin, Base):
+    __tablename__ = "semantic_training_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_user_id",
+            "kind",
+            "dataset_sha256",
+            "training_config_sha256",
+            name="uq_semantic_training_runs_dataset_config",
+        ),
+        CheckConstraint("length(profile_sha256) = 64", name="valid_profile_sha256"),
+        CheckConstraint("length(dataset_sha256) = 64", name="valid_dataset_sha256"),
+        CheckConstraint(
+            "length(split_manifest_sha256) = 64",
+            name="valid_split_manifest_sha256",
+        ),
+        CheckConstraint(
+            "length(training_config_sha256) = 64",
+            name="valid_training_config_sha256",
+        ),
+        CheckConstraint("attempts >= 0", name="nonnegative_attempts"),
+        CheckConstraint("max_attempts > 0", name="positive_max_attempts"),
+        CheckConstraint("attempts <= max_attempts", name="attempts_within_limit"),
+        CheckConstraint(
+            "estimated_cost_microusd IS NULL OR estimated_cost_microusd >= 0",
+            name="nonnegative_estimated_cost",
+        ),
+        CheckConstraint(
+            "actual_cost_microusd IS NULL OR actual_cost_microusd >= 0",
+            name="nonnegative_actual_cost",
+        ),
+        CheckConstraint(
+            "(state IN ('preparing', 'running') "
+            "AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL) "
+            "OR (state NOT IN ('preparing', 'running') "
+            "AND lease_owner IS NULL AND lease_expires_at IS NULL)",
+            name="lease_state",
+        ),
+        CheckConstraint(
+            "(state = 'succeeded' AND artifact_sha256 IS NOT NULL "
+            "AND evaluation_report IS NOT NULL AND evaluation_sha256 IS NOT NULL "
+            "AND completed_at IS NOT NULL AND last_error_code IS NULL) "
+            "OR (state IN ('failed', 'cancelled') AND completed_at IS NOT NULL) "
+            "OR (state NOT IN ('succeeded', 'failed', 'cancelled') "
+            "AND completed_at IS NULL)",
+            name="terminal_result_state",
+        ),
+        Index(
+            "ix_semantic_training_runs_claim",
+            "state",
+            "available_at",
+            "lease_expires_at",
+            "created_at",
+        ),
+        Index(
+            "ix_semantic_training_runs_owner_profile",
+            "owner_user_id",
+            "profile_sha256",
+            "created_at",
+        ),
+    )
+
+    owner_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    kind: Mapped[SemanticTrainingKind] = mapped_column(
+        Enum(
+            SemanticTrainingKind,
+            name="semantic_training_kind",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=20,
+        ),
+        nullable=False,
+    )
+    state: Mapped[SemanticTrainingState] = mapped_column(
+        Enum(
+            SemanticTrainingState,
+            name="semantic_training_state",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=12,
+        ),
+        nullable=False,
+        default=SemanticTrainingState.QUEUED,
+    )
+    profile_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_schema_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    split_manifest: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, nullable=False)
+    split_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    training_config: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, nullable=False)
+    training_config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(200))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    provider: Mapped[str | None] = mapped_column(String(50))
+    provider_job_id: Mapped[str | None] = mapped_column(String(200))
+    base_model: Mapped[str | None] = mapped_column(String(200))
+    base_model_revision: Mapped[str | None] = mapped_column(String(200))
+    trainer_image_digest: Mapped[str | None] = mapped_column(String(512))
+    artifact_sha256: Mapped[str | None] = mapped_column(String(64))
+    artifact_storage_bucket: Mapped[str | None] = mapped_column(String(255))
+    artifact_object_key: Mapped[str | None] = mapped_column(String(1024))
+    artifact_object_version_id: Mapped[str | None] = mapped_column(String(1024))
+    artifact_size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    model_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON_TYPE)
+    evaluation_report: Mapped[dict[str, Any] | None] = mapped_column(JSON_TYPE)
+    evaluation_sha256: Mapped[str | None] = mapped_column(String(64))
+    promotion_report: Mapped[dict[str, Any] | None] = mapped_column(JSON_TYPE)
+    estimated_cost_microusd: Mapped[int | None] = mapped_column(BigInteger)
+    actual_cost_microusd: Mapped[int | None] = mapped_column(BigInteger)
+    last_error_code: Mapped[str | None] = mapped_column(String(100))
+    last_error_detail: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class SemanticModelPromotion(UuidPrimaryKeyMixin, Base):
+    __tablename__ = "semantic_model_promotions"
+    __table_args__ = (
+        CheckConstraint("length(profile_sha256) = 64", name="valid_profile_sha256"),
+        CheckConstraint("length(artifact_sha256) = 64", name="valid_artifact_sha256"),
+        CheckConstraint("length(dataset_sha256) = 64", name="valid_dataset_sha256"),
+        CheckConstraint("length(evaluation_sha256) = 64", name="valid_evaluation_sha256"),
+        CheckConstraint(
+            "keep_threshold_micros BETWEEN -1 AND 1000000",
+            name="valid_keep_threshold",
+        ),
+        CheckConstraint(
+            "reject_threshold_micros BETWEEN 0 AND 1000001",
+            name="valid_reject_threshold",
+        ),
+        CheckConstraint(
+            "keep_threshold_micros < reject_threshold_micros",
+            name="ordered_thresholds",
+        ),
+        CheckConstraint("length(trim(reason)) > 0", name="nonempty_reason"),
+        Index(
+            "ix_semantic_model_promotions_owner_profile",
+            "owner_user_id",
+            "profile_sha256",
+            "created_at",
+        ),
+    )
+
+    owner_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    kind: Mapped[SemanticTrainingKind] = mapped_column(
+        Enum(
+            SemanticTrainingKind,
+            name="semantic_promotion_training_kind",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=20,
+        ),
+        nullable=False,
+    )
+    training_run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("semantic_training_runs.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    previous_training_run_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("semantic_training_runs.id", ondelete="RESTRICT")
+    )
+    profile_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    evaluation_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    decision: Mapped[SemanticPromotionDecision] = mapped_column(
+        Enum(
+            SemanticPromotionDecision,
+            name="semantic_promotion_decision",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=11,
+        ),
+        nullable=False,
+    )
+    keep_threshold_micros: Mapped[int] = mapped_column(Integer, nullable=False)
+    reject_threshold_micros: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"),
+        nullable=False,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -4529,6 +4767,49 @@ event.listen(
 
 
 event.listen(
+    SemanticTrainingRun.__table__,
+    "after_create",
+    _ddl(
+        "CREATE TRIGGER semantic_training_runs_guard_terminal_update "
+        "BEFORE UPDATE ON semantic_training_runs WHEN "
+        "OLD.state IN ('succeeded', 'failed', 'cancelled') "
+        "BEGIN SELECT RAISE(ABORT, 'terminal semantic training runs are immutable'); END"
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    SemanticTrainingRun.__table__,
+    "after_create",
+    _ddl(
+        "CREATE TRIGGER semantic_training_runs_guard_delete "
+        "BEFORE DELETE ON semantic_training_runs "
+        "BEGIN SELECT RAISE(ABORT, 'semantic training runs cannot be deleted'); END"
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    SemanticTrainingRun.__table__,
+    "after_create",
+    _ddl(
+        "CREATE OR REPLACE FUNCTION gen_automation_guard_semantic_training_run_mutation() "
+        "RETURNS trigger AS $$ BEGIN "
+        "IF TG_OP = 'DELETE' THEN "
+        "RAISE EXCEPTION 'semantic training runs cannot be deleted'; END IF; "
+        "IF OLD.state IN ('succeeded', 'failed', 'cancelled') THEN "
+        "RAISE EXCEPTION 'terminal semantic training runs are immutable'; END IF; "
+        "RETURN NEW; END; $$ LANGUAGE plpgsql"
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    SemanticTrainingRun.__table__,
+    "after_create",
+    _ddl(
+        "CREATE TRIGGER semantic_training_runs_guard_mutation "
+        "BEFORE UPDATE OR DELETE ON semantic_training_runs FOR EACH ROW "
+        "EXECUTE FUNCTION gen_automation_guard_semantic_training_run_mutation()"
+    ).execute_if(dialect="postgresql"),
+)
+
+
+event.listen(
     ReviewAssetInspection.__table__,
     "after_create",
     _ddl(
@@ -4578,6 +4859,11 @@ for _immutable_table, _table_name, _label in (
         SemanticCalibrationArtifact.__table__,
         "semantic_calibration_artifacts",
         "semantic calibration artifacts",
+    ),
+    (
+        SemanticModelPromotion.__table__,
+        "semantic_model_promotions",
+        "semantic model promotions",
     ),
 ):
     event.listen(

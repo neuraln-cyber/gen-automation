@@ -60,6 +60,14 @@ same job/output with different bytes is quarantined as a conflict.
 - `semantic_assessments`: retry state plus an immutable terminal anatomy result
   or explicit unavailable outcome, bound to the exact ranked master and pinned
   model/prompt/schema profile.
+- `semantic_learning_policies`: one owner-scoped standing authorization for free
+  CPU retraining, validated promotion, visual-training readiness, retraining
+  cadence, and the absolute visual-run cost ceiling.
+- `semantic_training_runs`: restart-safe meta-classifier or visual-LoRA lifecycle,
+  frozen dataset/split/config digests, leases, bounded attempts, costs, immutable
+  terminal artifacts, and evaluation reports.
+- `semantic_model_promotions`: append-only champion, rejection, and rollback
+  decisions bound to the exact run, artifact, dataset, thresholds, and holdout.
 - `review_tasks`: review round, state, ranking run, configured maximum selection
   goal, final frozen selection count, assignee, and lease. During the one terminal
   completion transition, its goal may shrink to the non-empty accepted count; it

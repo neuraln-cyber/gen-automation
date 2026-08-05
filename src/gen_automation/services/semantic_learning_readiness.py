@@ -63,6 +63,7 @@ LORA_MINIMUM_SAMPLES = 2_000
 LORA_MINIMUM_GOOD = 1_000
 LORA_MINIMUM_DEFECT = 500
 LORA_MINIMUM_EXPLICIT = 500
+LORA_MINIMUM_ISSUE_CODED_DEFECTS = 300
 LORA_MINIMUM_COMPLETED_REVIEW_SETS = 5
 LORA_MINIMUM_BATCHES = 10
 LORA_MINIMUM_READY_ISSUE_FAMILIES = 3
@@ -163,6 +164,28 @@ class SemanticLearningSample:
 
 
 @dataclass(frozen=True, slots=True)
+class SemanticResolvedLearningSamples:
+    """Exact per-owner/profile evidence selected by the readiness contract."""
+
+    eligible: tuple[SemanticLearningSample, ...]
+    binary: tuple[SemanticLearningSample, ...]
+    duplicate_content_count: int
+    conflicting_content_count: int
+    resolved_conflicting_content_count: int
+    excluded_conflicting_content_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticLearningDatasetPartition:
+    """The readiness-selected whole-group chronological evaluation partition."""
+
+    group_key: str
+    cutoff_at: datetime
+    training: tuple[SemanticLearningSample, ...]
+    untouched_holdout: tuple[SemanticLearningSample, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class NamedCount:
     name: str
     count: int
@@ -240,6 +263,7 @@ class SemanticProfileLearningReadiness:
     unjudgeable_count: int
     explicit_label_count: int
     generic_defect_count: int
+    issue_coded_defect_count: int
     ground_truth_counts: tuple[NamedCount, ...]
     source_counts: tuple[NamedCount, ...]
     owner_issue_counts: tuple[NamedCount, ...]
@@ -396,17 +420,54 @@ def summarize_semantic_learning_readiness(
 def semantic_meta_feature_values(sample: SemanticLearningSample) -> tuple[int, ...]:
     """Extract the pinned v1 CPU meta-classifier feature row from VLM output."""
 
+    return semantic_meta_prediction_feature_values(
+        verdict=sample.verdict,
+        confidence_micros=sample.confidence_micros,
+        predicted_issues=sample.predicted_issues,
+    )
+
+
+def semantic_meta_prediction_feature_values(
+    *,
+    verdict: SemanticVerdict,
+    confidence_micros: int,
+    predicted_issues: Iterable[SemanticPredictedIssue],
+) -> tuple[int, ...]:
+    """Extract the pinned feature row from a live, unlabeled VLM prediction.
+
+    Training and advisory inference deliberately share this function so a
+    promoted model can never observe a feature layout that differs from the
+    immutable learning snapshot it was fitted against.
+    """
+
+    if not isinstance(verdict, SemanticVerdict):
+        raise ValueError("semantic verdict is invalid")
+    if (
+        isinstance(confidence_micros, bool)
+        or not isinstance(confidence_micros, int)
+        or not 0 <= confidence_micros <= 1_000_000
+    ):
+        raise ValueError("semantic confidence is invalid")
+    issues = tuple(predicted_issues)
+    for issue in issues:
+        if (
+            isinstance(issue.confidence_micros, bool)
+            or not isinstance(issue.confidence_micros, int)
+            or not 0 <= issue.confidence_micros <= 1_000_000
+        ):
+            raise ValueError("semantic issue confidence is invalid")
+
     by_code: dict[SemanticIssueCode, list[int]] = defaultdict(list)
-    for issue in sample.predicted_issues:
+    for issue in issues:
         by_code[issue.code].append(issue.confidence_micros)
     values: list[int] = [
-        int(sample.verdict == SemanticVerdict.PASS),
-        int(sample.verdict == SemanticVerdict.REVIEW),
-        int(sample.verdict == SemanticVerdict.SEVERE),
-        sample.confidence_micros,
-        len(sample.predicted_issues),
-        max((issue.confidence_micros for issue in sample.predicted_issues), default=0),
-        sum(issue.has_box for issue in sample.predicted_issues),
+        int(verdict == SemanticVerdict.PASS),
+        int(verdict == SemanticVerdict.REVIEW),
+        int(verdict == SemanticVerdict.SEVERE),
+        confidence_micros,
+        len(issues),
+        max((issue.confidence_micros for issue in issues), default=0),
+        sum(issue.has_box for issue in issues),
     ]
     for code in SemanticIssueCode:
         confidences = by_code.get(code, [])
@@ -414,11 +475,29 @@ def semantic_meta_feature_values(sample: SemanticLearningSample) -> tuple[int, .
     return tuple(values)
 
 
-def _profile_readiness(
+def resolve_semantic_profile_learning_samples(
+    samples: Iterable[SemanticLearningSample],
+    *,
     owner_user_id: UUID,
     profile_sha256: str,
-    raw_samples: tuple[SemanticLearningSample, ...],
-) -> SemanticProfileLearningReadiness:
+) -> SemanticResolvedLearningSamples:
+    """Apply the canonical readiness dedupe and conflict-resolution policy.
+
+    This is the single selection contract shared by readiness reporting and
+    immutable training exports.  Keeping it public prevents a visual trainer
+    from silently learning from a different label population than the gates
+    that admitted it.
+    """
+
+    _validate_sha256(profile_sha256, label="semantic profile")
+    raw_samples = tuple(samples)
+    for sample in raw_samples:
+        _validate_sample(sample)
+        if sample.feedback_by_user_id != owner_user_id:
+            raise ValueError("semantic learning samples mix owners")
+        if sample.profile_sha256 != profile_sha256:
+            raise ValueError("semantic learning samples mix profiles")
+
     ordered = tuple(sorted(raw_samples, key=_sample_sort_key))
     by_content: dict[str, list[SemanticLearningSample]] = defaultdict(list)
     for sample in ordered:
@@ -455,6 +534,71 @@ def _profile_readiness(
         if sample.ground_truth
         in (SemanticGroundTruth.ANATOMY_GOOD, SemanticGroundTruth.ANATOMY_DEFECT)
     )
+    return SemanticResolvedLearningSamples(
+        eligible=eligible,
+        binary=binary,
+        duplicate_content_count=duplicate_count,
+        conflicting_content_count=conflicting_count,
+        resolved_conflicting_content_count=resolved_conflicting_count,
+        excluded_conflicting_content_count=excluded_conflicting_count,
+    )
+
+
+def select_semantic_learning_dataset_partition(
+    samples: Iterable[SemanticLearningSample],
+) -> SemanticLearningDatasetPartition | None:
+    """Materialize the exact holdout selected by readiness, without leakage."""
+
+    binary = tuple(samples)
+    for sample in binary:
+        _validate_sample(sample)
+        if sample.ground_truth not in (
+            SemanticGroundTruth.ANATOMY_GOOD,
+            SemanticGroundTruth.ANATOMY_DEFECT,
+        ):
+            raise ValueError("semantic learning partition requires binary labels")
+    split = _split_readiness(binary)
+    holdout = split.evaluation_holdout
+    if holdout is None:
+        return None
+    cohorts = _semantic_group_cohorts(binary, group_key=holdout.group_key)
+    training = tuple(
+        sample
+        for timestamp in sorted(cohorts)
+        if timestamp < holdout.cutoff_at
+        for sample in cohorts[timestamp]
+    )
+    untouched_holdout = tuple(
+        sample
+        for timestamp in sorted(cohorts)
+        if timestamp >= holdout.cutoff_at
+        for sample in cohorts[timestamp]
+    )
+    if (
+        len(training) != holdout.training_count
+        or len(untouched_holdout) != holdout.holdout_count
+    ):
+        raise ValueError("semantic learning split identity changed")
+    return SemanticLearningDatasetPartition(
+        group_key=holdout.group_key,
+        cutoff_at=holdout.cutoff_at,
+        training=training,
+        untouched_holdout=untouched_holdout,
+    )
+
+
+def _profile_readiness(
+    owner_user_id: UUID,
+    profile_sha256: str,
+    raw_samples: tuple[SemanticLearningSample, ...],
+) -> SemanticProfileLearningReadiness:
+    resolved = resolve_semantic_profile_learning_samples(
+        raw_samples,
+        owner_user_id=owner_user_id,
+        profile_sha256=profile_sha256,
+    )
+    eligible = resolved.eligible
+    binary = resolved.binary
     good_count = sum(
         sample.ground_truth == SemanticGroundTruth.ANATOMY_GOOD for sample in binary
     )
@@ -466,6 +610,11 @@ def _profile_readiness(
     generic_defect_count = sum(
         sample.ground_truth == SemanticGroundTruth.ANATOMY_DEFECT
         and sample.owner_issue_code is None
+        for sample in binary
+    )
+    issue_coded_defect_count = sum(
+        sample.ground_truth == SemanticGroundTruth.ANATOMY_DEFECT
+        and sample.owner_issue_code is not None
         for sample in binary
     )
 
@@ -543,6 +692,10 @@ def _profile_readiness(
     )
     if explicit_count < LORA_MINIMUM_EXPLICIT:
         lora_blockers.append(f"need {LORA_MINIMUM_EXPLICIT} explicit owner labels")
+    if issue_coded_defect_count < LORA_MINIMUM_ISSUE_CODED_DEFECTS:
+        lora_blockers.append(
+            f"need {LORA_MINIMUM_ISSUE_CODED_DEFECTS} owner-confirmed defect subtypes"
+        )
     if split.completed_review_set_count < LORA_MINIMUM_COMPLETED_REVIEW_SETS:
         lora_blockers.append(f"need {LORA_MINIMUM_COMPLETED_REVIEW_SETS} completed review sets")
     if split.generation_batch_count < LORA_MINIMUM_BATCHES:
@@ -590,15 +743,16 @@ def _profile_readiness(
         raw_feedback_count=len(raw_samples),
         unique_content_count=len(eligible),
         binary_labeled_count=len(binary),
-        duplicate_content_count=duplicate_count,
-        conflicting_content_count=conflicting_count,
-        resolved_conflicting_content_count=resolved_conflicting_count,
-        excluded_conflicting_content_count=excluded_conflicting_count,
+        duplicate_content_count=resolved.duplicate_content_count,
+        conflicting_content_count=resolved.conflicting_content_count,
+        resolved_conflicting_content_count=resolved.resolved_conflicting_content_count,
+        excluded_conflicting_content_count=resolved.excluded_conflicting_content_count,
         anatomy_good_count=good_count,
         anatomy_defect_count=defect_count,
         unjudgeable_count=unjudgeable_count,
         explicit_label_count=explicit_count,
         generic_defect_count=generic_defect_count,
+        issue_coded_defect_count=issue_coded_defect_count,
         ground_truth_counts=_named_counts(
             Counter(sample.ground_truth.value for sample in eligible),
             names=tuple(item.value for item in SemanticGroundTruth),
@@ -718,18 +872,7 @@ def _temporal_group_splits(
 ) -> tuple[SemanticTemporalHoldout, ...]:
     if len(samples) < 4 or group_key == "asset_sha256":
         return ()
-    grouped: dict[object, list[SemanticLearningSample]] = defaultdict(list)
-    for sample in samples:
-        key: object = (
-            sample.release_id
-            if group_key == "release_id"
-            else sample.generation_job_id
-        )
-        if key is not None:
-            grouped[key].append(sample)
-    cohorts: dict[datetime, list[SemanticLearningSample]] = defaultdict(list)
-    for group in grouped.values():
-        cohorts[min(sample.generated_at for sample in group)].extend(group)
+    cohorts = _semantic_group_cohorts(samples, group_key=group_key)
     timestamps = sorted(cohorts)
     result: list[SemanticTemporalHoldout] = []
     for cutoff in timestamps[1:]:
@@ -766,6 +909,36 @@ def _temporal_group_splits(
                 )
             )
     return tuple(result)
+
+
+def _semantic_group_cohorts(
+    samples: tuple[SemanticLearningSample, ...],
+    *,
+    group_key: str,
+) -> dict[datetime, list[SemanticLearningSample]]:
+    if group_key not in {"release_id", "generation_job_id"}:
+        raise ValueError("semantic learning group key is unsupported")
+    grouped: dict[object, list[SemanticLearningSample]] = defaultdict(list)
+    for sample in samples:
+        key: object = (
+            sample.release_id
+            if group_key == "release_id"
+            else sample.generation_job_id
+        )
+        if key is not None:
+            grouped[key].append(sample)
+    cohorts: dict[datetime, list[SemanticLearningSample]] = defaultdict(list)
+    for group in grouped.values():
+        cohorts[min(sample.generated_at for sample in group)].extend(group)
+    for cohort in cohorts.values():
+        cohort.sort(
+            key=lambda sample: (
+                sample.generated_at,
+                sample.asset_sha256,
+                str(sample.feedback_id),
+            )
+        )
+    return cohorts
 
 
 def _select_evaluation_holdout(

@@ -106,6 +106,12 @@ from gen_automation.services.semantic_feedback import (
     record_semantic_anatomy_feedback,
     refresh_semantic_calibration_artifact,
 )
+from gen_automation.services.semantic_learning import SemanticLearningError
+from gen_automation.services.semantic_meta_advisory import (
+    SemanticMetaAdvisory,
+    load_semantic_meta_advisories,
+)
+from gen_automation.services.semantic_meta_classifier import SemanticMetaClassifierError
 from gen_automation.services.semantic_review_learning import ANATOMY_REASON_CODES
 from gen_automation.storage.base import ObjectStore, ObjectStoreError
 
@@ -119,6 +125,7 @@ class ReviewAssetView:
     master: RankedMaster
     current: CurrentAssetDecision
     semantic: SemanticReviewAssessment | None
+    semantic_meta_advisory: SemanticMetaAdvisory | None
     semantic_feedback: SemanticAnatomyFeedbackResult | None
     semantic_flagged: bool
     ai_excluded: bool
@@ -517,6 +524,25 @@ async def dashboard_review_task(
             scoring_run_id=navigation.scoring_run_id,
             profile_sha256=semantic_profile,
         )
+        semantic_meta_advisories: dict[UUID, SemanticMetaAdvisory] = {}
+        if principal.role == AdminRole.OWNER and semantic_profile is not None:
+            try:
+                semantic_meta_advisories = await load_semantic_meta_advisories(
+                    session,
+                    owner_user_id=principal.user_id,
+                    profile_sha256=semantic_profile,
+                    assessments=semantic_assessments,
+                )
+            except (
+                SemanticLearningError,
+                SemanticMetaClassifierError,
+                TypeError,
+                ValueError,
+            ):
+                # Personalized inference is advisory only.  A missing, malformed,
+                # or cross-scope artifact must never weaken or replace the frozen
+                # VLM evidence and its calibrated enforcement policy.
+                semantic_meta_advisories = {}
         semantic_feedback: dict[UUID, SemanticAnatomyFeedbackResult] = {}
         inspected_asset_ids = await load_review_inspected_asset_ids(
             session,
@@ -581,6 +607,7 @@ async def dashboard_review_task(
             summary=summary,
             masters=release.assets,
             semantic_assessments=semantic_assessments,
+            semantic_meta_advisories=semantic_meta_advisories,
             semantic_feedback=semantic_feedback,
             inspected_asset_ids=inspected_asset_ids,
             semantic_mode=semantic_mode,
@@ -1115,6 +1142,7 @@ def _review_assets(
     summary: ReviewSummary,
     masters: tuple[RankedMaster, ...],
     semantic_assessments: Mapping[UUID, SemanticReviewAssessment],
+    semantic_meta_advisories: Mapping[UUID, SemanticMetaAdvisory],
     semantic_feedback: Mapping[UUID, SemanticAnatomyFeedbackResult],
     inspected_asset_ids: frozenset[UUID],
     semantic_mode: str,
@@ -1139,6 +1167,7 @@ def _review_assets(
             master=master,
             current=decisions[master.asset_id],
             semantic=semantic_assessments.get(master.asset_id),
+            semantic_meta_advisory=semantic_meta_advisories.get(master.asset_id),
             semantic_feedback=(
                 semantic_feedback.get(semantic_assessments[master.asset_id].assessment_id)
                 if master.asset_id in semantic_assessments

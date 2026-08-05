@@ -94,14 +94,16 @@ remains active. The dashboard reports the label mix, applied and candidate
 versions, validation metrics, and whether learning improved, stayed stable, or
 regressed.
 
-This first learning stage is a CPU/SQL personalization layer; it changes the
+The first learning stage is a CPU/SQL personalization layer; it changes the
 decision threshold, not the vision model's neural weights, and adds no GPU cost.
-The next stage is a CPU meta-classifier over the stored structured VLM verdict,
-confidence, and issue signals. It requires at least 500 binary labels including
-150 defects plus multiple completed review sets and a group-aware chronological
-holdout. A later VLM LoRA challenger is not considered ready before at least
-2,000 diverse binary labels, 500 defects, and meaningful owner-confirmed
-issue-family coverage. These are operational targets, not accuracy guarantees.
+The second stage is an implemented CPU meta-classifier over the stored structured
+VLM verdict, confidence, and issue signals. It trains automatically under the
+owner's standing policy after at least 500 binary labels including 150 defects,
+multiple completed review sets, and a group-aware chronological holdout. A later
+VLM LoRA challenger is not considered ready before at least 2,000 diverse binary
+labels, 500 defects, 300 owner-confirmed defect subtypes, and meaningful
+issue-family coverage. Its current RunPod boundary creates a sealed dry plan only
+and cannot submit or spend. These are operational targets, not accuracy guarantees.
 The exact dataset inventory, split eligibility, feature contract, two-threshold
 triage metrics, and champion/challenger gates are defined in
 [`semantic-visual-learning-contract.md`](semantic-visual-learning-contract.md).

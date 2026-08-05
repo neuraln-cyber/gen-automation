@@ -194,6 +194,28 @@ class SemanticGroundTruth(StrEnum):
     UNJUDGEABLE = "unjudgeable"
 
 
+class SemanticTrainingKind(StrEnum):
+    META_CLASSIFIER = "meta_classifier"
+    VISUAL_LORA = "visual_lora"
+
+
+class SemanticTrainingState(StrEnum):
+    PLANNED = "planned"
+    QUEUED = "queued"
+    PREPARING = "preparing"
+    SUBMITTED = "submitted"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class SemanticPromotionDecision(StrEnum):
+    PROMOTED = "promoted"
+    REJECTED = "rejected"
+    ROLLED_BACK = "rolled_back"
+
+
 class ReviewTaskState(StrEnum):
     OPEN = "open"
     COMPLETED = "completed"

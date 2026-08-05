@@ -109,6 +109,7 @@ from gen_automation.services.semantic_anatomy import (
     SemanticAssessmentProfile,
     run_semantic_assessment_cycle,
 )
+from gen_automation.services.semantic_learning import run_semantic_learning_cycle
 from gen_automation.services.semantic_review_reconciliation import (
     reconcile_one_completed_semantic_review,
 )
@@ -1195,6 +1196,19 @@ class ControllerWorkloads:
             )
         return result.did_work or reconciled
 
+    async def semantic_learning_once(self) -> bool:
+        if not self.settings.semantic_learning_enabled:
+            return False
+        result = await run_semantic_learning_cycle(
+            self.sessions,
+            worker_id=self._worker_id("semantic-learning"),
+            configured_baseline_threshold_micros=(
+                self.settings.semantic_anatomy_severe_confidence_micros
+            ),
+            lease_seconds=self.settings.background_semantic_learning_lease_seconds,
+        )
+        return result.did_work
+
     async def derivative_once(self) -> bool:
         if self.object_store is None or not self.settings.derivative_rendering_enabled:
             return False
@@ -1781,6 +1795,17 @@ def build_controller_runtime(
                     timeout_seconds=settings.background_mega_timeout_seconds + 5,
                 )
             )
+    if settings.semantic_learning_enabled:
+        loops.append(
+            LoopSpec(
+                name="semantic-learning",
+                cycle=workloads.semantic_learning_once,
+                idle_interval_seconds=max(poll, 60),
+                timeout_seconds=(
+                    settings.background_semantic_learning_timeout_seconds + 5
+                ),
+            )
+        )
     return ControllerRuntime(
         instance_id=instance_id,
         loops=loops,

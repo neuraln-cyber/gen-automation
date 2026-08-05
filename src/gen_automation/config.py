@@ -265,6 +265,17 @@ class Settings(BaseSettings):
         ge=0,
         le=1_000_000,
     )
+    semantic_learning_enabled: bool = True
+    background_semantic_learning_timeout_seconds: float = Field(
+        default=300,
+        ge=30,
+        le=1800,
+    )
+    background_semantic_learning_lease_seconds: int = Field(
+        default=600,
+        ge=60,
+        le=3600,
+    )
     background_semantic_timeout_seconds: float = Field(default=210, ge=15, le=900)
     background_semantic_request_timeout_seconds: float = Field(default=180, ge=10, le=840)
     background_semantic_lease_seconds: int = Field(default=300, ge=30, le=3600)
@@ -608,6 +619,12 @@ class Settings(BaseSettings):
             and self.background_semantic_lease_seconds <= self.background_semantic_timeout_seconds
         ):
             errors.append("semantic lease must exceed the semantic cycle timeout")
+        if (
+            self.semantic_learning_enabled
+            and self.background_semantic_learning_lease_seconds
+            <= self.background_semantic_learning_timeout_seconds
+        ):
+            errors.append("semantic learning lease must exceed the training cycle timeout")
         if self.derivative_rendering_enabled and not self.storage_enabled:
             errors.append("automatic derivative rendering requires private object storage")
         if self.derivative_rendering_enabled and not self.background_runtime_enabled:
@@ -859,6 +876,8 @@ class Settings(BaseSettings):
                 cycle_timeouts.append(self.background_quality_timeout_seconds + 5)
             if self.storage_enabled and self.semantic_anatomy_enabled:
                 cycle_timeouts.append(self.background_semantic_timeout_seconds + 5)
+            if self.semantic_learning_enabled:
+                cycle_timeouts.append(self.background_semantic_learning_timeout_seconds + 5)
             if self.storage_enabled and self.derivative_rendering_enabled:
                 cycle_timeouts.append(self.background_derivative_timeout_seconds + 5)
             if self.storage_enabled and self.publishing_enabled:

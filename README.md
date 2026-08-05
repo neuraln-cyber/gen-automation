@@ -15,6 +15,8 @@ workers:
 - Versioned Forge-style prompt wildcards with seed-reproducible expansion
 - Automated quality checks with human approval before publication
 - Optional burst semantic anatomy checks with completion gating and audited owner overrides
+- Owner-scoped anatomy learning with free CPU retraining, holdout-gated promotion,
+  and a cost-locked visual-LoRA training boundary
 - Non-destructive watermarking and platform-specific derivatives
 - Official X API publishing and an isolated official-UI Patreon browser publisher
 - Private versioned archive storage, deterministic clean Patreon handoff
@@ -43,6 +45,8 @@ canaries remain deployment work. See:
 - [Live object-storage conformance](docs/storage-conformance.md)
 - [Deterministic derivative rendering](docs/derivative-rendering.md)
 - [Optional semantic anatomy QC](docs/semantic-anatomy-qc.md)
+- [Semantic anatomy learning contract](docs/semantic-visual-learning-contract.md)
+- [RunPod visual-LoRA training boundary](docs/semantic-visual-lora-runpod.md)
 - [Prompt wildcard libraries](docs/prompt-wildcards.md)
 - [New Set operator flow](docs/new-set-dashboard.md)
 - [Generation workflow profiles](docs/generation-workflows.md)

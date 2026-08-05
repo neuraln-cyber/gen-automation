@@ -28,6 +28,11 @@ from gen_automation.semantic import SemanticIssue
 from gen_automation.services.review import append_review_decision, transition_review_task
 from gen_automation.services.semantic_anatomy import SemanticReviewAssessment
 from gen_automation.services.semantic_feedback import SemanticAnatomyFeedbackResult
+from gen_automation.services.semantic_meta_advisory import SemanticMetaAdvisory
+from gen_automation.services.semantic_meta_classifier import (
+    SemanticMetaClassifierError,
+    SemanticMetaTriage,
+)
 from tests.test_dashboard_review import (
     _FORM_HEADERS,
     SameOriginReviewStore,
@@ -553,6 +558,22 @@ def test_open_review_page_renders_prediction_and_integrated_anatomy_rejection(
             created_at=completed_at,
         )
 
+    async def load_meta_advisories(*_args: object, **_kwargs: object) -> object:
+        return {
+            context.asset_ids[0]: SemanticMetaAdvisory(
+                probability_micros=930_000,
+                triage=SemanticMetaTriage.REJECT,
+                model_artifact_sha256="c" * 64,
+                training_dataset_sha256="d" * 64,
+            ),
+            context.asset_ids[1]: SemanticMetaAdvisory(
+                probability_micros=120_000,
+                triage=SemanticMetaTriage.KEEP,
+                model_artifact_sha256="c" * 64,
+                training_dataset_sha256="d" * 64,
+            ),
+        }
+
     monkeypatch.setattr(
         dashboard_routes,
         "_configured_semantic_profile_sha256",
@@ -573,6 +594,11 @@ def test_open_review_page_renders_prediction_and_integrated_anatomy_rejection(
         dashboard_routes,
         "load_latest_semantic_calibration_artifact",
         load_calibration,
+    )
+    monkeypatch.setattr(
+        dashboard_routes,
+        "load_semantic_meta_advisories",
+        load_meta_advisories,
     )
 
     app = create_app(context.settings)
@@ -608,6 +634,47 @@ def test_open_review_page_renders_prediction_and_integrated_anatomy_rejection(
     assert "Applied threshold" in page.text
     assert "90.0%" in page.text
     assert "Latest candidate" in page.text
+    assert 'data-semantic-meta-advisory="keep"' in page.text
+    assert 'data-semantic-meta-advisory="reject"' in page.text
+    assert "Personalized: likely reject" in page.text
+    assert "93.0% learned defect" in page.text
+    assert "original VLM" in page.text
+
+
+def test_review_page_fails_closed_when_personalized_artifact_is_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = asyncio.run(_seed_review_api(_settings(tmp_path / "meta-advisory-invalid.db")))
+    task_id = asyncio.run(_create_task(context))
+
+    async def invalid_advisory(*_args: object, **_kwargs: object) -> object:
+        raise SemanticMetaClassifierError("stored model digest is invalid")
+
+    monkeypatch.setattr(
+        dashboard_routes,
+        "_configured_semantic_profile_sha256",
+        lambda _settings: "a" * 64,
+    )
+    monkeypatch.setattr(
+        dashboard_routes,
+        "load_semantic_meta_advisories",
+        invalid_advisory,
+    )
+
+    app = create_app(context.settings)
+    with TestClient(app, base_url=ORIGIN, client=("192.0.2.113", 50000)) as client:
+        app.state.object_store = SameOriginReviewStore()
+        _login(
+            client,
+            context.users[AdminRole.OWNER],
+            csrf_cookie_name=context.settings.auth_csrf_cookie_name,
+        )
+        page = client.get(f"/dashboard/review-tasks/{task_id}")
+
+    assert page.status_code == 200
+    assert "data-semantic-meta-advisory" not in page.text
+    assert "AI anatomy check:" in page.text
 
 
 @pytest.mark.parametrize(

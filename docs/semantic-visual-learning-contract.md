@@ -1,9 +1,10 @@
 # Semantic anatomy visual-learning contract
 
 This document fixes the data and evaluation contract for personalized anatomy
-learning. It does **not** enable a training job. The current VLM remains pinned,
-and the first learnable model is a small CPU meta-classifier over already-stored
-VLM outputs.
+learning. The first learnable model is now an automatically trained, small CPU
+meta-classifier over already-stored VLM outputs. Pixel-level visual LoRA training
+remains a gated challenger: the control plane can evaluate readiness and seal a
+cost-bounded, immutable dry plan, but it cannot spend or submit a RunPod job yet.
 
 Operational sample targets below are conservative readiness gates, not accuracy
 guarantees. No model becomes authoritative until a challenger passes the
@@ -124,6 +125,14 @@ Version its feature schema, training-set digest, split manifest, hyperparameters
 and output thresholds. If a linear model cannot beat calibrated VLM confidence,
 keep the existing champion.
 
+This stage is implemented as a durable owner-scoped lifecycle. A standing policy
+collects labels without further prompts, queues one idempotent challenger after
+the exact readiness and retraining-delta gates pass, fits it on CPU, evaluates it
+against the current champion on the frozen holdout, and records an append-only
+promotion or rejection event. Training runs survive restarts and never incur GPU
+cost. A promoted artifact remains advisory and reversible; the pinned VLM result
+is retained as evidence.
+
 ## Group-aware split
 
 Preferred split groups are, in order:
@@ -190,3 +199,14 @@ Train a versioned LoRA challenger only in a separate GPU job after the gate is
 met, then run it in shadow mode. The same champion/challenger rules apply. New
 checkpoints, LoRAs, styles, multi-character compositions, or prompt distributions
 are drift cohorts; they remain assisted until their audit metrics are safe.
+
+Before any paid job can be planned, build the input contract with
+`build_semantic_visual_dataset_manifest_from_database`. The manifest reuses the
+readiness module's exact owner/profile dedupe, conflict-resolution, and selected
+chronological whole-group holdout. Every row binds its label to the assessed raw
+master's S3 bucket, key, non-null version ID, SHA-256, exact byte size, and media
+type. Current asset identity must still equal the immutable semantic-assessment
+snapshot or construction fails closed. Canonical asset, label, split, and full
+manifest digests make replay deterministic. The manifest intentionally contains
+no prompts, generation metadata beyond non-sensitive cohort digests, presigned
+URLs, or credentials; building it performs no network or GPU operation.
