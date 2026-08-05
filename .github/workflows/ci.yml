@@ -138,6 +138,8 @@ jobs:
           python -m alembic downgrade base
           python -m alembic upgrade head
           python -m alembic check
+      - name: Exercise PostgreSQL review completion query contract
+        run: python -m pytest -q tests/test_review_postgresql_contract.py
 
   container:
     runs-on: ubuntu-24.04

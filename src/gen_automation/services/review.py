@@ -8,6 +8,7 @@ from uuid import UUID
 from sqlalchemy import and_, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import Select
 
 from gen_automation.db.models import (
     AdminUser,
@@ -1298,35 +1299,12 @@ async def _freeze_release_selections(
         raise ReviewConflictError(
             "review task is stale or its release phase does not allow completion"
         )
-    latest_revisions = (
-        select(
-            ReviewDecision.asset_id.label("asset_id"),
-            func.max(ReviewDecision.revision).label("revision"),
-        )
-        .where(ReviewDecision.review_task_id == task.id)
-        .group_by(ReviewDecision.asset_id)
-        .subquery()
-    )
     rows = (
         await session.execute(
-            select(ReviewDecision, AssetRanking, Asset)
-            .join(
-                latest_revisions,
-                (latest_revisions.c.asset_id == ReviewDecision.asset_id)
-                & (latest_revisions.c.revision == ReviewDecision.revision),
+            _accepted_release_selection_sources_statement(
+                review_task_id=task.id,
+                scoring_run_id=task.scoring_run_id,
             )
-            .join(
-                AssetRanking,
-                (AssetRanking.scoring_run_id == task.scoring_run_id)
-                & (AssetRanking.asset_id == ReviewDecision.asset_id),
-            )
-            .join(Asset, Asset.id == ReviewDecision.asset_id)
-            .where(
-                ReviewDecision.review_task_id == task.id,
-                ReviewDecision.decision == ReviewDecisionValue.ACCEPT,
-            )
-            .order_by(AssetRanking.rank, Asset.id)
-            .with_for_update()
         )
     ).all()
     if len(rows) != final_accepted_count:
@@ -1445,6 +1423,42 @@ async def _freeze_release_selections(
         )
     )
     return UUID(str(release.id))
+
+
+def _accepted_release_selection_sources_statement(
+    *,
+    review_task_id: UUID,
+    scoring_run_id: UUID,
+) -> Select[tuple[ReviewDecision, AssetRanking, Asset]]:
+    latest_revisions = (
+        select(
+            ReviewDecision.asset_id.label("asset_id"),
+            func.max(ReviewDecision.revision).label("revision"),
+        )
+        .where(ReviewDecision.review_task_id == review_task_id)
+        .group_by(ReviewDecision.asset_id)
+        .subquery()
+    )
+    return (
+        select(ReviewDecision, AssetRanking, Asset)
+        .join(
+            latest_revisions,
+            (latest_revisions.c.asset_id == ReviewDecision.asset_id)
+            & (latest_revisions.c.revision == ReviewDecision.revision),
+        )
+        .join(
+            AssetRanking,
+            (AssetRanking.scoring_run_id == scoring_run_id)
+            & (AssetRanking.asset_id == ReviewDecision.asset_id),
+        )
+        .join(Asset, Asset.id == ReviewDecision.asset_id)
+        .where(
+            ReviewDecision.review_task_id == review_task_id,
+            ReviewDecision.decision == ReviewDecisionValue.ACCEPT,
+        )
+        .order_by(AssetRanking.rank, Asset.id)
+        .with_for_update(of=(ReviewDecision, AssetRanking, Asset))
+    )
 
 
 async def get_review_summary(
