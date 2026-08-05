@@ -179,9 +179,12 @@ exact raw-master assets can receive new assessment rows; already-created rows ma
 still finish or retry after the allowlist or limit changes.
 
 AWS staging uses a separate canary-to-coverage promotion. After the canary succeeds,
-dispatch `.github/workflows/promote-semantic-anatomy.yml` with `status`, `dry-run`,
-then `promote`. Its default per-scoring-run cap is 400, matching a typical master
-set, with an explicit supported override no higher than 1,000. It keeps `shadow` mode
+manually dispatch `.github/workflows/deploy-staging.yml` with `status`, `dry-run`,
+then `promote`. The manual job shares the existing **Deploy staging control plane**
+workflow identity required by the AWS OIDC trust policy; it remains event-isolated
+from the automatic image rollout job. Its default per-scoring-run cap is 400,
+matching a typical master set, with an explicit supported override no higher than
+1,000. It keeps `shadow` mode
 and changes the allowlist to `[]`, allowing eligible ranked raw masters in open
 reviews to be assessed, prioritizing the newest open review and then rank order.
 The configured cap is monotonic, so a scoring run that exhausted the canary cap

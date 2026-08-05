@@ -5,7 +5,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "deploy-staging.yml"
-SEMANTIC_PROMOTION_WORKFLOW = ROOT / ".github" / "workflows" / "promote-semantic-anatomy.yml"
 DEPLOY = ROOT / "infra" / "aws-staging" / "deploy"
 
 
@@ -32,8 +31,10 @@ def _semantic_promoter() -> str:
 def test_staging_rollout_follows_only_successful_immutable_publication() -> None:
     workflow = _workflow()
 
+    assert "name: Deploy staging control plane" in workflow
     assert 'workflows: ["Publish immutable images"]' in workflow
-    assert "workflow_dispatch:" not in workflow
+    assert "workflow_dispatch:" in workflow
+    assert "github.event_name == 'workflow_run'" in workflow
     assert "github.event.workflow_run.conclusion == 'success'" in workflow
     assert "github.event.workflow_run.head_branch == 'main'" in workflow
     assert "github.event.workflow_run.head_sha" not in workflow
@@ -304,7 +305,8 @@ def test_semantic_anatomy_promotion_is_shadow_only_monotonic_and_reversible() ->
 
 
 def test_semantic_anatomy_promotion_workflow_uses_pinned_oidc_ssm_dispatch() -> None:
-    workflow = SEMANTIC_PROMOTION_WORKFLOW.read_text(encoding="utf-8")
+    workflow = _workflow()
+    manual_job = workflow.split("  semantic-anatomy:\n", maxsplit=1)[1]
 
     assert "workflow_dispatch:" in workflow
     assert "default: dry-run" in workflow
@@ -313,6 +315,7 @@ def test_semantic_anatomy_promotion_workflow_uses_pinned_oidc_ssm_dispatch() -> 
     assert "timeout-minutes: 25" in workflow
     assert "status|dry-run|promote|pause" in workflow
     assert '"pause": "--pause"' in workflow
+    assert "github.event_name == 'workflow_dispatch'" in workflow
     assert "github.ref == 'refs/heads/main'" in workflow
     assert "id-token: write" in workflow
     assert "contents: read" in workflow
@@ -338,8 +341,11 @@ def test_semantic_anatomy_promotion_workflow_uses_pinned_oidc_ssm_dispatch() -> 
     assert "secrets.AWS" not in workflow
 
     embedded = textwrap.dedent(
-        workflow.split("python3 -c '", maxsplit=1)[1].split('\' >"$parameters_file"', maxsplit=1)[0]
+        manual_job.split("python3 -c '", maxsplit=1)[1].split('\' >"$parameters_file"', maxsplit=1)[
+            0
+        ]
     )
     command = shlex.split(f"python3 -c '{embedded}'", posix=True)
     assert command[:2] == ["python3", "-c"]
     compile(command[2], "semantic-anatomy-ssm-command", "exec")
+    assert not (ROOT / ".github" / "workflows" / "promote-semantic-anatomy.yml").exists()
