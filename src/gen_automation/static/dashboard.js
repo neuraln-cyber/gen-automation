@@ -1462,31 +1462,215 @@
     }
   };
 
-  function initializeDeliveryAutoRefresh() {
-    const panel = document.querySelector("[data-delivery-auto-refresh]");
+  function initializeDeliveryProgress() {
+    const panel = document.querySelector("[data-delivery-progress]");
     if (!(panel instanceof HTMLElement)) return;
-    const status = panel.querySelector("[data-delivery-refresh-status]");
-    const delay = Math.min(
-      30000,
-      Math.max(5000, integerValue(panel.dataset.deliveryAutoRefresh, 8000)),
-    );
+    const progressUrl = panel.dataset.deliveryProgressUrl || "";
+    if (!progressUrl.startsWith("/dashboard/")) return;
+
+    const jobsComplete = panel.querySelector("[data-delivery-jobs-complete]");
+    const fullOutputs = panel.querySelector("[data-delivery-full-outputs]");
+    const xOutputs = panel.querySelector("[data-delivery-x-outputs]");
+    const failures = panel.querySelector("[data-delivery-failures]");
+    const activeJobs = panel.querySelector("[data-delivery-active-jobs]");
+    const progress = panel.querySelector("[data-delivery-output-progress]");
+    const progressLabel = panel.querySelector("[data-delivery-output-progress-label]");
+    const outputStatus = panel.querySelector("[data-delivery-output-status]");
+    const liveStatus = panel.querySelector("[data-delivery-live-status]");
+    const archiveStatus = document.querySelector("[data-delivery-archive-status]");
+    const archiveDetail = document.querySelector("[data-delivery-archive-detail]");
+    const initialOutputState = panel.dataset.deliveryOutputState || "not_started";
+    const initialArchiveState = panel.dataset.deliveryArchiveState || "not_started";
     let timer = null;
-    const schedule = () => {
+    let requestInFlight = false;
+    let stopped = false;
+    let reloadRequested = false;
+    let consecutiveFailures = 0;
+    const maxConsecutiveFailures = 6;
+
+    const count = (value) => Math.max(0, integerValue(value, 0));
+    const setText = (node, value) => {
+      if (node instanceof HTMLElement) node.textContent = value;
+    };
+    const delayFor = (value, fallback = 3000) => Math.min(
+      60000,
+      Math.max(1000, integerValue(value, fallback)),
+    );
+    const schedule = (delay) => {
       if (timer !== null) window.clearTimeout(timer);
-      timer = window.setTimeout(() => {
-        if (document.visibilityState === "hidden") {
-          schedule();
-          return;
-        }
-        if (status instanceof HTMLElement) status.textContent = "Checking output progress...";
+      timer = null;
+      if (stopped || document.visibilityState === "hidden") return;
+      timer = window.setTimeout(poll, delayFor(delay));
+    };
+    const reloadForNewControls = () => {
+      if (reloadRequested) return;
+      reloadRequested = true;
+      stopped = true;
+      if (timer !== null) window.clearTimeout(timer);
+      window.requestAnimationFrame(() => {
         persistSamePageScroll();
         window.location.reload();
-      }, delay);
+      });
     };
+    const stopPolling = (message) => {
+      stopped = true;
+      if (timer !== null) window.clearTimeout(timer);
+      timer = null;
+      setText(liveStatus || archiveStatus || outputStatus, message);
+    };
+    const renderOutput = (output) => {
+      const knownStates = ["not_started", "rendering", "ready", "failed", "stalled"];
+      const state = knownStates.includes(output.state) ? output.state : "stalled";
+      const succeeded = count(output.succeeded);
+      const totalJobs = count(output.total_jobs);
+      const failed = count(output.failed);
+      const active = count(output.active_jobs);
+      const readyFull = count(output.ready_full_outputs);
+      const expectedFull = count(output.expected_full_outputs);
+      const readyTeasers = count(output.ready_x_teasers);
+      const expectedTeasers = count(output.expected_x_teasers);
+
+      setText(jobsComplete, `${succeeded} / ${totalJobs}`);
+      setText(fullOutputs, `${readyFull} / ${expectedFull}`);
+      setText(xOutputs, `${readyTeasers} / ${expectedTeasers}`);
+      setText(failures, String(failed));
+      setText(activeJobs, String(active));
+      setText(progressLabel, `${succeeded} / ${totalJobs} jobs complete`);
+      if (progress instanceof HTMLProgressElement) {
+        progress.max = Math.max(1, totalJobs);
+        progress.value = Math.min(succeeded, Math.max(1, totalJobs));
+        progress.textContent = `${succeeded} / ${totalJobs}`;
+      }
+
+      if (state === "ready") {
+        setText(outputStatus, "All clean publishing copies are ready.");
+        setText(liveStatus, "Copy preparation finished. Loading the next controls once.");
+      } else if (state === "failed") {
+        setText(
+          outputStatus,
+          `Copy preparation stopped with ${failed} failed job${failed === 1 ? "" : "s"}.`,
+        );
+        setText(liveStatus, "No jobs are active. Retry is required before ZIP creation.");
+      } else if (state === "stalled") {
+        setText(outputStatus, "Copy preparation is stalled with no active jobs.");
+        setText(liveStatus, "Operator repair or a retry is required before ZIP creation.");
+      } else {
+        setText(
+          outputStatus,
+          `Creating clean publishing copies in the background (${active} active).`,
+        );
+        setText(liveStatus, "Progress updates here without reloading the page.");
+      }
+      return state;
+    };
+    const renderArchive = (archive) => {
+      const knownStates = ["not_started", "preparing", "ready", "failed", "blocked"];
+      const state = knownStates.includes(archive.state) ? archive.state : "failed";
+      const partCount = count(archive.part_count);
+      const serverDetail = typeof archive.detail === "string" ? archive.detail.trim() : "";
+      if (state === "ready") {
+        setText(
+          archiveStatus,
+          `${partCount} finished ranked ZIP part${partCount === 1 ? " is" : "s are"} ready.`,
+        );
+        setText(archiveDetail, "Loading the download controls once.");
+      } else if (state === "preparing") {
+        setText(archiveStatus, "Creating ZIP parts in the background.");
+        setText(
+          archiveDetail,
+          "The page remains usable while the clean ranked archive is assembled.",
+        );
+      } else if (state === "blocked") {
+        setText(
+          archiveStatus,
+          "ZIP preparation is paused because the publication runtime or switch is stopped.",
+        );
+        setText(
+          archiveDetail,
+          serverDetail || "Re-enable publication to continue; this page will not keep polling.",
+        );
+      } else if (state === "failed") {
+        setText(archiveStatus, "ZIP creation failed and no archive job is active.");
+        setText(
+          archiveDetail,
+          serverDetail || "Retry destination preparation after resolving the failure.",
+        );
+      } else {
+        setText(archiveStatus, "ZIP creation has not started.");
+        setText(archiveDetail, "Prepare destinations when the publishing copies are ready.");
+      }
+      return state;
+    };
+    const render = (payload) => {
+      if (
+        !isRecord(payload)
+        || payload.schema !== "delivery-progress/v1"
+        || !isRecord(payload.outputs)
+        || !isRecord(payload.archive)
+      ) return null;
+      const outputState = renderOutput(payload.outputs);
+      const archiveState = renderArchive(payload.archive);
+      if (
+        (initialOutputState !== "ready" && outputState === "ready")
+        || (initialArchiveState !== "ready" && archiveState === "ready")
+      ) {
+        reloadForNewControls();
+        return { polling: false, delay: null };
+      }
+      return {
+        polling: outputState === "rendering" || archiveState === "preparing",
+        delay: payload.poll_after_ms,
+      };
+    };
+    async function poll() {
+      if (stopped || requestInFlight || document.visibilityState === "hidden") return;
+      requestInFlight = true;
+      try {
+        const response = await fetch(progressUrl, {
+          method: "GET",
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        if (response.redirected || response.status === 401 || response.status === 403) {
+          stopPolling("Session expired; sign in again or reload this page.");
+          return;
+        }
+        if (response.status === 404) {
+          stopPolling("Live updates paused; reload this page to retry.");
+          return;
+        }
+        if (!response.ok) throw new Error("delivery progress unavailable");
+        const next = render(await response.json());
+        if (!next) throw new Error("invalid delivery progress response");
+        consecutiveFailures = 0;
+        if (!reloadRequested && next.polling) schedule(next.delay);
+        else if (!reloadRequested) stopped = true;
+      } catch (_error) {
+        consecutiveFailures += 1;
+        if (consecutiveFailures >= maxConsecutiveFailures) {
+          stopPolling("Live updates paused; reload this page to retry.");
+          return;
+        }
+        setText(
+          liveStatus || archiveStatus || outputStatus,
+          "Network interrupted live progress; retrying without reloading the page.",
+        );
+        const backoff = Math.min(60000, 3000 * (2 ** Math.min(4, consecutiveFailures)));
+        schedule(backoff);
+      } finally {
+        requestInFlight = false;
+      }
+    }
+
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible") schedule();
+      if (document.visibilityState === "visible" && !stopped && !requestInFlight) schedule(250);
+      else if (document.visibilityState === "hidden" && timer !== null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
     });
-    schedule();
+    schedule(250);
   }
 
   function initializeDeliveryReauthentication() {
@@ -4637,7 +4821,7 @@
   clearAutomationDraftAfterQueue();
   initializeGenerationProgress();
   initializeDeliveryReauthentication();
-  initializeDeliveryAutoRefresh();
+  initializeDeliveryProgress();
   initializeExperimentLab();
   initializeExperimentWarmSession();
   initializeExperimentResults();

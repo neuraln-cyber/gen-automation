@@ -10,7 +10,7 @@ from typing import Annotated, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.datastructures import UploadFile
@@ -52,7 +52,9 @@ from gen_automation.services.operator_delivery import (
     OperatorDeliveryConflictError,
     OperatorDeliveryInputError,
     OperatorDeliveryNotFoundError,
+    OperatorDeliverySnapshot,
     load_operator_delivery,
+    package_parts_ready,
     prepare_operator_destinations,
 )
 from gen_automation.services.publication import (
@@ -197,7 +199,7 @@ async def dashboard_review_delivery(
             and destination.intent_id is not None
             and destination.intent_digest is not None
             and destination.intent_lock_version is not None
-            and destination.package_parts
+            and package_parts_ready(destination.package_parts)
         ),
         None,
     )
@@ -226,7 +228,15 @@ async def dashboard_review_delivery(
                 action="patreon-confirm-absent",
                 parts=recovery_parts,
             )
-    previews = await _preview_views(request, snapshot.full_outputs)
+    previews = (
+        await _preview_views(request, snapshot.full_outputs)
+        if _can_render_destination_form(snapshot, settings=settings)
+        else ()
+    )
+    delivery_progress = _delivery_progress_payload(
+        snapshot,
+        publishing_enabled=settings.publishing_enabled,
+    )
     return _secure(
         request,
         templates.TemplateResponse(
@@ -236,6 +246,7 @@ async def dashboard_review_delivery(
                 "page_title": f"Deliver {snapshot.release_title}",
                 "principal": principal,
                 "delivery": snapshot,
+                "delivery_progress": delivery_progress,
                 "watermarks": watermarks,
                 "previews": previews,
                 "csrf_token": csrf_token,
@@ -259,6 +270,49 @@ async def dashboard_review_delivery(
                 "x_configured": settings.x_oauth_secret_reference is not None,
                 "mega_configured": settings.mega_delivery_enabled,
             },
+        ),
+    )
+
+
+@router.get(
+    "/review-tasks/{review_task_id}/delivery/progress",
+    response_class=JSONResponse,
+    name="dashboard_review_delivery_progress",
+)
+async def dashboard_review_delivery_progress(
+    review_task_id: UUID,
+    request: Request,
+    session: Session,
+    principal: PublicationReader,
+) -> Response:
+    """Return lightweight output and archive progress for one completed review."""
+
+    if principal.role != AdminRole.OWNER:
+        return _secure(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": "only the owner can view delivery progress"},
+            ),
+        )
+    try:
+        snapshot = await load_operator_delivery(session, review_task_id=review_task_id)
+    except OperatorDeliveryNotFoundError:
+        return _secure(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"detail": "completed review was not found"},
+            ),
+        )
+    settings: Settings = request.app.state.settings
+    return _secure(
+        request,
+        JSONResponse(
+            content=_delivery_progress_payload(
+                snapshot,
+                publishing_enabled=settings.publishing_enabled,
+            )
         ),
     )
 
@@ -936,6 +990,102 @@ async def _preview_views(
             )
         )
     return tuple(previews)
+
+
+def _delivery_progress_payload(
+    snapshot: OperatorDeliverySnapshot,
+    *,
+    publishing_enabled: bool,
+) -> dict[str, object]:
+    progress = snapshot.progress
+    if progress.outputs_ready:
+        output_state = "ready"
+    elif progress.terminal_failures:
+        output_state = "failed"
+    elif progress.stalled:
+        output_state = "stalled"
+    elif progress.planned:
+        output_state = "rendering"
+    else:
+        output_state = "not_started"
+
+    patreon = next(
+        (destination for destination in snapshot.destinations if destination.key == "patreon"),
+        None,
+    )
+    parts = patreon.package_parts if patreon is not None else ()
+    archive_detail: str | None = None
+    if package_parts_ready(parts):
+        archive_state = "ready"
+    elif patreon is not None and patreon.intent_id is not None:
+        if patreon.state == "failed":
+            archive_state = "failed"
+            archive_detail = patreon.detail
+        elif patreon.state in {"queued", "running"}:
+            if not publishing_enabled:
+                archive_state = "blocked"
+                archive_detail = "Publication workers are disabled."
+            elif not snapshot.publishing_guard_enabled:
+                archive_state = "blocked"
+                archive_detail = "The global publication guard is stopped."
+            else:
+                archive_state = "preparing"
+        else:
+            archive_state = "not_started"
+    else:
+        archive_state = "not_started"
+
+    payload: dict[str, object] = {
+        "schema": "delivery-progress/v1",
+        "review_task_id": str(snapshot.review_task_id),
+        "outputs": {
+            "state": output_state,
+            "planned": progress.planned,
+            "total_jobs": progress.total_jobs,
+            "requested": progress.requested,
+            "running": progress.running,
+            "retrying": progress.retrying,
+            "succeeded": progress.succeeded,
+            "failed": progress.failed,
+            "active_jobs": progress.active_jobs,
+            "expected_full_outputs": progress.expected_full_outputs,
+            "ready_full_outputs": progress.ready_full_outputs,
+            "expected_x_teasers": progress.expected_x_teasers,
+            "ready_x_teasers": progress.ready_x_teasers,
+        },
+        "archive": {
+            "state": archive_state,
+            "detail": archive_detail,
+            "part_count": len(parts),
+            "parts": [
+                {
+                    "part_number": part.part_number,
+                    "part_count": part.part_count,
+                    "first_ordinal": part.first_ordinal,
+                    "last_ordinal": part.last_ordinal,
+                }
+                for part in parts
+            ],
+        },
+        "poll_after_ms": (
+            3000 if output_state == "rendering" or archive_state == "preparing" else None
+        ),
+    }
+    return payload
+
+
+def _can_render_destination_form(
+    snapshot: OperatorDeliverySnapshot,
+    *,
+    settings: Settings,
+) -> bool:
+    return (
+        settings.publishing_enabled
+        and snapshot.publishing_guard_enabled
+        and (snapshot.x_selected_count == 0 or settings.x_oauth_secret_reference is not None)
+        and snapshot.progress.ready_for_destinations
+        and (not snapshot.destinations_prepared or snapshot.destinations_need_retry)
+    )
 
 
 def _store(request: Request) -> ObjectStore | None:

@@ -1,5 +1,8 @@
 {% extends "dashboard/base.html" %}
 {% block content %}
+  {% set output_state = delivery_progress.outputs.state %}
+  {% set archive_state = delivery_progress.archive.state %}
+  {% set poll_delivery = delivery_progress.poll_after_ms is not none %}
   <a class="back" href="/dashboard/review-tasks/{{ delivery.review_task_id }}">
     &larr; Completed review
   </a>
@@ -17,43 +20,83 @@
   <section
     class="panel review-summary step-panel panel-accent"
     aria-labelledby="outputs-heading"
-    {% if delivery.progress.planned and not delivery.progress.ready_for_destinations %}
-      data-delivery-auto-refresh="8000"
+    {% if poll_delivery %}
+      data-delivery-progress
+      data-delivery-progress-url="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/progress"
+      data-delivery-output-state="{{ output_state }}"
+      data-delivery-archive-state="{{ archive_state }}"
     {% endif %}
   >
     <div class="step-heading">
       <span class="step-number" aria-hidden="true">1</span>
       <div>
-        <h2 id="outputs-heading">Prepare exact outputs</h2>
+        <h2 id="outputs-heading">Preparing clean publishing copies</h2>
         <p class="muted">
-          Every accepted image gets one clean full output. Only the
+          Your AI images are already finished. This step creates one clean publishing
+          copy for every accepted image. Only the
           {{ delivery.x_selected_count }} image{% if delivery.x_selected_count != 1 %}s{% endif %}
-          selected for X get a watermarked teaser.
+          selected for X get a separate watermarked teaser. ZIP creation happens
+          afterward.
         </p>
       </div>
+    </div>
+    <div class="review-target-progress" data-delivery-output-progress-region>
+      <div class="review-target-progress-copy">
+        <strong data-delivery-output-status aria-live="polite">
+          {% if output_state == "ready" %}
+            All clean publishing copies are ready.
+          {% elif output_state == "failed" %}
+            Copy preparation stopped with {{ delivery.progress.failed }} failed
+            job{% if delivery.progress.failed != 1 %}s{% endif %}.
+          {% elif output_state == "stalled" %}
+            Copy preparation is stalled with no active jobs.
+          {% elif output_state == "rendering" %}
+            Creating clean publishing copies in the background.
+          {% else %}
+            Ready to prepare clean publishing copies.
+          {% endif %}
+        </strong>
+        <span class="muted" data-delivery-output-progress-label>
+          {{ delivery.progress.succeeded }} / {{ delivery.progress.total_jobs }} jobs complete
+        </span>
+      </div>
+      <progress
+        data-delivery-output-progress
+        value="{{ delivery.progress.succeeded }}"
+        max="{{ [delivery.progress.total_jobs, 1] | max }}"
+        aria-label="Clean publishing copy preparation progress"
+      >
+        {{ delivery.progress.succeeded }} / {{ delivery.progress.total_jobs }}
+      </progress>
     </div>
     <dl class="count-grid">
       <div>
         <dt>Jobs complete</dt>
-        <dd>{{ delivery.progress.succeeded }} / {{ delivery.progress.total_jobs }}</dd>
+        <dd data-delivery-jobs-complete>
+          {{ delivery.progress.succeeded }} / {{ delivery.progress.total_jobs }}
+        </dd>
       </div>
       <div>
         <dt>Clean full set</dt>
-        <dd>
+        <dd data-delivery-full-outputs>
           {{ delivery.progress.ready_full_outputs }} /
           {{ delivery.progress.expected_full_outputs }}
         </dd>
       </div>
       <div>
         <dt>X teasers</dt>
-        <dd>
+        <dd data-delivery-x-outputs>
           {{ delivery.progress.ready_x_teasers }} /
           {{ delivery.progress.expected_x_teasers }}
         </dd>
       </div>
       <div>
         <dt>Failures</dt>
-        <dd>{{ delivery.progress.failed }}</dd>
+        <dd data-delivery-failures>{{ delivery.progress.failed }}</dd>
+      </div>
+      <div>
+        <dt>Active jobs</dt>
+        <dd data-delivery-active-jobs>{{ delivery.progress.active_jobs }}</dd>
       </div>
     </dl>
 
@@ -81,7 +124,7 @@
             {% endfor %}
           </select>
           <button class="primary-button" type="submit" {% if not watermarks %}disabled{% endif %}>
-            Prepare outputs
+            Prepare publishing copies
           </button>
         </form>
       {% else %}
@@ -97,19 +140,30 @@
           >
           <input type="hidden" name="submission_id" value="{{ output_submission_id }}">
           <input type="hidden" name="watermark_asset_id" value="">
-          <button class="primary-button" type="submit">Prepare outputs</button>
+          <button class="primary-button" type="submit">Prepare publishing copies</button>
         </form>
       {% endif %}
-    {% elif delivery.progress.ready_for_destinations %}
-      <p class="terminal-state" role="status">All exact outputs are ready.</p>
+    {% elif output_state == "ready" %}
+      <p class="terminal-state" role="status">All clean publishing copies are ready.</p>
+    {% elif output_state == "failed" %}
+      <p class="form-error" role="alert">
+        Copy preparation ended with failures. No jobs are still running; retry the
+        failed preparation before creating the finished archive.
+      </p>
+    {% elif output_state == "stalled" %}
+      <p class="form-error" role="alert">
+        Copy preparation is stalled. No job is active and the expected files are not
+        complete; operator repair or a retry is required.
+      </p>
     {% else %}
-      <p class="terminal-state" role="status" data-delivery-refresh-status>
-        Rendering is in progress. This page updates automatically.
+      <p class="terminal-state" role="status" data-delivery-live-status aria-live="polite">
+        Clean publishing copies are being prepared in the background. You can leave
+        this page and return later.
       </p>
     {% endif %}
   </section>
 
-  {% if delivery.progress.ready_for_destinations or finished_set_destination %}
+  {% if delivery.progress.outputs_ready or finished_set_destination %}
     <section class="panel review-entry" aria-labelledby="finished-set-heading">
       <div class="step-heading">
         <span class="step-number" aria-hidden="true">ZIP</span>
@@ -156,10 +210,31 @@
           reliable. Every part carries the same set manifest and preserves global order.
         </p>
       {% else %}
-        <p class="terminal-state" role="status">
-          Prepare destinations once to materialize the immutable ZIP package. It then
-          remains downloadable here after Patreon or MEGA publishing completes.
-        </p>
+        {% if delivery.destinations_prepared %}
+          <div class="review-target-progress" data-delivery-archive-progress-region>
+            <strong data-delivery-archive-status aria-live="polite">
+              {% if archive_state == "blocked" %}
+                ZIP preparation is paused because the publication runtime or switch is stopped.
+              {% elif archive_state == "failed" %}
+                ZIP creation failed and no archive job is active.
+              {% else %}
+                Creating ZIP parts in the background.
+              {% endif %}
+            </strong>
+            <span class="muted" data-delivery-archive-detail>
+              {% if archive_state == "failed" %}
+                Retry destination preparation after resolving the failure.
+              {% else %}
+                The page remains usable while the clean ranked archive is assembled.
+              {% endif %}
+            </span>
+          </div>
+        {% else %}
+          <p class="terminal-state" role="status" data-delivery-archive-status>
+            Prepare destinations once to create the immutable ZIP package. It then
+            remains downloadable here after Patreon or MEGA publishing completes.
+          </p>
+        {% endif %}
       {% endif %}
     </section>
   {% endif %}

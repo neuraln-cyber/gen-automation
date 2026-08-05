@@ -303,12 +303,12 @@ class Settings(BaseSettings):
         le=86400,
     )
     background_publication_timeout_seconds: float = Field(
-        default=300,
+        default=840,
         ge=10,
         le=900,
     )
     background_publication_lease_seconds: int = Field(
-        default=600,
+        default=1200,
         ge=30,
         le=3600,
     )
@@ -369,7 +369,7 @@ class Settings(BaseSettings):
     background_shutdown_cancel_seconds: float = Field(default=5, ge=0.1, le=60)
     background_readiness_failure_threshold: int = Field(default=3, ge=1, le=100)
     background_liveness_failure_threshold: int = Field(default=10, ge=1, le=100)
-    background_loop_stale_after_seconds: float = Field(default=900, ge=10, le=7200)
+    background_loop_stale_after_seconds: float = Field(default=1200, ge=10, le=7200)
     gpu_allocation_enabled: bool = False
     publishing_enabled: bool = False
     patreon_browser_publishing_enabled: bool = False

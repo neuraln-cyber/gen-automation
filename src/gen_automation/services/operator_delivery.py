@@ -91,6 +91,42 @@ class DerivativeProgress:
     ready_x_teasers: int
     ready_for_destinations: bool
 
+    @property
+    def active_jobs(self) -> int:
+        """Jobs which can still make forward progress without operator repair."""
+
+        return self.requested + self.running + self.retrying
+
+    @property
+    def outputs_ready(self) -> bool:
+        """Whether every planned job and exact derivative output is complete."""
+
+        return (
+            self.planned
+            and self.total_jobs == self.succeeded
+            and self.active_jobs == 0
+            and self.failed == 0
+            and self.ready_full_outputs == self.expected_full_outputs
+            and self.ready_x_teasers == self.expected_x_teasers
+        )
+
+    @property
+    def terminal_failures(self) -> bool:
+        """Whether output preparation ended with failures and no live work."""
+
+        return self.failed > 0 and self.active_jobs == 0
+
+    @property
+    def stalled(self) -> bool:
+        """Whether planned work stopped short without an explicit failure."""
+
+        return (
+            self.planned
+            and not self.outputs_ready
+            and self.active_jobs == 0
+            and not self.terminal_failures
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class DestinationState:
@@ -112,6 +148,18 @@ class DeliveryPackagePart:
     part_count: int
     first_ordinal: int
     last_ordinal: int
+
+
+def package_parts_ready(parts: tuple[DeliveryPackagePart, ...]) -> bool:
+    """Return whether every deterministic archive part is present exactly once."""
+
+    expected_part_count = len(parts)
+    return (
+        expected_part_count > 0
+        and tuple(sorted(part.part_number for part in parts))
+        == tuple(range(1, expected_part_count + 1))
+        and all(part.part_count == expected_part_count for part in parts)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -599,6 +647,12 @@ def _publication_state(
         return (
             "ready",
             "Package ready for the signed-in Patreon browser driver or manual upload.",
+        )
+    if intent.state == PublicationIntentState.AWAITING_APPROVAL:
+        return (
+            "failed",
+            "A fresh approval is required. Prepare destinations again to authorize and "
+            "resume delivery.",
         )
     if (
         intent.target == PublicationTarget.PATREON
