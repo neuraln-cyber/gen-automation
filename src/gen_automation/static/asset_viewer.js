@@ -228,28 +228,26 @@
     const shortcuts = createElement(
       "p",
       "asset-viewer-shortcuts",
-      "\u2190/\u2192 Navigate \u00b7 Del Mark out \u00b7 Esc Close",
+      "\u2190/\u2192 Navigate \u00b7 Del Reject \u00b7 Shift+Del Reject + train anatomy \u00b7 Esc Close",
     );
     const exclusionHelp = createElement(
       "p",
       "asset-viewer-exclusion-help",
-      "Mark out excludes an image from the final set; its raw master is retained.",
+      "Reject removes this image from the final set immediately; its raw master is retained.",
     );
     exclusionHelp.hidden = true;
-    const markOut = createElement("button", "asset-viewer-mark-out", "Mark out");
+    const markOut = createElement("button", "asset-viewer-mark-out", "Reject");
     markOut.type = "button";
     markOut.dataset.assetViewerMarkOut = "";
-    markOut.setAttribute("aria-pressed", "false");
     markOut.hidden = true;
-    const saveExclusions = createElement(
+    const anatomyReject = createElement(
       "button",
-      "asset-viewer-save-exclusions",
-      "Save 0 exclusions",
+      "asset-viewer-anatomy-reject",
+      "Reject + train anatomy",
     );
-    saveExclusions.type = "button";
-    saveExclusions.dataset.assetViewerSaveExclusions = "";
-    saveExclusions.disabled = true;
-    saveExclusions.hidden = true;
+    anatomyReject.type = "button";
+    anatomyReject.dataset.assetViewerAnatomyReject = "";
+    anatomyReject.hidden = true;
     const select = createElement("button", "asset-viewer-select", "Select for bulk action");
     select.type = "button";
     select.dataset.assetViewerSelect = "";
@@ -283,7 +281,7 @@
       shortcuts,
       exclusionHelp,
       markOut,
-      saveExclusions,
+      anatomyReject,
       select,
       more,
     );
@@ -293,6 +291,7 @@
     document.body.append(dialog);
     return {
       close,
+      anatomyReject,
       copyClean,
       counter,
       dialog,
@@ -306,7 +305,6 @@
       more,
       next,
       previous,
-      saveExclusions,
       score,
       select,
       settings,
@@ -329,23 +327,11 @@
 
     const viewer = createViewer();
     const boundCards = new WeakSet();
-    let bulkForm = null;
-    let bulkReject = null;
-    let exclusionStorageKey = null;
-    const refreshReviewControls = () => {
-      bulkForm = document.querySelector("#bulk-action-form, [data-bulk-action-form]");
-      bulkReject = bulkForm
-        ? bulkForm.querySelector('button[name="action"][value="reject"]')
-        : null;
-      exclusionStorageKey = bulkForm
-        ? `gen-automation:review-exclusions:v1:${bulkForm.getAttribute("action") || window.location.pathname}`
-        : null;
-    };
-    refreshReviewControls();
-    const markedForExclusion = new Set();
     let activeCard = null;
     let announcement = "";
     let cleanActionBusy = false;
+    let rejectionBusy = false;
+    let pendingRejection = null;
     let returnFocus = null;
 
     const resetViewerScroll = () => {
@@ -491,102 +477,69 @@
       }
     };
 
-    const exclusionContext = (card) => {
-      if (!card || !bulkForm || !bulkReject) return null;
-      const selection = card.querySelector('input[type="checkbox"][name="asset_id"]');
-      const assetId = selection && selection.value ? selection.value : card.dataset.assetId;
-      if (!selection || !assetId || selection.form !== bulkForm) return null;
+    const rejectionContext = (card) => {
+      if (!card) return null;
+      const form = card.querySelector("form[data-review-decision-form]");
+      const rejectButton = form?.querySelector('button[data-decision="reject"]');
+      const assetIdField = form?.querySelector('input[name="asset_id"]');
+      const assetId = form?.dataset.assetId
+        || (assetIdField instanceof HTMLInputElement ? assetIdField.value : "")
+        || card.dataset.assetId;
+      if (!(form instanceof HTMLFormElement)
+          || !(rejectButton instanceof HTMLButtonElement)
+          || !assetId) return null;
+      const anatomyToggle = form.querySelector("[data-anatomy-training-toggle]");
+      const anatomyIssue = form.querySelector("[data-anatomy-training-issue]");
       return {
+        anatomyIssue: anatomyIssue instanceof HTMLSelectElement ? anatomyIssue : null,
+        anatomyLabeled: anatomyToggle instanceof HTMLInputElement && anatomyToggle.checked,
+        anatomyToggle: anatomyToggle instanceof HTMLInputElement ? anatomyToggle : null,
         assetId,
-        alreadyExcluded: card.dataset.decision === "reject",
-        selection,
+        alreadyRejected: card.dataset.decision === "reject",
+        form,
+        rejectButton,
       };
     };
 
-    const persistMarkedExclusions = () => {
-      if (!exclusionStorageKey) return;
-      try {
-        if (markedForExclusion.size === 0) {
-          window.sessionStorage.removeItem(exclusionStorageKey);
-        } else {
-          window.sessionStorage.setItem(
-            exclusionStorageKey,
-            JSON.stringify(Array.from(markedForExclusion)),
-          );
-        }
-      } catch (_error) {
-        // Review remains usable when private-browser storage is unavailable.
-      }
-    };
-    const restoreMarkedExclusions = () => {
-      if (!exclusionStorageKey) return;
-      try {
-        const raw = window.sessionStorage.getItem(exclusionStorageKey);
-        const saved = raw ? JSON.parse(raw) : [];
-        if (!Array.isArray(saved)) return;
-        saved.forEach((assetId) => {
-          const card = assetCards().find((candidate) => candidate.dataset.assetId === assetId);
-          const context = exclusionContext(card);
-          if (context && !context.alreadyExcluded) markedForExclusion.add(context.assetId);
-        });
-        persistMarkedExclusions();
-      } catch (_error) {
-        try {
-          window.sessionStorage.removeItem(exclusionStorageKey);
-        } catch (_storageError) {
-          // Storage can be unavailable without preventing the viewer from initializing.
-        }
-      }
-    };
-
-    const updateExclusionControls = () => {
-      const context = exclusionContext(activeCard);
-      const hasReviewControls = Boolean(bulkForm && bulkReject);
-      const markedCount = markedForExclusion.size;
-      viewer.shortcuts.textContent = hasReviewControls
-        ? "\u2190/\u2192 Navigate \u00b7 Del Mark out \u00b7 Esc Close"
+    const updateRejectionControls = () => {
+      const context = rejectionContext(activeCard);
+      const canTrainAnatomy = Boolean(context?.anatomyToggle && context?.anatomyIssue);
+      viewer.shortcuts.textContent = context
+        ? (
+          canTrainAnatomy
+            ? "\u2190/\u2192 Navigate \u00b7 Del Reject \u00b7 Shift+Del Reject + train anatomy \u00b7 Esc Close"
+            : "\u2190/\u2192 Navigate \u00b7 Del Reject \u00b7 Esc Close"
+        )
         : "\u2190/\u2192 Navigate \u00b7 Esc Close";
       viewer.exclusionHelp.hidden = !context;
       viewer.markOut.hidden = !context;
-      viewer.saveExclusions.hidden = !hasReviewControls;
-      viewer.saveExclusions.disabled = markedCount === 0;
-      viewer.saveExclusions.textContent = (
-        `Save ${markedCount} exclusion${markedCount === 1 ? "" : "s"}`
-      );
-      viewer.saveExclusions.setAttribute(
-        "aria-label",
-        markedCount === 0
-          ? "No images are marked for exclusion"
-          : `Save ${markedCount} marked exclusion${markedCount === 1 ? "" : "s"}`,
-      );
-
-      assetCards().forEach((card) => {
-        const cardContext = exclusionContext(card);
-        const marked = Boolean(cardContext && markedForExclusion.has(cardContext.assetId));
-        card.classList.toggle("viewer-marked-for-exclusion", marked);
-      });
-
+      viewer.anatomyReject.hidden = !context || !canTrainAnatomy;
       if (!context) return;
-      if (context.alreadyExcluded) {
-        viewer.markOut.disabled = true;
-        viewer.markOut.textContent = "Excluded";
-        viewer.markOut.setAttribute("aria-pressed", "true");
-        viewer.markOut.setAttribute(
-          "aria-label",
-          "Already excluded from the final set; raw master retained",
-        );
-        return;
-      }
 
-      const marked = markedForExclusion.has(context.assetId);
-      viewer.markOut.disabled = false;
-      viewer.markOut.textContent = marked ? "Undo mark out" : "Mark out";
-      viewer.markOut.setAttribute("aria-pressed", String(marked));
+      viewer.markOut.disabled = rejectionBusy || context.alreadyRejected;
+      viewer.markOut.textContent = rejectionBusy
+        ? "Saving..."
+        : context.alreadyRejected ? "Rejected" : "Reject";
       viewer.markOut.setAttribute(
         "aria-label",
-        marked
-          ? `Undo mark out for ${cardRank(activeCard)}`
-          : `Mark ${cardRank(activeCard)} for exclusion; raw master retained`,
+        context.alreadyRejected
+          ? "Already rejected from the final set; raw master retained"
+          : `Reject ${cardRank(activeCard)} from the final set; raw master retained`,
+      );
+
+      viewer.anatomyReject.disabled = rejectionBusy || context.anatomyLabeled;
+      viewer.anatomyReject.textContent = rejectionBusy
+        ? "Saving..."
+        : context.anatomyLabeled
+          ? "Anatomy label saved"
+          : context.alreadyRejected
+            ? "Add anatomy training label"
+            : "Reject + train anatomy";
+      viewer.anatomyReject.setAttribute(
+        "aria-label",
+        context.alreadyRejected
+          ? `Label ${cardRank(activeCard)} as an anatomy defect for training`
+          : `Reject ${cardRank(activeCard)} and label it as an anatomy defect for training`,
       );
     };
 
@@ -647,7 +600,7 @@
         : "Select for bulk action";
       viewer.settings.hidden = !activeCard.querySelector("[data-generation-details]");
       viewer.more.open = false;
-      updateExclusionControls();
+      updateRejectionControls();
 
       const hasMultiple = available.length > 1;
       viewer.previous.disabled = !hasMultiple;
@@ -663,95 +616,49 @@
     };
 
     const step = (offset) => {
+      if (rejectionBusy) return;
       const available = visibleCards();
       if (available.length < 2) return;
       const currentIndex = Math.max(0, available.indexOf(activeCard));
       renderCard(available[(currentIndex + offset + available.length) % available.length]);
     };
 
-    const toggleMarkOut = () => {
-      const context = exclusionContext(activeCard);
-      if (!context) return false;
-      if (context.alreadyExcluded) {
-        announcement = "Already excluded from the final set; raw master retained.";
-        updateExclusionControls();
-        viewer.status.textContent = announcement;
-        viewer.status.hidden = false;
+    const submitRejection = (withAnatomyTraining = false) => {
+      const context = rejectionContext(activeCard);
+      if (!context || rejectionBusy) return false;
+      if (withAnatomyTraining && (!context.anatomyToggle || !context.anatomyIssue)) {
+        announce("Anatomy training is unavailable for this review. The image was not changed.");
+        return false;
+      }
+      if (context.alreadyRejected && (!withAnatomyTraining || context.anatomyLabeled)) {
+        announce(
+          context.anatomyLabeled
+            ? "Already rejected and labeled for anatomy learning."
+            : "Already rejected from the final set; raw master retained.",
+        );
+        step(1);
         return false;
       }
 
-      const wasMarked = markedForExclusion.delete(context.assetId);
-      if (wasMarked) {
-        persistMarkedExclusions();
-        announcement = `${cardRank(activeCard)} mark removed; raw master retained.`;
-        updateExclusionControls();
-        viewer.status.textContent = announcement;
-        viewer.status.hidden = false;
-        return false;
-      }
-
-      markedForExclusion.add(context.assetId);
-      persistMarkedExclusions();
-      announcement = (
-        `${cardRank(activeCard)} marked for exclusion; raw master retained until you save.`
-      );
-      updateExclusionControls();
-      viewer.status.textContent = announcement;
-      viewer.status.hidden = false;
-      step(1);
-      return true;
-    };
-
-    const saveMarkedExclusions = () => {
-      if (!bulkForm || !bulkReject || markedForExclusion.size === 0) return;
-      const selections = Array.from(
-        document.querySelectorAll('input[type="checkbox"][name="asset_id"]'),
-      ).filter((selection) => selection.form === bulkForm);
-      const states = selections.map((selection) => ({
-        checked: selection.checked,
-        disabled: selection.disabled,
-        selection,
-      }));
-      const rejectWasDisabled = bulkReject.disabled;
-      let markedSelection = null;
-
-      selections.forEach((selection) => {
-        const marked = markedForExclusion.has(selection.value);
-        selection.disabled = !marked;
-        selection.checked = marked;
-        if (marked && markedSelection === null) markedSelection = selection;
-      });
-      if (!markedSelection) {
-        states.forEach(({ checked, disabled, selection }) => {
-          selection.checked = checked;
-          selection.disabled = disabled;
-        });
-        return;
-      }
-
-      markedSelection.dispatchEvent(new Event("change", { bubbles: true }));
-      bulkReject.disabled = false;
-      viewer.saveExclusions.disabled = true;
-      viewer.saveExclusions.textContent = "Saving exclusions...";
-      announcement = (
-        `Saving ${markedForExclusion.size} exclusion${markedForExclusion.size === 1 ? "" : "s"}; raw masters retained.`
-      );
-      viewer.status.textContent = announcement;
-      viewer.status.hidden = false;
-
-      const restoreSelections = () => {
-        states.forEach(({ checked, disabled, selection }) => {
-          selection.checked = checked;
-          selection.disabled = disabled;
-        });
-        bulkReject.disabled = rejectWasDisabled;
+      if (context.anatomyToggle) context.anatomyToggle.checked = withAnatomyTraining;
+      const available = visibleCards();
+      const currentIndex = Math.max(0, available.indexOf(activeCard));
+      const nextCard = available.length > 1
+        ? available[(currentIndex + 1) % available.length]
+        : null;
+      pendingRejection = {
+        anatomyRequested: withAnatomyTraining,
+        assetId: context.assetId,
+        nextAssetId: nextCard?.dataset.assetId || "",
       };
-      window.setTimeout(restoreSelections, 0);
-      if (typeof bulkForm.requestSubmit === "function") {
-        bulkForm.requestSubmit(bulkReject);
-      } else {
-        bulkReject.click();
-      }
+      rejectionBusy = true;
+      announcement = withAnatomyTraining
+        ? `Rejecting ${cardRank(activeCard)} and adding an anatomy training label...`
+        : `Rejecting ${cardRank(activeCard)}...`;
+      updateRejectionControls();
+      announce(announcement);
+      context.form.requestSubmit(context.rejectButton);
+      return true;
     };
 
     const openViewer = (card, trigger) => {
@@ -814,23 +721,48 @@
     document.addEventListener("gen-automation:assets-updated", (event) => {
       const root = event.detail && event.detail.root;
       const activeAssetId = activeCard?.dataset.assetId || "";
-      refreshReviewControls();
       bindCards(root || document);
       applyDensity(storedDensity());
-      Array.from(markedForExclusion).forEach((assetId) => {
-        const card = assetCards().find((candidate) => candidate.dataset.assetId === assetId);
-        const context = exclusionContext(card);
-        if (!context || context.alreadyExcluded) markedForExclusion.delete(assetId);
-      });
-      persistMarkedExclusions();
-      restoreMarkedExclusions();
-      updateExclusionControls();
       if (viewer.dialog.open && activeAssetId) {
         const refreshedCard = assetCards().find(
           (candidate) => candidate.dataset.assetId === activeAssetId,
         );
         if (refreshedCard) renderCard(refreshedCard);
       }
+    });
+    document.addEventListener("gen-automation:review-action-settled", (event) => {
+      const detail = event.detail || {};
+      if (!pendingRejection
+          || detail.assetId !== pendingRejection.assetId
+          || detail.decision !== "reject") return;
+      const settled = pendingRejection;
+      pendingRejection = null;
+      rejectionBusy = false;
+
+      if (!detail.success) {
+        updateRejectionControls();
+        announce(
+          detail.reason === "conflict"
+            ? "The review changed in another tab. Refresh once, then reject this image again."
+            : "The rejection was not saved. This image is still in the final set; try again.",
+        );
+        return;
+      }
+
+      announcement = settled.anatomyRequested
+        ? "Rejected and labeled for anatomy learning; raw master retained."
+        : "Rejected from the final set; raw master retained.";
+      if (viewer.dialog.open && settled.nextAssetId) {
+        const nextCard = assetCards().find(
+          (candidate) => candidate.dataset.assetId === settled.nextAssetId && !candidate.hidden,
+        );
+        if (nextCard) {
+          renderCard(nextCard);
+          return;
+        }
+      }
+      updateRejectionControls();
+      announce(announcement);
     });
 
     viewer.close.addEventListener("click", closeViewer);
@@ -841,8 +773,8 @@
     });
     viewer.previous.addEventListener("click", () => step(-1));
     viewer.next.addEventListener("click", () => step(1));
-    viewer.markOut.addEventListener("click", toggleMarkOut);
-    viewer.saveExclusions.addEventListener("click", saveMarkedExclusions);
+    viewer.markOut.addEventListener("click", () => submitRejection(false));
+    viewer.anatomyReject.addEventListener("click", () => submitRejection(true));
     viewer.copyClean.addEventListener("click", () => performCleanAction("copy"));
     viewer.downloadClean.addEventListener("click", () => performCleanAction("download"));
     viewer.select.addEventListener("click", () => {
@@ -887,9 +819,9 @@
         event.preventDefault();
         step(1);
       } else if (event.key === "Delete") {
-        if (exclusionContext(activeCard)) {
+        if (rejectionContext(activeCard)) {
           event.preventDefault();
-          toggleMarkOut();
+          submitRejection(event.shiftKey);
         }
       } else if (event.key === "Escape") {
         event.preventDefault();
@@ -930,8 +862,7 @@
     viewer.media.addEventListener("touchcancel", () => {
       touchStart = null;
     }, { passive: true });
-    restoreMarkedExclusions();
-    updateExclusionControls();
+    updateRejectionControls();
     setViewerMode("fit");
   }
 

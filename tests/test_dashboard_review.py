@@ -23,7 +23,7 @@ from gen_automation.db.models import (
     ReviewXSelection,
 )
 from gen_automation.db.session import Database
-from gen_automation.domain.enums import AdminRole, ReviewTaskState
+from gen_automation.domain.enums import AdminRole, ReviewDecisionValue, ReviewTaskState
 from gen_automation.middleware import asset_connection_source, content_security_policy
 from gen_automation.services.review import create_review_task
 from gen_automation.storage.base import ObjectMetadata, PresignedUpload
@@ -304,6 +304,26 @@ async def _single_task_identity(
         await database.dispose()
 
 
+async def _review_decisions(
+    context: ReviewApiContext,
+) -> tuple[ReviewDecision, ...]:
+    database = Database(context.settings.database_url)
+    try:
+        async with database.sessions() as session:
+            return tuple(
+                (
+                    await session.scalars(
+                        select(ReviewDecision).order_by(
+                            ReviewDecision.asset_id,
+                            ReviewDecision.revision,
+                        )
+                    )
+                ).all()
+            )
+    finally:
+        await database.dispose()
+
+
 async def _x_selected_assets(
     context: ReviewApiContext,
     *,
@@ -569,6 +589,15 @@ def test_browser_review_forms_are_bounded_same_origin_and_cookie_csrf_bound(
         context.scoring_run_id,
         context.users[AdminRole.REVIEWER].id,
     )
+    default_decisions = asyncio.run(_review_decisions(context))
+    assert len(default_decisions) == len(context.asset_ids)
+    assert all(row.revision == 1 for row in default_decisions)
+    assert all(row.decision == ReviewDecisionValue.ACCEPT for row in default_decisions)
+    assert all(row.reason_code == "sorting_default_accept" for row in default_decisions)
+    assert all(
+        row.decided_by_user_id == context.users[AdminRole.REVIEWER].id
+        for row in default_decisions
+    )
 
 
 def test_review_detail_reads_its_exact_run_after_release_advances(
@@ -704,8 +733,8 @@ def test_review_dashboard_exposes_progressive_bulk_controls(tmp_path: Path) -> N
     assert _FORM_KEY.fullmatch(bulk_form.fields["idempotency_key"])
     assert bulk_form.fields["expected_lock_version"] == "1"
     assert page.text.count('form="bulk-action-form"') == len(context.asset_ids)
-    assert "Accept selected" in page.text
-    assert "Exclude selected" in page.text
+    assert "Keep selected" in page.text
+    assert "Reject selected" in page.text
     assert "Hold selected" in page.text
     assert "Add to X" in page.text
     assert "Remove from X" in page.text

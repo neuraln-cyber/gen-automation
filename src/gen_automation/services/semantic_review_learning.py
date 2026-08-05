@@ -29,6 +29,7 @@ GENERIC_ANATOMY_REASON_CODES = frozenset({"anatomy", "anatomy_defect", "bad_anat
 ANATOMY_REASON_CODES = GENERIC_ANATOMY_REASON_CODES | frozenset(
     issue.value for issue in SemanticIssueCode
 )
+AUTOMATIC_ACCEPT_REASON_CODES = frozenset({"sorting_default_accept"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,7 +163,11 @@ def _inferred_label(
     choice: SemanticReviewChoice,
 ) -> tuple[SemanticGroundTruth, SemanticIssueCode | None, str] | None:
     if choice.decision == ReviewDecisionValue.ACCEPT:
-        if choice.semantic_severe_override_attested:
+        normalized_reason = (choice.reason_code or "").strip().lower()
+        if (
+            choice.semantic_severe_override_attested
+            or normalized_reason in AUTOMATIC_ACCEPT_REASON_CODES
+        ):
             return None
         return SemanticGroundTruth.ANATOMY_GOOD, None, SEMANTIC_INFERRED_REVIEW_ACCEPT_NOTE
     normalized_reason = (choice.reason_code or "").strip().lower()

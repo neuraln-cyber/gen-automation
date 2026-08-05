@@ -49,6 +49,7 @@ from gen_automation.services.ranking_manifest import (
 )
 from gen_automation.services.semantic_feedback import SemanticFeedbackError
 from gen_automation.services.semantic_review_learning import (
+    ANATOMY_REASON_CODES,
     SemanticReviewChoice,
     SemanticReviewLearningResult,
     learn_semantic_anatomy_from_final_review,
@@ -62,6 +63,7 @@ _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 SEMANTIC_SEVERE_OVERRIDE_REASON_CODE = "semantic_severe_override"
 SEMANTIC_SEVERE_OVERRIDE_AUDIT_ACTION = "review.semantic_severe_overridden"
+SORTING_DEFAULT_ACCEPT_REASON_CODE = "sorting_default_accept"
 
 
 class ReviewServiceError(Exception):
@@ -194,16 +196,20 @@ async def create_review_task(
     scoring_run_id: UUID,
     created_by_user_id: UUID,
     idempotency_key: str,
+    default_accept_ranked_assets: bool = False,
     now: datetime | None = None,
 ) -> ReviewTaskResult:
     """Create one review task from an exact, completed ranking snapshot."""
 
     normalized_key = _validate_idempotency_key(idempotency_key)
+    if not isinstance(default_accept_ranked_assets, bool):
+        raise ReviewInputError("default acceptance mode must be boolean")
     scope = f"scoring-run:{scoring_run_id}:create-review-task"
     request_sha256 = canonical_sha256(
         {
             "scoring_run_id": str(scoring_run_id),
             "created_by_user_id": str(created_by_user_id),
+            "default_accept_ranked_assets": default_accept_ranked_assets,
         }
     )
     await _require_active_reviewer(session, created_by_user_id)
@@ -314,10 +320,45 @@ async def create_review_task(
                 "ranking_manifest_sha256": task.ranking_manifest_sha256,
                 "desired_accepted_count": task.desired_accepted_count,
                 "ranked_asset_count": task.ranked_asset_count,
+                "default_accept_ranked_assets": default_accept_ranked_assets,
             },
             occurred_at=created_at,
         )
     )
+    if default_accept_ranked_assets:
+        default_decisions = tuple(
+            ReviewDecision(
+                id=uuid7(),
+                review_task_id=task.id,
+                scoring_run_id=task.scoring_run_id,
+                asset_id=ranking.asset_id,
+                revision=1,
+                decision=ReviewDecisionValue.ACCEPT,
+                reason_code=SORTING_DEFAULT_ACCEPT_REASON_CODE,
+                note=None,
+                decided_by_user_id=created_by_user_id,
+                decided_at=created_at,
+                supersedes_revision=None,
+                supersedes_decision_id=None,
+            )
+            for ranking, _score in ranking_rows
+        )
+        session.add_all(default_decisions)
+        session.add(
+            AuditEvent(
+                actor=_audit_actor(created_by_user_id),
+                action="review.default_acceptance_seeded",
+                resource_type="review_task",
+                resource_id=task.id,
+                correlation_id=normalized_key,
+                detail={
+                    "scoring_run_id": str(task.scoring_run_id),
+                    "accepted_count": len(default_decisions),
+                    "reason_code": SORTING_DEFAULT_ACCEPT_REASON_CODE,
+                },
+                occurred_at=created_at,
+            )
+        )
     session.add(
         _idempotency_record(
             scope=scope,
@@ -329,6 +370,11 @@ async def create_review_task(
         )
     )
     try:
+        if default_accept_ranked_assets:
+            # ReviewDecision has a database-level task-state trigger but no ORM
+            # relationship that lets SQLAlchemy infer insert order. Flush only the
+            # open parent before the seeded decisions are flushed at commit.
+            await session.flush((task,))
         await session.commit()
     except IntegrityError as error:
         await session.rollback()
@@ -370,6 +416,10 @@ async def append_review_decision(
     normalized_key = _validate_idempotency_key(idempotency_key)
     normalized_decision = _validate_decision(decision)
     normalized_reason = _normalize_reason_code(reason_code)
+    normalized_reason = _reason_compatible_with_decision(
+        decision=normalized_decision,
+        reason_code=normalized_reason,
+    )
     normalized_note = _normalize_note(note)
     normalized_semantic_profile = _normalize_semantic_profile_sha256(semantic_profile_sha256)
     semantic_threshold = _validate_semantic_confidence_threshold(semantic_severe_confidence_micros)
@@ -584,6 +634,11 @@ async def apply_bulk_review_action(
         ReviewBulkAction.REJECT,
         ReviewBulkAction.HOLD,
     }
+    if normalized_action in decision_actions:
+        normalized_reason = _reason_compatible_with_decision(
+            decision=ReviewDecisionValue(normalized_action.value),
+            reason_code=normalized_reason,
+        )
     if normalized_action not in decision_actions and (
         normalized_reason is not None or normalized_note is not None
     ):
@@ -2155,6 +2210,24 @@ def _normalize_reason_code(value: str | None) -> str | None:
     if not _REASON_CODE_PATTERN.fullmatch(normalized):
         raise ReviewInputError("reason_code must be a lowercase machine identifier")
     return normalized
+
+
+def _reason_compatible_with_decision(
+    *,
+    decision: ReviewDecisionValue,
+    reason_code: str | None,
+) -> str | None:
+    """Discard stale internal reasons that cannot describe the submitted decision."""
+
+    if reason_code is None:
+        return None
+    if reason_code == SEMANTIC_SEVERE_OVERRIDE_REASON_CODE:
+        return reason_code if decision == ReviewDecisionValue.ACCEPT else None
+    if reason_code == SORTING_DEFAULT_ACCEPT_REASON_CODE:
+        return reason_code if decision == ReviewDecisionValue.ACCEPT else None
+    if reason_code in ANATOMY_REASON_CODES:
+        return reason_code if decision == ReviewDecisionValue.REJECT else None
+    return reason_code
 
 
 def _normalize_note(value: str | None) -> str | None:

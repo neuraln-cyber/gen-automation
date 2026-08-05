@@ -236,9 +236,9 @@
         <span class="workflow-label">Review progress</span>
         <h2 id="review-summary-heading">Build your final set</h2>
         <p class="muted">
-          The configured final-set goal is a maximum of {{ final_set_goal }}
-          image{% if final_set_goal != 1 %}s{% endif %}. Finish with any non-empty curated
-          subset; other masters may stay undecided.
+          Cull mode keeps images unless you reject them. The final-set maximum is
+          {{ final_set_goal }} image{% if final_set_goal != 1 %}s{% endif %}; reject enough
+          images to reach that limit, then finish the review.
         </p>
       </div>
       <span class="status {{ summary.state.value }}">{{ summary.state.value }}</span>
@@ -343,6 +343,15 @@
         {% endif %}
       </div>
       <div class="task-actions">
+        {% if summary.undecided_count %}
+          <button
+            class="secondary-button"
+            type="button"
+            data-accept-undecided
+          >
+            Keep all {{ summary.undecided_count }} undecided
+          </button>
+        {% endif %}
         <form
           method="post"
           action="/dashboard/review-tasks/{{ summary.task_id }}:complete"
@@ -457,10 +466,10 @@
       </div>
       <div class="bulk-actions">
         <button class="secondary-button bulk-accept" type="submit" name="action" value="accept">
-          Accept selected
+          Keep selected
         </button>
         <button class="secondary-button bulk-reject" type="submit" name="action" value="reject">
-          Exclude selected
+          Reject selected
         </button>
         <button class="secondary-button bulk-hold" type="submit" name="action" value="hold">
           Hold selected
@@ -488,8 +497,8 @@
     <div>
       <h2>Ranked images</h2>
       <p class="muted">
-        Use the one-tap decisions on each card. Reject excludes an image from the final
-        set without deleting its raw master.
+        Open an image for fast culling. Left and Right navigate; Delete rejects immediately;
+        Shift+Delete rejects and adds an anatomy-defect training label. Raw masters are retained.
       </p>
     </div>
     {% if ai_excluded_count %}
@@ -606,7 +615,7 @@
               {{ item.master.batch_name }} &middot; image {{ item.master.batch_image_number }}
             </span>
             <span class="decision-chip {{ decision_value }}">
-              {{ decision_value }}
+              {{ "kept" if decision_value == "accept" else "rejected" if decision_value == "reject" else decision_value }}
             </span>
             <span class="decision-chip{% if item.current.selected_for_x %} x-selected{% endif %}">
               X: {{ "selected" if item.current.selected_for_x else "not selected" }}
@@ -784,9 +793,9 @@
                   <span class="anatomy-feedback-mode">{{ semantic_mode }}</span>
                 </div>
                 <p class="anatomy-feedback-learning-copy">
-                  Good and Defect update learning immediately. When you complete this
-                  review, accepted images also teach good anatomy; generic excludes are
-                  never treated as anatomy defects.
+                  During culling, use Reject + train anatomy for a bad-anatomy image.
+                  Plain rejection only removes an image from the final set and never labels
+                  it as an anatomy defect.
                 </p>
 
                 {% if item.semantic_feedback %}
@@ -812,10 +821,7 @@
                       {% endif %}
                     </span>
                   </div>
-                {% elif
-                  summary.state.value in ["open", "completed"]
-                  and principal.role.value == "owner"
-                %}
+                {% elif summary.state.value == "completed" and principal.role.value == "owner" %}
                   <form
                     class="anatomy-feedback-form"
                     method="post"
@@ -1009,7 +1015,7 @@
                       disabled
                       aria-describedby="severe-owner-only-{{ item.master.asset_id }}"
                     {% endif %}
-                  >Accept</button>
+                  >Keep</button>
                   <button
                     class="decision-button reject"
                     type="submit"
@@ -1017,7 +1023,7 @@
                     value="reject"
                     aria-label="Reject rank {{ item.master.rank }}"
                     data-decision="reject"
-                  >Exclude</button>
+                  >Reject</button>
                   <button
                     class="decision-button hold"
                     type="submit"
@@ -1028,6 +1034,36 @@
                   >Hold</button>
                 </div>
               </fieldset>
+
+              {% if principal.role.value == "owner" and semantic_mode != "off" %}
+                <div class="anatomy-reject-option" data-anatomy-training-control>
+                  <label>
+                    <input
+                      type="checkbox"
+                      data-anatomy-training-toggle
+                      {% if item.current.reason_code in anatomy_reason_codes %}checked{% endif %}
+                    >
+                    <span>
+                      <strong>Use rejection for anatomy training</strong>
+                      <small>Only enable this when anatomy is the reason the image is rejected.</small>
+                    </span>
+                  </label>
+                  <label>
+                    Defect type
+                    <select data-anatomy-training-issue>
+                      <option value="anatomy">Not specified</option>
+                      {% for issue_code in semantic_issue_codes %}
+                        <option
+                          value="{{ issue_code.value }}"
+                          {% if item.current.reason_code == issue_code.value %}selected{% endif %}
+                        >
+                          {{ issue_code.value.replace("_", " ") }}
+                        </option>
+                      {% endfor %}
+                    </select>
+                  </label>
+                </div>
+              {% endif %}
 
               <details
                 class="decision-details"
@@ -1079,8 +1115,8 @@
                 </p>
               {% else %}
                 <p class="decision-help">
-                  Accept keeps it, exclude removes it from the final set without deleting the
-                  raw master, and hold leaves it for another pass.
+                  Keep includes it, reject removes it from the final set without deleting the
+                  raw master, and hold leaves it for another pass. Anatomy training is optional.
                 </p>
               {% endif %}
             </form>

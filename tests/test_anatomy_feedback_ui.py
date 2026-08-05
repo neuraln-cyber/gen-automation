@@ -295,10 +295,14 @@ def test_owner_feedback_controls_are_available_after_completion_but_not_cancella
     assert page.status_code == 200
     forms = _forms(page.text, action)
     assert len(forms) == expected_form_count
+    assert "data-anatomy-training-control" not in page.text
     if terminal_state == ReviewTaskState.COMPLETED:
         assert forms[0].fields["assessment_id"] == str(assessment_id)
         assert forms[0].fields["csrf_token"]
         assert len(forms[0].fields["csrf_token"]) > 10
+        assert "Good anatomy" in page.text
+        assert "Defect" in page.text
+        assert "Unsure" in page.text
     else:
         assert "This task is cancelled and is now read-only" in page.text
 
@@ -406,8 +410,9 @@ def test_anatomy_feedback_template_is_quick_responsive_and_explicit() -> None:
     assert "Regressed" in template
     assert "prior policy retained" in template.lower()
     assert "How learning is measured" in template
-    assert "generic excludes are" in template
-    assert "never treated as anatomy defects" in template
+    assert "Plain rejection only removes an image from the final set" in template
+    assert "never labels" in template
+    assert "it as an anatomy defect" in template
     assert "Validation F1" in template
     assert "False-positive rate" in template
     assert "Applied threshold" in template
@@ -416,6 +421,12 @@ def test_anatomy_feedback_template_is_quick_responsive_and_explicit() -> None:
     assert "out-of-fold images" in template
     assert 'principal.role.value == "owner"' in template
     assert "data-anatomy-feedback-form" in template
+    assert 'summary.state.value == "completed" and principal.role.value == "owner"' in template
+    assert "data-anatomy-training-control" in template
+    assert "data-anatomy-training-toggle" in template
+    assert "data-anatomy-training-issue" in template
+    assert "Use rejection for anatomy training" in template
+    assert "Only enable this when anatomy is the reason the image is rejected" in template
     assert 'value="anatomy_good"' in template
     assert 'value="anatomy_defect"' in template
     assert 'value="unjudgeable"' in template
@@ -432,7 +443,7 @@ def test_anatomy_feedback_template_is_quick_responsive_and_explicit() -> None:
     assert "min-height: 3.2rem" in css
 
 
-def test_review_page_renders_prediction_details_saved_feedback_and_quick_actions(
+def test_open_review_page_renders_prediction_and_integrated_anatomy_rejection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -546,10 +557,14 @@ def test_review_page_renders_prediction_details_saved_feedback_and_quick_actions
     assert "malformed hand" in page.text
     assert "96.0%" in page.text
     assert "Saved:" in page.text
-    assert page.text.count("data-anatomy-feedback-form") == 1
+    assert "data-anatomy-feedback-form" not in page.text
+    assert page.text.count("data-review-decision-form") == len(context.asset_ids)
+    assert page.text.count("data-anatomy-training-control") == len(context.asset_ids)
+    assert page.text.count("data-anatomy-training-toggle") == len(context.asset_ids)
+    assert page.text.count("data-anatomy-training-issue") == len(context.asset_ids)
+    assert "Use rejection for anatomy training" in page.text
+    assert "Plain rejection only removes an image from the final set" in page.text
     assert str(second_assessment_id) in page.text
-    assert "Flag correct" in page.text
-    assert "Flag incorrect" in page.text
     assert 'data-anatomy-learning-status="collecting"' in page.text
     assert "12 / 100 useful labels" in page.text
     assert "19 more defect" in page.text

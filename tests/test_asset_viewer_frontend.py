@@ -34,23 +34,28 @@ def test_asset_viewer_is_safe_progressive_enhancement() -> None:
     assert "asset-viewer-shortcuts" in script
     assert "Navigate" in script
     assert "assetViewerMarkOut" in script
-    assert "assetViewerSaveExclusions" in script
-    assert 'document.querySelector("#bulk-action-form, [data-bulk-action-form]")' in script
-    assert 'button[name="action"][value="reject"]' in script
-    assert "selection.form !== bulkForm" in script
-    assert "markedForExclusion" in script
-    assert "review-exclusions:v1" in script
-    assert "restoreMarkedExclusions" in script
-    assert "viewer-marked-for-exclusion" in script
+    assert "assetViewerAnatomyReject" in script
+    assert "Reject + train anatomy" in script
+    assert "form[data-review-decision-form]" in script
+    assert 'button[data-decision="reject"]' in script
+    assert "submitRejection" in script
+    assert "context.form.requestSubmit(context.rejectButton)" in script
+    assert "pendingRejection" in script
+    assert "rejectionBusy" in script
+    assert 'document.addEventListener("gen-automation:review-action-settled"' in script
     assert 'card.dataset.decision === "reject"' in script
-    assert 'viewer.markOut.textContent = "Excluded"' in script
+    assert 'viewer.markOut.textContent = rejectionBusy' in script
     assert "raw master retained" in script
-    assert "raw masters retained" in script
     assert "step(1)" in script
-    assert "selection.disabled = !marked" in script
-    assert "selection.checked = marked" in script
-    assert "restoreSelections" in script
-    assert "bulkForm.requestSubmit(bulkReject)" in script
+    assert "submitRejection(event.shiftKey)" in script
+    assert 'viewer.markOut.addEventListener("click", () => submitRejection(false))' in script
+    assert 'viewer.anatomyReject.addEventListener("click", () => submitRejection(true))' in script
+    assert "assetViewerSaveExclusions" not in script
+    assert "markedForExclusion" not in script
+    assert "review-exclusions:v1" not in script
+    assert "restoreMarkedExclusions" not in script
+    assert "viewer-marked-for-exclusion" not in script
+    assert "bulkForm.requestSubmit(bulkReject)" not in script
     assert "assetViewerCopyClean" in script
     assert "assetViewerDownloadClean" in script
     assert "Copy clean image" in script
@@ -86,7 +91,6 @@ def test_asset_viewer_is_safe_progressive_enhancement() -> None:
     assert 'card.closest("[data-asset-grid]")' in script
     assert "boundCards.has(card)" in script
     assert "assetCards().find" in script
-    assert "assetCards().forEach" in script
     assert "card.dataset.assetLabel" in script
     assert 'if (!document.querySelector("[data-asset-grid]")) return;' in script
     assert "${details.rank}${scoreAnnouncement}" in script
@@ -97,6 +101,93 @@ def test_asset_viewer_is_safe_progressive_enhancement() -> None:
     assert "innerHTML" not in script
     assert "document.write" not in script
     assert "eval(" not in script
+
+
+def test_asset_viewer_waits_for_persisted_rejection_before_advancing() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+    submission = script.split("const submitRejection", 1)[1].split("const openViewer", 1)[0]
+    settlement = script.split(
+        'document.addEventListener("gen-automation:review-action-settled"',
+        1,
+    )[1].split('viewer.close.addEventListener("click"', 1)[0]
+
+    pending_index = submission.index("pendingRejection =")
+    busy_index = submission.index("rejectionBusy = true")
+    request_index = submission.index("context.form.requestSubmit(context.rejectButton)")
+    request_return_index = submission.index("return true", request_index)
+
+    assert "nextAssetId" in submission
+    assert pending_index < busy_index < request_index
+    assert "renderCard(" not in submission[request_index:request_return_index]
+    assert "step(" not in submission[request_index:request_return_index]
+
+    failure = settlement.split("if (!detail.success)", 1)[1].split(
+        "announcement = settled.anatomyRequested",
+        1,
+    )[0]
+    assert settlement.index("pendingRejection = null") < settlement.index("if (!detail.success)")
+    assert settlement.index("rejectionBusy = false") < settlement.index("if (!detail.success)")
+    assert "if (!detail.success)" in settlement
+    assert "updateRejectionControls()" in failure
+    assert "This image is still in the final set; try again." in failure
+    assert "return;" in failure
+    assert "renderCard(" not in failure
+    assert "settled.nextAssetId" in settlement
+    assert "renderCard(nextCard)" in settlement
+    assert settlement.index("if (!detail.success)") < settlement.index("renderCard(nextCard)")
+
+
+def test_asset_viewer_delete_shortcuts_distinguish_plain_and_anatomy_rejection() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+    keyboard = script.split('viewer.dialog.addEventListener("keydown"', 1)[1].split(
+        'viewer.dialog.addEventListener("close"',
+        1,
+    )[0]
+
+    assert 'event.key === "Delete"' in keyboard
+    assert "event.preventDefault()" in keyboard
+    assert "submitRejection(event.shiftKey)" in keyboard
+    assert "Shift+Del Reject + train anatomy" in script
+    assert (
+        "if (context.anatomyToggle) context.anatomyToggle.checked = withAnatomyTraining"
+        in script
+    )
+
+
+def test_asset_viewer_rejects_immediately_through_the_active_cards_own_form() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+    context = script.split("const rejectionContext", 1)[1].split(
+        "const updateRejectionControls",
+        1,
+    )[0]
+    submission = script.split("const submitRejection", 1)[1].split("const openViewer", 1)[0]
+
+    assert 'card.querySelector("form[data-review-decision-form]")' in context
+    assert 'form?.querySelector(\'button[data-decision="reject"]\')' in context
+    assert "context.form.requestSubmit(context.rejectButton)" in submission
+    assert "bulkForm" not in submission
+    assert "bulkReject" not in submission
+
+
+def test_asset_viewer_has_no_staged_exclusion_queue_or_save_step() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+    template = (
+        ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "review_task.html"
+    ).read_text(encoding="utf-8")
+    styles = STYLES.read_text(encoding="utf-8")
+
+    assert "sessionStorage" not in script
+    for removed_contract in (
+        "assetViewerSaveExclusions",
+        "markedForExclusion",
+        "review-exclusions:v1",
+        "restoreMarkedExclusions",
+        "viewer-marked-for-exclusion",
+        "Save exclusions",
+    ):
+        assert removed_contract not in script
+        assert removed_contract not in template
+        assert removed_contract not in styles
 
 
 def test_asset_density_is_bounded_persisted_and_accessible() -> None:
@@ -129,13 +220,16 @@ def test_asset_grid_uses_intrinsic_image_ratio_and_viewer_is_responsive() -> Non
     assert "overflow: auto" in styles
     assert ".asset-viewer-fit-toggle" in styles
     assert ".asset-viewer-mark-out" in styles
-    assert ".asset-viewer-save-exclusions" in styles
+    assert ".asset-viewer-anatomy-reject" in styles
     assert ".asset-viewer-copy-clean" in styles
     assert ".asset-viewer-download-clean" in styles
     assert ".asset-viewer-more-body" in styles
     assert ".asset-viewer-previous" in styles
     assert ".asset-viewer-next" in styles
-    assert ".viewer-marked-for-exclusion" in styles
+    assert ".asset-card.decision-reject" in styles
+    assert 'content: "Rejected"' in styles
+    assert ".asset-viewer-save-exclusions" not in styles
+    assert ".viewer-marked-for-exclusion" not in styles
     assert "env(safe-area-inset-bottom)" in styles
     assert "@media (max-width: 680px)" in styles
     assert "@media (prefers-reduced-motion: reduce)" in styles
@@ -159,8 +253,9 @@ def test_review_ui_treats_the_configured_size_as_a_maximum_goal() -> None:
     ).read_text(encoding="utf-8")
     script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
 
-    assert "final-set goal is a maximum" in template
-    assert "other masters may stay undecided" in template
+    assert "Cull mode keeps images unless you reject them" in template
+    assert "final-set maximum is" in template
+    assert "undecided masters are optional" in template
     assert "Complete with {{ summary.accepted_count }}" in template
     assert "Optional slots left" in template
     assert "Over goal" in template
@@ -174,3 +269,25 @@ def test_review_ui_treats_the_configured_size_as_a_maximum_goal() -> None:
     )
     assert "over its maximum; exclude accepted images before accepting more" in script
     assert "Goal reached" in script
+
+
+def test_review_template_integrates_anatomy_rejection_and_legacy_keep_all() -> None:
+    template = (
+        ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "review_task.html"
+    ).read_text(encoding="utf-8")
+    script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
+    styles = STYLES.read_text(encoding="utf-8")
+
+    assert "data-accept-undecided" in template
+    assert "Keep all {{ summary.undecided_count }} undecided" in template
+    assert "data-anatomy-training-control" in template
+    assert "data-anatomy-training-toggle" in template
+    assert "data-anatomy-training-issue" in template
+    assert "Use rejection for anatomy training" in template
+    assert "Plain rejection only removes an image from the final set" in template
+    assert 'document.querySelector("[data-accept-undecided]")' in script
+    assert 'bulkReasonInput.value = "sorting_default_accept"' in script
+    assert "form.requestSubmit(acceptButton)" in script
+    assert "anatomyRequested" in script
+    assert 'reasonInput.value = anatomyIssue instanceof HTMLSelectElement' in script
+    assert ".anatomy-reject-option" in styles

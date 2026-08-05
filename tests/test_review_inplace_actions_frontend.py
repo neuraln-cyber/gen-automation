@@ -61,14 +61,40 @@ def test_review_page_has_replaceable_workspace_and_live_action_status() -> None:
 
 def test_asset_viewer_rebinds_review_controls_after_in_place_refresh() -> None:
     script = ASSET_VIEWER_SCRIPT.read_text(encoding="utf-8")
+    refresh_listener = script.split(
+        'document.addEventListener("gen-automation:assets-updated"',
+        1,
+    )[1].split(
+        'document.addEventListener("gen-automation:review-action-settled"',
+        1,
+    )[0]
 
-    assert "let bulkForm = null" in script
-    assert "let bulkReject = null" in script
-    assert "refreshReviewControls" in script
-    assert 'document.addEventListener("gen-automation:assets-updated"' in script
-    assert "const activeAssetId = activeCard?.dataset.assetId" in script
-    assert "if (viewer.dialog.open && activeAssetId)" in script
-    assert "renderCard(refreshedCard)" in script
+    assert "const boundCards = new WeakSet()" in script
+    assert "bindCards(root || document)" in refresh_listener
+    assert "const activeAssetId = activeCard?.dataset.assetId" in refresh_listener
+    assert "if (viewer.dialog.open && activeAssetId)" in refresh_listener
+    assert "assetCards().find" in refresh_listener
+    assert "candidate.dataset.assetId === activeAssetId" in refresh_listener
+    assert "renderCard(refreshedCard)" in refresh_listener
+    assert refresh_listener.index("bindCards(root || document)") < refresh_listener.index(
+        "renderCard(refreshedCard)"
+    )
+
+
+def test_review_refresh_notifies_the_viewer_after_replacing_the_workspace() -> None:
+    script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
+    handler = script.split("function initializeReviewActions()", 1)[1].split("const isRecord", 1)[0]
+    restore = script.split("const restoreReviewViewState", 1)[1].split(
+        "const showReviewActionStatus",
+        1,
+    )[0]
+
+    replace_index = handler.index("workspace.replaceWith(nextWorkspace)")
+    restore_call_index = handler.index("restoreReviewViewState(nextWorkspace, viewState)")
+    success_index = handler.index("actionSucceeded = true")
+
+    assert 'new CustomEvent("gen-automation:assets-updated"' in restore
+    assert replace_index < restore_call_index < success_index
 
 
 def test_server_round_trip_forms_preserve_scroll_application_wide() -> None:

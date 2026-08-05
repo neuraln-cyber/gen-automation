@@ -24,6 +24,7 @@ from gen_automation.db.models import (
     ReviewTask,
     ReviewXSelection,
     ScoringRun,
+    SemanticAnatomyFeedback,
     SemanticAssessment,
 )
 from gen_automation.db.session import Database
@@ -48,6 +49,7 @@ from gen_automation.services.ranking_manifest import ranking_manifest_sha256
 from gen_automation.services.review import (
     SEMANTIC_SEVERE_OVERRIDE_AUDIT_ACTION,
     SEMANTIC_SEVERE_OVERRIDE_REASON_CODE,
+    SORTING_DEFAULT_ACCEPT_REASON_CODE,
     ReviewConflictError,
     ReviewNotFoundError,
     ReviewTaskResult,
@@ -58,6 +60,9 @@ from gen_automation.services.review import (
     transition_review_task,
 )
 from gen_automation.services.semantic_anatomy import SemanticAssessmentProfile
+from gen_automation.services.semantic_review_reconciliation import (
+    reconcile_one_completed_semantic_review,
+)
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
 
@@ -446,6 +451,233 @@ async def test_create_task_snapshots_frozen_run_and_naturally_replays(
             )
             == 3
         )
+
+
+@pytest.mark.asyncio
+async def test_default_accept_creation_seeds_once_and_reject_supersedes_latest_choice(
+    review_context: ReviewContext,
+) -> None:
+    async with review_context.database.sessions() as session:
+        first = await create_review_task(
+            session,
+            scoring_run_id=review_context.scoring_run_id,
+            created_by_user_id=review_context.reviewer_id,
+            idempotency_key="create-default-kept-review",
+            default_accept_ranked_assets=True,
+            now=NOW + timedelta(minutes=2),
+        )
+    async with review_context.database.sessions() as session:
+        replay = await create_review_task(
+            session,
+            scoring_run_id=review_context.scoring_run_id,
+            created_by_user_id=review_context.reviewer_id,
+            idempotency_key="create-default-kept-review",
+            default_accept_ranked_assets=True,
+            now=NOW + timedelta(minutes=3),
+        )
+    async with review_context.database.sessions() as session:
+        alias_replay = await create_review_task(
+            session,
+            scoring_run_id=review_context.scoring_run_id,
+            created_by_user_id=review_context.reviewer_id,
+            idempotency_key="create-default-kept-review-alias",
+            default_accept_ranked_assets=True,
+            now=NOW + timedelta(minutes=4),
+        )
+
+    assert replay.task_id == first.task_id
+    assert replay.replayed
+    assert alias_replay.task_id == first.task_id
+    assert alias_replay.replayed
+
+    async with review_context.database.sessions() as session:
+        summary = await get_review_summary(session, review_task_id=first.task_id)
+        seeded = list(
+            (
+                await session.scalars(
+                    select(ReviewDecision)
+                    .where(ReviewDecision.review_task_id == first.task_id)
+                    .order_by(ReviewDecision.asset_id)
+                )
+            ).all()
+        )
+        seed_audit_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(AuditEvent)
+                .where(AuditEvent.action == "review.default_acceptance_seeded")
+            )
+            or 0
+        )
+
+    assert summary.accepted_count == len(review_context.ranked_asset_ids)
+    assert summary.rejected_count == 0
+    assert summary.held_count == 0
+    assert summary.undecided_count == 0
+    assert summary.lock_version == 1
+    assert len(seeded) == len(review_context.ranked_asset_ids)
+    assert all(row.revision == 1 for row in seeded)
+    assert all(row.decision == ReviewDecisionValue.ACCEPT for row in seeded)
+    assert all(row.reason_code == SORTING_DEFAULT_ACCEPT_REASON_CODE for row in seeded)
+    assert all(row.decided_by_user_id == review_context.reviewer_id for row in seeded)
+    assert seed_audit_count == 1
+
+    rejected_asset_id = review_context.ranked_asset_ids[0]
+    original = next(row for row in seeded if row.asset_id == rejected_asset_id)
+    async with review_context.database.sessions() as session:
+        rejected = await append_review_decision(
+            session,
+            review_task_id=first.task_id,
+            asset_id=rejected_asset_id,
+            decision=ReviewDecisionValue.REJECT,
+            decided_by_user_id=review_context.reviewer_id,
+            expected_lock_version=1,
+            idempotency_key="reject-default-kept-image",
+            reason_code="composition",
+            now=NOW + timedelta(minutes=5),
+        )
+
+    assert rejected.revision == 2
+    assert rejected.supersedes_decision_id == original.id
+    assert rejected.task_lock_version == 2
+
+    async with review_context.database.sessions() as session:
+        summary = await get_review_summary(session, review_task_id=first.task_id)
+        revisions = list(
+            (
+                await session.scalars(
+                    select(ReviewDecision)
+                    .where(
+                        ReviewDecision.review_task_id == first.task_id,
+                        ReviewDecision.asset_id == rejected_asset_id,
+                    )
+                    .order_by(ReviewDecision.revision)
+                )
+            ).all()
+        )
+
+    assert summary.accepted_count == len(review_context.ranked_asset_ids) - 1
+    assert summary.rejected_count == 1
+    assert summary.undecided_count == 0
+    assert [row.decision for row in revisions] == [
+        ReviewDecisionValue.ACCEPT,
+        ReviewDecisionValue.REJECT,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_internal_reason_codes_are_cleared_when_the_decision_is_incompatible(
+    review_context: ReviewContext,
+) -> None:
+    async with review_context.database.sessions() as session:
+        task = await create_review_task(
+            session,
+            scoring_run_id=review_context.scoring_run_id,
+            created_by_user_id=review_context.reviewer_id,
+            idempotency_key="create-reason-compatibility-review",
+            default_accept_ranked_assets=True,
+            now=NOW + timedelta(minutes=2),
+        )
+
+    asset_id = review_context.ranked_asset_ids[0]
+    submissions = (
+        (ReviewDecisionValue.REJECT, SORTING_DEFAULT_ACCEPT_REASON_CODE),
+        (ReviewDecisionValue.ACCEPT, "anatomy"),
+        (ReviewDecisionValue.REJECT, SEMANTIC_SEVERE_OVERRIDE_REASON_CODE),
+    )
+    for index, (decision, reason_code) in enumerate(submissions, start=1):
+        async with review_context.database.sessions() as session:
+            await append_review_decision(
+                session,
+                review_task_id=task.task_id,
+                asset_id=asset_id,
+                decision=decision,
+                decided_by_user_id=review_context.reviewer_id,
+                expected_lock_version=index,
+                idempotency_key=f"reason-compatibility-{index}",
+                reason_code=reason_code,
+                now=NOW + timedelta(minutes=2 + index),
+            )
+
+    async with review_context.database.sessions() as session:
+        revisions = list(
+            (
+                await session.scalars(
+                    select(ReviewDecision)
+                    .where(
+                        ReviewDecision.review_task_id == task.task_id,
+                        ReviewDecision.asset_id == asset_id,
+                    )
+                    .order_by(ReviewDecision.revision)
+                )
+            ).all()
+        )
+
+    assert [row.reason_code for row in revisions] == [
+        SORTING_DEFAULT_ACCEPT_REASON_CODE,
+        None,
+        None,
+        None,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_untouched_default_accepts_never_become_anatomy_good_training_labels(
+    review_context: ReviewContext,
+) -> None:
+    profile = SemanticAssessmentProfile(
+        model_name="Qwen/Qwen3-VL-8B-Instruct",
+        model_revision="default-kept-learning-guard",
+    )
+    async with review_context.database.sessions() as session:
+        release = await session.get(Release, review_context.release_id)
+        assert release is not None
+        release.desired_accepted_count = len(review_context.ranked_asset_ids)
+        await session.commit()
+    async with review_context.database.sessions() as session:
+        task = await create_review_task(
+            session,
+            scoring_run_id=review_context.scoring_run_id,
+            created_by_user_id=review_context.owner_id,
+            idempotency_key="create-default-kept-learning-guard",
+            default_accept_ranked_assets=True,
+            now=NOW + timedelta(minutes=2),
+        )
+    await _seed_terminal_semantic_assessments(review_context, profile=profile)
+
+    async with review_context.database.sessions() as session:
+        completed = await transition_review_task(
+            session,
+            review_task_id=task.task_id,
+            target_state=ReviewTaskState.COMPLETED,
+            changed_by_user_id=review_context.owner_id,
+            expected_lock_version=1,
+            idempotency_key="complete-default-kept-learning-guard",
+            semantic_profile_sha256=profile.profile_sha256,
+            semantic_enforcement_mode=SemanticEnforcementMode.SHADOW,
+            now=NOW + timedelta(minutes=4),
+        )
+
+    assert completed.state == ReviewTaskState.COMPLETED
+    assert completed.accepted_count == len(review_context.ranked_asset_ids)
+
+    async with review_context.database.sessions() as session:
+        feedback_count = int(
+            await session.scalar(
+                select(func.count()).select_from(SemanticAnatomyFeedback)
+            )
+            or 0
+        )
+        reconciled = await reconcile_one_completed_semantic_review(
+            session,
+            profile_sha256=profile.profile_sha256,
+            now=NOW + timedelta(minutes=5),
+        )
+        await session.commit()
+
+    assert feedback_count == 0
+    assert not reconciled.did_work
+    assert reconciled.review_task_id is None
 
 
 @pytest.mark.asyncio

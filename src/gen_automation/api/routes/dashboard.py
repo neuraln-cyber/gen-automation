@@ -101,6 +101,7 @@ from gen_automation.services.semantic_feedback import (
     record_semantic_anatomy_feedback,
     refresh_semantic_calibration_artifact,
 )
+from gen_automation.services.semantic_review_learning import ANATOMY_REASON_CODES
 from gen_automation.storage.base import ObjectStore, ObjectStoreError
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"], include_in_schema=False)
@@ -444,6 +445,7 @@ async def dashboard_create_review_task(
             scoring_run_id=scoring_run_id,
             created_by_user_id=principal.user_id,
             idempotency_key=idempotency_key,
+            default_accept_ranked_assets=True,
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         return _service_error_response(request, principal, error)
@@ -618,6 +620,7 @@ async def dashboard_review_task(
                 "semantic_flagged_count": sum(asset.semantic_flagged for asset in assets.ordered),
                 "semantic_override_reason_code": (SEMANTIC_SEVERE_OVERRIDE_REASON_CODE),
                 "semantic_issue_codes": tuple(SemanticIssueCode),
+                "anatomy_reason_codes": ANATOMY_REASON_CODES,
                 "semantic_mode": semantic_mode,
                 "semantic_calibration": semantic_calibration,
                 "semantic_effective_threshold_micros": semantic_threshold,

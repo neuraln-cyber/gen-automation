@@ -2255,6 +2255,8 @@
     const selectToTargetButtons = Array.from(document.querySelectorAll("[data-select-to-target]"));
     const countLabels = document.querySelectorAll("[data-selected-count]");
     const selectionStatus = form.querySelector("[data-bulk-selection-status]");
+    const acceptUndecidedButton = document.querySelector("[data-accept-undecided]");
+    const bulkReasonInput = form.querySelector('input[name="reason_code"]');
     const currentXCount = Math.max(0, integerValue(form.dataset.xSelectedCount, 0));
     const xCapacity = Math.max(1, integerValue(form.dataset.xCapacity, 4));
     const reviewTarget = Math.max(1, integerValue(form.dataset.reviewTarget, 1));
@@ -2422,6 +2424,34 @@
         updateSelection();
       });
     });
+    if (acceptUndecidedButton instanceof HTMLButtonElement && acceptButton) {
+      acceptUndecidedButton.addEventListener("click", () => {
+        checkboxes.forEach((checkbox) => {
+          const card = checkbox.closest(".asset-card");
+          checkbox.checked = Boolean(
+            card
+            && card.dataset.decision === "undecided"
+            && card.dataset.aiExcluded !== "true",
+          );
+        });
+        const selected = checkboxes.filter((checkbox) => checkbox.checked).length;
+        if (selected === 0) {
+          if (selectionStatus) {
+            selectionStatus.textContent = "There are no undecided images available to keep.";
+            selectionStatus.hidden = false;
+          }
+          return;
+        }
+        if (bulkReasonInput instanceof HTMLInputElement) {
+          bulkReasonInput.value = "sorting_default_accept";
+        }
+        updateSelection();
+        // Legacy reviews can contain more masters than the final-set maximum. Cull mode keeps
+        // them first and asks the owner to reject down to the configured maximum.
+        acceptButton.disabled = false;
+        form.requestSubmit(acceptButton);
+      });
+    }
     document.querySelectorAll("[data-review-filter]").forEach((button) => {
       button.addEventListener("click", () => {
         const filter = button.dataset.reviewFilter;
@@ -2451,7 +2481,12 @@
       ? submitter.dataset.decision || ""
       : "";
     if (decision === "accept") return "Image accepted. Your review position was preserved.";
-    if (decision === "reject") return "Image excluded. The raw master was retained.";
+    if (decision === "reject") {
+      const anatomyToggle = form.querySelector("[data-anatomy-training-toggle]");
+      return anatomyToggle instanceof HTMLInputElement && anatomyToggle.checked
+        ? "Image rejected and labeled for anatomy learning. The raw master was retained."
+        : "Image rejected. The raw master was retained.";
+    }
     if (decision === "hold") return "Image held for another pass.";
 
     if (form.matches("[data-bulk-action-form]")) {
@@ -2644,14 +2679,48 @@
 
       const workspace = form.closest("[data-review-workspace]");
       if (!(workspace instanceof HTMLElement)) return;
-      if (reviewActionRequestActive) {
-        showReviewActionStatus(workspace, "The previous review action is still saving.", true);
-        return;
-      }
-
       const submitter = event.submitter instanceof HTMLButtonElement
         ? event.submitter
         : null;
+      const assetIdField = form.querySelector('input[name="asset_id"]');
+      const assetId = form.dataset.assetId
+        || (assetIdField instanceof HTMLInputElement ? assetIdField.value : "");
+      const decision = submitter?.dataset.decision || "";
+      const anatomyToggle = form.querySelector("[data-anatomy-training-toggle]");
+      const anatomyIssue = form.querySelector("[data-anatomy-training-issue]");
+      const reasonInput = form.querySelector('input[name="reason_code"]');
+      const anatomyRequested = decision === "reject"
+        && anatomyToggle instanceof HTMLInputElement
+        && anatomyToggle.checked;
+
+      if (reviewActionRequestActive) {
+        showReviewActionStatus(workspace, "The previous review action is still saving.", true);
+        document.dispatchEvent(new CustomEvent("gen-automation:review-action-settled", {
+          detail: { assetId, anatomyRequested, decision, success: false, reason: "busy" },
+        }));
+        return;
+      }
+
+      if (form.matches("[data-review-decision-form]") && reasonInput instanceof HTMLInputElement) {
+        const anatomyReasonValues = new Set([
+          "anatomy",
+          ...Array.from(
+            anatomyIssue instanceof HTMLSelectElement ? anatomyIssue.options : [],
+          ).map((option) => option.value),
+        ]);
+        if (anatomyRequested) {
+          reasonInput.value = anatomyIssue instanceof HTMLSelectElement
+            ? anatomyIssue.value || "anatomy"
+            : "anatomy";
+        } else if (
+          anatomyReasonValues.has(reasonInput.value)
+          || reasonInput.value === "sorting_default_accept"
+          || (decision !== "accept" && reasonInput.value === "semantic_severe_override")
+        ) {
+          reasonInput.value = "";
+        }
+      }
+
       const selectedCount = form.matches("[data-bulk-action-form]")
         ? Array.from(
           document.querySelectorAll('input[type="checkbox"][name="asset_id"]:checked'),
@@ -2665,6 +2734,8 @@
       if (submitter?.name) body.append(submitter.name, submitter.value);
 
       reviewActionRequestActive = true;
+      let actionSucceeded = false;
+      let actionFailure = "request";
       workspace.setAttribute("aria-busy", "true");
       if (submitter) submitter.disabled = true;
       try {
@@ -2681,11 +2752,13 @@
         });
         const destination = new URL(response.url, window.location.href);
         if (response.status === 401 || destination.pathname === "/login") {
+          actionFailure = "authentication";
           persistSamePageScroll();
           window.location.assign(destination.href);
           return;
         }
         if (!response.ok) {
+          actionFailure = response.status === 409 ? "conflict" : "server";
           showReviewActionStatus(
             workspace,
             response.status === 409
@@ -2699,6 +2772,7 @@
         const parsed = new DOMParser().parseFromString(await response.text(), "text/html");
         const nextWorkspace = parsed.querySelector("[data-review-workspace]");
         if (!(nextWorkspace instanceof HTMLElement)) {
+          actionFailure = "navigation";
           persistSamePageScroll();
           window.location.assign(destination.href);
           return;
@@ -2711,7 +2785,9 @@
           nextWorkspace,
           reviewActionLabel(form, submitter, selectedCount),
         );
+        actionSucceeded = true;
       } catch (_error) {
+        actionFailure = "network";
         showReviewActionStatus(
           workspace,
           "The connection was interrupted. Your position is unchanged; try the action again.",
@@ -2721,6 +2797,15 @@
         reviewActionRequestActive = false;
         if (workspace.isConnected) workspace.removeAttribute("aria-busy");
         if (submitter?.isConnected) submitter.disabled = false;
+        document.dispatchEvent(new CustomEvent("gen-automation:review-action-settled", {
+          detail: {
+            assetId,
+            anatomyRequested,
+            decision,
+            success: actionSucceeded,
+            reason: actionSucceeded ? "" : actionFailure,
+          },
+        }));
       }
     });
   }
