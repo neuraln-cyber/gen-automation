@@ -40,6 +40,19 @@ def test_batch_submission_preserves_a_64_bit_seed_from_json_text() -> None:
     assert batch.seed == seed
 
 
+def test_batch_submission_accepts_the_random_per_image_seed_sentinel() -> None:
+    batch = NewSetBatchSubmission.model_validate(
+        {
+            "name": "Random seeds",
+            "image_count": 4,
+            "prompt": "masterpiece, __sfw__",
+            "seed": "-1",
+        }
+    )
+
+    assert batch.seed == -1
+
+
 def test_new_set_submission_requires_a_complete_distinct_duo() -> None:
     base = {
         "slug": "duo-validation",
@@ -406,6 +419,84 @@ async def test_twenty_five_image_batch_expands_to_one_provider_job(
     assert [resolution["seed"] for resolution in resolutions] == list(range(500, 525))
     assert all(output["outputs_per_job"] == 1 for output in outputs)
     assert all("__sfw__" not in output["prompt"] for output in outputs)
+
+
+async def test_random_seed_sentinel_resolves_unique_nonsequential_seeds_per_image(
+    batch_database: Database,
+) -> None:
+    payload = deepcopy(valid_release_payload())
+    payload["desired_accepted_count"] = 25
+    specification = payload["specification"]
+    assert isinstance(specification, dict)
+    generation = specification["generation"]
+    assert isinstance(generation, dict)
+    generation.update(
+        {
+            "prompt": "portrait, __sfw__",
+            "seed": -1,
+            "outputs_per_job": 25,
+        }
+    )
+    specification.update(
+        {
+            "schema_version": 2,
+            "planned_job_count": 1,
+            "generation_batches": [
+                {
+                    "name": "Randomized provider job",
+                    "image_count": 25,
+                    "generation": deepcopy(generation),
+                }
+            ],
+        }
+    )
+
+    async with batch_database.sessions() as session:
+        await create_wildcard_library(
+            session,
+            command=WildcardCreate(name="sfw", entries=["standing", "seated", "walking"]),
+            actor="fixture-owner",
+        )
+        project = await create_project(
+            session,
+            ProjectCreate(slug="random-seeds", name="Random seeds"),
+        )
+        result = await create_release(
+            session,
+            project_id=project.id,
+            command=ReleaseCreate.model_validate(payload),
+            idempotency_key="create-random-seed-release",
+        )
+        await seed_release_approvals(session, payload)
+
+    async with batch_database.sessions() as session:
+        first = await approve_and_expand_generation_plan(
+            session,
+            release_id=result.response.id,
+            idempotency_key="approve-random-seed-release",
+        )
+        replay = await approve_and_expand_generation_plan(
+            session,
+            release_id=result.response.id,
+            idempotency_key="approve-random-seed-release",
+        )
+        job = await session.scalar(
+            select(GenerationJob).where(
+                GenerationJob.release_version_id == first.response.release_version_id
+            )
+        )
+
+    assert replay.replayed is True
+    assert job is not None
+    outputs = job.parameters["output_generations"]
+    resolutions = job.parameters["output_prompt_resolutions"]
+    seeds = [output["seed"] for output in outputs]
+    assert len(seeds) == 25
+    assert len(set(seeds)) == 25
+    assert all(0 <= seed <= (2**63) - 1 for seed in seeds)
+    assert seeds != list(range(seeds[0], seeds[0] + 25))
+    assert [resolution["seed"] for resolution in resolutions] == seeds
+    assert all(output["seed"] != -1 for output in outputs)
 
 
 async def test_new_set_service_freezes_a_batch_queue_with_inherited_prompt_settings(

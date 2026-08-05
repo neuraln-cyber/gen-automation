@@ -1,5 +1,4 @@
 import hmac
-import secrets
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID, uuid4
@@ -477,7 +476,7 @@ def _default_values(options: NewSetOptions) -> dict[str, str]:
         "detailer_prompt": "sexy, expressive, ",
         "detailer_negative_prompt": "closed eyes, ",
         "batch_plan": "",
-        "seed": str(secrets.randbelow(2**63)),
+        "seed": "-1",
         "width": "1144",
         "height": "1480",
         "cfg": "6.0",

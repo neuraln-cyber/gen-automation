@@ -95,7 +95,7 @@ class NewSetBatchSubmission(BaseModel):
     negative_prompt: str | None = Field(default=None, max_length=20_000)
     detailer_prompt: str | None = Field(default=None, max_length=20_000)
     detailer_negative_prompt: str | None = Field(default=None, max_length=20_000)
-    seed: int | None = Field(default=None, ge=0, le=(2**63) - 1)
+    seed: int | None = Field(default=None, ge=-1, le=(2**63) - 1)
 
     @field_validator("name")
     @classmethod
@@ -130,7 +130,7 @@ class NewSetSubmission(BaseModel):
     detailer_prompt: str = Field(default="", max_length=20_000)
     detailer_negative_prompt: str = Field(default="", max_length=20_000)
     batches: tuple[NewSetBatchSubmission, ...] = Field(default=(), max_length=50)
-    seed: int = Field(ge=0, le=(2**63) - 1)
+    seed: int = Field(ge=-1, le=(2**63) - 1)
     width: int = Field(ge=512, le=4096, multiple_of=8)
     height: int = Field(ge=512, le=4096, multiple_of=8)
     cfg: float = Field(default=5.0, ge=0.0, le=30.0)
@@ -512,7 +512,7 @@ async def create_and_approve_new_set(
         batch_seed = (
             batch.seed
             if batch.seed is not None
-            else (command.seed + implicit_seed_offset) % (2**63)
+            else (-1 if command.seed == -1 else (command.seed + implicit_seed_offset) % (2**63))
         )
         generation_batches.append(
             GenerationBatchSpecification(

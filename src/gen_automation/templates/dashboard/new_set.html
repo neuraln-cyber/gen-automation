@@ -404,10 +404,14 @@
           <div class="form-grid">
             <div class="seed-control">
               <label>
-                Base seed
-                <input type="number" name="seed" value="{{ form_values['seed'] }}" min="0" max="9223372036854775807" data-default-seed required>
+                Seed
+                <input type="number" name="seed" value="{{ form_values['seed'] }}" min="-1" max="9223372036854775807" data-default-seed required>
               </label>
-              <button class="secondary-button" type="button" data-random-seed>New random seed</button>
+              <div class="seed-actions">
+                <button class="secondary-button" type="button" data-random-each-seed>Random each image (-1)</button>
+                <button class="secondary-button" type="button" data-random-seed>New fixed seed</button>
+              </div>
+              <small>Use -1 for an independent random seed on every image. Actual seeds are saved with each result.</small>
             </div>
             <label>
               Width
@@ -822,7 +826,7 @@
             </div>
             <label>
               Starting seed override
-              <input type="number" min="0" max="9223372036854775807" placeholder="Leave blank to derive automatically" data-batch-field="seed">
+              <input type="number" min="-1" max="9223372036854775807" placeholder="Blank inherits; -1 randomizes every image" data-batch-field="seed">
             </label>
           </div>
         </details>

@@ -92,7 +92,9 @@ class GenerationParameters(StrictModel):
     negative_prompt: str = Field(default="", max_length=20000)
     detailer_prompt: str = Field(default="", max_length=20000)
     detailer_negative_prompt: str = Field(default="", max_length=20000)
-    seed: int = Field(ge=0, le=(2**63) - 1)
+    # -1 mirrors the A1111/Forge sentinel. It is resolved into a concrete,
+    # per-output seed before a job is sent to a worker.
+    seed: int = Field(ge=-1, le=(2**63) - 1)
     width: int = Field(ge=512, le=4096, multiple_of=8)
     height: int = Field(ge=512, le=4096, multiple_of=8)
     steps: int = Field(ge=1, le=200)

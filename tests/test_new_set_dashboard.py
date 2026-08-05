@@ -202,7 +202,13 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert "data-automation-draft-status" in page.text
     assert "data-automation-storage-scope" in page.text
     assert "data-match-queue-target" in page.text
+    assert "data-random-each-seed" in page.text
     assert "data-random-seed" in page.text
+    assert 'name="seed" value="-1" min="-1"' in page.text
+    assert "Actual seeds are saved with each result" in page.text
+    assert (
+        'min="-1" max="9223372036854775807" placeholder="Blank inherits; -1 randomizes every image"'
+    ) in batch_template
     assert "Saved on this device" in page.text
     assert page.text.count("data-lora-option\n") == 2
     assert page.text.count("data-lora-native-slot>") == 8
@@ -241,7 +247,7 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
         "negative_prompt": "low quality",
         "detailer_prompt": "expressive face",
         "detailer_negative_prompt": "closed eyes",
-        "seed": "1234",
+        "seed": "-1",
         "width": "1024",
         "height": "1024",
         "cfg": "6.5",
@@ -300,6 +306,13 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert version.specification["generation"]["detailer_negative_prompt"] == "closed eyes"
     assert version.specification["generation"]["clip_skip"] == 2
     assert version.specification["generation"]["detailer_feather"] == 4
+    assert version.specification["generation"]["seed"] == -1
+    resolved_seeds = [
+        output["seed"] for job in jobs for output in job.parameters["output_generations"]
+    ]
+    assert len(resolved_seeds) == 12
+    assert len(set(resolved_seeds)) == 12
+    assert all(0 <= seed <= (2**63) - 1 for seed in resolved_seeds)
     assert [(lora["name"], lora["weight"]) for lora in version.specification["loras"]] == [
         ("Portrait Style", 0.75),
         ("Texture Style", 0.4),

@@ -783,6 +783,7 @@
     const plannedJobCount = form.querySelector("[data-planned-job-count]");
     const desiredCount = form.querySelector("[data-desired-count]");
     const matchQueueTarget = form.querySelector("[data-match-queue-target]");
+    const randomEachSeedButton = form.querySelector("[data-random-each-seed]");
     const randomSeedButton = form.querySelector("[data-random-seed]");
     const batchSequenceInput = form.querySelector("[data-batch-sequence-input]");
     const batchSequenceApply = form.querySelector("[data-batch-sequence-apply]");
@@ -1276,6 +1277,14 @@
         window.crypto.getRandomValues(values);
         const seed = ((BigInt(values[0] & 0x7fffffff) << 32n) | BigInt(values[1])).toString();
         defaultSeed.value = seed;
+        defaultSeed.dispatchEvent(new Event("input", { bubbles: true }));
+        defaultSeed.focus();
+      });
+    }
+    if (randomEachSeedButton instanceof HTMLButtonElement
+        && defaultSeed instanceof HTMLInputElement) {
+      randomEachSeedButton.addEventListener("click", () => {
+        defaultSeed.value = "-1";
         defaultSeed.dispatchEvent(new Event("input", { bubbles: true }));
         defaultSeed.focus();
       });

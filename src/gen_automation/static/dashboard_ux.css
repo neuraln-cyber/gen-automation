@@ -780,6 +780,7 @@
   gap: .45rem;
 }
 .seed-control .secondary-button { width: fit-content; min-height: 2.35rem; padding: .48rem .65rem; }
+.seed-actions { display: flex; gap: .4rem; flex-wrap: wrap; }
 
 .automation-final-target {
   display: grid;

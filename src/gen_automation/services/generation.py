@@ -1,3 +1,4 @@
+import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
@@ -56,6 +57,11 @@ class GenerationPlanConflictError(GenerationPlanError):
     pass
 
 
+_SEED_MODULUS = 2**63
+_RANDOM_SEED_SENTINEL = -1
+_RANDOM_SEED_PERSON = b"gen-seed-v1"
+
+
 @dataclass(frozen=True)
 class GenerationPlanResult:
     response: GenerationPlanRead
@@ -77,9 +83,21 @@ class _PlannedGenerationJob:
 
 def _planned_generation_jobs(
     specification: ReleaseSpecification,
+    *,
+    random_seed_key: bytes,
 ) -> tuple[_PlannedGenerationJob, ...]:
     if not specification.generation_batches:
         generation = specification.generation
+        randomized_seeds = (
+            _random_output_seeds(
+                count=specification.planned_job_count * generation.outputs_per_job,
+                key=random_seed_key,
+                namespace="default",
+                used=set(),
+            )
+            if generation.seed == _RANDOM_SEED_SENTINEL
+            else ()
+        )
         return tuple(
             _PlannedGenerationJob(
                 ordinal=ordinal,
@@ -90,8 +108,12 @@ def _planned_generation_jobs(
                 generation=generation,
                 expected_output_count=generation.outputs_per_job,
                 output_seeds=tuple(
-                    (generation.seed + ordinal + (output_index * specification.planned_job_count))
-                    % (2**63)
+                    randomized_seeds[ordinal + (output_index * specification.planned_job_count)]
+                    if randomized_seeds
+                    else (
+                        generation.seed + ordinal + (output_index * specification.planned_job_count)
+                    )
+                    % _SEED_MODULUS
                     for output_index in range(generation.outputs_per_job)
                 ),
                 include_batch_metadata=False,
@@ -101,8 +123,19 @@ def _planned_generation_jobs(
 
     plans: list[_PlannedGenerationJob] = []
     ordinal = 0
+    used_random_seeds: set[int] = set()
     for batch_index, batch in enumerate(specification.generation_batches):
         outputs_per_job = batch.generation.outputs_per_job
+        randomized_seeds = (
+            _random_output_seeds(
+                count=batch.image_count,
+                key=random_seed_key,
+                namespace=f"batch:{batch_index}",
+                used=used_random_seeds,
+            )
+            if batch.generation.seed == _RANDOM_SEED_SENTINEL
+            else ()
+        )
         for image_offset in range(0, batch.image_count, outputs_per_job):
             output_count = min(outputs_per_job, batch.image_count - image_offset)
             plans.append(
@@ -115,7 +148,9 @@ def _planned_generation_jobs(
                     generation=batch.generation,
                     expected_output_count=output_count,
                     output_seeds=tuple(
-                        (batch.generation.seed + image_offset + output_index) % (2**63)
+                        randomized_seeds[image_offset + output_index]
+                        if randomized_seeds
+                        else (batch.generation.seed + image_offset + output_index) % _SEED_MODULUS
                         for output_index in range(output_count)
                     ),
                     include_batch_metadata=True,
@@ -123,6 +158,37 @@ def _planned_generation_jobs(
             )
             ordinal += 1
     return tuple(plans)
+
+
+def _random_output_seeds(
+    *,
+    count: int,
+    key: bytes,
+    namespace: str,
+    used: set[int],
+) -> tuple[int, ...]:
+    """Derive unique random-looking seeds while keeping retries deterministic."""
+
+    if not key:
+        raise GenerationPlanConflictError("random seed key is unavailable")
+    seeds: list[int] = []
+    for output_index in range(count):
+        collision_index = 0
+        while True:
+            payload = f"{namespace}:{output_index}:{collision_index}".encode()
+            digest = hashlib.blake2b(
+                payload,
+                digest_size=8,
+                key=key,
+                person=_RANDOM_SEED_PERSON,
+            ).digest()
+            seed = int.from_bytes(digest, "big") & (_SEED_MODULUS - 1)
+            if seed not in used:
+                seeds.append(seed)
+                used.add(seed)
+                break
+            collision_index += 1
+    return tuple(seeds)
 
 
 def _job_parameters(
@@ -351,7 +417,10 @@ async def approve_and_expand_generation_plan(
     )
     jobs_by_key = {job.logical_key: job for job in existing_jobs}
     created_count = 0
-    planned_jobs = _planned_generation_jobs(specification)
+    planned_jobs = _planned_generation_jobs(
+        specification,
+        random_seed_key=version.id.bytes,
+    )
     if len(planned_jobs) != specification.planned_job_count:
         raise GenerationPlanConflictError(
             "generation batch expansion conflicts with the frozen release plan"
