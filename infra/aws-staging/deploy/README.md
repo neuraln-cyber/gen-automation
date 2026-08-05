@@ -80,9 +80,11 @@ cloud-hosted browser. The executable sequence is in
 
 The gateway activator deliberately leaves anatomy disabled with a zero cap. After
 the bounded canary has proved the pinned RunPod endpoint and gateway contract,
-use the **Promote semantic anatomy coverage** GitHub Actions workflow. It uses the
-existing short-lived GitHub OIDC deployment role and AWS Systems Manager; no
-local AWS login or long-lived AWS key is needed.
+manually run the **Deploy staging control plane** GitHub Actions workflow with an
+anatomy operation. The manual job uses the existing workflow identity, short-lived
+GitHub OIDC deployment role, and AWS Systems Manager; no local AWS login or
+long-lived AWS key is needed. The automatic rollout job and manual anatomy job are
+guarded by event type and cannot run on each other's trigger.
 
 Run `status` first, then `dry-run`, and finally `promote`. Promotion requires at
 least one completed assessment for the current model/prompt profile, so a merely
@@ -93,6 +95,15 @@ keeps `shadow` mode, clears the canary UUID allowlist, and only permits the cap 
 move upward. It does not enable enforcement or make a paid inference request as part
 of the deployment command. The already-running background loop consumes the new
 allowance, and the scale-to-zero provider may bill those assessments.
+
+The equivalent GitHub CLI dispatches are:
+
+```console
+gh workflow run deploy-staging.yml --ref main -f operation=status -f max_assessments=400
+gh workflow run deploy-staging.yml --ref main -f operation=dry-run -f max_assessments=400
+gh workflow run deploy-staging.yml --ref main -f operation=promote -f max_assessments=400
+gh workflow run deploy-staging.yml --ref main -f operation=pause -f max_assessments=400
+```
 
 The equivalent command from a private root SSM session is:
 
