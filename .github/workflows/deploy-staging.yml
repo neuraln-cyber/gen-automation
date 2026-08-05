@@ -190,9 +190,30 @@ jobs:
 
           image = os.environ["SSM_IMAGE_REF"]
           revision = os.environ["SSM_SOURCE_REVISION"]
-          command = (
+          migration_preflight = (
+              "sudo /usr/local/libexec/"
+              "gen-automation-validate-migration-environment"
+          )
+          migration_command = (
+              "sudo /usr/bin/timeout --signal=TERM --kill-after=30s 600s"
+              " /usr/bin/docker run --rm"
+              " --network bridge"
+              " --user 10001:10001"
+              " --read-only"
+              " --env-file /etc/gen-automation/migration.env"
+              " --mount type=bind,src=/etc/gen-automation/rds-global-bundle.pem,dst=/run/gen-automation/rds-global-bundle.pem,readonly"
+              " --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=1770"
+              " --cap-drop ALL"
+              " --security-opt no-new-privileges:true"
+              f" {shlex.quote(image)}"
+              " python3.12 -m alembic upgrade head"
+          )
+          rollout_command = (
               "sudo /usr/local/sbin/gen-automation-update-control-plane"
               f" --image {shlex.quote(image)} --revision {shlex.quote(revision)}"
+          )
+          command = (
+              f"{migration_preflight} && {migration_command} && {rollout_command}"
           )
           print(json.dumps({"commands": [command]}))
           ' >"$parameters_file"

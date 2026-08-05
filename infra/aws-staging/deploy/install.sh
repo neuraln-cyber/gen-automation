@@ -35,6 +35,9 @@ install -o root -g root -m 0755 \
   "$source_dir/validate-proxy-images.sh" \
   /usr/local/libexec/gen-automation-validate-proxy-images
 install -o root -g root -m 0755 \
+  "$source_dir/validate-migration-environment.sh" \
+  /usr/local/libexec/gen-automation-validate-migration-environment
+install -o root -g root -m 0755 \
   "$source_dir/install-compose-plugin.sh" \
   /usr/local/sbin/gen-automation-install-compose-plugin
 install -o root -g root -m 0755 \
@@ -88,4 +91,4 @@ fi
 systemctl daemon-reload
 printf '%s\n' \
   "Bundle and pinned Docker Compose plugin installed without credentials." \
-  "Create the four root-owned 0600 files under $config_root, validate them, then enable the unit."
+  "Create the six root-owned 0600 files under $config_root, validate them, then enable the unit."

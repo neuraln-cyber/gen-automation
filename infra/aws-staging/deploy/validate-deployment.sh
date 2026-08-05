@@ -44,7 +44,7 @@ require_service_directory() {
     fail "$path must have mode 0700"
 }
 
-for file in deploy.env control-plane.env patreon-browser.env semantic-gateway.env caddy.env; do
+for file in deploy.env control-plane.env migration.env patreon-browser.env semantic-gateway.env caddy.env; do
   require_private_root_file "$config_root/$file"
 done
 

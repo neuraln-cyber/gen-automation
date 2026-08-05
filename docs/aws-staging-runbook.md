@@ -212,7 +212,9 @@ cd /path/to/reviewed/infra/aws-staging/deploy
 sudo ./install.sh
 sudo cp /etc/gen-automation/examples/deploy.env.example /etc/gen-automation/deploy.env
 sudo cp /etc/gen-automation/examples/control-plane.env.example /etc/gen-automation/control-plane.env
+sudo cp /etc/gen-automation/examples/migration.env.example /etc/gen-automation/migration.env
 sudo cp /etc/gen-automation/examples/patreon-browser.env.example /etc/gen-automation/patreon-browser.env
+sudo cp /etc/gen-automation/examples/semantic-gateway.env.example /etc/gen-automation/semantic-gateway.env
 sudo cp /etc/gen-automation/examples/caddy.env.example /etc/gen-automation/caddy.env
 sudo chmod 0600 /etc/gen-automation/*.env
 sudo chown root:root /etc/gen-automation/*.env

@@ -14,6 +14,10 @@ def _updater() -> str:
     return (DEPLOY / "update-control-plane.sh").read_text(encoding="utf-8")
 
 
+def _migration_validator() -> str:
+    return (DEPLOY / "validate-migration-environment.sh").read_text(encoding="utf-8")
+
+
 def _semantic_activator() -> str:
     return (DEPLOY / "activate-semantic-gateway.sh").read_text(encoding="utf-8")
 
@@ -106,12 +110,33 @@ def test_host_updater_is_locked_atomic_validated_and_rolls_back() -> None:
 def test_ssm_command_contains_only_public_immutable_coordinates() -> None:
     workflow = _workflow()
 
-    command_block = workflow.split("command = (", maxsplit=1)[1].split(
+    command_block = workflow.split("migration_preflight = (", maxsplit=1)[1].split(
         "print(json.dumps", maxsplit=1
     )[0]
     assert "gen-automation-update-control-plane" in command_block
     assert "--image" in command_block
     assert "--revision" in command_block
+    assert "/usr/bin/timeout --signal=TERM --kill-after=30s 600s" in command_block
+    assert "/usr/bin/docker run --rm" in command_block
+    assert "gen-automation-validate-migration-environment" in command_block
+    assert "--network bridge" in command_block
+    assert "--network host" not in command_block
+    assert "--user 10001:10001" in command_block
+    assert "--read-only" in command_block
+    assert "--env-file /etc/gen-automation/migration.env" in command_block
+    assert (
+        "--mount type=bind,src=/etc/gen-automation/rds-global-bundle.pem,"
+        "dst=/run/gen-automation/rds-global-bundle.pem,readonly"
+    ) in command_block
+    assert "--cap-drop ALL" in command_block
+    assert "--security-opt no-new-privileges:true" in command_block
+    assert "python3.12 -m alembic upgrade head" in command_block
+    assert command_block.index("python3.12 -m alembic upgrade head") < command_block.index(
+        "gen-automation-update-control-plane"
+    )
+    assert command_block.index(
+        "gen-automation-validate-migration-environment"
+    ) < command_block.index("python3.12 -m alembic upgrade head")
     for prohibited in (
         "TOKEN",
         "PASSWORD",
@@ -122,6 +147,26 @@ def test_ssm_command_contains_only_public_immutable_coordinates() -> None:
         "DATABASE",
     ):
         assert prohibited not in command_block.upper()
+
+
+def test_migration_environment_is_private_separate_and_tls_verified() -> None:
+    validator = _migration_validator()
+    installer = (DEPLOY / "install.sh").read_text(encoding="utf-8")
+    deployment_validator = (DEPLOY / "validate-deployment.sh").read_text(encoding="utf-8")
+    example = (DEPLOY / "migration.env.example").read_text(encoding="utf-8")
+
+    assert "root:root" in validator
+    assert "400|600" in validator
+    assert "exactly one active assignment" in validator
+    assert "may define only GEN_AUTOMATION_DATABASE_URL" in validator
+    assert "migration and runtime database URLs must be distinct" in validator
+    assert "migration and runtime database usernames must be distinct" in validator
+    assert "sslmode=verify-full" in validator
+    assert "sslrootcert=/run/gen-automation/rds-global-bundle.pem" in validator
+    assert "gen-automation-validate-migration-environment" in installer
+    assert "migration.env" in deployment_validator
+    assert example.count("GEN_AUTOMATION_DATABASE_URL=") == 1
+    assert "master role" in example
 
 
 def test_semantic_gateway_activation_is_pinned_bounded_atomic_and_reversible() -> None:

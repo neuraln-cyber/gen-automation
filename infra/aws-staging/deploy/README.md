@@ -50,6 +50,7 @@ Install from an SSM session:
 sudo ./install.sh
 sudo cp /etc/gen-automation/examples/deploy.env.example /etc/gen-automation/deploy.env
 sudo cp /etc/gen-automation/examples/control-plane.env.example /etc/gen-automation/control-plane.env
+sudo cp /etc/gen-automation/examples/migration.env.example /etc/gen-automation/migration.env
 sudo cp /etc/gen-automation/examples/patreon-browser.env.example /etc/gen-automation/patreon-browser.env
 sudo cp /etc/gen-automation/examples/semantic-gateway.env.example /etc/gen-automation/semantic-gateway.env
 sudo cp /etc/gen-automation/examples/caddy.env.example /etc/gen-automation/caddy.env
@@ -124,8 +125,15 @@ one-time GitHub OIDC role and repository variables are configured, a successful
 `Publish immutable images` run for the current tip of `main` triggers
 `.github/workflows/deploy-staging.yml`. That workflow resolves the published
 `control-plane-mega` digest, verifies its exact source-revision label, exchanges
-GitHub's short-lived OIDC identity for the staging role, and invokes only this
-root-owned host command through SSM:
+GitHub's short-lived OIDC identity for the staging role, and runs a bounded,
+one-off Alembic migration container with the host-only `migration.env`. The
+migration container is read-only, non-root, capability-free, time-limited,
+isolated from the EC2 instance role by bridge networking, and receives no
+secret value in the SSM command. A root-owned preflight requires
+`migration.env` to contain only one TLS-verified database URL and proves its
+username differs from the continuously running application role. Only after the
+migration succeeds does the workflow invoke this root-owned host command
+through SSM:
 
 ```shell
 sudo /usr/local/sbin/gen-automation-update-control-plane \
@@ -133,13 +141,15 @@ sudo /usr/local/sbin/gen-automation-update-control-plane \
   --revision <40-hex-main-revision>
 ```
 
-The command accepts no credentials. It serializes updates with `flock`, pulls
-and verifies the immutable linux/amd64 image and revision label, atomically
-changes only `GEN_AUTOMATION_CONTROL_PLANE_MEGA_IMAGE`, validates Compose,
-restarts the staging unit, and waits for local readiness. Any failed validation
-or readiness check restores the previous environment atomically and restarts
-the previous image. It never runs database migrations or changes external-
-effect settings.
+The update command accepts no credentials. It serializes updates with `flock`,
+pulls and verifies the immutable linux/amd64 image and revision label,
+atomically changes only `GEN_AUTOMATION_CONTROL_PLANE_MEGA_IMAGE`, validates
+Compose, restarts the staging unit, and waits for local readiness. Any failed
+validation or readiness check restores the previous environment atomically and
+restarts the previous image. The update command itself never runs database
+migrations or changes external-effect settings. Schema changes must remain
+backward-compatible with the previous application image for the rollback
+window; destructive changes require an expand-and-contract release sequence.
 
 Set these non-secret GitHub repository variables once:
 
