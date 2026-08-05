@@ -161,23 +161,54 @@ GEN_AUTOMATION_SEMANTIC_ANATOMY_MODE=shadow
 GEN_AUTOMATION_SEMANTIC_ANATOMY_ENDPOINT_URL=https://<private-service>/v1/anatomy/assess
 GEN_AUTOMATION_SEMANTIC_ANATOMY_MODEL=Qwen/Qwen3-VL-8B-Instruct
 GEN_AUTOMATION_SEMANTIC_ANATOMY_MODEL_REVISION=<immutable revision>
-GEN_AUTOMATION_SEMANTIC_ANATOMY_MAX_ASSESSMENTS_PER_PROFILE=<positive hard limit>
+GEN_AUTOMATION_SEMANTIC_ANATOMY_MAX_ASSESSMENTS_PER_PROFILE=<positive per-scoring-run hard limit>
 GEN_AUTOMATION_SEMANTIC_ANATOMY_ASSET_ALLOWLIST='["<exact asset UUID>"]'
 GEN_AUTOMATION_BACKGROUND_SEMANTIC_MAX_ATTEMPTS=5
 GEN_AUTOMATION_BACKGROUND_SEMANTIC_RETRY_BASE_SECONDS=30
 GEN_AUTOMATION_BACKGROUND_SEMANTIC_RETRY_MAX_SECONDS=120
 ```
 
-The default per-profile limit is `0`, so disabled or partially configured anatomy QC
-cannot create billable assessments. Enabling the feature requires a positive limit.
-Every assessment row for the model/revision profile counts toward that cap, including
-completed, unavailable, and retrying rows. When the UUID allowlist is non-empty, only
-those exact raw-master assets can receive new assessment rows; already-created rows
-may still finish or retry after the allowlist or limit changes.
+The deployment-compatible environment variable retains `PER_PROFILE` in its name,
+but its enforced scope is one scoring run. The default configured per-scoring-run
+limit is `0`, so disabled or partially
+configured anatomy QC cannot create billable assessments. Enabling the feature
+requires a positive limit. Every assessment row for the same scoring run and
+model/revision profile counts toward that run's cap, including completed,
+unavailable, and retrying rows. When the UUID allowlist is non-empty, only those
+exact raw-master assets can receive new assessment rows; already-created rows may
+still finish or retry after the allowlist or limit changes.
+
+AWS staging uses a separate canary-to-coverage promotion. After the canary succeeds,
+dispatch `.github/workflows/promote-semantic-anatomy.yml` with `status`, `dry-run`,
+then `promote`. Its default per-scoring-run cap is 400, matching a typical master
+set, with an explicit supported override no higher than 1,000. It keeps `shadow` mode
+and changes the allowlist to `[]`, allowing eligible ranked raw masters in open
+reviews to be assessed, prioritizing the newest open review and then rank order.
+The configured cap is monotonic, so a scoring run that exhausted the canary cap
+must receive a higher cap before another row can be created. Feedback controls
+appear only after an assessment reaches `completed`; `pending` masters cannot be
+labelled yet. Workflow status also reports current-profile rows by state, open
+review/task coverage, and the count of open-review assets with no current
+profile assessment, without printing asset IDs. This missing count describes open
+review coverage independent of the current canary allowlist and cap; dry-run shows
+the cap and allowlist changes that would make those rows schedulable. Status also
+reports that missing count as the projected new-assessment count under the promoted
+empty allowlist, bounded by the planned cap for each scoring run, and multiplies it
+by the configured maximum attempts per assessment to show the provider-attempt
+ceiling before promotion. Promotion refuses an aggregate initial backlog above
+1,000 new assessment rows. Promotion
+fails closed unless the current profile already contains at least one completed
+canary assessment; status and dry-run report that gate as `pass` or `fail`.
+
+The same workflow exposes an emergency `pause` operation. It atomically changes
+only `GEN_AUTOMATION_SEMANTIC_ANATOMY_ENABLED=false`, restarts and verifies the
+controller, and preserves all configuration, assessments, and owner feedback.
+Pause uses GitHub OIDC and SSM, not a RunPod key or local AWS login, and remains
+available even when the deployed control-plane revision is behind current `main`.
 
 The staging cold-start policy makes at most five total attempts: the initial
 request plus four retries. Retry delays are bounded at 30, 60, 120, and 120
-seconds. Every provider call may be billable, so keep the per-profile cap and
+seconds. Every provider call may be billable, so keep the per-scoring-run cap and
 exact UUID allowlist small while calibrating. Terminal `completed` and
 `unavailable` rows remain immutable; retry settings apply only when a new
 assessment row is created.

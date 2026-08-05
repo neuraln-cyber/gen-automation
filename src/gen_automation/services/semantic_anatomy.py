@@ -17,6 +17,7 @@ from gen_automation.db.models import (
     Asset,
     AssetRanking,
     AssetScore,
+    ReviewTask,
     ScoringRun,
     SemanticAssessment,
 )
@@ -25,6 +26,7 @@ from gen_automation.domain.enums import (
     AssetKind,
     AssetScoreState,
     AssetState,
+    ReviewTaskState,
     ScoringRunState,
     SemanticAssessmentState,
     SemanticIssueCode,
@@ -56,6 +58,7 @@ _RANKABLE_SCORE_STATES = (
     AssetScoreState.DEAD_LETTER,
 )
 _SUPPORTED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
+_MAX_PREFILL_CANDIDATES = 400
 _SAFE_UNAVAILABLE_DETAIL = (
     "Semantic anatomy assessment is unavailable. The raw master remains in human review."
 )
@@ -168,7 +171,7 @@ async def ensure_semantic_assessment(
     max_attempts: int,
     now: datetime | None = None,
 ) -> bool:
-    """Create one assessment job for a frozen, CPU-ranked raw master."""
+    """Prefill assessment jobs for ranked raw masters in open reviews."""
 
     assessment_limit = _assessment_limit(max_assessments_per_profile)
     allowed_asset_ids = _asset_allowlist(asset_allowlist)
@@ -178,9 +181,9 @@ async def ensure_semantic_assessment(
     created_at = _as_utc(now or datetime.now(UTC))
     profile_digest = profile.profile_sha256
 
-    # Serialize assessment creation before counting. Without a stable row lock,
-    # two controller replicas could both observe room beneath the cap and create
-    # different assessment rows, exceeding the configured hard limit.
+    # Serialize assessment creation before selecting a run. Without a stable row
+    # lock, two controller replicas could both observe room beneath the per-run
+    # cap and create different assessment rows beyond that bound.
     creation_guard = await session.scalar(
         select(ScoringRun.id)
         .where(ScoringRun.state == ScoringRunState.COMPLETED)
@@ -191,15 +194,6 @@ async def ensure_semantic_assessment(
     if creation_guard is None:
         await session.rollback()
         return False
-    existing_count = await session.scalar(
-        select(func.count(SemanticAssessment.id)).where(
-            SemanticAssessment.profile_sha256 == profile_digest
-        )
-    )
-    if existing_count is None or existing_count >= assessment_limit:
-        await session.rollback()
-        return False
-
     assessment_exists = exists(
         select(SemanticAssessment.id).where(
             SemanticAssessment.scoring_run_id == AssetScore.scoring_run_id,
@@ -214,9 +208,22 @@ async def ensure_semantic_assessment(
             SemanticAssessment.state == SemanticAssessmentState.COMPLETED,
         )
     )
+    run_assessment_count = (
+        select(func.count(SemanticAssessment.id))
+        .where(
+            SemanticAssessment.scoring_run_id == AssetScore.scoring_run_id,
+            SemanticAssessment.profile_sha256 == profile_digest,
+        )
+        .correlate(AssetScore)
+        .scalar_subquery()
+    )
     candidate = (
         select(AssetScore, Asset)
         .join(ScoringRun, ScoringRun.id == AssetScore.scoring_run_id)
+        .join(
+            ReviewTask,
+            ReviewTask.scoring_run_id == AssetScore.scoring_run_id,
+        )
         .join(
             AssetRanking,
             (AssetRanking.scoring_run_id == AssetScore.scoring_run_id)
@@ -229,64 +236,82 @@ async def ensure_semantic_assessment(
             AssetScore.completed_at.is_not(None),
             Asset.kind == AssetKind.RAW_MASTER,
             Asset.state == AssetState.AVAILABLE,
+            run_assessment_count < assessment_limit,
             ~assessment_exists,
         )
     )
     if allowed_asset_ids:
         candidate = candidate.where(AssetScore.asset_id.in_(allowed_asset_ids))
-    row = (
+    else:
+        # Automatic scheduling is intentionally limited to active review work.
+        # A non-empty exact allowlist is the explicit repair path for historical
+        # completed/cancelled reviews and therefore bypasses only this state gate.
+        candidate = candidate.where(ReviewTask.state == ReviewTaskState.OPEN)
+    rows = (
         await session.execute(
-            candidate.order_by(
+            candidate.add_columns(run_assessment_count.label("run_assessment_count"))
+            .order_by(
+                ReviewTask.created_at.desc(),
                 completed_assessment_exists.asc(),
-                ScoringRun.completed_at,
                 AssetRanking.rank,
                 AssetScore.id,
             )
-            .limit(1)
+            .limit(_MAX_PREFILL_CANDIDATES)
             .with_for_update(skip_locked=True)
         )
-    ).one_or_none()
-    if row is None:
+    ).all()
+    if not rows:
         await session.rollback()
         return False
-    score, asset = row
-    if (
-        asset.object_key is None
-        or asset.object_version_id is None
-        or asset.sha256 is None
-        or asset.content_type is None
-        or asset.byte_size is None
-        or score.asset_storage_backend != asset.storage_backend
-        or score.asset_storage_bucket != asset.storage_bucket
-        or score.asset_object_key != asset.object_key
-        or score.asset_object_version_id != asset.object_version_id
-        or score.asset_sha256 != asset.sha256
-        or score.asset_byte_size != asset.byte_size
-    ):
-        raise SemanticAssessmentContractError("ranked asset snapshot is inconsistent")
-    assessment = SemanticAssessment(
-        scoring_run_id=score.scoring_run_id,
-        asset_score_id=score.id,
-        asset_id=score.asset_id,
-        asset_storage_backend=score.asset_storage_backend,
-        asset_storage_bucket=score.asset_storage_bucket,
-        asset_object_key=score.asset_object_key,
-        asset_object_version_id=score.asset_object_version_id,
-        asset_sha256=score.asset_sha256,
-        asset_content_type=asset.content_type,
-        asset_byte_size=score.asset_byte_size,
-        profile_sha256=profile_digest,
-        model_name=profile.model_name,
-        model_revision=profile.model_revision,
-        prompt_sha256=prompt_sha256(),
-        schema_sha256=schema_sha256(),
-        state=SemanticAssessmentState.PENDING,
-        attempts=0,
-        max_attempts=max_attempts,
-        available_at=created_at,
-        created_at=created_at,
-    )
-    session.add(assessment)
+    created_per_run: dict[UUID, int] = {}
+    created_count = 0
+    for score, asset, existing_count in rows:
+        already_created = created_per_run.get(score.scoring_run_id, 0)
+        if _int(existing_count) + already_created >= assessment_limit:
+            continue
+        if (
+            asset.object_key is None
+            or asset.object_version_id is None
+            or asset.sha256 is None
+            or asset.content_type is None
+            or asset.byte_size is None
+            or score.asset_storage_backend != asset.storage_backend
+            or score.asset_storage_bucket != asset.storage_bucket
+            or score.asset_object_key != asset.object_key
+            or score.asset_object_version_id != asset.object_version_id
+            or score.asset_sha256 != asset.sha256
+            or score.asset_byte_size != asset.byte_size
+        ):
+            raise SemanticAssessmentContractError("ranked asset snapshot is inconsistent")
+        session.add(
+            SemanticAssessment(
+                scoring_run_id=score.scoring_run_id,
+                asset_score_id=score.id,
+                asset_id=score.asset_id,
+                asset_storage_backend=score.asset_storage_backend,
+                asset_storage_bucket=score.asset_storage_bucket,
+                asset_object_key=score.asset_object_key,
+                asset_object_version_id=score.asset_object_version_id,
+                asset_sha256=score.asset_sha256,
+                asset_content_type=asset.content_type,
+                asset_byte_size=score.asset_byte_size,
+                profile_sha256=profile_digest,
+                model_name=profile.model_name,
+                model_revision=profile.model_revision,
+                prompt_sha256=prompt_sha256(),
+                schema_sha256=schema_sha256(),
+                state=SemanticAssessmentState.PENDING,
+                attempts=0,
+                max_attempts=max_attempts,
+                available_at=created_at,
+                created_at=created_at,
+            )
+        )
+        created_per_run[score.scoring_run_id] = already_created + 1
+        created_count += 1
+    if created_count == 0:
+        await session.rollback()
+        return False
     try:
         await session.commit()
     except IntegrityError:
@@ -836,7 +861,7 @@ def _max_attempts(value: object) -> int:
 
 def _assessment_limit(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 10_000:
-        raise ValueError("semantic per-profile assessment limit must be between 0 and 10000")
+        raise ValueError("semantic per-scoring-run assessment limit must be between 0 and 10000")
     return value
 
 

@@ -14,6 +14,7 @@ from sqlalchemy import select
 
 from gen_automation.app import create_app
 from gen_automation.db.models import (
+    AdminUser,
     Asset,
     AssetRanking,
     AssetScore,
@@ -21,6 +22,7 @@ from gen_automation.db.models import (
     Project,
     Release,
     ReleaseVersion,
+    ReviewTask,
     ScoringRun,
     SemanticAssessment,
 )
@@ -35,6 +37,7 @@ from gen_automation.domain.enums import (
     RankingDisposition,
     ReleasePhase,
     ReviewDecisionValue,
+    ReviewTaskState,
     ScoringRunState,
     SemanticAssessmentState,
     SemanticEnforcementMode,
@@ -54,6 +57,8 @@ from gen_automation.semantic import (
     prompt_sha256,
     schema_sha256,
 )
+from gen_automation.services import semantic_anatomy as anatomy_service
+from gen_automation.services.ranking_manifest import ranking_manifest_sha256
 from gen_automation.services.review import (
     SEMANTIC_SEVERE_OVERRIDE_REASON_CODE,
     append_review_decision,
@@ -172,6 +177,7 @@ class SemanticRuntimeContext:
     database: Database
     store: MemoryObjectStore
     asset_id: UUID
+    owner_id: UUID
 
 
 @pytest.fixture
@@ -184,6 +190,18 @@ async def semantic_runtime_context(tmp_path: Path) -> AsyncIterator[SemanticRunt
     store.put_for_test(object_key, payload)
     stored = store.objects[object_key]
     async with database.sessions() as session:
+        owner = AdminUser(
+            username_normalized="semantic-owner",
+            display_name="Semantic Owner",
+            password_hash="disabled-semantic-test-password-hash",  # noqa: S106
+            role=AdminRole.OWNER,
+            is_active=True,
+            failed_login_count=0,
+            password_changed_at=_NOW,
+            credential_version=1,
+            lock_version=1,
+        )
+        session.add(owner)
         project = Project(slug="semantic", name="Semantic")
         session.add(project)
         await session.flush()
@@ -301,8 +319,30 @@ async def semantic_runtime_context(tmp_path: Path) -> AsyncIterator[SemanticRunt
         run.ranking_manifest_sha256 = "6" * 64
         run.state = ScoringRunState.COMPLETED
         run.completed_at = _NOW + timedelta(seconds=1)
+        session.add(
+            ReviewTask(
+                release_version_id=version.id,
+                release_version_no=version.version_no,
+                release_specification_sha256=version.specification_sha256,
+                scoring_run_id=run.id,
+                scoring_config_sha256=run.config_sha256,
+                scoring_input_manifest_sha256=run.input_manifest_sha256,
+                ranking_manifest_sha256=run.ranking_manifest_sha256,
+                desired_accepted_count=1,
+                ranked_asset_count=1,
+                state=ReviewTaskState.OPEN,
+                lock_version=1,
+                created_by_user_id=owner.id,
+                created_at=_NOW + timedelta(seconds=2),
+            )
+        )
         await session.commit()
-        context = SemanticRuntimeContext(database=database, store=store, asset_id=asset.id)
+        context = SemanticRuntimeContext(
+            database=database,
+            store=store,
+            asset_id=asset.id,
+            owner_id=owner.id,
+        )
     try:
         yield context
     finally:
@@ -382,6 +422,8 @@ async def _add_ranked_asset(
     *,
     output_index: int,
     rank: int,
+    review_state: ReviewTaskState | None = ReviewTaskState.OPEN,
+    review_created_at: datetime | None = None,
 ) -> UUID:
     payload = f"exact-semantic-master-{output_index}".encode()
     object_key = f"masters/exact-{output_index}.png"
@@ -417,8 +459,8 @@ async def _add_ranked_asset(
         run = ScoringRun(
             release_version_id=job.release_version_id,
             configuration={"quality": f"fixture-{output_index}"},
-            config_sha256="7" * 64,
-            input_manifest_sha256="8" * 64,
+            config_sha256=f"{output_index + 16:064x}",
+            input_manifest_sha256=f"{output_index + 256:064x}",
             ranking_manifest_sha256=None,
             scorer_version="fixture",
             pillow_version="12.0.0",
@@ -477,8 +519,184 @@ async def _add_ranked_asset(
         run.ranking_manifest_sha256 = "9" * 64
         run.state = ScoringRunState.COMPLETED
         run.completed_at = _NOW + timedelta(seconds=2)
+        if review_state is not None:
+            version = await session.get(ReleaseVersion, run.release_version_id)
+            assert version is not None
+            task_created_at = review_created_at or _NOW + timedelta(seconds=10 + output_index)
+            terminal_at = task_created_at + timedelta(seconds=1)
+            session.add(
+                ReviewTask(
+                    release_version_id=version.id,
+                    release_version_no=version.version_no,
+                    release_specification_sha256=version.specification_sha256,
+                    scoring_run_id=run.id,
+                    scoring_config_sha256=run.config_sha256,
+                    scoring_input_manifest_sha256=run.input_manifest_sha256,
+                    ranking_manifest_sha256=run.ranking_manifest_sha256,
+                    desired_accepted_count=1,
+                    ranked_asset_count=1,
+                    state=review_state,
+                    lock_version=1,
+                    created_by_user_id=context.owner_id,
+                    created_at=task_created_at,
+                    completed_by_user_id=(
+                        context.owner_id if review_state == ReviewTaskState.COMPLETED else None
+                    ),
+                    completed_at=(
+                        terminal_at if review_state == ReviewTaskState.COMPLETED else None
+                    ),
+                    cancelled_by_user_id=(
+                        context.owner_id if review_state == ReviewTaskState.CANCELLED else None
+                    ),
+                    cancelled_at=(
+                        terminal_at if review_state == ReviewTaskState.CANCELLED else None
+                    ),
+                )
+            )
         await session.commit()
         return asset.id
+
+
+async def _add_ranked_review(
+    context: SemanticRuntimeContext,
+    *,
+    output_indexes: tuple[int, ...],
+    review_created_at: datetime,
+) -> tuple[UUID, UUID, tuple[UUID, ...]]:
+    assert output_indexes
+    stored_payloads: list[tuple[int, bytes, str, str]] = []
+    for output_index in output_indexes:
+        payload = f"prefilled-semantic-master-{output_index}".encode()
+        object_key = f"masters/prefill-{output_index}.png"
+        context.store.put_for_test(object_key, payload)
+        stored_payloads.append(
+            (
+                output_index,
+                payload,
+                object_key,
+                context.store.objects[object_key].version_id,
+            )
+        )
+
+    async with context.database.sessions() as session:
+        original = await session.get(Asset, context.asset_id)
+        assert original is not None
+        assert original.generation_job_id is not None
+        job = await session.get(GenerationJob, original.generation_job_id)
+        assert job is not None
+        version = await session.get(ReleaseVersion, job.release_version_id)
+        assert version is not None
+        identity = ",".join(str(value) for value in output_indexes)
+        config_digest = hashlib.sha256(f"prefill-config:{identity}".encode()).hexdigest()
+        input_digest = hashlib.sha256(f"prefill-input:{identity}".encode()).hexdigest()
+        run = ScoringRun(
+            release_version_id=version.id,
+            configuration={"quality": f"prefill-{identity}"},
+            config_sha256=config_digest,
+            input_manifest_sha256=input_digest,
+            ranking_manifest_sha256=None,
+            scorer_version="fixture",
+            pillow_version="12.0.0",
+            state=ScoringRunState.RUNNING,
+            asset_count=len(output_indexes),
+            max_attempts=3,
+            created_at=review_created_at - timedelta(seconds=2),
+            started_at=review_created_at - timedelta(seconds=2),
+            completed_at=None,
+        )
+        session.add(run)
+        await session.flush()
+        asset_ids: list[UUID] = []
+        manifest_rows: list[tuple[AssetRanking, AssetScore]] = []
+        for rank, (output_index, payload, object_key, version_id) in enumerate(
+            stored_payloads,
+            start=1,
+        ):
+            asset = Asset(
+                release_id=original.release_id,
+                generation_job_id=job.id,
+                output_index=output_index,
+                kind=AssetKind.RAW_MASTER,
+                state=AssetState.AVAILABLE,
+                storage_backend=context.store.backend,
+                storage_bucket=context.store.bucket,
+                object_key=object_key,
+                object_version_id=version_id,
+                sha256=hashlib.sha256(payload).hexdigest(),
+                content_type="image/png",
+                image_format="PNG",
+                width=64,
+                height=64,
+                byte_size=len(payload),
+                asset_metadata={},
+                available_at=review_created_at - timedelta(seconds=2),
+            )
+            session.add(asset)
+            await session.flush()
+            score = AssetScore(
+                scoring_run_id=run.id,
+                asset_id=asset.id,
+                asset_storage_backend=asset.storage_backend,
+                asset_storage_bucket=asset.storage_bucket,
+                asset_sha256=asset.sha256,
+                asset_object_key=asset.object_key,
+                asset_object_version_id=asset.object_version_id,
+                asset_byte_size=asset.byte_size,
+                asset_image_format=asset.image_format,
+                asset_width=asset.width,
+                asset_height=asset.height,
+                state=AssetScoreState.FLAGGED_CORRUPT,
+                attempts=1,
+                max_attempts=3,
+                available_at=review_created_at - timedelta(seconds=2),
+                aggregate_score_micros=500_000 - rank,
+                signal_detail={"classification": "prefill-fixture"},
+                scorer_version=run.scorer_version,
+                pillow_version=run.pillow_version,
+                config_sha256=run.config_sha256,
+                completed_at=review_created_at - timedelta(seconds=1),
+                created_at=review_created_at - timedelta(seconds=2),
+            )
+            session.add(score)
+            await session.flush()
+            ranking = AssetRanking(
+                scoring_run_id=run.id,
+                asset_score_id=score.id,
+                asset_id=asset.id,
+                rank=rank,
+                aggregate_score_micros=score.aggregate_score_micros,
+                disposition=RankingDisposition.FLAGGED_REVIEW,
+                explanation={"fixture": True},
+                is_duplicate_representative=False,
+                scorer_version=run.scorer_version,
+                pillow_version=run.pillow_version,
+                config_sha256=run.config_sha256,
+                frozen_at=review_created_at - timedelta(seconds=1),
+            )
+            session.add(ranking)
+            manifest_rows.append((ranking, score))
+            asset_ids.append(asset.id)
+        run.ranking_manifest_sha256 = ranking_manifest_sha256(run, manifest_rows)
+        run.state = ScoringRunState.COMPLETED
+        run.completed_at = review_created_at - timedelta(seconds=1)
+        task = ReviewTask(
+            release_version_id=version.id,
+            release_version_no=version.version_no,
+            release_specification_sha256=version.specification_sha256,
+            scoring_run_id=run.id,
+            scoring_config_sha256=run.config_sha256,
+            scoring_input_manifest_sha256=run.input_manifest_sha256,
+            ranking_manifest_sha256=run.ranking_manifest_sha256,
+            desired_accepted_count=1,
+            ranked_asset_count=len(asset_ids),
+            state=ReviewTaskState.OPEN,
+            lock_version=1,
+            created_by_user_id=context.owner_id,
+            created_at=review_created_at,
+        )
+        session.add(task)
+        await session.commit()
+        return task.id, run.id, tuple(asset_ids)
 
 
 async def _add_ranked_repeat(
@@ -486,6 +704,7 @@ async def _add_ranked_repeat(
     *,
     asset_id: UUID,
     rank: int,
+    review_created_at: datetime | None = None,
 ) -> UUID:
     async with context.database.sessions() as session:
         asset = await session.get(Asset, asset_id)
@@ -556,6 +775,25 @@ async def _add_ranked_repeat(
         run.ranking_manifest_sha256 = "c" * 64
         run.state = ScoringRunState.COMPLETED
         run.completed_at = _NOW + timedelta(milliseconds=1500)
+        version = await session.get(ReleaseVersion, run.release_version_id)
+        assert version is not None
+        session.add(
+            ReviewTask(
+                release_version_id=version.id,
+                release_version_no=version.version_no,
+                release_specification_sha256=version.specification_sha256,
+                scoring_run_id=run.id,
+                scoring_config_sha256=run.config_sha256,
+                scoring_input_manifest_sha256=run.input_manifest_sha256,
+                ranking_manifest_sha256=run.ranking_manifest_sha256,
+                desired_accepted_count=1,
+                ranked_asset_count=1,
+                state=ReviewTaskState.OPEN,
+                lock_version=1,
+                created_by_user_id=context.owner_id,
+                created_at=review_created_at or _NOW + timedelta(seconds=11),
+            )
+        )
         await session.commit()
         return run.id
 
@@ -597,10 +835,9 @@ async def test_zero_assessment_limit_schedules_no_new_rows(
 
 
 @pytest.mark.asyncio
-async def test_profile_assessment_limit_counts_all_existing_rows(
+async def test_profile_assessment_limit_applies_per_open_scoring_run(
     semantic_runtime_context: SemanticRuntimeContext,
 ) -> None:
-    await _add_ranked_asset(semantic_runtime_context, output_index=1, rank=1)
     profile = SemanticAssessmentProfile(model_name=_MODEL, model_revision=_REVISION)
     first = await run_semantic_assessment_cycle(
         semantic_runtime_context.database.sessions,
@@ -616,6 +853,11 @@ async def test_profile_assessment_limit_counts_all_existing_rows(
         retry_max_seconds=30,
         now=_NOW + timedelta(minutes=1),
     )
+    new_asset_id = await _add_ranked_asset(
+        semantic_runtime_context,
+        output_index=1,
+        rank=1,
+    )
     second = await run_semantic_assessment_cycle(
         semantic_runtime_context.database.sessions,
         semantic_runtime_context.store,
@@ -630,18 +872,41 @@ async def test_profile_assessment_limit_counts_all_existing_rows(
         retry_max_seconds=30,
         now=_NOW + timedelta(minutes=2),
     )
+    exhausted = await run_semantic_assessment_cycle(
+        semantic_runtime_context.database.sessions,
+        semantic_runtime_context.store,
+        worker_id="semantic:hard-limit",
+        profile=profile,
+        analyzer=_passing_assessment,
+        max_assessments_per_profile=1,
+        asset_allowlist=(),
+        max_attempts=2,
+        lease_seconds=120,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+        now=_NOW + timedelta(minutes=3),
+    )
 
     assert first.created_assessment
     assert first.processed_assessment
-    assert not second.did_work
+    assert second.created_assessment
+    assert second.processed_assessment
+    assert not exhausted.did_work
     async with semantic_runtime_context.database.sessions() as session:
         assessments = list((await session.scalars(select(SemanticAssessment))).all())
-        assert len(assessments) == 1
-        assert assessments[0].state == SemanticAssessmentState.COMPLETED
+        assert len(assessments) == 2
+        assert {assessment.asset_id for assessment in assessments} == {
+            semantic_runtime_context.asset_id,
+            new_asset_id,
+        }
+        assert len({assessment.scoring_run_id for assessment in assessments}) == 2
+        assert all(
+            assessment.state == SemanticAssessmentState.COMPLETED for assessment in assessments
+        )
 
 
 @pytest.mark.asyncio
-async def test_unassessed_asset_precedes_cross_run_repeat_with_one_cap_slot(
+async def test_cross_run_repeat_is_created_once_per_open_run(
     semantic_runtime_context: SemanticRuntimeContext,
 ) -> None:
     profile = SemanticAssessmentProfile(model_name=_MODEL, model_revision=_REVISION)
@@ -667,18 +932,13 @@ async def test_unassessed_asset_precedes_cross_run_repeat_with_one_cap_slot(
         asset_id=semantic_runtime_context.asset_id,
         rank=1,
     )
-    unassessed_asset_id = await _add_ranked_asset(
-        semantic_runtime_context,
-        output_index=2,
-        rank=1,
-    )
     second = await run_semantic_assessment_cycle(
         semantic_runtime_context.database.sessions,
         semantic_runtime_context.store,
         worker_id="semantic:asset-priority",
         profile=profile,
         analyzer=_passing_assessment,
-        max_assessments_per_profile=2,
+        max_assessments_per_profile=1,
         asset_allowlist=(),
         max_attempts=2,
         lease_seconds=120,
@@ -689,13 +949,13 @@ async def test_unassessed_asset_precedes_cross_run_repeat_with_one_cap_slot(
     assert second.created_assessment
     assert second.processed_assessment
 
-    capped = await run_semantic_assessment_cycle(
+    exhausted = await run_semantic_assessment_cycle(
         semantic_runtime_context.database.sessions,
         semantic_runtime_context.store,
         worker_id="semantic:asset-priority",
         profile=profile,
         analyzer=_passing_assessment,
-        max_assessments_per_profile=2,
+        max_assessments_per_profile=1,
         asset_allowlist=(),
         max_attempts=2,
         lease_seconds=120,
@@ -703,16 +963,304 @@ async def test_unassessed_asset_precedes_cross_run_repeat_with_one_cap_slot(
         retry_max_seconds=30,
         now=_NOW + timedelta(minutes=3),
     )
-    assert not capped.did_work
+    assert not exhausted.did_work
 
     async with semantic_runtime_context.database.sessions() as session:
         assessments = list((await session.scalars(select(SemanticAssessment))).all())
         assert len(assessments) == 2
         assert {assessment.asset_id for assessment in assessments} == {
-            semantic_runtime_context.asset_id,
-            unassessed_asset_id,
+            semantic_runtime_context.asset_id
         }
-        assert all(assessment.scoring_run_id != repeated_run_id for assessment in assessments)
+        assert repeated_run_id in {assessment.scoring_run_id for assessment in assessments}
+        assert len({assessment.scoring_run_id for assessment in assessments}) == 2
+        assert (
+            len(
+                {
+                    (
+                        assessment.scoring_run_id,
+                        assessment.asset_id,
+                        assessment.profile_sha256,
+                    )
+                    for assessment in assessments
+                }
+            )
+            == 2
+        )
+
+
+@pytest.mark.asyncio
+async def test_newest_open_review_is_prioritized_and_closed_history_is_not_scheduled(
+    semantic_runtime_context: SemanticRuntimeContext,
+) -> None:
+    historical_asset_id = await _add_ranked_asset(
+        semantic_runtime_context,
+        output_index=10,
+        rank=1,
+        review_state=ReviewTaskState.COMPLETED,
+    )
+    newest_open_asset_id = await _add_ranked_asset(
+        semantic_runtime_context,
+        output_index=11,
+        rank=1,
+        review_created_at=_NOW + timedelta(minutes=10),
+    )
+    profile = SemanticAssessmentProfile(model_name=_MODEL, model_revision=_REVISION)
+
+    first = await run_semantic_assessment_cycle(
+        semantic_runtime_context.database.sessions,
+        semantic_runtime_context.store,
+        worker_id="semantic:open-review-priority",
+        profile=profile,
+        analyzer=_passing_assessment,
+        max_assessments_per_profile=1,
+        asset_allowlist=(),
+        max_attempts=2,
+        lease_seconds=120,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+        now=_NOW + timedelta(minutes=11),
+    )
+    second = await run_semantic_assessment_cycle(
+        semantic_runtime_context.database.sessions,
+        semantic_runtime_context.store,
+        worker_id="semantic:open-review-priority",
+        profile=profile,
+        analyzer=_passing_assessment,
+        max_assessments_per_profile=1,
+        asset_allowlist=(),
+        max_attempts=2,
+        lease_seconds=120,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+        now=_NOW + timedelta(minutes=12),
+    )
+    exhausted = await run_semantic_assessment_cycle(
+        semantic_runtime_context.database.sessions,
+        semantic_runtime_context.store,
+        worker_id="semantic:open-review-priority",
+        profile=profile,
+        analyzer=_passing_assessment,
+        max_assessments_per_profile=1,
+        asset_allowlist=(),
+        max_attempts=2,
+        lease_seconds=120,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+        now=_NOW + timedelta(minutes=13),
+    )
+
+    assert first.created_assessment and first.processed_assessment
+    assert not second.created_assessment and second.processed_assessment
+    assert not exhausted.did_work
+    async with semantic_runtime_context.database.sessions() as session:
+        assessments = list(
+            (
+                await session.scalars(
+                    select(SemanticAssessment).order_by(SemanticAssessment.created_at)
+                )
+            ).all()
+        )
+    assert [assessment.asset_id for assessment in assessments] == [
+        newest_open_asset_id,
+        semantic_runtime_context.asset_id,
+    ]
+    assert historical_asset_id not in {assessment.asset_id for assessment in assessments}
+
+
+@pytest.mark.asyncio
+async def test_exact_allowlist_can_repair_a_completed_review(
+    semantic_runtime_context: SemanticRuntimeContext,
+) -> None:
+    historical_asset_id = await _add_ranked_asset(
+        semantic_runtime_context,
+        output_index=12,
+        rank=1,
+        review_state=ReviewTaskState.COMPLETED,
+    )
+    profile = SemanticAssessmentProfile(model_name=_MODEL, model_revision=_REVISION)
+
+    repaired = await run_semantic_assessment_cycle(
+        semantic_runtime_context.database.sessions,
+        semantic_runtime_context.store,
+        worker_id="semantic:historical-repair",
+        profile=profile,
+        analyzer=_passing_assessment,
+        max_assessments_per_profile=1,
+        asset_allowlist=(historical_asset_id,),
+        max_attempts=2,
+        lease_seconds=120,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+        now=_NOW + timedelta(minutes=14),
+    )
+
+    assert repaired.created_assessment and repaired.processed_assessment
+    async with semantic_runtime_context.database.sessions() as session:
+        assessment = await session.scalar(
+            select(SemanticAssessment).where(
+                SemanticAssessment.asset_id == historical_asset_id,
+                SemanticAssessment.profile_sha256 == profile.profile_sha256,
+            )
+        )
+    assert assessment is not None
+    assert assessment.state == SemanticAssessmentState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_prefill_selector_is_bounded_per_transaction(
+    semantic_runtime_context: SemanticRuntimeContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, scoring_run_id, asset_ids = await _add_ranked_review(
+        semantic_runtime_context,
+        output_indexes=(13, 14, 15),
+        review_created_at=_NOW + timedelta(minutes=15),
+    )
+    profile = SemanticAssessmentProfile(model_name=_MODEL, model_revision=_REVISION)
+    monkeypatch.setattr(anatomy_service, "_MAX_PREFILL_CANDIDATES", 2)
+
+    first = await run_semantic_assessment_cycle(
+        semantic_runtime_context.database.sessions,
+        semantic_runtime_context.store,
+        worker_id="semantic:bounded-prefill",
+        profile=profile,
+        analyzer=_passing_assessment,
+        max_assessments_per_profile=3,
+        asset_allowlist=asset_ids,
+        max_attempts=2,
+        lease_seconds=120,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+        now=_NOW + timedelta(minutes=16),
+    )
+    assert first.created_assessment and first.processed_assessment
+    async with semantic_runtime_context.database.sessions() as session:
+        first_count = len(
+            list(
+                await session.scalars(
+                    select(SemanticAssessment.id).where(
+                        SemanticAssessment.scoring_run_id == scoring_run_id,
+                        SemanticAssessment.profile_sha256 == profile.profile_sha256,
+                    )
+                )
+            )
+        )
+    assert first_count == 2
+
+    second = await run_semantic_assessment_cycle(
+        semantic_runtime_context.database.sessions,
+        semantic_runtime_context.store,
+        worker_id="semantic:bounded-prefill",
+        profile=profile,
+        analyzer=_passing_assessment,
+        max_assessments_per_profile=3,
+        asset_allowlist=asset_ids,
+        max_attempts=2,
+        lease_seconds=120,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+        now=_NOW + timedelta(minutes=17),
+    )
+    assert second.created_assessment and second.processed_assessment
+    async with semantic_runtime_context.database.sessions() as session:
+        all_ids = set(
+            await session.scalars(
+                select(SemanticAssessment.asset_id).where(
+                    SemanticAssessment.scoring_run_id == scoring_run_id,
+                    SemanticAssessment.profile_sha256 == profile.profile_sha256,
+                )
+            )
+        )
+    assert all_ids == set(asset_ids)
+
+
+@pytest.mark.asyncio
+async def test_open_review_is_prefilled_before_analysis_and_finishes_after_close(
+    semantic_runtime_context: SemanticRuntimeContext,
+) -> None:
+    task_id, scoring_run_id, asset_ids = await _add_ranked_review(
+        semantic_runtime_context,
+        output_indexes=(20, 21, 22),
+        review_created_at=_NOW + timedelta(minutes=20),
+    )
+    profile = SemanticAssessmentProfile(model_name=_MODEL, model_revision=_REVISION)
+    analyzer_calls = 0
+
+    async def assert_prefilled_then_pass(
+        _payload: bytes,
+        _content_type: str,
+        _sha256: str,
+    ) -> SemanticAssessmentResult:
+        nonlocal analyzer_calls
+        analyzer_calls += 1
+        async with semantic_runtime_context.database.sessions() as session:
+            prefetched_ids = set(
+                await session.scalars(
+                    select(SemanticAssessment.asset_id).where(
+                        SemanticAssessment.scoring_run_id == scoring_run_id,
+                        SemanticAssessment.profile_sha256 == profile.profile_sha256,
+                    )
+                )
+            )
+        assert prefetched_ids == set(asset_ids)
+        return await _passing_assessment(_payload, _content_type, _sha256)
+
+    first = await run_semantic_assessment_cycle(
+        semantic_runtime_context.database.sessions,
+        semantic_runtime_context.store,
+        worker_id="semantic:prefill-close-race",
+        profile=profile,
+        analyzer=assert_prefilled_then_pass,
+        max_assessments_per_profile=3,
+        asset_allowlist=(),
+        max_attempts=2,
+        lease_seconds=120,
+        retry_base_seconds=5,
+        retry_max_seconds=30,
+        now=_NOW + timedelta(minutes=21),
+    )
+    assert first.created_assessment and first.processed_assessment
+
+    async with semantic_runtime_context.database.sessions() as session:
+        task = await session.get(ReviewTask, task_id)
+        assert task is not None
+        task.state = ReviewTaskState.CANCELLED
+        task.lock_version += 1
+        task.cancelled_by_user_id = semantic_runtime_context.owner_id
+        task.cancelled_at = _NOW + timedelta(minutes=22)
+        await session.commit()
+
+    for minute in range(22, 27):
+        await run_semantic_assessment_cycle(
+            semantic_runtime_context.database.sessions,
+            semantic_runtime_context.store,
+            worker_id="semantic:prefill-close-race",
+            profile=profile,
+            analyzer=assert_prefilled_then_pass,
+            max_assessments_per_profile=3,
+            asset_allowlist=(),
+            max_attempts=2,
+            lease_seconds=120,
+            retry_base_seconds=5,
+            retry_max_seconds=30,
+            now=_NOW + timedelta(minutes=minute),
+        )
+
+    async with semantic_runtime_context.database.sessions() as session:
+        assessments = list(
+            (
+                await session.scalars(
+                    select(SemanticAssessment).where(
+                        SemanticAssessment.scoring_run_id == scoring_run_id,
+                        SemanticAssessment.profile_sha256 == profile.profile_sha256,
+                    )
+                )
+            ).all()
+        )
+    assert len(assessments) == len(asset_ids)
+    assert {assessment.asset_id for assessment in assessments} == set(asset_ids)
+    assert all(assessment.state == SemanticAssessmentState.COMPLETED for assessment in assessments)
+    assert analyzer_calls >= len(asset_ids)
 
 
 @pytest.mark.asyncio

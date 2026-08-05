@@ -109,6 +109,9 @@ from gen_automation.services.semantic_anatomy import (
     SemanticAssessmentProfile,
     run_semantic_assessment_cycle,
 )
+from gen_automation.services.semantic_review_reconciliation import (
+    reconcile_one_completed_semantic_review,
+)
 from gen_automation.services.worker_inputs import SaladWorkerJobInputProvider
 from gen_automation.storage.base import ObjectStore
 
@@ -1164,7 +1167,28 @@ class ControllerWorkloads:
             retry_base_seconds=self.settings.background_semantic_retry_base_seconds,
             retry_max_seconds=self.settings.background_semantic_retry_max_seconds,
         )
-        return result.did_work
+        reconciled = False
+        try:
+            async with self.sessions() as session:
+                reconciliation = await reconcile_one_completed_semantic_review(
+                    session,
+                    profile_sha256=SemanticAssessmentProfile(
+                        model_name=self.settings.semantic_anatomy_model,
+                        model_revision=revision,
+                    ).profile_sha256,
+                    baseline_threshold_micros=(
+                        self.settings.semantic_anatomy_severe_confidence_micros
+                    ),
+                )
+                await session.commit()
+                reconciled = reconciliation.did_work
+        except Exception as error:
+            logger.exception(
+                "semantic_review_learning_reconciliation_failed",
+                controller_instance_id=self.instance_id,
+                error_type=type(error).__name__,
+            )
+        return result.did_work or reconciled
 
     async def derivative_once(self) -> bool:
         if self.object_store is None or not self.settings.derivative_rendering_enabled:

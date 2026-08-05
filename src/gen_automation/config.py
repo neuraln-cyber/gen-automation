@@ -249,6 +249,8 @@ class Settings(BaseSettings):
         min_length=1,
         max_length=200,
     )
+    # The environment variable keeps its original name for deployment compatibility;
+    # scheduling enforces this bound independently for each scoring run.
     semantic_anatomy_max_assessments_per_profile: int = Field(
         default=0,
         ge=0,
@@ -592,7 +594,7 @@ class Settings(BaseSettings):
                 errors.append("semantic anatomy QC requires a pinned model revision")
             if self.semantic_anatomy_max_assessments_per_profile <= 0:
                 errors.append(
-                    "semantic anatomy QC requires a positive per-profile assessment limit"
+                    "semantic anatomy QC requires a positive per-scoring-run assessment limit"
                 )
         if self.background_semantic_retry_max_seconds < self.background_semantic_retry_base_seconds:
             errors.append("semantic retry maximum cannot be lower than its base delay")

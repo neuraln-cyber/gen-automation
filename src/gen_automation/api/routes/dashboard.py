@@ -522,7 +522,10 @@ async def dashboard_review_task(
                 user_id=principal.user_id,
             )
         csrf_token = (
-            _form_csrf_token(request, principal) if summary.state == ReviewTaskState.OPEN else None
+            _form_csrf_token(request, principal)
+            if summary.state == ReviewTaskState.OPEN
+            or (summary.state == ReviewTaskState.COMPLETED and principal.role == AdminRole.OWNER)
+            else None
         )
     except (RankedReleaseNotFoundError, ReviewNotFoundError):
         return _error_response(

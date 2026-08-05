@@ -296,7 +296,12 @@
         </div>
         <div><dt>Anatomy checks pending</dt><dd>{{ summary.semantic_gate.pending_count }}</dd></div>
         <div><dt>Unavailable checks</dt><dd>{{ summary.semantic_gate.unavailable_count }}</dd></div>
-        <div><dt>Severe final-set blocks</dt><dd>{{ summary.semantic_gate.severe_blocked_count }}</dd></div>
+        <div>
+          <dt>{{ "Severe final-set blocks" if semantic_mode == "enforce" else "Severe flags" }}</dt>
+          <dd>
+            {{ summary.semantic_gate.severe_blocked_count if semantic_mode == "enforce" else summary.semantic_gate.severe_count }}
+          </dd>
+        </div>
         <div><dt>Owner overrides</dt><dd>{{ summary.semantic_gate.severe_override_count }}</dd></div>
         </dl>
       </details>
@@ -391,10 +396,10 @@
         {% elif accepted_over_goal %}
           Exclude {{ accepted_over_goal }} accepted image{% if accepted_over_goal != 1 %}s{% endif %}
           before completing; {{ final_set_goal }} is the configured maximum.
-        {% elif summary.semantic_gate.pending_count %}
+        {% elif summary.semantic_gate.pending_count and semantic_mode == "enforce" %}
           Completion is blocked until all {{ summary.ranked_asset_count }} configured
           anatomy checks finish or become explicitly unavailable after bounded retries.
-        {% elif summary.semantic_gate.severe_blocked_count %}
+        {% elif summary.semantic_gate.severe_blocked_count and semantic_mode == "enforce" %}
           Completion is blocked because an accepted high-confidence severe image needs
           an explicit owner override reason and attestation.
         {% else %}
@@ -641,9 +646,15 @@
               <span>
                 Anatomy check:
                 {% if item.semantic is none %}
-                  pending
+                  not scheduled
                 {% elif item.semantic.state.value == "completed" %}
                   {{ item.semantic.verdict.value }}
+                {% elif item.semantic.state.value == "pending" %}
+                  queued
+                {% elif item.semantic.state.value == "processing" %}
+                  processing
+                {% elif item.semantic.state.value == "retry_wait" %}
+                  waiting to retry
                 {% else %}
                   {{ item.semantic.state.value }}
                 {% endif %}
@@ -655,7 +666,7 @@
               {% if summary.semantic_gate.enabled %}
                 <p>
                   <strong>AI anatomy check:</strong>
-                  queued or not yet created; review completion is blocked.
+                  not yet scheduled for the current anatomy model.
                 </p>
               {% else %}
                 <p><strong>AI anatomy check:</strong> not assessed; review manually.</p>
@@ -683,10 +694,48 @@
                 <strong>AI anatomy check:</strong>
                 explicitly unavailable after bounded processing; review manually.
               </p>
+            {% elif item.semantic.state.value == "pending" %}
+              <p>
+                <strong>AI anatomy check:</strong>
+                queued and waiting for an anatomy worker.
+              </p>
+            {% elif item.semantic.state.value == "processing" %}
+              <p>
+                <strong>AI anatomy check:</strong>
+                currently processing.
+              </p>
+            {% elif item.semantic.state.value == "retry_wait" %}
+              <p>
+                <strong>AI anatomy check:</strong>
+                waiting for an automatic retry after a temporary failure.
+              </p>
             {% else %}
               <p>
                 <strong>AI anatomy check:</strong>
-                pending; decisions remain available but completion is blocked.
+                {{ item.semantic.state.value.replace("_", " ") }}; review manually.
+              </p>
+            {% endif %}
+            {% if
+              summary.semantic_gate.enabled
+              and semantic_mode == "enforce"
+              and (
+                item.semantic is none
+                or item.semantic.state.value in ["pending", "processing", "retry_wait"]
+              )
+            %}
+              <p class="muted">
+                Review completion is blocked until this check completes or becomes unavailable.
+              </p>
+            {% elif
+              summary.semantic_gate.enabled
+              and semantic_mode in ["shadow", "assist"]
+              and (
+                item.semantic is none
+                or item.semantic.state.value in ["pending", "processing", "retry_wait"]
+              )
+            %}
+              <p class="muted">
+                This check does not block review completion in {{ semantic_mode }} mode.
               </p>
             {% endif %}
             {% if item.ai_excluded and item.current.semantic_severe_override_attested %}
@@ -763,7 +812,10 @@
                       {% endif %}
                     </span>
                   </div>
-                {% elif summary.state.value == "open" and principal.role.value == "owner" %}
+                {% elif
+                  summary.state.value in ["open", "completed"]
+                  and principal.role.value == "owner"
+                %}
                   <form
                     class="anatomy-feedback-form"
                     method="post"

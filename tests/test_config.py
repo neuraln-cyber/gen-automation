@@ -201,7 +201,7 @@ def test_semantic_anatomy_defaults_to_non_blocking_shadow_mode() -> None:
 
 
 def test_enabled_semantic_anatomy_requires_positive_assessment_limit() -> None:
-    with pytest.raises(ValidationError, match="positive per-profile assessment limit"):
+    with pytest.raises(ValidationError, match="positive per-scoring-run assessment limit"):
         Settings(semantic_anatomy_enabled=True)
 
 

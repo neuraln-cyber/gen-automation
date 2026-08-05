@@ -6,12 +6,17 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from gen_automation.api.routes import dashboard as dashboard_routes
 from gen_automation.api.routes import review_tasks as review_routes
 from gen_automation.app import create_app
+from gen_automation.db.models import Asset, AssetScore, SemanticAssessment
+from gen_automation.db.session import Database
 from gen_automation.domain.enums import (
     AdminRole,
+    ReviewDecisionValue,
+    ReviewTaskState,
     SemanticAssessmentState,
     SemanticEnforcementMode,
     SemanticFeedbackAgreement,
@@ -20,17 +25,26 @@ from gen_automation.domain.enums import (
     SemanticVerdict,
 )
 from gen_automation.semantic import SemanticIssue
+from gen_automation.services.review import append_review_decision, transition_review_task
 from gen_automation.services.semantic_anatomy import SemanticReviewAssessment
 from gen_automation.services.semantic_feedback import SemanticAnatomyFeedbackResult
-from tests.test_dashboard_review import _FORM_HEADERS, SameOriginReviewStore, _create_task
+from tests.test_dashboard_review import (
+    _FORM_HEADERS,
+    SameOriginReviewStore,
+    _create_task,
+    _forms,
+)
 from tests.test_review_api import (
     ORIGIN,
     PASSWORD,
+    ReviewApiContext,
     UserCredential,
     _seed_review_api,
     _settings,
     _totp_code,
 )
+
+_TEST_SEMANTIC_PROFILE = "a" * 64
 
 
 def _login(client: TestClient, credential: UserCredential, *, csrf_cookie_name: str) -> str:
@@ -58,6 +72,94 @@ async def _feedback_target_exists(*_args: object, **_kwargs: object) -> bool:
     return True
 
 
+async def _close_review_task(
+    context: ReviewApiContext,
+    *,
+    task_id: UUID,
+    target_state: ReviewTaskState,
+) -> None:
+    database = Database(context.settings.database_url)
+    try:
+        async with database.sessions() as session:
+            expected_lock_version = 1
+            if target_state == ReviewTaskState.COMPLETED:
+                decision = await append_review_decision(
+                    session,
+                    review_task_id=task_id,
+                    asset_id=context.asset_ids[0],
+                    decision=ReviewDecisionValue.ACCEPT,
+                    decided_by_user_id=context.users[AdminRole.OWNER].id,
+                    expected_lock_version=expected_lock_version,
+                    idempotency_key=f"feedback-complete-decision-{task_id}",
+                    reason_code="manual_qc_pass",
+                    note="Accepted before the anatomy result was labelled.",
+                )
+                expected_lock_version = decision.task_lock_version
+            result = await transition_review_task(
+                session,
+                review_task_id=task_id,
+                target_state=target_state,
+                changed_by_user_id=context.users[AdminRole.OWNER].id,
+                expected_lock_version=expected_lock_version,
+                idempotency_key=f"feedback-transition-{target_state.value}-{task_id}",
+            )
+            assert result.state == target_state
+    finally:
+        await database.dispose()
+
+
+async def _add_completed_assessment(
+    context: ReviewApiContext,
+) -> UUID:
+    database = Database(context.settings.database_url)
+    try:
+        async with database.sessions() as session:
+            score = await session.scalar(
+                select(AssetScore).where(
+                    AssetScore.scoring_run_id == context.scoring_run_id,
+                    AssetScore.asset_id == context.asset_ids[0],
+                )
+            )
+            asset = await session.get(Asset, context.asset_ids[0])
+            assert score is not None
+            assert asset is not None
+            assert asset.content_type is not None
+            completed_at = datetime.now(UTC)
+            assessment = SemanticAssessment(
+                scoring_run_id=score.scoring_run_id,
+                asset_score_id=score.id,
+                asset_id=score.asset_id,
+                asset_storage_backend=score.asset_storage_backend,
+                asset_storage_bucket=score.asset_storage_bucket,
+                asset_object_key=score.asset_object_key,
+                asset_object_version_id=score.asset_object_version_id,
+                asset_sha256=score.asset_sha256,
+                asset_content_type=asset.content_type,
+                asset_byte_size=score.asset_byte_size,
+                profile_sha256=_TEST_SEMANTIC_PROFILE,
+                model_name="private/anatomy-vlm",
+                model_revision="revision-completed-review",
+                prompt_sha256="b" * 64,
+                schema_sha256="c" * 64,
+                state=SemanticAssessmentState.COMPLETED,
+                attempts=1,
+                max_attempts=1,
+                available_at=completed_at,
+                verdict=SemanticVerdict.PASS,
+                confidence_micros=940_000,
+                issues=[],
+                response_sha256="d" * 64,
+                created_at=completed_at,
+                started_at=completed_at,
+                completed_at=completed_at,
+            )
+            session.add(assessment)
+            await session.commit()
+            return assessment.id
+    finally:
+        await database.dispose()
+
+
 def _feedback_result(
     *,
     assessment_id: UUID,
@@ -79,13 +181,20 @@ def _feedback_result(
     )
 
 
-def test_owner_can_record_anatomy_feedback_through_api(
+def test_owner_can_record_anatomy_feedback_for_completed_review_through_api(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     context = asyncio.run(_seed_review_api(_settings(tmp_path / "anatomy-feedback-api.db")))
     task_id = asyncio.run(_create_task(context))
-    assessment_id = uuid4()
+    assessment_id = asyncio.run(_add_completed_assessment(context))
+    asyncio.run(
+        _close_review_task(
+            context,
+            task_id=task_id,
+            target_state=ReviewTaskState.COMPLETED,
+        )
+    )
     captured: dict[str, object] = {}
 
     async def record_feedback(_session: object, **kwargs: object) -> SemanticAnatomyFeedbackResult:
@@ -98,12 +207,7 @@ def test_owner_can_record_anatomy_feedback_through_api(
     monkeypatch.setattr(
         review_routes,
         "_semantic_gate_configuration",
-        lambda _request: ("a" * 64, 900_000, SemanticEnforcementMode.SHADOW),
-    )
-    monkeypatch.setattr(
-        review_routes,
-        "semantic_feedback_target_belongs_to_review",
-        _feedback_target_exists,
+        lambda _request: (_TEST_SEMANTIC_PROFILE, 900_000, SemanticEnforcementMode.SHADOW),
     )
     monkeypatch.setattr(
         review_routes,
@@ -144,6 +248,59 @@ def test_owner_can_record_anatomy_feedback_through_api(
         "issue_code": None,
         "note": None,
     }
+
+
+@pytest.mark.parametrize(
+    ("terminal_state", "expected_form_count"),
+    (
+        (ReviewTaskState.COMPLETED, 1),
+        (ReviewTaskState.CANCELLED, 0),
+    ),
+)
+def test_owner_feedback_controls_are_available_after_completion_but_not_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_state: ReviewTaskState,
+    expected_form_count: int,
+) -> None:
+    context = asyncio.run(
+        _seed_review_api(_settings(tmp_path / f"anatomy-feedback-{terminal_state.value}.db"))
+    )
+    task_id = asyncio.run(_create_task(context))
+    assessment_id = asyncio.run(_add_completed_assessment(context))
+    asyncio.run(
+        _close_review_task(
+            context,
+            task_id=task_id,
+            target_state=terminal_state,
+        )
+    )
+    monkeypatch.setattr(
+        dashboard_routes,
+        "_configured_semantic_profile_sha256",
+        lambda _settings: _TEST_SEMANTIC_PROFILE,
+    )
+
+    action = f"/dashboard/review-tasks/{task_id}/anatomy-feedback"
+    app = create_app(context.settings)
+    with TestClient(app, base_url=ORIGIN, client=("192.0.2.115", 50000)) as client:
+        app.state.object_store = SameOriginReviewStore()
+        _login(
+            client,
+            context.users[AdminRole.OWNER],
+            csrf_cookie_name=context.settings.auth_csrf_cookie_name,
+        )
+        page = client.get(f"/dashboard/review-tasks/{task_id}")
+
+    assert page.status_code == 200
+    forms = _forms(page.text, action)
+    assert len(forms) == expected_form_count
+    if terminal_state == ReviewTaskState.COMPLETED:
+        assert forms[0].fields["assessment_id"] == str(assessment_id)
+        assert forms[0].fields["csrf_token"]
+        assert len(forms[0].fields["csrf_token"]) > 10
+    else:
+        assert "This task is cancelled and is now read-only" in page.text
 
 
 def test_dashboard_feedback_is_owner_only_and_ignores_issue_for_good_label(
@@ -401,3 +558,129 @@ def test_review_page_renders_prediction_details_saved_feedback_and_quick_actions
     assert "Applied threshold" in page.text
     assert "90.0%" in page.text
     assert "Latest candidate" in page.text
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (
+        SemanticEnforcementMode.SHADOW,
+        SemanticEnforcementMode.ASSIST,
+        SemanticEnforcementMode.ENFORCE,
+    ),
+)
+def test_review_page_distinguishes_missing_and_active_anatomy_states(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: SemanticEnforcementMode,
+) -> None:
+    context = asyncio.run(_seed_review_api(_settings(tmp_path / f"anatomy-status-{mode.value}.db")))
+    task_id = asyncio.run(_create_task(context))
+    visible_assessments: dict[UUID, SemanticReviewAssessment] = {}
+
+    async def load_assessments(*_args: object, **_kwargs: object) -> object:
+        return visible_assessments
+
+    async def load_feedback(*_args: object, **_kwargs: object) -> object:
+        return {}
+
+    monkeypatch.setattr(
+        dashboard_routes,
+        "_configured_semantic_profile_sha256",
+        lambda _settings: "a" * 64,
+    )
+    monkeypatch.setattr(
+        dashboard_routes,
+        "_semantic_mode",
+        lambda _settings: mode.value,
+    )
+    monkeypatch.setattr(
+        dashboard_routes,
+        "load_semantic_review_assessments",
+        load_assessments,
+    )
+    monkeypatch.setattr(
+        dashboard_routes,
+        "load_semantic_anatomy_feedback",
+        load_feedback,
+    )
+
+    settings = context.settings.model_copy(update={"semantic_anatomy_mode": mode})
+    app = create_app(settings)
+    with TestClient(app, base_url=ORIGIN, client=("192.0.2.114", 50000)) as client:
+        app.state.object_store = SameOriginReviewStore()
+        _login(
+            client,
+            context.users[AdminRole.OWNER],
+            csrf_cookie_name=settings.auth_csrf_cookie_name,
+        )
+
+        missing = client.get(f"/dashboard/review-tasks/{task_id}")
+        assert missing.status_code == 200
+        assert "Anatomy check:" in missing.text
+        assert "not scheduled" in missing.text
+        assert "not yet scheduled for the current anatomy model" in missing.text
+        assert "queued or not yet created" not in missing.text
+        assert "data-anatomy-feedback-form" not in missing.text
+        if mode == SemanticEnforcementMode.ENFORCE:
+            assert (
+                "Review completion is blocked until this check completes or becomes unavailable"
+                in missing.text
+            )
+            assert "This check does not block review completion" not in missing.text
+        else:
+            assert (
+                f"This check does not block review completion in {mode.value} mode" in missing.text
+            )
+            assert "Review completion is blocked until this check completes" not in missing.text
+
+        state_copy = {
+            SemanticAssessmentState.PENDING: (
+                "queued",
+                "queued and waiting for an anatomy worker",
+            ),
+            SemanticAssessmentState.PROCESSING: (
+                "processing",
+                "currently processing",
+            ),
+            SemanticAssessmentState.RETRY_WAIT: (
+                "waiting to retry",
+                "waiting for an automatic retry after a temporary failure",
+            ),
+        }
+        for state, (heading, detail) in state_copy.items():
+            visible_assessments.clear()
+            visible_assessments.update(
+                {
+                    asset_id: SemanticReviewAssessment(
+                        assessment_id=uuid4(),
+                        asset_id=asset_id,
+                        state=state,
+                        verdict=None,
+                        confidence_micros=None,
+                        issues=(),
+                        model_name="private/anatomy-vlm",
+                        model_revision="revision-123",
+                        completed_at=None,
+                        error_code=None,
+                    )
+                    for asset_id in context.asset_ids
+                }
+            )
+            page = client.get(f"/dashboard/review-tasks/{task_id}")
+
+            assert page.status_code == 200
+            assert heading in page.text
+            assert detail in page.text
+            assert "data-anatomy-feedback-form" not in page.text
+            assert "pending; decisions remain available but completion is blocked" not in page.text
+
+            if mode == SemanticEnforcementMode.ENFORCE:
+                assert (
+                    "Review completion is blocked until this check completes or becomes unavailable"
+                ) in page.text
+                assert "This check does not block review completion" not in page.text
+            else:
+                assert (
+                    f"This check does not block review completion in {mode.value} mode" in page.text
+                )
+                assert "Review completion is blocked until this check completes" not in page.text

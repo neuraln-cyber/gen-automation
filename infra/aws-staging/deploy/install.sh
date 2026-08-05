@@ -55,6 +55,9 @@ install -o root -g root -m 0755 \
 install -o root -g root -m 0755 \
   "$source_dir/activate-semantic-gateway.sh" \
   /usr/local/sbin/gen-automation-activate-semantic-gateway
+install -o root -g root -m 0755 \
+  "$source_dir/promote-semantic-anatomy.sh" \
+  /usr/local/sbin/gen-automation-promote-semantic-anatomy
 install -o root -g root -m 0644 \
   "$source_dir/gen-automation-staging.service" \
   /etc/systemd/system/gen-automation-staging.service

@@ -1,8 +1,11 @@
 import re
+import shlex
+import textwrap
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "deploy-staging.yml"
+SEMANTIC_PROMOTION_WORKFLOW = ROOT / ".github" / "workflows" / "promote-semantic-anatomy.yml"
 DEPLOY = ROOT / "infra" / "aws-staging" / "deploy"
 
 
@@ -20,6 +23,10 @@ def _migration_validator() -> str:
 
 def _semantic_activator() -> str:
     return (DEPLOY / "activate-semantic-gateway.sh").read_text(encoding="utf-8")
+
+
+def _semantic_promoter() -> str:
+    return (DEPLOY / "promote-semantic-anatomy.sh").read_text(encoding="utf-8")
 
 
 def test_staging_rollout_follows_only_successful_immutable_publication() -> None:
@@ -219,3 +226,120 @@ def test_semantic_gateway_activation_is_pinned_bounded_atomic_and_reversible() -
     assert "used outside the managed semantic gateway" in activator
     assert "loopback gateway port 8091 is already in use" not in activator
     assert "gen-automation-activate-semantic-gateway" in installer
+
+
+def test_semantic_anatomy_promotion_is_shadow_only_monotonic_and_reversible() -> None:
+    promoter = _semantic_promoter()
+    installer = (DEPLOY / "install.sh").read_text(encoding="utf-8")
+
+    assert "default_max_assessments=400" in promoter
+    assert "max_initial_backlog=1000" in promoter
+    assert "max assessments must be an integer from 1 through 1000" in promoter
+    assert 'operation="status"' in promoter
+    assert "--dry-run)" in promoter
+    assert "--promote)" in promoter
+    assert "--pause)" in promoter
+    assert 'GEN_AUTOMATION_SEMANTIC_ANATOMY_ENABLED": "true"' in promoter
+    assert 'GEN_AUTOMATION_SEMANTIC_ANATOMY_MODE": "shadow"' in promoter
+    assert 'GEN_AUTOMATION_SEMANTIC_ANATOMY_ASSET_ALLOWLIST": "[]"' in promoter
+    assert 'updates = {"GEN_AUTOMATION_SEMANTIC_ANATOMY_ENABLED": "false"}' in promoter
+    assert "requested cap $requested_max would lower the current cap $current_max" in promoter
+    assert "flock --exclusive --wait 60 8" in promoter
+    assert "flock --exclusive --wait 60 9" in promoter
+    assert "for _ in $(seq 1 50)" in promoter
+    assert promoter.count("--max-time 2") >= 3
+    assert "sleep 3" in promoter
+    assert 'mktemp "$config_root/.control-plane.env.semantic.update.' in promoter
+    assert 'mv -- "$temporary_env" "$controller_env"' in promoter
+    assert "restore_previous_environment" in promoter
+    assert 'mv -- "$backup_env" "$controller_env"' in promoter
+    assert "restore_previous_environment || rollback_failed=1" in promoter
+    assert "Rollback copy preserved at $backup_env." in promoter
+    assert '[ "$rollback_failed" -eq 1 ]' in promoter
+    assert 'systemctl restart --no-block "$service_name"' in promoter
+    assert "http://127.0.0.1:8091/health/ready" in promoter
+    assert "http://127.0.0.1:8000/api/v1/health/ready" in promoter
+    assert "semantic_anatomy_asset_allowlist_count=" in promoter
+    assert "semantic_anatomy_configured_per_scoring_run_cap=" in promoter
+    assert '("pending", "processing", "retry_wait", "completed", "unavailable")' in promoter
+    assert "semantic_current_profile_{state}_count=" in promoter
+    assert "semantic_successful_canary_gate=" in promoter
+    assert "promotion requires at least one completed current-profile canary assessment" in promoter
+    assert "semantic_open_review_task_count=" in promoter
+    assert "semantic_open_review_ranked_asset_count=" in promoter
+    assert "semantic_open_review_missing_current_profile_count=" in promoter
+    assert "semantic_projected_new_assessment_count=" in promoter
+    assert "semantic_projected_attempt_ceiling=" in promoter
+    assert "semantic_initial_backlog_guard=" in promoter
+    assert "semantic_initial_backlog_guard_limit=" in promoter
+    assert "min(int(missing), max(0, projection_cap - int(existing)))" in promoter
+    assert "GROUP BY score.scoring_run_id" in promoter
+    assert "projected initial backlog $projected_count exceeds the hard limit" in promoter
+    assert 'os.environ["GEN_AUTOMATION_BACKGROUND_SEMANTIC_MAX_ATTEMPTS"]' in promoter
+    assert "docker compose" in promoter
+    assert '[ -x /usr/bin/docker ] || fail "/usr/bin/docker is required"' in promoter
+    assert "exec --no-TTY control-plane-mega" in promoter
+    assert 'GEN_AUTOMATION_DATABASE_URL"]' in promoter
+    assert 'print(f"semantic_profile_sha256=' in promoter
+    assert 'fail "$operation requires --expected-control-plane-revision"' in promoter
+    assert promoter.count('actual_revision="$(control_plane_revision)"') == 2
+    assert "control_plane_source_revision=" in promoter
+    assert "org.opencontainers.image.revision" in promoter
+    assert "GEN_AUTOMATION_SEMANTIC_GATEWAY_UPSTREAM_API_KEY" not in promoter
+    assert "existing rows were preserved" in promoter
+    paused_branch = promoter.rsplit('if [ "$operation" = "pause" ]; then', maxsplit=1)[1].split(
+        "else", maxsplit=1
+    )[0]
+    assert "rollback_armed=0" in paused_branch
+    assert "wait_for_stack" not in paused_branch
+    assert "control_plane_health=$(health_status" in paused_branch
+    assert "semantic_gateway_health=$(health_status" in paused_branch
+    assert "gen-automation-promote-semantic-anatomy" in installer
+    assert '"$source_dir/promote-semantic-anatomy.sh"' in installer
+
+    coverage_program = promoter.split("coverage_program <<'PY' || true\n", maxsplit=1)[1].split(
+        "\nPY\n", maxsplit=1
+    )[0]
+    compile(coverage_program, "semantic-anatomy-coverage-status", "exec")
+
+
+def test_semantic_anatomy_promotion_workflow_uses_pinned_oidc_ssm_dispatch() -> None:
+    workflow = SEMANTIC_PROMOTION_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "workflow_dispatch:" in workflow
+    assert "default: dry-run" in workflow
+    assert 'default: "400"' in workflow
+    assert "assessment cap (1-1000)" in workflow
+    assert "timeout-minutes: 25" in workflow
+    assert "status|dry-run|promote|pause" in workflow
+    assert '"pause": "--pause"' in workflow
+    assert "github.ref == 'refs/heads/main'" in workflow
+    assert "id-token: write" in workflow
+    assert "contents: read" in workflow
+    assert "packages: write" not in workflow
+    assert (
+        "aws-actions/configure-aws-credentials@acca2b1b2070338fb9fd1ca27ecee81d687e58e5"
+    ) in workflow
+    assert "role-to-assume: ${{ vars.AWS_STAGING_DEPLOY_ROLE_ARN }}" in workflow
+    assert 'allowed-account-ids: "861912887470"' in workflow
+    assert "role-duration-seconds: 1800" in workflow
+    assert "--timeout-seconds 1200" in workflow
+    assert "for _ in $(seq 1 250)" in workflow
+    assert "aws ssm send-command" in workflow
+    assert "AWS-RunShellScript" in workflow
+    assert "raw.githubusercontent.com/neuraln-cyber/gen-automation/" in workflow
+    assert "SSM_SCRIPT_SHA256" in workflow
+    assert "sha256sum --check --status" in workflow
+    assert "promote-semantic-anatomy.sh" in workflow
+    assert "--expected-control-plane-revision" in workflow
+    assert 'if operation in {"dry-run", "promote"}' in workflow
+    assert "AWS_ACCESS_KEY_ID" not in workflow
+    assert "AWS_SECRET_ACCESS_KEY" not in workflow
+    assert "secrets.AWS" not in workflow
+
+    embedded = textwrap.dedent(
+        workflow.split("python3 -c '", maxsplit=1)[1].split('\' >"$parameters_file"', maxsplit=1)[0]
+    )
+    command = shlex.split(f"python3 -c '{embedded}'", posix=True)
+    assert command[:2] == ["python3", "-c"]
+    compile(command[2], "semantic-anatomy-ssm-command", "exec")

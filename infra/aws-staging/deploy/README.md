@@ -76,6 +76,65 @@ AWS SSM port-forward to `127.0.0.1:6080` to complete Patreon login in the
 cloud-hosted browser. The executable sequence is in
 `docs/patreon-browser-publisher.md`; no public VNC/noVNC ingress is required.
 
+### Promote semantic anatomy beyond the canary
+
+The gateway activator deliberately leaves anatomy disabled with a zero cap. After
+the bounded canary has proved the pinned RunPod endpoint and gateway contract,
+use the **Promote semantic anatomy coverage** GitHub Actions workflow. It uses the
+existing short-lived GitHub OIDC deployment role and AWS Systems Manager; no
+local AWS login or long-lived AWS key is needed.
+
+Run `status` first, then `dry-run`, and finally `promote`. Promotion requires at
+least one completed assessment for the current model/prompt profile, so a merely
+healthy gateway cannot bypass the successful-canary gate. The default
+per-scoring-run cap is 400 assessments, matching a typical master set, and the
+promotion command accepts an explicit bound no higher than 1,000. Promotion always
+keeps `shadow` mode, clears the canary UUID allowlist, and only permits the cap to
+move upward. It does not enable enforcement or make a paid inference request as part
+of the deployment command. The already-running background loop consumes the new
+allowance, and the scale-to-zero provider may bill those assessments.
+
+The equivalent command from a private root SSM session is:
+
+```console
+sudo /usr/local/sbin/gen-automation-promote-semantic-anatomy --status
+sudo /usr/local/sbin/gen-automation-promote-semantic-anatomy \
+  --dry-run --max-assessments 400 \
+  --expected-control-plane-revision <40-hex-deployed-main-revision>
+sudo /usr/local/sbin/gen-automation-promote-semantic-anatomy \
+  --promote --max-assessments 400 \
+  --expected-control-plane-revision <40-hex-deployed-main-revision>
+sudo /usr/local/sbin/gen-automation-promote-semantic-anatomy --pause
+```
+
+The promotion is atomic and idempotent. It serializes against gateway activation
+and control-plane updates, validates the existing gateway before mutation,
+restarts the service, requires both gateway and controller readiness, and restores
+the previous root-owned environment file if readiness fails. `status` reports only
+non-secret mode/cap/allowlist-count and health values, current-profile assessment
+counts by state, open-review totals, and the number of open-review images that do
+not yet have a row for the current profile. It also projects the number of new
+assessment rows under the promoted empty allowlist and the maximum provider-attempt
+ceiling using the configured attempts per assessment, making spend exposure visible
+before promotion. The projection applies the planned cap independently to each
+scoring run, and promotion refuses an aggregate initial backlog above 1,000 new
+assessment rows. The legacy environment variable retains `PER_PROFILE` in its name
+for deployment compatibility. The GitHub workflow also binds
+promotion to its exact deployed control-plane source revision, so dispatching while
+the automatic rollout is still pending fails without changing configuration. Status
+never prints asset IDs or a database credential.
+
+Dispatch the workflow's `pause` operation at any time to stop new semantic
+assessment work. It uses the same keyless GitHub OIDC/SSM path, requires no local
+AWS login or RunPod key, does not wait for staging to catch up to the workflow
+revision, and changes only `GEN_AUTOMATION_SEMANTIC_ANATOMY_ENABLED=false`.
+Existing assessment and feedback rows, the configured cap, and the allowlist are
+preserved. The command is atomic, restarts the controller, reports readiness,
+and uses the same rollback path for configuration validation. After a disabled
+configuration validates, pause never restores `enabled=true` merely because the
+controller or gateway is already unhealthy; it reports both health states instead.
+A later successful `promote` resumes processing.
+
 After migrations complete, run the TTY-only initial owner enrollment from a
 private interactive SSM session:
 

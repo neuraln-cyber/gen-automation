@@ -1,0 +1,157 @@
+name: Promote semantic anatomy coverage
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Read status, preview, promote, or pause staging anatomy
+        required: true
+        type: choice
+        default: dry-run
+        options:
+          - status
+          - dry-run
+          - promote
+          - pause
+      max_assessments:
+        description: Monotonic per-scoring-run assessment cap (1-1000)
+        required: true
+        type: string
+        default: "400"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: promote-semantic-anatomy-staging
+  cancel-in-progress: false
+
+jobs:
+  staging:
+    name: ${{ inputs.operation }} staging anatomy coverage
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      AWS_REGION: eu-central-1
+      AWS_STAGING_INSTANCE_ID: ${{ vars.AWS_STAGING_INSTANCE_ID }}
+      OPERATION: ${{ inputs.operation }}
+      MAX_ASSESSMENTS: ${{ inputs.max_assessments }}
+      SOURCE_REVISION: ${{ github.sha }}
+    steps:
+      - name: Check out the exact workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate bounded public inputs
+        shell: bash
+        env:
+          AWS_STAGING_DEPLOY_ROLE_ARN: ${{ vars.AWS_STAGING_DEPLOY_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$MAX_ASSESSMENTS" =~ ^[1-9][0-9]{0,3}$ ]]
+          [ "$MAX_ASSESSMENTS" -le 1000 ]
+          case "$OPERATION" in status|dry-run|promote|pause) ;; *) exit 1 ;; esac
+          [[ "$AWS_STAGING_INSTANCE_ID" =~ ^i-[0-9a-f]{8,17}$ ]]
+          [[ "$AWS_STAGING_DEPLOY_ROLE_ARN" =~ ^arn:aws:iam::861912887470:role/[A-Za-z0-9+=,.@_/-]+$ ]]
+          script_path="infra/aws-staging/deploy/promote-semantic-anatomy.sh"
+          printf 'SCRIPT_SHA256=%s\n' "$(sha256sum "$script_path" | cut -d' ' -f1)" >>"$GITHUB_ENV"
+
+      - name: Exchange GitHub OIDC identity for the staging deploy role
+        uses: aws-actions/configure-aws-credentials@acca2b1b2070338fb9fd1ca27ecee81d687e58e5 # v6.1.2
+        with:
+          role-to-assume: ${{ vars.AWS_STAGING_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+          allowed-account-ids: "861912887470"
+          role-duration-seconds: 1800
+          role-session-name: gen-automation-anatomy-${{ github.run_id }}
+
+      - name: Run the pinned promotion command through Systems Manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          parameters_file="$RUNNER_TEMP/semantic-anatomy-parameters.json"
+          SSM_INSTANCE_ID="$AWS_STAGING_INSTANCE_ID" \
+          SSM_OPERATION="$OPERATION" \
+          SSM_MAX="$MAX_ASSESSMENTS" \
+          SSM_REVISION="$SOURCE_REVISION" \
+          SSM_SCRIPT_SHA256="$SCRIPT_SHA256" \
+            python3 -c '
+          import json
+          import os
+          import shlex
+
+          operation = os.environ["SSM_OPERATION"]
+          maximum = os.environ["SSM_MAX"]
+          revision = os.environ["SSM_REVISION"]
+          checksum = os.environ["SSM_SCRIPT_SHA256"]
+          source = (
+              "https://raw.githubusercontent.com/neuraln-cyber/gen-automation/"
+              f"{revision}/infra/aws-staging/deploy/promote-semantic-anatomy.sh"
+          )
+          flag = {
+              "status": "--status",
+              "dry-run": "--dry-run",
+              "promote": "--promote",
+              "pause": "--pause",
+          }[operation]
+          revision_guard = (
+              f" --expected-control-plane-revision {shlex.quote(revision)}"
+              if operation in {"dry-run", "promote"}
+              else ""
+          )
+          inner = (
+              "set -Eeuo pipefail; "
+              "script_file=$(/usr/bin/mktemp); "
+              "trap '\''/usr/bin/rm -f -- \"$script_file\"'\'' EXIT; "
+              "/usr/bin/curl --fail --location --proto '\''=https'\'' --proto-redir '\''=https'\'' "
+              "--retry 3 --retry-all-errors --silent --show-error "
+              f"--output \"$script_file\" {shlex.quote(source)}; "
+              f"printf '\''%s  %s\\n'\'' {shlex.quote(checksum)} \"$script_file\" | "
+              "/usr/bin/sha256sum --check --status; "
+              f"/usr/bin/bash \"$script_file\" {flag} --max-assessments {shlex.quote(maximum)} "
+              f"{revision_guard}"
+          )
+          command = f"sudo /usr/bin/bash -c {shlex.quote(inner)}"
+          print(json.dumps({"commands": [command]}))
+          ' >"$parameters_file"
+
+          command_id="$(
+            aws ssm send-command \
+              --region "$AWS_REGION" \
+              --instance-ids "$AWS_STAGING_INSTANCE_ID" \
+              --document-name AWS-RunShellScript \
+              --comment "Semantic anatomy ${OPERATION} at ${SOURCE_REVISION}" \
+              --timeout-seconds 1200 \
+              --parameters "file://${parameters_file}" \
+              --query 'Command.CommandId' \
+              --output text
+          )"
+
+          final_status=""
+          for _ in $(seq 1 250); do
+            final_status="$(
+              aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$command_id" \
+                --instance-id "$AWS_STAGING_INSTANCE_ID" \
+                --query 'Status' \
+                --output text 2>/dev/null || true
+            )"
+            case "$final_status" in
+              Success|Cancelled|TimedOut|Failed|Cancelling) break ;;
+            esac
+            sleep 5
+          done
+
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$command_id" \
+            --instance-id "$AWS_STAGING_INSTANCE_ID" \
+            --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
+            --output json
+          [ "$final_status" = "Success" ] || {
+            printf '%s\n' "SSM anatomy command finished with status: ${final_status:-unknown}" >&2
+            exit 1
+          }
