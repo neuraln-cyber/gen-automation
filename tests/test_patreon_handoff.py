@@ -172,9 +172,7 @@ def test_large_set_is_split_deterministically_with_one_ordered_manifest() -> Non
     assert duplicate.sha256 == parts[1].sha256
 
     manifest = json.loads(set_manifest_bytes)
-    assert [record["ordinal"] for record in manifest["approved_derivatives"]] == list(
-        range(1, 401)
-    )
+    assert [record["ordinal"] for record in manifest["approved_derivatives"]] == list(range(1, 401))
     for part in parts:
         with ZipFile(BytesIO(part.archive_bytes)) as archive:
             assert archive.read("set-manifest.json") == set_manifest_bytes
