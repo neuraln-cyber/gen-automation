@@ -225,7 +225,7 @@ jobs:
           worker_image = os.environ["SSM_WORKER_IMAGE_REF"]
           revision = os.environ["SSM_SOURCE_REVISION"]
           runtime_env = "/etc/gen-automation/control-plane.env"
-          runtime_env_backup = f"/run/gen-automation/control-plane.env.{revision}.rollback"
+          runtime_env_backup = f"{runtime_env}.{revision}.rollback"
           worker_image_key = "GEN_AUTOMATION_SALAD_WORKER_IMAGE"
           update_worker_image = """
           import os

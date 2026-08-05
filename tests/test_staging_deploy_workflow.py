@@ -120,7 +120,7 @@ def test_ssm_command_contains_only_public_immutable_coordinates() -> None:
     assert "--image" in command_block
     assert "--revision" in command_block
     assert "GEN_AUTOMATION_SALAD_WORKER_IMAGE" in workflow
-    assert "control-plane.env.{revision}.rollback" in workflow
+    assert 'runtime_env_backup = f"{runtime_env}.{revision}.rollback"' in workflow
     assert "tempfile.mkstemp" in workflow
     assert "os.replace(temporary, path)" in workflow
     assert "restore_runtime_env" in workflow
