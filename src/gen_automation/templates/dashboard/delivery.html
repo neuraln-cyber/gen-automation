@@ -109,6 +109,61 @@
     {% endif %}
   </section>
 
+  {% if delivery.progress.ready_for_destinations or finished_set_destination %}
+    <section class="panel review-entry" aria-labelledby="finished-set-heading">
+      <div class="step-heading">
+        <span class="step-number" aria-hidden="true">ZIP</span>
+        <div>
+          <h2 id="finished-set-heading">Download finished ranked set</h2>
+          <p class="muted">
+            Clean, unwatermarked images are numbered in final rank order under
+            <code>content/</code>. Each ZIP also includes the shared ordered manifest.
+          </p>
+        </div>
+      </div>
+      {% if finished_set_destination %}
+        <div class="decision-form" aria-label="Finished ranked set ZIP files">
+          {% for package_part in finished_set_destination.package_parts %}
+            <form
+              method="post"
+              action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/finished-set/{{ finished_set_destination.intent_id }}:download"
+            >
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input
+                type="hidden"
+                name="expected_intent_digest"
+                value="{{ finished_set_destination.intent_digest }}"
+              >
+              <input
+                type="hidden"
+                name="expected_lock_version"
+                value="{{ finished_set_destination.intent_lock_version }}"
+              >
+              <input type="hidden" name="part_number" value="{{ package_part.part_number }}">
+              <button class="primary-button" type="submit">
+                {% if package_part.part_count == 1 %}
+                  Download finished ranked set (.zip)
+                {% else %}
+                  Download ZIP part {{ package_part.part_number }} / {{ package_part.part_count }}
+                  (images {{ package_part.first_ordinal }}–{{ package_part.last_ordinal }})
+                {% endif %}
+              </button>
+            </form>
+          {% endfor %}
+        </div>
+        <p class="muted">
+          Large sets are split into deterministic 100-image parts so downloads remain
+          reliable. Every part carries the same set manifest and preserves global order.
+        </p>
+      {% else %}
+        <p class="terminal-state" role="status">
+          Prepare destinations once to materialize the immutable ZIP package. It then
+          remains downloadable here after Patreon or MEGA publishing completes.
+        </p>
+      {% endif %}
+    </section>
+  {% endif %}
+
   {% if delivery.x_selected_count and not delivery.progress.planned %}
     <section class="panel review-entry" aria-labelledby="watermark-heading">
       <h2 id="watermark-heading">Add a watermark</h2>
@@ -243,31 +298,6 @@
             {{ destination.state.replace("_", " ") }}
           </span>
           <p class="muted">{{ destination.detail }}</p>
-          {% if destination.key == "patreon" and destination.state == "ready" %}
-            {% for package_part in destination.package_parts %}
-            <form
-              method="post"
-              action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/patreon/{{ destination.intent_id }}:download"
-            >
-              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-              <input
-                type="hidden"
-                name="expected_intent_digest"
-                value="{{ destination.intent_digest }}"
-              >
-              <input
-                type="hidden"
-                name="expected_lock_version"
-                value="{{ destination.intent_lock_version }}"
-              >
-              <input type="hidden" name="part_number" value="{{ package_part.part_number }}">
-              <button class="secondary-button" type="submit">
-                Download part {{ package_part.part_number }} / {{ package_part.part_count }}
-                (images {{ package_part.first_ordinal }}–{{ package_part.last_ordinal }})
-              </button>
-            </form>
-            {% endfor %}
-          {% endif %}
           {% if destination.key == "patreon" and destination.state in ["ready", "unknown"] %}
             <div class="decision-form">
               <h3>

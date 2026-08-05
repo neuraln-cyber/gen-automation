@@ -293,7 +293,8 @@ async def test_unknown_patreon_absent_opens_download_without_retry(
     assert audit is not None
     assert audit.detail["authorization_basis"] == "confirmed_absent_reconciliation"
     assert next(item for item in after.destinations if item.key == "patreon").state == "ready"
-    assert f"/patreon/{context.intent_id}:download" in recovered_html
+    assert f"/finished-set/{context.intent_id}:download" in recovered_html
+    assert "Download finished ranked set (.zip)" in recovered_html
     assert f"/patreon/{context.intent_id}:confirm-present" in recovered_html
     assert f"/patreon/{context.intent_id}:confirm-absent" not in recovered_html
 

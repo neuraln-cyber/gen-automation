@@ -5,6 +5,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -33,6 +34,7 @@ from gen_automation.db.models import (
     Release,
     ReleaseSelection,
     ReleaseVersion,
+    ReviewTask,
     ReviewXSelection,
 )
 from gen_automation.domain.canonical import canonical_json_bytes, canonical_sha256
@@ -53,6 +55,7 @@ from gen_automation.domain.enums import (
     PublicationStepState,
     PublicationTarget,
     ReleasePhase,
+    ReviewTaskState,
 )
 from gen_automation.domain.ids import uuid7
 from gen_automation.domain.release_spec import ReleaseSpecification
@@ -198,6 +201,23 @@ class PublicationReconciliationResult:
 
 @dataclass(frozen=True, slots=True)
 class PatreonPackageDownloadResult:
+    intent_id: UUID
+    package_id: UUID
+    url: str
+    filename: str
+    sha256: str
+    manifest_sha256: str
+    byte_size: int
+    expires_at: datetime
+    part_number: int
+    part_count: int
+    first_ordinal: int
+    last_ordinal: int
+
+
+@dataclass(frozen=True, slots=True)
+class FinishedSetPackageDownloadResult:
+    review_task_id: UUID
     intent_id: UUID
     package_id: UUID
     url: str
@@ -1511,6 +1531,218 @@ async def presign_patreon_package_download(
             f"patreon-handoff-{intent.id}-part-"
             f"{package.part_number:03d}-of-{package.part_count:03d}.zip"
         ),
+        sha256=package.sha256,
+        manifest_sha256=package.manifest_sha256,
+        byte_size=package.byte_size,
+        expires_at=expires_at,
+        part_number=package.part_number,
+        part_count=package.part_count,
+        first_ordinal=package.first_ordinal,
+        last_ordinal=package.last_ordinal,
+    )
+
+
+async def presign_finished_set_package_download(
+    session: AsyncSession,
+    store: ObjectStore,
+    *,
+    review_task_id: UUID,
+    intent_id: UUID,
+    expected_intent_digest: str,
+    expected_lock_version: int,
+    actor_user_id: UUID,
+    actor_role: AdminRole | str,
+    expires_in_seconds: int = 300,
+    part_number: int = 1,
+    now: datetime | None = None,
+) -> FinishedSetPackageDownloadResult:
+    """Presign one immutable, ranked finished-set archive part for its owner.
+
+    The archive already exists as the clean Patreon/MEGA package.  This path is
+    intentionally read-only: publication state, effect approval expiry, and the
+    global publication guard do not govern an owner's access to their completed
+    set.
+    """
+
+    requested_at = _utc_now(now)
+    normalized_digest = _sha256(expected_intent_digest, "intent digest")
+    normalized_lock = _positive_int(
+        expected_lock_version,
+        "expected lock version",
+        1_000_000_000,
+    )
+    normalized_expiry = _bounded_int(
+        expires_in_seconds,
+        "download expiry seconds",
+        30,
+        900,
+    )
+    normalized_part_number = _bounded_int(
+        part_number,
+        "package part number",
+        1,
+        PATREON_MAX_ARCHIVE_PARTS,
+    )
+    actor = await _require_owner(
+        session,
+        actor_user_id,
+        asserted_role=actor_role,
+    )
+    review_task = await session.scalar(
+        select(ReviewTask).where(ReviewTask.id == review_task_id).with_for_update()
+    )
+    if review_task is None:
+        raise PublicationNotFoundError("completed review task was not found")
+    if review_task.state != ReviewTaskState.COMPLETED:
+        raise PublicationConflictError("finished-set download requires a completed review")
+
+    intent = await session.scalar(
+        select(PublicationIntent).where(PublicationIntent.id == intent_id).with_for_update()
+    )
+    if intent is None:
+        raise PublicationNotFoundError("publication intent was not found")
+    _require_expected_intent(intent, normalized_digest, normalized_lock)
+    if (
+        intent.target != PublicationTarget.PATREON
+        or intent.release_version_id != review_task.release_version_id
+    ):
+        raise PublicationConflictError(
+            "finished-set package does not belong to the completed review"
+        )
+    release, release_version = await _load_intent_release(session, intent, lock=True)
+    if (
+        release_version.id != review_task.release_version_id
+        or release_version.release_id != release.id
+        or intent.release_id != release.id
+    ):
+        raise PublicationConflictError(
+            "finished-set package release snapshot does not match the completed review"
+        )
+
+    review_selection_ids = tuple(
+        (
+            await session.scalars(
+                select(ReleaseSelection.id)
+                .where(ReleaseSelection.review_task_id == review_task.id)
+                .order_by(ReleaseSelection.display_order)
+            )
+        ).all()
+    )
+    publication_selection_ids = tuple(
+        (
+            await session.scalars(
+                select(DerivativeOutput.release_selection_id)
+                .join(
+                    PublicationInput,
+                    PublicationInput.derivative_output_id == DerivativeOutput.id,
+                )
+                .where(
+                    PublicationInput.intent_id == intent.id,
+                    PublicationInput.role == "patreon_content",
+                )
+                .order_by(PublicationInput.ordinal)
+            )
+        ).all()
+    )
+    if not review_selection_ids or publication_selection_ids != review_selection_ids:
+        raise PublicationConflictError(
+            "finished-set package inputs do not match the completed ranked selection"
+        )
+
+    packages = tuple(
+        (
+            await session.scalars(
+                select(PublicationPackage)
+                .where(PublicationPackage.intent_id == intent.id)
+                .order_by(PublicationPackage.part_number)
+            )
+        ).all()
+    )
+    if (
+        not packages
+        or len(packages) > PATREON_MAX_ARCHIVE_PARTS
+        or tuple(package.part_number for package in packages) != tuple(range(1, len(packages) + 1))
+        or any(package.part_count != len(packages) for package in packages)
+        or len({package.manifest_sha256 for package in packages}) != 1
+        or packages[0].first_ordinal != 1
+        or packages[-1].last_ordinal != len(review_selection_ids)
+        or any(
+            current.last_ordinal + 1 != following.first_ordinal
+            for current, following in pairwise(packages)
+        )
+        or normalized_part_number > len(packages)
+    ):
+        raise PublicationConflictError("finished-set package parts are incomplete")
+    package = packages[normalized_part_number - 1]
+    if store.backend != package.storage_backend or store.bucket != package.storage_bucket:
+        raise PublicationConflictError("finished-set package storage is unavailable")
+
+    expires_at = requested_at + timedelta(seconds=normalized_expiry)
+    filename = (
+        f"finished-ranked-set-{review_task.id}.zip"
+        if package.part_count == 1
+        else (
+            f"finished-ranked-set-{review_task.id}-part-"
+            f"{package.part_number:03d}-of-{package.part_count:03d}.zip"
+        )
+    )
+    session.add(
+        _audit(
+            actor_id=actor.id,
+            action="review.finished_set_package_download_authorized",
+            resource_id=intent.id,
+            correlation_id=f"finished-set-package:{review_task.id}:{package.id}",
+            detail={
+                "review_task_id": str(review_task.id),
+                "intent_digest": intent.intent_digest,
+                "package_id": str(package.id),
+                "package_sha256": package.sha256,
+                "manifest_sha256": package.manifest_sha256,
+                "part_number": package.part_number,
+                "part_count": package.part_count,
+                "first_ordinal": package.first_ordinal,
+                "last_ordinal": package.last_ordinal,
+                "expires_at": _canonical_datetime(expires_at),
+                "authorization_basis": "completed_review_owner",
+            },
+            now=requested_at,
+        )
+    )
+    await session.commit()
+
+    metadata = await store.head(package.object_key)
+    expected_metadata = {
+        "sha256": package.sha256,
+        "intent-digest": intent.intent_digest,
+        "manifest-sha256": package.manifest_sha256,
+        "part-number": str(package.part_number),
+        "part-count": str(package.part_count),
+        "first-ordinal": str(package.first_ordinal),
+        "last-ordinal": str(package.last_ordinal),
+        "publication-intent-id": str(intent.id),
+    }
+    if (
+        package.content_type != "application/zip"
+        or metadata is None
+        or metadata.key != package.object_key
+        or metadata.version_id != package.object_version_id
+        or metadata.byte_size != package.byte_size
+        or metadata.content_type != package.content_type
+        or any(metadata.metadata.get(key) != value for key, value in expected_metadata.items())
+    ):
+        raise PublicationConflictError("finished-set package storage snapshot is invalid")
+    url = await store.presign_download(
+        key=package.object_key,
+        version_id=package.object_version_id,
+        expires_in=normalized_expiry,
+        download_name=filename,
+    )
+    return FinishedSetPackageDownloadResult(
+        review_task_id=review_task.id,
+        intent_id=intent.id,
+        package_id=package.id,
+        url=url,
+        filename=filename,
         sha256=package.sha256,
         manifest_sha256=package.manifest_sha256,
         byte_size=package.byte_size,

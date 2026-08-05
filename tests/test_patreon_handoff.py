@@ -124,7 +124,7 @@ def test_large_set_is_split_deterministically_with_one_ordered_manifest() -> Non
             image_format="PNG",
             content_type="image/png",
         )
-        for ordinal in range(1, 206)
+        for ordinal in range(1, 401)
     )
     preview_record = PatreonSetImageRecord(
         ordinal=0,
@@ -156,22 +156,25 @@ def test_large_set_is_split_deterministically_with_one_ordered_manifest() -> Non
             part_number=part_number,
         )
 
-    parts = (build(1, 100), build(2, 100), build(3, 5))
+    parts = (build(1, 100), build(2, 100), build(3, 100), build(4, 100))
     duplicate = build(2, 100)
 
     assert tuple((part.first_ordinal, part.last_ordinal) for part in parts) == (
         (1, 100),
         (101, 200),
-        (201, 205),
+        (201, 300),
+        (301, 400),
     )
-    assert all(part.part_count == 3 for part in parts)
+    assert all(part.part_count == 4 for part in parts)
     assert all(part.set_manifest_bytes == set_manifest_bytes for part in parts)
     assert all(part.set_manifest_sha256 == set_manifest_sha256 for part in parts)
     assert duplicate.archive_bytes == parts[1].archive_bytes
     assert duplicate.sha256 == parts[1].sha256
 
     manifest = json.loads(set_manifest_bytes)
-    assert [record["ordinal"] for record in manifest["approved_derivatives"]] == list(range(1, 206))
+    assert [record["ordinal"] for record in manifest["approved_derivatives"]] == list(
+        range(1, 401)
+    )
     for part in parts:
         with ZipFile(BytesIO(part.archive_bytes)) as archive:
             assert archive.read("set-manifest.json") == set_manifest_bytes

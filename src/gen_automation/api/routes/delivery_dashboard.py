@@ -61,6 +61,7 @@ from gen_automation.services.publication import (
     PublicationConflictError,
     PublicationInputError,
     PublicationNotFoundError,
+    presign_finished_set_package_download,
     presign_patreon_package_download,
     reconcile_publication_absent,
     reconcile_publication_present,
@@ -188,6 +189,18 @@ async def dashboard_review_delivery(
         ),
         None,
     )
+    finished_set_destination = next(
+        (
+            destination
+            for destination in snapshot.destinations
+            if destination.key == "patreon"
+            and destination.intent_id is not None
+            and destination.intent_digest is not None
+            and destination.intent_lock_version is not None
+            and destination.package_parts
+        ),
+        None,
+    )
     patreon_present_key = None
     patreon_absent_key = None
     if patreon_confirmation is not None:
@@ -240,6 +253,7 @@ async def dashboard_review_delivery(
                 "patreon_absent_idempotency_key": patreon_absent_key,
                 "patreon_present_attestation": PUBLICATION_CONFIRM_PRESENT_ATTESTATION,
                 "patreon_absent_attestation": (PUBLICATION_CONFIRM_PATREON_ABSENT_ATTESTATION),
+                "finished_set_destination": finished_set_destination,
                 "storage_available": _store(request) is not None,
                 "publishing_enabled": settings.publishing_enabled,
                 "x_configured": settings.x_oauth_secret_reference is not None,
@@ -660,6 +674,11 @@ async def dashboard_download_patreon_package(
     try:
         form = await read_package_download_form(request)
         owner = await _verified_mutation_owner(request, session, principal, form.csrf_token)
+        await _require_review_patreon_intent(
+            session,
+            review_task_id=review_task_id,
+            intent_id=intent_id,
+        )
         result = await presign_patreon_package_download(
             session,
             store,
@@ -681,6 +700,58 @@ async def dashboard_download_patreon_package(
             principal,
             status.HTTP_409_CONFLICT,
             "The Patreon package is not currently available for download.",
+        )
+    return _secure(
+        request,
+        RedirectResponse(result.url, status_code=status.HTTP_303_SEE_OTHER),
+    )
+
+
+@router.post(
+    "/review-tasks/{review_task_id}/delivery/finished-set/{intent_id}:download",
+    response_class=HTMLResponse,
+    response_model=None,
+)
+async def dashboard_download_finished_set_package(
+    review_task_id: UUID,
+    intent_id: UUID,
+    request: Request,
+    session: Session,
+    principal: PublicationReader,
+) -> Response:
+    store = _store(request)
+    if store is None:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Private object storage is unavailable.",
+        )
+    try:
+        form = await read_package_download_form(request)
+        owner = await _verified_mutation_owner(request, session, principal, form.csrf_token)
+        result = await presign_finished_set_package_download(
+            session,
+            store,
+            review_task_id=review_task_id,
+            intent_id=intent_id,
+            expected_intent_digest=form.expected_intent_digest,
+            expected_lock_version=form.expected_lock_version,
+            actor_user_id=owner.user_id,
+            actor_role=owner.role,
+            expires_in_seconds=300,
+            part_number=form.part_number,
+        )
+    except BrowserDeliveryFormError as error:
+        return _form_error(request, principal, error.status_code, error.message)
+    except HTTPException:
+        return _form_error(request, principal, status.HTTP_403_FORBIDDEN, "Request denied.")
+    except (PublicationInputError, PublicationNotFoundError, PublicationConflictError):
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_409_CONFLICT,
+            "The finished ranked-set package is not currently available for download.",
         )
     return _secure(
         request,
