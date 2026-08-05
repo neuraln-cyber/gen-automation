@@ -1065,9 +1065,7 @@ class ControllerWorkloads:
                 self.object_store,
                 worker_id=worker_id,
                 max_image_bytes=self.settings.storage_max_image_bytes,
-                verification_lease_seconds=(
-                    self.settings.storage_verification_lease_seconds
-                ),
+                verification_lease_seconds=(self.settings.storage_verification_lease_seconds),
             )
         if progressive.finalized:
             return True

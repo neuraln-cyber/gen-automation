@@ -409,9 +409,7 @@ def create_worker_app(
 
                 for output, content in sorted(outputs, key=lambda item: item[0].output_index):
                     output_index = (
-                        output.output_index
-                        if branch_output_index is None
-                        else branch_output_index
+                        output.output_index if branch_output_index is None else branch_output_index
                     )
                     grant = grants_by_index[output_index]
                     if output.media_type != grant.content_type:

@@ -586,9 +586,7 @@ def test_multi_prompt_job_executes_and_uploads_each_image_in_order() -> None:
             media_type: str,
         ) -> None:
             events.append(f"upload-{grant.output_index}")
-            self.uploads.append(
-                RecordedUpload(grant=grant, content=content, media_type=media_type)
-            )
+            self.uploads.append(RecordedUpload(grant=grant, content=content, media_type=media_type))
 
     request = _unsigned_request(uploads=3)
     request["payload"]["workflow"] = _progressive_workflow(3)
@@ -611,10 +609,7 @@ def test_multi_prompt_job_executes_and_uploads_each_image_in_order() -> None:
     assert [item["output_index"] for item in response.json()["outputs"]] == [0, 1, 2]
     assert len(executor.workflows) == 3
     assert all(
-        all(
-            node_id.startswith(f"output-{output_index:02d}-")
-            for node_id in workflow
-        )
+        all(node_id.startswith(f"output-{output_index:02d}-") for node_id in workflow)
         for output_index, workflow in enumerate(executor.workflows)
     )
     assert [upload.grant.output_index for upload in uploader.uploads] == [0, 1, 2]
