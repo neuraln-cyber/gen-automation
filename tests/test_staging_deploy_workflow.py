@@ -43,6 +43,9 @@ def test_staging_rollout_follows_only_successful_immutable_publication() -> None
     assert 'printf \'%s\\n\' "deploy=false" >>"$GITHUB_OUTPUT"' in workflow
     assert workflow.count("if: steps.main_gate.outputs.deploy == 'true'") == 4
     assert "control-plane-mega@sha256:[0-9a-f]{64}" in workflow
+    assert "gpu-worker@sha256:[0-9a-f]{64}" in workflow
+    assert "WORKER_IMAGE_REPOSITORY: ghcr.io/neuraln-cyber/gen-automation/gpu-worker" in workflow
+    assert "WORKER_IMAGE_REF=%s@%s" in workflow
     assert "org.opencontainers.image.revision" in workflow
 
 
@@ -116,6 +119,12 @@ def test_ssm_command_contains_only_public_immutable_coordinates() -> None:
     assert "gen-automation-update-control-plane" in command_block
     assert "--image" in command_block
     assert "--revision" in command_block
+    assert "GEN_AUTOMATION_SALAD_WORKER_IMAGE" in workflow
+    assert "control-plane.env.{revision}.rollback" in workflow
+    assert "tempfile.mkstemp" in workflow
+    assert "os.replace(temporary, path)" in workflow
+    assert "restore_runtime_env" in workflow
+    assert "systemctl restart --no-block gen-automation-staging.service" in workflow
     assert "/usr/bin/timeout --signal=TERM --kill-after=30s 600s" in command_block
     assert "/usr/bin/docker run --rm" in command_block
     assert "gen-automation-validate-migration-environment" in command_block
@@ -141,7 +150,6 @@ def test_ssm_command_contains_only_public_immutable_coordinates() -> None:
         "TOKEN",
         "PASSWORD",
         "SECRET",
-        "SALAD",
         "PATREON",
         "MEGA",
         "DATABASE",
