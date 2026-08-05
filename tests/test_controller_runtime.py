@@ -12,7 +12,10 @@ from gen_automation.controller.runtime import (
     ControllerRuntimeSnapshot,
     LoopSpec,
     RuntimeStatus,
+    build_controller_runtime,
 )
+from gen_automation.db.session import Database
+from gen_automation.storage.memory import MemoryObjectStore
 
 
 @pytest.mark.asyncio
@@ -53,6 +56,215 @@ async def test_runtime_contains_loop_failure_and_keeps_task_alive() -> None:
 
     await runtime.stop()
     assert runtime.snapshot().status == RuntimeStatus.STOPPED
+
+
+@pytest.mark.asyncio
+async def test_optional_initial_success_does_not_block_startup_readiness() -> None:
+    ordinary_completed = asyncio.Event()
+    cold_provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def ordinary_cycle() -> bool:
+        ordinary_completed.set()
+        return False
+
+    async def cold_provider_cycle() -> bool:
+        cold_provider_started.set()
+        await release_provider.wait()
+        return False
+
+    runtime = ControllerRuntime(
+        instance_id="controller-test-cold-provider-readiness",
+        loops=(
+            LoopSpec(
+                name="ordinary-loop",
+                cycle=ordinary_cycle,
+                idle_interval_seconds=1,
+                timeout_seconds=2,
+            ),
+            LoopSpec(
+                name="scale-to-zero-provider-loop",
+                cycle=cold_provider_cycle,
+                idle_interval_seconds=1,
+                timeout_seconds=2,
+                requires_initial_success_for_readiness=False,
+            ),
+        ),
+        shutdown_grace_seconds=0.1,
+        shutdown_cancel_seconds=0.1,
+        jitter=lambda: 0.5,
+    )
+    await runtime.start()
+    await asyncio.wait_for(ordinary_completed.wait(), timeout=1)
+    await asyncio.wait_for(cold_provider_started.wait(), timeout=1)
+    for _ in range(10):
+        snapshot = runtime.snapshot()
+        if snapshot.loops[0].last_success_at is not None:
+            break
+        await asyncio.sleep(0)
+
+    snapshot = runtime.snapshot()
+    ordinary, cold_provider = snapshot.loops
+    assert ordinary.last_success_at is not None
+    assert cold_provider.task_alive is True
+    assert cold_provider.last_success_at is None
+    assert snapshot.ready is True
+    assert snapshot.status == RuntimeStatus.HEALTHY
+
+    release_provider.set()
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_optional_initial_success_still_fails_readiness_after_repeated_errors() -> None:
+    ordinary_completed = asyncio.Event()
+    failure_threshold_reached = asyncio.Event()
+    release_failure = asyncio.Event()
+    failures = 0
+
+    async def ordinary_cycle() -> bool:
+        ordinary_completed.set()
+        return False
+
+    async def failing_provider_cycle() -> bool:
+        nonlocal failures
+        failures += 1
+        if failures == 3:
+            failure_threshold_reached.set()
+            await release_failure.wait()
+        raise RuntimeError("provider unavailable")
+
+    runtime = ControllerRuntime(
+        instance_id="controller-test-cold-provider-failures",
+        loops=(
+            LoopSpec(
+                name="ordinary-loop",
+                cycle=ordinary_cycle,
+                idle_interval_seconds=0.001,
+                timeout_seconds=0.1,
+            ),
+            LoopSpec(
+                name="scale-to-zero-provider-loop",
+                cycle=failing_provider_cycle,
+                idle_interval_seconds=0.001,
+                timeout_seconds=0.1,
+                requires_initial_success_for_readiness=False,
+            ),
+        ),
+        error_backoff_max_seconds=0.001,
+        shutdown_grace_seconds=0.01,
+        shutdown_cancel_seconds=0.02,
+        readiness_failure_threshold=2,
+        liveness_failure_threshold=4,
+        stale_after_seconds=1,
+        jitter=lambda: 0.5,
+    )
+    await runtime.start()
+    await asyncio.wait_for(ordinary_completed.wait(), timeout=1)
+    await asyncio.wait_for(failure_threshold_reached.wait(), timeout=1)
+
+    snapshot = runtime.snapshot()
+    provider = snapshot.loops[1]
+    assert provider.last_success_at is None
+    assert provider.consecutive_failures == 2
+    assert snapshot.ready is False
+    assert snapshot.live is True
+    assert snapshot.status == RuntimeStatus.DEGRADED
+
+    release_failure.set()
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_optional_initial_success_still_fails_readiness_when_stale() -> None:
+    ordinary_completed = asyncio.Event()
+    provider_timeout_started = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def ordinary_cycle() -> bool:
+        ordinary_completed.set()
+        return False
+
+    async def stuck_provider_cycle() -> bool:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            provider_timeout_started.set()
+            while not release_provider.is_set():
+                try:
+                    await release_provider.wait()
+                except asyncio.CancelledError:
+                    continue
+        return False
+
+    runtime = ControllerRuntime(
+        instance_id="controller-test-cold-provider-stale",
+        loops=(
+            LoopSpec(
+                name="ordinary-loop",
+                cycle=ordinary_cycle,
+                idle_interval_seconds=0.001,
+                timeout_seconds=0.01,
+            ),
+            LoopSpec(
+                name="scale-to-zero-provider-loop",
+                cycle=stuck_provider_cycle,
+                idle_interval_seconds=0.001,
+                timeout_seconds=0.01,
+                requires_initial_success_for_readiness=False,
+            ),
+        ),
+        error_backoff_max_seconds=0.001,
+        shutdown_grace_seconds=0.01,
+        shutdown_cancel_seconds=0.01,
+        stale_after_seconds=0.03,
+        jitter=lambda: 0.5,
+    )
+    await runtime.start()
+    await asyncio.wait_for(ordinary_completed.wait(), timeout=1)
+    await asyncio.wait_for(provider_timeout_started.wait(), timeout=1)
+
+    await asyncio.sleep(0.04)
+    snapshot = runtime.snapshot()
+    assert snapshot.loops[1].stale is True
+    assert snapshot.ready is False
+    assert snapshot.live is False
+
+    await runtime.stop()
+    release_provider.set()
+    await asyncio.wait_for(
+        asyncio.gather(*runtime._tasks.values(), return_exceptions=True),
+        timeout=1,
+    )
+
+
+def test_only_semantic_anatomy_loop_relaxes_initial_readiness_gate(tmp_path: Path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'semantic-runtime.db').as_posix()}")
+    settings = Settings(
+        environment=Environment.TEST,
+        background_runtime_enabled=True,
+        storage_enabled=True,
+        storage_bucket="semantic-runtime",
+        quality_scoring_enabled=True,
+        semantic_anatomy_enabled=True,
+        semantic_anatomy_max_assessments_per_profile=400,
+        semantic_anatomy_model_revision="60595ebc30ec8e3b1d3b9e65d4943ca011c0006a",
+        semantic_anatomy_endpoint_url="http://127.0.0.1:8091/v1/anatomy/assess",
+    )
+    runtime = build_controller_runtime(
+        settings=settings,
+        sessions=database.sessions,
+        salad_client=None,
+        object_store=MemoryObjectStore(bucket="semantic-runtime"),
+    )
+
+    specs = {spec.name: spec for spec in runtime._loop_specs}
+    assert specs["semantic-anatomy-qc"].requires_initial_success_for_readiness is False
+    assert all(
+        spec.requires_initial_success_for_readiness
+        for name, spec in specs.items()
+        if name != "semantic-anatomy-qc"
+    )
 
 
 @pytest.mark.asyncio
@@ -420,6 +632,50 @@ def test_app_lifespan_starts_runtime_reports_health_and_stops_it(
         assert build_calls == 1
 
     assert runtime.stop_calls == 1
+
+
+def test_ready_health_allows_alive_uninitialized_optional_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def cold_provider_cycle() -> bool:
+        await asyncio.Event().wait()
+        return False
+
+    runtime = ControllerRuntime(
+        instance_id="controller-health-cold-provider",
+        loops=(
+            LoopSpec(
+                name="semantic-anatomy-qc",
+                cycle=cold_provider_cycle,
+                idle_interval_seconds=1,
+                timeout_seconds=60,
+                requires_initial_success_for_readiness=False,
+            ),
+        ),
+        shutdown_grace_seconds=0.01,
+        shutdown_cancel_seconds=0.05,
+        jitter=lambda: 0.5,
+    )
+    monkeypatch.setattr(
+        "gen_automation.app.build_controller_runtime",
+        lambda **_kwargs: runtime,
+    )
+    settings = Settings(
+        environment=Environment.TEST,
+        database_url=f"sqlite+aiosqlite:///{(tmp_path / 'cold-provider-ready.db').as_posix()}",
+        auto_create_schema=True,
+        background_runtime_enabled=True,
+        session_secret="test-session-secret-with-more-than-32-characters",  # noqa: S106
+    )
+
+    with TestClient(create_app(settings)) as client:
+        response = client.get("/api/v1/health/ready")
+        assert response.status_code == 200
+        assert response.json()["controller_runtime"] == "healthy"
+        loop = runtime.snapshot().loops[0]
+        assert loop.task_alive is True
+        assert loop.last_success_at is None
 
 
 def test_ready_health_fails_when_enabled_runtime_is_not_ready(

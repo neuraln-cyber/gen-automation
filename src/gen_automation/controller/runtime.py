@@ -224,6 +224,7 @@ class LoopSpec:
     cycle: LoopCycle
     idle_interval_seconds: float
     timeout_seconds: float
+    requires_initial_success_for_readiness: bool = True
 
     def __post_init__(self) -> None:
         if not self.name or len(self.name) > 100:
@@ -477,7 +478,10 @@ class ControllerRuntime:
             for spec in self._loop_specs
         )
         all_alive = all(loop.task_alive for loop in loops)
-        all_initialized = all(loop.last_success_at is not None for loop in loops)
+        all_initialized = all(
+            loop.last_success_at is not None or not spec.requires_initial_success_for_readiness
+            for spec, loop in zip(self._loop_specs, loops, strict=True)
+        )
         readiness_failed = any(
             loop.stale or loop.consecutive_failures >= self._readiness_failure_threshold
             for loop in loops
@@ -1743,6 +1747,10 @@ def build_controller_runtime(
                     cycle=workloads.semantic_anatomy_once,
                     idle_interval_seconds=poll,
                     timeout_seconds=settings.background_semantic_timeout_seconds + 5,
+                    # The provider can be scaled to zero. Its first bounded call
+                    # remains supervised, but startup readiness must not wait for
+                    # that cold allocation. Failures and staleness still apply.
+                    requires_initial_success_for_readiness=False,
                 )
             )
         if settings.derivative_rendering_enabled:
