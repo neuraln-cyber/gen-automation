@@ -171,6 +171,52 @@ async def test_incomplete_upload_grants_can_be_rotated_for_a_new_provider_attemp
 
 
 @pytest.mark.asyncio
+async def test_provider_retry_reissues_and_cleans_grant_for_progressively_available_asset(
+    asset_context: AssetContext,
+) -> None:
+    store = MemoryObjectStore()
+    first = await create_intents(asset_context, store)
+    original = png_bytes("red")
+    stage_upload(store, first[0], original)
+    async with asset_context.database.sessions() as session:
+        finalized = await finalize_raw_master(
+            session,
+            store,
+            asset_id=first[0].asset_id,
+            max_bytes=1_000_000,
+        )
+        rotated = await create_raw_master_upload_intents(
+            session,
+            store,
+            generation_job_id=asset_context.job_id,
+            max_bytes=1_000_000,
+            rotate_incomplete_uploads=True,
+        )
+
+    assert rotated[0].asset_id == first[0].asset_id
+    assert rotated[0].state == AssetState.AVAILABLE
+    assert rotated[0].staging_key != first[0].staging_key
+    assert rotated[0].upload_url is not None
+
+    stage_upload(store, rotated[0], original)
+    async with asset_context.database.sessions() as session:
+        replay = await finalize_raw_master(
+            session,
+            store,
+            asset_id=rotated[0].asset_id,
+            max_bytes=1_000_000,
+        )
+        asset = await session.get(Asset, rotated[0].asset_id)
+
+    assert replay.replayed is True
+    assert replay.object_key == finalized.object_key
+    assert rotated[0].staging_key not in store.objects
+    assert asset is not None
+    assert asset.state == AssetState.AVAILABLE
+    assert asset.asset_metadata["staging_cleanup"] == "completed"
+
+
+@pytest.mark.asyncio
 async def test_raw_master_is_promoted_without_changing_bytes(
     asset_context: AssetContext,
 ) -> None:

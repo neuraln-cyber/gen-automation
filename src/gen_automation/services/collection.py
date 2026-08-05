@@ -54,10 +54,90 @@ class CollectionResult:
     error_code: str | None = None
 
 
+@dataclass(frozen=True)
+class ProgressiveCollectionResult:
+    """One bounded attempt to publish the next output from an active GPU job."""
+
+    asset_id: UUID | None
+    finalized: bool
+
+
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+async def collect_next_ready_running_asset(
+    session: AsyncSession,
+    store: ObjectStore,
+    *,
+    worker_id: str,
+    max_image_bytes: int,
+    verification_lease_seconds: int = 900,
+) -> ProgressiveCollectionResult:
+    """Verify one visible staging upload without waiting for its batch to finish.
+
+    The GPU worker uploads outputs in ``output_index`` order. Looking only at the
+    first unfinished output keeps the active-job poll to one object-store HEAD
+    request per cycle. The existing per-asset verification lease remains the
+    concurrency boundary, while the generation job stays RUNNING and under the
+    provider reconciler's ownership.
+    """
+
+    if not worker_id.strip() or len(worker_id) > 200:
+        raise ValueError("worker_id is invalid")
+    if max_image_bytes <= 0:
+        raise ValueError("max_image_bytes must be positive")
+    if verification_lease_seconds <= 0:
+        raise ValueError("verification_lease_seconds must be positive")
+
+    candidate = (
+        await session.execute(
+            select(Asset.id, Asset.staging_object_key)
+            .join(GenerationJob, GenerationJob.id == Asset.generation_job_id)
+            .where(
+                GenerationJob.state == GenerationState.RUNNING,
+                Asset.kind == AssetKind.RAW_MASTER,
+                Asset.state == AssetState.UPLOADING,
+                Asset.staging_object_key.is_not(None),
+            )
+            .order_by(
+                GenerationJob.priority,
+                GenerationJob.updated_at,
+                GenerationJob.id,
+                Asset.output_index,
+            )
+            .limit(1)
+        )
+    ).one_or_none()
+    await session.rollback()
+    if candidate is None:
+        return ProgressiveCollectionResult(asset_id=None, finalized=False)
+
+    asset_id, staging_object_key = candidate
+    assert staging_object_key is not None
+    if await store.head(staging_object_key) is None:
+        return ProgressiveCollectionResult(asset_id=asset_id, finalized=False)
+
+    try:
+        result = await finalize_raw_master(
+            session,
+            store,
+            asset_id=asset_id,
+            max_bytes=max_image_bytes,
+            verification_lease_seconds=verification_lease_seconds,
+            actor=worker_id,
+        )
+    except (UploadNotReadyError, AssetBusyError, AssetStorageUnavailableError):
+        await session.rollback()
+        return ProgressiveCollectionResult(asset_id=asset_id, finalized=False)
+    except AssetQuarantinedError:
+        # The normal post-provider collection pass owns the fail-closed job and
+        # release transition. The quarantined asset is durable until that pass.
+        await session.rollback()
+        return ProgressiveCollectionResult(asset_id=asset_id, finalized=False)
+    return ProgressiveCollectionResult(asset_id=asset_id, finalized=not result.replayed)
 
 
 async def claim_collection_jobs(

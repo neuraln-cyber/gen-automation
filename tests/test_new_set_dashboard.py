@@ -33,6 +33,12 @@ def test_dashboard_javascript_is_packaged_and_served(client: TestClient) -> None
     assert 'url.searchParams.set("cursor", cursor)' in response.text
     assert 'image.loading = "lazy"' in response.text
     assert 'new CustomEvent("gen-automation:assets-updated"' in response.text
+    assert "generated: assets.size, expected" in response.text
+    assert 'document.addEventListener("gen-automation:assets-updated", (event) =>' in (
+        response.text
+    )
+    assert "liveGenerated = Math.max(liveGenerated" in response.text
+    assert "renderImageProgress(liveGenerated, liveExpected)" in response.text
     assert "reorderCards" in response.text
     assert 'createNode("span", "live-generation-asset-batch"' in response.text
     assert "payload.has_more === true" in response.text

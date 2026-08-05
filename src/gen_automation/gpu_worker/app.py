@@ -4,6 +4,7 @@ import binascii
 import io
 import json
 import math
+import re
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -39,6 +40,7 @@ from gen_automation.gpu_worker.security import AuthorizationError, verify_author
 
 MAX_JSON_DEPTH = 64
 _OUTPUTS_ADAPTER = TypeAdapter(list[ComfyOutput])
+_OUTPUT_BRANCH_PATTERN = re.compile(r"^output-(\d{2})-")
 _EXPECTED_FORMATS = {
     "image/png": "PNG",
     "image/jpeg": "JPEG",
@@ -56,6 +58,45 @@ class WorkerOutputError(Exception):
 
 class WorkerNotReadyError(Exception):
     pass
+
+
+def _progressive_workflows(
+    workflow: JsonObject,
+    *,
+    expected_count: int,
+) -> list[tuple[int | None, JsonObject]]:
+    """Split controller-rendered multi-prompt graphs into ordered image graphs.
+
+    Shared loader nodes remain in each graph and are cached by ComfyUI. A legacy
+    batched graph without the deterministic ``output-NN-`` branches keeps its
+    original all-at-once execution behavior.
+    """
+
+    if expected_count <= 1:
+        return [(None, workflow)]
+
+    shared: JsonObject = {}
+    branches: dict[int, JsonObject] = {}
+    saw_prefixed_node = False
+    for node_id, node in workflow.items():
+        match = _OUTPUT_BRANCH_PATTERN.match(node_id)
+        if match is None:
+            if node_id.startswith("output-"):
+                raise WorkerRequestError("invalid request")
+            shared[node_id] = node
+            continue
+        saw_prefixed_node = True
+        output_index = int(match.group(1))
+        branches.setdefault(output_index, {})[node_id] = node
+
+    if not saw_prefixed_node:
+        return [(None, workflow)]
+    if set(branches) != set(range(expected_count)):
+        raise WorkerRequestError("invalid request")
+    return [
+        (output_index, {**shared, **branches[output_index]})
+        for output_index in range(expected_count)
+    ]
 
 
 def _execute_if_ready(executor: ComfyExecutor, workflow: JsonObject) -> object:
@@ -288,7 +329,17 @@ def create_worker_app(
                 settings.approved_workflow_node_classes,
             )
             require_comfy_workflow_deliverability(envelope.payload.workflow)
-        except ValueError:
+            progressive_workflows = _progressive_workflows(
+                envelope.payload.workflow,
+                expected_count=len(envelope.payload.uploads),
+            )
+            for _output_index, workflow in progressive_workflows:
+                validate_approved_workflow(
+                    workflow,
+                    settings.approved_workflow_node_classes,
+                )
+                require_comfy_workflow_deliverability(workflow)
+        except (ValueError, WorkerRequestError):
             raise HTTPException(status_code=400, detail="invalid request") from None
 
         # One worker owns one GPU execution lane. Serializing here also makes the
@@ -315,64 +366,77 @@ def create_worker_app(
                 replay_cache.move_to_end(envelope.payload.attempt_id)
                 return cached_response
 
-            try:
-                loop = asyncio.get_running_loop()
-                raw_outputs = await loop.run_in_executor(
-                    execution_pool,
-                    _execute_if_ready,
-                    executor,
-                    envelope.payload.workflow,
-                )
-            except WorkerNotReadyError:
-                raise HTTPException(status_code=503, detail="worker not ready") from None
-            except Exception:
-                raise HTTPException(status_code=502, detail="generation failed") from None
-
-            try:
-                outputs = await loop.run_in_executor(
-                    execution_pool,
-                    partial(
-                        _decode_and_verify_outputs,
-                        raw_outputs,
-                        expected_count=len(envelope.payload.uploads),
-                        max_output_bytes=settings.max_output_bytes,
-                        max_total_output_bytes=settings.max_total_output_bytes,
-                        max_image_dimension=settings.max_image_dimension,
-                        max_image_pixels=settings.max_image_pixels,
-                    ),
-                )
-            except WorkerOutputError:
-                raise HTTPException(
-                    status_code=502,
-                    detail="generation output invalid",
-                ) from None
-
+            loop = asyncio.get_running_loop()
             grants_by_index = {grant.output_index: grant for grant in envelope.payload.uploads}
             uploaded: list[UploadedOutput] = []
-            for output, content in sorted(outputs, key=lambda item: item[0].output_index):
-                grant = grants_by_index[output.output_index]
-                if output.media_type != grant.content_type:
+            total_output_bytes = 0
+            for branch_output_index, workflow in progressive_workflows:
+                try:
+                    raw_outputs = await loop.run_in_executor(
+                        execution_pool,
+                        _execute_if_ready,
+                        executor,
+                        workflow,
+                    )
+                except WorkerNotReadyError:
+                    raise HTTPException(status_code=503, detail="worker not ready") from None
+                except Exception:
+                    raise HTTPException(status_code=502, detail="generation failed") from None
+
+                expected_branch_count = (
+                    len(envelope.payload.uploads) if branch_output_index is None else 1
+                )
+                try:
+                    outputs = await loop.run_in_executor(
+                        execution_pool,
+                        partial(
+                            _decode_and_verify_outputs,
+                            raw_outputs,
+                            expected_count=expected_branch_count,
+                            max_output_bytes=settings.max_output_bytes,
+                            max_total_output_bytes=(
+                                settings.max_total_output_bytes - total_output_bytes
+                            ),
+                            max_image_dimension=settings.max_image_dimension,
+                            max_image_pixels=settings.max_image_pixels,
+                        ),
+                    )
+                except WorkerOutputError:
                     raise HTTPException(
                         status_code=502,
                         detail="generation output invalid",
+                    ) from None
+
+                for output, content in sorted(outputs, key=lambda item: item[0].output_index):
+                    output_index = (
+                        output.output_index
+                        if branch_output_index is None
+                        else branch_output_index
                     )
-                try:
-                    await resolved_uploader.upload(
-                        grant=grant,
-                        content=content,
-                        media_type=output.media_type,
+                    grant = grants_by_index[output_index]
+                    if output.media_type != grant.content_type:
+                        raise HTTPException(
+                            status_code=502,
+                            detail="generation output invalid",
+                        )
+                    try:
+                        await resolved_uploader.upload(
+                            grant=grant,
+                            content=content,
+                            media_type=output.media_type,
+                        )
+                    except WorkerUploadError:
+                        raise HTTPException(status_code=502, detail="upload failed") from None
+                    except Exception:
+                        raise HTTPException(status_code=502, detail="upload failed") from None
+                    total_output_bytes += len(content)
+                    uploaded.append(
+                        UploadedOutput(
+                            asset_id=grant.asset_id,
+                            upload_attempt_id=grant.upload_attempt_id,
+                            output_index=output_index,
+                        )
                     )
-                except WorkerUploadError:
-                    raise HTTPException(status_code=502, detail="upload failed") from None
-                except Exception:
-                    raise HTTPException(status_code=502, detail="upload failed") from None
-                uploaded.append(
-                    UploadedOutput(
-                        asset_id=grant.asset_id,
-                        upload_attempt_id=grant.upload_attempt_id,
-                        output_index=output.output_index,
-                    )
-                )
 
             response = GenerateResponse(
                 job_id=envelope.payload.job_id,

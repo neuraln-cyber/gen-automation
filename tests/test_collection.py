@@ -30,6 +30,7 @@ from gen_automation.services.assets import UploadIntent, create_raw_master_uploa
 from gen_automation.services.collection import (
     claim_collection_jobs,
     collect_generation_job,
+    collect_next_ready_running_asset,
 )
 from gen_automation.storage.memory import MemoryObjectStore
 
@@ -163,6 +164,81 @@ async def _claim(context: CollectionContext, *, now: datetime = NOW) -> None:
             now=now,
         )
     assert [item.job_id for item in claimed] == [context.job_id]
+
+
+@pytest.mark.asyncio
+async def test_running_job_publishes_each_staged_master_independently(
+    collection_context: CollectionContext,
+) -> None:
+    _stage(collection_context.store, collection_context.intents[0], _png("red"))
+    async with collection_context.database.sessions() as session:
+        job = await session.get(GenerationJob, collection_context.job_id)
+        assert job is not None
+        job.state = GenerationState.RUNNING
+        await session.commit()
+
+        first = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="progressive-collector",
+            max_image_bytes=1_000_000,
+        )
+        assets = list(
+            (
+                await session.scalars(
+                    select(Asset)
+                    .where(Asset.generation_job_id == collection_context.job_id)
+                    .order_by(Asset.output_index)
+                )
+            ).all()
+        )
+        release = await session.get(Release, collection_context.release_id)
+        job = await session.get(GenerationJob, collection_context.job_id)
+
+    assert first.asset_id == collection_context.intents[0].asset_id
+    assert first.finalized is True
+    assert [asset.state for asset in assets] == [
+        AssetState.AVAILABLE,
+        AssetState.UPLOADING,
+    ]
+    assert job is not None and job.state == GenerationState.RUNNING
+    assert release is not None and release.phase == ReleasePhase.GENERATING
+
+    async with collection_context.database.sessions() as session:
+        waiting = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="progressive-collector",
+            max_image_bytes=1_000_000,
+        )
+
+    assert waiting.asset_id == collection_context.intents[1].asset_id
+    assert waiting.finalized is False
+
+    _stage(collection_context.store, collection_context.intents[1], _png("blue"))
+    async with collection_context.database.sessions() as session:
+        second = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="progressive-collector",
+            max_image_bytes=1_000_000,
+        )
+        assets = list(
+            (
+                await session.scalars(
+                    select(Asset)
+                    .where(Asset.generation_job_id == collection_context.job_id)
+                    .order_by(Asset.output_index)
+                )
+            ).all()
+        )
+
+    assert second.asset_id == collection_context.intents[1].asset_id
+    assert second.finalized is True
+    assert [asset.state for asset in assets] == [
+        AssetState.AVAILABLE,
+        AssetState.AVAILABLE,
+    ]
 
 
 @pytest.mark.asyncio

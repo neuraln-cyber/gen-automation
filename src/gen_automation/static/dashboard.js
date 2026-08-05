@@ -3422,7 +3422,7 @@
       reorderCards();
       renderCount();
       document.dispatchEvent(new CustomEvent("gen-automation:assets-updated", {
-        detail: { root: grid },
+        detail: { root: grid, generated: assets.size, expected },
       }));
       return added;
     };
@@ -3565,10 +3565,22 @@
     const jobStates = document.querySelector("[data-progress-job-states]");
     let timer = null;
     let networkFailures = 0;
+    let liveGenerated = 0;
+    let liveExpected = 0;
 
     const safeCount = (value) => (
       Number.isInteger(value) && value >= 0 ? value : 0
     );
+
+    const renderImageProgress = (generated, expected) => {
+      const displayedExpected = safeCount(expected);
+      const progressMaximum = Math.max(1, displayedExpected);
+      if (imageCount) imageCount.textContent = `${generated} / ${displayedExpected} images`;
+      if (progressBar) {
+        progressBar.max = progressMaximum;
+        progressBar.value = Math.min(generated, progressMaximum);
+      }
+    };
 
     const updatePipeline = (stage) => {
       panel.querySelectorAll("[data-pipeline-stage]").forEach((item) => {
@@ -3606,8 +3618,9 @@
       const stageKey = stageKeys.has(payload.stage.key) ? payload.stage.key : "error";
       const stageStep = Math.min(5, Math.max(1, safeCount(payload.stage.step)));
       const stage = { key: stageKey, step: stageStep };
-      const generated = safeCount(payload.images.generated);
-      const expected = Math.max(1, safeCount(payload.images.expected));
+      const expected = safeCount(payload.images.expected);
+      liveExpected = Math.max(liveExpected, expected);
+      liveGenerated = Math.max(liveGenerated, safeCount(payload.images.generated));
       const completedJobs = safeCount(payload.jobs.completed);
       const totalJobs = safeCount(payload.jobs.total);
 
@@ -3624,11 +3637,7 @@
       if (detail && typeof payload.stage.detail === "string") {
         detail.textContent = payload.stage.detail;
       }
-      if (imageCount) imageCount.textContent = `${generated} / ${safeCount(payload.images.expected)} images`;
-      if (progressBar) {
-        progressBar.max = expected;
-        progressBar.value = Math.min(generated, expected);
-      }
+      renderImageProgress(liveGenerated, liveExpected);
       if (jobCount) jobCount.textContent = `${completedJobs} / ${totalJobs} complete`;
       if (activeJobs) activeJobs.textContent = String(safeCount(payload.jobs.active));
       if (scoringCount) {
@@ -3699,6 +3708,14 @@
         schedule(Math.min(30000, 3000 * (2 ** Math.min(networkFailures, 3))));
       }
     };
+
+    document.addEventListener("gen-automation:assets-updated", (event) => {
+      const eventDetail = event.detail;
+      if (!isRecord(eventDetail) || !Number.isInteger(eventDetail.generated)) return;
+      liveGenerated = Math.max(liveGenerated, safeCount(eventDetail.generated));
+      liveExpected = Math.max(liveExpected, safeCount(eventDetail.expected));
+      renderImageProgress(liveGenerated, liveExpected);
+    });
 
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") refresh();

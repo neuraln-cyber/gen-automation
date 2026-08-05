@@ -198,6 +198,39 @@ def _signed_request(
     return raw
 
 
+def _sign_request(raw: dict[str, Any]) -> dict[str, Any]:
+    envelope = GenerateEnvelope.model_validate(raw, strict=True)
+    raw["signature"] = calculate_signature(envelope, TEST_PRIVATE_KEY)
+    return raw
+
+
+def _progressive_workflow(outputs: int) -> dict[str, object]:
+    workflow: dict[str, object] = {}
+    for output_index in range(outputs):
+        prefix = f"output-{output_index:02d}-"
+        workflow.update(
+            {
+                f"{prefix}2": {
+                    "class_type": "KSampler",
+                    "inputs": {"cfg": 5.5, "steps": 20, "latent_image": [f"{prefix}5", 0]},
+                },
+                f"{prefix}3": {
+                    "class_type": "VAEDecode",
+                    "inputs": {"samples": [f"{prefix}2", 0]},
+                },
+                f"{prefix}4": {
+                    "class_type": "SaveImage",
+                    "inputs": {"images": [f"{prefix}3", 0]},
+                },
+                f"{prefix}5": {
+                    "class_type": "EmptyLatentImage",
+                    "inputs": {"width": 512, "height": 512, "batch_size": 1},
+                },
+            }
+        )
+    return workflow
+
+
 def _client(
     *,
     executor: FakeExecutor | None = None,
@@ -530,6 +563,61 @@ def test_signed_generation_uploads_supported_image_and_returns_stable_ids(
         "data_base64",
     ):
         assert private_value not in response.text
+
+
+def test_multi_prompt_job_executes_and_uploads_each_image_in_order() -> None:
+    events: list[str] = []
+
+    @dataclass
+    class OrderedExecutor(FakeExecutor):
+        def execute(self, workflow: dict[str, object]) -> object:
+            output_index = len(self.workflows)
+            events.append(f"execute-{output_index}")
+            self.workflows.append(workflow)
+            return [_output()]
+
+    @dataclass
+    class OrderedUploader(FakeUploader):
+        async def upload(
+            self,
+            *,
+            grant: UploadGrant,
+            content: bytes,
+            media_type: str,
+        ) -> None:
+            events.append(f"upload-{grant.output_index}")
+            self.uploads.append(
+                RecordedUpload(grant=grant, content=content, media_type=media_type)
+            )
+
+    request = _unsigned_request(uploads=3)
+    request["payload"]["workflow"] = _progressive_workflow(3)
+    executor = OrderedExecutor()
+    uploader = OrderedUploader()
+    client, executor, uploader = _client(executor=executor, uploader=uploader)
+
+    with client:
+        response = client.post("/jobs/generate", json=_sign_request(request))
+
+    assert response.status_code == 200
+    assert events == [
+        "execute-0",
+        "upload-0",
+        "execute-1",
+        "upload-1",
+        "execute-2",
+        "upload-2",
+    ]
+    assert [item["output_index"] for item in response.json()["outputs"]] == [0, 1, 2]
+    assert len(executor.workflows) == 3
+    assert all(
+        all(
+            node_id.startswith(f"output-{output_index:02d}-")
+            for node_id in workflow
+        )
+        for output_index, workflow in enumerate(executor.workflows)
+    )
+    assert [upload.grant.output_index for upload in uploader.uploads] == [0, 1, 2]
 
 
 def test_ed25519_authenticates_the_payload_and_upload_grants() -> None:

@@ -44,6 +44,7 @@ from gen_automation.services.collection import (
     ClaimedCollectionJob,
     claim_collection_jobs,
     collect_generation_job,
+    collect_next_ready_running_asset,
 )
 from gen_automation.services.derivative_isolation import DerivativeIsolationPolicy
 from gen_automation.services.derivative_runtime import run_derivative_cycle
@@ -1058,6 +1059,18 @@ class ControllerWorkloads:
         if self.object_store is None:
             return False
         worker_id = self._worker_id("collection")
+        async with self.sessions() as session:
+            progressive = await collect_next_ready_running_asset(
+                session,
+                self.object_store,
+                worker_id=worker_id,
+                max_image_bytes=self.settings.storage_max_image_bytes,
+                verification_lease_seconds=(
+                    self.settings.storage_verification_lease_seconds
+                ),
+            )
+        if progressive.finalized:
+            return True
         async with self.sessions() as session:
             jobs = await claim_collection_jobs(
                 session,

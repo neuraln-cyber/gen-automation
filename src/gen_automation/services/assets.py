@@ -283,6 +283,28 @@ async def create_raw_master_upload_intents(
             asset.asset_metadata = metadata
             issued_asset_ids.append(str(asset.id))
             issue_upload = True
+        elif asset.state == AssetState.AVAILABLE and rotate_incomplete_uploads:
+            # A prior provider attempt may have uploaded and progressively
+            # published this output before a later branch failed. A replacement
+            # attempt retains the immutable master but still needs a complete,
+            # deterministic grant set for the worker response contract.
+            upload_attempt_id = uuid7()
+            asset.staging_object_key = _staging_key(
+                release_id=release_version.release_id,
+                job_id=job.id,
+                asset_id=asset.id,
+                upload_attempt_id=upload_attempt_id,
+            )
+            metadata = dict(asset.asset_metadata)
+            metadata.update(
+                {
+                    "staging_cleanup": "not_started",
+                    "upload_attempt_id": str(upload_attempt_id),
+                }
+            )
+            asset.asset_metadata = metadata
+            issued_asset_ids.append(str(asset.id))
+            issue_upload = True
 
         if asset.staging_object_key is None or asset.output_index is None:
             raise AssetConflictError("asset upload metadata is incomplete")
@@ -750,7 +772,27 @@ async def finalize_raw_master(
             )
             await session.commit()
             raise AssetConflictError("duplicate completion reported a different checksum") from None
-        return FinalizedAsset.from_model(existing.asset, replayed=True)
+        replayed = FinalizedAsset.from_model(existing.asset, replayed=True)
+        cleanup_state = existing.asset.asset_metadata.get("staging_cleanup")
+        if cleanup_state != "completed" and existing.asset.staging_object_key is not None:
+            try:
+                staging = await store.head(existing.asset.staging_object_key)
+                if staging is not None:
+                    _validate_staging_metadata(existing.asset, staging)
+                    await store.delete(
+                        existing.asset.staging_object_key,
+                        version_id=staging.version_id,
+                    )
+                await _mark_staging_cleaned_up(
+                    session,
+                    asset_id=existing.asset.id,
+                    actor=actor,
+                )
+            except (ImageVerificationError, ObjectStoreError):
+                # The immutable verified master remains authoritative. Staging
+                # lifecycle cleanup can safely retry independently.
+                await session.rollback()
+        return replayed
 
     if asset.storage_backend != store.backend or asset.storage_bucket != store.bucket:
         await _release_verification_claim(
