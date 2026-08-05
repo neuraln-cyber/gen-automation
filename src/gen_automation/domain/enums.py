@@ -107,6 +107,15 @@ class DesiredDeploymentState(StrEnum):
     STOPPED = "stopped"
 
 
+class ExperimentWarmLeaseState(StrEnum):
+    STARTING = "starting"
+    ACTIVE = "active"
+    ENDING = "ending"
+    ENDED = "ended"
+    EXPIRED = "expired"
+    FAILED = "failed"
+
+
 class BudgetState(StrEnum):
     OPEN = "open"
     BLOCKED = "blocked"

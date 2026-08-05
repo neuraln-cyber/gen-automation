@@ -9,6 +9,7 @@ workers:
 - PostgreSQL as the authoritative workflow database
 - S3-compatible object storage as the authoritative asset archive
 - SaladCloud Job Queues and pinned ComfyUI workers for generation
+- A cost-bounded Experiment Lab for warm, side-by-side prompt/model comparisons
 - Deterministic, versioned generation specifications
 - Versioned Forge-style prompt wildcards with seed-reproducible expansion
 - Automated quality checks with human approval before publication

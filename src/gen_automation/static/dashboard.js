@@ -33,6 +33,7 @@
     "character_b_prompt",
     "checkpoint_id",
     "workflow_id",
+    "prompt",
     "negative_prompt",
     "detailer_prompt",
     "detailer_negative_prompt",
@@ -86,7 +87,8 @@
     const fields = {};
     AUTOMATION_PRESET_FIELDS.forEach((name) => {
       const control = name === "composition_mode"
-        ? form.querySelector('[name="composition_mode"]:checked')
+        ? (form.querySelector('[name="composition_mode"]:checked')
+          || namedControl(form, "composition_mode"))
         : namedControl(form, name);
       if (control instanceof HTMLInputElement
           || control instanceof HTMLTextAreaElement
@@ -270,6 +272,12 @@
     if (compositionControl instanceof HTMLInputElement) {
       compositionControl.checked = true;
       compositionControl.dispatchEvent(new Event("change", { bubbles: true }));
+    } else {
+      const compositionSelect = namedControl(form, "composition_mode");
+      if (compositionSelect instanceof HTMLSelectElement) {
+        compositionSelect.value = compositionMode;
+        compositionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      }
     }
     const checkpointSha256 = typeof matches.checkpoint_sha256 === "string"
       ? matches.checkpoint_sha256.toLowerCase()
@@ -3696,14 +3704,566 @@
     render();
   };
 
+  function initializeExperimentLab() {
+    const form = document.querySelector("[data-experiment-form]");
+    if (!(form instanceof HTMLFormElement)) return;
+    const planField = form.querySelector("[data-experiment-plan]");
+    const list = form.querySelector("[data-experiment-variant-list]");
+    const template = document.querySelector("#experiment-variant-template");
+    const labelInput = form.querySelector("[data-experiment-label]");
+    const saveButton = form.querySelector("[data-experiment-save-variant]");
+    const clearButton = form.querySelector("[data-experiment-clear-editor]");
+    const editorHeading = form.querySelector("[data-experiment-editor-heading]");
+    const editorStatus = form.querySelector("[data-experiment-editor-status]");
+    const outputCount = form.querySelector("[data-experiment-output-count]");
+    const empty = form.querySelector("[data-experiment-empty]");
+    const count = form.querySelector("[data-experiment-count]");
+    const submit = form.querySelector("[data-experiment-submit]");
+    const submitStatus = form.querySelector("[data-experiment-submit-status]");
+    const randomSeed = form.querySelector("[data-experiment-random-seed]");
+    const baseSeed = form.querySelector("[data-experiment-base-seed]");
+    const composition = namedControl(form, "composition_mode");
+    const secondSubject = form.querySelector("[data-experiment-second-subject]");
+    const regionalPrompts = form.querySelector("[data-experiment-regional-prompts]");
+    if (!(planField instanceof HTMLTextAreaElement)
+        || !(list instanceof HTMLOListElement)
+        || !(template instanceof HTMLTemplateElement)
+        || !(labelInput instanceof HTMLInputElement)
+        || !(saveButton instanceof HTMLButtonElement)) return;
+
+    const maximum = 12;
+    const numericNames = new Set([
+      "seed", "width", "height", "cfg", "steps", "clip_skip", "hires_scale",
+      "hires_denoise", "detailer_guide_size", "detailer_max_size", "detailer_denoise",
+      "detailer_bbox_threshold", "detailer_bbox_dilation", "detailer_bbox_crop_factor",
+      "detailer_feather",
+    ]);
+    const profileNames = [
+      "subject_id", "subject_2_id", "composition_mode", "character_a_prompt",
+      "character_b_prompt", "checkpoint_id", "workflow_id", "prompt", "negative_prompt",
+      "detailer_prompt", "detailer_negative_prompt", "seed", "width", "height", "cfg",
+      "steps", "sampler", "scheduler", "clip_skip", "hires_scale", "hires_denoise",
+      "hires_upscale_method", "detailer_guide_size", "detailer_max_size",
+      "detailer_denoise", "detailer_bbox_threshold", "detailer_bbox_dilation",
+      "detailer_bbox_crop_factor", "detailer_feather",
+    ];
+    let variants = [];
+    let editingIndex = null;
+
+    const nextLabel = () => `Variant ${String.fromCharCode(65 + Math.min(variants.length, 25))}`;
+    const setEditorStatus = (message, tone = "") => {
+      if (!(editorStatus instanceof HTMLElement)) return;
+      editorStatus.textContent = message;
+      editorStatus.className = `experiment-editor-status${tone ? ` ${tone}` : ""}`;
+    };
+    const formValue = (name) => {
+      const control = namedControl(form, name);
+      if (control instanceof HTMLInputElement
+          || control instanceof HTMLTextAreaElement
+          || control instanceof HTMLSelectElement) return control.value;
+      return "";
+    };
+    const collect = () => {
+      const result = { label: labelInput.value.trim() };
+      profileNames.forEach((name) => {
+        const raw = formValue(name);
+        result[name] = numericNames.has(name) ? Number(raw) : raw;
+      });
+      result.loras = Array.from(form.querySelectorAll("[data-lora-native-slot]")).flatMap((slot) => {
+        const id = slot.querySelector("[data-lora-native-id]");
+        const weight = slot.querySelector("[data-lora-native-weight]");
+        if (!(id instanceof HTMLSelectElement) || !id.value) return [];
+        return [{ approval_id: id.value, weight: Number(weight?.value || "1") }];
+      });
+      return result;
+    };
+    const profileIsValid = (variant) => (
+      variant.label.length > 0
+      && variant.prompt.trim().length > 0
+      && variant.subject_id.length > 0
+      && variant.checkpoint_id.length > 0
+      && variant.workflow_id.length > 0
+      && profileNames.filter((name) => numericNames.has(name)).every(
+        (name) => Number.isFinite(variant[name]),
+      )
+      && variant.loras.every((item) => Number.isFinite(item.weight))
+    );
+    const profileIsWarmReady = (variant) => {
+      const checkpoint = Array.from(namedControl(form, "checkpoint_id")?.options || [])
+        .find((option) => option.value === variant.checkpoint_id);
+      if (checkpoint?.dataset.warmReady !== "true") return false;
+      return variant.loras.every((item) => {
+        const option = form.querySelector(`[data-lora-option][data-lora-id="${item.approval_id}"]`);
+        return option?.dataset.warmReady === "true";
+      });
+    };
+    const dispatchProfile = (variant) => {
+      profileNames.forEach((name) => {
+        const control = namedControl(form, name);
+        if (!(control instanceof HTMLInputElement)
+            && !(control instanceof HTMLTextAreaElement)
+            && !(control instanceof HTMLSelectElement)) return;
+        control.value = String(variant[name] ?? "");
+        control.dispatchEvent(new Event("change", { bubbles: true }));
+        control.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      window.dispatchEvent(new CustomEvent("gen-automation:apply-lora-stack", {
+        detail: {
+          selections: variant.loras.map((item) => ({
+            id: item.approval_id,
+            weight: String(item.weight),
+          })),
+        },
+      }));
+      labelInput.value = variant.label;
+    };
+    const valueLabel = (name, value) => {
+      const control = namedControl(form, name);
+      if (!(control instanceof HTMLSelectElement)) return String(value);
+      const option = Array.from(control.options).find((candidate) => candidate.value === value);
+      return (option?.textContent || String(value)).split(" · ")[0].trim();
+    };
+    const stackKey = (variant) => variant.loras
+      .map((item) => `${item.approval_id}:${item.weight}`)
+      .join("|");
+    const diffLabels = (variant, baseline, index) => {
+      if (index === 0 || !baseline) return ["Baseline"];
+      const diffs = [];
+      if (variant.checkpoint_id !== baseline.checkpoint_id) {
+        diffs.push(`Checkpoint: ${valueLabel("checkpoint_id", variant.checkpoint_id)}`);
+      }
+      if (variant.workflow_id !== baseline.workflow_id) {
+        diffs.push(`Workflow: ${valueLabel("workflow_id", variant.workflow_id)}`);
+      }
+      if (stackKey(variant) !== stackKey(baseline)) diffs.push("LoRA stack");
+      if (variant.prompt !== baseline.prompt) diffs.push("Prompt");
+      if (variant.negative_prompt !== baseline.negative_prompt) diffs.push("Negative prompt");
+      if (variant.steps !== baseline.steps) diffs.push(`Steps ${variant.steps}`);
+      if (variant.cfg !== baseline.cfg) diffs.push(`CFG ${variant.cfg}`);
+      if (variant.sampler !== baseline.sampler || variant.scheduler !== baseline.scheduler) {
+        diffs.push(`${variant.sampler} / ${variant.scheduler}`);
+      }
+      if (variant.width !== baseline.width || variant.height !== baseline.height) {
+        diffs.push(`${variant.width}×${variant.height}`);
+      }
+      if (variant.detailer_prompt !== baseline.detailer_prompt
+          || variant.detailer_denoise !== baseline.detailer_denoise) diffs.push("Face detailer");
+      if (variant.hires_scale !== baseline.hires_scale
+          || variant.hires_denoise !== baseline.hires_denoise) diffs.push("Hires settings");
+      return diffs.length ? diffs : ["Same settings as A"];
+    };
+    const serialize = () => {
+      planField.value = JSON.stringify(variants);
+    };
+    const render = () => {
+      list.replaceChildren();
+      variants.forEach((variant, index) => {
+        const fragment = template.content.cloneNode(true);
+        const card = fragment.querySelector("[data-experiment-variant-card]");
+        const letter = fragment.querySelector("[data-experiment-variant-letter]");
+        const name = fragment.querySelector("[data-experiment-variant-name]");
+        const diffs = fragment.querySelector("[data-experiment-diffs]");
+        card.dataset.experimentIndex = String(index);
+        letter.textContent = String.fromCharCode(65 + index);
+        name.value = variant.label;
+        diffLabels(variant, variants[0], index).forEach((label) => {
+          diffs.append(createNode("span", "experiment-diff-chip", label));
+        });
+        list.append(fragment);
+      });
+      const images = variants.length * Math.max(1, integerValue(outputCount?.value, 2));
+      form.querySelector("[data-experiment-summary-variants]").textContent = String(variants.length);
+      form.querySelector("[data-experiment-summary-images]").textContent = String(images);
+      form.querySelector("[data-experiment-summary-jobs]").textContent = String(variants.length);
+      if (count) count.textContent = `${variants.length} / ${maximum}`;
+      if (empty) empty.hidden = variants.length !== 0;
+      const ready = variants.length >= 2;
+      if (submit instanceof HTMLButtonElement) submit.disabled = !ready;
+      if (submitStatus) {
+        submitStatus.textContent = ready
+          ? `${images} images in ${variants.length} jobs, queued for one allocation.`
+          : "Add at least two variants.";
+      }
+      serialize();
+    };
+    const finishEdit = () => {
+      editingIndex = null;
+      labelInput.value = nextLabel();
+      saveButton.textContent = "Add current profile";
+      if (editorHeading) editorHeading.textContent = `Build ${nextLabel()}`;
+    };
+
+    try {
+      const restored = JSON.parse(planField.value || "[]");
+      if (Array.isArray(restored)) variants = restored.slice(0, maximum);
+    } catch (_error) {
+      variants = [];
+    }
+    labelInput.value = nextLabel();
+    render();
+
+    saveButton.addEventListener("click", () => {
+      if (!form.checkValidity()) {
+        form.reportValidity();
+        setEditorStatus("Fix the highlighted profile setting before saving this variant.", "warning");
+        return;
+      }
+      const variant = collect();
+      if (!profileIsValid(variant)) {
+        setEditorStatus("Complete the prompt, model choices, and numeric settings first.", "warning");
+        form.reportValidity();
+        return;
+      }
+      if (!profileIsWarmReady(variant)) {
+        setEditorStatus(
+          "This profile includes a checkpoint or LoRA that is not in the worker manifest. Onboard it and redeploy the worker before queueing this variant.",
+          "warning",
+        );
+        return;
+      }
+      const duplicateName = variants.some((item, index) => (
+        index !== editingIndex && item.label.toLowerCase() === variant.label.toLowerCase()
+      ));
+      if (duplicateName) {
+        setEditorStatus("Use a unique label for each variant.", "warning");
+        labelInput.focus();
+        return;
+      }
+      if (editingIndex === null) {
+        if (variants.length >= maximum) {
+          setEditorStatus(`The comparison is limited to ${maximum} variants.`, "warning");
+          return;
+        }
+        variants.push(variant);
+        setEditorStatus(`${variant.label} added. Change only what you want to compare.`, "success");
+      } else {
+        variants[editingIndex] = variant;
+        setEditorStatus(`${variant.label} updated.`, "success");
+      }
+      finishEdit();
+      render();
+    });
+
+    list.addEventListener("input", (event) => {
+      const name = event.target.closest("[data-experiment-variant-name]");
+      const card = event.target.closest("[data-experiment-variant-card]");
+      if (!(name instanceof HTMLInputElement) || !card) return;
+      const index = integerValue(card.dataset.experimentIndex, -1);
+      if (!variants[index]) return;
+      variants[index].label = name.value.slice(0, 80);
+      serialize();
+    });
+    list.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-experiment-action]");
+      const card = event.target.closest("[data-experiment-variant-card]");
+      if (!(button instanceof HTMLButtonElement) || !card) return;
+      const index = integerValue(card.dataset.experimentIndex, -1);
+      const variant = variants[index];
+      if (!variant) return;
+      if (button.dataset.experimentAction === "load") {
+        editingIndex = index;
+        dispatchProfile(variant);
+        saveButton.textContent = "Update variant";
+        if (editorHeading) editorHeading.textContent = `Editing ${variant.label}`;
+        form.querySelector("[data-experiment-editor]")?.scrollIntoView({ behavior: "smooth" });
+      } else if (button.dataset.experimentAction === "duplicate") {
+        if (variants.length >= maximum) return;
+        const duplicate = JSON.parse(JSON.stringify(variant));
+        duplicate.label = `${variant.label} copy`.slice(0, 80);
+        variants.splice(index + 1, 0, duplicate);
+        render();
+      } else if (button.dataset.experimentAction === "delete") {
+        variants.splice(index, 1);
+        finishEdit();
+        render();
+      }
+    });
+    if (clearButton instanceof HTMLButtonElement) {
+      clearButton.addEventListener("click", () => {
+        finishEdit();
+        setEditorStatus("Edit cleared; the profile fields are unchanged.");
+      });
+    }
+    if (outputCount instanceof HTMLSelectElement) outputCount.addEventListener("change", render);
+    if (randomSeed instanceof HTMLButtonElement && baseSeed instanceof HTMLInputElement) {
+      randomSeed.addEventListener("click", () => {
+        const values = new Uint32Array(2);
+        window.crypto.getRandomValues(values);
+        baseSeed.value = String((BigInt(values[0]) << 31n) | BigInt(values[1] >>> 1));
+      });
+    }
+    if (composition instanceof HTMLSelectElement) {
+      const renderComposition = () => {
+        const duo = composition.value === "duo";
+        if (secondSubject) secondSubject.hidden = !duo;
+        if (regionalPrompts) regionalPrompts.hidden = !duo;
+      };
+      composition.addEventListener("change", renderComposition);
+      renderComposition();
+    }
+    form.addEventListener("submit", (event) => {
+      variants.forEach((variant) => { variant.label = variant.label.trim(); });
+      if (variants.length < 2 || variants.some((variant) => (
+        !profileIsValid(variant) || !profileIsWarmReady(variant)
+      ))) {
+        event.preventDefault();
+        if (submitStatus) submitStatus.textContent = "Fix invalid variants before queueing.";
+        return;
+      }
+      serialize();
+      if (submit instanceof HTMLButtonElement) {
+        submit.disabled = true;
+        submit.textContent = "Queuing comparison…";
+      }
+    }, { capture: true });
+  }
+
+  function initializeExperimentWarmSession() {
+    document.querySelectorAll("[data-experiment-warm-session]").forEach((panel) => {
+      const statusNode = panel.querySelector("[data-warm-session-status]");
+      const heading = panel.querySelector("[data-warm-session-heading]");
+      const actions = panel.querySelector("[data-warm-session-actions]");
+      const buttons = Array.from(panel.querySelectorAll("[data-warm-start], [data-warm-extend], [data-warm-end]"));
+      const csrf = panel.dataset.csrfToken || "";
+      let endpointAvailable = false;
+      let statusTimer = 0;
+      const safeEndpoint = (value) => {
+        try {
+          const url = new URL(value, window.location.href);
+          return url.origin === window.location.origin ? url.href : "";
+        } catch (_error) { return ""; }
+      };
+      const render = (payload) => {
+        if (!isRecord(payload) || payload.available !== true) return false;
+        endpointAvailable = true;
+        if (actions) actions.hidden = false;
+        const state = ["off", "starting", "warm", "ending"].includes(payload.state)
+          ? payload.state : "off";
+        if (heading) heading.textContent = state === "warm" ? "GPU warm for follow-up tests" : `Warm session: ${state}`;
+        const seconds = Math.max(0, integerValue(payload.remaining_seconds, 0));
+        const cost = typeof payload.hourly_rate_usd === "string" ? payload.hourly_rate_usd : "";
+        if (statusNode) {
+          if (state === "warm") {
+            statusNode.textContent = `${Math.ceil(seconds / 60)} minutes remain${cost ? ` at up to $${cost}/hour` : ""}.`;
+          } else if (state === "starting") {
+            statusNode.textContent = "Allocating the single GPU now. Keep editing; queued variants will reuse it when ready.";
+          } else if (state === "ending") {
+            statusNode.textContent = "Releasing the warm worker and returning to scale-to-zero.";
+          } else {
+            statusNode.textContent = "Batch mode remains available and scales to zero after the queue.";
+          }
+        }
+        buttons.forEach((button) => {
+          if (button.hasAttribute("data-warm-start")) button.hidden = state !== "off";
+          if (button.hasAttribute("data-warm-extend")) button.hidden = state !== "warm";
+          if (button.hasAttribute("data-warm-end")) button.hidden = !["starting", "warm"].includes(state);
+        });
+        return state;
+      };
+      const statusUrl = safeEndpoint(panel.dataset.warmStatusUrl || "");
+      if (!statusUrl) return;
+      const scheduleStatusRefresh = (state) => {
+        window.clearTimeout(statusTimer);
+        const delay = ["starting", "ending"].includes(state)
+          ? 5000
+          : state === "warm" ? 15000 : 0;
+        if (delay) statusTimer = window.setTimeout(refreshStatus, delay);
+      };
+      const refreshStatus = async () => {
+        try {
+          const response = await fetch(statusUrl, {
+            credentials: "same-origin",
+            cache: "no-store",
+            headers: { Accept: "application/json" },
+          });
+          if ([404, 501].includes(response.status)) {
+            if (statusNode) statusNode.textContent = "Queue all variants together for one allocation; optional warm follow-up is not enabled yet.";
+            return;
+          }
+          if (!response.ok) throw new Error("warm status unavailable");
+          const state = render(await response.json());
+          if (state) scheduleStatusRefresh(state);
+        } catch (_error) {
+          if (statusNode) statusNode.textContent = "Warm-session status is temporarily unavailable. Normal batch mode still works.";
+        }
+      };
+      refreshStatus();
+      buttons.forEach((button) => button.addEventListener("click", async () => {
+        if (!endpointAvailable) return;
+        const url = safeEndpoint(
+          button.hasAttribute("data-warm-start") ? panel.dataset.warmStartUrl
+            : button.hasAttribute("data-warm-extend") ? panel.dataset.warmExtendUrl
+              : panel.dataset.warmEndUrl,
+        );
+        if (!url) return;
+        buttons.forEach((item) => { item.disabled = true; });
+        try {
+          const body = button.hasAttribute("data-warm-end") ? {} : { duration_minutes: 15 };
+          const response = await fetch(url, {
+            method: "POST",
+            credentials: "same-origin",
+            cache: "no-store",
+            headers: { Accept: "application/json", "Content-Type": "application/json", "X-CSRF-Token": csrf },
+            body: JSON.stringify(body),
+          });
+          if (!response.ok) throw new Error("warm session update failed");
+          const state = render(await response.json());
+          if (state) scheduleStatusRefresh(state);
+        } catch (_error) {
+          if (statusNode) statusNode.textContent = "Warm session could not be changed. The queued experiment is unaffected.";
+        } finally {
+          buttons.forEach((item) => { item.disabled = false; });
+        }
+      }));
+    });
+  }
+
+  function initializeExperimentResults() {
+    const root = document.querySelector("[data-experiment-results]");
+    if (!(root instanceof HTMLElement)) return;
+    const statusNode = root.querySelector("[data-experiment-results-status]");
+    const progressLabel = root.querySelector("[data-experiment-progress-label]");
+    const progressPercent = root.querySelector("[data-experiment-progress-percent]");
+    const progressbar = root.querySelector("[data-experiment-progressbar]");
+    const progressFill = root.querySelector("[data-experiment-progress-fill]");
+    const known = new Set();
+    let stopped = false;
+    const safeUrl = (value) => {
+      try {
+        const url = new URL(value, window.location.href);
+        return url.origin === window.location.origin ? url.href : "";
+      } catch (_error) { return ""; }
+    };
+    const progressUrl = safeUrl(root.dataset.progressUrl || "");
+    const assetsUrl = safeUrl(root.dataset.assetsUrl || "");
+    const assetUrl = (value, id) => {
+      const url = safeUrl(value);
+      return url && new URL(url).pathname.startsWith(`/dashboard/assets/${id}/`) ? url : "";
+    };
+    const assetCard = (asset) => {
+      const id = typeof asset.asset_id === "string" ? asset.asset_id : "";
+      const view = assetUrl(asset.view_url, id);
+      if (!id || !view) return null;
+      const card = createNode("article", "asset-card experiment-asset-card");
+      card.dataset.assetCard = "";
+      card.dataset.assetId = id;
+      card.dataset.outputIndex = String(Math.max(0, integerValue(asset.output_index, 0)));
+      const link = createNode("a", "asset-preview-link");
+      link.href = view;
+      const image = document.createElement("img");
+      image.src = view;
+      image.alt = `Generated sample ${Math.max(0, integerValue(asset.output_index, 0)) + 1}`;
+      image.loading = "lazy";
+      image.width = Math.max(1, integerValue(asset.width, 1));
+      image.height = Math.max(1, integerValue(asset.height, 1));
+      link.append(image);
+      card.append(link);
+      const footer = createNode("div", "experiment-asset-footer");
+      footer.append(createNode("strong", "", `Sample ${Math.max(0, integerValue(asset.output_index, 0)) + 1}`));
+      const download = assetUrl(asset.download_url, id);
+      if (download) {
+        const anchor = createNode("a", "text-button", "Download");
+        anchor.href = download;
+        footer.append(anchor);
+      }
+      card.append(footer);
+      const detailsUrl = assetUrl(asset.generation_details_url, id);
+      if (detailsUrl) {
+        const details = createNode("details", "generation-details");
+        details.dataset.generationDetails = "";
+        details.dataset.generationDetailsUrl = detailsUrl;
+        details.append(createNode("summary", "", "Full prompt & settings"));
+        const body = createNode("div", "generation-details-body");
+        body.dataset.generationDetailsBody = "";
+        const loading = createNode("p", "generation-details-status", "Open to load exact settings.");
+        loading.dataset.generationDetailsStatus = "";
+        body.append(loading);
+        details.append(body);
+        card.append(details);
+      }
+      return card;
+    };
+    const refreshAssets = async () => {
+      if (!assetsUrl || stopped) return;
+      try {
+        const response = await fetch(assetsUrl, { credentials: "same-origin", cache: "no-store", headers: { Accept: "application/json" } });
+        if (!response.ok) throw new Error("asset refresh failed");
+        const payload = await response.json();
+        if (!isRecord(payload) || !Array.isArray(payload.variants)) throw new Error("invalid assets");
+        payload.variants.forEach((variant) => {
+          if (!isRecord(variant) || !Array.isArray(variant.assets)) return;
+          const index = Math.max(0, integerValue(variant.index, 0));
+          const grid = root.querySelector(`[data-experiment-variant-assets="${index}"]`);
+          const empty = root.querySelector(`[data-experiment-variant-empty="${index}"]`);
+          if (!(grid instanceof HTMLElement)) return;
+          variant.assets.sort((a, b) => integerValue(a.output_index, 0) - integerValue(b.output_index, 0));
+          variant.assets.forEach((asset) => {
+            if (!isRecord(asset) || known.has(asset.asset_id)) return;
+            const card = assetCard(asset);
+            if (!card) return;
+            known.add(asset.asset_id);
+            grid.append(card);
+          });
+          if (empty) empty.hidden = grid.childElementCount > 0;
+          document.dispatchEvent(new CustomEvent("gen-automation:assets-updated", { detail: { root: grid } }));
+        });
+        if (statusNode) statusNode.textContent = "Results are updated automatically.";
+      } catch (_error) {
+        if (statusNode) statusNode.textContent = "Network interrupted live results; retrying automatically.";
+      }
+    };
+    const refreshProgress = async () => {
+      if (!progressUrl || stopped) return;
+      try {
+        const response = await fetch(progressUrl, { credentials: "same-origin", cache: "no-store", headers: { Accept: "application/json" } });
+        if (!response.ok) throw new Error("progress failed");
+        const payload = await response.json();
+        if (!isRecord(payload) || !Array.isArray(payload.variants)) throw new Error("invalid progress");
+        const generated = Math.max(0, integerValue(payload.generated, 0));
+        const expected = Math.max(0, integerValue(payload.expected, 0));
+        const percent = Math.max(0, Math.min(100, Number(payload.percent) || 0));
+        if (progressLabel) progressLabel.textContent = `${generated} / ${expected} images`;
+        if (progressPercent) progressPercent.textContent = `${percent.toFixed(1)}%`;
+        if (progressFill) progressFill.style.width = `${percent}%`;
+        if (progressbar) {
+          progressbar.setAttribute("aria-valuemax", String(expected));
+          progressbar.setAttribute("aria-valuenow", String(generated));
+        }
+        payload.variants.forEach((variant) => {
+          if (!isRecord(variant) || !isRecord(variant.stage) || !isRecord(variant.images)) return;
+          const node = root.querySelector(`[data-experiment-variant="${integerValue(variant.index, 0)}"] [data-experiment-variant-status]`);
+          if (node) node.textContent = `${variant.stage.label || "Queued"} · ${integerValue(variant.images.generated, 0)}/${integerValue(variant.images.expected, 0)}`;
+        });
+        await refreshAssets();
+        if (payload.complete === true) {
+          stopped = true;
+          if (statusNode) statusNode.textContent = "Comparison complete. Open any image to inspect it at full size.";
+          return;
+        }
+      } catch (_error) {
+        if (statusNode) statusNode.textContent = "Network interrupted live progress; retrying automatically.";
+      }
+      window.setTimeout(refreshProgress, 3000);
+    };
+    root.querySelectorAll("[data-experiment-result-tab]").forEach((tab) => {
+      tab.addEventListener("click", () => {
+        root.querySelectorAll("[data-experiment-result-tab]").forEach((candidate) => candidate.setAttribute("aria-selected", String(candidate === tab)));
+        root.querySelectorAll("[data-experiment-variant]").forEach((column) => column.classList.toggle("mobile-selected", column.dataset.experimentVariant === tab.dataset.experimentResultTab));
+      });
+    });
+    root.querySelector('[data-experiment-variant="0"]')?.classList.add("mobile-selected");
+    refreshProgress();
+  }
+
+  const experimentFormPresent = Boolean(document.querySelector("[data-experiment-form]"));
   const reusedImageSettings = consumePendingImageProfile();
-  if (!reusedImageSettings) restoreAutomationDraft();
+  if (!reusedImageSettings && !experimentFormPresent) restoreAutomationDraft();
   initializeLoraPicker();
   initializeAutomationBuilder();
   initializeWorkflowRefinement();
   initializeCharacterComposition();
   initializeAutomationPresets();
-  initializeAutomationDraft();
+  if (!experimentFormPresent) initializeAutomationDraft();
   initializeReleaseLibrary();
   initializeAssetSorting();
   initializeWildcardLibraryTools();
@@ -3714,4 +4274,7 @@
   initializeGenerationProgress();
   initializeDeliveryReauthentication();
   initializeDeliveryAutoRefresh();
+  initializeExperimentLab();
+  initializeExperimentWarmSession();
+  initializeExperimentResults();
 })();

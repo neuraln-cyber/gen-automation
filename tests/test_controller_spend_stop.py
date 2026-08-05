@@ -11,12 +11,14 @@ from uuid import UUID
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import gen_automation.controller.runtime as controller_runtime
 from gen_automation.config import Settings
 from gen_automation.controller.runtime import ControllerWorkloads, _SubmissionProgress
 from gen_automation.db.models import (
     AuditEvent,
+    ExperimentWarmLease,
     GenerationAttempt,
     GenerationJob,
     OutboxEvent,
@@ -45,6 +47,7 @@ from gen_automation.integrations.salad.models import (
     SaladQueue,
 )
 from gen_automation.services.budgets import ensure_budget_guard, reserve_attempt_budget
+from gen_automation.services.experiment_warm_leases import start_experiment_warm_lease
 from gen_automation.services.outbox import (
     GENERATION_ATTEMPT_AGGREGATE,
     SALAD_JOB_SUBMIT_TOPIC,
@@ -468,6 +471,112 @@ async def test_submit_refreshes_runtime_only_at_same_deployment_idle_boundary(
             second.generation_attempt_id,
             second.generation_attempt_id,
         ]
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_experiment_warm_lease_refreshes_first_submit_once_then_reuses_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'warm-submit.db').as_posix()}")
+    await database.create_schema()
+    try:
+        context = await _seed_submission_database(database)
+        warm_now = datetime.now(UTC)
+        async with database.sessions() as session:
+            deployment = await session.scalar(select(SaladDeployment))
+            assert deployment is not None
+            started = await start_experiment_warm_lease(
+                session,
+                salad_deployment_id=deployment.id,
+                actor="lab-post",
+                now=warm_now,
+            )
+            await session.commit()
+            deployment_id = deployment.id
+
+        refreshes: list[UUID] = []
+        submissions: list[UUID] = []
+
+        async def fake_refresh(
+            deployment: SaladDeployment,
+            client: object,
+            resolver: object,
+        ) -> SaladContainerGroup:
+            del client, resolver
+            refreshes.append(deployment.id)
+            return _group(deployment.container_group_name, deployment.queue_name)
+
+        async def fake_submit(
+            *args: object,
+            generation_attempt_id: UUID,
+            **kwargs: object,
+        ) -> SubmissionResult:
+            del kwargs
+            session = cast(AsyncSession, args[0])
+            await session.commit()
+            submissions.append(generation_attempt_id)
+            return SubmissionResult(
+                generation_attempt_id=generation_attempt_id,
+                attempt_state=GenerationAttemptState.CREATED,
+                generation_job_state=GenerationState.CLAIMED,
+                disposition=SubmissionDisposition.SUBMITTED,
+                mutation_effect=MutationEffect.CONFIRMED,
+                provider_external_id="provider-job",
+            )
+
+        monkeypatch.setattr(
+            controller_runtime,
+            "refresh_container_group_runtime",
+            fake_refresh,
+        )
+        artifact_manifest = ArtifactManifest.model_construct(
+            version="v1",
+            artifacts=(),
+            manifest_sha256="0" * 64,
+        )
+        monkeypatch.setattr(
+            controller_runtime,
+            "load_artifact_manifest",
+            lambda _raw: artifact_manifest,
+        )
+        monkeypatch.setattr(controller_runtime, "submit_prepared_attempt", fake_submit)
+        workloads = ControllerWorkloads(
+            settings=Settings(
+                worker_signing_key_id="worker-key-1",
+                worker_signing_private_key=WORKER_SIGNING_PRIVATE_KEY,
+                salad_worker_model_manifest_json=RUNTIME_MANIFEST,
+                salad_worker_model_manifest_sha256="0" * 64,
+            ),
+            sessions=database.sessions,
+            instance_id="controller-warm-submit-test",
+            salad_client=cast(SaladClient, object()),
+            object_store=cast(ObjectStore, object()),
+        )
+        event = ClaimedOutboxEvent(
+            id=UUID("0af360ac-9a91-4684-8e48-09c0f4ee788d"),
+            topic=SALAD_JOB_SUBMIT_TOPIC,
+            dedupe_key=f"{SALAD_JOB_SUBMIT_TOPIC}:{context.attempt_id}",
+            correlation_id=str(context.attempt_id),
+            aggregate_type=GENERATION_ATTEMPT_AGGREGATE,
+            aggregate_id=context.attempt_id,
+            payload={"generation_attempt_id": str(context.attempt_id)},
+            attempt=1,
+            max_attempts=3,
+            lease_expires_at=NOW + timedelta(minutes=5),
+        )
+
+        await workloads._submit_event(event, progress=_SubmissionProgress())
+        await workloads._submit_event(event, progress=_SubmissionProgress())
+
+        assert refreshes == [deployment_id]
+        assert submissions == [context.attempt_id, context.attempt_id]
+        async with database.sessions() as session:
+            lease = await session.get(ExperimentWarmLease, started.lease_id)
+            assert lease is not None
+            assert lease.provider_version == 1
     finally:
         await database.dispose()
 

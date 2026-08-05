@@ -1,0 +1,81 @@
+{% extends "dashboard/base.html" %}
+
+{% block content %}
+  <a class="back" href="/dashboard/experiments/new">&larr; New experiment</a>
+  <header class="page-header experiment-page-header">
+    <div class="page-header-row">
+      <div class="page-header-copy">
+        <p class="page-kicker">Experiment Lab</p>
+        <h1>{{ experiment.title }}</h1>
+        <p class="lede">Results appear as soon as each image is verified. Paired outputs stay aligned by sample number.</p>
+      </div>
+      <a class="primary-button" href="/dashboard/experiments/new">Run another comparison</a>
+    </div>
+  </header>
+
+  {% if warm_notice %}
+    <div class="form-error" role="status">
+      The comparison was queued successfully, but the optional follow-up GPU hold could not
+      be started. Batch mode is still running normally and will scale to zero afterward.
+    </div>
+  {% endif %}
+
+  <section
+    class="experiment-results"
+    data-experiment-results
+    data-progress-url="/dashboard/experiments/{{ experiment.group_slug }}/progress"
+    data-assets-url="/dashboard/experiments/{{ experiment.group_slug }}/generated-assets"
+  >
+    <section class="experiment-progress panel" aria-live="polite">
+      <div class="experiment-progress-copy">
+        <div><span class="experiment-eyebrow">Comparison progress</span><strong data-experiment-progress-label>{{ experiment.generated_outputs }} / {{ experiment.expected_outputs }} images</strong></div>
+        <span data-experiment-progress-percent>{{ ((experiment.generated_outputs * 100 / experiment.expected_outputs) if experiment.expected_outputs else 0)|round(1) }}%</span>
+      </div>
+      <div class="experiment-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="{{ experiment.expected_outputs }}" aria-valuenow="{{ experiment.generated_outputs }}" data-experiment-progressbar>
+        <span data-experiment-progress-fill style="width: {{ ((experiment.generated_outputs * 100 / experiment.expected_outputs) if experiment.expected_outputs else 0)|round(1) }}%"></span>
+      </div>
+      <p class="muted" data-experiment-progress-status>Waiting for the queued GPU comparison.</p>
+    </section>
+
+    <section
+      class="experiment-warm-panel"
+      data-experiment-warm-session
+      data-warm-status-url="/dashboard/experiments/warm-session"
+      data-warm-start-url="/dashboard/experiments/warm-session/start"
+      data-warm-extend-url="/dashboard/experiments/warm-session/extend"
+      data-warm-end-url="/dashboard/experiments/warm-session/end"
+      data-csrf-token="{{ csrf_token }}"
+    >
+      <div><span class="experiment-eyebrow">Follow-up session</span><strong data-warm-session-heading>Checking GPU availability</strong><p data-warm-session-status>The comparison remains safe if this optional accelerator is unavailable.</p></div>
+      <div class="experiment-warm-actions" hidden data-warm-session-actions>
+        <button class="secondary-button" type="button" data-warm-start>Start 15-minute session</button>
+        <button class="secondary-button" type="button" data-warm-extend>+15 minutes</button>
+        <button class="text-button danger" type="button" data-warm-end>End now</button>
+      </div>
+    </section>
+
+    <div class="experiment-result-tabs" role="tablist" aria-label="Variants">
+      {% for variant in experiment.variants %}
+        <button type="button" role="tab" data-experiment-result-tab="{{ variant.index }}" aria-selected="{{ 'true' if loop.first else 'false' }}">{{ variant.label }}</button>
+      {% endfor %}
+    </div>
+
+    <div class="experiment-comparison-grid" data-experiment-comparison-grid style="--experiment-columns: {{ experiment.variants|length }}">
+      {% for variant in experiment.variants %}
+        <section class="experiment-result-column" data-experiment-variant="{{ variant.index }}" data-release-id="{{ variant.release_id }}">
+          <header>
+            <span class="experiment-variant-letter">{{ 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[variant.index] }}</span>
+            <div><h2>{{ variant.label }}</h2><p data-experiment-variant-status>{{ variant.status.stage.label }} &middot; {{ variant.status.images.generated }}/{{ variant.status.expected_outputs }}</p></div>
+            <a class="text-button" href="/dashboard/releases/{{ variant.release_id }}/status">Open run</a>
+          </header>
+          <div class="experiment-result-assets" data-asset-grid data-experiment-variant-assets="{{ variant.index }}"></div>
+          <div class="experiment-result-placeholder" data-experiment-variant-empty="{{ variant.index }}">
+            <span class="experiment-result-spinner" aria-hidden="true"></span>
+            <p>Waiting for sample 1</p>
+          </div>
+        </section>
+      {% endfor %}
+    </div>
+    <p class="experiment-results-network" data-experiment-results-status aria-live="polite"></p>
+  </section>
+{% endblock %}

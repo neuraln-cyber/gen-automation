@@ -136,6 +136,7 @@ def test_foundation_migration_round_trip(
         "derivative_jobs",
         "derivative_outputs",
         "derivative_recipes",
+        "experiment_warm_leases",
         "generation_attempts",
         "generation_jobs",
         "idempotency_records",

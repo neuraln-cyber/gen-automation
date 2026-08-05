@@ -1,0 +1,343 @@
+{% extends "dashboard/base.html" %}
+
+{% block content %}
+  <a class="back" href="/dashboard">&larr; Automation library</a>
+  <header class="page-header experiment-page-header">
+    <div class="page-header-row">
+      <div class="page-header-copy">
+        <p class="page-kicker">Experiment Lab</p>
+        <h1>Compare ideas without repeated cold starts</h1>
+        <p class="lede">
+          Tune one profile, save it as a variant, then change only what you want to test.
+          Every variant is queued together so one GPU allocation can process the comparison.
+        </p>
+      </div>
+      <a class="secondary-button" href="/dashboard/new-set">Build a production set</a>
+    </div>
+  </header>
+
+  {% if error_message %}<div class="form-error" role="alert">{{ error_message }}</div>{% endif %}
+
+  <section
+    class="experiment-warm-panel"
+    data-experiment-warm-session
+    data-warm-status-url="/dashboard/experiments/warm-session"
+    data-warm-start-url="/dashboard/experiments/warm-session/start"
+    data-warm-extend-url="/dashboard/experiments/warm-session/extend"
+    data-warm-end-url="/dashboard/experiments/warm-session/end"
+    data-csrf-token="{{ csrf_token }}"
+  >
+    <div>
+      <span class="experiment-eyebrow">GPU strategy</span>
+      <strong data-warm-session-heading>Batch mode &middot; one allocation</strong>
+      <p data-warm-session-status>
+        Queue the complete comparison now. The worker stays useful between variants and scales to zero afterward.
+      </p>
+    </div>
+    <div class="experiment-warm-actions" hidden data-warm-session-actions>
+      <button class="secondary-button" type="button" data-warm-start>Start 15-minute session</button>
+      <button class="secondary-button" type="button" data-warm-extend>+15 minutes</button>
+      <button class="text-button danger" type="button" data-warm-end>End now</button>
+    </div>
+  </section>
+
+  <form
+    class="experiment-form"
+    method="post"
+    action="/dashboard/experiments/new"
+    autocomplete="off"
+    data-experiment-form
+    data-automation-form
+    data-server-error="{{ 'true' if error_message else 'false' }}"
+  >
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="submission_id" value="{{ submission_id }}">
+    <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+    <input type="hidden" name="group_slug" value="{{ form_values['group_slug'] }}">
+    <textarea name="variant_plan" data-experiment-plan hidden>{{ form_values['variant_plan'] }}</textarea>
+
+    <section class="experiment-setup panel">
+      <div class="experiment-section-heading">
+        <div>
+          <span class="experiment-eyebrow">1 &middot; Comparison</span>
+          <h2>Name the test and choose its sample size</h2>
+        </div>
+        <span class="experiment-limit">2&ndash;12 variants &middot; 1&ndash;4 images each</span>
+      </div>
+      <div class="form-grid experiment-setup-grid">
+        <label>
+          Experiment title
+          <input name="experiment_title" value="{{ form_values['experiment_title'] }}" minlength="1" maxlength="240" required>
+        </label>
+        <label>
+          Images per variant
+          <select name="outputs_per_variant" data-experiment-output-count>
+            {% for count in range(1, 5) %}
+              <option value="{{ count }}" {% if form_values['outputs_per_variant'] == count|string %}selected{% endif %}>{{ count }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Seed comparison
+          <select name="paired_seeds" data-experiment-paired-seeds>
+            <option value="true" {% if form_values['paired_seeds'] != 'false' %}selected{% endif %}>Paired seeds (recommended)</option>
+            <option value="false" {% if form_values['paired_seeds'] == 'false' %}selected{% endif %}>Independent seeds</option>
+          </select>
+          <small>Paired seeds make A/B differences easier to judge.</small>
+        </label>
+        <label>
+          Shared base seed
+          <span class="inline-input-action">
+            <input type="number" name="base_seed" value="{{ form_values['base_seed'] }}" min="0" max="9223372036854775807" data-experiment-base-seed required>
+            <button class="secondary-button" type="button" data-experiment-random-seed>Randomize</button>
+          </span>
+        </label>
+        <label class="experiment-warm-choice">
+          <span>Follow-up testing</span>
+          <span class="experiment-checkbox-row">
+            <input type="checkbox" name="keep_warm" value="true" {% if form_values['keep_warm'] != 'false' %}checked{% endif %}>
+            Keep GPU warm for another 15 minutes
+          </span>
+          <small>
+            Maximum added idle exposure: ${{ warm_idle_cost_usd }}. Estimated maximum at the
+            controller auto-stop limit (90 minutes): ${{ warm_session_max_usd }} if the controller
+            remains healthy. Budget guards: ${{ salad_daily_budget_usd }}/day and
+            ${{ salad_monthly_budget_usd }}/month.
+          </small>
+        </label>
+      </div>
+    </section>
+
+    <div class="experiment-workbench">
+      <section class="experiment-editor panel" data-experiment-editor>
+        <div class="experiment-section-heading">
+          <div>
+            <span class="experiment-eyebrow">2 &middot; Profile editor</span>
+            <h2 data-experiment-editor-heading>Build variant A</h2>
+          </div>
+          <button class="text-button" type="button" data-experiment-clear-editor>Reset edit</button>
+        </div>
+
+        <section class="settings-preset-bar" data-automation-presets aria-label="Saved settings presets">
+          <div class="settings-preset-copy"><strong>Presets</strong><span>Saved on this device</span></div>
+          <select data-automation-preset-select aria-label="Saved settings preset"><option value="">No saved presets</option></select>
+          <button class="secondary-button" type="button" data-automation-preset-load disabled>Load</button>
+          <details class="settings-preset-manage">
+            <summary>Manage</summary>
+            <div class="settings-preset-manage-body">
+              <input type="text" maxlength="80" placeholder="Preset name" data-automation-preset-name>
+              <button class="secondary-button" type="button" data-automation-preset-save>Save current</button>
+              <button class="secondary-button" type="button" data-automation-preset-export>Export</button>
+              <button class="secondary-button" type="button" data-automation-preset-import>Import</button>
+              <input type="file" accept="application/json,.json" data-automation-preset-import-file hidden>
+              <button class="text-button danger" type="button" data-automation-preset-delete disabled>Delete</button>
+            </div>
+          </details>
+          <output class="settings-preset-status" data-automation-preset-status aria-live="polite"></output>
+        </section>
+
+        <div class="form-grid experiment-profile-grid">
+          <label>
+            Character
+            <select name="subject_id" required>
+              {% if not options.subjects %}<option value="">No approved subjects</option>{% endif %}
+              {% for subject in options.subjects %}
+                <option value="{{ subject.approval_id }}" {% if form_values['subject_id'] == subject.approval_id|string %}selected{% endif %}>{{ subject.name }} &middot; age {{ subject.canonical_age }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>
+            Composition
+            <select name="composition_mode" data-experiment-composition>
+              <option value="single" {% if form_values['composition_mode'] != 'duo' %}selected{% endif %}>One character</option>
+              <option value="duo" {% if form_values['composition_mode'] == 'duo' %}selected{% endif %} {% if options.subjects|length < 2 %}disabled{% endif %}>Two characters</option>
+            </select>
+          </label>
+          <label data-experiment-second-subject {% if form_values['composition_mode'] != 'duo' %}hidden{% endif %}>
+            Second character
+            <select name="subject_2_id">
+              <option value="">Choose character</option>
+              {% for subject in options.subjects %}
+                <option value="{{ subject.approval_id }}" {% if form_values['subject_2_id'] == subject.approval_id|string %}selected{% endif %}>{{ subject.name }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>
+            Checkpoint
+            <select name="checkpoint_id" required data-experiment-checkpoint>
+              {% if not options.checkpoints %}<option value="">No approved checkpoints</option>{% endif %}
+              {% for checkpoint in options.checkpoints %}
+                {% set ready = checkpoint_readiness[checkpoint.approval_id|string] %}
+                <option
+                  value="{{ checkpoint.approval_id }}"
+                  data-checkpoint-name="{{ checkpoint.name }}"
+                  data-warm-ready="{{ 'true' if ready.warm_ready else 'false' }}"
+                  {% if form_values['checkpoint_id'] == checkpoint.approval_id|string %}selected{% endif %}
+                >{{ checkpoint.name }} &middot; {{ 'warm-ready' if ready.warm_ready else 'worker restart' }}</option>
+              {% endfor %}
+            </select>
+            <small data-experiment-model-hint>Warm-ready inputs are already present in the configured worker manifest.</small>
+          </label>
+          <label>
+            Workflow
+            <select name="workflow_id" data-workflow-profile required>
+              {% if not options.workflows %}<option value="">No approved workflows</option>{% endif %}
+              {% for workflow in options.workflows %}
+                <option
+                  value="{{ workflow.approval_id }}"
+                  data-workflow-name="{{ workflow.name }}"
+                  data-workflow-version="{{ workflow.version }}"
+                  data-upscaler-enabled="{{ 'true' if workflow.has_hires_pass else 'false' }}"
+                  data-detailer-enabled="{{ 'true' if workflow.has_face_detailer else 'false' }}"
+                  data-regional-prompting="{{ 'true' if workflow.has_regional_prompting else 'false' }}"
+                  {% if form_values['workflow_id'] == workflow.approval_id|string %}selected{% endif %}
+                >{{ workflow.name }} &middot; v{{ workflow.version }}</option>
+              {% endfor %}
+            </select>
+          </label>
+        </div>
+
+        <div class="experiment-regional-prompts" data-experiment-regional-prompts {% if form_values['composition_mode'] != 'duo' %}hidden{% endif %}>
+          <label>Character A prompt<textarea name="character_a_prompt" rows="2" maxlength="20000">{{ form_values['character_a_prompt'] }}</textarea></label>
+          <label>Character B prompt<textarea name="character_b_prompt" rows="2" maxlength="20000">{{ form_values['character_b_prompt'] }}</textarea></label>
+        </div>
+
+        <label class="experiment-prompt-field">
+          Positive prompt
+          <textarea name="prompt" rows="7" maxlength="20000" spellcheck="false" required>{{ form_values['prompt'] }}</textarea>
+        </label>
+        <label class="experiment-prompt-field">
+          Negative prompt
+          <textarea name="negative_prompt" rows="5" maxlength="20000" spellcheck="false">{{ form_values['negative_prompt'] }}</textarea>
+        </label>
+
+        <details class="form-disclosure" open>
+          <summary>LoRA stack <span data-lora-summary>Optional &middot; up to 8</span></summary>
+          <div class="disclosure-body">
+            <section class="lora-picker" data-lora-picker data-max-selections="8" hidden>
+              <div class="lora-picker-toolbar">
+                <label>Find a LoRA<input type="search" placeholder="Search by name or hash" autocomplete="off" data-lora-search></label>
+                <div class="lora-picker-status"><output data-lora-selection-count>0 of 8 selected</output><button class="secondary-button" type="button" data-lora-clear disabled>Clear</button></div>
+              </div>
+              {% if options.loras %}
+                <ul class="lora-catalog" data-lora-catalog aria-label="Available LoRAs">
+                  {% for lora in options.loras %}
+                    {% set ready = lora_readiness[lora.approval_id|string] %}
+                    <li>
+                      <button class="lora-option" type="button" data-lora-option data-lora-id="{{ lora.approval_id }}" data-lora-name="{{ lora.name }}" data-lora-sha256="{{ lora.sha256 }}" data-warm-ready="{{ 'true' if ready.warm_ready else 'false' }}" aria-pressed="false">
+                        <span class="lora-option-copy"><strong>{{ lora.name }}</strong><small>{{ lora.sha256[:12] }} &middot; {{ 'warm-ready' if ready.warm_ready else 'worker restart' }}</small></span>
+                        <span class="lora-option-action" data-lora-option-action>Add</span>
+                      </button>
+                    </li>
+                  {% endfor %}
+                </ul>
+                <p class="lora-catalog-empty muted" data-lora-catalog-empty hidden>No LoRAs match this search.</p>
+              {% else %}<p class="muted">No approved LoRAs are available.</p>{% endif %}
+              <h3>Selected stack</h3>
+              <ol class="lora-selected-list" data-lora-selected aria-live="polite"></ol>
+              <p class="lora-stack-empty muted" data-lora-stack-empty>No LoRAs selected.</p>
+              <p class="lora-feedback" data-lora-feedback role="status"></p>
+            </section>
+            <div class="lora-native-slots" data-lora-native-slots>
+              {% for slot in range(1, 9) %}
+                <div class="lora-row" data-lora-native-slot>
+                  <label>LoRA {{ slot }}<select name="lora_{{ slot }}_id" data-lora-native-id><option value="">None</option>{% for lora in options.loras %}{% set ready = lora_readiness[lora.approval_id|string] %}<option value="{{ lora.approval_id }}" data-warm-ready="{{ 'true' if ready.warm_ready else 'false' }}" {% if form_values['lora_' ~ slot ~ '_id'] == lora.approval_id|string %}selected{% endif %}>{{ lora.name }}</option>{% endfor %}</select></label>
+                  <label>Weight<input type="number" name="lora_{{ slot }}_weight" value="{{ form_values['lora_' ~ slot ~ '_weight'] }}" min="-2" max="2" step="0.05" data-lora-native-weight></label>
+                </div>
+              {% endfor %}
+            </div>
+          </div>
+        </details>
+
+        <details class="form-disclosure">
+          <summary>Sampling and image size <span>Compare exact settings</span></summary>
+          <div class="disclosure-body form-grid">
+            <label>Variant seed<input type="number" name="seed" value="{{ form_values['seed'] }}" min="0" max="9223372036854775807" required></label>
+            <label>Width<input type="number" name="width" value="{{ form_values['width'] }}" min="512" max="4096" step="8" required></label>
+            <label>Height<input type="number" name="height" value="{{ form_values['height'] }}" min="512" max="4096" step="8" required></label>
+            <label>Steps<input type="number" name="steps" value="{{ form_values['steps'] }}" min="1" max="200" required></label>
+            <label>CFG<input type="number" name="cfg" value="{{ form_values['cfg'] }}" min="0" max="30" step="0.1" required></label>
+            <label>Sampler<input name="sampler" value="{{ form_values['sampler'] }}" maxlength="100" required></label>
+            <label>Scheduler<input name="scheduler" value="{{ form_values['scheduler'] }}" maxlength="100" required></label>
+            <label>Clip skip<input type="number" name="clip_skip" value="{{ form_values['clip_skip'] }}" min="1" max="12" required></label>
+          </div>
+        </details>
+
+        <details class="form-disclosure">
+          <summary>Hires and face detailer <span>Workflow-dependent</span></summary>
+          <div class="disclosure-body form-grid">
+            <label>Hires scale<input type="number" name="hires_scale" value="{{ form_values['hires_scale'] }}" min="1" max="3" step="0.05" required></label>
+            <label>Hires denoise<input type="number" name="hires_denoise" value="{{ form_values['hires_denoise'] }}" min="0.05" max="1" step="0.01" required></label>
+            <label>Upscale method<select name="hires_upscale_method">{% for method in ['bislerp','bicubic','bilinear','nearest-exact','area'] %}<option value="{{ method }}" {% if form_values['hires_upscale_method'] == method %}selected{% endif %}>{{ method }}</option>{% endfor %}</select></label>
+            <label>Detailer prompt<textarea name="detailer_prompt" rows="2" maxlength="20000">{{ form_values['detailer_prompt'] }}</textarea></label>
+            <label>Detailer negative<textarea name="detailer_negative_prompt" rows="2" maxlength="20000">{{ form_values['detailer_negative_prompt'] }}</textarea></label>
+            <label>Guide size<input type="number" name="detailer_guide_size" value="{{ form_values['detailer_guide_size'] }}" min="512" max="2048" step="64" required></label>
+            <label>Maximum size<input type="number" name="detailer_max_size" value="{{ form_values['detailer_max_size'] }}" min="512" max="4096" step="64" required></label>
+            <label>Detailer denoise<input type="number" name="detailer_denoise" value="{{ form_values['detailer_denoise'] }}" min="0.05" max="1" step="0.01" required></label>
+            <label>Face threshold<input type="number" name="detailer_bbox_threshold" value="{{ form_values['detailer_bbox_threshold'] }}" min="0.1" max="0.95" step="0.01" required></label>
+            <label>Face dilation<input type="number" name="detailer_bbox_dilation" value="{{ form_values['detailer_bbox_dilation'] }}" min="-64" max="128" required></label>
+            <label>Crop factor<input type="number" name="detailer_bbox_crop_factor" value="{{ form_values['detailer_bbox_crop_factor'] }}" min="1" max="5" step="0.1" required></label>
+            <label>Feather<input type="number" name="detailer_feather" value="{{ form_values['detailer_feather'] }}" min="0" max="128" required></label>
+          </div>
+        </details>
+
+        <div class="experiment-editor-actions">
+          <label class="experiment-label-field">Variant label<input type="text" maxlength="80" value="Variant A" data-experiment-label></label>
+          <button class="primary-button" type="button" data-experiment-save-variant>Add current profile</button>
+          <output data-experiment-editor-status aria-live="polite"></output>
+        </div>
+      </section>
+
+      <aside class="experiment-queue panel" data-experiment-queue-panel>
+        <div class="experiment-section-heading">
+          <div><span class="experiment-eyebrow">3 &middot; Variant queue</span><h2>Profiles to compare</h2></div>
+          <span class="experiment-count" data-experiment-count>0 / 12</span>
+        </div>
+        <p class="muted">Cards show only what changed from variant A.</p>
+        <div class="experiment-empty" data-experiment-empty>
+          <strong>No variants yet</strong>
+          <p>Save the current profile, change one or more settings, then save the next.</p>
+        </div>
+        <ol class="experiment-variant-list" data-experiment-variant-list></ol>
+        <div class="experiment-run-summary" aria-live="polite">
+          <span><strong data-experiment-summary-variants>0</strong> variants</span>
+          <span><strong data-experiment-summary-images>0</strong> images</span>
+          <span><strong data-experiment-summary-jobs>0</strong> jobs</span>
+          <span><strong>1</strong> allocation</span>
+        </div>
+        <p class="experiment-cost-note">The worker scales to zero after the queued comparison. Model-stack changes are grouped to avoid unnecessary reloads.</p>
+        <button class="primary-button experiment-submit" type="submit" data-experiment-submit disabled>Queue comparison</button>
+        <output class="experiment-submit-status" data-experiment-submit-status aria-live="polite">Add at least two variants.</output>
+      </aside>
+    </div>
+  </form>
+
+  <template id="experiment-variant-template">
+    <li class="experiment-variant-card" data-experiment-variant-card>
+      <div class="experiment-variant-card-heading">
+        <span class="experiment-variant-letter" data-experiment-variant-letter>A</span>
+        <input type="text" maxlength="80" data-experiment-variant-name aria-label="Variant name">
+      </div>
+      <div class="experiment-diff-chips" data-experiment-diffs></div>
+      <div class="experiment-variant-actions">
+        <button class="secondary-button" type="button" data-experiment-action="load">Edit</button>
+        <button class="text-button" type="button" data-experiment-action="duplicate">Duplicate</button>
+        <button class="text-button danger" type="button" data-experiment-action="delete">Delete</button>
+      </div>
+    </li>
+  </template>
+
+  <template id="lora-selection-template">
+    <li class="lora-selection" data-lora-selection>
+      <span class="lora-drag-handle" draggable="true" aria-hidden="true">&#8942;&#8942;</span>
+      <span class="lora-selection-position" data-lora-position>1</span>
+      <span class="lora-selection-copy"><strong data-lora-selected-name></strong><code data-lora-selected-sha256></code></span>
+      <label class="lora-selection-weight">Weight<input type="number" min="-2" max="2" step="0.05" value="1" data-lora-visible-weight required></label>
+      <span class="lora-selection-actions">
+        <button type="button" data-lora-selection-action="up" aria-label="Move LoRA up">&uarr;</button>
+        <button type="button" data-lora-selection-action="down" aria-label="Move LoRA down">&darr;</button>
+        <button class="danger" type="button" data-lora-selection-action="remove">Remove</button>
+      </span>
+    </li>
+  </template>
+{% endblock %}

@@ -38,6 +38,7 @@ from gen_automation.domain.enums import (
     ComplianceResult,
     DerivativeJobState,
     DesiredDeploymentState,
+    ExperimentWarmLeaseState,
     GenerationAttemptState,
     GenerationState,
     InboxStatus,
@@ -752,6 +753,78 @@ class SaladDeployment(UuidPrimaryKeyMixin, TimestampMixin, Base):
     lock_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ExperimentWarmLease(UuidPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "experiment_warm_leases"
+    __table_args__ = (
+        CheckConstraint(
+            "started_at < expires_at AND expires_at <= hard_expires_at",
+            name="valid_expiry_window",
+        ),
+        CheckConstraint(
+            "max_cost_microusd > 0",
+            name="positive_max_cost",
+        ),
+        CheckConstraint(
+            "idle_ttl_seconds >= 60 AND idle_ttl_seconds <= 5400",
+            name="valid_idle_ttl",
+        ),
+        CheckConstraint(
+            "provider_version IS NULL OR provider_version > 0",
+            name="positive_provider_version",
+        ),
+        CheckConstraint(
+            "lock_version > 0",
+            name="positive_lock_version",
+        ),
+        CheckConstraint(
+            "(state IN ('starting', 'active', 'ending') AND ended_at IS NULL) "
+            "OR (state IN ('ended', 'expired', 'failed') AND ended_at IS NOT NULL)",
+            name="terminal_end_timestamp",
+        ),
+        Index(
+            "uq_experiment_warm_leases_live_deployment",
+            "salad_deployment_id",
+            unique=True,
+            postgresql_where=text("state IN ('starting', 'active', 'ending')"),
+            sqlite_where=text("state IN ('starting', 'active', 'ending')"),
+        ),
+        Index(
+            "ix_experiment_warm_leases_expiry",
+            "state",
+            "expires_at",
+            "hard_expires_at",
+        ),
+    )
+
+    salad_deployment_id: Mapped[UUID] = mapped_column(
+        ForeignKey("salad_deployments.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    state: Mapped[ExperimentWarmLeaseState] = mapped_column(
+        Enum(
+            ExperimentWarmLeaseState,
+            name="experiment_warm_lease_state",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=8,
+        ),
+        nullable=False,
+        default=ExperimentWarmLeaseState.STARTING,
+    )
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    hard_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    idle_ttl_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_cost_microusd: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    provider_version: Mapped[int | None] = mapped_column(Integer)
+    created_by: Mapped[str] = mapped_column(String(200), nullable=False)
+    lock_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
 
 class ProviderBudgetGuard(UuidPrimaryKeyMixin, Base):

@@ -125,6 +125,36 @@ Normal idle cost control uses queue autoscaling to zero. Explicit stop is for
 maintenance or the global kill switch because stop destroys runtime instances
 and their local data.
 
+### Experiment Lab warm sessions
+
+Experiment Lab keeps the normal scale-to-zero posture and adds an explicit,
+bounded editing lease for interactive prompt/model comparisons:
+
+- the operator can begin warming the current worker while assembling variants;
+- 2-12 complete setting snapshots, with 1-4 outputs each, are queued together;
+- variants sharing a workflow, checkpoint, and LoRA stack are kept adjacent so
+  the same one-replica worker can reuse already loaded models;
+- a ready worker remains at autoscaler minimum `1` only while the lease is live;
+- the default idle window is 15 minutes and validated experiment activity resets
+  that window without moving the absolute deadline;
+- the controller targets an absolute 90-minute auto-stop and then restores
+  autoscaler minimum `0`; this is a controller safety boundary, not a
+  provider-enforced billing cap; and
+- the existing daily/monthly budget guard and emergency stop remain authoritative.
+
+At the staging `$0.35/hour` ceiling, the default idle window is at most
+`$0.0875` and the 90-minute controller envelope is at most `$0.525`. Starting a
+lease reserves its remaining envelope in the durable budget calculation so a
+restart cannot silently drop the cost commitment.
+
+Prompt text, negative prompts, sampler settings, dimensions, workflow profiles,
+and weights for already onboarded LoRAs can change without a container rollout.
+Checkpoints and LoRAs are warm-ready only when their exact SHA-256 is present
+under the expected artifact kind in the configured worker manifest. A genuinely
+new artifact still requires the normal reviewed manifest update and immutable
+worker deployment, because Salad runtime storage is ephemeral and bootstrap
+credentials are intentionally removed after model initialization.
+
 The worker image pins ComfyUI and embeds the pinned Salad HTTP Job Queue worker.
 The runtime supervises ComfyUI, the embedded queue forwarder, and the worker HTTP
 API as one failure domain. The Salad container-group queue connection must

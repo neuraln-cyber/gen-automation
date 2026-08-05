@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.db.models import (
     AuditEvent,
+    ExperimentWarmLease,
     GenerationAttempt,
     ProviderBudgetGuard,
     ProviderSpendEntry,
@@ -22,6 +23,7 @@ from gen_automation.db.models import (
 from gen_automation.domain.enums import (
     BudgetState,
     DesiredDeploymentState,
+    ExperimentWarmLeaseState,
     GenerationAttemptState,
     SpendEntryType,
 )
@@ -69,6 +71,7 @@ class BudgetSnapshot:
     daily_spend_microusd: int
     monthly_spend_microusd: int
     active_reservations_microusd: int
+    active_warm_leases_microusd: int
     daily_committed_microusd: int
     monthly_committed_microusd: int
     blocked_reason: str | None
@@ -558,6 +561,36 @@ async def _evaluate_locked(
         )
     )
     active_reservations = int(reservations or 0)
+    active_warm_leases = 0
+    if guard.provider == "salad":
+        warm_leases = list(
+            (
+                await session.scalars(
+                    select(ExperimentWarmLease).where(
+                        ExperimentWarmLease.state.in_(
+                            (
+                                ExperimentWarmLeaseState.STARTING,
+                                ExperimentWarmLeaseState.ACTIVE,
+                                ExperimentWarmLeaseState.ENDING,
+                            )
+                        )
+                    )
+                )
+            ).all()
+        )
+        for lease in warm_leases:
+            realized = await session.scalar(
+                select(func.coalesce(func.sum(ProviderSpendEntry.amount_microusd), 0)).where(
+                    ProviderSpendEntry.salad_deployment_id == lease.salad_deployment_id,
+                    ProviderSpendEntry.entry_type == SpendEntryType.USAGE,
+                    ProviderSpendEntry.effective_at >= lease.started_at,
+                )
+            )
+            active_warm_leases += max(
+                lease.max_cost_microusd - int(realized or 0),
+                0,
+            )
+    active_commitments = active_reservations + active_warm_leases
     return BudgetSnapshot(
         guard_id=guard.id,
         provider=guard.provider,
@@ -567,8 +600,9 @@ async def _evaluate_locked(
         daily_spend_microusd=daily_spend,
         monthly_spend_microusd=monthly_spend,
         active_reservations_microusd=active_reservations,
-        daily_committed_microusd=daily_spend + active_reservations,
-        monthly_committed_microusd=monthly_spend + active_reservations,
+        active_warm_leases_microusd=active_warm_leases,
+        daily_committed_microusd=daily_spend + active_commitments,
+        monthly_committed_microusd=monthly_spend + active_commitments,
         blocked_reason=guard.blocked_reason,
         evaluated_at=evaluated_at,
     )
@@ -623,6 +657,38 @@ async def _engage_salad_kill_switch(
                 resource_type="salad_deployment",
                 resource_id=deployment.id,
                 correlation_id=f"salad-deployment:{deployment.id}",
+                detail={"reason": reason},
+                occurred_at=evaluated_at,
+            )
+        )
+    leases = list(
+        (
+            await session.scalars(
+                select(ExperimentWarmLease)
+                .where(
+                    ExperimentWarmLease.state.in_(
+                        (
+                            ExperimentWarmLeaseState.STARTING,
+                            ExperimentWarmLeaseState.ACTIVE,
+                            ExperimentWarmLeaseState.ENDING,
+                        )
+                    )
+                )
+                .order_by(ExperimentWarmLease.started_at, ExperimentWarmLease.id)
+                .with_for_update()
+            )
+        ).all()
+    )
+    for lease in leases:
+        lease.state = ExperimentWarmLeaseState.FAILED
+        lease.ended_at = evaluated_at
+        lease.lock_version += 1
+        session.add(
+            _audit_event(
+                action="experiment_warm_lease.budget_kill_switch_engaged",
+                resource_type="experiment_warm_lease",
+                resource_id=lease.id,
+                correlation_id=f"experiment-warm-lease:{lease.id}",
                 detail={"reason": reason},
                 occurred_at=evaluated_at,
             )

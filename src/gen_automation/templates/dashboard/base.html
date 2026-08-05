@@ -1333,6 +1333,11 @@
           >New automation</a>
           <a
             class="nav-link"
+            href="/dashboard/experiments/new"
+            {% if request.url.path.startswith("/dashboard/experiments") %}aria-current="page"{% endif %}
+          >Experiment Lab</a>
+          <a
+            class="nav-link"
             href="/dashboard/wildcards"
             {% if request.url.path.startswith("/dashboard/wildcards") %}aria-current="page"{% endif %}
           >Wildcards</a>

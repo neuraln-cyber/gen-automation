@@ -41,6 +41,9 @@ from gen_automation.services.budgets import (
     record_spend_entry,
     reevaluate_budget_guard,
 )
+from gen_automation.services.experiment_warm_leases import (
+    effective_experiment_min_replicas,
+)
 from gen_automation.services.runtime_secrets import (
     RuntimeSecretResolutionError,
     RuntimeSecretResolver,
@@ -477,7 +480,17 @@ async def _reconcile_locked(
             observed_at=observed_at,
         )
 
-    drift_code = _remote_drift_code(deployment, queue, group)
+    effective_min_replicas = await effective_experiment_min_replicas(
+        session,
+        salad_deployment_id=deployment.id,
+        now=observed_at,
+    )
+    drift_code = _remote_drift_code(
+        deployment,
+        queue,
+        group,
+        effective_min_replicas=effective_min_replicas,
+    )
     current_replicas = _observed_replicas(group)
     try:
         metered = await _meter_runtime_interval(
@@ -530,6 +543,7 @@ async def _reconcile_locked(
             client,
             group,
             drift_code=drift_code,
+            effective_min_replicas=effective_min_replicas,
             observed_at=observed_at,
             metered_microusd=metered,
         )
@@ -577,6 +591,7 @@ async def _request_active_contract_repair(
     group: SaladContainerGroup,
     *,
     drift_code: str | None,
+    effective_min_replicas: int,
     observed_at: datetime,
     metered_microusd: int,
 ) -> DeploymentResult | None:
@@ -588,7 +603,12 @@ async def _request_active_contract_repair(
     """
 
     if drift_code == "provider_autoscaler_drift":
-        patch: JSONObject = {"queue_autoscaler": _desired_queue_autoscaler(deployment)}
+        patch: JSONObject = {
+            "queue_autoscaler": _desired_queue_autoscaler(
+                deployment,
+                min_replicas=effective_min_replicas,
+            )
+        }
         try:
             updated = await client.update_container_group(
                 deployment.container_group_name,
@@ -1496,6 +1516,8 @@ def _remote_drift_code(
     deployment: SaladDeployment,
     queue: SaladQueue,
     group: SaladContainerGroup,
+    *,
+    effective_min_replicas: int | None = None,
 ) -> str | None:
     if queue.name != deployment.queue_name or str(queue.id) != deployment.provider_queue_id:
         return "provider_queue_identity_drift"
@@ -1504,12 +1526,18 @@ def _remote_drift_code(
         or str(group.id) != deployment.provider_container_group_id
     ):
         return "provider_group_identity_drift"
-    return _group_configuration_drift(deployment, group)
+    return _group_configuration_drift(
+        deployment,
+        group,
+        effective_min_replicas=effective_min_replicas,
+    )
 
 
 def _group_configuration_drift(
     deployment: SaladDeployment,
     group: SaladContainerGroup,
+    *,
+    effective_min_replicas: int | None = None,
 ) -> str | None:
     raw = group.raw
     container = raw.get("container")
@@ -1558,7 +1586,10 @@ def _group_configuration_drift(
         ):
             return f"provider_{probe_name}_drift"
     autoscaler = raw.get("queue_autoscaler")
-    expected_autoscaler = _desired_queue_autoscaler(deployment)
+    expected_autoscaler = _desired_queue_autoscaler(
+        deployment,
+        min_replicas=effective_min_replicas,
+    )
     if not isinstance(autoscaler, dict) or not _matches_worker_contract(
         autoscaler,
         expected_autoscaler,
@@ -1577,10 +1608,23 @@ def _group_configuration_drift(
     return None
 
 
-def _desired_queue_autoscaler(deployment: SaladDeployment) -> JSONObject:
+def _desired_queue_autoscaler(
+    deployment: SaladDeployment,
+    *,
+    min_replicas: int | None = None,
+) -> JSONObject:
+    resolved_min_replicas = deployment.min_replicas if min_replicas is None else min_replicas
+    if resolved_min_replicas not in {0, 1}:
+        raise SaladDeploymentValidationError(
+            "effective queue autoscaler minimum must be zero or one"
+        )
+    if resolved_min_replicas > deployment.max_replicas:
+        raise SaladDeploymentValidationError(
+            "effective queue autoscaler minimum exceeds the replica cap"
+        )
     configured = deployment.provider_configuration.get("queue_autoscaler")
     desired = deepcopy(configured) if isinstance(configured, dict) else {}
-    desired["min_replicas"] = deployment.min_replicas
+    desired["min_replicas"] = resolved_min_replicas
     desired["max_replicas"] = deployment.max_replicas
     desired["desired_queue_length"] = deployment.desired_queue_length
     return cast(JSONObject, desired)

@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from gen_automation.config import Settings
 from gen_automation.db.models import (
     AuditEvent,
+    ExperimentWarmLease,
     GenerationAttempt,
     GenerationJob,
     ProviderBudgetGuard,
@@ -25,6 +26,7 @@ from gen_automation.db.models import (
 )
 from gen_automation.domain.enums import (
     DesiredDeploymentState,
+    ExperimentWarmLeaseState,
     GenerationAttemptState,
     GenerationState,
     SaladDeploymentState,
@@ -45,6 +47,16 @@ from gen_automation.services.collection import (
 )
 from gen_automation.services.derivative_isolation import DerivativeIsolationPolicy
 from gen_automation.services.derivative_runtime import run_derivative_cycle
+from gen_automation.services.experiment_warm_leases import (
+    activate_ready_experiment_warm_leases,
+    complete_ending_experiment_warm_leases,
+    expire_experiment_warm_leases,
+    load_live_experiment_warm_lease_for_update,
+    mark_experiment_warm_runtime_refreshed_locked,
+    next_starting_experiment_warm_lease_id,
+    touch_completed_experiment_warm_leases,
+    touch_experiment_warm_lease_locked,
+)
 from gen_automation.services.mega_delivery import (
     MegaDeliveryClient,
     run_mega_delivery_cycle,
@@ -783,6 +795,93 @@ class ControllerWorkloads:
             )
             return bool(result.dispatched)
 
+    async def experiment_warm_once(self) -> bool:
+        """Reconcile bounded warm holds without issuing a separate provider rollout."""
+
+        if self.salad_client is None or not self.settings.gpu_allocation_enabled:
+            return False
+        now = datetime.now(UTC)
+        async with self.sessions() as session:
+            await self._lock_budget_guard(session)
+            # A newly completed provider job earns the full idle editing window,
+            # even when the generation itself lasted longer than the idle TTL.
+            touched = await touch_completed_experiment_warm_leases(
+                session,
+                actor=self._worker_id("experiment-warm"),
+                now=now,
+            )
+            expired = await expire_experiment_warm_leases(
+                session,
+                actor=self._worker_id("experiment-warm"),
+                now=now,
+            )
+            activated = await activate_ready_experiment_warm_leases(
+                session,
+                actor=self._worker_id("experiment-warm"),
+                now=now,
+            )
+            ended = await complete_ending_experiment_warm_leases(
+                session,
+                actor=self._worker_id("experiment-warm"),
+                now=now,
+            )
+            await session.commit()
+        housekeeping_worked = bool(touched or expired or activated or ended)
+
+        async with self.sessions() as session:
+            candidate_id = await next_starting_experiment_warm_lease_id(
+                session,
+                now=now,
+            )
+            await session.rollback()
+        if candidate_id is None:
+            return housekeeping_worked
+
+        async with self.sessions() as session:
+            await self._lock_budget_guard(session)
+            deployment_id = await session.scalar(
+                select(ExperimentWarmLease.salad_deployment_id).where(
+                    ExperimentWarmLease.id == candidate_id
+                )
+            )
+            if deployment_id is None:
+                await session.rollback()
+                return housekeeping_worked
+            deployment = await session.scalar(
+                select(SaladDeployment).where(SaladDeployment.id == deployment_id).with_for_update()
+            )
+            lease = await session.scalar(
+                select(ExperimentWarmLease)
+                .where(
+                    ExperimentWarmLease.id == candidate_id,
+                    ExperimentWarmLease.state == ExperimentWarmLeaseState.STARTING,
+                    ExperimentWarmLease.provider_version.is_(None),
+                    ExperimentWarmLease.hard_expires_at > now,
+                )
+                .with_for_update()
+            )
+            if deployment is None or lease is None:
+                await session.rollback()
+                return housekeeping_worked
+            refreshed = await refresh_container_group_runtime(
+                deployment,
+                self.salad_client,
+                self.secret_resolver,
+            )
+            mark_experiment_warm_runtime_refreshed_locked(
+                session,
+                lease,
+                provider_version=refreshed.version,
+                actor=self._worker_id("experiment-warm"),
+                now=now,
+            )
+            # Require a fresh provider observation after the rollout before the
+            # idle timer begins; the previous ready count is now stale.
+            deployment.ready_replicas = 0
+            deployment.reconcile_after = now
+            await session.commit()
+        return True
+
     async def submit_once(self) -> bool:
         if (
             self.salad_client is None
@@ -1172,7 +1271,42 @@ class ControllerWorkloads:
                 )
                 .limit(1)
             )
-            if active_attempt_id is None:
+            warm_lease = await load_live_experiment_warm_lease_for_update(
+                session,
+                salad_deployment_id=deployment.id,
+            )
+            if warm_lease is not None:
+                if (
+                    warm_lease.state == ExperimentWarmLeaseState.STARTING
+                    and warm_lease.provider_version is None
+                ):
+                    refreshed = await refresh_container_group_runtime(
+                        deployment,
+                        self.salad_client,
+                        self.secret_resolver,
+                    )
+                    mark_experiment_warm_runtime_refreshed_locked(
+                        session,
+                        warm_lease,
+                        provider_version=refreshed.version,
+                        actor=self._worker_id("submit"),
+                    )
+                    deployment.ready_replicas = 0
+                    deployment.reconcile_after = datetime.now(UTC)
+                if warm_lease.state == ExperimentWarmLeaseState.ACTIVE:
+                    touch_experiment_warm_lease_locked(
+                        session,
+                        warm_lease,
+                        actor=self._worker_id("submit"),
+                    )
+                logger.debug(
+                    "salad_runtime_reused_for_experiment",
+                    salad_deployment_id=str(deployment.id),
+                    generation_attempt_id=str(event.aggregate_id),
+                    experiment_warm_lease_id=str(warm_lease.id),
+                    experiment_warm_lease_state=warm_lease.state.value,
+                )
+            elif active_attempt_id is None:
                 # Bootstrap credentials are refreshed only at an idle-to-active
                 # boundary. PATCHing the container environment creates a Salad
                 # version and restarts every replica, so doing this per batch
@@ -1534,6 +1668,12 @@ def build_controller_runtime(
                         cycle=workloads.dispatch_once,
                         idle_interval_seconds=poll,
                         timeout_seconds=30,
+                    ),
+                    LoopSpec(
+                        name="experiment-warm-leases",
+                        cycle=workloads.experiment_warm_once,
+                        idle_interval_seconds=max(poll, 5),
+                        timeout_seconds=(settings.background_deployment_timeout_seconds + 15),
                     ),
                     LoopSpec(
                         name="salad-submit",
