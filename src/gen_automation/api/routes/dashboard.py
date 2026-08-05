@@ -625,7 +625,7 @@ async def dashboard_review_task(
                 "bulk_action_idempotency_key": bulk_action_idempotency_key,
                 "can_complete": (
                     summary.state == ReviewTaskState.OPEN
-                    and summary.accepted_count == summary.desired_accepted_count
+                    and 1 <= summary.accepted_count <= summary.desired_accepted_count
                     and all(
                         not asset.selected_for_x or asset.decision == ReviewDecisionValue.ACCEPT
                         for asset in summary.assets

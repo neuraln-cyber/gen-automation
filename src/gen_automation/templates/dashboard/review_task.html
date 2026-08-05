@@ -226,28 +226,43 @@
     {% endif %}
   </aside>
 
+  {% set final_set_goal = summary.desired_accepted_count %}
+  {% set optional_slots_remaining = [final_set_goal - summary.accepted_count, 0] | max %}
+  {% set accepted_over_goal = [summary.accepted_count - final_set_goal, 0] | max %}
   <section class="panel review-summary" aria-labelledby="review-summary-heading">
     <div class="panel-heading">
       <div>
         <span class="workflow-label">Review progress</span>
         <h2 id="review-summary-heading">Build your final set</h2>
         <p class="muted">
-          Completion requires exactly {{ summary.desired_accepted_count }} accepted
-          asset{% if summary.desired_accepted_count != 1 %}s{% endif %}.
+          The configured final-set goal is a maximum of {{ final_set_goal }}
+          image{% if final_set_goal != 1 %}s{% endif %}. Finish with any non-empty curated
+          subset; other masters may stay undecided.
         </p>
       </div>
       <span class="status {{ summary.state.value }}">{{ summary.state.value }}</span>
     </div>
     <div class="review-target-progress">
       <div>
-        <strong>{{ summary.accepted_count }} / {{ summary.desired_accepted_count }} accepted</strong>
-        <span>{{ summary.undecided_count }} undecided</span>
+        <strong>{{ summary.accepted_count }} / {{ final_set_goal }} accepted</strong>
+        {% if summary.accepted_count == 0 %}
+          <span>Accept at least one image; undecided masters are optional.</span>
+        {% elif accepted_over_goal %}
+          <span>{{ accepted_over_goal }} above the configured maximum.</span>
+        {% elif optional_slots_remaining %}
+          <span>
+            {{ optional_slots_remaining }} optional slot{% if optional_slots_remaining != 1 %}s{% endif %}
+            remain &middot; undecided masters are optional
+          </span>
+        {% else %}
+          <span>Goal reached &middot; undecided masters are optional</span>
+        {% endif %}
       </div>
       <progress
-        value="{{ summary.accepted_count }}"
-        max="{{ summary.desired_accepted_count }}"
-        aria-label="Accepted images toward the final-set target"
-      >{{ summary.accepted_count }} / {{ summary.desired_accepted_count }}</progress>
+        value="{{ [summary.accepted_count, final_set_goal] | min }}"
+        max="{{ final_set_goal }}"
+        aria-label="Accepted images toward the final-set maximum"
+      >{{ summary.accepted_count }} / {{ final_set_goal }}</progress>
     </div>
     <dl class="count-grid">
       <div><dt>Accepted</dt><dd>{{ summary.accepted_count }}</dd></div>
@@ -255,8 +270,11 @@
       <div><dt>Held</dt><dd>{{ summary.held_count }}</dd></div>
       <div><dt>Undecided</dt><dd>{{ summary.undecided_count }}</dd></div>
       <div>
-        <dt>Still needed</dt>
-        <dd>{{ [summary.desired_accepted_count - summary.accepted_count, 0] | max }}</dd>
+        {% if accepted_over_goal %}
+          <dt>Over goal</dt><dd>{{ accepted_over_goal }}</dd>
+        {% else %}
+          <dt>Optional slots left</dt><dd>{{ optional_slots_remaining }}</dd>
+        {% endif %}
       </div>
       <div><dt>Selected for X</dt><dd>{{ summary.x_selected_count }} / 4</dd></div>
       <div>
@@ -307,8 +325,16 @@
       data-lock-version="{{ summary.lock_version }}"
     >
       <div class="review-command-copy">
-        <strong>{{ summary.accepted_count }} / {{ summary.desired_accepted_count }} accepted</strong>
-        <span>{{ summary.undecided_count }} still undecided</span>
+        <strong>{{ summary.accepted_count }} / {{ final_set_goal }} accepted</strong>
+        {% if summary.accepted_count == 0 %}
+          <span>Choose at least one final image.</span>
+        {% elif accepted_over_goal %}
+          <span>Exclude {{ accepted_over_goal }} accepted image{% if accepted_over_goal != 1 %}s{% endif %} to return to the maximum.</span>
+        {% elif optional_slots_remaining %}
+          <span>{{ optional_slots_remaining }} optional slot{% if optional_slots_remaining != 1 %}s{% endif %} left; {{ summary.undecided_count }} masters may remain undecided.</span>
+        {% else %}
+          <span>Goal reached; {{ summary.undecided_count }} masters may remain undecided.</span>
+        {% endif %}
       </div>
       <div class="task-actions">
         <form
@@ -332,7 +358,8 @@
             type="submit"
             {% if not can_complete %}disabled aria-describedby="completion-help"{% endif %}
           >
-            Complete review
+            Complete with {{ summary.accepted_count }}
+            image{% if summary.accepted_count != 1 %}s{% endif %}
           </button>
         </form>
         <form
@@ -357,15 +384,20 @@
     </aside>
     {% if not can_complete %}
       <p class="muted" id="completion-help">
-        {% if summary.semantic_gate.pending_count %}
+        {% if summary.accepted_count == 0 %}
+          Accept at least one image before completing this set. All other masters may remain
+          undecided.
+        {% elif accepted_over_goal %}
+          Exclude {{ accepted_over_goal }} accepted image{% if accepted_over_goal != 1 %}s{% endif %}
+          before completing; {{ final_set_goal }} is the configured maximum.
+        {% elif summary.semantic_gate.pending_count %}
           Completion is blocked until all {{ summary.ranked_asset_count }} configured
           anatomy checks finish or become explicitly unavailable after bounded retries.
         {% elif summary.semantic_gate.severe_blocked_count %}
           Completion is blocked because an accepted high-confidence severe image needs
           an explicit owner override reason and attestation.
         {% else %}
-          Complete becomes available when the accepted count is exactly
-          {{ summary.desired_accepted_count }}.
+          Every X teaser must be accepted. Accept it or remove it from X before completing.
         {% endif %}
       </p>
     {% endif %}
@@ -400,8 +432,19 @@
       </div>
       <div class="bulk-selection-controls" data-review-selection-controls hidden>
         <button class="secondary-button" type="button" data-select-all>Select visible</button>
-        <button class="secondary-button" type="button" data-select-to-target>
-          Select enough undecided to fill target
+        <button
+          class="secondary-button"
+          type="button"
+          data-select-to-target
+          {% if optional_slots_remaining == 0 %}disabled{% endif %}
+        >
+          {% if accepted_over_goal %}
+            Goal exceeded by {{ accepted_over_goal }}
+          {% elif optional_slots_remaining == 0 %}
+            Goal reached
+          {% else %}
+            Select {{ optional_slots_remaining }} undecided to reach goal
+          {% endif %}
         </button>
         <button class="secondary-button" type="button" data-clear-selection>Clear</button>
         <button class="secondary-button" type="button" data-clear-hidden-selection>Clear hidden</button>

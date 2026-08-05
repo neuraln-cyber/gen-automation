@@ -82,8 +82,10 @@ and external publishing remain disabled until their individual gates pass.
   master object key and version.
 - Review through the authenticated dashboard. Rejections and superseded
   decisions remain append-only and do not delete raw masters.
-- Complete the exact acceptance target, then render full-resolution and X
-  teaser derivatives in a bounded CPU worker process.
+- Complete with a non-empty curated subset no larger than the configured review
+  goal, then confirm the task freezes that actual count as its exact final-set
+  size before rendering full-resolution and X teaser derivatives in a bounded
+  CPU worker process.
 - When semantic anatomy is enabled, verify that completion waits for every
   configured assessment to become completed or terminally unavailable. Confirm
   a high-confidence severe acceptance requires an explicit OWNER override and

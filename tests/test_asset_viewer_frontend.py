@@ -151,3 +151,26 @@ def test_review_filter_hides_empty_ai_excluded_separator() -> None:
     assert 'document.querySelectorAll(".ai-excluded-heading")' in script
     assert "grid.querySelectorAll('.asset-card[data-ai-excluded=\"true\"]')" in script
     assert "heading.hidden = !hasVisibleExcluded" in script
+
+
+def test_review_ui_treats_the_configured_size_as_a_maximum_goal() -> None:
+    template = (
+        ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "review_task.html"
+    ).read_text(encoding="utf-8")
+    script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
+
+    assert "final-set goal is a maximum" in template
+    assert "other masters may stay undecided" in template
+    assert "Complete with {{ summary.accepted_count }}" in template
+    assert "Optional slots left" in template
+    assert "Over goal" in template
+    assert "Accept at least one image before completing this set" in template
+    assert "Select {{ optional_slots_remaining }} undecided to reach goal" in template
+    assert "const netNewAccepts" in script
+    assert "const exceedsReviewGoal" in script
+    assert (
+        "acceptButton.disabled = selected === 0 || hasSevereSelection || exceedsReviewGoal"
+        in script
+    )
+    assert "over its maximum; exclude accepted images before accepting more" in script
+    assert "Goal reached" in script

@@ -60,7 +60,10 @@ same job/output with different bytes is quarantined as a conflict.
 - `semantic_assessments`: retry state plus an immutable terminal anatomy result
   or explicit unavailable outcome, bound to the exact ranked master and pinned
   model/prompt/schema profile.
-- `review_tasks`: review round, state, ranking run, assignee, and lease.
+- `review_tasks`: review round, state, ranking run, configured maximum selection
+  goal, final frozen selection count, assignee, and lease. During the one terminal
+  completion transition, its goal may shrink to the non-empty accepted count; it
+  cannot grow or change afterward.
 - `review_decisions`: append-only decision events.
 - `release_selections`: the approved set, display order, role, and tier.
 

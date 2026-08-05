@@ -18,6 +18,7 @@ from gen_automation.db.models import (
     IdempotencyRecord,
     Project,
     Release,
+    ReleaseSelection,
     ReleaseVersion,
     ReviewDecision,
     ReviewTask,
@@ -1038,7 +1039,7 @@ async def test_decision_requires_exact_ranking_and_current_lock_version(
 
 
 @pytest.mark.asyncio
-async def test_completion_requires_exact_acceptance_target_and_is_terminal(
+async def test_completion_shrinks_target_to_accepted_count_and_is_terminal(
     review_context: ReviewContext,
 ) -> None:
     task = await _create_task(review_context)
@@ -1053,33 +1054,12 @@ async def test_completion_requires_exact_acceptance_target_and_is_terminal(
             idempotency_key="accept-one",
         )
     async with review_context.database.sessions() as session:
-        with pytest.raises(ReviewConflictError, match="exactly match"):
-            await transition_review_task(
-                session,
-                review_task_id=task.task_id,
-                target_state=ReviewTaskState.COMPLETED,
-                changed_by_user_id=review_context.reviewer_id,
-                expected_lock_version=2,
-                idempotency_key="complete-too-early",
-            )
-
-    async with review_context.database.sessions() as session:
-        await append_review_decision(
-            session,
-            review_task_id=task.task_id,
-            asset_id=review_context.ranked_asset_ids[1],
-            decision=ReviewDecisionValue.ACCEPT,
-            decided_by_user_id=review_context.second_reviewer_id,
-            expected_lock_version=2,
-            idempotency_key="accept-two",
-        )
-    async with review_context.database.sessions() as session:
         completed = await transition_review_task(
             session,
             review_task_id=task.task_id,
             target_state=ReviewTaskState.COMPLETED,
             changed_by_user_id=review_context.reviewer_id,
-            expected_lock_version=3,
+            expected_lock_version=2,
             idempotency_key="complete-review",
             now=NOW + timedelta(minutes=8),
         )
@@ -1089,16 +1069,16 @@ async def test_completion_requires_exact_acceptance_target_and_is_terminal(
             review_task_id=task.task_id,
             target_state=ReviewTaskState.COMPLETED,
             changed_by_user_id=review_context.reviewer_id,
-            expected_lock_version=3,
+            expected_lock_version=2,
             idempotency_key="complete-review",
             now=NOW + timedelta(minutes=9),
         )
 
     assert completed.state == ReviewTaskState.COMPLETED
-    assert completed.accepted_count == 2
-    assert completed.lock_version == 4
+    assert completed.accepted_count == 1
+    assert completed.lock_version == 3
     assert replay.replayed is True
-    assert replay.lock_version == 4
+    assert replay.lock_version == 3
 
     async with review_context.database.sessions() as session:
         with pytest.raises(ReviewConflictError, match="not open"):
@@ -1108,15 +1088,74 @@ async def test_completion_requires_exact_acceptance_target_and_is_terminal(
                 asset_id=review_context.ranked_asset_ids[2],
                 decision=ReviewDecisionValue.REJECT,
                 decided_by_user_id=review_context.reviewer_id,
-                expected_lock_version=4,
+                expected_lock_version=3,
                 idempotency_key="after-completion",
             )
         stored = await session.get(ReviewTask, task.task_id)
         assert stored is not None
         assert stored.state == ReviewTaskState.COMPLETED
+        assert stored.desired_accepted_count == 1
         assert stored.completed_by_user_id == review_context.reviewer_id
         assert stored.completed_at == (NOW + timedelta(minutes=8)).replace(tzinfo=None)
         assert stored.cancelled_at is None
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(ReleaseSelection)
+                .where(ReleaseSelection.review_task_id == task.task_id)
+            )
+            == 1
+        )
+        completed_audit = await session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.action == "review.task_completed",
+                AuditEvent.resource_id == task.task_id,
+            )
+        )
+        assert completed_audit is not None
+        assert completed_audit.detail["configured_accepted_count"] == 2
+        assert completed_audit.detail["final_accepted_count"] == 1
+        assert completed_audit.detail["desired_accepted_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_completion_rejects_zero_and_over_configured_target(
+    review_context: ReviewContext,
+) -> None:
+    task = await _create_task(review_context)
+    async with review_context.database.sessions() as session:
+        with pytest.raises(ReviewConflictError, match="at least one"):
+            await transition_review_task(
+                session,
+                review_task_id=task.task_id,
+                target_state=ReviewTaskState.COMPLETED,
+                changed_by_user_id=review_context.reviewer_id,
+                expected_lock_version=1,
+                idempotency_key="complete-with-zero",
+            )
+
+    for offset, asset_id in enumerate(review_context.ranked_asset_ids):
+        async with review_context.database.sessions() as session:
+            await append_review_decision(
+                session,
+                review_task_id=task.task_id,
+                asset_id=asset_id,
+                decision=ReviewDecisionValue.ACCEPT,
+                decided_by_user_id=review_context.reviewer_id,
+                expected_lock_version=offset + 1,
+                idempotency_key=f"accept-over-target-{offset}",
+            )
+
+    async with review_context.database.sessions() as session:
+        with pytest.raises(ReviewConflictError, match="exceeds the configured"):
+            await transition_review_task(
+                session,
+                review_task_id=task.task_id,
+                target_state=ReviewTaskState.COMPLETED,
+                changed_by_user_id=review_context.reviewer_id,
+                expected_lock_version=4,
+                idempotency_key="complete-over-target",
+            )
 
 
 @pytest.mark.asyncio

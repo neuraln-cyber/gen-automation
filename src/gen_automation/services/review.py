@@ -902,7 +902,12 @@ async def transition_review_task(
     semantic_enforcement_mode: SemanticEnforcementMode = SemanticEnforcementMode.ENFORCE,
     now: datetime | None = None,
 ) -> ReviewTransitionResult:
-    """Close an open task once its exact acceptance target is satisfied, or cancel it."""
+    """Close or cancel an open task.
+
+    Completion treats the configured acceptance target as a ceiling. At least
+    one asset must be accepted, and the accepted count is frozen as the task's
+    final exact target in the same terminal transition.
+    """
 
     normalized_key = _validate_idempotency_key(idempotency_key)
     normalized_target = _validate_terminal_state(target_state)
@@ -937,6 +942,7 @@ async def transition_review_task(
         raise ReviewConflictError("review task is not open")
     if task.lock_version != expected_version:
         raise ReviewConflictError("review task lock version is stale")
+    configured_accepted_count = task.desired_accepted_count
     summary = await _review_summary(
         session,
         task,
@@ -946,11 +952,13 @@ async def transition_review_task(
         semantic_severe_confidence_micros=semantic_threshold,
         semantic_enforcement_mode=semantic_mode,
     )
+    if normalized_target == ReviewTaskState.COMPLETED and summary.accepted_count < 1:
+        raise ReviewConflictError("at least one asset must be accepted before completion")
     if (
         normalized_target == ReviewTaskState.COMPLETED
-        and summary.accepted_count != task.desired_accepted_count
+        and summary.accepted_count > configured_accepted_count
     ):
-        raise ReviewConflictError("accepted asset count must exactly match the task target")
+        raise ReviewConflictError("accepted asset count exceeds the configured task target")
     if (
         normalized_target == ReviewTaskState.COMPLETED
         and semantic_mode == SemanticEnforcementMode.ENFORCE
@@ -972,6 +980,7 @@ async def transition_review_task(
         approved_release_id = await _freeze_release_selections(
             session,
             task=task,
+            final_accepted_count=summary.accepted_count,
             frozen_at=changed_at,
             actor_user_id=changed_by_user_id,
             correlation_id=normalized_key,
@@ -1010,6 +1019,7 @@ async def transition_review_task(
     }
     if normalized_target == ReviewTaskState.COMPLETED:
         values.update(
+            desired_accepted_count=summary.accepted_count,
             completed_by_user_id=changed_by_user_id,
             completed_at=changed_at,
         )
@@ -1046,9 +1056,45 @@ async def transition_review_task(
                     "review_task_id": str(task.id),
                     "release_version_id": str(task.release_version_id),
                     "phase": ReleasePhase.APPROVED.value,
+                    "configured_accepted_count": configured_accepted_count,
+                    "final_accepted_count": summary.accepted_count,
                 },
                 occurred_at=changed_at,
             )
+        )
+
+    terminal_detail: dict[str, Any] = {
+        "previous_state": ReviewTaskState.OPEN.value,
+        "state": normalized_target.value,
+        "accepted_count": summary.accepted_count,
+        "rejected_count": summary.rejected_count,
+        "held_count": summary.held_count,
+        "undecided_count": summary.undecided_count,
+        "desired_accepted_count": (
+            summary.accepted_count
+            if normalized_target == ReviewTaskState.COMPLETED
+            else configured_accepted_count
+        ),
+        "semantic_gate_enabled": summary.semantic_gate.enabled,
+        "semantic_terminal_count": summary.semantic_gate.terminal_count,
+        "semantic_unavailable_count": summary.semantic_gate.unavailable_count,
+        "semantic_severe_override_count": summary.semantic_gate.severe_override_count,
+        "semantic_learning_inferred_good_count": (
+            semantic_learning.inferred_good_count if semantic_learning else 0
+        ),
+        "semantic_learning_inferred_defect_count": (
+            semantic_learning.inferred_defect_count if semantic_learning else 0
+        ),
+        "semantic_learning_skipped_existing_count": (
+            semantic_learning.skipped_existing_count if semantic_learning else 0
+        ),
+        "semantic_learning_error": semantic_learning_error,
+        "task_lock_version": expected_version + 1,
+    }
+    if normalized_target == ReviewTaskState.COMPLETED:
+        terminal_detail.update(
+            configured_accepted_count=configured_accepted_count,
+            final_accepted_count=summary.accepted_count,
         )
 
     result = ReviewTransitionResult(
@@ -1065,30 +1111,7 @@ async def transition_review_task(
             resource_type="review_task",
             resource_id=task.id,
             correlation_id=normalized_key,
-            detail={
-                "previous_state": ReviewTaskState.OPEN.value,
-                "state": normalized_target.value,
-                "accepted_count": summary.accepted_count,
-                "rejected_count": summary.rejected_count,
-                "held_count": summary.held_count,
-                "undecided_count": summary.undecided_count,
-                "desired_accepted_count": task.desired_accepted_count,
-                "semantic_gate_enabled": summary.semantic_gate.enabled,
-                "semantic_terminal_count": summary.semantic_gate.terminal_count,
-                "semantic_unavailable_count": summary.semantic_gate.unavailable_count,
-                "semantic_severe_override_count": (summary.semantic_gate.severe_override_count),
-                "semantic_learning_inferred_good_count": (
-                    semantic_learning.inferred_good_count if semantic_learning else 0
-                ),
-                "semantic_learning_inferred_defect_count": (
-                    semantic_learning.inferred_defect_count if semantic_learning else 0
-                ),
-                "semantic_learning_skipped_existing_count": (
-                    semantic_learning.skipped_existing_count if semantic_learning else 0
-                ),
-                "semantic_learning_error": semantic_learning_error,
-                "task_lock_version": expected_version + 1,
-            },
+            detail=terminal_detail,
             occurred_at=changed_at,
         )
     )
@@ -1245,6 +1268,7 @@ async def _freeze_release_selections(
     session: AsyncSession,
     *,
     task: ReviewTask,
+    final_accepted_count: int,
     frozen_at: datetime,
     actor_user_id: UUID,
     correlation_id: str,
@@ -1305,7 +1329,7 @@ async def _freeze_release_selections(
             .with_for_update()
         )
     ).all()
-    if len(rows) != task.desired_accepted_count:
+    if len(rows) != final_accepted_count:
         raise ReviewConflictError("accepted source count changed before selection freeze")
     accepted_asset_ids = {decision.asset_id for decision, _, _ in rows}
     x_selected_asset_ids = set(

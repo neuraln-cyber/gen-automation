@@ -694,9 +694,13 @@
     let slugWasEdited = Boolean(slugInput && slugInput.value.trim());
     let previousDefaultPrompt = defaultPrompt ? defaultPrompt.value : "";
     let previousDefaultNegative = defaultNegative ? defaultNegative.value : "";
-    let targetFollowsQueue = typeof form.dataset.restoredTargetFollowsQueue === "string"
+    const defaultFinalSetCap = 250;
+    const restoredTargetFollowsQueue = typeof form.dataset.restoredTargetFollowsQueue === "string";
+    let targetFollowsQueue = restoredTargetFollowsQueue
       ? form.dataset.restoredTargetFollowsQueue === "true"
-      : Boolean(desiredCount && !planData.value.trim());
+      : false;
+    let targetUsesSmartDefault = !restoredTargetFollowsQueue
+      && Boolean(desiredCount && !planData.value.trim());
     delete form.dataset.restoredTargetFollowsQueue;
 
     builder.hidden = false;
@@ -935,10 +939,13 @@
         row.querySelector('[data-batch-action="remove"]').disabled = rows.length === 1;
       });
       if (plannedJobCount) plannedJobCount.value = Math.max(1, totalJobs);
-      if (desiredCount && targetFollowsQueue
+      if (desiredCount && (targetFollowsQueue || targetUsesSmartDefault)
           && form.dataset.applyingAutomationProfile !== "true") {
         const maximumAccepted = Math.max(1, integerValue(desiredCount.max, 500));
-        desiredCount.value = String(Math.max(1, Math.min(maximumAccepted, totalImages)));
+        const automaticMaximum = targetFollowsQueue
+          ? maximumAccepted
+          : Math.min(maximumAccepted, defaultFinalSetCap);
+        desiredCount.value = String(Math.max(1, Math.min(automaticMaximum, totalImages)));
       }
       form.dataset.targetFollowsQueue = String(targetFollowsQueue);
       addButtons.forEach((button) => { button.disabled = rows.length >= 50; });
@@ -1143,11 +1150,13 @@
     });
     desiredCount && desiredCount.addEventListener("input", () => {
       targetFollowsQueue = false;
+      targetUsesSmartDefault = false;
       updateBuilder();
     });
     if (matchQueueTarget instanceof HTMLButtonElement) {
       matchQueueTarget.addEventListener("click", () => {
         targetFollowsQueue = true;
+        targetUsesSmartDefault = false;
         updateBuilder();
         desiredCount.focus();
       });
@@ -1940,15 +1949,31 @@
     const acceptButton = form.querySelector('button[name="action"][value="accept"]');
     const xAddButton = form.querySelector('button[name="action"][value="x_add"]');
     const xRemoveButton = form.querySelector('button[name="action"][value="x_remove"]');
+    const selectToTargetButtons = Array.from(document.querySelectorAll("[data-select-to-target]"));
     const countLabels = document.querySelectorAll("[data-selected-count]");
     const selectionStatus = form.querySelector("[data-bulk-selection-status]");
     const currentXCount = Math.max(0, integerValue(form.dataset.xSelectedCount, 0));
     const xCapacity = Math.max(1, integerValue(form.dataset.xCapacity, 4));
     const reviewTarget = Math.max(1, integerValue(form.dataset.reviewTarget, 1));
     const acceptedCount = Math.max(0, integerValue(form.dataset.acceptedCount, 0));
+    const remainingReviewSlots = Math.max(0, reviewTarget - acceptedCount);
     let lastClickedCheckbox = null;
     document.querySelectorAll("[data-review-selection-controls], [data-review-tools]").forEach((item) => {
       item.hidden = false;
+    });
+
+    selectToTargetButtons.forEach((button) => {
+      if (acceptedCount > reviewTarget) {
+        const excess = acceptedCount - reviewTarget;
+        button.textContent = `Goal exceeded by ${excess}`;
+        button.disabled = true;
+      } else if (remainingReviewSlots === 0) {
+        button.textContent = "Goal reached";
+        button.disabled = true;
+      } else {
+        button.textContent = `Select ${remainingReviewSlots} undecided to reach goal`;
+        button.disabled = false;
+      }
     });
 
     const updateExcludedHeadings = () => {
@@ -1985,12 +2010,17 @@
         .filter(Boolean);
       const hasSevereSelection = selectedCards.some((card) => card.dataset.aiExcluded === "true");
       const hasUnacceptedSelection = selectedCards.some((card) => card.dataset.decision !== "accept");
+      const netNewAccepts = selectedCards.filter((card) => card.dataset.decision !== "accept").length;
+      const acceptedAlreadyOverGoal = acceptedCount > reviewTarget;
+      const exceedsReviewGoal = acceptedAlreadyOverGoal || netNewAccepts > remainingReviewSlots;
       const selectedForX = selectedCards.filter((card) => card.dataset.selectedForX === "true").length;
       const netNewForX = selected - selectedForX;
       const remainingXSlots = Math.max(0, xCapacity - currentXCount);
       const exceedsXCapacity = netNewForX > remainingXSlots;
 
-      if (acceptButton) acceptButton.disabled = selected === 0 || hasSevereSelection;
+      if (acceptButton) {
+        acceptButton.disabled = selected === 0 || hasSevereSelection || exceedsReviewGoal;
+      }
       if (xAddButton) {
         xAddButton.disabled = selected === 0
           || netNewForX === 0
@@ -2003,6 +2033,16 @@
         const messages = [];
         if (hasSevereSelection) {
           messages.push("AI-excluded images need individual owner review before acceptance.");
+        }
+        if (acceptedAlreadyOverGoal) {
+          const excess = acceptedCount - reviewTarget;
+          messages.push(
+            `The final set is ${excess} image${excess === 1 ? "" : "s"} over its maximum; exclude accepted images before accepting more.`,
+          );
+        } else if (exceedsReviewGoal) {
+          messages.push(
+            `Only ${remainingReviewSlots} final-set slot${remainingReviewSlots === 1 ? " remains" : "s remain"}; deselect ${netNewAccepts - remainingReviewSlots}.`,
+          );
         }
         if (exceedsXCapacity) {
           messages.push(
@@ -2044,10 +2084,10 @@
         updateSelection();
       });
     });
-    document.querySelectorAll("[data-select-to-target]").forEach((button) => {
+    selectToTargetButtons.forEach((button) => {
       button.addEventListener("click", () => {
         checkboxes.forEach((checkbox) => { checkbox.checked = false; });
-        let remaining = Math.max(0, reviewTarget - acceptedCount);
+        let remaining = remainingReviewSlots;
         checkboxes.forEach((checkbox) => {
           if (remaining === 0) return;
           const card = checkbox.closest(".asset-card");

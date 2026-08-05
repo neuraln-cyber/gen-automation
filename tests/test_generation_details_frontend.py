@@ -88,6 +88,27 @@ def test_generation_form_has_named_device_local_settings_presets() -> None:
     assert "draft.submission_id !== submittedDraftId" in script
 
 
+def test_fresh_generation_queue_uses_an_editable_250_image_final_set_cap() -> None:
+    template = (
+        ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "new_set.html"
+    ).read_text(encoding="utf-8")
+    script = (ROOT / "src" / "gen_automation" / "static" / "dashboard.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Final set size" in template
+    assert "maximum images to keep" in template
+    assert "Fresh queues default to a 250-image cap" in template
+    assert "generate 400; keep the best 250" in template
+    assert "Other masters may remain undecided" in template
+    assert "Keep all generated" in template
+    assert "const defaultFinalSetCap = 250" in script
+    assert "targetUsesSmartDefault" in script
+    assert ": Math.min(maximumAccepted, defaultFinalSetCap)" in script
+    assert "targetUsesSmartDefault = false" in script
+    assert "targetFollowsQueue = true" in script
+
+
 def test_batch_negative_prompt_is_visible_editable_and_tracks_shared_defaults() -> None:
     template = (
         ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "new_set.html"

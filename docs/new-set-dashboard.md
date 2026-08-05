@@ -15,10 +15,17 @@ For large sets, **Build a large wildcard queue quickly** accepts one compact
 `50 nsfw`, `20 oral`, `100 reworked`, and `20 group` creates all six batch cards
 in exactly that order while copying the shared starting prompt into each one.
 The queue summary continuously shows total images, GPU jobs, and the final-set
-target before submission. The visible **Keep best** target follows the queue by
-default (up to the supported 500-image final set) and becomes independent after
-the operator edits it. Unknown wildcard tokens are rejected in the batch card
-before submission.
+target before submission. The visible **Final set size** starts at the smaller of
+the queue total or 250 images, matching the normal workflow of generating roughly
+400 masters and curating about 250. Editing it makes the goal independent; **Keep
+all generated** explicitly makes it follow the queue. Unknown wildcard tokens are
+rejected in the batch card before submission.
+
+The configured final-set size is a maximum review goal, not a requirement to keep
+every generated master. An open review can be completed with any non-empty accepted
+subset up to that goal. Completion atomically freezes only those accepted masters
+and records their actual count as the exact downstream Patreon/MEGA package size;
+unaccepted and undecided raw masters remain available in private storage.
 
 Named settings presets are stored on the current device. They include the
 approved subject, checkpoint, workflow, ordered LoRA stack and weights,

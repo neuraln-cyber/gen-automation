@@ -568,14 +568,14 @@
             <div><dt>Batches</dt><dd id="summary-batches">1</dd></div>
             <div><dt>Images</dt><dd id="summary-images">0</dd></div>
             <div><dt>GPU jobs</dt><dd id="summary-jobs">0</dd></div>
-            <div><dt>Final target</dt><dd id="summary-target">0</dd></div>
+            <div><dt>Final set size</dt><dd id="summary-target">0</dd></div>
           </dl>
           <p class="summary-note" id="summary-note">
             Add a prompt and image count to prepare this automation.
           </p>
           <div class="automation-final-target">
             <label>
-              Keep best
+              Final set size
               <input
                 type="number"
                 name="desired_accepted_count"
@@ -585,10 +585,14 @@
                 data-desired-count
                 required
               >
-              <span>images in the final set</span>
+              <span>maximum images to keep</span>
             </label>
-            <button class="text-button" type="button" data-match-queue-target>Match queue</button>
+            <button class="text-button" type="button" data-match-queue-target>Keep all generated</button>
           </div>
+          <p class="decision-help">
+            Fresh queues default to a 250-image cap, which you can edit anytime. For example:
+            generate 400; keep the best 250. Other masters may remain undecided.
+          </p>
           <div class="automation-draft-row">
             <span data-automation-draft-status>Draft autosaves on this device.</span>
             <button class="text-button" type="button" data-automation-draft-clear>Clear draft</button>
@@ -605,7 +609,7 @@
       <div class="mobile-queue-dock" aria-label="Queue automation">
         <div>
           <strong><span data-mobile-summary-images>0</span> images</strong>
-          <span><span data-mobile-summary-jobs>0</span> GPU jobs &middot; keep best <span data-mobile-summary-target>0</span></span>
+          <span><span data-mobile-summary-jobs>0</span> GPU jobs &middot; final set <span data-mobile-summary-target>0</span></span>
         </div>
         <button class="primary-button queue-submit" type="submit" {% if not options.ready %}disabled{% endif %}>
           Queue automation

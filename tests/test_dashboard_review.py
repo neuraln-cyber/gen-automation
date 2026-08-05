@@ -199,6 +199,22 @@ async def _release_id(context: ReviewApiContext) -> UUID:
         await database.dispose()
 
 
+async def _set_release_final_set_goal(
+    context: ReviewApiContext,
+    *,
+    desired_accepted_count: int,
+) -> None:
+    database = Database(context.settings.database_url)
+    try:
+        async with database.sessions() as session:
+            await session.execute(
+                update(Release).values(desired_accepted_count=desired_accepted_count)
+            )
+            await session.commit()
+    finally:
+        await database.dispose()
+
+
 async def _create_task(
     context: ReviewApiContext,
     *,
@@ -697,6 +713,56 @@ def test_review_dashboard_exposes_progressive_bulk_controls(tmp_path: Path) -> N
     assert 'data-x-selected-count="0"' in page.text
     assert 'data-x-capacity="4"' in page.text
     assert "data-bulk-selection-status" in page.text
+
+
+def test_review_dashboard_can_complete_a_nonempty_subset_below_goal(tmp_path: Path) -> None:
+    context = asyncio.run(_seed_review_api(_settings(tmp_path / "browser-subset-ui.db")))
+    asyncio.run(_set_release_final_set_goal(context, desired_accepted_count=2))
+    task_id = asyncio.run(_create_task(context))
+    app = create_app(context.settings)
+    detail_action = f"/dashboard/review-tasks/{task_id}"
+    decision_action = f"{detail_action}/decisions"
+
+    with TestClient(
+        app,
+        base_url=ORIGIN,
+        client=("192.0.2.98", 50000),
+    ) as client:
+        app.state.object_store = SameOriginReviewStore()
+        _login(client, context.settings, context.users[AdminRole.REVIEWER])
+        empty_page = client.get(detail_action)
+        empty_button = re.search(
+            r"<button(?P<attributes>[^>]*)>\s*Complete with 0\s+images\s*</button>",
+            empty_page.text,
+            re.DOTALL,
+        )
+        assert empty_button is not None
+        assert "disabled" in empty_button.group("attributes")
+
+        decision_form = _forms(empty_page.text, decision_action)[0]
+        accepted = client.post(
+            decision_action,
+            data={
+                **decision_form.fields,
+                "decision": "accept",
+                "reason_code": "manual_qc_pass",
+                "note": "Curated final-set selection.",
+            },
+            headers=_FORM_HEADERS,
+            follow_redirects=False,
+        )
+        subset_page = client.get(detail_action)
+
+    assert accepted.status_code == 303
+    subset_button = re.search(
+        r"<button(?P<attributes>[^>]*)>\s*Complete with 1\s+image\s*</button>",
+        subset_page.text,
+        re.DOTALL,
+    )
+    assert subset_button is not None
+    assert "disabled" not in subset_button.group("attributes")
+    assert "1 optional slot" in subset_page.text
+    assert "masters may remain undecided" in subset_page.text
 
 
 def test_browser_bulk_review_action_applies_repeated_selected_assets(tmp_path: Path) -> None:
