@@ -2066,3 +2066,701 @@ body.asset-viewer-open { overflow: hidden; }
 @media (prefers-reduced-motion: reduce) {
   .danbooru-autocomplete-message.is-loading::after { animation: none; }
 }
+
+/* New set builder --------------------------------------------------------- */
+.automation-create {
+  --automation-gap-xs: .25rem;
+  --automation-gap-sm: .5rem;
+  --automation-gap-md: .75rem;
+  --automation-gap-lg: 1rem;
+  --automation-panel-radius: .9rem;
+  min-width: 0;
+}
+
+.automation-create .automation-back {
+  min-height: 2rem;
+  margin-bottom: .55rem;
+  font-size: .82rem;
+}
+
+.automation-create .new-automation-header {
+  display: grid;
+  gap: .9rem;
+  margin-bottom: 1rem;
+}
+
+.automation-create .new-automation-header .page-header-row { align-items: end; }
+.automation-create .new-automation-header .page-kicker { margin-bottom: .3rem; }
+.automation-create .new-automation-header h1 { font-size: clamp(2rem, 4vw, 2.8rem); }
+.automation-create .new-automation-header .lede {
+  margin-top: .35rem;
+  color: var(--muted);
+  font-size: .92rem;
+}
+
+.automation-jump-nav {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: .35rem;
+  padding: .3rem;
+  border: 1px solid var(--border);
+  border-radius: .8rem;
+  background: rgba(255, 255, 255, .018);
+}
+
+.automation-jump-nav a {
+  display: flex;
+  min-height: 2.55rem;
+  align-items: center;
+  justify-content: center;
+  gap: .45rem;
+  padding: .45rem .65rem;
+  border-radius: .58rem;
+  color: var(--muted-strong);
+  font-size: .78rem;
+  font-weight: 760;
+  text-decoration: none;
+}
+
+.automation-jump-nav a:hover {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.automation-jump-nav a span {
+  display: grid;
+  width: 1.35rem;
+  height: 1.35rem;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: .68rem;
+  font-weight: 900;
+}
+
+.automation-create .automation-readiness-warning {
+  display: flex;
+  align-items: baseline;
+  gap: .75rem;
+  margin-bottom: .75rem;
+  padding: .8rem 1rem;
+  border-color: rgba(251, 191, 119, .3);
+  background: var(--warn-soft);
+}
+
+.automation-create .automation-readiness-warning h2 { font-size: .95rem; }
+.automation-create .automation-readiness-warning p { margin: 0; font-size: .8rem; }
+
+.automation-create-form { margin-top: 0; }
+.automation-create-form .automation-layout {
+  grid-template-columns: minmax(0, 1fr) minmax(16.5rem, 18.5rem);
+  gap: 1rem;
+}
+
+.automation-create-form .automation-main { gap: .7rem; }
+.automation-create-form #set-details,
+.automation-create-form #generation-setup,
+.automation-create-form #batch-builder,
+.automation-create-form #final-set-target { scroll-margin-top: 6rem; }
+
+.automation-create-form .set-form fieldset,
+.automation-create-form fieldset.step-panel,
+.automation-create-form details.step-panel {
+  border-radius: var(--automation-panel-radius);
+}
+
+.automation-create-form fieldset.step-panel {
+  gap: .75rem;
+  padding: .9rem;
+  background: rgba(255, 255, 255, .018);
+}
+
+.automation-panel-heading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: .75rem;
+}
+
+.automation-panel-heading > div { min-width: 0; }
+.automation-panel-heading h2 { font-size: 1.08rem; }
+.automation-section-label {
+  display: block;
+  margin: 0 0 .16rem;
+  color: var(--accent);
+  font-size: .64rem;
+  font-weight: 850;
+  letter-spacing: .1em;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.automation-panel-hint,
+.automation-queue-count {
+  color: var(--muted);
+  font-size: .72rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.automation-create-form label { font-size: .78rem; }
+.automation-create-form input:not([type="radio"]):not([type="checkbox"]),
+.automation-create-form select {
+  min-height: 2.7rem;
+}
+
+.automation-create-form textarea { line-height: 1.45; }
+
+.automation-create-form .automation-identity-panel {
+  gap: .6rem;
+  padding-block: .8rem;
+}
+
+.automation-create-form .automation-title-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: .55rem;
+}
+
+.automation-create-form .automation-title-field input { font-size: .95rem; }
+.automation-create-form .automation-name-advanced > summary {
+  min-height: 2.7rem;
+  padding-inline: .75rem;
+}
+
+.automation-create-form .automation-name-advanced[open] {
+  padding: .65rem;
+  border-radius: .7rem;
+}
+
+.automation-create-form .settings-preset-bar {
+  display: grid;
+  grid-template-columns: auto minmax(10rem, 1fr) auto auto;
+  align-items: end;
+  gap: .45rem;
+  padding: .55rem;
+  border-color: var(--border);
+  border-radius: .72rem;
+  background: rgba(255, 255, 255, .02);
+}
+
+.automation-create-form .settings-preset-copy {
+  min-width: 5rem;
+  align-self: center;
+}
+
+.automation-create-form .settings-preset-copy strong { font-size: .78rem; }
+.automation-create-form .settings-preset-copy span { font-size: .62rem; }
+.automation-create-form .settings-preset-select { min-width: 0; }
+.automation-create-form .settings-preset-bar .secondary-button,
+.automation-create-form .settings-preset-bar .text-button,
+.automation-create-form .settings-preset-manage > summary {
+  min-height: 2.7rem;
+  padding: .5rem .68rem;
+  font-size: .74rem;
+}
+
+.automation-create-form .settings-preset-status { grid-column: 1 / -1; }
+.automation-create-form .settings-preset-status:empty { display: none; }
+
+.automation-create-form .settings-preset-manage-body {
+  min-width: 0;
+  border-radius: .72rem;
+  box-shadow: var(--shadow-lg);
+}
+
+.automation-create-form .composition-builder {
+  gap: .65rem;
+  margin: 0;
+  padding: .75rem 0 0;
+  border-width: 1px 0 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.automation-create-form .composition-heading { min-height: 2.4rem; }
+.automation-create-form .composition-mode { padding: .2rem; }
+.automation-create-form .composition-mode input {
+  width: 1px;
+  height: 1px;
+  clip-path: inset(50%);
+}
+.automation-create-form .composition-mode span {
+  min-height: 2.15rem;
+  padding: .3rem .65rem;
+  font-size: .74rem;
+}
+
+.automation-create-form .character-composition-grid { gap: .55rem; }
+.automation-create-form .character-composition-card {
+  gap: .5rem;
+  padding: .65rem;
+  border-radius: .72rem;
+  background: rgba(0, 0, 0, .08);
+}
+
+.automation-create-form .character-card-heading { font-size: .78rem; }
+.automation-create-form .composition-actions { justify-content: flex-start; }
+.automation-create-form .composition-status { min-height: 0; margin: 0; font-size: .72rem; }
+.automation-create-form .composition-status:empty { display: none; }
+
+.automation-create-form .automation-profile-panel > .form-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: .65rem;
+}
+
+.automation-create-form .upscaler-toggle-field {
+  grid-column: 1 / -1;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: .2rem .7rem;
+  padding: .6rem .7rem;
+  border-radius: .72rem;
+}
+
+.automation-create-form .upscaler-toggle-field > small { grid-column: 1 / -1; font-size: .68rem; }
+.automation-create-form .lora-option-copy small,
+.automation-create-form .lora-selection-copy code { display: none; }
+
+.automation-create-form .form-disclosure {
+  border-radius: .72rem;
+  background: rgba(255, 255, 255, .012);
+}
+
+.automation-create-form .form-disclosure > summary {
+  min-height: 2.7rem;
+  padding: .58rem .72rem;
+  font-size: .78rem;
+}
+
+.automation-create-form .disclosure-body { gap: .65rem; padding: 0 .7rem .7rem; }
+
+.automation-create-form .automation-settings-panel,
+.automation-create-form .automation-defaults-panel,
+.automation-create-form .automation-target-panel {
+  overflow: visible;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, .018);
+}
+
+.automation-create-form .automation-settings-panel > summary,
+.automation-create-form .automation-defaults-panel > summary,
+.automation-create-form .automation-target-panel > summary {
+  min-height: 3.25rem;
+  padding: .7rem .9rem;
+}
+
+.automation-create-form .automation-settings-summary > span:first-child {
+  display: grid;
+  gap: .08rem;
+}
+
+.automation-create-form .automation-settings-summary > span:last-child {
+  color: var(--muted);
+  font-size: .7rem;
+  font-weight: 650;
+}
+
+.automation-create-form .automation-settings-body {
+  display: grid;
+  gap: .65rem;
+  padding: 0 .8rem .8rem;
+}
+
+.automation-create-form .automation-settings-body > .form-grid {
+  grid-template-columns: minmax(15rem, 1.4fr) repeat(4, minmax(5.5rem, .55fr));
+  align-items: end;
+  gap: .6rem;
+}
+
+.automation-create-form .seed-control { gap: .35rem; }
+.automation-create-form .seed-control small { color: var(--muted); font-size: .64rem; line-height: 1.35; }
+.automation-create-form .seed-actions { gap: .3rem; }
+.automation-create-form .seed-control .secondary-button {
+  min-height: 2.2rem;
+  padding: .38rem .55rem;
+  font-size: .68rem;
+}
+
+.automation-create-form .automation-defaults-panel textarea { min-height: 6.5rem; }
+.automation-create-form .automation-defaults-panel .form-grid textarea { min-height: 4.5rem; }
+
+.automation-create-form .automation-batches-panel {
+  gap: .8rem;
+  padding: .9rem;
+  border-color: rgba(184, 165, 255, .3) !important;
+  background: linear-gradient(180deg, rgba(148, 121, 255, .045), rgba(255, 255, 255, .012));
+}
+
+.automation-create-form .automation-batches-panel .section-heading {
+  align-items: center;
+  gap: .7rem;
+  margin: 0;
+}
+
+.automation-create-form .automation-batches-panel .automation-panel-heading {
+  align-items: end;
+  justify-content: flex-start;
+  gap: .65rem;
+}
+
+.automation-create-form .batch-queue-heading-actions { justify-content: flex-end; }
+.automation-create-form .batch-sequence-builder {
+  margin: 0;
+  border: 1px dashed rgba(184, 165, 255, .3);
+  border-radius: .72rem;
+  background: rgba(148, 121, 255, .035);
+}
+
+.automation-create-form .batch-sequence-builder > summary {
+  width: 100%;
+  min-height: 2.6rem;
+  border: 0;
+  background: transparent;
+  white-space: normal;
+}
+
+.automation-create-form .batch-sequence-builder[open] {
+  grid-column: auto;
+  padding: 0;
+  border-style: solid;
+  border-radius: .72rem;
+}
+
+.automation-create-form .batch-sequence-builder[open] > summary {
+  margin: 0;
+  padding: .58rem .72rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.automation-create-form .batch-sequence-builder .disclosure-body { padding: .7rem; }
+.automation-create-form .batch-sequence-builder textarea { min-height: 7rem; }
+.automation-create-form .batch-sequence-actions { margin-top: .15rem; }
+
+.automation-create-form .batch-queue { gap: .65rem; }
+.automation-create-form .automation-batches-panel .batch-card {
+  border-color: var(--border);
+  border-radius: .78rem;
+  background: rgba(10, 11, 18, .48);
+}
+
+.automation-create-form .batch-card-header {
+  min-height: 3.8rem;
+  gap: .65rem;
+  padding: .62rem .7rem;
+}
+
+.automation-create-form .batch-card-header strong { font-size: .88rem; }
+.automation-create-form .batch-meta { font-size: .66rem; }
+.automation-create-form .batch-card-actions { flex-wrap: nowrap; }
+.automation-create-form .batch-card-actions button {
+  min-height: 2.25rem;
+  padding: .35rem .5rem;
+  font-size: .68rem;
+}
+
+.automation-create-form .batch-card-body { gap: .65rem; padding: .7rem; }
+.automation-create-form .batch-identity-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(8rem, .25fr);
+  gap: .6rem;
+}
+
+.automation-create-form .batch-prompts-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: .65rem;
+}
+
+.automation-create-form .batch-prompt-editor {
+  min-width: 0;
+  align-content: start;
+}
+
+.automation-create-form .batch-negative-prompt-editor {
+  padding: 0;
+  border: 0;
+}
+
+.automation-create-form .batch-prompt-heading { min-height: 2.35rem; font-size: .76rem; }
+.automation-create-form .batch-wildcard-picker { width: min(100%, 12rem); }
+.automation-create-form .batch-prompt-editor > textarea {
+  min-height: 10.5rem;
+  resize: vertical;
+}
+
+.automation-create-form .batch-prompt-editor > small { font-size: .64rem; }
+.automation-create-form .batch-overrides summary { font-size: .75rem; }
+.automation-create-form .batch-queue-footer { justify-content: center; padding-top: .1rem; }
+
+.automation-create-form .automation-sidebar { top: 5.35rem; }
+.automation-create-form .automation-summary-card {
+  gap: .7rem;
+  padding: .85rem;
+  border-radius: var(--automation-panel-radius);
+}
+
+.automation-create-form .automation-totals { gap: .4rem; }
+.automation-create-form .automation-totals div {
+  padding: .55rem;
+  border-radius: .62rem;
+}
+
+.automation-create-form .automation-totals dt { font-size: .62rem; }
+.automation-create-form .automation-totals dd { font-size: 1.05rem; }
+.automation-create-form .summary-note { padding: .62rem; font-size: .74rem; }
+.automation-create-form .automation-final-target {
+  gap: .4rem;
+  margin: 0;
+  padding: .65rem;
+  border-radius: .68rem;
+}
+
+.automation-create-form .automation-final-target label { font-size: .72rem; }
+.automation-create-form .automation-final-target label > span { flex: 1 0 100%; font-size: .64rem; }
+.automation-create-form .automation-queue-target {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: .75rem;
+  margin: 0;
+  padding: .6rem .7rem;
+  background: rgba(148, 121, 255, .055);
+}
+
+.automation-create-form .automation-queue-target > label {
+  display: grid;
+  flex: 1 1 auto;
+  gap: .3rem;
+}
+
+.automation-create-form .automation-target-input {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+}
+
+.automation-create-form .automation-target-input > span {
+  color: var(--muted);
+  font-size: .66rem;
+}
+
+.automation-create-form .automation-queue-target .text-button {
+  flex: 0 0 auto;
+  padding: .45rem .2rem;
+}
+.automation-create-form .summary-help {
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.automation-create-form .summary-help > summary {
+  min-height: 2.45rem;
+  padding: .52rem .1rem;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: .7rem;
+  font-weight: 760;
+}
+
+.automation-create-form .summary-help .decision-help { margin: 0; padding: 0 .1rem .65rem; font-size: .68rem; }
+.automation-create-form .automation-draft-row { margin: 0; font-size: .66rem; }
+.automation-create-form .automation-draft-row .text-button { font-size: .66rem; }
+.automation-create-form .queue-submit { min-height: 3rem; }
+
+@media (min-width: 901px) {
+  .automation-create-form .settings-preset-manage-body {
+    position: absolute;
+    z-index: 12;
+    right: 0;
+    width: min(35rem, calc(100vw - 3rem));
+    background: var(--surface-solid);
+  }
+
+  .automation-create-form .mobile-queue-dock { display: none !important; }
+}
+
+@media (max-width: 1100px) {
+  .automation-create-form .automation-settings-body > .form-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .automation-create-form .seed-control { grid-column: 1 / -1; }
+  .automation-create-form .batch-prompts-grid { grid-template-columns: minmax(0, 1fr); }
+  .automation-create-form .batch-prompt-editor > textarea { min-height: 8.5rem; }
+}
+
+@media (max-width: 900px) {
+  .automation-create { padding-bottom: 5.8rem; }
+  .automation-create-form #set-details,
+  .automation-create-form #generation-setup,
+  .automation-create-form #batch-builder,
+  .automation-create-form #final-set-target { scroll-margin-top: 8rem; }
+  .automation-create-form .automation-layout { grid-template-columns: minmax(0, 1fr); }
+  .automation-create-form .automation-sidebar { display: none; }
+  .automation-create-form .mobile-queue-dock {
+    z-index: 45;
+    right: max(.65rem, env(safe-area-inset-right));
+    bottom: max(.65rem, env(safe-area-inset-bottom));
+    left: max(.65rem, env(safe-area-inset-left));
+    display: flex;
+  }
+}
+
+@media (max-width: 680px) {
+  .automation-create .new-automation-header { gap: .7rem; }
+  .automation-create .new-automation-header .page-header-row {
+    align-items: center;
+    flex-direction: row;
+  }
+
+  .automation-create .new-automation-header .page-header-copy { min-width: 0; }
+  .automation-create .new-automation-header .page-kicker,
+  .automation-create .new-automation-header .lede { display: none; }
+  .automation-create .new-automation-header h1 { font-size: 1.85rem; }
+  .automation-create .new-automation-header .secondary-button {
+    min-height: 2.55rem;
+    padding: .5rem .65rem;
+    font-size: .74rem;
+  }
+
+  .automation-jump-nav {
+    display: flex;
+    gap: .25rem;
+    overflow-x: auto;
+    padding: .25rem;
+    scrollbar-width: none;
+  }
+
+  .automation-jump-nav::-webkit-scrollbar { display: none; }
+  .automation-jump-nav a {
+    min-width: max-content;
+    min-height: 2.45rem;
+    flex: 1 0 auto;
+    padding-inline: .55rem;
+  }
+
+  .automation-create .automation-readiness-warning {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: .2rem;
+  }
+
+  .automation-create-form .automation-main { gap: .6rem; }
+  .automation-create-form fieldset.step-panel { padding: .75rem; }
+  .automation-panel-heading { align-items: flex-start; }
+  .automation-panel-hint { padding-top: .2rem; }
+  .automation-create-form .automation-title-row { grid-template-columns: minmax(0, 1fr); }
+  .automation-create-form .automation-name-advanced { width: 100%; }
+  .automation-create-form .automation-name-advanced > summary { justify-content: center; text-align: center; }
+
+  .automation-create-form .settings-preset-bar {
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: end;
+  }
+
+  .automation-create-form .settings-preset-copy { grid-column: 1 / -1; }
+  .automation-create-form .settings-preset-manage { width: auto; }
+  .automation-create-form .settings-preset-manage > summary { justify-content: center; }
+  .automation-create-form .settings-preset-manage-body {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .automation-create-form .settings-preset-name { grid-column: 1 / -1; }
+  .automation-create-form .settings-preset-manage-body .text-button { width: 100%; }
+  .automation-create-form .composition-heading,
+  .automation-create-form .composition-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .automation-create-form .composition-mode { width: 100%; }
+  .automation-create-form .composition-mode label { flex: 1; }
+  .automation-create-form .character-composition-grid,
+  .automation-create-form .automation-profile-panel > .form-grid { grid-template-columns: minmax(0, 1fr); }
+  .automation-create-form .upscaler-toggle-field { grid-column: auto; }
+
+  .automation-create-form .automation-settings-summary { align-items: flex-start; }
+  .automation-create-form .automation-settings-summary > span:last-child {
+    max-width: 50%;
+    padding-top: .15rem;
+    text-align: right;
+  }
+
+  .automation-create-form .automation-settings-body > .form-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .automation-create-form .seed-control { grid-column: 1 / -1; }
+  .automation-create-form .automation-batches-panel .section-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .automation-create-form .automation-batches-panel .automation-panel-heading { align-items: end; }
+  .automation-create-form .automation-queue-target {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .automation-create-form .automation-queue-target .text-button {
+    min-height: 2.65rem;
+    align-self: stretch;
+    border: 1px solid var(--border);
+    border-radius: .62rem;
+    background: rgba(255, 255, 255, .025);
+    text-align: center;
+  }
+  .automation-create-form .batch-queue-heading-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .automation-create-form .batch-queue-heading-actions button { width: 100%; }
+  .automation-create-form .batch-card-header { align-items: stretch; }
+  .automation-create-form .batch-card-actions {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    justify-content: stretch;
+  }
+
+  .automation-create-form .batch-card-actions button {
+    min-width: 0;
+    min-height: 2.75rem;
+    padding-inline: .25rem;
+  }
+
+  .automation-create-form .batch-identity-grid,
+  .automation-create-form .batch-prompts-grid { grid-template-columns: minmax(0, 1fr); }
+  .automation-create-form .batch-prompt-heading { align-items: stretch; flex-direction: column; }
+  .automation-create-form .batch-wildcard-picker { width: 100%; }
+  .automation-create-form .batch-prompt-editor > textarea { min-height: 8rem; }
+  .automation-create-form .batch-queue-footer button { width: 100%; }
+
+  .automation-create-form .mobile-queue-dock {
+    gap: .55rem;
+    padding: .55rem;
+  }
+
+  .automation-create-form .mobile-queue-dock .queue-submit {
+    min-width: 7.6rem;
+    min-height: 2.8rem;
+    padding-inline: .65rem;
+  }
+}
+
+@media (max-width: 420px) {
+  .automation-create .new-automation-header .secondary-button { font-size: .68rem; }
+  .automation-jump-nav a span { display: none; }
+  .automation-create-form .automation-settings-body > .form-grid { grid-template-columns: minmax(0, 1fr); }
+  .automation-create-form .seed-control { grid-column: auto; }
+  .automation-create-form .settings-preset-bar { grid-template-columns: minmax(0, 1fr) auto; }
+  .automation-create-form .settings-preset-manage { grid-column: 1 / -1; }
+  .automation-create-form .settings-preset-manage > summary { width: 100%; }
+  .automation-create-form .automation-queue-count { font-size: .66rem; }
+  .automation-create-form .batch-card-actions button { font-size: .62rem; }
+  .automation-create-form .mobile-queue-dock > div > span { display: none; }
+}

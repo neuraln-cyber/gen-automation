@@ -141,7 +141,7 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     page = client.get("/dashboard/new-set")
     assert page.status_code == 200
     assert "Approved Adult Character" in page.text
-    assert "Characters in each image" in page.text
+    assert ">Characters</strong>" in page.text
     assert "Two characters" in page.text
     assert "Swap left / right" in page.text
     assert 'name="composition_mode"' in page.text

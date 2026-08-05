@@ -1,19 +1,23 @@
 {% extends "dashboard/base.html" %}
 
 {% block content %}
-  <a class="back" href="/dashboard">&larr; Automation library</a>
-  <header class="page-header">
+  <div class="automation-create">
+  <a class="back automation-back" href="/dashboard">&larr; All sets</a>
+  <header class="page-header new-automation-header">
     <div class="page-header-row">
       <div class="page-header-copy">
-        <p class="page-kicker">New automation</p>
-        <h1>Queue image batches</h1>
-        <p class="lede">
-          Choose the model and image settings once, then line up as many prompt and
-          wildcard batches as you need. They run in order and arrive together for review.
-        </p>
+        <p class="page-kicker">Create</p>
+        <h1>New set</h1>
+        <p class="lede">Choose a look, build the queue, then launch.</p>
       </div>
       <a class="secondary-button" href="/dashboard/wildcards">Manage wildcards</a>
     </div>
+    <nav class="automation-jump-nav" aria-label="New set sections">
+      <a href="#set-details"><span>1</span> Set details</a>
+      <a href="#generation-setup"><span>2</span> Generation</a>
+      <a href="#batch-builder"><span>3</span> Batches</a>
+      <a href="#final-set-target"><span>4</span> Finish</a>
+    </nav>
   </header>
 
   {% if error_message %}
@@ -21,17 +25,14 @@
   {% endif %}
 
   {% if not options.ready %}
-    <section class="panel review-entry">
-      <h2>Generation inputs are not ready</h2>
-      <p class="muted">
-        At least one current adult fictional subject, checkpoint, and workflow profile
-        is required before this run can be queued.
-      </p>
+    <section class="panel review-entry automation-readiness-warning">
+      <h2>Setup needed</h2>
+      <p class="muted">Add an approved subject, checkpoint, and workflow before queueing.</p>
     </section>
   {% endif %}
 
   <form
-    class="set-form automation-form"
+    class="set-form automation-form automation-create-form"
     method="post"
     action="/dashboard/new-set"
     autocomplete="off"
@@ -45,18 +46,18 @@
 
     <div class="automation-layout">
       <div class="automation-main">
-        <fieldset class="step-panel automation-identity-panel">
-          <legend class="visually-hidden">Automation identity</legend>
-          <div class="step-heading">
-            <span class="step-number" aria-hidden="true">1</span>
+        <fieldset class="step-panel automation-identity-panel" id="set-details">
+          <legend class="visually-hidden">Set details</legend>
+          <div class="automation-panel-heading">
             <div>
-              <h2>Name the run</h2>
-              <p class="muted">Use a title you will recognize later in the library.</p>
+              <span class="automation-section-label">Set details</span>
+              <h2>Name this set</h2>
             </div>
+            <span class="automation-panel-hint">Autosaved locally</span>
           </div>
           <div class="automation-title-row">
             <label class="automation-title-field">
-              Run title
+              Set name
               <input
                 type="text"
                 name="title"
@@ -69,7 +70,7 @@
               >
             </label>
             <details class="compact-disclosure automation-name-advanced">
-              <summary>Advanced naming</summary>
+              <summary>URL name</summary>
               <label>
                 URL slug
                 <input
@@ -88,18 +89,17 @@
           </div>
         </fieldset>
 
-        <fieldset class="step-panel automation-profile-panel">
+        <fieldset class="step-panel automation-profile-panel" id="generation-setup">
           <legend class="visually-hidden">Approved generation inputs</legend>
-          <div class="step-heading">
-            <span class="step-number" aria-hidden="true">2</span>
+          <div class="automation-panel-heading">
             <div>
-              <h2>Set the generation profile</h2>
-              <p class="muted">These model and style choices are shared by every queued batch.</p>
+              <span class="automation-section-label">Generation</span>
+              <h2>Choose the look</h2>
             </div>
           </div>
           <section class="settings-preset-bar" data-automation-presets aria-labelledby="settings-presets-heading">
             <div class="settings-preset-copy">
-              <strong id="settings-presets-heading">Settings presets</strong>
+              <strong id="settings-presets-heading">Preset</strong>
               <span>Saved on this device</span>
             </div>
             <label class="settings-preset-select">
@@ -110,7 +110,7 @@
             </label>
             <button class="secondary-button" type="button" data-automation-preset-load disabled>Load</button>
             <details class="settings-preset-manage">
-              <summary>Manage</summary>
+              <summary>More</summary>
               <div class="settings-preset-manage-body">
                 <label class="settings-preset-name">
                   <span class="visually-hidden">New preset name</span>
@@ -127,10 +127,7 @@
           </section>
           <section class="composition-builder" data-composition-builder>
             <div class="composition-heading">
-              <div>
-                <strong>Characters in each image</strong>
-                <p class="muted">Use one character normally, or place two approved characters in one scene.</p>
-              </div>
+              <strong>Characters</strong>
               <div class="composition-mode" role="radiogroup" aria-label="Character composition">
                 <label>
                   <input
@@ -152,11 +149,6 @@
                   <span>Two characters</span>
                 </label>
               </div>
-            </div>
-
-            <div class="composition-preview" data-composition-preview aria-hidden="true">
-              <span data-composition-preview-a>Character 1</span>
-              <span data-composition-preview-b>Character 2</span>
             </div>
 
             <div class="character-composition-grid">
@@ -230,7 +222,6 @@
               <button class="secondary-button compact-action" type="button" data-swap-characters>
                 Swap left / right
               </button>
-              <span class="muted">Batch prompts remain the shared scene, action, and wildcard prompt.</span>
             </div>
             <output class="composition-status" data-composition-status aria-live="polite"></output>
           </section>
@@ -246,12 +237,12 @@
                     data-checkpoint-name="{{ checkpoint.name }}"
                     data-checkpoint-sha256="{{ checkpoint.sha256 }}"
                     {% if form_values['checkpoint_id'] == checkpoint.approval_id|string %}selected{% endif %}
-                  >{{ checkpoint.name }} &middot; {{ checkpoint.sha256[:12] }}</option>
+                  >{{ checkpoint.name }}</option>
                 {% endfor %}
               </select>
             </label>
             <label>
-              Workflow profile
+              Workflow
               <select name="workflow_id" data-workflow-profile required>
                 {% if not options.workflows %}<option value="">No approved workflows</option>{% endif %}
                 {% for workflow in options.workflows %}
@@ -286,15 +277,8 @@
           </div>
 
           <details class="form-disclosure">
-            <summary>
-              LoRA stack
-              <span data-lora-summary>Optional &middot; up to 8</span>
-            </summary>
+            <summary>LoRA stack <span data-lora-summary>Optional &middot; up to 8</span></summary>
             <div class="disclosure-body">
-              <p class="muted">
-                LoRAs are applied from top to bottom with the exact weights shown.
-              </p>
-
               <section class="lora-picker" data-lora-picker data-max-selections="8" hidden>
                 <div class="lora-picker-toolbar">
                   <label>
@@ -347,7 +331,6 @@
                 <div class="lora-stack-heading">
                   <div>
                     <h3>Selected stack</h3>
-                    <p class="muted">Drag on desktop or use the arrow buttons to set order.</p>
                   </div>
                 </div>
                 <ol class="lora-selected-list" data-lora-selected aria-live="polite"></ol>
@@ -392,15 +375,15 @@
           </details>
         </fieldset>
 
-        <fieldset class="step-panel automation-settings-panel">
-          <legend class="visually-hidden">Generation settings</legend>
-          <div class="step-heading">
-            <span class="step-number" aria-hidden="true">3</span>
-            <div>
-              <h2>Set image quality</h2>
-              <p class="muted">The visible controls cover normal use; detailed tuning stays below.</p>
-            </div>
-          </div>
+        <details class="step-panel form-disclosure automation-settings-panel">
+          <summary class="automation-settings-summary">
+            <span>
+              <small class="automation-section-label">Generation</small>
+              <strong>Image settings</strong>
+            </span>
+            <span data-image-settings-summary>{{ form_values['width'] }} &times; {{ form_values['height'] }} &middot; {{ form_values['steps'] }} steps &middot; CFG {{ form_values['cfg'] }}</span>
+          </summary>
+          <div class="automation-settings-body">
           <div class="form-grid">
             <div class="seed-control">
               <label>
@@ -408,7 +391,7 @@
                 <input type="number" name="seed" value="{{ form_values['seed'] }}" min="-1" max="9223372036854775807" data-default-seed required>
               </label>
               <div class="seed-actions">
-                <button class="secondary-button" type="button" data-random-each-seed>Random each image (-1)</button>
+                <button class="secondary-button" type="button" data-random-each-seed>Random each (-1)</button>
                 <button class="secondary-button" type="button" data-random-seed>New fixed seed</button>
               </div>
               <small>Use -1 for an independent random seed on every image. Actual seeds are saved with each result.</small>
@@ -513,20 +496,17 @@
               </label>
             </div>
           </details>
-        </fieldset>
+          </div>
+        </details>
 
         <details class="step-panel form-disclosure automation-defaults-panel">
           <summary>
-            Prompt and face defaults
-            <span>Applied to new batches</span>
+            Prompt defaults
+            <span>For new batches</span>
           </summary>
           <div class="disclosure-body">
-            <p class="muted">
-              Keep common negative and face-detailer prompts here. Each batch can override
-              them without changing the rest of the queue.
-            </p>
             <label>
-              Starting prompt for new batches
+              Default positive prompt
               <textarea
                 name="prompt"
                 rows="7"
@@ -576,37 +556,48 @@
           </div>
         </details>
 
+        <section class="automation-final-target automation-queue-target" id="final-set-target">
+          <label>
+            Final set size
+            <span class="automation-target-input">
+              <input
+                type="number"
+                name="desired_accepted_count"
+                value="{{ form_values['desired_accepted_count'] }}"
+                min="1"
+                max="{{ max_accepted_images_per_release }}"
+                data-desired-count
+                required
+              >
+              <span>maximum images to keep</span>
+            </span>
+          </label>
+          <button class="text-button" type="button" data-match-queue-target>Keep all generated</button>
+        </section>
+
         <fieldset class="step-panel batch-builder-panel automation-batches-panel" id="batch-builder" hidden>
           <legend class="visually-hidden">Batch queue</legend>
           <div class="section-heading">
-            <div class="step-heading">
-              <span class="step-number" aria-hidden="true">4</span>
+            <div class="automation-panel-heading">
               <div>
-                <h2>Queue prompt batches</h2>
-                <p class="muted">
-                  Every card runs in order and can use a different prompt structure,
-                  wildcard, image count, or seed.
-                </p>
+                <span class="automation-section-label">Ordered queue</span>
+                <h2>Batches</h2>
               </div>
+              <span class="automation-queue-count" data-queue-summary>1 batch &middot; 0 images</span>
             </div>
             <div class="batch-queue-heading-actions">
-              <button class="secondary-button compact-action" type="button" data-collapse-batches>Collapse all</button>
               <button class="primary-button compact-action" type="button" data-add-batch>+ Add batch</button>
+              <button class="secondary-button compact-action" type="button" data-collapse-batches>Collapse all</button>
             </div>
           </div>
 
           <details class="compact-disclosure batch-sequence-builder" data-batch-sequence-builder>
-            <summary>Build a large wildcard queue quickly</summary>
+            <summary>Quick add a wildcard sequence</summary>
             <div class="disclosure-body">
-              <p class="muted">
-                Enter one batch per line as <code>image count</code> followed by the
-                wildcard name. Lines stay in this exact order. The current starting prompt
-                is copied to every batch and its first wildcard token is replaced.
-              </p>
               <label>
-                Ordered wildcard batches
+                One batch per line: <code>count wildcard</code>
                 <textarea
-                  rows="6"
+                  rows="5"
                   spellcheck="false"
                   placeholder="50 sfw&#10;100 nnsfw&#10;50 nsfw&#10;20 oral&#10;100 reworked&#10;20 group"
                   data-batch-sequence-input
@@ -614,7 +605,7 @@
               </label>
               <div class="batch-sequence-actions">
                 <button class="secondary-button" type="button" data-batch-sequence-apply>
-                  Replace queue with these batches
+                  Build sequence
                 </button>
                 <output data-batch-sequence-status aria-live="polite"></output>
               </div>
@@ -630,7 +621,6 @@
 
           <div class="batch-queue-footer">
             <button class="secondary-button" type="button" data-add-batch>+ Add another batch</button>
-            <span class="muted">The queue runs from top to bottom.</span>
           </div>
         </fieldset>
 
@@ -645,7 +635,7 @@
         </noscript>
 
         <details class="step-panel form-disclosure legacy-plan-size automation-target-panel">
-          <summary>GPU job sizing <span>Advanced</span></summary>
+          <summary>Cloud efficiency <span>Advanced</span></summary>
           <div class="disclosure-body">
             <div class="form-grid">
             <label>
@@ -657,18 +647,19 @@
               <input type="number" name="planned_job_count" value="{{ form_values['planned_job_count'] }}" min="1" max="10000" data-planned-job-count required>
             </label>
             </div>
-            <p class="muted">
-              Images per job controls cloud-GPU efficiency. Batch cards still control the
-              exact generated total.
-            </p>
+            <p class="muted">Larger jobs reduce pauses between batches.</p>
           </div>
         </details>
       </div>
 
-      <aside class="automation-sidebar" aria-label="Run summary">
+      <aside class="automation-sidebar" aria-label="Set summary">
         <section class="panel automation-summary-card">
-          <p class="page-kicker">Run summary</p>
-          <h2>Ready when you are</h2>
+          <div class="automation-panel-heading">
+            <div>
+              <span class="automation-section-label">Final step</span>
+              <h2>Launch</h2>
+            </div>
+          </div>
           <dl class="automation-totals" aria-live="polite">
             <div><dt>Batches</dt><dd id="summary-batches">1</dd></div>
             <div><dt>Images</dt><dd id="summary-images">0</dd></div>
@@ -676,48 +667,31 @@
             <div><dt>Final set size</dt><dd id="summary-target">0</dd></div>
           </dl>
           <p class="summary-note" id="summary-note">
-            Add a prompt and image count to prepare this automation.
+            Add a prompt and image count to prepare this set.
           </p>
-          <div class="automation-final-target">
-            <label>
-              Final set size
-              <input
-                type="number"
-                name="desired_accepted_count"
-                value="{{ form_values['desired_accepted_count'] }}"
-                min="1"
-                max="{{ max_accepted_images_per_release }}"
-                data-desired-count
-                required
-              >
-              <span>maximum images to keep</span>
-            </label>
-            <button class="text-button" type="button" data-match-queue-target>Keep all generated</button>
-          </div>
-          <p class="decision-help">
-            Fresh queues default to a 250-image cap, which you can edit anytime. For example:
-            generate 400; keep the best 250. Other masters may remain undecided.
-          </p>
+          <details class="summary-help">
+            <summary>How the final set works</summary>
+            <p class="decision-help">
+              Fresh queues default to a 250-image cap, which you can edit anytime. For example:
+              generate 400; keep the best 250. Other masters may remain undecided.
+            </p>
+          </details>
           <div class="automation-draft-row">
             <span data-automation-draft-status>Draft autosaves on this device.</span>
             <button class="text-button" type="button" data-automation-draft-clear>Clear draft</button>
           </div>
           <button class="primary-button queue-submit" type="submit" {% if not options.ready %}disabled{% endif %}>
-            Queue automation
+            Queue set
           </button>
-          <p class="decision-help">
-            One click freezes the run and queues every batch. Generation starts as GPU capacity
-            becomes available.
-          </p>
         </section>
       </aside>
-      <div class="mobile-queue-dock" aria-label="Queue automation">
+      <div class="mobile-queue-dock" aria-label="Queue set">
         <div>
           <strong><span data-mobile-summary-images>0</span> images</strong>
           <span><span data-mobile-summary-jobs>0</span> GPU jobs &middot; final set <span data-mobile-summary-target>0</span></span>
         </div>
         <button class="primary-button queue-submit" type="submit" {% if not options.ready %}disabled{% endif %}>
-          Queue automation
+          Queue set
         </button>
       </div>
     </div>
@@ -731,12 +705,12 @@
           <strong data-batch-heading>Untitled batch</strong>
           <span class="batch-meta" data-batch-meta>4 images &middot; 1 GPU job</span>
         </div>
-        <div class="batch-card-actions" aria-label="Batch order and duplication">
-          <button type="button" data-batch-action="up" aria-label="Move batch up">&uarr;</button>
-          <button type="button" data-batch-action="down" aria-label="Move batch down">&darr;</button>
-          <button type="button" data-batch-action="duplicate">Duplicate</button>
+        <div class="batch-card-actions" aria-label="Batch actions">
+          <button type="button" data-batch-action="up" aria-label="Move batch up" title="Move up">&uarr;</button>
+          <button type="button" data-batch-action="down" aria-label="Move batch down" title="Move down">&darr;</button>
+          <button type="button" data-batch-action="duplicate" aria-label="Duplicate batch" title="Duplicate batch">Copy</button>
           <button type="button" data-batch-action="collapse" aria-expanded="true">Collapse</button>
-          <button class="danger" type="button" data-batch-action="remove">Remove</button>
+          <button class="danger" type="button" data-batch-action="remove" aria-label="Delete batch">Delete</button>
         </div>
       </header>
       <div class="batch-card-body">
@@ -750,6 +724,7 @@
             <input type="number" min="1" max="80000" value="4" inputmode="numeric" data-batch-field="image_count" required>
           </label>
         </div>
+        <div class="batch-prompts-grid">
         <div class="batch-prompt-editor">
           <div class="batch-prompt-heading">
             <strong>Positive prompt</strong>
@@ -810,6 +785,7 @@
           ></textarea>
           <small>Starts with the shared negative prompt; edit it freely for this batch.</small>
         </div>
+        </div>
         <div class="batch-wildcard-summary" data-batch-wildcard-summary aria-live="polite"></div>
         <details class="batch-overrides">
           <summary>Batch-specific overrides <span>Optional</span></summary>
@@ -862,4 +838,5 @@
       </span>
     </li>
   </template>
+  </div>
 {% endblock %}

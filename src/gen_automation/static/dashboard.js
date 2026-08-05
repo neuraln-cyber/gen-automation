@@ -407,6 +407,37 @@
     return { applied: true, missing };
   };
 
+  function initializeImageSettingsSummary() {
+    const form = document.querySelector("[data-automation-form]");
+    const summary = document.querySelector("[data-image-settings-summary]");
+    if (!form || !summary) return;
+
+    const watchedFields = new Set(["width", "height", "steps", "cfg"]);
+    const valueFor = (name, fallback) => {
+      const control = namedControl(form, name);
+      if (!(control instanceof HTMLInputElement)
+          && !(control instanceof HTMLSelectElement)) return fallback;
+      return control.value.trim() || fallback;
+    };
+    const render = () => {
+      const width = valueFor("width", "—");
+      const height = valueFor("height", "—");
+      const steps = valueFor("steps", "—");
+      const cfg = valueFor("cfg", "—");
+      summary.textContent = `${width} × ${height} · ${steps} steps · CFG ${cfg}`;
+    };
+    const renderForSettingsChange = (event) => {
+      const control = event.target;
+      if ((control instanceof HTMLInputElement || control instanceof HTMLSelectElement)
+          && watchedFields.has(control.name)) render();
+    };
+
+    form.addEventListener("input", renderForSettingsChange);
+    form.addEventListener("change", renderForSettingsChange);
+    form.addEventListener("gen-automation:profile-changed", render);
+    render();
+  }
+
   function consumePendingImageProfile() {
     const form = document.querySelector("[data-automation-form]");
     if (!form) return false;
@@ -1065,6 +1096,7 @@
       const imagesSummary = document.querySelector("#summary-images");
       const jobsSummary = document.querySelector("#summary-jobs");
       const targetSummary = document.querySelector("#summary-target");
+      const queueSummaries = document.querySelectorAll("[data-queue-summary]");
       const mobileImageSummaries = document.querySelectorAll("[data-mobile-summary-images]");
       const mobileJobSummaries = document.querySelectorAll("[data-mobile-summary-jobs]");
       const mobileTargetSummaries = document.querySelectorAll("[data-mobile-summary-target]");
@@ -1073,6 +1105,9 @@
       if (imagesSummary) imagesSummary.textContent = totalImages.toLocaleString();
       if (jobsSummary) jobsSummary.textContent = totalJobs.toLocaleString();
       if (targetSummary) targetSummary.textContent = String(integerValue(desiredCount && desiredCount.value));
+      queueSummaries.forEach((item) => {
+        item.textContent = `${rows.length.toLocaleString()} batch${rows.length === 1 ? "" : "es"} · ${totalImages.toLocaleString()} images`;
+      });
       mobileImageSummaries.forEach((item) => { item.textContent = totalImages.toLocaleString(); });
       mobileJobSummaries.forEach((item) => { item.textContent = totalJobs.toLocaleString(); });
       mobileTargetSummaries.forEach((item) => {
@@ -1139,7 +1174,17 @@
         seed: null,
       }];
     }
-    initialBatches.forEach((batch) => addBatch(batch));
+    initialBatches.forEach((batch, index) => {
+      const row = addBatch(batch);
+      if (initialBatches.length > 1 && index > 0) {
+        row.classList.add("is-collapsed");
+        const collapseButton = row.querySelector('[data-batch-action="collapse"]');
+        if (collapseButton) {
+          collapseButton.setAttribute("aria-expanded", "false");
+          collapseButton.textContent = "Expand";
+        }
+      }
+    });
 
     if (batchSequenceApply instanceof HTMLButtonElement
         && batchSequenceInput instanceof HTMLTextAreaElement) {
@@ -4218,8 +4263,9 @@
           ? "A matching standard/couple workflow with the same hires and detailer settings is unavailable."
           : (duo
             ? "Regional prompting keeps the first character on the left and the second on the right."
-            : "Single-character workflow selected.");
+            : "");
         status.className = `composition-status${paired ? "" : " warning"}`;
+        status.hidden = paired && !duo;
       }
       form.dispatchEvent(new CustomEvent("gen-automation:profile-changed"));
     };
@@ -4946,6 +4992,7 @@
   initializeAutomationBuilder();
   initializeWorkflowRefinement();
   initializeCharacterComposition();
+  initializeImageSettingsSummary();
   initializeAutomationPresets();
   if (!experimentFormPresent) initializeAutomationDraft();
   initializeReleaseLibrary();

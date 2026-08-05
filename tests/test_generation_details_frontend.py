@@ -98,6 +98,33 @@ def test_generation_form_has_named_device_local_settings_presets() -> None:
     assert "draft.submission_id !== submittedDraftId" in script
 
 
+def test_generation_form_uses_one_responsive_progressive_builder() -> None:
+    template = (
+        ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "new_set.html"
+    ).read_text(encoding="utf-8")
+    styles = (ROOT / "src" / "gen_automation" / "static" / "dashboard_ux.css").read_text(
+        encoding="utf-8"
+    )
+    script = (ROOT / "src" / "gen_automation" / "static" / "dashboard.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert '<div class="automation-create">' in template
+    assert '<h1>New set</h1>' in template
+    assert 'class="automation-jump-nav"' in template
+    assert 'class="step-panel form-disclosure automation-settings-panel"' in template
+    assert "data-image-settings-summary" in template
+    assert 'class="batch-prompts-grid"' in template
+    assert "data-queue-summary" in template
+    assert template.count('name="desired_accepted_count"') == 1
+    assert template.index('id="final-set-target"') < template.index('id="batch-builder"')
+    assert ".automation-create-form .automation-sidebar { display: none; }" in styles
+    assert ".automation-create-form .mobile-queue-dock { display: none !important; }" in styles
+
+    assert "initializeImageSettingsSummary" in script
+    assert 'form.addEventListener("gen-automation:profile-changed", render)' in script
+
+
 def test_fresh_generation_queue_uses_an_editable_250_image_final_set_cap() -> None:
     template = (
         ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "new_set.html"
