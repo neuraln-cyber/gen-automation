@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select, update
 
+from gen_automation.api.routes import dashboard as dashboard_routes
 from gen_automation.app import create_app
 from gen_automation.config import Environment
 from gen_automation.db.models import (
@@ -579,6 +580,39 @@ def test_review_detail_reads_its_exact_run_after_release_advances(
     assert "Frozen release version 1" in page.text
     assert str(context.asset_ids[0]) in page.text
     assert str(context.asset_ids[1]) in page.text
+
+
+def test_review_detail_resolves_anatomy_threshold_through_activation_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = asyncio.run(_seed_review_api(_settings(tmp_path / "browser-threshold-guard.db")))
+    task_id = asyncio.run(_create_task(context))
+    calls: list[str | None] = []
+
+    async def guarded_threshold(
+        _session: object,
+        *,
+        settings: object,
+        profile_sha256: str | None,
+    ) -> int:
+        calls.append(profile_sha256)
+        return context.settings.semantic_anatomy_severe_confidence_micros
+
+    monkeypatch.setattr(dashboard_routes, "_effective_semantic_threshold", guarded_threshold)
+    app = create_app(context.settings)
+
+    with TestClient(
+        app,
+        base_url=ORIGIN,
+        client=("192.0.2.93", 50000),
+    ) as client:
+        app.state.object_store = SameOriginReviewStore()
+        _login(client, context.settings, context.users[AdminRole.OWNER])
+        page = client.get(f"/dashboard/review-tasks/{task_id}")
+
+    assert page.status_code == 200
+    assert calls == [None]
 
 
 def test_owner_selects_and_removes_specific_x_image_from_review_dashboard(

@@ -372,7 +372,7 @@ async def test_calibration_deduplicates_cross_run_owner_labels_by_earliest_feedb
     assert report.anatomy_defect_count == 1
     assert report.dataset_sha256 == repeated.dataset_sha256
     assert report.to_wire()["schema_version"] == SEMANTIC_CALIBRATION_SCHEMA_VERSION
-    assert SEMANTIC_CALIBRATION_SCHEMA_VERSION == "semantic-anatomy-calibration/v2"
+    assert SEMANTIC_CALIBRATION_SCHEMA_VERSION == "semantic-anatomy-calibration/v3"
 
 
 @pytest.mark.asyncio
@@ -545,7 +545,11 @@ async def test_calibration_sweeps_thresholds_and_versions_immutable_artifacts(
         assert report_one.agreement_correct_count == 1
         assert report_one.agreement_incorrect_count == 1
         assert report_one.recommended_threshold_micros == 950_000
-        assert report_one.ready_for_enforcement
+        # Two conflicting labels for the same raw image cannot form an honest
+        # grouped out-of-fold validation set, even when the test lowers the
+        # collection minimums.
+        assert not report_one.ready_for_enforcement
+        assert report_one.learning_status == "calibrating"
         at_950 = next(
             item for item in report_one.threshold_sweep if item.threshold_micros == 950_000
         )

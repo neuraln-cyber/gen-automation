@@ -46,6 +46,12 @@ from gen_automation.services.ranking_manifest import (
     load_ranking_manifest_rows,
     validate_completed_ranking_manifest,
 )
+from gen_automation.services.semantic_feedback import SemanticFeedbackError
+from gen_automation.services.semantic_review_learning import (
+    SemanticReviewChoice,
+    SemanticReviewLearningResult,
+    learn_semantic_anatomy_from_final_review,
+)
 
 _REASON_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_.-]{0,99}")
 _MAX_NOTE_LENGTH = 4_000
@@ -960,6 +966,8 @@ async def transition_review_task(
 
     changed_at = _as_utc(now or datetime.now(UTC))
     approved_release_id: UUID | None = None
+    semantic_learning: SemanticReviewLearningResult | None = None
+    semantic_learning_error: str | None = None
     if normalized_target == ReviewTaskState.COMPLETED:
         approved_release_id = await _freeze_release_selections(
             session,
@@ -968,6 +976,34 @@ async def transition_review_task(
             actor_user_id=changed_by_user_id,
             correlation_id=normalized_key,
         )
+        if normalized_semantic_profile is not None:
+            try:
+                async with session.begin_nested():
+                    semantic_learning = await learn_semantic_anatomy_from_final_review(
+                        session,
+                        scoring_run_id=task.scoring_run_id,
+                        profile_sha256=normalized_semantic_profile,
+                        owner_user_id=changed_by_user_id,
+                        choices=tuple(
+                            SemanticReviewChoice(
+                                asset_id=asset.asset_id,
+                                decision=asset.decision,
+                                reason_code=asset.reason_code,
+                                decided_by_user_id=asset.decided_by_user_id,
+                                semantic_severe_override_attested=(
+                                    asset.semantic_severe_override_attested
+                                ),
+                            )
+                            for asset in summary.assets
+                        ),
+                        baseline_threshold_micros=semantic_threshold,
+                        now=changed_at,
+                    )
+            except (IntegrityError, SemanticFeedbackError):
+                # Review completion is authoritative. A calibration race or an
+                # invalid learning snapshot must not strand an otherwise valid
+                # final set; the next explicit label/completion rebuilds it.
+                semantic_learning_error = "calibration_refresh_failed"
     values: dict[str, Any] = {
         "state": normalized_target,
         "lock_version": expected_version + 1,
@@ -1041,6 +1077,16 @@ async def transition_review_task(
                 "semantic_terminal_count": summary.semantic_gate.terminal_count,
                 "semantic_unavailable_count": summary.semantic_gate.unavailable_count,
                 "semantic_severe_override_count": (summary.semantic_gate.severe_override_count),
+                "semantic_learning_inferred_good_count": (
+                    semantic_learning.inferred_good_count if semantic_learning else 0
+                ),
+                "semantic_learning_inferred_defect_count": (
+                    semantic_learning.inferred_defect_count if semantic_learning else 0
+                ),
+                "semantic_learning_skipped_existing_count": (
+                    semantic_learning.skipped_existing_count if semantic_learning else 0
+                ),
+                "semantic_learning_error": semantic_learning_error,
                 "task_lock_version": expected_version + 1,
             },
             occurred_at=changed_at,

@@ -42,6 +42,7 @@ from gen_automation.services.semantic_feedback import (
     SemanticFeedbackConflictError,
     SemanticFeedbackNotFoundError,
     SemanticFeedbackValidationError,
+    load_effective_semantic_threshold_micros,
     record_semantic_anatomy_feedback,
     refresh_semantic_calibration_artifact,
 )
@@ -227,7 +228,11 @@ async def read_review_task(
     session: Session,
     _principal: ReviewReader,
 ) -> ReviewSummaryResponse:
-    semantic_profile, semantic_threshold, semantic_mode = _semantic_gate_configuration(request)
+    (
+        semantic_profile,
+        semantic_threshold,
+        semantic_mode,
+    ) = await _semantic_gate_configuration_with_learning(request, session)
     try:
         result = await get_review_summary(
             session,
@@ -255,7 +260,11 @@ async def post_review_decision(
     response: Response,
     principal: ReviewPrincipal,
 ) -> ReviewDecisionResponse:
-    semantic_profile, semantic_threshold, semantic_mode = _semantic_gate_configuration(request)
+    (
+        semantic_profile,
+        semantic_threshold,
+        semantic_mode,
+    ) = await _semantic_gate_configuration_with_learning(request, session)
     try:
         result = await append_review_decision(
             session,
@@ -316,6 +325,7 @@ async def post_semantic_anatomy_feedback(
             session,
             profile_sha256=semantic_profile,
             created_by_user_id=principal.user_id,
+            configured_baseline_threshold_micros=_semantic_threshold,
         )
         await session.commit()
     except (
@@ -348,7 +358,11 @@ async def post_bulk_review_action(
         principal.role != AdminRole.OWNER
     ):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="permission denied")
-    semantic_profile, semantic_threshold, semantic_mode = _semantic_gate_configuration(request)
+    (
+        semantic_profile,
+        semantic_threshold,
+        semantic_mode,
+    ) = await _semantic_gate_configuration_with_learning(request, session)
     try:
         result: ReviewBulkActionResult = await apply_bulk_review_action(
             session,
@@ -431,7 +445,11 @@ async def _transition(
     principal: ReviewPrincipal,
     request: Request,
 ) -> ReviewTransitionResponse:
-    semantic_profile, semantic_threshold, semantic_mode = _semantic_gate_configuration(request)
+    (
+        semantic_profile,
+        semantic_threshold,
+        semantic_mode,
+    ) = await _semantic_gate_configuration_with_learning(request, session)
     try:
         result = await transition_review_task(
             session,
@@ -518,6 +536,21 @@ def _semantic_gate_configuration(
         settings.semantic_anatomy_severe_confidence_micros,
         settings.semantic_anatomy_mode,
     )
+
+
+async def _semantic_gate_configuration_with_learning(
+    request: Request,
+    session: Session,
+) -> tuple[str | None, int, SemanticEnforcementMode]:
+    profile_sha256, configured_threshold, mode = _semantic_gate_configuration(request)
+    if profile_sha256 is None:
+        return profile_sha256, configured_threshold, mode
+    effective_threshold = await load_effective_semantic_threshold_micros(
+        session,
+        profile_sha256=profile_sha256,
+        configured_fallback_micros=configured_threshold,
+    )
+    return profile_sha256, effective_threshold, mode
 
 
 def _set_replay_response(

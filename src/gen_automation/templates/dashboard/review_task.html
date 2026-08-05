@@ -35,26 +35,194 @@
         Automated anatomy assessment is off; review images manually.
       {% endif %}
     </p>
-    {% if semantic_calibration %}
-      <div class="anatomy-calibration-progress" role="status">
-        <span>
-          Calibration labels:
-          <strong>
-            {{ semantic_calibration.sample_count }} / {{ semantic_calibration_minimum_samples }}
-          </strong>
-        </span>
-        {% if semantic_calibration.ready_for_enforcement %}
-          <span class="ready">Ready for enforcement review</span>
-        {% else %}
-          <span>Collecting owner labels in shadow mode</span>
-        {% endif %}
-        {% if semantic_calibration.recommended_threshold_micros is not none %}
-          <span>
-            Suggested severe threshold:
-            {{ "%.1f%%"|format(semantic_calibration.recommended_threshold_micros / 10000) }}
+    {% if semantic_mode != "off" and principal.role.value == "owner" %}
+      {% set minimum_defect_labels = semantic_calibration.minimum_per_class if semantic_calibration else 20 %}
+      {% if semantic_calibration %}
+        {% set learning_status = semantic_calibration.learning_status %}
+        {% set learning_minimum = semantic_calibration.minimum_samples %}
+        {% set remaining_total = [learning_minimum - semantic_calibration.sample_count, 0] | max %}
+        {% set remaining_good = [minimum_defect_labels - semantic_calibration.anatomy_good_count, 0] | max %}
+        {% set remaining_defects = [minimum_defect_labels - semantic_calibration.anatomy_defect_count, 0] | max %}
+      {% else %}
+        {% set learning_status = "collecting" %}
+        {% set learning_minimum = semantic_calibration_minimum_samples %}
+        {% set remaining_total = learning_minimum %}
+        {% set remaining_good = minimum_defect_labels %}
+        {% set remaining_defects = minimum_defect_labels %}
+      {% endif %}
+      <section
+        class="anatomy-learning-card status-{{ learning_status }}"
+        aria-labelledby="anatomy-learning-heading"
+        data-anatomy-learning-status="{{ learning_status }}"
+      >
+        <div class="anatomy-learning-heading">
+          <div>
+            <span class="workflow-label">Personal calibration</span>
+            <h2 id="anatomy-learning-heading">Anatomy learning</h2>
+          </div>
+          <span class="anatomy-learning-status" role="status" aria-live="polite">
+            {% if learning_status == "collecting" %}
+              Collecting
+            {% elif learning_status == "calibrating" %}
+              Calibrating
+            {% elif learning_status == "improved" %}
+              Improved
+            {% elif learning_status == "stable" %}
+              Stable
+            {% elif learning_status == "regressed" %}
+              Regressed
+            {% else %}
+              {{ learning_status.replace("_", " ") | title }}
+            {% endif %}
           </span>
+        </div>
+
+        {% if semantic_calibration %}
+          <div class="anatomy-learning-progress">
+            <div>
+              <strong>{{ semantic_calibration.sample_count }} / {{ learning_minimum }} useful labels</strong>
+              {% if remaining_total or remaining_good or remaining_defects %}
+                <span>
+                  {% if remaining_total %}
+                    {{ remaining_total }} more total
+                  {% else %}
+                    Total target met
+                  {% endif %}
+                  {% if remaining_good %}&middot; {{ remaining_good }} more good{% endif %}
+                  {% if remaining_defects %}&middot; {{ remaining_defects }} more defect{% endif %}
+                </span>
+              {% elif learning_status == "calibrating" %}
+                <span>Enough labels collected; validating a safer policy.</span>
+              {% elif learning_status == "regressed" %}
+                <span>Validation slipped; the previous better policy is still applied.</span>
+              {% else %}
+                <span>Minimum evidence target reached.</span>
+              {% endif %}
+            </div>
+            <progress
+              value="{{ [semantic_calibration.sample_count, learning_minimum] | min }}"
+              max="{{ learning_minimum }}"
+              aria-label="Useful anatomy labels collected"
+            >
+              {{ semantic_calibration.sample_count }} / {{ learning_minimum }}
+            </progress>
+          </div>
+
+          <dl class="anatomy-learning-counts">
+            <div><dt>Good</dt><dd>{{ semantic_calibration.anatomy_good_count }}</dd></div>
+            <div><dt>Defect</dt><dd>{{ semantic_calibration.anatomy_defect_count }}</dd></div>
+            <div><dt>Unsure</dt><dd>{{ semantic_calibration.unjudgeable_count }}</dd></div>
+            <div><dt>Your labels</dt><dd>{{ semantic_calibration.explicit_label_count }}</dd></div>
+            <div><dt>From review choices</dt><dd>{{ semantic_calibration.inferred_label_count }}</dd></div>
+          </dl>
+
+          {% if semantic_calibration.validation_sample_count > 0 and semantic_calibration.validation_f1_micros is not none %}
+            <div class="anatomy-learning-validation" aria-label="Out-of-fold validation results">
+              <div>
+                <span>Validation F1</span>
+                <strong>{{ "%.1f%%"|format(semantic_calibration.validation_f1_micros / 10000) }}</strong>
+                {% if semantic_calibration.validation_f1_delta_micros is not none %}
+                  <small class="metric-delta {{ 'positive' if semantic_calibration.validation_f1_delta_micros > 0 else 'negative' if semantic_calibration.validation_f1_delta_micros < 0 else 'neutral' }}">
+                    {% if semantic_calibration.validation_f1_delta_micros > 0 %}+{% endif %}{{ "%.1f"|format(semantic_calibration.validation_f1_delta_micros / 10000) }} points
+                  </small>
+                {% endif %}
+              </div>
+              <div>
+                <span>False-positive rate</span>
+                <strong>
+                  {% if semantic_calibration.validation_false_positive_rate_micros is not none %}
+                    {{ "%.1f%%"|format(semantic_calibration.validation_false_positive_rate_micros / 10000) }}
+                  {% else %}
+                    Not available
+                  {% endif %}
+                </strong>
+                <small>{{ semantic_calibration.validation_sample_count }} out-of-fold images</small>
+              </div>
+              {% if semantic_calibration.previous_validation_f1_micros is not none %}
+                <div>
+                  <span>Previous F1</span>
+                  <strong>{{ "%.1f%%"|format(semantic_calibration.previous_validation_f1_micros / 10000) }}</strong>
+                  <small>Applied-policy comparison</small>
+                </div>
+              {% endif %}
+            </div>
+          {% else %}
+            <p class="anatomy-learning-evidence">
+              Improvement is not scored until out-of-fold validation contains enough
+              good and defective examples.
+            </p>
+          {% endif %}
+
+          <div class="anatomy-learning-policy">
+            <span>
+              Applied threshold
+              <strong>
+                {{ "%.1f%%"|format(semantic_effective_threshold_micros / 10000) }}
+              </strong>
+            </span>
+            <span>
+              Latest candidate
+              <strong>
+                {% if semantic_calibration.candidate_threshold_micros is not none %}
+                  {{ "%.1f%%"|format(semantic_calibration.candidate_threshold_micros / 10000) }}
+                {% else %}
+                  Waiting for evidence
+                {% endif %}
+              </strong>
+            </span>
+            <small>
+              {% if learning_status == "regressed" %}
+                Prior policy retained; a worse candidate is never auto-applied.
+              {% elif semantic_calibration.active_policy_changed %}
+                This validated candidate is now applied.
+              {% elif learning_status in ["collecting", "calibrating"] %}
+                Candidate not applied yet; the current safe threshold remains in use.
+              {% elif semantic_calibration.candidate_threshold_micros is not none and semantic_calibration.candidate_threshold_micros != semantic_effective_threshold_micros %}
+                Candidate observed; the current validated policy remains applied.
+              {% else %}
+                The applied policy matches the latest validated candidate.
+              {% endif %}
+            </small>
+          </div>
+
+          <div class="anatomy-learning-meta">
+            <span>Calibration version {{ semantic_calibration.version }}</span>
+            <span>
+              Updated
+              <time datetime="{{ semantic_calibration.created_at.isoformat() }}">
+                {{ semantic_calibration.created_at }}
+              </time>
+            </span>
+          </div>
+        {% else %}
+          <div class="anatomy-learning-progress">
+            <div>
+              <strong>0 / {{ learning_minimum }} useful labels</strong>
+              <span>
+                {{ remaining_total }} more total &middot; {{ remaining_good }} more good
+                &middot; {{ remaining_defects }} more defect
+              </span>
+            </div>
+            <progress value="0" max="{{ learning_minimum }}" aria-label="Useful anatomy labels collected">
+              0 / {{ learning_minimum }}
+            </progress>
+          </div>
+          <p class="anatomy-learning-evidence">
+            No calibration evidence yet. Your first Good or Defect choice starts learning.
+          </p>
         {% endif %}
-      </div>
+
+        <details class="anatomy-learning-method">
+          <summary>How learning is measured</summary>
+          <p>
+            Duplicate images stay in one deterministic fold. The system tunes its anatomy
+            threshold on the other folds, then scores the unseen fold, repeating this until
+            every image has been tested out of sample. "Improved" appears only when those
+            validation results rise without worse defect recall or false alarms. A regression
+            keeps the previous better policy instead of applying the weaker candidate.
+          </p>
+        </details>
+      </section>
     {% endif %}
   </aside>
 
@@ -522,6 +690,11 @@
                   </div>
                   <span class="anatomy-feedback-mode">{{ semantic_mode }}</span>
                 </div>
+                <p class="anatomy-feedback-learning-copy">
+                  Good and Defect update learning immediately. When you complete this
+                  review, accepted images also teach good anatomy; generic excludes are
+                  never treated as anatomy defects.
+                </p>
 
                 {% if item.semantic_feedback %}
                   <div

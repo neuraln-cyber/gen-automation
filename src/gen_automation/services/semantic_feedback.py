@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -25,10 +26,27 @@ from gen_automation.domain.enums import (
     SemanticVerdict,
 )
 
-SEMANTIC_CALIBRATION_SCHEMA_VERSION = "semantic-anatomy-calibration/v2"
+SEMANTIC_CALIBRATION_SCHEMA_VERSION = "semantic-anatomy-calibration/v3"
+LEGACY_SEMANTIC_CALIBRATION_SCHEMA_VERSION = "semantic-anatomy-calibration/v2"
 DEFAULT_CALIBRATION_MINIMUM_SAMPLES = 100
 DEFAULT_CALIBRATION_MINIMUM_PER_CLASS = 20
 DEFAULT_CALIBRATION_THRESHOLD_STEP_MICROS = 50_000
+DEFAULT_CONFIGURED_BASELINE_THRESHOLD_MICROS = 900_000
+SEMANTIC_CALIBRATION_FOLD_COUNT = 5
+
+# These values are reserved for system-derived feedback.  Human-entered notes
+# never need to use them; keeping the source marker in the immutable note lets
+# v3 reports distinguish explicit owner labels from frictionless review signals
+# without a schema migration.
+SEMANTIC_INFERRED_REVIEW_ACCEPT_NOTE = "system:inferred-review-accept"
+SEMANTIC_INFERRED_ANATOMY_REJECT_NOTE = "system:inferred-anatomy-reject"
+_INFERRED_NOTES = frozenset(
+    {
+        SEMANTIC_INFERRED_REVIEW_ACCEPT_NOTE,
+        SEMANTIC_INFERRED_ANATOMY_REJECT_NOTE,
+    }
+)
+_LEARNING_STATUSES = frozenset({"collecting", "calibrating", "improved", "stable", "regressed"})
 
 
 class SemanticFeedbackError(Exception):
@@ -86,11 +104,23 @@ class SemanticConfusionCounts:
         return _ratio_micros(self.true_negative, self.true_negative + self.false_positive)
 
     @property
+    def false_positive_rate_micros(self) -> int | None:
+        return _ratio_micros(self.false_positive, self.false_positive + self.true_negative)
+
+    @property
     def f1_micros(self) -> int | None:
         return _ratio_micros(
             2 * self.true_positive,
             (2 * self.true_positive) + self.false_positive + self.false_negative,
         )
+
+    @property
+    def balanced_accuracy_micros(self) -> int | None:
+        recall = self.recall_micros
+        specificity = self.specificity_micros
+        if recall is None or specificity is None:
+            return None
+        return round((recall + specificity) / 2)
 
     def to_wire(self) -> dict[str, int | None]:
         return {
@@ -102,7 +132,64 @@ class SemanticConfusionCounts:
             "precision_micros": self.precision_micros,
             "recall_micros": self.recall_micros,
             "specificity_micros": self.specificity_micros,
+            "false_positive_rate_micros": self.false_positive_rate_micros,
             "f1_micros": self.f1_micros,
+            "balanced_accuracy_micros": self.balanced_accuracy_micros,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticValidationMetrics:
+    sample_count: int
+    true_positive: int
+    false_positive: int
+    true_negative: int
+    false_negative: int
+
+    @property
+    def precision_micros(self) -> int | None:
+        return _ratio_micros(self.true_positive, self.true_positive + self.false_positive)
+
+    @property
+    def recall_micros(self) -> int | None:
+        return _ratio_micros(self.true_positive, self.true_positive + self.false_negative)
+
+    @property
+    def specificity_micros(self) -> int | None:
+        return _ratio_micros(self.true_negative, self.true_negative + self.false_positive)
+
+    @property
+    def false_positive_rate_micros(self) -> int | None:
+        return _ratio_micros(self.false_positive, self.false_positive + self.true_negative)
+
+    @property
+    def f1_micros(self) -> int | None:
+        return _ratio_micros(
+            2 * self.true_positive,
+            (2 * self.true_positive) + self.false_positive + self.false_negative,
+        )
+
+    @property
+    def balanced_accuracy_micros(self) -> int | None:
+        recall = self.recall_micros
+        specificity = self.specificity_micros
+        if recall is None or specificity is None:
+            return None
+        return round((recall + specificity) / 2)
+
+    def to_wire(self) -> dict[str, int | None]:
+        return {
+            "sample_count": self.sample_count,
+            "true_positive": self.true_positive,
+            "false_positive": self.false_positive,
+            "true_negative": self.true_negative,
+            "false_negative": self.false_negative,
+            "precision_micros": self.precision_micros,
+            "recall_micros": self.recall_micros,
+            "specificity_micros": self.specificity_micros,
+            "false_positive_rate_micros": self.false_positive_rate_micros,
+            "f1_micros": self.f1_micros,
+            "balanced_accuracy_micros": self.balanced_accuracy_micros,
         }
 
 
@@ -124,6 +211,22 @@ class SemanticCalibrationReport:
     threshold_sweep: tuple[SemanticConfusionCounts, ...]
     recommended_threshold_micros: int | None
     ready_for_enforcement: bool
+    explicit_label_count: int
+    inferred_label_count: int
+    inferred_accept_count: int
+    inferred_anatomy_reject_count: int
+    configured_baseline_threshold_micros: int
+    previous_policy_threshold_micros: int
+    previous_artifact_version: int | None
+    previous_active_policy_version: int | None
+    candidate_threshold_micros: int | None
+    effective_threshold_micros: int
+    active_policy_changed: bool
+    learning_status: str
+    validation_fold_thresholds_micros: tuple[int | None, ...]
+    configured_baseline_validation: SemanticValidationMetrics | None
+    current_candidate_validation: SemanticValidationMetrics | None
+    previous_policy_validation: SemanticValidationMetrics | None
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -148,6 +251,40 @@ class SemanticCalibrationReport:
             "threshold_sweep": [item.to_wire() for item in self.threshold_sweep],
             "recommended_threshold_micros": self.recommended_threshold_micros,
             "ready_for_enforcement": self.ready_for_enforcement,
+            "source_counts": {
+                "explicit": self.explicit_label_count,
+                "inferred": self.inferred_label_count,
+                "inferred_review_accept": self.inferred_accept_count,
+                "inferred_anatomy_reject": self.inferred_anatomy_reject_count,
+            },
+            "configured_baseline_threshold_micros": (self.configured_baseline_threshold_micros),
+            "previous_policy_threshold_micros": self.previous_policy_threshold_micros,
+            "previous_artifact_version": self.previous_artifact_version,
+            "previous_active_policy_version": self.previous_active_policy_version,
+            "candidate_threshold_micros": self.candidate_threshold_micros,
+            "effective_threshold_micros": self.effective_threshold_micros,
+            "active_policy_changed": self.active_policy_changed,
+            "learning_status": self.learning_status,
+            "validation": {
+                "fold_count": SEMANTIC_CALIBRATION_FOLD_COUNT,
+                "group_key": "asset_sha256",
+                "fold_thresholds_micros": list(self.validation_fold_thresholds_micros),
+                "configured_baseline": (
+                    self.configured_baseline_validation.to_wire()
+                    if self.configured_baseline_validation is not None
+                    else None
+                ),
+                "current_candidate": (
+                    self.current_candidate_validation.to_wire()
+                    if self.current_candidate_validation is not None
+                    else None
+                ),
+                "previous_policy": (
+                    self.previous_policy_validation.to_wire()
+                    if self.previous_policy_validation is not None
+                    else None
+                ),
+            },
         }
 
 
@@ -163,6 +300,30 @@ class SemanticCalibrationArtifactResult:
     ready_for_enforcement: bool
     created_at: datetime
     created: bool
+    calibration_schema_version: str
+    learning_status: str
+    minimum_samples: int
+    minimum_per_class: int
+    anatomy_good_count: int
+    anatomy_defect_count: int
+    unjudgeable_count: int
+    explicit_label_count: int
+    inferred_label_count: int
+    validation_sample_count: int
+    validation_f1_micros: int | None
+    previous_validation_f1_micros: int | None
+    validation_f1_delta_micros: int | None
+    validation_recall_micros: int | None
+    previous_validation_recall_micros: int | None
+    validation_false_positive_rate_micros: int | None
+    previous_validation_false_positive_rate_micros: int | None
+    configured_baseline_validation_f1_micros: int | None
+    effective_threshold_micros: int | None
+    candidate_threshold_micros: int | None
+    configured_baseline_threshold_micros: int | None
+    active_policy_changed: bool
+    previous_artifact_version: int | None
+    active_policy_version: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,24 +331,28 @@ class _CalibrationSample:
     feedback_id: UUID
     assessment_id: UUID
     asset_id: UUID
+    asset_sha256: str
     agreement: SemanticFeedbackAgreement
     ground_truth: SemanticGroundTruth
     issue_code: SemanticIssueCode | None
     verdict: SemanticVerdict
     confidence_micros: int
     response_sha256: str
+    source: str
 
     def identity_wire(self) -> dict[str, str | int | None]:
         return {
             "feedback_id": str(self.feedback_id),
             "assessment_id": str(self.assessment_id),
             "asset_id": str(self.asset_id),
+            "asset_sha256": self.asset_sha256,
             "agreement": self.agreement.value,
             "ground_truth": self.ground_truth.value,
             "issue_code": self.issue_code.value if self.issue_code is not None else None,
             "verdict": self.verdict.value,
             "confidence_micros": self.confidence_micros,
             "response_sha256": self.response_sha256,
+            "source": self.source,
         }
 
 
@@ -322,8 +487,9 @@ async def build_semantic_calibration_report(
     minimum_samples: int = DEFAULT_CALIBRATION_MINIMUM_SAMPLES,
     minimum_per_class: int = DEFAULT_CALIBRATION_MINIMUM_PER_CLASS,
     threshold_step_micros: int = DEFAULT_CALIBRATION_THRESHOLD_STEP_MICROS,
+    configured_baseline_threshold_micros: int = (DEFAULT_CONFIGURED_BASELINE_THRESHOLD_MICROS),
 ) -> SemanticCalibrationReport:
-    """Build a deterministic severe-verdict threshold sweep from owner labels."""
+    """Build deterministic grouped out-of-fold calibration from owner labels."""
 
     profile_digest = _sha256(profile_sha256, label="semantic profile")
     _positive_int(minimum_samples, label="minimum samples", maximum=1_000_000)
@@ -332,6 +498,28 @@ async def build_semantic_calibration_report(
         threshold_step_micros,
         label="threshold step",
         maximum=1_000_000,
+    )
+    configured_baseline = _confidence_threshold(
+        configured_baseline_threshold_micros,
+        label="configured baseline threshold",
+    )
+    previous_artifact = await _latest_artifact_record(
+        session,
+        profile_sha256=profile_digest,
+    )
+    previous_result = (
+        _artifact_result(previous_artifact, created=False)
+        if previous_artifact is not None
+        else None
+    )
+    previous_policy_threshold = (
+        previous_result.effective_threshold_micros
+        if previous_result is not None and previous_result.effective_threshold_micros is not None
+        else configured_baseline
+    )
+    previous_artifact_version = previous_result.version if previous_result is not None else None
+    previous_active_policy_version = (
+        previous_result.active_policy_version if previous_result is not None else None
     )
     rows = (
         await session.execute(
@@ -371,6 +559,7 @@ async def build_semantic_calibration_report(
     labeled = tuple(
         sample for sample in samples if sample.ground_truth != SemanticGroundTruth.UNJUDGEABLE
     )
+    explicit_samples = tuple(sample for sample in samples if sample.source == "explicit")
     thresholds = list(range(0, 1_000_001, threshold_step_micros))
     if thresholds[-1] != 1_000_000:
         thresholds.append(1_000_000)
@@ -380,12 +569,41 @@ async def build_semantic_calibration_report(
         has_good=good_count > 0,
         has_defect=defect_count > 0,
     )
-    ready = (
+    (
+        configured_validation,
+        candidate_validation,
+        previous_validation,
+        fold_thresholds,
+    ) = _out_of_fold_validation(
+        labeled,
+        validation_labeled=labeled,
+        configured_baseline_threshold_micros=configured_baseline,
+        previous_policy_threshold_micros=previous_policy_threshold,
+        threshold_step_micros=threshold_step_micros,
+    )
+    enough_labels = (
         len(labeled) >= minimum_samples
         and good_count >= minimum_per_class
         and defect_count >= minimum_per_class
-        and recommended is not None
     )
+    validation_complete = (
+        candidate_validation is not None and candidate_validation.sample_count == len(labeled)
+    )
+    ready = enough_labels and validation_complete and recommended is not None
+    learning_status, effective_threshold, active_policy_changed = _learning_outcome(
+        enough_labels=enough_labels,
+        validation_complete=validation_complete,
+        has_previous_active_policy=previous_active_policy_version is not None,
+        candidate_threshold_micros=recommended,
+        previous_policy_threshold_micros=previous_policy_threshold,
+        current_candidate_validation=candidate_validation,
+        previous_policy_validation=previous_validation,
+    )
+    inferred_accept_count = sum(sample.source == "inferred_review_accept" for sample in samples)
+    inferred_anatomy_reject_count = sum(
+        sample.source == "inferred_anatomy_reject" for sample in samples
+    )
+    inferred_count = inferred_accept_count + inferred_anatomy_reject_count
     return SemanticCalibrationReport(
         profile_sha256=profile_digest,
         dataset_sha256=dataset_digest,
@@ -409,6 +627,22 @@ async def build_semantic_calibration_report(
         threshold_sweep=sweep,
         recommended_threshold_micros=recommended,
         ready_for_enforcement=ready,
+        explicit_label_count=len(explicit_samples),
+        inferred_label_count=inferred_count,
+        inferred_accept_count=inferred_accept_count,
+        inferred_anatomy_reject_count=inferred_anatomy_reject_count,
+        configured_baseline_threshold_micros=configured_baseline,
+        previous_policy_threshold_micros=previous_policy_threshold,
+        previous_artifact_version=previous_artifact_version,
+        previous_active_policy_version=previous_active_policy_version,
+        candidate_threshold_micros=recommended,
+        effective_threshold_micros=effective_threshold,
+        active_policy_changed=active_policy_changed,
+        learning_status=learning_status,
+        validation_fold_thresholds_micros=fold_thresholds,
+        configured_baseline_validation=configured_validation,
+        current_candidate_validation=candidate_validation,
+        previous_policy_validation=previous_validation,
     )
 
 
@@ -474,13 +708,36 @@ async def load_latest_semantic_calibration_artifact(
     profile_sha256: str,
 ) -> SemanticCalibrationArtifactResult | None:
     profile_digest = _sha256(profile_sha256, label="semantic profile")
-    artifact = await session.scalar(
-        select(SemanticCalibrationArtifact)
-        .where(SemanticCalibrationArtifact.profile_sha256 == profile_digest)
-        .order_by(SemanticCalibrationArtifact.version.desc())
-        .limit(1)
+    artifact = await _latest_artifact_record(
+        session,
+        profile_sha256=profile_digest,
     )
     return _artifact_result(artifact, created=False) if artifact is not None else None
+
+
+async def load_effective_semantic_threshold_micros(
+    session: AsyncSession,
+    *,
+    profile_sha256: str,
+    configured_fallback_micros: int = DEFAULT_CONFIGURED_BASELINE_THRESHOLD_MICROS,
+) -> int:
+    """Return the non-regressing learned threshold, or the configured fallback."""
+
+    fallback = _confidence_threshold(
+        configured_fallback_micros,
+        label="configured fallback threshold",
+    )
+    artifact = await load_latest_semantic_calibration_artifact(
+        session,
+        profile_sha256=profile_sha256,
+    )
+    if (
+        artifact is None
+        or artifact.active_policy_version is None
+        or artifact.effective_threshold_micros is None
+    ):
+        return fallback
+    return artifact.effective_threshold_micros
 
 
 async def refresh_semantic_calibration_artifact(
@@ -489,12 +746,14 @@ async def refresh_semantic_calibration_artifact(
     profile_sha256: str,
     created_by_user_id: UUID,
     now: datetime | None = None,
+    configured_baseline_threshold_micros: int = (DEFAULT_CONFIGURED_BASELINE_THRESHOLD_MICROS),
 ) -> SemanticCalibrationArtifactResult:
     """Rebuild and persist the exact calibration snapshot after owner feedback."""
 
     report = await build_semantic_calibration_report(
         session,
         profile_sha256=profile_sha256,
+        configured_baseline_threshold_micros=configured_baseline_threshold_micros,
     )
     return await persist_semantic_calibration_artifact(
         session,
@@ -536,13 +795,205 @@ def _calibration_sample(
         feedback_id=feedback.id,
         assessment_id=assessment.id,
         asset_id=assessment.asset_id,
+        asset_sha256=_sha256(assessment.asset_sha256, label="asset"),
         agreement=feedback.agreement,
         ground_truth=feedback.ground_truth,
         issue_code=feedback.issue_code,
         verdict=assessment.verdict,
         confidence_micros=assessment.confidence_micros,
         response_sha256=assessment.response_sha256,
+        source=_feedback_source(feedback.note),
     )
+
+
+def _feedback_source(note: str | None) -> str:
+    if note not in _INFERRED_NOTES:
+        return "explicit"
+    if note == SEMANTIC_INFERRED_REVIEW_ACCEPT_NOTE:
+        return "inferred_review_accept"
+    return "inferred_anatomy_reject"
+
+
+def _calibration_fold(asset_sha256: str) -> int:
+    """Assign duplicate content to one stable validation fold."""
+
+    digest = _sha256(asset_sha256, label="asset")
+    grouped_digest = hashlib.sha256(f"semantic-calibration-fold-v1:{digest}".encode()).digest()
+    return int.from_bytes(grouped_digest[:8], "big") % SEMANTIC_CALIBRATION_FOLD_COUNT
+
+
+def _out_of_fold_validation(
+    labeled: tuple[_CalibrationSample, ...],
+    *,
+    validation_labeled: tuple[_CalibrationSample, ...],
+    configured_baseline_threshold_micros: int,
+    previous_policy_threshold_micros: int,
+    threshold_step_micros: int,
+) -> tuple[
+    SemanticValidationMetrics | None,
+    SemanticValidationMetrics | None,
+    SemanticValidationMetrics | None,
+    tuple[int | None, ...],
+]:
+    configured_predictions: list[tuple[bool, bool]] = []
+    candidate_predictions: list[tuple[bool, bool]] = []
+    previous_predictions: list[tuple[bool, bool]] = []
+    fold_thresholds: list[int | None] = [None] * SEMANTIC_CALIBRATION_FOLD_COUNT
+
+    for fold in range(SEMANTIC_CALIBRATION_FOLD_COUNT):
+        training = tuple(
+            sample for sample in labeled if _calibration_fold(sample.asset_sha256) != fold
+        )
+        validation = tuple(
+            sample
+            for sample in validation_labeled
+            if _calibration_fold(sample.asset_sha256) == fold
+        )
+        if not validation:
+            continue
+        training_good = any(
+            sample.ground_truth == SemanticGroundTruth.ANATOMY_GOOD for sample in training
+        )
+        training_defect = any(
+            sample.ground_truth == SemanticGroundTruth.ANATOMY_DEFECT for sample in training
+        )
+        sweep = _threshold_sweep(training, threshold_step_micros)
+        threshold = _recommended_threshold(
+            sweep,
+            has_good=training_good,
+            has_defect=training_defect,
+        )
+        if threshold is None:
+            continue
+        fold_thresholds[fold] = threshold
+        for sample in validation:
+            actual_defect = sample.ground_truth == SemanticGroundTruth.ANATOMY_DEFECT
+            configured_predictions.append(
+                (
+                    actual_defect,
+                    _predicts_defect(sample, configured_baseline_threshold_micros),
+                )
+            )
+            candidate_predictions.append((actual_defect, _predicts_defect(sample, threshold)))
+            previous_predictions.append(
+                (
+                    actual_defect,
+                    _predicts_defect(sample, previous_policy_threshold_micros),
+                )
+            )
+
+    return (
+        _validation_metrics(configured_predictions),
+        _validation_metrics(candidate_predictions),
+        _validation_metrics(previous_predictions),
+        tuple(fold_thresholds),
+    )
+
+
+def _threshold_sweep(
+    samples: tuple[_CalibrationSample, ...],
+    threshold_step_micros: int,
+) -> tuple[SemanticConfusionCounts, ...]:
+    thresholds = list(range(0, 1_000_001, threshold_step_micros))
+    if thresholds[-1] != 1_000_000:
+        thresholds.append(1_000_000)
+    return tuple(_confusion_counts(samples, threshold) for threshold in thresholds)
+
+
+def _validation_metrics(
+    predictions: list[tuple[bool, bool]],
+) -> SemanticValidationMetrics | None:
+    if not predictions:
+        return None
+    true_positive = false_positive = true_negative = false_negative = 0
+    for actual_defect, predicted_defect in predictions:
+        if actual_defect and predicted_defect:
+            true_positive += 1
+        elif not actual_defect and predicted_defect:
+            false_positive += 1
+        elif not actual_defect:
+            true_negative += 1
+        else:
+            false_negative += 1
+    return SemanticValidationMetrics(
+        sample_count=len(predictions),
+        true_positive=true_positive,
+        false_positive=false_positive,
+        true_negative=true_negative,
+        false_negative=false_negative,
+    )
+
+
+def _learning_outcome(
+    *,
+    enough_labels: bool,
+    validation_complete: bool,
+    has_previous_active_policy: bool,
+    candidate_threshold_micros: int | None,
+    previous_policy_threshold_micros: int,
+    current_candidate_validation: SemanticValidationMetrics | None,
+    previous_policy_validation: SemanticValidationMetrics | None,
+) -> tuple[str, int, bool]:
+    if not enough_labels:
+        return "collecting", previous_policy_threshold_micros, False
+    if (
+        not validation_complete
+        or candidate_threshold_micros is None
+        or current_candidate_validation is None
+        or previous_policy_validation is None
+    ):
+        return "calibrating", previous_policy_threshold_micros, False
+
+    candidate_f1 = current_candidate_validation.f1_micros
+    previous_f1 = previous_policy_validation.f1_micros
+    candidate_recall = current_candidate_validation.recall_micros
+    previous_recall = previous_policy_validation.recall_micros
+    candidate_fpr = current_candidate_validation.false_positive_rate_micros
+    previous_fpr = previous_policy_validation.false_positive_rate_micros
+    if None in (
+        candidate_f1,
+        previous_f1,
+        candidate_recall,
+        previous_recall,
+        candidate_fpr,
+        previous_fpr,
+    ):
+        return "calibrating", previous_policy_threshold_micros, False
+
+    assert candidate_f1 is not None
+    assert previous_f1 is not None
+    assert candidate_recall is not None
+    assert previous_recall is not None
+    assert candidate_fpr is not None
+    assert previous_fpr is not None
+    no_regression = (
+        candidate_f1 >= previous_f1
+        and candidate_recall >= previous_recall
+        and candidate_fpr <= previous_fpr
+    )
+    measurable_gain = (
+        candidate_f1 > previous_f1
+        or candidate_recall > previous_recall
+        or candidate_fpr < previous_fpr
+    )
+    if no_regression and measurable_gain:
+        return (
+            "improved",
+            candidate_threshold_micros,
+            not has_previous_active_policy
+            or candidate_threshold_micros != previous_policy_threshold_micros,
+        )
+    if no_regression:
+        if not has_previous_active_policy:
+            # The configured baseline is only a fallback until the first
+            # adequately validated snapshot pins an immutable champion version.
+            return "stable", candidate_threshold_micros, True
+        return "stable", previous_policy_threshold_micros, False
+    return "regressed", previous_policy_threshold_micros, False
+
+
+def _predicts_defect(sample: _CalibrationSample, threshold_micros: int) -> bool:
+    return sample.verdict == SemanticVerdict.SEVERE and sample.confidence_micros >= threshold_micros
 
 
 def _confusion_counts(
@@ -552,10 +1003,7 @@ def _confusion_counts(
     true_positive = false_positive = true_negative = false_negative = 0
     for sample in samples:
         actual_defect = sample.ground_truth == SemanticGroundTruth.ANATOMY_DEFECT
-        predicted_defect = (
-            sample.verdict == SemanticVerdict.SEVERE
-            and sample.confidence_micros >= threshold_micros
-        )
+        predicted_defect = _predicts_defect(sample, threshold_micros)
         if actual_defect and predicted_defect:
             true_positive += 1
         elif not actual_defect and predicted_defect:
@@ -637,6 +1085,102 @@ def _artifact_result(
     *,
     created: bool,
 ) -> SemanticCalibrationArtifactResult:
+    report = artifact.report if isinstance(artifact.report, dict) else {}
+    ground_truth_counts = _wire_mapping(report.get("ground_truth_counts"))
+    anatomy_good_count = _wire_int(ground_truth_counts.get("anatomy_good")) or 0
+    anatomy_defect_count = _wire_int(ground_truth_counts.get("anatomy_defect")) or 0
+    unjudgeable_count = _wire_int(ground_truth_counts.get("unjudgeable")) or 0
+    schema_version = artifact.calibration_schema_version
+    active_policy_version: int | None
+    effective_threshold: int | None
+
+    if schema_version == SEMANTIC_CALIBRATION_SCHEMA_VERSION:
+        source_counts = _wire_mapping(report.get("source_counts"))
+        validation = _wire_mapping(report.get("validation"))
+        configured_validation = _wire_mapping(validation.get("configured_baseline"))
+        candidate_validation = _wire_mapping(validation.get("current_candidate"))
+        previous_validation = _wire_mapping(validation.get("previous_policy"))
+        learning_status = _wire_learning_status(report.get("learning_status"))
+        previous_artifact_version = _wire_positive_int(report.get("previous_artifact_version"))
+        previous_active_policy_version = _wire_positive_int(
+            report.get("previous_active_policy_version")
+        )
+        if (
+            previous_active_policy_version is not None
+            and previous_active_policy_version >= artifact.version
+        ):
+            previous_active_policy_version = None
+        explicit_label_count = _wire_int(source_counts.get("explicit")) or 0
+        inferred_label_count = _wire_int(source_counts.get("inferred")) or 0
+        configured_baseline_threshold = _wire_threshold(
+            report.get("configured_baseline_threshold_micros")
+        )
+        candidate_threshold = _wire_threshold(report.get("candidate_threshold_micros"))
+        previous_policy_threshold = _wire_threshold(report.get("previous_policy_threshold_micros"))
+        reported_effective_threshold = _wire_threshold(report.get("effective_threshold_micros"))
+        active_policy_changed = (
+            report.get("active_policy_changed") is True
+            and artifact.ready_for_enforcement
+            and learning_status in {"improved", "stable"}
+            and candidate_threshold is not None
+            and reported_effective_threshold == candidate_threshold
+        )
+        if active_policy_changed:
+            active_policy_version = artifact.version
+            effective_threshold = candidate_threshold
+        else:
+            active_policy_version = previous_active_policy_version
+            effective_threshold = (
+                previous_policy_threshold if active_policy_version is not None else None
+            )
+    elif schema_version == LEGACY_SEMANTIC_CALIBRATION_SCHEMA_VERSION:
+        # v2 artifacts remain readable.  They did not contain out-of-fold
+        # evidence, so they can provide a threshold but never an improvement
+        # claim.  A ready v2 threshold is treated as the prior champion.
+        configured_validation = {}
+        candidate_validation = {}
+        previous_validation = {}
+        learning_status = "calibrating" if artifact.ready_for_enforcement else "collecting"
+        active_policy_changed = False
+        previous_artifact_version = None
+        explicit_label_count = (
+            _wire_int(report.get("feedback_count"))
+            or anatomy_good_count + anatomy_defect_count + unjudgeable_count
+        )
+        inferred_label_count = 0
+        configured_baseline_threshold = None
+        candidate_threshold = artifact.recommended_threshold_micros
+        effective_threshold = (
+            artifact.recommended_threshold_micros if artifact.ready_for_enforcement else None
+        )
+        active_policy_version = artifact.version if effective_threshold is not None else None
+    else:
+        # Unsupported report schemas must not inherit v2's activation rules.
+        # They remain visible for diagnostics, but enforcement falls back to
+        # the operator's configured threshold until the schema is understood.
+        configured_validation = {}
+        candidate_validation = {}
+        previous_validation = {}
+        learning_status = "collecting"
+        active_policy_changed = False
+        previous_artifact_version = None
+        explicit_label_count = (
+            _wire_int(report.get("feedback_count"))
+            or anatomy_good_count + anatomy_defect_count + unjudgeable_count
+        )
+        inferred_label_count = 0
+        configured_baseline_threshold = None
+        candidate_threshold = None
+        effective_threshold = None
+        active_policy_version = None
+
+    validation_f1 = _wire_ratio(candidate_validation.get("f1_micros"))
+    previous_validation_f1 = _wire_ratio(previous_validation.get("f1_micros"))
+    validation_f1_delta = (
+        validation_f1 - previous_validation_f1
+        if validation_f1 is not None and previous_validation_f1 is not None
+        else None
+    )
     return SemanticCalibrationArtifactResult(
         artifact_id=artifact.id,
         profile_sha256=artifact.profile_sha256,
@@ -648,7 +1192,84 @@ def _artifact_result(
         ready_for_enforcement=artifact.ready_for_enforcement,
         created_at=artifact.created_at,
         created=created,
+        calibration_schema_version=schema_version,
+        learning_status=learning_status,
+        minimum_samples=(
+            _wire_positive_int(report.get("minimum_samples")) or DEFAULT_CALIBRATION_MINIMUM_SAMPLES
+        ),
+        minimum_per_class=(
+            _wire_positive_int(report.get("minimum_per_class"))
+            or DEFAULT_CALIBRATION_MINIMUM_PER_CLASS
+        ),
+        anatomy_good_count=anatomy_good_count,
+        anatomy_defect_count=anatomy_defect_count,
+        unjudgeable_count=unjudgeable_count,
+        explicit_label_count=explicit_label_count,
+        inferred_label_count=inferred_label_count,
+        validation_sample_count=_wire_int(candidate_validation.get("sample_count")) or 0,
+        validation_f1_micros=validation_f1,
+        previous_validation_f1_micros=previous_validation_f1,
+        validation_f1_delta_micros=validation_f1_delta,
+        validation_recall_micros=_wire_ratio(candidate_validation.get("recall_micros")),
+        previous_validation_recall_micros=_wire_ratio(previous_validation.get("recall_micros")),
+        validation_false_positive_rate_micros=_wire_ratio(
+            candidate_validation.get("false_positive_rate_micros")
+        ),
+        previous_validation_false_positive_rate_micros=_wire_ratio(
+            previous_validation.get("false_positive_rate_micros")
+        ),
+        configured_baseline_validation_f1_micros=_wire_ratio(
+            configured_validation.get("f1_micros")
+        ),
+        effective_threshold_micros=effective_threshold,
+        candidate_threshold_micros=candidate_threshold,
+        configured_baseline_threshold_micros=configured_baseline_threshold,
+        active_policy_changed=active_policy_changed,
+        previous_artifact_version=previous_artifact_version,
+        active_policy_version=active_policy_version,
     )
+
+
+async def _latest_artifact_record(
+    session: AsyncSession,
+    *,
+    profile_sha256: str,
+) -> SemanticCalibrationArtifact | None:
+    artifact: SemanticCalibrationArtifact | None = await session.scalar(
+        select(SemanticCalibrationArtifact)
+        .where(SemanticCalibrationArtifact.profile_sha256 == profile_sha256)
+        .order_by(SemanticCalibrationArtifact.version.desc())
+        .limit(1)
+    )
+    return artifact
+
+
+def _wire_mapping(value: object) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _wire_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _wire_positive_int(value: object) -> int | None:
+    parsed = _wire_int(value)
+    return parsed if parsed is not None and parsed > 0 else None
+
+
+def _wire_ratio(value: object) -> int | None:
+    parsed = _wire_int(value)
+    return parsed if parsed is not None and parsed <= 1_000_000 else None
+
+
+def _wire_threshold(value: object) -> int | None:
+    return _wire_ratio(value)
+
+
+def _wire_learning_status(value: object) -> str:
+    return value if isinstance(value, str) and value in _LEARNING_STATUSES else "calibrating"
 
 
 async def _feedback_for_owner(
@@ -711,6 +1332,12 @@ def _sha256(value: str, *, label: str) -> str:
 def _positive_int(value: int, *, label: str, maximum: int) -> None:
     if isinstance(value, bool) or value <= 0 or value > maximum:
         raise SemanticFeedbackValidationError(f"{label} must be between 1 and {maximum}")
+
+
+def _confidence_threshold(value: int, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 1_000_000:
+        raise SemanticFeedbackValidationError(f"{label} must be between 0 and 1000000")
+    return value
 
 
 def _ratio_micros(numerator: int, denominator: int) -> int | None:

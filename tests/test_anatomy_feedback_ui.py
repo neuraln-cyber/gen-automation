@@ -1,6 +1,7 @@
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -239,6 +240,24 @@ def test_anatomy_feedback_template_is_quick_responsive_and_explicit() -> None:
     assert 'data-semantic-mode="{{ semantic_mode }}"' in template
     assert "Predictions are visible for calibration only" in template
     assert "High-confidence severe flags can block" in template
+    assert "data-anatomy-learning-status" in template
+    assert "Anatomy learning" in template
+    assert "Collecting" in template
+    assert "Calibrating" in template
+    assert "Improved" in template
+    assert "Stable" in template
+    assert "Regressed" in template
+    assert "prior policy retained" in template.lower()
+    assert "How learning is measured" in template
+    assert "generic excludes are" in template
+    assert "never treated as anatomy defects" in template
+    assert "Validation F1" in template
+    assert "False-positive rate" in template
+    assert "Applied threshold" in template
+    assert "Latest candidate" in template
+    assert "candidate_threshold_micros" in template
+    assert "out-of-fold images" in template
+    assert 'principal.role.value == "owner"' in template
     assert "data-anatomy-feedback-form" in template
     assert 'value="anatomy_good"' in template
     assert 'value="anatomy_defect"' in template
@@ -250,6 +269,8 @@ def test_anatomy_feedback_template_is_quick_responsive_and_explicit() -> None:
     assert "Assessment details" in template
     assert 'principal.role.value == "owner"' in template
     assert "@media (max-width: 680px)" in css
+    assert ".anatomy-learning-progress { grid-template-columns: 1fr;" in css
+    assert ".anatomy-learning-validation { grid-template-columns: 1fr; }" in css
     assert ".anatomy-feedback-actions { grid-template-columns: 1fr; }" in css
     assert "min-height: 3.2rem" in css
 
@@ -306,6 +327,29 @@ def test_review_page_renders_prediction_details_saved_feedback_and_quick_actions
         )
         return {first_assessment_id: saved}
 
+    async def load_calibration(*_args: object, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            effective_threshold_micros=900_000,
+            minimum_per_class=20,
+            learning_status="collecting",
+            minimum_samples=100,
+            sample_count=12,
+            anatomy_good_count=11,
+            anatomy_defect_count=1,
+            unjudgeable_count=2,
+            explicit_label_count=8,
+            inferred_label_count=6,
+            validation_sample_count=4,
+            validation_f1_micros=500_000,
+            validation_f1_delta_micros=None,
+            validation_false_positive_rate_micros=None,
+            previous_validation_f1_micros=None,
+            candidate_threshold_micros=850_000,
+            active_policy_changed=False,
+            version=3,
+            created_at=completed_at,
+        )
+
     monkeypatch.setattr(
         dashboard_routes,
         "_configured_semantic_profile_sha256",
@@ -321,6 +365,11 @@ def test_review_page_renders_prediction_details_saved_feedback_and_quick_actions
         dashboard_routes,
         "load_semantic_anatomy_feedback",
         load_feedback,
+    )
+    monkeypatch.setattr(
+        dashboard_routes,
+        "load_latest_semantic_calibration_artifact",
+        load_calibration,
     )
 
     app = create_app(context.settings)
@@ -344,3 +393,11 @@ def test_review_page_renders_prediction_details_saved_feedback_and_quick_actions
     assert str(second_assessment_id) in page.text
     assert "Flag correct" in page.text
     assert "Flag incorrect" in page.text
+    assert 'data-anatomy-learning-status="collecting"' in page.text
+    assert "12 / 100 useful labels" in page.text
+    assert "19 more defect" in page.text
+    assert "Not available" in page.text
+    assert "From review choices" in page.text
+    assert "Applied threshold" in page.text
+    assert "90.0%" in page.text
+    assert "Latest candidate" in page.text

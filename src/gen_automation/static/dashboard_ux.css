@@ -164,22 +164,136 @@
 
 .anatomy-mode-banner > div { display: grid; gap: .08rem; }
 .anatomy-mode-banner strong { font-size: .92rem; letter-spacing: .06em; }
-.anatomy-mode-banner p { margin: 0; color: var(--muted, #a9abc2); font-size: .8rem; }
+.anatomy-mode-banner > p { margin: 0; color: var(--muted, #a9abc2); font-size: .8rem; }
 .anatomy-mode-label { color: var(--muted, #a9abc2); font-size: .68rem; font-weight: 800; text-transform: uppercase; }
 .anatomy-mode-banner.mode-shadow { border-left-color: #93c5fd; }
 .anatomy-mode-banner.mode-assist { border-left-color: var(--warn, #fbbf77); }
 .anatomy-mode-banner.mode-enforce { border-left-color: #fda4af; }
-.anatomy-mode-banner > .anatomy-calibration-progress {
+.anatomy-learning-card {
   grid-column: 1 / -1;
+  display: grid;
+  gap: .7rem;
+  padding: .78rem;
+  border-top: 1px solid var(--border, rgba(255, 255, 255, .1));
+  border-radius: .64rem;
+  background: rgba(7, 9, 21, .22);
+}
+
+.anatomy-learning-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: .75rem;
+}
+.anatomy-learning-heading > div { display: grid; gap: .1rem; }
+.anatomy-learning-heading h2 { margin: 0; font-size: 1rem; }
+.anatomy-learning-status {
+  flex: none;
+  padding: .3rem .55rem;
+  border: 1px solid rgba(147, 197, 253, .3);
+  border-radius: 999px;
+  background: rgba(59, 130, 246, .12);
+  color: #bfdbfe;
+  font-size: .68rem;
+  font-weight: 820;
+  letter-spacing: .035em;
+  text-transform: uppercase;
+}
+.anatomy-learning-card.status-improved .anatomy-learning-status,
+.anatomy-learning-card.status-stable .anatomy-learning-status {
+  border-color: rgba(110, 231, 183, .34);
+  background: rgba(16, 185, 129, .12);
+  color: #a7f3d0;
+}
+.anatomy-learning-card.status-regressed .anatomy-learning-status {
+  border-color: rgba(253, 164, 175, .38);
+  background: rgba(244, 63, 94, .11);
+  color: #fecdd3;
+}
+
+.anatomy-learning-progress {
+  display: grid;
+  grid-template-columns: minmax(12rem, .42fr) minmax(0, 1fr);
+  align-items: center;
+  gap: .8rem;
+}
+.anatomy-learning-progress > div { display: grid; gap: .12rem; }
+.anatomy-learning-progress strong { font-size: .82rem; letter-spacing: 0; }
+.anatomy-learning-progress span,
+.anatomy-learning-evidence {
+  color: var(--muted, #a9abc2);
+  font-size: .72rem;
+}
+.anatomy-learning-progress progress {
+  width: 100%;
+  height: .65rem;
+  border: 0;
+  border-radius: 999px;
+  accent-color: #93c5fd;
+}
+
+.anatomy-learning-counts,
+.anatomy-learning-validation {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: .42rem;
+  margin: 0;
+}
+.anatomy-learning-counts > div,
+.anatomy-learning-validation > div {
+  display: grid;
+  gap: .08rem;
+  min-width: 0;
+  padding: .5rem .58rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, .1));
+  border-radius: .56rem;
+  background: rgba(255, 255, 255, .025);
+}
+.anatomy-learning-counts dt,
+.anatomy-learning-validation span {
+  color: var(--muted, #a9abc2);
+  font-size: .64rem;
+  font-weight: 740;
+}
+.anatomy-learning-counts dd { margin: 0; font-size: .88rem; font-weight: 820; }
+.anatomy-learning-validation { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.anatomy-learning-validation strong { font-size: 1rem; letter-spacing: 0; }
+.anatomy-learning-validation small { color: var(--muted, #a9abc2); font-size: .64rem; }
+.anatomy-learning-validation .metric-delta.positive { color: #86efac; }
+.anatomy-learning-validation .metric-delta.negative { color: #fda4af; }
+.anatomy-learning-validation .metric-delta.neutral { color: var(--muted, #a9abc2); }
+.anatomy-learning-evidence { margin: 0; }
+
+.anatomy-learning-policy {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: .35rem .8rem;
-  padding-top: .55rem;
-  border-top: 1px solid var(--border, rgba(255, 255, 255, .1));
-  color: var(--muted, #a9abc2);
-  font-size: .74rem;
+  padding: .55rem .62rem;
+  border: 1px solid var(--border, rgba(255, 255, 255, .1));
+  border-radius: .56rem;
+  background: rgba(255, 255, 255, .025);
+  font-size: .7rem;
 }
-.anatomy-calibration-progress .ready { color: #86efac; font-weight: 750; }
+.anatomy-learning-policy > span { color: var(--muted, #a9abc2); }
+.anatomy-learning-policy > span strong { margin-left: .18rem; color: var(--text, #f7f5ff); font-size: .74rem; letter-spacing: 0; }
+.anatomy-learning-policy > small { flex: 1 1 16rem; color: var(--muted, #a9abc2); }
+
+.anatomy-learning-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .25rem .8rem;
+  color: var(--muted, #a9abc2);
+  font-size: .65rem;
+}
+.anatomy-learning-method { color: var(--muted, #a9abc2); font-size: .7rem; }
+.anatomy-learning-method > summary { cursor: pointer; font-weight: 740; }
+.anatomy-learning-method p { margin: .45rem 0 0; max-width: 70rem; }
+.anatomy-learning-method > summary:focus-visible {
+  border-radius: .2rem;
+  outline: 3px solid var(--warn, #fbbf77);
+  outline-offset: 2px;
+}
 
 .asset-card.semantic-flagged {
   border-color: rgba(251, 191, 119, .38);
@@ -249,6 +363,12 @@
 }
 .anatomy-feedback-heading > div { min-width: 0; }
 .anatomy-feedback-heading p { margin: .2rem 0 0; color: var(--muted, #a9abc2); font-size: .72rem; }
+.anatomy-feedback-learning-copy {
+  margin: 0;
+  color: var(--muted, #a9abc2);
+  font-size: .68rem;
+  line-height: 1.45;
+}
 .anatomy-feedback-mode {
   flex: none;
   padding: .25rem .42rem;
@@ -1177,6 +1297,11 @@ body.asset-viewer-open { overflow: hidden; }
   .settings-preset-bar .text-button { flex: 1 1 8rem; }
   .review-target-progress { grid-template-columns: 1fr; gap: .5rem; }
   .anatomy-mode-banner { grid-template-columns: 1fr; gap: .35rem; }
+  .anatomy-learning-heading { align-items: center; }
+  .anatomy-learning-progress { grid-template-columns: 1fr; gap: .45rem; }
+  .anatomy-learning-counts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .anatomy-learning-validation { grid-template-columns: 1fr; }
+  .anatomy-learning-policy { display: grid; }
   .anatomy-feedback-heading { display: grid; }
   .anatomy-feedback-mode { justify-self: start; }
   .anatomy-feedback-actions { grid-template-columns: 1fr; }

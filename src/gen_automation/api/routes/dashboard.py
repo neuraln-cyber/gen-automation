@@ -95,6 +95,7 @@ from gen_automation.services.semantic_feedback import (
     SemanticFeedbackConflictError,
     SemanticFeedbackNotFoundError,
     SemanticFeedbackValidationError,
+    load_effective_semantic_threshold_micros,
     load_latest_semantic_calibration_artifact,
     load_semantic_anatomy_feedback,
     record_semantic_anatomy_feedback,
@@ -473,6 +474,19 @@ async def dashboard_review_task(
     semantic_profile = _configured_semantic_profile_sha256(settings)
     semantic_mode = _semantic_mode(settings)
     try:
+        active_semantic_calibration = (
+            await load_latest_semantic_calibration_artifact(
+                session,
+                profile_sha256=semantic_profile,
+            )
+            if semantic_profile is not None
+            else None
+        )
+        semantic_threshold = await _effective_semantic_threshold(
+            session,
+            settings=settings,
+            profile_sha256=semantic_profile,
+        )
         navigation = await load_review_task_navigation(
             session,
             review_task_id=review_task_id,
@@ -481,7 +495,7 @@ async def dashboard_review_task(
             session,
             review_task_id=review_task_id,
             semantic_profile_sha256=semantic_profile,
-            semantic_severe_confidence_micros=(settings.semantic_anatomy_severe_confidence_micros),
+            semantic_severe_confidence_micros=semantic_threshold,
             semantic_enforcement_mode=settings.semantic_anatomy_mode,
         )
         release = await load_ranked_scoring_run(
@@ -496,7 +510,9 @@ async def dashboard_review_task(
             profile_sha256=semantic_profile,
         )
         semantic_feedback: dict[UUID, SemanticAnatomyFeedbackResult] = {}
-        semantic_calibration: SemanticCalibrationArtifactResult | None = None
+        semantic_calibration: SemanticCalibrationArtifactResult | None = (
+            active_semantic_calibration if principal.role == AdminRole.OWNER else None
+        )
         if principal.role == AdminRole.OWNER:
             semantic_feedback = await load_semantic_anatomy_feedback(
                 session,
@@ -505,11 +521,6 @@ async def dashboard_review_task(
                 ),
                 user_id=principal.user_id,
             )
-            if semantic_profile is not None:
-                semantic_calibration = await load_latest_semantic_calibration_artifact(
-                    session,
-                    profile_sha256=semantic_profile,
-                )
         csrf_token = (
             _form_csrf_token(request, principal) if summary.state == ReviewTaskState.OPEN else None
         )
@@ -556,7 +567,7 @@ async def dashboard_review_task(
             semantic_assessments=semantic_assessments,
             semantic_feedback=semantic_feedback,
             semantic_mode=semantic_mode,
-            severe_confidence_micros=(settings.semantic_anatomy_severe_confidence_micros),
+            severe_confidence_micros=semantic_threshold,
         )
     except RankingIntegrityError:
         return _error_response(
@@ -606,6 +617,7 @@ async def dashboard_review_task(
                 "semantic_issue_codes": tuple(SemanticIssueCode),
                 "semantic_mode": semantic_mode,
                 "semantic_calibration": semantic_calibration,
+                "semantic_effective_threshold_micros": semantic_threshold,
                 "semantic_calibration_minimum_samples": (DEFAULT_CALIBRATION_MINIMUM_SAMPLES),
                 "csrf_token": csrf_token,
                 "complete_idempotency_key": complete_idempotency_key,
@@ -649,6 +661,11 @@ async def dashboard_review_decision(
 
     settings: Settings = request.app.state.settings
     semantic_profile = _configured_semantic_profile_sha256(settings)
+    semantic_threshold = await _effective_semantic_threshold(
+        session,
+        settings=settings,
+        profile_sha256=semantic_profile,
+    )
     expected_key = review_form_idempotency_key(
         settings,
         session_id=principal.session_id,
@@ -677,7 +694,7 @@ async def dashboard_review_decision(
             reason_code=form.reason_code,
             note=form.note,
             semantic_profile_sha256=semantic_profile,
-            semantic_severe_confidence_micros=(settings.semantic_anatomy_severe_confidence_micros),
+            semantic_severe_confidence_micros=semantic_threshold,
             semantic_enforcement_mode=settings.semantic_anatomy_mode,
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
@@ -737,6 +754,9 @@ async def dashboard_anatomy_feedback(
             session,
             profile_sha256=semantic_profile,
             created_by_user_id=principal.user_id,
+            configured_baseline_threshold_micros=(
+                settings.semantic_anatomy_severe_confidence_micros
+            ),
         )
         await session.commit()
     except (
@@ -786,6 +806,11 @@ async def dashboard_bulk_review_action(
     if not form_key_matches(form.idempotency_key, expected_key):
         return _invalid_form_response(request, principal, status.HTTP_400_BAD_REQUEST)
     semantic_profile = _configured_semantic_profile_sha256(settings)
+    semantic_threshold = await _effective_semantic_threshold(
+        session,
+        settings=settings,
+        profile_sha256=semantic_profile,
+    )
     try:
         await apply_bulk_review_action(
             session,
@@ -798,7 +823,7 @@ async def dashboard_bulk_review_action(
             reason_code=form.reason_code,
             note=form.note,
             semantic_profile_sha256=semantic_profile,
-            semantic_severe_confidence_micros=(settings.semantic_anatomy_severe_confidence_micros),
+            semantic_severe_confidence_micros=semantic_threshold,
             semantic_enforcement_mode=settings.semantic_anatomy_mode,
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
@@ -924,6 +949,11 @@ async def _dashboard_transition(
 
     settings: Settings = request.app.state.settings
     semantic_profile = _configured_semantic_profile_sha256(settings)
+    semantic_threshold = await _effective_semantic_threshold(
+        session,
+        settings=settings,
+        profile_sha256=semantic_profile,
+    )
     expected_key = review_form_idempotency_key(
         settings,
         session_id=principal.session_id,
@@ -945,7 +975,7 @@ async def _dashboard_transition(
             expected_lock_version=form.expected_lock_version,
             idempotency_key=form.idempotency_key,
             semantic_profile_sha256=semantic_profile,
-            semantic_severe_confidence_micros=(settings.semantic_anatomy_severe_confidence_micros),
+            semantic_severe_confidence_micros=semantic_threshold,
             semantic_enforcement_mode=settings.semantic_anatomy_mode,
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
@@ -1041,6 +1071,22 @@ def _configured_semantic_profile_sha256(settings: Settings) -> str | None:
         model_name=settings.semantic_anatomy_model,
         model_revision=revision,
     ).profile_sha256
+
+
+async def _effective_semantic_threshold(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    profile_sha256: str | None,
+) -> int:
+    configured = settings.semantic_anatomy_severe_confidence_micros
+    if profile_sha256 is None:
+        return configured
+    return await load_effective_semantic_threshold_micros(
+        session,
+        profile_sha256=profile_sha256,
+        configured_fallback_micros=configured,
+    )
 
 
 def _semantic_mode(settings: Settings) -> str:

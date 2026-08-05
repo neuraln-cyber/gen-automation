@@ -62,14 +62,29 @@ exact asset, assessment response, model revision, prompt/schema profile, and
 owner. A repeated identical submission is idempotent; a different replacement
 is rejected so calibration history cannot be silently rewritten.
 
-Calibration uses only these explicit anatomy labels. Generic Accept, Exclude,
-and Hold decisions are deliberately not treated as training data because they
-can reflect style, composition, duplication, or publishing choices unrelated
-to anatomy. Threshold reports are deterministic and versioned. Enforcement is
-not considered calibration-ready until there are at least 100 judged examples,
-including at least 20 good and 20 defective examples. The first learning stage
-adjusts the severe-confidence threshold; a later fine-tune can use the same
-immutable dataset once it is large and balanced enough.
+Calibration uses explicit anatomy labels plus two narrowly inferred signals from
+a completed OWNER review. A final Accept becomes an `anatomy_good` example unless
+it overrides a severe anatomy flag. A Reject becomes an `anatomy_defect` example
+only when its reason is explicitly anatomy-specific. Generic Reject, Delete,
+Exclude, and Hold choices are deliberately not treated as defects because they
+can reflect style, composition, duplication, or publishing preferences. An
+explicit Good/Defect/Unsure label always wins over an inferred signal.
+
+Threshold reports are deterministic and versioned. Duplicate image content is
+kept in one validation fold using the raw-master SHA-256. Five-fold out-of-fold
+validation selects thresholds without scoring them on the same examples used to
+fit that fold. A candidate becomes the effective severe-confidence threshold only
+when it has at least 100 judged examples, including at least 20 good and 20
+defective examples, and its held-out F1, defect recall, and false-positive rate do
+not regress against the currently applied policy. Otherwise the previous policy
+remains active. The dashboard reports the label mix, applied and candidate
+versions, validation metrics, and whether learning improved, stayed stable, or
+regressed.
+
+This first learning stage is a CPU/SQL personalization layer; it changes the
+decision threshold, not the vision model's neural weights, and adds no GPU cost.
+A future VLM fine-tune can use the same immutable dataset after it grows large and
+balanced enough for a separately validated model revision.
 
 ## Private service contract
 
