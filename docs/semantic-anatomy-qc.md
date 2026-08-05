@@ -62,13 +62,26 @@ exact asset, assessment response, model revision, prompt/schema profile, and
 owner. A repeated identical submission is idempotent; a different replacement
 is rejected so calibration history cannot be silently rewritten.
 
-Calibration uses explicit anatomy labels plus two narrowly inferred signals from
-a completed OWNER review. A final Accept becomes an `anatomy_good` example unless
-it overrides a severe anatomy flag. A Reject becomes an `anatomy_defect` example
-only when its reason is explicitly anatomy-specific. Generic Reject, Delete,
-Exclude, and Hold choices are deliberately not treated as defects because they
-can reflect style, composition, duplication, or publishing preferences. An
-explicit Good/Defect/Unsure label always wins over an inferred signal.
+Calibration uses explicit anatomy labels plus narrowly inferred review signals.
+A default-kept image is never positive training data merely because the owner did
+not reject it. The intended low-friction positive is an image that was actually
+displayed during fullscreen culling, remained kept in the final review, and is
+materialized as `anatomy_good` when that review completes. Only that durable
+inspected-state signal or an explicit owner **Anatomy good** label can supply
+positive evidence. A Reject becomes `anatomy_defect` only when its reason is
+explicitly anatomy-specific. Generic Reject, Delete, Exclude, and Hold choices
+are deliberately not treated as defects because they can reflect style,
+composition, duplication, or publishing preference.
+
+An anatomy-training rejection made while a review is open should remain a
+provisional intent attached to the latest decision. Labels are materialized from
+the final revisions in one batch at review completion (or after an explicit
+correction window), then calibration is rebuilt once. This avoids training on an
+action that the owner subsequently undoes and avoids producing one calibration
+artifact per click. An explicit Good/Defect/Unsure label always wins over an
+inferred signal. Existing deployments may still contain immediately reconciled
+open-review labels; readiness reporting keeps their source visible rather than
+silently upgrading their authority.
 
 Threshold reports are deterministic and versioned. Duplicate image content is
 kept in one validation fold using the raw-master SHA-256. Five-fold out-of-fold
@@ -83,8 +96,15 @@ regressed.
 
 This first learning stage is a CPU/SQL personalization layer; it changes the
 decision threshold, not the vision model's neural weights, and adds no GPU cost.
-A future VLM fine-tune can use the same immutable dataset after it grows large and
-balanced enough for a separately validated model revision.
+The next stage is a CPU meta-classifier over the stored structured VLM verdict,
+confidence, and issue signals. It requires at least 500 binary labels including
+150 defects plus multiple completed review sets and a group-aware chronological
+holdout. A later VLM LoRA challenger is not considered ready before at least
+2,000 diverse binary labels, 500 defects, and meaningful owner-confirmed
+issue-family coverage. These are operational targets, not accuracy guarantees.
+The exact dataset inventory, split eligibility, feature contract, two-threshold
+triage metrics, and champion/challenger gates are defined in
+[`semantic-visual-learning-contract.md`](semantic-visual-learning-contract.md).
 
 ## Private service contract
 

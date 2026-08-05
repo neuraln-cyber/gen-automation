@@ -20,6 +20,7 @@ from gen_automation.db.models import (
     Release,
     ReleaseSelection,
     ReleaseVersion,
+    ReviewAssetInspection,
     ReviewDecision,
     ReviewTask,
     ReviewXSelection,
@@ -1026,6 +1027,15 @@ async def transition_review_task(
         if normalized_semantic_profile is not None:
             try:
                 async with session.begin_nested():
+                    inspected_asset_ids = set(
+                        await session.scalars(
+                            select(ReviewAssetInspection.asset_id).where(
+                                ReviewAssetInspection.review_task_id == task.id,
+                                ReviewAssetInspection.inspected_by_user_id
+                                == changed_by_user_id,
+                            )
+                        )
+                    )
                     semantic_learning = await learn_semantic_anatomy_from_final_review(
                         session,
                         scoring_run_id=task.scoring_run_id,
@@ -1040,6 +1050,7 @@ async def transition_review_task(
                                 semantic_severe_override_attested=(
                                     asset.semantic_severe_override_attested
                                 ),
+                                inspected=asset.asset_id in inspected_asset_ids,
                             )
                             for asset in summary.assets
                         ),

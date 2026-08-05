@@ -6,8 +6,6 @@ import pytest
 from sqlalchemy import select
 
 from gen_automation.db.models import (
-    ReviewDecision,
-    ReviewTask,
     SemanticAnatomyFeedback,
     SemanticAssessment,
 )
@@ -21,13 +19,13 @@ from gen_automation.domain.enums import (
 )
 from gen_automation.services import semantic_review_learning as learning_service
 from gen_automation.services.review import append_review_decision, transition_review_task
+from gen_automation.services.review_inspections import record_review_inspections
 from gen_automation.services.semantic_anatomy import (
     SemanticAssessmentProfile,
     run_semantic_assessment_cycle,
 )
 from gen_automation.services.semantic_review_reconciliation import (
     reconcile_one_completed_semantic_review,
-    reconcile_one_open_anatomy_reject,
 )
 from tests.test_semantic_anatomy import (
     SemanticRuntimeContext,
@@ -56,7 +54,7 @@ def _capture_refresh(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]
 
 
 @pytest.mark.asyncio
-async def test_open_owner_anatomy_reject_is_recorded_then_learned_by_reconciliation(
+async def test_open_anatomy_reject_corrected_before_completion_never_becomes_a_defect(
     semantic_runtime_context: SemanticRuntimeContext,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -70,7 +68,7 @@ async def test_open_owner_anatomy_reject_is_recorded_then_learned_by_reconciliat
     assessed = await run_semantic_assessment_cycle(
         semantic_runtime_context.database.sessions,
         semantic_runtime_context.store,
-        worker_id="semantic:open-review-immediate-learning",
+        worker_id="semantic:open-review-correction",
         profile=profile,
         analyzer=_passing_assessment,
         max_assessments_per_profile=1,
@@ -86,58 +84,68 @@ async def test_open_owner_anatomy_reject_is_recorded_then_learned_by_reconciliat
     refresh_calls = _capture_refresh(monkeypatch)
 
     async with semantic_runtime_context.database.sessions() as session:
-        decision = await append_review_decision(
+        rejected = await append_review_decision(
             session,
             review_task_id=task_id,
             asset_id=asset_id,
             decision=ReviewDecisionValue.REJECT,
             decided_by_user_id=semantic_runtime_context.owner_id,
             expected_lock_version=1,
-            idempotency_key="open-review-immediate-anatomy-reject",
+            idempotency_key="open-review-corrected-anatomy-reject",
             reason_code=SemanticIssueCode.MALFORMED_HAND.value,
             semantic_profile_sha256=profile.profile_sha256,
             semantic_enforcement_mode=SemanticEnforcementMode.SHADOW,
             now=_NOW + timedelta(minutes=2),
         )
-
-    assert decision.revision == 1
-    assert decision.task_lock_version == 2
+    assert rejected.revision == 1
+    assert rejected.task_lock_version == 2
     assert refresh_calls == []
 
     async with semantic_runtime_context.database.sessions() as session:
-        task_state = await session.scalar(
-            select(ReviewTask.state).where(ReviewTask.id == task_id)
-        )
-        stored_decision = await session.scalar(
-            select(ReviewDecision).where(
-                ReviewDecision.review_task_id == task_id,
-                ReviewDecision.asset_id == asset_id,
-            )
-        )
         feedback_id = await session.scalar(
             select(SemanticAnatomyFeedback.id).where(
                 SemanticAnatomyFeedback.asset_id == asset_id
             )
         )
-
-    assert task_state == ReviewTaskState.OPEN
-    assert stored_decision is not None
-    assert stored_decision.decision == ReviewDecisionValue.REJECT
-    assert stored_decision.reason_code == SemanticIssueCode.MALFORMED_HAND.value
     assert feedback_id is None
 
     async with semantic_runtime_context.database.sessions() as session:
-        reconciled = await reconcile_one_open_anatomy_reject(
+        corrected = await append_review_decision(
             session,
-            profile_sha256=profile.profile_sha256,
+            review_task_id=task_id,
+            asset_id=asset_id,
+            decision=ReviewDecisionValue.ACCEPT,
+            decided_by_user_id=semantic_runtime_context.owner_id,
+            expected_lock_version=2,
+            idempotency_key="open-review-corrected-final-accept",
+            semantic_profile_sha256=profile.profile_sha256,
+            semantic_enforcement_mode=SemanticEnforcementMode.SHADOW,
             now=_NOW + timedelta(minutes=3),
         )
-        await session.commit()
+    assert corrected.revision == 2
+    assert corrected.task_lock_version == 3
 
-    assert reconciled.review_task_id == task_id
-    assert reconciled.did_work
-    assert reconciled.learning is not None
-    assert reconciled.learning.inferred_defect_count == 1
+    async with semantic_runtime_context.database.sessions() as session:
+        await record_review_inspections(
+            session,
+            review_task_id=task_id,
+            asset_ids=(asset_id,),
+            inspected_by_user_id=semantic_runtime_context.owner_id,
+            now=_NOW + timedelta(minutes=3, seconds=1),
+        )
+    async with semantic_runtime_context.database.sessions() as session:
+        await transition_review_task(
+            session,
+            review_task_id=task_id,
+            target_state=ReviewTaskState.COMPLETED,
+            changed_by_user_id=semantic_runtime_context.owner_id,
+            expected_lock_version=3,
+            idempotency_key="open-review-corrected-completion",
+            semantic_profile_sha256=profile.profile_sha256,
+            semantic_enforcement_mode=SemanticEnforcementMode.SHADOW,
+            now=_NOW + timedelta(minutes=4),
+        )
+
     assert len(refresh_calls) == 1
 
     async with semantic_runtime_context.database.sessions() as session:
@@ -156,103 +164,142 @@ async def test_open_owner_anatomy_reject_is_recorded_then_learned_by_reconciliat
         )
 
     assert feedback is not None
-    assert feedback.ground_truth == SemanticGroundTruth.ANATOMY_DEFECT
-    assert feedback.issue_code == SemanticIssueCode.MALFORMED_HAND
+    assert feedback.ground_truth == SemanticGroundTruth.ANATOMY_GOOD
+    assert feedback.issue_code is None
 
 
 @pytest.mark.asyncio
-async def test_open_anatomy_reject_is_reconciled_after_late_assessment_completion(
+async def test_completed_anatomy_reject_is_reconciled_after_late_assessment_completion(
     semantic_runtime_context: SemanticRuntimeContext,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     task_id, scoring_run_id, asset_ids = await _add_ranked_review(
         semantic_runtime_context,
-        output_indexes=(31,),
+        output_indexes=(31, 32),
         review_created_at=_NOW,
     )
-    asset_id = asset_ids[0]
+    accepted_asset_id, rejected_asset_id = asset_ids
     profile = SemanticAssessmentProfile(model_name=_MODEL, model_revision=_REVISION)
     refresh_calls = _capture_refresh(monkeypatch)
 
     async with semantic_runtime_context.database.sessions() as session:
-        await append_review_decision(
+        accepted = await append_review_decision(
             session,
             review_task_id=task_id,
-            asset_id=asset_id,
-            decision=ReviewDecisionValue.REJECT,
+            asset_id=accepted_asset_id,
+            decision=ReviewDecisionValue.ACCEPT,
             decided_by_user_id=semantic_runtime_context.owner_id,
             expected_lock_version=1,
-            idempotency_key="open-review-late-anatomy-reject",
-            reason_code="anatomy",
+            idempotency_key="completed-review-late-accept",
             semantic_profile_sha256=profile.profile_sha256,
             semantic_enforcement_mode=SemanticEnforcementMode.SHADOW,
             now=_NOW + timedelta(minutes=1),
         )
+    async with semantic_runtime_context.database.sessions() as session:
+        rejected = await append_review_decision(
+            session,
+            review_task_id=task_id,
+            asset_id=rejected_asset_id,
+            decision=ReviewDecisionValue.REJECT,
+            decided_by_user_id=semantic_runtime_context.owner_id,
+            expected_lock_version=accepted.task_lock_version,
+            idempotency_key="completed-review-late-anatomy-reject",
+            reason_code="anatomy",
+            semantic_profile_sha256=profile.profile_sha256,
+            semantic_enforcement_mode=SemanticEnforcementMode.SHADOW,
+            now=_NOW + timedelta(minutes=1, seconds=1),
+        )
+    async with semantic_runtime_context.database.sessions() as session:
+        await record_review_inspections(
+            session,
+            review_task_id=task_id,
+            asset_ids=(accepted_asset_id,),
+            inspected_by_user_id=semantic_runtime_context.owner_id,
+            now=_NOW + timedelta(minutes=1, seconds=2),
+        )
+    async with semantic_runtime_context.database.sessions() as session:
+        await transition_review_task(
+            session,
+            review_task_id=task_id,
+            target_state=ReviewTaskState.COMPLETED,
+            changed_by_user_id=semantic_runtime_context.owner_id,
+            expected_lock_version=rejected.task_lock_version,
+            idempotency_key="completed-review-before-assessment",
+            semantic_profile_sha256=profile.profile_sha256,
+            semantic_enforcement_mode=SemanticEnforcementMode.SHADOW,
+            now=_NOW + timedelta(minutes=2),
+        )
         assert (
             await session.scalar(
                 select(SemanticAnatomyFeedback.id).where(
-                    SemanticAnatomyFeedback.asset_id == asset_id
+                    SemanticAnatomyFeedback.asset_id.in_(asset_ids)
                 )
             )
             is None
         )
 
-    assessed = await run_semantic_assessment_cycle(
-        semantic_runtime_context.database.sessions,
-        semantic_runtime_context.store,
-        worker_id="semantic:open-review-late-learning",
-        profile=profile,
-        analyzer=_passing_assessment,
-        max_assessments_per_profile=1,
-        asset_allowlist=asset_ids,
-        max_attempts=2,
-        lease_seconds=120,
-        retry_base_seconds=5,
-        retry_max_seconds=30,
-        now=_NOW + timedelta(minutes=2),
-    )
-    assert assessed.created_assessment
-    assert assessed.processed_assessment
+    for minute in range(3, 6):
+        await run_semantic_assessment_cycle(
+            semantic_runtime_context.database.sessions,
+            semantic_runtime_context.store,
+            worker_id="semantic:completed-review-late-learning",
+            profile=profile,
+            analyzer=_passing_assessment,
+            max_assessments_per_profile=2,
+            asset_allowlist=asset_ids if minute == 3 else (),
+            max_attempts=2,
+            lease_seconds=120,
+            retry_base_seconds=5,
+            retry_max_seconds=30,
+            now=_NOW + timedelta(minutes=minute),
+        )
 
     async with semantic_runtime_context.database.sessions() as session:
-        reconciled = await reconcile_one_open_anatomy_reject(
+        reconciled = await reconcile_one_completed_semantic_review(
             session,
             profile_sha256=profile.profile_sha256,
-            now=_NOW + timedelta(minutes=3),
+            now=_NOW + timedelta(minutes=6),
         )
         await session.commit()
 
     assert reconciled.review_task_id == task_id
     assert reconciled.did_work
     assert reconciled.learning is not None
-    assert reconciled.learning.inferred_good_count == 0
+    assert reconciled.learning.inferred_good_count == 1
     assert reconciled.learning.inferred_defect_count == 1
     assert len(refresh_calls) == 1
 
     async with semantic_runtime_context.database.sessions() as session:
-        feedback = await session.scalar(
-            select(SemanticAnatomyFeedback)
-            .join(
-                SemanticAssessment,
-                SemanticAssessment.id == SemanticAnatomyFeedback.semantic_assessment_id,
-            )
-            .where(
-                SemanticAssessment.scoring_run_id == scoring_run_id,
-                SemanticAssessment.asset_id == asset_id,
-                SemanticAnatomyFeedback.feedback_by_user_id
-                == semantic_runtime_context.owner_id,
-            )
+        feedback = list(
+            (
+                await session.scalars(
+                    select(SemanticAnatomyFeedback)
+                    .join(
+                        SemanticAssessment,
+                        SemanticAssessment.id == SemanticAnatomyFeedback.semantic_assessment_id,
+                    )
+                    .where(
+                        SemanticAssessment.scoring_run_id == scoring_run_id,
+                        SemanticAnatomyFeedback.feedback_by_user_id
+                        == semantic_runtime_context.owner_id,
+                    )
+                    .order_by(SemanticAnatomyFeedback.asset_id)
+                )
+            ).all()
         )
-        repeated = await reconcile_one_open_anatomy_reject(
+        repeated = await reconcile_one_completed_semantic_review(
             session,
             profile_sha256=profile.profile_sha256,
-            now=_NOW + timedelta(minutes=4),
+            now=_NOW + timedelta(minutes=7),
         )
         await session.commit()
 
-    assert feedback is not None
-    assert feedback.ground_truth == SemanticGroundTruth.ANATOMY_DEFECT
-    assert feedback.issue_code is None
+    assert len(feedback) == 2
+    by_asset = {item.asset_id: item for item in feedback}
+    assert by_asset[accepted_asset_id].ground_truth == SemanticGroundTruth.ANATOMY_GOOD
+    assert by_asset[accepted_asset_id].issue_code is None
+    assert by_asset[rejected_asset_id].ground_truth == SemanticGroundTruth.ANATOMY_DEFECT
+    assert by_asset[rejected_asset_id].issue_code is None
     assert not repeated.did_work
     assert len(refresh_calls) == 1
 
@@ -330,6 +377,14 @@ async def test_late_results_are_learned_once_and_unsafe_choices_are_ignored(
             )
         lock_version = result.task_lock_version
 
+    async with semantic_runtime_context.database.sessions() as session:
+        await record_review_inspections(
+            session,
+            review_task_id=task_id,
+            asset_ids=(accepted_asset_id,),
+            inspected_by_user_id=semantic_runtime_context.owner_id,
+            now=_NOW + timedelta(minutes=1, seconds=4),
+        )
     async with semantic_runtime_context.database.sessions() as session:
         await transition_review_task(
             session,

@@ -1859,6 +1859,47 @@ class ReviewDecision(UuidPrimaryKeyMixin, Base):
     )
 
 
+class ReviewAssetInspection(UuidPrimaryKeyMixin, Base):
+    __tablename__ = "review_asset_inspections"
+    __table_args__ = (
+        UniqueConstraint(
+            "review_task_id",
+            "asset_id",
+            "inspected_by_user_id",
+            name="uq_review_asset_inspections_task_asset_user",
+        ),
+        ForeignKeyConstraint(
+            ["review_task_id", "scoring_run_id"],
+            ["review_tasks.id", "review_tasks.scoring_run_id"],
+            name="fk_review_asset_inspections_task_scoring_run",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["scoring_run_id", "asset_id"],
+            ["asset_rankings.scoring_run_id", "asset_rankings.asset_id"],
+            name="fk_review_asset_inspections_ranking_membership",
+            ondelete="RESTRICT",
+        ),
+        Index(
+            "ix_review_asset_inspections_task_user",
+            "review_task_id",
+            "inspected_by_user_id",
+        ),
+    )
+
+    review_task_id: Mapped[UUID] = mapped_column(nullable=False)
+    scoring_run_id: Mapped[UUID] = mapped_column(nullable=False)
+    asset_id: Mapped[UUID] = mapped_column(
+        ForeignKey("assets.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    inspected_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    inspected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class ReviewXSelection(UuidPrimaryKeyMixin, Base):
     __tablename__ = "review_x_selections"
     __table_args__ = (
@@ -4487,7 +4528,47 @@ event.listen(
 )
 
 
+event.listen(
+    ReviewAssetInspection.__table__,
+    "after_create",
+    _ddl(
+        "CREATE TRIGGER review_asset_inspections_guard_insert "
+        "BEFORE INSERT ON review_asset_inspections BEGIN "
+        "SELECT CASE WHEN NOT EXISTS ("
+        "SELECT 1 FROM review_tasks AS task "
+        "WHERE task.id = NEW.review_task_id AND task.state = 'open'"
+        ") THEN RAISE(ABORT, 'review inspections require an open task') END; END"
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    ReviewAssetInspection.__table__,
+    "after_create",
+    _ddl(
+        "CREATE OR REPLACE FUNCTION gen_automation_guard_review_asset_inspection_insert() "
+        "RETURNS trigger AS $$ BEGIN "
+        "IF NOT EXISTS (SELECT 1 FROM review_tasks AS task "
+        "WHERE task.id = NEW.review_task_id AND task.state = 'open') THEN "
+        "RAISE EXCEPTION 'review inspections require an open task'; END IF; "
+        "RETURN NEW; END; $$ LANGUAGE plpgsql"
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    ReviewAssetInspection.__table__,
+    "after_create",
+    _ddl(
+        "CREATE TRIGGER review_asset_inspections_guard_insert "
+        "BEFORE INSERT ON review_asset_inspections FOR EACH ROW "
+        "EXECUTE FUNCTION gen_automation_guard_review_asset_inspection_insert()"
+    ).execute_if(dialect="postgresql"),
+)
+
+
 for _immutable_table, _table_name, _label in (
+    (
+        ReviewAssetInspection.__table__,
+        "review_asset_inspections",
+        "review asset inspections",
+    ),
     (
         SemanticAnatomyFeedback.__table__,
         "semantic_anatomy_feedback",

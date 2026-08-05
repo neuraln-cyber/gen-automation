@@ -32,6 +32,7 @@ from gen_automation.db.models import (
     Project,
     Release,
     ReleaseVersion,
+    ReviewAssetInspection,
     ReviewTask,
     ScoringRun,
 )
@@ -359,6 +360,28 @@ async def _review_task_rows(settings: Settings) -> tuple[int, UUID | None]:
         await database.dispose()
 
 
+async def _review_inspection_state(
+    settings: Settings,
+    *,
+    task_id: UUID,
+) -> tuple[int, int, tuple[UUID, ...]]:
+    database = Database(settings.database_url)
+    try:
+        async with database.sessions() as session:
+            task = await session.get(ReviewTask, task_id)
+            assert task is not None
+            asset_ids = tuple(
+                await session.scalars(
+                    select(ReviewAssetInspection.asset_id)
+                    .where(ReviewAssetInspection.review_task_id == task_id)
+                    .order_by(ReviewAssetInspection.asset_id)
+                )
+            )
+            return task.lock_version, len(asset_ids), asset_ids
+    finally:
+        await database.dispose()
+
+
 @pytest.mark.parametrize(
     ("role", "allowed"),
     [
@@ -423,6 +446,69 @@ def test_review_role_matrix_denies_before_service_mutation(
         assert count == 0
         assert stored_actor is None
         assert read_unknown.status_code == 403
+
+
+def test_review_inspection_api_unions_retries_without_changing_task_lock(
+    tmp_path: Path,
+) -> None:
+    context = asyncio.run(_seed_review_api(_settings(tmp_path / "inspection-api.db")))
+    app = create_app(context.settings)
+    owner = context.users[AdminRole.OWNER]
+
+    with TestClient(
+        app,
+        base_url=ORIGIN,
+        client=("192.0.2.82", 50000),
+    ) as client:
+        csrf = _login(client, context.settings, owner)
+        created = client.post(
+            "/api/v1/review-tasks",
+            json={"scoring_run_id": str(context.scoring_run_id)},
+            headers=_mutation_headers(csrf, "inspection-create-task"),
+        )
+        assert created.status_code == 201
+        task_id = UUID(created.json()["task_id"])
+        endpoint = f"/api/v1/review-tasks/{task_id}/inspections"
+        stable_key = "inspection-session-token"
+
+        first = client.post(
+            endpoint,
+            json={"asset_ids": [str(context.asset_ids[0])]},
+            headers=_mutation_headers(csrf, stable_key),
+        )
+        overlap = client.post(
+            endpoint,
+            json={"asset_ids": [str(asset_id) for asset_id in context.asset_ids]},
+            headers=_mutation_headers(csrf, stable_key),
+        )
+        repeated = client.post(
+            endpoint,
+            json={"asset_ids": [str(asset_id) for asset_id in context.asset_ids]},
+            headers=_mutation_headers(csrf, stable_key),
+        )
+        duplicate = client.post(
+            endpoint,
+            json={"asset_ids": [str(context.asset_ids[0]), str(context.asset_ids[0])]},
+            headers=_mutation_headers(csrf, stable_key),
+        )
+
+    assert first.status_code == 200
+    assert first.json() == {
+        "task_id": str(task_id),
+        "inspected_asset_ids": [str(context.asset_ids[0])],
+        "created_count": 1,
+    }
+    assert overlap.status_code == 200
+    assert overlap.json()["created_count"] == 1
+    assert repeated.status_code == 200
+    assert repeated.json()["created_count"] == 0
+    assert duplicate.status_code == 422
+    lock_version, count, inspected_ids = asyncio.run(
+        _review_inspection_state(context.settings, task_id=task_id)
+    )
+    assert lock_version == 1
+    assert count == 2
+    assert set(inspected_ids) == set(context.asset_ids)
 
 
 def test_review_mutations_require_origin_csrf_and_replay_idempotently(

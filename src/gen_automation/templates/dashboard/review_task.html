@@ -1,6 +1,9 @@
 {% extends "dashboard/base.html" %}
 {% block content %}
-  <div data-review-workspace>
+  <div
+    data-review-workspace
+    data-review-task-id="{{ summary.task_id }}"
+  >
   <a class="back" href="/dashboard/releases/{{ navigation.release_id }}">
     &larr; Ranked release
   </a>
@@ -15,6 +18,22 @@
       </p>
     </div>
   </section>
+
+  {% if summary.state.value == "open" %}
+    <form
+      method="post"
+      action="{{ inspection_endpoint }}"
+      data-review-inspection-form
+      hidden
+    >
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input
+        type="hidden"
+        name="idempotency_key"
+        value="{{ inspection_idempotency_key }}"
+      >
+    </form>
+  {% endif %}
 
   <aside
     class="anatomy-mode-banner mode-{{ semantic_mode }}"
@@ -573,6 +592,7 @@
         data-batch-index="{{ item.master.batch_index }}"
         data-batch-image-number="{{ item.master.batch_image_number }}"
         data-decision="{{ decision_value }}"
+        data-inspected="{{ 'true' if item.inspected else 'false' }}"
         data-selected-for-x="{{ 'true' if item.current.selected_for_x else 'false' }}"
         {% if item.semantic_flagged %}data-semantic-flagged="true"{% endif %}
         {% if item.ai_excluded %}data-ai-excluded="true"{% endif %}
@@ -620,8 +640,18 @@
             <span class="decision-chip{% if item.current.selected_for_x %} x-selected{% endif %}">
               X: {{ "selected" if item.current.selected_for_x else "not selected" }}
             </span>
+            <span
+              class="decision-chip inspected"
+              data-inspected-chip
+              {% if not item.inspected %}hidden{% endif %}
+            >Reviewed</span>
             {% if item.current.revision %}
               <span class="decision-chip">Revision {{ item.current.revision }}</span>
+            {% endif %}
+            {% if summary.state.value == "open" and item.current.reason_code in anatomy_reason_codes %}
+              <span class="decision-chip anatomy-provisional">
+                Anatomy: {{ item.current.reason_code.replace("_", " ") }} &middot; provisional
+              </span>
             {% endif %}
           </div>
           <details class="review-card-details"{% if item.semantic_flagged %} open{% endif %}>
@@ -793,7 +823,9 @@
                   <span class="anatomy-feedback-mode">{{ semantic_mode }}</span>
                 </div>
                 <p class="anatomy-feedback-learning-copy">
-                  During culling, use Reject + train anatomy for a bad-anatomy image.
+                  During culling, use Reject + anatomy label for a bad-anatomy image.
+                  The label is provisional while review is open and becomes calibration data
+                  only after you complete the review.
                   Plain rejection only removes an image from the final set and never labels
                   it as an anatomy defect.
                 </p>
@@ -1044,13 +1076,16 @@
                       {% if item.current.reason_code in anatomy_reason_codes %}checked{% endif %}
                     >
                     <span>
-                      <strong>Use rejection for anatomy training</strong>
-                      <small>Only enable this when anatomy is the reason the image is rejected.</small>
+                      <strong>Mark as anatomy defect (provisional)</strong>
+                      <small>Only enable when anatomy caused the rejection. Learning waits until review completion.</small>
                     </span>
                   </label>
                   <label>
                     Defect type
-                    <select data-anatomy-training-issue>
+                    <select
+                      data-anatomy-training-issue
+                      data-saved-anatomy-issue="{{ item.current.reason_code if item.current.reason_code in anatomy_reason_codes else '' }}"
+                    >
                       <option value="anatomy">Not specified</option>
                       {% for issue_code in semantic_issue_codes %}
                         <option

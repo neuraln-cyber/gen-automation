@@ -2484,7 +2484,7 @@
     if (decision === "reject") {
       const anatomyToggle = form.querySelector("[data-anatomy-training-toggle]");
       return anatomyToggle instanceof HTMLInputElement && anatomyToggle.checked
-        ? "Image rejected and labeled for anatomy learning. The raw master was retained."
+        ? "Image rejected with a provisional anatomy label. Learning waits until review completion."
         : "Image rejected. The raw master was retained.";
     }
     if (decision === "hold") return "Image held for another pass.";
@@ -2666,6 +2666,58 @@
       if (status.isConnected) status.hidden = true;
     }, isError ? 6000 : 2600);
   };
+
+  const requestInspectionFlush = () => {
+    let requestedFlush = null;
+    document.dispatchEvent(new CustomEvent("gen-automation:inspection-flush-request", {
+      detail: {
+        respondWith(value) {
+          requestedFlush = Promise.resolve(value);
+        },
+      },
+    }));
+    return requestedFlush || Promise.resolve(true);
+  };
+
+  function initializeReviewCompletionInspectionFlush() {
+    document.addEventListener("submit", async (event) => {
+      const form = event.target;
+      if (!(form instanceof HTMLFormElement) || !form.matches("[data-review-complete-form]")) {
+        return;
+      }
+      if (form.dataset.inspectionsFlushed === "true") return;
+      event.preventDefault();
+      if (form.dataset.inspectionFlushPending === "true") return;
+
+      const workspace = form.closest("[data-review-workspace]");
+      const submitter = event.submitter instanceof HTMLButtonElement ? event.submitter : null;
+      form.dataset.inspectionFlushPending = "true";
+      if (submitter) submitter.disabled = true;
+      if (workspace instanceof HTMLElement) {
+        workspace.setAttribute("aria-busy", "true");
+        showReviewActionStatus(workspace, "Saving the images you reviewed before completion...");
+      }
+
+      const flushed = await requestInspectionFlush().catch(() => false);
+      delete form.dataset.inspectionFlushPending;
+      if (workspace instanceof HTMLElement) workspace.removeAttribute("aria-busy");
+      if (!flushed) {
+        if (submitter) submitter.disabled = false;
+        if (workspace instanceof HTMLElement) {
+          showReviewActionStatus(
+            workspace,
+            "Reviewed-image progress could not be saved. Check the connection and complete again.",
+            true,
+          );
+        }
+        return;
+      }
+
+      form.dataset.inspectionsFlushed = "true";
+      if (submitter) form.requestSubmit(submitter);
+      else form.requestSubmit();
+    });
+  }
 
   function initializeReviewActions() {
     if (!document.querySelector("[data-review-workspace]")) return;
@@ -4901,6 +4953,7 @@
   initializeWildcardLibraryTools();
   initializeBulkReview();
   initializeReviewActions();
+  initializeReviewCompletionInspectionFlush();
   initializeGenerationDetails();
   initializeLiveGeneratedAssets();
   clearAutomationDraftAfterQueue();

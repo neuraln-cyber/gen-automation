@@ -35,7 +35,16 @@ def test_asset_viewer_is_safe_progressive_enhancement() -> None:
     assert "Navigate" in script
     assert "assetViewerMarkOut" in script
     assert "assetViewerAnatomyReject" in script
-    assert "Reject + train anatomy" in script
+    assert "Reject + anatomy label" in script
+    assert "data-review-inspection-form" in script
+    assert "queueInspection(activeCard)" in script
+    assert "flushInspectionQueue(true)" in script
+    assert "drainInspectionQueue" in script
+    assert "INSPECTION_BATCH_SIZE = 500" in script
+    assert "INSPECTION_IDLE_FLUSH_MS = 5000" in script
+    assert "assetViewerDefectPicker" in script
+    assert "data-defect-code" in script
+    assert 'event.key.toLowerCase() === "a"' in script
     assert "form[data-review-decision-form]" in script
     assert 'button[data-decision="reject"]' in script
     assert "submitRejection" in script
@@ -47,8 +56,8 @@ def test_asset_viewer_is_safe_progressive_enhancement() -> None:
     assert 'viewer.markOut.textContent = rejectionBusy' in script
     assert "raw master retained" in script
     assert "step(1)" in script
-    assert "submitRejection(event.shiftKey)" in script
-    assert 'viewer.markOut.addEventListener("click", () => submitRejection(false))' in script
+    assert "submitRejection(event.shiftKey, {" in script
+    assert 'viewer.markOut.addEventListener("click", () => submitRejection(false, {' in script
     assert 'viewer.anatomyReject.addEventListener("click", () => submitRejection(true))' in script
     assert "assetViewerSaveExclusions" not in script
     assert "markedForExclusion" not in script
@@ -122,7 +131,7 @@ def test_asset_viewer_waits_for_persisted_rejection_before_advancing() -> None:
     assert "step(" not in submission[request_index:request_return_index]
 
     failure = settlement.split("if (!detail.success)", 1)[1].split(
-        "announcement = settled.anatomyRequested",
+        "announcement = settled.removingAnatomyLabel",
         1,
     )[0]
     assert settlement.index("pendingRejection = null") < settlement.index("if (!detail.success)")
@@ -146,8 +155,9 @@ def test_asset_viewer_delete_shortcuts_distinguish_plain_and_anatomy_rejection()
 
     assert 'event.key === "Delete"' in keyboard
     assert "event.preventDefault()" in keyboard
-    assert "submitRejection(event.shiftKey)" in keyboard
-    assert "Shift+Del Reject + train anatomy" in script
+    assert "submitRejection(event.shiftKey, {" in keyboard
+    assert "removeAnatomyLabel: !event.shiftKey && Boolean(context.anatomyLabeled)" in keyboard
+    assert "Shift+Del Reject + anatomy" in script
     assert (
         "if (context.anatomyToggle) context.anatomyToggle.checked = withAnatomyTraining"
         in script
@@ -283,11 +293,105 @@ def test_review_template_integrates_anatomy_rejection_and_legacy_keep_all() -> N
     assert "data-anatomy-training-control" in template
     assert "data-anatomy-training-toggle" in template
     assert "data-anatomy-training-issue" in template
-    assert "Use rejection for anatomy training" in template
-    assert "Plain rejection only removes an image from the final set" in template
+    assert "Mark as anatomy defect (provisional)" in template
+    assert "becomes calibration data" in template
+    assert "Plain rejection only removes an image" in template
+    assert "from the final set" in template
     assert 'document.querySelector("[data-accept-undecided]")' in script
     assert 'bulkReasonInput.value = "sorting_default_accept"' in script
     assert "form.requestSubmit(acceptButton)" in script
     assert "anatomyRequested" in script
     assert 'reasonInput.value = anatomyIssue instanceof HTMLSelectElement' in script
     assert ".anatomy-reject-option" in styles
+
+
+def test_fullscreen_inspections_are_batched_retried_and_flushed_without_rendering() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+    template = (
+        ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "review_task.html"
+    ).read_text(encoding="utf-8")
+
+    queue = script.split("const queueInspection", 1)[1].split(
+        "const flushInspectionQueue",
+        1,
+    )[0]
+    flush = script.split("const flushInspectionQueue", 1)[1].split(
+        "const drainInspectionQueue",
+        1,
+    )[0]
+    step = script.split("const step", 1)[1].split("const submitRejection", 1)[0]
+    close = script.split("const closeViewer", 1)[1].split("const renderCard", 1)[0]
+
+    assert 'action="{{ inspection_endpoint }}"' in template
+    assert 'value="{{ inspection_idempotency_key }}"' in template
+    assert 'data-inspected="{{ \'true\' if item.inspected else \'false\' }}"' in template
+    assert "data-inspected-chip" in template
+    assert "pendingInspectionIds.add(assetId)" in queue
+    assert "scheduleInspectionFlush()" in queue
+    assert 'body.append("asset_id", assetId)' in flush
+    assert 'Accept: "application/json"' in flush
+    assert "failedInspectionBatch = batch" in flush
+    assert "idempotencyKey: config.keyPrefix" in flush
+    assert "let batch = failedInspectionBatch" in flush
+    assert "workspace.replaceWith" not in flush
+    assert "renderCard" not in flush
+    assert "if (activeCard) queueInspection(activeCard)" in script.split(
+        "const drainInspectionQueue",
+        1,
+    )[1].split("const updateCleanControls", 1)[0]
+    assert step.index("queueInspection(activeCard)") < step.index("renderCard(")
+    assert "queueInspection(activeCard)" in close
+    assert "flushInspectionQueue(true)" in close
+    assert "restoreInspectionState()" in script
+    assert ".decision-chip.inspected" in STYLES.read_text(encoding="utf-8")
+
+
+def test_fullscreen_inspection_requires_successfully_loaded_exact_asset_source() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+    queue = script.split("const queueInspection", 1)[1].split(
+        "const flushInspectionQueue",
+        1,
+    )[0]
+    render = script.split("const renderCard", 1)[1].split("const step", 1)[0]
+    image_events = script.split('viewer.image.addEventListener("error"', 1)[1].split(
+        "let touchStart",
+        1,
+    )[0]
+
+    assert "const successfullyViewedSources = new Map()" in script
+    assert "successfullyViewedSources.get(assetId) !== source" in queue
+    assert "requestedSource !== renderedSource" in script
+    assert "viewer.image.naturalWidth <= 0" in script
+    assert "normalizedSource(sourceFor(activeCard)) !== requestedSource" in script
+    assert "viewer.image.dataset.inspectionAssetId" in render
+    assert "viewer.image.dataset.inspectionSource" in render
+    assert "viewer.image.complete && viewer.image.naturalWidth > 0" in render
+    assert "markViewerImageLoaded()" in render
+    assert "clearFailedViewerImage()" in image_events
+    assert "markViewerImageLoaded()" in image_events
+
+
+def test_fullscreen_defect_picker_is_optional_exact_and_per_image() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+    styles = STYLES.read_text(encoding="utf-8")
+
+    sync = script.split("const syncDefectPicker", 1)[1].split(
+        "const updateRejectionControls",
+        1,
+    )[0]
+    submission = script.split("const submitRejection", 1)[1].split("const openViewer", 1)[0]
+
+    assert "context.anatomyIssue.options" in sync
+    assert "context.anatomyIssue.value || \"anatomy\"" in sync
+    assert "chip.dataset.defectCode = option.value" in sync
+    assert 'chip.setAttribute("role", "radio")' in sync
+    assert "selectedOptions[0]" in script
+    assert "Generic is enough" in script
+    assert "until review completion" in script
+    assert "previousAnatomyChecked" in submission
+    assert "context.anatomyToggle.checked = withAnatomyTraining" in submission
+    assert ".asset-viewer-defect-picker" in styles
+    assert ".asset-viewer-defect-chip" in styles
+    assert "data-saved-anatomy-issue" in (
+        ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "review_task.html"
+    ).read_text(encoding="utf-8")

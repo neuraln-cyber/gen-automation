@@ -35,6 +35,11 @@ from gen_automation.services.review import (
     get_review_summary,
     transition_review_task,
 )
+from gen_automation.services.review_inspections import (
+    MAX_REVIEW_INSPECTION_ASSETS,
+    ReviewInspectionResult,
+    record_review_inspections,
+)
 from gen_automation.services.semantic_anatomy import SemanticAssessmentProfile
 from gen_automation.services.semantic_feedback import (
     SemanticAnatomyFeedbackResult,
@@ -81,6 +86,13 @@ class BulkReviewActionRequest(_StrictRequest):
     expected_lock_version: int = Field(gt=0, le=2_147_483_647)
     reason_code: str | None = Field(default=None, max_length=100)
     note: str | None = Field(default=None, max_length=4_000)
+
+
+class RecordReviewInspectionsRequest(_StrictRequest):
+    asset_ids: tuple[UUID, ...] = Field(
+        min_length=1,
+        max_length=MAX_REVIEW_INSPECTION_ASSETS,
+    )
 
 
 class ReviewTransitionRequest(_StrictRequest):
@@ -131,6 +143,12 @@ class ReviewBulkActionResponse(_AttributeResponse):
     x_selected_count: int
     task_lock_version: int
     replayed: bool
+
+
+class ReviewInspectionResponse(_AttributeResponse):
+    task_id: UUID
+    inspected_asset_ids: tuple[UUID, ...]
+    created_count: int
 
 
 class ReviewTransitionResponse(_AttributeResponse):
@@ -284,6 +302,29 @@ async def post_review_decision(
         raise _http_error(error) from error
     _set_replay_response(response, replayed=result.replayed, created=True)
     return ReviewDecisionResponse.model_validate(result)
+
+
+@router.post(
+    "/{review_task_id}/inspections",
+    response_model=ReviewInspectionResponse,
+)
+async def post_review_inspections(
+    review_task_id: UUID,
+    command: RecordReviewInspectionsRequest,
+    session: Session,
+    _idempotency_key: IdempotencyKey,
+    principal: ReviewPrincipal,
+) -> ReviewInspectionResponse:
+    try:
+        result: ReviewInspectionResult = await record_review_inspections(
+            session,
+            review_task_id=review_task_id,
+            asset_ids=command.asset_ids,
+            inspected_by_user_id=principal.user_id,
+        )
+    except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
+        raise _http_error(error) from error
+    return ReviewInspectionResponse.model_validate(result)
 
 
 @router.post(

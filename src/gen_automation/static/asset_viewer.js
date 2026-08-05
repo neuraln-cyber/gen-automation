@@ -6,6 +6,9 @@
   const IMAGE_LOAD_ERROR = (
     "The full-size preview could not be loaded. Reload the page to refresh its private link."
   );
+  const INSPECTION_BATCH_SIZE = 500;
+  const INSPECTION_IDLE_FLUSH_MS = 5000;
+  const INSPECTION_RETRY_MS = 2500;
   const preloadedSources = new Set();
 
   const createElement = (tagName, className, text) => {
@@ -228,7 +231,7 @@
     const shortcuts = createElement(
       "p",
       "asset-viewer-shortcuts",
-      "\u2190/\u2192 Navigate \u00b7 Del Reject \u00b7 Shift+Del Reject + train anatomy \u00b7 Esc Close",
+      "\u2190/\u2192 Navigate \u00b7 Del Reject \u00b7 Shift+Del Reject + anatomy \u00b7 A Defect type \u00b7 Esc Close",
     );
     const exclusionHelp = createElement(
       "p",
@@ -243,11 +246,29 @@
     const anatomyReject = createElement(
       "button",
       "asset-viewer-anatomy-reject",
-      "Reject + train anatomy",
+      "Reject + anatomy label",
     );
     anatomyReject.type = "button";
     anatomyReject.dataset.assetViewerAnatomyReject = "";
     anatomyReject.hidden = true;
+    const defectPicker = createElement("details", "asset-viewer-defect-picker");
+    defectPicker.dataset.assetViewerDefectPicker = "";
+    defectPicker.hidden = true;
+    const defectPickerSummary = createElement(
+      "summary",
+      "asset-viewer-defect-picker-summary",
+      "Defect: Not specified (optional)",
+    );
+    const defectPickerHelp = createElement(
+      "p",
+      "asset-viewer-defect-picker-help",
+      "Generic is enough. Choose a type only when it is obvious; the label stays provisional until review completion.",
+    );
+    const defectChips = createElement("div", "asset-viewer-defect-chips");
+    defectChips.dataset.assetViewerDefectChips = "";
+    defectChips.setAttribute("role", "radiogroup");
+    defectChips.setAttribute("aria-label", "Optional anatomy defect type");
+    defectPicker.append(defectPickerSummary, defectPickerHelp, defectChips);
     const select = createElement("button", "asset-viewer-select", "Select for bulk action");
     select.type = "button";
     select.dataset.assetViewerSelect = "";
@@ -282,6 +303,7 @@
       exclusionHelp,
       markOut,
       anatomyReject,
+      defectPicker,
       select,
       more,
     );
@@ -297,6 +319,9 @@
       dialog,
       download,
       downloadClean,
+      defectChips,
+      defectPicker,
+      defectPickerSummary,
       exclusionHelp,
       fitToggle,
       image,
@@ -330,6 +355,18 @@
     let activeCard = null;
     let announcement = "";
     let cleanActionBusy = false;
+    const inspectedAssetIds = new Set(
+      assetCards()
+        .filter((card) => card.dataset.inspected === "true")
+        .map((card) => card.dataset.assetId)
+        .filter(Boolean),
+    );
+    const pendingInspectionIds = new Set();
+    const successfullyViewedSources = new Map();
+    let activeInspectionBatch = null;
+    let failedInspectionBatch = null;
+    let inspectionFlushTimer = null;
+    let inspectionRequestPromise = null;
     let rejectionBusy = false;
     let pendingRejection = null;
     let returnFocus = null;
@@ -358,6 +395,201 @@
       announcement = message;
       viewer.status.textContent = message;
       viewer.status.hidden = !message;
+    };
+
+    const inspectionForm = () => document.querySelector("form[data-review-inspection-form]");
+
+    const normalizedSource = (source) => {
+      if (!source) return "";
+      try {
+        return new URL(source, document.baseURI).href;
+      } catch (_error) {
+        return "";
+      }
+    };
+
+    const markViewerImageLoaded = () => {
+      const assetId = viewer.image.dataset.inspectionAssetId || "";
+      const requestedSource = normalizedSource(viewer.image.dataset.inspectionSource || "");
+      const renderedSource = normalizedSource(viewer.image.currentSrc || viewer.image.src);
+      if (!assetId
+          || !requestedSource
+          || requestedSource !== renderedSource
+          || !viewer.image.complete
+          || viewer.image.naturalWidth <= 0
+          || activeCard?.dataset.assetId !== assetId
+          || normalizedSource(sourceFor(activeCard)) !== requestedSource) return false;
+      successfullyViewedSources.set(assetId, requestedSource);
+      return true;
+    };
+
+    const clearFailedViewerImage = () => {
+      const assetId = viewer.image.dataset.inspectionAssetId || "";
+      const requestedSource = normalizedSource(viewer.image.dataset.inspectionSource || "");
+      if (assetId && successfullyViewedSources.get(assetId) === requestedSource) {
+        successfullyViewedSources.delete(assetId);
+      }
+    };
+
+    const inspectionConfiguration = () => {
+      const form = inspectionForm();
+      if (!(form instanceof HTMLFormElement) || !form.action) return null;
+      const csrf = form.querySelector('input[name="csrf_token"]');
+      const key = form.querySelector('input[name="idempotency_key"]');
+      if (!(csrf instanceof HTMLInputElement)
+          || !(key instanceof HTMLInputElement)
+          || !csrf.value
+          || !key.value) return null;
+      return { csrfToken: csrf.value, keyPrefix: key.value, url: form.action };
+    };
+
+    const setInspectionChip = (card, state) => {
+      const chip = card.querySelector("[data-inspected-chip]");
+      if (!(chip instanceof HTMLElement)) return;
+      chip.hidden = false;
+      chip.classList.toggle("pending", state !== "saved");
+      chip.textContent = state === "saved" ? "Reviewed" : "Reviewed · saving";
+    };
+
+    const restoreInspectionState = () => {
+      assetCards().forEach((card) => {
+        const assetId = card.dataset.assetId || "";
+        if (!assetId) return;
+        if (inspectedAssetIds.has(assetId)) {
+          card.dataset.inspected = "true";
+          delete card.dataset.inspectionState;
+          setInspectionChip(card, "saved");
+          return;
+        }
+        const pending = pendingInspectionIds.has(assetId)
+          || activeInspectionBatch?.assetIds.includes(assetId)
+          || failedInspectionBatch?.assetIds.includes(assetId);
+        if (pending) {
+          card.dataset.inspectionState = "pending";
+          setInspectionChip(card, "pending");
+        }
+      });
+    };
+
+    const markInspectionSaved = (assetIds) => {
+      assetIds.forEach((assetId) => {
+        inspectedAssetIds.add(assetId);
+        assetCards()
+          .filter((card) => card.dataset.assetId === assetId)
+          .forEach((card) => {
+            card.dataset.inspected = "true";
+            delete card.dataset.inspectionState;
+            setInspectionChip(card, "saved");
+          });
+      });
+      document.dispatchEvent(new CustomEvent("gen-automation:review-inspections-saved", {
+        detail: { assetIds: [...assetIds] },
+      }));
+    };
+
+    const scheduleInspectionFlush = (delay = INSPECTION_IDLE_FLUSH_MS) => {
+      if (inspectionFlushTimer !== null) window.clearTimeout(inspectionFlushTimer);
+      inspectionFlushTimer = window.setTimeout(() => {
+        inspectionFlushTimer = null;
+        void flushInspectionQueue();
+      }, delay);
+    };
+
+    const queueInspection = (card) => {
+      const assetId = card?.dataset.assetId || "";
+      const source = normalizedSource(card ? sourceFor(card) : "");
+      if (!assetId
+          || !source
+          || successfullyViewedSources.get(assetId) !== source
+          || inspectedAssetIds.has(assetId)
+          || pendingInspectionIds.has(assetId)
+          || activeInspectionBatch?.assetIds.includes(assetId)
+          || failedInspectionBatch?.assetIds.includes(assetId)) return;
+      pendingInspectionIds.add(assetId);
+      card.dataset.inspectionState = "pending";
+      setInspectionChip(card, "pending");
+      if (pendingInspectionIds.size >= INSPECTION_BATCH_SIZE) {
+        if (inspectionFlushTimer !== null) window.clearTimeout(inspectionFlushTimer);
+        inspectionFlushTimer = null;
+        void flushInspectionQueue();
+      } else {
+        scheduleInspectionFlush();
+      }
+    };
+
+    const flushInspectionQueue = (keepalive = false) => {
+      if (inspectionRequestPromise) return inspectionRequestPromise;
+      const config = inspectionConfiguration();
+      if (!config) return Promise.resolve(pendingInspectionIds.size === 0);
+
+      let batch = failedInspectionBatch;
+      if (!batch) {
+        const assetIds = [...pendingInspectionIds].slice(0, INSPECTION_BATCH_SIZE);
+        if (assetIds.length === 0) return Promise.resolve(true);
+        assetIds.forEach((assetId) => pendingInspectionIds.delete(assetId));
+        batch = {
+          assetIds,
+          idempotencyKey: config.keyPrefix,
+        };
+      }
+      failedInspectionBatch = null;
+      activeInspectionBatch = batch;
+      if (inspectionFlushTimer !== null) window.clearTimeout(inspectionFlushTimer);
+      inspectionFlushTimer = null;
+
+      const body = new URLSearchParams();
+      body.append("csrf_token", config.csrfToken);
+      body.append("idempotency_key", batch.idempotencyKey);
+      batch.assetIds.forEach((assetId) => body.append("asset_id", assetId));
+
+      inspectionRequestPromise = fetch(config.url, {
+        method: "POST",
+        credentials: "same-origin",
+        keepalive,
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+          "X-Requested-With": "fetch",
+        },
+        body,
+      }).then(async (response) => {
+        if (!response.ok) throw new Error(`inspection_http_${response.status}`);
+        const payload = await response.json();
+        if (!payload || payload.ok !== true || !Array.isArray(payload.inspected_asset_ids)) {
+          throw new Error("inspection_response_invalid");
+        }
+        const confirmed = new Set(payload.inspected_asset_ids.map(String));
+        if (!batch.assetIds.every((assetId) => confirmed.has(assetId))) {
+          throw new Error("inspection_response_incomplete");
+        }
+        markInspectionSaved(batch.assetIds);
+        return true;
+      }).catch(() => {
+        failedInspectionBatch = batch;
+        batch.assetIds.forEach((assetId) => {
+          assetCards()
+            .filter((card) => card.dataset.assetId === assetId)
+            .forEach((card) => { card.dataset.inspectionState = "pending"; });
+        });
+        scheduleInspectionFlush(INSPECTION_RETRY_MS);
+        return false;
+      }).finally(() => {
+        activeInspectionBatch = null;
+        inspectionRequestPromise = null;
+        if (!failedInspectionBatch && pendingInspectionIds.size > 0) scheduleInspectionFlush();
+      });
+      return inspectionRequestPromise;
+    };
+
+    const drainInspectionQueue = async () => {
+      if (activeCard) queueInspection(activeCard);
+      if (inspectionFlushTimer !== null) window.clearTimeout(inspectionFlushTimer);
+      inspectionFlushTimer = null;
+      while (inspectionRequestPromise || failedInspectionBatch || pendingInspectionIds.size > 0) {
+        const succeeded = await (inspectionRequestPromise || flushInspectionQueue());
+        if (!succeeded) return false;
+      }
+      return true;
     };
 
     const updateCleanControls = (sourceAvailable) => {
@@ -490,15 +722,79 @@
           || !assetId) return null;
       const anatomyToggle = form.querySelector("[data-anatomy-training-toggle]");
       const anatomyIssue = form.querySelector("[data-anatomy-training-issue]");
+      const savedAnatomyIssue = anatomyIssue instanceof HTMLSelectElement
+        ? anatomyIssue.dataset.savedAnatomyIssue || ""
+        : "";
       return {
         anatomyIssue: anatomyIssue instanceof HTMLSelectElement ? anatomyIssue : null,
-        anatomyLabeled: anatomyToggle instanceof HTMLInputElement && anatomyToggle.checked,
+        anatomyLabeled: anatomyToggle instanceof HTMLInputElement
+          && anatomyToggle.checked
+          && Boolean(savedAnatomyIssue)
+          && anatomyIssue.value === savedAnatomyIssue,
         anatomyToggle: anatomyToggle instanceof HTMLInputElement ? anatomyToggle : null,
         assetId,
         alreadyRejected: card.dataset.decision === "reject",
         form,
         rejectButton,
+        savedAnatomyIssue,
       };
+    };
+
+    const defectLabel = (option) => {
+      const label = option?.textContent?.trim();
+      if (!label || option.value === "anatomy") return "Not specified";
+      return label.replace(/\b\w/g, (character) => character.toUpperCase());
+    };
+
+    const selectDefect = (context, value, { focus = false } = {}) => {
+      if (!context?.anatomyIssue) return;
+      const allowed = Array.from(context.anatomyIssue.options).some(
+        (option) => option.value === value,
+      );
+      context.anatomyIssue.value = allowed ? value : "anatomy";
+      context.anatomyIssue.dispatchEvent(new Event("change", { bubbles: true }));
+      const selected = context.anatomyIssue.selectedOptions[0];
+      viewer.defectPickerSummary.textContent = `Defect: ${defectLabel(selected)} (optional)`;
+      Array.from(viewer.defectChips.querySelectorAll("[data-defect-code]")).forEach((chip) => {
+        const isSelected = chip.dataset.defectCode === context.anatomyIssue.value;
+        chip.setAttribute("aria-checked", String(isSelected));
+        chip.tabIndex = isSelected ? 0 : -1;
+        if (focus && isSelected) chip.focus({ preventScroll: true });
+      });
+    };
+
+    const syncDefectPicker = (context) => {
+      const canLabel = Boolean(context?.anatomyToggle && context?.anatomyIssue);
+      viewer.defectPicker.hidden = !canLabel;
+      if (!canLabel) {
+        viewer.defectPicker.open = false;
+        viewer.defectChips.replaceChildren();
+        delete viewer.defectChips.dataset.optionSignature;
+        return;
+      }
+
+      const options = Array.from(context.anatomyIssue.options);
+      const signature = options.map((option) => `${option.value}:${defectLabel(option)}`).join("|");
+      if (viewer.defectChips.dataset.optionSignature !== signature) {
+        viewer.defectChips.replaceChildren();
+        options.forEach((option) => {
+          const chip = createElement("button", "asset-viewer-defect-chip", defectLabel(option));
+          chip.type = "button";
+          chip.dataset.defectCode = option.value;
+          chip.setAttribute("role", "radio");
+          chip.addEventListener("click", () => {
+            const activeContext = rejectionContext(activeCard);
+            selectDefect(activeContext, chip.dataset.defectCode || "anatomy");
+            updateRejectionControls();
+            announce(
+              `${chip.textContent} selected. Press Shift+Delete to reject with this provisional label.`,
+            );
+          });
+          viewer.defectChips.append(chip);
+        });
+        viewer.defectChips.dataset.optionSignature = signature;
+      }
+      selectDefect(context, context.anatomyIssue.value || "anatomy");
     };
 
     const updateRejectionControls = () => {
@@ -507,22 +803,28 @@
       viewer.shortcuts.textContent = context
         ? (
           canTrainAnatomy
-            ? "\u2190/\u2192 Navigate \u00b7 Del Reject \u00b7 Shift+Del Reject + train anatomy \u00b7 Esc Close"
+            ? "\u2190/\u2192 Navigate \u00b7 Del Reject \u00b7 Shift+Del Reject + anatomy \u00b7 A Defect type \u00b7 Esc Close"
             : "\u2190/\u2192 Navigate \u00b7 Del Reject \u00b7 Esc Close"
         )
         : "\u2190/\u2192 Navigate \u00b7 Esc Close";
       viewer.exclusionHelp.hidden = !context;
       viewer.markOut.hidden = !context;
       viewer.anatomyReject.hidden = !context || !canTrainAnatomy;
+      syncDefectPicker(context);
       if (!context) return;
 
-      viewer.markOut.disabled = rejectionBusy || context.alreadyRejected;
+      viewer.markOut.disabled = rejectionBusy
+        || (context.alreadyRejected && !context.anatomyLabeled);
       viewer.markOut.textContent = rejectionBusy
         ? "Saving..."
-        : context.alreadyRejected ? "Rejected" : "Reject";
+        : context.anatomyLabeled
+          ? "Remove anatomy label"
+          : context.alreadyRejected ? "Rejected" : "Reject";
       viewer.markOut.setAttribute(
         "aria-label",
-        context.alreadyRejected
+        context.anatomyLabeled
+          ? `Remove the provisional anatomy label from ${cardRank(activeCard)}; keep it rejected`
+          : context.alreadyRejected
           ? "Already rejected from the final set; raw master retained"
           : `Reject ${cardRank(activeCard)} from the final set; raw master retained`,
       );
@@ -531,20 +833,25 @@
       viewer.anatomyReject.textContent = rejectionBusy
         ? "Saving..."
         : context.anatomyLabeled
-          ? "Anatomy label saved"
+          ? "Provisional anatomy label set"
           : context.alreadyRejected
-            ? "Add anatomy training label"
-            : "Reject + train anatomy";
+            ? context.savedAnatomyIssue
+              ? "Update provisional anatomy label"
+              : "Add provisional anatomy label"
+            : "Reject + anatomy label";
       viewer.anatomyReject.setAttribute(
         "aria-label",
         context.alreadyRejected
-          ? `Label ${cardRank(activeCard)} as an anatomy defect for training`
-          : `Reject ${cardRank(activeCard)} and label it as an anatomy defect for training`,
+          ? `Provisionally label ${cardRank(activeCard)} as an anatomy defect`
+          : `Reject ${cardRank(activeCard)} and provisionally label it as an anatomy defect`,
       );
     };
 
     const closeViewer = () => {
-      if (viewer.dialog.open) viewer.dialog.close();
+      if (!viewer.dialog.open) return;
+      if (activeCard) queueInspection(activeCard);
+      void flushInspectionQueue(true);
+      viewer.dialog.close();
     };
 
     const renderCard = (card) => {
@@ -574,9 +881,15 @@
       window.requestAnimationFrame(resetViewerScroll);
 
       if (details.source) {
+        viewer.image.dataset.inspectionAssetId = activeCard.dataset.assetId || "";
+        viewer.image.dataset.inspectionSource = details.source;
         viewer.image.src = details.source;
         viewer.image.hidden = false;
+        // Cached images may already be complete and do not reliably emit another load event.
+        if (viewer.image.complete && viewer.image.naturalWidth > 0) markViewerImageLoaded();
       } else {
+        delete viewer.image.dataset.inspectionAssetId;
+        delete viewer.image.dataset.inspectionSource;
         viewer.image.removeAttribute("src");
         viewer.image.hidden = true;
         viewer.status.textContent = "This preview is unavailable. Reload the page and try again.";
@@ -620,17 +933,23 @@
       const available = visibleCards();
       if (available.length < 2) return;
       const currentIndex = Math.max(0, available.indexOf(activeCard));
+      queueInspection(activeCard);
       renderCard(available[(currentIndex + offset + available.length) % available.length]);
     };
 
-    const submitRejection = (withAnatomyTraining = false) => {
+    const submitRejection = (
+      withAnatomyTraining = false,
+      { removeAnatomyLabel = false } = {},
+    ) => {
       const context = rejectionContext(activeCard);
       if (!context || rejectionBusy) return false;
       if (withAnatomyTraining && (!context.anatomyToggle || !context.anatomyIssue)) {
         announce("Anatomy training is unavailable for this review. The image was not changed.");
         return false;
       }
-      if (context.alreadyRejected && (!withAnatomyTraining || context.anatomyLabeled)) {
+      if (context.alreadyRejected
+          && ((!withAnatomyTraining && (!context.anatomyLabeled || !removeAnatomyLabel))
+            || (withAnatomyTraining && context.anatomyLabeled))) {
         announce(
           context.anatomyLabeled
             ? "Already rejected and labeled for anatomy learning."
@@ -640,7 +959,9 @@
         return false;
       }
 
+      const previousAnatomyChecked = Boolean(context.anatomyToggle?.checked);
       if (context.anatomyToggle) context.anatomyToggle.checked = withAnatomyTraining;
+      queueInspection(activeCard);
       const available = visibleCards();
       const currentIndex = Math.max(0, available.indexOf(activeCard));
       const nextCard = available.length > 1
@@ -649,11 +970,17 @@
       pendingRejection = {
         anatomyRequested: withAnatomyTraining,
         assetId: context.assetId,
+        removingAnatomyLabel: !withAnatomyTraining
+          && removeAnatomyLabel
+          && context.anatomyLabeled,
         nextAssetId: nextCard?.dataset.assetId || "",
+        previousAnatomyChecked,
       };
       rejectionBusy = true;
-      announcement = withAnatomyTraining
-        ? `Rejecting ${cardRank(activeCard)} and adding an anatomy training label...`
+      announcement = pendingRejection.removingAnatomyLabel
+        ? `Removing the provisional anatomy label from ${cardRank(activeCard)}...`
+        : withAnatomyTraining
+        ? `Rejecting ${cardRank(activeCard)} with a provisional anatomy label...`
         : `Rejecting ${cardRank(activeCard)}...`;
       updateRejectionControls();
       announce(announcement);
@@ -722,6 +1049,7 @@
       const root = event.detail && event.detail.root;
       const activeAssetId = activeCard?.dataset.assetId || "";
       bindCards(root || document);
+      restoreInspectionState();
       applyDensity(storedDensity());
       if (viewer.dialog.open && activeAssetId) {
         const refreshedCard = assetCards().find(
@@ -740,6 +1068,10 @@
       rejectionBusy = false;
 
       if (!detail.success) {
+        const currentContext = rejectionContext(activeCard);
+        if (currentContext?.anatomyToggle) {
+          currentContext.anatomyToggle.checked = settled.previousAnatomyChecked;
+        }
         updateRejectionControls();
         announce(
           detail.reason === "conflict"
@@ -749,8 +1081,10 @@
         return;
       }
 
-      announcement = settled.anatomyRequested
-        ? "Rejected and labeled for anatomy learning; raw master retained."
+      announcement = settled.removingAnatomyLabel
+        ? "Provisional anatomy label removed; the image remains rejected and its raw master is retained."
+        : settled.anatomyRequested
+        ? "Rejected with a provisional anatomy label. Learning waits until review completion; raw master retained."
         : "Rejected from the final set; raw master retained.";
       if (viewer.dialog.open && settled.nextAssetId) {
         const nextCard = assetCards().find(
@@ -773,8 +1107,27 @@
     });
     viewer.previous.addEventListener("click", () => step(-1));
     viewer.next.addEventListener("click", () => step(1));
-    viewer.markOut.addEventListener("click", () => submitRejection(false));
+    viewer.markOut.addEventListener("click", () => submitRejection(false, {
+      removeAnatomyLabel: Boolean(rejectionContext(activeCard)?.anatomyLabeled),
+    }));
     viewer.anatomyReject.addEventListener("click", () => submitRejection(true));
+    viewer.defectChips.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      const chips = Array.from(viewer.defectChips.querySelectorAll("[data-defect-code]"));
+      if (chips.length === 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const currentIndex = Math.max(0, chips.indexOf(event.target));
+      let nextIndex = currentIndex;
+      if (event.key === "Home") nextIndex = 0;
+      if (event.key === "End") nextIndex = chips.length - 1;
+      if (event.key === "ArrowLeft") nextIndex = (currentIndex - 1 + chips.length) % chips.length;
+      if (event.key === "ArrowRight") nextIndex = (currentIndex + 1) % chips.length;
+      const nextChip = chips[nextIndex];
+      const context = rejectionContext(activeCard);
+      selectDefect(context, nextChip.dataset.defectCode || "anatomy", { focus: true });
+      updateRejectionControls();
+    });
     viewer.copyClean.addEventListener("click", () => performCleanAction("copy"));
     viewer.downloadClean.addEventListener("click", () => performCleanAction("download"));
     viewer.select.addEventListener("click", () => {
@@ -819,9 +1172,19 @@
         event.preventDefault();
         step(1);
       } else if (event.key === "Delete") {
-        if (rejectionContext(activeCard)) {
+        const context = rejectionContext(activeCard);
+        if (context) {
           event.preventDefault();
-          submitRejection(event.shiftKey);
+          submitRejection(event.shiftKey, {
+            removeAnatomyLabel: !event.shiftKey && Boolean(context.anatomyLabeled),
+          });
+        }
+      } else if (event.key.toLowerCase() === "a") {
+        const context = rejectionContext(activeCard);
+        if (context?.anatomyIssue) {
+          event.preventDefault();
+          viewer.defectPicker.open = true;
+          selectDefect(context, context.anatomyIssue.value || "anatomy", { focus: true });
         }
       } else if (event.key === "Escape") {
         event.preventDefault();
@@ -829,16 +1192,20 @@
       }
     });
     viewer.dialog.addEventListener("close", () => {
+      if (activeCard) queueInspection(activeCard);
+      void flushInspectionQueue(true);
       document.body.classList.remove("asset-viewer-open");
       if (returnFocus && returnFocus.isConnected) returnFocus.focus();
       returnFocus = null;
       activeCard = null;
     });
     viewer.image.addEventListener("error", () => {
+      clearFailedViewerImage();
       announce(IMAGE_LOAD_ERROR);
     });
     viewer.image.addEventListener("load", () => {
       resetViewerScroll();
+      markViewerImageLoaded();
       if (announcement === IMAGE_LOAD_ERROR) announce("");
     });
     let touchStart = null;
@@ -862,6 +1229,14 @@
     viewer.media.addEventListener("touchcancel", () => {
       touchStart = null;
     }, { passive: true });
+    document.addEventListener("gen-automation:inspection-flush-request", (event) => {
+      const respondWith = event.detail?.respondWith;
+      if (typeof respondWith === "function") respondWith(drainInspectionQueue());
+    });
+    window.addEventListener("pagehide", () => {
+      if (activeCard) queueInspection(activeCard);
+      void flushInspectionQueue(true);
+    });
     updateRejectionControls();
     setViewerMode("fit");
   }

@@ -159,6 +159,7 @@ def test_foundation_migration_round_trip(
         "release_versions",
         "release_selections",
         "releases",
+        "review_asset_inspections",
         "review_decisions",
         "review_tasks",
         "review_x_selections",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
@@ -47,6 +48,20 @@ _INFERRED_NOTES = frozenset(
     }
 )
 _LEARNING_STATUSES = frozenset({"collecting", "calibrating", "improved", "stable", "regressed"})
+
+
+class SemanticFeedbackSource(StrEnum):
+    """Trusted source used to derive the immutable feedback source marker."""
+
+    EXPLICIT = "explicit"
+    INFERRED_REVIEW_ACCEPT = "inferred_review_accept"
+    INFERRED_ANATOMY_REJECT = "inferred_anatomy_reject"
+
+
+_INFERRED_NOTE_BY_SOURCE = {
+    SemanticFeedbackSource.INFERRED_REVIEW_ACCEPT: SEMANTIC_INFERRED_REVIEW_ACCEPT_NOTE,
+    SemanticFeedbackSource.INFERRED_ANATOMY_REJECT: SEMANTIC_INFERRED_ANATOMY_REJECT_NOTE,
+}
 
 
 class SemanticFeedbackError(Exception):
@@ -385,13 +400,15 @@ async def record_semantic_anatomy_feedback(
     agreement: SemanticFeedbackAgreement | None = None,
     issue_code: SemanticIssueCode | None = None,
     note: str | None = None,
+    source: SemanticFeedbackSource = SemanticFeedbackSource.EXPLICIT,
     now: datetime | None = None,
 ) -> SemanticAnatomyFeedbackResult:
     """Record one immutable, idempotent owner label for an exact assessment."""
 
     normalized_truth = _ground_truth(ground_truth)
     normalized_issue = _issue_code(issue_code)
-    normalized_note = _note(note)
+    normalized_source = _normalize_feedback_source(source)
+    normalized_note = _feedback_note(note, source=normalized_source)
     assessment = await session.get(SemanticAssessment, assessment_id)
     if assessment is None:
         raise SemanticFeedbackNotFoundError("semantic assessment does not exist")
@@ -1319,6 +1336,28 @@ def _note(value: str | None) -> str | None:
     if len(normalized) > 2_000:
         raise SemanticFeedbackValidationError("feedback note exceeds 2000 characters")
     return normalized
+
+
+def _normalize_feedback_source(value: SemanticFeedbackSource) -> SemanticFeedbackSource:
+    try:
+        return SemanticFeedbackSource(value)
+    except ValueError as exc:
+        raise SemanticFeedbackValidationError("invalid semantic feedback source") from exc
+
+
+def _feedback_note(value: str | None, *, source: SemanticFeedbackSource) -> str | None:
+    if source == SemanticFeedbackSource.EXPLICIT:
+        normalized = _note(value)
+        if normalized is not None and normalized.casefold().startswith("system:"):
+            raise SemanticFeedbackValidationError(
+                "feedback notes beginning with 'system:' are reserved"
+            )
+        return normalized
+    if value is not None:
+        raise SemanticFeedbackValidationError(
+            "system-inferred feedback cannot include a caller-provided note"
+        )
+    return _INFERRED_NOTE_BY_SOURCE[source]
 
 
 def _sha256(value: str, *, label: str) -> str:

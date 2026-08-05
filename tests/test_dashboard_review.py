@@ -31,6 +31,7 @@ from tests.test_review_api import (
     ORIGIN,
     ReviewApiContext,
     _login,
+    _review_inspection_state,
     _seed_review_api,
     _settings,
 )
@@ -598,6 +599,98 @@ def test_browser_review_forms_are_bounded_same_origin_and_cookie_csrf_bound(
         row.decided_by_user_id == context.users[AdminRole.REVIEWER].id
         for row in default_decisions
     )
+
+
+def test_browser_review_inspections_require_csrf_and_union_retried_batches(
+    tmp_path: Path,
+) -> None:
+    context = asyncio.run(_seed_review_api(_settings(tmp_path / "browser-inspections.db")))
+    task_id = asyncio.run(_create_task(context))
+    app = create_app(context.settings)
+    action = f"{ORIGIN}/dashboard/review-tasks/{task_id}/inspections"
+
+    with TestClient(
+        app,
+        base_url=ORIGIN,
+        client=("192.0.2.92", 50000),
+    ) as client:
+        app.state.object_store = SameOriginReviewStore()
+        csrf = _login(client, context.settings, context.users[AdminRole.OWNER])
+        detail = client.get(f"/dashboard/review-tasks/{task_id}")
+        assert detail.status_code == 200
+        form = _one_form(detail.text, action)
+        assert form.fields["csrf_token"] == csrf
+        assert _FORM_KEY.fullmatch(form.fields["idempotency_key"])
+
+        def body(asset_ids: tuple[UUID, ...], *, token: str | None = None) -> str:
+            return urlencode(
+                [
+                    ("csrf_token", form.fields["csrf_token"]),
+                    ("idempotency_key", token or form.fields["idempotency_key"]),
+                    *(("asset_id", str(asset_id)) for asset_id in asset_ids),
+                ]
+            )
+
+        form_headers = {
+            **_FORM_HEADERS,
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        missing_origin = client.post(
+            action,
+            content=body((context.asset_ids[0],)),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        wrong_csrf = client.post(
+            action,
+            content=body((context.asset_ids[0],)).replace(csrf, "wrong-hidden-token"),
+            headers={**form_headers, "X-CSRF-Token": csrf},
+        )
+        invalid_token = client.post(
+            action,
+            content=body((context.asset_ids[0],), token=f"web-review-{'0' * 64}"),
+            headers=form_headers,
+        )
+        duplicate_asset = client.post(
+            action,
+            content=body((context.asset_ids[0], context.asset_ids[0])),
+            headers=form_headers,
+        )
+        first = client.post(
+            action,
+            content=body((context.asset_ids[0],)),
+            headers=form_headers,
+        )
+        overlap = client.post(
+            action,
+            content=body(context.asset_ids),
+            headers=form_headers,
+        )
+        repeated = client.post(
+            action,
+            content=body(context.asset_ids),
+            headers=form_headers,
+        )
+
+    assert missing_origin.status_code == 403
+    assert wrong_csrf.status_code == 403
+    assert invalid_token.status_code == 400
+    assert duplicate_asset.status_code == 400
+    assert first.status_code == 200
+    assert first.json() == {
+        "ok": True,
+        "inspected_asset_ids": [str(context.asset_ids[0])],
+        "created_count": 1,
+    }
+    assert overlap.status_code == 200
+    assert overlap.json()["created_count"] == 1
+    assert repeated.status_code == 200
+    assert repeated.json()["created_count"] == 0
+    lock_version, count, inspected_ids = asyncio.run(
+        _review_inspection_state(context.settings, task_id=task_id)
+    )
+    assert lock_version == 1
+    assert count == 2
+    assert set(inspected_ids) == set(context.asset_ids)
 
 
 def test_review_detail_reads_its_exact_run_after_release_advances(

@@ -111,7 +111,6 @@ from gen_automation.services.semantic_anatomy import (
 )
 from gen_automation.services.semantic_review_reconciliation import (
     reconcile_one_completed_semantic_review,
-    reconcile_one_open_anatomy_reject,
 )
 from gen_automation.services.worker_inputs import SaladWorkerJobInputProvider
 from gen_automation.storage.base import ObjectStore
@@ -1179,13 +1178,6 @@ class ControllerWorkloads:
                     model_name=self.settings.semantic_anatomy_model,
                     model_revision=revision,
                 ).profile_sha256
-                open_reconciliation = await reconcile_one_open_anatomy_reject(
-                    session,
-                    profile_sha256=profile_sha256,
-                    baseline_threshold_micros=(
-                        self.settings.semantic_anatomy_severe_confidence_micros
-                    ),
-                )
                 reconciliation = await reconcile_one_completed_semantic_review(
                     session,
                     profile_sha256=profile_sha256,
@@ -1194,7 +1186,7 @@ class ControllerWorkloads:
                     ),
                 )
                 await session.commit()
-                reconciled = open_reconciliation.did_work or reconciliation.did_work
+                reconciled = reconciliation.did_work
         except Exception as error:
             logger.exception(
                 "semantic_review_learning_reconciliation_failed",

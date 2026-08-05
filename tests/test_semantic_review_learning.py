@@ -59,6 +59,7 @@ def _choice(
     decision: ReviewDecisionValue,
     reason_code: str | None = None,
     severe_override: bool = False,
+    inspected: bool = False,
 ) -> SemanticReviewChoice:
     return SemanticReviewChoice(
         asset_id=identity.asset_id,
@@ -66,6 +67,7 @@ def _choice(
         reason_code=reason_code,
         decided_by_user_id=owner_user_id,
         semantic_severe_override_attested=severe_override,
+        inspected=inspected,
     )
 
 
@@ -84,7 +86,50 @@ def _capture_refresh(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]
 
 
 @pytest.mark.asyncio
-async def test_final_owner_accept_is_inferred_as_anatomy_good(
+async def test_final_inspected_owner_accept_is_inferred_as_anatomy_good(
+    feedback_context: FeedbackContext,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = await _assessment_identity(feedback_context)
+    owner_id = feedback_context.owner_ids[0]
+    refresh_calls = _capture_refresh(monkeypatch)
+
+    async with feedback_context.database.sessions() as session:
+        result = await learn_semantic_anatomy_from_final_review(
+            session,
+            scoring_run_id=identity.scoring_run_id,
+            profile_sha256=identity.profile_sha256,
+            owner_user_id=owner_id,
+            choices=(
+                _choice(
+                    identity,
+                    owner_user_id=owner_id,
+                    decision=ReviewDecisionValue.ACCEPT,
+                    inspected=True,
+                ),
+            ),
+            now=_NOW,
+        )
+        feedback = await session.scalar(
+            select(SemanticAnatomyFeedback).where(
+                SemanticAnatomyFeedback.semantic_assessment_id == identity.assessment_id,
+                SemanticAnatomyFeedback.feedback_by_user_id == owner_id,
+            )
+        )
+
+    assert result.inferred_good_count == 1
+    assert result.inferred_defect_count == 0
+    assert result.skipped_existing_count == 0
+    assert result.skipped_unsafe_count == 0
+    assert feedback is not None
+    assert feedback.ground_truth == SemanticGroundTruth.ANATOMY_GOOD
+    assert feedback.issue_code is None
+    assert feedback.note == SEMANTIC_INFERRED_REVIEW_ACCEPT_NOTE
+    assert len(refresh_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_uninspected_manual_accept_is_not_an_anatomy_positive(
     feedback_context: FeedbackContext,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -107,22 +152,45 @@ async def test_final_owner_accept_is_inferred_as_anatomy_good(
             ),
             now=_NOW,
         )
-        feedback = await session.scalar(
-            select(SemanticAnatomyFeedback).where(
-                SemanticAnatomyFeedback.semantic_assessment_id == identity.assessment_id,
-                SemanticAnatomyFeedback.feedback_by_user_id == owner_id,
-            )
+
+    assert result.inferred_count == 0
+    assert result.skipped_unsafe_count == 1
+    assert refresh_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("inspected", "expected_good"), ((False, 0), (True, 1)))
+async def test_default_accept_requires_fullscreen_inspection_for_positive_label(
+    feedback_context: FeedbackContext,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    inspected: bool,
+    expected_good: int,
+) -> None:
+    identity = await _assessment_identity(feedback_context)
+    owner_id = feedback_context.owner_ids[0]
+    refresh_calls = _capture_refresh(monkeypatch)
+
+    async with feedback_context.database.sessions() as session:
+        result = await learn_semantic_anatomy_from_final_review(
+            session,
+            scoring_run_id=identity.scoring_run_id,
+            profile_sha256=identity.profile_sha256,
+            owner_user_id=owner_id,
+            choices=(
+                _choice(
+                    identity,
+                    owner_user_id=owner_id,
+                    decision=ReviewDecisionValue.ACCEPT,
+                    reason_code="sorting_default_accept",
+                    inspected=inspected,
+                ),
+            ),
+            now=_NOW,
         )
 
-    assert result.inferred_good_count == 1
-    assert result.inferred_defect_count == 0
-    assert result.skipped_existing_count == 0
-    assert result.skipped_unsafe_count == 0
-    assert feedback is not None
-    assert feedback.ground_truth == SemanticGroundTruth.ANATOMY_GOOD
-    assert feedback.issue_code is None
-    assert feedback.note == SEMANTIC_INFERRED_REVIEW_ACCEPT_NOTE
-    assert len(refresh_calls) == 1
+    assert result.inferred_good_count == expected_good
+    assert result.skipped_unsafe_count == 1 - expected_good
+    assert len(refresh_calls) == expected_good
 
 
 @pytest.mark.asyncio
@@ -242,6 +310,7 @@ async def test_severe_override_accept_is_ignored(
                     decision=ReviewDecisionValue.ACCEPT,
                     reason_code="semantic_severe_override",
                     severe_override=True,
+                    inspected=True,
                 ),
             ),
             now=_NOW,
@@ -273,6 +342,7 @@ async def test_non_owner_decision_is_ignored(
                     identity,
                     owner_user_id=other_actor_id,
                     decision=ReviewDecisionValue.ACCEPT,
+                    inspected=True,
                 ),
             ),
             now=_NOW,
@@ -341,6 +411,7 @@ async def test_repeated_learning_is_idempotent_and_refreshes_only_after_new_labe
         identity,
         owner_user_id=owner_id,
         decision=ReviewDecisionValue.ACCEPT,
+        inspected=True,
     )
 
     async with feedback_context.database.sessions() as session:

@@ -37,6 +37,8 @@ from gen_automation.services.semantic_anatomy import (
 )
 from gen_automation.services.semantic_feedback import (
     SEMANTIC_CALIBRATION_SCHEMA_VERSION,
+    SEMANTIC_INFERRED_ANATOMY_REJECT_NOTE,
+    SEMANTIC_INFERRED_REVIEW_ACCEPT_NOTE,
     SemanticFeedbackConflictError,
     SemanticFeedbackValidationError,
     agreement_for_ground_truth,
@@ -268,6 +270,27 @@ def test_agreement_is_derived_from_assessment_and_owner_ground_truth() -> None:
         )
         == SemanticFeedbackAgreement.UNSURE
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reserved_note",
+    (SEMANTIC_INFERRED_REVIEW_ACCEPT_NOTE, SEMANTIC_INFERRED_ANATOMY_REJECT_NOTE),
+)
+async def test_explicit_feedback_cannot_spoof_reserved_system_source_notes(
+    feedback_context: FeedbackContext,
+    reserved_note: str,
+) -> None:
+    async with feedback_context.database.sessions() as session:
+        with pytest.raises(SemanticFeedbackValidationError, match="reserved"):
+            await record_semantic_anatomy_feedback(
+                session,
+                assessment_id=feedback_context.assessment_id,
+                user_id=feedback_context.owner_ids[0],
+                ground_truth=SemanticGroundTruth.ANATOMY_GOOD,
+                note=f"  {reserved_note}  ",
+                now=_NOW + timedelta(minutes=1),
+            )
 
 
 @pytest.mark.asyncio

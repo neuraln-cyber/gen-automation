@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.db.models import ReviewTask, SemanticAssessment
+from gen_automation.domain.enums import ReviewTaskState
 
 
 async def semantic_feedback_target_belongs_to_review(
@@ -15,7 +16,7 @@ async def semantic_feedback_target_belongs_to_review(
     assessment_id: UUID,
     profile_sha256: str,
 ) -> bool:
-    """Return whether the exact configured assessment belongs to this review snapshot."""
+    """Return whether the assessment belongs to an already completed review snapshot."""
 
     found = await session.scalar(
         select(SemanticAssessment.id)
@@ -25,6 +26,7 @@ async def semantic_feedback_target_belongs_to_review(
         )
         .where(
             ReviewTask.id == review_task_id,
+            ReviewTask.state == ReviewTaskState.COMPLETED,
             SemanticAssessment.id == assessment_id,
             SemanticAssessment.profile_sha256 == profile_sha256,
         )

@@ -17,6 +17,7 @@ from gen_automation.api.browser_review_forms import (
     read_bulk_action_form,
     read_create_form,
     read_decision_form,
+    read_inspection_form,
     read_transition_form,
     read_x_selection_form,
     review_form_idempotency_key,
@@ -82,6 +83,10 @@ from gen_automation.services.review import (
     set_review_x_selection,
     transition_review_task,
 )
+from gen_automation.services.review_inspections import (
+    load_review_inspected_asset_ids,
+    record_review_inspections,
+)
 from gen_automation.services.semantic_anatomy import (
     SemanticAssessmentProfile,
     SemanticReviewAssessment,
@@ -117,6 +122,7 @@ class ReviewAssetView:
     semantic_feedback: SemanticAnatomyFeedbackResult | None
     semantic_flagged: bool
     ai_excluded: bool
+    inspected: bool
     idempotency_key: str | None
     x_selection_idempotency_key: str | None
 
@@ -512,6 +518,11 @@ async def dashboard_review_task(
             profile_sha256=semantic_profile,
         )
         semantic_feedback: dict[UUID, SemanticAnatomyFeedbackResult] = {}
+        inspected_asset_ids = await load_review_inspected_asset_ids(
+            session,
+            review_task_id=review_task_id,
+            inspected_by_user_id=principal.user_id,
+        )
         semantic_calibration: SemanticCalibrationArtifactResult | None = (
             active_semantic_calibration if principal.role == AdminRole.OWNER else None
         )
@@ -571,6 +582,7 @@ async def dashboard_review_task(
             masters=release.assets,
             semantic_assessments=semantic_assessments,
             semantic_feedback=semantic_feedback,
+            inspected_asset_ids=inspected_asset_ids,
             semantic_mode=semantic_mode,
             severe_confidence_micros=semantic_threshold,
         )
@@ -585,6 +597,7 @@ async def dashboard_review_task(
     complete_idempotency_key = None
     cancel_idempotency_key = None
     bulk_action_idempotency_key = None
+    inspection_idempotency_key = None
     if summary.state == ReviewTaskState.OPEN:
         complete_idempotency_key = review_form_idempotency_key(
             settings,
@@ -603,6 +616,12 @@ async def dashboard_review_task(
             session_id=principal.session_id,
             action="bulk-action",
             parts=(str(review_task_id), str(summary.lock_version)),
+        )
+        inspection_idempotency_key = review_form_idempotency_key(
+            settings,
+            session_id=principal.session_id,
+            action="inspection-token",
+            parts=(str(review_task_id),),
         )
     return _secure_response(
         request,
@@ -629,6 +648,13 @@ async def dashboard_review_task(
                 "complete_idempotency_key": complete_idempotency_key,
                 "cancel_idempotency_key": cancel_idempotency_key,
                 "bulk_action_idempotency_key": bulk_action_idempotency_key,
+                "inspection_idempotency_key": inspection_idempotency_key,
+                "inspection_endpoint": str(
+                    request.url_for(
+                        "dashboard_review_inspections",
+                        review_task_id=review_task_id,
+                    )
+                ),
                 "can_complete": (
                     summary.state == ReviewTaskState.OPEN
                     and 1 <= summary.accepted_count <= summary.desired_accepted_count
@@ -706,6 +732,98 @@ async def dashboard_review_decision(
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         return _service_error_response(request, principal, error)
     return _review_redirect(request, review_task_id)
+
+
+@router.post(
+    "/review-tasks/{review_task_id}/inspections",
+    response_class=JSONResponse,
+    response_model=None,
+    name="dashboard_review_inspections",
+)
+async def dashboard_review_inspections(
+    review_task_id: UUID,
+    request: Request,
+    session: Session,
+    principal: ReviewReader,
+) -> Response:
+    try:
+        require_same_origin(request)
+    except HTTPException:
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"ok": False, "detail": "request verification failed"},
+            ),
+        )
+    try:
+        form = await read_inspection_form(request)
+    except BrowserReviewFormError as error:
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=error.status_code,
+                content={"ok": False, "detail": "inspection form is invalid"},
+            ),
+        )
+    if not _valid_form_csrf(request, principal, form.csrf_token):
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"ok": False, "detail": "request verification failed"},
+            ),
+        )
+    settings: Settings = request.app.state.settings
+    expected_key = review_form_idempotency_key(
+        settings,
+        session_id=principal.session_id,
+        action="inspection-token",
+        parts=(str(review_task_id),),
+    )
+    if not form_key_matches(form.idempotency_key, expected_key):
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"ok": False, "detail": "inspection token is invalid"},
+            ),
+        )
+    try:
+        result = await record_review_inspections(
+            session,
+            review_task_id=review_task_id,
+            asset_ids=form.asset_ids,
+            inspected_by_user_id=principal.user_id,
+        )
+    except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
+        await session.rollback()
+        status_code = (
+            status.HTTP_404_NOT_FOUND
+            if isinstance(error, ReviewNotFoundError)
+            else status.HTTP_409_CONFLICT
+            if isinstance(error, ReviewConflictError)
+            else status.HTTP_422_UNPROCESSABLE_CONTENT
+        )
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status_code,
+                content={"ok": False, "detail": str(error)},
+            ),
+        )
+    return _secure_response(
+        request,
+        JSONResponse(
+            content={
+                "ok": True,
+                "inspected_asset_ids": [
+                    str(asset_id) for asset_id in result.inspected_asset_ids
+                ],
+                "created_count": result.created_count,
+            }
+        ),
+    )
 
 
 @router.post(
@@ -998,6 +1116,7 @@ def _review_assets(
     masters: tuple[RankedMaster, ...],
     semantic_assessments: Mapping[UUID, SemanticReviewAssessment],
     semantic_feedback: Mapping[UUID, SemanticAnatomyFeedbackResult],
+    inspected_asset_ids: frozenset[UUID],
     semantic_mode: str,
     severe_confidence_micros: int,
 ) -> ReviewAssetGroups:
@@ -1029,6 +1148,7 @@ def _review_assets(
             ai_excluded=(
                 semantic_mode == SemanticEnforcementMode.ENFORCE.value and is_flagged(master)
             ),
+            inspected=master.asset_id in inspected_asset_ids,
             idempotency_key=(
                 review_form_idempotency_key(
                     settings,

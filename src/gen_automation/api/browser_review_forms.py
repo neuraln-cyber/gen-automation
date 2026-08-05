@@ -64,6 +64,7 @@ ANATOMY_FEEDBACK_FIELDS = frozenset(
         "note",
     }
 )
+INSPECTION_FIELDS = frozenset({"csrf_token", "idempotency_key", "asset_id"})
 
 
 class BrowserReviewFormError(ValueError):
@@ -119,6 +120,13 @@ class AnatomyFeedbackForm:
     ground_truth: SemanticGroundTruth
     issue_code: SemanticIssueCode | None
     note: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class InspectionForm:
+    csrf_token: str
+    idempotency_key: str
+    asset_ids: tuple[UUID, ...]
 
 
 async def read_create_form(request: Request) -> tuple[str, str]:
@@ -247,6 +255,34 @@ async def read_anatomy_feedback_form(request: Request) -> AnatomyFeedbackForm:
         ground_truth=ground_truth,
         issue_code=issue_code,
         note=note,
+    )
+
+
+async def read_inspection_form(request: Request) -> InspectionForm:
+    parsed = await _read_form_values(
+        request,
+        max_num_fields=len(INSPECTION_FIELDS) + _MAX_BULK_ASSET_COUNT - 1,
+    )
+    if set(parsed) != INSPECTION_FIELDS:
+        raise _bad_request()
+    if len(parsed["csrf_token"]) != 1 or len(parsed["idempotency_key"]) != 1:
+        raise _bad_request()
+    raw_asset_ids = parsed["asset_id"]
+    if not 1 <= len(raw_asset_ids) <= _MAX_BULK_ASSET_COUNT:
+        raise _bad_request()
+    try:
+        asset_ids = tuple(UUID(value) for value in raw_asset_ids)
+    except ValueError:
+        raise _bad_request() from None
+    if any(
+        str(asset_id) != value.lower()
+        for asset_id, value in zip(asset_ids, raw_asset_ids, strict=True)
+    ) or len(set(asset_ids)) != len(asset_ids):
+        raise _bad_request()
+    return InspectionForm(
+        csrf_token=_bounded_nonempty(parsed["csrf_token"][0], maximum=200),
+        idempotency_key=_idempotency_key(parsed["idempotency_key"][0]),
+        asset_ids=asset_ids,
     )
 
 

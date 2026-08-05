@@ -20,6 +20,7 @@ from gen_automation.db.models import (
     Release,
     ReleaseSelection,
     ReleaseVersion,
+    ReviewAssetInspection,
     ReviewDecision,
     ReviewTask,
     ReviewXSelection,
@@ -42,6 +43,7 @@ from gen_automation.domain.enums import (
     ScoringRunState,
     SemanticAssessmentState,
     SemanticEnforcementMode,
+    SemanticGroundTruth,
     SemanticVerdict,
 )
 from gen_automation.semantic import prompt_sha256, schema_sha256
@@ -59,6 +61,7 @@ from gen_automation.services.review import (
     get_review_summary,
     transition_review_task,
 )
+from gen_automation.services.review_inspections import record_review_inspections
 from gen_automation.services.semantic_anatomy import SemanticAssessmentProfile
 from gen_automation.services.semantic_review_reconciliation import (
     reconcile_one_completed_semantic_review,
@@ -389,6 +392,97 @@ async def _seed_terminal_semantic_assessments(
 
 
 @pytest.mark.asyncio
+async def test_review_inspections_union_batches_without_changing_task_lock(
+    review_context: ReviewContext,
+) -> None:
+    task = await _create_task(review_context, key="create-inspection-review")
+    first_two = review_context.ranked_asset_ids[:2]
+    async with review_context.database.sessions() as session:
+        first = await record_review_inspections(
+            session,
+            review_task_id=task.task_id,
+            asset_ids=first_two,
+            inspected_by_user_id=review_context.reviewer_id,
+            now=NOW + timedelta(minutes=3),
+        )
+    assert first.inspected_asset_ids == first_two
+    assert first.created_count == 2
+
+    overlap = review_context.ranked_asset_ids[1:]
+    async with review_context.database.sessions() as session:
+        second = await record_review_inspections(
+            session,
+            review_task_id=task.task_id,
+            asset_ids=overlap,
+            inspected_by_user_id=review_context.reviewer_id,
+            now=NOW + timedelta(minutes=4),
+        )
+        stored = set(
+            await session.scalars(
+                select(ReviewAssetInspection.asset_id).where(
+                    ReviewAssetInspection.review_task_id == task.task_id,
+                    ReviewAssetInspection.inspected_by_user_id
+                    == review_context.reviewer_id,
+                )
+            )
+        )
+        persisted_task = await session.get(ReviewTask, task.task_id)
+
+    assert second.inspected_asset_ids == overlap
+    assert second.created_count == 1
+    assert stored == set(review_context.ranked_asset_ids)
+    assert persisted_task is not None and persisted_task.lock_version == 1
+
+    async with review_context.database.sessions() as session:
+        replay = await record_review_inspections(
+            session,
+            review_task_id=task.task_id,
+            asset_ids=overlap,
+            inspected_by_user_id=review_context.reviewer_id,
+            now=NOW + timedelta(minutes=5),
+        )
+    assert replay.created_count == 0
+
+
+@pytest.mark.asyncio
+async def test_review_inspections_reject_nonmembers_and_terminal_tasks(
+    review_context: ReviewContext,
+) -> None:
+    task = await _create_task(review_context, key="create-bounded-inspection-review")
+    async with review_context.database.sessions() as session:
+        with pytest.raises(ReviewConflictError, match="not part of the review ranking"):
+            await record_review_inspections(
+                session,
+                review_task_id=task.task_id,
+                asset_ids=(review_context.unranked_asset_id,),
+                inspected_by_user_id=review_context.reviewer_id,
+                now=NOW + timedelta(minutes=3),
+            )
+        await session.rollback()
+
+    async with review_context.database.sessions() as session:
+        await transition_review_task(
+            session,
+            review_task_id=task.task_id,
+            target_state=ReviewTaskState.CANCELLED,
+            changed_by_user_id=review_context.reviewer_id,
+            expected_lock_version=1,
+            idempotency_key="cancel-inspection-review",
+            now=NOW + timedelta(minutes=4),
+        )
+
+    async with review_context.database.sessions() as session:
+        with pytest.raises(ReviewConflictError, match="review task is not open"):
+            await record_review_inspections(
+                session,
+                review_task_id=task.task_id,
+                asset_ids=(review_context.ranked_asset_ids[0],),
+                inspected_by_user_id=review_context.reviewer_id,
+                now=NOW + timedelta(minutes=5),
+            )
+
+
+@pytest.mark.asyncio
 async def test_create_task_snapshots_frozen_run_and_naturally_replays(
     review_context: ReviewContext,
 ) -> None:
@@ -678,6 +772,66 @@ async def test_untouched_default_accepts_never_become_anatomy_good_training_labe
     assert feedback_count == 0
     assert not reconciled.did_work
     assert reconciled.review_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_inspected_default_accepts_become_positive_labels_on_completion(
+    review_context: ReviewContext,
+) -> None:
+    profile = SemanticAssessmentProfile(
+        model_name="Qwen/Qwen3-VL-8B-Instruct",
+        model_revision="inspected-default-kept-learning",
+    )
+    async with review_context.database.sessions() as session:
+        release = await session.get(Release, review_context.release_id)
+        assert release is not None
+        release.desired_accepted_count = len(review_context.ranked_asset_ids)
+        await session.commit()
+    async with review_context.database.sessions() as session:
+        task = await create_review_task(
+            session,
+            scoring_run_id=review_context.scoring_run_id,
+            created_by_user_id=review_context.owner_id,
+            idempotency_key="create-inspected-default-kept-learning",
+            default_accept_ranked_assets=True,
+            now=NOW + timedelta(minutes=2),
+        )
+    await _seed_terminal_semantic_assessments(review_context, profile=profile)
+    async with review_context.database.sessions() as session:
+        await record_review_inspections(
+            session,
+            review_task_id=task.task_id,
+            asset_ids=review_context.ranked_asset_ids,
+            inspected_by_user_id=review_context.owner_id,
+            now=NOW + timedelta(minutes=3),
+        )
+    async with review_context.database.sessions() as session:
+        completed = await transition_review_task(
+            session,
+            review_task_id=task.task_id,
+            target_state=ReviewTaskState.COMPLETED,
+            changed_by_user_id=review_context.owner_id,
+            expected_lock_version=1,
+            idempotency_key="complete-inspected-default-kept-learning",
+            semantic_profile_sha256=profile.profile_sha256,
+            semantic_enforcement_mode=SemanticEnforcementMode.SHADOW,
+            now=NOW + timedelta(minutes=4),
+        )
+
+    assert completed.state == ReviewTaskState.COMPLETED
+    async with review_context.database.sessions() as session:
+        feedback = list(
+            (
+                await session.scalars(
+                    select(SemanticAnatomyFeedback).where(
+                        SemanticAnatomyFeedback.feedback_by_user_id
+                        == review_context.owner_id
+                    )
+                )
+            ).all()
+        )
+    assert len(feedback) == 2
+    assert all(item.ground_truth == SemanticGroundTruth.ANATOMY_GOOD for item in feedback)
 
 
 @pytest.mark.asyncio

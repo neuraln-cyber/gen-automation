@@ -250,6 +250,40 @@ def test_owner_can_record_anatomy_feedback_for_completed_review_through_api(
     }
 
 
+def test_open_review_cannot_create_immutable_anatomy_feedback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = asyncio.run(_seed_review_api(_settings(tmp_path / "anatomy-feedback-open.db")))
+    task_id = asyncio.run(_create_task(context))
+    assessment_id = asyncio.run(_add_completed_assessment(context))
+    monkeypatch.setattr(
+        review_routes,
+        "_semantic_gate_configuration",
+        lambda _request: (_TEST_SEMANTIC_PROFILE, 900_000, SemanticEnforcementMode.SHADOW),
+    )
+
+    app = create_app(context.settings)
+    with TestClient(app, base_url=ORIGIN, client=("192.0.2.116", 50000)) as client:
+        csrf = _login(
+            client,
+            context.users[AdminRole.OWNER],
+            csrf_cookie_name=context.settings.auth_csrf_cookie_name,
+        )
+        response = client.post(
+            f"/api/v1/review-tasks/{task_id}/anatomy-feedback",
+            json={
+                "assessment_id": str(assessment_id),
+                "ground_truth": "anatomy_defect",
+                "issue_code": None,
+                "note": None,
+            },
+            headers={**_FORM_HEADERS, "X-CSRF-Token": csrf},
+        )
+
+    assert response.status_code == 404
+
+
 @pytest.mark.parametrize(
     ("terminal_state", "expected_form_count"),
     (
@@ -425,8 +459,9 @@ def test_anatomy_feedback_template_is_quick_responsive_and_explicit() -> None:
     assert "data-anatomy-training-control" in template
     assert "data-anatomy-training-toggle" in template
     assert "data-anatomy-training-issue" in template
-    assert "Use rejection for anatomy training" in template
-    assert "Only enable this when anatomy is the reason the image is rejected" in template
+    assert "Mark as anatomy defect (provisional)" in template
+    assert "Only enable when anatomy caused the rejection" in template
+    assert "Learning waits until review completion" in template
     assert 'value="anatomy_good"' in template
     assert 'value="anatomy_defect"' in template
     assert 'value="unjudgeable"' in template
@@ -562,7 +597,7 @@ def test_open_review_page_renders_prediction_and_integrated_anatomy_rejection(
     assert page.text.count("data-anatomy-training-control") == len(context.asset_ids)
     assert page.text.count("data-anatomy-training-toggle") == len(context.asset_ids)
     assert page.text.count("data-anatomy-training-issue") == len(context.asset_ids)
-    assert "Use rejection for anatomy training" in page.text
+    assert "Mark as anatomy defect (provisional)" in page.text
     assert "Plain rejection only removes an image from the final set" in page.text
     assert str(second_assessment_id) in page.text
     assert 'data-anatomy-learning-status="collecting"' in page.text

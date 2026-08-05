@@ -18,9 +18,8 @@ from gen_automation.domain.enums import (
     SemanticIssueCode,
 )
 from gen_automation.services.semantic_feedback import (
-    SEMANTIC_INFERRED_ANATOMY_REJECT_NOTE,
-    SEMANTIC_INFERRED_REVIEW_ACCEPT_NOTE,
     SemanticCalibrationArtifactResult,
+    SemanticFeedbackSource,
     record_semantic_anatomy_feedback,
     refresh_semantic_calibration_artifact,
 )
@@ -29,7 +28,6 @@ GENERIC_ANATOMY_REASON_CODES = frozenset({"anatomy", "anatomy_defect", "bad_anat
 ANATOMY_REASON_CODES = GENERIC_ANATOMY_REASON_CODES | frozenset(
     issue.value for issue in SemanticIssueCode
 )
-AUTOMATIC_ACCEPT_REASON_CODES = frozenset({"sorting_default_accept"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +39,7 @@ class SemanticReviewChoice:
     reason_code: str | None
     decided_by_user_id: UUID | None
     semantic_severe_override_attested: bool
+    inspected: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,14 +121,14 @@ async def learn_semantic_anatomy_from_final_review(
         if label is None:
             skipped_unsafe += 1
             continue
-        ground_truth, issue_code, note = label
+        ground_truth, issue_code, source = label
         result = await record_semantic_anatomy_feedback(
             session,
             assessment_id=assessment.id,
             user_id=owner_user_id,
             ground_truth=ground_truth,
             issue_code=issue_code,
-            note=note,
+            source=source,
             now=learned_at,
         )
         if not result.created:
@@ -161,15 +160,15 @@ async def learn_semantic_anatomy_from_final_review(
 
 def _inferred_label(
     choice: SemanticReviewChoice,
-) -> tuple[SemanticGroundTruth, SemanticIssueCode | None, str] | None:
+) -> tuple[SemanticGroundTruth, SemanticIssueCode | None, SemanticFeedbackSource] | None:
     if choice.decision == ReviewDecisionValue.ACCEPT:
-        normalized_reason = (choice.reason_code or "").strip().lower()
-        if (
-            choice.semantic_severe_override_attested
-            or normalized_reason in AUTOMATIC_ACCEPT_REASON_CODES
-        ):
+        if choice.semantic_severe_override_attested or not choice.inspected:
             return None
-        return SemanticGroundTruth.ANATOMY_GOOD, None, SEMANTIC_INFERRED_REVIEW_ACCEPT_NOTE
+        return (
+            SemanticGroundTruth.ANATOMY_GOOD,
+            None,
+            SemanticFeedbackSource.INFERRED_REVIEW_ACCEPT,
+        )
     normalized_reason = (choice.reason_code or "").strip().lower()
     if (
         choice.decision != ReviewDecisionValue.REJECT
@@ -184,7 +183,7 @@ def _inferred_label(
     return (
         SemanticGroundTruth.ANATOMY_DEFECT,
         issue_code,
-        SEMANTIC_INFERRED_ANATOMY_REJECT_NOTE,
+        SemanticFeedbackSource.INFERRED_ANATOMY_REJECT,
     )
 
 
