@@ -161,8 +161,12 @@ def test_migration_environment_is_private_separate_and_tls_verified() -> None:
     assert "may define only GEN_AUTOMATION_DATABASE_URL" in validator
     assert "migration and runtime database URLs must be distinct" in validator
     assert "migration and runtime database usernames must be distinct" in validator
+    assert "urlsplit" in validator
+    assert "parse_qs" in validator
+    assert 'python3 - "$migration_env" "$runtime_env"' in validator
     assert "sslmode=verify-full" in validator
-    assert "sslrootcert=/run/gen-automation/rds-global-bundle.pem" in validator
+    assert 'query.get("sslrootcert")' in validator
+    assert "/run/gen-automation/rds-global-bundle.pem" in validator
     assert "gen-automation-validate-migration-environment" in installer
     assert "migration.env" in deployment_validator
     assert example.count("GEN_AUTOMATION_DATABASE_URL=") == 1
