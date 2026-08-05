@@ -329,10 +329,19 @@
 
     const viewer = createViewer();
     const boundCards = new WeakSet();
-    const bulkForm = document.querySelector("#bulk-action-form, [data-bulk-action-form]");
-    const bulkReject = bulkForm
-      ? bulkForm.querySelector('button[name="action"][value="reject"]')
-      : null;
+    let bulkForm = null;
+    let bulkReject = null;
+    let exclusionStorageKey = null;
+    const refreshReviewControls = () => {
+      bulkForm = document.querySelector("#bulk-action-form, [data-bulk-action-form]");
+      bulkReject = bulkForm
+        ? bulkForm.querySelector('button[name="action"][value="reject"]')
+        : null;
+      exclusionStorageKey = bulkForm
+        ? `gen-automation:review-exclusions:v1:${bulkForm.getAttribute("action") || window.location.pathname}`
+        : null;
+    };
+    refreshReviewControls();
     const markedForExclusion = new Set();
     let activeCard = null;
     let announcement = "";
@@ -494,9 +503,6 @@
       };
     };
 
-    const exclusionStorageKey = bulkForm
-      ? `gen-automation:review-exclusions:v1:${bulkForm.getAttribute("action") || window.location.pathname}`
-      : null;
     const persistMarkedExclusions = () => {
       if (!exclusionStorageKey) return;
       try {
@@ -807,10 +813,24 @@
     bindCards();
     document.addEventListener("gen-automation:assets-updated", (event) => {
       const root = event.detail && event.detail.root;
+      const activeAssetId = activeCard?.dataset.assetId || "";
+      refreshReviewControls();
       bindCards(root || document);
       applyDensity(storedDensity());
+      Array.from(markedForExclusion).forEach((assetId) => {
+        const card = assetCards().find((candidate) => candidate.dataset.assetId === assetId);
+        const context = exclusionContext(card);
+        if (!context || context.alreadyExcluded) markedForExclusion.delete(assetId);
+      });
+      persistMarkedExclusions();
       restoreMarkedExclusions();
       updateExclusionControls();
+      if (viewer.dialog.open && activeAssetId) {
+        const refreshedCard = assetCards().find(
+          (candidate) => candidate.dataset.assetId === activeAssetId,
+        );
+        if (refreshedCard) renderCard(refreshedCard);
+      }
     });
 
     viewer.close.addEventListener("click", closeViewer);

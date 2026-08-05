@@ -1,5 +1,6 @@
 {% extends "dashboard/base.html" %}
 {% block content %}
+  <div data-review-workspace>
   <a class="back" href="/dashboard/releases/{{ navigation.release_id }}">
     &larr; Ranked release
   </a>
@@ -1039,4 +1040,12 @@
       </li>
     {% endfor %}
   </ol>
+  <p
+    class="review-action-status"
+    data-review-action-status
+    role="status"
+    aria-live="polite"
+    hidden
+  ></p>
+  </div>
 {% endblock %}

@@ -21,10 +21,64 @@
   const AUTOMATION_DRAFT_STORAGE_KEY = "gen-automation:automation-draft:v1";
   const AUTOMATION_DRAFT_SUBMISSION_KEY = "gen-automation:automation-draft-submission:v1";
   const PENDING_IMAGE_PROFILE_KEY = "gen-automation:reuse-image-settings:v1";
+  const SAME_PAGE_SCROLL_STORAGE_KEY = "gen-automation:same-page-scroll:v1";
+  const REVIEW_ACTION_FORM_SELECTOR = [
+    "form[data-review-decision-form]",
+    "form[data-bulk-action-form]",
+    "form[data-x-selection-form]",
+    "form[data-anatomy-feedback-form]",
+  ].join(",");
   const scopedStorageKey = (key) => {
     const scope = document.body?.dataset.automationStorageScope?.trim() || "unknown-user";
     return `${key}:${scope}`;
   };
+
+  const persistSamePageScroll = () => {
+    try {
+      window.sessionStorage.setItem(SAME_PAGE_SCROLL_STORAGE_KEY, JSON.stringify({
+        path: `${window.location.pathname}${window.location.search}`,
+        x: Math.max(0, Math.round(window.scrollX)),
+        y: Math.max(0, Math.round(window.scrollY)),
+        saved_at: Date.now(),
+      }));
+    } catch (_error) {
+      // Storage can be unavailable without blocking the server-rendered fallback.
+    }
+  };
+
+  function initializeSamePageScrollPreservation() {
+    try {
+      const raw = window.sessionStorage.getItem(SAME_PAGE_SCROLL_STORAGE_KEY);
+      if (raw) {
+        window.sessionStorage.removeItem(SAME_PAGE_SCROLL_STORAGE_KEY);
+        const saved = JSON.parse(raw);
+        const currentPath = `${window.location.pathname}${window.location.search}`;
+        if (
+          saved
+          && saved.path === currentPath
+          && Number.isFinite(saved.x)
+          && Number.isFinite(saved.y)
+          && Date.now() - integerValue(saved.saved_at, 0) < 300000
+        ) {
+          window.requestAnimationFrame(() => window.scrollTo(saved.x, saved.y));
+        }
+      }
+    } catch (_error) {
+      try {
+        window.sessionStorage.removeItem(SAME_PAGE_SCROLL_STORAGE_KEY);
+      } catch (_storageError) {
+        // No-op: scroll restoration remains a progressive enhancement.
+      }
+    }
+
+    document.addEventListener("submit", (event) => {
+      const form = event.target;
+      if (!(form instanceof HTMLFormElement)) return;
+      if (form.matches(REVIEW_ACTION_FORM_SELECTOR)) return;
+      if ((form.method || "get").toLowerCase() !== "post") return;
+      persistSamePageScroll();
+    }, { capture: true });
+  }
   const AUTOMATION_PRESET_FIELDS = Object.freeze([
     "subject_id",
     "subject_2_id",
@@ -1416,6 +1470,7 @@
           return;
         }
         if (status instanceof HTMLElement) status.textContent = "Checking output progress...";
+        persistSamePageScroll();
         window.location.reload();
       }, delay);
     };
@@ -2194,6 +2249,254 @@
     });
     updateExcludedHeadings();
     updateSelection();
+  }
+
+  let reviewActionRequestActive = false;
+
+  const reviewActionLabel = (form, submitter, selectedCount) => {
+    const decision = submitter instanceof HTMLButtonElement
+      ? submitter.dataset.decision || ""
+      : "";
+    if (decision === "accept") return "Image accepted. Your review position was preserved.";
+    if (decision === "reject") return "Image excluded. The raw master was retained.";
+    if (decision === "hold") return "Image held for another pass.";
+
+    if (form.matches("[data-bulk-action-form]")) {
+      const action = submitter instanceof HTMLButtonElement ? submitter.value : "";
+      const count = Math.max(1, selectedCount);
+      const images = `${count} image${count === 1 ? "" : "s"}`;
+      if (action === "accept") return `${images} accepted. Your review position was preserved.`;
+      if (action === "reject") return `${images} excluded. Raw masters were retained.`;
+      if (action === "hold") return `${images} held for another pass.`;
+      if (action === "x_add") return `${images} added to the X teaser selection.`;
+      if (action === "x_remove") return `${images} removed from the X teaser selection.`;
+    }
+
+    if (form.matches("[data-x-selection-form]")) {
+      const selected = form.querySelector('input[name="selected"]');
+      return selected instanceof HTMLInputElement && selected.value === "true"
+        ? "Image added to the X teaser selection."
+        : "Image removed from the X teaser selection.";
+    }
+    if (form.matches("[data-anatomy-feedback-form]")) {
+      return "Anatomy feedback saved and learning metrics refreshed.";
+    }
+    return "Review updated. Your position was preserved.";
+  };
+
+  const reviewScrollAnchor = (form) => {
+    const directCard = form.closest("[data-review-asset]");
+    const cards = Array.from(document.querySelectorAll("[data-review-asset]"));
+    const card = directCard || cards.find((candidate) => {
+      if (candidate.hidden) return false;
+      const bounds = candidate.getBoundingClientRect();
+      return bounds.bottom > 96 && bounds.top < window.innerHeight;
+    });
+    return {
+      assetId: card instanceof HTMLElement ? card.dataset.assetId || "" : "",
+      top: card instanceof HTMLElement ? card.getBoundingClientRect().top : 0,
+      x: window.scrollX,
+      y: window.scrollY,
+    };
+  };
+
+  const captureReviewViewState = (form, submitter) => {
+    const activeFilter = document.querySelector("[data-review-filter].active");
+    const activeSort = document.querySelector("[data-asset-sort].active");
+    const formCard = form.closest("[data-review-asset]");
+    return {
+      activeFilter: activeFilter instanceof HTMLElement
+        ? activeFilter.dataset.reviewFilter || "all"
+        : "all",
+      activeSort: activeSort instanceof HTMLElement
+        ? activeSort.dataset.assetSort || "quality"
+        : "quality",
+      anchor: reviewScrollAnchor(form),
+      selectedAssetIds: Array.from(
+        document.querySelectorAll('input[type="checkbox"][name="asset_id"]:checked'),
+      ).map((input) => input.value),
+      clearSelection: form.matches("[data-bulk-action-form]"),
+      focusAssetId: formCard instanceof HTMLElement ? formCard.dataset.assetId || "" : "",
+      focusDecision: submitter instanceof HTMLButtonElement
+        ? submitter.dataset.decision || ""
+        : "",
+      focusAction: submitter instanceof HTMLButtonElement && submitter.name === "action"
+        ? submitter.value
+        : "",
+    };
+  };
+
+  const restoreReviewViewState = (workspace, state) => {
+    initializeAssetSorting();
+    initializeBulkReview();
+
+    const sortButton = Array.from(workspace.querySelectorAll("[data-asset-sort]")).find(
+      (button) => button.dataset.assetSort === state.activeSort,
+    );
+    if (sortButton instanceof HTMLButtonElement) sortButton.click();
+
+    if (!state.clearSelection) {
+      state.selectedAssetIds.forEach((assetId) => {
+        const card = document.getElementById(`asset-${assetId}`);
+        const checkbox = card?.querySelector('input[type="checkbox"][name="asset_id"]');
+        if (checkbox instanceof HTMLInputElement) checkbox.checked = true;
+      });
+      const restored = workspace.querySelector('input[type="checkbox"][name="asset_id"]:checked');
+      if (restored instanceof HTMLInputElement) {
+        restored.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    }
+
+    const filterButton = Array.from(workspace.querySelectorAll("[data-review-filter]")).find(
+      (button) => button.dataset.reviewFilter === state.activeFilter,
+    );
+    if (filterButton instanceof HTMLButtonElement) filterButton.click();
+
+    document.dispatchEvent(new CustomEvent("gen-automation:assets-updated", {
+      detail: { root: workspace },
+    }));
+    document.dispatchEvent(new CustomEvent("gen-automation:review-updated", {
+      detail: { root: workspace },
+    }));
+
+    const restoreScroll = () => {
+      const anchor = state.anchor.assetId
+        ? document.getElementById(`asset-${state.anchor.assetId}`)
+        : null;
+      if (anchor instanceof HTMLElement && !anchor.hidden) {
+        const delta = anchor.getBoundingClientRect().top - state.anchor.top;
+        window.scrollBy(0, delta);
+      } else {
+        window.scrollTo(state.anchor.x, state.anchor.y);
+      }
+    };
+    restoreScroll();
+    window.requestAnimationFrame(() => {
+      restoreScroll();
+      window.requestAnimationFrame(restoreScroll);
+    });
+
+    let focusTarget = null;
+    if (state.focusAssetId) {
+      const card = document.getElementById(`asset-${state.focusAssetId}`);
+      if (state.focusDecision) {
+        focusTarget = Array.from(card?.querySelectorAll("[data-decision]") || []).find(
+          (button) => button.dataset.decision === state.focusDecision,
+        );
+      } else {
+        focusTarget = card?.querySelector("button[type=submit]") || null;
+      }
+    } else if (state.focusAction) {
+      focusTarget = Array.from(workspace.querySelectorAll('button[name="action"]')).find(
+        (button) => button.value === state.focusAction,
+      );
+    }
+    if (focusTarget instanceof HTMLElement && !focusTarget.closest("[hidden]")) {
+      window.requestAnimationFrame(() => focusTarget.focus({ preventScroll: true }));
+    }
+  };
+
+  const showReviewActionStatus = (workspace, message, isError = false) => {
+    const status = workspace.querySelector("[data-review-action-status]");
+    if (!(status instanceof HTMLElement)) return;
+    status.textContent = message;
+    status.classList.toggle("error", isError);
+    status.hidden = false;
+    window.setTimeout(() => {
+      if (status.isConnected) status.hidden = true;
+    }, isError ? 6000 : 2600);
+  };
+
+  function initializeReviewActions() {
+    if (!document.querySelector("[data-review-workspace]")) return;
+
+    document.addEventListener("submit", async (event) => {
+      const form = event.target;
+      if (!(form instanceof HTMLFormElement) || !form.matches(REVIEW_ACTION_FORM_SELECTOR)) {
+        return;
+      }
+      event.preventDefault();
+
+      const workspace = form.closest("[data-review-workspace]");
+      if (!(workspace instanceof HTMLElement)) return;
+      if (reviewActionRequestActive) {
+        showReviewActionStatus(workspace, "The previous review action is still saving.", true);
+        return;
+      }
+
+      const submitter = event.submitter instanceof HTMLButtonElement
+        ? event.submitter
+        : null;
+      const selectedCount = form.matches("[data-bulk-action-form]")
+        ? Array.from(
+          document.querySelectorAll('input[type="checkbox"][name="asset_id"]:checked'),
+        ).filter((input) => input.form === form).length
+        : 1;
+      const viewState = captureReviewViewState(form, submitter);
+      const body = new URLSearchParams();
+      new FormData(form).forEach((value, name) => {
+        if (typeof value === "string") body.append(name, value);
+      });
+      if (submitter?.name) body.append(submitter.name, submitter.value);
+
+      reviewActionRequestActive = true;
+      workspace.setAttribute("aria-busy", "true");
+      if (submitter) submitter.disabled = true;
+      try {
+        const response = await fetch(form.action, {
+          method: "POST",
+          credentials: "same-origin",
+          redirect: "follow",
+          headers: {
+            Accept: "text/html",
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "X-Requested-With": "fetch",
+          },
+          body,
+        });
+        const destination = new URL(response.url, window.location.href);
+        if (response.status === 401 || destination.pathname === "/login") {
+          persistSamePageScroll();
+          window.location.assign(destination.href);
+          return;
+        }
+        if (!response.ok) {
+          showReviewActionStatus(
+            workspace,
+            response.status === 409
+              ? "This review changed in another tab. Refresh once, then continue."
+              : "The review action could not be saved. Nothing was changed in this view.",
+            true,
+          );
+          return;
+        }
+
+        const parsed = new DOMParser().parseFromString(await response.text(), "text/html");
+        const nextWorkspace = parsed.querySelector("[data-review-workspace]");
+        if (!(nextWorkspace instanceof HTMLElement)) {
+          persistSamePageScroll();
+          window.location.assign(destination.href);
+          return;
+        }
+
+        workspace.replaceWith(nextWorkspace);
+        restoreReviewViewState(nextWorkspace, viewState);
+        showReviewActionStatus(
+          nextWorkspace,
+          reviewActionLabel(form, submitter, selectedCount),
+        );
+      } catch (_error) {
+        showReviewActionStatus(
+          workspace,
+          "The connection was interrupted. Your position is unchanged; try the action again.",
+          true,
+        );
+      } finally {
+        reviewActionRequestActive = false;
+        if (workspace.isConnected) workspace.removeAttribute("aria-busy");
+        if (submitter?.isConnected) submitter.disabled = false;
+      }
+    });
   }
 
   const isRecord = (value) => (
@@ -4258,6 +4561,7 @@
   const experimentFormPresent = Boolean(document.querySelector("[data-experiment-form]"));
   const reusedImageSettings = consumePendingImageProfile();
   if (!reusedImageSettings && !experimentFormPresent) restoreAutomationDraft();
+  initializeSamePageScrollPreservation();
   initializeLoraPicker();
   initializeAutomationBuilder();
   initializeWorkflowRefinement();
@@ -4268,6 +4572,7 @@
   initializeAssetSorting();
   initializeWildcardLibraryTools();
   initializeBulkReview();
+  initializeReviewActions();
   initializeGenerationDetails();
   initializeLiveGeneratedAssets();
   clearAutomationDraftAfterQueue();

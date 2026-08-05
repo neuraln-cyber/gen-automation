@@ -1813,6 +1813,37 @@ body.asset-viewer-open { overflow: hidden; }
   animation: experiment-spin .8s linear infinite;
 }
 
+.review-action-status {
+  position: fixed;
+  z-index: 90;
+  right: max(1rem, env(safe-area-inset-right));
+  bottom: max(1rem, env(safe-area-inset-bottom));
+  max-width: min(28rem, calc(100vw - 2rem));
+  margin: 0;
+  padding: .75rem 1rem;
+  border: 1px solid rgba(110, 231, 183, .32);
+  border-radius: .8rem;
+  background: rgba(18, 32, 31, .96);
+  box-shadow: var(--shadow-lg);
+  color: var(--good);
+  font-size: .88rem;
+  font-weight: 760;
+  pointer-events: none;
+}
+
+.review-action-status.error {
+  border-color: rgba(253, 164, 175, .34);
+  background: rgba(42, 24, 31, .97);
+  color: var(--danger);
+}
+
+[data-review-workspace][aria-busy="true"] .decision-button,
+[data-review-workspace][aria-busy="true"] .bulk-actions button,
+[data-review-workspace][aria-busy="true"] .x-toggle,
+[data-review-workspace][aria-busy="true"] .anatomy-feedback-button {
+  cursor: progress;
+}
+
 @media (max-width: 560px) {
   .danbooru-autocomplete {
     max-height: min(25rem, 62dvh);
