@@ -60,7 +60,7 @@ async def test_bulk_review_decisions_execute_on_postgresql() -> None:
     settings = _settings(Path("unused-postgresql-review.db")).model_copy(
         update={"database_url": POSTGRESQL_URL}
     )
-    context = await _seed_review_api(settings)
+    context = await _seed_review_api(settings, create_schema=False)
     database = Database(POSTGRESQL_URL)
     try:
         async with database.sessions() as session:

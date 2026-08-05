@@ -104,10 +104,15 @@ def _password_manager() -> PasswordManager:
     )
 
 
-async def _seed_review_api(settings: Settings) -> ReviewApiContext:
+async def _seed_review_api(
+    settings: Settings,
+    *,
+    create_schema: bool = True,
+) -> ReviewApiContext:
     database = Database(settings.database_url)
     try:
-        await database.create_schema()
+        if create_schema:
+            await database.create_schema()
         now = datetime.now(UTC)
         credentials: dict[AdminRole, UserCredential] = {}
         async with database.sessions() as session:
