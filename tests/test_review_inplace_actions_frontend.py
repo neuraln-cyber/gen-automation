@@ -21,6 +21,7 @@ def test_review_mutations_are_progressively_enhanced_without_page_reload() -> No
     assert 'redirect: "follow"' in handler
     assert "new DOMParser().parseFromString" in handler
     assert 'parsed.querySelector("[data-review-workspace]")' in handler
+    assert "preserveReviewMedia(workspace, nextWorkspace)" in handler
     assert "workspace.replaceWith(nextWorkspace)" in handler
     assert "window.location.reload()" not in handler
     assert "HTMLFormElement.prototype.submit" not in handler
@@ -32,6 +33,11 @@ def test_review_refresh_restores_scroll_filters_sort_selection_and_focus() -> No
     assert "captureReviewViewState" in script
     assert "reviewScrollAnchor" in script
     assert "restoreReviewViewState" in script
+    assert "const preserveReviewMedia" in script
+    assert 'card.querySelector(".asset-preview")' in script
+    assert "nextImage.replaceWith(currentImage)" in script
+    assert "window.requestAnimationFrame(restoreScroll)" in script
+    assert "window.requestAnimationFrame(() => {\n      restoreScroll();" not in script
     assert 'document.querySelector("[data-review-filter].active")' in script
     assert 'document.querySelector("[data-asset-sort].active")' in script
     assert "state.selectedAssetIds.forEach" in script

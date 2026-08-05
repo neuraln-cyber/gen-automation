@@ -2326,6 +2326,39 @@
     };
   };
 
+  const preserveReviewMedia = (workspace, nextWorkspace) => {
+    const currentImages = new Map();
+    workspace.querySelectorAll("[data-review-asset]").forEach((card) => {
+      const assetId = card.dataset.assetId || "";
+      const image = card.querySelector(".asset-preview");
+      if (assetId && image instanceof HTMLImageElement) currentImages.set(assetId, image);
+    });
+
+    nextWorkspace.querySelectorAll("[data-review-asset]").forEach((card) => {
+      const assetId = card.dataset.assetId || "";
+      const currentImage = currentImages.get(assetId);
+      const nextImage = card.querySelector(".asset-preview");
+      if (!(currentImage instanceof HTMLImageElement)
+          || !(nextImage instanceof HTMLImageElement)) return;
+
+      // Moving the existing node retains its decoded bitmap and browser cache state.
+      // The surrounding card still comes from the authoritative server response.
+      nextImage.replaceWith(currentImage);
+    });
+
+    const currentGrid = workspace.querySelector("[data-review-grid]");
+    const nextGrid = nextWorkspace.querySelector("[data-review-grid]");
+    if (currentGrid instanceof HTMLElement && nextGrid instanceof HTMLElement) {
+      const density = currentGrid.dataset.assetDensity;
+      if (density) nextGrid.dataset.assetDensity = density;
+    }
+
+    const densityControls = workspace.querySelector("[data-asset-density-controls]");
+    if (densityControls instanceof HTMLElement && nextGrid?.parentNode) {
+      nextGrid.parentNode.insertBefore(densityControls, nextGrid);
+    }
+  };
+
   const restoreReviewViewState = (workspace, state) => {
     initializeAssetSorting();
     initializeBulkReview();
@@ -2370,11 +2403,10 @@
         window.scrollTo(state.anchor.x, state.anchor.y);
       }
     };
+    // All updates above happen in the same task. Restore before the browser paints,
+    // then make one post-layout correction for controls added by update listeners.
     restoreScroll();
-    window.requestAnimationFrame(() => {
-      restoreScroll();
-      window.requestAnimationFrame(restoreScroll);
-    });
+    window.requestAnimationFrame(restoreScroll);
 
     let focusTarget = null;
     if (state.focusAssetId) {
@@ -2479,6 +2511,7 @@
           return;
         }
 
+        preserveReviewMedia(workspace, nextWorkspace);
         workspace.replaceWith(nextWorkspace);
         restoreReviewViewState(nextWorkspace, viewState);
         showReviewActionStatus(
