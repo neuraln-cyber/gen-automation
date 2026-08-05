@@ -676,30 +676,12 @@ async def apply_bulk_review_action(
                     )
                 await _require_active_owner(session, changed_by_user_id)
 
-        latest_revisions = (
-            select(
-                ReviewDecision.asset_id.label("asset_id"),
-                func.max(ReviewDecision.revision).label("revision"),
-            )
-            .where(
-                ReviewDecision.review_task_id == task.id,
-                ReviewDecision.asset_id.in_(normalized_asset_ids),
-            )
-            .group_by(ReviewDecision.asset_id)
-            .subquery()
-        )
         prior_rows = (
             await session.scalars(
-                select(ReviewDecision)
-                .join(
-                    latest_revisions,
-                    and_(
-                        latest_revisions.c.asset_id == ReviewDecision.asset_id,
-                        latest_revisions.c.revision == ReviewDecision.revision,
-                    ),
+                _latest_review_decisions_for_update_statement(
+                    review_task_id=task.id,
+                    asset_ids=normalized_asset_ids,
                 )
-                .where(ReviewDecision.review_task_id == task.id)
-                .with_for_update()
             )
         ).all()
         priors = {prior.asset_id: prior for prior in prior_rows}
@@ -1711,6 +1693,37 @@ async def _load_task_locked(
     if task is None:
         raise ReviewNotFoundError("review task was not found")
     return task
+
+
+def _latest_review_decisions_for_update_statement(
+    *,
+    review_task_id: UUID,
+    asset_ids: Sequence[UUID],
+) -> Select[tuple[ReviewDecision]]:
+    latest_revisions = (
+        select(
+            ReviewDecision.asset_id.label("asset_id"),
+            func.max(ReviewDecision.revision).label("revision"),
+        )
+        .where(
+            ReviewDecision.review_task_id == review_task_id,
+            ReviewDecision.asset_id.in_(asset_ids),
+        )
+        .group_by(ReviewDecision.asset_id)
+        .subquery()
+    )
+    return (
+        select(ReviewDecision)
+        .join(
+            latest_revisions,
+            and_(
+                latest_revisions.c.asset_id == ReviewDecision.asset_id,
+                latest_revisions.c.revision == ReviewDecision.revision,
+            ),
+        )
+        .where(ReviewDecision.review_task_id == review_task_id)
+        .with_for_update(of=ReviewDecision)
+    )
 
 
 async def _claim_review_task_version(

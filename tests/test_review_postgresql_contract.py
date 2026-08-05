@@ -9,6 +9,7 @@ from gen_automation.db.session import Database
 from gen_automation.domain.enums import AdminRole, ReviewBulkAction
 from gen_automation.services.review import (
     _accepted_release_selection_sources_statement,
+    _latest_review_decisions_for_update_statement,
     apply_bulk_review_action,
     create_review_task,
     get_review_summary,
@@ -28,6 +29,18 @@ def test_release_selection_lock_is_scoped_away_from_grouped_subquery() -> None:
 
     assert " GROUP BY " in sql
     assert sql.endswith("FOR UPDATE OF review_decisions, asset_rankings, assets")
+
+
+def test_bulk_decision_lock_is_scoped_away_from_grouped_subquery() -> None:
+    statement = _latest_review_decisions_for_update_statement(
+        review_task_id=uuid4(),
+        asset_ids=(uuid4(), uuid4()),
+    )
+
+    sql = str(statement.compile(dialect=postgresql.dialect()))
+
+    assert " GROUP BY " in sql
+    assert sql.endswith("FOR UPDATE OF review_decisions")
 
 
 @pytest.mark.skipif(
