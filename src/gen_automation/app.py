@@ -33,6 +33,7 @@ from gen_automation.config import Environment, Settings, get_settings
 from gen_automation.controller.runtime import ControllerRuntime, build_controller_runtime
 from gen_automation.db import models as _models  # noqa: F401
 from gen_automation.db.session import Database
+from gen_automation.integrations.danbooru import DanbooruAutocompleteClient
 from gen_automation.integrations.patreon import PatreonSidecarDriver
 from gen_automation.integrations.salad.client import SaladClient
 from gen_automation.integrations.salad.webhooks import SaladWebhookVerifier
@@ -41,6 +42,7 @@ from gen_automation.logging import configure_logging
 from gen_automation.middleware import RequestContextMiddleware
 from gen_automation.services.admin_enrollment import AdminEnrollmentService
 from gen_automation.services.authentication import AuthenticationService
+from gen_automation.services.danbooru_tags import DanbooruTagAutocompleteService
 from gen_automation.services.runtime_secrets import (
     RuntimeSecretResolver,
     build_runtime_secret_resolver,
@@ -82,6 +84,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         database = Database(resolved_settings.database_url)
         object_store = build_object_store(resolved_settings)
+        danbooru_http_client = httpx2.AsyncClient(
+            follow_redirects=False,
+            trust_env=False,
+            limits=httpx2.Limits(max_connections=2, max_keepalive_connections=1),
+        )
+        danbooru_tag_autocomplete_service = DanbooruTagAutocompleteService(
+            client=DanbooruAutocompleteClient(http_client=danbooru_http_client)
+        )
         salad_http_client: httpx2.AsyncClient | None = None
         salad_client: SaladClient | None = None
         semantic_http_client: httpx2.AsyncClient | None = None
@@ -149,6 +159,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         app.state.database = database
         app.state.object_store = object_store
+        app.state.danbooru_tag_autocomplete_service = danbooru_tag_autocomplete_service
         app.state.salad_client = salad_client
         app.state.salad_webhook_verifier = (
             SaladWebhookVerifier(
@@ -206,6 +217,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.authentication_service = None
             app.state.admin_enrollment_service = None
             app.state.x_oauth_provider = None
+            app.state.danbooru_tag_autocomplete_service = None
             try:
                 if controller_runtime is not None:
                     await controller_runtime.stop()
@@ -234,7 +246,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                         if salad_http_client is not None:
                                             await salad_http_client.aclose()
                                     finally:
-                                        await database.dispose()
+                                        try:
+                                            await danbooru_http_client.aclose()
+                                        finally:
+                                            await database.dispose()
 
     expose_docs = resolved_settings.environment in {
         Environment.LOCAL,
@@ -250,6 +265,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     application.state.settings = resolved_settings
     application.state.salad_client = None
+    application.state.danbooru_tag_autocomplete_service = None
     application.state.salad_webhook_verifier = None
     application.state.controller_runtime = None
     application.state.x_oauth_provider = None

@@ -198,17 +198,17 @@
         </div>
 
         <div class="experiment-regional-prompts" data-experiment-regional-prompts {% if form_values['composition_mode'] != 'duo' %}hidden{% endif %}>
-          <label>Character A prompt<textarea name="character_a_prompt" rows="2" maxlength="20000">{{ form_values['character_a_prompt'] }}</textarea></label>
-          <label>Character B prompt<textarea name="character_b_prompt" rows="2" maxlength="20000">{{ form_values['character_b_prompt'] }}</textarea></label>
+          <label>Character A prompt<textarea name="character_a_prompt" rows="2" maxlength="20000" spellcheck="false" data-danbooru-autocomplete>{{ form_values['character_a_prompt'] }}</textarea></label>
+          <label>Character B prompt<textarea name="character_b_prompt" rows="2" maxlength="20000" spellcheck="false" data-danbooru-autocomplete>{{ form_values['character_b_prompt'] }}</textarea></label>
         </div>
 
         <label class="experiment-prompt-field">
           Positive prompt
-          <textarea name="prompt" rows="7" maxlength="20000" spellcheck="false" required>{{ form_values['prompt'] }}</textarea>
+          <textarea name="prompt" rows="7" maxlength="20000" spellcheck="false" data-danbooru-autocomplete required>{{ form_values['prompt'] }}</textarea>
         </label>
         <label class="experiment-prompt-field">
           Negative prompt
-          <textarea name="negative_prompt" rows="5" maxlength="20000" spellcheck="false">{{ form_values['negative_prompt'] }}</textarea>
+          <textarea name="negative_prompt" rows="5" maxlength="20000" spellcheck="false" data-danbooru-autocomplete>{{ form_values['negative_prompt'] }}</textarea>
         </label>
 
         <details class="form-disclosure" open>
@@ -269,8 +269,8 @@
             <label>Hires scale<input type="number" name="hires_scale" value="{{ form_values['hires_scale'] }}" min="1" max="3" step="0.05" required></label>
             <label>Hires denoise<input type="number" name="hires_denoise" value="{{ form_values['hires_denoise'] }}" min="0.05" max="1" step="0.01" required></label>
             <label>Upscale method<select name="hires_upscale_method">{% for method in ['bislerp','bicubic','bilinear','nearest-exact','area'] %}<option value="{{ method }}" {% if form_values['hires_upscale_method'] == method %}selected{% endif %}>{{ method }}</option>{% endfor %}</select></label>
-            <label>Detailer prompt<textarea name="detailer_prompt" rows="2" maxlength="20000">{{ form_values['detailer_prompt'] }}</textarea></label>
-            <label>Detailer negative<textarea name="detailer_negative_prompt" rows="2" maxlength="20000">{{ form_values['detailer_negative_prompt'] }}</textarea></label>
+            <label>Detailer prompt<textarea name="detailer_prompt" rows="2" maxlength="20000" spellcheck="false" data-danbooru-autocomplete>{{ form_values['detailer_prompt'] }}</textarea></label>
+            <label>Detailer negative<textarea name="detailer_negative_prompt" rows="2" maxlength="20000" spellcheck="false" data-danbooru-autocomplete>{{ form_values['detailer_negative_prompt'] }}</textarea></label>
             <label>Guide size<input type="number" name="detailer_guide_size" value="{{ form_values['detailer_guide_size'] }}" min="512" max="2048" step="64" required></label>
             <label>Maximum size<input type="number" name="detailer_max_size" value="{{ form_values['detailer_max_size'] }}" min="512" max="4096" step="64" required></label>
             <label>Detailer denoise<input type="number" name="detailer_denoise" value="{{ form_values['detailer_denoise'] }}" min="0.05" max="1" step="0.01" required></label>

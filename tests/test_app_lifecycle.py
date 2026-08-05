@@ -9,6 +9,7 @@ from gen_automation.app import create_app
 from gen_automation.config import Environment, Settings
 from gen_automation.integrations.salad.client import SaladClient
 from gen_automation.integrations.salad.webhooks import SaladWebhookVerifier
+from gen_automation.services.danbooru_tags import DanbooruTagAutocompleteService
 
 
 @pytest.mark.parametrize(
@@ -57,6 +58,41 @@ def test_salad_clients_are_built_without_contacting_provider(tmp_path: Path) -> 
         assert isinstance(client.app.state.salad_client, SaladClient)
         assert isinstance(client.app.state.salad_webhook_verifier, SaladWebhookVerifier)
         assert "dedicated-test-key" not in repr(client.app.state.salad_client)
+
+
+def test_danbooru_client_is_long_lived_bounded_and_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeAsyncClient:
+        def __init__(self, **kwargs: object) -> None:
+            assert kwargs["follow_redirects"] is False
+            assert kwargs["trust_env"] is False
+            created.append(self)
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    created: list[FakeAsyncClient] = []
+
+    monkeypatch.setattr(app_module.httpx2, "AsyncClient", FakeAsyncClient)
+    settings = Settings(
+        environment=Environment.TEST,
+        database_url=f"sqlite+aiosqlite:///{(tmp_path / 'danbooru-lifecycle.db').as_posix()}",
+        auto_create_schema=True,
+        auth_development_bypass_enabled=True,
+    )
+
+    with TestClient(create_app(settings)) as client:
+        assert isinstance(
+            client.app.state.danbooru_tag_autocomplete_service,
+            DanbooruTagAutocompleteService,
+        )
+        assert len(created) == 1
+        assert not created[0].closed
+
+    assert created[0].closed
 
 
 def test_x_oauth_provider_is_injected_and_closed_without_startup_secret_read(

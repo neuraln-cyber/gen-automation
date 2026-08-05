@@ -188,6 +188,7 @@
                     spellcheck="false"
                     placeholder="nico robin (one piece), adult woman, black hair"
                     data-character-prompt="a"
+                    data-danbooru-autocomplete
                   >{{ form_values['character_a_prompt'] }}</textarea>
                 </label>
               </article>
@@ -220,6 +221,7 @@
                     spellcheck="false"
                     placeholder="boa hancock (one piece), adult woman, long black hair"
                     data-character-prompt="b"
+                    data-danbooru-autocomplete
                   >{{ form_values['character_b_prompt'] }}</textarea>
                 </label>
               </article>
@@ -528,6 +530,7 @@
                 spellcheck="false"
                 placeholder="masterpiece, best quality, 1girl, character name, __sfw__"
                 data-default-prompt
+                data-danbooru-autocomplete
                 required
               >{{ form_values['prompt'] }}</textarea>
             </label>
@@ -539,6 +542,7 @@
                 maxlength="20000"
                 spellcheck="false"
                 data-default-negative
+                data-danbooru-autocomplete
               >{{ form_values['negative_prompt'] }}</textarea>
             </label>
             <div class="form-grid">
@@ -550,6 +554,7 @@
                   maxlength="20000"
                   spellcheck="false"
                   data-default-detailer
+                  data-danbooru-autocomplete
                 >{{ form_values['detailer_prompt'] }}</textarea>
               </label>
               <label>
@@ -560,6 +565,7 @@
                   maxlength="20000"
                   spellcheck="false"
                   data-default-detailer-negative
+                  data-danbooru-autocomplete
                 >{{ form_values['detailer_negative_prompt'] }}</textarea>
               </label>
             </div>
@@ -766,6 +772,7 @@
             aria-label="Positive prompt"
             placeholder="masterpiece, best quality, 1girl, character name, __sfw__"
             data-batch-field="prompt"
+            data-danbooru-autocomplete
             required
           ></textarea>
         </div>
@@ -795,6 +802,7 @@
             aria-label="Negative prompt"
             placeholder="bad quality, worst quality, bad anatomy, watermark"
             data-batch-field="negative_prompt"
+            data-danbooru-autocomplete
           ></textarea>
           <small>Starts with the shared negative prompt; edit it freely for this batch.</small>
         </div>
@@ -805,11 +813,11 @@
             <div class="form-grid">
               <label>
                 Face-detailer prompt override
-                <textarea rows="3" maxlength="20000" spellcheck="false" placeholder="Leave blank to inherit" data-batch-field="detailer_prompt"></textarea>
+                <textarea rows="3" maxlength="20000" spellcheck="false" placeholder="Leave blank to inherit" data-batch-field="detailer_prompt" data-danbooru-autocomplete></textarea>
               </label>
               <label>
                 Face-detailer negative override
-                <textarea rows="3" maxlength="20000" spellcheck="false" placeholder="Leave blank to inherit" data-batch-field="detailer_negative_prompt"></textarea>
+                <textarea rows="3" maxlength="20000" spellcheck="false" placeholder="Leave blank to inherit" data-batch-field="detailer_negative_prompt" data-danbooru-autocomplete></textarea>
               </label>
             </div>
             <label>
