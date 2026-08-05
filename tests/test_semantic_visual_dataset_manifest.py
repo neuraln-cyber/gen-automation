@@ -125,13 +125,9 @@ def test_manifest_is_deterministic_and_freezes_whole_group_holdout() -> None:
     assert first == second
     assert first.group_key == "release_id"
     assert first.training_count + first.holdout_count == len(samples)
-    training_groups = {
-        entry.group_id for entry in first.entries if entry.membership == "train"
-    }
+    training_groups = {entry.group_id for entry in first.entries if entry.membership == "train"}
     holdout_groups = {
-        entry.group_id
-        for entry in first.entries
-        if entry.membership == "untouched_holdout"
+        entry.group_id for entry in first.entries if entry.membership == "untouched_holdout"
     }
     assert training_groups.isdisjoint(holdout_groups)
     assert all(entry.asset.storage_backend == "s3" for entry in first.entries)
@@ -169,9 +165,7 @@ def test_manifest_uses_readiness_strongest_evidence_dedupe() -> None:
         profile_sha256=_PROFILE,
     )
 
-    selected = [
-        entry for entry in manifest.entries if entry.asset.sha256 == original.asset_sha256
-    ]
+    selected = [entry for entry in manifest.entries if entry.asset.sha256 == original.asset_sha256]
     assert len(selected) == 1
     assert selected[0].feedback_id == replacement.feedback_id
     assert selected[0].binary_label == "anatomy_defect"

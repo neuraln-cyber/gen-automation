@@ -263,9 +263,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["training_run_id"],
             ["semantic_training_runs.id"],
-            name=op.f(
-                "fk_semantic_model_promotions_training_run_id_semantic_training_runs"
-            ),
+            name=op.f("fk_semantic_model_promotions_training_run_id_semantic_training_runs"),
             ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_semantic_model_promotions")),
@@ -379,13 +377,8 @@ def _drop_guards() -> None:
         "DROP TRIGGER IF EXISTS semantic_model_promotions_guard_mutation "
         "ON semantic_model_promotions"
     )
+    op.execute("DROP FUNCTION IF EXISTS gen_automation_guard_semantic_model_promotions_mutation()")
     op.execute(
-        "DROP FUNCTION IF EXISTS gen_automation_guard_semantic_model_promotions_mutation()"
+        "DROP TRIGGER IF EXISTS semantic_training_runs_guard_mutation ON semantic_training_runs"
     )
-    op.execute(
-        "DROP TRIGGER IF EXISTS semantic_training_runs_guard_mutation "
-        "ON semantic_training_runs"
-    )
-    op.execute(
-        "DROP FUNCTION IF EXISTS gen_automation_guard_semantic_training_run_mutation()"
-    )
+    op.execute("DROP FUNCTION IF EXISTS gen_automation_guard_semantic_training_run_mutation()")

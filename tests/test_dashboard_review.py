@@ -596,8 +596,7 @@ def test_browser_review_forms_are_bounded_same_origin_and_cookie_csrf_bound(
     assert all(row.decision == ReviewDecisionValue.ACCEPT for row in default_decisions)
     assert all(row.reason_code == "sorting_default_accept" for row in default_decisions)
     assert all(
-        row.decided_by_user_id == context.users[AdminRole.REVIEWER].id
-        for row in default_decisions
+        row.decided_by_user_id == context.users[AdminRole.REVIEWER].id for row in default_decisions
     )
 
 

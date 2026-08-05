@@ -47,9 +47,7 @@ from gen_automation.services.semantic_learning_readiness import (
     summarize_semantic_learning_readiness,
 )
 
-SEMANTIC_VISUAL_DATASET_MANIFEST_SCHEMA_VERSION = (
-    "semantic-anatomy-visual-dataset-manifest/v1"
-)
+SEMANTIC_VISUAL_DATASET_MANIFEST_SCHEMA_VERSION = "semantic-anatomy-visual-dataset-manifest/v1"
 SEMANTIC_VISUAL_DATASET_ENTRY_SCHEMA_VERSION = "semantic-anatomy-visual-dataset-entry/v1"
 
 _SHA256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -189,9 +187,7 @@ class SemanticVisualDatasetEntry(_FrozenStrictModel):
         if self.binary_label == "anatomy_good" and self.owner_issue_code is not None:
             raise ValueError("anatomy-good visual labels cannot carry a defect issue code")
         expected_group_id = (
-            self.release_id
-            if self.group_key == "release_id"
-            else self.generation_job_id
+            self.release_id if self.group_key == "release_id" else self.generation_job_id
         )
         if expected_group_id is None or expected_group_id != self.group_id:
             raise ValueError("visual dataset group identity does not match its sample")
@@ -240,16 +236,12 @@ class SemanticVisualDatasetManifest(_FrozenStrictModel):
         if self.holdout_good_count + self.holdout_defect_count != self.holdout_count:
             raise ValueError("visual dataset holdout counts are inconsistent")
         training = tuple(entry for entry in self.entries if entry.membership == "train")
-        holdout = tuple(
-            entry for entry in self.entries if entry.membership == "untouched_holdout"
-        )
+        holdout = tuple(entry for entry in self.entries if entry.membership == "untouched_holdout")
         if len(training) != self.training_count or len(holdout) != self.holdout_count:
             raise ValueError("visual dataset membership counts are inconsistent")
         if any(entry.group_key != self.group_key for entry in self.entries):
             raise ValueError("visual dataset entries use mixed group contracts")
-        if {entry.asset.sha256 for entry in training} & {
-            entry.asset.sha256 for entry in holdout
-        }:
+        if {entry.asset.sha256 for entry in training} & {entry.asset.sha256 for entry in holdout}:
             raise ValueError("visual dataset content crosses training and holdout")
         if {entry.group_id for entry in training} & {entry.group_id for entry in holdout}:
             raise ValueError("visual dataset group crosses training and holdout")
@@ -346,8 +338,7 @@ def build_semantic_visual_dataset_manifest(
         )
     selected_ids = {sample.feedback_id for sample in resolved.binary}
     partitioned_ids = {
-        sample.feedback_id
-        for sample in (*partition.training, *partition.untouched_holdout)
+        sample.feedback_id for sample in (*partition.training, *partition.untouched_holdout)
     }
     if selected_ids != partitioned_ids:
         raise SemanticVisualDatasetIdentityError(
@@ -389,14 +380,10 @@ def build_semantic_visual_dataset_manifest(
         entries=entries,
         training_count=len(training),
         training_good_count=sum(entry.binary_label == "anatomy_good" for entry in training),
-        training_defect_count=sum(
-            entry.binary_label == "anatomy_defect" for entry in training
-        ),
+        training_defect_count=sum(entry.binary_label == "anatomy_defect" for entry in training),
         holdout_count=len(holdout),
         holdout_good_count=sum(entry.binary_label == "anatomy_good" for entry in holdout),
-        holdout_defect_count=sum(
-            entry.binary_label == "anatomy_defect" for entry in holdout
-        ),
+        holdout_defect_count=sum(entry.binary_label == "anatomy_defect" for entry in holdout),
         asset_manifest_sha256=digests[0],
         label_manifest_sha256=digests[1],
         split_manifest_sha256=digests[2],

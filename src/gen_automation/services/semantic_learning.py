@@ -90,9 +90,7 @@ class SemanticLearningCycleResult:
 
     @property
     def did_work(self) -> bool:
-        return bool(
-            self.created_policies or self.queued_meta_runs or self.processed_meta_run
-        )
+        return bool(self.created_policies or self.queued_meta_runs or self.processed_meta_run)
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,9 +250,7 @@ async def update_semantic_learning_policy(
                 "auto_train_visual": policy.auto_train_visual,
                 "auto_promote_validated": policy.auto_promote_validated,
                 "max_visual_run_microusd": policy.max_visual_run_microusd,
-                "minimum_new_labels_for_retrain": (
-                    policy.minimum_new_labels_for_retrain
-                ),
+                "minimum_new_labels_for_retrain": (policy.minimum_new_labels_for_retrain),
                 "lock_version": policy.lock_version,
             },
             occurred_at=policy.updated_at,
@@ -280,11 +276,7 @@ async def enqueue_ready_meta_training_runs(
     if owner_user_id is not None:
         query = query.where(SemanticLearningPolicy.owner_user_id == owner_user_id)
     policies = tuple(
-        (
-            await session.scalars(
-                query.order_by(SemanticLearningPolicy.owner_user_id)
-            )
-        ).all()
+        (await session.scalars(query.order_by(SemanticLearningPolicy.owner_user_id))).all()
     )
     queued = 0
     for policy in policies:
@@ -380,9 +372,7 @@ async def claim_meta_training_run(
             SemanticTrainingRun.available_at <= claimed_at,
             or_(
                 SemanticTrainingRun.state == SemanticTrainingState.QUEUED,
-                (
-                    SemanticTrainingRun.state == SemanticTrainingState.PREPARING
-                )
+                (SemanticTrainingRun.state == SemanticTrainingState.PREPARING)
                 & (SemanticTrainingRun.lease_expires_at <= claimed_at),
             ),
         )
@@ -417,9 +407,7 @@ async def process_claimed_meta_training_run(
     sessions: async_sessionmaker[AsyncSession],
     *,
     claimed: ClaimedSemanticTrainingRun,
-    configured_baseline_threshold_micros: int = (
-        DEFAULT_CONFIGURED_BASELINE_THRESHOLD_MICROS
-    ),
+    configured_baseline_threshold_micros: int = (DEFAULT_CONFIGURED_BASELINE_THRESHOLD_MICROS),
 ) -> None:
     try:
         async with sessions() as session:
@@ -466,9 +454,7 @@ async def run_semantic_learning_cycle(
     sessions: async_sessionmaker[AsyncSession],
     *,
     worker_id: str,
-    configured_baseline_threshold_micros: int = (
-        DEFAULT_CONFIGURED_BASELINE_THRESHOLD_MICROS
-    ),
+    configured_baseline_threshold_micros: int = (DEFAULT_CONFIGURED_BASELINE_THRESHOLD_MICROS),
     lease_seconds: int = DEFAULT_META_LEASE_SECONDS,
 ) -> SemanticLearningCycleResult:
     """Perform one bounded policy/enqueue/train cycle without external spending."""
@@ -488,9 +474,7 @@ async def run_semantic_learning_cycle(
         await process_claimed_meta_training_run(
             sessions,
             claimed=claimed,
-            configured_baseline_threshold_micros=(
-                configured_baseline_threshold_micros
-            ),
+            configured_baseline_threshold_micros=(configured_baseline_threshold_micros),
         )
     return SemanticLearningCycleResult(
         created_policies=created_policies,
@@ -748,10 +732,7 @@ async def _retrain_interval_satisfied(
     previous_count = latest.training_config.get("binary_labeled_count")
     if not isinstance(previous_count, int):
         return True
-    return (
-        profile.binary_labeled_count - previous_count
-        >= policy.minimum_new_labels_for_retrain
-    )
+    return profile.binary_labeled_count - previous_count >= policy.minimum_new_labels_for_retrain
 
 
 def _meta_split(
@@ -919,9 +900,7 @@ def _validate_meta_training_output(
         raise SemanticLearningError("semantic promotion decision is not reproducible")
     if output.evaluation_sha256 != canonical_sha256(output.evaluation_report):
         raise SemanticLearningError("semantic evaluation report identity does not match")
-    if output.evaluation_report.get("holdout_sha256") != (
-        output.challenger.evaluation_sha256
-    ):
+    if output.evaluation_report.get("holdout_sha256") != (output.challenger.evaluation_sha256):
         raise SemanticLearningError("semantic evaluation report holdout does not match")
     if output.evaluation_report.get("challenger") != asdict(output.challenger):
         raise SemanticLearningError("semantic challenger evaluation report does not match")
@@ -1030,9 +1009,7 @@ async def _complete_meta_training_run(
             owner_user_id=claimed.owner_user_id,
             kind=SemanticTrainingKind.META_CLASSIFIER,
             training_run_id=run.id,
-            previous_training_run_id=(
-                previous.training_run_id if previous is not None else None
-            ),
+            previous_training_run_id=(previous.training_run_id if previous is not None else None),
             profile_sha256=claimed.profile_sha256,
             artifact_sha256=output.model.artifact_sha256,
             dataset_sha256=run.dataset_sha256,
@@ -1117,9 +1094,7 @@ async def _retry_or_fail_meta_training_run(
             error,
             (SemanticLearningError, SemanticMetaClassifierError),
         )
-        run.state = (
-            SemanticTrainingState.FAILED if terminal else SemanticTrainingState.QUEUED
-        )
+        run.state = SemanticTrainingState.FAILED if terminal else SemanticTrainingState.QUEUED
         run.available_at = now + timedelta(minutes=5)
         run.lease_owner = None
         run.lease_expires_at = None

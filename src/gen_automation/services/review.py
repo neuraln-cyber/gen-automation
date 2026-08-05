@@ -1031,8 +1031,7 @@ async def transition_review_task(
                         await session.scalars(
                             select(ReviewAssetInspection.asset_id).where(
                                 ReviewAssetInspection.review_task_id == task.id,
-                                ReviewAssetInspection.inspected_by_user_id
-                                == changed_by_user_id,
+                                ReviewAssetInspection.inspected_by_user_id == changed_by_user_id,
                             )
                         )
                     )

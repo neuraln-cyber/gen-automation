@@ -103,9 +103,7 @@ async def test_open_anatomy_reject_corrected_before_completion_never_becomes_a_d
 
     async with semantic_runtime_context.database.sessions() as session:
         feedback_id = await session.scalar(
-            select(SemanticAnatomyFeedback.id).where(
-                SemanticAnatomyFeedback.asset_id == asset_id
-            )
+            select(SemanticAnatomyFeedback.id).where(SemanticAnatomyFeedback.asset_id == asset_id)
         )
     assert feedback_id is None
 
@@ -158,8 +156,7 @@ async def test_open_anatomy_reject_corrected_before_completion_never_becomes_a_d
             .where(
                 SemanticAssessment.scoring_run_id == scoring_run_id,
                 SemanticAssessment.asset_id == asset_id,
-                SemanticAnatomyFeedback.feedback_by_user_id
-                == semantic_runtime_context.owner_id,
+                SemanticAnatomyFeedback.feedback_by_user_id == semantic_runtime_context.owner_id,
             )
         )
 

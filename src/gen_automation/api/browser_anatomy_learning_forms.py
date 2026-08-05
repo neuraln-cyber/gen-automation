@@ -32,9 +32,7 @@ _POLICY_BOOLEAN_FIELDS = frozenset(
         "auto_promote_validated",
     }
 )
-_TRAIN_FIELDS = frozenset(
-    {"csrf_token", "idempotency_key", "profile_sha256", "dataset_sha256"}
-)
+_TRAIN_FIELDS = frozenset({"csrf_token", "idempotency_key", "profile_sha256", "dataset_sha256"})
 
 
 class AnatomyLearningFormError(ValueError):
@@ -81,9 +79,7 @@ async def read_anatomy_learning_policy_form(
         minimum_new_labels = int(values["minimum_new_labels_for_retrain"])
         visual_usd = Decimal(values["max_visual_run_usd"])
     except (InvalidOperation, ValueError):
-        raise AnatomyLearningFormError(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT
-        ) from None
+        raise AnatomyLearningFormError(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT) from None
     visual_microusd = visual_usd * Decimal(1_000_000)
     if (
         expected_lock_version < 1
@@ -91,9 +87,7 @@ async def read_anatomy_learning_policy_form(
         or not Decimal("0.01") <= visual_usd <= Decimal("25.00")
         or visual_microusd != visual_microusd.to_integral_value()
     ):
-        raise AnatomyLearningFormError(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT
-        )
+        raise AnatomyLearningFormError(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
     return AnatomyLearningPolicyForm(
         csrf_token=_bounded(values["csrf_token"], maximum=200),
         idempotency_key=_bounded(values["idempotency_key"], maximum=200),
@@ -152,9 +146,7 @@ async def _read_form(
 ) -> dict[str, str]:
     content_type = request.headers.get("content-type", "")
     if content_type.partition(";")[0].strip().lower() != _FORM_CONTENT_TYPE:
-        raise AnatomyLearningFormError(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE
-        )
+        raise AnatomyLearningFormError(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE)
     content_length = request.headers.get("content-length")
     if content_length is not None:
         try:
@@ -164,15 +156,11 @@ async def _read_form(
         if declared_length < 0:
             raise AnatomyLearningFormError()
         if declared_length > _MAX_FORM_BODY_BYTES:
-            raise AnatomyLearningFormError(
-                status_code=status.HTTP_413_CONTENT_TOO_LARGE
-            )
+            raise AnatomyLearningFormError(status_code=status.HTTP_413_CONTENT_TOO_LARGE)
     body = bytearray()
     async for chunk in request.stream():
         if len(body) + len(chunk) > _MAX_FORM_BODY_BYTES:
-            raise AnatomyLearningFormError(
-                status_code=status.HTTP_413_CONTENT_TOO_LARGE
-            )
+            raise AnatomyLearningFormError(status_code=status.HTTP_413_CONTENT_TOO_LARGE)
         body.extend(chunk)
     try:
         encoded = bytes(body).decode("utf-8", errors="strict")
@@ -202,9 +190,7 @@ def _bounded(value: str, *, maximum: int) -> str:
 def _sha256(value: str) -> str:
     bounded = _bounded(value, maximum=64)
     if len(bounded) != 64 or any(character not in "0123456789abcdef" for character in bounded):
-        raise AnatomyLearningFormError(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT
-        )
+        raise AnatomyLearningFormError(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
     return bounded
 
 

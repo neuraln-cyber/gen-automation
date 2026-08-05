@@ -138,9 +138,7 @@ def _training_output(
         reject_threshold_micros=900_000 if promote else 1_000_000,
     )
     challenger_probabilities = {
-        example.sample_id: (
-            (1_000_000 if example.is_defect else 0) if promote else 500_000
-        )
+        example.sample_id: ((1_000_000 if example.is_defect else 0) if promote else 500_000)
         for example in split.holdout
     }
     challenger = evaluate_semantic_meta_predictions(
@@ -480,9 +478,7 @@ async def test_training_output_with_wrong_identity_fails_closed_before_promotion
 
     async with learning_context.database.sessions() as session:
         run = await session.get(SemanticTrainingRun, claimed.run_id)
-        promotion_count = await session.scalar(
-            select(func.count(SemanticModelPromotion.id))
-        )
+        promotion_count = await session.scalar(select(func.count(SemanticModelPromotion.id)))
 
     assert run is not None
     assert run.state == SemanticTrainingState.FAILED

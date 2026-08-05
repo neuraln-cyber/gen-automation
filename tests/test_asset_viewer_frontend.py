@@ -53,7 +53,7 @@ def test_asset_viewer_is_safe_progressive_enhancement() -> None:
     assert "rejectionBusy" in script
     assert 'document.addEventListener("gen-automation:review-action-settled"' in script
     assert 'card.dataset.decision === "reject"' in script
-    assert 'viewer.markOut.textContent = rejectionBusy' in script
+    assert "viewer.markOut.textContent = rejectionBusy" in script
     assert "raw master retained" in script
     assert "step(1)" in script
     assert "submitRejection(event.shiftKey, {" in script
@@ -159,8 +159,7 @@ def test_asset_viewer_delete_shortcuts_distinguish_plain_and_anatomy_rejection()
     assert "removeAnatomyLabel: !event.shiftKey && Boolean(context.anatomyLabeled)" in keyboard
     assert "Shift+Del Reject + anatomy" in script
     assert (
-        "if (context.anatomyToggle) context.anatomyToggle.checked = withAnatomyTraining"
-        in script
+        "if (context.anatomyToggle) context.anatomyToggle.checked = withAnatomyTraining" in script
     )
 
 
@@ -173,7 +172,7 @@ def test_asset_viewer_rejects_immediately_through_the_active_cards_own_form() ->
     submission = script.split("const submitRejection", 1)[1].split("const openViewer", 1)[0]
 
     assert 'card.querySelector("form[data-review-decision-form]")' in context
-    assert 'form?.querySelector(\'button[data-decision="reject"]\')' in context
+    assert "form?.querySelector('button[data-decision=\"reject\"]')" in context
     assert "context.form.requestSubmit(context.rejectButton)" in submission
     assert "bulkForm" not in submission
     assert "bulkReject" not in submission
@@ -301,7 +300,7 @@ def test_review_template_integrates_anatomy_rejection_and_legacy_keep_all() -> N
     assert 'bulkReasonInput.value = "sorting_default_accept"' in script
     assert "form.requestSubmit(acceptButton)" in script
     assert "anatomyRequested" in script
-    assert 'reasonInput.value = anatomyIssue instanceof HTMLSelectElement' in script
+    assert "reasonInput.value = anatomyIssue instanceof HTMLSelectElement" in script
     assert ".anatomy-reject-option" in styles
 
 
@@ -324,7 +323,7 @@ def test_fullscreen_inspections_are_batched_retried_and_flushed_without_renderin
 
     assert 'action="{{ inspection_endpoint }}"' in template
     assert 'value="{{ inspection_idempotency_key }}"' in template
-    assert 'data-inspected="{{ \'true\' if item.inspected else \'false\' }}"' in template
+    assert "data-inspected=\"{{ 'true' if item.inspected else 'false' }}\"" in template
     assert "data-inspected-chip" in template
     assert "pendingInspectionIds.add(assetId)" in queue
     assert "scheduleInspectionFlush()" in queue
@@ -335,10 +334,13 @@ def test_fullscreen_inspections_are_batched_retried_and_flushed_without_renderin
     assert "let batch = failedInspectionBatch" in flush
     assert "workspace.replaceWith" not in flush
     assert "renderCard" not in flush
-    assert "if (activeCard) queueInspection(activeCard)" in script.split(
-        "const drainInspectionQueue",
-        1,
-    )[1].split("const updateCleanControls", 1)[0]
+    assert (
+        "if (activeCard) queueInspection(activeCard)"
+        in script.split(
+            "const drainInspectionQueue",
+            1,
+        )[1].split("const updateCleanControls", 1)[0]
+    )
     assert step.index("queueInspection(activeCard)") < step.index("renderCard(")
     assert "queueInspection(activeCard)" in close
     assert "flushInspectionQueue(true)" in close
@@ -382,7 +384,7 @@ def test_fullscreen_defect_picker_is_optional_exact_and_per_image() -> None:
     submission = script.split("const submitRejection", 1)[1].split("const openViewer", 1)[0]
 
     assert "context.anatomyIssue.options" in sync
-    assert "context.anatomyIssue.value || \"anatomy\"" in sync
+    assert 'context.anatomyIssue.value || "anatomy"' in sync
     assert "chip.dataset.defectCode = option.value" in sync
     assert 'chip.setAttribute("role", "radio")' in sync
     assert "selectedOptions[0]" in script

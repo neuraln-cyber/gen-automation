@@ -200,11 +200,9 @@ class ImmutableTrainingObject(_FrozenStrictModel):
 
     storage_backend: Literal["s3"] = "s3"
     bucket: Annotated[str, StringConstraints(min_length=3, max_length=63)]
-    object_key: Annotated[str, StringConstraints(min_length=1, max_length=1024)] = Field(
+    object_key: Annotated[str, StringConstraints(min_length=1, max_length=1024)] = Field(repr=False)
+    object_version_id: Annotated[str, StringConstraints(min_length=1, max_length=1024)] = Field(
         repr=False
-    )
-    object_version_id: Annotated[str, StringConstraints(min_length=1, max_length=1024)] = (
-        Field(repr=False)
     )
     sha256: _SHA256
     exact_size_bytes: int = Field(ge=1, le=VISUAL_LORA_MAX_INPUT_ARTIFACT_BYTES)

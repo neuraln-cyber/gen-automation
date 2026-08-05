@@ -364,8 +364,7 @@ def chronological_semantic_meta_split(
         minimum_holdout_defect,
     )
     if any(
-        isinstance(value, bool) or not isinstance(value, int) or value < 1
-        for value in minimums
+        isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in minimums
     ):
         raise SemanticMetaClassifierError("split class minimums must be positive integers")
     ordered = _ordered_examples(examples)
@@ -437,9 +436,7 @@ def build_semantic_meta_split_from_learning_samples(
 
     training_samples = _deduplicated_binary_learning_samples(training)
     holdout_samples = _deduplicated_binary_learning_samples(holdout)
-    owner_user_id, profile_sha256 = _learning_scope(
-        (*training_samples, *holdout_samples)
-    )
+    owner_user_id, profile_sha256 = _learning_scope((*training_samples, *holdout_samples))
     return build_semantic_meta_dataset_split(
         training=(
             _meta_example_from_learning_sample(sample, group_by=group_by)
@@ -469,10 +466,7 @@ def chronological_semantic_meta_split_from_learning_samples(
     selected = _deduplicated_binary_learning_samples(samples)
     owner_user_id, profile_sha256 = _learning_scope(selected)
     return chronological_semantic_meta_split(
-        (
-            _meta_example_from_learning_sample(sample, group_by=group_by)
-            for sample in selected
-        ),
+        (_meta_example_from_learning_sample(sample, group_by=group_by) for sample in selected),
         owner_user_id=owner_user_id,
         profile_sha256=profile_sha256,
         holdout_fraction=holdout_fraction,
@@ -534,10 +528,7 @@ def evaluate_semantic_meta_model_on_learning_samples(
         _validate_model_learning_scope(model, sample)
     return evaluate_semantic_meta_model(
         model,
-        (
-            _meta_example_from_learning_sample(sample, group_by=group_by)
-            for sample in selected
-        ),
+        (_meta_example_from_learning_sample(sample, group_by=group_by) for sample in selected),
     )
 
 
@@ -593,9 +584,7 @@ def fit_semantic_meta_classifier(
         profile_sha256=split.profile_sha256,
         training_dataset_sha256=split.training_dataset_sha256,
         split_manifest_sha256=split.manifest_sha256,
-        fit_sample_sha256=canonical_sha256(
-            [example.identity_wire() for example in fit_examples]
-        ),
+        fit_sample_sha256=canonical_sha256([example.identity_wire() for example in fit_examples]),
         fit_sample_count=len(fit_examples),
         parameters=selected_parameters,
         feature_means=means,
@@ -704,9 +693,7 @@ def select_semantic_meta_thresholds(
     raw_rows = tuple(labeled_probabilities)
     if any(not isinstance(label, bool) for label, _ in raw_rows):
         raise SemanticMetaClassifierError("threshold labels must be booleans")
-    rows = tuple(
-        (label, _micros(value, label="probability")) for label, value in raw_rows
-    )
+    rows = tuple((label, _micros(value, label="probability")) for label, value in raw_rows)
     if not rows:
         raise SemanticMetaClassifierError("threshold selection requires labeled probabilities")
     if len({label for label, _ in rows}) != 2:
@@ -784,8 +771,7 @@ def evaluate_semantic_meta_predictions(
     if set(probabilities_micros) != expected_sample_ids:
         raise SemanticMetaClassifierError("predictions do not match evaluation sample IDs")
     probabilities = tuple(
-        _micros(probabilities_micros[example.sample_id], label="probability")
-        for example in ordered
+        _micros(probabilities_micros[example.sample_id], label="probability") for example in ordered
     )
     _sha256(model_sha256, label="model")
     predictions = tuple(
@@ -819,9 +805,7 @@ def evaluate_semantic_meta_predictions(
     )
     binary_fn = defect_count - binary_tp
     binary_tn = good_count - binary_fp
-    false_reject_bounds = (
-        binomial_safety_bounds(good_rejected, good_count) if good_count else None
-    )
+    false_reject_bounds = binomial_safety_bounds(good_rejected, good_count) if good_count else None
     reject_precision_bounds = (
         binomial_safety_bounds(defect_rejected, len(reject)) if reject else None
     )
@@ -934,15 +918,11 @@ def compare_semantic_meta_challenger(
     false_reject_bounds = challenger.false_reject_rate_bounds
     if false_reject_bounds is None:
         blockers.append("challenger has no good-image false-reject safety bound")
-    elif (
-        false_reject_bounds.upper_micros
-        > selected_policy.maximum_false_reject_upper_micros
-    ):
+    elif false_reject_bounds.upper_micros > selected_policy.maximum_false_reject_upper_micros:
         blockers.append("challenger false-reject upper bound exceeds the safety target")
     if (
         challenger.reject_precision_micros is None
-        or challenger.reject_precision_micros
-        < selected_policy.minimum_reject_precision_micros
+        or challenger.reject_precision_micros < selected_policy.minimum_reject_precision_micros
     ):
         blockers.append("challenger auto-reject precision is below the safety target")
     if (
@@ -1009,18 +989,14 @@ def deserialize_semantic_meta_model(payload: bytes) -> SemanticMetaModel:
         split_manifest_sha256=_string(
             artifact.get("split_manifest_sha256"), label="split manifest digest"
         ),
-        fit_sample_sha256=_string(
-            artifact.get("fit_sample_sha256"), label="fit sample digest"
-        ),
+        fit_sample_sha256=_string(artifact.get("fit_sample_sha256"), label="fit sample digest"),
         fit_sample_count=_integer(artifact.get("fit_sample_count"), label="fit sample count"),
         parameters=SemanticMetaTrainingParameters(
             iterations=_integer(parameters_wire.get("iterations"), label="iterations"),
             learning_rate=_hex_float(
                 parameters_wire.get("learning_rate_hex"), label="learning rate"
             ),
-            l2_strength=_hex_float(
-                parameters_wire.get("l2_strength_hex"), label="L2 strength"
-            ),
+            l2_strength=_hex_float(parameters_wire.get("l2_strength_hex"), label="L2 strength"),
             maximum_good_to_defect_ratio=_integer(
                 parameters_wire.get("maximum_good_to_defect_ratio"),
                 label="maximum good-to-defect ratio",
@@ -1038,12 +1014,8 @@ def deserialize_semantic_meta_model(payload: bytes) -> SemanticMetaModel:
                 label="keep NPV target",
             ),
         ),
-        feature_means=_hex_float_tuple(
-            artifact.get("feature_means_hex"), label="feature means"
-        ),
-        feature_scales=_hex_float_tuple(
-            artifact.get("feature_scales_hex"), label="feature scales"
-        ),
+        feature_means=_hex_float_tuple(artifact.get("feature_means_hex"), label="feature means"),
+        feature_scales=_hex_float_tuple(artifact.get("feature_scales_hex"), label="feature scales"),
         weights=_hex_float_tuple(artifact.get("weights_hex"), label="weights"),
         intercept=_hex_float(artifact.get("intercept_hex"), label="intercept"),
         keep_threshold_micros=_integer(
@@ -1091,9 +1063,7 @@ def _deduplicated_binary_learning_samples(
         content = by_content[asset_sha256]
         strongest_rank = max(_learning_source_rank(sample.source) for sample in content)
         strongest = tuple(
-            sample
-            for sample in content
-            if _learning_source_rank(sample.source) == strongest_rank
+            sample for sample in content if _learning_source_rank(sample.source) == strongest_rank
         )
         if len({sample.ground_truth for sample in strongest}) != 1:
             continue
@@ -1297,10 +1267,7 @@ def _validate_model(model: SemanticMetaModel) -> None:
     _sha256(model.profile_sha256, label="semantic profile")
     feature_count = len(SEMANTIC_META_FEATURE_NAMES)
     if not (
-        len(model.feature_means)
-        == len(model.feature_scales)
-        == len(model.weights)
-        == feature_count
+        len(model.feature_means) == len(model.feature_scales) == len(model.weights) == feature_count
     ):
         raise SemanticMetaClassifierError("model coefficient dimensions are invalid")
     _sha256(model.training_dataset_sha256, label="training dataset")

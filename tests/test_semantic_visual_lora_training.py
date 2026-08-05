@@ -61,9 +61,7 @@ def _sample(index: int) -> SemanticLearningSample:
         profile_sha256=_PROFILE_SHA256,
         asset_sha256=f"{index + 1:064x}",
         ground_truth=(
-            SemanticGroundTruth.ANATOMY_GOOD
-            if is_good
-            else SemanticGroundTruth.ANATOMY_DEFECT
+            SemanticGroundTruth.ANATOMY_GOOD if is_good else SemanticGroundTruth.ANATOMY_DEFECT
         ),
         owner_issue_code=None if is_good else issues[index % len(issues)],
         source=SOURCE_EXPLICIT,
@@ -140,8 +138,7 @@ def ready_inputs() -> dict[str, object]:
     )
     trainer = VisualLoraTrainerIdentity(
         trainer_contract_version="semantic-anatomy-visual-lora-trainer/v1",
-        container_image="registry.example/gen-automation/visual-lora-trainer@sha256:"
-        + "f" * 64,
+        container_image="registry.example/gen-automation/visual-lora-trainer@sha256:" + "f" * 64,
         base_model=_MODEL,
         base_model_revision=_MODEL_REVISION,
     )
@@ -217,9 +214,7 @@ def test_plan_is_deterministic_spend_disabled_and_shadow_only(
     assert first.request.output.deployment_mode == "shadow"
     assert first.request.output.auto_promote is False
     assert first.request.output.may_change_review_decisions is False
-    assert first.request.idempotency_key == (
-        f"visual-lora-v1:{first.request.request_sha256}"
-    )
+    assert first.request.idempotency_key == (f"visual-lora-v1:{first.request.request_sha256}")
     wire = first.model_dump_json()
     assert "https://" not in wire
     assert "api_key" not in wire.casefold()
@@ -402,9 +397,7 @@ def test_request_integrity_and_idempotency_replay_are_fail_closed(
         {
             **ready_inputs,
             "output": output.model_copy(
-                update={
-                    "object_key": "visual-lora/challengers/qwen3-vl-owner-71000-v2.safetensors"
-                }
+                update={"object_key": "visual-lora/challengers/qwen3-vl-owner-71000-v2.safetensors"}
             ),
         }
     ).request

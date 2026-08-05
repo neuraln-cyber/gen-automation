@@ -293,8 +293,10 @@ def test_learning_page_renders_exact_readiness_and_latest_metrics(
         style_stack_count=5,
         missing_style_metadata_count=7,
     )
+
     def named(name: str, count: int) -> SimpleNamespace:
         return SimpleNamespace(name=name, count=count)
+
     profile = SimpleNamespace(
         profile_sha256=profile_sha256,
         dataset_sha256="b" * 64,

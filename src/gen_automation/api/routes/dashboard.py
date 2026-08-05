@@ -844,9 +844,7 @@ async def dashboard_review_inspections(
         JSONResponse(
             content={
                 "ok": True,
-                "inspected_asset_ids": [
-                    str(asset_id) for asset_id in result.inspected_asset_ids
-                ],
+                "inspected_asset_ids": [str(asset_id) for asset_id in result.inspected_asset_ids],
                 "created_count": result.created_count,
             }
         ),

@@ -121,7 +121,6 @@ def _drop_guards() -> None:
         op.execute("DROP TRIGGER IF EXISTS review_asset_inspections_guard_insert")
         return
     op.execute(
-        "DROP TRIGGER IF EXISTS review_asset_inspections_guard_mutation "
-        "ON review_asset_inspections"
+        "DROP TRIGGER IF EXISTS review_asset_inspections_guard_mutation ON review_asset_inspections"
     )
     op.execute("DROP FUNCTION IF EXISTS gen_automation_guard_review_asset_inspection()")

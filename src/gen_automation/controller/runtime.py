@@ -1801,9 +1801,7 @@ def build_controller_runtime(
                 name="semantic-learning",
                 cycle=workloads.semantic_learning_once,
                 idle_interval_seconds=max(poll, 60),
-                timeout_seconds=(
-                    settings.background_semantic_learning_timeout_seconds + 5
-                ),
+                timeout_seconds=(settings.background_semantic_learning_timeout_seconds + 5),
             )
         )
     return ControllerRuntime(

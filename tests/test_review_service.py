@@ -421,8 +421,7 @@ async def test_review_inspections_union_batches_without_changing_task_lock(
             await session.scalars(
                 select(ReviewAssetInspection.asset_id).where(
                     ReviewAssetInspection.review_task_id == task.task_id,
-                    ReviewAssetInspection.inspected_by_user_id
-                    == review_context.reviewer_id,
+                    ReviewAssetInspection.inspected_by_user_id == review_context.reviewer_id,
                 )
             )
         )
@@ -757,10 +756,7 @@ async def test_untouched_default_accepts_never_become_anatomy_good_training_labe
 
     async with review_context.database.sessions() as session:
         feedback_count = int(
-            await session.scalar(
-                select(func.count()).select_from(SemanticAnatomyFeedback)
-            )
-            or 0
+            await session.scalar(select(func.count()).select_from(SemanticAnatomyFeedback)) or 0
         )
         reconciled = await reconcile_one_completed_semantic_review(
             session,
@@ -824,8 +820,7 @@ async def test_inspected_default_accepts_become_positive_labels_on_completion(
             (
                 await session.scalars(
                     select(SemanticAnatomyFeedback).where(
-                        SemanticAnatomyFeedback.feedback_by_user_id
-                        == review_context.owner_id
+                        SemanticAnatomyFeedback.feedback_by_user_id == review_context.owner_id
                     )
                 )
             ).all()

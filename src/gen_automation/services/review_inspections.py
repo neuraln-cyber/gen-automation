@@ -65,9 +65,7 @@ async def record_review_inspections(
         raise ReviewNotFoundError("authorized review actor was not found")
 
     task = await session.scalar(
-        select(ReviewTask)
-        .where(ReviewTask.id == review_task_id)
-        .with_for_update()
+        select(ReviewTask).where(ReviewTask.id == review_task_id).with_for_update()
     )
     if task is None:
         raise ReviewNotFoundError("review task was not found")

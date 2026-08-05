@@ -110,7 +110,7 @@ def test_generation_form_uses_one_responsive_progressive_builder() -> None:
     )
 
     assert '<div class="automation-create">' in template
-    assert '<h1>New set</h1>' in template
+    assert "<h1>New set</h1>" in template
     assert 'class="automation-jump-nav"' in template
     assert 'class="step-panel form-disclosure automation-settings-panel"' in template
     assert "data-image-settings-summary" in template

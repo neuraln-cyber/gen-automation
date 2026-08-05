@@ -103,9 +103,7 @@ ISSUE_FAMILIES: tuple[tuple[str, tuple[SemanticIssueCode, ...]], ...] = (
     ),
     ("face", (SemanticIssueCode.SEVERE_FACE_DEFORMATION,)),
 )
-_ISSUE_FAMILY_BY_CODE = {
-    code: family for family, codes in ISSUE_FAMILIES for code in codes
-}
+_ISSUE_FAMILY_BY_CODE = {code: family for family, codes in ISSUE_FAMILIES for code in codes}
 
 SEMANTIC_META_FEATURE_NAMES: tuple[str, ...] = (
     "verdict_pass",
@@ -574,10 +572,7 @@ def select_semantic_learning_dataset_partition(
         if timestamp >= holdout.cutoff_at
         for sample in cohorts[timestamp]
     )
-    if (
-        len(training) != holdout.training_count
-        or len(untouched_holdout) != holdout.holdout_count
-    ):
+    if len(training) != holdout.training_count or len(untouched_holdout) != holdout.holdout_count:
         raise ValueError("semantic learning split identity changed")
     return SemanticLearningDatasetPartition(
         group_key=holdout.group_key,
@@ -599,9 +594,7 @@ def _profile_readiness(
     )
     eligible = resolved.eligible
     binary = resolved.binary
-    good_count = sum(
-        sample.ground_truth == SemanticGroundTruth.ANATOMY_GOOD for sample in binary
-    )
+    good_count = sum(sample.ground_truth == SemanticGroundTruth.ANATOMY_GOOD for sample in binary)
     defect_count = len(binary) - good_count
     unjudgeable_count = sum(
         sample.ground_truth == SemanticGroundTruth.UNJUDGEABLE for sample in eligible
@@ -619,9 +612,7 @@ def _profile_readiness(
     )
 
     owner_issues = Counter(
-        sample.owner_issue_code.value
-        for sample in binary
-        if sample.owner_issue_code is not None
+        sample.owner_issue_code.value for sample in binary if sample.owner_issue_code is not None
     )
     family_counts = Counter(
         _ISSUE_FAMILY_BY_CODE[sample.owner_issue_code]
@@ -728,9 +719,7 @@ def _profile_readiness(
                 "source": sample.source,
                 "release_id": str(sample.release_id),
                 "generation_job_id": (
-                    str(sample.generation_job_id)
-                    if sample.generation_job_id is not None
-                    else None
+                    str(sample.generation_job_id) if sample.generation_job_id is not None else None
                 ),
             }
             for sample in eligible
@@ -814,9 +803,7 @@ def _split_readiness(samples: tuple[SemanticLearningSample, ...]) -> SemanticSpl
     sets = {sample.release_id for sample in samples}
     completed_sets = {sample.release_id for sample in samples if sample.completed_review}
     batches = {
-        sample.generation_job_id
-        for sample in samples
-        if sample.generation_job_id is not None
+        sample.generation_job_id for sample in samples if sample.generation_job_id is not None
     }
     dates = {sample.generated_at.date() for sample in samples}
     set_eligible = _class_spans_multiple_groups(samples, lambda sample: sample.release_id)
@@ -826,11 +813,7 @@ def _split_readiness(samples: tuple[SemanticLearningSample, ...]) -> SemanticSpl
         reject_none=True,
     )
     recommended = (
-        "release_id"
-        if set_eligible
-        else "generation_job_id"
-        if batch_eligible
-        else "asset_sha256"
+        "release_id" if set_eligible else "generation_job_id" if batch_eligible else "asset_sha256"
     )
     temporal_splits = _temporal_group_splits(samples, group_key=recommended)
     return SemanticSplitReadiness(
@@ -902,9 +885,7 @@ def _temporal_group_splits(
                     holdout_good_count=holdout_good,
                     holdout_defect_count=holdout_defect,
                     zero_false_reject_upper_micros=(
-                        _zero_error_upper_micros(holdout_good)
-                        if holdout_good > 0
-                        else None
+                        _zero_error_upper_micros(holdout_good) if holdout_good > 0 else None
                     ),
                 )
             )
@@ -920,11 +901,7 @@ def _semantic_group_cohorts(
         raise ValueError("semantic learning group key is unsupported")
     grouped: dict[object, list[SemanticLearningSample]] = defaultdict(list)
     for sample in samples:
-        key: object = (
-            sample.release_id
-            if group_key == "release_id"
-            else sample.generation_job_id
-        )
+        key: object = sample.release_id if group_key == "release_id" else sample.generation_job_id
         if key is not None:
             grouped[key].append(sample)
     cohorts: dict[datetime, list[SemanticLearningSample]] = defaultdict(list)
@@ -953,18 +930,15 @@ def _select_evaluation_holdout(
             (
                 max(
                     0,
-                    META_EVALUATION_MINIMUM_TRAINING_GOOD
-                    - candidate.training_good_count,
+                    META_EVALUATION_MINIMUM_TRAINING_GOOD - candidate.training_good_count,
                 ),
                 max(
                     0,
-                    META_EVALUATION_MINIMUM_TRAINING_DEFECT
-                    - candidate.training_defect_count,
+                    META_EVALUATION_MINIMUM_TRAINING_DEFECT - candidate.training_defect_count,
                 ),
                 max(
                     0,
-                    META_EVALUATION_MINIMUM_HOLDOUT_DEFECT
-                    - candidate.holdout_defect_count,
+                    META_EVALUATION_MINIMUM_HOLDOUT_DEFECT - candidate.holdout_defect_count,
                 ),
                 max(
                     0,
@@ -979,10 +953,7 @@ def _select_evaluation_holdout(
             len(_meta_evaluation_blockers(candidate)),
             shortfall(candidate),
             abs(
-                (
-                    candidate.holdout_count
-                    / (candidate.training_count + candidate.holdout_count)
-                )
+                (candidate.holdout_count / (candidate.training_count + candidate.holdout_count))
                 - 0.2
             ),
             candidate.cutoff_at,
@@ -1009,10 +980,7 @@ def _meta_evaluation_blockers(
             f"need {META_EVALUATION_MINIMUM_HOLDOUT_DEFECT} holdout anatomy-defect labels"
         )
     upper = holdout.zero_false_reject_upper_micros
-    if (
-        upper is None
-        or upper > META_EVALUATION_MAXIMUM_ZERO_ERROR_FALSE_REJECT_UPPER_MICROS
-    ):
+    if upper is None or upper > META_EVALUATION_MAXIMUM_ZERO_ERROR_FALSE_REJECT_UPPER_MICROS:
         blockers.append("need enough holdout anatomy-good labels for a <=2% 95% upper bound")
     return tuple(blockers)
 
@@ -1086,9 +1054,7 @@ def _cohort_diversity(
         workflow_count=len(
             {sample.workflow_cohort for sample in samples if sample.workflow_cohort}
         ),
-        style_stack_count=len(
-            {sample.style_cohort for sample in samples if sample.style_cohort}
-        ),
+        style_stack_count=len({sample.style_cohort for sample in samples if sample.style_cohort}),
         missing_style_metadata_count=sum(sample.style_cohort is None for sample in samples),
     )
 

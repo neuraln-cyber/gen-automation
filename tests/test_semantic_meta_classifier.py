@@ -129,9 +129,7 @@ def _learning_sample(
         profile_sha256=PROFILE_SHA256,
         asset_sha256=_sha(name),
         ground_truth=(
-            SemanticGroundTruth.ANATOMY_DEFECT
-            if defect
-            else SemanticGroundTruth.ANATOMY_GOOD
+            SemanticGroundTruth.ANATOMY_DEFECT if defect else SemanticGroundTruth.ANATOMY_GOOD
         ),
         owner_issue_code=None,
         source=SOURCE_EXPLICIT,
@@ -229,23 +227,25 @@ def test_training_serialization_and_inference_are_byte_reproducible() -> None:
     assert first.artifact_sha256 == second.artifact_sha256
     restored = deserialize_semantic_meta_model(first.serialize())
     assert restored == first
-    good_probability = predict_semantic_meta_probability_micros(
-        restored, _features(defect=False)
-    )
-    defect_probability = predict_semantic_meta_probability_micros(
-        restored, _features(defect=True)
-    )
+    good_probability = predict_semantic_meta_probability_micros(restored, _features(defect=False))
+    defect_probability = predict_semantic_meta_probability_micros(restored, _features(defect=True))
     assert good_probability < defect_probability
-    assert semantic_meta_triage(
-        good_probability,
-        keep_threshold_micros=restored.keep_threshold_micros,
-        reject_threshold_micros=restored.reject_threshold_micros,
-    ) == SemanticMetaTriage.KEEP
-    assert semantic_meta_triage(
-        defect_probability,
-        keep_threshold_micros=restored.keep_threshold_micros,
-        reject_threshold_micros=restored.reject_threshold_micros,
-    ) == SemanticMetaTriage.REJECT
+    assert (
+        semantic_meta_triage(
+            good_probability,
+            keep_threshold_micros=restored.keep_threshold_micros,
+            reject_threshold_micros=restored.reject_threshold_micros,
+        )
+        == SemanticMetaTriage.KEEP
+    )
+    assert (
+        semantic_meta_triage(
+            defect_probability,
+            keep_threshold_micros=restored.keep_threshold_micros,
+            reject_threshold_micros=restored.reject_threshold_micros,
+        )
+        == SemanticMetaTriage.REJECT
+    )
 
     envelope = json.loads(first.serialize())
     envelope["artifact"]["weights_hex"][0] = float(123).hex()
@@ -286,16 +286,22 @@ def test_unsafe_threshold_fit_abstains_instead_of_leaking_edge_probabilities() -
 
     assert keep == NO_KEEP_THRESHOLD_MICROS
     assert reject == NO_REJECT_THRESHOLD_MICROS
-    assert semantic_meta_triage(
-        0,
-        keep_threshold_micros=keep,
-        reject_threshold_micros=reject,
-    ) == SemanticMetaTriage.REVIEW
-    assert semantic_meta_triage(
-        1_000_000,
-        keep_threshold_micros=keep,
-        reject_threshold_micros=reject,
-    ) == SemanticMetaTriage.REVIEW
+    assert (
+        semantic_meta_triage(
+            0,
+            keep_threshold_micros=keep,
+            reject_threshold_micros=reject,
+        )
+        == SemanticMetaTriage.REVIEW
+    )
+    assert (
+        semantic_meta_triage(
+            1_000_000,
+            keep_threshold_micros=keep,
+            reject_threshold_micros=reject,
+        )
+        == SemanticMetaTriage.REVIEW
+    )
 
 
 def test_binomial_bounds_use_exact_edges_and_wilson_interior() -> None:
@@ -338,8 +344,7 @@ def test_challenger_promotes_only_on_same_safe_holdout_with_improvement() -> Non
         for example in examples
     }
     challenger_probabilities = {
-        example.sample_id: 950_000 if example.is_defect else 50_000
-        for example in examples
+        example.sample_id: 950_000 if example.is_defect else 50_000 for example in examples
     }
     champion = evaluate_semantic_meta_predictions(
         examples,
@@ -429,8 +434,7 @@ def test_promotion_policy_can_be_tightened_without_changing_model_artifact() -> 
         for index in range(300)
     )
     probabilities = {
-        example.sample_id: 950_000 if example.is_defect else 50_000
-        for example in examples
+        example.sample_id: 950_000 if example.is_defect else 50_000 for example in examples
     }
     evaluation = evaluate_semantic_meta_predictions(
         examples,

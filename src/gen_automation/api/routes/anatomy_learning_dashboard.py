@@ -80,8 +80,7 @@ async def dashboard_anatomy_learning(
             status_code=status.HTTP_403_FORBIDDEN,
             heading="Anatomy learning is owner-only",
             message=(
-                "Only the owner can view personalized training data and model "
-                "promotion history."
+                "Only the owner can view personalized training data and model promotion history."
             ),
         )
 
@@ -430,8 +429,7 @@ def _is_policy_replay(
         and policy.auto_train_meta == form.auto_train_meta
         and policy.auto_train_visual == form.auto_train_visual
         and policy.auto_promote_validated == form.auto_promote_validated
-        and policy.minimum_new_labels_for_retrain
-        == form.minimum_new_labels_for_retrain
+        and policy.minimum_new_labels_for_retrain == form.minimum_new_labels_for_retrain
         and policy.max_visual_run_microusd == form.max_visual_run_microusd
     )
 
@@ -477,9 +475,7 @@ def _secure_response(request: Request, response: Response) -> Response:
     settings: Settings = request.app.state.settings
     response.headers["Cache-Control"] = "private, no-store"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Content-Security-Policy"] = content_security_policy(
-        settings.environment
-    )
+    response.headers["Content-Security-Policy"] = content_security_policy(settings.environment)
     return response
 
 

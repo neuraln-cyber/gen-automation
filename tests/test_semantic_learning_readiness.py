@@ -158,9 +158,10 @@ def test_readiness_counts_sources_issues_conflicts_and_disagreement_priority() -
     assert _counts(profile.audit_priority_counts)["confirmed_review"] == 1
     assert not profile.calibration.ready
     assert report.meta_feature_names
-    assert profile.dataset_sha256 == summarize_semantic_learning_readiness(samples).profiles[
-        0
-    ].dataset_sha256
+    assert (
+        profile.dataset_sha256
+        == summarize_semantic_learning_readiness(samples).profiles[0].dataset_sha256
+    )
 
 
 def test_readiness_is_per_owner_and_dedupes_by_strongest_evidence() -> None:
