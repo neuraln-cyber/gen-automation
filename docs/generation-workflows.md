@@ -117,6 +117,40 @@ The release freezes guide size, maximum size, denoise, face threshold, dilation,
 crop factor, and feather. The New Set preset values are `768`, `1024`, `0.4`,
 `0.3`, `4`, `3.0`, and `4`.
 
+## Two-character area-composition profiles
+
+The four `illustrious-sdxl-couple-*-v1.json` templates mirror the base, base +
+detailer, hires, and hires + detailer profiles while keeping two character
+identities spatially separated with ComfyUI core nodes. Their SHA-256 values
+are:
+
+- base: `539bfdf81d9668b6e0c60c77034ac5ff3c4d233e468c1f3dd1fe398415892923`;
+- base + detailer: `62f8db236c95a5c88f130c1fc10fa34dbc7455dba45695081aa5bc19d2bde890`;
+- hires: `b674f45c8b62f6742b74c1364f4c6b172ef2ed3446f4e29034e1c1da3727773c`;
+  and
+- hires + detailer:
+  `9f2d863469bcc6ab069244c72797e19aa8a95aa9f253170fdd5066a754fe586e`.
+
+Each template encodes the normal positive prompt as full-frame scene and style
+conditioning. It independently encodes `character_a_prompt` and
+`character_b_prompt`, assigns them to overlapping left and right regions with
+`ConditioningSetAreaPercentage`, and merges all three conditionings with
+`ConditioningCombine`. Character A covers `x=0.0..0.55`; character B covers
+`x=0.45..1.0`. The ten-percent overlap avoids an unconditioned seam while the
+separate regional embeddings reduce identity and outfit blending.
+
+Both samplers in each hires graph receive the same combined regional
+conditioning. Dropping the regions for the refinement pass can merge character
+traits. The negative prompt remains full-frame. Detailer variants keep one
+generic detailer prompt and let the existing face detector refine every face it
+finds; they do not assign character identities during the face pass.
+
+These profiles use no additional extension, model artifact, or sampling pass.
+Their only additional runtime node classes are `ConditioningSetAreaPercentage`
+and `ConditioningCombine`, both built into the pinned ComfyUI revision. Style
+LoRAs remain global because the workflow has one model path; character-specific
+LoRAs are not spatially isolated by this profile.
+
 The worker image pins:
 
 - Impact Pack commit `429d0159ad429e64d2b3916e6e7be9c22d025c3c`;
@@ -160,8 +194,8 @@ artifact bucket.
 Bundling a JSON template does not automatically make it selectable. Upload the
 exact template bytes to private workflow storage and create a current approved
 workflow registry record using the path's SHA-256 above. Register the base,
-base + detailer, hires, and hires + detailer files as four separate workflow
-approvals. They
+base + detailer, hires, hires + detailer, and their four couple counterparts as
+eight separate workflow approvals. They
 then appear in the New Set workflow selector.
 
 Upstream contracts:

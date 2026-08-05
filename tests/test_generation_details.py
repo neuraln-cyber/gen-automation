@@ -198,6 +198,102 @@ def _job_parameters() -> dict[str, Any]:
     }
 
 
+def _duo_prompt_resolution(
+    *,
+    seed: int,
+    resolved_prompt: str,
+    resolved_character_a_prompt: str,
+    resolved_character_b_prompt: str,
+    entry_index: int,
+) -> dict[str, Any]:
+    evidence = _prompt_resolution(
+        seed=seed,
+        resolved_prompt=resolved_prompt,
+        entry_index=entry_index,
+    )
+    source_character_a_prompt = "nico robin, __poses__, left side"
+    source_character_b_prompt = "boa hancock, right side"
+    evidence.update(
+        {
+            "schema_version": 2,
+            "source_character_a_prompt": source_character_a_prompt,
+            "source_character_b_prompt": source_character_b_prompt,
+            "source_character_a_prompt_sha256": _sha256(source_character_a_prompt),
+            "source_character_b_prompt_sha256": _sha256(source_character_b_prompt),
+            "resolved_character_a_prompt_sha256": _sha256(resolved_character_a_prompt),
+            "resolved_character_b_prompt_sha256": _sha256(resolved_character_b_prompt),
+        }
+    )
+    evidence["selections"].append(
+        {
+            "field": "character_a_prompt",
+            "occurrence": 1,
+            "depth": 1,
+            "name": "poses",
+            "version_id": str(WILDCARD_VERSION_ID),
+            "version_no": 3,
+            "entries_sha256": "d" * 64,
+            "entry_index": entry_index,
+            "entry_sha256": _sha256("standing" if entry_index == 0 else "sitting"),
+        }
+    )
+    return evidence
+
+
+def _duo_job_parameters() -> dict[str, Any]:
+    parameters = _job_parameters()
+    legacy_outputs = parameters["output_generations"]
+    assert isinstance(legacy_outputs, list)
+    first = GenerationParameters.model_validate(legacy_outputs[0]).model_copy(
+        update={
+            "composition_mode": "duo",
+            "character_a_prompt": "nico robin, standing, left side",
+            "character_b_prompt": "boa hancock, right side",
+        }
+    )
+    second = GenerationParameters.model_validate(legacy_outputs[1]).model_copy(
+        update={
+            "composition_mode": "duo",
+            "character_a_prompt": "nico robin, sitting, left side",
+            "character_b_prompt": "boa hancock, right side",
+        }
+    )
+    outputs = [first.model_dump(mode="json"), second.model_dump(mode="json")]
+    resolutions = [
+        _duo_prompt_resolution(
+            seed=first.seed,
+            resolved_prompt=first.prompt,
+            resolved_character_a_prompt=first.character_a_prompt,
+            resolved_character_b_prompt=first.character_b_prompt,
+            entry_index=0,
+        ),
+        _duo_prompt_resolution(
+            seed=second.seed,
+            resolved_prompt=second.prompt,
+            resolved_character_a_prompt=second.character_a_prompt,
+            resolved_character_b_prompt=second.character_b_prompt,
+            entry_index=1,
+        ),
+    ]
+    parameters.update(
+        {
+            "subjects": [
+                *parameters["subjects"],
+                {
+                    "name": "Second example adult character",
+                    "canonical_age": 31,
+                    "canonical_source_url": "https://private-source.example/character-two",
+                },
+            ],
+            "generation": {**outputs[0], "outputs_per_job": 2},
+            "prompt_resolution": resolutions[0],
+            "output_generations": outputs,
+            "output_prompt_resolutions": resolutions,
+        }
+    )
+    return parameters
+
+
 def test_generation_details_accept_twenty_five_output_snapshots() -> None:
     parameters = _job_parameters()
     base = GenerationParameters.model_validate(parameters["output_generations"][0])
@@ -363,6 +459,7 @@ def test_generation_details_selects_exact_output_and_returns_only_safe_fields(
         "output",
         "batch",
         "subjects",
+        "composition",
         "prompts",
         "sampling",
         "hires",
@@ -378,8 +475,13 @@ def test_generation_details_selects_exact_output_and_returns_only_safe_fields(
     assert payload["sampling"]["seed"] == str(MAX_SEED)
     assert payload["hires"]["enabled"] is True
     assert payload["detailer"]["enabled"] is True
+    assert payload["composition"] == {"mode": "single"}
     assert payload["prompts"]["positive"]["source"] == "portrait, __poses__"
     assert payload["prompts"]["positive"]["resolved"] == "portrait, sitting"
+    assert payload["prompts"]["character_a"]["source"] == ""
+    assert payload["prompts"]["character_a"]["resolved"] == ""
+    assert payload["prompts"]["character_b"]["source"] == ""
+    assert payload["prompts"]["character_b"]["resolved"] == ""
     assert payload["prompts"]["detailer_positive"] == {
         **payload["prompts"]["positive"],
         "inherited": True,
@@ -413,6 +515,51 @@ def test_generation_details_selects_exact_output_and_returns_only_safe_fields(
         "asset_metadata",
     ):
         assert forbidden not in serialized
+
+
+def test_generation_details_exposes_source_and_resolved_duo_character_prompts(
+    client: TestClient,
+) -> None:
+    client.portal.call(_seed_generation_details, client)
+    parameters = _duo_job_parameters()
+    client.portal.call(_replace_job_parameters, client, parameters)
+
+    response = client.get(f"/dashboard/assets/{ASSET_ID}/generation-details")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["available"] is True
+    assert payload["composition"] == {"mode": "duo"}
+    assert [subject["name"] for subject in payload["subjects"]] == [
+        "Example adult character",
+        "Second example adult character",
+    ]
+    assert payload["prompts"]["character_a"] == {
+        "source": "nico robin, __poses__, left side",
+        "resolved": "nico robin, sitting, left side",
+        "source_sha256": _sha256("nico robin, __poses__, left side"),
+        "resolved_sha256": _sha256("nico robin, sitting, left side"),
+        "inherited": False,
+    }
+    assert payload["prompts"]["character_b"] == {
+        "source": "boa hancock, right side",
+        "resolved": "boa hancock, right side",
+        "source_sha256": _sha256("boa hancock, right side"),
+        "resolved_sha256": _sha256("boa hancock, right side"),
+        "inherited": False,
+    }
+    assert {item["field"] for item in payload["wildcards"]["selections"]} == {
+        "prompt",
+        "character_a_prompt",
+    }
+
+    tampered = copy.deepcopy(parameters)
+    tampered["output_prompt_resolutions"][1]["resolved_character_a_prompt_sha256"] = "f" * 64
+    client.portal.call(_replace_job_parameters, client, tampered)
+    assert client.get(f"/dashboard/assets/{ASSET_ID}/generation-details").json() == {
+        "available": False,
+        "message": "Generation details are unavailable for this image.",
+    }
 
 
 def test_generation_details_reports_base_detailer_without_upscaler(

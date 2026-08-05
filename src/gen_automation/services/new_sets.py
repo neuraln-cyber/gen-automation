@@ -38,7 +38,10 @@ from gen_automation.domain.enums import (
     ResourceHealth,
     ScoringRunState,
 )
-from gen_automation.domain.generation_limits import MAX_OUTPUTS_PER_GENERATION_JOB
+from gen_automation.domain.generation_limits import (
+    MAX_OUTPUTS_PER_GENERATION_JOB,
+    REGIONAL_PROMPT_NODE_CLASSES,
+)
 from gen_automation.domain.release_spec import (
     ArtifactSpecification,
     GenerationBatchSpecification,
@@ -115,6 +118,10 @@ class NewSetSubmission(BaseModel):
     slug: Slug
     title: str = Field(min_length=1, max_length=300)
     subject_approval_id: UUID
+    secondary_subject_approval_id: UUID | None = None
+    composition_mode: Literal["single", "duo"] = "single"
+    character_a_prompt: str = Field(default="", max_length=20_000)
+    character_b_prompt: str = Field(default="", max_length=20_000)
     checkpoint_approval_id: UUID
     loras: tuple[NewSetLoraSelection, ...] = Field(default=(), max_length=8)
     workflow_approval_id: UUID
@@ -160,6 +167,18 @@ class NewSetSubmission(BaseModel):
 
     @model_validator(mode="after")
     def validate_plan(self) -> "NewSetSubmission":
+        if self.composition_mode == "single":
+            if self.secondary_subject_approval_id is not None:
+                raise ValueError("single-character composition cannot include a second subject")
+            if self.character_a_prompt.strip() or self.character_b_prompt.strip():
+                raise ValueError("single-character composition cannot include regional prompts")
+        else:
+            if self.secondary_subject_approval_id is None:
+                raise ValueError("two-character composition requires a second subject")
+            if self.secondary_subject_approval_id == self.subject_approval_id:
+                raise ValueError("two-character composition requires two different subjects")
+            if not self.character_a_prompt.strip() or not self.character_b_prompt.strip():
+                raise ValueError("two-character composition requires both character prompts")
         lora_ids = [selection.approval_id for selection in self.loras]
         if len(lora_ids) != len(set(lora_ids)):
             raise ValueError("a LoRA can be selected only once")
@@ -214,6 +233,7 @@ class WorkflowOption:
     sha256: str
     has_hires_pass: bool
     has_face_detailer: bool
+    has_regional_prompting: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,6 +398,7 @@ async def list_new_set_options(session: AsyncSession) -> NewSetOptions:
             sha256=row.workflow_sha256,
             has_hires_pass="LatentUpscaleBy" in row.reviewed_node_classes,
             has_face_detailer="FaceDetailer" in row.reviewed_node_classes,
+            has_regional_prompting=REGIONAL_PROMPT_NODE_CLASSES.issubset(row.reviewed_node_classes),
         )
         for row in (
             await session.scalars(
@@ -421,6 +442,11 @@ async def create_and_approve_new_set(
         raise NewSetInputError("the submission idempotency key is invalid")
 
     subject = await _approved_subject(session, command.subject_approval_id)
+    secondary_subject = (
+        await _approved_subject(session, command.secondary_subject_approval_id)
+        if command.secondary_subject_approval_id is not None
+        else None
+    )
     checkpoint = await _approved_artifact(
         session,
         command.checkpoint_approval_id,
@@ -435,6 +461,13 @@ async def create_and_approve_new_set(
         for selection in command.loras
     ]
     workflow = await _approved_workflow(session, command.workflow_approval_id)
+    workflow_has_regional_prompting = REGIONAL_PROMPT_NODE_CLASSES.issubset(
+        workflow.reviewed_node_classes
+    )
+    if command.composition_mode == "duo" and not workflow_has_regional_prompting:
+        raise NewSetInputError("two-character composition requires a couple workflow profile")
+    if command.composition_mode == "single" and workflow_has_regional_prompting:
+        raise NewSetInputError("single-character composition requires a standard workflow profile")
     try:
         require_generation_deliverability(
             width=command.width,
@@ -469,6 +502,9 @@ async def create_and_approve_new_set(
         detailer_bbox_dilation=command.detailer_bbox_dilation,
         detailer_bbox_crop_factor=command.detailer_bbox_crop_factor,
         detailer_feather=command.detailer_feather,
+        composition_mode=command.composition_mode,
+        character_a_prompt=command.character_a_prompt,
+        character_b_prompt=command.character_b_prompt,
     )
     generation_batches: list[GenerationBatchSpecification] = []
     implicit_seed_offset = 0
@@ -514,16 +550,18 @@ async def create_and_approve_new_set(
         schema_version=2 if generation_batches else 1,
         subjects=[
             SubjectSpecification(
-                name=subject.display_name,
-                canonical_source_url=subject.canonical_source_url,
-                canonical_age=subject.canonical_age,
+                name=row.display_name,
+                canonical_source_url=row.canonical_source_url,
+                canonical_age=row.canonical_age,
                 clearly_adult_approved=True,
                 adult_approval_evidence=(
-                    f"Server approval {subject.id}, version {subject.approval_version}."
+                    f"Server approval {row.id}, version {row.approval_version}."
                 ),
                 is_real_person=False,
                 is_aged_up_minor=False,
             )
+            for row in (subject, secondary_subject)
+            if row is not None
         ],
         checkpoint=ArtifactSpecification(
             name=checkpoint.name,

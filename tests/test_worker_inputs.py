@@ -17,7 +17,9 @@ from sqlalchemy import func, select
 from gen_automation.db.models import Asset, GenerationJob, Project, Release, ReleaseVersion
 from gen_automation.db.session import Database
 from gen_automation.domain.canonical import canonical_sha256
+from gen_automation.domain.deliverability import require_comfy_workflow_deliverability
 from gen_automation.domain.enums import AssetState
+from gen_automation.domain.release_spec import GenerationParameters
 from gen_automation.domain.signing import derive_public_key, encode_base64url
 from gen_automation.gpu_worker.app import create_worker_app
 from gen_automation.gpu_worker.artifacts import (
@@ -59,6 +61,28 @@ DETAILER_WORKFLOW_BODY = (
 BASE_DETAILER_WORKFLOW_BODY = (
     Path(__file__).resolve().parents[1] / "workflows" / "illustrious-sdxl-base-detailer-v1.json"
 ).read_bytes()
+COUPLE_BASE_WORKFLOW_BODY = (
+    Path(__file__).resolve().parents[1] / "workflows" / "illustrious-sdxl-couple-base-v1.json"
+).read_bytes()
+COUPLE_BASE_DETAILER_WORKFLOW_BODY = (
+    Path(__file__).resolve().parents[1]
+    / "workflows"
+    / "illustrious-sdxl-couple-base-detailer-v1.json"
+).read_bytes()
+COUPLE_HIRES_WORKFLOW_BODY = (
+    Path(__file__).resolve().parents[1] / "workflows" / "illustrious-sdxl-couple-hires-v1.json"
+).read_bytes()
+COUPLE_HIRES_DETAILER_WORKFLOW_BODY = (
+    Path(__file__).resolve().parents[1]
+    / "workflows"
+    / "illustrious-sdxl-couple-hires-detailer-v1.json"
+).read_bytes()
+COUPLE_WORKFLOW_SHA256S = {
+    "base": "539bfdf81d9668b6e0c60c77034ac5ff3c4d233e468c1f3dd1fe398415892923",
+    "base-detailer": "62f8db236c95a5c88f130c1fc10fa34dbc7455dba45695081aa5bc19d2bde890",
+    "hires": "b674f45c8b62f6742b74c1364f4c6b172ef2ed3446f4e29034e1c1da3727773c",
+    "hires-detailer": "9f2d863469bcc6ab069244c72797e19aa8a95aa9f253170fdd5066a754fe586e",
+}
 UPLOAD_ORIGIN = "https://uploads.example.test"
 
 
@@ -313,6 +337,7 @@ def _profile_context(
     *,
     workflow_body: bytes,
     detector: bool = False,
+    duo: bool = False,
 ) -> WorkerInputContext:
     context.store.put_for_test(
         context.workflow_key,
@@ -326,6 +351,15 @@ def _profile_context(
         **raw_workflow,
         "sha256": hashlib.sha256(workflow_body).hexdigest(),
     }
+    if duo:
+        raw_generation = parameters["generation"]
+        assert isinstance(raw_generation, dict)
+        parameters["generation"] = {
+            **raw_generation,
+            "composition_mode": "duo",
+            "character_a_prompt": "nico robin, on the left",
+            "character_b_prompt": "boa hancock, on the right",
+        }
     job_context = SaladJobInputContext(
         **{
             **context.job_context.__dict__,
@@ -357,6 +391,15 @@ def _profile_context(
         job_context=job_context,
         artifact_manifest=manifest,
     )
+
+
+def test_couple_workflow_template_hashes_are_frozen() -> None:
+    assert {
+        "base": hashlib.sha256(COUPLE_BASE_WORKFLOW_BODY).hexdigest(),
+        "base-detailer": hashlib.sha256(COUPLE_BASE_DETAILER_WORKFLOW_BODY).hexdigest(),
+        "hires": hashlib.sha256(COUPLE_HIRES_WORKFLOW_BODY).hexdigest(),
+        "hires-detailer": hashlib.sha256(COUPLE_HIRES_DETAILER_WORKFLOW_BODY).hexdigest(),
+    } == COUPLE_WORKFLOW_SHA256S
 
 
 @pytest.mark.asyncio
@@ -499,6 +542,54 @@ async def test_one_provider_job_renders_independent_prompt_branches(
         )
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_one_provider_job_allows_independent_regional_prompts_per_output(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _profile_context(
+        worker_input_context,
+        workflow_body=COUPLE_BASE_WORKFLOW_BODY,
+        duo=True,
+    )
+    parameters = dict(context.job_context.parameters)
+    generation = dict(parameters["generation"])  # type: ignore[arg-type]
+    first = {**generation, "outputs_per_job": 1}
+    second = {
+        **first,
+        "character_a_prompt": "nico robin, seated on the left",
+        "character_b_prompt": "boa hancock, standing on the right",
+        "seed": 43,
+    }
+    parameters.update(
+        {
+            "schema_version": 2,
+            "generation": {**first, "outputs_per_job": 2},
+            "output_generations": [first, second],
+            "output_prompt_resolutions": [{"seed": 42}, {"seed": 43}],
+        }
+    )
+    context = replace(
+        context,
+        job_context=SaladJobInputContext(
+            **{
+                **context.job_context.__dict__,
+                "parameters": parameters,
+                "parameters_sha256": canonical_sha256(parameters),
+            }
+        ),
+    )
+
+    workflow = GenerateEnvelope.model_validate(
+        await _build(context),
+        strict=True,
+    ).payload.workflow
+
+    assert workflow["output-00-18"]["inputs"]["text"] == "nico robin, on the left"
+    assert workflow["output-00-19"]["inputs"]["text"] == "boa hancock, on the right"
+    assert workflow["output-01-18"]["inputs"]["text"] == "nico robin, seated on the left"
+    assert workflow["output-01-19"]["inputs"]["text"] == "boa hancock, standing on the right"
 
 
 @pytest.mark.asyncio
@@ -731,6 +822,95 @@ async def test_base_detailer_profile_skips_hires_refinement(
     assert workflow["10"]["class_type"] == "VAEDecode"
     assert workflow["14"]["inputs"]["image"] == ["10", 0]
     validate_approved_workflow(workflow, DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("workflow_body", "detector", "expected_sampler_count"),
+    (
+        (COUPLE_BASE_WORKFLOW_BODY, False, 1),
+        (COUPLE_BASE_DETAILER_WORKFLOW_BODY, True, 1),
+        (COUPLE_HIRES_WORKFLOW_BODY, False, 2),
+        (COUPLE_HIRES_DETAILER_WORKFLOW_BODY, True, 2),
+    ),
+)
+async def test_couple_profiles_render_two_overlapping_core_conditioning_regions(
+    worker_input_context: WorkerInputContext,
+    workflow_body: bytes,
+    detector: bool,
+    expected_sampler_count: int,
+) -> None:
+    context = _profile_context(
+        worker_input_context,
+        workflow_body=workflow_body,
+        detector=detector,
+        duo=True,
+    )
+
+    envelope = GenerateEnvelope.model_validate(await _build(context), strict=True)
+    workflow = envelope.payload.workflow
+    assert workflow["18"]["inputs"]["text"] == "nico robin, on the left"
+    assert workflow["19"]["inputs"]["text"] == "boa hancock, on the right"
+    assert workflow["20"] == {
+        "class_type": "ConditioningSetAreaPercentage",
+        "inputs": {
+            "conditioning": ["18", 0],
+            "height": 1.0,
+            "strength": 1.0,
+            "width": 0.55,
+            "x": 0.0,
+            "y": 0.0,
+        },
+    }
+    assert workflow["21"]["inputs"] == {
+        "conditioning": ["19", 0],
+        "height": 1.0,
+        "strength": 1.0,
+        "width": 0.55,
+        "x": 0.45,
+        "y": 0.0,
+    }
+    assert workflow["22"]["inputs"] == {
+        "conditioning_1": ["6", 0],
+        "conditioning_2": ["20", 0],
+    }
+    assert workflow["23"]["inputs"] == {
+        "conditioning_1": ["22", 0],
+        "conditioning_2": ["21", 0],
+    }
+    samplers = [
+        node
+        for node in workflow.values()
+        if isinstance(node, dict) and node.get("class_type") == "KSampler"
+    ]
+    assert len(samplers) == expected_sampler_count
+    assert all(node["inputs"]["positive"] == ["23", 0] for node in samplers)
+    assert require_comfy_workflow_deliverability(workflow)
+    validate_approved_workflow(workflow, DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
+
+
+def test_generation_parameters_keep_single_mode_backward_compatible_and_guard_duo() -> None:
+    legacy = GenerationParameters(
+        prompt="one adult fictional character",
+        seed=1,
+        width=1024,
+        height=1024,
+        steps=20,
+        sampler="euler",
+        scheduler="normal",
+    )
+    assert legacy.composition_mode == "single"
+    assert legacy.character_a_prompt == ""
+    assert legacy.character_b_prompt == ""
+
+    with pytest.raises(ValueError, match="requires both character prompts"):
+        GenerationParameters.model_validate(
+            {
+                **legacy.model_dump(mode="json"),
+                "composition_mode": "duo",
+                "character_a_prompt": "nico robin",
+            }
+        )
 
 
 @pytest.mark.asyncio

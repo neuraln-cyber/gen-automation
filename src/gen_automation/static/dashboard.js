@@ -27,6 +27,10 @@
   };
   const AUTOMATION_PRESET_FIELDS = Object.freeze([
     "subject_id",
+    "subject_2_id",
+    "composition_mode",
+    "character_a_prompt",
+    "character_b_prompt",
     "checkpoint_id",
     "workflow_id",
     "negative_prompt",
@@ -81,7 +85,9 @@
   const collectAutomationProfile = (form) => {
     const fields = {};
     AUTOMATION_PRESET_FIELDS.forEach((name) => {
-      const control = namedControl(form, name);
+      const control = name === "composition_mode"
+        ? form.querySelector('[name="composition_mode"]:checked')
+        : namedControl(form, name);
       if (control instanceof HTMLInputElement
           || control instanceof HTMLTextAreaElement
           || control instanceof HTMLSelectElement) {
@@ -103,6 +109,7 @@
       }];
     });
     const subject = namedControl(form, "subject_id")?.selectedOptions?.item(0);
+    const secondarySubject = namedControl(form, "subject_2_id")?.selectedOptions?.item(0);
     const checkpoint = namedControl(form, "checkpoint_id")?.selectedOptions?.item(0);
     const workflow = namedControl(form, "workflow_id")?.selectedOptions?.item(0);
     return {
@@ -112,6 +119,8 @@
       matches: {
         subject_name: subject?.dataset.subjectName || "",
         subject_slug: subject?.dataset.subjectSlug || "",
+        secondary_subject_name: secondarySubject?.dataset.subjectName || "",
+        secondary_subject_slug: secondarySubject?.dataset.subjectSlug || "",
         checkpoint_name: checkpoint?.dataset.checkpointName || "",
         checkpoint_sha256: checkpoint?.dataset.checkpointSha256 || "",
         workflow_name: workflow?.dataset.workflowName || "",
@@ -177,7 +186,13 @@
     form.dataset.applyingAutomationProfile = "true";
     const fields = profile.fields && typeof profile.fields === "object" ? profile.fields : {};
     const missing = [];
-    const matchedSelects = new Set(["subject_id", "checkpoint_id", "workflow_id"]);
+    const matchedSelects = new Set([
+      "subject_id",
+      "subject_2_id",
+      "composition_mode",
+      "checkpoint_id",
+      "workflow_id",
+    ]);
     AUTOMATION_PRESET_FIELDS.forEach((name) => {
       if (matchedSelects.has(name)) return;
       const value = fields[name];
@@ -223,6 +238,38 @@
         ],
         subjectName ? `Subject ${subjectName}` : "Saved subject",
       );
+    }
+    const secondarySubjectName = typeof matches.secondary_subject_name === "string"
+      ? matches.secondary_subject_name
+      : "";
+    const secondarySubjectSlug = typeof matches.secondary_subject_slug === "string"
+      ? matches.secondary_subject_slug
+      : "";
+    const secondarySubjectId = typeof fields.subject_2_id === "string"
+      ? fields.subject_2_id
+      : "";
+    if (secondarySubjectName || secondarySubjectSlug || secondarySubjectId) {
+      matchRequiredSelect(
+        "subject_2_id",
+        [
+          (option) => Boolean(secondarySubjectId && option.value === secondarySubjectId),
+          (option) => Boolean(
+            secondarySubjectSlug && option.dataset.subjectSlug === secondarySubjectSlug
+          ),
+          (option) => Boolean(
+            secondarySubjectName && option.dataset.subjectName === secondarySubjectName
+          ),
+        ],
+        secondarySubjectName ? `Subject ${secondarySubjectName}` : "Saved second subject",
+      );
+    }
+    const compositionMode = fields.composition_mode === "duo" ? "duo" : "single";
+    const compositionControl = form.querySelector(
+      `[name="composition_mode"][value="${compositionMode}"]`,
+    );
+    if (compositionControl instanceof HTMLInputElement) {
+      compositionControl.checked = true;
+      compositionControl.dispatchEvent(new Event("change", { bubbles: true }));
     }
     const checkpointSha256 = typeof matches.checkpoint_sha256 === "string"
       ? matches.checkpoint_sha256.toLowerCase()
@@ -2184,9 +2231,22 @@
   function sanitizedGenerationDetails(value) {
     if (!isRecord(value) || value.available !== true) return { available: false };
 
+    const compositionMode = isRecord(value.composition) && value.composition.mode === "duo"
+      ? "duo"
+      : "single";
     const promptSource = isRecord(value.prompts) ? value.prompts : {};
     const prompts = {};
-    ["positive", "negative", "detailer_positive", "detailer_negative"].forEach((name) => {
+    [
+      "positive",
+      "character_a",
+      "character_b",
+      "negative",
+      "detailer_positive",
+      "detailer_negative",
+    ].forEach((name) => {
+      if ((name === "character_a" || name === "character_b") && compositionMode !== "duo") {
+        return;
+      }
       const prompt = safePrompt(promptSource[name]);
       if (prompt !== null) prompts[name] = prompt;
     });
@@ -2243,6 +2303,7 @@
         ? null
         : safeFields(value.batch, ["index", "name", "image_offset", "image_count"]),
       subjects,
+      composition: { mode: compositionMode },
       prompts,
       sampling: safeFields(value.sampling, [
         "seed",
@@ -2393,6 +2454,8 @@
 
   const promptLabels = {
     positive: "Positive prompt",
+    character_a: "Left character prompt",
+    character_b: "Right character prompt",
     negative: "Negative prompt",
     detailer_positive: "Detailer prompt",
     detailer_negative: "Detailer negative prompt",
@@ -2439,6 +2502,13 @@
   const forgeStyleImageInfo = (details) => {
     const positive = details.prompts.positive?.resolved || "";
     const negative = details.prompts.negative?.resolved || "";
+    const regionalPrompts = details.composition.mode === "duo"
+      ? [
+        "Composition: two characters (left / right)",
+        `Left character prompt: ${details.prompts.character_a?.resolved || ""}`,
+        `Right character prompt: ${details.prompts.character_b?.resolved || ""}`,
+      ]
+      : [];
     const loraTags = details.loras.map((lora) => (
       `<lora:${displayValue(lora.name)}:${displayValue(lora.weight)}>`
     ));
@@ -2480,6 +2550,7 @@
     if (loras.length > 0) sampling.push(`Lora hashes: "${loras.join(", ")}"`);
     return [
       positiveWithLoras,
+      ...regionalPrompts,
       `Negative prompt: ${negative}`,
       sampling.join(", "),
     ].join("\n");
@@ -2491,6 +2562,9 @@
       if (hasDisplayValue(value)) fields[name] = String(value);
     };
     assign("negative_prompt", preferredPromptText(details.prompts.negative));
+    assign("composition_mode", details.composition.mode);
+    assign("character_a_prompt", preferredPromptText(details.prompts.character_a));
+    assign("character_b_prompt", preferredPromptText(details.prompts.character_b));
     assign("detailer_prompt", preferredPromptText(details.prompts.detailer_positive));
     assign("detailer_negative_prompt", preferredPromptText(details.prompts.detailer_negative));
     ["width", "height", "cfg", "steps", "sampler", "scheduler", "clip_skip"].forEach((name) => {
@@ -2522,6 +2596,7 @@
       })),
       matches: {
         subject_name: details.subjects[0]?.name || "",
+        secondary_subject_name: details.subjects[1]?.name || "",
         checkpoint_name: details.checkpoint.name || "",
         checkpoint_sha256: details.checkpoint.sha256 || "",
         workflow_name: details.workflow.name || "",
@@ -2595,6 +2670,9 @@
       ["Batch image", batchPosition],
       ["Job image", jobPosition],
       ["Subject", details.subjects.map((item) => item.name).filter(Boolean).join(", ")],
+      ["Composition", (
+        details.composition.mode === "duo" ? "Two characters (left / right)" : "Single character"
+      )],
     ]);
 
     const promptsSection = addSection(body, "Prompts used");
@@ -3317,6 +3395,172 @@
     schedule(1500);
   }
 
+  const initializeCharacterComposition = () => {
+    const form = document.querySelector("[data-automation-form]");
+    const builder = document.querySelector("[data-composition-builder]");
+    const workflow = document.querySelector("[data-workflow-profile]");
+    if (!form || !(builder instanceof HTMLElement) || !(workflow instanceof HTMLSelectElement)) {
+      return;
+    }
+    const modeControls = Array.from(
+      builder.querySelectorAll('[name="composition_mode"]'),
+    ).filter((control) => control instanceof HTMLInputElement);
+    const firstSubject = namedControl(form, "subject_id");
+    const secondSubject = namedControl(form, "subject_2_id");
+    const firstPrompt = namedControl(form, "character_a_prompt");
+    const secondPrompt = namedControl(form, "character_b_prompt");
+    const secondCard = builder.querySelector('[data-character-card="b"]');
+    const promptFields = Array.from(builder.querySelectorAll("[data-character-prompt-field]"));
+    const actions = builder.querySelector("[data-composition-actions]");
+    const preview = builder.querySelector("[data-composition-preview]");
+    const previewA = builder.querySelector("[data-composition-preview-a]");
+    const previewB = builder.querySelector("[data-composition-preview-b]");
+    const firstSide = builder.querySelector("[data-character-side-a]");
+    const firstPosition = builder.querySelector("[data-character-position-a]");
+    const status = builder.querySelector("[data-composition-status]");
+    const swap = builder.querySelector("[data-swap-characters]");
+    if (!(firstSubject instanceof HTMLSelectElement)
+      || !(secondSubject instanceof HTMLSelectElement)
+      || !(firstPrompt instanceof HTMLTextAreaElement)
+      || !(secondPrompt instanceof HTMLTextAreaElement)) return;
+
+    const workflowOptions = Array.from(workflow.options).filter(
+      (option) => ["true", "false"].includes(option.dataset.regionalPrompting),
+    );
+    const workflowFamily = (option) => (option?.dataset.workflowName || "")
+      .toLowerCase()
+      .replace(/\b(base|hires|highres|upscale|upscaler|couple|duo|regional)\b/g, " ")
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+    const pairedWorkflow = (current, desiredRegional) => {
+      const family = workflowFamily(current);
+      if (!family) return null;
+      return workflowOptions.find((option) => (
+        !option.disabled
+        && option !== current
+        && option.dataset.regionalPrompting === desiredRegional
+        && option.dataset.upscalerEnabled === current?.dataset.upscalerEnabled
+        && option.dataset.detailerEnabled === current?.dataset.detailerEnabled
+        && option.dataset.workflowVersion === current?.dataset.workflowVersion
+        && workflowFamily(option) === family
+      )) || null;
+    };
+    const selectedName = (control, fallback) => (
+      control.selectedOptions.item(0)?.dataset.subjectName || fallback
+    );
+    const suggestedPrompt = (control) => selectedName(control, "");
+    const setAutomaticPrompt = (control, subjectControl) => {
+      const previous = control.dataset.automaticCharacterPrompt || "";
+      const suggested = suggestedPrompt(subjectControl);
+      if (!control.value.trim() || control.value === previous) control.value = suggested;
+      control.dataset.automaticCharacterPrompt = suggested;
+    };
+    const activeMode = () => (
+      modeControls.find((control) => control.checked)?.value === "duo" ? "duo" : "single"
+    );
+    const cacheDuoValues = () => {
+      builder.dataset.duoSubjectId = secondSubject.value;
+      builder.dataset.duoFirstPrompt = firstPrompt.value;
+      builder.dataset.duoSecondPrompt = secondPrompt.value;
+    };
+    const restoreDuoValues = () => {
+      if (!secondSubject.value && builder.dataset.duoSubjectId) {
+        secondSubject.value = builder.dataset.duoSubjectId;
+      }
+      if (!firstPrompt.value && builder.dataset.duoFirstPrompt) {
+        firstPrompt.value = builder.dataset.duoFirstPrompt;
+      }
+      if (!secondPrompt.value && builder.dataset.duoSecondPrompt) {
+        secondPrompt.value = builder.dataset.duoSecondPrompt;
+      }
+      setAutomaticPrompt(firstPrompt, firstSubject);
+      setAutomaticPrompt(secondPrompt, secondSubject);
+    };
+    const clearSingleOnlyFields = () => {
+      cacheDuoValues();
+      secondSubject.value = "";
+      firstPrompt.value = "";
+      secondPrompt.value = "";
+    };
+    const pairWorkflow = (duo) => {
+      const selected = workflow.selectedOptions.item(0);
+      const desired = duo ? "true" : "false";
+      if (selected?.dataset.regionalPrompting === desired) return true;
+      const replacement = pairedWorkflow(selected, desired);
+      if (!replacement) return false;
+      workflow.value = replacement.value;
+      workflow.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    };
+    const render = ({ modeChanged = false } = {}) => {
+      const duo = activeMode() === "duo";
+      if (modeChanged) {
+        if (duo) restoreDuoValues();
+        else clearSingleOnlyFields();
+      }
+      if (secondCard instanceof HTMLElement) secondCard.hidden = !duo;
+      promptFields.forEach((field) => { field.hidden = !duo; });
+      if (actions instanceof HTMLElement) actions.hidden = !duo;
+      if (preview instanceof HTMLElement) preview.hidden = !duo;
+      if (firstSide instanceof HTMLElement) firstSide.textContent = duo ? "Character 1" : "Character";
+      if (firstPosition instanceof HTMLElement) firstPosition.hidden = !duo;
+      secondSubject.required = duo;
+      firstPrompt.required = duo;
+      secondPrompt.required = duo;
+      secondSubject.setCustomValidity(
+        duo && firstSubject.value === secondSubject.value
+          ? "Choose two different approved characters."
+          : "",
+      );
+      const paired = pairWorkflow(duo);
+      modeControls.forEach((control) => {
+        control.setCustomValidity(paired ? "" : "No matching workflow is available for this composition.");
+      });
+      if (previewA instanceof HTMLElement) {
+        previewA.textContent = selectedName(firstSubject, "Character 1");
+      }
+      if (previewB instanceof HTMLElement) {
+        previewB.textContent = selectedName(secondSubject, "Character 2");
+      }
+      if (status instanceof HTMLElement) {
+        status.textContent = !paired
+          ? "A matching standard/couple workflow with the same hires and detailer settings is unavailable."
+          : (duo
+            ? "Regional prompting keeps the first character on the left and the second on the right."
+            : "Single-character workflow selected.");
+        status.className = `composition-status${paired ? "" : " warning"}`;
+      }
+      form.dispatchEvent(new CustomEvent("gen-automation:profile-changed"));
+    };
+
+    modeControls.forEach((control) => {
+      control.addEventListener("change", () => render({ modeChanged: true }));
+    });
+    firstSubject.addEventListener("change", () => {
+      if (activeMode() === "duo") setAutomaticPrompt(firstPrompt, firstSubject);
+      render();
+    });
+    secondSubject.addEventListener("change", () => {
+      if (activeMode() === "duo") setAutomaticPrompt(secondPrompt, secondSubject);
+      render();
+    });
+    workflow.addEventListener("change", () => render());
+    if (swap instanceof HTMLButtonElement) {
+      swap.addEventListener("click", () => {
+        const subjectValue = firstSubject.value;
+        const promptValue = firstPrompt.value;
+        firstSubject.value = secondSubject.value;
+        firstPrompt.value = secondPrompt.value;
+        secondSubject.value = subjectValue;
+        secondPrompt.value = promptValue;
+        firstPrompt.dataset.automaticCharacterPrompt = suggestedPrompt(firstSubject);
+        secondPrompt.dataset.automaticCharacterPrompt = suggestedPrompt(secondSubject);
+        render();
+      });
+    }
+    render();
+  };
+
   const initializeWorkflowRefinement = () => {
     const workflow = document.querySelector("[data-workflow-profile]");
     const status = document.querySelector("[data-workflow-refinement-status]");
@@ -3361,7 +3605,7 @@
     };
     const workflowFamily = (option) => (option?.dataset.workflowName || "")
       .toLowerCase()
-      .replace(/\b(base|hires|highres|upscale|upscaler)\b/g, " ")
+      .replace(/\b(base|hires|highres|upscale|upscaler|couple|duo|regional)\b/g, " ")
       .replace(/[^a-z0-9]+/g, " ")
       .trim();
     const pairedWorkflow = (current, desired) => {
@@ -3372,6 +3616,7 @@
         && option !== current
         && option.dataset.upscalerEnabled === desired
         && option.dataset.detailerEnabled === current?.dataset.detailerEnabled
+        && option.dataset.regionalPrompting === current?.dataset.regionalPrompting
         && option.dataset.workflowVersion === current?.dataset.workflowVersion
         && workflowFamily(option) === family
       )) || null;
@@ -3456,6 +3701,7 @@
   initializeLoraPicker();
   initializeAutomationBuilder();
   initializeWorkflowRefinement();
+  initializeCharacterComposition();
   initializeAutomationPresets();
   initializeAutomationDraft();
   initializeReleaseLibrary();

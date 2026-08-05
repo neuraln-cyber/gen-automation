@@ -79,6 +79,16 @@ def test_generation_form_has_named_device_local_settings_presets() -> None:
     assert "is not currently approved" in script
     assert "is not currently available" in script
     assert "firstInvalidPresetControl" in script
+    assert '"subject_2_id"' in script
+    assert '"composition_mode"' in script
+    assert '"character_a_prompt"' in script
+    assert '"character_b_prompt"' in script
+    assert "secondary_subject_name" in script
+    assert "secondary_subject_slug" in script
+    assert 'compositionMode !== "duo"' in script
+    assert '"Composition: two characters (left / right)"' in script
+    assert "Left character prompt" in script
+    assert "Right character prompt" in script
     preset_fields = script.split("AUTOMATION_PRESET_FIELDS", maxsplit=1)[1].split(
         "]);", maxsplit=1
     )[0]

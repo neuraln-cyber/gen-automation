@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import select
 
-from gen_automation.db.models import GenerationJob, ReleaseVersion
+from gen_automation.db.models import GenerationJob, ReleaseVersion, WorkflowApproval
 from gen_automation.db.session import Database
 from gen_automation.domain.release_spec import ProjectCreate, ReleaseCreate, ReleaseSpecification
 from gen_automation.domain.wildcards import WildcardCreate
@@ -38,6 +38,59 @@ def test_batch_submission_preserves_a_64_bit_seed_from_json_text() -> None:
     )
 
     assert batch.seed == seed
+
+
+def test_new_set_submission_requires_a_complete_distinct_duo() -> None:
+    base = {
+        "slug": "duo-validation",
+        "title": "Duo validation",
+        "subject_approval_id": "00000000-0000-0000-0000-000000000001",
+        "checkpoint_approval_id": "00000000-0000-0000-0000-000000000003",
+        "workflow_approval_id": "00000000-0000-0000-0000-000000000004",
+        "prompt": "two women together",
+        "seed": 1,
+        "width": 1024,
+        "height": 1024,
+        "steps": 30,
+        "sampler": "euler",
+        "scheduler": "normal",
+        "outputs_per_job": 4,
+        "planned_job_count": 1,
+        "desired_accepted_count": 4,
+    }
+
+    with pytest.raises(ValidationError, match="requires a second subject"):
+        NewSetSubmission.model_validate({**base, "composition_mode": "duo"})
+    with pytest.raises(ValidationError, match="two different subjects"):
+        NewSetSubmission.model_validate(
+            {
+                **base,
+                "composition_mode": "duo",
+                "secondary_subject_approval_id": base["subject_approval_id"],
+                "character_a_prompt": "character a",
+                "character_b_prompt": "character b",
+            }
+        )
+    with pytest.raises(ValidationError, match="both character prompts"):
+        NewSetSubmission.model_validate(
+            {
+                **base,
+                "composition_mode": "duo",
+                "secondary_subject_approval_id": ("00000000-0000-0000-0000-000000000002"),
+                "character_a_prompt": "character a",
+            }
+        )
+
+    parsed = NewSetSubmission.model_validate(
+        {
+            **base,
+            "composition_mode": "duo",
+            "secondary_subject_approval_id": "00000000-0000-0000-0000-000000000002",
+            "character_a_prompt": "character a",
+            "character_b_prompt": "character b",
+        }
+    )
+    assert parsed.composition_mode == "duo"
 
 
 @pytest.fixture
@@ -424,6 +477,85 @@ async def test_new_set_service_freezes_a_batch_queue_with_inherited_prompt_setti
     assert frozen_batches[0]["generation"]["seed"] == 100
     assert frozen_batches[1]["generation"]["seed"] == 105
     assert sorted(job.expected_output_count for job in jobs) == [1, 3, 4]
+
+
+async def test_new_set_service_freezes_two_subjects_and_regional_prompts_in_order(
+    batch_database: Database,
+) -> None:
+    payload = valid_release_payload()
+    specification = payload["specification"]
+    assert isinstance(specification, dict)
+    subjects = specification["subjects"]
+    assert isinstance(subjects, list)
+    second_subject = deepcopy(subjects[0])
+    second_subject.update(
+        {
+            "name": "Second Approved Adult Character",
+            "canonical_source_url": "https://example.com/second-character",
+            "canonical_age": 31,
+            "adult_approval_evidence": "Official profile states age 31.",
+        }
+    )
+    subjects.append(second_subject)
+
+    async with batch_database.sessions() as session:
+        await seed_release_approvals(session, payload)
+        workflow = await session.scalar(select(WorkflowApproval))
+        assert workflow is not None
+        workflow.reviewed_node_classes = [
+            *workflow.reviewed_node_classes,
+            "ConditioningSetAreaPercentage",
+            "ConditioningCombine",
+        ]
+        await session.flush()
+        options = await list_new_set_options(session)
+        primary = next(item for item in options.subjects if item.name == "Approved Adult Character")
+        secondary = next(
+            item for item in options.subjects if item.name == "Second Approved Adult Character"
+        )
+        assert options.workflows[0].has_regional_prompting is True
+        result = await create_and_approve_new_set(
+            session,
+            command=NewSetSubmission(
+                slug="regional-duo",
+                title="Regional duo",
+                subject_approval_id=primary.approval_id,
+                secondary_subject_approval_id=secondary.approval_id,
+                composition_mode="duo",
+                character_a_prompt="nico robin (one piece), adult woman",
+                character_b_prompt="boa hancock (one piece), adult woman",
+                checkpoint_approval_id=options.checkpoints[0].approval_id,
+                workflow_approval_id=options.workflows[0].approval_id,
+                prompt="2girls, together, snowy onsen",
+                seed=700,
+                width=1024,
+                height=1024,
+                cfg=6,
+                steps=30,
+                sampler="euler_ancestral",
+                scheduler="karras",
+                outputs_per_job=4,
+                planned_job_count=1,
+                desired_accepted_count=4,
+            ),
+            idempotency_key="new-set-regional-duo",
+            actor="fixture-owner",
+        )
+
+    async with batch_database.sessions() as session:
+        version = await session.scalar(
+            select(ReleaseVersion).where(ReleaseVersion.release_id == result.release.id)
+        )
+        assert version is not None
+
+    assert [item["name"] for item in version.specification["subjects"]] == [
+        "Approved Adult Character",
+        "Second Approved Adult Character",
+    ]
+    generation = version.specification["generation"]
+    assert generation["composition_mode"] == "duo"
+    assert generation["character_a_prompt"] == "nico robin (one piece), adult woman"
+    assert generation["character_b_prompt"] == "boa hancock (one piece), adult woman"
 
 
 def test_browser_new_set_accepts_the_optional_batch_plan_json_field(

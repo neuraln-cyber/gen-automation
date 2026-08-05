@@ -57,7 +57,15 @@ _FIELDS = frozenset(
         *(f"lora_{slot}_weight" for slot in _LORA_SLOTS),
     }
 )
-_OPTIONAL_FIELDS = frozenset({"batch_plan"})
+_OPTIONAL_FIELDS = frozenset(
+    {
+        "batch_plan",
+        "subject_2_id",
+        "composition_mode",
+        "character_a_prompt",
+        "character_b_prompt",
+    }
+)
 
 
 class BrowserNewSetFormError(ValueError):
@@ -112,6 +120,14 @@ async def read_new_set_form(request: Request) -> BrowserNewSetForm:
             slug=values["slug"],
             title=values["title"],
             subject_approval_id=_uuid(values["subject_id"], label="Subject"),
+            secondary_subject_approval_id=(
+                _uuid(values["subject_2_id"], label="Second subject")
+                if values.get("subject_2_id")
+                else None
+            ),
+            composition_mode=values.get("composition_mode", "single"),
+            character_a_prompt=values.get("character_a_prompt", ""),
+            character_b_prompt=values.get("character_b_prompt", ""),
             checkpoint_approval_id=_uuid(values["checkpoint_id"], label="Checkpoint"),
             loras=tuple(loras),
             workflow_approval_id=_uuid(values["workflow_id"], label="Workflow profile"),
@@ -368,6 +384,10 @@ def _validation_message(error: ValidationError) -> str:
     labels = {
         "slug": "Set slug",
         "title": "Set title",
+        "secondary_subject_approval_id": "Second subject",
+        "composition_mode": "Composition",
+        "character_a_prompt": "Left character prompt",
+        "character_b_prompt": "Right character prompt",
         "loras": "LoRAs",
         "prompt": "Prompt",
         "negative_prompt": "Negative prompt",

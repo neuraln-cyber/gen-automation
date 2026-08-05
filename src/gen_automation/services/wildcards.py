@@ -83,6 +83,8 @@ class FrozenWildcardCatalog:
 @dataclass(frozen=True, slots=True)
 class ResolvedWildcardPrompts:
     prompt: str
+    character_a_prompt: str
+    character_b_prompt: str
     negative_prompt: str
     detailer_prompt: str
     detailer_negative_prompt: str
@@ -538,6 +540,20 @@ def resolve_wildcard_prompts(
         field_name="prompt",
         selections=selections,
     )
+    character_a_prompt = _expand_text(
+        selected_generation.character_a_prompt,
+        catalog=catalog.by_name,
+        seed=seed,
+        field_name="character_a_prompt",
+        selections=selections,
+    )
+    character_b_prompt = _expand_text(
+        selected_generation.character_b_prompt,
+        catalog=catalog.by_name,
+        seed=seed,
+        field_name="character_b_prompt",
+        selections=selections,
+    )
     negative_prompt = _expand_text(
         selected_generation.negative_prompt,
         catalog=catalog.by_name,
@@ -561,19 +577,25 @@ def resolve_wildcard_prompts(
     )
     references = [reference.model_dump(mode="json") for reference in catalog.references]
     evidence: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "seed": seed,
         "source_prompt": selected_generation.prompt,
+        "source_character_a_prompt": selected_generation.character_a_prompt,
+        "source_character_b_prompt": selected_generation.character_b_prompt,
         "source_negative_prompt": selected_generation.negative_prompt,
         "source_detailer_prompt": selected_generation.detailer_prompt,
         "source_detailer_negative_prompt": selected_generation.detailer_negative_prompt,
         "source_prompt_sha256": _text_sha256(selected_generation.prompt),
+        "source_character_a_prompt_sha256": _text_sha256(selected_generation.character_a_prompt),
+        "source_character_b_prompt_sha256": _text_sha256(selected_generation.character_b_prompt),
         "source_negative_prompt_sha256": _text_sha256(selected_generation.negative_prompt),
         "source_detailer_prompt_sha256": _text_sha256(selected_generation.detailer_prompt),
         "source_detailer_negative_prompt_sha256": _text_sha256(
             selected_generation.detailer_negative_prompt
         ),
         "resolved_prompt_sha256": _text_sha256(prompt),
+        "resolved_character_a_prompt_sha256": _text_sha256(character_a_prompt),
+        "resolved_character_b_prompt_sha256": _text_sha256(character_b_prompt),
         "resolved_negative_prompt_sha256": _text_sha256(negative_prompt),
         "resolved_detailer_prompt_sha256": _text_sha256(detailer_prompt),
         "resolved_detailer_negative_prompt_sha256": _text_sha256(detailer_negative_prompt),
@@ -582,6 +604,8 @@ def resolve_wildcard_prompts(
     }
     return ResolvedWildcardPrompts(
         prompt=prompt,
+        character_a_prompt=character_a_prompt,
+        character_b_prompt=character_b_prompt,
         negative_prompt=negative_prompt,
         detailer_prompt=detailer_prompt,
         detailer_negative_prompt=detailer_negative_prompt,
@@ -595,6 +619,8 @@ def _generation_wildcard_names(specification: ReleaseSpecification) -> set[str]:
         generation = batch.generation
         for text in (
             generation.prompt,
+            generation.character_a_prompt,
+            generation.character_b_prompt,
             generation.negative_prompt,
             generation.detailer_prompt,
             generation.detailer_negative_prompt,

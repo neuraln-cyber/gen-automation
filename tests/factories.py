@@ -93,7 +93,7 @@ async def seed_release_approvals(
         session.add(user)
         await session.flush()
 
-    for subject in specification.subjects:
+    for subject_index, subject in enumerate(specification.subjects):
         source_url = str(subject.canonical_source_url)
         source_sha256 = canonical_source_sha256(source_url)
         existing_subject = await session.scalar(
@@ -110,7 +110,11 @@ async def seed_release_approvals(
             }
             session.add(
                 SubjectApproval(
-                    slug="approved-adult-character",
+                    slug=(
+                        "approved-adult-character"
+                        if subject_index == 0
+                        else f"approved-adult-character-{subject_index + 1}"
+                    ),
                     display_name=subject.name,
                     canonical_source_url=source_url,
                     canonical_source_sha256=source_sha256,

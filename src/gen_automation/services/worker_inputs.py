@@ -15,6 +15,9 @@ from gen_automation.domain.deliverability import (
     DeliverabilityError,
     require_comfy_workflow_deliverability,
 )
+from gen_automation.domain.generation_limits import (
+    MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB,
+)
 from gen_automation.domain.release_spec import (
     ArtifactSpecification,
     GenerationParameters,
@@ -219,6 +222,8 @@ def _resolve_job_parameters(context: SaladJobInputContext) -> _ResolvedJobParame
             raise WorkerInputError("generation output parameters are inconsistent")
         varying_fields = {
             "prompt",
+            "character_a_prompt",
+            "character_b_prompt",
             "negative_prompt",
             "detailer_prompt",
             "detailer_negative_prompt",
@@ -238,6 +243,20 @@ def _resolve_job_parameters(context: SaladJobInputContext) -> _ResolvedJobParame
             raise WorkerInputError("generation output parameters are inconsistent")
         if len({item.seed for item in output_generations}) != len(output_generations):
             raise WorkerInputError("generation output seeds are inconsistent")
+        prompt_bytes = sum(
+            len(value.encode("utf-8"))
+            for item in output_generations
+            for value in (
+                item.prompt,
+                item.character_a_prompt,
+                item.character_b_prompt,
+                item.negative_prompt,
+                item.detailer_prompt,
+                item.detailer_negative_prompt,
+            )
+        )
+        if prompt_bytes > MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB:
+            raise WorkerInputError("generation prompt text exceeds the worker request budget")
     return _ResolvedJobParameters(
         checkpoint=checkpoint,
         loras=loras,

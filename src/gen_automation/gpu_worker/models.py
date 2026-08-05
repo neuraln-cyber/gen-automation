@@ -31,6 +31,8 @@ DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES = frozenset(
         "CheckpointLoaderSimple",
         "CLIPSetLastLayer",
         "CLIPTextEncode",
+        "ConditioningCombine",
+        "ConditioningSetAreaPercentage",
         "EmptyLatentImage",
         "FaceDetailer",
         "KSampler",

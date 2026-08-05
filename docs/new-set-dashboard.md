@@ -10,6 +10,13 @@ The browser presents this as a settings-first builder. Operators choose one
 shared generation profile and image-quality configuration, then queue up to 50
 ordered batch cards. Every batch has its own label, image count, prompt and
 wildcards, optional negative/detailer overrides, and optional starting seed.
+The **Characters in each image** control supports either the established single
+character flow or a two-character left/right composition. Couple mode requires
+two different approved adult fictional subjects and a short prompt for each
+character. The browser selects the matching regional workflow while preserving
+the chosen base/hires and face-detailer configuration. Batch prompts remain the
+shared scene, action, and wildcard prompt, so the same cast can be used across a
+large ordered queue without repeating identity tags in every card.
 For large sets, **Build a large wildcard queue quickly** accepts one compact
 `image-count wildcard-name` line per stage. For example, `50 sfw`, `100 nnsfw`,
 `50 nsfw`, `20 oral`, `100 reworked`, and `20 group` creates all six batch cards
@@ -28,7 +35,8 @@ and records their actual count as the exact downstream Patreon/MEGA package size
 unaccepted and undecided raw masters remain available in private storage.
 
 Named settings presets are stored on the current device. They include the
-approved subject, checkpoint, workflow, ordered LoRA stack and weights,
+approved subject or ordered two-character composition and prompts, checkpoint,
+workflow, ordered LoRA stack and weights,
 sampling, dimensions, shared prompt defaults, refinement controls, GPU batch
 size. They intentionally exclude the run name, prompt batch queue, seed, and
 final-set target so loading a style preset does not replace creative queue work.

@@ -1,4 +1,5 @@
 from collections.abc import AsyncIterator
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -144,6 +145,43 @@ async def test_plan_approval_fails_closed_without_server_owned_approvals(
                 release_id=release.id,
                 idempotency_key="missing-server-approval",
             )
+
+
+async def test_duo_plan_rejects_a_standard_workflow_before_creating_jobs(
+    generation_database: Database,
+) -> None:
+    payload = valid_release_payload()
+    specification = payload["specification"]
+    assert isinstance(specification, dict)
+    subjects = specification["subjects"]
+    generation = specification["generation"]
+    assert isinstance(subjects, list)
+    assert isinstance(generation, dict)
+    second_subject = deepcopy(subjects[0])
+    second_subject.update(
+        {
+            "name": "Second Approved Adult Character",
+            "canonical_source_url": "https://example.com/second-character",
+        }
+    )
+    subjects.append(second_subject)
+    generation.update(
+        {
+            "composition_mode": "duo",
+            "character_a_prompt": "first adult character, on the left",
+            "character_b_prompt": "second adult character, on the right",
+        }
+    )
+    _project, release = await _create_release(generation_database, payload=payload)
+
+    async with generation_database.sessions() as session:
+        with pytest.raises(GenerationPlanConflictError, match="approved regional workflow"):
+            await approve_and_expand_generation_plan(
+                session,
+                release_id=release.id,
+                idempotency_key="duo-with-standard-workflow",
+            )
+        assert int(await session.scalar(select(func.count()).select_from(GenerationJob)) or 0) == 0
 
 
 async def test_plan_rejects_post_hires_size_before_creating_gpu_jobs(

@@ -96,3 +96,95 @@ def test_release_supports_up_to_eight_loras() -> None:
     loras.append(ninth)
     with pytest.raises(ValidationError, match="at most 8"):
         ReleaseCreate.model_validate(payload)
+
+
+def _duo_release_payload() -> dict[str, object]:
+    payload = valid_release_payload()
+    specification = payload["specification"]
+    assert isinstance(specification, dict)
+    subjects = specification["subjects"]
+    generation = specification["generation"]
+    assert isinstance(subjects, list)
+    assert isinstance(generation, dict)
+    second_subject = deepcopy(subjects[0])
+    second_subject.update(
+        {
+            "name": "Second Approved Adult Character",
+            "canonical_source_url": "https://example.com/second-character",
+        }
+    )
+    subjects.append(second_subject)
+    generation.update(
+        {
+            "composition_mode": "duo",
+            "character_a_prompt": "first adult character, on the left",
+            "character_b_prompt": "second adult character, on the right",
+        }
+    )
+    return payload
+
+
+def test_duo_release_requires_exactly_two_distinct_subjects() -> None:
+    payload = _duo_release_payload()
+    specification = payload["specification"]
+    assert isinstance(specification, dict)
+    subjects = specification["subjects"]
+    assert isinstance(subjects, list)
+
+    subjects.pop()
+    with pytest.raises(ValidationError, match="exactly two distinct subjects"):
+        ReleaseCreate.model_validate(payload)
+
+    subjects.append(deepcopy(subjects[0]))
+    with pytest.raises(ValidationError, match="exactly two distinct subjects"):
+        ReleaseCreate.model_validate(payload)
+
+
+def test_release_batches_cannot_mix_single_and_duo_composition() -> None:
+    payload = _duo_release_payload()
+    specification = payload["specification"]
+    assert isinstance(specification, dict)
+    duo_generation = specification["generation"]
+    assert isinstance(duo_generation, dict)
+    single_generation = deepcopy(duo_generation)
+    single_generation.update(
+        {
+            "composition_mode": "single",
+            "character_a_prompt": "",
+            "character_b_prompt": "",
+        }
+    )
+    specification.update(
+        {
+            "schema_version": 2,
+            "generation_batches": [
+                {
+                    "name": "Duo batch",
+                    "image_count": 4,
+                    "generation": deepcopy(duo_generation),
+                },
+                {
+                    "name": "Single batch",
+                    "image_count": 4,
+                    "generation": single_generation,
+                },
+            ],
+            "planned_job_count": 2,
+        }
+    )
+
+    with pytest.raises(ValidationError, match="same composition mode"):
+        ReleaseCreate.model_validate(payload)
+
+
+def test_multi_output_prompt_text_has_an_early_envelope_budget() -> None:
+    payload = _duo_release_payload()
+    specification = payload["specification"]
+    assert isinstance(specification, dict)
+    generation = specification["generation"]
+    assert isinstance(generation, dict)
+    generation["character_a_prompt"] = "a" * 16_000
+    generation["character_b_prompt"] = "b" * 16_000
+
+    with pytest.raises(ValidationError, match="too large for one multi-output"):
+        ReleaseCreate.model_validate(payload)

@@ -11,7 +11,10 @@ from pydantic import (
 )
 
 from gen_automation.domain.deliverability import MAX_ACCEPTED_IMAGES_PER_RELEASE
-from gen_automation.domain.generation_limits import MAX_OUTPUTS_PER_GENERATION_JOB
+from gen_automation.domain.generation_limits import (
+    MAX_OUTPUTS_PER_GENERATION_JOB,
+    MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB,
+)
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 Slug = Annotated[
@@ -82,7 +85,10 @@ class WorkflowSpecification(StrictModel):
 
 
 class GenerationParameters(StrictModel):
+    composition_mode: Literal["single", "duo"] = "single"
     prompt: str = Field(min_length=1, max_length=20000)
+    character_a_prompt: str = Field(default="", max_length=20000)
+    character_b_prompt: str = Field(default="", max_length=20000)
     negative_prompt: str = Field(default="", max_length=20000)
     detailer_prompt: str = Field(default="", max_length=20000)
     detailer_negative_prompt: str = Field(default="", max_length=20000)
@@ -116,6 +122,24 @@ class GenerationParameters(StrictModel):
     def validate_detailer_sizes(self) -> "GenerationParameters":
         if self.detailer_max_size < self.detailer_guide_size:
             raise ValueError("detailer maximum size must cover its guide size")
+        if self.composition_mode == "duo":
+            if not self.character_a_prompt.strip() or not self.character_b_prompt.strip():
+                raise ValueError("two-character composition requires both character prompts")
+        elif self.character_a_prompt or self.character_b_prompt:
+            raise ValueError("character prompts require two-character composition")
+        prompt_bytes = sum(
+            len(value.encode("utf-8"))
+            for value in (
+                self.prompt,
+                self.character_a_prompt,
+                self.character_b_prompt,
+                self.negative_prompt,
+                self.detailer_prompt,
+                self.detailer_negative_prompt,
+            )
+        )
+        if prompt_bytes * self.outputs_per_job > MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB:
+            raise ValueError("prompt text is too large for one multi-output generation job")
         return self
 
 
@@ -172,6 +196,16 @@ class ReleaseSpecification(StrictModel):
         names = [reference.name for reference in self.wildcard_versions]
         if len(names) != len(set(names)):
             raise ValueError("wildcard version names must be unique")
+        composition_mode = self.generation.composition_mode
+        if composition_mode == "duo":
+            subject_urls = {str(subject.canonical_source_url) for subject in self.subjects}
+            if len(self.subjects) != 2 or len(subject_urls) != 2:
+                raise ValueError("two-character composition requires exactly two distinct subjects")
+        if any(
+            batch.generation.composition_mode != composition_mode
+            for batch in self.generation_batches
+        ):
+            raise ValueError("all generation batches must use the same composition mode")
         if self.schema_version == 1:
             if self.generation_batches:
                 raise ValueError(

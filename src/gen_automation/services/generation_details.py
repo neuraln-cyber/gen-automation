@@ -23,8 +23,16 @@ from gen_automation.domain.release_spec import (
 from gen_automation.domain.wildcards import MAX_WILDCARD_EXPANSIONS, MAX_WILDCARD_NESTING
 
 _UNAVAILABLE_MESSAGE = "Generation details are unavailable for this image."
+_LEGACY_PROMPT_FIELDS = (
+    "prompt",
+    "negative_prompt",
+    "detailer_prompt",
+    "detailer_negative_prompt",
+)
 _PROMPT_FIELDS = (
     "prompt",
+    "character_a_prompt",
+    "character_b_prompt",
     "negative_prompt",
     "detailer_prompt",
     "detailer_negative_prompt",
@@ -55,6 +63,8 @@ class _BatchSnapshot(_FrozenModel):
 class _WildcardSelection(_FrozenModel):
     field: Literal[
         "prompt",
+        "character_a_prompt",
+        "character_b_prompt",
         "negative_prompt",
         "detailer_prompt",
         "detailer_negative_prompt",
@@ -69,8 +79,7 @@ class _WildcardSelection(_FrozenModel):
     entry_sha256: Sha256
 
 
-class _PromptResolution(_FrozenModel):
-    schema_version: Literal[1]
+class _PromptResolutionBase(_FrozenModel):
     seed: int = Field(ge=0, le=(2**63) - 1)
     source_prompt: str = Field(min_length=1, max_length=20_000)
     source_negative_prompt: str = Field(max_length=20_000)
@@ -88,13 +97,7 @@ class _PromptResolution(_FrozenModel):
     selections: list[_WildcardSelection] = Field(max_length=MAX_WILDCARD_EXPANSIONS)
 
     @model_validator(mode="after")
-    def validate_evidence(self) -> "_PromptResolution":
-        for field_name in _PROMPT_FIELDS:
-            source = getattr(self, f"source_{field_name}")
-            expected = getattr(self, f"source_{field_name}_sha256")
-            if not hmac.compare_digest(_text_sha256(source), expected):
-                raise ValueError("prompt resolution source digest mismatch")
-
+    def validate_wildcard_evidence(self) -> "_PromptResolutionBase":
         references = {(item.name, item.version_id): item for item in self.wildcard_versions}
         for selection in self.selections:
             reference = references.get((selection.name, selection.version_id))
@@ -106,6 +109,46 @@ class _PromptResolution(_FrozenModel):
             ):
                 raise ValueError("wildcard selection does not match its frozen version")
         return self
+
+
+class _PromptResolutionV1(_PromptResolutionBase):
+    schema_version: Literal[1]
+
+    @model_validator(mode="after")
+    def validate_legacy_evidence(self) -> "_PromptResolutionV1":
+        _validate_source_digests(self, _LEGACY_PROMPT_FIELDS)
+        if any(selection.field not in _LEGACY_PROMPT_FIELDS for selection in self.selections):
+            raise ValueError("legacy prompt resolution contains an unsupported field")
+        return self
+
+
+class _PromptResolutionV2(_PromptResolutionBase):
+    schema_version: Literal[2]
+    source_character_a_prompt: str = Field(max_length=20_000)
+    source_character_b_prompt: str = Field(max_length=20_000)
+    source_character_a_prompt_sha256: Sha256
+    source_character_b_prompt_sha256: Sha256
+    resolved_character_a_prompt_sha256: Sha256
+    resolved_character_b_prompt_sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_evidence(self) -> "_PromptResolutionV2":
+        _validate_source_digests(self, _PROMPT_FIELDS)
+        return self
+
+
+type _PromptResolution = _PromptResolutionV1 | _PromptResolutionV2
+
+
+def _validate_source_digests(
+    resolution: _PromptResolutionBase,
+    field_names: tuple[str, ...],
+) -> None:
+    for field_name in field_names:
+        source = getattr(resolution, f"source_{field_name}")
+        expected = getattr(resolution, f"source_{field_name}_sha256")
+        if not hmac.compare_digest(_text_sha256(source), expected):
+            raise ValueError("prompt resolution source digest mismatch")
 
 
 class _GenerationJobParametersV2(_FrozenModel):
@@ -146,6 +189,8 @@ class _GenerationJobParametersV2(_FrozenModel):
             raise ValueError("first output snapshot does not match the job generation")
         varying = {
             "prompt",
+            "character_a_prompt",
+            "character_b_prompt",
             "negative_prompt",
             "detailer_prompt",
             "detailer_negative_prompt",
@@ -296,6 +341,7 @@ def _response_payload(
             {"name": subject.name, "canonical_age": subject.canonical_age}
             for subject in parameters.subjects
         ],
+        "composition": {"mode": generation.composition_mode},
         "prompts": _prompt_payload(generation, resolution),
         "sampling": {
             "seed": str(generation.seed),
@@ -376,6 +422,33 @@ def _prompt_payload(
         source_sha256=resolution.source_prompt_sha256,
         resolved_sha256=resolution.resolved_prompt_sha256,
     )
+    if isinstance(resolution, _PromptResolutionV2):
+        character_a = _prompt_pair(
+            source=resolution.source_character_a_prompt,
+            resolved=generation.character_a_prompt,
+            source_sha256=resolution.source_character_a_prompt_sha256,
+            resolved_sha256=resolution.resolved_character_a_prompt_sha256,
+        )
+        character_b = _prompt_pair(
+            source=resolution.source_character_b_prompt,
+            resolved=generation.character_b_prompt,
+            source_sha256=resolution.source_character_b_prompt_sha256,
+            resolved_sha256=resolution.resolved_character_b_prompt_sha256,
+        )
+    else:
+        empty_sha256 = _text_sha256("")
+        character_a = _prompt_pair(
+            source="",
+            resolved=generation.character_a_prompt,
+            source_sha256=empty_sha256,
+            resolved_sha256=empty_sha256,
+        )
+        character_b = _prompt_pair(
+            source="",
+            resolved=generation.character_b_prompt,
+            source_sha256=empty_sha256,
+            resolved_sha256=empty_sha256,
+        )
     negative = _prompt_pair(
         source=resolution.source_negative_prompt,
         resolved=generation.negative_prompt,
@@ -414,6 +487,8 @@ def _prompt_payload(
     )
     return {
         "positive": positive,
+        "character_a": character_a,
+        "character_b": character_b,
         "negative": negative,
         "detailer_positive": detailer_positive,
         "detailer_negative": detailer_negative,
@@ -441,12 +516,19 @@ def _resolution_matches_generation(
     resolution: _PromptResolution,
     generation: GenerationParameters,
 ) -> bool:
+    field_names: tuple[str, ...]
+    if isinstance(resolution, _PromptResolutionV1):
+        if generation.composition_mode != "single":
+            return False
+        field_names = _LEGACY_PROMPT_FIELDS
+    else:
+        field_names = _PROMPT_FIELDS
     return resolution.seed == generation.seed and all(
         hmac.compare_digest(
             getattr(resolution, f"resolved_{field_name}_sha256"),
             _text_sha256(getattr(generation, field_name)),
         )
-        for field_name in _PROMPT_FIELDS
+        for field_name in field_names
     )
 
 

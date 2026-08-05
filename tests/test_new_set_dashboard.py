@@ -72,6 +72,10 @@ def test_new_set_builder_frontend_keeps_batch_edits_safe_and_actionable(
     assert "lines.length > 50" in script.text
     assert "targetFollowsQueue" in script.text
     assert "pairedWorkflow" in script.text
+    assert "initializeCharacterComposition" in script.text
+    assert "ConditioningSetAreaPercentage" not in script.text
+    assert "dataset.regionalPrompting" in script.text
+    assert "Swap left / right" not in script.text
     assert 'event.target.closest("details")' in script.text
 
     assert stylesheet.status_code == 200
@@ -131,6 +135,14 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     page = client.get("/dashboard/new-set")
     assert page.status_code == 200
     assert "Approved Adult Character" in page.text
+    assert "Characters in each image" in page.text
+    assert "Two characters" in page.text
+    assert "Swap left / right" in page.text
+    assert 'name="composition_mode"' in page.text
+    assert 'name="subject_2_id"' in page.text
+    assert 'name="character_a_prompt"' in page.text
+    assert 'name="character_b_prompt"' in page.text
+    assert 'data-regional-prompting="false"' in page.text
     assert "Illustrious" in page.text
     assert "Portrait Style" in page.text
     assert "production-v1" in page.text

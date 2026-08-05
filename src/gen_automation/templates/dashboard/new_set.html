@@ -125,21 +125,115 @@
             </details>
             <output class="settings-preset-status" data-automation-preset-status aria-live="polite"></output>
           </section>
+          <section class="composition-builder" data-composition-builder>
+            <div class="composition-heading">
+              <div>
+                <strong>Characters in each image</strong>
+                <p class="muted">Use one character normally, or place two approved characters in one scene.</p>
+              </div>
+              <div class="composition-mode" role="radiogroup" aria-label="Character composition">
+                <label>
+                  <input
+                    type="radio"
+                    name="composition_mode"
+                    value="single"
+                    {% if form_values['composition_mode'] != 'duo' %}checked{% endif %}
+                  >
+                  <span>Single</span>
+                </label>
+                <label>
+                  <input
+                    type="radio"
+                    name="composition_mode"
+                    value="duo"
+                    {% if options.subjects|length < 2 %}disabled{% endif %}
+                    {% if form_values['composition_mode'] == 'duo' %}checked{% endif %}
+                  >
+                  <span>Two characters</span>
+                </label>
+              </div>
+            </div>
+
+            <div class="composition-preview" data-composition-preview aria-hidden="true">
+              <span data-composition-preview-a>Character 1</span>
+              <span data-composition-preview-b>Character 2</span>
+            </div>
+
+            <div class="character-composition-grid">
+              <article class="character-composition-card" data-character-card="a">
+                <div class="character-card-heading">
+                  <strong data-character-side-a>Character</strong>
+                  <span data-character-position-a hidden>Left side</span>
+                </div>
+                <label>
+                  <span class="visually-hidden">First adult fictional subject</span>
+                  <select name="subject_id" data-character-subject="a" required>
+                    {% if not options.subjects %}<option value="">No approved subjects</option>{% endif %}
+                    {% for subject in options.subjects %}
+                      <option
+                        value="{{ subject.approval_id }}"
+                        data-subject-name="{{ subject.name }}"
+                        data-subject-slug="{{ subject.slug }}"
+                        {% if form_values['subject_id'] == subject.approval_id|string %}selected{% endif %}
+                      >{{ subject.name }} &middot; age {{ subject.canonical_age }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <label class="character-region-prompt" data-character-prompt-field hidden>
+                  Left character prompt
+                  <textarea
+                    name="character_a_prompt"
+                    rows="3"
+                    maxlength="20000"
+                    spellcheck="false"
+                    placeholder="nico robin (one piece), adult woman, black hair"
+                    data-character-prompt="a"
+                  >{{ form_values['character_a_prompt'] }}</textarea>
+                </label>
+              </article>
+
+              <article class="character-composition-card" data-character-card="b" hidden>
+                <div class="character-card-heading">
+                  <strong>Character 2</strong>
+                  <span>Right side</span>
+                </div>
+                <label>
+                  <span class="visually-hidden">Second adult fictional subject</span>
+                  <select name="subject_2_id" data-character-subject="b">
+                    <option value="">Choose second character</option>
+                    {% for subject in options.subjects %}
+                      <option
+                        value="{{ subject.approval_id }}"
+                        data-subject-name="{{ subject.name }}"
+                        data-subject-slug="{{ subject.slug }}"
+                        {% if form_values['subject_2_id'] == subject.approval_id|string %}selected{% endif %}
+                      >{{ subject.name }} &middot; age {{ subject.canonical_age }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <label class="character-region-prompt" data-character-prompt-field>
+                  Right character prompt
+                  <textarea
+                    name="character_b_prompt"
+                    rows="3"
+                    maxlength="20000"
+                    spellcheck="false"
+                    placeholder="boa hancock (one piece), adult woman, long black hair"
+                    data-character-prompt="b"
+                  >{{ form_values['character_b_prompt'] }}</textarea>
+                </label>
+              </article>
+            </div>
+            <div class="composition-actions" data-composition-actions hidden>
+              <button class="secondary-button compact-action" type="button" data-swap-characters>
+                Swap left / right
+              </button>
+              <span class="muted">Batch prompts remain the shared scene, action, and wildcard prompt.</span>
+            </div>
+            <output class="composition-status" data-composition-status aria-live="polite"></output>
+          </section>
+
           <div class="form-grid">
-            <label>
-              Adult fictional subject
-              <select name="subject_id" required>
-                {% if not options.subjects %}<option value="">No approved subjects</option>{% endif %}
-                {% for subject in options.subjects %}
-                  <option
-                    value="{{ subject.approval_id }}"
-                    data-subject-name="{{ subject.name }}"
-                    data-subject-slug="{{ subject.slug }}"
-                    {% if form_values['subject_id'] == subject.approval_id|string %}selected{% endif %}
-                  >{{ subject.name }} &middot; age {{ subject.canonical_age }}</option>
-                {% endfor %}
-              </select>
-            </label>
             <label>
               Checkpoint
               <select name="checkpoint_id" required>
@@ -166,6 +260,7 @@
                     data-workflow-sha256="{{ workflow.sha256 }}"
                     data-upscaler-enabled="{{ 'true' if workflow.has_hires_pass else 'false' }}"
                     data-detailer-enabled="{{ 'true' if workflow.has_face_detailer else 'false' }}"
+                    data-regional-prompting="{{ 'true' if workflow.has_regional_prompting else 'false' }}"
                     {% if form_values['workflow_id'] == workflow.approval_id|string %}selected{% endif %}
                   >{{ workflow.name }} &middot; v{{ workflow.version }}</option>
                 {% endfor %}

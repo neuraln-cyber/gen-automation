@@ -13,6 +13,7 @@ from gen_automation.db.models import (
 )
 from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import ApprovalStatus, ModelArtifactKind
+from gen_automation.domain.generation_limits import REGIONAL_PROMPT_NODE_CLASSES
 from gen_automation.domain.release_spec import (
     ArtifactSpecification,
     ReleaseSpecification,
@@ -125,6 +126,15 @@ def _validate_workflow(
         or approval.revoked_by_user_id is not None
     ):
         raise _approval_error("workflow")
+    has_regional_prompting = REGIONAL_PROMPT_NODE_CLASSES.issubset(approval.reviewed_node_classes)
+    if specification.generation.composition_mode == "duo" and not has_regional_prompting:
+        raise ReleaseApprovalError(
+            "two-character composition requires an approved regional workflow"
+        )
+    if specification.generation.composition_mode == "single" and has_regional_prompting:
+        raise ReleaseApprovalError(
+            "single-character composition requires an approved standard workflow"
+        )
     return {
         "approval_id": str(approval.id),
         "approval_version": approval.approval_version,

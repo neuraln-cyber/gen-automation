@@ -9,6 +9,7 @@ from gen_automation.db.models import (
     ReleaseVersion,
     WildcardLibrary,
     WildcardLibraryVersion,
+    WorkflowApproval,
 )
 from gen_automation.domain.canonical import canonical_sha256
 from tests.factories import seed_release_approvals, valid_release_payload
@@ -275,7 +276,23 @@ def test_release_freezes_nested_wildcards_and_jobs_store_resolution_evidence(
         json={"slug": "wildcard-project", "name": "Wildcard project"},
     ).json()
     payload = valid_release_payload()
+    subjects = payload["specification"]["subjects"]  # type: ignore[index]
+    second_subject = deepcopy(subjects[0])
+    second_subject.update(
+        {
+            "name": "Second Approved Adult Character",
+            "canonical_source_url": "https://example.com/second-character",
+        }
+    )
+    subjects.append(second_subject)
     payload["specification"]["generation"]["prompt"] = "portrait, __locations__"  # type: ignore[index]
+    payload["specification"]["generation"].update(  # type: ignore[index]
+        {
+            "composition_mode": "duo",
+            "character_a_prompt": "first adult character, __poses__",
+            "character_b_prompt": "second adult character, __locations__",
+        }
+    )
     payload["specification"]["generation"]["detailer_prompt"] = "face, __poses__"  # type: ignore[index]
     payload["specification"]["generation"]["detailer_negative_prompt"] = (  # type: ignore[index]
         "avoid, __locations__"
@@ -301,6 +318,14 @@ def test_release_freezes_nested_wildcards_and_jobs_store_resolution_evidence(
     async def seed() -> None:
         async with database.sessions() as session:
             await seed_release_approvals(session, payload)
+            workflow = await session.scalar(select(WorkflowApproval))
+            assert workflow is not None
+            workflow.reviewed_node_classes = [
+                *workflow.reviewed_node_classes,
+                "ConditioningCombine",
+                "ConditioningSetAreaPercentage",
+            ]
+            await session.commit()
 
     client.portal.call(seed)
     response = client.post(
@@ -338,9 +363,14 @@ def test_release_freezes_nested_wildcards_and_jobs_store_resolution_evidence(
         generation = parameters["generation"]
         evidence = parameters["prompt_resolution"]
         assert "__" not in generation["prompt"]
+        assert "__" not in generation["character_a_prompt"]
+        assert "__" not in generation["character_b_prompt"]
         assert "__" not in generation["detailer_prompt"]
         assert "__" not in generation["detailer_negative_prompt"]
         assert evidence["source_prompt"] == "portrait, __locations__"
+        assert evidence["schema_version"] == 2
+        assert evidence["source_character_a_prompt"] == "first adult character, __poses__"
+        assert evidence["source_character_b_prompt"] == "second adult character, __locations__"
         assert evidence["source_detailer_prompt"] == "face, __poses__"
         assert evidence["source_detailer_negative_prompt"] == "avoid, __locations__"
         assert len(evidence["wildcard_versions"]) == 2
@@ -350,9 +380,74 @@ def test_release_freezes_nested_wildcards_and_jobs_store_resolution_evidence(
         }
         assert {selection["field"] for selection in evidence["selections"]} >= {
             "prompt",
+            "character_a_prompt",
+            "character_b_prompt",
             "detailer_prompt",
             "detailer_negative_prompt",
         }
+
+
+def test_generation_plan_rejects_prompt_budget_exceeded_only_after_wildcard_expansion(
+    client: TestClient,
+) -> None:
+    assert (
+        client.post(
+            "/api/v1/wildcards",
+            json={"name": "large", "entries": ["x" * 2_000]},
+        ).status_code
+        == 201
+    )
+    project = client.post(
+        "/api/v1/projects",
+        json={"slug": "expanded-budget", "name": "Expanded prompt budget"},
+    ).json()
+    payload = valid_release_payload()
+    generation = payload["specification"]["generation"]  # type: ignore[index]
+    wildcard_source = ", ".join(["__large__"] * 4)
+    generation.update(  # type: ignore[union-attr]
+        {
+            "prompt": wildcard_source,
+            "negative_prompt": wildcard_source,
+            "detailer_prompt": wildcard_source,
+            "detailer_negative_prompt": wildcard_source,
+        }
+    )
+    created = client.post(
+        f"/api/v1/projects/{project['id']}/releases",
+        json=payload,
+        headers={"Idempotency-Key": "create-expanded-budget-release"},
+    )
+    assert created.status_code == 201
+
+    database = client.app.state.database
+    assert client.portal is not None
+
+    async def seed() -> None:
+        async with database.sessions() as session:
+            await seed_release_approvals(session, payload)
+
+    client.portal.call(seed)
+    response = client.post(
+        f"/api/v1/releases/{created.json()['id']}/generation-plan:approve",
+        headers={"Idempotency-Key": "approve-expanded-budget-release"},
+    )
+
+    assert response.status_code == 409
+    assert "expanded prompt text is too large" in response.json()["detail"]
+
+    async def read_jobs() -> list[GenerationJob]:
+        async with database.sessions() as session:
+            return list(
+                (
+                    await session.scalars(
+                        select(GenerationJob)
+                        .join(ReleaseVersion)
+                        .where(ReleaseVersion.release_id == UUID(created.json()["id"]))
+                    )
+                ).all()
+            )
+
+    assert client.portal.call(read_jobs) == []
 
 
 def test_release_rejects_missing_and_cyclic_wildcards(client: TestClient) -> None:

@@ -26,6 +26,9 @@ from gen_automation.domain.enums import (
     ReleasePhase,
     ResourceHealth,
 )
+from gen_automation.domain.generation_limits import (
+    MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB,
+)
 from gen_automation.domain.release_spec import GenerationParameters, ReleaseSpecification
 from gen_automation.schemas import GenerationPlanRead
 from gen_automation.services.compliance import (
@@ -144,6 +147,8 @@ def _job_parameters(
                 update={
                     "seed": seed,
                     "prompt": resolved_prompts.prompt,
+                    "character_a_prompt": resolved_prompts.character_a_prompt,
+                    "character_b_prompt": resolved_prompts.character_b_prompt,
                     "negative_prompt": resolved_prompts.negative_prompt,
                     "detailer_prompt": resolved_prompts.detailer_prompt,
                     "detailer_negative_prompt": resolved_prompts.detailer_negative_prompt,
@@ -152,6 +157,23 @@ def _job_parameters(
             ).model_dump(mode="json")
         )
         output_prompt_resolutions.append(resolved_prompts.evidence)
+
+    prompt_bytes = sum(
+        len(str(generation[field]).encode("utf-8"))
+        for generation in output_generations
+        for field in (
+            "prompt",
+            "character_a_prompt",
+            "character_b_prompt",
+            "negative_prompt",
+            "detailer_prompt",
+            "detailer_negative_prompt",
+        )
+    )
+    if prompt_bytes > MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB:
+        raise GenerationPlanConflictError(
+            "expanded prompt text is too large for one multi-output generation job"
+        )
 
     generation = dict(output_generations[0])
     generation["outputs_per_job"] = plan.expected_output_count
@@ -334,6 +356,7 @@ async def approve_and_expand_generation_plan(
         raise GenerationPlanConflictError(
             "generation batch expansion conflicts with the frozen release plan"
         )
+    prepared_jobs: list[tuple[_PlannedGenerationJob, str, dict[str, object], str]] = []
     for plan in planned_jobs:
         logical_identity: dict[str, object] = {
             "release_version_id": str(version.id),
@@ -355,6 +378,9 @@ async def approve_and_expand_generation_plan(
             plan=plan,
         )
         parameters_sha256 = canonical_sha256(parameters)
+        prepared_jobs.append((plan, logical_key, parameters, parameters_sha256))
+
+    for plan, logical_key, parameters, parameters_sha256 in prepared_jobs:
         existing_job = jobs_by_key.get(logical_key)
         if existing_job is not None:
             if (
