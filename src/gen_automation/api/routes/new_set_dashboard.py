@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
@@ -20,6 +20,7 @@ from gen_automation.api.browser_new_set_forms import (
     read_new_set_form,
 )
 from gen_automation.api.security import (
+    RawMasterReader,
     ReleaseReader,
     authentication_service,
     require_release_manager,
@@ -44,7 +45,14 @@ from gen_automation.services.new_sets import (
     load_new_set_status,
     new_set_progress_payload,
 )
+from gen_automation.services.progressive_assets import (
+    ProgressiveAssetCursorError,
+    ProgressiveAssetIntegrityError,
+    ProgressiveAssetNotFoundError,
+    list_available_raw_masters,
+)
 from gen_automation.services.releases import ConflictError, NotFoundError
+from gen_automation.storage.base import ObjectStore
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"], include_in_schema=False)
 templates = Jinja2Templates(directory=str(Path(__file__).parents[2] / "templates"))
@@ -288,6 +296,97 @@ async def dashboard_release_progress(
     return _secure_response(
         request,
         JSONResponse(content=new_set_progress_payload(release_status)),
+    )
+
+
+@router.get(
+    "/releases/{release_id}/generated-assets",
+    response_class=JSONResponse,
+    response_model=None,
+    name="dashboard_release_generated_assets",
+)
+async def dashboard_release_generated_assets(
+    release_id: UUID,
+    request: Request,
+    session: Session,
+    _principal: RawMasterReader,
+    cursor: Annotated[str | None, Query(max_length=256)] = None,
+    limit: Annotated[int, Query(ge=1, le=64)] = 32,
+) -> Response:
+    store: ObjectStore | None = request.app.state.object_store
+    if store is None:
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"detail": "private storage is unavailable"},
+            ),
+        )
+    try:
+        page = await list_available_raw_masters(
+            session,
+            store=store,
+            release_id=release_id,
+            cursor=cursor,
+            limit=limit,
+        )
+    except ProgressiveAssetCursorError:
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"detail": "available-master cursor is invalid"},
+            ),
+        )
+    except ProgressiveAssetNotFoundError:
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"detail": "release not found"},
+            ),
+        )
+    except ProgressiveAssetIntegrityError:
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"detail": "available raw masters are unavailable"},
+            ),
+        )
+
+    assets = [
+        {
+            "asset_id": str(asset.asset_id),
+            "available_at": asset.available_at.isoformat().replace("+00:00", "Z"),
+            "width": asset.width,
+            "height": asset.height,
+            "image_format": asset.image_format,
+            "byte_size": asset.byte_size,
+            "checksum_prefix": asset.checksum_prefix,
+            "ordinal": asset.ordinal,
+            "output_index": asset.output_index,
+            "queue_position": asset.queue_position,
+            "batch_index": asset.batch_index,
+            "batch_name": asset.batch_name,
+            "batch_image_number": asset.batch_image_number,
+            "view_url": f"/dashboard/assets/{asset.asset_id}/view",
+            "download_url": f"/dashboard/assets/{asset.asset_id}/download",
+            "generation_details_url": (f"/dashboard/assets/{asset.asset_id}/generation-details"),
+        }
+        for asset in page.assets
+    ]
+    return _secure_response(
+        request,
+        JSONResponse(
+            content={
+                "schema_version": 1,
+                "release_id": str(page.release_id),
+                "assets": assets,
+                "next_cursor": page.next_cursor,
+                "has_more": page.has_more,
+            }
+        ),
     )
 
 

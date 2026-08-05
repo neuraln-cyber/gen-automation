@@ -59,9 +59,10 @@ def test_asset_viewer_is_safe_progressive_enhancement() -> None:
     assert "Select for bulk action" in script
     assert 'viewer.media.addEventListener("touchstart"' in script
     assert "cleanPngFor" in script
-    assert "fetch(source" in script
+    assert "new URL(source, window.location.href)" in script
+    assert "fetch(sourceUrl.href" in script
     assert 'cache: "no-store"' in script
-    assert 'credentials: "omit"' in script
+    assert 'sourceUrl.origin === window.location.origin ? "same-origin" : "omit"' in script
     assert "window.createImageBitmap(sourceBlob)" in script
     assert 'document.createElement("canvas")' in script
     assert "context.drawImage(bitmap, 0, 0)" in script
@@ -79,6 +80,15 @@ def test_asset_viewer_is_safe_progressive_enhancement() -> None:
     assert "ensureTrigger" in script
     assert 'createElement("button", "asset-viewer-open-button", "Full screen")' in script
     assert 'button.type = "button"' in script
+    assert "const boundCards = new WeakSet()" in script
+    assert 'document.addEventListener("gen-automation:assets-updated"' in script
+    assert 'root.querySelectorAll("[data-asset-card], .asset-card")' in script
+    assert 'card.closest("[data-asset-grid]")' in script
+    assert "boundCards.has(card)" in script
+    assert "assetCards().find" in script
+    assert "assetCards().forEach" in script
+    assert "card.dataset.assetLabel" in script
+    assert 'if (!document.querySelector("[data-asset-grid]")) return;' in script
     assert "${details.rank}${scoreAnnouncement}" in script
     assert "const scrollTarget = summary || settingsPanel" in script
     assert 'block: "center"' in script
@@ -129,6 +139,9 @@ def test_asset_grid_uses_intrinsic_image_ratio_and_viewer_is_responsive() -> Non
     assert "env(safe-area-inset-bottom)" in styles
     assert "@media (max-width: 680px)" in styles
     assert "@media (prefers-reduced-motion: reduce)" in styles
+    assert ".live-generation-assets" in styles
+    assert ".live-generation-assets-empty:not([hidden]) + .asset-grid-density" in styles
+    assert ".live-generation-assets-grid:empty" in styles
 
 
 def test_review_filter_hides_empty_ai_excluded_separator() -> None:

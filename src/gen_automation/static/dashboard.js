@@ -2781,13 +2781,331 @@
     }
   }
 
-  function initializeGenerationDetails() {
-    document.querySelectorAll("[data-generation-details]").forEach((panel) => {
-      panel.dataset.generationDetailsState = "idle";
+  const initializedGenerationDetails = new WeakSet();
+
+  function bindGenerationDetails(root = document) {
+    if (!root || typeof root.querySelectorAll !== "function") return;
+    root.querySelectorAll("[data-generation-details]").forEach((panel) => {
+      if (initializedGenerationDetails.has(panel)) return;
+      initializedGenerationDetails.add(panel);
+      panel.dataset.generationDetailsState ||= "idle";
       panel.addEventListener("toggle", () => {
         if (panel.open) loadGenerationDetails(panel);
       });
     });
+  }
+
+  function initializeGenerationDetails() {
+    bindGenerationDetails();
+    document.addEventListener("gen-automation:assets-updated", (event) => {
+      const root = event.detail && event.detail.root;
+      bindGenerationDetails(root || document);
+    });
+  }
+
+  function initializeLiveGeneratedAssets() {
+    const panel = document.querySelector("[data-live-generated-assets]");
+    if (!(panel instanceof HTMLElement) || !panel.dataset.liveAssetsUrl) return;
+    const grid = panel.querySelector("[data-live-assets-grid]");
+    const count = panel.querySelector("[data-live-assets-count]");
+    const status = panel.querySelector("[data-live-assets-status]");
+    const empty = panel.querySelector("[data-live-assets-empty]");
+    if (!(grid instanceof HTMLElement)) return;
+
+    const assetIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const assets = new Map();
+    let cursor = "";
+    let expected = Math.max(0, integerValue(panel.dataset.liveAssetsExpected, 0));
+    let timer = null;
+    let networkFailures = 0;
+    let terminalAfterRefresh = false;
+    let stopped = false;
+    let refreshing = false;
+    let refreshRequested = false;
+    let immediatePages = 0;
+
+    const positiveInteger = (value, fallback = 0) => {
+      const parsed = integerValue(value, fallback);
+      return parsed > 0 ? parsed : fallback;
+    };
+
+    const safeAssetUrl = (value, assetId) => {
+      if (typeof value !== "string" || value.length === 0 || value.length > 16_384) return "";
+      try {
+        const url = new URL(value, window.location.href);
+        const expectedPrefix = `/dashboard/assets/${assetId.toLowerCase()}/`;
+        return url.origin === window.location.origin
+          && url.pathname.toLowerCase().startsWith(expectedPrefix)
+          ? url.href
+          : "";
+      } catch (_error) {
+        return "";
+      }
+    };
+
+    const normalizedAsset = (item) => {
+      if (!isRecord(item) || typeof item.asset_id !== "string"
+          || !assetIdPattern.test(item.asset_id)) return null;
+      const assetId = item.asset_id.toLowerCase();
+      const viewUrl = safeAssetUrl(item.view_url, assetId);
+      if (!viewUrl) return null;
+      const ordinal = Math.max(0, integerValue(item.ordinal, 0));
+      const outputIndex = Math.max(0, integerValue(item.output_index, 0));
+      const suppliedPosition = positiveInteger(item.queue_position, 0)
+        || positiveInteger(item.position, 0);
+      const position = suppliedPosition || ordinal + outputIndex + 1;
+      const batchName = typeof item.batch_name === "string"
+        ? item.batch_name.trim().slice(0, 120)
+        : "";
+      return {
+        assetId,
+        batchImageNumber: positiveInteger(item.batch_image_number, 0),
+        batchIndex: Math.max(0, integerValue(item.batch_index, 0)),
+        batchName,
+        downloadUrl: safeAssetUrl(item.download_url, assetId),
+        generationDetailsUrl: safeAssetUrl(item.generation_details_url, assetId),
+        height: positiveInteger(item.height, 1),
+        ordinal,
+        outputIndex,
+        position,
+        viewUrl,
+        width: positiveInteger(item.width, 1),
+      };
+    };
+
+    const assetLabel = (asset) => {
+      const image = `Image ${asset.position}`;
+      return asset.batchName ? `${image} · ${asset.batchName}` : image;
+    };
+
+    const createGenerationDetails = (asset) => {
+      if (!asset.generationDetailsUrl) return null;
+      const details = createNode("details", "generation-details");
+      details.dataset.generationDetails = "";
+      details.dataset.generationDetailsUrl = asset.generationDetailsUrl;
+      details.append(createNode("summary", "", "Full prompt & generation settings"));
+      const body = createNode("div", "generation-details-body");
+      body.dataset.generationDetailsBody = "";
+      const detailsStatus = createNode(
+        "p",
+        "generation-details-status",
+        "Open this section to load the exact settings for this image.",
+      );
+      detailsStatus.dataset.generationDetailsStatus = "";
+      detailsStatus.setAttribute("role", "status");
+      const fallback = createNode(
+        "a",
+        "generation-details-fallback",
+        "Open sanitized settings JSON",
+      );
+      fallback.dataset.generationDetailsFallback = "";
+      fallback.href = asset.generationDetailsUrl;
+      fallback.target = "_blank";
+      fallback.rel = "noopener noreferrer";
+      body.append(detailsStatus, fallback);
+      details.append(body);
+      return details;
+    };
+
+    const createAssetCard = (asset) => {
+      const label = assetLabel(asset);
+      const card = createNode("li", "asset-card live-generation-asset-card");
+      card.dataset.assetCard = "";
+      card.dataset.assetId = asset.assetId;
+      card.dataset.assetLabel = label;
+      card.dataset.assetPosition = String(asset.position);
+      card.dataset.assetViewUrl = asset.viewUrl;
+
+      const media = createNode("div", "asset-media");
+      const image = createNode("img", "asset-preview");
+      image.src = asset.viewUrl;
+      image.alt = `${label} generated image`;
+      image.width = asset.width;
+      image.height = asset.height;
+      image.loading = "lazy";
+      image.decoding = "async";
+      image.referrerPolicy = "no-referrer";
+      const badge = createNode("span", "asset-rank-badge live-generation-asset-badge", `#${asset.position}`);
+      media.append(image, badge);
+
+      const body = createNode("div", "asset-body");
+      const titleRow = createNode("div", "rank-line");
+      titleRow.append(
+        createNode("span", "rank", `Image ${asset.position}`),
+        createNode("span", "live-generation-asset-batch", asset.batchName || "Generated"),
+      );
+      const detailParts = [];
+      if (asset.batchImageNumber > 0) detailParts.push(`batch image ${asset.batchImageNumber}`);
+      detailParts.push(`${asset.width} × ${asset.height}`);
+      body.append(
+        titleRow,
+        createNode(
+          "p",
+          "muted live-generation-asset-meta",
+          `Verified raw master · ${detailParts.join(" · ")} · ranking pending`,
+        ),
+      );
+      const details = createGenerationDetails(asset);
+      if (details) body.append(details);
+      if (asset.downloadUrl) {
+        const download = createNode("a", "download", "Download exact raw master");
+        download.dataset.assetDownload = "";
+        download.href = asset.downloadUrl;
+        download.rel = "noopener noreferrer";
+        body.append(download);
+      }
+      card.append(media, body);
+      return card;
+    };
+
+    const compareAssets = (left, right) => (
+      left.position - right.position
+      || left.ordinal - right.ordinal
+      || left.outputIndex - right.outputIndex
+      || left.assetId.localeCompare(right.assetId)
+    );
+
+    const reorderCards = () => {
+      const ordered = Array.from(assets.values()).sort(compareAssets);
+      ordered.forEach((asset, index) => {
+        const current = grid.children.item(index);
+        if (current !== asset.card) grid.insertBefore(asset.card, current || null);
+      });
+    };
+
+    const renderCount = () => {
+      if (count) count.textContent = expected > 0
+        ? `${assets.size} / ${expected} ready`
+        : `${assets.size} ready`;
+      if (empty) empty.hidden = assets.size > 0;
+    };
+
+    const addAssets = (items) => {
+      let added = 0;
+      items.forEach((item) => {
+        const asset = normalizedAsset(item);
+        if (!asset || assets.has(asset.assetId)) return;
+        asset.card = createAssetCard(asset);
+        assets.set(asset.assetId, asset);
+        added += 1;
+      });
+      if (added === 0) return 0;
+      reorderCards();
+      renderCount();
+      document.dispatchEvent(new CustomEvent("gen-automation:assets-updated", {
+        detail: { root: grid },
+      }));
+      return added;
+    };
+
+    const schedule = (delay) => {
+      if (stopped) return;
+      if (timer !== null) window.clearTimeout(timer);
+      timer = window.setTimeout(refresh, Math.min(30_000, Math.max(2_000, delay)));
+    };
+
+    const stopWithMessage = (message) => {
+      stopped = true;
+      if (timer !== null) window.clearTimeout(timer);
+      if (status) status.textContent = message;
+    };
+
+    async function refresh() {
+      if (stopped) return;
+      if (refreshing) {
+        refreshRequested = true;
+        return;
+      }
+      if (document.visibilityState === "hidden") {
+        schedule(10_000);
+        return;
+      }
+      refreshing = true;
+      try {
+        const url = new URL(panel.dataset.liveAssetsUrl, window.location.href);
+        if (cursor) url.searchParams.set("cursor", cursor);
+        const response = await fetch(url.href, {
+          method: "GET",
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        if (response.redirected || response.status === 401 || response.status === 403) {
+          stopWithMessage("Your session no longer permits live image previews. Sign in again to continue.");
+          return;
+        }
+        if (!response.ok) throw new Error("generated assets unavailable");
+        const payload = await response.json();
+        if (!isRecord(payload)) throw new Error("invalid generated assets response");
+        const items = Array.isArray(payload.items)
+          ? payload.items
+          : (Array.isArray(payload.assets) ? payload.assets : null);
+        if (items === null) throw new Error("invalid generated assets response");
+        const added = addAssets(items);
+        const previousCursor = cursor;
+        if (typeof payload.cursor === "string" && payload.cursor.length <= 4096) {
+          cursor = payload.cursor;
+        } else if (typeof payload.next_cursor === "string" && payload.next_cursor.length <= 4096) {
+          cursor = payload.next_cursor;
+        }
+        networkFailures = 0;
+        if (status) {
+          status.textContent = added > 0
+            ? `${added} new ${added === 1 ? "image" : "images"} ready. ${assets.size} loaded in queue order.`
+            : (assets.size > 0 ? `${assets.size} images ready. Waiting for more.` : "Waiting for the first verified image.");
+        }
+        if (payload.has_more === true) {
+          if (cursor !== previousCursor && immediatePages < 20) {
+            immediatePages += 1;
+            refreshRequested = true;
+          } else {
+            immediatePages = 0;
+            schedule(2_000);
+          }
+          return;
+        }
+        immediatePages = 0;
+        if (payload.complete === true || terminalAfterRefresh) {
+          stopWithMessage(
+            assets.size > 0
+              ? `All ${assets.size} available images are shown. Ranking may still be finishing.`
+              : "Generation finished without an available image preview.",
+          );
+          return;
+        }
+        schedule(positiveInteger(payload.poll_after_ms, 3_000));
+      } catch (_error) {
+        immediatePages = 0;
+        networkFailures += 1;
+        if (status) status.textContent = "Live previews were interrupted. Retrying automatically…";
+        schedule(Math.min(30_000, 3_000 * (2 ** Math.min(networkFailures, 3))));
+      } finally {
+        refreshing = false;
+        if (refreshRequested && !stopped) {
+          refreshRequested = false;
+          window.setTimeout(refresh, 0);
+        }
+      }
+    }
+
+    document.addEventListener("gen-automation:generation-progress", (event) => {
+      const detail = event.detail;
+      if (!isRecord(detail)) return;
+      const nextExpected = Math.max(0, integerValue(detail.expected, expected));
+      if (nextExpected !== expected) {
+        expected = nextExpected;
+        renderCount();
+      }
+      if (detail.terminal === true) {
+        terminalAfterRefresh = true;
+        refresh();
+      }
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") refresh();
+    });
+    renderCount();
+    window.setTimeout(refresh, 500);
   }
 
   function initializeGenerationProgress() {
@@ -2937,6 +3255,14 @@
         const terminal = payload.ready_for_review === true
           || ["cancelled"].includes(payload.stage.key)
           || (payload.stage.key === "error" && payload.error && payload.error.retryable === false);
+        document.dispatchEvent(new CustomEvent("gen-automation:generation-progress", {
+          detail: {
+            expected: safeCount(payload.images.expected),
+            generated: safeCount(payload.images.generated),
+            stage: payload.stage.key,
+            terminal,
+          },
+        }));
         if (!terminal) schedule(safeCount(payload.poll_after_ms) || 5000);
       } catch (_error) {
         networkFailures += 1;
@@ -3097,6 +3423,7 @@
   initializeWildcardLibraryTools();
   initializeBulkReview();
   initializeGenerationDetails();
+  initializeLiveGeneratedAssets();
   clearAutomationDraftAfterQueue();
   initializeGenerationProgress();
   initializeDeliveryReauthentication();

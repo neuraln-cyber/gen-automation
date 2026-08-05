@@ -59,6 +59,38 @@
 .generation-progress-next { justify-self: start; }
 .generation-progress-error { margin: 0; }
 
+.live-generation-assets { display: grid; gap: .9rem; }
+.live-generation-assets-heading { align-items: center; }
+.live-generation-assets-heading .page-kicker { margin-bottom: .25rem; }
+.live-generation-assets-heading .muted { margin: .35rem 0 0; }
+.live-generation-assets-count {
+  color: var(--accent, #b8a5ff);
+  font-size: clamp(1rem, 2.5vw, 1.3rem);
+  white-space: nowrap;
+}
+.live-generation-assets-status { min-height: 1.25rem; margin: 0; }
+.live-generation-assets-empty {
+  margin: 0;
+  padding: 1rem;
+  border: 1px dashed var(--border-strong, rgba(255, 255, 255, .18));
+  border-radius: .75rem;
+  background: rgba(255, 255, 255, .025);
+  color: var(--muted, #a9abc2);
+  text-align: center;
+}
+.live-generation-assets-empty:not([hidden]) + .asset-grid-density { display: none; }
+.live-generation-assets-grid:empty { display: none; }
+.live-generation-asset-batch {
+  overflow: hidden;
+  color: var(--muted-strong, #c7c8d8);
+  font-size: .78rem;
+  font-weight: 760;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.live-generation-asset-meta { margin: .45rem 0 .7rem; font-size: .78rem; }
+.live-generation-asset-card .download { display: inline-flex; margin-top: .7rem; }
+
 .pipeline-steps {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -1121,6 +1153,9 @@ body.asset-viewer-open { overflow: hidden; }
 @media (max-width: 680px) {
   .generation-progress .panel-heading { flex-direction: row; align-items: center; }
   .generation-progress-stats { grid-template-columns: 1fr 1fr; }
+  .live-generation-assets-heading { align-items: flex-start; }
+  .live-generation-assets-count { font-size: 1rem; }
+  .live-generation-assets-empty { padding: .8rem; text-align: left; }
   .pipeline-step { overflow: hidden; font-size: .68rem; text-overflow: ellipsis; white-space: nowrap; }
   .batch-card-actions button { min-width: 2.75rem; min-height: 2.75rem; }
   .batch-queue-footer, .batch-prompt-heading { align-items: stretch; flex-direction: column; }

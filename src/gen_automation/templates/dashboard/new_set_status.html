@@ -121,6 +121,41 @@
     >Open ranked images</a>
   </section>
 
+  <section
+    class="panel live-generation-assets"
+    aria-labelledby="live-generation-assets-heading"
+    data-live-generated-assets
+    data-live-assets-url="/dashboard/releases/{{ release.release_id }}/generated-assets"
+    data-live-assets-expected="{{ release.images.expected }}"
+  >
+    <div class="panel-heading live-generation-assets-heading">
+      <div>
+        <p class="page-kicker">Current set</p>
+        <h2 id="live-generation-assets-heading">Generated images</h2>
+        <p class="muted">Verified raw masters appear here as soon as each one is ready.</p>
+      </div>
+      <strong class="live-generation-assets-count" data-live-assets-count>
+        0 / {{ release.images.expected }} ready
+      </strong>
+    </div>
+    <p
+      class="muted live-generation-assets-status"
+      role="status"
+      aria-live="polite"
+      data-live-assets-status
+    >Waiting for the first verified image.</p>
+    <p class="live-generation-assets-empty" data-live-assets-empty>
+      You can leave this page open. New images will be added automatically in their planned
+      queue order.
+    </p>
+    <ol
+      class="asset-grid live-generation-assets-grid"
+      aria-label="Generated images in queue order"
+      data-asset-grid
+      data-live-assets-grid
+    ></ol>
+  </section>
+
   <details class="panel review-entry technical-disclosure">
     <summary class="panel-heading">
       <div>

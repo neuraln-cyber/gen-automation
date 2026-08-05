@@ -40,6 +40,12 @@ from gen_automation.domain.enums import (
     SemanticIssueCode,
 )
 from gen_automation.middleware import content_security_policy
+from gen_automation.services.assets import (
+    AssetConflictError,
+    AssetNotFoundError,
+    AssetStorageUnavailableError,
+    presign_raw_master_access,
+)
 from gen_automation.services.authentication import (
     AuthenticatedPrincipal,
     CsrfValidationError,
@@ -94,7 +100,7 @@ from gen_automation.services.semantic_feedback import (
     record_semantic_anatomy_feedback,
     refresh_semantic_calibration_artifact,
 )
-from gen_automation.storage.base import ObjectStore
+from gen_automation.storage.base import ObjectStore, ObjectStoreError
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"], include_in_schema=False)
 templates = Jinja2Templates(directory=str(Path(__file__).parents[2] / "templates"))
@@ -159,6 +165,101 @@ async def dashboard_asset_generation_details(
     return _secure_response(
         request,
         JSONResponse(content=details or unavailable_generation_details()),
+    )
+
+
+@router.get(
+    "/assets/{asset_id}/view",
+    response_class=RedirectResponse,
+    response_model=None,
+    name="dashboard_asset_view",
+)
+async def dashboard_asset_view(
+    asset_id: UUID,
+    request: Request,
+    session: Session,
+    _principal: RawMasterReader,
+) -> Response:
+    return await _asset_access_redirect(
+        asset_id,
+        request=request,
+        session=session,
+        as_attachment=False,
+    )
+
+
+@router.get(
+    "/assets/{asset_id}/download",
+    response_class=RedirectResponse,
+    response_model=None,
+    name="dashboard_asset_download",
+)
+async def dashboard_asset_download(
+    asset_id: UUID,
+    request: Request,
+    session: Session,
+    _principal: RawMasterReader,
+) -> Response:
+    return await _asset_access_redirect(
+        asset_id,
+        request=request,
+        session=session,
+        as_attachment=True,
+    )
+
+
+async def _asset_access_redirect(
+    asset_id: UUID,
+    *,
+    request: Request,
+    session: AsyncSession,
+    as_attachment: bool,
+) -> Response:
+    store = _object_store(request)
+    if store is None:
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"detail": "private storage is unavailable"},
+            ),
+        )
+    settings: Settings = request.app.state.settings
+    try:
+        url = await presign_raw_master_access(
+            session,
+            store,
+            asset_id=asset_id,
+            expires_in=min(settings.storage_presign_ttl_seconds, 900),
+            as_attachment=as_attachment,
+        )
+    except AssetNotFoundError:
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"detail": "raw master not found"},
+            ),
+        )
+    except AssetConflictError:
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={"detail": "raw master is not available"},
+            ),
+        )
+    except (AssetStorageUnavailableError, ObjectStoreError):
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"detail": "raw master storage is unavailable"},
+            ),
+        )
+    return _secure_response(
+        request,
+        RedirectResponse(url=url, status_code=status.HTTP_307_TEMPORARY_REDIRECT),
     )
 
 

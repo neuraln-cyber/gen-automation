@@ -131,6 +131,8 @@
   }
 
   function cardRank(card) {
+    const label = card.dataset.assetLabel && card.dataset.assetLabel.trim();
+    if (label) return label;
     const rank = card.dataset.rank && card.dataset.rank.trim();
     if (rank) return `Rank ${rank.replace(/^#/, "#")}`;
     const rankNode = card.querySelector(".rank, .asset-rank-badge:not(.asset-score-badge)");
@@ -323,10 +325,10 @@
   }
 
   function initializeAssetViewer() {
-    const cards = assetCards();
-    if (cards.length === 0) return;
+    if (!document.querySelector("[data-asset-grid]")) return;
 
     const viewer = createViewer();
+    const boundCards = new WeakSet();
     const bulkForm = document.querySelector("#bulk-action-form, [data-bulk-action-form]");
     const bulkReject = bulkForm
       ? bulkForm.querySelector('button[name="action"][value="reject"]')
@@ -388,9 +390,10 @@
         throw new Error("clean_image_decode_unsupported");
       }
 
-      const response = await fetch(source, {
+      const sourceUrl = new URL(source, window.location.href);
+      const response = await fetch(sourceUrl.href, {
         cache: "no-store",
-        credentials: "omit",
+        credentials: sourceUrl.origin === window.location.origin ? "same-origin" : "omit",
         referrerPolicy: "no-referrer",
       });
       if (!response.ok) throw new Error("clean_source_fetch_failed");
@@ -516,7 +519,7 @@
         const saved = raw ? JSON.parse(raw) : [];
         if (!Array.isArray(saved)) return;
         saved.forEach((assetId) => {
-          const card = cards.find((candidate) => candidate.dataset.assetId === assetId);
+          const card = assetCards().find((candidate) => candidate.dataset.assetId === assetId);
           const context = exclusionContext(card);
           if (context && !context.alreadyExcluded) markedForExclusion.add(context.assetId);
         });
@@ -551,7 +554,7 @@
           : `Save ${markedCount} marked exclusion${markedCount === 1 ? "" : "s"}`,
       );
 
-      cards.forEach((card) => {
+      assetCards().forEach((card) => {
         const cardContext = exclusionContext(card);
         const marked = Boolean(cardContext && markedForExclusion.has(cardContext.assetId));
         card.classList.toggle("viewer-marked-for-exclusion", marked);
@@ -603,7 +606,8 @@
         `Image ${index + 1} of ${available.length} · ${details.rank}${scoreAnnouncement}`
       );
       viewer.title.textContent = details.rank;
-      viewer.score.textContent = details.score ? `Rank score ${details.score}` : "Rank score unavailable";
+      viewer.score.textContent = details.score ? `Rank score ${details.score}` : "";
+      viewer.score.hidden = !details.score;
       viewer.image.alt = details.alt;
       viewer.status.textContent = announcement;
       viewer.status.hidden = !announcement;
@@ -758,11 +762,13 @@
       viewer.close.focus();
     };
 
-    cards.forEach((card) => {
+    const bindCard = (card) => {
+      if (boundCards.has(card)) return;
       const image = imageFor(card);
       if (!image) return;
       const trigger = ensureTrigger(card, image);
       if (!trigger) return;
+      boundCards.add(card);
 
       trigger.dataset.assetViewerTrigger = "";
       trigger.setAttribute("aria-haspopup", "dialog");
@@ -789,6 +795,22 @@
       if (trigger !== image && !trigger.contains(image)) {
         image.addEventListener("click", () => openViewer(card, trigger));
       }
+    };
+
+    const bindCards = (root = document) => {
+      if (!root || typeof root.querySelectorAll !== "function") return;
+      root.querySelectorAll("[data-asset-card], .asset-card").forEach((card) => {
+        if (card.closest("[data-asset-grid]")) bindCard(card);
+      });
+    };
+
+    bindCards();
+    document.addEventListener("gen-automation:assets-updated", (event) => {
+      const root = event.detail && event.detail.root;
+      bindCards(root || document);
+      applyDensity(storedDensity());
+      restoreMarkedExclusions();
+      updateExclusionControls();
     });
 
     viewer.close.addEventListener("click", closeViewer);

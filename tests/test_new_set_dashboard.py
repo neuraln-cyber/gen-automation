@@ -27,6 +27,21 @@ def test_dashboard_javascript_is_packaged_and_served(client: TestClient) -> None
     assert "initializeLoraPicker" in response.text
     assert "syncCanonicalSlots" in response.text
     assert "gen-automation:generation-presets:v1" in response.text
+    assert "initializeLiveGeneratedAssets" in response.text
+    assert "data-live-assets-grid" in response.text
+    assert "const assets = new Map()" in response.text
+    assert 'url.searchParams.set("cursor", cursor)' in response.text
+    assert 'image.loading = "lazy"' in response.text
+    assert 'new CustomEvent("gen-automation:assets-updated"' in response.text
+    assert "reorderCards" in response.text
+    assert 'createNode("span", "live-generation-asset-batch"' in response.text
+    assert "payload.has_more === true" in response.text
+    assert "immediatePages < 20" in response.text
+    assert "window.setTimeout(refresh, 0)" in response.text
+    assert "url.origin === window.location.origin" in response.text
+    assert "`/dashboard/assets/${assetId.toLowerCase()}/`" in response.text
+    assert "const initializedGenerationDetails = new WeakSet()" in response.text
+    assert "bindGenerationDetails(root || document)" in response.text
 
 
 def test_new_set_builder_frontend_keeps_batch_edits_safe_and_actionable(
@@ -287,6 +302,15 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert "data-generation-progress" in status_page.text
     assert f'data-submitted-draft-id="{form["submission_id"]}"' in status_page.text
     assert "data-progress-bar" in status_page.text
+    assert "data-live-generated-assets" in status_page.text
+    assert f'data-live-assets-url="/dashboard/releases/{releases[0].id}/generated-assets"' in (
+        status_page.text
+    )
+    assert 'data-live-assets-expected="12"' in status_page.text
+    assert "data-live-assets-grid" in status_page.text
+    assert "Verified raw masters appear here" in status_page.text
+    assert "automatically in their planned" in status_page.text
+    assert "queue order" in status_page.text
 
     progress = client.get(first.headers["location"].replace("/status", "/progress"))
     assert progress.status_code == 200

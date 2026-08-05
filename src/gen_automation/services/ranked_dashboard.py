@@ -24,6 +24,7 @@ from gen_automation.db.models import (
     ScoringRun,
 )
 from gen_automation.domain.enums import AssetKind, AssetScoreState, ScoringRunState
+from gen_automation.services.generation_positions import generation_position
 from gen_automation.services.ranking_manifest import (
     RankingManifestIntegrityError,
     validate_completed_ranking_manifest,
@@ -545,7 +546,7 @@ async def _sign_ranked_master(
     _validate_signed_url(view_url)
     _validate_signed_url(download_url)
     explanation = dict(ranking.explanation)
-    batch_index, batch_name, batch_image_number = _generation_position(job, asset)
+    position = generation_position(job, asset)
     return RankedMaster(
         asset_id=ranking.asset_id,
         rank=ranking.rank,
@@ -562,39 +563,10 @@ async def _sign_ranked_master(
         view_url=view_url,
         download_url=download_url,
         download_name=download_name,
-        batch_index=batch_index,
-        batch_name=batch_name,
-        batch_image_number=batch_image_number,
+        batch_index=position.batch_index,
+        batch_name=position.batch_name,
+        batch_image_number=position.batch_image_number,
     )
-
-
-def _generation_position(job: GenerationJob, asset: Asset) -> tuple[int, str, int]:
-    """Return stable, human-facing generation queue metadata for a raw master."""
-
-    parameters = job.parameters if isinstance(job.parameters, dict) else {}
-    ordinal = _nonnegative_int(parameters.get("ordinal"), default=0)
-    batch_index = ordinal
-    batch_name = f"Batch {batch_index + 1}"
-    image_offset = 0
-
-    batch = parameters.get("batch")
-    if isinstance(batch, dict):
-        batch_index = _nonnegative_int(batch.get("index"), default=batch_index)
-        raw_name = batch.get("name")
-        if isinstance(raw_name, str) and raw_name.strip():
-            batch_name = raw_name.strip()[:120]
-        else:
-            batch_name = f"Batch {batch_index + 1}"
-        image_offset = _nonnegative_int(batch.get("image_offset"), default=0)
-
-    output_index = _nonnegative_int(asset.output_index, default=0)
-    return batch_index, batch_name, image_offset + output_index + 1
-
-
-def _nonnegative_int(value: object, *, default: int) -> int:
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-        return value
-    return default
 
 
 def _download_name(

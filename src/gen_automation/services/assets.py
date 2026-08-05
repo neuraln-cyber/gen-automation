@@ -1,6 +1,8 @@
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from string import hexdigits
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from sqlalchemy import and_, or_, select, update
@@ -31,6 +33,9 @@ from gen_automation.storage.images import (
 )
 
 ALLOWED_UPLOAD_CONTENT_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
+_ALLOWED_SIGNED_URL_SCHEMES = frozenset({"http", "https", "memory"})
+_MAX_SIGNED_URL_LENGTH = 16_384
+_SAFE_IMAGE_FORMAT = re.compile(r"^[a-zA-Z0-9]{1,10}$")
 
 
 class AssetServiceError(Exception):
@@ -901,9 +906,54 @@ async def presign_asset_download(
         raise AssetConflictError("asset is not available for download")
     if asset.storage_backend != store.backend or asset.storage_bucket != store.bucket:
         raise AssetConflictError("asset belongs to another object store")
-    return await store.presign_download(
+    url = await store.presign_download(
         key=asset.object_key,
         expires_in=expires_in,
         download_name=download_name,
         version_id=asset.object_version_id,
     )
+    _validate_presigned_download_url(url)
+    return url
+
+
+async def presign_raw_master_access(
+    session: AsyncSession,
+    store: ObjectStore,
+    *,
+    asset_id: UUID,
+    expires_in: int,
+    as_attachment: bool,
+) -> str:
+    asset = await session.get(Asset, asset_id)
+    if asset is None:
+        raise AssetNotFoundError("asset not found")
+    if asset.kind != AssetKind.RAW_MASTER:
+        raise AssetConflictError("asset is not a raw master")
+    image_format = asset.image_format or ""
+    safe_format = image_format.lower() if _SAFE_IMAGE_FORMAT.fullmatch(image_format) else "img"
+    download_name = f"raw-master-{asset.id}.{safe_format}" if as_attachment else None
+    return await presign_asset_download(
+        session,
+        store,
+        asset_id=asset.id,
+        expires_in=expires_in,
+        download_name=download_name,
+    )
+
+
+def _validate_presigned_download_url(url: str) -> None:
+    if (
+        not isinstance(url, str)
+        or not url
+        or len(url) > _MAX_SIGNED_URL_LENGTH
+        or any(ord(character) < 32 for character in url)
+    ):
+        raise AssetStorageUnavailableError("object storage returned an invalid download URL")
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme not in _ALLOWED_SIGNED_URL_SCHEMES
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise AssetStorageUnavailableError("object storage returned an invalid download URL")
