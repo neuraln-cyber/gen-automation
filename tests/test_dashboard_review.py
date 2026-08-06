@@ -623,7 +623,7 @@ def test_browser_review_inspections_require_csrf_and_union_retried_batches(
     context = asyncio.run(_seed_review_api(_settings(tmp_path / "browser-inspections.db")))
     task_id = asyncio.run(_create_task(context))
     app = create_app(context.settings)
-    action = f"{ORIGIN}/dashboard/review-tasks/{task_id}/inspections"
+    action = f"/dashboard/review-tasks/{task_id}/inspections"
 
     with TestClient(
         app,
@@ -635,6 +635,8 @@ def test_browser_review_inspections_require_csrf_and_union_retried_batches(
         detail = client.get(f"/dashboard/review-tasks/{task_id}")
         assert detail.status_code == 200
         form = _one_form(detail.text, action)
+        assert form.action.startswith("/")
+        assert "://" not in form.action
         assert form.fields["csrf_token"] == csrf
         assert _FORM_KEY.fullmatch(form.fields["idempotency_key"])
 

@@ -366,6 +366,14 @@ def test_fullscreen_inspections_are_batched_retried_and_flushed_without_renderin
     assert "failedInspectionBatch = batch" in flush
     assert "idempotencyKey: config.keyPrefix" in flush
     assert "let batch = failedInspectionBatch" in flush
+    configuration = script.split("const inspectionConfiguration", 1)[1].split(
+        "const setInspectionChip",
+        1,
+    )[0]
+    assert 'form.getAttribute("action")' in configuration
+    assert "new URL(action, document.baseURI)" in configuration
+    assert "window.location.origin" in configuration
+    assert "form.action" not in configuration
     assert "workspace.replaceWith" not in flush
     assert "renderCard" not in flush
     assert (

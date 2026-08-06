@@ -434,14 +434,27 @@
 
     const inspectionConfiguration = () => {
       const form = inspectionForm();
-      if (!(form instanceof HTMLFormElement) || !form.action) return null;
+      if (!(form instanceof HTMLFormElement)) return null;
       const csrf = form.querySelector('input[name="csrf_token"]');
       const key = form.querySelector('input[name="idempotency_key"]');
       if (!(csrf instanceof HTMLInputElement)
           || !(key instanceof HTMLInputElement)
           || !csrf.value
           || !key.value) return null;
-      return { csrfToken: csrf.value, keyPrefix: key.value, url: form.action };
+      const action = form.getAttribute("action");
+      if (!action) return null;
+      let endpoint;
+      try {
+        endpoint = new URL(action, document.baseURI);
+      } catch (_error) {
+        return null;
+      }
+      // URL generation happens behind the TLS terminator, so an absolute form
+      // action can carry the internal http scheme. Review progress is strictly
+      // same-origin; rebuild the endpoint on the browser's public origin to
+      // avoid a mixed-content failure when finishing the set.
+      const url = new URL(`${endpoint.pathname}${endpoint.search}`, window.location.origin).href;
+      return { csrfToken: csrf.value, keyPrefix: key.value, url };
     };
 
     const setInspectionChip = (card, state) => {

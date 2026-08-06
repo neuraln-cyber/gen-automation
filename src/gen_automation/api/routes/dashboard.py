@@ -660,12 +660,15 @@ async def dashboard_review_task(
                 "cancel_idempotency_key": cancel_idempotency_key,
                 "bulk_action_idempotency_key": bulk_action_idempotency_key,
                 "inspection_idempotency_key": inspection_idempotency_key,
-                "inspection_endpoint": str(
-                    request.url_for(
-                        "dashboard_review_inspections",
-                        review_task_id=review_task_id,
-                    )
-                ),
+                # Keep browser mutations same-origin even when TLS terminates at
+                # the trusted ingress.  Uvicorn intentionally ignores proxy
+                # headers, so an absolute ``request.url_for`` would otherwise
+                # expose the internal ``http`` scheme to an HTTPS browser and
+                # make inspection flushes fail as mixed-content requests.
+                "inspection_endpoint": request.url_for(
+                    "dashboard_review_inspections",
+                    review_task_id=review_task_id,
+                ).path,
                 "can_complete": (
                     summary.state == ReviewTaskState.OPEN
                     and 1 <= summary.accepted_count <= summary.desired_accepted_count
