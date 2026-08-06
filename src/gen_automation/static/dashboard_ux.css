@@ -169,6 +169,99 @@
 .anatomy-mode-banner.mode-shadow { border-left-color: #93c5fd; }
 .anatomy-mode-banner.mode-assist { border-left-color: var(--warn, #fbbf77); }
 .anatomy-mode-banner.mode-enforce { border-left-color: #fda4af; }
+
+.anatomy-learning-disclosure {
+  grid-column: 1 / -1;
+  border-top: 1px solid var(--border, rgba(255, 255, 255, .1));
+}
+
+.anatomy-learning-disclosure > summary {
+  display: flex;
+  min-height: 2.6rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: .75rem;
+  padding: .55rem .15rem .15rem;
+  color: var(--muted-strong, #c7c8d8);
+  cursor: pointer;
+  font-size: .78rem;
+  font-weight: 760;
+  list-style: none;
+}
+
+.anatomy-learning-disclosure > summary::-webkit-details-marker { display: none; }
+.anatomy-learning-disclosure > summary::after { color: var(--accent, #b8a5ff); content: "+"; font-size: 1.1rem; }
+.anatomy-learning-disclosure[open] > summary::after { content: "−"; }
+.anatomy-learning-disclosure > summary strong { color: var(--accent, #b8a5ff); font-size: .74rem; }
+.anatomy-learning-disclosure .anatomy-learning-card { margin-top: .5rem; }
+
+.review-more-actions {
+  position: relative;
+  align-self: stretch;
+}
+
+.review-more-actions > summary {
+  display: inline-flex;
+  min-height: 2.85rem;
+  align-items: center;
+  padding: .68rem .9rem;
+  border: 1px solid var(--border-strong, rgba(255, 255, 255, .18));
+  border-radius: .72rem;
+  background: var(--surface-raised, #222438);
+  color: var(--muted-strong, #c7c8d8);
+  cursor: pointer;
+  font-weight: 780;
+  list-style: none;
+}
+
+.review-more-actions > summary::-webkit-details-marker { display: none; }
+.review-more-actions > form {
+  position: absolute;
+  z-index: 5;
+  top: calc(100% + .4rem);
+  right: 0;
+  min-width: 11rem;
+  padding: .55rem;
+  border: 1px solid var(--border-strong, rgba(255, 255, 255, .18));
+  border-radius: .72rem;
+  background: var(--surface-solid, #191a28);
+  box-shadow: var(--shadow-lg, 0 24px 70px rgba(0, 0, 0, .3));
+}
+
+.review-more-actions button { width: 100%; }
+
+.review-bootstrap {
+  display: grid;
+  max-width: 46rem;
+  gap: 1rem;
+  margin: clamp(2rem, 8vh, 6rem) auto 0;
+  text-align: center;
+}
+
+.review-bootstrap .workflow-label,
+.review-bootstrap form { justify-self: center; }
+
+.review-bootstrap-progress {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: .65rem;
+  color: var(--muted-strong, #c7c8d8);
+  font-size: .88rem;
+  font-weight: 760;
+}
+
+.review-bootstrap-spinner {
+  width: 1rem;
+  height: 1rem;
+  border: 2px solid rgba(184, 165, 255, .28);
+  border-top-color: var(--accent, #b8a5ff);
+  border-radius: 50%;
+  animation: review-bootstrap-spin .8s linear infinite;
+}
+
+@keyframes review-bootstrap-spin { to { transform: rotate(1turn); } }
+
 .anatomy-learning-card {
   grid-column: 1 / -1;
   display: grid;
@@ -987,7 +1080,7 @@
   border-radius: 999px;
   background: rgba(127, 29, 29, .9);
   color: #fff;
-  content: "Rejected";
+  content: "Removed";
   font-size: .7rem;
   font-weight: 850;
   line-height: 1;

@@ -1,161 +1,35 @@
 {% extends "dashboard/base.html" %}
 {% block content %}
-  <a class="back" href="/dashboard">&larr; All releases</a>
-  <section class="page-header" aria-labelledby="page-heading">
-    <div class="page-header-row">
-      <div class="page-header-copy">
-        <p class="page-kicker">Ranked release</p>
-        <h1 id="page-heading">{{ release.release_title }}</h1>
-        <p class="lede">
-          {{ release.project_name }} &middot; current version {{ release.current_version_no }}
-          &middot; {{ release.assets | length }} exact raw masters
-        </p>
-      </div>
-      {% if review_task_id %}
-        <a class="primary-action" href="/dashboard/review-tasks/{{ review_task_id }}">
-          Continue review
-        </a>
-      {% endif %}
-    </div>
-    <p class="muted">
-      Ranked by {{ release.scorer_version }}. Private view and download links expire shortly.
-    </p>
-  </section>
-
-  <section class="panel panel-accent review-entry" aria-labelledby="review-heading">
-    <span class="workflow-label">Next step</span>
-    <div class="panel-heading">
-      <div>
-        <h2 id="review-heading">Choose the final set</h2>
-        {% if review_task_id %}
-          <p class="muted">
-            Your review is saved. Continue accepting, rejecting, holding, and selecting
-            X teasers from this exact ranked snapshot.
-          </p>
-        {% else %}
-          <p class="muted">
-            Create a durable review for these {{ release.assets | length }} frozen assets.
-            You can revise every decision until the task is completed or cancelled.
-          </p>
-        {% endif %}
-      </div>
-      {% if review_task_id %}
-        <a class="primary-action" href="/dashboard/review-tasks/{{ review_task_id }}">
-          Open ranked review
-        </a>
-      {% else %}
-        <form method="post" action="/dashboard/releases/{{ release.release_id }}/review-tasks">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <input
-            type="hidden"
-            name="idempotency_key"
-            value="{{ create_idempotency_key }}"
-          >
-          <button class="primary-button" type="submit">Start ranked review</button>
-        </form>
-      {% endif %}
-    </div>
-  </section>
-
-  <div class="section-heading">
-    <div>
-      <h2>Ranked masters</h2>
-      <p class="muted">Highest score first. Downloads preserve the exact generated file.</p>
-    </div>
-    <span class="status ready">{{ release.assets | length }} images</span>
-  </div>
-
-  <nav
-    class="asset-sort-bar"
-    aria-label="Sort raw masters"
-    data-asset-sort-controls
-    data-asset-sort-target="ranked-masters"
-    hidden
+  <a class="back" href="/dashboard">&larr; All sets</a>
+  <section
+    class="panel panel-accent review-bootstrap"
+    aria-labelledby="review-bootstrap-heading"
+    aria-live="polite"
   >
-    <span>Order</span>
-    <button class="filter-chip active" type="button" data-asset-sort="quality" aria-pressed="true">
-      Quality rank
-    </button>
-    <button class="filter-chip" type="button" data-asset-sort="generation" aria-pressed="false">
-      Generation queue
-    </button>
-    <output data-asset-sort-status aria-live="polite"></output>
-  </nav>
-
-  <ol class="asset-grid" id="ranked-masters" data-asset-grid>
-    {% for asset in release.assets %}
-      <li
-        class="asset-card"
-        data-asset-id="{{ asset.asset_id }}"
-        data-rank="{{ asset.rank }}"
-        data-quality-order="{{ loop.index }}"
-        data-batch-index="{{ asset.batch_index }}"
-        data-batch-image-number="{{ asset.batch_image_number }}"
+    <span class="workflow-label">Opening set</span>
+    <h1 id="review-bootstrap-heading">Preparing your review workspace</h1>
+    <p class="lede">
+      Every ranked master starts in the final set. Remove only the images you do not want;
+      anatomy labels stay optional.
+    </p>
+    <div class="review-bootstrap-progress" role="status">
+      <span class="review-bootstrap-spinner" aria-hidden="true"></span>
+      <span>Loading the unified image library&hellip;</span>
+    </div>
+    <form
+      method="post"
+      action="/dashboard/releases/{{ release_id }}/review-tasks"
+      data-review-bootstrap
+    >
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input
+        type="hidden"
+        name="idempotency_key"
+        value="{{ create_idempotency_key }}"
       >
-        <div class="asset-media">
-          <img
-            class="asset-preview"
-            src="{{ asset.view_url }}"
-            alt="Rank {{ asset.rank }} generated image"
-            width="{{ asset.width }}"
-            height="{{ asset.height }}"
-            loading="lazy"
-            decoding="async"
-          >
-          <span class="asset-rank-badge">#{{ asset.rank }}</span>
-          <span class="asset-rank-badge asset-score-badge">{{ asset.score_percent }}</span>
-        </div>
-        <div class="asset-body">
-          <div class="rank-line">
-            <span class="rank">Rank {{ asset.rank }}</span>
-            <span class="score">{{ asset.score_percent }}</span>
-          </div>
-          <p class="batch-origin">{{ asset.batch_name }} &middot; image {{ asset.batch_image_number }}</p>
-          <dl>
-            <dt>Disposition</dt>
-            <dd>{{ asset.disposition.replace("_", " ") }}</dd>
-            <dt>Dimensions</dt>
-            <dd>{{ asset.width }} &times; {{ asset.height }}</dd>
-            <dt>Format</dt>
-            <dd>{{ asset.image_format }}</dd>
-            <dt>Asset</dt>
-            <dd>{{ asset.asset_id }}</dd>
-            <dt>Checksum</dt>
-            <dd>{{ asset.checksum_prefix }}&hellip;</dd>
-          </dl>
-          <ul class="notes">
-            {% for note in asset.explanation_summary %}
-              <li>{{ note }}</li>
-            {% endfor %}
-          </ul>
-          <details
-            class="generation-details"
-            data-generation-details
-            data-generation-details-url="/dashboard/assets/{{ asset.asset_id }}/generation-details"
-          >
-            <summary>Full prompt &amp; generation settings</summary>
-            <div class="generation-details-body" data-generation-details-body>
-              <p
-                class="generation-details-status"
-                data-generation-details-status
-                role="status"
-              >
-                Open this section to load the exact settings for this image.
-              </p>
-              <a
-                class="generation-details-fallback"
-                href="/dashboard/assets/{{ asset.asset_id }}/generation-details"
-                data-generation-details-fallback
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                Open sanitized settings JSON
-              </a>
-            </div>
-          </details>
-          <a class="download" href="{{ asset.download_url }}">Download exact raw master</a>
-        </div>
-      </li>
-    {% endfor %}
-  </ol>
+      <button class="secondary-button" type="submit">
+        Continue if the workspace does not open
+      </button>
+    </form>
+  </section>
 {% endblock %}

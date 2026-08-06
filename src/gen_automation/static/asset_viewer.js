@@ -231,22 +231,22 @@
     const shortcuts = createElement(
       "p",
       "asset-viewer-shortcuts",
-      "\u2190/\u2192 Navigate \u00b7 Del Reject \u00b7 Shift+Del Reject + anatomy \u00b7 A Defect type \u00b7 Esc Close",
+      "\u2190/\u2192 Keep & navigate \u00b7 Del Remove \u00b7 Shift+Del Remove + anatomy \u00b7 A Defect type \u00b7 Esc Close",
     );
     const exclusionHelp = createElement(
       "p",
       "asset-viewer-exclusion-help",
-      "Reject removes this image from the final set immediately; its raw master is retained.",
+      "Moving past keeps this image. Remove takes it out of the final set; its raw master is retained.",
     );
     exclusionHelp.hidden = true;
-    const markOut = createElement("button", "asset-viewer-mark-out", "Reject");
+    const markOut = createElement("button", "asset-viewer-mark-out", "Remove from set");
     markOut.type = "button";
     markOut.dataset.assetViewerMarkOut = "";
     markOut.hidden = true;
     const anatomyReject = createElement(
       "button",
       "asset-viewer-anatomy-reject",
-      "Reject + anatomy label",
+      "Remove + anatomy label",
     );
     anatomyReject.type = "button";
     anatomyReject.dataset.assetViewerAnatomyReject = "";
@@ -262,7 +262,7 @@
     const defectPickerHelp = createElement(
       "p",
       "asset-viewer-defect-picker-help",
-      "Generic is enough. Choose a type only when it is obvious; the label stays provisional until review completion.",
+      "Generic is enough. Choose a type only when it is obvious; the label stays provisional until the set is finished.",
     );
     const defectChips = createElement("div", "asset-viewer-defect-chips");
     defectChips.dataset.assetViewerDefectChips = "";
@@ -352,6 +352,7 @@
 
     const viewer = createViewer();
     const boundCards = new WeakSet();
+    const boundReviewLaunchers = new WeakSet();
     let activeCard = null;
     let announcement = "";
     let cleanActionBusy = false;
@@ -1044,11 +1045,27 @@
       });
     };
 
+    const bindReviewLaunchers = (root = document) => {
+      if (!root || typeof root.querySelectorAll !== "function") return;
+      root.querySelectorAll("[data-open-review-viewer]").forEach((launcher) => {
+        if (!(launcher instanceof HTMLButtonElement) || boundReviewLaunchers.has(launcher)) return;
+        boundReviewLaunchers.add(launcher);
+        launcher.addEventListener("click", () => {
+          const card = visibleCards()[0] || assetCards()[0];
+          if (!card) return;
+          const trigger = triggerFor(card);
+          if (trigger) openViewer(card, launcher);
+        });
+      });
+    };
+
     bindCards();
+    bindReviewLaunchers();
     document.addEventListener("gen-automation:assets-updated", (event) => {
       const root = event.detail && event.detail.root;
       const activeAssetId = activeCard?.dataset.assetId || "";
       bindCards(root || document);
+      bindReviewLaunchers(root || document);
       restoreInspectionState();
       applyDensity(storedDensity());
       if (viewer.dialog.open && activeAssetId) {
@@ -1084,8 +1101,8 @@
       announcement = settled.removingAnatomyLabel
         ? "Provisional anatomy label removed; the image remains rejected and its raw master is retained."
         : settled.anatomyRequested
-        ? "Rejected with a provisional anatomy label. Learning waits until review completion; raw master retained."
-        : "Rejected from the final set; raw master retained.";
+        ? "Removed with a provisional anatomy label. Learning waits until the set is finished; raw master retained."
+        : "Removed from the final set; raw master retained.";
       if (viewer.dialog.open && settled.nextAssetId) {
         const nextCard = assetCards().find(
           (candidate) => candidate.dataset.assetId === settled.nextAssetId && !candidate.hidden,

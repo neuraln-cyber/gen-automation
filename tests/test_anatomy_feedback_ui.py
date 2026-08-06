@@ -38,6 +38,7 @@ from tests.test_dashboard_review import (
     SameOriginReviewStore,
     _create_task,
     _forms,
+    _release_id,
 )
 from tests.test_review_api import (
     ORIGIN,
@@ -290,23 +291,19 @@ def test_open_review_cannot_create_immutable_anatomy_feedback(
 
 
 @pytest.mark.parametrize(
-    ("terminal_state", "expected_form_count"),
-    (
-        (ReviewTaskState.COMPLETED, 1),
-        (ReviewTaskState.CANCELLED, 0),
-    ),
+    "terminal_state",
+    (ReviewTaskState.COMPLETED, ReviewTaskState.CANCELLED),
 )
-def test_owner_feedback_controls_are_available_after_completion_but_not_cancellation(
+def test_terminal_review_has_no_second_per_image_anatomy_labeling_step(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     terminal_state: ReviewTaskState,
-    expected_form_count: int,
 ) -> None:
     context = asyncio.run(
         _seed_review_api(_settings(tmp_path / f"anatomy-feedback-{terminal_state.value}.db"))
     )
     task_id = asyncio.run(_create_task(context))
-    assessment_id = asyncio.run(_add_completed_assessment(context))
+    asyncio.run(_add_completed_assessment(context))
     asyncio.run(
         _close_review_task(
             context,
@@ -333,17 +330,15 @@ def test_owner_feedback_controls_are_available_after_completion_but_not_cancella
 
     assert page.status_code == 200
     forms = _forms(page.text, action)
-    assert len(forms) == expected_form_count
+    assert forms == []
+    assert "data-anatomy-feedback-form" not in page.text
     assert "data-anatomy-training-control" not in page.text
     if terminal_state == ReviewTaskState.COMPLETED:
-        assert forms[0].fields["assessment_id"] == str(assessment_id)
-        assert forms[0].fields["csrf_token"]
-        assert len(forms[0].fields["csrf_token"]) > 10
-        assert "Good anatomy" in page.text
-        assert "Defect" in page.text
-        assert "Unsure" in page.text
+        assert "Learning was captured from the keep and anatomy-removal choices" in page.text
+        assert "no second labeling pass is required" in page.text
+        assert "Good anatomy" not in page.text
     else:
-        assert "This task is cancelled and is now read-only" in page.text
+        assert "Review task cancelled" in page.text
 
 
 def test_dashboard_feedback_is_owner_only_and_ignores_issue_for_good_label(
@@ -351,6 +346,7 @@ def test_dashboard_feedback_is_owner_only_and_ignores_issue_for_good_label(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     context = asyncio.run(_seed_review_api(_settings(tmp_path / "anatomy-feedback-web.db")))
+    release_id = asyncio.run(_release_id(context))
     task_id = asyncio.run(_create_task(context))
     assessment_id = uuid4()
     captured: dict[str, object] = {}
@@ -425,7 +421,7 @@ def test_dashboard_feedback_is_owner_only_and_ignores_issue_for_good_label(
 
     assert denied.status_code == 403
     assert saved.status_code == 303
-    assert saved.headers["location"] == f"/dashboard/review-tasks/{task_id}"
+    assert saved.headers["location"] == f"/dashboard/releases/{release_id}"
     assert captured["ground_truth"] == SemanticGroundTruth.ANATOMY_GOOD
     assert captured["issue_code"] is None
 
@@ -449,7 +445,7 @@ def test_anatomy_feedback_template_is_quick_responsive_and_explicit() -> None:
     assert "Regressed" in template
     assert "prior policy retained" in template.lower()
     assert "How learning is measured" in template
-    assert "Plain rejection only removes an image from the final set" in template
+    assert "Plain removal only removes an image from the final set" in template
     assert "never labels" in template
     assert "it as an anatomy defect" in template
     assert "Validation F1" in template
@@ -459,27 +455,19 @@ def test_anatomy_feedback_template_is_quick_responsive_and_explicit() -> None:
     assert "candidate_threshold_micros" in template
     assert "out-of-fold images" in template
     assert 'principal.role.value == "owner"' in template
-    assert "data-anatomy-feedback-form" in template
-    assert 'summary.state.value == "completed" and principal.role.value == "owner"' in template
+    assert "data-anatomy-feedback-form" not in template
+    assert "no second labeling pass is required" in template
     assert "data-anatomy-training-control" in template
     assert "data-anatomy-training-toggle" in template
     assert "data-anatomy-training-issue" in template
-    assert "Mark as anatomy defect (provisional)" in template
-    assert "Only enable when anatomy caused the rejection" in template
-    assert "Learning waits until review completion" in template
-    assert 'value="anatomy_good"' in template
-    assert 'value="anatomy_defect"' in template
-    assert 'value="unjudgeable"' in template
-    assert "Good anatomy" in template
-    assert "Flag incorrect" in template
-    assert "Flag correct" in template
+    assert "Teach anatomy from this removal" in template
+    assert "Enable only when anatomy is why this image is leaving the set" in template
     assert "semantic-issue-chip" in template
     assert "Assessment details" in template
     assert 'principal.role.value == "owner"' in template
     assert "@media (max-width: 680px)" in css
     assert ".anatomy-learning-progress { grid-template-columns: 1fr;" in css
     assert ".anatomy-learning-validation { grid-template-columns: 1fr; }" in css
-    assert ".anatomy-feedback-actions { grid-template-columns: 1fr; }" in css
     assert "min-height: 3.2rem" in css
 
 
@@ -623,8 +611,8 @@ def test_open_review_page_renders_prediction_and_integrated_anatomy_rejection(
     assert page.text.count("data-anatomy-training-control") == len(context.asset_ids)
     assert page.text.count("data-anatomy-training-toggle") == len(context.asset_ids)
     assert page.text.count("data-anatomy-training-issue") == len(context.asset_ids)
-    assert "Mark as anatomy defect (provisional)" in page.text
-    assert "Plain rejection only removes an image from the final set" in page.text
+    assert "Teach anatomy from this removal" in page.text
+    assert "Plain removal only removes an image from the final set" in page.text
     assert str(second_assessment_id) in page.text
     assert 'data-anatomy-learning-status="collecting"' in page.text
     assert "12 / 100 useful labels" in page.text

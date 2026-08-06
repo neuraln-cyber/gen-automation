@@ -474,7 +474,7 @@ def test_browser_review_detail_is_owner_or_reviewer_only(
         )
 
 
-def test_browser_review_forms_are_bounded_same_origin_and_cookie_csrf_bound(
+def test_release_auto_bootstrap_is_bounded_idempotent_and_renders_unified_review(
     tmp_path: Path,
 ) -> None:
     context = asyncio.run(_seed_review_api(_settings(tmp_path / "browser-forms.db")))
@@ -498,6 +498,11 @@ def test_browser_review_forms_are_bounded_same_origin_and_cookie_csrf_bound(
         first_form = _one_form(first_page.text, action)
         second_form = _one_form(second_page.text, action)
 
+        assert "data-review-bootstrap" in first_page.text
+        assert "data-review-workspace" not in first_page.text
+        assert "Start ranked review" not in first_page.text
+        assert "Open ranked review" not in first_page.text
+        assert "Continue review" not in first_page.text
         assert first_form.fields["csrf_token"] == csrf
         assert first_form.fields["idempotency_key"] == second_form.fields["idempotency_key"]
         assert _FORM_KEY.fullmatch(first_form.fields["idempotency_key"])
@@ -565,6 +570,7 @@ def test_browser_review_forms_are_bounded_same_origin_and_cookie_csrf_bound(
             headers=_FORM_HEADERS,
             follow_redirects=False,
         )
+        canonical = client.get(f"/dashboard/releases/{release_id}")
 
     assert missing_origin.status_code == 403
     assert wrong_hidden_csrf.status_code == 403
@@ -583,8 +589,19 @@ def test_browser_review_forms_are_bounded_same_origin_and_cookie_csrf_bound(
         _assert_safe_error(response.text)
     assert created.status_code == 303
     assert replay.status_code == 303
-    assert created.headers["location"] == replay.headers["location"]
-    assert created.headers["location"].startswith("/dashboard/review-tasks/")
+    assert created.headers["location"] == f"/dashboard/releases/{release_id}"
+    assert replay.headers["location"] == created.headers["location"]
+    assert canonical.status_code == 200
+    assert 'data-review-workspace' in canonical.text
+    assert 'data-review-task-id="' in canonical.text
+    assert "everything starts kept" in canonical.text
+    assert "Start ranked review" not in canonical.text
+    assert "Open ranked review" not in canonical.text
+    assert "Continue review" not in canonical.text
+    assert 'data-decision="hold"' not in canonical.text
+    assert "Hold selected" not in canonical.text
+    assert "data-anatomy-feedback-form" not in canonical.text
+    assert canonical.text.count('data-decision="reject"') == len(context.asset_ids)
     assert asyncio.run(_single_task_identity(context)) == (
         1,
         context.scoring_run_id,
@@ -825,9 +842,10 @@ def test_review_dashboard_exposes_progressive_bulk_controls(tmp_path: Path) -> N
     assert _FORM_KEY.fullmatch(bulk_form.fields["idempotency_key"])
     assert bulk_form.fields["expected_lock_version"] == "1"
     assert page.text.count('form="bulk-action-form"') == len(context.asset_ids)
-    assert "Keep selected" in page.text
+    assert "Restore selected" in page.text
     assert "Reject selected" in page.text
-    assert "Hold selected" in page.text
+    assert "Hold selected" not in page.text
+    assert 'data-decision="hold"' not in page.text
     assert "Add to X" in page.text
     assert "Remove from X" in page.text
     assert "data-review-asset" in page.text
@@ -853,7 +871,7 @@ def test_review_dashboard_can_complete_a_nonempty_subset_below_goal(tmp_path: Pa
         _login(client, context.settings, context.users[AdminRole.REVIEWER])
         empty_page = client.get(detail_action)
         empty_button = re.search(
-            r"<button(?P<attributes>[^>]*)>\s*Complete with 0\s+images\s*</button>",
+            r"<button(?P<attributes>[^>]*)>\s*Finish set with 0\s+images\s*</button>",
             empty_page.text,
             re.DOTALL,
         )
@@ -876,18 +894,18 @@ def test_review_dashboard_can_complete_a_nonempty_subset_below_goal(tmp_path: Pa
 
     assert accepted.status_code == 303
     subset_button = re.search(
-        r"<button(?P<attributes>[^>]*)>\s*Complete with 1\s+image\s*</button>",
+        r"<button(?P<attributes>[^>]*)>\s*Finish set with 1\s+image\s*</button>",
         subset_page.text,
         re.DOTALL,
     )
     assert subset_button is not None
     assert "disabled" not in subset_button.group("attributes")
     assert "1 optional slot" in subset_page.text
-    assert "masters may remain undecided" in subset_page.text
 
 
 def test_browser_bulk_review_action_applies_repeated_selected_assets(tmp_path: Path) -> None:
     context = asyncio.run(_seed_review_api(_settings(tmp_path / "browser-bulk-submit.db")))
+    release_id = asyncio.run(_release_id(context))
     task_id = asyncio.run(_create_task(context))
     app = create_app(context.settings)
     detail_action = f"/dashboard/review-tasks/{task_id}"
@@ -925,7 +943,7 @@ def test_browser_bulk_review_action_applies_repeated_selected_assets(tmp_path: P
 
     assert rejected.status_code == 303
     assert replay.status_code == 303
-    assert rejected.headers["location"] == detail_action
+    assert rejected.headers["location"] == f"/dashboard/releases/{release_id}"
     assert summary.status_code == 200
     assert summary.json()["rejected_count"] == len(context.asset_ids)
     assert summary.json()["lock_version"] == 2
@@ -935,6 +953,7 @@ def test_browser_review_decisions_lock_replay_actor_and_exact_completion(
     tmp_path: Path,
 ) -> None:
     context = asyncio.run(_seed_review_api(_settings(tmp_path / "browser-workflow.db")))
+    release_id = asyncio.run(_release_id(context))
     task_id = asyncio.run(_create_task(context))
     app = create_app(context.settings)
     detail_action = f"/dashboard/review-tasks/{task_id}"
@@ -1048,8 +1067,8 @@ def test_browser_review_decisions_lock_replay_actor_and_exact_completion(
     _assert_safe_error(invalid_reason.text)
     assert decision.status_code == 303
     assert decision_replay.status_code == 303
-    assert decision.headers["location"] == detail_action
-    assert decision_replay.headers["location"] == detail_action
+    assert decision.headers["location"] == f"/dashboard/releases/{release_id}"
+    assert decision_replay.headers["location"] == f"/dashboard/releases/{release_id}"
     assert stale.status_code == 409
     assert "changed before the form was submitted" in stale.text
     _assert_safe_error(stale.text)
@@ -1060,7 +1079,7 @@ def test_browser_review_decisions_lock_replay_actor_and_exact_completion(
     assert completed.status_code == 303
     assert completed_replay.status_code == 303
     assert final_page.status_code == 200
-    assert "task completed" in final_page.text
+    assert "Review task completed" in final_page.text
     assert _forms(final_page.text, decision_action) == []
     state, actor = asyncio.run(
         _review_state_and_actor(
@@ -1077,6 +1096,7 @@ def test_browser_review_cancel_redirects_and_replays(
     tmp_path: Path,
 ) -> None:
     context = asyncio.run(_seed_review_api(_settings(tmp_path / "browser-cancel.db")))
+    release_id = asyncio.run(_release_id(context))
     task_id = asyncio.run(_create_task(context))
     app = create_app(context.settings)
     detail_action = f"/dashboard/review-tasks/{task_id}"
@@ -1111,9 +1131,9 @@ def test_browser_review_cancel_redirects_and_replays(
 
     assert cancelled.status_code == 303
     assert replay.status_code == 303
-    assert cancelled.headers["location"] == detail_action
-    assert replay.headers["location"] == detail_action
-    assert "task cancelled" in terminal.text
+    assert cancelled.headers["location"] == f"/dashboard/releases/{release_id}"
+    assert replay.headers["location"] == f"/dashboard/releases/{release_id}"
+    assert "Review task cancelled" in terminal.text
     assert asyncio.run(_review_state_and_actor(context, task_id=task_id)) == (
         ReviewTaskState.CANCELLED,
         None,

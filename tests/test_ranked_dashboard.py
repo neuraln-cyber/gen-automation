@@ -11,9 +11,7 @@ from uuid import UUID
 import pytest
 from argon2 import PasswordHasher, Type
 from fastapi.testclient import TestClient
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from gen_automation.api.routes import dashboard as dashboard_routes
 from gen_automation.app import create_app
 from gen_automation.auth.security import (
     PasswordManager,
@@ -43,18 +41,12 @@ from gen_automation.domain.enums import (
     ReleasePhase,
     ScoringRunState,
 )
-from gen_automation.services.ranked_dashboard import (
-    RankedRelease,
-)
-from gen_automation.services.ranked_dashboard import (
-    load_ranked_release as service_load_ranked_release,
-)
 from gen_automation.services.ranking_manifest import ranking_manifest_sha256
 from gen_automation.storage.base import (
     ObjectMetadata,
-    ObjectStore,
     PresignedUpload,
 )
+from tests.test_dashboard_review import _FORM_HEADERS, _one_form
 
 SESSION_KEY = base64.urlsafe_b64encode(bytes(range(32))).rstrip(b"=").decode("ascii")
 TOTP_KEY = base64.urlsafe_b64encode(bytes(range(32, 64))).rstrip(b"=").decode("ascii")
@@ -528,7 +520,6 @@ def test_dashboard_requires_authentication_before_loading_private_state(
 )
 def test_raw_master_access_is_least_privilege_and_precedes_signing(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     role: AdminRole,
     may_view_raw_masters: bool,
 ) -> None:
@@ -548,25 +539,6 @@ def test_raw_master_access_is_least_privilege_and_precedes_signing(
     asyncio.run(_seed_release(settings))
     store = RecordingObjectStore()
     app = create_app(settings)
-    service_calls = 0
-
-    async def tracked_load(
-        session: AsyncSession,
-        *,
-        store: ObjectStore,
-        release_id: UUID,
-        expires_in: int,
-    ) -> RankedRelease:
-        nonlocal service_calls
-        service_calls += 1
-        return await service_load_ranked_release(
-            session,
-            store=store,
-            release_id=release_id,
-            expires_in=expires_in,
-        )
-
-    monkeypatch.setattr(dashboard_routes, "load_ranked_release", tracked_load)
     with TestClient(
         app,
         base_url="http://testserver",
@@ -576,19 +548,35 @@ def test_raw_master_access_is_least_privilege_and_precedes_signing(
         _login(client, username=username, secret=secret)
         index = client.get("/dashboard")
         detail = client.get(f"/dashboard/releases/{RELEASE_ID}")
+        if may_view_raw_masters:
+            assert store.calls == []
+            bootstrap_form = _one_form(
+                detail.text,
+                f"/dashboard/releases/{RELEASE_ID}/review-tasks",
+            )
+            created = client.post(
+                bootstrap_form.action,
+                data=bootstrap_form.fields,
+                headers=_FORM_HEADERS,
+                follow_redirects=False,
+            )
+            canonical = client.get(f"/dashboard/releases/{RELEASE_ID}")
 
     assert index.status_code == 200
     assert "2 ranked masters" in index.text
     assert "no-store" in detail.headers["cache-control"]
     if may_view_raw_masters:
         assert detail.status_code == 200
-        assert service_calls == 1
+        assert "data-review-bootstrap" in detail.text
+        assert created.status_code == 303
+        assert created.headers["location"] == f"/dashboard/releases/{RELEASE_ID}"
+        assert canonical.status_code == 200
+        assert "data-review-workspace" in canonical.text
         assert len(store.calls) == 4
-        assert "Download exact raw master" in detail.text
+        assert "Download exact raw master" in canonical.text
     else:
         assert detail.status_code == 403
         assert detail.json() == {"detail": "permission denied"}
-        assert service_calls == 0
         assert store.calls == []
         assert "frozen/private-master" not in detail.text
         assert "exact-version" not in detail.text
@@ -597,20 +585,45 @@ def test_raw_master_access_is_least_privilege_and_precedes_signing(
 def test_ranked_dashboard_orders_assets_and_signs_exact_frozen_versions(
     tmp_path: Path,
 ) -> None:
-    settings = _settings(tmp_path / "ranked.db")
+    settings = _settings(tmp_path / "ranked.db", auth_enabled=True)
+    owner_secret = asyncio.run(_prepare_owner(settings))
     asyncio.run(_seed_release(settings))
     store = RecordingObjectStore()
     app = create_app(settings)
 
-    with TestClient(app, base_url="http://testserver") as client:
+    with TestClient(
+        app,
+        base_url="http://testserver",
+        client=("192.0.2.56", 50000),
+    ) as client:
         app.state.object_store = store
+        _login(client, username="owner@example.test", secret=owner_secret)
         index = client.get("/dashboard")
+        bootstrap = client.get(f"/dashboard/releases/{RELEASE_ID}")
+        bootstrap_form = _one_form(
+            bootstrap.text,
+            f"/dashboard/releases/{RELEASE_ID}/review-tasks",
+        )
+        created = client.post(
+            bootstrap_form.action,
+            data=bootstrap_form.fields,
+            headers=_FORM_HEADERS,
+            follow_redirects=False,
+        )
         detail = client.get(f"/dashboard/releases/{RELEASE_ID}")
 
     assert index.status_code == 200
     assert "2 ranked masters" in index.text
     assert f"/dashboard/releases/{RELEASE_ID}" in index.text
+    assert bootstrap.status_code == 200
+    assert "data-review-bootstrap" in bootstrap.text
+    assert "data-review-workspace" not in bootstrap.text
+    assert "Start ranked review" not in bootstrap.text
+    assert "Open ranked review" not in bootstrap.text
+    assert created.status_code == 303
+    assert created.headers["location"] == f"/dashboard/releases/{RELEASE_ID}"
     assert detail.status_code == 200
+    assert "data-review-workspace" in detail.text
     assert detail.text.index("#1") < detail.text.index("#2")
     assert detail.text.index(str(ASSET_B_ID)) < detail.text.index(str(ASSET_A_ID))
     assert "90.0%" in detail.text

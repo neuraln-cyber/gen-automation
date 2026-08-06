@@ -4,18 +4,20 @@
     data-review-workspace
     data-review-task-id="{{ summary.task_id }}"
   >
-  <a class="back" href="/dashboard/releases/{{ navigation.release_id }}">
-    &larr; Ranked release
-  </a>
+  <a class="back" href="/dashboard">&larr; All sets</a>
   <section class="page-header" aria-labelledby="page-heading">
-    <div class="page-header-copy">
-      <p class="page-kicker">Final set review</p>
-      <h1 id="page-heading">{{ release.release_title }}</h1>
-      <p class="lede">
-        Frozen release version {{ release.release_version_no }} &middot;
-        {{ summary.ranked_asset_count }} ranked assets &middot;
-        task {{ summary.state.value }}
-      </p>
+    <div class="page-header-row">
+      <div class="page-header-copy">
+        <p class="page-kicker">Image library &amp; final set</p>
+        <h1 id="page-heading">{{ release.release_title }}</h1>
+        <p class="lede">
+          Frozen release version {{ release.release_version_no }} &middot;
+          {{ summary.ranked_asset_count }} masters &middot; everything starts kept
+        </p>
+      </div>
+      <button class="primary-button" type="button" data-open-review-viewer>
+        Review full screen
+      </button>
     </div>
   </section>
 
@@ -70,6 +72,16 @@
         {% set remaining_good = minimum_defect_labels %}
         {% set remaining_defects = minimum_defect_labels %}
       {% endif %}
+      <details class="anatomy-learning-disclosure">
+        <summary>
+          <span>Anatomy learning</span>
+          <strong>
+            {% if semantic_calibration %}
+              {{ semantic_calibration.sample_count }} labels &middot;
+            {% endif %}
+            {{ learning_status.replace("_", " ") | title }}
+          </strong>
+        </summary>
       <section
         class="anatomy-learning-card status-{{ learning_status }}"
         aria-labelledby="anatomy-learning-heading"
@@ -243,6 +255,7 @@
           </p>
         </details>
       </section>
+      </details>
     {% endif %}
   </aside>
 
@@ -252,43 +265,42 @@
   <section class="panel review-summary" aria-labelledby="review-summary-heading">
     <div class="panel-heading">
       <div>
-        <span class="workflow-label">Review progress</span>
-        <h2 id="review-summary-heading">Build your final set</h2>
+        <span class="workflow-label">Set progress</span>
+        <h2 id="review-summary-heading">Keep what works, remove what does not</h2>
         <p class="muted">
-          Cull mode keeps images unless you reject them. The final-set maximum is
-          {{ final_set_goal }} image{% if final_set_goal != 1 %}s{% endif %}; reject enough
-          images to reach that limit, then finish the review.
+          All images start in the final set. Open full screen and move with the arrow keys;
+          Delete removes an image, while Shift+Delete also teaches the anatomy model.
         </p>
       </div>
       <span class="status {{ summary.state.value }}">{{ summary.state.value }}</span>
     </div>
     <div class="review-target-progress">
       <div>
-        <strong>{{ summary.accepted_count }} / {{ final_set_goal }} accepted</strong>
+        <strong>{{ summary.accepted_count }} / {{ final_set_goal }} kept</strong>
         {% if summary.accepted_count == 0 %}
-          <span>Accept at least one image; undecided masters are optional.</span>
+          <span>Restore at least one image to build a finished set.</span>
         {% elif accepted_over_goal %}
           <span>{{ accepted_over_goal }} above the configured maximum.</span>
         {% elif optional_slots_remaining %}
           <span>
             {{ optional_slots_remaining }} optional slot{% if optional_slots_remaining != 1 %}s{% endif %}
-            remain &middot; undecided masters are optional
+            remain
           </span>
         {% else %}
-          <span>Goal reached &middot; undecided masters are optional</span>
+          <span>Final-set target reached</span>
         {% endif %}
       </div>
       <progress
         value="{{ [summary.accepted_count, final_set_goal] | min }}"
         max="{{ final_set_goal }}"
-        aria-label="Accepted images toward the final-set maximum"
+        aria-label="Kept images toward the final-set maximum"
       >{{ summary.accepted_count }} / {{ final_set_goal }}</progress>
     </div>
     <dl class="count-grid">
-      <div><dt>Accepted</dt><dd>{{ summary.accepted_count }}</dd></div>
-      <div><dt>Excluded</dt><dd>{{ summary.rejected_count }}</dd></div>
-      <div><dt>Held</dt><dd>{{ summary.held_count }}</dd></div>
-      <div><dt>Undecided</dt><dd>{{ summary.undecided_count }}</dd></div>
+      <div><dt>In final set</dt><dd>{{ summary.accepted_count }}</dd></div>
+      <div><dt>Removed</dt><dd>{{ summary.rejected_count }}</dd></div>
+      {% if summary.held_count %}<div><dt>Legacy held</dt><dd>{{ summary.held_count }}</dd></div>{% endif %}
+      {% if summary.undecided_count %}<div><dt>Needs decision</dt><dd>{{ summary.undecided_count }}</dd></div>{% endif %}
       <div>
         {% if accepted_over_goal %}
           <dt>Over goal</dt><dd>{{ accepted_over_goal }}</dd>
@@ -328,7 +340,7 @@
 
     {% if summary.state.value != "open" %}
       <p class="terminal-state" role="status">
-        This task is {{ summary.state.value }} and is now read-only.
+        Review task {{ summary.state.value }}. This set is now read-only.
       </p>
       {% if summary.state.value == "completed" and principal.role.value == "owner" %}
         <a
@@ -350,15 +362,15 @@
       data-lock-version="{{ summary.lock_version }}"
     >
       <div class="review-command-copy">
-        <strong>{{ summary.accepted_count }} / {{ final_set_goal }} accepted</strong>
+        <strong>{{ summary.accepted_count }} / {{ final_set_goal }} kept</strong>
         {% if summary.accepted_count == 0 %}
           <span>Choose at least one final image.</span>
         {% elif accepted_over_goal %}
-          <span>Exclude {{ accepted_over_goal }} accepted image{% if accepted_over_goal != 1 %}s{% endif %} to return to the maximum.</span>
+          <span>Remove {{ accepted_over_goal }} image{% if accepted_over_goal != 1 %}s{% endif %} to return to the maximum.</span>
         {% elif optional_slots_remaining %}
-          <span>{{ optional_slots_remaining }} optional slot{% if optional_slots_remaining != 1 %}s{% endif %} left; {{ summary.undecided_count }} masters may remain undecided.</span>
+          <span>{{ optional_slots_remaining }} optional slot{% if optional_slots_remaining != 1 %}s{% endif %} left.</span>
         {% else %}
-          <span>Goal reached; {{ summary.undecided_count }} masters may remain undecided.</span>
+          <span>Ready to finish and package.</span>
         {% endif %}
       </div>
       <div class="task-actions">
@@ -392,37 +404,39 @@
             type="submit"
             {% if not can_complete %}disabled aria-describedby="completion-help"{% endif %}
           >
-            Complete with {{ summary.accepted_count }}
+            Finish set with {{ summary.accepted_count }}
             image{% if summary.accepted_count != 1 %}s{% endif %}
           </button>
         </form>
-        <form
-          method="post"
-          action="/dashboard/review-tasks/{{ summary.task_id }}:cancel"
-          data-review-cancel-form
-        >
-          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <input
-            type="hidden"
-            name="idempotency_key"
-            value="{{ cancel_idempotency_key }}"
+        <details class="review-more-actions">
+          <summary>More</summary>
+          <form
+            method="post"
+            action="/dashboard/review-tasks/{{ summary.task_id }}:cancel"
+            data-review-cancel-form
           >
-          <input
-            type="hidden"
-            name="expected_lock_version"
-            value="{{ summary.lock_version }}"
-          >
-          <button class="secondary-button danger" type="submit">Cancel</button>
-        </form>
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input
+              type="hidden"
+              name="idempotency_key"
+              value="{{ cancel_idempotency_key }}"
+            >
+            <input
+              type="hidden"
+              name="expected_lock_version"
+              value="{{ summary.lock_version }}"
+            >
+            <button class="secondary-button danger" type="submit">Cancel review</button>
+          </form>
+        </details>
       </div>
     </aside>
     {% if not can_complete %}
       <p class="muted" id="completion-help">
         {% if summary.accepted_count == 0 %}
-          Accept at least one image before completing this set. All other masters may remain
-          undecided.
+          Restore at least one image before finishing this set.
         {% elif accepted_over_goal %}
-          Exclude {{ accepted_over_goal }} accepted image{% if accepted_over_goal != 1 %}s{% endif %}
+          Remove {{ accepted_over_goal }} image{% if accepted_over_goal != 1 %}s{% endif %}
           before completing; {{ final_set_goal }} is the configured maximum.
         {% elif summary.semantic_gate.pending_count and semantic_mode == "enforce" %}
           Completion is blocked until all {{ summary.ranked_asset_count }} configured
@@ -431,7 +445,7 @@
           Completion is blocked because an accepted high-confidence severe image needs
           an explicit owner override reason and attestation.
         {% else %}
-          Every X teaser must be accepted. Accept it or remove it from X before completing.
+          Every X teaser must stay in the final set. Restore it or remove it from X before finishing.
         {% endif %}
       </p>
     {% endif %}
@@ -485,13 +499,10 @@
       </div>
       <div class="bulk-actions">
         <button class="secondary-button bulk-accept" type="submit" name="action" value="accept">
-          Keep selected
+          Restore selected
         </button>
         <button class="secondary-button bulk-reject" type="submit" name="action" value="reject">
           Reject selected
-        </button>
-        <button class="secondary-button bulk-hold" type="submit" name="action" value="hold">
-          Hold selected
         </button>
         {% if principal.role.value == "owner" %}
           <button class="secondary-button bulk-x" type="submit" name="action" value="x_add">
@@ -514,10 +525,10 @@
 
   <div class="section-heading" id="review-images">
     <div>
-      <h2>Ranked images</h2>
+      <h2>Review images</h2>
       <p class="muted">
-        Open an image for fast culling. Left and Right navigate; Delete rejects immediately;
-        Shift+Delete rejects and adds an anatomy-defect training label. Raw masters are retained.
+        Open full screen once, then use Left and Right to move through the set. Delete removes;
+        Shift+Delete removes and adds an anatomy-defect training label. Raw masters are retained.
       </p>
     </div>
     {% if ai_excluded_count %}
@@ -528,10 +539,10 @@
     <nav class="review-filter-bar" aria-label="Filter ranked images" data-review-tools hidden>
       <span>Show</span>
       <button class="filter-chip active" type="button" data-review-filter="all" aria-pressed="true">All <span>{{ summary.ranked_asset_count }}</span></button>
-      <button class="filter-chip" type="button" data-review-filter="undecided" aria-pressed="false">Undecided <span>{{ summary.undecided_count }}</span></button>
-      <button class="filter-chip" type="button" data-review-filter="accept" aria-pressed="false">Accepted <span>{{ summary.accepted_count }}</span></button>
-      <button class="filter-chip" type="button" data-review-filter="reject" aria-pressed="false">Excluded <span>{{ summary.rejected_count }}</span></button>
-      <button class="filter-chip" type="button" data-review-filter="hold" aria-pressed="false">Held <span>{{ summary.held_count }}</span></button>
+      {% if summary.undecided_count %}<button class="filter-chip" type="button" data-review-filter="undecided" aria-pressed="false">Needs decision <span>{{ summary.undecided_count }}</span></button>{% endif %}
+      <button class="filter-chip" type="button" data-review-filter="accept" aria-pressed="false">In final set <span>{{ summary.accepted_count }}</span></button>
+      <button class="filter-chip" type="button" data-review-filter="reject" aria-pressed="false">Removed <span>{{ summary.rejected_count }}</span></button>
+      {% if summary.held_count %}<button class="filter-chip" type="button" data-review-filter="hold" aria-pressed="false">Legacy held <span>{{ summary.held_count }}</span></button>{% endif %}
       <button class="filter-chip" type="button" data-review-filter="x" aria-pressed="false">For X <span>{{ summary.x_selected_count }}</span></button>
       {% if semantic_flagged_count %}
         <button class="filter-chip" type="button" data-review-filter="semantic" aria-pressed="false">AI flagged <span>{{ semantic_flagged_count }}</span></button>
@@ -852,7 +863,7 @@
                   During culling, use Reject + anatomy label for a bad-anatomy image.
                   The label is provisional while review is open and becomes calibration data
                   only after you complete the review.
-                  Plain rejection only removes an image from the final set and never labels
+                  Plain removal only removes an image from the final set and never labels
                   it as an anatomy defect.
                 </p>
 
@@ -880,68 +891,10 @@
                     </span>
                   </div>
                 {% elif summary.state.value == "completed" and principal.role.value == "owner" %}
-                  <form
-                    class="anatomy-feedback-form"
-                    method="post"
-                    action="/dashboard/review-tasks/{{ summary.task_id }}/anatomy-feedback"
-                    data-anatomy-feedback-form
-                  >
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                    <input type="hidden" name="assessment_id" value="{{ item.semantic.assessment_id }}">
-                    <div class="anatomy-feedback-actions" role="group" aria-label="Rate visible anatomy">
-                      <button
-                        class="anatomy-feedback-button good"
-                        type="submit"
-                        name="ground_truth"
-                        value="anatomy_good"
-                      >
-                        <span>Good anatomy</span>
-                        <small>{{ "AI correct" if item.semantic.verdict.value == "pass" else "Flag incorrect" }}</small>
-                      </button>
-                      <button
-                        class="anatomy-feedback-button defect"
-                        type="submit"
-                        name="ground_truth"
-                        value="anatomy_defect"
-                      >
-                        <span>Defect</span>
-                        <small>{{ "AI incorrect" if item.semantic.verdict.value == "pass" else "Flag correct" }}</small>
-                      </button>
-                      <button
-                        class="anatomy-feedback-button unsure"
-                        type="submit"
-                        name="ground_truth"
-                        value="unjudgeable"
-                      >
-                        <span>Unsure</span>
-                        <small>Skip calibration</small>
-                      </button>
-                    </div>
-                    <details class="anatomy-feedback-details">
-                      <summary>Optional defect type or note</summary>
-                      <div>
-                        <label for="feedback-issue-{{ item.semantic.assessment_id }}">
-                          Defect type (used only with Defect)
-                        </label>
-                        <select id="feedback-issue-{{ item.semantic.assessment_id }}" name="issue_code">
-                          <option value="">Not specified</option>
-                          {% for issue_code in semantic_issue_codes %}
-                            <option value="{{ issue_code.value }}">
-                              {{ issue_code.value.replace("_", " ") }}
-                            </option>
-                          {% endfor %}
-                        </select>
-                        <label for="feedback-note-{{ item.semantic.assessment_id }}">Calibration note</label>
-                        <textarea
-                          id="feedback-note-{{ item.semantic.assessment_id }}"
-                          name="note"
-                          maxlength="1000"
-                          rows="2"
-                          placeholder="Optional: what looked right or wrong?"
-                        ></textarea>
-                      </div>
-                    </details>
-                  </form>
+                  <p class="anatomy-feedback-readonly">
+                    Learning was captured from the keep and anatomy-removal choices made while
+                    reviewing this set; no second labeling pass is required.
+                  </p>
                 {% elif principal.role.value != "owner" %}
                   <p class="anatomy-feedback-readonly">Only the owner can save calibration labels.</p>
                 {% endif %}
@@ -1062,34 +1015,38 @@
                   Save a decision for rank {{ item.master.rank }}
                 </legend>
                 <div class="decision-actions">
-                  <button
-                    class="decision-button accept"
-                    type="submit"
-                    name="decision"
-                    value="accept"
-                    aria-label="Accept rank {{ item.master.rank }}"
-                    data-decision="accept"
-                    {% if summary.semantic_gate.enabled and item.ai_excluded and principal.role.value != "owner" %}
-                      disabled
-                      aria-describedby="severe-owner-only-{{ item.master.asset_id }}"
-                    {% endif %}
-                  >Keep</button>
-                  <button
-                    class="decision-button reject"
-                    type="submit"
-                    name="decision"
-                    value="reject"
-                    aria-label="Reject rank {{ item.master.rank }}"
-                    data-decision="reject"
-                  >Reject</button>
-                  <button
-                    class="decision-button hold"
-                    type="submit"
-                    name="decision"
-                    value="hold"
-                    aria-label="Hold rank {{ item.master.rank }}"
-                    data-decision="hold"
-                  >Hold</button>
+                  {% if decision_value != "accept" %}
+                    <button
+                      class="decision-button accept"
+                      type="submit"
+                      name="decision"
+                      value="accept"
+                      aria-label="Restore rank {{ item.master.rank }} to the final set"
+                      data-decision="accept"
+                      {% if summary.semantic_gate.enabled and item.ai_excluded and principal.role.value != "owner" %}
+                        disabled
+                        aria-describedby="severe-owner-only-{{ item.master.asset_id }}"
+                      {% endif %}
+                    >Restore to final set</button>
+                  {% endif %}
+                  {% if decision_value != "reject" %}
+                    <button
+                      class="decision-button reject"
+                      type="submit"
+                      name="decision"
+                      value="reject"
+                      aria-label="Remove rank {{ item.master.rank }} from the final set"
+                      data-decision="reject"
+                    >Remove from set</button>
+                  {% else %}
+                    <button
+                      type="submit"
+                      name="decision"
+                      value="reject"
+                      data-decision="reject"
+                      hidden
+                    >Keep removed</button>
+                  {% endif %}
                 </div>
               </fieldset>
 
@@ -1102,8 +1059,8 @@
                       {% if item.current.reason_code in anatomy_reason_codes %}checked{% endif %}
                     >
                     <span>
-                      <strong>Mark as anatomy defect (provisional)</strong>
-                      <small>Only enable when anatomy caused the rejection. Learning waits until review completion.</small>
+                      <strong>Teach anatomy from this removal</strong>
+                      <small>Enable only when anatomy is why this image is leaving the set.</small>
                     </span>
                   </label>
                   <label>

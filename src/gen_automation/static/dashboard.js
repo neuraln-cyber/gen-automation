@@ -2599,7 +2599,7 @@
         if (acceptedAlreadyOverGoal) {
           const excess = acceptedCount - reviewTarget;
           messages.push(
-            `The final set is ${excess} image${excess === 1 ? "" : "s"} over its maximum; exclude accepted images before accepting more.`,
+            `The final set is ${excess} image${excess === 1 ? "" : "s"} over its maximum; remove kept images before restoring more.`,
           );
         } else if (exceedsReviewGoal) {
           messages.push(
@@ -2737,12 +2737,12 @@
     const decision = submitter instanceof HTMLButtonElement
       ? submitter.dataset.decision || ""
       : "";
-    if (decision === "accept") return "Image accepted. Your review position was preserved.";
+    if (decision === "accept") return "Image restored to the final set. Your position was preserved.";
     if (decision === "reject") {
       const anatomyToggle = form.querySelector("[data-anatomy-training-toggle]");
       return anatomyToggle instanceof HTMLInputElement && anatomyToggle.checked
-        ? "Image rejected with a provisional anatomy label. Learning waits until review completion."
-        : "Image rejected. The raw master was retained.";
+        ? "Image removed with a provisional anatomy label. Learning waits until the set is finished."
+        : "Image removed from the final set. The raw master was retained.";
     }
     if (decision === "hold") return "Image held for another pass.";
 
@@ -2750,8 +2750,8 @@
       const action = submitter instanceof HTMLButtonElement ? submitter.value : "";
       const count = Math.max(1, selectedCount);
       const images = `${count} image${count === 1 ? "" : "s"}`;
-      if (action === "accept") return `${images} accepted. Your review position was preserved.`;
-      if (action === "reject") return `${images} excluded. Raw masters were retained.`;
+      if (action === "accept") return `${images} restored to the final set. Your position was preserved.`;
+      if (action === "reject") return `${images} removed from the final set. Raw masters were retained.`;
       if (action === "hold") return `${images} held for another pass.`;
       if (action === "x_add") return `${images} added to the X teaser selection.`;
       if (action === "x_remove") return `${images} removed from the X teaser selection.`;
@@ -5196,6 +5196,18 @@
     refreshProgress();
   }
 
+  function initializeReviewBootstrap() {
+    const form = document.querySelector("form[data-review-bootstrap]");
+    if (!(form instanceof HTMLFormElement)) return;
+    const submit = () => {
+      if (!form.isConnected || form.dataset.reviewBootstrapSubmitted === "true") return;
+      form.dataset.reviewBootstrapSubmitted = "true";
+      form.setAttribute("aria-busy", "true");
+      form.requestSubmit();
+    };
+    window.requestAnimationFrame(submit);
+  }
+
   const experimentFormPresent = Boolean(document.querySelector("[data-experiment-form]"));
   const reusedImageSettings = consumePendingImageProfile();
   if (!reusedImageSettings && !experimentFormPresent) restoreAutomationDraft();
@@ -5222,4 +5234,5 @@
   initializeExperimentLab();
   initializeExperimentWarmSession();
   initializeExperimentResults();
+  initializeReviewBootstrap();
 })();

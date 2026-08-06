@@ -4,6 +4,7 @@ ROOT = Path(__file__).parents[1]
 DASHBOARD_SCRIPT = ROOT / "src/gen_automation/static/dashboard.js"
 ASSET_VIEWER_SCRIPT = ROOT / "src/gen_automation/static/asset_viewer.js"
 REVIEW_TEMPLATE = ROOT / "src/gen_automation/templates/dashboard/review_task.html"
+RELEASE_TEMPLATE = ROOT / "src/gen_automation/templates/dashboard/release_detail.html"
 STYLES = ROOT / "src/gen_automation/static/dashboard_ux.css"
 
 
@@ -15,7 +16,6 @@ def test_review_mutations_are_progressively_enhanced_without_page_reload() -> No
     assert "form[data-review-decision-form]" in script
     assert "form[data-bulk-action-form]" in script
     assert "form[data-x-selection-form]" in script
-    assert "form[data-anatomy-feedback-form]" in script
     assert "event.preventDefault()" in handler
     assert "await fetch(form.action" in handler
     assert 'redirect: "follow"' in handler
@@ -25,6 +25,35 @@ def test_review_mutations_are_progressively_enhanced_without_page_reload() -> No
     assert "workspace.replaceWith(nextWorkspace)" in handler
     assert "window.location.reload()" not in handler
     assert "HTMLFormElement.prototype.submit" not in handler
+
+
+def test_release_auto_bootstraps_the_single_review_workspace() -> None:
+    bootstrap = RELEASE_TEMPLATE.read_text(encoding="utf-8")
+    workspace = REVIEW_TEMPLATE.read_text(encoding="utf-8")
+    script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
+    initializer = script.split("function initializeReviewBootstrap()", 1)[1].split(
+        "const experimentFormPresent",
+        1,
+    )[0]
+
+    assert "data-review-bootstrap" in bootstrap
+    assert 'action="/dashboard/releases/{{ release_id }}/review-tasks"' in bootstrap
+    assert "Preparing your review workspace" in bootstrap
+    assert "Start ranked review" not in bootstrap
+    assert "Open ranked review" not in bootstrap
+    assert "Continue review" not in bootstrap
+
+    assert "data-review-workspace" in workspace
+    assert "data-open-review-viewer" in workspace
+    assert "everything starts kept" in workspace
+    assert "data-anatomy-feedback-form" not in workspace
+    assert 'data-decision="hold"' not in workspace
+    assert "Hold selected" not in workspace
+
+    assert 'document.querySelector("form[data-review-bootstrap]")' in initializer
+    assert "window.requestAnimationFrame(submit)" in initializer
+    assert "form.requestSubmit()" in initializer
+    assert 'form.dataset.reviewBootstrapSubmitted = "true"' in initializer
 
 
 def test_review_refresh_restores_scroll_filters_sort_selection_and_focus() -> None:

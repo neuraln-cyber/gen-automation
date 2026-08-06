@@ -35,7 +35,7 @@ def test_asset_viewer_is_safe_progressive_enhancement() -> None:
     assert "Navigate" in script
     assert "assetViewerMarkOut" in script
     assert "assetViewerAnatomyReject" in script
-    assert "Reject + anatomy label" in script
+    assert "Remove + anatomy label" in script
     assert "data-review-inspection-form" in script
     assert "queueInspection(activeCard)" in script
     assert "flushInspectionQueue(true)" in script
@@ -157,7 +157,7 @@ def test_asset_viewer_delete_shortcuts_distinguish_plain_and_anatomy_rejection()
     assert "event.preventDefault()" in keyboard
     assert "submitRejection(event.shiftKey, {" in keyboard
     assert "removeAnatomyLabel: !event.shiftKey && Boolean(context.anatomyLabeled)" in keyboard
-    assert "Shift+Del Reject + anatomy" in script
+    assert "Shift+Del Remove + anatomy" in script
     assert (
         "if (context.anatomyToggle) context.anatomyToggle.checked = withAnatomyTraining" in script
     )
@@ -236,7 +236,7 @@ def test_asset_grid_uses_intrinsic_image_ratio_and_viewer_is_responsive() -> Non
     assert ".asset-viewer-previous" in styles
     assert ".asset-viewer-next" in styles
     assert ".asset-card.decision-reject" in styles
-    assert 'content: "Rejected"' in styles
+    assert 'content: "Removed"' in styles
     assert ".asset-viewer-save-exclusions" not in styles
     assert ".viewer-marked-for-exclusion" not in styles
     assert "env(safe-area-inset-bottom)" in styles
@@ -262,22 +262,21 @@ def test_review_ui_treats_the_configured_size_as_a_maximum_goal() -> None:
     ).read_text(encoding="utf-8")
     script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
 
-    assert "Cull mode keeps images unless you reject them" in template
-    assert "final-set maximum is" in template
-    assert "undecided masters are optional" in template
-    assert "Complete with {{ summary.accepted_count }}" in template
+    assert "All images start in the final set" in template
+    assert "Keep what works, remove what does not" in template
+    assert "Finish set with {{ summary.accepted_count }}" in template
     assert "Optional slots left" in template
     assert "Over goal" in template
-    assert "Accept at least one image before completing this set" in template
-    assert "Select {{ optional_slots_remaining }} undecided to reach goal" in template
+    assert "Restore at least one image before finishing this set" in template
+    assert "Remove {{ accepted_over_goal }} image" in template
     assert "const netNewAccepts" in script
     assert "const exceedsReviewGoal" in script
     assert (
         "acceptButton.disabled = selected === 0 || hasSevereSelection || exceedsReviewGoal"
         in script
     )
-    assert "over its maximum; exclude accepted images before accepting more" in script
-    assert "Goal reached" in script
+    assert "over its maximum; remove kept images before restoring more" in script
+    assert "Final-set target reached" in template
 
 
 def test_review_template_integrates_anatomy_rejection_and_legacy_keep_all() -> None:
@@ -292,9 +291,9 @@ def test_review_template_integrates_anatomy_rejection_and_legacy_keep_all() -> N
     assert "data-anatomy-training-control" in template
     assert "data-anatomy-training-toggle" in template
     assert "data-anatomy-training-issue" in template
-    assert "Mark as anatomy defect (provisional)" in template
+    assert "Teach anatomy from this removal" in template
     assert "becomes calibration data" in template
-    assert "Plain rejection only removes an image" in template
+    assert "Plain removal only removes an image" in template
     assert "from the final set" in template
     assert 'document.querySelector("[data-accept-undecided]")' in script
     assert 'bulkReasonInput.value = "sorting_default_accept"' in script
@@ -389,7 +388,7 @@ def test_fullscreen_defect_picker_is_optional_exact_and_per_image() -> None:
     assert 'chip.setAttribute("role", "radio")' in sync
     assert "selectedOptions[0]" in script
     assert "Generic is enough" in script
-    assert "until review completion" in script
+    assert "until the set is finished" in script
     assert "previousAnatomyChecked" in submission
     assert "context.anatomyToggle.checked = withAnatomyTraining" in submission
     assert ".asset-viewer-defect-picker" in styles

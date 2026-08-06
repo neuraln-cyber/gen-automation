@@ -65,7 +65,6 @@ from gen_automation.services.ranked_dashboard import (
     find_review_task_id,
     list_dashboard_releases,
     load_current_completed_scoring_run_id,
-    load_ranked_release,
     load_ranked_scoring_run,
     load_review_task_navigation,
 )
@@ -310,28 +309,16 @@ async def dashboard_release_detail(
     session: Session,
     principal: RawMasterReader,
 ) -> Response:
-    store = _object_store(request)
-    if store is None:
-        return _error_response(
-            request,
-            principal=principal,
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            heading="Private storage is unavailable",
-            message="Raw-master links cannot be created until private object storage is ready.",
-        )
     settings: Settings = request.app.state.settings
     try:
-        release = await load_ranked_release(
+        scoring_run_id = await load_current_completed_scoring_run_id(
             session,
-            store=store,
             release_id=release_id,
-            expires_in=min(settings.storage_presign_ttl_seconds, 900),
         )
         review_task_id = await find_review_task_id(
             session,
-            scoring_run_id=release.scoring_run_id,
+            scoring_run_id=scoring_run_id,
         )
-        csrf_token = _form_csrf_token(request, principal)
     except RankedReleaseNotFoundError:
         return _error_response(
             request,
@@ -348,22 +335,20 @@ async def dashboard_release_detail(
             heading="Ranking not ready",
             message="The current release version has no completed ranking yet.",
         )
-    except RankingIntegrityError:
-        return _error_response(
-            request,
+
+    # The release URL is the canonical workspace.  Once the idempotent review
+    # exists, render its exact frozen snapshot here instead of making the user
+    # open a second copy of the same gallery.
+    if review_task_id is not None:
+        return await dashboard_review_task(
+            review_task_id=review_task_id,
+            request=request,
+            session=session,
             principal=principal,
-            status_code=status.HTTP_409_CONFLICT,
-            heading="Ranking needs attention",
-            message="The completed ranking is incomplete or inconsistent.",
         )
-    except RankingStorageError:
-        return _error_response(
-            request,
-            principal=principal,
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            heading="Raw-master links are unavailable",
-            message="Private, exact-version links could not be created. Try again shortly.",
-        )
+
+    try:
+        csrf_token = _form_csrf_token(request, principal)
     except BrowserReviewSecurityError:
         return _error_response(
             request,
@@ -377,7 +362,7 @@ async def dashboard_release_detail(
         settings,
         session_id=principal.session_id,
         action="create",
-        parts=(str(release.release_id), str(release.scoring_run_id)),
+        parts=(str(release_id), str(scoring_run_id)),
     )
     return _secure_response(
         request,
@@ -385,10 +370,9 @@ async def dashboard_release_detail(
             request=request,
             name="dashboard/release_detail.html",
             context={
-                "page_title": release.release_title,
+                "page_title": "Opening set",
                 "principal": principal,
-                "release": release,
-                "review_task_id": review_task_id,
+                "release_id": release_id,
                 "csrf_token": csrf_token,
                 "create_idempotency_key": create_idempotency_key,
             },
@@ -453,7 +437,7 @@ async def dashboard_create_review_task(
             status.HTTP_400_BAD_REQUEST,
         )
     try:
-        result = await create_review_task(
+        await create_review_task(
             session,
             scoring_run_id=scoring_run_id,
             created_by_user_id=principal.user_id,
@@ -462,7 +446,7 @@ async def dashboard_create_review_task(
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         return _service_error_response(request, principal, error)
-    return _review_redirect(request, result.task_id)
+    return _release_redirect(request, release_id)
 
 
 @router.get(
@@ -758,7 +742,7 @@ async def dashboard_review_decision(
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         return _service_error_response(request, principal, error)
-    return _review_redirect(request, review_task_id)
+    return await _review_redirect(request, session, review_task_id)
 
 
 @router.post(
@@ -916,7 +900,7 @@ async def dashboard_anatomy_feedback(
     ) as error:
         await session.rollback()
         return _feedback_service_error_response(request, principal, error)
-    return _review_redirect(request, review_task_id)
+    return await _review_redirect(request, session, review_task_id)
 
 
 @router.post(
@@ -977,7 +961,7 @@ async def dashboard_bulk_review_action(
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         return _service_error_response(request, principal, error)
-    return _review_redirect(request, review_task_id)
+    return await _review_redirect(request, session, review_task_id)
 
 
 @router.post(
@@ -1033,7 +1017,7 @@ async def dashboard_review_x_selection(
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         return _service_error_response(request, principal, error)
-    return _review_redirect(request, review_task_id)
+    return await _review_redirect(request, session, review_task_id)
 
 
 @router.post(
@@ -1129,7 +1113,7 @@ async def _dashboard_transition(
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         return _service_error_response(request, principal, error)
-    return _review_redirect(request, review_task_id)
+    return await _review_redirect(request, session, review_task_id)
 
 
 def _review_assets(
@@ -1314,11 +1298,45 @@ def _origin_error_response(
     return None
 
 
-def _review_redirect(request: Request, review_task_id: UUID) -> Response:
+async def _review_redirect(
+    request: Request,
+    session: AsyncSession,
+    review_task_id: UUID,
+) -> Response:
+    """Return current reviews to their canonical release workspace.
+
+    A legacy review can outlive the release's current ranked version.  Keep
+    those exact-snapshot bookmarks on the task URL instead of silently moving
+    them to a different ranking.
+    """
+    destination = f"/dashboard/review-tasks/{review_task_id}"
+    try:
+        navigation = await load_review_task_navigation(
+            session,
+            review_task_id=review_task_id,
+        )
+        current_scoring_run_id = await load_current_completed_scoring_run_id(
+            session,
+            release_id=navigation.release_id,
+        )
+        if current_scoring_run_id == navigation.scoring_run_id:
+            destination = f"/dashboard/releases/{navigation.release_id}"
+    except (RankedReleaseNotFoundError, RankingUnavailableError, ReviewNotFoundError):
+        pass
     return _secure_response(
         request,
         RedirectResponse(
-            url=f"/dashboard/review-tasks/{review_task_id}",
+            url=destination,
+            status_code=status.HTTP_303_SEE_OTHER,
+        ),
+    )
+
+
+def _release_redirect(request: Request, release_id: UUID) -> Response:
+    return _secure_response(
+        request,
+        RedirectResponse(
+            url=f"/dashboard/releases/{release_id}",
             status_code=status.HTTP_303_SEE_OTHER,
         ),
     )
