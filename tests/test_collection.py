@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from gen_automation.db.models import (
     Asset,
+    AuditEvent,
     GenerationAttempt,
     GenerationJob,
     Project,
@@ -31,6 +32,7 @@ from gen_automation.services.collection import (
     claim_collection_jobs,
     collect_generation_job,
     collect_next_ready_running_asset,
+    load_stop_salvage_status,
 )
 from gen_automation.storage.memory import MemoryObjectStore
 
@@ -239,6 +241,178 @@ async def test_running_job_publishes_each_staged_master_independently(
         AssetState.AVAILABLE,
         AssetState.AVAILABLE,
     ]
+
+
+@pytest.mark.asyncio
+async def test_stopped_terminal_job_salvages_uploaded_master_then_retires_absent_intent(
+    collection_context: CollectionContext,
+) -> None:
+    _stage(collection_context.store, collection_context.intents[0], _png("purple"))
+    async with collection_context.database.sessions() as session:
+        job = await session.get(GenerationJob, collection_context.job_id)
+        release = await session.get(Release, collection_context.release_id)
+        assert job is not None and release is not None
+        release_version_id = job.release_version_id
+        job.state = GenerationState.CANCELLED
+        release.phase = ReleasePhase.PAUSED
+        session.add(
+            AuditEvent(
+                actor="owner",
+                action="release.generation_stop_requested",
+                resource_type="release",
+                resource_id=release.id,
+                correlation_id=f"generation-stop:{release.id}",
+                detail={"safe_drain": True},
+                occurred_at=NOW,
+            )
+        )
+        await session.commit()
+
+        before = await load_stop_salvage_status(
+            session,
+            release_version_id=release_version_id,
+        )
+        salvaged = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="stop-salvage-collector",
+            max_image_bytes=1_000_000,
+            now=NOW,
+        )
+        middle = await load_stop_salvage_status(
+            session,
+            release_version_id=release_version_id,
+        )
+        retired = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="stop-salvage-collector",
+            max_image_bytes=1_000_000,
+            now=NOW,
+        )
+        after = await load_stop_salvage_status(
+            session,
+            release_version_id=release_version_id,
+        )
+        assets = list(
+            (
+                await session.scalars(
+                    select(Asset)
+                    .where(Asset.generation_job_id == collection_context.job_id)
+                    .order_by(Asset.output_index)
+                )
+            ).all()
+        )
+        retired_events = list(
+            (
+                await session.scalars(
+                    select(AuditEvent).where(
+                        AuditEvent.action == "asset.stop_salvage_upload_absent"
+                    )
+                )
+            ).all()
+        )
+
+    assert before.stop_requested is True
+    assert before.uploading_assets == 2
+    assert before.pending_assets == 2
+    assert before.pending is True
+    assert salvaged.asset_id == collection_context.intents[0].asset_id
+    assert salvaged.finalized is True
+    assert middle.pending_assets == 1
+    assert retired.asset_id == collection_context.intents[1].asset_id
+    assert retired.finalized is False
+    assert after.pending is False
+    assert [asset.state for asset in assets] == [
+        AssetState.AVAILABLE,
+        AssetState.QUARANTINED,
+    ]
+    assert assets[1].verification_error_code == "stopped_generation_upload_absent"
+    assert len(retired_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_stopped_terminal_job_reclaims_expired_verification_lease(
+    collection_context: CollectionContext,
+) -> None:
+    _stage(collection_context.store, collection_context.intents[0], _png("orange"))
+    async with collection_context.database.sessions() as session:
+        job = await session.get(GenerationJob, collection_context.job_id)
+        release = await session.get(Release, collection_context.release_id)
+        asset = await session.get(Asset, collection_context.intents[0].asset_id)
+        assert job is not None and release is not None and asset is not None
+        release_version_id = job.release_version_id
+        asset_id = asset.id
+        job.state = GenerationState.FAILED
+        release.phase = ReleasePhase.PAUSED
+        asset.state = AssetState.VERIFYING
+        asset.verification_lease_owner = "dead-collector"
+        asset.verification_lease_expires_at = NOW - timedelta(seconds=1)
+        session.add(
+            AuditEvent(
+                actor="owner",
+                action="release.generation_stop_requested",
+                resource_type="release",
+                resource_id=release.id,
+                correlation_id=f"generation-stop:{release.id}",
+                detail={"safe_drain": True},
+                occurred_at=NOW,
+            )
+        )
+        await session.commit()
+
+        status = await load_stop_salvage_status(
+            session,
+            release_version_id=release_version_id,
+        )
+        result = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="replacement-stop-salvage-collector",
+            max_image_bytes=1_000_000,
+            now=NOW,
+        )
+        reclaimed = await session.get(Asset, asset_id)
+
+    assert status.verifying_assets == 1
+    assert status.uploading_assets == 1
+    assert result.asset_id == asset_id
+    assert result.finalized is True
+    assert reclaimed is not None
+    assert reclaimed.state == AssetState.AVAILABLE
+    assert reclaimed.verification_lease_owner is None
+    assert reclaimed.verification_lease_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_job_without_stop_marker_is_not_progressively_salvaged(
+    collection_context: CollectionContext,
+) -> None:
+    _stage(collection_context.store, collection_context.intents[0], _png("green"))
+    async with collection_context.database.sessions() as session:
+        job = await session.get(GenerationJob, collection_context.job_id)
+        assert job is not None
+        job.state = GenerationState.FAILED
+        await session.commit()
+
+        status = await load_stop_salvage_status(
+            session,
+            release_version_id=job.release_version_id,
+        )
+        result = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="progressive-collector",
+            max_image_bytes=1_000_000,
+            now=NOW,
+        )
+        asset = await session.get(Asset, collection_context.intents[0].asset_id)
+
+    assert status.stop_requested is False
+    assert status.pending is False
+    assert result.asset_id is None
+    assert result.finalized is False
+    assert asset is not None and asset.state == AssetState.UPLOADING
 
 
 @pytest.mark.asyncio

@@ -15,9 +15,11 @@ from gen_automation.services.new_sets import NewSetLoraSelection, NewSetSubmissi
 
 _FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
 _MAX_FORM_BODY_BYTES = 512 * 1024
+_MAX_STOP_FORM_BODY_BYTES = 4 * 1024
 _FORM_KEY = re.compile(r"web-new-set-[0-9a-f]{64}")
 _HEX = frozenset("0123456789abcdefABCDEF")
 _LORA_SLOTS = range(1, 9)
+_STOP_FIELDS = frozenset({"csrf_token", "idempotency_key"})
 _FIELDS = frozenset(
     {
         "csrf_token",
@@ -89,6 +91,12 @@ class BrowserNewSetForm:
     idempotency_key: str
     command: NewSetSubmission
     values: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserGenerationStopForm:
+    csrf_token: str
+    idempotency_key: str
 
 
 async def read_new_set_form(request: Request) -> BrowserNewSetForm:
@@ -200,6 +208,23 @@ async def read_new_set_form(request: Request) -> BrowserNewSetForm:
     )
 
 
+async def read_generation_stop_form(request: Request) -> BrowserGenerationStopForm:
+    values = await _read_exact_form(
+        request,
+        required_fields=_STOP_FIELDS,
+        optional_fields=frozenset(),
+        maximum_body_bytes=_MAX_STOP_FORM_BODY_BYTES,
+    )
+    csrf_token = _bounded(values["csrf_token"], label="Security token", maximum=200)
+    idempotency_key = values["idempotency_key"]
+    if _FORM_KEY.fullmatch(idempotency_key) is None:
+        raise _bad_request("The stop control expired or was changed. Reload and try again.")
+    return BrowserGenerationStopForm(
+        csrf_token=csrf_token,
+        idempotency_key=idempotency_key,
+    )
+
+
 def new_set_form_key(
     settings: Settings,
     *,
@@ -211,6 +236,20 @@ def new_set_form_key(
         session_id=session_id,
         action="submit",
         value=str(submission_id),
+    )
+
+
+def generation_stop_form_key(
+    settings: Settings,
+    *,
+    session_id: UUID,
+    release_id: UUID,
+) -> str:
+    return _signed_key(
+        settings,
+        session_id=session_id,
+        action="stop-generation",
+        value=str(release_id),
     )
 
 
@@ -244,6 +283,21 @@ def _signed_key(
 
 
 async def _read_form(request: Request) -> dict[str, str]:
+    return await _read_exact_form(
+        request,
+        required_fields=_FIELDS,
+        optional_fields=_OPTIONAL_FIELDS,
+        maximum_body_bytes=_MAX_FORM_BODY_BYTES,
+    )
+
+
+async def _read_exact_form(
+    request: Request,
+    *,
+    required_fields: frozenset[str],
+    optional_fields: frozenset[str],
+    maximum_body_bytes: int,
+) -> dict[str, str]:
     content_type = request.headers.get("content-type", "")
     if content_type.partition(";")[0].strip().lower() != _FORM_CONTENT_TYPE:
         raise BrowserNewSetFormError(
@@ -258,7 +312,7 @@ async def _read_form(request: Request) -> dict[str, str]:
             raise _bad_request("The submitted form length was invalid.") from None
         if declared_length < 0:
             raise _bad_request("The submitted form length was invalid.")
-        if declared_length > _MAX_FORM_BODY_BYTES:
+        if declared_length > maximum_body_bytes:
             raise BrowserNewSetFormError(
                 "The submitted form was too large.",
                 status_code=status.HTTP_413_CONTENT_TOO_LARGE,
@@ -266,7 +320,7 @@ async def _read_form(request: Request) -> dict[str, str]:
 
     body = bytearray()
     async for chunk in request.stream():
-        if len(body) + len(chunk) > _MAX_FORM_BODY_BYTES:
+        if len(body) + len(chunk) > maximum_body_bytes:
             raise BrowserNewSetFormError(
                 "The submitted form was too large.",
                 status_code=status.HTTP_413_CONTENT_TOO_LARGE,
@@ -285,14 +339,14 @@ async def _read_form(request: Request) -> dict[str, str]:
             strict_parsing=True,
             encoding="utf-8",
             errors="strict",
-            max_num_fields=len(_FIELDS | _OPTIONAL_FIELDS),
+            max_num_fields=len(required_fields | optional_fields),
         )
     except (UnicodeDecodeError, ValueError):
         raise _bad_request("The submitted form fields were invalid.") from None
     submitted_fields = set(parsed)
     if (
-        not _FIELDS.issubset(submitted_fields)
-        or not submitted_fields.issubset(_FIELDS | _OPTIONAL_FIELDS)
+        not required_fields.issubset(submitted_fields)
+        or not submitted_fields.issubset(required_fields | optional_fields)
         or any(len(items) != 1 for items in parsed.values())
     ):
         raise _bad_request("The submitted form fields were invalid.")

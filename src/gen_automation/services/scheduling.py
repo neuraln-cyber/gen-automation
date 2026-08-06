@@ -4,7 +4,7 @@ from typing import Any
 from uuid import UUID
 
 from pydantic import ValidationError
-from sqlalchemy import func, or_, select
+from sqlalchemy import exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.db.models import (
@@ -30,6 +30,7 @@ from gen_automation.services.compliance import (
     ReleaseApprovalError,
     validate_release_approvals,
 )
+from gen_automation.services.generation_control import GENERATION_STOP_REQUESTED_ACTION
 from gen_automation.services.salad import PreparedAttempt, prepare_generation_attempt
 
 _DISPATCHABLE_RELEASE_PHASES = frozenset(
@@ -240,6 +241,13 @@ async def dispatch_generation_jobs(
                     Release.phase.in_(_DISPATCHABLE_RELEASE_PHASES),
                     Release.health == ResourceHealth.HEALTHY,
                     Release.current_version_no == ReleaseVersion.version_no,
+                    ~exists(
+                        select(AuditEvent.id).where(
+                            AuditEvent.resource_type == "release",
+                            AuditEvent.resource_id == Release.id,
+                            AuditEvent.action == GENERATION_STOP_REQUESTED_ACTION,
+                        )
+                    ),
                     (
                         select(func.count(func.distinct(ComplianceCheck.check_type)))
                         .where(

@@ -12,6 +12,7 @@ from gen_automation.db.models import (
     Asset,
     AssetRanking,
     AssetScore,
+    AuditEvent,
     GenerationAttempt,
     GenerationJob,
     ModelArtifactApproval,
@@ -56,6 +57,10 @@ from gen_automation.domain.release_spec import (
 )
 from gen_automation.schemas import GenerationPlanRead, ProjectRead, ReleaseRead
 from gen_automation.services.generation import approve_and_expand_generation_plan
+from gen_automation.services.generation_control import (
+    GENERATION_STOP_REQUESTED_ACTION,
+    GENERATION_STOPPED_ACTION,
+)
 from gen_automation.services.releases import create_project, create_release
 from gen_automation.services.wildcards import list_wildcard_libraries
 
@@ -331,6 +336,10 @@ class NewSetStatus:
     ready_for_review: bool
     next_url: str | None
     poll_after_ms: int
+    stop_requested: bool = False
+    stop_settled: bool = False
+    can_stop: bool = False
+    planned_outputs: int = 0
 
 
 async def list_new_set_options(session: AsyncSession) -> NewSetOptions:
@@ -661,7 +670,36 @@ async def load_new_set_status(
     ).all()
     state_counts = {state: int(count) for state, count, _outputs in state_rows}
     total_jobs = sum(state_counts.values())
-    expected_outputs = sum(int(outputs or 0) for _state, _count, outputs in state_rows)
+    planned_outputs = sum(int(outputs or 0) for _state, _count, outputs in state_rows)
+    stop_actions = frozenset(
+        (
+            await session.scalars(
+                select(AuditEvent.action).where(
+                    AuditEvent.resource_type == "release",
+                    AuditEvent.resource_id == release.id,
+                    AuditEvent.action.in_(
+                        (GENERATION_STOP_REQUESTED_ACTION, GENERATION_STOPPED_ACTION)
+                    ),
+                )
+            )
+        ).all()
+    )
+    stop_requested = GENERATION_STOP_REQUESTED_ACTION in stop_actions
+    stop_settled = GENERATION_STOPPED_ACTION in stop_actions
+    intentionally_unfinished_states = {
+        GenerationState.CANCELLED,
+        GenerationState.FAILED,
+        GenerationState.DEAD_LETTER,
+    }
+    expected_outputs = (
+        sum(
+            int(outputs or 0)
+            for state, _count, outputs in state_rows
+            if state not in intentionally_unfinished_states
+        )
+        if stop_requested
+        else planned_outputs
+    )
     generated_outputs = int(
         await session.scalar(
             select(func.count(Asset.id))
@@ -675,6 +713,11 @@ async def load_new_set_status(
         )
         or 0
     )
+    if stop_requested:
+        # A failed provider job can still have uploaded valid masters before its
+        # terminal error. Those retained images are part of the partial set, so
+        # never show a denominator smaller than the number already preserved.
+        expected_outputs = max(expected_outputs, generated_outputs)
     active_attempt_rows = (
         await session.execute(
             select(
@@ -737,14 +780,20 @@ async def load_new_set_status(
             )
 
     completed_jobs = state_counts.get(GenerationState.SUCCEEDED, 0)
-    failed_jobs = sum(
-        state_counts.get(state, 0)
-        for state in (
+    if stop_requested:
+        completed_jobs += sum(
+            state_counts.get(state, 0) for state in intentionally_unfinished_states
+        )
+    failed_states = (
+        (GenerationState.FAILED, GenerationState.DEAD_LETTER)
+        if stop_requested
+        else (
             GenerationState.FAILED,
             GenerationState.DEAD_LETTER,
             GenerationState.CANCELLED,
         )
     )
+    failed_jobs = sum(state_counts.get(state, 0) for state in failed_states)
     active_jobs = sum(
         state_counts.get(state, 0)
         for state in (
@@ -762,6 +811,20 @@ async def load_new_set_status(
         and scoring_run.state == ScoringRunState.COMPLETED
         and ranking_count == scoring_run.asset_count
     )
+    terminal_job_count = sum(
+        state_counts.get(state, 0)
+        for state in (
+            GenerationState.SUCCEEDED,
+            GenerationState.FAILED,
+            GenerationState.DEAD_LETTER,
+            GenerationState.CANCELLED,
+        )
+    )
+    can_stop = bool(
+        not stop_requested
+        and release.phase in {ReleasePhase.READY, ReleasePhase.GENERATING}
+        and terminal_job_count < total_jobs
+    )
     stage, progress_error = _generation_progress_stage(
         release=release,
         state_counts=state_counts,
@@ -773,6 +836,7 @@ async def load_new_set_status(
         ranking_count=ranking_count,
         ready_for_review=ready_for_review,
         failed_jobs=failed_jobs,
+        stop_requested=stop_requested,
     )
     if stage.key == GenerationProgressStage.SCORING and scoring_progress is None:
         scoring_progress = GenerationScoringProgress(
@@ -812,7 +876,17 @@ async def load_new_set_status(
         error=progress_error,
         ready_for_review=ready_for_review,
         next_url=(f"/dashboard/releases/{release.id}" if ready_for_review else None),
-        poll_after_ms=_poll_after_ms(stage.key),
+        poll_after_ms=(
+            0
+            if stop_settled and release.phase == ReleasePhase.CANCELLED
+            else 3_000
+            if stop_requested and not stop_settled and release.phase == ReleasePhase.PAUSED
+            else _poll_after_ms(stage.key)
+        ),
+        stop_requested=stop_requested,
+        stop_settled=stop_settled,
+        can_stop=can_stop,
+        planned_outputs=planned_outputs,
     )
 
 
@@ -857,6 +931,11 @@ def new_set_progress_payload(progress: NewSetStatus) -> dict[str, object]:
         },
         "scoring": scoring,
         "error": error,
+        "stop": {
+            "available": progress.can_stop,
+            "requested": progress.stop_requested,
+            "settled": progress.stop_settled,
+        },
         "ready_for_review": progress.ready_for_review,
         "next_url": progress.next_url,
         "poll_after_ms": progress.poll_after_ms,
@@ -875,22 +954,63 @@ def _generation_progress_stage(
     ranking_count: int,
     ready_for_review: bool,
     failed_jobs: int,
+    stop_requested: bool = False,
 ) -> tuple[GenerationProgressStageView, GenerationProgressError | None]:
+    release_unhealthy = release.health == ResourceHealth.BLOCKED or (
+        stop_requested and release.health != ResourceHealth.HEALTHY
+    )
+    # A safe stop deliberately turns provider/job failures into a reviewable
+    # partial set. Integrity failures still mark the release unhealthy and must
+    # remain fail-closed, but a terminal GPU job by itself must not hide the
+    # masters that were successfully preserved before it failed.
+    if release_unhealthy or (failed_jobs and not stop_requested):
+        error_code = (
+            "generation_failed"
+            if failed_jobs
+            else (
+                "release_blocked"
+                if release.health == ResourceHealth.BLOCKED
+                else "release_unhealthy"
+            )
+        )
+        return (
+            _stage(
+                GenerationProgressStage.ERROR,
+                step=_generation_step(state_counts, scoring_run),
+                label="Generation needs attention",
+                detail=(
+                    f"{generated_outputs} of {expected_outputs} verified raw masters are safe."
+                ),
+            ),
+            GenerationProgressError(
+                code=error_code,
+                message=(
+                    "One or more generation jobs need operator attention."
+                    if failed_jobs
+                    else "The release is unhealthy and its retained images need operator attention."
+                ),
+                retryable=False,
+            ),
+        )
     if release.phase == ReleasePhase.CANCELLED:
         return (
             _stage(
                 GenerationProgressStage.CANCELLED,
                 step=_generation_step(state_counts, scoring_run),
-                label="Run cancelled",
+                label=("Generation stopped" if stop_requested else "Run cancelled"),
                 detail=(
                     f"{generated_outputs} of {expected_outputs} verified raw masters "
                     "were completed."
                 ),
             ),
-            GenerationProgressError(
-                code="release_cancelled",
-                message="This generation run was cancelled.",
-                retryable=False,
+            (
+                None
+                if stop_requested
+                else GenerationProgressError(
+                    code="release_cancelled",
+                    message="This generation run was cancelled.",
+                    retryable=False,
+                )
             ),
         )
     if ready_for_review:
@@ -908,10 +1028,17 @@ def _generation_progress_stage(
             _stage(
                 GenerationProgressStage.PAUSED,
                 step=_generation_step(state_counts, scoring_run),
-                label="Run paused",
+                label=("Stopping safely" if stop_requested else "Run paused"),
                 detail=(
-                    f"Progress is saved at {generated_outputs} of {expected_outputs} "
-                    "verified images."
+                    (
+                        f"{generated_outputs} verified images are saved. Active GPU work "
+                        "will finish uploading; no new jobs will start."
+                    )
+                    if stop_requested
+                    else (
+                        f"Progress is saved at {generated_outputs} of {expected_outputs} "
+                        "verified images."
+                    )
                 ),
             ),
             None,
@@ -927,22 +1054,6 @@ def _generation_progress_stage(
             GenerationProgressError(
                 code="ranking_incomplete",
                 message="The completed ranking needs operator attention.",
-                retryable=False,
-            ),
-        )
-    if release.health == ResourceHealth.BLOCKED or failed_jobs:
-        return (
-            _stage(
-                GenerationProgressStage.ERROR,
-                step=_generation_step(state_counts, scoring_run),
-                label="Generation needs attention",
-                detail=(
-                    f"{generated_outputs} of {expected_outputs} verified raw masters are safe."
-                ),
-            ),
-            GenerationProgressError(
-                code="generation_failed" if failed_jobs else "release_blocked",
-                message="One or more generation jobs need operator attention.",
                 retryable=False,
             ),
         )

@@ -14,8 +14,10 @@ from gen_automation.api.browser_new_set_forms import (
     BrowserNewSetForm,
     BrowserNewSetFormError,
     form_key_matches,
+    generation_stop_form_key,
     new_set_csrf_token,
     new_set_form_key,
+    read_generation_stop_form,
     read_new_set_form,
 )
 from gen_automation.api.security import (
@@ -35,6 +37,12 @@ from gen_automation.services.authentication import (
     CsrfValidationError,
 )
 from gen_automation.services.generation import GenerationPlanConflictError
+from gen_automation.services.generation_control import (
+    GenerationControlConflictError,
+    GenerationControlInputError,
+    GenerationControlNotFoundError,
+    request_generation_stop,
+)
 from gen_automation.services.new_sets import (
     NewSetInputError,
     NewSetNotFoundError,
@@ -265,6 +273,21 @@ async def dashboard_release_status(
                 "principal": principal,
                 "release": release_status,
                 "submitted_draft_id": submitted_draft_id,
+                "can_manage_generation": principal.role in _MANAGER_ROLES,
+                "stop_generation_csrf_token": (
+                    _form_csrf_token(request, principal)
+                    if principal.role in _MANAGER_ROLES and release_status.can_stop
+                    else ""
+                ),
+                "stop_generation_idempotency_key": (
+                    generation_stop_form_key(
+                        request.app.state.settings,
+                        session_id=principal.session_id,
+                        release_id=release_id,
+                    )
+                    if principal.role in _MANAGER_ROLES and release_status.can_stop
+                    else ""
+                ),
             },
         ),
     )
@@ -295,6 +318,107 @@ async def dashboard_release_progress(
     return _secure_response(
         request,
         JSONResponse(content=new_set_progress_payload(release_status)),
+    )
+
+
+@router.post(
+    "/releases/{release_id}:stop-generation",
+    response_class=JSONResponse,
+    response_model=None,
+    name="dashboard_stop_release_generation",
+)
+async def dashboard_stop_release_generation(
+    release_id: UUID,
+    request: Request,
+    session: Session,
+    principal: ReleaseReader,
+) -> Response:
+    if principal.role not in _MANAGER_ROLES:
+        return _generation_stop_error_response(
+            request,
+            principal=principal,
+            status_code=status.HTTP_403_FORBIDDEN,
+            message="Your account cannot stop generation runs.",
+        )
+    try:
+        form = await read_generation_stop_form(request)
+        manager = await require_release_manager(
+            request,
+            session,
+            csrf_header=form.csrf_token,
+        )
+        settings: Settings = request.app.state.settings
+        if not settings.auth_enabled and not hmac.compare_digest(
+            form.csrf_token,
+            new_set_csrf_token(settings, session_id=manager.session_id),
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="CSRF validation failed",
+            )
+        expected_key = generation_stop_form_key(
+            settings,
+            session_id=manager.session_id,
+            release_id=release_id,
+        )
+        if not form_key_matches(form.idempotency_key, expected_key):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="form idempotency validation failed",
+            )
+        await request_generation_stop(
+            session,
+            release_id=release_id,
+            actor=f"admin:{manager.user_id}",
+            correlation_id=form.idempotency_key,
+        )
+        release_status = await load_new_set_status(session, release_id=release_id)
+    except BrowserNewSetFormError as error:
+        await session.rollback()
+        return _generation_stop_error_response(
+            request,
+            principal=principal,
+            status_code=error.status_code,
+            message=error.message,
+        )
+    except HTTPException as error:
+        await session.rollback()
+        return _generation_stop_error_response(
+            request,
+            principal=principal,
+            status_code=error.status_code,
+            message=(
+                "The browser session or stop control could not be verified. Reload and try again."
+            ),
+        )
+    except GenerationControlNotFoundError:
+        await session.rollback()
+        return _generation_stop_error_response(
+            request,
+            principal=principal,
+            status_code=status.HTTP_404_NOT_FOUND,
+            message="The generation run could not be found.",
+        )
+    except (GenerationControlInputError, GenerationControlConflictError) as error:
+        await session.rollback()
+        return _generation_stop_error_response(
+            request,
+            principal=principal,
+            status_code=status.HTTP_409_CONFLICT,
+            message=str(error).capitalize() + ".",
+        )
+
+    if _wants_json(request):
+        return _secure_response(
+            request,
+            JSONResponse(content=new_set_progress_payload(release_status)),
+        )
+    return _secure_response(
+        request,
+        RedirectResponse(
+            url=f"/dashboard/releases/{release_id}/status",
+            status_code=status.HTTP_303_SEE_OTHER,
+        ),
     )
 
 
@@ -548,6 +672,31 @@ def _release_conflict_message(error: ConflictError) -> str:
     if "idempotency" in detail.casefold():
         return "This form was already used with different values. Reload New Set and try again."
     return "The release conflicts with current project data. Reload New Set and try again."
+
+
+def _wants_json(request: Request) -> bool:
+    return "application/json" in request.headers.get("accept", "").casefold()
+
+
+def _generation_stop_error_response(
+    request: Request,
+    *,
+    principal: AuthenticatedPrincipal,
+    status_code: int,
+    message: str,
+) -> Response:
+    if _wants_json(request):
+        return _secure_response(
+            request,
+            JSONResponse(status_code=status_code, content={"detail": message}),
+        )
+    return _error_response(
+        request,
+        principal=principal,
+        status_code=status_code,
+        heading="Generation could not be stopped",
+        message=message,
+    )
 
 
 def _secure_response(request: Request, response: Response) -> Response:

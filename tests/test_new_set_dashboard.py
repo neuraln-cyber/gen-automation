@@ -368,6 +368,11 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
         },
         "scoring": None,
         "error": None,
+        "stop": {
+            "available": True,
+            "requested": False,
+            "settled": False,
+        },
         "ready_for_review": False,
         "next_url": None,
         "poll_after_ms": 3000,

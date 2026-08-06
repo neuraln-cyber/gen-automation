@@ -12,10 +12,19 @@
           automatically while you keep it open.
         </p>
       </div>
-      <span
-        class="status {{ release.stage.key.value }}"
-        data-progress-stage-badge
-      >{{ release.stage.label }}</span>
+      <div class="generation-page-actions">
+        <span
+          class="status {{ release.stage.key.value }}"
+          data-progress-stage-badge
+        >{{ release.stage.label }}</span>
+        {% if can_manage_generation and release.can_stop %}
+          <button
+            class="secondary-button stop-button"
+            type="button"
+            data-stop-generation-open
+          >Stop generation</button>
+        {% endif %}
+      </div>
     </div>
   </section>
 
@@ -25,6 +34,7 @@
     data-generation-progress
     data-progress-url="/dashboard/releases/{{ release.release_id }}/progress"
     data-progress-stage="{{ release.stage.key.value }}"
+    data-stop-generation-requested="{{ 'true' if release.stop_requested else 'false' }}"
     data-submitted-draft-id="{{ submitted_draft_id }}"
   >
     <div class="panel-heading">
@@ -49,6 +59,13 @@
     <p class="muted generation-progress-detail" role="status" aria-live="polite" data-progress-detail>
       {{ release.stage.detail }}
     </p>
+    <p
+      class="generation-stop-status"
+      role="status"
+      aria-live="polite"
+      data-stop-generation-status
+      {% if not release.stop_requested %}hidden{% endif %}
+    >{% if release.stop_requested and not release.stop_settled %}Stopping safely. Finished images are saved while active GPU work completes.{% elif release.stop_requested %}Generation stopped. All completed images were saved.{% endif %}</p>
 
     <ol class="pipeline-steps" aria-label="Generation pipeline">
       <li
@@ -118,8 +135,54 @@
       href="{{ release.next_url or '#' }}"
       data-progress-next
       {% if not release.ready_for_review %}hidden{% endif %}
-    >Open ranked images</a>
+    >{{ "Review saved images" if release.stop_requested else "Open ranked images" }}</a>
   </section>
+
+  {% if can_manage_generation and release.can_stop %}
+    <dialog
+      class="reauth-dialog generation-stop-dialog"
+      aria-labelledby="generation-stop-heading"
+      data-stop-generation-dialog
+    >
+      <form
+        class="reauth-form"
+        method="post"
+        action="/dashboard/releases/{{ release.release_id }}:stop-generation"
+        data-stop-generation-form
+      >
+        <input type="hidden" name="csrf_token" value="{{ stop_generation_csrf_token }}">
+        <input type="hidden" name="idempotency_key" value="{{ stop_generation_idempotency_key }}">
+        <p class="page-kicker">Safe stop</p>
+        <h2 id="generation-stop-heading">Stop this generation?</h2>
+        <p class="muted">
+          Queued images will not start. Images already finished stay saved, and any GPU
+          work already rendering will finish and upload safely before the run closes.
+        </p>
+        <div class="reauth-actions">
+          <button class="secondary-button" type="button" data-stop-generation-cancel>
+            Keep generating
+          </button>
+          <button class="stop-button" type="submit" data-stop-generation-confirm>
+            Stop generation
+          </button>
+        </div>
+        <p class="form-error" role="alert" data-stop-generation-error hidden></p>
+      </form>
+    </dialog>
+    <noscript>
+      <form
+        class="generation-stop-noscript"
+        method="post"
+        action="/dashboard/releases/{{ release.release_id }}:stop-generation"
+      >
+        <input type="hidden" name="csrf_token" value="{{ stop_generation_csrf_token }}">
+        <input type="hidden" name="idempotency_key" value="{{ stop_generation_idempotency_key }}">
+        <button class="secondary-button stop-button" type="submit">
+          Stop after active GPU work
+        </button>
+      </form>
+    </noscript>
+  {% endif %}
 
   <section
     class="panel live-generation-assets"
@@ -175,7 +238,7 @@
         <dt>Generation jobs</dt>
         <dd>{{ release.total_jobs }}</dd>
         <dt>Planned raw outputs</dt>
-        <dd>{{ release.expected_outputs }}</dd>
+        <dd>{{ release.planned_outputs or release.expected_outputs }}</dd>
         <dt>Frozen specification</dt>
         <dd><span class="digest">{{ release.specification_sha256 }}</span></dd>
       </dl>

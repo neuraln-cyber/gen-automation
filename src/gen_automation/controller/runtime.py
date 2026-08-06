@@ -12,7 +12,7 @@ from typing import cast
 from uuid import UUID, uuid4
 
 import structlog
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from gen_automation.config import Settings
@@ -22,6 +22,7 @@ from gen_automation.db.models import (
     GenerationAttempt,
     GenerationJob,
     ProviderBudgetGuard,
+    Release,
     SaladDeployment,
 )
 from gen_automation.domain.enums import (
@@ -57,6 +58,11 @@ from gen_automation.services.experiment_warm_leases import (
     next_starting_experiment_warm_lease_id,
     touch_completed_experiment_warm_leases,
     touch_experiment_warm_lease_locked,
+)
+from gen_automation.services.generation_control import (
+    GENERATION_STOP_REQUESTED_ACTION,
+    GENERATION_STOPPED_ACTION,
+    settle_stopped_generation_once,
 )
 from gen_automation.services.mega_delivery import (
     MegaDeliveryClient,
@@ -123,6 +129,7 @@ type StartupHook = Callable[[], Awaitable[None]]
 type JitterSource = Callable[[], float]
 
 _MAX_DELAY_JITTER_MULTIPLIER = 1.2
+_STOP_SETTLEMENT_CANDIDATE_LIMIT = 16
 _RECONCILABLE_ATTEMPT_STATES = (
     GenerationAttemptState.UNKNOWN,
     GenerationAttemptState.SUBMITTED,
@@ -633,6 +640,7 @@ class ControllerWorkloads:
         self.semantic_vlm_client = semantic_vlm_client
         self.patreon_driver = patreon_driver
         self._next_attempt_reconciliation: dict[UUID, float] = {}
+        self._generation_stop_settlement_cursor: UUID | None = None
 
     async def initialize(self) -> None:
         if self.salad_client is None:
@@ -1068,6 +1076,25 @@ class ControllerWorkloads:
             return False
         worker_id = self._worker_id("collection")
         async with self.sessions() as session:
+            stopped_release_ids = await self._pending_generation_stop_release_ids(
+                session,
+                limit=_STOP_SETTLEMENT_CANDIDATE_LIMIT,
+            )
+            await session.rollback()
+        for stopped_release_id in stopped_release_ids:
+            # Advance the cursor even when this release still has provider work
+            # draining. The next cycle starts after it, so an old long-running
+            # stop cannot indefinitely hide a later release that is ready.
+            self._generation_stop_settlement_cursor = stopped_release_id
+            async with self.sessions() as session:
+                settlement = await settle_stopped_generation_once(
+                    session,
+                    release_id=stopped_release_id,
+                    actor=worker_id,
+                )
+            if settlement.settled and not settlement.replayed:
+                return True
+        async with self.sessions() as session:
             progressive = await collect_next_ready_running_asset(
                 session,
                 self.object_store,
@@ -1317,72 +1344,87 @@ class ControllerWorkloads:
                 upload_grant_ttl_seconds=self.settings.worker_upload_grant_ttl_seconds,
                 max_upload_bytes=self.settings.storage_max_image_bytes,
             )
-            active_attempt_id = await session.scalar(
-                select(GenerationAttempt.id)
-                .where(
-                    GenerationAttempt.salad_deployment_id == deployment.id,
-                    GenerationAttempt.state.in_(_RUNTIME_REFRESH_BLOCKING_ATTEMPT_STATES),
+            attempt_state = await session.scalar(
+                select(GenerationAttempt.state)
+                .where(GenerationAttempt.id == event.aggregate_id)
+                .with_for_update()
+            )
+            if attempt_state is None:
+                raise RuntimeError("generation attempt is unavailable")
+            if attempt_state != GenerationAttemptState.CREATED:
+                logger.info(
+                    "salad_runtime_refresh_skipped_for_recorded_attempt",
+                    salad_deployment_id=str(deployment.id),
+                    generation_attempt_id=str(event.aggregate_id),
+                    generation_attempt_state=attempt_state.value,
                 )
-                .limit(1)
-            )
-            warm_lease = await load_live_experiment_warm_lease_for_update(
-                session,
-                salad_deployment_id=deployment.id,
-            )
-            if warm_lease is not None:
-                if (
-                    warm_lease.state == ExperimentWarmLeaseState.STARTING
-                    and warm_lease.provider_version is None
-                ):
-                    refreshed = await refresh_container_group_runtime(
+            else:
+                active_attempt_id = await session.scalar(
+                    select(GenerationAttempt.id)
+                    .where(
+                        GenerationAttempt.salad_deployment_id == deployment.id,
+                        GenerationAttempt.state.in_(_RUNTIME_REFRESH_BLOCKING_ATTEMPT_STATES),
+                    )
+                    .limit(1)
+                )
+                warm_lease = await load_live_experiment_warm_lease_for_update(
+                    session,
+                    salad_deployment_id=deployment.id,
+                )
+                if warm_lease is not None:
+                    if (
+                        warm_lease.state == ExperimentWarmLeaseState.STARTING
+                        and warm_lease.provider_version is None
+                    ):
+                        refreshed = await refresh_container_group_runtime(
+                            deployment,
+                            self.salad_client,
+                            self.secret_resolver,
+                        )
+                        mark_experiment_warm_runtime_refreshed_locked(
+                            session,
+                            warm_lease,
+                            provider_version=refreshed.version,
+                            actor=self._worker_id("submit"),
+                        )
+                        deployment.ready_replicas = 0
+                        deployment.reconcile_after = datetime.now(UTC)
+                    if warm_lease.state == ExperimentWarmLeaseState.ACTIVE:
+                        touch_experiment_warm_lease_locked(
+                            session,
+                            warm_lease,
+                            actor=self._worker_id("submit"),
+                        )
+                    logger.debug(
+                        "salad_runtime_reused_for_experiment",
+                        salad_deployment_id=str(deployment.id),
+                        generation_attempt_id=str(event.aggregate_id),
+                        experiment_warm_lease_id=str(warm_lease.id),
+                        experiment_warm_lease_state=warm_lease.state.value,
+                    )
+                elif active_attempt_id is None:
+                    # Bootstrap credentials are refreshed only at an idle-to-active
+                    # boundary. PATCHing the container environment creates a Salad
+                    # version and restarts every replica, so doing this per batch
+                    # defeats warm GPU/model reuse. Subsequent ordered jobs reuse
+                    # the running deployment while any durable provider work exists.
+                    logger.info(
+                        "salad_runtime_refresh_at_work_boundary",
+                        salad_deployment_id=str(deployment.id),
+                        generation_attempt_id=str(event.aggregate_id),
+                    )
+                    await refresh_container_group_runtime(
                         deployment,
                         self.salad_client,
                         self.secret_resolver,
                     )
-                    mark_experiment_warm_runtime_refreshed_locked(
-                        session,
-                        warm_lease,
-                        provider_version=refreshed.version,
-                        actor=self._worker_id("submit"),
+                else:
+                    logger.debug(
+                        "salad_runtime_reused_for_batch",
+                        salad_deployment_id=str(deployment.id),
+                        generation_attempt_id=str(event.aggregate_id),
+                        active_generation_attempt_id=str(active_attempt_id),
                     )
-                    deployment.ready_replicas = 0
-                    deployment.reconcile_after = datetime.now(UTC)
-                if warm_lease.state == ExperimentWarmLeaseState.ACTIVE:
-                    touch_experiment_warm_lease_locked(
-                        session,
-                        warm_lease,
-                        actor=self._worker_id("submit"),
-                    )
-                logger.debug(
-                    "salad_runtime_reused_for_experiment",
-                    salad_deployment_id=str(deployment.id),
-                    generation_attempt_id=str(event.aggregate_id),
-                    experiment_warm_lease_id=str(warm_lease.id),
-                    experiment_warm_lease_state=warm_lease.state.value,
-                )
-            elif active_attempt_id is None:
-                # Bootstrap credentials are refreshed only at an idle-to-active
-                # boundary. PATCHing the container environment creates a Salad
-                # version and restarts every replica, so doing this per batch
-                # defeats warm GPU/model reuse. Subsequent ordered jobs reuse
-                # the running deployment while any durable provider work exists.
-                logger.info(
-                    "salad_runtime_refresh_at_work_boundary",
-                    salad_deployment_id=str(deployment.id),
-                    generation_attempt_id=str(event.aggregate_id),
-                )
-                await refresh_container_group_runtime(
-                    deployment,
-                    self.salad_client,
-                    self.secret_resolver,
-                )
-            else:
-                logger.debug(
-                    "salad_runtime_reused_for_batch",
-                    salad_deployment_id=str(deployment.id),
-                    generation_attempt_id=str(event.aggregate_id),
-                    active_generation_attempt_id=str(active_attempt_id),
-                )
             return await submit_prepared_attempt(
                 session,
                 self.salad_client,
@@ -1392,6 +1434,42 @@ class ControllerWorkloads:
                 reservation_microusd=deployment.max_hourly_cost_microusd,
                 provider_post_started=progress.mark_provider_post_started,
             )
+
+    async def _pending_generation_stop_release_ids(
+        self,
+        session: AsyncSession,
+        *,
+        limit: int,
+    ) -> tuple[UUID, ...]:
+        requested = exists(
+            select(AuditEvent.id).where(
+                AuditEvent.resource_type == "release",
+                AuditEvent.resource_id == Release.id,
+                AuditEvent.action == GENERATION_STOP_REQUESTED_ACTION,
+            )
+        )
+        stopped = exists(
+            select(AuditEvent.id).where(
+                AuditEvent.resource_type == "release",
+                AuditEvent.resource_id == Release.id,
+                AuditEvent.action == GENERATION_STOPPED_ACTION,
+            )
+        )
+        pending = and_(requested, ~stopped)
+        cursor = self._generation_stop_settlement_cursor
+        query = select(Release.id).where(pending).order_by(Release.id).limit(limit)
+        if cursor is not None:
+            query = query.where(Release.id > cursor)
+        release_ids = list((await session.scalars(query)).all())
+        if cursor is not None and len(release_ids) < limit:
+            wrapped = await session.scalars(
+                select(Release.id)
+                .where(pending, Release.id <= cursor)
+                .order_by(Release.id)
+                .limit(limit - len(release_ids))
+            )
+            release_ids.extend(wrapped.all())
+        return tuple(release_ids)
 
     async def _transition_submit_result(
         self,

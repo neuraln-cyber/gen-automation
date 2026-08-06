@@ -4183,10 +4183,18 @@
     const nextLink = panel.querySelector("[data-progress-next]");
     const releasePhase = document.querySelector("[data-progress-release-phase]");
     const jobStates = document.querySelector("[data-progress-job-states]");
+    const stopOpen = document.querySelector("[data-stop-generation-open]");
+    const stopDialog = document.querySelector("[data-stop-generation-dialog]");
+    const stopForm = document.querySelector("[data-stop-generation-form]");
+    const stopCancel = document.querySelector("[data-stop-generation-cancel]");
+    const stopConfirm = document.querySelector("[data-stop-generation-confirm]");
+    const stopError = document.querySelector("[data-stop-generation-error]");
+    const stopStatus = panel.querySelector("[data-stop-generation-status]");
     let timer = null;
     let networkFailures = 0;
     let liveGenerated = 0;
     let liveExpected = 0;
+    let stopSubmissionPending = false;
 
     const safeCount = (value) => (
       Number.isInteger(value) && value >= 0 ? value : 0
@@ -4199,6 +4207,33 @@
       if (progressBar) {
         progressBar.max = progressMaximum;
         progressBar.value = Math.min(generated, progressMaximum);
+      }
+    };
+
+    const renderStopState = (payload) => {
+      const stop = isRecord(payload.stop) ? payload.stop : {};
+      const requested = stop.requested === true;
+      const settled = stop.settled === true;
+      const available = stop.available === true;
+      panel.dataset.stopGenerationRequested = requested ? "true" : "false";
+      if (stopOpen instanceof HTMLButtonElement) {
+        stopOpen.hidden = !available;
+        stopOpen.disabled = requested || stopSubmissionPending;
+        stopOpen.textContent = requested || stopSubmissionPending
+          ? "Stopping safely…"
+          : "Stop generation";
+      }
+      if (stopStatus) {
+        stopStatus.hidden = !requested && !stopSubmissionPending;
+        if (requested) {
+          stopStatus.textContent = settled
+            ? `Generation stopped. All ${liveGenerated} completed ${liveGenerated === 1 ? "image was" : "images were"} saved.`
+            : `Stopping safely. ${liveGenerated} verified ${liveGenerated === 1 ? "image is" : "images are"} saved; active GPU work will finish uploading.`;
+        } else if (stopSubmissionPending) {
+          stopStatus.textContent = "Requesting a safe stop…";
+        } else {
+          stopStatus.textContent = "";
+        }
       }
     };
 
@@ -4239,7 +4274,8 @@
       const stageStep = Math.min(5, Math.max(1, safeCount(payload.stage.step)));
       const stage = { key: stageKey, step: stageStep };
       const expected = safeCount(payload.images.expected);
-      liveExpected = Math.max(liveExpected, expected);
+      const stopRequested = isRecord(payload.stop) && payload.stop.requested === true;
+      liveExpected = stopRequested ? expected : Math.max(liveExpected, expected);
       liveGenerated = Math.max(liveGenerated, safeCount(payload.images.generated));
       const completedJobs = safeCount(payload.jobs.completed);
       const totalJobs = safeCount(payload.jobs.total);
@@ -4270,6 +4306,7 @@
       }
       renderJobStates(payload.jobs.states);
       updatePipeline(stage);
+      renderStopState(payload);
 
       if (errorBox) {
         const message = isRecord(payload.error) && typeof payload.error.message === "string"
@@ -4328,6 +4365,77 @@
         schedule(Math.min(30000, 3000 * (2 ** Math.min(networkFailures, 3))));
       }
     };
+
+    if (stopOpen instanceof HTMLButtonElement
+      && stopDialog instanceof HTMLDialogElement
+      && stopForm instanceof HTMLFormElement) {
+      stopOpen.addEventListener("click", () => {
+        if (typeof stopDialog.showModal === "function") {
+          stopDialog.showModal();
+        } else if (window.confirm(
+          "Stop generation safely? Finished images stay saved and active GPU work will finish uploading.",
+        )) {
+          stopForm.requestSubmit();
+        }
+      });
+      if (stopCancel instanceof HTMLButtonElement) {
+        stopCancel.addEventListener("click", () => stopDialog.close());
+      }
+      stopForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (stopSubmissionPending) return;
+        const stopUrl = new URL(stopForm.action, window.location.href);
+        if (stopUrl.origin !== window.location.origin) return;
+        stopSubmissionPending = true;
+        if (stopConfirm instanceof HTMLButtonElement) stopConfirm.disabled = true;
+        if (stopError) stopError.hidden = true;
+        renderStopState({ stop: { requested: false, available: false } });
+        try {
+          const body = new URLSearchParams(new FormData(stopForm));
+          const response = await fetch(stopUrl, {
+            method: "POST",
+            credentials: "same-origin",
+            cache: "no-store",
+            headers: {
+              Accept: "application/json",
+              "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            },
+            body,
+          });
+          const payload = await response.json();
+          if (response.redirected || !response.ok || !render(payload)) {
+            throw new Error(
+              isRecord(payload) && typeof payload.detail === "string"
+                ? payload.detail
+                : "Generation could not be stopped.",
+            );
+          }
+          stopSubmissionPending = false;
+          stopDialog.close();
+          renderStopState(payload);
+          document.dispatchEvent(new CustomEvent("gen-automation:generation-progress", {
+            detail: {
+              expected: safeCount(payload.images.expected),
+              generated: safeCount(payload.images.generated),
+              stage: payload.stage.key,
+              terminal: payload.ready_for_review === true || payload.stage.key === "cancelled",
+            },
+          }));
+          schedule(500);
+        } catch (error) {
+          stopSubmissionPending = false;
+          if (stopConfirm instanceof HTMLButtonElement) stopConfirm.disabled = false;
+          if (stopOpen instanceof HTMLButtonElement) stopOpen.disabled = false;
+          if (stopError) {
+            stopError.textContent = error instanceof Error
+              ? error.message
+              : "Generation could not be stopped.";
+            stopError.hidden = false;
+          }
+          renderStopState({ stop: { requested: false, available: true } });
+        }
+      });
+    }
 
     document.addEventListener("gen-automation:assets-updated", (event) => {
       const eventDetail = event.detail;

@@ -62,6 +62,34 @@ class ProgressiveCollectionResult:
     finalized: bool
 
 
+@dataclass(frozen=True)
+class StopSalvageStatus:
+    """Database-visible raw-master work that must drain before stop settlement."""
+
+    stop_requested: bool
+    uploading_assets: int
+    verifying_assets: int
+
+    @property
+    def pending_assets(self) -> int:
+        return self.uploading_assets + self.verifying_assets
+
+    @property
+    def pending(self) -> bool:
+        return self.pending_assets > 0
+
+
+_GENERATION_STOP_REQUESTED_ACTION = "release.generation_stop_requested"
+_TERMINAL_GENERATION_STATES = frozenset(
+    {
+        GenerationState.SUCCEEDED,
+        GenerationState.FAILED,
+        GenerationState.DEAD_LETTER,
+        GenerationState.CANCELLED,
+    }
+)
+
+
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
@@ -75,14 +103,16 @@ async def collect_next_ready_running_asset(
     worker_id: str,
     max_image_bytes: int,
     verification_lease_seconds: int = 900,
+    now: datetime | None = None,
 ) -> ProgressiveCollectionResult:
     """Verify one visible staging upload without waiting for its batch to finish.
 
     The GPU worker uploads outputs in ``output_index`` order. Looking only at the
     first unfinished output keeps the active-job poll to one object-store HEAD
     request per cycle. The existing per-asset verification lease remains the
-    concurrency boundary, while the generation job stays RUNNING and under the
-    provider reconciler's ownership.
+    concurrency boundary. A durable operator stop broadens the scan to provider-
+    active and terminal jobs so every successfully uploaded output is promoted
+    before the partial set is frozen.
     """
 
     if not worker_id.strip() or len(worker_id) > 200:
@@ -91,15 +121,42 @@ async def collect_next_ready_running_asset(
         raise ValueError("max_image_bytes must be positive")
     if verification_lease_seconds <= 0:
         raise ValueError("verification_lease_seconds must be positive")
+    collected_at = _as_utc(now or datetime.now(UTC))
+
+    stop_requested = (
+        select(AuditEvent.id)
+        .where(
+            AuditEvent.resource_type == "release",
+            AuditEvent.resource_id == ReleaseVersion.release_id,
+            AuditEvent.action == _GENERATION_STOP_REQUESTED_ACTION,
+        )
+        .exists()
+    )
+    unfinished_asset = or_(
+        Asset.state == AssetState.UPLOADING,
+        (
+            (Asset.state == AssetState.VERIFYING)
+            & or_(
+                Asset.verification_lease_expires_at.is_(None),
+                Asset.verification_lease_expires_at <= collected_at,
+            )
+        ),
+    )
 
     candidate = (
         await session.execute(
-            select(Asset.id, Asset.staging_object_key)
+            select(
+                Asset.id,
+                Asset.staging_object_key,
+                GenerationJob.id,
+                GenerationJob.state,
+            )
             .join(GenerationJob, GenerationJob.id == Asset.generation_job_id)
+            .join(ReleaseVersion, ReleaseVersion.id == GenerationJob.release_version_id)
             .where(
-                GenerationJob.state == GenerationState.RUNNING,
+                or_(GenerationJob.state == GenerationState.RUNNING, stop_requested),
                 Asset.kind == AssetKind.RAW_MASTER,
-                Asset.state == AssetState.UPLOADING,
+                unfinished_asset,
                 Asset.staging_object_key.is_not(None),
             )
             .order_by(
@@ -115,9 +172,17 @@ async def collect_next_ready_running_asset(
     if candidate is None:
         return ProgressiveCollectionResult(asset_id=None, finalized=False)
 
-    asset_id, staging_object_key = candidate
+    asset_id, staging_object_key, job_id, job_state = candidate
     assert staging_object_key is not None
     if await store.head(staging_object_key) is None:
+        if job_state in _TERMINAL_GENERATION_STATES:
+            await _quarantine_terminal_missing_stop_asset(
+                session,
+                asset_id=asset_id,
+                job_id=job_id,
+                worker_id=worker_id,
+                now=collected_at,
+            )
         return ProgressiveCollectionResult(asset_id=asset_id, finalized=False)
 
     try:
@@ -138,6 +203,142 @@ async def collect_next_ready_running_asset(
         await session.rollback()
         return ProgressiveCollectionResult(asset_id=asset_id, finalized=False)
     return ProgressiveCollectionResult(asset_id=asset_id, finalized=not result.replayed)
+
+
+async def load_stop_salvage_status(
+    session: AsyncSession,
+    *,
+    release_version_id: UUID,
+) -> StopSalvageStatus:
+    """Return the asset-intent fence a graceful-stop settlement must honor.
+
+    The result deliberately counts a non-expired verification lease: another
+    collector may be promoting that object at this moment, so settlement must not
+    snapshot the partial set until the lease resolves to AVAILABLE or QUARANTINED.
+    """
+
+    release_id = await session.scalar(
+        select(ReleaseVersion.release_id).where(ReleaseVersion.id == release_version_id)
+    )
+    if release_id is None:
+        return StopSalvageStatus(
+            stop_requested=False,
+            uploading_assets=0,
+            verifying_assets=0,
+        )
+    stop_requested = bool(
+        await session.scalar(
+            select(AuditEvent.id)
+            .where(
+                AuditEvent.resource_type == "release",
+                AuditEvent.resource_id == release_id,
+                AuditEvent.action == _GENERATION_STOP_REQUESTED_ACTION,
+            )
+            .limit(1)
+        )
+    )
+    if not stop_requested:
+        return StopSalvageStatus(
+            stop_requested=False,
+            uploading_assets=0,
+            verifying_assets=0,
+        )
+
+    rows = (
+        await session.execute(
+            select(Asset.state, func.count(Asset.id))
+            .join(GenerationJob, GenerationJob.id == Asset.generation_job_id)
+            .where(
+                GenerationJob.release_version_id == release_version_id,
+                Asset.kind == AssetKind.RAW_MASTER,
+                Asset.state.in_((AssetState.UPLOADING, AssetState.VERIFYING)),
+            )
+            .group_by(Asset.state)
+        )
+    ).all()
+    counts = {state: int(count) for state, count in rows}
+    return StopSalvageStatus(
+        stop_requested=True,
+        uploading_assets=counts.get(AssetState.UPLOADING, 0),
+        verifying_assets=counts.get(AssetState.VERIFYING, 0),
+    )
+
+
+async def _quarantine_terminal_missing_stop_asset(
+    session: AsyncSession,
+    *,
+    asset_id: UUID,
+    job_id: UUID,
+    worker_id: str,
+    now: datetime,
+) -> bool:
+    """Retire one absent terminal-job intent so it cannot block forever."""
+
+    row = (
+        await session.execute(
+            select(Asset, GenerationJob, ReleaseVersion)
+            .join(GenerationJob, GenerationJob.id == Asset.generation_job_id)
+            .join(ReleaseVersion, ReleaseVersion.id == GenerationJob.release_version_id)
+            .where(Asset.id == asset_id, GenerationJob.id == job_id)
+            .with_for_update()
+        )
+    ).one_or_none()
+    if row is None:
+        await session.rollback()
+        return False
+    asset, job, version = row
+    stop_requested = bool(
+        await session.scalar(
+            select(AuditEvent.id)
+            .where(
+                AuditEvent.resource_type == "release",
+                AuditEvent.resource_id == version.release_id,
+                AuditEvent.action == _GENERATION_STOP_REQUESTED_ACTION,
+            )
+            .limit(1)
+        )
+    )
+    reclaimable = asset.state == AssetState.UPLOADING or (
+        asset.state == AssetState.VERIFYING
+        and (
+            asset.verification_lease_expires_at is None
+            or _as_utc(asset.verification_lease_expires_at) <= now
+        )
+    )
+    if not stop_requested or job.state not in _TERMINAL_GENERATION_STATES or not reclaimable:
+        await session.rollback()
+        return False
+
+    metadata = dict(asset.asset_metadata)
+    metadata["stop_salvage"] = {
+        "state": "terminal_upload_absent",
+        "checked_at": now.isoformat(),
+    }
+    asset.state = AssetState.QUARANTINED
+    asset.asset_metadata = metadata
+    asset.verification_error_code = "stopped_generation_upload_absent"
+    asset.verification_error_detail = (
+        "No staged object existed after the provider job became terminal during a safe stop."
+    )
+    asset.verification_lease_owner = None
+    asset.verification_lease_expires_at = None
+    session.add(
+        AuditEvent(
+            actor=worker_id,
+            action="asset.stop_salvage_upload_absent",
+            resource_type="asset",
+            resource_id=asset.id,
+            correlation_id=f"generation-stop:{version.release_id}",
+            detail={
+                "generation_job_id": str(job.id),
+                "generation_job_state": job.state.value,
+                "reason_code": "stopped_generation_upload_absent",
+            },
+            occurred_at=now,
+        )
+    )
+    await session.commit()
+    return True
 
 
 async def claim_collection_jobs(
