@@ -936,6 +936,7 @@ async def transition_review_task(
     changed_by_user_id: UUID,
     expected_lock_version: int,
     idempotency_key: str,
+    inspected_asset_ids: Sequence[UUID] = (),
     semantic_profile_sha256: str | None = None,
     semantic_severe_confidence_micros: int = 900_000,
     semantic_enforcement_mode: SemanticEnforcementMode = SemanticEnforcementMode.ENFORCE,
@@ -954,6 +955,12 @@ async def transition_review_task(
     semantic_threshold = _validate_semantic_confidence_threshold(semantic_severe_confidence_micros)
     semantic_mode = _validate_semantic_enforcement_mode(semantic_enforcement_mode)
     expected_version = _validate_lock_version(expected_lock_version)
+    normalized_inspected_asset_ids = _normalize_optional_asset_ids(
+        inspected_asset_ids,
+        label="inspected_asset_ids",
+    )
+    if normalized_target != ReviewTaskState.COMPLETED and normalized_inspected_asset_ids:
+        raise ReviewInputError("inspected_asset_ids may only accompany review completion")
     scope = f"review-task:{review_task_id}:transition"
     request_sha256 = canonical_sha256(
         {
@@ -982,6 +989,14 @@ async def transition_review_task(
     if task.lock_version != expected_version:
         raise ReviewConflictError("review task lock version is stale")
     configured_accepted_count = task.desired_accepted_count
+    changed_at = _as_utc(now or datetime.now(UTC))
+    await _record_completion_inspections(
+        session,
+        task=task,
+        asset_ids=normalized_inspected_asset_ids,
+        inspected_by_user_id=changed_by_user_id,
+        inspected_at=changed_at,
+    )
     summary = await _review_summary(
         session,
         task,
@@ -1011,7 +1026,6 @@ async def transition_review_task(
     ):
         raise ReviewConflictError("accepted severe anatomy requires an explicit owner override")
 
-    changed_at = _as_utc(now or datetime.now(UTC))
     approved_release_id: UUID | None = None
     semantic_learning: SemanticReviewLearningResult | None = None
     semantic_learning_error: str | None = None
@@ -1027,7 +1041,7 @@ async def transition_review_task(
         if normalized_semantic_profile is not None:
             try:
                 async with session.begin_nested():
-                    inspected_asset_ids = set(
+                    persisted_inspected_asset_ids = set(
                         await session.scalars(
                             select(ReviewAssetInspection.asset_id).where(
                                 ReviewAssetInspection.review_task_id == task.id,
@@ -1049,7 +1063,7 @@ async def transition_review_task(
                                 semantic_severe_override_attested=(
                                     asset.semantic_severe_override_attested
                                 ),
-                                inspected=asset.asset_id in inspected_asset_ids,
+                                inspected=asset.asset_id in persisted_inspected_asset_ids,
                             )
                             for asset in summary.assets
                         ),
@@ -1310,6 +1324,63 @@ async def set_review_x_selection(
         selected_count=selected_count,
         replayed=False,
     )
+
+
+async def _record_completion_inspections(
+    session: AsyncSession,
+    *,
+    task: ReviewTask,
+    asset_ids: tuple[UUID, ...],
+    inspected_by_user_id: UUID,
+    inspected_at: datetime,
+) -> None:
+    """Persist the browser's final viewed-image snapshot under the task lock.
+
+    The standalone inspection endpoint and completion both lock the same review
+    task. Whichever request wins is committed first; this transaction then only
+    inserts the missing immutable rows. That keeps completion independent from a
+    slow browser telemetry request without losing positive-learning eligibility.
+    """
+
+    if not asset_ids:
+        return
+    ranked_asset_ids = set(
+        await session.scalars(
+            select(AssetRanking.asset_id).where(
+                AssetRanking.scoring_run_id == task.scoring_run_id,
+                AssetRanking.asset_id.in_(asset_ids),
+            )
+        )
+    )
+    if ranked_asset_ids != set(asset_ids):
+        raise ReviewConflictError("inspection asset is not part of the review ranking")
+    existing_asset_ids = set(
+        await session.scalars(
+            select(ReviewAssetInspection.asset_id).where(
+                ReviewAssetInspection.review_task_id == task.id,
+                ReviewAssetInspection.inspected_by_user_id == inspected_by_user_id,
+                ReviewAssetInspection.asset_id.in_(asset_ids),
+            )
+        )
+    )
+    session.add_all(
+        [
+            ReviewAssetInspection(
+                review_task_id=task.id,
+                scoring_run_id=task.scoring_run_id,
+                asset_id=asset_id,
+                inspected_by_user_id=inspected_by_user_id,
+                inspected_at=inspected_at,
+            )
+            for asset_id in asset_ids
+            if asset_id not in existing_asset_ids
+        ]
+    )
+    try:
+        await session.flush()
+    except IntegrityError as error:
+        await session.rollback()
+        raise ReviewConflictError("reviewed-image progress could not be frozen") from error
 
 
 async def _freeze_release_selections(
@@ -2200,6 +2271,23 @@ def _normalize_bulk_asset_ids(values: Sequence[UUID]) -> tuple[UUID, ...]:
         normalized.append(value)
     if len(set(normalized)) != len(normalized):
         raise ReviewInputError("asset_ids must not contain duplicates")
+    return tuple(sorted(normalized, key=str))
+
+
+def _normalize_optional_asset_ids(
+    values: Sequence[UUID],
+    *,
+    label: str,
+) -> tuple[UUID, ...]:
+    if isinstance(values, (str, bytes)) or len(values) > _MAX_BULK_ASSET_COUNT:
+        raise ReviewInputError(f"{label} must contain at most 500 assets")
+    normalized: list[UUID] = []
+    for value in values:
+        if not isinstance(value, UUID):
+            raise ReviewInputError(f"{label} must contain UUID values")
+        normalized.append(value)
+    if len(set(normalized)) != len(normalized):
+        raise ReviewInputError(f"{label} must not contain duplicates")
     return tuple(sorted(normalized, key=str))
 
 

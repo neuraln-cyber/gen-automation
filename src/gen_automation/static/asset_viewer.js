@@ -6,9 +6,10 @@
   const IMAGE_LOAD_ERROR = (
     "The full-size preview could not be loaded. Reload the page to refresh its private link."
   );
-  const INSPECTION_BATCH_SIZE = 500;
+  const INSPECTION_BATCH_SIZE = 25;
   const INSPECTION_IDLE_FLUSH_MS = 5000;
   const INSPECTION_RETRY_MS = 2500;
+  const INSPECTION_REQUEST_TIMEOUT_MS = 8000;
   const preloadedSources = new Set();
 
   const createElement = (tagName, className, text) => {
@@ -368,6 +369,8 @@
     let failedInspectionBatch = null;
     let inspectionFlushTimer = null;
     let inspectionRequestPromise = null;
+    let inspectionAbortController = null;
+    let completionInspectionHandoff = false;
     let rejectionBusy = false;
     let pendingRejection = null;
     let returnFocus = null;
@@ -502,6 +505,7 @@
     };
 
     const scheduleInspectionFlush = (delay = INSPECTION_IDLE_FLUSH_MS) => {
+      if (completionInspectionHandoff) return;
       if (inspectionFlushTimer !== null) window.clearTimeout(inspectionFlushTimer);
       inspectionFlushTimer = window.setTimeout(() => {
         inspectionFlushTimer = null;
@@ -509,7 +513,13 @@
       }, delay);
     };
 
-    const queueInspection = (card) => {
+    const inspectionBacklogIds = () => new Set([
+      ...pendingInspectionIds,
+      ...(activeInspectionBatch?.assetIds || []),
+      ...(failedInspectionBatch?.assetIds || []),
+    ]);
+
+    const queueInspection = (card, { schedule = true } = {}) => {
       const assetId = card?.dataset.assetId || "";
       const source = normalizedSource(card ? sourceFor(card) : "");
       if (!assetId
@@ -522,6 +532,7 @@
       pendingInspectionIds.add(assetId);
       card.dataset.inspectionState = "pending";
       setInspectionChip(card, "pending");
+      if (!schedule || completionInspectionHandoff) return;
       if (pendingInspectionIds.size >= INSPECTION_BATCH_SIZE) {
         if (inspectionFlushTimer !== null) window.clearTimeout(inspectionFlushTimer);
         inspectionFlushTimer = null;
@@ -532,6 +543,7 @@
     };
 
     const flushInspectionQueue = (keepalive = false) => {
+      if (completionInspectionHandoff) return Promise.resolve(false);
       if (inspectionRequestPromise) return inspectionRequestPromise;
       const config = inspectionConfiguration();
       if (!config) return Promise.resolve(pendingInspectionIds.size === 0);
@@ -556,7 +568,12 @@
       body.append("idempotency_key", batch.idempotencyKey);
       batch.assetIds.forEach((assetId) => body.append("asset_id", assetId));
 
-      inspectionRequestPromise = fetch(config.url, {
+      const controller = typeof AbortController === "function" ? new AbortController() : null;
+      inspectionAbortController = controller;
+      const timeoutId = controller ? window.setTimeout(() => {
+        controller.abort();
+      }, INSPECTION_REQUEST_TIMEOUT_MS) : null;
+      const requestOptions = {
         method: "POST",
         credentials: "same-origin",
         keepalive,
@@ -566,7 +583,10 @@
           "X-Requested-With": "fetch",
         },
         body,
-      }).then(async (response) => {
+      };
+      if (controller) requestOptions.signal = controller.signal;
+
+      inspectionRequestPromise = fetch(config.url, requestOptions).then(async (response) => {
         if (!response.ok) throw new Error(`inspection_http_${response.status}`);
         const payload = await response.json();
         if (!payload || payload.ok !== true || !Array.isArray(payload.inspected_asset_ids)) {
@@ -579,31 +599,26 @@
         markInspectionSaved(batch.assetIds);
         return true;
       }).catch(() => {
-        failedInspectionBatch = batch;
-        batch.assetIds.forEach((assetId) => {
-          assetCards()
-            .filter((card) => card.dataset.assetId === assetId)
-            .forEach((card) => { card.dataset.inspectionState = "pending"; });
-        });
-        scheduleInspectionFlush(INSPECTION_RETRY_MS);
+        if (!completionInspectionHandoff) {
+          failedInspectionBatch = batch;
+          batch.assetIds.forEach((assetId) => {
+            assetCards()
+              .filter((card) => card.dataset.assetId === assetId)
+              .forEach((card) => { card.dataset.inspectionState = "pending"; });
+          });
+          scheduleInspectionFlush(INSPECTION_RETRY_MS);
+        }
         return false;
       }).finally(() => {
+        if (timeoutId !== null) window.clearTimeout(timeoutId);
+        if (inspectionAbortController === controller) inspectionAbortController = null;
         activeInspectionBatch = null;
         inspectionRequestPromise = null;
-        if (!failedInspectionBatch && pendingInspectionIds.size > 0) scheduleInspectionFlush();
+        if (!completionInspectionHandoff
+            && !failedInspectionBatch
+            && pendingInspectionIds.size > 0) scheduleInspectionFlush();
       });
       return inspectionRequestPromise;
-    };
-
-    const drainInspectionQueue = async () => {
-      if (activeCard) queueInspection(activeCard);
-      if (inspectionFlushTimer !== null) window.clearTimeout(inspectionFlushTimer);
-      inspectionFlushTimer = null;
-      while (inspectionRequestPromise || failedInspectionBatch || pendingInspectionIds.size > 0) {
-        const succeeded = await (inspectionRequestPromise || flushInspectionQueue());
-        if (!succeeded) return false;
-      }
-      return true;
     };
 
     const updateCleanControls = (sourceAvailable) => {
@@ -1259,11 +1274,19 @@
     viewer.media.addEventListener("touchcancel", () => {
       touchStart = null;
     }, { passive: true });
-    document.addEventListener("gen-automation:inspection-flush-request", (event) => {
-      const respondWith = event.detail?.respondWith;
-      if (typeof respondWith === "function") respondWith(drainInspectionQueue());
+    document.addEventListener("gen-automation:inspection-completion-handoff", (event) => {
+      const includeAssetIds = event.detail?.includeAssetIds;
+      completionInspectionHandoff = true;
+      if (activeCard) queueInspection(activeCard, { schedule: false });
+      if (inspectionFlushTimer !== null) window.clearTimeout(inspectionFlushTimer);
+      inspectionFlushTimer = null;
+      if (typeof includeAssetIds === "function") {
+        includeAssetIds([...inspectionBacklogIds()]);
+      }
+      if (inspectionAbortController) inspectionAbortController.abort();
     });
     window.addEventListener("pagehide", () => {
+      if (completionInspectionHandoff) return;
       if (activeCard) queueInspection(activeCard);
       void flushInspectionQueue(true);
     });

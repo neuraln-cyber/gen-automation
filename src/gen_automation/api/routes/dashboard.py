@@ -1110,6 +1110,7 @@ async def _dashboard_transition(
             changed_by_user_id=principal.user_id,
             expected_lock_version=form.expected_lock_version,
             idempotency_key=form.idempotency_key,
+            inspected_asset_ids=form.inspected_asset_ids,
             semantic_profile_sha256=semantic_profile,
             semantic_severe_confidence_micros=semantic_threshold,
             semantic_enforcement_mode=settings.semantic_anatomy_mode,

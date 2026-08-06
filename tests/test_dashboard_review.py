@@ -863,6 +863,7 @@ def test_review_dashboard_can_complete_a_nonempty_subset_below_goal(tmp_path: Pa
     app = create_app(context.settings)
     detail_action = f"/dashboard/review-tasks/{task_id}"
     decision_action = f"{detail_action}/decisions"
+    complete_action = f"{detail_action}:complete"
 
     with TestClient(
         app,
@@ -893,6 +894,16 @@ def test_review_dashboard_can_complete_a_nonempty_subset_below_goal(tmp_path: Pa
             follow_redirects=False,
         )
         subset_page = client.get(detail_action)
+        complete_form = _one_form(subset_page.text, complete_action)
+        completed = client.post(
+            complete_action,
+            data={
+                **complete_form.fields,
+                "inspected_asset_id": [str(asset_id) for asset_id in context.asset_ids],
+            },
+            headers=_FORM_HEADERS,
+            follow_redirects=False,
+        )
 
     assert accepted.status_code == 303
     subset_button = re.search(
@@ -903,6 +914,12 @@ def test_review_dashboard_can_complete_a_nonempty_subset_below_goal(tmp_path: Pa
     assert subset_button is not None
     assert "disabled" not in subset_button.group("attributes")
     assert "1 optional slot" in subset_page.text
+    assert completed.status_code == 303
+    _, inspection_count, inspected_ids = asyncio.run(
+        _review_inspection_state(context.settings, task_id=task_id)
+    )
+    assert inspection_count == len(context.asset_ids)
+    assert set(inspected_ids) == set(context.asset_ids)
 
 
 def test_browser_bulk_review_action_applies_repeated_selected_assets(tmp_path: Path) -> None:

@@ -35,6 +35,7 @@ DECISION_FIELDS = frozenset(
     }
 )
 TRANSITION_FIELDS = frozenset({"csrf_token", "idempotency_key", "expected_lock_version"})
+TRANSITION_INSPECTION_FIELD = "inspected_asset_id"
 X_SELECTION_FIELDS = frozenset(
     {
         "csrf_token",
@@ -91,6 +92,7 @@ class TransitionForm:
     csrf_token: str
     idempotency_key: str
     expected_lock_version: int
+    inspected_asset_ids: tuple[UUID, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,11 +166,37 @@ async def read_decision_form(request: Request) -> DecisionForm:
 
 
 async def read_transition_form(request: Request) -> TransitionForm:
-    values = await _read_form(request, expected_fields=TRANSITION_FIELDS)
+    parsed = await _read_form_values(
+        request,
+        max_num_fields=len(TRANSITION_FIELDS) + _MAX_BULK_ASSET_COUNT,
+    )
+    if not TRANSITION_FIELDS.issubset(parsed) or set(parsed) - (
+        TRANSITION_FIELDS | {TRANSITION_INSPECTION_FIELD}
+    ):
+        raise _bad_request()
+    if any(len(parsed[field]) != 1 for field in TRANSITION_FIELDS):
+        raise _bad_request()
+    raw_inspected_asset_ids = parsed.get(TRANSITION_INSPECTION_FIELD, [])
+    if len(raw_inspected_asset_ids) > _MAX_BULK_ASSET_COUNT:
+        raise _bad_request()
+    try:
+        inspected_asset_ids = tuple(UUID(value) for value in raw_inspected_asset_ids)
+    except ValueError:
+        raise _bad_request() from None
+    if any(
+        str(asset_id) != value.lower()
+        for asset_id, value in zip(
+            inspected_asset_ids,
+            raw_inspected_asset_ids,
+            strict=True,
+        )
+    ) or len(set(inspected_asset_ids)) != len(inspected_asset_ids):
+        raise _bad_request()
     return TransitionForm(
-        csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
-        idempotency_key=_idempotency_key(values["idempotency_key"]),
-        expected_lock_version=_lock_version(values["expected_lock_version"]),
+        csrf_token=_bounded_nonempty(parsed["csrf_token"][0], maximum=200),
+        idempotency_key=_idempotency_key(parsed["idempotency_key"][0]),
+        expected_lock_version=_lock_version(parsed["expected_lock_version"][0]),
+        inspected_asset_ids=inspected_asset_ids,
     )
 
 

@@ -88,7 +88,7 @@ def test_review_page_has_replaceable_workspace_and_live_action_status() -> None:
     assert '[data-review-workspace][aria-busy="true"]' in styles
 
 
-def test_review_completion_waits_for_background_inspection_flush() -> None:
+def test_review_completion_hands_off_inspections_and_submits_immediately() -> None:
     script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
     handler = script.split("function initializeReviewCompletionInspectionFlush()", 1)[1].split(
         "function initializeReviewActions()",
@@ -97,20 +97,25 @@ def test_review_completion_waits_for_background_inspection_flush() -> None:
 
     assert 'form.matches("[data-review-complete-form]")' in handler
     assert "event.preventDefault()" in handler
-    assert "await requestInspectionFlush()" in handler
-    assert 'form.dataset.inspectionsFlushed = "true"' in handler
-    assert "if (submitter) form.requestSubmit(submitter)" in handler
-    assert "else form.requestSubmit()" in handler
-    assert handler.index("await requestInspectionFlush()") < handler.index(
-        'form.dataset.inspectionsFlushed = "true"'
-    )
-    failure = handler.split("if (!flushed)", 1)[1].split(
-        'form.dataset.inspectionsFlushed = "true"',
+    assert "captureCompletionInspectionIds(form)" in handler
+    assert "await " not in handler
+    assert "REVIEW_INSPECTION_FLUSH_TIMEOUT_MS" not in script
+    assert '"gen-automation:inspection-flush-progress"' not in handler
+    assert 'submitter.textContent = "Finishing set..."' in handler
+    assert "reviewActionStatusTimers" in script
+    assert "false,\n          0," in handler
+    assert 'form.dataset.inspectionsCaptured = "true"' in handler
+    assert "window.queueMicrotask(() => form.requestSubmit())" in handler
+    assert "form.requestSubmit(submitter)" not in handler
+    assert "inspectionFlushPending" not in handler
+    request = script.split("const attachCompletionInspectionIds", 1)[1].split(
+        "function initializeReviewCompletionInspectionFlush()",
         1,
     )[0]
-    assert "return;" in failure
-    assert "form.requestSubmit" not in failure
-    assert "Reviewed-image progress could not be saved" in handler
+    assert 'field.name = "inspected_asset_id"' in request
+    assert "field.dataset.completionInspectionId" in request
+    assert "attachCompletionInspectionIds(form, assetIds)" in request
+    assert '"gen-automation:inspection-completion-handoff"' in request
 
 
 def test_asset_viewer_rebinds_review_controls_after_in_place_refresh() -> None:

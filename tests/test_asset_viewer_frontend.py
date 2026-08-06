@@ -39,9 +39,10 @@ def test_asset_viewer_is_safe_progressive_enhancement() -> None:
     assert "data-review-inspection-form" in script
     assert "queueInspection(activeCard)" in script
     assert "flushInspectionQueue(true)" in script
-    assert "drainInspectionQueue" in script
-    assert "INSPECTION_BATCH_SIZE = 500" in script
+    assert "inspection-completion-handoff" in script
+    assert "INSPECTION_BATCH_SIZE = 25" in script
     assert "INSPECTION_IDLE_FLUSH_MS = 5000" in script
+    assert "INSPECTION_REQUEST_TIMEOUT_MS = 8000" in script
     assert "assetViewerDefectPicker" in script
     assert "data-defect-code" in script
     assert 'event.key.toLowerCase() === "a"' in script
@@ -349,7 +350,7 @@ def test_fullscreen_inspections_are_batched_retried_and_flushed_without_renderin
         1,
     )[0]
     flush = script.split("const flushInspectionQueue", 1)[1].split(
-        "const drainInspectionQueue",
+        "const updateCleanControls",
         1,
     )[0]
     step = script.split("const step", 1)[1].split("const submitRejection", 1)[0]
@@ -364,6 +365,8 @@ def test_fullscreen_inspections_are_batched_retried_and_flushed_without_renderin
     assert 'body.append("asset_id", assetId)' in flush
     assert 'Accept: "application/json"' in flush
     assert "failedInspectionBatch = batch" in flush
+    assert "controller.abort()" in flush
+    assert "requestOptions.signal = controller.signal" in flush
     assert "idempotencyKey: config.keyPrefix" in flush
     assert "let batch = failedInspectionBatch" in flush
     configuration = script.split("const inspectionConfiguration", 1)[1].split(
@@ -376,17 +379,20 @@ def test_fullscreen_inspections_are_batched_retried_and_flushed_without_renderin
     assert "form.action" not in configuration
     assert "workspace.replaceWith" not in flush
     assert "renderCard" not in flush
-    assert (
-        "if (activeCard) queueInspection(activeCard)"
-        in script.split(
-            "const drainInspectionQueue",
-            1,
-        )[1].split("const updateCleanControls", 1)[0]
-    )
     assert step.index("queueInspection(activeCard)") < step.index("renderCard(")
     assert "queueInspection(activeCard)" in close
     assert "flushInspectionQueue(true)" in close
     assert "restoreInspectionState()" in script
+    completion_listener = script.split(
+        'document.addEventListener("gen-automation:inspection-completion-handoff"',
+        1,
+    )[1].split('window.addEventListener("pagehide"', 1)[0]
+    assert "completionInspectionHandoff = true" in completion_listener
+    assert "queueInspection(activeCard, { schedule: false })" in completion_listener
+    assert "includeAssetIds([...inspectionBacklogIds()])" in completion_listener
+    assert "inspectionAbortController.abort()" in completion_listener
+    pagehide = script.split('window.addEventListener("pagehide"', 1)[1]
+    assert "if (completionInspectionHandoff) return" in pagehide
     assert ".decision-chip.inspected" in STYLES.read_text(encoding="utf-8")
 
 

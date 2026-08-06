@@ -2913,66 +2913,75 @@
     }
   };
 
-  const showReviewActionStatus = (workspace, message, isError = false) => {
+  const reviewActionStatusTimers = new WeakMap();
+
+  const showReviewActionStatus = (workspace, message, isError = false, autoHideMs = null) => {
     const status = workspace.querySelector("[data-review-action-status]");
     if (!(status instanceof HTMLElement)) return;
+    const existingTimer = reviewActionStatusTimers.get(status);
+    if (existingTimer !== undefined) window.clearTimeout(existingTimer);
+    reviewActionStatusTimers.delete(status);
     status.textContent = message;
     status.classList.toggle("error", isError);
     status.hidden = false;
-    window.setTimeout(() => {
-      if (status.isConnected) status.hidden = true;
-    }, isError ? 6000 : 2600);
+    const hideAfter = autoHideMs === null ? (isError ? 6000 : 2600) : autoHideMs;
+    if (hideAfter > 0) {
+      reviewActionStatusTimers.set(status, window.setTimeout(() => {
+        reviewActionStatusTimers.delete(status);
+        if (status.isConnected) status.hidden = true;
+      }, hideAfter));
+    }
   };
 
-  const requestInspectionFlush = () => {
-    let requestedFlush = null;
-    document.dispatchEvent(new CustomEvent("gen-automation:inspection-flush-request", {
+  const attachCompletionInspectionIds = (form, assetIds) => {
+    form.querySelectorAll("[data-completion-inspection-id]").forEach((field) => field.remove());
+    [...new Set(Array.from(assetIds || [], String).filter(Boolean))].forEach((assetId) => {
+      const field = document.createElement("input");
+      field.type = "hidden";
+      field.name = "inspected_asset_id";
+      field.value = assetId;
+      field.dataset.completionInspectionId = "";
+      form.append(field);
+    });
+  };
+
+  const captureCompletionInspectionIds = (form) => {
+    document.dispatchEvent(new CustomEvent("gen-automation:inspection-completion-handoff", {
       detail: {
-        respondWith(value) {
-          requestedFlush = Promise.resolve(value);
+        includeAssetIds(assetIds) {
+          attachCompletionInspectionIds(form, assetIds);
         },
       },
     }));
-    return requestedFlush || Promise.resolve(true);
   };
 
   function initializeReviewCompletionInspectionFlush() {
-    document.addEventListener("submit", async (event) => {
+    document.addEventListener("submit", (event) => {
       const form = event.target;
       if (!(form instanceof HTMLFormElement) || !form.matches("[data-review-complete-form]")) {
         return;
       }
-      if (form.dataset.inspectionsFlushed === "true") return;
+      if (form.dataset.inspectionsCaptured === "true") return;
       event.preventDefault();
-      if (form.dataset.inspectionFlushPending === "true") return;
 
       const workspace = form.closest("[data-review-workspace]");
       const submitter = event.submitter instanceof HTMLButtonElement ? event.submitter : null;
-      form.dataset.inspectionFlushPending = "true";
-      if (submitter) submitter.disabled = true;
+      form.dataset.inspectionsCaptured = "true";
+      if (submitter) {
+        submitter.textContent = "Finishing set...";
+        submitter.disabled = true;
+      }
       if (workspace instanceof HTMLElement) {
         workspace.setAttribute("aria-busy", "true");
-        showReviewActionStatus(workspace, "Saving the images you reviewed before completion...");
+        showReviewActionStatus(
+          workspace,
+          "Finishing set...",
+          false,
+          0,
+        );
       }
-
-      const flushed = await requestInspectionFlush().catch(() => false);
-      delete form.dataset.inspectionFlushPending;
-      if (workspace instanceof HTMLElement) workspace.removeAttribute("aria-busy");
-      if (!flushed) {
-        if (submitter) submitter.disabled = false;
-        if (workspace instanceof HTMLElement) {
-          showReviewActionStatus(
-            workspace,
-            "Reviewed-image progress could not be saved. Check the connection and complete again.",
-            true,
-          );
-        }
-        return;
-      }
-
-      form.dataset.inspectionsFlushed = "true";
-      if (submitter) form.requestSubmit(submitter);
-      else form.requestSubmit();
+      captureCompletionInspectionIds(form);
+      window.queueMicrotask(() => form.requestSubmit());
     });
   }
 

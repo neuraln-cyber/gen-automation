@@ -750,7 +750,6 @@ async def test_untouched_default_accepts_never_become_anatomy_good_training_labe
             semantic_enforcement_mode=SemanticEnforcementMode.SHADOW,
             now=NOW + timedelta(minutes=4),
         )
-
     assert completed.state == ReviewTaskState.COMPLETED
     assert completed.accepted_count == len(review_context.ranked_asset_ids)
 
@@ -797,7 +796,7 @@ async def test_inspected_default_accepts_become_positive_labels_on_completion(
         await record_review_inspections(
             session,
             review_task_id=task.task_id,
-            asset_ids=review_context.ranked_asset_ids,
+            asset_ids=review_context.ranked_asset_ids[:1],
             inspected_by_user_id=review_context.owner_id,
             now=NOW + timedelta(minutes=3),
         )
@@ -809,13 +808,35 @@ async def test_inspected_default_accepts_become_positive_labels_on_completion(
             changed_by_user_id=review_context.owner_id,
             expected_lock_version=1,
             idempotency_key="complete-inspected-default-kept-learning",
+            inspected_asset_ids=review_context.ranked_asset_ids,
             semantic_profile_sha256=profile.profile_sha256,
             semantic_enforcement_mode=SemanticEnforcementMode.SHADOW,
             now=NOW + timedelta(minutes=4),
         )
+    async with review_context.database.sessions() as session:
+        replayed = await transition_review_task(
+            session,
+            review_task_id=task.task_id,
+            target_state=ReviewTaskState.COMPLETED,
+            changed_by_user_id=review_context.owner_id,
+            expected_lock_version=1,
+            idempotency_key="complete-inspected-default-kept-learning",
+            semantic_profile_sha256=profile.profile_sha256,
+            semantic_enforcement_mode=SemanticEnforcementMode.SHADOW,
+            now=NOW + timedelta(minutes=5),
+        )
 
     assert completed.state == ReviewTaskState.COMPLETED
+    assert replayed.replayed
     async with review_context.database.sessions() as session:
+        inspected_asset_ids = set(
+            await session.scalars(
+                select(ReviewAssetInspection.asset_id).where(
+                    ReviewAssetInspection.review_task_id == task.task_id,
+                    ReviewAssetInspection.inspected_by_user_id == review_context.owner_id,
+                )
+            )
+        )
         feedback = list(
             (
                 await session.scalars(
@@ -825,6 +846,7 @@ async def test_inspected_default_accepts_become_positive_labels_on_completion(
                 )
             ).all()
         )
+    assert inspected_asset_ids == set(review_context.ranked_asset_ids)
     assert len(feedback) == 2
     assert all(item.ground_truth == SemanticGroundTruth.ANATOMY_GOOD for item in feedback)
 
