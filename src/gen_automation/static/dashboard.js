@@ -137,6 +137,92 @@
     );
   };
 
+  const normalizeAutomationPresetBatchPlan = (requested) => {
+    if (!Array.isArray(requested) || requested.length < 1 || requested.length > 50) {
+      return null;
+    }
+    try {
+      if (JSON.stringify(requested).length > 400_000) return null;
+    } catch (_error) {
+      return null;
+    }
+    const names = new Set();
+    const maximumSeed = 9223372036854775807n;
+    const optionalPromptFields = [
+      "negative_prompt",
+      "detailer_prompt",
+      "detailer_negative_prompt",
+    ];
+    const normalized = [];
+    for (const batch of requested) {
+      if (!batch || typeof batch !== "object") return null;
+      const name = typeof batch.name === "string" ? batch.name : "";
+      const normalizedName = name.trim();
+      const nameKey = normalizedName.toLowerCase();
+      if (!normalizedName || normalizedName !== name || normalizedName.length > 100
+          || names.has(nameKey)) return null;
+      if (!Number.isInteger(batch.image_count)
+          || batch.image_count < 1 || batch.image_count > 80_000) return null;
+      if (typeof batch.prompt !== "string"
+          || !batch.prompt.trim() || batch.prompt.length > 20_000) return null;
+
+      const optionalPrompts = {};
+      let optionalPromptsValid = true;
+      optionalPromptFields.forEach((fieldName) => {
+        const value = batch[fieldName];
+        if (value === null || typeof value === "undefined"
+            || (fieldName !== "negative_prompt" && value === "")) {
+          optionalPrompts[fieldName] = null;
+        } else if (typeof value === "string" && value.length <= 20_000) {
+          optionalPrompts[fieldName] = value;
+        } else {
+          optionalPromptsValid = false;
+        }
+      });
+      if (!optionalPromptsValid) return null;
+
+      let seed = null;
+      if (batch.seed !== null && typeof batch.seed !== "undefined" && batch.seed !== "") {
+        if (typeof batch.seed !== "string") return null;
+        seed = batch.seed.trim();
+        if (!/^-?[0-9]+$/.test(seed)) return null;
+        try {
+          const numericSeed = BigInt(seed);
+          if (numericSeed < -1n || numericSeed > maximumSeed) return null;
+        } catch (_error) {
+          return null;
+        }
+      }
+
+      names.add(nameKey);
+      normalized.push({
+        name: normalizedName,
+        image_count: batch.image_count,
+        prompt: batch.prompt,
+        negative_prompt: optionalPrompts.negative_prompt,
+        detailer_prompt: optionalPrompts.detailer_prompt,
+        detailer_negative_prompt: optionalPrompts.detailer_negative_prompt,
+        seed,
+      });
+    }
+    return normalized;
+  };
+
+  const collectAutomationPresetBatchPlan = (form) => {
+    const planData = form.querySelector("#batch-plan-data");
+    if (!(planData instanceof HTMLTextAreaElement)) return null;
+    try {
+      return normalizeAutomationPresetBatchPlan(JSON.parse(planData.value || "[]"));
+    } catch (_error) {
+      return null;
+    }
+  };
+
+  const summarizeAutomationBatchPlan = (batchPlan) => ({
+    batchCount: batchPlan.length,
+    imageCount: batchPlan.reduce((total, batch) => total + batch.image_count, 0),
+  });
+
   const collectAutomationProfile = (form) => {
     const fields = {};
     AUTOMATION_PRESET_FIELDS.forEach((name) => {
@@ -856,7 +942,8 @@
         name: field(row, "name").value.trim(),
         image_count: integerValue(field(row, "image_count").value, 0),
         prompt: field(row, "prompt").value,
-        negative_prompt: optionalText(field(row, "negative_prompt").value),
+        // An empty negative prompt explicitly disables the shared negative prompt.
+        negative_prompt: field(row, "negative_prompt").value,
         detailer_prompt: optionalText(field(row, "detailer_prompt").value),
         detailer_negative_prompt: optionalText(field(row, "detailer_negative_prompt").value),
         // Keep the decimal text exact; valid backend seeds extend beyond JS's safe integer range.
@@ -960,7 +1047,7 @@
       seed: null,
     });
 
-    const addBatch = (batch, before = null) => {
+    const addBatch = (batch, before = null, deferUpdate = false) => {
       const fragment = template.content.cloneNode(true);
       const row = fragment.querySelector("[data-batch-row]");
       field(row, "name").value = batch.name || nextUniqueName("Batch");
@@ -972,8 +1059,30 @@
       field(row, "detailer_negative_prompt").value = batch.detailer_negative_prompt ?? "";
       field(row, "seed").value = batch.seed ?? "";
       list.insertBefore(fragment, before);
-      updateBuilder();
+      if (!deferUpdate) updateBuilder();
       return row;
+    };
+
+    const replaceBatchPlan = (requested) => {
+      const batches = normalizeAutomationPresetBatchPlan(requested);
+      if (!batches) return false;
+      list.replaceChildren();
+      lastPrompt = null;
+      batches.forEach((batch, index) => {
+        const row = addBatch(batch, null, true);
+        const collapsed = index > 0;
+        row.classList.toggle("is-collapsed", collapsed);
+        const collapseButton = row.querySelector('[data-batch-action="collapse"]');
+        if (collapseButton) {
+          collapseButton.setAttribute("aria-expanded", String(!collapsed));
+          collapseButton.textContent = collapsed ? "Expand" : "Collapse";
+        }
+      });
+      if (collapseAllButton instanceof HTMLButtonElement) {
+        collapseAllButton.textContent = "Collapse all";
+      }
+      updateBuilder();
+      return true;
     };
 
     const unknownWildcardNames = (value) => Array.from(
@@ -1039,6 +1148,7 @@
     };
 
     const updateBuilder = () => {
+      if (form.dataset.applyingAutomationProfile === "true") return;
       const rows = batchRows();
       const perJob = Math.max(1, integerValue(outputsPerJob && outputsPerJob.value, 1));
       let totalImages = 0;
@@ -1175,7 +1285,7 @@
       }];
     }
     initialBatches.forEach((batch, index) => {
-      const row = addBatch(batch);
+      const row = addBatch(batch, null, true);
       if (initialBatches.length > 1 && index > 0) {
         row.classList.add("is-collapsed");
         const collapseButton = row.querySelector('[data-batch-action="collapse"]');
@@ -1185,6 +1295,13 @@
         }
       }
     });
+
+    form.addEventListener("gen-automation:replace-batch-plan", (event) => {
+      if (!(event instanceof CustomEvent)
+          || !event.detail || typeof event.detail !== "object") return;
+      event.detail.replaced = replaceBatchPlan(event.detail.batch_plan);
+    });
+    form.addEventListener("gen-automation:refresh-batch-plan", updateBuilder);
 
     if (batchSequenceApply instanceof HTMLButtonElement
         && batchSequenceInput instanceof HTMLTextAreaElement) {
@@ -1335,6 +1452,10 @@
       });
     }
     defaultPrompt && defaultPrompt.addEventListener("input", () => {
+      if (form.dataset.applyingAutomationProfile === "true") {
+        previousDefaultPrompt = defaultPrompt.value;
+        return;
+      }
       const rows = batchRows();
       rows.forEach((row) => {
         const prompt = field(row, "prompt");
@@ -1344,6 +1465,10 @@
       updateBuilder();
     });
     defaultNegative && defaultNegative.addEventListener("input", () => {
+      if (form.dataset.applyingAutomationProfile === "true") {
+        previousDefaultNegative = defaultNegative.value;
+        return;
+      }
       const rows = batchRows();
       rows.forEach((row) => {
         const negativePrompt = field(row, "negative_prompt");
@@ -1931,7 +2056,27 @@
       const loraWeights = visibleLoraWeights.length > 0
         ? visibleLoraWeights
         : Array.from(form.querySelectorAll("[data-lora-native-weight]"));
-      return [...controls, ...loraWeights].find((control) => !control.checkValidity());
+      const batchControls = Array.from(form.querySelectorAll("[data-batch-field]"));
+      return [...controls, ...loraWeights, ...batchControls]
+        .find((control) => !control.checkValidity());
+    };
+    const revealInvalidPresetControl = (control) => {
+      let disclosure = control.closest("details");
+      while (disclosure) {
+        disclosure.open = true;
+        disclosure = disclosure.parentElement?.closest("details") || null;
+      }
+      const row = control.closest("[data-batch-row]");
+      if (row) {
+        row.classList.remove("is-collapsed");
+        const collapseButton = row.querySelector('[data-batch-action="collapse"]');
+        if (collapseButton) {
+          collapseButton.setAttribute("aria-expanded", "true");
+          collapseButton.textContent = "Collapse";
+        }
+      }
+      control.focus();
+      control.reportValidity();
     };
     const render = (selectedId = select.value) => {
       select.replaceChildren();
@@ -1942,7 +2087,10 @@
       presets.forEach((preset) => {
         const option = document.createElement("option");
         option.value = preset.id;
-        option.textContent = preset.name;
+        const batchPlan = normalizeAutomationPresetBatchPlan(preset.batch_plan);
+        option.textContent = batchPlan
+          ? `${preset.name} · ${batchPlan.length} batch${batchPlan.length === 1 ? "" : "es"}`
+          : `${preset.name} · settings only`;
         select.append(option);
       });
       select.value = presets.some((preset) => preset.id === selectedId) ? selectedId : "";
@@ -1965,26 +2113,45 @@
       }
       const invalidControl = firstInvalidPresetControl();
       if (invalidControl) {
-        const disclosure = invalidControl.closest("details");
-        if (disclosure) disclosure.open = true;
-        invalidControl.focus();
-        invalidControl.reportValidity();
-        setStatus("Fix the highlighted setting before saving this preset.", "warning");
+        revealInvalidPresetControl(invalidControl);
+        setStatus("Fix the highlighted setting or batch before saving.", "warning");
         return;
       }
       const existing = presets.find((preset) => preset.name.toLowerCase() === name.toLowerCase());
+      const hasBatchBuilder = form.querySelector("#batch-plan-data") instanceof HTMLTextAreaElement;
+      const currentBatchPlan = collectAutomationPresetBatchPlan(form);
+      if (hasBatchBuilder && !currentBatchPlan) {
+        setStatus("Fix the batch queue before saving this preset.", "warning");
+        return;
+      }
+      const preservedBatchPlan = normalizeAutomationPresetBatchPlan(existing?.batch_plan);
+      const batchPlan = currentBatchPlan || preservedBatchPlan;
+      const batchSummary = batchPlan ? summarizeAutomationBatchPlan(batchPlan) : null;
       const id = existing?.id || `${slugify(name) || "preset"}-${Date.now().toString(36)}`;
       const saved = {
+        schema_version: batchPlan ? 2 : 1,
         id,
         name,
         profile: collectAutomationProfile(form),
+        ...(batchPlan ? {
+          batch_plan: batchPlan,
+          batch_count: batchSummary.batchCount,
+          image_count: batchSummary.imageCount,
+        } : {}),
         updated_at: new Date().toISOString(),
       };
-      presets = [saved, ...presets.filter((preset) => preset.id !== id)].slice(0, 30);
+      const nextPresets = [saved, ...presets.filter((preset) => preset.id !== id)].slice(0, 30);
       try {
-        writeStoredAutomationPresets(presets);
+        writeStoredAutomationPresets(nextPresets);
+        presets = nextPresets;
         render(id);
-        setStatus(existing ? "Preset updated." : "Preset saved.", "success");
+        const action = existing ? "updated" : "saved";
+        setStatus(
+          batchSummary
+            ? `“${name}” ${action} · ${batchSummary.batchCount} batch${batchSummary.batchCount === 1 ? "" : "es"} · ${batchSummary.imageCount.toLocaleString()} images.`
+            : `“${name}” ${action} as settings only.`,
+          "success",
+        );
       } catch (_error) {
         setStatus("This browser could not save the preset.", "warning");
       }
@@ -1995,20 +2162,37 @@
         setStatus("That preset is no longer available.", "warning");
         return;
       }
+      const hasSavedBatchPlan = Object.prototype.hasOwnProperty.call(preset, "batch_plan");
+      const savedBatchPlan = hasSavedBatchPlan
+        ? normalizeAutomationPresetBatchPlan(preset.batch_plan)
+        : null;
+      if (hasSavedBatchPlan && !savedBatchPlan) {
+        setStatus("That preset has an invalid saved batch queue and was not loaded.", "warning");
+        return;
+      }
+      const hasBatchBuilder = Boolean(form.querySelector("#batch-builder"));
       const result = applyAutomationProfile(form, preset.profile);
       if (!result.applied) {
         setStatus("That preset contains invalid saved data.", "warning");
         return;
       }
+      let queueReplaced = false;
+      if (savedBatchPlan) {
+        const replacement = { batch_plan: savedBatchPlan, replaced: false };
+        form.dispatchEvent(new CustomEvent("gen-automation:replace-batch-plan", {
+          detail: replacement,
+        }));
+        queueReplaced = replacement.replaced;
+        if (!queueReplaced && hasBatchBuilder) {
+          setStatus("The saved settings loaded, but the batch queue could not be restored.", "warning");
+          return;
+        }
+      } else {
+        form.dispatchEvent(new CustomEvent("gen-automation:refresh-batch-plan"));
+      }
       const invalidControl = firstInvalidPresetControl();
       if (invalidControl) {
-        let disclosure = invalidControl.closest("details");
-        while (disclosure) {
-          disclosure.open = true;
-          disclosure = disclosure.parentElement?.closest("details") || null;
-        }
-        invalidControl.focus();
-        invalidControl.reportValidity();
+        revealInvalidPresetControl(invalidControl);
         setStatus(`${preset.name} loaded, but one or more saved values need correction.`, "warning");
         return;
       }
@@ -2019,14 +2203,30 @@
         );
         return;
       }
-      setStatus(`${preset.name} loaded.`, "success");
+      if (!savedBatchPlan) {
+        setStatus(
+          hasBatchBuilder
+            ? "Older settings-only preset loaded; the current queue was left unchanged. Save it again to include every batch."
+            : `${preset.name} settings loaded. This older preset has no saved batch queue.`,
+          "warning",
+        );
+        return;
+      }
+      const batchSummary = summarizeAutomationBatchPlan(savedBatchPlan);
+      setStatus(
+        queueReplaced
+          ? `“${preset.name}” loaded · ${batchSummary.batchCount} batch${batchSummary.batchCount === 1 ? "" : "es"} · ${batchSummary.imageCount.toLocaleString()} images. Queue replaced.`
+          : `“${preset.name}” settings loaded. Its ${batchSummary.batchCount} saved batches will load on New set.`,
+        "success",
+      );
     });
     deleteButton.addEventListener("click", () => {
       const preset = presets.find((item) => item.id === select.value);
       if (!preset) return;
-      presets = presets.filter((item) => item.id !== preset.id);
+      const nextPresets = presets.filter((item) => item.id !== preset.id);
       try {
-        writeStoredAutomationPresets(presets);
+        writeStoredAutomationPresets(nextPresets);
+        presets = nextPresets;
         nameInput.value = "";
         render();
         setStatus(`${preset.name} deleted.`);
@@ -2041,14 +2241,14 @@
           return;
         }
         const blob = new Blob([JSON.stringify({
-          schema_version: 1,
+          schema_version: 2,
           exported_at: new Date().toISOString(),
           presets,
         }, null, 2)], { type: "application/json" });
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
         link.href = url;
-        link.download = "generation-settings-presets.json";
+        link.download = "automation-presets.json";
         link.hidden = true;
         document.body.append(link);
         link.click();
@@ -2067,22 +2267,34 @@
           const payload = JSON.parse(await file.text());
           const requested = Array.isArray(payload) ? payload : payload?.presets;
           if (!Array.isArray(requested)) throw new Error("invalid preset export");
-          const imported = requested.filter((item) => (
-            item && typeof item === "object"
-            && typeof item.id === "string"
-            && typeof item.name === "string"
-            && item.profile && typeof item.profile === "object"
-          )).slice(0, 30);
+          const imported = requested.flatMap((item) => {
+            if (!(item && typeof item === "object")
+                || typeof item.id !== "string"
+                || typeof item.name !== "string"
+                || !item.profile || typeof item.profile !== "object") return [];
+            if (!Object.prototype.hasOwnProperty.call(item, "batch_plan")) return [item];
+            const batchPlan = normalizeAutomationPresetBatchPlan(item.batch_plan);
+            if (!batchPlan) return [];
+            const batchSummary = summarizeAutomationBatchPlan(batchPlan);
+            return [{
+              ...item,
+              schema_version: 2,
+              batch_plan: batchPlan,
+              batch_count: batchSummary.batchCount,
+              image_count: batchSummary.imageCount,
+            }];
+          }).slice(0, 30);
           if (imported.length === 0) throw new Error("empty preset export");
           const importedIds = new Set(imported.map((item) => item.id));
           const importedNames = new Set(imported.map((item) => item.name.toLowerCase()));
-          presets = [
+          const nextPresets = [
             ...imported,
             ...presets.filter(
               (item) => !importedIds.has(item.id) && !importedNames.has(item.name.toLowerCase()),
             ),
           ].slice(0, 30);
-          writeStoredAutomationPresets(presets);
+          writeStoredAutomationPresets(nextPresets);
+          presets = nextPresets;
           render(imported[0].id);
           setStatus(`${imported.length} preset${imported.length === 1 ? "" : "s"} imported.`, "success");
         } catch (_error) {

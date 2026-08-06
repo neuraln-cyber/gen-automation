@@ -99,12 +99,12 @@
           </div>
           <section class="settings-preset-bar" data-automation-presets aria-labelledby="settings-presets-heading">
             <div class="settings-preset-copy">
-              <strong id="settings-presets-heading">Preset</strong>
-              <span>Saved on this device</span>
+              <strong id="settings-presets-heading">Set presets</strong>
+              <span>Generation setup + every named batch and prompt &middot; Saved on this device</span>
             </div>
             <label class="settings-preset-select">
-              <span class="visually-hidden">Saved settings preset</span>
-              <select data-automation-preset-select aria-label="Saved settings preset">
+              <span class="visually-hidden">Saved set preset</span>
+              <select data-automation-preset-select aria-label="Saved set preset">
                 <option value="">No saved presets</option>
               </select>
             </label>
@@ -114,16 +114,16 @@
               <div class="settings-preset-manage-body">
                 <label class="settings-preset-name">
                   <span class="visually-hidden">New preset name</span>
-                  <input type="text" maxlength="80" placeholder="Preset name" data-automation-preset-name>
+                  <input type="text" maxlength="80" placeholder="Preset name" aria-label="Preset name" data-automation-preset-name>
                 </label>
-                <button class="secondary-button" type="button" data-automation-preset-save>Save current</button>
+                <button class="secondary-button" type="button" data-automation-preset-save>Save preset</button>
                 <button class="secondary-button" type="button" data-automation-preset-export>Export</button>
                 <button class="secondary-button" type="button" data-automation-preset-import>Import</button>
                 <input type="file" accept="application/json,.json" data-automation-preset-import-file hidden>
                 <button class="text-button danger" type="button" data-automation-preset-delete disabled>Delete</button>
               </div>
             </details>
-            <output class="settings-preset-status" data-automation-preset-status aria-live="polite"></output>
+            <output class="settings-preset-status" data-automation-preset-status aria-live="polite" aria-atomic="true"></output>
           </section>
           <section class="composition-builder" data-composition-builder>
             <div class="composition-heading">

@@ -60,6 +60,8 @@ def test_generation_form_has_named_device_local_settings_presets() -> None:
     )
 
     assert "data-automation-presets" in template
+    assert "Set presets" in template
+    assert "every named batch and prompt" in template
     assert "Saved on this device" in template
     assert "data-automation-preset-save" in template
     assert "data-automation-preset-load" in template
@@ -96,6 +98,64 @@ def test_generation_form_has_named_device_local_settings_presets() -> None:
     assert '"desired_accepted_count"' not in preset_fields
     assert "scopedStorageKey" in script
     assert "draft.submission_id !== submittedDraftId" in script
+
+
+def test_generation_presets_capture_and_restore_complete_ordered_batch_queues() -> None:
+    template = (
+        ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "new_set.html"
+    ).read_text(encoding="utf-8")
+    script = (ROOT / "src" / "gen_automation" / "static" / "dashboard.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Save preset" in template
+    assert 'aria-atomic="true"' in template
+    assert "normalizeAutomationPresetBatchPlan" in script
+    assert "collectAutomationPresetBatchPlan" in script
+    assert "summarizeAutomationBatchPlan" in script
+    assert "JSON.stringify(requested).length > 400_000" in script
+    assert "const maximumSeed = 9223372036854775807n" in script
+    for field in (
+        "name",
+        "image_count",
+        "prompt",
+        "negative_prompt",
+        "detailer_prompt",
+        "detailer_negative_prompt",
+        "seed",
+    ):
+        assert field in script
+
+    save_handler = script.split('saveButton.addEventListener("click"', maxsplit=1)[1].split(
+        'loadButton.addEventListener("click"', maxsplit=1
+    )[0]
+    assert "const currentBatchPlan = collectAutomationPresetBatchPlan(form)" in save_handler
+    assert "batch_plan: batchPlan" in save_handler
+    assert "batch_count: batchSummary.batchCount" in save_handler
+    assert "image_count: batchSummary.imageCount" in save_handler
+    assert "currentBatchPlan || preservedBatchPlan" in save_handler
+
+    load_handler = script.split('loadButton.addEventListener("click"', maxsplit=1)[1].split(
+        'deleteButton.addEventListener("click"', maxsplit=1
+    )[0]
+    assert load_handler.index("applyAutomationProfile") < load_handler.index(
+        "gen-automation:replace-batch-plan"
+    )
+    assert "if (savedBatchPlan)" in load_handler
+    assert 'new CustomEvent("gen-automation:refresh-batch-plan")' in load_handler
+    assert "Older settings-only preset loaded" in load_handler
+    assert "Queue replaced" in load_handler
+
+    assert 'negative_prompt: field(row, "negative_prompt").value' in script
+    assert '(fieldName !== "negative_prompt" && value === "")' in script
+    assert 'form.addEventListener("gen-automation:replace-batch-plan"' in script
+    assert "event.detail.replaced = replaceBatchPlan(event.detail.batch_plan)" in script
+    assert 'form.addEventListener("gen-automation:refresh-batch-plan", updateBuilder)' in script
+    assert 'if (form.dataset.applyingAutomationProfile === "true") return' in script
+    assert "const addBatch = (batch, before = null, deferUpdate = false)" in script
+    assert "addBatch(batch, null, true)" in script
+    assert 'link.download = "automation-presets.json"' in script
+    assert "schema_version: 2" in script
 
 
 def test_generation_form_uses_one_responsive_progressive_builder() -> None:
