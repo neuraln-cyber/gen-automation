@@ -592,7 +592,7 @@ def test_release_auto_bootstrap_is_bounded_idempotent_and_renders_unified_review
     assert created.headers["location"] == f"/dashboard/releases/{release_id}"
     assert replay.headers["location"] == created.headers["location"]
     assert canonical.status_code == 200
-    assert 'data-review-workspace' in canonical.text
+    assert "data-review-workspace" in canonical.text
     assert 'data-review-task-id="' in canonical.text
     assert "everything starts kept" in canonical.text
     assert "Start ranked review" not in canonical.text
