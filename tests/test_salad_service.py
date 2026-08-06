@@ -48,6 +48,8 @@ from gen_automation.integrations.salad.models import (
 from gen_automation.services.budgets import ensure_budget_guard, reserve_attempt_budget
 from gen_automation.services.outbox import SALAD_JOB_SUBMIT_TOPIC
 from gen_automation.services.salad import (
+    DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE,
+    DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE,
     OPERATOR_STOP_CANCEL_REQUESTED_ERROR_CODE,
     SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE,
     SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE,
@@ -1672,6 +1674,276 @@ async def test_attempt_watchdog_leaves_active_attempt_before_deadline(
 
     assert result.observation.attempt_state == GenerationAttemptState.RUNNING
     assert not client.cancel_calls
+
+
+@pytest.mark.asyncio
+async def test_superseded_deployment_cancels_then_retries_on_current_deployment(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        old_deployment = await session.get(SaladDeployment, context.deployment_id)
+        job = await session.get(GenerationJob, context.job_id)
+        assert old_deployment is not None
+        assert job is not None
+        version = await session.get(ReleaseVersion, job.release_version_id)
+        assert version is not None
+        retained_asset = Asset(
+            release_id=version.release_id,
+            generation_job_id=job.id,
+            output_index=0,
+            kind=AssetKind.RAW_MASTER,
+            state=AssetState.AVAILABLE,
+            storage_backend="memory",
+            storage_bucket="test-assets",
+            object_key=f"masters/{job.id}/0.png",
+            object_version_id="retained-version",
+            sha256="9" * 64,
+            content_type="image/png",
+            image_format="png",
+            width=1024,
+            height=1024,
+            byte_size=4096,
+            asset_metadata={"source": "progressive-upload"},
+            available_at=NOW + timedelta(seconds=1),
+        )
+        session.add(retained_asset)
+        old_deployment.is_current = False
+        old_deployment.desired_state = DesiredDeploymentState.STOPPED
+        old_deployment.state = SaladDeploymentState.STOPPED
+        old_deployment.stopped_at = NOW + timedelta(seconds=2)
+        current_deployment = SaladDeployment(
+            version_no=2,
+            config_sha256="c" * 64,
+            worker_image_digest=IMAGE_DIGEST,
+            organization_name="creator-org",
+            project_name="production",
+            queue_name="generation-v2",
+            provider_queue_id="provider-queue-v2",
+            container_group_name="worker-v2",
+            provider_container_group_id="provider-group-v2",
+            state=SaladDeploymentState.ACTIVE,
+            desired_state=DesiredDeploymentState.ACTIVE,
+            is_current=True,
+            min_replicas=0,
+            max_replicas=1,
+            desired_queue_length=1,
+            max_hourly_cost_microusd=2_000_000,
+            lock_version=1,
+        )
+        session.add(current_deployment)
+        await session.commit()
+        retained_asset_id = retained_asset.id
+        retained_object_key = retained_asset.object_key
+        current_deployment_id = current_deployment.id
+
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+        pending = remote_job(
+            status=SaladJobStatus.PENDING,
+            metadata=metadata,
+            update_time=NOW + timedelta(minutes=1),
+        )
+        deferred_client = FakeSaladClient(
+            get_result=pending,
+            cancel_error=SaladTransportError("connection reset"),
+        )
+        deferred = await reconcile_generation_attempt(
+            session,
+            deferred_client,
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=2),
+        )
+        cancelling_attempt = await session.get(GenerationAttempt, attempt_id)
+        blocked_job = await session.get(GenerationJob, context.job_id)
+
+        assert deferred_client.cancel_calls == [("generation-v1", str(REMOTE_JOB_ID))]
+        assert deferred.error_code == "salad_deployment_rollover_cancel_unavailable"
+        assert cancelling_attempt is not None
+        assert cancelling_attempt.state == GenerationAttemptState.CANCEL_REQUESTED
+        assert (
+            cancelling_attempt.error_code
+            == DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE
+        )
+        assert cancelling_attempt.response_metadata is not None
+        assert cancelling_attempt.response_metadata["deployment_rollover_cancel_requested"] is True
+        assert cancelling_attempt.reservation_released_at is None
+        assert blocked_job is not None
+        assert blocked_job.state == GenerationState.RUNNING
+
+        cancel_client = FakeSaladClient(get_result=pending)
+        cancel_requested = await reconcile_generation_attempt(
+            session,
+            cancel_client,
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=3),
+        )
+        assert cancel_client.cancel_calls == [("generation-v1", str(REMOTE_JOB_ID))]
+        assert cancel_requested.error_code == DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE
+
+        confirmed = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(
+                get_result=remote_job(
+                    status=SaladJobStatus.CANCELLED,
+                    metadata=metadata,
+                    update_time=NOW + timedelta(minutes=4),
+                )
+            ),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=5),
+        )
+        retrying_job = await session.get(GenerationJob, context.job_id)
+        final_old_attempt = await session.get(GenerationAttempt, attempt_id)
+        unchanged_asset = await session.get(Asset, retained_asset_id)
+
+        assert confirmed.observation.attempt_state == GenerationAttemptState.FAILED
+        assert confirmed.observation.generation_job_state == GenerationState.RETRY_WAIT
+        assert final_old_attempt is not None
+        assert final_old_attempt.error_code == DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE
+        assert final_old_attempt.reservation_released_at is not None
+        assert retrying_job is not None
+        assert retrying_job.state == GenerationState.RETRY_WAIT
+        assert retrying_job.last_error_code == DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE
+        assert unchanged_asset is not None
+        assert unchanged_asset.state == AssetState.AVAILABLE
+        assert unchanged_asset.object_key == retained_object_key
+        assert unchanged_asset.object_version_id == "retained-version"
+
+        replacement = await prepare_generation_attempt(
+            session,
+            generation_job_id=context.job_id,
+            salad_deployment_id=current_deployment_id,
+            idempotency_key="scheduler-claim-2",
+            now=NOW + timedelta(minutes=6),
+        )
+        replacement_attempt = await session.get(
+            GenerationAttempt,
+            replacement.generation_attempt_id,
+        )
+
+    assert replacement_attempt is not None
+    assert replacement_attempt.salad_deployment_id == current_deployment_id
+    assert replacement_attempt.attempt_no == 2
+
+
+@pytest.mark.asyncio
+async def test_superseded_unknown_attempt_retries_only_after_confirmed_provider_absence(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(create_error=SaladTimeoutError("ambiguous provider post")),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        deployment = await session.get(SaladDeployment, context.deployment_id)
+        assert deployment is not None
+        deployment.is_current = False
+        deployment.desired_state = DesiredDeploymentState.STOPPED
+        deployment.state = SaladDeploymentState.STOPPED
+        deployment.stopped_at = NOW + timedelta(seconds=1)
+        await session.commit()
+
+        for minute in (1, 2):
+            pending = await reconcile_generation_attempt(
+                session,
+                FakeSaladClient(list_pages={1: ()}),
+                generation_attempt_id=attempt_id,
+                list_page_size=10,
+                now=NOW + timedelta(minutes=minute),
+            )
+            attempt = await session.get(GenerationAttempt, attempt_id)
+            job = await session.get(GenerationJob, context.job_id)
+            assert pending.error_code == (
+                "salad_deployment_rollover_provider_absence_pending"
+            )
+            assert attempt is not None
+            assert attempt.state == GenerationAttemptState.UNKNOWN
+            assert attempt.reservation_released_at is None
+            assert job is not None
+            assert job.state == GenerationState.UNKNOWN
+
+        unavailable = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(list_error=SaladTransportError("temporary outage")),
+            generation_attempt_id=attempt_id,
+            list_page_size=10,
+            now=NOW + timedelta(minutes=3),
+        )
+        assert unavailable.error_code == "salad_reconciliation_unavailable"
+
+        after_reset = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(list_pages={1: ()}),
+            generation_attempt_id=attempt_id,
+            list_page_size=10,
+            now=NOW + timedelta(minutes=4),
+        )
+        after_reset_attempt = await session.get(GenerationAttempt, attempt_id)
+        assert after_reset.error_code == (
+            "salad_deployment_rollover_provider_absence_pending"
+        )
+        assert after_reset_attempt is not None
+        assert after_reset_attempt.response_metadata is not None
+        tracker = after_reset_attempt.response_metadata[
+            "deployment_rollover_absence_confirmation"
+        ]
+        assert isinstance(tracker, dict)
+        assert tracker["count"] == 1
+        assert after_reset_attempt.reservation_released_at is None
+
+        for minute in (5,):
+            pending = await reconcile_generation_attempt(
+                session,
+                FakeSaladClient(list_pages={1: ()}),
+                generation_attempt_id=attempt_id,
+                list_page_size=10,
+                now=NOW + timedelta(minutes=minute),
+            )
+            assert pending.error_code == (
+                "salad_deployment_rollover_provider_absence_pending"
+            )
+
+        confirmed = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(list_pages={1: ()}),
+            generation_attempt_id=attempt_id,
+            list_page_size=10,
+            now=NOW + timedelta(minutes=6),
+        )
+        final_attempt = await session.get(GenerationAttempt, attempt_id)
+        retrying_job = await session.get(GenerationJob, context.job_id)
+
+    assert confirmed.error_code == "salad_deployment_rollover_provider_absent"
+    assert confirmed.observation.attempt_state == GenerationAttemptState.FAILED
+    assert confirmed.observation.generation_job_state == GenerationState.RETRY_WAIT
+    assert final_attempt is not None
+    assert final_attempt.reservation_released_at is not None
+    assert retrying_job is not None
+    assert retrying_job.state == GenerationState.RETRY_WAIT
 
 
 @pytest.mark.asyncio

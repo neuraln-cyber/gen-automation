@@ -1047,6 +1047,10 @@ class ControllerWorkloads:
                     select(GenerationAttempt)
                     .join(GenerationJob, GenerationJob.id == GenerationAttempt.job_id)
                     .join(
+                        SaladDeployment,
+                        SaladDeployment.id == GenerationAttempt.salad_deployment_id,
+                    )
+                    .join(
                         ReleaseVersion,
                         ReleaseVersion.id == GenerationJob.release_version_id,
                     )
@@ -1057,6 +1061,10 @@ class ControllerWorkloads:
                     )
                     .order_by(
                         stop_requested.desc(),
+                        and_(
+                            SaladDeployment.is_current.is_(False),
+                            SaladDeployment.desired_state == DesiredDeploymentState.STOPPED,
+                        ).desc(),
                         GenerationAttempt.last_observed_at,
                         GenerationAttempt.created_at,
                         GenerationAttempt.id,

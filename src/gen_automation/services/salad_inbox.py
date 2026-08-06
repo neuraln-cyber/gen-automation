@@ -12,6 +12,7 @@ from gen_automation.db.models import (
     GenerationAttempt,
     GenerationJob,
     ProviderBudgetGuard,
+    ReleaseVersion,
     WebhookReceipt,
 )
 from gen_automation.domain.enums import (
@@ -21,7 +22,11 @@ from gen_automation.domain.enums import (
 )
 from gen_automation.integrations.salad.models import SaladJobStatus
 from gen_automation.services.budgets import release_attempt_reservation
+from gen_automation.services.generation_control import GENERATION_STOP_REQUESTED_ACTION
 from gen_automation.services.salad import (
+    DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE,
+    DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_METADATA_KEY,
+    DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE,
     SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE,
     SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE,
 )
@@ -684,6 +689,18 @@ async def _apply_provider_state(
         previous_attempt_state == GenerationAttemptState.CANCEL_REQUESTED
         and attempt.error_code == SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
     )
+    deployment_rollover_cancel_requested = (
+        (
+            previous_attempt_state == GenerationAttemptState.CANCEL_REQUESTED
+            and attempt.error_code == DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE
+        )
+        or (
+            (attempt.response_metadata or {}).get(
+                DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_METADATA_KEY
+            )
+            is True
+        )
+    ) and not await _operator_generation_stop_requested(session, job=job)
     attempt_changed = attempt.provider_state != status.value or (
         attempt.last_observed_at is None or _as_utc(attempt.last_observed_at) != observed_at
     )
@@ -759,25 +776,34 @@ async def _apply_provider_state(
             )
             or attempt_changed
         )
-    elif watchdog_cancel_requested:
+    elif watchdog_cancel_requested or deployment_rollover_cancel_requested:
+        retry_error_code = (
+            SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE
+            if watchdog_cancel_requested
+            else DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE
+        )
+        retry_error_detail = (
+            "The Salad attempt exceeded its runtime envelope and was cancelled for retry."
+            if watchdog_cancel_requested
+            else (
+                "The Salad deployment was superseded; the cancelled job will retry on the "
+                "current deployment."
+            )
+        )
         attempt_changed = attempt_changed or (attempt.state != GenerationAttemptState.FAILED)
         attempt.state = GenerationAttemptState.FAILED
         attempt.completed_at = observed_at
         attempt.unknown_since = None
-        attempt.error_code = SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE
-        attempt.error_detail = (
-            "The Salad attempt exceeded its runtime envelope and was cancelled for retry."
-        )
+        attempt.error_code = retry_error_code
+        attempt.error_detail = retry_error_detail
         effective_attempt_count = max(job.attempt_count, attempt.attempt_no)
         if effective_attempt_count < job.max_attempts:
             _set_job_state(
                 job,
                 state=GenerationState.RETRY_WAIT,
                 retry_at=processed_at + timedelta(seconds=retry_delay_seconds),
-                error_code=SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE,
-                error_detail=(
-                    "The Salad attempt exceeded its runtime envelope and was cancelled for retry."
-                ),
+                error_code=retry_error_code,
+                error_detail=retry_error_detail,
             )
         else:
             _set_job_state(
@@ -826,6 +852,28 @@ async def _apply_provider_state(
             occurred_at=processed_at,
         )
     return attempt_changed
+
+
+async def _operator_generation_stop_requested(
+    session: AsyncSession,
+    *,
+    job: GenerationJob,
+) -> bool:
+    release_id = await session.scalar(
+        select(ReleaseVersion.release_id).where(ReleaseVersion.id == job.release_version_id)
+    )
+    if release_id is None:
+        return False
+    marker_id = await session.scalar(
+        select(AuditEvent.id)
+        .where(
+            AuditEvent.resource_type == "release",
+            AuditEvent.resource_id == release_id,
+            AuditEvent.action == GENERATION_STOP_REQUESTED_ACTION,
+        )
+        .limit(1)
+    )
+    return marker_id is not None
 
 
 async def process_salad_webhook_receipt(

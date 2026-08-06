@@ -29,6 +29,8 @@ from gen_automation.domain.enums import (
 )
 from gen_automation.services.budgets import ensure_budget_guard
 from gen_automation.services.salad import (
+    DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE,
+    DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE,
     SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE,
     SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE,
 )
@@ -508,6 +510,92 @@ async def test_watchdog_cancel_confirmation_retries_generation_job(
         assert job.last_error_code == SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE
         assert job.retry_at is not None
         assert job.retry_at.replace(tzinfo=UTC) == NOW + timedelta(seconds=91)
+
+
+async def test_deployment_rollover_cancel_confirmation_retries_generation_job(
+    database: Database,
+) -> None:
+    context = await _seed(
+        database,
+        provider_status="cancelled",
+        attempt_state=GenerationAttemptState.CANCEL_REQUESTED,
+        job_state=GenerationState.RUNNING,
+        reservation_microusd=100_000,
+    )
+    async with database.sessions() as session:
+        attempt = await session.get(GenerationAttempt, context.attempt_id)
+        assert attempt is not None
+        attempt.error_code = DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE
+        attempt.error_detail = "deployment rollover cancellation pending"
+        await session.commit()
+    await _claim_one(database)
+
+    async with database.sessions() as session:
+        result = await process_salad_webhook_receipt(
+            session,
+            receipt_id=context.receipt_id,
+            worker_id="inbox-worker",
+            retry_delay_seconds=90,
+            now=NOW + timedelta(seconds=1),
+        )
+
+    assert result.attempt_state == GenerationAttemptState.FAILED
+    assert result.job_state == GenerationState.RETRY_WAIT
+    async with database.sessions() as session:
+        attempt = await session.get(GenerationAttempt, context.attempt_id)
+        job = await session.get(GenerationJob, context.job_id)
+        assert attempt is not None
+        assert job is not None
+        assert attempt.error_code == DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE
+        assert attempt.reservation_released_at is not None
+        assert job.last_error_code == DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE
+        assert job.retry_at is not None
+        assert job.retry_at.replace(tzinfo=UTC) == NOW + timedelta(seconds=91)
+
+
+async def test_operator_stop_wins_over_deployment_rollover_retry(
+    database: Database,
+) -> None:
+    context = await _seed(
+        database,
+        provider_status="cancelled",
+        attempt_state=GenerationAttemptState.CANCEL_REQUESTED,
+        job_state=GenerationState.RUNNING,
+        reservation_microusd=100_000,
+    )
+    async with database.sessions() as session:
+        attempt = await session.get(GenerationAttempt, context.attempt_id)
+        job = await session.get(GenerationJob, context.job_id)
+        assert attempt is not None
+        assert job is not None
+        version = await session.get(ReleaseVersion, job.release_version_id)
+        assert version is not None
+        attempt.error_code = DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE
+        attempt.response_metadata = {"deployment_rollover_cancel_requested": True}
+        session.add(
+            AuditEvent(
+                actor="test-owner",
+                action="release.generation_stop_requested",
+                resource_type="release",
+                resource_id=version.release_id,
+                correlation_id=f"generation-stop:{version.release_id}",
+                detail={"assets_retained": True},
+                occurred_at=NOW,
+            )
+        )
+        await session.commit()
+    await _claim_one(database)
+
+    async with database.sessions() as session:
+        result = await process_salad_webhook_receipt(
+            session,
+            receipt_id=context.receipt_id,
+            worker_id="inbox-worker",
+            now=NOW + timedelta(seconds=1),
+        )
+
+    assert result.attempt_state == GenerationAttemptState.CANCELLED
+    assert result.job_state == GenerationState.CANCELLED
 
 
 async def test_stale_and_regressive_callbacks_cannot_move_state_backwards(
