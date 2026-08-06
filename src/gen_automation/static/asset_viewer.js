@@ -546,7 +546,7 @@
       if (completionInspectionHandoff) return Promise.resolve(false);
       if (inspectionRequestPromise) return inspectionRequestPromise;
       const config = inspectionConfiguration();
-      if (!config) return Promise.resolve(pendingInspectionIds.size === 0);
+      if (!config) return Promise.resolve(inspectionBacklogIds().size === 0);
 
       let batch = failedInspectionBatch;
       if (!batch) {

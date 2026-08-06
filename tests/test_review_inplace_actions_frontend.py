@@ -88,7 +88,7 @@ def test_review_page_has_replaceable_workspace_and_live_action_status() -> None:
     assert '[data-review-workspace][aria-busy="true"]' in styles
 
 
-def test_review_completion_hands_off_inspections_and_submits_immediately() -> None:
+def test_review_completion_hands_off_inspections_with_a_bounded_retryable_request() -> None:
     script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
     handler = script.split("function initializeReviewCompletionInspectionFlush()", 1)[1].split(
         "function initializeReviewActions()",
@@ -98,15 +98,21 @@ def test_review_completion_hands_off_inspections_and_submits_immediately() -> No
     assert 'form.matches("[data-review-complete-form]")' in handler
     assert "event.preventDefault()" in handler
     assert "captureCompletionInspectionIds(form)" in handler
-    assert "await " not in handler
     assert "REVIEW_INSPECTION_FLUSH_TIMEOUT_MS" not in script
     assert '"gen-automation:inspection-flush-progress"' not in handler
     assert 'submitter.textContent = "Finishing set..."' in handler
     assert "reviewActionStatusTimers" in script
     assert "false,\n          0," in handler
-    assert 'form.dataset.inspectionsCaptured = "true"' in handler
-    assert "window.queueMicrotask(() => form.requestSubmit())" in handler
-    assert "form.requestSubmit(submitter)" not in handler
+    assert 'form.dataset.completionSubmitting = "true"' in handler
+    assert "REVIEW_COMPLETION_TIMEOUT_MS = 25000" in script
+    assert "await fetch(action, options)" in handler
+    assert 'redirect: "follow"' in handler
+    assert "controller.abort()" in handler
+    assert 'error.name === "AbortError"' in handler
+    assert "Nothing was lost; click Finish again." in handler
+    assert "window.location.assign(destination.href)" in handler
+    assert "delete form.dataset.completionSubmitting" in handler
+    assert "form.requestSubmit" not in handler
     assert "inspectionFlushPending" not in handler
     request = script.split("const attachCompletionInspectionIds", 1)[1].split(
         "function initializeReviewCompletionInspectionFlush()",

@@ -2,12 +2,15 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
+import gen_automation.services.review as review_service
 from gen_automation.db.models import (
     AdminUser,
     Asset,
@@ -68,6 +71,12 @@ from gen_automation.services.semantic_review_reconciliation import (
 )
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
+
+
+class _DriverError(Exception):
+    def __init__(self, sqlstate: str) -> None:
+        super().__init__(sqlstate)
+        self.sqlstate = sqlstate
 
 
 @dataclass(frozen=True, slots=True)
@@ -837,6 +846,35 @@ async def test_inspected_default_accepts_become_positive_labels_on_completion(
                 )
             )
         )
+        feedback_count_before_reconciliation = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(SemanticAnatomyFeedback)
+                .where(SemanticAnatomyFeedback.feedback_by_user_id == review_context.owner_id)
+            )
+            or 0
+        )
+        completion_audit = await session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.action == "review.task_completed",
+                AuditEvent.resource_id == task.task_id,
+            )
+        )
+        assert completion_audit is not None
+        assert completion_audit.detail["semantic_learning_status"] == "deferred_to_reconciler"
+        assert completion_audit.detail["semantic_learning_inferred_good_count"] == 0
+        assert completion_audit.detail["semantic_learning_inferred_defect_count"] == 0
+        reconciled = await reconcile_one_completed_semantic_review(
+            session,
+            profile_sha256=profile.profile_sha256,
+            now=NOW + timedelta(minutes=6),
+        )
+        await session.commit()
+    assert inspected_asset_ids == set(review_context.ranked_asset_ids)
+    assert feedback_count_before_reconciliation == 0
+    assert reconciled.did_work
+
+    async with review_context.database.sessions() as session:
         feedback = list(
             (
                 await session.scalars(
@@ -846,9 +884,92 @@ async def test_inspected_default_accepts_become_positive_labels_on_completion(
                 )
             ).all()
         )
-    assert inspected_asset_ids == set(review_context.ranked_asset_ids)
     assert len(feedback) == 2
     assert all(item.ground_truth == SemanticGroundTruth.ANATOMY_GOOD for item in feedback)
+
+
+@pytest.mark.asyncio
+async def test_postgresql_review_transition_timeouts_are_transaction_local() -> None:
+    session = MagicMock()
+    session.execute = AsyncMock()
+    session.get_bind.return_value = SimpleNamespace(
+        dialect=SimpleNamespace(name="postgresql")
+    )
+
+    await review_service._configure_review_transition_timeouts(session)
+
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert statements == [
+        "SET LOCAL lock_timeout = '5s'",
+        "SET LOCAL statement_timeout = '20s'",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sqlstate", ["55P03", "57014"])
+async def test_review_transition_database_timeout_is_retryable_and_rolls_back(
+    review_context: ReviewContext,
+    monkeypatch: pytest.MonkeyPatch,
+    sqlstate: str,
+) -> None:
+    task = await _create_task(review_context)
+
+    async def time_out_after_starting_transaction(session: object, **_: object) -> None:
+        await session.scalar(  # type: ignore[attr-defined]
+            select(ReviewTask.id).where(ReviewTask.id == task.task_id)
+        )
+        raise OperationalError("SELECT review_tasks", {}, _DriverError(sqlstate))
+
+    monkeypatch.setattr(
+        review_service,
+        "_transition_review_task",
+        time_out_after_starting_transaction,
+    )
+    async with review_context.database.sessions() as session:
+        with pytest.raises(ReviewConflictError, match="please retry"):
+            await transition_review_task(
+                session,
+                review_task_id=task.task_id,
+                target_state=ReviewTaskState.COMPLETED,
+                changed_by_user_id=review_context.owner_id,
+                expected_lock_version=task.lock_version,
+                idempotency_key=f"timed-out-transition-{sqlstate}",
+            )
+        assert not session.in_transaction()
+        stored = await session.get(ReviewTask, task.task_id)
+        assert stored is not None
+        assert stored.state == ReviewTaskState.OPEN
+
+
+@pytest.mark.asyncio
+async def test_review_transition_unrelated_database_error_is_not_mapped(
+    review_context: ReviewContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = await _create_task(review_context)
+
+    async def fail_with_connection_error(session: object, **_: object) -> None:
+        await session.scalar(  # type: ignore[attr-defined]
+            select(ReviewTask.id).where(ReviewTask.id == task.task_id)
+        )
+        raise OperationalError("SELECT review_tasks", {}, _DriverError("08006"))
+
+    monkeypatch.setattr(
+        review_service,
+        "_transition_review_task",
+        fail_with_connection_error,
+    )
+    async with review_context.database.sessions() as session:
+        with pytest.raises(OperationalError):
+            await transition_review_task(
+                session,
+                review_task_id=task.task_id,
+                target_state=ReviewTaskState.COMPLETED,
+                changed_by_user_id=review_context.owner_id,
+                expected_lock_version=task.lock_version,
+                idempotency_key="unrelated-database-error",
+            )
+        await session.rollback()
 
 
 @pytest.mark.asyncio

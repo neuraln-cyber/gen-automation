@@ -144,6 +144,24 @@ async def test_open_anatomy_reject_corrected_before_completion_never_becomes_a_d
             now=_NOW + timedelta(minutes=4),
         )
 
+    assert refresh_calls == []
+
+    async with semantic_runtime_context.database.sessions() as session:
+        feedback_id = await session.scalar(
+            select(SemanticAnatomyFeedback.id).where(
+                SemanticAnatomyFeedback.asset_id == asset_id
+            )
+        )
+        assert feedback_id is None
+        reconciled = await reconcile_one_completed_semantic_review(
+            session,
+            profile_sha256=profile.profile_sha256,
+            now=_NOW + timedelta(minutes=5),
+        )
+        await session.commit()
+
+    assert reconciled.did_work
+    assert reconciled.review_task_id == task_id
     assert len(refresh_calls) == 1
 
     async with semantic_runtime_context.database.sessions() as session:

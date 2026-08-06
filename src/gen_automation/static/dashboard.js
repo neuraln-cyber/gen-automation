@@ -22,6 +22,7 @@
   const AUTOMATION_DRAFT_SUBMISSION_KEY = "gen-automation:automation-draft-submission:v1";
   const PENDING_IMAGE_PROFILE_KEY = "gen-automation:reuse-image-settings:v1";
   const SAME_PAGE_SCROLL_STORAGE_KEY = "gen-automation:same-page-scroll:v1";
+  const REVIEW_COMPLETION_TIMEOUT_MS = 25000;
   const REVIEW_ACTION_FORM_SELECTOR = [
     "form[data-review-decision-form]",
     "form[data-bulk-action-form]",
@@ -2956,17 +2957,18 @@
   };
 
   function initializeReviewCompletionInspectionFlush() {
-    document.addEventListener("submit", (event) => {
+    document.addEventListener("submit", async (event) => {
       const form = event.target;
       if (!(form instanceof HTMLFormElement) || !form.matches("[data-review-complete-form]")) {
         return;
       }
-      if (form.dataset.inspectionsCaptured === "true") return;
       event.preventDefault();
+      if (form.dataset.completionSubmitting === "true") return;
 
       const workspace = form.closest("[data-review-workspace]");
       const submitter = event.submitter instanceof HTMLButtonElement ? event.submitter : null;
-      form.dataset.inspectionsCaptured = "true";
+      const originalLabel = submitter?.textContent || "Finish set";
+      form.dataset.completionSubmitting = "true";
       if (submitter) {
         submitter.textContent = "Finishing set...";
         submitter.disabled = true;
@@ -2981,7 +2983,86 @@
         );
       }
       captureCompletionInspectionIds(form);
-      window.queueMicrotask(() => form.requestSubmit());
+
+      const body = new URLSearchParams();
+      new FormData(form).forEach((value, name) => {
+        if (typeof value === "string") body.append(name, value);
+      });
+      const configuredAction = new URL(
+        form.getAttribute("action") || window.location.href,
+        document.baseURI,
+      );
+      const action = new URL(
+        `${configuredAction.pathname}${configuredAction.search}`,
+        window.location.origin,
+      ).href;
+      const controller = typeof AbortController === "function" ? new AbortController() : null;
+      const timeoutId = controller ? window.setTimeout(
+        () => controller.abort(),
+        REVIEW_COMPLETION_TIMEOUT_MS,
+      ) : null;
+      let navigationStarted = false;
+
+      try {
+        const options = {
+          method: "POST",
+          credentials: "same-origin",
+          redirect: "follow",
+          headers: {
+            Accept: "text/html",
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "X-Requested-With": "fetch",
+          },
+          body,
+        };
+        if (controller) options.signal = controller.signal;
+        const response = await fetch(action, options);
+        const destination = new URL(response.url || action, window.location.href);
+        if (response.status === 401 || destination.pathname === "/login") {
+          persistSamePageScroll();
+          navigationStarted = true;
+          window.location.assign(destination.href);
+          return;
+        }
+        if (!response.ok) {
+          if (workspace instanceof HTMLElement) {
+            showReviewActionStatus(
+              workspace,
+              response.status === 409 || response.status === 503
+                ? "Finishing briefly conflicted with another save. Nothing was lost; click Finish again."
+                : "The set could not be finished. Nothing was lost; click Finish again.",
+              true,
+              0,
+            );
+          }
+          return;
+        }
+        persistSamePageScroll();
+        navigationStarted = true;
+        window.location.assign(destination.href);
+      } catch (error) {
+        const timedOut = error && typeof error === "object" && error.name === "AbortError";
+        if (workspace instanceof HTMLElement) {
+          showReviewActionStatus(
+            workspace,
+            timedOut
+              ? "Finishing took too long and was stopped safely. Nothing was lost; click Finish again."
+              : "The connection was interrupted while finishing. Nothing was lost; click Finish again.",
+            true,
+            0,
+          );
+        }
+      } finally {
+        if (timeoutId !== null) window.clearTimeout(timeoutId);
+        if (!navigationStarted && form.isConnected) {
+          delete form.dataset.completionSubmitting;
+          if (workspace instanceof HTMLElement) workspace.removeAttribute("aria-busy");
+          if (submitter?.isConnected) {
+            submitter.textContent = originalLabel;
+            submitter.disabled = false;
+          }
+        }
+      }
     });
   }
 

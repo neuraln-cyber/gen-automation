@@ -369,6 +369,7 @@ def test_fullscreen_inspections_are_batched_retried_and_flushed_without_renderin
     assert "requestOptions.signal = controller.signal" in flush
     assert "idempotencyKey: config.keyPrefix" in flush
     assert "let batch = failedInspectionBatch" in flush
+    assert "if (!config) return Promise.resolve(inspectionBacklogIds().size === 0)" in flush
     configuration = script.split("const inspectionConfiguration", 1)[1].split(
         "const setInspectionChip",
         1,

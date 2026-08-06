@@ -5,8 +5,8 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import and_, func, select, text, update
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
 
@@ -48,19 +48,16 @@ from gen_automation.services.ranking_manifest import (
     load_ranking_manifest_rows,
     validate_completed_ranking_manifest,
 )
-from gen_automation.services.semantic_feedback import SemanticFeedbackError
-from gen_automation.services.semantic_review_learning import (
-    ANATOMY_REASON_CODES,
-    SemanticReviewChoice,
-    SemanticReviewLearningResult,
-    learn_semantic_anatomy_from_final_review,
-)
+from gen_automation.services.semantic_review_learning import ANATOMY_REASON_CODES
 
 _REASON_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_.-]{0,99}")
 _MAX_NOTE_LENGTH = 4_000
 _MAX_IDEMPOTENCY_KEY_LENGTH = 200
 _MAX_BULK_ASSET_COUNT = 500
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_RETRYABLE_TRANSITION_SQLSTATES = frozenset({"55P03", "57014"})
+_REVIEW_TRANSITION_LOCK_TIMEOUT = "5s"
+_REVIEW_TRANSITION_STATEMENT_TIMEOUT = "20s"
 
 SEMANTIC_SEVERE_OVERRIDE_REASON_CODE = "semantic_severe_override"
 SEMANTIC_SEVERE_OVERRIDE_AUDIT_ACTION = "review.semantic_severe_overridden"
@@ -928,7 +925,71 @@ async def apply_bulk_review_action(
     return result
 
 
+async def _configure_review_transition_timeouts(session: AsyncSession) -> None:
+    """Bound lock and statement waits for the current PostgreSQL transaction."""
+
+    if session.get_bind().dialect.name != "postgresql":
+        return
+    await session.execute(
+        text(f"SET LOCAL lock_timeout = '{_REVIEW_TRANSITION_LOCK_TIMEOUT}'")
+    )
+    await session.execute(
+        text(f"SET LOCAL statement_timeout = '{_REVIEW_TRANSITION_STATEMENT_TIMEOUT}'")
+    )
+
+
+def _is_retryable_transition_database_timeout(error: DBAPIError) -> bool:
+    candidate: BaseException | None = error.orig
+    visited: set[int] = set()
+    while candidate is not None and id(candidate) not in visited:
+        visited.add(id(candidate))
+        sqlstate = getattr(candidate, "sqlstate", None) or getattr(candidate, "pgcode", None)
+        if isinstance(sqlstate, str):
+            return sqlstate.strip().upper() in _RETRYABLE_TRANSITION_SQLSTATES
+        candidate = candidate.__cause__ or candidate.__context__
+    return False
+
+
 async def transition_review_task(
+    session: AsyncSession,
+    *,
+    review_task_id: UUID,
+    target_state: ReviewTaskState,
+    changed_by_user_id: UUID,
+    expected_lock_version: int,
+    idempotency_key: str,
+    inspected_asset_ids: Sequence[UUID] = (),
+    semantic_profile_sha256: str | None = None,
+    semantic_severe_confidence_micros: int = 900_000,
+    semantic_enforcement_mode: SemanticEnforcementMode = SemanticEnforcementMode.ENFORCE,
+    now: datetime | None = None,
+) -> ReviewTransitionResult:
+    """Run a terminal transition with bounded PostgreSQL lock and query waits."""
+
+    try:
+        return await _transition_review_task(
+            session,
+            review_task_id=review_task_id,
+            target_state=target_state,
+            changed_by_user_id=changed_by_user_id,
+            expected_lock_version=expected_lock_version,
+            idempotency_key=idempotency_key,
+            inspected_asset_ids=inspected_asset_ids,
+            semantic_profile_sha256=semantic_profile_sha256,
+            semantic_severe_confidence_micros=semantic_severe_confidence_micros,
+            semantic_enforcement_mode=semantic_enforcement_mode,
+            now=now,
+        )
+    except DBAPIError as error:
+        if not _is_retryable_transition_database_timeout(error):
+            raise
+        await session.rollback()
+        raise ReviewConflictError(
+            "review transition timed out waiting for concurrent work; please retry"
+        ) from error
+
+
+async def _transition_review_task(
     session: AsyncSession,
     *,
     review_task_id: UUID,
@@ -973,6 +1034,7 @@ async def transition_review_task(
             "semantic_enforcement_mode": semantic_mode.value,
         }
     )
+    await _configure_review_transition_timeouts(session)
     await _require_active_reviewer(session, changed_by_user_id)
     replay = await _transition_idempotency_replay(
         session,
@@ -1027,8 +1089,6 @@ async def transition_review_task(
         raise ReviewConflictError("accepted severe anatomy requires an explicit owner override")
 
     approved_release_id: UUID | None = None
-    semantic_learning: SemanticReviewLearningResult | None = None
-    semantic_learning_error: str | None = None
     if normalized_target == ReviewTaskState.COMPLETED:
         approved_release_id = await _freeze_release_selections(
             session,
@@ -1038,43 +1098,6 @@ async def transition_review_task(
             actor_user_id=changed_by_user_id,
             correlation_id=normalized_key,
         )
-        if normalized_semantic_profile is not None:
-            try:
-                async with session.begin_nested():
-                    persisted_inspected_asset_ids = set(
-                        await session.scalars(
-                            select(ReviewAssetInspection.asset_id).where(
-                                ReviewAssetInspection.review_task_id == task.id,
-                                ReviewAssetInspection.inspected_by_user_id == changed_by_user_id,
-                            )
-                        )
-                    )
-                    semantic_learning = await learn_semantic_anatomy_from_final_review(
-                        session,
-                        scoring_run_id=task.scoring_run_id,
-                        profile_sha256=normalized_semantic_profile,
-                        owner_user_id=changed_by_user_id,
-                        choices=tuple(
-                            SemanticReviewChoice(
-                                asset_id=asset.asset_id,
-                                decision=asset.decision,
-                                reason_code=asset.reason_code,
-                                decided_by_user_id=asset.decided_by_user_id,
-                                semantic_severe_override_attested=(
-                                    asset.semantic_severe_override_attested
-                                ),
-                                inspected=asset.asset_id in persisted_inspected_asset_ids,
-                            )
-                            for asset in summary.assets
-                        ),
-                        baseline_threshold_micros=semantic_threshold,
-                        now=changed_at,
-                    )
-            except (IntegrityError, SemanticFeedbackError):
-                # Review completion is authoritative. A calibration race or an
-                # invalid learning snapshot must not strand an otherwise valid
-                # final set; the next explicit label/completion rebuilds it.
-                semantic_learning_error = "calibration_refresh_failed"
     values: dict[str, Any] = {
         "state": normalized_target,
         "lock_version": expected_version + 1,
@@ -1141,16 +1164,16 @@ async def transition_review_task(
         "semantic_terminal_count": summary.semantic_gate.terminal_count,
         "semantic_unavailable_count": summary.semantic_gate.unavailable_count,
         "semantic_severe_override_count": summary.semantic_gate.severe_override_count,
-        "semantic_learning_inferred_good_count": (
-            semantic_learning.inferred_good_count if semantic_learning else 0
+        "semantic_learning_status": (
+            "deferred_to_reconciler"
+            if normalized_target == ReviewTaskState.COMPLETED
+            and normalized_semantic_profile is not None
+            else "not_requested"
         ),
-        "semantic_learning_inferred_defect_count": (
-            semantic_learning.inferred_defect_count if semantic_learning else 0
-        ),
-        "semantic_learning_skipped_existing_count": (
-            semantic_learning.skipped_existing_count if semantic_learning else 0
-        ),
-        "semantic_learning_error": semantic_learning_error,
+        "semantic_learning_inferred_good_count": 0,
+        "semantic_learning_inferred_defect_count": 0,
+        "semantic_learning_skipped_existing_count": 0,
+        "semantic_learning_error": None,
         "task_lock_version": expected_version + 1,
     }
     if normalized_target == ReviewTaskState.COMPLETED:
