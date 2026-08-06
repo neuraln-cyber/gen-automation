@@ -19,6 +19,7 @@ from gen_automation.db.models import (
     GenerationJob,
     OutboxEvent,
     ProviderBudgetGuard,
+    ReleaseVersion,
     SaladDeployment,
 )
 from gen_automation.domain.canonical import canonical_sha256
@@ -48,6 +49,7 @@ from gen_automation.services.budgets import (
     release_attempt_reservation,
     reserve_attempt_budget,
 )
+from gen_automation.services.generation_control import GENERATION_STOP_REQUESTED_ACTION
 from gen_automation.services.outbox import (
     GENERATION_ATTEMPT_AGGREGATE,
     SALAD_JOB_SUBMIT_TOPIC,
@@ -60,6 +62,17 @@ _DEFINITIVE_REJECTION_STATUS_CODES = frozenset({400, 401, 403, 404, 422})
 SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE = "salad_attempt_watchdog_cancel_requested"
 SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE = "salad_attempt_watchdog_expired"
 _SALAD_ATTEMPT_WATCHDOG_CANCEL_UNAVAILABLE_ERROR_CODE = "salad_attempt_watchdog_cancel_unavailable"
+OPERATOR_STOP_CANCEL_REQUESTED_ERROR_CODE = "operator_generation_stop_cancel_requested"
+_OPERATOR_STOP_CANCEL_UNAVAILABLE_ERROR_CODE = "operator_generation_stop_cancel_unavailable"
+_OPERATOR_STOP_PROVIDER_ABSENT_ERROR_CODE = "operator_generation_stop_provider_absent"
+_OPERATOR_STOP_PROVIDER_ABSENCE_PENDING_ERROR_CODE = (
+    "operator_generation_stop_provider_absence_pending"
+)
+_OPERATOR_STOP_PROVIDER_SCAN_INCONCLUSIVE_ERROR_CODE = (
+    "operator_generation_stop_provider_scan_inconclusive"
+)
+_OPERATOR_STOP_ABSENCE_CONFIRMATIONS = 3
+_OPERATOR_STOP_ABSENCE_TRACKER_KEY = "operator_stop_absence_confirmation"
 _SECRET_KEY_MARKERS = frozenset(
     {
         "secret",
@@ -1161,6 +1174,7 @@ async def reconcile_generation_attempt(
         else:
             source = ReconciliationSource.LIST
             matches: dict[UUID, SaladQueueJob] = {}
+            scan_exhaustive = False
             for page_number in range(1, max_list_pages + 1):
                 page = await client.list_jobs(
                     deployment.queue_name,
@@ -1171,23 +1185,92 @@ async def reconcile_generation_attempt(
                     if _remote_metadata_matches(attempt, candidate):
                         matches[candidate.id] = candidate
                 if len(page.items) < list_page_size:
+                    scan_exhaustive = True
                     break
-            if len(matches) != 1:
-                error_code = (
-                    "salad_provider_job_not_found"
-                    if not matches
-                    else "salad_duplicate_provider_jobs"
-                )
+            if not matches:
                 attempt, job, _ = await _load_attempt_context(
                     session,
                     generation_attempt_id,
                     lock=True,
                 )
+                if await _operator_generation_stop_requested(session, job=job):
+                    if not scan_exhaustive:
+                        _reset_operator_stop_absence_tracking(
+                            session,
+                            attempt=attempt,
+                            reason="provider_list_scan_inconclusive",
+                            occurred_at=reconciled_at,
+                        )
+                        await _mark_outcome_unknown(
+                            session,
+                            attempt=attempt,
+                            job=job,
+                            error_code=_OPERATOR_STOP_PROVIDER_SCAN_INCONCLUSIVE_ERROR_CODE,
+                            occurred_at=reconciled_at,
+                        )
+                        await session.commit()
+                        return ReconciliationResult(
+                            observation=_observation_result(
+                                attempt,
+                                job,
+                                applied=False,
+                                stale=False,
+                            ),
+                            source=source,
+                            matched=False,
+                            error_code=_OPERATOR_STOP_PROVIDER_SCAN_INCONCLUSIVE_ERROR_CODE,
+                        )
+                    confirmations = await _record_operator_stop_absence_confirmation(
+                        session,
+                        attempt=attempt,
+                        source=source,
+                        occurred_at=reconciled_at,
+                    )
+                    if confirmations >= _OPERATOR_STOP_ABSENCE_CONFIRMATIONS:
+                        applied = await _mark_operator_stop_provider_absent(
+                            session,
+                            attempt=attempt,
+                            job=job,
+                            remote_job=None,
+                            absence_source=source,
+                            occurred_at=reconciled_at,
+                        )
+                        await session.commit()
+                        return ReconciliationResult(
+                            observation=_observation_result(
+                                attempt,
+                                job,
+                                applied=applied,
+                                stale=False,
+                            ),
+                            source=source,
+                            matched=False,
+                            error_code=_OPERATOR_STOP_PROVIDER_ABSENT_ERROR_CODE,
+                        )
+                    await _mark_outcome_unknown(
+                        session,
+                        attempt=attempt,
+                        job=job,
+                        error_code=_OPERATOR_STOP_PROVIDER_ABSENCE_PENDING_ERROR_CODE,
+                        occurred_at=reconciled_at,
+                    )
+                    await session.commit()
+                    return ReconciliationResult(
+                        observation=_observation_result(
+                            attempt,
+                            job,
+                            applied=False,
+                            stale=False,
+                        ),
+                        source=source,
+                        matched=False,
+                        error_code=_OPERATOR_STOP_PROVIDER_ABSENCE_PENDING_ERROR_CODE,
+                    )
                 await _mark_outcome_unknown(
                     session,
                     attempt=attempt,
                     job=job,
-                    error_code=error_code,
+                    error_code="salad_provider_job_not_found",
                     occurred_at=reconciled_at,
                 )
                 await session.commit()
@@ -1200,7 +1283,38 @@ async def reconcile_generation_attempt(
                     ),
                     source=source,
                     matched=False,
-                    error_code=error_code,
+                    error_code="salad_provider_job_not_found",
+                )
+            if len(matches) != 1:
+                attempt, job, _ = await _load_attempt_context(
+                    session,
+                    generation_attempt_id,
+                    lock=True,
+                )
+                _reset_operator_stop_absence_tracking(
+                    session,
+                    attempt=attempt,
+                    reason="duplicate_provider_match",
+                    occurred_at=reconciled_at,
+                )
+                await _mark_outcome_unknown(
+                    session,
+                    attempt=attempt,
+                    job=job,
+                    error_code="salad_duplicate_provider_jobs",
+                    occurred_at=reconciled_at,
+                )
+                await session.commit()
+                return ReconciliationResult(
+                    observation=_observation_result(
+                        attempt,
+                        job,
+                        applied=False,
+                        stale=False,
+                    ),
+                    source=source,
+                    matched=False,
+                    error_code="salad_duplicate_provider_jobs",
                 )
             remote_job = next(iter(matches.values()))
     except SaladAPIError as error:
@@ -1214,6 +1328,64 @@ async def reconcile_generation_attempt(
             generation_attempt_id,
             lock=True,
         )
+        if (
+            error.status_code == 404
+            and source == ReconciliationSource.GET
+            and await _operator_generation_stop_requested(session, job=job)
+        ):
+            confirmations = await _record_operator_stop_absence_confirmation(
+                session,
+                attempt=attempt,
+                source=source,
+                occurred_at=reconciled_at,
+            )
+            if confirmations >= _OPERATOR_STOP_ABSENCE_CONFIRMATIONS:
+                applied = await _mark_operator_stop_provider_absent(
+                    session,
+                    attempt=attempt,
+                    job=job,
+                    remote_job=None,
+                    absence_source=source,
+                    occurred_at=reconciled_at,
+                )
+                await session.commit()
+                return ReconciliationResult(
+                    observation=_observation_result(
+                        attempt,
+                        job,
+                        applied=applied,
+                        stale=False,
+                    ),
+                    source=source,
+                    matched=False,
+                    error_code=_OPERATOR_STOP_PROVIDER_ABSENT_ERROR_CODE,
+                )
+            await _mark_outcome_unknown(
+                session,
+                attempt=attempt,
+                job=job,
+                error_code=_OPERATOR_STOP_PROVIDER_ABSENCE_PENDING_ERROR_CODE,
+                occurred_at=reconciled_at,
+            )
+            await session.commit()
+            return ReconciliationResult(
+                observation=_observation_result(
+                    attempt,
+                    job,
+                    applied=False,
+                    stale=False,
+                ),
+                source=source,
+                matched=False,
+                error_code=_OPERATOR_STOP_PROVIDER_ABSENCE_PENDING_ERROR_CODE,
+            )
+        if await _operator_generation_stop_requested(session, job=job):
+            _reset_operator_stop_absence_tracking(
+                session,
+                attempt=attempt,
+                reason="provider_reconciliation_error",
+                occurred_at=reconciled_at,
+            )
         if error.status_code == 404:
             await _mark_outcome_unknown(
                 session,
@@ -1242,6 +1414,13 @@ async def reconcile_generation_attempt(
             generation_attempt_id,
             lock=True,
         )
+        if await _operator_generation_stop_requested(session, job=job):
+            _reset_operator_stop_absence_tracking(
+                session,
+                attempt=attempt,
+                reason="provider_reconciliation_unavailable",
+                occurred_at=reconciled_at,
+            )
         _note_reconciliation_error(
             session,
             attempt=attempt,
@@ -1254,6 +1433,91 @@ async def reconcile_generation_attempt(
             source=source,
             matched=False,
             error_code="salad_reconciliation_unavailable",
+        )
+
+    if remote_job.status in {
+        SaladJobStatus.PENDING,
+        SaladJobStatus.RUNNING,
+    } and await _operator_generation_stop_requested(session, job=job):
+        queue_name = deployment.queue_name
+        attempt, job, _ = await _load_attempt_context(
+            session,
+            generation_attempt_id,
+            lock=True,
+        )
+        _persist_operator_stop_remote_identity(
+            session,
+            attempt=attempt,
+            remote_job=remote_job,
+            occurred_at=reconciled_at,
+        )
+        await session.commit()
+        try:
+            await client.cancel_job(queue_name, remote_job.id)
+        except SaladAPIError as error:
+            attempt, job, _ = await _load_attempt_context(
+                session,
+                generation_attempt_id,
+                lock=True,
+            )
+            _note_operator_stop_cancel_error(
+                session,
+                attempt=attempt,
+                job=job,
+                status_code=error.status_code,
+                occurred_at=reconciled_at,
+            )
+            await session.commit()
+            return ReconciliationResult(
+                observation=_observation_result(attempt, job, applied=False, stale=False),
+                source=source,
+                matched=True,
+                error_code=_OPERATOR_STOP_CANCEL_UNAVAILABLE_ERROR_CODE,
+            )
+        except (SaladTransportError, SaladProtocolError):
+            attempt, job, _ = await _load_attempt_context(
+                session,
+                generation_attempt_id,
+                lock=True,
+            )
+            _note_operator_stop_cancel_error(
+                session,
+                attempt=attempt,
+                job=job,
+                status_code=None,
+                occurred_at=reconciled_at,
+            )
+            await session.commit()
+            return ReconciliationResult(
+                observation=_observation_result(attempt, job, applied=False, stale=False),
+                source=source,
+                matched=True,
+                error_code=_OPERATOR_STOP_CANCEL_UNAVAILABLE_ERROR_CODE,
+            )
+
+        attempt, job, _ = await _load_attempt_context(
+            session,
+            generation_attempt_id,
+            lock=True,
+        )
+        applied = _mark_operator_stop_cancel_requested(
+            session,
+            attempt=attempt,
+            job=job,
+            remote_job=remote_job,
+            occurred_at=reconciled_at,
+        )
+        await session.commit()
+        return ReconciliationResult(
+            observation=_observation_result(
+                attempt,
+                job,
+                applied=applied,
+                stale=False,
+            ),
+            source=source,
+            matched=True,
+            error_code=OPERATOR_STOP_CANCEL_REQUESTED_ERROR_CODE,
         )
 
     if _attempt_watchdog_is_due(
@@ -1380,6 +1644,28 @@ async def _load_attempt_context(
         raise SaladServiceNotFoundError("generation attempt was not found")
     attempt, job, deployment = row
     return attempt, job, deployment
+
+
+async def _operator_generation_stop_requested(
+    session: AsyncSession,
+    *,
+    job: GenerationJob,
+) -> bool:
+    return bool(
+        await session.scalar(
+            select(AuditEvent.id)
+            .join(
+                ReleaseVersion,
+                ReleaseVersion.release_id == AuditEvent.resource_id,
+            )
+            .where(
+                ReleaseVersion.id == job.release_version_id,
+                AuditEvent.resource_type == "release",
+                AuditEvent.action == GENERATION_STOP_REQUESTED_ACTION,
+            )
+            .limit(1)
+        )
+    )
 
 
 def _require_submittable_deployment(deployment: SaladDeployment) -> None:
@@ -1651,6 +1937,347 @@ def _note_reconciliation_error(
             action="generation_attempt.reconciliation_deferred",
             attempt=attempt,
             detail={"error_code": error_code},
+            occurred_at=occurred_at,
+        )
+    )
+
+
+def _mark_operator_stop_cancel_requested(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    remote_job: SaladQueueJob,
+    occurred_at: datetime,
+) -> bool:
+    if attempt.state in _TERMINAL_ATTEMPT_STATES:
+        return False
+
+    remote_id = str(remote_job.id)
+    if attempt.provider_external_id is not None and attempt.provider_external_id != remote_id:
+        raise SaladServiceConflictError("Salad stop cancellation found another provider job ID")
+
+    provider_update_time = _as_utc(remote_job.update_time)
+    previous_observed_at = (
+        _stored_as_utc(attempt.last_observed_at) if attempt.last_observed_at is not None else None
+    )
+    attempt_changed = (
+        attempt.provider_external_id != remote_id
+        or attempt.provider_state != remote_job.status.value
+        or attempt.state != GenerationAttemptState.CANCEL_REQUESTED
+        or attempt.error_code != OPERATOR_STOP_CANCEL_REQUESTED_ERROR_CODE
+        or previous_observed_at is None
+        or provider_update_time > previous_observed_at
+    )
+    job_changed = job.state not in _TERMINAL_JOB_STATES and (
+        job.state != GenerationState.CANCEL_REQUESTED
+        or job.retry_at is not None
+        or job.last_error_code != OPERATOR_STOP_CANCEL_REQUESTED_ERROR_CODE
+    )
+
+    attempt.provider_external_id = remote_id
+    attempt.provider_state = remote_job.status.value
+    attempt.submitted_at = attempt.submitted_at or _as_utc(remote_job.create_time)
+    if remote_job.status == SaladJobStatus.RUNNING:
+        attempt.started_at = attempt.started_at or provider_update_time
+    if previous_observed_at is None or provider_update_time > previous_observed_at:
+        attempt.last_observed_at = provider_update_time
+    attempt.response_metadata = {
+        "provider_status": remote_job.status.value,
+        "provider_create_time": _as_utc(remote_job.create_time).isoformat(),
+        "provider_update_time": provider_update_time.isoformat(),
+        "event_count": len(remote_job.events),
+        "operator_stop_cancel_requested": True,
+    }
+    attempt.state = GenerationAttemptState.CANCEL_REQUESTED
+    attempt.unknown_since = None
+    attempt.error_code = OPERATOR_STOP_CANCEL_REQUESTED_ERROR_CODE
+    attempt.error_detail = (
+        "The operator stopped this generation; provider cancellation was requested."
+    )
+
+    if job.state not in _TERMINAL_JOB_STATES:
+        job.state = GenerationState.CANCEL_REQUESTED
+        job.retry_at = None
+        job.last_error_code = OPERATOR_STOP_CANCEL_REQUESTED_ERROR_CODE
+        job.last_error_detail = (
+            "The operator stopped this generation; provider cancellation was requested."
+        )
+
+    if not attempt_changed and not job_changed:
+        return False
+
+    if attempt_changed:
+        attempt.lock_version += 1
+    if job_changed:
+        job.lock_version += 1
+    session.add(
+        _audit(
+            action="generation_attempt.operator_stop_cancel_requested",
+            attempt=attempt,
+            detail={
+                "provider_external_id": remote_id,
+                "provider_status": remote_job.status.value,
+                "reason_code": OPERATOR_STOP_CANCEL_REQUESTED_ERROR_CODE,
+                "assets_retained": True,
+            },
+            occurred_at=occurred_at,
+        )
+    )
+    return True
+
+
+def _persist_operator_stop_remote_identity(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    remote_job: SaladQueueJob,
+    occurred_at: datetime,
+) -> bool:
+    """Durably bind an ambiguous attempt to the exact provider job before DELETE."""
+
+    remote_id = str(remote_job.id)
+    if attempt.provider_external_id is not None and attempt.provider_external_id != remote_id:
+        raise SaladServiceConflictError("Salad stop cancellation found another provider job ID")
+
+    provider_update_time = _as_utc(remote_job.update_time)
+    previous_observed_at = (
+        _stored_as_utc(attempt.last_observed_at) if attempt.last_observed_at is not None else None
+    )
+    response_metadata = dict(attempt.response_metadata or {})
+    absence_tracking = response_metadata.pop(_OPERATOR_STOP_ABSENCE_TRACKER_KEY, None)
+    response_metadata.update(
+        {
+            "provider_status": remote_job.status.value,
+            "provider_create_time": _as_utc(remote_job.create_time).isoformat(),
+            "provider_update_time": provider_update_time.isoformat(),
+            "event_count": len(remote_job.events),
+            "operator_stop_provider_identity_persisted": True,
+        }
+    )
+    changed = (
+        attempt.provider_external_id != remote_id
+        or attempt.provider_state != remote_job.status.value
+        or previous_observed_at is None
+        or provider_update_time > previous_observed_at
+        or attempt.response_metadata != response_metadata
+    )
+
+    attempt.provider_external_id = remote_id
+    attempt.provider_state = remote_job.status.value
+    attempt.submitted_at = attempt.submitted_at or _as_utc(remote_job.create_time)
+    if remote_job.status == SaladJobStatus.RUNNING:
+        attempt.started_at = attempt.started_at or provider_update_time
+    if previous_observed_at is None or provider_update_time > previous_observed_at:
+        attempt.last_observed_at = provider_update_time
+    attempt.response_metadata = response_metadata
+
+    if not changed:
+        return False
+    attempt.lock_version += 1
+    session.add(
+        _audit(
+            action="generation_attempt.operator_stop_provider_identity_persisted",
+            attempt=attempt,
+            detail={
+                "provider_external_id": remote_id,
+                "provider_status": remote_job.status.value,
+                "absence_tracking_reset": absence_tracking is not None,
+            },
+            occurred_at=occurred_at,
+        )
+    )
+    return True
+
+
+async def _record_operator_stop_absence_confirmation(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    source: ReconciliationSource,
+    occurred_at: datetime,
+) -> int:
+    response_metadata = dict(attempt.response_metadata or {})
+    previous = response_metadata.get(_OPERATOR_STOP_ABSENCE_TRACKER_KEY)
+    previous_source = previous.get("source") if isinstance(previous, dict) else None
+    previous_count_value = previous.get("count") if isinstance(previous, dict) else None
+    previous_count = (
+        previous_count_value
+        if isinstance(previous_count_value, int) and not isinstance(previous_count_value, bool)
+        else 0
+    )
+    confirmation = previous_count + 1 if previous_source == source.value else 1
+    response_metadata[_OPERATOR_STOP_ABSENCE_TRACKER_KEY] = {
+        "source": source.value,
+        "count": confirmation,
+        "observed_at": occurred_at.isoformat(),
+        "required_confirmations": _OPERATOR_STOP_ABSENCE_CONFIRMATIONS,
+    }
+    attempt.response_metadata = response_metadata
+    attempt.lock_version += 1
+    session.add(
+        _audit(
+            action="generation_attempt.operator_stop_provider_absence_observed",
+            attempt=attempt,
+            detail={
+                "source": source.value,
+                "confirmation": confirmation,
+                "required_confirmations": _OPERATOR_STOP_ABSENCE_CONFIRMATIONS,
+            },
+            occurred_at=occurred_at,
+        )
+    )
+    await session.flush()
+    return confirmation
+
+
+def _reset_operator_stop_absence_tracking(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    reason: str,
+    occurred_at: datetime,
+) -> bool:
+    response_metadata = dict(attempt.response_metadata or {})
+    previous = response_metadata.pop(_OPERATOR_STOP_ABSENCE_TRACKER_KEY, None)
+    if previous is None:
+        return False
+    attempt.response_metadata = response_metadata
+    attempt.lock_version += 1
+    session.add(
+        _audit(
+            action="generation_attempt.operator_stop_provider_absence_reset",
+            attempt=attempt,
+            detail={"reason": reason, "previous": previous},
+            occurred_at=occurred_at,
+        )
+    )
+    return True
+
+
+async def _mark_operator_stop_provider_absent(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    remote_job: SaladQueueJob | None,
+    absence_source: ReconciliationSource,
+    occurred_at: datetime,
+) -> bool:
+    if attempt.state in _TERMINAL_ATTEMPT_STATES:
+        return False
+
+    remote_id = str(remote_job.id) if remote_job is not None else attempt.provider_external_id
+    if (
+        remote_job is not None
+        and attempt.provider_external_id is not None
+        and attempt.provider_external_id != remote_id
+    ):
+        raise SaladServiceConflictError("Salad stop cancellation found another provider job ID")
+
+    provider_update_time = (
+        _as_utc(remote_job.update_time) if remote_job is not None else occurred_at
+    )
+    if remote_id is not None:
+        attempt.provider_external_id = remote_id
+    attempt.provider_state = "absent_after_stop"
+    attempt.last_observed_at = provider_update_time
+    attempt.response_metadata = {
+        "provider_absence_source": absence_source.value,
+        "provider_absent_after_stop": True,
+        **(
+            {
+                "provider_status_before_cancel": remote_job.status.value,
+                "provider_create_time": _as_utc(remote_job.create_time).isoformat(),
+                "provider_update_time": provider_update_time.isoformat(),
+                "event_count": len(remote_job.events),
+            }
+            if remote_job is not None
+            else {}
+        ),
+    }
+    if remote_job is not None:
+        attempt.submitted_at = attempt.submitted_at or _as_utc(remote_job.create_time)
+    if remote_job is not None and remote_job.status == SaladJobStatus.RUNNING:
+        attempt.started_at = attempt.started_at or provider_update_time
+    attempt.state = (
+        GenerationAttemptState.CANCELLED
+        if attempt.provider_external_id is not None
+        else GenerationAttemptState.FAILED
+    )
+    attempt.completed_at = occurred_at
+    attempt.unknown_since = None
+    attempt.error_code = _OPERATOR_STOP_PROVIDER_ABSENT_ERROR_CODE
+    attempt.error_detail = (
+        "Salad confirmed that the stopped generation attempt has no provider job."
+    )
+    attempt.lock_version += 1
+
+    if job.state not in _TERMINAL_JOB_STATES:
+        job.state = GenerationState.CANCELLED
+        job.retry_at = None
+        job.last_error_code = _OPERATOR_STOP_PROVIDER_ABSENT_ERROR_CODE
+        job.last_error_detail = (
+            "Salad confirmed that the stopped generation attempt has no provider job."
+        )
+        job.lock_version += 1
+
+    session.add(
+        _audit(
+            action="generation_attempt.operator_stop_provider_absent",
+            attempt=attempt,
+            detail={
+                **({"provider_external_id": remote_id} if remote_id is not None else {}),
+                **(
+                    {"provider_status_before_cancel": remote_job.status.value}
+                    if remote_job is not None
+                    else {}
+                ),
+                "source": absence_source.value,
+                "reason_code": _OPERATOR_STOP_PROVIDER_ABSENT_ERROR_CODE,
+                "assets_retained": True,
+            },
+            occurred_at=occurred_at,
+        )
+    )
+    if attempt.cost_reservation_microusd > 0 and attempt.reservation_released_at is None:
+        await release_attempt_reservation(
+            session,
+            provider=_PROVIDER,
+            attempt_id=attempt.id,
+            now=occurred_at,
+        )
+    await session.flush()
+    return True
+
+
+def _note_operator_stop_cancel_error(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    status_code: int | None,
+    occurred_at: datetime,
+) -> None:
+    if attempt.state in _TERMINAL_ATTEMPT_STATES:
+        return
+    attempt.error_code = _OPERATOR_STOP_CANCEL_UNAVAILABLE_ERROR_CODE
+    attempt.error_detail = "Provider cancellation is temporarily unavailable and will be retried."
+    attempt.lock_version += 1
+    if job.state not in _TERMINAL_JOB_STATES:
+        job.last_error_code = _OPERATOR_STOP_CANCEL_UNAVAILABLE_ERROR_CODE
+        job.last_error_detail = (
+            "Provider cancellation is temporarily unavailable and will be retried."
+        )
+        job.lock_version += 1
+    session.add(
+        _audit(
+            action="generation_attempt.operator_stop_cancel_deferred",
+            attempt=attempt,
+            detail={
+                "error_code": _OPERATOR_STOP_CANCEL_UNAVAILABLE_ERROR_CODE,
+                **({"provider_status_code": status_code} if status_code is not None else {}),
+            },
             occurred_at=occurred_at,
         )
     )

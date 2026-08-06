@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.db.models import (
     Asset,
+    AuditEvent,
     GenerationAttempt,
     GenerationJob,
     OutboxEvent,
@@ -47,6 +48,7 @@ from gen_automation.integrations.salad.models import (
 from gen_automation.services.budgets import ensure_budget_guard, reserve_attempt_budget
 from gen_automation.services.outbox import SALAD_JOB_SUBMIT_TOPIC
 from gen_automation.services.salad import (
+    OPERATOR_STOP_CANCEL_REQUESTED_ERROR_CODE,
     SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE,
     SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE,
     MutationEffect,
@@ -274,6 +276,28 @@ async def prepared_attempt(
     )
     await session.commit()
     return prepared.generation_attempt_id
+
+
+async def mark_operator_stop(
+    session: AsyncSession,
+    context: SeededContext,
+) -> None:
+    job = await session.get(GenerationJob, context.job_id)
+    assert job is not None
+    version = await session.get(ReleaseVersion, job.release_version_id)
+    assert version is not None
+    session.add(
+        AuditEvent(
+            actor="test-owner",
+            action="release.generation_stop_requested",
+            resource_type="release",
+            resource_id=version.release_id,
+            correlation_id=f"generation-stop:{version.release_id}",
+            detail={"assets_retained": True},
+            occurred_at=NOW + timedelta(seconds=2),
+        )
+    )
+    await session.commit()
 
 
 async def expected_worker_outputs(
@@ -1024,6 +1048,509 @@ async def test_reconciliation_errors_never_trigger_a_submission_retry(
     assert result.observation.attempt_state == expected_state
     assert len(create_client.create_calls) == 1
     assert len(reconcile_client.get_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remote_status", [SaladJobStatus.PENDING, SaladJobStatus.RUNNING])
+async def test_operator_stop_cancels_active_provider_work_and_waits_for_confirmation(
+    database: Database,
+    remote_status: SaladJobStatus,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        await mark_operator_stop(session, context)
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+        active = remote_job(
+            status=remote_status,
+            metadata=metadata,
+            update_time=NOW + timedelta(minutes=1),
+        )
+        cancel_client = FakeSaladClient(get_result=active)
+
+        requested = await reconcile_generation_attempt(
+            session,
+            cancel_client,
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=2),
+        )
+        pending_attempt = await session.get(GenerationAttempt, attempt_id)
+        pending_job = await session.get(GenerationJob, context.job_id)
+        request_audit_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(AuditEvent)
+                .where(
+                    AuditEvent.resource_id == attempt_id,
+                    AuditEvent.action == "generation_attempt.operator_stop_cancel_requested",
+                )
+            )
+            or 0
+        )
+
+        assert requested.observation.attempt_state == GenerationAttemptState.CANCEL_REQUESTED
+        assert requested.observation.generation_job_state == GenerationState.CANCEL_REQUESTED
+        assert requested.error_code == OPERATOR_STOP_CANCEL_REQUESTED_ERROR_CODE
+        assert cancel_client.cancel_calls == [("generation-v1", str(REMOTE_JOB_ID))]
+        assert pending_attempt is not None
+        assert pending_attempt.error_code == OPERATOR_STOP_CANCEL_REQUESTED_ERROR_CODE
+        assert pending_attempt.reservation_released_at is None
+        assert pending_job is not None
+        assert pending_job.state == GenerationState.CANCEL_REQUESTED
+        assert request_audit_count == 1
+
+        cancelled = remote_job(
+            status=SaladJobStatus.CANCELLED,
+            metadata=metadata,
+            update_time=NOW + timedelta(minutes=3),
+        )
+        confirmed = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(get_result=cancelled),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=4),
+        )
+        final_attempt = await session.get(GenerationAttempt, attempt_id)
+        final_job = await session.get(GenerationJob, context.job_id)
+
+    assert confirmed.observation.attempt_state == GenerationAttemptState.CANCELLED
+    assert confirmed.observation.generation_job_state == GenerationState.CANCELLED
+    assert final_attempt is not None
+    assert final_attempt.reservation_released_at is not None
+    assert final_job is not None
+    assert final_job.state == GenerationState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_operator_stop_retries_transient_provider_cancellation(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        await mark_operator_stop(session, context)
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+        pending = remote_job(
+            status=SaladJobStatus.PENDING,
+            metadata=metadata,
+            update_time=NOW + timedelta(minutes=1),
+        )
+        unavailable = FakeSaladClient(
+            get_result=pending,
+            cancel_error=SaladTransportError("connection reset"),
+        )
+
+        deferred = await reconcile_generation_attempt(
+            session,
+            unavailable,
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=2),
+        )
+        deferred_attempt = await session.get(GenerationAttempt, attempt_id)
+        deferred_job = await session.get(GenerationJob, context.job_id)
+
+        assert deferred.error_code == "operator_generation_stop_cancel_unavailable"
+        assert unavailable.cancel_calls == [("generation-v1", str(REMOTE_JOB_ID))]
+        assert deferred_attempt is not None
+        assert deferred_attempt.state == GenerationAttemptState.SUBMITTED
+        assert deferred_attempt.reservation_released_at is None
+        assert deferred_job is not None
+        assert deferred_job.state == GenerationState.RUNNING
+
+        retry = FakeSaladClient(get_result=pending)
+        requested = await reconcile_generation_attempt(
+            session,
+            retry,
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=3),
+        )
+
+    assert requested.observation.attempt_state == GenerationAttemptState.CANCEL_REQUESTED
+    assert requested.observation.generation_job_state == GenerationState.CANCEL_REQUESTED
+    assert retry.cancel_calls == [("generation-v1", str(REMOTE_JOB_ID))]
+
+
+@pytest.mark.asyncio
+async def test_operator_stop_delete_not_found_keeps_exact_provider_attempt_pending(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        await mark_operator_stop(session, context)
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+        pending = remote_job(
+            status=SaladJobStatus.PENDING,
+            metadata=metadata,
+            update_time=NOW + timedelta(minutes=1),
+        )
+        client = FakeSaladClient(
+            get_result=pending,
+            cancel_error=SaladAPIError(
+                status_code=404,
+                message="not found",
+                response_body="",
+                request_id=None,
+            ),
+        )
+
+        result = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=2),
+        )
+        deferred_attempt = await session.get(GenerationAttempt, attempt_id)
+        deferred_job = await session.get(GenerationJob, context.job_id)
+
+    assert result.observation.attempt_state == GenerationAttemptState.SUBMITTED
+    assert result.observation.generation_job_state == GenerationState.RUNNING
+    assert result.error_code == "operator_generation_stop_cancel_unavailable"
+    assert deferred_attempt is not None
+    assert deferred_attempt.provider_external_id == str(REMOTE_JOB_ID)
+    assert deferred_attempt.provider_state == SaladJobStatus.PENDING.value
+    assert deferred_attempt.reservation_released_at is None
+    assert deferred_job is not None
+    assert deferred_job.state == GenerationState.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_operator_stop_get_not_found_requires_three_consecutive_confirmations(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        await mark_operator_stop(session, context)
+
+        not_found = SaladAPIError(
+            status_code=404,
+            message="not found",
+            response_body="",
+            request_id=None,
+        )
+        first = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(get_error=not_found),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=2),
+        )
+        first_attempt = await session.get(GenerationAttempt, attempt_id)
+        assert first_attempt is not None
+        assert first_attempt.reservation_released_at is None
+        assert first_attempt.response_metadata is not None
+        first_tracker = first_attempt.response_metadata["operator_stop_absence_confirmation"]
+        assert isinstance(first_tracker, dict)
+        assert first_tracker["source"] == ReconciliationSource.GET.value
+        assert first_tracker["count"] == 1
+
+        second = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(get_error=not_found),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=3),
+        )
+        third = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(get_error=not_found),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=4),
+        )
+        final_attempt = await session.get(GenerationAttempt, attempt_id)
+        final_job = await session.get(GenerationJob, context.job_id)
+
+    assert first.source == ReconciliationSource.GET
+    assert first.matched is False
+    assert first.observation.attempt_state == GenerationAttemptState.UNKNOWN
+    assert first.observation.generation_job_state == GenerationState.UNKNOWN
+    assert first.error_code == "operator_generation_stop_provider_absence_pending"
+    assert second.error_code == "operator_generation_stop_provider_absence_pending"
+    assert second.observation.attempt_state == GenerationAttemptState.UNKNOWN
+    assert third.observation.attempt_state == GenerationAttemptState.CANCELLED
+    assert third.observation.generation_job_state == GenerationState.CANCELLED
+    assert third.error_code == "operator_generation_stop_provider_absent"
+    assert final_attempt is not None
+    assert final_attempt.reservation_released_at is not None
+    assert final_job is not None
+    assert final_job.state == GenerationState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_operator_stop_list_absence_retires_after_three_confirmations(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(create_error=SaladTimeoutError("timeout")),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        await mark_operator_stop(session, context)
+
+        first = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(list_pages={1: ()}),
+            generation_attempt_id=attempt_id,
+            list_page_size=10,
+            now=NOW + timedelta(minutes=1),
+        )
+        second = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(list_pages={1: ()}),
+            generation_attempt_id=attempt_id,
+            list_page_size=10,
+            now=NOW + timedelta(minutes=2),
+        )
+        third = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(list_pages={1: ()}),
+            generation_attempt_id=attempt_id,
+            list_page_size=10,
+            now=NOW + timedelta(minutes=3),
+        )
+        final_attempt = await session.get(GenerationAttempt, attempt_id)
+        final_job = await session.get(GenerationJob, context.job_id)
+        confirmation_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(AuditEvent)
+                .where(
+                    AuditEvent.resource_id == attempt_id,
+                    AuditEvent.action
+                    == "generation_attempt.operator_stop_provider_absence_observed",
+                )
+            )
+            or 0
+        )
+
+    assert first.error_code == "operator_generation_stop_provider_absence_pending"
+    assert second.error_code == "operator_generation_stop_provider_absence_pending"
+    assert third.error_code == "operator_generation_stop_provider_absent"
+    assert third.observation.attempt_state == GenerationAttemptState.FAILED
+    assert third.observation.generation_job_state == GenerationState.CANCELLED
+    assert final_attempt is not None
+    assert final_attempt.reservation_released_at is not None
+    assert final_job is not None
+    assert final_job.state == GenerationState.CANCELLED
+    assert confirmation_count == 3
+
+
+@pytest.mark.asyncio
+async def test_operator_stop_full_list_pages_are_inconclusive_and_do_not_count_absence(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(create_error=SaladTimeoutError("timeout")),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        await mark_operator_stop(session, context)
+        unrelated_one = remote_job(
+            status=SaladJobStatus.PENDING,
+            metadata={"generation_attempt_id": "another-attempt"},
+            update_time=NOW + timedelta(minutes=1),
+            job_id=uuid4(),
+        )
+        unrelated_two = remote_job(
+            status=SaladJobStatus.PENDING,
+            metadata={"generation_attempt_id": "another-attempt"},
+            update_time=NOW + timedelta(minutes=1),
+            job_id=uuid4(),
+        )
+
+        inconclusive = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(list_pages={1: (unrelated_one,), 2: (unrelated_two,)}),
+            generation_attempt_id=attempt_id,
+            max_list_pages=2,
+            list_page_size=1,
+            now=NOW + timedelta(minutes=1),
+        )
+        after_inconclusive = await session.get(GenerationAttempt, attempt_id)
+        assert after_inconclusive is not None
+        assert after_inconclusive.response_metadata is None or (
+            "operator_stop_absence_confirmation" not in after_inconclusive.response_metadata
+        )
+
+        first_exhaustive_miss = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(list_pages={1: ()}),
+            generation_attempt_id=attempt_id,
+            list_page_size=1,
+            now=NOW + timedelta(minutes=2),
+        )
+        after_miss = await session.get(GenerationAttempt, attempt_id)
+        assert after_miss is not None
+        assert after_miss.response_metadata is not None
+        tracker = after_miss.response_metadata["operator_stop_absence_confirmation"]
+        assert isinstance(tracker, dict)
+
+    assert inconclusive.error_code == "operator_generation_stop_provider_scan_inconclusive"
+    assert inconclusive.observation.attempt_state == GenerationAttemptState.UNKNOWN
+    assert first_exhaustive_miss.error_code == ("operator_generation_stop_provider_absence_pending")
+    assert tracker["source"] == ReconciliationSource.LIST.value
+    assert tracker["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_operator_stop_positive_match_resets_prior_misses_before_get_absence(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(create_error=SaladTimeoutError("timeout")),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        await mark_operator_stop(session, context)
+
+        for minute in (1, 2):
+            miss = await reconcile_generation_attempt(
+                session,
+                FakeSaladClient(list_pages={1: ()}),
+                generation_attempt_id=attempt_id,
+                list_page_size=10,
+                now=NOW + timedelta(minutes=minute),
+            )
+            assert miss.error_code == "operator_generation_stop_provider_absence_pending"
+
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+        pending = remote_job(
+            status=SaladJobStatus.PENDING,
+            metadata=metadata,
+            update_time=NOW + timedelta(minutes=3),
+        )
+        match_then_transport_failure = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(
+                list_pages={1: (pending,)},
+                cancel_error=SaladTransportError("connection reset"),
+            ),
+            generation_attempt_id=attempt_id,
+            list_page_size=10,
+            now=NOW + timedelta(minutes=3),
+        )
+        after_match = await session.get(GenerationAttempt, attempt_id)
+        assert after_match is not None
+        assert after_match.provider_external_id == str(REMOTE_JOB_ID)
+        assert after_match.response_metadata is not None
+        assert "operator_stop_absence_confirmation" not in after_match.response_metadata
+        assert after_match.reservation_released_at is None
+
+        one_exact_get_miss = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(
+                get_error=SaladAPIError(
+                    status_code=404,
+                    message="not found",
+                    response_body="",
+                    request_id=None,
+                )
+            ),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=4),
+        )
+        after_get_miss = await session.get(GenerationAttempt, attempt_id)
+        final_job = await session.get(GenerationJob, context.job_id)
+
+    assert match_then_transport_failure.error_code == (
+        "operator_generation_stop_cancel_unavailable"
+    )
+    assert one_exact_get_miss.source == ReconciliationSource.GET
+    assert one_exact_get_miss.error_code == "operator_generation_stop_provider_absence_pending"
+    assert one_exact_get_miss.observation.attempt_state == GenerationAttemptState.UNKNOWN
+    assert after_get_miss is not None
+    assert after_get_miss.response_metadata is not None
+    get_tracker = after_get_miss.response_metadata["operator_stop_absence_confirmation"]
+    assert isinstance(get_tracker, dict)
+    assert get_tracker["source"] == ReconciliationSource.GET.value
+    assert get_tracker["count"] == 1
+    assert after_get_miss.reservation_released_at is None
+    assert final_job is not None
+    assert final_job.state == GenerationState.UNKNOWN
 
 
 @pytest.mark.asyncio

@@ -359,7 +359,7 @@ async def _quarantine_terminal_missing_stop_asset(
     asset.asset_metadata = metadata
     asset.verification_error_code = "stopped_generation_upload_absent"
     asset.verification_error_detail = (
-        "No staged object existed after the provider job became terminal during a safe stop."
+        "No staged object existed after the provider job became terminal during an operator stop."
     )
     asset.verification_lease_owner = None
     asset.verification_lease_expires_at = None

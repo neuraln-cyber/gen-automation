@@ -23,6 +23,7 @@ from gen_automation.db.models import (
     GenerationJob,
     ProviderBudgetGuard,
     Release,
+    ReleaseVersion,
     SaladDeployment,
 )
 from gen_automation.domain.enums import (
@@ -1035,13 +1036,27 @@ class ControllerWorkloads:
         async def operation() -> bool:
             async with self.sessions() as session:
                 await self._lock_budget_guard(session)
+                stop_requested = exists(
+                    select(AuditEvent.id).where(
+                        AuditEvent.resource_type == "release",
+                        AuditEvent.resource_id == Release.id,
+                        AuditEvent.action == GENERATION_STOP_REQUESTED_ACTION,
+                    )
+                )
                 query = (
                     select(GenerationAttempt)
+                    .join(GenerationJob, GenerationJob.id == GenerationAttempt.job_id)
+                    .join(
+                        ReleaseVersion,
+                        ReleaseVersion.id == GenerationJob.release_version_id,
+                    )
+                    .join(Release, Release.id == ReleaseVersion.release_id)
                     .where(
                         GenerationAttempt.provider == "salad",
                         GenerationAttempt.state.in_(_RECONCILABLE_ATTEMPT_STATES),
                     )
                     .order_by(
+                        stop_requested.desc(),
                         GenerationAttempt.last_observed_at,
                         GenerationAttempt.created_at,
                         GenerationAttempt.id,

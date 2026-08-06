@@ -959,7 +959,7 @@ def _generation_progress_stage(
     release_unhealthy = release.health == ResourceHealth.BLOCKED or (
         stop_requested and release.health != ResourceHealth.HEALTHY
     )
-    # A safe stop deliberately turns provider/job failures into a reviewable
+    # An operator stop deliberately turns provider/job failures into a reviewable
     # partial set. Integrity failures still mark the release unhealthy and must
     # remain fail-closed, but a terminal GPU job by itself must not hide the
     # masters that were successfully preserved before it failed.
@@ -1028,11 +1028,11 @@ def _generation_progress_stage(
             _stage(
                 GenerationProgressStage.PAUSED,
                 step=_generation_step(state_counts, scoring_run),
-                label=("Stopping safely" if stop_requested else "Run paused"),
+                label=("Stopping generation" if stop_requested else "Run paused"),
                 detail=(
                     (
-                        f"{generated_outputs} verified images are saved. Active GPU work "
-                        "will finish uploading; no new jobs will start."
+                        f"{generated_outputs} verified images are saved. Active GPU jobs "
+                        "are being cancelled; no new jobs from this set will start."
                     )
                     if stop_requested
                     else (

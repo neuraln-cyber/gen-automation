@@ -454,7 +454,7 @@ def test_async_stop_returns_progress_in_place_and_replays_idempotently(
     assert payload["release_id"] == str(context.release_id)
     assert payload["phase"] == "paused"
     assert payload["stage"]["key"] == "paused"
-    assert payload["stage"]["label"] == "Stopping safely"
+    assert payload["stage"]["label"] == "Stopping generation"
     assert payload["images"] == {"generated": 2, "expected": 2, "percent": 100.0}
     assert payload["jobs"] == {
         "completed": 3,

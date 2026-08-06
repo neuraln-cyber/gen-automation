@@ -4357,7 +4357,7 @@
         stopOpen.hidden = !available;
         stopOpen.disabled = requested || stopSubmissionPending;
         stopOpen.textContent = requested || stopSubmissionPending
-          ? "Stopping safely…"
+          ? "Stopping generation…"
           : "Stop generation";
       }
       if (stopStatus) {
@@ -4365,9 +4365,9 @@
         if (requested) {
           stopStatus.textContent = settled
             ? `Generation stopped. All ${liveGenerated} completed ${liveGenerated === 1 ? "image was" : "images were"} saved.`
-            : `Stopping safely. ${liveGenerated} verified ${liveGenerated === 1 ? "image is" : "images are"} saved; active GPU work will finish uploading.`;
+            : `Stopping generation. ${liveGenerated} verified ${liveGenerated === 1 ? "image is" : "images are"} saved; active GPU jobs are being cancelled.`;
         } else if (stopSubmissionPending) {
-          stopStatus.textContent = "Requesting a safe stop…";
+          stopStatus.textContent = "Requesting generation stop…";
         } else {
           stopStatus.textContent = "";
         }
@@ -4510,7 +4510,7 @@
         if (typeof stopDialog.showModal === "function") {
           stopDialog.showModal();
         } else if (window.confirm(
-          "Stop generation safely? Finished images stay saved and active GPU work will finish uploading.",
+          "Stop generation now? Finished uploads stay saved, but the image currently rendering may be interrupted.",
         )) {
           stopForm.requestSubmit();
         }

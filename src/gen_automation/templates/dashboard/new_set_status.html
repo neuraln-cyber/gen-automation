@@ -65,7 +65,7 @@
       aria-live="polite"
       data-stop-generation-status
       {% if not release.stop_requested %}hidden{% endif %}
-    >{% if release.stop_requested and not release.stop_settled %}Stopping safely. Finished images are saved while active GPU work completes.{% elif release.stop_requested %}Generation stopped. All completed images were saved.{% endif %}</p>
+    >{% if release.stop_requested and not release.stop_settled %}Stopping generation. Finished images stay saved while active GPU jobs are cancelled.{% elif release.stop_requested %}Generation stopped. All completed images were saved.{% endif %}</p>
 
     <ol class="pipeline-steps" aria-label="Generation pipeline">
       <li
@@ -152,11 +152,11 @@
       >
         <input type="hidden" name="csrf_token" value="{{ stop_generation_csrf_token }}">
         <input type="hidden" name="idempotency_key" value="{{ stop_generation_idempotency_key }}">
-        <p class="page-kicker">Safe stop</p>
+        <p class="page-kicker">Stop now</p>
         <h2 id="generation-stop-heading">Stop this generation?</h2>
         <p class="muted">
-          Queued images will not start. Images already finished stay saved, and any GPU
-          work already rendering will finish and upload safely before the run closes.
+          Queued and active GPU jobs will be cancelled. Images that already finished
+          uploading stay saved; an image still rendering may be interrupted.
         </p>
         <div class="reauth-actions">
           <button class="secondary-button" type="button" data-stop-generation-cancel>
@@ -178,7 +178,7 @@
         <input type="hidden" name="csrf_token" value="{{ stop_generation_csrf_token }}">
         <input type="hidden" name="idempotency_key" value="{{ stop_generation_idempotency_key }}">
         <button class="secondary-button stop-button" type="submit">
-          Stop after active GPU work
+          Stop generation now
         </button>
       </form>
     </noscript>
