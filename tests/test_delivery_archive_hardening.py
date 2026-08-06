@@ -128,15 +128,17 @@ def test_awaiting_approval_is_action_required_and_does_not_poll() -> None:
     assert delivery_routes._can_render_destination_form(snapshot, settings=settings)
     payload = delivery_routes._delivery_progress_payload(
         snapshot,
-        publishing_enabled=True,
+        finished_set_archive=None,
     )
     assert payload["archive"] == {
-        "state": "failed",
-        "detail": detail,
+        "state": "not_started",
+        "detail": "Waiting for automatic ZIP preparation or an explicit request.",
+        "archive_id": None,
+        "worker_state": None,
         "part_count": 0,
         "parts": [],
     }
-    assert payload["poll_after_ms"] is None
+    assert payload["poll_after_ms"] == 3000
 
 
 @pytest.mark.parametrize(
@@ -163,10 +165,10 @@ def test_package_parts_ready_requires_one_contiguous_consistent_set(
     [
         ((_part(1, 2),), False),
         ((_part(1, 2), _part(2, 3)), False),
-        ((_part(2, 2), _part(1, 2)), True),
+        ((_part(2, 2), _part(1, 2)), False),
     ],
 )
-async def test_dashboard_only_offers_complete_archive_parts(
+async def test_dashboard_does_not_treat_patreon_packages_as_finished_set_archives(
     monkeypatch: pytest.MonkeyPatch,
     parts: tuple[DeliveryPackagePart, ...],
     shows_download: bool,
@@ -189,7 +191,11 @@ async def test_dashboard_only_offers_complete_archive_parts(
     async def no_watermarks(*_args: object, **_kwargs: object) -> tuple[()]:
         return ()
 
+    async def no_archive(*_args: object, **_kwargs: object) -> None:
+        return None
+
     monkeypatch.setattr(delivery_routes, "load_operator_delivery", load_snapshot)
+    monkeypatch.setattr(delivery_routes, "load_finished_set_archive", no_archive)
     monkeypatch.setattr(delivery_routes, "list_registered_watermarks", no_watermarks)
     app = FastAPI()
     app.state.settings = _settings()
@@ -219,7 +225,7 @@ async def test_dashboard_only_offers_complete_archive_parts(
     assert (download_action in html) is shows_download
     progress = delivery_routes._delivery_progress_payload(
         snapshot,
-        publishing_enabled=True,
+        finished_set_archive=None,
     )
-    assert progress["archive"]["state"] == ("ready" if shows_download else "not_started")
-    assert progress["poll_after_ms"] is None
+    assert progress["archive"]["state"] == "not_started"
+    assert progress["poll_after_ms"] == 3000

@@ -1620,14 +1620,15 @@ async def test_completion_shrinks_target_to_accepted_count_and_is_terminal(
         assert stored.completed_by_user_id == review_context.reviewer_id
         assert stored.completed_at == (NOW + timedelta(minutes=8)).replace(tzinfo=None)
         assert stored.cancelled_at is None
-        assert (
-            await session.scalar(
-                select(func.count())
-                .select_from(ReleaseSelection)
-                .where(ReleaseSelection.review_task_id == task.task_id)
-            )
-            == 1
+        frozen_selection = await session.scalar(
+            select(ReleaseSelection).where(ReleaseSelection.review_task_id == task.task_id)
         )
+        assert frozen_selection is not None
+        assert frozen_selection.source_generation_job_id is not None
+        assert frozen_selection.source_output_index is not None
+        assert frozen_selection.source_generation_ordinal is not None
+        assert frozen_selection.source_generation_queue_position is not None
+        assert frozen_selection.source_generation_queue_position > 0
         completed_audit = await session.scalar(
             select(AuditEvent).where(
                 AuditEvent.action == "review.task_completed",

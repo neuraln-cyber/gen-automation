@@ -148,32 +148,46 @@ async def test_one_action_plans_full_set_and_only_selected_watermarked_teaser(
             watermark_asset_id=watermark.asset_id,
             now=PLAN_AT + timedelta(minutes=1),
         )
-        assert plan.jobs_created == 2
+        assert plan.jobs_created == 3
+        assert plan.total_jobs == 3
+        replay_plan = await prepare_completed_review_derivatives(
+            session,
+            review_task_id=approved.review_task_id,
+            actor_user_id=approved.owner_id,
+            idempotency_key="prepare-reviewed-set",
+            watermark_asset_id=watermark.asset_id,
+            now=PLAN_AT + timedelta(minutes=1),
+        )
+        assert replay_plan.replayed is True
+        assert replay_plan.job_ids == plan.job_ids
+        assert replay_plan.total_jobs == 3
 
         jobs = tuple(
             (await session.scalars(select(DerivativeJob).order_by(DerivativeJob.logical_key))).all()
         )
-        targets_by_source = {
-            job.release_selection_id: tuple(job.request_payload["output_targets"]) for job in jobs
+        jobs_by_asset: dict[UUID, list[DerivativeJob]] = {}
+        for job in jobs:
+            source_asset_id = UUID(job.request_payload["source"]["asset_id"])
+            jobs_by_asset.setdefault(source_asset_id, []).append(job)
+        selected_jobs = jobs_by_asset[approved.raw_asset_ids[0]]
+        clean_jobs = jobs_by_asset[approved.raw_asset_ids[1]]
+        selected_x_job = next(
+            job
+            for job in selected_jobs
+            if tuple(job.request_payload["output_targets"]) == ("x_teaser",)
+        )
+        assert {tuple(job.request_payload["output_targets"]) for job in selected_jobs} == {
+            ("full",),
+            ("x_teaser",),
         }
-        selected_job = next(
-            job
-            for job in jobs
-            if job.request_payload["source"]["asset_id"] == str(approved.raw_asset_ids[0])
-        )
-        clean_job = next(
-            job
-            for job in jobs
-            if job.request_payload["source"]["asset_id"] == str(approved.raw_asset_ids[1])
-        )
-        assert targets_by_source[selected_job.release_selection_id] == (
-            "full",
-            "x_teaser",
-        )
-        assert targets_by_source[clean_job.release_selection_id] == ("full",)
-        assert selected_job.request_payload["recipe"]["watermark_asset_id"] == str(
+        assert [tuple(job.request_payload["output_targets"]) for job in clean_jobs] == [("full",)]
+        assert selected_x_job.request_payload["recipe"]["watermark_asset_id"] == str(
             watermark.asset_id
         )
+        full_jobs = [
+            job for job in jobs if tuple(job.request_payload["output_targets"]) == ("full",)
+        ]
+        assert all(job.available_at < selected_x_job.available_at for job in full_jobs)
 
 
 @pytest.mark.asyncio

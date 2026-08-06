@@ -137,6 +137,8 @@ def test_foundation_migration_round_trip(
         "derivative_outputs",
         "derivative_recipes",
         "experiment_warm_leases",
+        "finished_set_archive_parts",
+        "finished_set_archives",
         "generation_attempts",
         "generation_jobs",
         "idempotency_records",
@@ -178,6 +180,12 @@ def test_foundation_migration_round_trip(
         "wildcard_library_versions",
     }
     assert set(inspect(engine).get_table_names()) == expected_tables
+    assert {
+        "source_generation_job_id",
+        "source_output_index",
+        "source_generation_ordinal",
+        "source_generation_queue_position",
+    } <= {column["name"] for column in inspect(engine).get_columns("release_selections")}
     with engine.connect() as connection:
         trigger_names = set(
             connection.execute(

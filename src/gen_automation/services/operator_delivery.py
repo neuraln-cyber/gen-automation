@@ -111,6 +111,16 @@ class DerivativeProgress:
         )
 
     @property
+    def full_outputs_ready(self) -> bool:
+        """Whether clean full-set copies are ready, independent of X teasers."""
+
+        return (
+            self.planned
+            and self.expected_full_outputs > 0
+            and self.ready_full_outputs == self.expected_full_outputs
+        )
+
+    @property
     def terminal_failures(self) -> bool:
         """Whether output preparation ended with failures and no live work."""
 

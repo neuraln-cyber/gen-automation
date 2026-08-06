@@ -27,6 +27,13 @@ PREPARE_OUTPUT_FIELDS = frozenset(
         "watermark_asset_id",
     }
 )
+PREPARE_ARCHIVE_FIELDS = frozenset(
+    {
+        "csrf_token",
+        "idempotency_key",
+        "submission_id",
+    }
+)
 PREPARE_DESTINATION_FIELDS = frozenset(
     {
         "csrf_token",
@@ -47,6 +54,12 @@ PACKAGE_DOWNLOAD_FIELDS = frozenset(
         "csrf_token",
         "expected_intent_digest",
         "expected_lock_version",
+        "part_number",
+    }
+)
+FINISHED_SET_ARCHIVE_DOWNLOAD_FIELDS = frozenset(
+    {
+        "csrf_token",
         "part_number",
     }
 )
@@ -103,6 +116,13 @@ class PrepareOutputForm:
 
 
 @dataclass(frozen=True, slots=True)
+class PrepareArchiveForm:
+    csrf_token: str
+    idempotency_key: str
+    submission_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
 class PrepareDestinationForm:
     csrf_token: str
     idempotency_key: str
@@ -122,6 +142,12 @@ class PackageDownloadForm:
     csrf_token: str
     expected_intent_digest: str
     expected_lock_version: int
+    part_number: int
+
+
+@dataclass(frozen=True, slots=True)
+class FinishedSetArchiveDownloadForm:
+    csrf_token: str
     part_number: int
 
 
@@ -178,6 +204,15 @@ async def read_prepare_output_form(request: Request) -> PrepareOutputForm:
     )
 
 
+async def read_prepare_archive_form(request: Request) -> PrepareArchiveForm:
+    values = await _read_form(request, expected_fields=PREPARE_ARCHIVE_FIELDS)
+    return PrepareArchiveForm(
+        csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
+        idempotency_key=_idempotency_key(values["idempotency_key"]),
+        submission_id=_uuid(values["submission_id"]),
+    )
+
+
 async def read_prepare_destination_form(request: Request) -> PrepareDestinationForm:
     values = await _read_form(request, expected_fields=PREPARE_DESTINATION_FIELDS)
     submission_id = _uuid(values["submission_id"])
@@ -217,6 +252,19 @@ async def read_package_download_form(request: Request) -> PackageDownloadForm:
         csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
         expected_intent_digest=digest,
         expected_lock_version=_positive_int(values["expected_lock_version"]),
+        part_number=_positive_int(values["part_number"]),
+    )
+
+
+async def read_finished_set_archive_download_form(
+    request: Request,
+) -> FinishedSetArchiveDownloadForm:
+    values = await _read_form(
+        request,
+        expected_fields=FINISHED_SET_ARCHIVE_DOWNLOAD_FIELDS,
+    )
+    return FinishedSetArchiveDownloadForm(
+        csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
         part_number=_positive_int(values["part_number"]),
     )
 

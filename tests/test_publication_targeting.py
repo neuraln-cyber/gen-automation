@@ -72,6 +72,8 @@ async def test_publication_uses_exact_selected_x_and_only_clean_patreon_inputs(
     )
     await _cycle(prepared, worker_id="derivative-controller")
     await _cycle(prepared, worker_id="derivative-controller")
+    await _cycle(prepared, worker_id="derivative-controller")
+    await _cycle(prepared, worker_id="derivative-controller")
 
     async with approved.database.sessions() as session:
         rows = (

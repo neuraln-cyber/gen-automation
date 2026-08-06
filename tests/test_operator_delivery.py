@@ -342,6 +342,7 @@ async def test_completed_review_prepares_exact_patreon_mega_and_x_destinations(
     )
     await _cycle(prepared, worker_id="delivery-derivative")
     await _cycle(prepared, worker_id="delivery-derivative")
+    await _cycle(prepared, worker_id="delivery-derivative")
 
     payload = valid_release_payload()
     specification = ReleaseSpecification.model_validate(payload["specification"])

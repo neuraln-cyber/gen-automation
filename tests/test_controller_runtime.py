@@ -238,7 +238,7 @@ async def test_optional_initial_success_still_fails_readiness_when_stale() -> No
     )
 
 
-def test_only_semantic_anatomy_loop_relaxes_initial_readiness_gate(tmp_path: Path) -> None:
+def test_noncritical_background_loops_relax_initial_readiness_gate(tmp_path: Path) -> None:
     database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'semantic-runtime.db').as_posix()}")
     settings = Settings(
         environment=Environment.TEST,
@@ -260,10 +260,11 @@ def test_only_semantic_anatomy_loop_relaxes_initial_readiness_gate(tmp_path: Pat
 
     specs = {spec.name: spec for spec in runtime._loop_specs}
     assert specs["semantic-anatomy-qc"].requires_initial_success_for_readiness is False
+    assert specs["finished-set-archives"].requires_initial_success_for_readiness is False
     assert all(
         spec.requires_initial_success_for_readiness
         for name, spec in specs.items()
-        if name != "semantic-anatomy-qc"
+        if name not in {"semantic-anatomy-qc", "finished-set-archives"}
     )
 
 

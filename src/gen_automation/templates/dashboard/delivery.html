@@ -147,8 +147,13 @@
       <p class="terminal-state" role="status">All clean publishing copies are ready.</p>
     {% elif output_state == "failed" %}
       <p class="form-error" role="alert">
-        Copy preparation ended with failures. No jobs are still running; retry the
-        failed preparation before creating the finished archive.
+        {% if delivery.progress.full_outputs_ready %}
+          Some destination copies failed, but the clean full set is ready and ZIP
+          preparation continues independently.
+        {% else %}
+          Clean full-set copy preparation ended with failures. Retry it before the ZIP
+          can be completed.
+        {% endif %}
       </p>
     {% elif output_state == "stalled" %}
       <p class="form-error" role="alert">
@@ -163,43 +168,36 @@
     {% endif %}
   </section>
 
-  {% if delivery.progress.outputs_ready or finished_set_destination %}
-    <section class="panel review-entry" aria-labelledby="finished-set-heading">
-      <div class="step-heading">
+  <section class="panel review-entry" aria-labelledby="finished-set-heading">
+    <div class="step-heading">
         <span class="step-number" aria-hidden="true">ZIP</span>
         <div>
-          <h2 id="finished-set-heading">Download finished ranked set</h2>
+          <h2 id="finished-set-heading">Download finished set</h2>
           <p class="muted">
-            Clean, unwatermarked images are numbered in final rank order under
+            Clean, unwatermarked images are numbered in generation-queue order under
             <code>content/</code>. Each ZIP also includes the shared ordered manifest.
           </p>
         </div>
-      </div>
-      {% if finished_set_destination %}
-        <div class="decision-form" aria-label="Finished ranked set ZIP files">
-          {% for package_part in finished_set_destination.package_parts %}
+    </div>
+    <p class="muted">
+        This ZIP is independent of publishing. You can download it before or while
+        Patreon, MEGA, and X preparation is running.
+    </p>
+    {% if finished_set_archive %}
+        <div class="decision-form" aria-label="Finished set ZIP files">
+          {% for archive_part in finished_set_archive.parts %}
             <form
               method="post"
-              action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/finished-set/{{ finished_set_destination.intent_id }}:download"
+              action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/finished-set/{{ finished_set_archive.archive_id }}:download"
             >
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-              <input
-                type="hidden"
-                name="expected_intent_digest"
-                value="{{ finished_set_destination.intent_digest }}"
-              >
-              <input
-                type="hidden"
-                name="expected_lock_version"
-                value="{{ finished_set_destination.intent_lock_version }}"
-              >
-              <input type="hidden" name="part_number" value="{{ package_part.part_number }}">
+              <input type="hidden" name="part_number" value="{{ archive_part.part_number }}">
               <button class="primary-button" type="submit">
-                {% if package_part.part_count == 1 %}
-                  Download finished ranked set (.zip)
+                {% if archive_part.part_count == 1 %}
+                  Download finished set (.zip)
                 {% else %}
-                  Download ZIP part {{ package_part.part_number }} / {{ package_part.part_count }}
-                  (images {{ package_part.first_ordinal }}–{{ package_part.last_ordinal }})
+                  Download ZIP part {{ archive_part.part_number }} / {{ archive_part.part_count }}
+                  (images {{ archive_part.first_ordinal }}–{{ archive_part.last_ordinal }})
                 {% endif %}
               </button>
             </form>
@@ -207,37 +205,77 @@
         </div>
         <p class="muted">
           Large sets are split into deterministic 100-image parts so downloads remain
-          reliable. Every part carries the same set manifest and preserves global order.
+          reliable. Every part carries the same set manifest and preserves generation-queue
+          order.
         </p>
+      {% elif finished_set_archive_snapshot and
+        finished_set_archive_snapshot.state.value in ["pending", "processing", "retry_wait"] %}
+        <div class="review-target-progress" data-delivery-archive-progress-region>
+          <strong data-delivery-archive-status aria-live="polite">
+            {% if finished_set_archive_snapshot.state.value == "pending" %}
+              ZIP preparation is queued.
+            {% elif finished_set_archive_snapshot.state.value == "retry_wait" %}
+              ZIP preparation will retry automatically.
+            {% else %}
+              Creating ZIP parts in the background.
+            {% endif %}
+          </strong>
+          <span class="muted" data-delivery-archive-detail>
+            {% if delivery.progress.full_outputs_ready %}
+              The page remains usable while the clean archive is assembled.
+            {% else %}
+              The ZIP is already queued and will begin as soon as the clean full-set copies
+              finish. Patreon, MEGA, and X continue independently.
+            {% endif %}
+          </span>
+        </div>
       {% else %}
-        {% if delivery.destinations_prepared %}
-          <div class="review-target-progress" data-delivery-archive-progress-region>
-            <strong data-delivery-archive-status aria-live="polite">
-              {% if archive_state == "blocked" %}
-                ZIP preparation is paused because the publication runtime or switch is stopped.
-              {% elif archive_state == "failed" %}
-                ZIP creation failed and no archive job is active.
-              {% else %}
-                Creating ZIP parts in the background.
-              {% endif %}
-            </strong>
-            <span class="muted" data-delivery-archive-detail>
-              {% if archive_state == "failed" %}
-                Retry destination preparation after resolving the failure.
-              {% else %}
-                The page remains usable while the clean ranked archive is assembled.
-              {% endif %}
-            </span>
-          </div>
+        {% if finished_set_archive_snapshot and
+          finished_set_archive_snapshot.state.value == "failed" %}
+          <p class="form-error" role="alert" data-delivery-archive-status>
+            ZIP creation failed. Request a clean retry without changing any destination.
+          </p>
+          {% if finished_set_archive_snapshot.last_error_detail %}
+            <p class="muted" data-delivery-archive-detail>
+              {{ finished_set_archive_snapshot.last_error_detail }}
+            </p>
+          {% endif %}
         {% else %}
           <p class="terminal-state" role="status" data-delivery-archive-status>
-            Prepare destinations once to create the immutable ZIP package. It then
-            remains downloadable here after Patreon or MEGA publishing completes.
+            {% if delivery.progress.full_outputs_ready %}
+              Automatic ZIP preparation has not started yet. Use the fallback below to
+              start it now.
+            {% else %}
+              Queue the ZIP now. It will start automatically as soon as the clean full-set
+              copies are ready, without waiting for Patreon, MEGA, or X.
+            {% endif %}
           </p>
         {% endif %}
-      {% endif %}
-    </section>
-  {% endif %}
+        <form
+          method="post"
+          action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:prepare-archive"
+        >
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input
+            type="hidden"
+            name="idempotency_key"
+            value="{{ archive_idempotency_key }}"
+          >
+          <input type="hidden" name="submission_id" value="{{ archive_submission_id }}">
+          <button class="primary-button" type="submit" {% if not storage_available %}disabled{% endif %}>
+            {% if finished_set_archive_snapshot and
+              finished_set_archive_snapshot.state.value == "failed" %}
+              Retry ZIP preparation
+            {% else %}
+              Prepare ZIP download
+            {% endif %}
+          </button>
+        </form>
+        {% if not storage_available %}
+          <p class="form-error">Private object storage is not configured.</p>
+        {% endif %}
+    {% endif %}
+  </section>
 
   {% if delivery.x_selected_count and not delivery.progress.planned %}
     <section class="panel review-entry" aria-labelledby="watermark-heading">
@@ -373,6 +411,38 @@
             {{ destination.state.replace("_", " ") }}
           </span>
           <p class="muted">{{ destination.detail }}</p>
+          {% if patreon_download_destination and
+            destination.intent_id == patreon_download_destination.intent_id %}
+            <div class="decision-form" aria-label="Patreon manual handoff ZIP files">
+              {% for package_part in patreon_download_destination.package_parts %}
+                <form
+                  method="post"
+                  action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/patreon/{{ destination.intent_id }}:download"
+                >
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input
+                    type="hidden"
+                    name="expected_intent_digest"
+                    value="{{ destination.intent_digest }}"
+                  >
+                  <input
+                    type="hidden"
+                    name="expected_lock_version"
+                    value="{{ destination.intent_lock_version }}"
+                  >
+                  <input type="hidden" name="part_number" value="{{ package_part.part_number }}">
+                  <button class="secondary-button" type="submit">
+                    {% if package_part.part_count == 1 %}
+                      Download Patreon handoff ZIP
+                    {% else %}
+                      Download Patreon handoff part {{ package_part.part_number }} /
+                      {{ package_part.part_count }}
+                    {% endif %}
+                  </button>
+                </form>
+              {% endfor %}
+            </div>
+          {% endif %}
           {% if destination.key == "patreon" and destination.state in ["ready", "unknown"] %}
             <div class="decision-form">
               <h3>

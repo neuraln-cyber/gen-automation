@@ -313,6 +313,34 @@ class Settings(BaseSettings):
         ge=1,
         le=86400,
     )
+    background_finished_set_archive_timeout_seconds: float = Field(
+        default=840,
+        ge=10,
+        le=900,
+    )
+    background_finished_set_archive_lease_seconds: int = Field(
+        default=1200,
+        ge=30,
+        le=3600,
+    )
+    background_finished_set_archive_retry_base_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=86400,
+    )
+    background_finished_set_archive_retry_max_seconds: int = Field(
+        default=900,
+        ge=1,
+        le=7 * 86400,
+    )
+    background_finished_set_archive_max_archive_bytes: int = Field(
+        default=160 * 1024 * 1024,
+        ge=1024,
+        # The current deterministic builder buffers input bytes plus one ZIP
+        # part. Keep its configurable ceiling within the controller's safe
+        # process-memory envelope; larger sets are split into more parts.
+        le=160 * 1024 * 1024,
+    )
     background_publication_timeout_seconds: float = Field(
         default=840,
         ge=10,
@@ -639,6 +667,19 @@ class Settings(BaseSettings):
             < self.background_derivative_render_timeout_seconds + 15
         ):
             errors.append("derivative cycle timeout must cover isolated rendering plus cleanup")
+        if (
+            self.background_finished_set_archive_retry_max_seconds
+            < self.background_finished_set_archive_retry_base_seconds
+        ):
+            errors.append("finished-set archive retry maximum cannot be lower than its base delay")
+        if (
+            self.storage_enabled
+            and self.background_finished_set_archive_lease_seconds
+            <= self.background_finished_set_archive_timeout_seconds + 5
+        ):
+            errors.append(
+                "finished-set archive lease must exceed the supervised archive cycle timeout"
+            )
         if self.publishing_enabled and not self.storage_enabled:
             errors.append("publication orchestration requires private object storage")
         if self.publishing_enabled and not self.background_runtime_enabled:
@@ -880,6 +921,8 @@ class Settings(BaseSettings):
                 cycle_timeouts.append(self.background_semantic_learning_timeout_seconds + 5)
             if self.storage_enabled and self.derivative_rendering_enabled:
                 cycle_timeouts.append(self.background_derivative_timeout_seconds + 5)
+            if self.storage_enabled:
+                cycle_timeouts.append(self.background_finished_set_archive_timeout_seconds + 5)
             if self.storage_enabled and self.publishing_enabled:
                 cycle_timeouts.append(self.background_publication_timeout_seconds + 5)
             if self.storage_enabled and self.mega_delivery_enabled:

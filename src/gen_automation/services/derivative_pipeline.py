@@ -139,7 +139,7 @@ async def create_derivative_recipe_and_plan(
     priority: int = 100,
     now: datetime | None = None,
 ) -> DerivativePlanResult:
-    """Approve one immutable recipe and plan one job per frozen selection."""
+    """Approve immutable recipes and plan target-isolated jobs for each selection."""
 
     normalized_configuration = _normalize_configuration(configuration)
     normalized_targets = _normalize_targets(output_targets)
@@ -257,14 +257,14 @@ async def _create_plan_once(
     selected_selections = [
         selection for selection in selections if selection.asset_id in x_selected_asset_ids
     ]
-    clean_only_selections = [
-        selection for selection in selections if selection.asset_id not in x_selected_asset_ids
+    # Keep the clean member copy independent from every destination-specific
+    # transform.  In particular, a watermark or teaser failure must not make
+    # the already-approved full set unavailable for its owner.
+    target_groups: list[tuple[tuple[str, ...], list[ReleaseSelection]]] = [
+        ((_FULL_TARGET,), selections)
     ]
-    target_groups: list[tuple[tuple[str, ...], list[ReleaseSelection]]] = []
     if selected_selections:
-        target_groups.append((output_targets, selected_selections))
-    if clean_only_selections:
-        target_groups.append(((_FULL_TARGET,), clean_only_selections))
+        target_groups.append(((_X_TARGET,), selected_selections))
     recipe_plans: list[
         tuple[
             tuple[str, ...],
@@ -392,9 +392,19 @@ async def _create_plan_once(
 
     recipes: list[DerivativeRecipe] = []
     job_ids: list[UUID] = []
+    job_order: list[tuple[int, int, UUID]] = []
     jobs_created = 0
     recipes_created = 0
-    for group_targets, group_selections, recipe_identity, recipe_logical_key in recipe_plans:
+    for group_order, (
+        group_targets,
+        group_selections,
+        recipe_identity,
+        recipe_logical_key,
+    ) in enumerate(recipe_plans):
+        # Full outputs are the owner's durable set and should drain before
+        # destination-only work even when every job shares the same caller
+        # priority and request timestamp.
+        group_available_at = planned_at + timedelta(microseconds=group_order)
         recipe = await session.scalar(
             select(DerivativeRecipe).where(DerivativeRecipe.logical_key == recipe_logical_key)
         )
@@ -512,6 +522,7 @@ async def _create_plan_once(
                         "existing derivative job conflicts with the frozen plan"
                     )
                 job_ids.append(existing.id)
+                job_order.append((selection.display_order, group_order, existing.id))
                 continue
 
             job = DerivativeJob(
@@ -528,11 +539,12 @@ async def _create_plan_once(
                 attempt_count=0,
                 max_attempts=max_attempts,
                 lock_version=1,
-                available_at=planned_at,
+                available_at=group_available_at,
                 requested_at=planned_at,
             )
             session.add(job)
             job_ids.append(job.id)
+            job_order.append((selection.display_order, group_order, job.id))
             jobs_created += 1
             session.add(
                 _outbox(
@@ -558,23 +570,12 @@ async def _create_plan_once(
         )
         or 0
     )
-    if total_jobs != len(selections):
+    expected_jobs = sum(len(group_selections) for _, group_selections in target_groups)
+    if total_jobs != expected_jobs or len(job_ids) != expected_jobs:
         raise DerivativePipelineConflictError(
-            "derivative job count conflicts with the frozen selections"
+            "derivative job count conflicts with the frozen target plan"
         )
-    ordered_job_ids = tuple(
-        (
-            await session.scalars(
-                select(DerivativeJob.id)
-                .join(
-                    ReleaseSelection,
-                    ReleaseSelection.id == DerivativeJob.release_selection_id,
-                )
-                .where(DerivativeJob.id.in_(job_ids))
-                .order_by(ReleaseSelection.display_order)
-            )
-        ).all()
-    )
+    ordered_job_ids = tuple(job_id for _display_order, _group_order, job_id in sorted(job_order))
     result = DerivativePlanResult(
         review_task_id=task.id,
         recipe_id=recipes[0].id,

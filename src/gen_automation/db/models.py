@@ -39,6 +39,7 @@ from gen_automation.domain.enums import (
     DerivativeJobState,
     DesiredDeploymentState,
     ExperimentWarmLeaseState,
+    FinishedSetArchiveState,
     GenerationAttemptState,
     GenerationState,
     InboxStatus,
@@ -2183,6 +2184,12 @@ class ReleaseSelection(UuidPrimaryKeyMixin, Base):
             "display_order",
             name="uq_release_selections_task_display_order",
         ),
+        Index(
+            "uq_release_selections_task_generation_queue_position",
+            "review_task_id",
+            "source_generation_queue_position",
+            unique=True,
+        ),
         UniqueConstraint(
             "review_decision_id",
             name="uq_release_selections_review_decision",
@@ -2250,6 +2257,17 @@ class ReleaseSelection(UuidPrimaryKeyMixin, Base):
             name="positive_source_dimensions",
         ),
         CheckConstraint(
+            "(source_generation_job_id IS NULL "
+            "AND source_output_index IS NULL "
+            "AND source_generation_ordinal IS NULL "
+            "AND source_generation_queue_position IS NULL) OR "
+            "(source_generation_job_id IS NOT NULL "
+            "AND source_output_index >= 0 "
+            "AND source_generation_ordinal >= 0 "
+            "AND source_generation_queue_position > 0)",
+            name="complete_source_generation_position",
+        ),
+        CheckConstraint(
             "frozen_at >= source_available_at",
             name="frozen_after_source_available",
         ),
@@ -2294,6 +2312,10 @@ class ReleaseSelection(UuidPrimaryKeyMixin, Base):
     source_width: Mapped[int] = mapped_column(Integer, nullable=False)
     source_height: Mapped[int] = mapped_column(Integer, nullable=False)
     source_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_generation_job_id: Mapped[UUID | None] = mapped_column()
+    source_output_index: Mapped[int | None] = mapped_column(Integer)
+    source_generation_ordinal: Mapped[int | None] = mapped_column(Integer)
+    source_generation_queue_position: Mapped[int | None] = mapped_column(Integer)
     source_available_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -3234,6 +3256,146 @@ class PublicationPackage(UuidPrimaryKeyMixin, Base):
     part_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     first_ordinal: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     last_ordinal: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    storage_backend: Mapped[str] = mapped_column(String(50), nullable=False)
+    storage_bucket: Mapped[str] = mapped_column(String(255), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    object_version_id: Mapped[str] = mapped_column(String(1024), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    content_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class FinishedSetArchive(UuidPrimaryKeyMixin, Base):
+    """Durable, provider-independent archive of one completed ranked set."""
+
+    __tablename__ = "finished_set_archives"
+    __table_args__ = (
+        UniqueConstraint("review_task_id", name="uq_finished_set_archives_review_task"),
+        CheckConstraint("selection_count > 0", name="positive_selection_count"),
+        CheckConstraint("attempts >= 0", name="nonnegative_attempts"),
+        CheckConstraint("max_attempts > 0", name="positive_max_attempts"),
+        CheckConstraint("attempts <= max_attempts", name="attempts_within_limit"),
+        CheckConstraint(
+            "(lease_owner IS NULL AND lease_expires_at IS NULL) OR "
+            "(lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)",
+            name="lease_pair",
+        ),
+        CheckConstraint(
+            "(state = 'processing' AND lease_owner IS NOT NULL) OR "
+            "(state <> 'processing' AND lease_owner IS NULL)",
+            name="state_lease_contract",
+        ),
+        CheckConstraint(
+            "manifest_sha256 IS NULL OR length(manifest_sha256) = 64",
+            name="valid_manifest_sha256",
+        ),
+        CheckConstraint("part_count IS NULL OR part_count > 0", name="positive_part_count"),
+        CheckConstraint(
+            "(state = 'ready' AND manifest_sha256 IS NOT NULL AND part_count IS NOT NULL "
+            "AND completed_at IS NOT NULL AND last_error_code IS NULL) OR "
+            "(state = 'failed' AND completed_at IS NOT NULL AND last_error_code IS NOT NULL) OR "
+            "(state NOT IN ('ready', 'failed') AND completed_at IS NULL)",
+            name="terminal_result_contract",
+        ),
+        Index(
+            "ix_finished_set_archives_claim",
+            "state",
+            "available_at",
+            "lease_expires_at",
+            "created_at",
+        ),
+    )
+
+    review_task_id: Mapped[UUID] = mapped_column(
+        ForeignKey("review_tasks.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    release_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("release_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    requested_by_user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"),
+    )
+    state: Mapped[FinishedSetArchiveState] = mapped_column(
+        Enum(
+            FinishedSetArchiveState,
+            name="finished_set_archive_state",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=12,
+        ),
+        nullable=False,
+        default=FinishedSetArchiveState.PENDING,
+    )
+    selection_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    part_count: Mapped[int | None] = mapped_column(Integer)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(200))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(String(100))
+    last_error_detail: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class FinishedSetArchivePart(UuidPrimaryKeyMixin, Base):
+    """One immutable deterministic part of a finished-set archive."""
+
+    __tablename__ = "finished_set_archive_parts"
+    __table_args__ = (
+        UniqueConstraint(
+            "archive_id",
+            "part_number",
+            name="uq_finished_set_archive_parts_archive_part",
+        ),
+        UniqueConstraint(
+            "storage_backend",
+            "storage_bucket",
+            "object_key",
+            "object_version_id",
+            name="uq_finished_set_archive_parts_storage_version",
+        ),
+        CheckConstraint(
+            "part_number > 0 AND part_count > 0 AND part_number <= part_count",
+            name="valid_part_identity",
+        ),
+        CheckConstraint(
+            "first_ordinal > 0 AND last_ordinal >= first_ordinal",
+            name="valid_ordinal_range",
+        ),
+        CheckConstraint("length(sha256) = 64", name="valid_sha256"),
+        CheckConstraint("length(manifest_sha256) = 64", name="valid_manifest_sha256"),
+        CheckConstraint("byte_size > 0", name="positive_byte_size"),
+        CheckConstraint(
+            "length(trim(storage_backend)) > 0 "
+            "AND length(trim(storage_bucket)) > 0 "
+            "AND length(trim(object_key)) > 0 "
+            "AND length(trim(object_version_id)) > 0 "
+            "AND content_type = 'application/zip'",
+            name="complete_storage_identity",
+        ),
+    )
+
+    archive_id: Mapped[UUID] = mapped_column(
+        ForeignKey("finished_set_archives.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    part_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    part_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    first_ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    last_ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
     storage_backend: Mapped[str] = mapped_column(String(50), nullable=False)
     storage_bucket: Mapped[str] = mapped_column(String(255), nullable=False)
     object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
@@ -4864,6 +5026,11 @@ for _immutable_table, _table_name, _label in (
         SemanticModelPromotion.__table__,
         "semantic_model_promotions",
         "semantic model promotions",
+    ),
+    (
+        FinishedSetArchivePart.__table__,
+        "finished_set_archive_parts",
+        "finished set archive parts",
     ),
 ):
     event.listen(

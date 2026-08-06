@@ -466,11 +466,14 @@ async def test_only_owner_selected_image_gets_watermarked_x_teaser(
 
     first = await _cycle(prepared, worker_id="derivative-controller")
     second = await _cycle(prepared, worker_id="derivative-controller")
+    third = await _cycle(prepared, worker_id="derivative-controller")
 
     assert first.execution is not None
     assert second.execution is not None
-    assert first.execution.outputs_registered == 2
+    assert third.execution is not None
+    assert first.execution.outputs_registered == 1
     assert second.execution.outputs_registered == 1
+    assert third.execution.outputs_registered == 1
     async with approved.database.sessions() as session:
         rows = (
             await session.execute(
@@ -503,6 +506,9 @@ async def test_inputs_are_read_sequentially_at_frozen_versions(
         x_selected_asset_ids=(approved_context.raw_asset_ids[0],),
     )
 
+    await _cycle(prepared, worker_id="derivative-controller")
+    await _cycle(prepared, worker_id="derivative-controller")
+    prepared.store.read_requests.clear()
     result = await _cycle(prepared, worker_id="derivative-controller")
 
     assert result.execution is not None
@@ -587,16 +593,24 @@ async def test_mutated_watermark_at_frozen_version_fails_before_render(
         version_id=original.version_id,
     )
 
+    first_full = await _cycle(prepared, worker_id="derivative-controller")
+    second_full = await _cycle(prepared, worker_id="derivative-controller")
+    assert first_full.execution is not None
+    assert second_full.execution is not None
+    assert first_full.execution.state == DerivativeJobState.SUCCEEDED
+    assert second_full.execution.state == DerivativeJobState.SUCCEEDED
+    writes_before_x = len(prepared.store.write_attempts)
+    prepared.store.read_requests.clear()
+
     result = await _cycle(prepared, worker_id="derivative-controller")
 
     assert result.execution is not None
     assert result.execution.state == DerivativeJobState.FAILED
     assert result.execution.error_code == "derivative_contract_invalid"
-    assert [request[0] for request in prepared.store.read_requests[:2]] == [
-        prepared.store.read_requests[0][0],
-        prepared.watermark_key,
-    ]
-    assert prepared.store.write_attempts == []
+    source_read, watermark_read = prepared.store.read_requests[:2]
+    assert source_read[0].startswith("raw/")
+    assert watermark_read[0] == prepared.watermark_key
+    assert len(prepared.store.write_attempts) == writes_before_x
 
 
 @pytest.mark.asyncio

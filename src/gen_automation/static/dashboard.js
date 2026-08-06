@@ -1700,6 +1700,7 @@
       const expectedFull = count(output.expected_full_outputs);
       const readyTeasers = count(output.ready_x_teasers);
       const expectedTeasers = count(output.expected_x_teasers);
+      const fullOutputsReady = output.full_outputs_ready === true;
 
       setText(jobsComplete, `${succeeded} / ${totalJobs}`);
       setText(fullOutputs, `${readyFull} / ${expectedFull}`);
@@ -1721,10 +1722,20 @@
           outputStatus,
           `Copy preparation stopped with ${failed} failed job${failed === 1 ? "" : "s"}.`,
         );
-        setText(liveStatus, "No jobs are active. Retry is required before ZIP creation.");
+        setText(
+          liveStatus,
+          fullOutputsReady
+            ? "The clean full set is ready; ZIP preparation continues independently."
+            : "No jobs are active. Retry the clean full-set copies before ZIP completion.",
+        );
       } else if (state === "stalled") {
         setText(outputStatus, "Copy preparation is stalled with no active jobs.");
-        setText(liveStatus, "Operator repair or a retry is required before ZIP creation.");
+        setText(
+          liveStatus,
+          fullOutputsReady
+            ? "The clean full set is ready; ZIP preparation continues independently."
+            : "Operator repair or a retry is required before ZIP completion.",
+        );
       } else {
         setText(
           outputStatus,
@@ -1735,40 +1746,34 @@
       return state;
     };
     const renderArchive = (archive) => {
-      const knownStates = ["not_started", "preparing", "ready", "failed", "blocked"];
+      const knownStates = ["not_started", "preparing", "ready", "failed"];
       const state = knownStates.includes(archive.state) ? archive.state : "failed";
       const partCount = count(archive.part_count);
       const serverDetail = typeof archive.detail === "string" ? archive.detail.trim() : "";
       if (state === "ready") {
         setText(
           archiveStatus,
-          `${partCount} finished ranked ZIP part${partCount === 1 ? " is" : "s are"} ready.`,
+          `${partCount} finished-set ZIP part${partCount === 1 ? " is" : "s are"} ready.`,
         );
         setText(archiveDetail, "Loading the download controls once.");
       } else if (state === "preparing") {
         setText(archiveStatus, "Creating ZIP parts in the background.");
         setText(
           archiveDetail,
-          "The page remains usable while the clean ranked archive is assembled.",
-        );
-      } else if (state === "blocked") {
-        setText(
-          archiveStatus,
-          "ZIP preparation is paused because the publication runtime or switch is stopped.",
-        );
-        setText(
-          archiveDetail,
-          serverDetail || "Re-enable publication to continue; this page will not keep polling.",
+          "The page remains usable while the clean archive is assembled.",
         );
       } else if (state === "failed") {
         setText(archiveStatus, "ZIP creation failed and no archive job is active.");
         setText(
           archiveDetail,
-          serverDetail || "Retry destination preparation after resolving the failure.",
+          serverDetail || "Use Retry ZIP preparation without changing any destination.",
         );
       } else {
         setText(archiveStatus, "ZIP creation has not started.");
-        setText(archiveDetail, "Prepare destinations when the publishing copies are ready.");
+        setText(
+          archiveDetail,
+          serverDetail || "Automatic preparation will start, or use Prepare ZIP download now.",
+        );
       }
       return state;
     };
@@ -1779,17 +1784,21 @@
         || !isRecord(payload.outputs)
         || !isRecord(payload.archive)
       ) return null;
+      const fullOutputsReady = payload.outputs.full_outputs_ready === true;
       const outputState = renderOutput(payload.outputs);
       const archiveState = renderArchive(payload.archive);
       if (
         (initialOutputState !== "ready" && outputState === "ready")
         || (initialArchiveState !== "ready" && archiveState === "ready")
+        || (initialArchiveState !== "failed" && archiveState === "failed")
       ) {
         reloadForNewControls();
         return { polling: false, delay: null };
       }
       return {
-        polling: outputState === "rendering" || archiveState === "preparing",
+        polling: outputState === "rendering"
+          || archiveState === "preparing"
+          || (archiveState === "not_started" && fullOutputsReady),
         delay: payload.poll_after_ms,
       };
     };

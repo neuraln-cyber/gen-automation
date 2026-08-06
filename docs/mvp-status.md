@@ -127,13 +127,26 @@ derivatives/{release_id}/{release_version_id}/{job_id}/
   {target}/{output_sha256}.{extension}
 ```
 
-The deterministic full-set archive parts are private:
+The destination-neutral finished-set ZIP parts are private:
+
+```text
+finished-set-archives/{archive_id}/part-NNN-of-NNN/{sha256}.zip
+```
+
+They are assembled from the exact clean `full` output for every accepted image,
+in frozen generation-queue order. ZIP preparation is checkpointed per part and
+runs independently of the publishing guard and Patreon, MEGA, or X state. The
+download controls therefore become available as soon as those clean full-set
+copies are ready, even while destination preparation continues or an unrelated
+X teaser fails. Every part includes the same set-wide manifest.
+
+Destination-specific Patreon package parts remain private and separate:
 
 ```text
 publication-packages/{publication_intent_id}/part-NNN-of-NNN/{sha256}.zip
 ```
 
-Each exact archive can be downloaded for the Patreon manual fallback and is
+Each exact Patreon package can be downloaded for the manual fallback and is
 mirrored to MEGA. Every part carries the same release-wide ordered manifest.
 Single-part sets can also be published through the Patreon browser sidecar; a
 multipart set waits for the operator so the official UI is not driven with an

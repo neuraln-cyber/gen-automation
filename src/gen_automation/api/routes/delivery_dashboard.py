@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import pairwise
 from pathlib import Path
 from typing import Annotated, cast
 from uuid import UUID, uuid4
@@ -21,9 +22,11 @@ from gen_automation.api.browser_delivery_forms import (
     delivery_csrf_token,
     delivery_form_key,
     form_key_matches,
+    read_finished_set_archive_download_form,
     read_package_download_form,
     read_patreon_confirm_absent_form,
     read_patreon_confirm_present_form,
+    read_prepare_archive_form,
     read_prepare_destination_form,
     read_prepare_output_form,
     read_publication_guard_form,
@@ -36,7 +39,7 @@ from gen_automation.api.security import (
 )
 from gen_automation.config import Settings
 from gen_automation.db.session import get_session
-from gen_automation.domain.enums import AdminRole
+from gen_automation.domain.enums import AdminRole, FinishedSetArchiveState
 from gen_automation.middleware import content_security_policy
 from gen_automation.services.authentication import (
     AuthenticatedPrincipal,
@@ -46,6 +49,15 @@ from gen_automation.services.derivative_pipeline import (
     DerivativePipelineConflictError,
     DerivativePipelineInputError,
     DerivativePipelineNotFoundError,
+)
+from gen_automation.services.finished_set_archives import (
+    FinishedSetArchiveConflictError,
+    FinishedSetArchiveInputError,
+    FinishedSetArchiveNotFoundError,
+    FinishedSetArchiveSnapshot,
+    load_finished_set_archive,
+    presign_finished_set_archive_part,
+    request_finished_set_archive,
 )
 from gen_automation.services.operator_delivery import (
     DeliveryOutput,
@@ -63,7 +75,6 @@ from gen_automation.services.publication import (
     PublicationConflictError,
     PublicationInputError,
     PublicationNotFoundError,
-    presign_finished_set_package_download,
     presign_patreon_package_download,
     reconcile_publication_absent,
     reconcile_publication_present,
@@ -81,7 +92,7 @@ from gen_automation.services.watermarks import (
     list_registered_watermarks,
     register_watermark,
 )
-from gen_automation.storage.base import ObjectStore
+from gen_automation.storage.base import ObjectStore, ObjectStoreError
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"], include_in_schema=False)
 templates = Jinja2Templates(directory=str(Path(__file__).parents[2] / "templates"))
@@ -119,9 +130,13 @@ async def dashboard_review_delivery(
         )
     try:
         snapshot = await load_operator_delivery(session, review_task_id=review_task_id)
+        finished_set_archive = await load_finished_set_archive(
+            session,
+            review_task_id=review_task_id,
+        )
         csrf_token = _csrf_token(request, principal)
         watermarks = await list_registered_watermarks(session)
-    except OperatorDeliveryNotFoundError:
+    except (OperatorDeliveryNotFoundError, FinishedSetArchiveNotFoundError):
         return _error(
             request,
             principal,
@@ -140,6 +155,7 @@ async def dashboard_review_delivery(
 
     settings: Settings = request.app.state.settings
     output_submission_id = uuid4()
+    archive_submission_id = uuid4()
     destination_submission_id = uuid4()
     watermark_submission_id = uuid4()
     guard_submission_id = uuid4()
@@ -148,6 +164,12 @@ async def dashboard_review_delivery(
         session_id=principal.session_id,
         action="prepare-outputs",
         parts=(str(review_task_id), str(output_submission_id)),
+    )
+    archive_key = delivery_form_key(
+        settings,
+        session_id=principal.session_id,
+        action="prepare-archive",
+        parts=(str(review_task_id), str(archive_submission_id)),
     )
     destination_key = delivery_form_key(
         settings,
@@ -191,11 +213,12 @@ async def dashboard_review_delivery(
         ),
         None,
     )
-    finished_set_destination = next(
+    patreon_download_destination = next(
         (
             destination
             for destination in snapshot.destinations
             if destination.key == "patreon"
+            and destination.state == "ready"
             and destination.intent_id is not None
             and destination.intent_digest is not None
             and destination.intent_lock_version is not None
@@ -235,7 +258,7 @@ async def dashboard_review_delivery(
     )
     delivery_progress = _delivery_progress_payload(
         snapshot,
-        publishing_enabled=settings.publishing_enabled,
+        finished_set_archive=finished_set_archive,
     )
     return _secure(
         request,
@@ -251,10 +274,12 @@ async def dashboard_review_delivery(
                 "previews": previews,
                 "csrf_token": csrf_token,
                 "output_submission_id": output_submission_id,
+                "archive_submission_id": archive_submission_id,
                 "destination_submission_id": destination_submission_id,
                 "watermark_submission_id": watermark_submission_id,
                 "guard_submission_id": guard_submission_id,
                 "output_idempotency_key": output_key,
+                "archive_idempotency_key": archive_key,
                 "destination_idempotency_key": destination_key,
                 "public_preview_attested_at": datetime.now(UTC).isoformat(),
                 "watermark_idempotency_key": watermark_key,
@@ -264,7 +289,13 @@ async def dashboard_review_delivery(
                 "patreon_absent_idempotency_key": patreon_absent_key,
                 "patreon_present_attestation": PUBLICATION_CONFIRM_PRESENT_ATTESTATION,
                 "patreon_absent_attestation": (PUBLICATION_CONFIRM_PATREON_ABSENT_ATTESTATION),
-                "finished_set_destination": finished_set_destination,
+                "patreon_download_destination": patreon_download_destination,
+                "finished_set_archive": (
+                    finished_set_archive
+                    if _finished_set_archive_parts_ready(finished_set_archive)
+                    else None
+                ),
+                "finished_set_archive_snapshot": finished_set_archive,
                 "storage_available": _store(request) is not None,
                 "publishing_enabled": settings.publishing_enabled,
                 "x_configured": settings.x_oauth_secret_reference is not None,
@@ -297,7 +328,11 @@ async def dashboard_review_delivery_progress(
         )
     try:
         snapshot = await load_operator_delivery(session, review_task_id=review_task_id)
-    except OperatorDeliveryNotFoundError:
+        finished_set_archive = await load_finished_set_archive(
+            session,
+            review_task_id=review_task_id,
+        )
+    except (OperatorDeliveryNotFoundError, FinishedSetArchiveNotFoundError):
         return _secure(
             request,
             JSONResponse(
@@ -305,13 +340,12 @@ async def dashboard_review_delivery_progress(
                 content={"detail": "completed review was not found"},
             ),
         )
-    settings: Settings = request.app.state.settings
     return _secure(
         request,
         JSONResponse(
             content=_delivery_progress_payload(
                 snapshot,
-                publishing_enabled=settings.publishing_enabled,
+                finished_set_archive=finished_set_archive,
             )
         ),
     )
@@ -447,6 +481,58 @@ async def dashboard_prepare_outputs(
             status.HTTP_409_CONFLICT,
             "Outputs could not be prepared from the current review snapshot.",
         )
+    return _redirect(review_task_id)
+
+
+@router.post(
+    "/review-tasks/{review_task_id}/delivery:prepare-archive",
+    response_class=HTMLResponse,
+    response_model=None,
+)
+async def dashboard_prepare_finished_set_archive(
+    review_task_id: UUID,
+    request: Request,
+    session: Session,
+    principal: PublicationReader,
+) -> Response:
+    """Idempotently request the owner's destination-neutral finished-set ZIP."""
+
+    try:
+        form = await read_prepare_archive_form(request)
+        owner = await _verified_mutation_owner(request, session, principal, form.csrf_token)
+        expected_key = delivery_form_key(
+            request.app.state.settings,
+            session_id=owner.session_id,
+            action="prepare-archive",
+            parts=(str(review_task_id), str(form.submission_id)),
+        )
+        if not form_key_matches(form.idempotency_key, expected_key):
+            raise BrowserDeliveryFormError(status_code=status.HTTP_400_BAD_REQUEST)
+        await request_finished_set_archive(
+            session,
+            review_task_id=review_task_id,
+            requested_by_user_id=owner.user_id,
+        )
+    except BrowserDeliveryFormError as error:
+        return _form_error(request, principal, error.status_code, error.message)
+    except HTTPException:
+        return _form_error(request, principal, status.HTTP_403_FORBIDDEN, "Request denied.")
+    except FinishedSetArchiveInputError as error:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            str(error),
+        )
+    except FinishedSetArchiveNotFoundError:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_404_NOT_FOUND,
+            "The completed review could not be found.",
+        )
+    except FinishedSetArchiveConflictError as error:
+        return _form_error(request, principal, status.HTTP_409_CONFLICT, str(error))
     return _redirect(review_task_id)
 
 
@@ -762,13 +848,13 @@ async def dashboard_download_patreon_package(
 
 
 @router.post(
-    "/review-tasks/{review_task_id}/delivery/finished-set/{intent_id}:download",
+    "/review-tasks/{review_task_id}/delivery/finished-set/{archive_id}:download",
     response_class=HTMLResponse,
     response_model=None,
 )
 async def dashboard_download_finished_set_package(
     review_task_id: UUID,
-    intent_id: UUID,
+    archive_id: UUID,
     request: Request,
     session: Session,
     principal: PublicationReader,
@@ -782,15 +868,13 @@ async def dashboard_download_finished_set_package(
             "Private object storage is unavailable.",
         )
     try:
-        form = await read_package_download_form(request)
+        form = await read_finished_set_archive_download_form(request)
         owner = await _verified_mutation_owner(request, session, principal, form.csrf_token)
-        result = await presign_finished_set_package_download(
+        result = await presign_finished_set_archive_part(
             session,
             store,
             review_task_id=review_task_id,
-            intent_id=intent_id,
-            expected_intent_digest=form.expected_intent_digest,
-            expected_lock_version=form.expected_lock_version,
+            archive_id=archive_id,
             actor_user_id=owner.user_id,
             actor_role=owner.role,
             expires_in_seconds=300,
@@ -800,12 +884,33 @@ async def dashboard_download_finished_set_package(
         return _form_error(request, principal, error.status_code, error.message)
     except HTTPException:
         return _form_error(request, principal, status.HTTP_403_FORBIDDEN, "Request denied.")
-    except (PublicationInputError, PublicationNotFoundError, PublicationConflictError):
+    except FinishedSetArchiveInputError:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "The finished ranked-set download request is invalid.",
+        )
+    except FinishedSetArchiveNotFoundError:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_404_NOT_FOUND,
+            "The finished ranked-set package could not be found.",
+        )
+    except FinishedSetArchiveConflictError:
         return _form_error(
             request,
             principal,
             status.HTTP_409_CONFLICT,
             "The finished ranked-set package is not currently available for download.",
+        )
+    except ObjectStoreError:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Private storage is temporarily unavailable. Try the ZIP download again.",
         )
     return _secure(
         request,
@@ -995,7 +1100,7 @@ async def _preview_views(
 def _delivery_progress_payload(
     snapshot: OperatorDeliverySnapshot,
     *,
-    publishing_enabled: bool,
+    finished_set_archive: FinishedSetArchiveSnapshot | None,
 ) -> dict[str, object]:
     progress = snapshot.progress
     if progress.outputs_ready:
@@ -1009,37 +1114,38 @@ def _delivery_progress_payload(
     else:
         output_state = "not_started"
 
-    patreon = next(
-        (destination for destination in snapshot.destinations if destination.key == "patreon"),
-        None,
+    parts = (
+        tuple(sorted(finished_set_archive.parts, key=lambda part: part.part_number))
+        if finished_set_archive is not None
+        else ()
     )
-    parts = patreon.package_parts if patreon is not None else ()
     archive_detail: str | None = None
-    if package_parts_ready(parts):
+    if _finished_set_archive_parts_ready(finished_set_archive):
         archive_state = "ready"
-    elif patreon is not None and patreon.intent_id is not None:
-        if patreon.state == "failed":
-            archive_state = "failed"
-            archive_detail = patreon.detail
-        elif patreon.state in {"queued", "running"}:
-            if not publishing_enabled:
-                archive_state = "blocked"
-                archive_detail = "Publication workers are disabled."
-            elif not snapshot.publishing_guard_enabled:
-                archive_state = "blocked"
-                archive_detail = "The global publication guard is stopped."
-            else:
-                archive_state = "preparing"
-        else:
-            archive_state = "not_started"
-    else:
+    elif finished_set_archive is None:
         archive_state = "not_started"
+        archive_detail = "Waiting for automatic ZIP preparation or an explicit request."
+    elif finished_set_archive.state == FinishedSetArchiveState.FAILED:
+        archive_state = "failed"
+        archive_detail = finished_set_archive.last_error_detail
+    elif finished_set_archive.state in {
+        FinishedSetArchiveState.PENDING,
+        FinishedSetArchiveState.PROCESSING,
+        FinishedSetArchiveState.RETRY_WAIT,
+    }:
+        archive_state = "preparing"
+        if finished_set_archive.state == FinishedSetArchiveState.RETRY_WAIT:
+            archive_detail = "ZIP creation will retry automatically."
+    else:
+        archive_state = "failed"
+        archive_detail = "The finished-set archive record is incomplete."
 
     payload: dict[str, object] = {
         "schema": "delivery-progress/v1",
         "review_task_id": str(snapshot.review_task_id),
         "outputs": {
             "state": output_state,
+            "full_outputs_ready": progress.full_outputs_ready,
             "planned": progress.planned,
             "total_jobs": progress.total_jobs,
             "requested": progress.requested,
@@ -1056,6 +1162,12 @@ def _delivery_progress_payload(
         "archive": {
             "state": archive_state,
             "detail": archive_detail,
+            "archive_id": (
+                str(finished_set_archive.archive_id) if finished_set_archive is not None else None
+            ),
+            "worker_state": (
+                finished_set_archive.state.value if finished_set_archive is not None else None
+            ),
             "part_count": len(parts),
             "parts": [
                 {
@@ -1068,10 +1180,42 @@ def _delivery_progress_payload(
             ],
         },
         "poll_after_ms": (
-            3000 if output_state == "rendering" or archive_state == "preparing" else None
+            3000
+            if output_state == "rendering"
+            or archive_state == "preparing"
+            or (archive_state == "not_started" and progress.full_outputs_ready)
+            else None
         ),
     }
     return payload
+
+
+def _finished_set_archive_parts_ready(
+    archive: FinishedSetArchiveSnapshot | None,
+) -> bool:
+    if (
+        archive is None
+        or archive.state != FinishedSetArchiveState.READY
+        or archive.part_count is None
+    ):
+        return False
+    part_count = archive.part_count
+    parts = tuple(sorted(archive.parts, key=lambda part: part.part_number))
+    return (
+        archive.selection_count > 0
+        and archive.manifest_sha256 is not None
+        and part_count == len(parts)
+        and part_count > 0
+        and tuple(part.part_number for part in parts) == tuple(range(1, part_count + 1))
+        and all(part.part_count == part_count for part in parts)
+        and all(part.manifest_sha256 == archive.manifest_sha256 for part in parts)
+        and parts[0].first_ordinal == 1
+        and parts[-1].last_ordinal == archive.selection_count
+        and all(
+            current.last_ordinal + 1 == following.first_ordinal
+            for current, following in pairwise(parts)
+        )
+    )
 
 
 def _can_render_destination_form(

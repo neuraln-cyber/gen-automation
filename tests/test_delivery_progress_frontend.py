@@ -27,6 +27,9 @@ def test_delivery_progress_uses_json_polling_without_periodic_page_reloads() -> 
     assert "reloadForNewControls" in handler
     assert 'outputState === "ready"' in handler
     assert 'archiveState === "ready"' in handler
+    assert 'initialArchiveState !== "failed" && archiveState === "failed"' in handler
+    assert "const fullOutputsReady = output.full_outputs_ready === true;" in handler
+    assert 'archiveState === "not_started" && fullOutputsReady' in handler
 
 
 def test_delivery_progress_stops_polling_when_the_session_expires() -> None:
@@ -57,7 +60,14 @@ def test_delivery_template_explains_copy_and_archive_work_truthfully() -> None:
     assert "Your AI images are already finished" in template
     assert "ZIP creation happens" in template
     assert "Creating ZIP parts in the background" in template
-    assert "publication runtime or switch is stopped" in template
+    assert "This ZIP is independent of publishing" in template
+    assert "before or while" in template
+    assert "Patreon, MEGA, and X preparation is running" in template
+    assert "delivery:prepare-archive" in template
+    assert "Prepare ZIP download" in template
+    assert "Retry ZIP preparation" in template
+    assert "publication runtime or switch is stopped" not in template
+    assert "Prepare destinations once to create" not in template
     assert "data-delivery-output-progress" in template
     assert 'aria-live="polite"' in template
     assert '{% elif output_state == "failed" %}' in template

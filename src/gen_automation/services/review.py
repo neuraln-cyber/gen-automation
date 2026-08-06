@@ -15,6 +15,7 @@ from gen_automation.db.models import (
     Asset,
     AssetRanking,
     AuditEvent,
+    GenerationJob,
     IdempotencyRecord,
     OutboxEvent,
     Release,
@@ -43,6 +44,10 @@ from gen_automation.domain.enums import (
     SemanticVerdict,
 )
 from gen_automation.domain.ids import uuid7
+from gen_automation.services.generation_positions import (
+    generation_ordinal,
+    generation_queue_offsets,
+)
 from gen_automation.services.ranking_manifest import (
     RankingManifestIntegrityError,
     load_ranking_manifest_rows,
@@ -1448,7 +1453,7 @@ async def _freeze_release_selections(
     ).all()
     if len(rows) != final_accepted_count:
         raise ReviewConflictError("accepted source count changed before selection freeze")
-    accepted_asset_ids = {decision.asset_id for decision, _, _ in rows}
+    accepted_asset_ids = {decision.asset_id for decision, _, _, _ in rows}
     x_selected_asset_ids = set(
         (
             await session.scalars(
@@ -1461,14 +1466,35 @@ async def _freeze_release_selections(
             "X selections must contain at most four currently accepted images"
         )
 
+    release_jobs = tuple(
+        (
+            await session.scalars(
+                select(GenerationJob).where(
+                    GenerationJob.release_version_id == task.release_version_id
+                )
+            )
+        ).all()
+    )
+    queue_offsets = generation_queue_offsets(release_jobs)
+    frozen_queue_positions: set[int] = set()
     selection_ids: list[str] = []
-    for display_order, (decision, ranking, asset) in enumerate(rows, start=1):
+    for display_order, (decision, ranking, asset, generation_job) in enumerate(
+        rows,
+        start=1,
+    ):
+        source_output_index = asset.output_index
+        queue_offset = queue_offsets.get(generation_job.id)
         if (
             decision.scoring_run_id != task.scoring_run_id
             or ranking.scoring_run_id != task.scoring_run_id
             or asset.release_id != release_version.release_id
             or asset.kind != AssetKind.RAW_MASTER
             or asset.state != AssetState.AVAILABLE
+            or asset.generation_job_id != generation_job.id
+            or generation_job.release_version_id != task.release_version_id
+            or source_output_index is None
+            or source_output_index < 0
+            or queue_offset is None
             or not asset.storage_backend.strip()
             or not asset.storage_bucket.strip()
             or asset.object_key is None
@@ -1491,6 +1517,10 @@ async def _freeze_release_selections(
             or _stored_as_utc(asset.available_at) > frozen_at
         ):
             raise ReviewConflictError("an accepted raw-master source is unavailable or incomplete")
+        source_queue_position = queue_offset + source_output_index + 1
+        if source_queue_position in frozen_queue_positions:
+            raise ReviewConflictError("accepted sources have duplicate generation queue positions")
+        frozen_queue_positions.add(source_queue_position)
         selection_id = uuid7()
         selection_ids.append(str(selection_id))
         session.add(
@@ -1515,6 +1545,10 @@ async def _freeze_release_selections(
                 source_width=asset.width,
                 source_height=asset.height,
                 source_byte_size=asset.byte_size,
+                source_generation_job_id=generation_job.id,
+                source_output_index=source_output_index,
+                source_generation_ordinal=generation_ordinal(generation_job),
+                source_generation_queue_position=source_queue_position,
                 source_available_at=_stored_as_utc(asset.available_at),
                 frozen_at=frozen_at,
             )
@@ -1568,7 +1602,7 @@ def _accepted_release_selection_sources_statement(
     *,
     review_task_id: UUID,
     scoring_run_id: UUID,
-) -> Select[tuple[ReviewDecision, AssetRanking, Asset]]:
+) -> Select[tuple[ReviewDecision, AssetRanking, Asset, GenerationJob]]:
     latest_revisions = (
         select(
             ReviewDecision.asset_id.label("asset_id"),
@@ -1579,7 +1613,7 @@ def _accepted_release_selection_sources_statement(
         .subquery()
     )
     return (
-        select(ReviewDecision, AssetRanking, Asset)
+        select(ReviewDecision, AssetRanking, Asset, GenerationJob)
         .join(
             latest_revisions,
             (latest_revisions.c.asset_id == ReviewDecision.asset_id)
@@ -1591,12 +1625,13 @@ def _accepted_release_selection_sources_statement(
             & (AssetRanking.asset_id == ReviewDecision.asset_id),
         )
         .join(Asset, Asset.id == ReviewDecision.asset_id)
+        .join(GenerationJob, GenerationJob.id == Asset.generation_job_id)
         .where(
             ReviewDecision.review_task_id == review_task_id,
             ReviewDecision.decision == ReviewDecisionValue.ACCEPT,
         )
         .order_by(AssetRanking.rank, Asset.id)
-        .with_for_update(of=(ReviewDecision, AssetRanking, Asset))
+        .with_for_update(of=(ReviewDecision, AssetRanking, Asset, GenerationJob))
     )
 
 

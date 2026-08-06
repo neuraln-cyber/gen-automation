@@ -254,6 +254,14 @@ class MegaDeliveryState(StrEnum):
     FAILED = "failed"
 
 
+class FinishedSetArchiveState(StrEnum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    RETRY_WAIT = "retry_wait"
+    READY = "ready"
+    FAILED = "failed"
+
+
 class PublicationTarget(StrEnum):
     X = "x"
     PATREON = "patreon"

@@ -60,6 +60,7 @@ from gen_automation.services.experiment_warm_leases import (
     touch_completed_experiment_warm_leases,
     touch_experiment_warm_lease_locked,
 )
+from gen_automation.services.finished_set_archives import run_finished_set_archive_cycle
 from gen_automation.services.generation_control import (
     GENERATION_STOP_REQUESTED_ACTION,
     GENERATION_STOPPED_ACTION,
@@ -1268,6 +1269,20 @@ class ControllerWorkloads:
         )
         return result.did_work
 
+    async def finished_set_archive_once(self) -> bool:
+        if self.object_store is None:
+            return False
+        result = await run_finished_set_archive_cycle(
+            self.sessions,
+            self.object_store,
+            worker_id=self._worker_id("finished-set-archive"),
+            lease_seconds=(self.settings.background_finished_set_archive_lease_seconds),
+            retry_base_seconds=(self.settings.background_finished_set_archive_retry_base_seconds),
+            retry_max_seconds=(self.settings.background_finished_set_archive_retry_max_seconds),
+            max_archive_bytes=(self.settings.background_finished_set_archive_max_archive_bytes),
+        )
+        return result.did_work
+
     async def publication_once(self) -> bool:
         if self.object_store is None or not self.settings.publishing_enabled:
             return False
@@ -1870,6 +1885,18 @@ def build_controller_runtime(
                     timeout_seconds=(settings.background_derivative_timeout_seconds + 5),
                 )
             )
+        loops.append(
+            LoopSpec(
+                name="finished-set-archives",
+                cycle=workloads.finished_set_archive_once,
+                idle_interval_seconds=poll,
+                timeout_seconds=(settings.background_finished_set_archive_timeout_seconds + 5),
+                # Existing completed sets may be discovered on the first cycle.
+                # Archive backfill remains supervised, but must not hold API
+                # readiness while large ZIP parts are assembled.
+                requires_initial_success_for_readiness=False,
+            )
+        )
         if settings.publishing_enabled:
             loops.append(
                 LoopSpec(

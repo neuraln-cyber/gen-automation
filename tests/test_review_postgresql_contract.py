@@ -28,7 +28,7 @@ def test_release_selection_lock_is_scoped_away_from_grouped_subquery() -> None:
     sql = str(statement.compile(dialect=postgresql.dialect()))
 
     assert " GROUP BY " in sql
-    assert sql.endswith("FOR UPDATE OF review_decisions, asset_rankings, assets")
+    assert sql.endswith("FOR UPDATE OF review_decisions, asset_rankings, assets, generation_jobs")
 
 
 def test_bulk_decision_lock_is_scoped_away_from_grouped_subquery() -> None:
