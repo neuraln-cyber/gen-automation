@@ -8,14 +8,16 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
-from typing import NoReturn, cast
+from typing import Any, NoReturn, cast
 from urllib.parse import SplitResult, urlsplit
 
 import uvicorn
 from pydantic import ValidationError
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from gen_automation.gpu_worker.app import create_worker_app
 from gen_automation.gpu_worker.artifacts import (
@@ -38,6 +40,7 @@ from gen_automation.gpu_worker.models import WorkerEnvironment, WorkerSettings
 
 COMFY_SHUTDOWN_GRACE_SECONDS = 20.0
 COMFY_MONITOR_INTERVAL_SECONDS = 1.0
+WORKER_SERVER_START_TIMEOUT_SECONDS = 10.0
 _PR_SET_DUMPABLE = 4
 _PR_SET_NO_NEW_PRIVS = 38
 _SAFE_CHILD_ENVIRONMENT_NAMES = frozenset(
@@ -452,6 +455,216 @@ async def serve_worker(
     return child_exit_event.is_set()
 
 
+async def _bootstrap_probe_application(
+    scope: Scope,
+    receive: Receive,
+    send: Send,
+) -> None:
+    del receive
+    if scope["type"] != "http":
+        return
+    path = scope.get("path", "")
+    method = scope.get("method", "GET")
+    if path == "/health":
+        status_code = 200
+        body = b'{"status":"bootstrapping"}'
+    elif path == "/ready":
+        status_code = 503
+        body = b'{"status":"not_ready"}'
+    else:
+        status_code = 404
+        body = b'{"status":"not_found"}'
+    headers = [
+        (b"content-type", b"application/json"),
+        (b"cache-control", b"no-store"),
+        (b"content-length", str(len(body)).encode("ascii")),
+    ]
+    await send({"type": "http.response.start", "status": status_code, "headers": headers})
+    await send(
+        {
+            "type": "http.response.body",
+            "body": b"" if method == "HEAD" else body,
+            "more_body": False,
+        }
+    )
+
+
+class _SwitchableWorkerApplication:
+    """Keep one listening socket while startup hands off to the real app."""
+
+    def __init__(self) -> None:
+        self._application: ASGIApp = _bootstrap_probe_application
+
+    def activate(self, application: ASGIApp) -> None:
+        self._application = application
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        application = self._application
+        await application(scope, receive, send)
+
+
+def _build_switchable_server(
+    application: ASGIApp,
+    *,
+    host: str,
+    port: int,
+    log_level: str,
+) -> uvicorn.Server:
+    return uvicorn.Server(
+        uvicorn.Config(
+            application,
+            host=host,
+            port=port,
+            log_level=log_level.lower(),
+            access_log=False,
+            proxy_headers=False,
+            server_header=False,
+            date_header=False,
+            workers=1,
+            limit_concurrency=8,
+            timeout_keep_alive=5,
+            # The real FastAPI lifespan is entered explicitly at handoff because
+            # the bootstrap responder owns the socket when Uvicorn starts.
+            lifespan="off",
+        )
+    )
+
+
+async def _wait_for_server_start(
+    server: uvicorn.Server,
+    server_task: asyncio.Task[None],
+) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + WORKER_SERVER_START_TIMEOUT_SECONDS
+    while not server.started:
+        if server_task.done():
+            with suppress(asyncio.CancelledError, OSError, SystemExit):
+                await server_task
+            raise WorkerBootstrapConfigurationError("worker bootstrap configuration is invalid")
+        if loop.time() >= deadline:
+            server.should_exit = True
+            raise WorkerBootstrapConfigurationError("worker bootstrap configuration is invalid")
+        await asyncio.sleep(0.01)
+
+
+async def _serve_worker_lifecycle(
+    settings: WorkerRuntimeSettings,
+    *,
+    startup_stage: list[str],
+    startup_started_at: float,
+) -> bool:
+    router = _SwitchableWorkerApplication()
+    server = _build_switchable_server(
+        router,
+        host=settings.worker_host,
+        port=settings.worker_port,
+        log_level=settings.worker_log_level,
+    )
+    server_task = asyncio.create_task(server.serve())
+    process: subprocess.Popen[bytes] | None = None
+    queue_process: subprocess.Popen[bytes] | None = None
+    executor: ComfyExecutor | None = None
+    monitor: asyncio.Task[None] | None = None
+    worker_lifespan: Any | None = None
+    worker_lifespan_started = False
+    try:
+        startup_stage[0] = "bootstrap_probe_server"
+        await _wait_for_server_start(server, server_task)
+        _startup_progress(
+            startup_stage[0],
+            "ready",
+            elapsed_seconds=time.monotonic() - startup_started_at,
+        )
+
+        startup_stage[0] = "model_bootstrap"
+        bootstrap_started_at = time.monotonic()
+        _startup_progress(
+            startup_stage[0],
+            "started",
+            elapsed_seconds=bootstrap_started_at - startup_started_at,
+        )
+        bootstrap_task = asyncio.create_task(bootstrap_worker_models(settings))
+        completed, _pending = await asyncio.wait(
+            (bootstrap_task, server_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if server_task in completed and not bootstrap_task.done():
+            bootstrap_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await bootstrap_task
+            if server.should_exit:
+                return False
+            raise WorkerBootstrapConfigurationError("worker bootstrap configuration is invalid")
+        bootstrap_result = await bootstrap_task
+        bootstrap_completed_at = time.monotonic()
+        _startup_progress(
+            startup_stage[0],
+            "completed",
+            elapsed_seconds=bootstrap_completed_at - startup_started_at,
+            duration_seconds=bootstrap_completed_at - bootstrap_started_at,
+            artifact_count=len(bootstrap_result.artifacts),
+        )
+
+        startup_stage[0] = "detector_whitelist"
+        write_verified_detector_whitelist(settings, bootstrap_result)
+        startup_stage[0] = "executor_initialization"
+        executor = ComfyExecutor(
+            base_url=settings.comfy_base_url,
+            execution_timeout_seconds=settings.comfy_execution_timeout_seconds,
+            max_output_bytes=settings.max_output_bytes,
+            max_total_output_bytes=settings.max_total_output_bytes,
+            approved_node_classes=settings.approved_workflow_node_classes,
+        )
+        startup_stage[0] = "comfy_start"
+        process = start_comfy(settings)
+        startup_stage[0] = "queue_worker_start"
+        queue_process = start_salad_queue_worker(settings)
+        startup_stage[0] = "worker_settings"
+        worker_settings = settings.to_worker_settings()
+        application = create_worker_app(settings=worker_settings, executor=executor)
+        worker_lifespan = application.router.lifespan_context(application)
+        await worker_lifespan.__aenter__()
+        worker_lifespan_started = True
+        router.activate(cast(ASGIApp, application))
+        _startup_progress(
+            "worker_application",
+            "active",
+            elapsed_seconds=time.monotonic() - startup_started_at,
+        )
+        del settings
+        gc.collect()
+
+        monitored_processes = (process, queue_process) if queue_process is not None else (process,)
+        child_exit_event = asyncio.Event()
+        monitor = asyncio.create_task(_monitor_comfy(monitored_processes, server, child_exit_event))
+        await server_task
+        return child_exit_event.is_set()
+    finally:
+        server.should_exit = True
+        if monitor is not None:
+            monitor.cancel()
+            with suppress(asyncio.CancelledError):
+                await monitor
+        if not server_task.done():
+            with suppress(asyncio.CancelledError, OSError, SystemExit):
+                await server_task
+        elif not server_task.cancelled():
+            # Retrieve any provider-server failure even when startup failed
+            # first, avoiding an unobserved task exception during teardown.
+            server_task.exception()
+        try:
+            if worker_lifespan_started:
+                assert worker_lifespan is not None
+                await worker_lifespan.__aexit__(None, None, None)
+        finally:
+            if executor is not None:
+                executor.close()
+            if queue_process is not None:
+                stop_comfy(queue_process)
+            if process is not None:
+                stop_comfy(process)
+
+
 def _safe_startup_error_message(error: BaseException) -> str:
     if isinstance(error, ValidationError):
         details = []
@@ -475,44 +688,39 @@ def _startup_failure(stage: str, error: BaseException | None = None) -> NoReturn
     raise SystemExit(78)
 
 
+def _startup_progress(
+    stage: str,
+    status: str,
+    *,
+    elapsed_seconds: float,
+    duration_seconds: float | None = None,
+    artifact_count: int | None = None,
+) -> None:
+    detail = (
+        f"GPU worker startup progress: stage={stage} status={status} "
+        f"elapsed_seconds={elapsed_seconds:.3f}"
+    )
+    if duration_seconds is not None:
+        detail += f" duration_seconds={duration_seconds:.3f}"
+    if artifact_count is not None:
+        detail += f" artifact_count={artifact_count}"
+    print(detail, file=sys.stderr, flush=True)
+
+
 def main() -> None:
-    process: subprocess.Popen[bytes] | None = None
-    queue_process: subprocess.Popen[bytes] | None = None
-    executor: ComfyExecutor | None = None
-    worker_settings: WorkerSettings | None = None
-    worker_host = ""
-    worker_port = 0
-    worker_log_level = ""
-    startup_stage = "runtime_settings"
+    startup_stage = ["runtime_settings"]
+    startup_started_at = time.monotonic()
     try:
         settings = WorkerRuntimeSettings()
-        startup_stage = "process_hardening"
+        startup_stage[0] = "process_hardening"
         harden_parent_process(settings.environment)
-        startup_stage = "model_bootstrap"
-        bootstrap_result = asyncio.run(bootstrap_worker_models(settings))
-        startup_stage = "detector_whitelist"
-        write_verified_detector_whitelist(settings, bootstrap_result)
-        startup_stage = "executor_initialization"
-        executor = ComfyExecutor(
-            base_url=settings.comfy_base_url,
-            execution_timeout_seconds=settings.comfy_execution_timeout_seconds,
-            max_output_bytes=settings.max_output_bytes,
-            max_total_output_bytes=settings.max_total_output_bytes,
-            approved_node_classes=settings.approved_workflow_node_classes,
+        child_exited = asyncio.run(
+            _serve_worker_lifecycle(
+                settings,
+                startup_stage=startup_stage,
+                startup_started_at=startup_started_at,
+            )
         )
-        startup_stage = "comfy_start"
-        process = start_comfy(settings)
-        startup_stage = "queue_worker_start"
-        queue_process = start_salad_queue_worker(settings)
-        startup_stage = "worker_settings"
-        worker_settings = settings.to_worker_settings()
-        worker_host = settings.worker_host
-        worker_port = settings.worker_port
-        worker_log_level = settings.worker_log_level
-        del settings
-        # Drop the last durable Python reference to bootstrap-only object-store
-        # credentials before the long-lived HTTP server accepts work.
-        gc.collect()
     except (
         ArtifactBootstrapError,
         ComfyConfigurationError,
@@ -520,35 +728,7 @@ def main() -> None:
         ValidationError,
         WorkerBootstrapConfigurationError,
     ) as error:
-        if executor is not None:
-            executor.close()
-        if process is not None:
-            stop_comfy(process)
-        if queue_process is not None:
-            stop_comfy(queue_process)
-        _startup_failure(startup_stage, error)
-
-    assert process is not None
-    assert executor is not None
-    assert worker_settings is not None
-    monitored_processes = (process, queue_process) if queue_process is not None else (process,)
-    child_exited = False
-    try:
-        child_exited = asyncio.run(
-            serve_worker(
-                worker_settings,
-                monitored_processes,
-                executor,
-                host=worker_host,
-                port=worker_port,
-                log_level=worker_log_level,
-            )
-        )
-    finally:
-        executor.close()
-        if queue_process is not None:
-            stop_comfy(queue_process)
-        stop_comfy(process)
+        _startup_failure(startup_stage[0], error)
 
     if child_exited:
         _startup_failure("managed_child_monitor")

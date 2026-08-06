@@ -121,7 +121,12 @@ RUN python -c "import sys; assert sys.version_info[:2] == (3, 12)" \
     && grep -Fq '"UltralyticsDetectorProvider": UltralyticsDetectorProvider' \
         /opt/comfyui/custom_nodes/ComfyUI-Impact-Subpack/modules/subpack_nodes.py
 
-COPY src ./src
+COPY src/gen_automation/__init__.py ./src/gen_automation/__init__.py
+COPY src/gen_automation/gpu_worker ./src/gen_automation/gpu_worker
+COPY src/gen_automation/domain/__init__.py ./src/gen_automation/domain/__init__.py
+COPY src/gen_automation/domain/deliverability.py ./src/gen_automation/domain/deliverability.py
+COPY src/gen_automation/domain/generation_limits.py ./src/gen_automation/domain/generation_limits.py
+COPY src/gen_automation/domain/signing.py ./src/gen_automation/domain/signing.py
 COPY --from=salad-queue-worker-builder --chmod=0555 \
     /out/salad-http-job-queue-worker \
     /usr/local/bin/salad-http-job-queue-worker

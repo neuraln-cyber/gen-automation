@@ -266,6 +266,75 @@ async def test_disabled_allocation_durably_stops_unknown_resource_with_missing_i
         await database.dispose()
 
 
+@pytest.mark.asyncio
+async def test_deployment_loop_reconciles_failed_stop_with_partial_identity(
+    tmp_path: Path,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'failed-stop.db').as_posix()}")
+    await database.create_schema()
+    queue_name, group_name = _remote_names()
+    client = DeploymentOnlyClient(
+        queue=_queue(queue_name),
+        group=_group(group_name, queue_name),
+    )
+    try:
+        async with database.sessions() as session:
+            deployment = SaladDeployment(
+                version_no=1,
+                config_sha256=CONFIG_SHA256,
+                provider_configuration=_provider_configuration(),
+                worker_image_digest=IMAGE_DIGEST,
+                organization_name="organization",
+                project_name="project",
+                queue_name="generation",
+                container_group_name="worker",
+                provider_container_group_id=str(GROUP_ID),
+                state=SaladDeploymentState.FAILED,
+                desired_state=DesiredDeploymentState.STOPPED,
+                is_current=False,
+                max_hourly_cost_microusd=3_600_000,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            session.add(deployment)
+            await ensure_budget_guard(
+                session,
+                provider="salad",
+                daily_limit_usd=Decimal("100"),
+                monthly_limit_usd=Decimal("1000"),
+                now=NOW,
+            )
+            await session.commit()
+            deployment_id = deployment.id
+
+        workloads = ControllerWorkloads(
+            settings=Settings().model_copy(
+                update={
+                    "gpu_allocation_enabled": True,
+                    "salad_daily_budget_usd": Decimal("100"),
+                    "salad_monthly_budget_usd": Decimal("1000"),
+                }
+            ),
+            sessions=database.sessions,
+            instance_id="controller-failed-stop-test",
+            salad_client=cast(SaladClient, client),
+            object_store=None,
+        )
+
+        assert await workloads.deployment_once() is True
+
+        async with database.sessions() as session:
+            deployment = await session.get(SaladDeployment, deployment_id)
+            assert deployment is not None
+            assert deployment.state == SaladDeploymentState.DRAINING
+            assert deployment.provider_queue_id == str(QUEUE_ID)
+            assert deployment.provider_container_group_id == str(GROUP_ID)
+        assert client.stop_names == [group_name]
+        assert client.create_calls == 0
+    finally:
+        await database.dispose()
+
+
 async def _seed_submission_database(database: Database) -> SubmissionContext:
     async with database.sessions() as session:
         await ensure_budget_guard(

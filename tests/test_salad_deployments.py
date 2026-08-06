@@ -73,7 +73,7 @@ STARTUP_PROBE: dict[str, JSONValue] = {
         "scheme": "http",
     },
     "initial_delay_seconds": 0,
-    "period_seconds": 120,
+    "period_seconds": 5,
     "timeout_seconds": 5,
     "success_threshold": 1,
     "failure_threshold": 20,
@@ -104,6 +104,12 @@ LIVENESS_PROBE: dict[str, JSONValue] = {
     "success_threshold": 1,
     "failure_threshold": 3,
 }
+
+
+def test_startup_probe_detects_bootstrap_responder_promptly_with_live_safe_limits() -> None:
+    assert STARTUP_PROBE["initial_delay_seconds"] == 0
+    assert STARTUP_PROBE["period_seconds"] == 5
+    assert STARTUP_PROBE["failure_threshold"] == 20
 
 
 def api_error(status_code: int) -> SaladAPIError:
@@ -1133,6 +1139,57 @@ async def test_current_rollout_waits_for_superseded_group_to_stop(
     assert result.action == DeploymentAction.DEFERRED
     assert result.error_code == "superseded_deployment_not_stopped"
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_confirmed_partial_identity_stop_does_not_block_current_rollout(
+    deployment_context: DeploymentContext,
+) -> None:
+    async with deployment_context.database.sessions() as session:
+        superseded = SaladDeployment(
+            version_no=2,
+            config_sha256="9" * 64,
+            provider_configuration=provider_configuration(),
+            worker_image_digest=IMAGE_DIGEST,
+            organization_name="creator-org",
+            project_name="production",
+            queue_name="superseded-queue",
+            container_group_name="superseded-group",
+            provider_container_group_id="superseded-group-id",
+            state=SaladDeploymentState.FAILED,
+            desired_state=DesiredDeploymentState.STOPPED,
+            is_current=False,
+            min_replicas=0,
+            max_replicas=1,
+            desired_queue_length=1,
+            max_hourly_cost_microusd=3_600_000,
+        )
+        session.add(superseded)
+        await session.commit()
+
+        client = FakeClient()
+        stopped = await provision_deployment_step(
+            session,
+            deployment_id=superseded.id,
+            client=client,
+            now=NOW,
+        )
+        await session.commit()
+        current = await provision_deployment_step(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=NOW + timedelta(seconds=1),
+        )
+        await session.commit()
+        await session.refresh(superseded)
+
+    assert stopped.action == DeploymentAction.STOPPED
+    assert stopped.state == SaladDeploymentState.FAILED
+    assert superseded.stopped_at is not None
+    assert superseded.stopped_at.replace(tzinfo=UTC) == NOW
+    assert current.action == DeploymentAction.QUEUE_CREATED
+    assert current.error_code is None
 
 
 async def make_fully_provisioned(

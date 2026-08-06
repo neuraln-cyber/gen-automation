@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import re
 from pathlib import Path
@@ -170,6 +171,50 @@ def test_expected_worker_entrypoint_is_the_only_runtime_entrypoint() -> None:
         '["/opt/worker-venv/bin/python", "-m", "gen_automation.gpu_worker.main"]'
     ]
     assert not re.search(r"^CMD\s+", dockerfile, flags=re.MULTILINE)
+
+
+def test_worker_image_copies_only_its_runtime_package_and_direct_domain_imports() -> None:
+    dockerfile = _dockerfile()
+    source_copies = [
+        line.strip() for line in dockerfile.splitlines() if line.strip().startswith("COPY src/")
+    ]
+
+    assert source_copies == [
+        "COPY src/gen_automation/__init__.py ./src/gen_automation/__init__.py",
+        "COPY src/gen_automation/gpu_worker ./src/gen_automation/gpu_worker",
+        "COPY src/gen_automation/domain/__init__.py ./src/gen_automation/domain/__init__.py",
+        (
+            "COPY src/gen_automation/domain/deliverability.py "
+            "./src/gen_automation/domain/deliverability.py"
+        ),
+        (
+            "COPY src/gen_automation/domain/generation_limits.py "
+            "./src/gen_automation/domain/generation_limits.py"
+        ),
+        "COPY src/gen_automation/domain/signing.py ./src/gen_automation/domain/signing.py",
+    ]
+    assert "COPY src ./src" not in dockerfile
+
+
+def test_worker_domain_copy_contract_matches_the_runtime_import_graph() -> None:
+    worker_package = ROOT / "src" / "gen_automation" / "gpu_worker"
+    direct_domain_imports: set[str] = set()
+    for source_path in worker_package.glob("*.py"):
+        module = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+        for node in ast.walk(module):
+            if isinstance(node, ast.ImportFrom) and node.module is not None:
+                if node.module.startswith("gen_automation.domain."):
+                    direct_domain_imports.add(node.module)
+
+    assert direct_domain_imports == {
+        "gen_automation.domain.deliverability",
+        "gen_automation.domain.generation_limits",
+        "gen_automation.domain.signing",
+    }
+    dockerfile = _dockerfile()
+    for module_name in direct_domain_imports:
+        source_path = module_name.replace(".", "/") + ".py"
+        assert f"COPY src/{source_path} ./src/{source_path}" in dockerfile
 
 
 def test_python_dependencies_are_hash_locked_and_cuda_stack_matches_base() -> None:

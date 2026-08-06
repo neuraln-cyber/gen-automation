@@ -10,13 +10,25 @@ from enum import StrEnum
 from typing import Any, Protocol, cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from gen_automation.db.models import AuditEvent, ProviderBudgetGuard, SaladDeployment
+from gen_automation.db.models import (
+    AuditEvent,
+    GenerationAttempt,
+    GenerationJob,
+    ProviderBudgetGuard,
+    Release,
+    ReleaseVersion,
+    SaladDeployment,
+)
 from gen_automation.domain.enums import (
     BudgetState,
     DesiredDeploymentState,
+    GenerationAttemptState,
+    GenerationState,
+    ReleasePhase,
+    ResourceHealth,
     SaladDeploymentState,
     SpendEntryType,
 )
@@ -70,12 +82,13 @@ _WORKER_STARTUP_PROBE: JSONObject = {
         "scheme": "http",
     },
     "initial_delay_seconds": 0,
-    "period_seconds": 120,
+    "period_seconds": 5,
     "timeout_seconds": 5,
     "success_threshold": 1,
-    # Model artifacts are downloaded before the HTTP server starts. Salad's
-    # live API caps this threshold at 20 and the period at 120 seconds, giving
-    # a roughly 40-minute cold-start window before reallocation.
+    # A bootstrap-only HTTP responder serves /health while model artifacts are
+    # materialized. Poll quickly so a healthy allocation is observed promptly;
+    # the threshold remains inside Salad's live API limits and now only bounds
+    # failure to start the Python responder.
     "failure_threshold": 20,
 }
 _WORKER_READINESS_PROBE: JSONObject = {
@@ -122,6 +135,20 @@ _SENSITIVE_CONFIGURATION_MARKERS = frozenset(
         "token",
     }
 )
+_GENERATION_ACTIVE_RELEASE_PHASES = (
+    ReleasePhase.READY,
+    ReleasePhase.GENERATING,
+)
+_GENERATION_ACTIVE_GPU_ATTEMPT_STATES = (
+    GenerationAttemptState.SUBMITTED,
+    GenerationAttemptState.RUNNING,
+    GenerationAttemptState.UNKNOWN,
+)
+_GENERATION_ACTIVE_GPU_JOB_STATES = (
+    GenerationState.RUNNING,
+    GenerationState.UNKNOWN,
+)
+_GENERATION_STOP_REQUESTED_ACTION = "release.generation_stop_requested"
 
 
 class SaladDeploymentError(Exception):
@@ -480,7 +507,7 @@ async def _reconcile_locked(
             observed_at=observed_at,
         )
 
-    effective_min_replicas = await effective_experiment_min_replicas(
+    effective_min_replicas = await effective_worker_min_replicas(
         session,
         salad_deployment_id=deployment.id,
         now=observed_at,
@@ -582,6 +609,78 @@ async def _reconcile_locked(
         metered_microusd=metered,
         error_code=deployment.last_error_code,
     )
+
+
+async def effective_worker_min_replicas(
+    session: AsyncSession,
+    *,
+    salad_deployment_id: UUID,
+    now: datetime,
+) -> int:
+    """Keep one worker only while experiments or generation genuinely need it."""
+
+    experiment_minimum = await effective_experiment_min_replicas(
+        session,
+        salad_deployment_id=salad_deployment_id,
+        now=now,
+    )
+    if experiment_minimum == 1:
+        return 1
+    observed_at = _as_utc(now)
+    stop_marker = exists(
+        select(AuditEvent.id).where(
+            AuditEvent.resource_type == "release",
+            AuditEvent.resource_id == Release.id,
+            AuditEvent.action == _GENERATION_STOP_REQUESTED_ACTION,
+        )
+    )
+    dispatchable_job_id = await session.scalar(
+        select(GenerationJob.id)
+        .join(ReleaseVersion, ReleaseVersion.id == GenerationJob.release_version_id)
+        .join(Release, Release.id == ReleaseVersion.release_id)
+        .where(
+            GenerationJob.provider == _PROVIDER,
+            GenerationJob.attempt_count < GenerationJob.max_attempts,
+            or_(
+                GenerationJob.state == GenerationState.QUEUED,
+                (
+                    (GenerationJob.state == GenerationState.RETRY_WAIT)
+                    & or_(
+                        GenerationJob.retry_at.is_(None),
+                        GenerationJob.retry_at <= observed_at,
+                    )
+                ),
+            ),
+            Release.phase.in_(_GENERATION_ACTIVE_RELEASE_PHASES),
+            Release.health == ResourceHealth.HEALTHY,
+            Release.current_version_no == ReleaseVersion.version_no,
+            ~stop_marker,
+        )
+        .order_by(GenerationJob.created_at, GenerationJob.id)
+        .limit(1)
+    )
+    if dispatchable_job_id is not None:
+        return 1
+
+    active_attempt_id = await session.scalar(
+        select(GenerationAttempt.id)
+        .join(GenerationJob, GenerationJob.id == GenerationAttempt.job_id)
+        .join(ReleaseVersion, ReleaseVersion.id == GenerationJob.release_version_id)
+        .join(Release, Release.id == ReleaseVersion.release_id)
+        .where(
+            GenerationAttempt.salad_deployment_id == salad_deployment_id,
+            GenerationAttempt.provider == _PROVIDER,
+            GenerationJob.provider == _PROVIDER,
+            GenerationAttempt.state.in_(_GENERATION_ACTIVE_GPU_ATTEMPT_STATES),
+            GenerationJob.state.in_(_GENERATION_ACTIVE_GPU_JOB_STATES),
+            Release.phase.in_(_GENERATION_ACTIVE_RELEASE_PHASES),
+            Release.current_version_no == ReleaseVersion.version_no,
+            ~stop_marker,
+        )
+        .order_by(GenerationAttempt.created_at, GenerationAttempt.id)
+        .limit(1)
+    )
+    return 1 if active_attempt_id is not None else 0
 
 
 async def _request_active_contract_repair(
@@ -963,6 +1062,7 @@ async def _has_unstopped_superseded_group(
             SaladDeployment.is_current.is_(False),
             SaladDeployment.provider_container_group_id.is_not(None),
             SaladDeployment.state != SaladDeploymentState.STOPPED,
+            SaladDeployment.stopped_at.is_(None),
         )
         .order_by(SaladDeployment.version_no)
         .limit(1)

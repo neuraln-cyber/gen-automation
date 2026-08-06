@@ -183,9 +183,12 @@ Expected paths:
 ```
 
 The model directories and runtime directory are writable by the non-root worker.
-The pinned ComfyUI source remains in `/opt/comfyui`. Model bootstrap completes
-before the HTTP server starts, `GET /health` reports process liveness, and
-`GET /ready` returns success only when the loopback ComfyUI executor is ready.
+The pinned ComfyUI source remains in `/opt/comfyui`. A bootstrap-only responder
+binds the worker port before model materialization: `GET /health` reports the
+Python process as live while `GET /ready` stays unavailable. After verified model
+bootstrap and managed-child startup, the same listening server hands requests to
+the real worker application without a port-close/rebind race. `GET /ready` then
+returns success only when the loopback ComfyUI executor is ready.
 
 ## GPU worker runtime settings
 

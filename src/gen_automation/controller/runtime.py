@@ -700,16 +700,8 @@ class ControllerWorkloads:
             )
             stoppable = and_(
                 SaladDeployment.desired_state == DesiredDeploymentState.STOPPED,
-                SaladDeployment.state.in_(
-                    (
-                        SaladDeploymentState.PLANNED,
-                        SaladDeploymentState.PROVISIONING,
-                        SaladDeploymentState.ACTIVE,
-                        SaladDeploymentState.DEGRADED,
-                        SaladDeploymentState.DRAINING,
-                        SaladDeploymentState.UNKNOWN,
-                    )
-                ),
+                SaladDeployment.state.in_(_DEPLOYMENT_WORK_STATES),
+                SaladDeployment.stopped_at.is_(None),
             )
             predicates = [reconcilable, stoppable]
             if self.settings.gpu_allocation_enabled:

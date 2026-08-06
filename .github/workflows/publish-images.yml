@@ -31,9 +31,6 @@ jobs:
           - component: control-plane
             image_suffix: control-plane
             dockerfile: Dockerfile
-          - component: gpu-worker
-            image_suffix: gpu-worker
-            dockerfile: Dockerfile.worker
           - component: semantic-gateway
             image_suffix: semantic-gateway
             dockerfile: Dockerfile.semantic-gateway
@@ -84,9 +81,188 @@ jobs:
           push-to-registry: true
           create-storage-record: false
 
+  publish-worker:
+    name: Publish or reuse the exact GPU worker
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    concurrency:
+      group: publish-gpu-worker
+      cancel-in-progress: false
+    outputs:
+      source_revision: ${{ steps.worker_source.outputs.revision }}
+      image_digest: ${{ steps.verify_worker.outputs.digest }}
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository }}/gpu-worker
+      SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Check out full history at the exact CI-tested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve the worker source revision
+        id: worker_source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          worker_inputs=(
+            .dockerignore
+            .gitattributes
+            Dockerfile.worker
+            requirements.lock
+            requirements-comfy.lock
+            requirements-worker-base.txt
+            patches/salad-queue-worker/strict-http-status.patch
+            src/gen_automation/__init__.py
+            src/gen_automation/gpu_worker
+            src/gen_automation/domain/__init__.py
+            src/gen_automation/domain/deliverability.py
+            src/gen_automation/domain/generation_limits.py
+            src/gen_automation/domain/signing.py
+          )
+          candidate="$(
+            git log -1 --format=%H "$SOURCE_SHA" -- "${worker_inputs[@]}"
+          )"
+          [[ "$candidate" =~ ^[0-9a-f]{40}$ ]] || {
+            printf '%s\n' "No worker source revision could be resolved." >&2
+            exit 1
+          }
+          fingerprint() {
+            git ls-tree -r "$1" -- "${worker_inputs[@]}" | sha256sum | cut -d' ' -f1
+          }
+          if [ "$(fingerprint "$candidate")" != "$(fingerprint "$SOURCE_SHA")" ]; then
+            # A merge can combine worker inputs that never coexisted in either
+            # parent. In that rare case the tested merge itself is the source.
+            candidate="$SOURCE_SHA"
+          fi
+          printf 'revision=%s\n' "$candidate" >>"$GITHUB_OUTPUT"
+      - name: Check out the resolved worker source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.worker_source.outputs.revision }}
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Reuse an existing immutable worker image when available
+        id: existing_worker
+        shell: bash
+        env:
+          WORKER_SOURCE_REVISION: ${{ steps.worker_source.outputs.revision }}
+        run: |
+          set -euo pipefail
+          image_tag="${IMAGE_NAME}:sha-${WORKER_SOURCE_REVISION}"
+          error_file="$RUNNER_TEMP/worker-image-inspect-error"
+          if manifest_json="$(
+            docker buildx imagetools inspect \
+              "$image_tag" \
+              --format '{{json .Manifest}}' \
+              2>"$error_file"
+          )"; then
+            image_json="$(
+              docker buildx imagetools inspect \
+                "$image_tag" \
+                --format '{{json .Image}}'
+            )"
+            digest="$(
+              MANIFEST_JSON="$manifest_json" python3 -c \
+                'import json, os; print(json.loads(os.environ["MANIFEST_JSON"])["digest"])'
+            )"
+            revision="$(
+              IMAGE_JSON="$image_json" python3 -c \
+                'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.revision"])'
+            )"
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            [ "$revision" = "$WORKER_SOURCE_REVISION" ] || {
+              printf '%s\n' "Existing worker tag has an unexpected source label." >&2
+              exit 1
+            }
+            printf '%s\n' "The exact worker input revision already exists; no worker image will be rebuilt."
+            printf '%s\n' "exists=true" >>"$GITHUB_OUTPUT"
+          elif grep -Eqi 'not found|manifest unknown|does not exist' "$error_file"; then
+            printf '%s\n' "exists=false" >>"$GITHUB_OUTPUT"
+          else
+            cat "$error_file" >&2
+            exit 1
+          fi
+      - name: Build and push a new immutable worker image
+        id: push_worker
+        if: steps.existing_worker.outputs.exists == 'false'
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: Dockerfile.worker
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:sha-${{ steps.worker_source.outputs.revision }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.worker_source.outputs.revision }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha,scope=gpu-worker
+          cache-to: type=gha,mode=max,scope=gpu-worker
+          provenance: mode=max
+          sbom: true
+      - name: Attest the new worker registry digest
+        if: steps.existing_worker.outputs.exists == 'false'
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push_worker.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+      - name: Verify the exact immutable worker image
+        id: verify_worker
+        shell: bash
+        env:
+          WORKER_SOURCE_REVISION: ${{ steps.worker_source.outputs.revision }}
+        run: |
+          set -euo pipefail
+          image_tag="${IMAGE_NAME}:sha-${WORKER_SOURCE_REVISION}"
+          manifest_json="$(
+            docker buildx imagetools inspect \
+              "$image_tag" \
+              --format '{{json .Manifest}}'
+          )"
+          image_json="$(
+            docker buildx imagetools inspect \
+              "$image_tag" \
+              --format '{{json .Image}}'
+          )"
+          digest="$(
+            MANIFEST_JSON="$manifest_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["MANIFEST_JSON"])["digest"])'
+          )"
+          revision="$(
+            IMAGE_JSON="$image_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.revision"])'
+          )"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [ "$revision" = "$WORKER_SOURCE_REVISION" ] || {
+            printf '%s\n' "Published worker source label does not match its resolved input revision." >&2
+            exit 1
+          }
+          if [ "${{ steps.existing_worker.outputs.exists }}" = "false" ]; then
+            [ "$digest" = "${{ steps.push_worker.outputs.digest }}" ] || {
+              printf '%s\n' "Published worker digest changed before verification." >&2
+              exit 1
+            }
+          fi
+          printf 'digest=%s\n' "$digest" >>"$GITHUB_OUTPUT"
+
   record-staging-source:
-    name: Record the exact published source revision
-    needs: publish
+    name: Record the exact published source revisions and digests
+    needs: [publish, publish-worker]
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
@@ -95,17 +271,26 @@ jobs:
     timeout-minutes: 5
     env:
       SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+      WORKER_SOURCE_REVISION: ${{ needs.publish-worker.outputs.source_revision }}
+      WORKER_IMAGE_DIGEST: ${{ needs.publish-worker.outputs.image_digest }}
     steps:
       - name: Write non-secret deployment metadata
         shell: bash
         run: |
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$WORKER_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$WORKER_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           printf '%s\n' "$SOURCE_SHA" >"$RUNNER_TEMP/staging-source-revision"
+          printf '%s\n' "$WORKER_SOURCE_REVISION" >"$RUNNER_TEMP/staging-worker-source-revision"
+          printf '%s\n' "$WORKER_IMAGE_DIGEST" >"$RUNNER_TEMP/staging-worker-image-digest"
       - name: Upload deployment metadata for the follow-on workflow
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: staging-deploy-source
-          path: ${{ runner.temp }}/staging-source-revision
+          path: |
+            ${{ runner.temp }}/staging-source-revision
+            ${{ runner.temp }}/staging-worker-source-revision
+            ${{ runner.temp }}/staging-worker-image-digest
           if-no-files-found: error
           retention-days: 1

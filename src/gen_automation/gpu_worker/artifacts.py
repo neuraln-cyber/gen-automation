@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any, Literal, NoReturn, Protocol, cast
+from typing import Annotated, Any, Literal, NoReturn, Protocol, cast, runtime_checkable
 
 from pydantic import (
     BaseModel,
@@ -30,6 +30,13 @@ MIN_FREE_SPACE_MARGIN_BYTES = 64 * 1024 * 1024
 MAX_SAFETENSORS_HEADER_BYTES = 16 * 1024 * 1024
 STREAM_READ_BYTES = 1024 * 1024
 MAX_PARALLEL_ARTIFACT_DOWNLOADS = 4
+# Keep small objects on the existing single-request stream. Large, immutable
+# model files can opt into a bounded ranged stream without changing the
+# materializer's validation or atomic-install boundary.
+MULTIPART_ARTIFACT_THRESHOLD_BYTES = 256 * 1024 * 1024
+MULTIPART_ARTIFACT_PART_BYTES = 32 * 1024 * 1024
+MAX_PARALLEL_ARTIFACT_PARTS = 4
+MAX_ARTIFACT_PART_DOWNLOAD_ATTEMPTS = 4
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SAFE_TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,223}(?:\.safetensors|\.pt)$")
@@ -283,6 +290,13 @@ class ArtifactDownloader(Protocol):
     def stream(self, artifact: ModelArtifactSpec) -> AsyncIterator[bytes]: ...
 
 
+@runtime_checkable
+class RangedArtifactDownloader(Protocol):
+    """Optional ordered ranged stream for large, version-pinned artifacts."""
+
+    def ranged_stream(self, artifact: ModelArtifactSpec) -> AsyncIterator[bytes]: ...
+
+
 class ArtifactBootstrapError(Exception):
     """A deliberately redacted artifact-bootstrap failure."""
 
@@ -519,7 +533,14 @@ async def _write_download(
         total_size = 0
         with os.fdopen(descriptor, "w+b", closefd=True) as file_object:
             descriptor = -1
-            async for chunk in downloader.stream(artifact):
+            stream = downloader.stream
+            if (
+                artifact.exact_size_bytes >= MULTIPART_ARTIFACT_THRESHOLD_BYTES
+                and artifact.source_object_version_id is not None
+                and isinstance(downloader, RangedArtifactDownloader)
+            ):
+                stream = downloader.ranged_stream
+            async for chunk in stream(artifact):
                 if not isinstance(chunk, bytes):
                     raise _InvalidArtifactError
                 total_size += len(chunk)

@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+import gen_automation.gpu_worker.artifacts as worker_artifacts
 from gen_automation.gpu_worker.artifacts import (
     MAX_SAFETENSORS_HEADER_BYTES,
     ArtifactBootstrapError,
@@ -58,6 +59,7 @@ def _artifact(
     max_size_bytes: int | None = None,
     sha256: str | None = None,
     source_object_id: str | None = "private/models/illustrious",
+    source_object_version_id: str | None = None,
     downloader_key: str | None = None,
 ) -> ModelArtifactSpec:
     size = len(content) if exact_size_bytes is None else exact_size_bytes
@@ -66,6 +68,7 @@ def _artifact(
         logical_name=logical_name,
         kind=kind,
         source_object_id=source_object_id,
+        source_object_version_id=source_object_version_id,
         downloader_key=downloader_key,
         sha256=sha256 or hashlib.sha256(content).hexdigest(),
         exact_size_bytes=size,
@@ -133,6 +136,21 @@ class CoordinatedDownloader:
             yield self.blobs[artifact.logical_name]
         finally:
             self.active -= 1
+
+
+@dataclass
+class RangedFakeDownloader:
+    content: bytes
+    stream_calls: int = 0
+    ranged_calls: int = 0
+
+    async def stream(self, _artifact: ModelArtifactSpec) -> AsyncIterator[bytes]:
+        self.stream_calls += 1
+        yield self.content
+
+    async def ranged_stream(self, _artifact: ModelArtifactSpec) -> AsyncIterator[bytes]:
+        self.ranged_calls += 1
+        yield self.content
 
 
 async def bootstrap_artifacts(
@@ -256,6 +274,110 @@ async def test_downloads_independent_model_artifacts_concurrently(
         "style-one",
         "style-two",
     ]
+
+
+@pytest.mark.asyncio
+async def test_large_version_pinned_artifact_uses_optional_ranged_stream(
+    model_roots: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_root, lora_root = model_roots
+    content = _safetensors(body=b"ranged-download")
+    artifact = _artifact(content, source_object_version_id="version-1")
+    downloader = RangedFakeDownloader(content)
+    monkeypatch.setattr(worker_artifacts, "MULTIPART_ARTIFACT_THRESHOLD_BYTES", len(content))
+
+    await bootstrap_artifacts(
+        _manifest(artifact),
+        downloader,
+        checkpoint_root=checkpoint_root.resolve(),
+        lora_root=lora_root.resolve(),
+    )
+
+    assert downloader.ranged_calls == 1
+    assert downloader.stream_calls == 0
+    assert (checkpoint_root / artifact.target_filename).read_bytes() == content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pinned", [False, True], ids=["unversioned-large", "pinned-small"])
+async def test_single_stream_is_preserved_without_both_size_and_version_eligibility(
+    model_roots: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    pinned: bool,
+) -> None:
+    checkpoint_root, lora_root = model_roots
+    content = _safetensors(body=b"single-stream")
+    artifact = _artifact(
+        content,
+        source_object_version_id="version-1" if pinned else None,
+    )
+    downloader = RangedFakeDownloader(content)
+    threshold = len(content) + 1 if pinned else len(content)
+    monkeypatch.setattr(worker_artifacts, "MULTIPART_ARTIFACT_THRESHOLD_BYTES", threshold)
+
+    await bootstrap_artifacts(
+        _manifest(artifact),
+        downloader,
+        checkpoint_root=checkpoint_root.resolve(),
+        lora_root=lora_root.resolve(),
+    )
+
+    assert downloader.stream_calls == 1
+    assert downloader.ranged_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_ranged_stream_still_uses_hash_validation_and_temp_cleanup(
+    model_roots: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_root, lora_root = model_roots
+    expected = _safetensors(body=b"expected-content")
+    corrupt = expected[:-1] + bytes([expected[-1] ^ 0xFF])
+    artifact = _artifact(expected, source_object_version_id="version-1")
+    downloader = RangedFakeDownloader(corrupt)
+    monkeypatch.setattr(worker_artifacts, "MULTIPART_ARTIFACT_THRESHOLD_BYTES", len(expected))
+
+    with pytest.raises(ArtifactBootstrapError, match="artifact bootstrap failed"):
+        await bootstrap_artifacts(
+            _manifest(artifact),
+            downloader,
+            checkpoint_root=checkpoint_root.resolve(),
+            lora_root=lora_root.resolve(),
+        )
+
+    assert downloader.ranged_calls == 1
+    assert list(checkpoint_root.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_ranged_stream_cancellation_propagates_after_temp_cleanup(
+    model_roots: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_root, lora_root = model_roots
+    content = _safetensors(body=b"cancelled-ranged-download")
+    artifact = _artifact(content, source_object_version_id="version-1")
+    monkeypatch.setattr(worker_artifacts, "MULTIPART_ARTIFACT_THRESHOLD_BYTES", len(content))
+
+    class CancelledRangedDownloader(RangedFakeDownloader):
+        async def ranged_stream(self, _artifact: ModelArtifactSpec) -> AsyncIterator[bytes]:
+            self.ranged_calls += 1
+            yield self.content[:8]
+            raise asyncio.CancelledError
+
+    downloader = CancelledRangedDownloader(content)
+    with pytest.raises(asyncio.CancelledError):
+        await bootstrap_artifacts(
+            _manifest(artifact),
+            downloader,
+            checkpoint_root=checkpoint_root.resolve(),
+            lora_root=lora_root.resolve(),
+        )
+
+    assert downloader.ranged_calls == 1
+    assert list(checkpoint_root.iterdir()) == []
 
 
 @pytest.mark.asyncio

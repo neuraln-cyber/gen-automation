@@ -9,8 +9,10 @@ from uuid import UUID
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.db.models import (
+    AuditEvent,
     ExperimentWarmLease,
     GenerationAttempt,
     GenerationJob,
@@ -27,6 +29,8 @@ from gen_automation.domain.enums import (
     ExperimentWarmLeaseState,
     GenerationAttemptState,
     GenerationState,
+    ReleasePhase,
+    ResourceHealth,
     SaladDeploymentState,
     SpendEntryType,
 )
@@ -45,7 +49,10 @@ from gen_automation.services.experiment_warm_leases import (
     touch_completed_experiment_warm_leases,
 )
 from gen_automation.services.salad import prepare_generation_attempt
-from gen_automation.services.salad_deployments import _desired_queue_autoscaler
+from gen_automation.services.salad_deployments import (
+    _desired_queue_autoscaler,
+    effective_worker_min_replicas,
+)
 
 NOW = datetime(2026, 8, 5, 9, 0, tzinfo=UTC)
 IMAGE_DIGEST = "registry.example.test/worker@sha256:" + "a" * 64
@@ -55,6 +62,7 @@ IMAGE_DIGEST = "registry.example.test/worker@sha256:" + "a" * 64
 class WarmContext:
     database: Database
     deployment_id: UUID
+    release_id: UUID
     release_version_id: UUID
 
 
@@ -78,6 +86,7 @@ async def warm_context(tmp_path: Path) -> AsyncIterator[WarmContext]:
             slug="warm-test",
             title="Warm test",
             desired_accepted_count=1,
+            phase=ReleasePhase.READY,
         )
         session.add(release)
         await session.flush()
@@ -120,12 +129,81 @@ async def warm_context(tmp_path: Path) -> AsyncIterator[WarmContext]:
         context = WarmContext(
             database=database,
             deployment_id=deployment.id,
+            release_id=release.id,
             release_version_id=version.id,
         )
     try:
         yield context
     finally:
         await database.dispose()
+
+
+async def _add_generation_job(
+    session: AsyncSession,
+    context: WarmContext,
+    *,
+    suffix: int,
+    state: GenerationState,
+    provider: str = "salad",
+    retry_at: datetime | None = None,
+) -> GenerationJob:
+    parameters = {"seed": suffix}
+    job = GenerationJob(
+        release_version_id=context.release_version_id,
+        logical_key=f"{suffix:064x}",
+        parameters=parameters,
+        parameters_sha256=canonical_sha256(parameters),
+        provider=provider,
+        state=state,
+        expected_output_count=1,
+        retry_at=retry_at,
+    )
+    session.add(job)
+    await session.flush()
+    return job
+
+
+async def _prepare_attempt(
+    session: AsyncSession,
+    context: WarmContext,
+    *,
+    suffix: int,
+    state: GenerationAttemptState,
+    deployment_id: UUID | None = None,
+) -> tuple[GenerationJob, GenerationAttempt]:
+    job = await _add_generation_job(
+        session,
+        context,
+        suffix=suffix,
+        state=GenerationState.QUEUED,
+    )
+    prepared = await prepare_generation_attempt(
+        session,
+        generation_job_id=job.id,
+        salad_deployment_id=deployment_id or context.deployment_id,
+        idempotency_key=f"warm-attempt-{suffix}",
+        now=NOW,
+    )
+    attempt = await session.get(GenerationAttempt, prepared.generation_attempt_id)
+    assert attempt is not None
+    attempt.state = state
+    if state in {GenerationAttemptState.SUBMITTED, GenerationAttemptState.RUNNING}:
+        job.state = GenerationState.RUNNING
+    elif state == GenerationAttemptState.UNKNOWN:
+        job.state = GenerationState.UNKNOWN
+    elif state == GenerationAttemptState.SUBMITTING:
+        job.state = GenerationState.SUBMITTING
+    elif state == GenerationAttemptState.CANCEL_REQUESTED:
+        job.state = GenerationState.CANCEL_REQUESTED
+    if state in {
+        GenerationAttemptState.SUBMITTED,
+        GenerationAttemptState.RUNNING,
+        GenerationAttemptState.UNKNOWN,
+        GenerationAttemptState.CANCEL_REQUESTED,
+    }:
+        attempt.provider_external_id = f"provider-job-{suffix}"
+    await session.flush()
+    return job, attempt
 
 
 async def _start_refresh_and_activate(
@@ -268,6 +346,444 @@ async def test_ensure_is_idempotent_and_explicit_extension_respects_hard_cap(
                 extension_seconds=30 * 60,
                 now=NOW + timedelta(minutes=31),
             )
+
+
+@pytest.mark.asyncio
+async def test_dispatchable_generation_holds_worker_without_an_experiment_lease(
+    warm_context: WarmContext,
+) -> None:
+    async with warm_context.database.sessions() as session:
+        job = await _add_generation_job(
+            session,
+            warm_context,
+            suffix=100,
+            state=GenerationState.QUEUED,
+        )
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 1
+        )
+
+        job.state = GenerationState.SUCCEEDED
+        await session.flush()
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_retry_wait_holds_worker_only_when_due(
+    warm_context: WarmContext,
+) -> None:
+    async with warm_context.database.sessions() as session:
+        job = await _add_generation_job(
+            session,
+            warm_context,
+            suffix=101,
+            state=GenerationState.RETRY_WAIT,
+            retry_at=NOW + timedelta(minutes=5),
+        )
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 0
+        )
+
+        job.retry_at = None
+        await session.flush()
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 1
+        )
+
+        job.retry_at = NOW - timedelta(seconds=1)
+        await session.flush()
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state",
+    [
+        GenerationState.CANCEL_REQUESTED,
+        GenerationState.COLLECTING,
+        GenerationState.VERIFYING,
+        GenerationState.RUNNING,
+        GenerationState.SUCCEEDED,
+        GenerationState.FAILED,
+        GenerationState.CANCELLED,
+    ],
+)
+async def test_non_dispatchable_or_post_gpu_job_does_not_hold_worker(
+    warm_context: WarmContext,
+    state: GenerationState,
+) -> None:
+    async with warm_context.database.sessions() as session:
+        await _add_generation_job(
+            session,
+            warm_context,
+            suffix=102,
+            state=state,
+        )
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_other_provider_job_does_not_hold_salad_worker(
+    warm_context: WarmContext,
+) -> None:
+    async with warm_context.database.sessions() as session:
+        await _add_generation_job(
+            session,
+            warm_context,
+            suffix=103,
+            state=GenerationState.QUEUED,
+            provider="runpod",
+        )
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", [ReleasePhase.PAUSED, ReleasePhase.CANCELLED])
+async def test_inactive_release_does_not_hold_worker_for_queued_work(
+    warm_context: WarmContext,
+    phase: ReleasePhase,
+) -> None:
+    async with warm_context.database.sessions() as session:
+        await _add_generation_job(
+            session,
+            warm_context,
+            suffix=104,
+            state=GenerationState.QUEUED,
+        )
+        release = await session.get(Release, warm_context.release_id)
+        assert release is not None
+        release.phase = phase
+        await session.flush()
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_durable_stop_marker_wins_over_stale_dispatchable_phase(
+    warm_context: WarmContext,
+) -> None:
+    async with warm_context.database.sessions() as session:
+        await _add_generation_job(
+            session,
+            warm_context,
+            suffix=105,
+            state=GenerationState.QUEUED,
+        )
+        session.add(
+            AuditEvent(
+                actor="test",
+                action="release.generation_stop_requested",
+                resource_type="release",
+                resource_id=warm_context.release_id,
+                correlation_id=f"generation-stop:{warm_context.release_id}",
+                detail={},
+                occurred_at=NOW,
+            )
+        )
+        await session.flush()
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("health", [ResourceHealth.WARNING, ResourceHealth.BLOCKED])
+async def test_unhealthy_release_does_not_hold_worker_for_queued_work(
+    warm_context: WarmContext,
+    health: ResourceHealth,
+) -> None:
+    async with warm_context.database.sessions() as session:
+        await _add_generation_job(
+            session,
+            warm_context,
+            suffix=106,
+            state=GenerationState.QUEUED,
+        )
+        release = await session.get(Release, warm_context.release_id)
+        assert release is not None
+        release.health = health
+        await session.flush()
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_noncurrent_release_version_does_not_hold_worker(
+    warm_context: WarmContext,
+) -> None:
+    async with warm_context.database.sessions() as session:
+        await _add_generation_job(
+            session,
+            warm_context,
+            suffix=107,
+            state=GenerationState.QUEUED,
+        )
+        release = await session.get(Release, warm_context.release_id)
+        assert release is not None
+        release.current_version_no = 2
+        await session.flush()
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attempt_state",
+    [
+        GenerationAttemptState.SUBMITTED,
+        GenerationAttemptState.RUNNING,
+        GenerationAttemptState.UNKNOWN,
+    ],
+)
+async def test_active_gpu_attempt_holds_only_its_salad_deployment(
+    warm_context: WarmContext,
+    attempt_state: GenerationAttemptState,
+) -> None:
+    async with warm_context.database.sessions() as session:
+        _, attempt = await _prepare_attempt(
+            session,
+            warm_context,
+            suffix=108,
+            state=attempt_state,
+        )
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 1
+        )
+
+        attempt.state = GenerationAttemptState.SUCCEEDED
+        attempt.completed_at = NOW
+        await session.flush()
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attempt_state",
+    [
+        GenerationAttemptState.CREATED,
+        GenerationAttemptState.SUBMITTING,
+        GenerationAttemptState.CANCEL_REQUESTED,
+    ],
+)
+async def test_nonexecuting_attempt_does_not_hold_worker(
+    warm_context: WarmContext,
+    attempt_state: GenerationAttemptState,
+) -> None:
+    async with warm_context.database.sessions() as session:
+        await _prepare_attempt(
+            session,
+            warm_context,
+            suffix=109,
+            state=attempt_state,
+        )
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_other_provider_attempt_does_not_hold_salad_worker(
+    warm_context: WarmContext,
+) -> None:
+    async with warm_context.database.sessions() as session:
+        _, attempt = await _prepare_attempt(
+            session,
+            warm_context,
+            suffix=110,
+            state=GenerationAttemptState.RUNNING,
+        )
+        attempt.provider = "runpod"
+        await session.flush()
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_running_attempt_for_cancelled_release_does_not_hold_worker(
+    warm_context: WarmContext,
+) -> None:
+    async with warm_context.database.sessions() as session:
+        await _prepare_attempt(
+            session,
+            warm_context,
+            suffix=111,
+            state=GenerationAttemptState.RUNNING,
+        )
+        release = await session.get(Release, warm_context.release_id)
+        assert release is not None
+        release.phase = ReleasePhase.CANCELLED
+        await session.flush()
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_terminal_job_with_stale_running_attempt_does_not_hold_worker(
+    warm_context: WarmContext,
+) -> None:
+    async with warm_context.database.sessions() as session:
+        job, _ = await _prepare_attempt(
+            session,
+            warm_context,
+            suffix=113,
+            state=GenerationAttemptState.RUNNING,
+        )
+        job.state = GenerationState.SUCCEEDED
+        await session.flush()
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_attempt_on_another_salad_deployment_does_not_hold_this_worker(
+    warm_context: WarmContext,
+) -> None:
+    async with warm_context.database.sessions() as session:
+        original = await session.get(SaladDeployment, warm_context.deployment_id)
+        assert original is not None
+        original.is_current = False
+        await session.flush()
+        other = SaladDeployment(
+            version_no=2,
+            config_sha256="d" * 64,
+            provider_configuration={"container": {}, "queue_autoscaler": {}},
+            worker_image_digest=IMAGE_DIGEST,
+            organization_name="organization",
+            project_name="project",
+            queue_name="generation-v2",
+            provider_queue_id="queue-id-v2",
+            container_group_name="worker-v2",
+            provider_container_group_id="group-id-v2",
+            state=SaladDeploymentState.ACTIVE,
+            desired_state=DesiredDeploymentState.ACTIVE,
+            is_current=True,
+            min_replicas=0,
+            max_replicas=1,
+            desired_queue_length=1,
+            max_hourly_cost_microusd=360_000,
+            observed_replicas=0,
+            ready_replicas=0,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(other)
+        await session.flush()
+        await _prepare_attempt(
+            session,
+            warm_context,
+            suffix=112,
+            state=GenerationAttemptState.RUNNING,
+            deployment_id=other.id,
+        )
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 0
+        )
 
 
 @pytest.mark.asyncio

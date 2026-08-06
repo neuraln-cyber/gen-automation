@@ -1,12 +1,14 @@
 import hashlib
 import io
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
+import gen_automation.gpu_worker.bootstrap as worker_bootstrap
 from gen_automation.domain.signing import derive_public_key, encode_base64url
 from gen_automation.gpu_worker.artifacts import (
     ArtifactBootstrapError,
@@ -38,12 +40,17 @@ def _safetensors() -> bytes:
     return len(header).to_bytes(8, "little") + header + body
 
 
-def _artifact(content: bytes | None = None) -> ModelArtifactSpec:
+def _artifact(
+    content: bytes | None = None,
+    *,
+    source_object_version_id: str | None = None,
+) -> ModelArtifactSpec:
     value = content if content is not None else _safetensors()
     return ModelArtifactSpec(
         logical_name="illustrious",
         kind=ArtifactKind.CHECKPOINT,
         source_object_id="models/illustrious.safetensors",
+        source_object_version_id=source_object_version_id,
         sha256=hashlib.sha256(value).hexdigest(),
         exact_size_bytes=len(value),
         max_size_bytes=len(value),
@@ -194,6 +201,67 @@ class _S3Client:
         self.closed = True
 
 
+class _CoordinatedBody(io.BytesIO):
+    def __init__(self, content: bytes, *, client: "_RangedS3Client") -> None:
+        super().__init__(content)
+        self._client = client
+        self._first_read = True
+        self.closed_by_adapter = False
+
+    def read(self, size: int = -1) -> bytes:
+        if self._first_read:
+            self._first_read = False
+            with self._client.lock:
+                self._client.active += 1
+                self._client.peak = max(self._client.peak, self._client.active)
+            try:
+                self._client.barrier.wait(timeout=2)
+            finally:
+                with self._client.lock:
+                    self._client.active -= 1
+        return super().read(size)
+
+    def close(self) -> None:
+        self.closed_by_adapter = True
+        super().close()
+
+
+class _RangedS3Client:
+    def __init__(self, content: bytes, *, first_range_truncated: bool = False) -> None:
+        self.content = content
+        self.first_range_truncated = first_range_truncated
+        self.calls: list[dict[str, str]] = []
+        self.bodies: list[_CoordinatedBody] = []
+        self.range_attempts: dict[str, int] = {}
+        self.lock = threading.Lock()
+        self.barrier = threading.Barrier(3) if not first_range_truncated else None
+        self.active = 0
+        self.peak = 0
+
+    def get_object(self, **parameters: str) -> dict[str, Any]:
+        range_header = parameters["Range"]
+        start_wire, end_wire = range_header.removeprefix("bytes=").split("-", maxsplit=1)
+        start, end = int(start_wire), int(end_wire)
+        with self.lock:
+            attempt = self.range_attempts.get(range_header, 0) + 1
+            self.range_attempts[range_header] = attempt
+            self.calls.append(parameters)
+        content = self.content[start : end + 1]
+        if self.first_range_truncated and start == 0 and attempt == 1:
+            content = content[:-1]
+        if self.barrier is None:
+            body = _Body(content)
+        else:
+            body = _CoordinatedBody(content, client=self)
+        self.bodies.append(body)  # type: ignore[arg-type]
+        return {
+            "ContentLength": end - start + 1,
+            "ContentRange": f"bytes {start}-{end}/{len(self.content)}",
+            "VersionId": parameters["VersionId"],
+            "Body": body,
+        }
+
+
 async def test_s3_downloader_streams_exact_object_and_closes_body() -> None:
     content = _safetensors()
     client = _S3Client(content)
@@ -228,6 +296,60 @@ async def test_s3_downloader_rejects_non_s3_manifest_source() -> None:
 
     with pytest.raises(ArtifactBootstrapError, match="artifact bootstrap failed"):
         _ = [chunk async for chunk in downloader.stream(source)]
+
+
+async def test_s3_downloader_fetches_version_pinned_ranges_concurrently_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = b"0123456789abcdefghijKLMNOPQRST"
+    client = _RangedS3Client(content)
+    downloader = S3ArtifactDownloader(client=client, bucket="models-private")
+    artifact = _artifact(content, source_object_version_id="version-7")
+    monkeypatch.setattr(worker_bootstrap, "MULTIPART_ARTIFACT_PART_BYTES", 10)
+    monkeypatch.setattr(worker_bootstrap, "MAX_PARALLEL_ARTIFACT_PARTS", 3)
+
+    received = b"".join([chunk async for chunk in downloader.ranged_stream(artifact)])
+
+    assert received == content
+    assert client.peak == 3
+    assert {call["Range"] for call in client.calls} == {
+        "bytes=0-9",
+        "bytes=10-19",
+        "bytes=20-29",
+    }
+    assert all(call["Bucket"] == "models-private" for call in client.calls)
+    assert all(call["Key"] == "models/illustrious.safetensors" for call in client.calls)
+    assert all(call["VersionId"] == "version-7" for call in client.calls)
+    assert all(body.closed_by_adapter for body in client.bodies)
+
+
+async def test_s3_ranged_downloader_retries_a_truncated_part_without_mixing_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = b"0123456789abcdefghij"
+    client = _RangedS3Client(content, first_range_truncated=True)
+    downloader = S3ArtifactDownloader(client=client, bucket="models-private")
+    artifact = _artifact(content, source_object_version_id="version-8")
+    monkeypatch.setattr(worker_bootstrap, "MULTIPART_ARTIFACT_PART_BYTES", 10)
+    monkeypatch.setattr(worker_bootstrap, "_ARTIFACT_PART_RETRY_BASE_SECONDS", 0)
+
+    received = b"".join([chunk async for chunk in downloader.ranged_stream(artifact)])
+
+    assert received == content
+    assert client.range_attempts["bytes=0-9"] == 2
+    assert client.range_attempts["bytes=10-19"] == 1
+    assert all(body.closed_by_adapter for body in client.bodies)
+
+
+async def test_s3_ranged_downloader_requires_an_exact_immutable_version() -> None:
+    content = b"0123456789"
+    downloader = S3ArtifactDownloader(
+        client=_RangedS3Client(content, first_range_truncated=True),
+        bucket="models-private",
+    )
+
+    with pytest.raises(ArtifactBootstrapError, match="artifact bootstrap failed"):
+        _ = [chunk async for chunk in downloader.ranged_stream(_artifact(content))]
 
 
 def test_scrub_artifact_credentials_preserves_unrelated_runtime_values() -> None:

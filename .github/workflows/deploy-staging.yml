@@ -81,11 +81,28 @@ jobs:
             --name staging-deploy-source \
             --dir "$metadata_dir"
           source_revision="$(tr -d '\r\n' <"$metadata_dir/staging-source-revision")"
+          worker_source_revision="$(
+            tr -d '\r\n' <"$metadata_dir/staging-worker-source-revision"
+          )"
+          worker_image_digest="$(
+            tr -d '\r\n' <"$metadata_dir/staging-worker-image-digest"
+          )"
           [[ "$source_revision" =~ ^[0-9a-f]{40}$ ]] || {
             printf '%s\n' "Publication metadata does not contain a full lowercase Git SHA." >&2
             exit 1
           }
+          [[ "$worker_source_revision" =~ ^[0-9a-f]{40}$ ]] || {
+            printf '%s\n' "Publication metadata does not contain a full worker Git SHA." >&2
+            exit 1
+          }
+          [[ "$worker_image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            printf '%s\n' "Publication metadata does not contain a valid worker digest." >&2
+            exit 1
+          }
           printf 'SOURCE_REVISION=%s\n' "$source_revision" >>"$GITHUB_ENV"
+          printf 'WORKER_SOURCE_REVISION=%s\n' "$worker_source_revision" >>"$GITHUB_ENV"
+          printf 'PUBLISHED_WORKER_IMAGE_DIGEST=%s\n' \
+            "$worker_image_digest" >>"$GITHUB_ENV"
           printf '%s\n' "available=true" >>"$GITHUB_OUTPUT"
 
       - name: Require the published revision to remain the tip of main
@@ -124,7 +141,7 @@ jobs:
           printf '%s' "$GHCR_TOKEN" |
             docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin >/dev/null
           image_tag="${IMAGE_REPOSITORY}:sha-${SOURCE_REVISION}"
-          worker_image_tag="${WORKER_IMAGE_REPOSITORY}:sha-${SOURCE_REVISION}"
+          worker_image_ref="${WORKER_IMAGE_REPOSITORY}@${PUBLISHED_WORKER_IMAGE_DIGEST}"
           manifest_json="$(
             docker buildx imagetools inspect \
               "$image_tag" \
@@ -137,12 +154,12 @@ jobs:
           )"
           worker_manifest_json="$(
             docker buildx imagetools inspect \
-              "$worker_image_tag" \
+              "$worker_image_ref" \
               --format '{{json .Manifest}}'
           )"
           worker_image_json="$(
             docker buildx imagetools inspect \
-              "$worker_image_tag" \
+              "$worker_image_ref" \
               --format '{{json .Image}}'
           )"
           image_digest="$(
@@ -173,7 +190,11 @@ jobs:
             printf '%s\n' "Registry did not return a valid immutable worker digest." >&2
             exit 1
           }
-          [ "$worker_image_revision" = "$SOURCE_REVISION" ] || {
+          [ "$worker_image_digest" = "$PUBLISHED_WORKER_IMAGE_DIGEST" ] || {
+            printf '%s\n' "Published worker digest does not match deployment metadata." >&2
+            exit 1
+          }
+          [ "$worker_image_revision" = "$WORKER_SOURCE_REVISION" ] || {
             printf '%s\n' "Published worker revision label does not match its workflow source." >&2
             exit 1
           }
@@ -218,6 +239,7 @@ jobs:
           [[ "$IMAGE_REF" =~ ^ghcr\.io/neuraln-cyber/gen-automation/control-plane-mega@sha256:[0-9a-f]{64}$ ]]
           [[ "$WORKER_IMAGE_REF" =~ ^ghcr\.io/neuraln-cyber/gen-automation/gpu-worker@sha256:[0-9a-f]{64}$ ]]
           [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$WORKER_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
 
           latest_main="$(
             gh api \

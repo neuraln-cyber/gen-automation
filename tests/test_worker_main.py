@@ -26,6 +26,8 @@ from gen_automation.gpu_worker.bootstrap import (
 )
 from gen_automation.gpu_worker.main import (
     _monitor_comfy,
+    _serve_worker_lifecycle,
+    _SwitchableWorkerApplication,
     bootstrap_worker_models,
     build_comfy_command,
     build_comfy_environment,
@@ -58,6 +60,150 @@ def test_parent_hardening_applies_linux_controls(
 
     assert umask_calls == [0o077]
     assert hardening_calls == [True]
+
+
+async def _asgi_request(
+    application: Any,
+    path: str,
+) -> tuple[int, bytes]:
+    messages: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        messages.append(message)
+
+    await application(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode("ascii"),
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 1),
+            "server": ("127.0.0.1", 8000),
+        },
+        receive,
+        send,
+    )
+    status = next(message["status"] for message in messages if "status" in message)
+    body = b"".join(message.get("body", b"") for message in messages)
+    return cast(int, status), body
+
+
+async def test_bootstrap_probe_is_live_but_not_ready_and_hands_off_in_place() -> None:
+    router = _SwitchableWorkerApplication()
+
+    assert await _asgi_request(router, "/health") == (200, b'{"status":"bootstrapping"}')
+    assert await _asgi_request(router, "/ready") == (503, b'{"status":"not_ready"}')
+
+    async def active_application(
+        _scope: object,
+        _receive: object,
+        send: Any,
+    ) -> None:
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    router.activate(cast(Any, active_application))
+
+    assert await _asgi_request(router, "/health") == (204, b"")
+
+
+async def test_worker_lifecycle_handoff_closes_every_owned_resource(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeServer:
+        def __init__(self) -> None:
+            self.started = False
+            self._should_exit = False
+            self.exit_event = asyncio.Event()
+
+        @property
+        def should_exit(self) -> bool:
+            return self._should_exit
+
+        @should_exit.setter
+        def should_exit(self, value: bool) -> None:
+            self._should_exit = value
+            if value:
+                self.exit_event.set()
+
+        async def serve(self) -> None:
+            self.started = True
+            await self.exit_event.wait()
+
+    class FakeProcess:
+        def poll(self) -> int:
+            return 0
+
+    class FakeExecutor:
+        def close(self) -> None:
+            events.append("executor_closed")
+
+    class FakeLifespan:
+        async def __aenter__(self) -> None:
+            events.append("lifespan_entered")
+
+        async def __aexit__(self, *_args: object) -> None:
+            events.append("lifespan_exited")
+
+    class FakeRouter:
+        def lifespan_context(self, _application: object) -> FakeLifespan:
+            return FakeLifespan()
+
+    class FakeApplication:
+        router = FakeRouter()
+
+        async def __call__(self, _scope: object, _receive: object, _send: object) -> None:
+            return None
+
+    server = FakeServer()
+    process = FakeProcess()
+
+    async def bootstrap(_settings: WorkerRuntimeSettings) -> ArtifactBootstrapResult:
+        events.append("models_bootstrapped")
+        return ArtifactBootstrapResult(
+            version="v1",
+            manifest_sha256="a" * 64,
+            artifacts=(),
+        )
+
+    monkeypatch.setattr(worker_main, "_build_switchable_server", lambda *_args, **_kw: server)
+    monkeypatch.setattr(worker_main, "bootstrap_worker_models", bootstrap)
+    monkeypatch.setattr(worker_main, "write_verified_detector_whitelist", lambda *_args: None)
+    monkeypatch.setattr(worker_main, "ComfyExecutor", lambda **_kwargs: FakeExecutor())
+    monkeypatch.setattr(worker_main, "start_comfy", lambda _settings: process)
+    monkeypatch.setattr(worker_main, "start_salad_queue_worker", lambda _settings: None)
+    monkeypatch.setattr(worker_main, "create_worker_app", lambda **_kwargs: FakeApplication())
+    monkeypatch.setattr(
+        worker_main,
+        "stop_comfy",
+        lambda stopped: events.append("process_stopped") if stopped is process else None,
+    )
+
+    stage = ["runtime_settings"]
+    child_exited = await _serve_worker_lifecycle(
+        _settings(),
+        startup_stage=stage,
+        startup_started_at=worker_main.time.monotonic(),
+    )
+
+    assert child_exited is True
+    assert events == [
+        "models_bootstrapped",
+        "lifespan_entered",
+        "lifespan_exited",
+        "executor_closed",
+        "process_stopped",
+    ]
 
 
 def test_parent_hardening_rejects_non_linux_production(
@@ -179,9 +325,12 @@ def test_main_reports_model_bootstrap_exception(
 
     stderr = capsys.readouterr().err
     assert raised.value.code == 78
+    assert "stage=bootstrap_probe_server status=ready" in stderr
+    assert "GPU worker startup progress: stage=model_bootstrap status=started" in stderr
     assert "stage=model_bootstrap" in stderr
     assert "exception=ArtifactBootstrapError" in stderr
     assert "message=artifact bootstrap failed" in stderr
+    assert WORKER_SIGNING_PRIVATE_KEY not in stderr
 
 
 def test_worker_runtime_settings_contain_only_verification_keys() -> None:

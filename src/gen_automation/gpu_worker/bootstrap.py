@@ -1,8 +1,10 @@
+import asyncio
 import json
 import math
 import os
 import re
 import stat
+from collections import deque
 from collections.abc import AsyncIterator, Mapping, MutableMapping
 from contextlib import suppress
 from functools import partial
@@ -18,6 +20,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from gen_automation.domain.generation_limits import MAX_OUTPUTS_PER_GENERATION_JOB
 from gen_automation.gpu_worker.artifacts import (
+    MAX_ARTIFACT_PART_DOWNLOAD_ATTEMPTS,
+    MAX_PARALLEL_ARTIFACT_PARTS,
+    MULTIPART_ARTIFACT_PART_BYTES,
     STREAM_READ_BYTES,
     ArtifactBootstrapError,
     ArtifactDownloader,
@@ -52,6 +57,11 @@ _ARTIFACT_CREDENTIAL_ENV_NAMES = frozenset(
         "BOTO_CONFIG",
     }
 )
+_ARTIFACT_PART_RETRY_BASE_SECONDS = 0.25
+
+
+class _RetryableArtifactPartError(Exception):
+    pass
 
 
 class WorkerBootstrapConfigurationError(Exception):
@@ -385,6 +395,129 @@ class S3ArtifactDownloader(ArtifactDownloader):
             raise ArtifactBootstrapError("artifact bootstrap failed") from None
         except Exception:
             raise ArtifactBootstrapError("artifact bootstrap failed") from None
+        finally:
+            if body is not None and hasattr(body, "close"):
+                with suppress(Exception):
+                    await to_thread.run_sync(body.close)
+
+    async def ranged_stream(self, artifact: ModelArtifactSpec) -> AsyncIterator[bytes]:
+        """Yield a pinned large object in order using bounded parallel range GETs."""
+
+        if (
+            self._closed
+            or artifact.source_object_id is None
+            or artifact.source_object_version_id is None
+            or artifact.downloader_key is not None
+        ):
+            raise ArtifactBootstrapError("artifact bootstrap failed")
+
+        ranges = iter(
+            (start, min(start + MULTIPART_ARTIFACT_PART_BYTES, artifact.exact_size_bytes) - 1)
+            for start in range(
+                0,
+                artifact.exact_size_bytes,
+                MULTIPART_ARTIFACT_PART_BYTES,
+            )
+        )
+        pending: deque[asyncio.Task[tuple[bytes, ...]]] = deque()
+
+        def schedule_next() -> bool:
+            try:
+                start, end = next(ranges)
+            except StopIteration:
+                return False
+            pending.append(asyncio.create_task(self._download_range(artifact, start, end)))
+            return True
+
+        for _ in range(MAX_PARALLEL_ARTIFACT_PARTS):
+            if not schedule_next():
+                break
+
+        try:
+            while pending:
+                chunks = await pending.popleft()
+                schedule_next()
+                for chunk in chunks:
+                    yield chunk
+        finally:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _download_range(
+        self,
+        artifact: ModelArtifactSpec,
+        start: int,
+        end: int,
+    ) -> tuple[bytes, ...]:
+        for attempt in range(MAX_ARTIFACT_PART_DOWNLOAD_ATTEMPTS):
+            try:
+                return await self._download_range_once(artifact, start, end)
+            except _RetryableArtifactPartError:
+                if attempt + 1 >= MAX_ARTIFACT_PART_DOWNLOAD_ATTEMPTS:
+                    raise ArtifactBootstrapError("artifact bootstrap failed") from None
+                await asyncio.sleep(_ARTIFACT_PART_RETRY_BASE_SECONDS * (2**attempt))
+        raise ArtifactBootstrapError("artifact bootstrap failed")
+
+    async def _download_range_once(
+        self,
+        artifact: ModelArtifactSpec,
+        start: int,
+        end: int,
+    ) -> tuple[bytes, ...]:
+        body: Any | None = None
+        expected_size = end - start + 1
+        try:
+            parameters = {
+                "Bucket": self._bucket,
+                "Key": artifact.source_object_id,
+                "VersionId": artifact.source_object_version_id,
+                "Range": f"bytes={start}-{end}",
+            }
+            response = await to_thread.run_sync(partial(self._client.get_object, **parameters))
+            if not isinstance(response, Mapping):
+                raise ArtifactBootstrapError("artifact bootstrap failed")
+            content_length = response.get("ContentLength")
+            response_version_id = response.get("VersionId")
+            content_range = response.get("ContentRange")
+            body = response.get("Body")
+            if (
+                isinstance(content_length, bool)
+                or not isinstance(content_length, int)
+                or content_length != expected_size
+                or response_version_id != artifact.source_object_version_id
+                or content_range != f"bytes {start}-{end}/{artifact.exact_size_bytes}"
+                or body is None
+                or not hasattr(body, "read")
+            ):
+                raise ArtifactBootstrapError("artifact bootstrap failed")
+
+            chunks: list[bytes] = []
+            total_size = 0
+            while total_size < expected_size:
+                chunk = await to_thread.run_sync(
+                    body.read,
+                    min(STREAM_READ_BYTES, expected_size - total_size),
+                )
+                if not chunk:
+                    raise _RetryableArtifactPartError
+                if not isinstance(chunk, bytes) or total_size + len(chunk) > expected_size:
+                    raise ArtifactBootstrapError("artifact bootstrap failed")
+                chunks.append(chunk)
+                total_size += len(chunk)
+            extra = await to_thread.run_sync(body.read, 1)
+            if extra:
+                raise ArtifactBootstrapError("artifact bootstrap failed")
+            return tuple(chunks)
+        except ArtifactBootstrapError:
+            raise
+        except _RetryableArtifactPartError:
+            raise
+        except (BotoCoreError, ClientError, OSError):
+            raise _RetryableArtifactPartError from None
+        except Exception:
+            raise _RetryableArtifactPartError from None
         finally:
             if body is not None and hasattr(body, "close"):
                 with suppress(Exception):
