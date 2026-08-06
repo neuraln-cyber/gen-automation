@@ -3859,6 +3859,14 @@
     const count = panel.querySelector("[data-live-assets-count]");
     const status = panel.querySelector("[data-live-assets-status]");
     const empty = panel.querySelector("[data-live-assets-empty]");
+    const latest = panel.querySelector("[data-live-assets-latest]");
+    const latestImage = panel.querySelector("[data-live-assets-latest-image]");
+    const latestTitle = panel.querySelector("[data-live-assets-latest-title]");
+    const latestBatch = panel.querySelector("[data-live-assets-latest-batch]");
+    const latestPosition = panel.querySelector("[data-live-assets-latest-position]");
+    const latestResolution = panel.querySelector("[data-live-assets-latest-resolution]");
+    const latestOpenButtons = panel.querySelectorAll("[data-live-assets-latest-open]");
+    const gridHeading = panel.querySelector("[data-live-assets-grid-heading]");
     if (!(grid instanceof HTMLElement)) return;
 
     const assetIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -3872,6 +3880,7 @@
     let refreshing = false;
     let refreshRequested = false;
     let immediatePages = 0;
+    let latestAssetId = "";
 
     const positiveInteger = (value, fallback = 0) => {
       const parsed = integerValue(value, fallback);
@@ -4022,6 +4031,41 @@
       });
     };
 
+    const renderLatestAsset = (asset) => {
+      if (!(latest instanceof HTMLElement) || !(latestImage instanceof HTMLImageElement)) return;
+      latestAssetId = asset.assetId;
+      const label = assetLabel(asset);
+      latestImage.src = asset.viewUrl;
+      latestImage.alt = `${label} latest generated image`;
+      latestImage.width = asset.width;
+      latestImage.height = asset.height;
+      if (latestTitle) latestTitle.textContent = `Image ${asset.position}`;
+      if (latestBatch) {
+        const batchDetails = asset.batchImageNumber > 0
+          ? `${asset.batchName || "Generated"} \u00b7 batch image ${asset.batchImageNumber}`
+          : (asset.batchName || "Generated");
+        latestBatch.textContent = batchDetails;
+      }
+      if (latestPosition) latestPosition.textContent = `#${asset.position}`;
+      if (latestResolution) latestResolution.textContent = `${asset.width} \u00d7 ${asset.height}`;
+      latestOpenButtons.forEach((button) => {
+        button.setAttribute("aria-label", `Open ${label} in the full-screen viewer`);
+      });
+      latest.hidden = false;
+      if (gridHeading instanceof HTMLElement) gridHeading.hidden = false;
+    };
+
+    const openLatestAsset = () => {
+      const card = assets.get(latestAssetId)?.card;
+      if (!(card instanceof HTMLElement)) return;
+      const trigger = card.querySelector("[data-asset-viewer-trigger], .asset-preview");
+      if (trigger instanceof HTMLElement) trigger.click();
+    };
+
+    latestOpenButtons.forEach((button) => {
+      button.addEventListener("click", openLatestAsset);
+    });
+
     const renderCount = () => {
       if (count) count.textContent = expected > 0
         ? `${assets.size} / ${expected} ready`
@@ -4031,15 +4075,18 @@
 
     const addAssets = (items) => {
       let added = 0;
+      let latestAdded = null;
       items.forEach((item) => {
         const asset = normalizedAsset(item);
         if (!asset || assets.has(asset.assetId)) return;
         asset.card = createAssetCard(asset);
         assets.set(asset.assetId, asset);
+        latestAdded = asset;
         added += 1;
       });
       if (added === 0) return 0;
       reorderCards();
+      renderLatestAsset(latestAdded);
       renderCount();
       document.dispatchEvent(new CustomEvent("gen-automation:assets-updated", {
         detail: { root: grid, generated: assets.size, expected },

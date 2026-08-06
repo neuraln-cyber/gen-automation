@@ -243,6 +243,107 @@ async def test_running_job_publishes_each_staged_master_independently(
     ]
 
 
+@pytest.mark.parametrize(
+    "job_state",
+    (GenerationState.SUBMITTING, GenerationState.UNKNOWN),
+)
+@pytest.mark.asyncio
+async def test_provider_active_job_publishes_first_master_before_batch_completion(
+    collection_context: CollectionContext,
+    job_state: GenerationState,
+) -> None:
+    """A first upload is visible while provider submission/recovery is unresolved."""
+
+    _stage(collection_context.store, collection_context.intents[0], _png("yellow"))
+    async with collection_context.database.sessions() as session:
+        job = await session.get(GenerationJob, collection_context.job_id)
+        assert job is not None
+        job.state = job_state
+        await session.commit()
+
+        result = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="progressive-collector",
+            max_image_bytes=1_000_000,
+        )
+        assets = list(
+            (
+                await session.scalars(
+                    select(Asset)
+                    .where(Asset.generation_job_id == collection_context.job_id)
+                    .order_by(Asset.output_index)
+                )
+            ).all()
+        )
+        persisted_job = await session.get(GenerationJob, collection_context.job_id)
+
+    assert result.asset_id == collection_context.intents[0].asset_id
+    assert result.finalized is True
+    assert [asset.state for asset in assets] == [
+        AssetState.AVAILABLE,
+        AssetState.UPLOADING,
+    ]
+    assert persisted_job is not None and persisted_job.state == job_state
+
+
+@pytest.mark.asyncio
+async def test_missing_older_job_does_not_hide_visible_later_job_master(
+    collection_context: CollectionContext,
+) -> None:
+    async with collection_context.database.sessions() as session:
+        first_job = await session.get(GenerationJob, collection_context.job_id)
+        assert first_job is not None
+        first_job.state = GenerationState.RUNNING
+        later_job = GenerationJob(
+            release_version_id=first_job.release_version_id,
+            logical_key="later-visible-job",
+            parameters={"seed": 2},
+            parameters_sha256="2" * 64,
+            provider="salad",
+            state=GenerationState.RUNNING,
+            priority=first_job.priority + 1,
+            expected_output_count=1,
+        )
+        session.add(later_job)
+        await session.commit()
+        later_intent = (
+            await create_raw_master_upload_intents(
+                session,
+                collection_context.store,
+                generation_job_id=later_job.id,
+                max_bytes=1_000_000,
+            )
+        )[0]
+
+    _stage(collection_context.store, later_intent, _png("cyan"))
+    async with collection_context.database.sessions() as session:
+        result = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="progressive-collector",
+            max_image_bytes=1_000_000,
+        )
+        first_assets = list(
+            (
+                await session.scalars(
+                    select(Asset)
+                    .where(Asset.generation_job_id == collection_context.job_id)
+                    .order_by(Asset.output_index)
+                )
+            ).all()
+        )
+        later_asset = await session.get(Asset, later_intent.asset_id)
+
+    assert result.asset_id == later_intent.asset_id
+    assert result.finalized is True
+    assert [asset.state for asset in first_assets] == [
+        AssetState.UPLOADING,
+        AssetState.UPLOADING,
+    ]
+    assert later_asset is not None and later_asset.state == AssetState.AVAILABLE
+
+
 @pytest.mark.asyncio
 async def test_stopped_terminal_job_salvages_uploaded_master_then_retires_absent_intent(
     collection_context: CollectionContext,

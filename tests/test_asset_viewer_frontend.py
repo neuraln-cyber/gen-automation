@@ -243,8 +243,43 @@ def test_asset_grid_uses_intrinsic_image_ratio_and_viewer_is_responsive() -> Non
     assert "@media (max-width: 680px)" in styles
     assert "@media (prefers-reduced-motion: reduce)" in styles
     assert ".live-generation-assets" in styles
-    assert ".live-generation-assets-empty:not([hidden]) + .asset-grid-density" in styles
+    assert ".live-generation-assets-empty:not([hidden]) ~ .asset-grid-density" in styles
     assert ".live-generation-assets-grid:empty" in styles
+
+
+def test_live_generation_surfaces_latest_without_reordering_the_canonical_grid() -> None:
+    template = (
+        ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "new_set_status.html"
+    ).read_text(encoding="utf-8")
+    script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
+    styles = STYLES.read_text(encoding="utf-8")
+
+    latest_index = template.index("data-live-assets-latest")
+    grid_index = template.index("data-live-assets-grid\n")
+    assert latest_index < grid_index
+    assert "data-live-assets-latest-image" in template
+    assert template.count("data-live-assets-latest-open") == 2
+    assert "The complete grid below stays in the planned queue" in template
+    assert "Planned batch and image order is preserved here." in template
+
+    live_assets = script.split("function initializeLiveGeneratedAssets()", 1)[1].split(
+        "function initializeGenerationProgress()",
+        1,
+    )[0]
+    add_assets = live_assets.split("const addAssets =", 1)[1].split("const schedule =", 1)[0]
+    assert "const renderLatestAsset" in live_assets
+    assert "let latestAssetId" in live_assets
+    assert "latestAdded = asset" in add_assets
+    assert add_assets.index("reorderCards();") < add_assets.index("renderLatestAsset(latestAdded);")
+    assert "grid.insertBefore(asset.card" in live_assets
+    assert "grid.prepend" not in live_assets
+    assert "assets.get(latestAssetId)?.card" in live_assets
+    assert 'card.querySelector("[data-asset-viewer-trigger], .asset-preview")' in live_assets
+
+    assert ".live-generation-latest" in styles
+    assert "max-height: min(62dvh, 44rem)" in styles
+    assert ".live-generation-latest-image { max-height: 56dvh; }" in styles
+    assert "grid-template-columns: minmax(0, 1fr)" in styles
 
 
 def test_review_filter_hides_empty_ai_excluded_separator() -> None:

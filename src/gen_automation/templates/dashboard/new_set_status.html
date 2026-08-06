@@ -211,6 +211,63 @@
       You can leave this page open. New images will be added automatically in their planned
       queue order.
     </p>
+    <div class="live-generation-latest" data-live-assets-latest hidden>
+      <button
+        class="live-generation-latest-media"
+        type="button"
+        aria-label="Open the latest generated image in the full-screen viewer"
+        data-live-assets-latest-open
+      >
+        <img
+          class="live-generation-latest-image"
+          alt=""
+          decoding="async"
+          fetchpriority="high"
+          referrerpolicy="no-referrer"
+          data-live-assets-latest-image
+        >
+        <span class="live-generation-latest-badge">
+          <span class="live-generation-latest-pulse" aria-hidden="true"></span>
+          Latest
+        </span>
+        <span class="live-generation-latest-zoom" aria-hidden="true">Full screen</span>
+      </button>
+      <div class="live-generation-latest-details">
+        <div>
+          <p class="page-kicker">Latest generated</p>
+          <h3 data-live-assets-latest-title>Newest image</h3>
+          <p class="muted" data-live-assets-latest-batch></p>
+        </div>
+        <dl class="live-generation-latest-stats">
+          <div>
+            <dt>Queue position</dt>
+            <dd data-live-assets-latest-position>&mdash;</dd>
+          </div>
+          <div>
+            <dt>Resolution</dt>
+            <dd data-live-assets-latest-resolution>&mdash;</dd>
+          </div>
+        </dl>
+        <p class="muted live-generation-latest-note">
+          This preview follows new arrivals. The complete grid below stays in the planned queue
+          order used by the final set.
+        </p>
+        <button
+          class="secondary-button live-generation-latest-action"
+          type="button"
+          data-live-assets-latest-open
+        >
+          Open latest full screen
+        </button>
+      </div>
+    </div>
+    <div class="live-generation-grid-heading" data-live-assets-grid-heading hidden>
+      <div>
+        <h3>All generated images</h3>
+        <p class="muted">Planned batch and image order is preserved here.</p>
+      </div>
+      <span class="live-generation-grid-order">Queue order</span>
+    </div>
     <ol
       class="asset-grid live-generation-assets-grid"
       aria-label="Generated images in queue order"

@@ -4,6 +4,7 @@ from uuid import UUID
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from gen_automation.db.models import (
     Asset,
@@ -88,6 +89,12 @@ _TERMINAL_GENERATION_STATES = frozenset(
         GenerationState.CANCELLED,
     }
 )
+_PROGRESSIVE_GENERATION_STATES = (
+    GenerationState.SUBMITTING,
+    GenerationState.RUNNING,
+    GenerationState.UNKNOWN,
+)
+_PROGRESSIVE_CANDIDATE_JOB_LIMIT = 8
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -107,12 +114,16 @@ async def collect_next_ready_running_asset(
 ) -> ProgressiveCollectionResult:
     """Verify one visible staging upload without waiting for its batch to finish.
 
-    The GPU worker uploads outputs in ``output_index`` order. Looking only at the
-    first unfinished output keeps the active-job poll to one object-store HEAD
-    request per cycle. The existing per-asset verification lease remains the
-    concurrency boundary. A durable operator stop broadens the scan to provider-
-    active and terminal jobs so every successfully uploaded output is promoted
-    before the partial set is frozen.
+    The GPU worker uploads outputs in ``output_index`` order. Upload grants are
+    durably committed while the provider request is still ``SUBMITTING``, so that
+    state (and an ambiguous ``UNKNOWN`` response) must remain eligible or the
+    first outputs wait for the whole provider job to finish. Looking only at the
+    first unfinished output from each of a bounded number of jobs prevents one
+    cold or missing staging object from hiding uploads produced by another job.
+    The existing per-asset verification lease remains the concurrency boundary.
+    A durable operator stop broadens the scan to provider-active and terminal
+    jobs so every successfully uploaded output is promoted before the partial set
+    is frozen.
     """
 
     if not worker_id.strip() or len(worker_id) > 200:
@@ -142,8 +153,30 @@ async def collect_next_ready_running_asset(
             )
         ),
     )
+    earlier_asset = aliased(Asset)
+    earlier_unfinished_asset = or_(
+        earlier_asset.state == AssetState.UPLOADING,
+        (
+            (earlier_asset.state == AssetState.VERIFYING)
+            & or_(
+                earlier_asset.verification_lease_expires_at.is_(None),
+                earlier_asset.verification_lease_expires_at <= collected_at,
+            )
+        ),
+    )
+    has_earlier_unfinished_output = (
+        select(earlier_asset.id)
+        .where(
+            earlier_asset.generation_job_id == Asset.generation_job_id,
+            earlier_asset.kind == AssetKind.RAW_MASTER,
+            earlier_unfinished_asset,
+            earlier_asset.staging_object_key.is_not(None),
+            earlier_asset.output_index < Asset.output_index,
+        )
+        .exists()
+    )
 
-    candidate = (
+    candidates = list(
         await session.execute(
             select(
                 Asset.id,
@@ -154,10 +187,14 @@ async def collect_next_ready_running_asset(
             .join(GenerationJob, GenerationJob.id == Asset.generation_job_id)
             .join(ReleaseVersion, ReleaseVersion.id == GenerationJob.release_version_id)
             .where(
-                or_(GenerationJob.state == GenerationState.RUNNING, stop_requested),
+                or_(
+                    GenerationJob.state.in_(_PROGRESSIVE_GENERATION_STATES),
+                    stop_requested,
+                ),
                 Asset.kind == AssetKind.RAW_MASTER,
                 unfinished_asset,
                 Asset.staging_object_key.is_not(None),
+                ~has_earlier_unfinished_output,
             )
             .order_by(
                 GenerationJob.priority,
@@ -165,16 +202,18 @@ async def collect_next_ready_running_asset(
                 GenerationJob.id,
                 Asset.output_index,
             )
-            .limit(1)
+            .limit(_PROGRESSIVE_CANDIDATE_JOB_LIMIT)
         )
-    ).one_or_none()
+    )
     await session.rollback()
-    if candidate is None:
+    if not candidates:
         return ProgressiveCollectionResult(asset_id=None, finalized=False)
 
-    asset_id, staging_object_key, job_id, job_state = candidate
-    assert staging_object_key is not None
-    if await store.head(staging_object_key) is None:
+    first_asset_id = candidates[0][0]
+    for asset_id, staging_object_key, job_id, job_state in candidates:
+        assert staging_object_key is not None
+        if await store.head(staging_object_key) is not None:
+            break
         if job_state in _TERMINAL_GENERATION_STATES:
             await _quarantine_terminal_missing_stop_asset(
                 session,
@@ -183,7 +222,9 @@ async def collect_next_ready_running_asset(
                 worker_id=worker_id,
                 now=collected_at,
             )
-        return ProgressiveCollectionResult(asset_id=asset_id, finalized=False)
+            return ProgressiveCollectionResult(asset_id=asset_id, finalized=False)
+    else:
+        return ProgressiveCollectionResult(asset_id=first_asset_id, finalized=False)
 
     try:
         result = await finalize_raw_master(
