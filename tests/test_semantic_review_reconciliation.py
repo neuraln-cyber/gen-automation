@@ -148,9 +148,7 @@ async def test_open_anatomy_reject_corrected_before_completion_never_becomes_a_d
 
     async with semantic_runtime_context.database.sessions() as session:
         feedback_id = await session.scalar(
-            select(SemanticAnatomyFeedback.id).where(
-                SemanticAnatomyFeedback.asset_id == asset_id
-            )
+            select(SemanticAnatomyFeedback.id).where(SemanticAnatomyFeedback.asset_id == asset_id)
         )
         assert feedback_id is None
         reconciled = await reconcile_one_completed_semantic_review(

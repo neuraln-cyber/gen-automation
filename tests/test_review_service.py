@@ -892,9 +892,7 @@ async def test_inspected_default_accepts_become_positive_labels_on_completion(
 async def test_postgresql_review_transition_timeouts_are_transaction_local() -> None:
     session = MagicMock()
     session.execute = AsyncMock()
-    session.get_bind.return_value = SimpleNamespace(
-        dialect=SimpleNamespace(name="postgresql")
-    )
+    session.get_bind.return_value = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
 
     await review_service._configure_review_transition_timeouts(session)
 

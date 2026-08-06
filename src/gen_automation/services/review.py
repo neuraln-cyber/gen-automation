@@ -930,9 +930,7 @@ async def _configure_review_transition_timeouts(session: AsyncSession) -> None:
 
     if session.get_bind().dialect.name != "postgresql":
         return
-    await session.execute(
-        text(f"SET LOCAL lock_timeout = '{_REVIEW_TRANSITION_LOCK_TIMEOUT}'")
-    )
+    await session.execute(text(f"SET LOCAL lock_timeout = '{_REVIEW_TRANSITION_LOCK_TIMEOUT}'"))
     await session.execute(
         text(f"SET LOCAL statement_timeout = '{_REVIEW_TRANSITION_STATEMENT_TIMEOUT}'")
     )
