@@ -695,9 +695,7 @@ async def _apply_provider_state(
             and attempt.error_code == DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE
         )
         or (
-            (attempt.response_metadata or {}).get(
-                DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_METADATA_KEY
-            )
+            (attempt.response_metadata or {}).get(DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_METADATA_KEY)
             is True
         )
     ) and not await _operator_generation_stop_requested(session, job=job)

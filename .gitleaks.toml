@@ -21,6 +21,7 @@ paths = [
 ]
 regexes = [
   '''^\s*idempotency_key="scheduler-claim-1",\s*$''',
+  '''^\s*idempotency_key="scheduler-claim-2",\s*$''',
   '''^\s*idempotency_key="subject-reaffirm-v1",\s*$''',
   '''^\s*idempotency_key="subject-revoke-v2",\s*$''',
   '''^\s*"Idempotency-Key": "approve-subject-v1",\s*$''',

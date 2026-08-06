@@ -62,19 +62,11 @@ _DEFINITIVE_REJECTION_STATUS_CODES = frozenset({400, 401, 403, 404, 422})
 SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE = "salad_attempt_watchdog_cancel_requested"
 SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE = "salad_attempt_watchdog_expired"
 _SALAD_ATTEMPT_WATCHDOG_CANCEL_UNAVAILABLE_ERROR_CODE = "salad_attempt_watchdog_cancel_unavailable"
-DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE = (
-    "salad_deployment_rollover_cancel_requested"
-)
+DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE = "salad_deployment_rollover_cancel_requested"
 DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE = "salad_deployment_superseded"
-DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_METADATA_KEY = (
-    "deployment_rollover_cancel_requested"
-)
-_DEPLOYMENT_ROLLOVER_CANCEL_UNAVAILABLE_ERROR_CODE = (
-    "salad_deployment_rollover_cancel_unavailable"
-)
-_DEPLOYMENT_ROLLOVER_PROVIDER_ABSENT_ERROR_CODE = (
-    "salad_deployment_rollover_provider_absent"
-)
+DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_METADATA_KEY = "deployment_rollover_cancel_requested"
+_DEPLOYMENT_ROLLOVER_CANCEL_UNAVAILABLE_ERROR_CODE = "salad_deployment_rollover_cancel_unavailable"
+_DEPLOYMENT_ROLLOVER_PROVIDER_ABSENT_ERROR_CODE = "salad_deployment_rollover_provider_absent"
 _DEPLOYMENT_ROLLOVER_PROVIDER_ABSENCE_PENDING_ERROR_CODE = (
     "salad_deployment_rollover_provider_absence_pending"
 )
@@ -1033,11 +1025,7 @@ async def apply_salad_job_observation(
         else (
             SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE
             if watchdog_cancelled
-            else (
-                DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE
-                if deployment_rollover_cancelled
-                else None
-            )
+            else (DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE if deployment_rollover_cancelled else None)
         )
     )
     attempt.error_detail = (
@@ -1326,9 +1314,7 @@ async def reconcile_generation_attempt(
                             session,
                             attempt=attempt,
                             job=job,
-                            error_code=(
-                                _DEPLOYMENT_ROLLOVER_PROVIDER_SCAN_INCONCLUSIVE_ERROR_CODE
-                            ),
+                            error_code=(_DEPLOYMENT_ROLLOVER_PROVIDER_SCAN_INCONCLUSIVE_ERROR_CODE),
                             occurred_at=reconciled_at,
                         )
                         await session.commit()
@@ -1341,9 +1327,7 @@ async def reconcile_generation_attempt(
                             ),
                             source=source,
                             matched=False,
-                            error_code=(
-                                _DEPLOYMENT_ROLLOVER_PROVIDER_SCAN_INCONCLUSIVE_ERROR_CODE
-                            ),
+                            error_code=(_DEPLOYMENT_ROLLOVER_PROVIDER_SCAN_INCONCLUSIVE_ERROR_CODE),
                         )
                     confirmations = await _record_deployment_rollover_absence_confirmation(
                         session,
@@ -1375,9 +1359,7 @@ async def reconcile_generation_attempt(
                         session,
                         attempt=attempt,
                         job=job,
-                        error_code=(
-                            _DEPLOYMENT_ROLLOVER_PROVIDER_ABSENCE_PENDING_ERROR_CODE
-                        ),
+                        error_code=(_DEPLOYMENT_ROLLOVER_PROVIDER_ABSENCE_PENDING_ERROR_CODE),
                         occurred_at=reconciled_at,
                     )
                     await session.commit()
@@ -2474,8 +2456,7 @@ async def _mark_deployment_rollover_provider_absent(
         job.retry_at = occurred_at if job.state == GenerationState.RETRY_WAIT else None
         job.last_error_code = _DEPLOYMENT_ROLLOVER_PROVIDER_ABSENT_ERROR_CODE
         job.last_error_detail = (
-            "The superseded provider job is absent; generation can retry on the current "
-            "deployment."
+            "The superseded provider job is absent; generation can retry on the current deployment."
         )
         job.lock_version += 1
 
@@ -2956,10 +2937,7 @@ def _retry_or_fail(job: GenerationJob) -> GenerationState:
 
 
 def _deployment_rollover_requested(deployment: SaladDeployment) -> bool:
-    return (
-        not deployment.is_current
-        and deployment.desired_state == DesiredDeploymentState.STOPPED
-    )
+    return not deployment.is_current and deployment.desired_state == DesiredDeploymentState.STOPPED
 
 
 def _deployment_rollover_cancel_was_requested(attempt: GenerationAttempt) -> bool:

@@ -1777,10 +1777,7 @@ async def test_superseded_deployment_cancels_then_retries_on_current_deployment(
         assert deferred.error_code == "salad_deployment_rollover_cancel_unavailable"
         assert cancelling_attempt is not None
         assert cancelling_attempt.state == GenerationAttemptState.CANCEL_REQUESTED
-        assert (
-            cancelling_attempt.error_code
-            == DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE
-        )
+        assert cancelling_attempt.error_code == DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE
         assert cancelling_attempt.response_metadata is not None
         assert cancelling_attempt.response_metadata["deployment_rollover_cancel_requested"] is True
         assert cancelling_attempt.reservation_released_at is None
@@ -1877,9 +1874,7 @@ async def test_superseded_unknown_attempt_retries_only_after_confirmed_provider_
             )
             attempt = await session.get(GenerationAttempt, attempt_id)
             job = await session.get(GenerationJob, context.job_id)
-            assert pending.error_code == (
-                "salad_deployment_rollover_provider_absence_pending"
-            )
+            assert pending.error_code == ("salad_deployment_rollover_provider_absence_pending")
             assert attempt is not None
             assert attempt.state == GenerationAttemptState.UNKNOWN
             assert attempt.reservation_released_at is None
@@ -1903,14 +1898,10 @@ async def test_superseded_unknown_attempt_retries_only_after_confirmed_provider_
             now=NOW + timedelta(minutes=4),
         )
         after_reset_attempt = await session.get(GenerationAttempt, attempt_id)
-        assert after_reset.error_code == (
-            "salad_deployment_rollover_provider_absence_pending"
-        )
+        assert after_reset.error_code == ("salad_deployment_rollover_provider_absence_pending")
         assert after_reset_attempt is not None
         assert after_reset_attempt.response_metadata is not None
-        tracker = after_reset_attempt.response_metadata[
-            "deployment_rollover_absence_confirmation"
-        ]
+        tracker = after_reset_attempt.response_metadata["deployment_rollover_absence_confirmation"]
         assert isinstance(tracker, dict)
         assert tracker["count"] == 1
         assert after_reset_attempt.reservation_released_at is None
@@ -1923,9 +1914,7 @@ async def test_superseded_unknown_attempt_retries_only_after_confirmed_provider_
                 list_page_size=10,
                 now=NOW + timedelta(minutes=minute),
             )
-            assert pending.error_code == (
-                "salad_deployment_rollover_provider_absence_pending"
-            )
+            assert pending.error_code == ("salad_deployment_rollover_provider_absence_pending")
 
         confirmed = await reconcile_generation_attempt(
             session,
