@@ -1,11 +1,18 @@
 import re
 from copy import deepcopy
+from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from gen_automation.db.models import GenerationJob, Project, Release, ReleaseVersion
-from gen_automation.domain.enums import ReleasePhase
+from gen_automation.db.models import (
+    GenerationJob,
+    Project,
+    Release,
+    ReleaseVersion,
+    SaladDeployment,
+)
+from gen_automation.domain.enums import ReleasePhase, SaladDeploymentState
 from gen_automation.domain.wildcards import WildcardCreate
 from gen_automation.services.new_sets import list_new_set_options
 from gen_automation.services.wildcards import create_wildcard_library
@@ -377,3 +384,84 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
         "next_url": None,
         "poll_after_ms": 3000,
     }
+
+    async def seed_preparing_deployment() -> None:
+        async with database.sessions() as session:
+            session.add(
+                SaladDeployment(
+                    version_no=1,
+                    config_sha256="d" * 64,
+                    provider_configuration={},
+                    worker_image_digest=f"registry.example/worker@sha256:{'e' * 64}",
+                    organization_name="organization",
+                    project_name="project",
+                    queue_name="queue",
+                    provider_queue_id="provider-queue",
+                    container_group_name="group",
+                    provider_container_group_id="provider-group",
+                    state=SaladDeploymentState.PROVISIONING,
+                    is_current=True,
+                    max_hourly_cost_microusd=1_000_000,
+                    provider_status=(
+                        "queue=3;group=pending;pending=1;phase=image_pull;progress=21"
+                    ),
+                    last_observed_at=datetime.now(UTC),
+                    last_error_code="provider_image_preparation_pending",
+                )
+            )
+            await session.commit()
+
+    client.portal.call(seed_preparing_deployment)
+
+    preparing_page = client.get(first.headers["location"])
+    preparing_progress = client.get(first.headers["location"].replace("/status", "/progress"))
+
+    assert preparing_page.status_code == 200
+    assert "Preparing worker image (21%)" in preparing_page.text
+    assert "queue=3" not in preparing_page.text
+    assert preparing_progress.status_code == 200
+    assert preparing_progress.json()["stage"] == {
+        "key": "queued",
+        "step": 1,
+        "step_count": 5,
+        "label": "Preparing worker image (21%)",
+        "detail": (
+            "The reusable cloud worker image is being prepared. Generation will start "
+            "automatically when it is ready."
+        ),
+    }
+    assert preparing_progress.json()["error"] is None
+
+    async def mark_preparation_stalled() -> None:
+        async with database.sessions() as session:
+            deployment = await session.scalar(
+                select(SaladDeployment).where(SaladDeployment.is_current.is_(True))
+            )
+            assert deployment is not None
+            deployment.state = SaladDeploymentState.DEGRADED
+            deployment.last_observed_at = datetime.now(UTC)
+            deployment.last_error_code = "provider_image_preparation_stalled"
+            deployment.last_error_detail = "Raw provider detail must not be rendered."
+            await session.commit()
+
+    client.portal.call(mark_preparation_stalled)
+
+    stalled_page = client.get(first.headers["location"])
+    stalled_progress = client.get(first.headers["location"].replace("/status", "/progress"))
+    stalled_payload = stalled_progress.json()
+
+    assert stalled_page.status_code == 200
+    assert "Worker image preparation stalled" in stalled_page.text
+    assert "Raw provider detail" not in stalled_page.text
+    assert stalled_progress.status_code == 200
+    assert stalled_payload["stage"]["key"] == "error"
+    assert stalled_payload["stage"]["label"] == "Worker image preparation stalled"
+    assert stalled_payload["error"] == {
+        "code": "provider_image_preparation_stalled",
+        "message": (
+            "Worker image preparation has not advanced for at least 30 minutes. "
+            "You can stop this run safely; no generated images will be discarded."
+        ),
+        "retryable": True,
+    }
+    assert stalled_payload["poll_after_ms"] == 10_000

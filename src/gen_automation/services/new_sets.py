@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Literal
 from uuid import UUID
@@ -19,6 +20,7 @@ from gen_automation.db.models import (
     Project,
     Release,
     ReleaseVersion,
+    SaladDeployment,
     ScoringRun,
     SubjectApproval,
     WorkflowApproval,
@@ -37,6 +39,7 @@ from gen_automation.domain.enums import (
     ModelArtifactKind,
     ReleasePhase,
     ResourceHealth,
+    SaladDeploymentState,
     ScoringRunState,
 )
 from gen_automation.domain.generation_limits import (
@@ -63,6 +66,29 @@ from gen_automation.services.generation_control import (
 )
 from gen_automation.services.releases import create_project, create_release
 from gen_automation.services.wildcards import list_wildcard_libraries
+
+_PROVIDER_STATUS_STALE_AFTER = timedelta(minutes=5)
+_PROVIDER_PREPARATION_ERROR_CODES = frozenset(
+    {
+        "provider_image_preparation_pending",
+        "provider_image_preparation_stalled",
+    }
+)
+_PROVIDER_PREPARATION_PHASES = frozenset({"allocation", "image_pull", "preparing", "unknown"})
+_PROVIDER_GROUP_STATUSES = frozenset(
+    {
+        "allocating",
+        "creating",
+        "deploying",
+        "failed",
+        "pending",
+        "preparing",
+        "running",
+        "stopped",
+        "stopping",
+        "unknown",
+    }
+)
 
 
 class NewSetInputError(ValueError):
@@ -313,6 +339,13 @@ class GenerationProgressError:
     code: str
     message: str
     retryable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderPreparationSnapshot:
+    phase: str
+    progress: int | None
+    stalled: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -838,6 +871,16 @@ async def load_new_set_status(
         failed_jobs=failed_jobs,
         stop_requested=stop_requested,
     )
+    if stage.key in {GenerationProgressStage.QUEUED, GenerationProgressStage.GPU_STARTING}:
+        current_deployment = await session.scalar(
+            select(SaladDeployment).where(SaladDeployment.is_current.is_(True)).limit(1)
+        )
+        stage, progress_error = _overlay_provider_preparation(
+            stage,
+            progress_error,
+            deployment=current_deployment,
+            now=datetime.now(UTC),
+        )
     if stage.key == GenerationProgressStage.SCORING and scoring_progress is None:
         scoring_progress = GenerationScoringProgress(
             completed=0,
@@ -1150,6 +1193,126 @@ def _stage(
         label=label,
         detail=detail,
     )
+
+
+def _overlay_provider_preparation(
+    stage: GenerationProgressStageView,
+    error: GenerationProgressError | None,
+    *,
+    deployment: SaladDeployment | None,
+    now: datetime,
+) -> tuple[GenerationProgressStageView, GenerationProgressError | None]:
+    if stage.key not in {GenerationProgressStage.QUEUED, GenerationProgressStage.GPU_STARTING}:
+        return stage, error
+    snapshot = _provider_preparation_snapshot(deployment, now=now)
+    if snapshot is None:
+        return stage, error
+    if snapshot.stalled:
+        return (
+            _stage(
+                GenerationProgressStage.ERROR,
+                step=stage.step,
+                label="Worker image preparation stalled",
+                detail=(
+                    "The worker image has reported no preparation progress for at least "
+                    "30 minutes. The system will keep checking automatically."
+                ),
+            ),
+            GenerationProgressError(
+                code="provider_image_preparation_stalled",
+                message=(
+                    "Worker image preparation has not advanced for at least 30 minutes. "
+                    "You can stop this run safely; no generated images will be discarded."
+                ),
+                retryable=True,
+            ),
+        )
+    if snapshot.phase != "image_pull":
+        return stage, error
+    progress_suffix = f" ({snapshot.progress}%)" if snapshot.progress is not None else ""
+    return (
+        _stage(
+            stage.key,
+            step=stage.step,
+            label=f"Preparing worker image{progress_suffix}",
+            detail=(
+                "The reusable cloud worker image is being prepared. Generation will start "
+                "automatically when it is ready."
+            ),
+        ),
+        error,
+    )
+
+
+def _provider_preparation_snapshot(
+    deployment: SaladDeployment | None,
+    *,
+    now: datetime,
+) -> _ProviderPreparationSnapshot | None:
+    if deployment is None or not deployment.is_current:
+        return None
+    if deployment.last_error_code not in _PROVIDER_PREPARATION_ERROR_CODES:
+        return None
+    expected_state = (
+        SaladDeploymentState.DEGRADED
+        if deployment.last_error_code == "provider_image_preparation_stalled"
+        else SaladDeploymentState.PROVISIONING
+    )
+    if deployment.state != expected_state or deployment.last_observed_at is None:
+        return None
+    observed_at = _stored_as_utc(deployment.last_observed_at)
+    current_time = _stored_as_utc(now)
+    age = current_time - observed_at
+    if age < timedelta(0) or age > _PROVIDER_STATUS_STALE_AFTER:
+        return None
+    fields = _strict_provider_status_fields(deployment.provider_status)
+    if fields is None or fields["pending"] != "1":
+        return None
+    phase = fields["phase"]
+    if phase not in _PROVIDER_PREPARATION_PHASES:
+        return None
+    progress_value = fields["progress"]
+    if progress_value == "unknown":
+        progress = None
+    elif progress_value.isascii() and progress_value.isdecimal():
+        progress = int(progress_value)
+        if not 0 <= progress <= 100:
+            return None
+    else:
+        return None
+    return _ProviderPreparationSnapshot(
+        phase=phase,
+        progress=progress,
+        stalled=deployment.last_error_code == "provider_image_preparation_stalled",
+    )
+
+
+def _strict_provider_status_fields(status: str | None) -> dict[str, str] | None:
+    if status is None or not status.isascii():
+        return None
+    fields: dict[str, str] = {}
+    for item in status.split(";"):
+        key, separator, value = item.partition("=")
+        if not separator or not key or not value or key in fields:
+            return None
+        fields[key] = value
+    if set(fields) != {"queue", "group", "pending", "phase", "progress"}:
+        return None
+    queue_value = fields["queue"]
+    queue_digits = queue_value[:-1] if queue_value.endswith("+") else queue_value
+    if not queue_digits.isdecimal() or not queue_digits.isascii():
+        return None
+    if not 0 <= int(queue_digits) <= 999_999_999:
+        return None
+    if fields["group"] not in _PROVIDER_GROUP_STATUSES:
+        return None
+    return fields
+
+
+def _stored_as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _generation_step(

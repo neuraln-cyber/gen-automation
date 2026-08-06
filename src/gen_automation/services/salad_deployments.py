@@ -64,6 +64,22 @@ from gen_automation.services.runtime_secrets import (
 _PROVIDER = "salad"
 _NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,61}[a-z0-9]$")
 _IMAGE_DIGEST_PATTERN = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
+_PROVIDER_PROGRESS_PATTERN = re.compile(r"(?<!\d)(100|[0-9]{1,2})(?:\.[0-9]+)?\s*%")
+_PROVIDER_PENDING_STALL_AFTER = timedelta(minutes=30)
+_SAFE_PROVIDER_GROUP_STATUSES = frozenset(
+    {
+        "allocating",
+        "creating",
+        "deploying",
+        "failed",
+        "pending",
+        "preparing",
+        "running",
+        "stopped",
+        "stopping",
+    }
+)
+_SAFE_PROVIDER_PREPARATION_PHASES = frozenset({"allocation", "image_pull", "preparing", "unknown"})
 _RECONCILE_DELAY = timedelta(seconds=30)
 _MAX_PROVIDER_NAME_LENGTH = 63
 _MICROSECONDS_PER_HOUR = 3_600_000_000
@@ -543,10 +559,11 @@ async def _reconcile_locked(
         await session.flush()
         return await _request_stop(session, deployment, client, observed_at)
 
+    previous_provider_status = deployment.provider_status
     deployment.observed_replicas = current_replicas
     deployment.ready_replicas = group.current_state.running_count
     deployment.last_observed_at = observed_at
-    deployment.provider_status = (f"queue={queue.current_queue_length};group={group.status}")[:100]
+    deployment.provider_status = _safe_provider_status(queue, group)
     deployment.reconcile_after = observed_at + _RECONCILE_DELAY
 
     # Recording an interval can engage the budget service's durable kill switch.
@@ -563,7 +580,28 @@ async def _reconcile_locked(
             error_code=stop_result.error_code,
         )
 
-    if not group.pending_change:
+    if group.pending_change:
+        stalled = _record_pending_preparation(
+            deployment,
+            previous_provider_status=previous_provider_status,
+            observed_at=observed_at,
+        )
+        deployment.state = (
+            SaladDeploymentState.DEGRADED if stalled else SaladDeploymentState.PROVISIONING
+        )
+        deployment.last_error_code = (
+            "provider_image_preparation_stalled"
+            if stalled
+            else "provider_image_preparation_pending"
+        )
+        deployment.last_error_detail = (
+            "Provider image preparation stopped reporting progress; reconciliation remains "
+            "read-only."
+            if stalled
+            else "Provider image preparation is pending; reconciliation remains read-only."
+        )
+    else:
+        deployment.unknown_since = None
         repair_result = await _request_active_contract_repair(
             session,
             deployment,
@@ -577,18 +615,17 @@ async def _reconcile_locked(
         if repair_result is not None:
             return repair_result
 
-    unhealthy_status = group.status.strip().lower() in {"failed", "stopped"}
-    if drift_code is not None or group.pending_change or unhealthy_status:
-        deployment.state = SaladDeploymentState.DEGRADED
-        deployment.last_error_code = drift_code or (
-            "provider_change_pending" if group.pending_change else "provider_group_unhealthy"
-        )
-        deployment.last_error_detail = "Provider resources do not match the active deployment."
-    else:
-        deployment.state = SaladDeploymentState.ACTIVE
-        deployment.activated_at = deployment.activated_at or observed_at
-        deployment.unknown_since = None
-        _clear_error(deployment)
+    if not group.pending_change:
+        unhealthy_status = group.status.strip().lower() in {"failed", "stopped"}
+        if drift_code is not None or unhealthy_status:
+            deployment.state = SaladDeploymentState.DEGRADED
+            deployment.last_error_code = drift_code or "provider_group_unhealthy"
+            deployment.last_error_detail = "Provider resources do not match the active deployment."
+        else:
+            deployment.state = SaladDeploymentState.ACTIVE
+            deployment.activated_at = deployment.activated_at or observed_at
+            deployment.unknown_since = None
+            _clear_error(deployment)
     _touch(deployment)
     _audit(
         session,
@@ -1473,6 +1510,86 @@ def _observed_replicas(group: SaladContainerGroup) -> int:
         state.allocating_count + state.creating_count + state.running_count + state.stopping_count
     )
     return max(group.replicas, lifecycle_count)
+
+
+def _safe_provider_status(queue: SaladQueue, group: SaladContainerGroup) -> str:
+    queue_length = max(0, min(queue.current_queue_length, 999_999_999))
+    queue_value = (
+        f"{queue_length}+" if queue.current_queue_length > queue_length else str(queue_length)
+    )
+    raw_status = group.status.strip().lower()
+    group_status = raw_status if raw_status in _SAFE_PROVIDER_GROUP_STATUSES else "unknown"
+    fields = [
+        f"queue={queue_value}",
+        f"group={group_status}",
+        f"pending={int(group.pending_change)}",
+    ]
+    if group.pending_change:
+        phase, progress = _safe_preparation_snapshot(group.current_state.description)
+        fields.extend(
+            (
+                f"phase={phase}",
+                f"progress={progress if progress is not None else 'unknown'}",
+            )
+        )
+    # Every field is selected from a fixed vocabulary or a bounded integer, so this
+    # representation is guaranteed to fit the 100-character database boundary.
+    return ";".join(fields)
+
+
+def _safe_preparation_snapshot(description: str) -> tuple[str, int | None]:
+    normalized = description.casefold()
+    if any(marker in normalized for marker in ("download", "image", "pull")):
+        phase = "image_pull"
+    elif any(marker in normalized for marker in ("allocat", "capacity", "node")):
+        phase = "allocation"
+    elif any(marker in normalized for marker in ("creat", "prepar", "provision", "start")):
+        phase = "preparing"
+    else:
+        phase = "unknown"
+    progress_match = _PROVIDER_PROGRESS_PATTERN.search(normalized)
+    progress = int(progress_match.group(1)) if progress_match is not None else None
+    return phase, progress
+
+
+def _parse_safe_preparation_snapshot(status: str | None) -> tuple[str, int | None] | None:
+    if status is None:
+        return None
+    fields: dict[str, str] = {}
+    for item in status.split(";"):
+        key, separator, value = item.partition("=")
+        if separator:
+            fields[key] = value
+    phase = fields.get("phase")
+    progress_value = fields.get("progress")
+    if phase not in _SAFE_PROVIDER_PREPARATION_PHASES or progress_value is None:
+        return None
+    if progress_value == "unknown":
+        return phase, None
+    if not progress_value.isascii() or not progress_value.isdecimal():
+        return None
+    progress = int(progress_value)
+    if not 0 <= progress <= 100:
+        return None
+    return phase, progress
+
+
+def _record_pending_preparation(
+    deployment: SaladDeployment,
+    *,
+    previous_provider_status: str | None,
+    observed_at: datetime,
+) -> bool:
+    current_snapshot = _parse_safe_preparation_snapshot(deployment.provider_status)
+    previous_snapshot = _parse_safe_preparation_snapshot(previous_provider_status)
+    if current_snapshot is None or current_snapshot != previous_snapshot:
+        deployment.unknown_since = observed_at
+        return False
+    if deployment.unknown_since is None:
+        deployment.unknown_since = observed_at
+        return False
+    unchanged_since = _stored_as_utc(deployment.unknown_since)
+    return observed_at - unchanged_since >= _PROVIDER_PENDING_STALL_AFTER
 
 
 async def _verify_persisted_queue(

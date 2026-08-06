@@ -149,6 +149,7 @@ def make_group(
     *,
     group_id: UUID = GROUP_ID,
     status: str = "running",
+    description: str | None = None,
     replicas: int = 0,
     running: int = 0,
     pending_change: bool = False,
@@ -201,7 +202,7 @@ def make_group(
         version=version,
         current_state=SaladContainerGroupState(
             status=status,
-            description=status,
+            description=status if description is None else description,
             allocating_count=0,
             creating_count=0,
             running_count=running,
@@ -474,6 +475,25 @@ def test_deterministic_names_are_dns_safe_bounded_and_idempotent() -> None:
         deterministic_provider_name("queue", version_no=0, config_sha256=CONFIG_SHA256)
     with pytest.raises(SaladDeploymentValidationError, match="hash"):
         deterministic_provider_name("queue", version_no=1, config_sha256="invalid")
+
+
+def test_safe_provider_status_allowlists_and_bounds_untrusted_provider_text() -> None:
+    queue_name, group_name = remote_names()
+    untrusted_text = "user:SUPERSECRET@registry.example.test/private?token=opaque"
+    status = deployment_service._safe_provider_status(
+        make_queue(queue_name, length=10**200),
+        make_group(
+            group_name,
+            queue_name,
+            status=untrusted_text,
+            description=f"Downloading image from {untrusted_text} at 4.7%",
+            pending_change=True,
+        ),
+    )
+
+    assert status == ("queue=999999999+;group=unknown;pending=1;phase=image_pull;progress=4")
+    assert len(status) <= 100
+    assert untrusted_text not in status
 
 
 @pytest.mark.asyncio
@@ -1802,6 +1822,284 @@ async def test_reconciliation_repairs_missing_autoscaler_before_activation(
         }
     ]
     assert client.start_names == []
+
+
+@pytest.mark.asyncio
+async def test_pending_image_preparation_tracks_safe_progress_without_mutation(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(deployment_context)
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.queues[queue_name] = make_queue(queue_name)
+    untrusted_text = "user:SUPERSECRET@registry.example.test/private?token=opaque"
+    group = make_group(
+        group_name,
+        queue_name,
+        status="preparing",
+        description=f"Downloading image from {untrusted_text} at 4%",
+        pending_change=True,
+    )
+    group.raw.pop("queue_autoscaler")
+    client.groups[group_name] = group
+    observed_at = NOW + timedelta(minutes=1)
+
+    async with deployment_context.database.sessions() as session:
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=observed_at,
+        )
+        await session.commit()
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+        audit_details = list((await session.scalars(select(AuditEvent.detail))).all())
+
+    assert result.action == DeploymentAction.RECONCILED
+    assert result.state == SaladDeploymentState.PROVISIONING
+    assert result.error_code == "provider_image_preparation_pending"
+    assert deployment.provider_status == (
+        "queue=0;group=preparing;pending=1;phase=image_pull;progress=4"
+    )
+    assert len(deployment.provider_status) <= 100
+    assert deployment.unknown_since is not None
+    assert deployment.unknown_since.replace(tzinfo=UTC) == observed_at
+    assert untrusted_text not in deployment.provider_status
+    assert untrusted_text not in (deployment.last_error_detail or "")
+    assert all(untrusted_text not in str(detail) for detail in audit_details)
+    assert client.updated_group_patches == []
+    assert client.start_names == []
+    assert client.stop_names == []
+
+
+@pytest.mark.asyncio
+async def test_pending_image_preparation_progress_resets_stall_clock(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(deployment_context)
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.queues[queue_name] = make_queue(queue_name)
+    client.groups[group_name] = make_group(
+        group_name,
+        queue_name,
+        status="preparing",
+        description="Downloading image 4%",
+        pending_change=True,
+    )
+    first_observed_at = NOW + timedelta(minutes=1)
+    second_observed_at = first_observed_at + timedelta(minutes=40)
+
+    async with deployment_context.database.sessions() as session:
+        await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=first_observed_at,
+        )
+        await session.commit()
+        client.groups[group_name] = make_group(
+            group_name,
+            queue_name,
+            status="preparing",
+            description="Downloading image 5%",
+            pending_change=True,
+        )
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=second_observed_at,
+        )
+        await session.commit()
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+
+    assert result.state == SaladDeploymentState.PROVISIONING
+    assert result.error_code == "provider_image_preparation_pending"
+    assert deployment.unknown_since is not None
+    assert deployment.unknown_since.replace(tzinfo=UTC) == second_observed_at
+    assert deployment.provider_status is not None
+    assert deployment.provider_status.endswith("phase=image_pull;progress=5")
+    assert client.updated_group_patches == []
+    assert client.start_names == []
+    assert client.stop_names == []
+
+
+@pytest.mark.asyncio
+async def test_unchanged_pending_image_preparation_stalls_read_only_after_30_minutes(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(deployment_context)
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.queues[queue_name] = make_queue(queue_name)
+    group = make_group(
+        group_name,
+        queue_name,
+        status="preparing",
+        description="Pulling image 4%",
+        pending_change=True,
+    )
+    group.raw.pop("queue_autoscaler")
+    client.groups[group_name] = group
+    first_observed_at = NOW + timedelta(minutes=1)
+
+    async with deployment_context.database.sessions() as session:
+        await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=first_observed_at,
+        )
+        await session.commit()
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=first_observed_at + timedelta(minutes=30),
+        )
+        await session.commit()
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+
+    assert result.action == DeploymentAction.RECONCILED
+    assert result.state == SaladDeploymentState.DEGRADED
+    assert result.error_code == "provider_image_preparation_stalled"
+    assert deployment.unknown_since is not None
+    assert deployment.unknown_since.replace(tzinfo=UTC) == first_observed_at
+    assert client.updated_group_patches == []
+    assert client.start_names == []
+    assert client.stop_names == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("second_description", "expected_snapshot"),
+    [
+        ("Downloading image 4%", "phase=image_pull;progress=4"),
+        ("Preparing container 5%", "phase=preparing;progress=5"),
+    ],
+)
+async def test_pending_snapshot_change_resets_stall_clock(
+    deployment_context: DeploymentContext,
+    second_description: str,
+    expected_snapshot: str,
+) -> None:
+    await make_fully_provisioned(deployment_context)
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.queues[queue_name] = make_queue(queue_name)
+    client.groups[group_name] = make_group(
+        group_name,
+        queue_name,
+        status="preparing",
+        description="Downloading image 5%",
+        pending_change=True,
+    )
+    first_observed_at = NOW + timedelta(minutes=1)
+    second_observed_at = first_observed_at + timedelta(minutes=31)
+
+    async with deployment_context.database.sessions() as session:
+        await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=first_observed_at,
+        )
+        await session.commit()
+        client.groups[group_name] = make_group(
+            group_name,
+            queue_name,
+            status="preparing",
+            description=second_description,
+            pending_change=True,
+        )
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=second_observed_at,
+        )
+        await session.commit()
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+
+    assert result.state == SaladDeploymentState.PROVISIONING
+    assert result.error_code == "provider_image_preparation_pending"
+    assert deployment.unknown_since is not None
+    assert deployment.unknown_since.replace(tzinfo=UTC) == second_observed_at
+    assert deployment.provider_status is not None
+    assert deployment.provider_status.endswith(expected_snapshot)
+    assert client.updated_group_patches == []
+    assert client.start_names == []
+    assert client.stop_names == []
+
+
+@pytest.mark.asyncio
+async def test_pending_clear_resets_tracking_and_repairs_autoscaler(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(deployment_context)
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.queues[queue_name] = make_queue(queue_name)
+    pending_group = make_group(
+        group_name,
+        queue_name,
+        status="preparing",
+        description="Downloading image 4%",
+        pending_change=True,
+    )
+    pending_group.raw.pop("queue_autoscaler")
+    client.groups[group_name] = pending_group
+    first_observed_at = NOW + timedelta(minutes=1)
+
+    async with deployment_context.database.sessions() as session:
+        await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=first_observed_at,
+        )
+        await session.commit()
+        settled_group = make_group(
+            group_name,
+            queue_name,
+            status="deploying",
+            description="deploying",
+            pending_change=False,
+        )
+        settled_group.raw.pop("queue_autoscaler")
+        client.groups[group_name] = settled_group
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=first_observed_at + timedelta(minutes=31),
+        )
+        await session.commit()
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+
+    assert result.action == DeploymentAction.AUTOSCALER_REPAIR_REQUESTED
+    assert result.state == SaladDeploymentState.PROVISIONING
+    assert result.error_code == "provider_autoscaler_repair_pending"
+    assert deployment.unknown_since is None
+    assert deployment.provider_status == "queue=0;group=deploying;pending=0"
+    assert client.updated_group_patches == [
+        {
+            "queue_autoscaler": {
+                "polling_period": 30,
+                "min_replicas": 0,
+                "max_replicas": 1,
+                "desired_queue_length": 1,
+            }
+        }
+    ]
+    assert client.start_names == []
+    assert client.stop_names == []
 
 
 @pytest.mark.asyncio
