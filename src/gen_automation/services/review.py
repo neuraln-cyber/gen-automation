@@ -429,19 +429,14 @@ async def append_review_decision(
     semantic_mode = _validate_semantic_enforcement_mode(semantic_enforcement_mode)
     expected_version = _validate_lock_version(expected_lock_version)
     scope = f"review-task:{review_task_id}:append-decision"
-    request_sha256 = canonical_sha256(
-        {
-            "review_task_id": str(review_task_id),
-            "asset_id": str(asset_id),
-            "decision": normalized_decision.value,
-            "decided_by_user_id": str(decided_by_user_id),
-            "expected_lock_version": expected_version,
-            "reason_code": normalized_reason,
-            "note": normalized_note,
-            "semantic_profile_sha256": normalized_semantic_profile,
-            "semantic_severe_confidence_micros": semantic_threshold,
-            "semantic_enforcement_mode": semantic_mode.value,
-        }
+    request_sha256 = _decision_request_sha256(
+        review_task_id=review_task_id,
+        asset_id=asset_id,
+        decision=normalized_decision,
+        decided_by_user_id=decided_by_user_id,
+        expected_lock_version=expected_version,
+        reason_code=normalized_reason,
+        note=normalized_note,
     )
     await _require_active_reviewer(session, decided_by_user_id)
     replay = await _decision_idempotency_replay(
@@ -2008,11 +2003,10 @@ async def _decision_idempotency_replay(
     idempotency_key: str,
     request_sha256: str,
 ) -> ReviewDecisionResult | None:
-    record = await _load_idempotency_record(
+    record = await _find_idempotency_record(
         session,
         scope=scope,
         key=idempotency_key,
-        request_sha256=request_sha256,
     )
     if record is None:
         return None
@@ -2025,6 +2019,20 @@ async def _decision_idempotency_replay(
     decision = await session.get(ReviewDecision, decision_id)
     if decision is None:
         raise ReviewConflictError("idempotency record references a missing review decision")
+    if record.request_sha256 != request_sha256:
+        if task_lock_version <= 1:
+            raise ReviewConflictError("review decision idempotency record is invalid")
+        persisted_request_sha256 = _decision_request_sha256(
+            review_task_id=decision.review_task_id,
+            asset_id=decision.asset_id,
+            decision=decision.decision,
+            decided_by_user_id=decision.decided_by_user_id,
+            expected_lock_version=task_lock_version - 1,
+            reason_code=decision.reason_code,
+            note=decision.note,
+        )
+        if persisted_request_sha256 != request_sha256:
+            raise ReviewConflictError("idempotency key was already used for another request")
     return _decision_result(
         decision,
         task_lock_version=task_lock_version,
@@ -2132,15 +2140,50 @@ async def _load_idempotency_record(
     key: str,
     request_sha256: str,
 ) -> IdempotencyRecord | None:
+    record = await _find_idempotency_record(session, scope=scope, key=key)
+    if record is not None and record.request_sha256 != request_sha256:
+        raise ReviewConflictError("idempotency key was already used for another request")
+    return record
+
+
+async def _find_idempotency_record(
+    session: AsyncSession,
+    *,
+    scope: str,
+    key: str,
+) -> IdempotencyRecord | None:
     record = await session.scalar(
         select(IdempotencyRecord).where(
             IdempotencyRecord.scope == scope,
             IdempotencyRecord.idempotency_key == key,
         )
     )
-    if record is not None and record.request_sha256 != request_sha256:
-        raise ReviewConflictError("idempotency key was already used for another request")
     return record
+
+
+def _decision_request_sha256(
+    *,
+    review_task_id: UUID,
+    asset_id: UUID,
+    decision: ReviewDecisionValue,
+    decided_by_user_id: UUID,
+    expected_lock_version: int,
+    reason_code: str | None,
+    note: str | None,
+) -> str:
+    """Hash the stable caller command, excluding mutable server policy inputs."""
+
+    return canonical_sha256(
+        {
+            "review_task_id": str(review_task_id),
+            "asset_id": str(asset_id),
+            "decision": decision.value,
+            "decided_by_user_id": str(decided_by_user_id),
+            "expected_lock_version": expected_lock_version,
+            "reason_code": reason_code,
+            "note": note,
+        }
+    )
 
 
 def _task_result(task: ReviewTask, *, replayed: bool) -> ReviewTaskResult:

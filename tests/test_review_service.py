@@ -1159,6 +1159,154 @@ async def test_decisions_are_revisioned_idempotent_and_preserve_raw_master(
 
 
 @pytest.mark.asyncio
+async def test_decision_idempotency_survives_semantic_policy_changes(
+    review_context: ReviewContext,
+) -> None:
+    task = await _create_task(
+        review_context,
+        key="create-policy-stable-decision-review",
+    )
+    asset_id = review_context.ranked_asset_ids[0]
+    request = {
+        "review_task_id": task.task_id,
+        "asset_id": asset_id,
+        "decision": ReviewDecisionValue.REJECT,
+        "decided_by_user_id": review_context.reviewer_id,
+        "expected_lock_version": 1,
+        "idempotency_key": "policy-stable-decision",
+        "reason_code": "anatomy",
+        "note": "Extra fingers.",
+    }
+
+    async with review_context.database.sessions() as session:
+        first = await append_review_decision(
+            session,
+            **request,
+            semantic_profile_sha256="a" * 64,
+            semantic_severe_confidence_micros=910_000,
+            semantic_enforcement_mode=SemanticEnforcementMode.SHADOW,
+        )
+
+    async with review_context.database.sessions() as session:
+        replay = await append_review_decision(
+            session,
+            **request,
+            semantic_profile_sha256="b" * 64,
+            semantic_severe_confidence_micros=720_000,
+            semantic_enforcement_mode=SemanticEnforcementMode.ASSIST,
+        )
+
+    assert replay.replayed is True
+    assert replay.decision_id == first.decision_id
+    assert replay.task_lock_version == first.task_lock_version == 2
+
+    async with review_context.database.sessions() as session:
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(ReviewDecision)
+                .where(ReviewDecision.review_task_id == task.task_id)
+            )
+            == 1
+        )
+        stored_task = await session.get(ReviewTask, task.task_id)
+        assert stored_task is not None
+        assert stored_task.lock_version == 2
+
+
+@pytest.mark.asyncio
+async def test_legacy_policy_sensitive_decision_idempotency_record_replays_safely(
+    review_context: ReviewContext,
+) -> None:
+    task = await _create_task(
+        review_context,
+        key="create-legacy-decision-replay-review",
+    )
+    asset_id = review_context.ranked_asset_ids[0]
+    idempotency_key = "legacy-policy-sensitive-decision"
+    request = {
+        "review_task_id": task.task_id,
+        "asset_id": asset_id,
+        "decision": ReviewDecisionValue.REJECT,
+        "decided_by_user_id": review_context.reviewer_id,
+        "expected_lock_version": 1,
+        "idempotency_key": idempotency_key,
+        "reason_code": "anatomy",
+        "note": "Extra limb.",
+    }
+    original_profile = "c" * 64
+    original_threshold = 930_000
+    original_mode = SemanticEnforcementMode.SHADOW
+
+    async with review_context.database.sessions() as session:
+        first = await append_review_decision(
+            session,
+            **request,
+            semantic_profile_sha256=original_profile,
+            semantic_severe_confidence_micros=original_threshold,
+            semantic_enforcement_mode=original_mode,
+        )
+
+    scope = f"review-task:{task.task_id}:append-decision"
+    legacy_request_sha256 = review_service.canonical_sha256(
+        {
+            "review_task_id": str(task.task_id),
+            "asset_id": str(asset_id),
+            "decision": ReviewDecisionValue.REJECT.value,
+            "decided_by_user_id": str(review_context.reviewer_id),
+            "expected_lock_version": 1,
+            "reason_code": "anatomy",
+            "note": "Extra limb.",
+            "semantic_profile_sha256": original_profile,
+            "semantic_severe_confidence_micros": original_threshold,
+            "semantic_enforcement_mode": original_mode.value,
+        }
+    )
+    async with review_context.database.sessions() as session:
+        record = await session.scalar(
+            select(IdempotencyRecord).where(
+                IdempotencyRecord.scope == scope,
+                IdempotencyRecord.idempotency_key == idempotency_key,
+            )
+        )
+        assert record is not None
+        record.request_sha256 = legacy_request_sha256
+        await session.commit()
+
+    async with review_context.database.sessions() as session:
+        replay = await append_review_decision(
+            session,
+            **request,
+            semantic_profile_sha256="d" * 64,
+            semantic_severe_confidence_micros=700_000,
+            semantic_enforcement_mode=SemanticEnforcementMode.ENFORCE,
+        )
+
+    assert replay.replayed is True
+    assert replay.decision_id == first.decision_id
+    assert replay.task_lock_version == 2
+
+    async with review_context.database.sessions() as session:
+        with pytest.raises(ReviewConflictError, match="idempotency key"):
+            await append_review_decision(
+                session,
+                **{**request, "note": "A different command."},
+                semantic_profile_sha256="d" * 64,
+                semantic_severe_confidence_micros=700_000,
+                semantic_enforcement_mode=SemanticEnforcementMode.ENFORCE,
+            )
+
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(ReviewDecision)
+                .where(ReviewDecision.review_task_id == task.task_id)
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
 async def test_bulk_decisions_are_atomic_idempotent_and_preserve_raw_masters(
     review_context: ReviewContext,
 ) -> None:

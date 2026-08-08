@@ -792,6 +792,82 @@ def test_review_mutations_require_origin_csrf_and_replay_idempotently(
     assert completed_replay.headers["idempotency-replayed"] == "true"
 
 
+def test_decision_api_chains_two_mixed_rejects_and_replays_without_advancing_lock(
+    tmp_path: Path,
+) -> None:
+    context = asyncio.run(_seed_review_api(_settings(tmp_path / "queued-decisions.db")))
+    app = create_app(context.settings)
+
+    with TestClient(
+        app,
+        base_url=ORIGIN,
+        client=("192.0.2.86", 50000),
+    ) as client:
+        csrf = _login(client, context.settings, context.users[AdminRole.OWNER])
+        created = client.post(
+            "/api/v1/review-tasks",
+            json={"scoring_run_id": str(context.scoring_run_id)},
+            headers=_mutation_headers(csrf, "queued-create-task"),
+        )
+        assert created.status_code == 201
+        task_id = created.json()["task_id"]
+        endpoint = f"/api/v1/review-tasks/{task_id}/decisions"
+
+        anatomy_command = {
+            "asset_id": str(context.asset_ids[0]),
+            "decision": "reject",
+            "expected_lock_version": 1,
+            "reason_code": "anatomy",
+            "note": None,
+        }
+        anatomy = client.post(
+            endpoint,
+            json=anatomy_command,
+            headers=_mutation_headers(csrf, "queued-anatomy-reject"),
+        )
+        anatomy_replay = client.post(
+            endpoint,
+            json=anatomy_command,
+            headers=_mutation_headers(csrf, "queued-anatomy-reject"),
+        )
+        plain_command = {
+            "asset_id": str(context.asset_ids[1]),
+            "decision": "reject",
+            "expected_lock_version": anatomy.json()["task_lock_version"],
+            "reason_code": "manual_reject",
+            "note": None,
+        }
+        plain = client.post(
+            endpoint,
+            json=plain_command,
+            headers=_mutation_headers(csrf, "queued-plain-reject"),
+        )
+        plain_replay = client.post(
+            endpoint,
+            json=plain_command,
+            headers=_mutation_headers(csrf, "queued-plain-reject"),
+        )
+        summary = client.get(f"/api/v1/review-tasks/{task_id}")
+
+    assert anatomy.status_code == 201
+    assert anatomy.json()["reason_code"] == "anatomy"
+    assert anatomy.json()["task_lock_version"] == 2
+    assert anatomy_replay.status_code == 200
+    assert anatomy_replay.json() == {**anatomy.json(), "replayed": True}
+    assert plain.status_code == 201
+    assert plain.json()["reason_code"] == "manual_reject"
+    assert plain.json()["task_lock_version"] == 3
+    assert plain_replay.status_code == 200
+    assert plain_replay.json() == {**plain.json(), "replayed": True}
+    assert summary.status_code == 200
+    assert summary.json()["lock_version"] == 3
+    assert summary.json()["rejected_count"] == 2
+    assert {asset["asset_id"]: asset["reason_code"] for asset in summary.json()["assets"]} == {
+        str(context.asset_ids[0]): "anatomy",
+        str(context.asset_ids[1]): "manual_reject",
+    }
+
+
 def test_bulk_review_action_api_supports_decisions_and_owner_x_selection(
     tmp_path: Path,
 ) -> None:

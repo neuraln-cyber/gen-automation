@@ -50,11 +50,12 @@ def test_asset_viewer_is_safe_progressive_enhancement() -> None:
     assert 'button[data-decision="reject"]' in script
     assert "submitRejection" in script
     assert "context.form.requestSubmit(context.rejectButton)" in script
-    assert "pendingRejection" in script
-    assert "rejectionBusy" in script
+    assert "pendingRejection" not in script
+    assert "rejectionBusy" not in script
+    assert 'document.addEventListener("gen-automation:review-action-optimistic"' in script
     assert 'document.addEventListener("gen-automation:review-action-settled"' in script
     assert 'card.dataset.decision === "reject"' in script
-    assert "viewer.markOut.textContent = rejectionBusy" in script
+    assert "activeCard?.dataset.reviewPendingCount" in script
     assert "raw master retained" in script
     assert "step(1)" in script
     assert "submitRejection(event.shiftKey, {" in script
@@ -113,7 +114,7 @@ def test_asset_viewer_is_safe_progressive_enhancement() -> None:
     assert "eval(" not in script
 
 
-def test_asset_viewer_waits_for_persisted_rejection_before_advancing() -> None:
+def test_asset_viewer_advances_immediately_while_rejection_saves_in_background() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
     submission = script.split("const submitRejection", 1)[1].split("const openViewer", 1)[0]
     settlement = script.split(
@@ -121,30 +122,46 @@ def test_asset_viewer_waits_for_persisted_rejection_before_advancing() -> None:
         1,
     )[1].split('viewer.close.addEventListener("click"', 1)[0]
 
-    pending_index = submission.index("pendingRejection =")
-    busy_index = submission.index("rejectionBusy = true")
     request_index = submission.index("context.form.requestSubmit(context.rejectButton)")
     request_return_index = submission.index("return true", request_index)
 
-    assert "nextAssetId" in submission
-    assert pending_index < busy_index < request_index
-    assert "renderCard(" not in submission[request_index:request_return_index]
-    assert "step(" not in submission[request_index:request_return_index]
+    assert "const nextCard" in submission
+    assert "pendingRejection" not in submission
+    assert "rejectionBusy" not in submission
+    assert "renderCard(nextCard)" in submission[request_index:request_return_index]
+    assert request_index < submission.index("renderCard(nextCard)") < request_return_index
+    assert "saving in background" in submission
+    assert (
+        submission.index('document.addEventListener("gen-automation:review-action-optimistic"')
+        < request_index
+    )
+    assert (
+        submission.index('document.removeEventListener("gen-automation:review-action-optimistic"')
+        > request_index
+    )
+    assert submission.index("if (!queued)") < submission.index("renderCard(nextCard)")
 
-    failure = settlement.split("if (!detail.success)", 1)[1].split(
-        "announcement = settled.removingAnatomyLabel",
+    # Persistence settlement may announce rollback/reconciliation, but navigation
+    # has already happened and never waits for that event.
+    assert "if (detail.success) return" in settlement
+    assert "renderCard(" not in settlement
+    assert "pending choices were reconciled" in settlement
+    assert "could not be saved and was restored" in settlement
+
+
+def test_asset_viewer_uses_delegated_image_clicks_after_workspace_refreshes() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+    binding = script.split("const bindCard", 1)[1].split("const bindCards", 1)[0]
+    delegated = script.split("bindReviewLaunchers();", 1)[1].split(
+        'document.addEventListener("gen-automation:assets-updated"',
         1,
     )[0]
-    assert settlement.index("pendingRejection = null") < settlement.index("if (!detail.success)")
-    assert settlement.index("rejectionBusy = false") < settlement.index("if (!detail.success)")
-    assert "if (!detail.success)" in settlement
-    assert "updateRejectionControls()" in failure
-    assert "This image is still in the final set; try again." in failure
-    assert "return;" in failure
-    assert "renderCard(" not in failure
-    assert "settled.nextAssetId" in settlement
-    assert "renderCard(nextCard)" in settlement
-    assert settlement.index("if (!detail.success)") < settlement.index("renderCard(nextCard)")
+
+    assert 'image.addEventListener("click"' not in binding
+    assert 'document.addEventListener("click"' in delegated
+    assert 'event.target.closest("[data-asset-viewer-image], .asset-preview")' in delegated
+    assert 'image.closest("[data-asset-card], .asset-card")' in delegated
+    assert "openViewer(card, trigger)" in delegated
 
 
 def test_asset_viewer_delete_shortcuts_distinguish_plain_and_anatomy_rejection() -> None:
@@ -335,7 +352,8 @@ def test_review_template_integrates_anatomy_rejection_and_legacy_keep_all() -> N
     assert 'bulkReasonInput.value = "sorting_default_accept"' in script
     assert "form.requestSubmit(acceptButton)" in script
     assert "anatomyRequested" in script
-    assert "reasonInput.value = anatomyIssue instanceof HTMLSelectElement" in script
+    assert "reason = anatomyIssue instanceof HTMLSelectElement" in script
+    assert "reasonInput.value = reason" in script
     assert ".anatomy-reject-option" in styles
 
 

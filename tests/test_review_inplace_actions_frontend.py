@@ -8,23 +8,158 @@ RELEASE_TEMPLATE = ROOT / "src/gen_automation/templates/dashboard/release_detail
 STYLES = ROOT / "src/gen_automation/static/dashboard_ux.css"
 
 
-def test_review_mutations_are_progressively_enhanced_without_page_reload() -> None:
+def test_single_review_decisions_use_compact_json_fifo_while_legacy_actions_refresh() -> None:
     script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
     handler = script.split("function initializeReviewActions()", 1)[1].split("const isRecord", 1)[0]
+    decision_branch = handler.split(
+        'if (form.matches("[data-review-decision-form]"))',
+        1,
+    )[1].split("if (!(await prepareReviewMutationForm", 1)[0]
+    sender = script.split("const sendReviewDecision", 1)[1].split(
+        "const drainReviewDecisionQueue",
+        1,
+    )[0]
+    legacy = handler.split("if (!(await prepareReviewMutationForm", 1)[1]
 
     assert "REVIEW_ACTION_FORM_SELECTOR" in script
     assert "form[data-review-decision-form]" in script
     assert "form[data-bulk-action-form]" in script
     assert "form[data-x-selection-form]" in script
     assert "event.preventDefault()" in handler
-    assert "await fetch(form.action" in handler
-    assert 'redirect: "follow"' in handler
-    assert "new DOMParser().parseFromString" in handler
-    assert 'parsed.querySelector("[data-review-workspace]")' in handler
-    assert "preserveReviewMedia(workspace, nextWorkspace)" in handler
-    assert "workspace.replaceWith(nextWorkspace)" in handler
+
+    assert "enqueueReviewDecision(form, submitter, workspace)" in decision_branch
+    assert "return;" in decision_branch
+    assert 'Accept: "application/json"' in sender
+    assert '"Content-Type": "application/json"' in sender
+    assert '"Idempotency-Key": command.idempotencyKey' in sender
+    assert '"X-CSRF-Token": command.csrfToken' in sender
+    assert "body: command.requestBody" in sender
+    assert "/api/v1/review-tasks/${encodeURIComponent(state.taskId)}/decisions" in sender
+    assert "DOMParser" not in sender
+    assert "workspace.replaceWith" not in sender
+
+    # Bulk review, X selection, and the other legacy form actions still wait for
+    # an authoritative refresh and replace the workspace after their response.
+    assert "await fetch(form.action" in legacy
+    assert 'redirect: "follow"' in legacy
+    assert "new DOMParser().parseFromString" in legacy
+    assert 'parsed.querySelector("[data-review-workspace]")' in legacy
+    assert "preserveReviewMedia(workspace, nextWorkspace)" in legacy
+    assert "workspace.replaceWith(nextWorkspace)" in legacy
     assert "window.location.reload()" not in handler
     assert "HTMLFormElement.prototype.submit" not in handler
+
+
+def test_review_decision_queue_is_serial_and_chains_returned_lock_versions() -> None:
+    script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
+    sender = script.split("const sendReviewDecision", 1)[1].split(
+        "const drainReviewDecisionQueue",
+        1,
+    )[0]
+    drain = script.split("const drainReviewDecisionQueue", 1)[1].split(
+        "const enqueueReviewDecision",
+        1,
+    )[0]
+
+    assert "if (!command.requestBody)" in sender
+    assert "command.expectedLockVersion = state.lockVersion" in sender
+    assert "command.requestBody = JSON.stringify" in sender
+    assert "expected_lock_version: command.expectedLockVersion" in sender
+    assert "body: command.requestBody" in sender
+    assert '"Idempotency-Key": command.idempotencyKey' in sender
+    assert "payload.task_lock_version" in sender
+    assert "integerValue(payload.task_lock_version, 0) <= command.expectedLockVersion" in sender
+
+    assert "state.drainPromise" in drain
+    assert "|| state.paused" in drain
+    assert "|| reviewActionRequestActive" in drain
+    assert "|| reviewCompletionRequestActive" in drain
+    assert "while (!state.paused && state.queue.length > 0)" in drain
+    assert "const command = state.queue[0]" in drain
+    assert "const result = await sendReviewDecision(command, state)" in drain
+    assert drain.index("await sendReviewDecision") < drain.index("state.queue.shift()")
+    assert "state.lockVersion = integerValue(result.payload.task_lock_version" in drain
+    assert drain.index("state.lockVersion =") < drain.index("state.queue.shift()")
+
+
+def test_review_decision_retries_reuse_the_exact_request_and_idempotency_key() -> None:
+    script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
+    sender = script.split("const sendReviewDecision", 1)[1].split(
+        "const drainReviewDecisionQueue",
+        1,
+    )[0]
+    drain = script.split("const drainReviewDecisionQueue", 1)[1].split(
+        "const enqueueReviewDecision",
+        1,
+    )[0]
+
+    assert "if (!command.requestBody)" in sender
+    assert sender.count("command.requestBody = JSON.stringify") == 1
+    assert '"Idempotency-Key": command.idempotencyKey' in sender
+    assert "body: command.requestBody" in sender
+    assert 'if (result.kind === "retry")' in drain
+    retry = drain.split('if (result.kind === "retry")', 1)[1].split(
+        'if (result.kind === "authentication")',
+        1,
+    )[0]
+    assert "command.retryCount += 1" in retry
+    assert "await delay(retryDelay(command.retryCount))" in retry
+    assert "continue" in retry
+    assert "state.queue.shift()" not in retry
+
+
+def test_each_queued_decision_captures_its_own_anatomy_reason() -> None:
+    script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
+    reason = script.split("const anatomyReasonFor", 1)[1].split(
+        "const reviewCardSnapshot",
+        1,
+    )[0]
+    enqueue = script.split("const enqueueReviewDecision", 1)[1].split(
+        "async function ensureReviewAuthoritativeRefresh",
+        1,
+    )[0]
+
+    assert 'decision === "reject"' in reason
+    assert "anatomyToggle.checked" in reason
+    assert 'anatomyIssue.value || "anatomy"' in reason
+    assert "return { anatomyRequested, reason, anatomyReasons }" in reason
+    assert "const { anatomyRequested, reason } = anatomyReasonFor(form, decision)" in enqueue
+    assert "anatomyRequested," in enqueue
+    assert "reason," in enqueue
+    assert "state.queue.push(command)" in enqueue
+    assert enqueue.index("anatomyReasonFor(form, decision)") < enqueue.index(
+        "state.queue.push(command)"
+    )
+
+
+def test_definitive_failure_rolls_back_or_rebases_then_reconciles_authoritatively() -> None:
+    script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
+    reject = script.split("const rejectQueuedReviewDecisions", 1)[1].split(
+        "function scheduleReviewDecisionReconciliation",
+        1,
+    )[0]
+    drain = script.split("const drainReviewDecisionQueue", 1)[1].split(
+        "const enqueueReviewDecision",
+        1,
+    )[0]
+    rebase = script.split("const rebaseQueuedReviewDecisions", 1)[1].split(
+        "function scheduleReviewDecisionReconciliation",
+        1,
+    )[0]
+
+    assert "const rejected = state.queue.splice(0)" in reject
+    assert "[...rejected].reverse().forEach" in reject
+    assert "restoreReviewCardSnapshot(card, command.snapshot)" in reject
+    assert "setReviewCardPending(command.assetId, -1)" in reject
+    assert "const reconciled = await compactReviewSummary(state)" in reject
+    assert "state.paused = !reconciled" in reject
+    assert 'if (result.kind === "definitive")' in drain
+    assert "result.response?.status === 409" in drain
+    assert "await rebaseQueuedReviewDecisions()" in drain
+    assert 'await rejectQueuedReviewDecisions("request")' in drain
+    assert "const reconciled = await compactReviewSummary(state)" in rebase
+    assert "applyRebasedReviewDecisions(state)" in rebase
+    assert "void drainReviewDecisionQueue()" in rebase
 
 
 def test_release_auto_bootstraps_the_single_review_workspace() -> None:
@@ -97,6 +232,7 @@ def test_review_completion_hands_off_inspections_with_a_bounded_retryable_reques
 
     assert 'form.matches("[data-review-complete-form]")' in handler
     assert "event.preventDefault()" in handler
+    assert "await prepareReviewMutationForm(form, submitter)" in handler
     assert "captureCompletionInspectionIds(form)" in handler
     assert "REVIEW_INSPECTION_FLUSH_TIMEOUT_MS" not in script
     assert '"gen-automation:inspection-flush-progress"' not in handler
@@ -122,6 +258,79 @@ def test_review_completion_hands_off_inspections_with_a_bounded_retryable_reques
     assert "field.dataset.completionInspectionId" in request
     assert "attachCompletionInspectionIds(form, assetIds)" in request
     assert '"gen-automation:inspection-completion-handoff"' in request
+
+
+def test_finish_bulk_and_x_wait_for_authoritative_refresh_after_queued_decisions() -> None:
+    script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
+    prepare = script.split("const prepareReviewMutationForm", 1)[1].split(
+        'window.addEventListener("online"',
+        1,
+    )[0]
+    completion = script.split(
+        "function initializeReviewCompletionInspectionFlush()",
+        1,
+    )[1].split("function initializeReviewActions()", 1)[0]
+    actions = script.split("function initializeReviewActions()", 1)[1].split(
+        "const isRecord",
+        1,
+    )[0]
+    decision_branch_end = actions.index("if (!(await prepareReviewMutationForm")
+    decision_branch = actions[:decision_branch_end]
+    legacy_actions = actions[decision_branch_end:]
+
+    assert "await waitForReviewDecisionIdle()" in prepare
+    assert "await ensureReviewAuthoritativeRefresh({ force: true })" in prepare
+    assert 'identity.kind === "bulk"' in script
+    assert 'identity.kind === "x"' in script
+    assert 'identity.kind === "complete"' in script
+    assert "freshForm.requestSubmit" in prepare
+
+    assert "await prepareReviewMutationForm(form, submitter)" in completion
+    assert "await prepareReviewMutationForm(form, submitter)" not in decision_branch
+    assert "await prepareReviewMutationForm(form, submitter)" in legacy_actions
+    assert 'form.matches("[data-bulk-action-form]")' in script
+    assert 'form.matches("[data-x-selection-form]")' in script
+
+
+def test_optimistic_review_updates_filters_finish_state_and_avoids_idle_full_refresh() -> None:
+    script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
+    apply_decision = script.split("const applyReviewCardDecision", 1)[1].split(
+        "const restoreReviewCardSnapshot",
+        1,
+    )[0]
+    counts = script.split("const refreshOptimisticReviewCounts", 1)[1].split(
+        "const anatomyReasonFor",
+        1,
+    )[0]
+    drain = script.split("const drainReviewDecisionQueue", 1)[1].split(
+        "const enqueueReviewDecision",
+        1,
+    )[0]
+
+    assert "applyActiveReviewFilterToCard(workspace, card)" in apply_decision
+    assert 'finishButton.dataset.reviewNonCountReady !== "true"' in counts
+    assert "accepted < 1" in counts and "accepted > target" in counts
+    assert "scheduleReviewAuthoritativeRefresh" not in script
+    assert "ensureReviewAuthoritativeRefresh" not in drain
+
+
+def test_reconciliation_and_legacy_mutations_preserve_newly_queued_choices() -> None:
+    script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
+    reject = script.split("const rejectQueuedReviewDecisions", 1)[1].split(
+        "const applyRebasedReviewDecisions",
+        1,
+    )[0]
+    legacy = script.split("function initializeReviewActions()", 1)[1].split(
+        "const isRecord",
+        1,
+    )[0]
+
+    assert "if (state.queue.length > 0) applyRebasedReviewDecisions(state)" in reject
+    assert "state.needsRebase = state.queue.length > 0" in reject
+    assert "if (state.queue.length > 0) void drainReviewDecisionQueue()" in reject
+    assert "applyRebasedReviewDecisions(state)" in legacy
+    assert "setReviewCardPending(command.assetId, 1)" in legacy
+    assert "void drainReviewDecisionQueue()" in legacy
 
 
 def test_asset_viewer_rebinds_review_controls_after_in_place_refresh() -> None:

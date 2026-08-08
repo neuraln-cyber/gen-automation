@@ -3,6 +3,12 @@
   <div
     data-review-workspace
     data-review-task-id="{{ summary.task_id }}"
+    data-review-lock-version="{{ summary.lock_version }}"
+    data-review-accepted-count="{{ summary.accepted_count }}"
+    data-review-rejected-count="{{ summary.rejected_count }}"
+    data-review-held-count="{{ summary.held_count }}"
+    data-review-undecided-count="{{ summary.undecided_count }}"
+    data-review-target="{{ summary.desired_accepted_count }}"
   >
   <a class="back" href="/dashboard">&larr; All sets</a>
   <section class="page-header" aria-labelledby="page-heading">
@@ -297,8 +303,8 @@
       >{{ summary.accepted_count }} / {{ final_set_goal }}</progress>
     </div>
     <dl class="count-grid">
-      <div><dt>In final set</dt><dd>{{ summary.accepted_count }}</dd></div>
-      <div><dt>Removed</dt><dd>{{ summary.rejected_count }}</dd></div>
+      <div><dt>In final set</dt><dd data-review-count="accept">{{ summary.accepted_count }}</dd></div>
+      <div><dt>Removed</dt><dd data-review-count="reject">{{ summary.rejected_count }}</dd></div>
       {% if summary.held_count %}<div><dt>Legacy held</dt><dd>{{ summary.held_count }}</dd></div>{% endif %}
       {% if summary.undecided_count %}<div><dt>Needs decision</dt><dd>{{ summary.undecided_count }}</dd></div>{% endif %}
       <div>
@@ -362,7 +368,7 @@
       data-lock-version="{{ summary.lock_version }}"
     >
       <div class="review-command-copy">
-        <strong>{{ summary.accepted_count }} / {{ final_set_goal }} kept</strong>
+        <strong data-review-kept-summary>{{ summary.accepted_count }} / {{ final_set_goal }} kept</strong>
         {% if summary.accepted_count == 0 %}
           <span>Choose at least one final image.</span>
         {% elif accepted_over_goal %}
@@ -373,6 +379,7 @@
           <span>Ready to finish and package.</span>
         {% endif %}
       </div>
+      <p class="review-save-status" data-review-save-status role="status" aria-live="polite" hidden></p>
       <div class="task-actions">
         {% if summary.undecided_count %}
           <button
@@ -402,6 +409,7 @@
           <button
             class="primary-button"
             type="submit"
+            data-review-non-count-ready="{{ 'true' if completion_non_count_ready else 'false' }}"
             {% if not can_complete %}disabled aria-describedby="completion-help"{% endif %}
           >
             Finish set with {{ summary.accepted_count }}
@@ -645,9 +653,10 @@
             <span class="decision-chip batch-chip">
               {{ item.master.batch_name }} &middot; image {{ item.master.batch_image_number }}
             </span>
-            <span class="decision-chip {{ decision_value }}">
+            <span class="decision-chip {{ decision_value }}" data-review-decision-chip>
               {{ "kept" if decision_value == "accept" else "rejected" if decision_value == "reject" else decision_value }}
             </span>
+            <span class="decision-chip review-save-chip" data-review-save-chip hidden></span>
             <span class="decision-chip{% if item.current.selected_for_x %} x-selected{% endif %}">
               X: {{ "selected" if item.current.selected_for_x else "not selected" }}
             </span>
@@ -659,9 +668,15 @@
             {% if item.current.revision %}
               <span class="decision-chip">Revision {{ item.current.revision }}</span>
             {% endif %}
-            {% if summary.state.value == "open" and item.current.reason_code in anatomy_reason_codes %}
-              <span class="decision-chip anatomy-provisional">
-                Anatomy: {{ item.current.reason_code.replace("_", " ") }} &middot; provisional
+            {% if summary.state.value == "open" %}
+              <span
+                class="decision-chip anatomy-provisional"
+                data-anatomy-provisional-chip
+                {% if item.current.reason_code not in anatomy_reason_codes %}hidden{% endif %}
+              >
+                {% if item.current.reason_code in anatomy_reason_codes %}
+                  Anatomy: {{ item.current.reason_code.replace("_", " ") }} &middot; provisional
+                {% endif %}
               </span>
             {% endif %}
             {% if item.semantic_meta_advisory %}
@@ -1015,38 +1030,28 @@
                   Save a decision for rank {{ item.master.rank }}
                 </legend>
                 <div class="decision-actions">
-                  {% if decision_value != "accept" %}
-                    <button
-                      class="decision-button accept"
-                      type="submit"
-                      name="decision"
-                      value="accept"
-                      aria-label="Restore rank {{ item.master.rank }} to the final set"
-                      data-decision="accept"
-                      {% if summary.semantic_gate.enabled and item.ai_excluded and principal.role.value != "owner" %}
-                        disabled
-                        aria-describedby="severe-owner-only-{{ item.master.asset_id }}"
-                      {% endif %}
-                    >Restore to final set</button>
-                  {% endif %}
-                  {% if decision_value != "reject" %}
-                    <button
-                      class="decision-button reject"
-                      type="submit"
-                      name="decision"
-                      value="reject"
-                      aria-label="Remove rank {{ item.master.rank }} from the final set"
-                      data-decision="reject"
-                    >Remove from set</button>
-                  {% else %}
-                    <button
-                      type="submit"
-                      name="decision"
-                      value="reject"
-                      data-decision="reject"
-                      hidden
-                    >Keep removed</button>
-                  {% endif %}
+                  <button
+                    class="decision-button accept"
+                    type="submit"
+                    name="decision"
+                    value="accept"
+                    aria-label="Restore rank {{ item.master.rank }} to the final set"
+                    data-decision="accept"
+                    {% if decision_value == "accept" %}hidden{% endif %}
+                    {% if summary.semantic_gate.enabled and item.ai_excluded and principal.role.value != "owner" %}
+                      disabled
+                      aria-describedby="severe-owner-only-{{ item.master.asset_id }}"
+                    {% endif %}
+                  >Restore to final set</button>
+                  <button
+                    class="decision-button reject"
+                    type="submit"
+                    name="decision"
+                    value="reject"
+                    aria-label="Remove rank {{ item.master.rank }} from the final set"
+                    data-decision="reject"
+                    {% if decision_value == "reject" %}hidden{% endif %}
+                  >Remove from set</button>
                 </div>
               </fieldset>
 

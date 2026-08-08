@@ -634,6 +634,14 @@ async def dashboard_review_task(
             action="inspection-token",
             parts=(str(review_task_id),),
         )
+    completion_non_count_ready = (
+        summary.state == ReviewTaskState.OPEN
+        and all(
+            not asset.selected_for_x or asset.decision == ReviewDecisionValue.ACCEPT
+            for asset in summary.assets
+        )
+        and summary.semantic_gate.completion_ready
+    )
     return _secure_response(
         request,
         templates.TemplateResponse(
@@ -669,14 +677,10 @@ async def dashboard_review_task(
                     "dashboard_review_inspections",
                     review_task_id=review_task_id,
                 ).path,
+                "completion_non_count_ready": completion_non_count_ready,
                 "can_complete": (
-                    summary.state == ReviewTaskState.OPEN
+                    completion_non_count_ready
                     and 1 <= summary.accepted_count <= summary.desired_accepted_count
-                    and all(
-                        not asset.selected_for_x or asset.decision == ReviewDecisionValue.ACCEPT
-                        for asset in summary.assets
-                    )
-                    and summary.semantic_gate.completion_ready
                 ),
             },
         ),

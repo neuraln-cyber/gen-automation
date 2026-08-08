@@ -2299,6 +2299,38 @@ body.asset-viewer-open { overflow: hidden; }
   color: var(--danger);
 }
 
+.review-save-status {
+  align-self: center;
+  margin: 0;
+  color: var(--muted);
+  font-size: .82rem;
+  font-weight: 720;
+  white-space: nowrap;
+}
+
+.review-save-status.is-retrying { color: var(--warning, #fcd34d); }
+.review-save-status.is-error { color: var(--danger); }
+
+.review-save-chip {
+  border-color: rgba(147, 197, 253, .28);
+  background: rgba(30, 64, 175, .18);
+  color: #bfdbfe;
+}
+
+.review-save-chip.is-retrying {
+  border-color: rgba(251, 191, 36, .28);
+  background: rgba(120, 53, 15, .2);
+  color: #fde68a;
+}
+
+.asset-card[data-review-save-state="pending"] {
+  box-shadow: inset 0 0 0 1px rgba(147, 197, 253, .12);
+}
+
+.asset-card[data-review-save-state="error"] {
+  box-shadow: inset 0 0 0 1px rgba(251, 113, 133, .28);
+}
+
 [data-review-workspace][aria-busy="true"] .decision-button,
 [data-review-workspace][aria-busy="true"] .bulk-actions button,
 [data-review-workspace][aria-busy="true"] .x-toggle,

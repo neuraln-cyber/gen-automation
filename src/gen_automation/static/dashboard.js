@@ -23,11 +23,14 @@
   const PENDING_IMAGE_PROFILE_KEY = "gen-automation:reuse-image-settings:v1";
   const SAME_PAGE_SCROLL_STORAGE_KEY = "gen-automation:same-page-scroll:v1";
   const REVIEW_COMPLETION_TIMEOUT_MS = 25000;
+  const REVIEW_DECISION_REQUEST_TIMEOUT_MS = 10000;
+  const REVIEW_DECISION_RETRY_DELAYS_MS = Object.freeze([400, 900, 1800, 3500, 5000]);
   const REVIEW_ACTION_FORM_SELECTOR = [
     "form[data-review-decision-form]",
     "form[data-bulk-action-form]",
     "form[data-x-selection-form]",
     "form[data-anatomy-feedback-form]",
+    "form[data-review-cancel-form]",
   ].join(",");
   const scopedStorageKey = (key) => {
     const scope = document.body?.dataset.automationStorageScope?.trim() || "unknown-user";
@@ -2777,6 +2780,7 @@
   }
 
   let reviewActionRequestActive = false;
+  let reviewCompletionRequestActive = false;
 
   const reviewActionLabel = (form, submitter, selectedCount) => {
     const decision = submitter instanceof HTMLButtonElement
@@ -2978,6 +2982,735 @@
     }
   };
 
+  const reviewDecisionPersistence = {
+    active: null,
+    dirty: false,
+    drainPromise: null,
+    generation: 0,
+    idleWaiters: [],
+    lockVersion: 0,
+    needsRebase: false,
+    paused: false,
+    queue: [],
+    reconcilePromise: null,
+    reconcileTimer: null,
+    refreshPromise: null,
+    taskId: "",
+    workspace: null,
+  };
+
+  const reviewViewerIsOpen = () => Boolean(
+    document.body.classList.contains("asset-viewer-open")
+    || document.querySelector("[data-asset-viewer][open]"),
+  );
+
+  const currentReviewWorkspace = () => document.querySelector("[data-review-workspace]");
+
+  const bindReviewDecisionWorkspace = (workspace) => {
+    if (!(workspace instanceof HTMLElement)) return null;
+    const taskId = workspace.dataset.reviewTaskId || "";
+    if (!taskId) return null;
+    const state = reviewDecisionPersistence;
+    if (state.taskId && state.taskId !== taskId && (state.active || state.queue.length > 0)) {
+      return null;
+    }
+    if (state.taskId !== taskId) {
+      state.taskId = taskId;
+      state.queue = [];
+      state.active = null;
+      state.dirty = false;
+      state.generation = 0;
+      state.needsRebase = false;
+      state.paused = false;
+    }
+    state.workspace = workspace;
+    if (!state.dirty && !state.active && state.queue.length === 0) {
+      state.lockVersion = integerValue(workspace.dataset.reviewLockVersion, 0);
+    }
+    return state;
+  };
+
+  const reviewDecisionIdempotencyKey = () => {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return `review-ui-${window.crypto.randomUUID()}`;
+    }
+    const random = Math.random().toString(16).slice(2);
+    return `review-ui-${Date.now().toString(16)}-${random}`;
+  };
+
+  const decisionCountKey = (decision) => ({
+    accept: "reviewAcceptedCount",
+    hold: "reviewHeldCount",
+    reject: "reviewRejectedCount",
+    undecided: "reviewUndecidedCount",
+  }[decision] || "reviewUndecidedCount");
+
+  const updateReviewCount = (workspace, decision, delta) => {
+    const key = decisionCountKey(decision);
+    workspace.dataset[key] = String(Math.max(0, integerValue(workspace.dataset[key], 0) + delta));
+  };
+
+  const refreshOptimisticReviewCounts = (workspace) => {
+    if (!(workspace instanceof HTMLElement)) return;
+    const accepted = integerValue(workspace.dataset.reviewAcceptedCount, 0);
+    const rejected = integerValue(workspace.dataset.reviewRejectedCount, 0);
+    const target = Math.max(1, integerValue(workspace.dataset.reviewTarget, accepted || 1));
+    const acceptedNode = workspace.querySelector('[data-review-count="accept"]');
+    const rejectedNode = workspace.querySelector('[data-review-count="reject"]');
+    if (acceptedNode) acceptedNode.textContent = String(accepted);
+    if (rejectedNode) rejectedNode.textContent = String(rejected);
+    const acceptedFilter = workspace.querySelector('[data-review-filter="accept"] span');
+    const rejectedFilter = workspace.querySelector('[data-review-filter="reject"] span');
+    if (acceptedFilter) acceptedFilter.textContent = String(accepted);
+    if (rejectedFilter) rejectedFilter.textContent = String(rejected);
+    const keptSummary = workspace.querySelector("[data-review-kept-summary]");
+    if (keptSummary) keptSummary.textContent = `${accepted} / ${target} kept`;
+    const progress = workspace.querySelector(".review-target-progress progress");
+    if (progress instanceof HTMLProgressElement) {
+      progress.value = Math.min(accepted, target);
+      progress.textContent = `${accepted} / ${target}`;
+    }
+    const bulkForm = workspace.querySelector("[data-bulk-action-form]");
+    if (bulkForm instanceof HTMLFormElement) bulkForm.dataset.acceptedCount = String(accepted);
+    const finishButton = workspace.querySelector('[data-review-complete-form] button[type="submit"]');
+    if (finishButton instanceof HTMLButtonElement) {
+      finishButton.textContent = `Finish set with ${accepted} image${accepted === 1 ? "" : "s"}`;
+      finishButton.disabled = accepted < 1
+        || accepted > target
+        || finishButton.dataset.reviewNonCountReady !== "true";
+    }
+  };
+
+  const anatomyReasonFor = (form, decision) => {
+    const anatomyToggle = form.querySelector("[data-anatomy-training-toggle]");
+    const anatomyIssue = form.querySelector("[data-anatomy-training-issue]");
+    const reasonInput = form.querySelector('input[name="reason_code"]');
+    const anatomyRequested = decision === "reject"
+      && anatomyToggle instanceof HTMLInputElement
+      && anatomyToggle.checked;
+    const anatomyReasons = new Set([
+      "anatomy",
+      ...Array.from(
+        anatomyIssue instanceof HTMLSelectElement ? anatomyIssue.options : [],
+      ).map((option) => option.value),
+    ]);
+    let reason = reasonInput instanceof HTMLInputElement ? reasonInput.value : "";
+    if (anatomyRequested) {
+      reason = anatomyIssue instanceof HTMLSelectElement
+        ? anatomyIssue.value || "anatomy"
+        : "anatomy";
+    } else if (
+      anatomyReasons.has(reason)
+      || reason === "sorting_default_accept"
+      || (decision !== "accept" && reason === "semantic_severe_override")
+    ) {
+      reason = "";
+    }
+    if (reasonInput instanceof HTMLInputElement) reasonInput.value = reason;
+    return { anatomyRequested, reason, anatomyReasons };
+  };
+
+  const reviewCardSnapshot = (card) => {
+    const form = card.querySelector("form[data-review-decision-form]");
+    const reason = form?.querySelector('input[name="reason_code"]');
+    const anatomyToggle = form?.querySelector("[data-anatomy-training-toggle]");
+    const anatomyIssue = form?.querySelector("[data-anatomy-training-issue]");
+    const previousAnatomyChecked = form instanceof HTMLFormElement
+      ? form.dataset.reviewPreviousAnatomyChecked
+      : undefined;
+    return {
+      anatomyChecked: previousAnatomyChecked === "true"
+        ? true
+        : previousAnatomyChecked === "false"
+          ? false
+          : anatomyToggle instanceof HTMLInputElement ? anatomyToggle.checked : false,
+      anatomyIssue: anatomyIssue instanceof HTMLSelectElement ? anatomyIssue.value : "",
+      anatomySavedIssue: anatomyIssue instanceof HTMLSelectElement
+        ? anatomyIssue.dataset.savedAnatomyIssue || ""
+        : "",
+      decision: card.dataset.decision || "undecided",
+      reason: reason instanceof HTMLInputElement ? reason.value : "",
+    };
+  };
+
+  const applyActiveReviewFilterToCard = (workspace, card) => {
+    if (!(workspace instanceof HTMLElement) || !(card instanceof HTMLElement)) return;
+    const activeFilter = workspace.querySelector("[data-review-filter].active");
+    if (!(activeFilter instanceof HTMLElement)) return;
+    const filter = activeFilter.dataset.reviewFilter || "all";
+    const matches = filter === "all"
+      || card.dataset.decision === filter
+      || (filter === "x" && card.dataset.selectedForX === "true")
+      || (filter === "semantic" && card.dataset.semanticFlagged === "true");
+    card.hidden = !matches;
+  };
+
+  const applyReviewCardDecision = (card, decision, reason = "") => {
+    if (!(card instanceof HTMLElement)) return;
+    const previousDecision = card.dataset.decision || "undecided";
+    const workspace = card.closest("[data-review-workspace]");
+    if (workspace instanceof HTMLElement && previousDecision !== decision) {
+      updateReviewCount(workspace, previousDecision, -1);
+      updateReviewCount(workspace, decision, 1);
+    }
+    card.dataset.decision = decision;
+    ["accept", "reject", "hold", "undecided"].forEach((value) => {
+      card.classList.toggle(`decision-${value}`, value === decision);
+    });
+    const chip = card.querySelector("[data-review-decision-chip]");
+    if (chip instanceof HTMLElement) {
+      ["accept", "reject", "hold", "undecided"].forEach((value) => {
+        chip.classList.toggle(value, value === decision);
+      });
+      chip.textContent = decision === "accept"
+        ? "kept"
+        : decision === "reject" ? "rejected" : decision;
+    }
+    card.querySelectorAll("button[data-decision]").forEach((button) => {
+      if (button instanceof HTMLButtonElement) button.hidden = button.dataset.decision === decision;
+    });
+    const form = card.querySelector("form[data-review-decision-form]");
+    const reasonInput = form?.querySelector('input[name="reason_code"]');
+    if (reasonInput instanceof HTMLInputElement) reasonInput.value = reason;
+    const anatomyToggle = form?.querySelector("[data-anatomy-training-toggle]");
+    const anatomyIssue = form?.querySelector("[data-anatomy-training-issue]");
+    const allowedAnatomyReasons = new Set(Array.from(
+      anatomyIssue instanceof HTMLSelectElement ? anatomyIssue.options : [],
+    ).map((option) => option.value));
+    const anatomyReason = decision === "reject" && allowedAnatomyReasons.has(reason)
+      ? reason
+      : "";
+    if (anatomyToggle instanceof HTMLInputElement) anatomyToggle.checked = Boolean(anatomyReason);
+    if (anatomyIssue instanceof HTMLSelectElement) {
+      anatomyIssue.value = anatomyReason || "anatomy";
+      anatomyIssue.dataset.savedAnatomyIssue = anatomyReason;
+    }
+    const anatomyChip = card.querySelector("[data-anatomy-provisional-chip]");
+    if (anatomyChip instanceof HTMLElement) {
+      anatomyChip.hidden = !anatomyReason;
+      anatomyChip.textContent = anatomyReason
+        ? `Anatomy: ${anatomyReason.replaceAll("_", " ")} · provisional`
+        : "";
+    }
+    if (workspace instanceof HTMLElement) {
+      applyActiveReviewFilterToCard(workspace, card);
+      refreshOptimisticReviewCounts(workspace);
+    }
+  };
+
+  const restoreReviewCardSnapshot = (card, snapshot) => {
+    applyReviewCardDecision(card, snapshot.decision, snapshot.reason);
+    const form = card.querySelector("form[data-review-decision-form]");
+    const anatomyToggle = form?.querySelector("[data-anatomy-training-toggle]");
+    const anatomyIssue = form?.querySelector("[data-anatomy-training-issue]");
+    if (anatomyToggle instanceof HTMLInputElement) anatomyToggle.checked = snapshot.anatomyChecked;
+    if (anatomyIssue instanceof HTMLSelectElement) {
+      anatomyIssue.value = snapshot.anatomyIssue;
+      anatomyIssue.dataset.savedAnatomyIssue = snapshot.anatomySavedIssue;
+    }
+  };
+
+  const updateReviewSaveStatus = (message = "", stateName = "") => {
+    const state = reviewDecisionPersistence;
+    const workspace = state.workspace?.isConnected ? state.workspace : currentReviewWorkspace();
+    if (!(workspace instanceof HTMLElement)) return;
+    const status = workspace.querySelector("[data-review-save-status]");
+    if (!(status instanceof HTMLElement)) return;
+    const pending = state.queue.length;
+    status.hidden = !message && pending === 0;
+    status.textContent = message || (pending
+      ? `Saving ${pending} change${pending === 1 ? "" : "s"}…`
+      : "");
+    status.classList.toggle("is-retrying", stateName === "retrying");
+    status.classList.toggle("is-error", stateName === "error");
+  };
+
+  const setReviewCardPending = (assetId, pending, stateName = "pending") => {
+    const card = document.getElementById(`asset-${assetId}`);
+    if (!(card instanceof HTMLElement)) return;
+    const count = Math.max(0, integerValue(card.dataset.reviewPendingCount, 0) + pending);
+    card.dataset.reviewPendingCount = String(count);
+    if (count > 0) {
+      card.dataset.reviewSaveState = stateName;
+    } else {
+      delete card.dataset.reviewSaveState;
+      delete card.dataset.reviewPendingCount;
+    }
+    const chip = card.querySelector("[data-review-save-chip]");
+    if (chip instanceof HTMLElement) {
+      chip.hidden = count === 0;
+      chip.textContent = stateName === "retrying" ? "Waiting to save" : "Saving";
+      chip.classList.toggle("is-retrying", stateName === "retrying");
+    }
+  };
+
+  const resolveReviewDecisionIdle = () => {
+    const state = reviewDecisionPersistence;
+    if (state.active || state.queue.length > 0) return;
+    const waiters = state.idleWaiters.splice(0);
+    waiters.forEach((resolve) => resolve());
+  };
+
+  const waitForReviewDecisionIdle = () => {
+    const state = reviewDecisionPersistence;
+    if (!state.active && state.queue.length === 0) return Promise.resolve();
+    return new Promise((resolve) => state.idleWaiters.push(resolve));
+  };
+
+  const retryDelay = (retryCount) => REVIEW_DECISION_RETRY_DELAYS_MS[
+    Math.min(retryCount, REVIEW_DECISION_RETRY_DELAYS_MS.length - 1)
+  ];
+
+  const delay = (milliseconds) => new Promise((resolve) => {
+    window.setTimeout(resolve, milliseconds);
+  });
+
+  const compactReviewSummary = async (state) => {
+    try {
+      const response = await fetch(`/api/v1/review-tasks/${encodeURIComponent(state.taskId)}`, {
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) return false;
+      const payload = await response.json();
+      if (!isRecord(payload) || !Array.isArray(payload.assets)) return false;
+      state.lockVersion = integerValue(payload.lock_version, state.lockVersion);
+      const workspace = state.workspace?.isConnected ? state.workspace : currentReviewWorkspace();
+      if (!(workspace instanceof HTMLElement)) return false;
+      payload.assets.forEach((asset) => {
+        if (!isRecord(asset) || !asset.asset_id) return;
+        const card = document.getElementById(`asset-${asset.asset_id}`);
+        if (card instanceof HTMLElement) {
+          applyReviewCardDecision(card, asset.decision || "undecided", asset.reason_code || "");
+        }
+      });
+      workspace.dataset.reviewLockVersion = String(state.lockVersion);
+      workspace.dataset.reviewAcceptedCount = String(integerValue(payload.accepted_count, 0));
+      workspace.dataset.reviewRejectedCount = String(integerValue(payload.rejected_count, 0));
+      workspace.dataset.reviewHeldCount = String(integerValue(payload.held_count, 0));
+      workspace.dataset.reviewUndecidedCount = String(integerValue(payload.undecided_count, 0));
+      refreshOptimisticReviewCounts(workspace);
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  };
+
+  const rejectQueuedReviewDecisions = async (reason) => {
+    const state = reviewDecisionPersistence;
+    const rejected = state.queue.splice(0);
+    state.active = null;
+    [...rejected].reverse().forEach((command) => {
+      const card = document.getElementById(`asset-${command.assetId}`);
+      if (card instanceof HTMLElement) restoreReviewCardSnapshot(card, command.snapshot);
+    });
+    rejected.forEach((command) => {
+      setReviewCardPending(command.assetId, -1);
+      document.dispatchEvent(new CustomEvent("gen-automation:review-action-settled", {
+        detail: {
+          assetId: command.assetId,
+          anatomyRequested: command.anatomyRequested,
+          commandId: command.id,
+          decision: command.decision,
+          reason,
+          success: false,
+        },
+      }));
+    });
+    state.paused = true;
+    state.needsRebase = false;
+    updateReviewSaveStatus("Review changed elsewhere; reconciling before saving more…", "error");
+    const reconciled = await compactReviewSummary(state);
+    state.paused = !reconciled;
+    state.dirty = true;
+    if (reconciled) {
+      if (state.queue.length > 0) applyRebasedReviewDecisions(state);
+      updateReviewSaveStatus("Review reconciled. New changes can continue.");
+      if (state.queue.length > 0) void drainReviewDecisionQueue();
+    } else {
+      state.needsRebase = state.queue.length > 0;
+      updateReviewSaveStatus("Could not reconcile yet. Keep reviewing; saving will retry.", "error");
+      scheduleReviewDecisionReconciliation();
+    }
+    resolveReviewDecisionIdle();
+  };
+
+  const applyRebasedReviewDecisions = (state) => {
+    state.queue.forEach((command) => {
+      const card = document.getElementById(`asset-${command.assetId}`);
+      if (card instanceof HTMLElement) {
+        command.snapshot = reviewCardSnapshot(card);
+        applyReviewCardDecision(card, command.decision, command.reason);
+      }
+      command.expectedLockVersion = null;
+      command.idempotencyKey = reviewDecisionIdempotencyKey();
+      command.requestBody = null;
+      command.retryCount = 0;
+    });
+    state.needsRebase = false;
+  };
+
+  const rebaseQueuedReviewDecisions = async () => {
+    const state = reviewDecisionPersistence;
+    state.active = null;
+    state.paused = true;
+    state.needsRebase = true;
+    updateReviewSaveStatus(
+      "Review state changed while saving; reconciling queued choices\u2026",
+      "retrying",
+    );
+    const reconciled = await compactReviewSummary(state);
+    if (!reconciled) {
+      updateReviewSaveStatus(
+        "Queued choices are safe and waiting for the review state to reconnect.",
+        "retrying",
+      );
+      scheduleReviewDecisionReconciliation();
+      return;
+    }
+    applyRebasedReviewDecisions(state);
+    state.paused = false;
+    updateReviewSaveStatus();
+    void drainReviewDecisionQueue();
+  };
+
+  function scheduleReviewDecisionReconciliation(delayMs = 2500) {
+    const state = reviewDecisionPersistence;
+    if (!state.paused || state.reconcilePromise || state.reconcileTimer !== null) return;
+    state.reconcileTimer = window.setTimeout(() => {
+      state.reconcileTimer = null;
+      let reconciled = false;
+      state.reconcilePromise = compactReviewSummary(state).then((result) => {
+        if (result) {
+          reconciled = true;
+          if (state.needsRebase) applyRebasedReviewDecisions(state);
+          state.paused = false;
+          updateReviewSaveStatus();
+          void drainReviewDecisionQueue();
+        }
+      }).finally(() => {
+        state.reconcilePromise = null;
+        if (!reconciled) scheduleReviewDecisionReconciliation(5000);
+      });
+    }, delayMs);
+  }
+
+  const sendReviewDecision = async (command, state) => {
+    if (!command.requestBody) {
+      command.expectedLockVersion = state.lockVersion;
+      command.requestBody = JSON.stringify({
+        asset_id: command.assetId,
+        decision: command.decision,
+        expected_lock_version: command.expectedLockVersion,
+        reason_code: command.reason || null,
+        note: command.note || null,
+      });
+    }
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    const timeoutId = controller ? window.setTimeout(
+      () => controller.abort(),
+      REVIEW_DECISION_REQUEST_TIMEOUT_MS,
+    ) : null;
+    const options = {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      redirect: "follow",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "Idempotency-Key": command.idempotencyKey,
+        "X-CSRF-Token": command.csrfToken,
+      },
+      body: command.requestBody,
+    };
+    if (controller) options.signal = controller.signal;
+    try {
+      const response = await fetch(
+        `/api/v1/review-tasks/${encodeURIComponent(state.taskId)}/decisions`,
+        options,
+      );
+      if (response.status === 401) return { kind: "authentication", response };
+      if (response.status >= 500 || [408, 425, 429].includes(response.status)) {
+        return { kind: "retry" };
+      }
+      if (!response.ok) return { kind: "definitive", response };
+      const payload = await response.json();
+      if (
+        !isRecord(payload)
+        || String(payload.asset_id || "") !== command.assetId
+        || payload.decision !== command.decision
+        || integerValue(payload.task_lock_version, 0) <= command.expectedLockVersion
+      ) {
+        return { kind: "retry" };
+      }
+      return { kind: "success", payload };
+    } catch (_error) {
+      return { kind: "retry" };
+    } finally {
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+    }
+  };
+
+  const drainReviewDecisionQueue = () => {
+    const state = reviewDecisionPersistence;
+    if (
+      state.drainPromise
+      || state.paused
+      || reviewActionRequestActive
+      || reviewCompletionRequestActive
+    ) return state.drainPromise || Promise.resolve();
+    state.drainPromise = (async () => {
+      while (!state.paused && state.queue.length > 0) {
+        const command = state.queue[0];
+        state.active = command;
+        const result = await sendReviewDecision(command, state);
+        if (result.kind === "retry") {
+          command.retryCount += 1;
+          setReviewCardPending(command.assetId, 0, "retrying");
+          updateReviewSaveStatus(
+            `Connection interrupted. ${state.queue.length} change${state.queue.length === 1 ? "" : "s"} waiting; retrying…`,
+            "retrying",
+          );
+          await delay(retryDelay(command.retryCount));
+          continue;
+        }
+        if (result.kind === "authentication") {
+          persistSamePageScroll();
+          window.location.assign("/login");
+          return;
+        }
+        if (result.kind === "definitive") {
+          if (result.response?.status === 409) {
+            await rebaseQueuedReviewDecisions();
+          } else {
+            await rejectQueuedReviewDecisions("request");
+          }
+          return;
+        }
+
+        state.lockVersion = integerValue(result.payload.task_lock_version, state.lockVersion + 1);
+        state.queue.shift();
+        state.active = null;
+        command.retryCount = 0;
+        setReviewCardPending(command.assetId, -1);
+        document.dispatchEvent(new CustomEvent("gen-automation:review-action-settled", {
+          detail: {
+            assetId: command.assetId,
+            anatomyRequested: command.anatomyRequested,
+            commandId: command.id,
+            decision: command.decision,
+            success: true,
+          },
+        }));
+        updateReviewSaveStatus();
+      }
+    })().finally(() => {
+      state.active = null;
+      state.drainPromise = null;
+      resolveReviewDecisionIdle();
+      if (!state.paused && state.queue.length > 0) void drainReviewDecisionQueue();
+    });
+    return state.drainPromise;
+  };
+
+  const enqueueReviewDecision = (form, submitter, workspace) => {
+    const state = bindReviewDecisionWorkspace(workspace);
+    const card = form.closest("[data-review-asset]");
+    const assetIdField = form.querySelector('input[name="asset_id"]');
+    const csrfField = form.querySelector('input[name="csrf_token"]');
+    const assetId = form.dataset.assetId
+      || (assetIdField instanceof HTMLInputElement ? assetIdField.value : "");
+    const decision = submitter instanceof HTMLButtonElement
+      ? submitter.dataset.decision || submitter.value
+      : "";
+    if (!state
+        || !(card instanceof HTMLElement)
+        || !(csrfField instanceof HTMLInputElement)
+        || !csrfField.value
+        || !assetId
+        || !["accept", "reject", "hold"].includes(decision)) return false;
+
+    const snapshot = reviewCardSnapshot(card);
+    const { anatomyRequested, reason } = anatomyReasonFor(form, decision);
+    const noteField = form.querySelector('[name="note"]');
+    const commandId = reviewDecisionIdempotencyKey();
+    const command = {
+      anatomyRequested,
+      assetId,
+      csrfToken: csrfField.value,
+      decision,
+      expectedLockVersion: null,
+      id: commandId,
+      idempotencyKey: commandId,
+      note: noteField instanceof HTMLInputElement || noteField instanceof HTMLTextAreaElement
+        ? noteField.value
+        : "",
+      reason,
+      requestBody: null,
+      retryCount: 0,
+      snapshot,
+    };
+    applyReviewCardDecision(card, decision, reason);
+    setReviewCardPending(assetId, 1);
+    state.queue.push(command);
+    state.dirty = true;
+    state.generation += 1;
+    updateReviewSaveStatus();
+    document.dispatchEvent(new CustomEvent("gen-automation:review-action-optimistic", {
+      detail: {
+        anatomyRequested,
+        assetId,
+        commandId: command.id,
+        decision,
+        reason,
+      },
+    }));
+    void drainReviewDecisionQueue();
+    return true;
+  };
+
+  async function ensureReviewAuthoritativeRefresh({ force = false } = {}) {
+    const state = reviewDecisionPersistence;
+    if (!state.dirty) return true;
+    if (state.active || state.queue.length > 0) await waitForReviewDecisionIdle();
+    if (!state.dirty) return true;
+    if (reviewViewerIsOpen() && !force) return false;
+    if (state.refreshPromise) return state.refreshPromise;
+
+    const generation = state.generation;
+    const workspace = state.workspace?.isConnected ? state.workspace : currentReviewWorkspace();
+    if (!(workspace instanceof HTMLElement)) return false;
+    const stateAnchorForm = workspace.querySelector(
+      "[data-review-complete-form], [data-bulk-action-form], [data-review-decision-form]",
+    );
+    let viewState = stateAnchorForm instanceof HTMLFormElement
+      ? captureReviewViewState(stateAnchorForm, null)
+      : null;
+    if (viewState) viewState.clearSelection = false;
+    updateReviewSaveStatus("Syncing the reviewed set…");
+    state.refreshPromise = (async () => {
+      try {
+        const response = await fetch(window.location.href, {
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: { Accept: "text/html", "X-Requested-With": "fetch" },
+        });
+        if (!response.ok) return false;
+        const parsed = new DOMParser().parseFromString(await response.text(), "text/html");
+        const nextWorkspace = parsed.querySelector("[data-review-workspace]");
+        if (!(nextWorkspace instanceof HTMLElement)) return false;
+        if (
+          state.generation !== generation
+          || state.active
+          || state.queue.length > 0
+          || (reviewViewerIsOpen() && !force)
+        ) {
+          return false;
+        }
+        const latestAnchorForm = workspace.querySelector(
+          "[data-review-complete-form], [data-bulk-action-form], [data-review-decision-form]",
+        );
+        if (latestAnchorForm instanceof HTMLFormElement) {
+          viewState = captureReviewViewState(latestAnchorForm, null);
+          viewState.clearSelection = false;
+        }
+        preserveReviewMedia(workspace, nextWorkspace);
+        workspace.replaceWith(nextWorkspace);
+        if (viewState) restoreReviewViewState(nextWorkspace, viewState);
+        bindReviewDecisionWorkspace(nextWorkspace);
+        state.lockVersion = integerValue(nextWorkspace.dataset.reviewLockVersion, state.lockVersion);
+        state.dirty = false;
+        state.needsRebase = false;
+        state.paused = false;
+        if (state.reconcileTimer !== null) window.clearTimeout(state.reconcileTimer);
+        state.reconcileTimer = null;
+        updateReviewSaveStatus();
+        return true;
+      } catch (_error) {
+        return false;
+      }
+    })().finally(() => {
+      state.refreshPromise = null;
+    });
+    return state.refreshPromise;
+  }
+
+  const reviewFormIdentity = (form, submitter) => ({
+    action: submitter instanceof HTMLButtonElement && submitter.name === "action"
+      ? submitter.value
+      : "",
+    assetId: form.dataset.assetId || "",
+    decision: submitter instanceof HTMLButtonElement ? submitter.dataset.decision || "" : "",
+    kind: form.matches("[data-bulk-action-form]")
+      ? "bulk"
+      : form.matches("[data-x-selection-form]")
+        ? "x"
+        : form.matches("[data-review-complete-form]")
+          ? "complete"
+          : form.matches("[data-review-cancel-form]") ? "cancel" : "feedback",
+  });
+
+  const findReviewFormAfterRefresh = (identity) => {
+    if (identity.kind === "bulk") return document.querySelector("[data-bulk-action-form]");
+    if (identity.kind === "complete") return document.querySelector("[data-review-complete-form]");
+    if (identity.kind === "cancel") return document.querySelector("[data-review-cancel-form]");
+    if (identity.kind === "x") {
+      return Array.from(document.querySelectorAll("[data-x-selection-form]")).find(
+        (form) => form.dataset.assetId === identity.assetId,
+      ) || null;
+    }
+    return null;
+  };
+
+  const findReviewSubmitterAfterRefresh = (form, identity) => {
+    if (!(form instanceof HTMLFormElement)) return null;
+    if (identity.action) {
+      return Array.from(form.querySelectorAll('button[name="action"]')).find(
+        (button) => button.value === identity.action,
+      ) || null;
+    }
+    if (identity.decision) {
+      return form.querySelector(`button[data-decision="${identity.decision}"]`);
+    }
+    return form.querySelector('button[type="submit"]');
+  };
+
+  const prepareReviewMutationForm = async (form, submitter) => {
+    if (form.dataset.reviewQueuePrepared === "true") {
+      delete form.dataset.reviewQueuePrepared;
+      return true;
+    }
+    const state = bindReviewDecisionWorkspace(form.closest("[data-review-workspace]"));
+    if (!state || (!state.dirty && !state.active && state.queue.length === 0)) return true;
+    const identity = reviewFormIdentity(form, submitter);
+    await waitForReviewDecisionIdle();
+    let refreshed = await ensureReviewAuthoritativeRefresh({ force: true });
+    if (!refreshed && state.dirty) refreshed = await ensureReviewAuthoritativeRefresh({ force: true });
+    if (!refreshed) {
+      updateReviewSaveStatus("Review changes are saved, but controls could not refresh. Try again.", "error");
+      return false;
+    }
+    const freshForm = findReviewFormAfterRefresh(identity);
+    const freshSubmitter = findReviewSubmitterAfterRefresh(freshForm, identity);
+    if (!(freshForm instanceof HTMLFormElement)) return false;
+    freshForm.dataset.reviewQueuePrepared = "true";
+    freshForm.requestSubmit(freshSubmitter instanceof HTMLElement ? freshSubmitter : undefined);
+    return false;
+  };
+
+  window.addEventListener("online", () => {
+    const state = reviewDecisionPersistence;
+    if (state.paused) scheduleReviewDecisionReconciliation(0);
+  });
+  window.addEventListener("beforeunload", (event) => {
+    const state = reviewDecisionPersistence;
+    if (!state.active && state.queue.length === 0) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
+
   const attachCompletionInspectionIds = (form, assetIds) => {
     form.querySelectorAll("[data-completion-inspection-id]").forEach((field) => field.remove());
     [...new Set(Array.from(assetIds || [], String).filter(Boolean))].forEach((assetId) => {
@@ -3007,12 +3740,14 @@
         return;
       }
       event.preventDefault();
+      const submitter = event.submitter instanceof HTMLButtonElement ? event.submitter : null;
+      if (!(await prepareReviewMutationForm(form, submitter))) return;
       if (form.dataset.completionSubmitting === "true") return;
 
       const workspace = form.closest("[data-review-workspace]");
-      const submitter = event.submitter instanceof HTMLButtonElement ? event.submitter : null;
       const originalLabel = submitter?.textContent || "Finish set";
       form.dataset.completionSubmitting = "true";
+      reviewCompletionRequestActive = true;
       if (submitter) {
         submitter.textContent = "Finishing set...";
         submitter.disabled = true;
@@ -3099,11 +3834,15 @@
       } finally {
         if (timeoutId !== null) window.clearTimeout(timeoutId);
         if (!navigationStarted && form.isConnected) {
+          reviewCompletionRequestActive = false;
           delete form.dataset.completionSubmitting;
           if (workspace instanceof HTMLElement) workspace.removeAttribute("aria-busy");
           if (submitter?.isConnected) {
             submitter.textContent = originalLabel;
             submitter.disabled = false;
+          }
+          if (reviewDecisionPersistence.queue.length > 0) {
+            void drainReviewDecisionQueue();
           }
         }
       }
@@ -3125,16 +3864,17 @@
       const submitter = event.submitter instanceof HTMLButtonElement
         ? event.submitter
         : null;
+      if (form.matches("[data-review-decision-form]")) {
+        enqueueReviewDecision(form, submitter, workspace);
+        return;
+      }
+      if (!(await prepareReviewMutationForm(form, submitter))) return;
+
       const assetIdField = form.querySelector('input[name="asset_id"]');
       const assetId = form.dataset.assetId
         || (assetIdField instanceof HTMLInputElement ? assetIdField.value : "");
       const decision = submitter?.dataset.decision || "";
-      const anatomyToggle = form.querySelector("[data-anatomy-training-toggle]");
-      const anatomyIssue = form.querySelector("[data-anatomy-training-issue]");
-      const reasonInput = form.querySelector('input[name="reason_code"]');
-      const anatomyRequested = decision === "reject"
-        && anatomyToggle instanceof HTMLInputElement
-        && anatomyToggle.checked;
+      const anatomyRequested = false;
 
       if (reviewActionRequestActive) {
         showReviewActionStatus(workspace, "The previous review action is still saving.", true);
@@ -3142,26 +3882,6 @@
           detail: { assetId, anatomyRequested, decision, success: false, reason: "busy" },
         }));
         return;
-      }
-
-      if (form.matches("[data-review-decision-form]") && reasonInput instanceof HTMLInputElement) {
-        const anatomyReasonValues = new Set([
-          "anatomy",
-          ...Array.from(
-            anatomyIssue instanceof HTMLSelectElement ? anatomyIssue.options : [],
-          ).map((option) => option.value),
-        ]);
-        if (anatomyRequested) {
-          reasonInput.value = anatomyIssue instanceof HTMLSelectElement
-            ? anatomyIssue.value || "anatomy"
-            : "anatomy";
-        } else if (
-          anatomyReasonValues.has(reasonInput.value)
-          || reasonInput.value === "sorting_default_accept"
-          || (decision !== "accept" && reasonInput.value === "semantic_severe_override")
-        ) {
-          reasonInput.value = "";
-        }
       }
 
       const selectedCount = form.matches("[data-bulk-action-form]")
@@ -3224,6 +3944,20 @@
         preserveReviewMedia(workspace, nextWorkspace);
         workspace.replaceWith(nextWorkspace);
         restoreReviewViewState(nextWorkspace, viewState);
+        const state = bindReviewDecisionWorkspace(nextWorkspace);
+        if (state) {
+          state.lockVersion = integerValue(
+            nextWorkspace.dataset.reviewLockVersion,
+            state.lockVersion,
+          );
+          if (state.queue.length > 0) {
+            applyRebasedReviewDecisions(state);
+            state.queue.forEach((command) => setReviewCardPending(command.assetId, 1));
+            state.dirty = true;
+          } else {
+            state.dirty = false;
+          }
+        }
         showReviewActionStatus(
           nextWorkspace,
           reviewActionLabel(form, submitter, selectedCount),
@@ -3249,6 +3983,9 @@
             reason: actionSucceeded ? "" : actionFailure,
           },
         }));
+        if (reviewDecisionPersistence.queue.length > 0) {
+          void drainReviewDecisionQueue();
+        }
       }
     });
   }

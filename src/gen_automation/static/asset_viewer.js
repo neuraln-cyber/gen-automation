@@ -371,8 +371,6 @@
     let inspectionRequestPromise = null;
     let inspectionAbortController = null;
     let completionInspectionHandoff = false;
-    let rejectionBusy = false;
-    let pendingRejection = null;
     let returnFocus = null;
 
     const resetViewerScroll = () => {
@@ -842,13 +840,13 @@
       syncDefectPicker(context);
       if (!context) return;
 
-      viewer.markOut.disabled = rejectionBusy
-        || (context.alreadyRejected && !context.anatomyLabeled);
-      viewer.markOut.textContent = rejectionBusy
-        ? "Saving..."
-        : context.anatomyLabeled
+      const pending = Number.parseInt(activeCard?.dataset.reviewPendingCount || "0", 10) > 0;
+      viewer.markOut.disabled = context.alreadyRejected && !context.anatomyLabeled;
+      viewer.markOut.textContent = context.anatomyLabeled
           ? "Remove anatomy label"
-          : context.alreadyRejected ? "Rejected" : "Reject";
+          : context.alreadyRejected
+            ? pending ? "Rejected · saving" : "Rejected"
+            : "Reject";
       viewer.markOut.setAttribute(
         "aria-label",
         context.anatomyLabeled
@@ -858,10 +856,8 @@
           : `Reject ${cardRank(activeCard)} from the final set; raw master retained`,
       );
 
-      viewer.anatomyReject.disabled = rejectionBusy || context.anatomyLabeled;
-      viewer.anatomyReject.textContent = rejectionBusy
-        ? "Saving..."
-        : context.anatomyLabeled
+      viewer.anatomyReject.disabled = context.anatomyLabeled;
+      viewer.anatomyReject.textContent = context.anatomyLabeled
           ? "Provisional anatomy label set"
           : context.alreadyRejected
             ? context.savedAnatomyIssue
@@ -958,7 +954,6 @@
     };
 
     const step = (offset) => {
-      if (rejectionBusy) return;
       const available = visibleCards();
       if (available.length < 2) return;
       const currentIndex = Math.max(0, available.indexOf(activeCard));
@@ -971,7 +966,7 @@
       { removeAnatomyLabel = false } = {},
     ) => {
       const context = rejectionContext(activeCard);
-      if (!context || rejectionBusy) return false;
+      if (!context) return false;
       if (withAnatomyTraining && (!context.anatomyToggle || !context.anatomyIssue)) {
         announce("Anatomy training is unavailable for this review. The image was not changed.");
         return false;
@@ -989,6 +984,7 @@
       }
 
       const previousAnatomyChecked = Boolean(context.anatomyToggle?.checked);
+      context.form.dataset.reviewPreviousAnatomyChecked = String(previousAnatomyChecked);
       if (context.anatomyToggle) context.anatomyToggle.checked = withAnatomyTraining;
       queueInspection(activeCard);
       const available = visibleCards();
@@ -996,24 +992,38 @@
       const nextCard = available.length > 1
         ? available[(currentIndex + 1) % available.length]
         : null;
-      pendingRejection = {
-        anatomyRequested: withAnatomyTraining,
-        assetId: context.assetId,
-        removingAnatomyLabel: !withAnatomyTraining
-          && removeAnatomyLabel
-          && context.anatomyLabeled,
-        nextAssetId: nextCard?.dataset.assetId || "",
-        previousAnatomyChecked,
-      };
-      rejectionBusy = true;
-      announcement = pendingRejection.removingAnatomyLabel
+      const removingAnatomyLabel = !withAnatomyTraining
+        && removeAnatomyLabel
+        && context.anatomyLabeled;
+      announcement = removingAnatomyLabel
         ? `Removing the provisional anatomy label from ${cardRank(activeCard)}...`
         : withAnatomyTraining
-        ? `Rejecting ${cardRank(activeCard)} with a provisional anatomy label...`
-        : `Rejecting ${cardRank(activeCard)}...`;
-      updateRejectionControls();
-      announce(announcement);
+          ? `Removed ${cardRank(activeCard)} with an anatomy label · saving in background`
+          : `Removed ${cardRank(activeCard)} · saving in background`;
+      let queued = false;
+      const acknowledgeQueue = (event) => {
+        const detail = event.detail || {};
+        if (detail.assetId === context.assetId && detail.decision === "reject") queued = true;
+      };
+      document.addEventListener("gen-automation:review-action-optimistic", acknowledgeQueue);
       context.form.requestSubmit(context.rejectButton);
+      document.removeEventListener("gen-automation:review-action-optimistic", acknowledgeQueue);
+      delete context.form.dataset.reviewPreviousAnatomyChecked;
+      if (!queued) {
+        if (context.anatomyToggle) context.anatomyToggle.checked = previousAnatomyChecked;
+        updateRejectionControls();
+        announce("The rejection could not be queued. Check the form and try again.");
+        return false;
+      }
+      if (viewer.dialog.open && nextCard) {
+        renderCard(nextCard);
+      } else {
+        updateRejectionControls();
+        announce(announcement);
+      }
+      if (context.anatomyToggle && !context.form.isConnected) {
+        context.anatomyToggle.checked = previousAnatomyChecked;
+      }
       return true;
     };
 
@@ -1061,9 +1071,6 @@
         if (trigger.tagName === "A") event.preventDefault();
         openViewer(card, trigger);
       });
-      if (trigger !== image && !trigger.contains(image)) {
-        image.addEventListener("click", () => openViewer(card, trigger));
-      }
     };
 
     const bindCards = (root = document) => {
@@ -1089,6 +1096,17 @@
 
     bindCards();
     bindReviewLaunchers();
+    document.addEventListener("click", (event) => {
+      const image = event.target instanceof Element
+        ? event.target.closest("[data-asset-viewer-image], .asset-preview")
+        : null;
+      if (!(image instanceof HTMLImageElement)) return;
+      const card = image.closest("[data-asset-card], .asset-card");
+      if (!(card instanceof HTMLElement) || !card.closest("[data-asset-grid]")) return;
+      const trigger = triggerFor(card);
+      if (!(trigger instanceof HTMLElement) || trigger === image || trigger.contains(image)) return;
+      openViewer(card, trigger);
+    });
     document.addEventListener("gen-automation:assets-updated", (event) => {
       const root = event.detail && event.detail.root;
       const activeAssetId = activeCard?.dataset.assetId || "";
@@ -1103,45 +1121,23 @@
         if (refreshedCard) renderCard(refreshedCard);
       }
     });
+    document.addEventListener("gen-automation:review-action-optimistic", (event) => {
+      const detail = event.detail || {};
+      if (viewer.dialog.open && activeCard?.dataset.assetId === detail.assetId) {
+        updateRejectionControls();
+      }
+    });
     document.addEventListener("gen-automation:review-action-settled", (event) => {
       const detail = event.detail || {};
-      if (!pendingRejection
-          || detail.assetId !== pendingRejection.assetId
-          || detail.decision !== "reject") return;
-      const settled = pendingRejection;
-      pendingRejection = null;
-      rejectionBusy = false;
-
-      if (!detail.success) {
-        const currentContext = rejectionContext(activeCard);
-        if (currentContext?.anatomyToggle) {
-          currentContext.anatomyToggle.checked = settled.previousAnatomyChecked;
-        }
-        updateRejectionControls();
+      if (detail.success) return;
+      if (viewer.dialog.open) {
         announce(
           detail.reason === "conflict"
-            ? "The review changed in another tab. Refresh once, then reject this image again."
-            : "The rejection was not saved. This image is still in the final set; try again.",
+            ? "The review changed elsewhere; pending choices were reconciled."
+            : "A pending review choice could not be saved and was restored.",
         );
-        return;
+        updateRejectionControls();
       }
-
-      announcement = settled.removingAnatomyLabel
-        ? "Provisional anatomy label removed; the image remains rejected and its raw master is retained."
-        : settled.anatomyRequested
-        ? "Removed with a provisional anatomy label. Learning waits until the set is finished; raw master retained."
-        : "Removed from the final set; raw master retained.";
-      if (viewer.dialog.open && settled.nextAssetId) {
-        const nextCard = assetCards().find(
-          (candidate) => candidate.dataset.assetId === settled.nextAssetId && !candidate.hidden,
-        );
-        if (nextCard) {
-          renderCard(nextCard);
-          return;
-        }
-      }
-      updateRejectionControls();
-      announce(announcement);
     });
 
     viewer.close.addEventListener("click", closeViewer);
@@ -1240,6 +1236,7 @@
       if (activeCard) queueInspection(activeCard);
       void flushInspectionQueue(true);
       document.body.classList.remove("asset-viewer-open");
+      document.dispatchEvent(new CustomEvent("gen-automation:asset-viewer-closed"));
       if (returnFocus && returnFocus.isConnected) returnFocus.focus();
       returnFocus = null;
       activeCard = null;
