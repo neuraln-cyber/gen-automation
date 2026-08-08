@@ -102,6 +102,7 @@ class DerivativeProgress:
     expected_x_teasers: int
     ready_x_teasers: int
     ready_for_destinations: bool
+    cancelled: int = 0
 
     @property
     def active_jobs(self) -> int:
@@ -136,7 +137,7 @@ class DerivativeProgress:
     def terminal_failures(self) -> bool:
         """Whether output preparation ended with failures and no live work."""
 
-        return self.failed > 0 and self.active_jobs == 0
+        return self.failed - self.cancelled > 0 and self.active_jobs == 0
 
     @property
     def stalled(self) -> bool:
@@ -313,6 +314,7 @@ async def load_operator_delivery(
         expected_x_teasers=expected_x_count,
         ready_x_teasers=len(x_outputs),
         ready_for_destinations=ready_for_destinations,
+        cancelled=state_counts[DerivativeJobState.CANCELLED],
     )
 
     try:

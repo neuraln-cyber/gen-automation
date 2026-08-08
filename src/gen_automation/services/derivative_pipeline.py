@@ -122,6 +122,17 @@ class DerivativeOutputResult:
     replayed: bool
 
 
+@dataclass(frozen=True, slots=True)
+class DerivativeRetryResult:
+    review_task_id: UUID
+    release_version_id: UUID
+    job_ids: tuple[UUID, ...]
+    retried_job_ids: tuple[UUID, ...]
+    failed_jobs_found: int
+    jobs_retried: int
+    replayed: bool
+
+
 async def create_derivative_recipe_and_plan(
     session: AsyncSession,
     *,
@@ -921,6 +932,271 @@ async def retry_derivative_job(
     return _job_result(job)
 
 
+async def retry_failed_completed_review_target(
+    session: AsyncSession,
+    *,
+    review_task_id: UUID,
+    actor_user_id: UUID,
+    idempotency_key: str,
+    target: str,
+    retry_allowance: int = 3,
+    expected_failed_job_ids: Sequence[UUID] | None = None,
+    now: datetime | None = None,
+) -> DerivativeRetryResult:
+    """Re-arm only failed jobs for one frozen target of a completed review.
+
+    This is deliberately narrower than a new derivative plan: job, recipe, and
+    source identities remain frozen.  A terminal object-identity conflict must
+    be investigated instead of being retried against the immutable object key.
+    """
+
+    normalized_target = _normalize_target(target)
+    if normalized_target != _FULL_TARGET:
+        raise DerivativePipelineInputError("owner retry currently supports only full outputs")
+    normalized_key = _bounded_text(idempotency_key, "idempotency key", 200)
+    normalized_allowance = _bounded_int(
+        retry_allowance,
+        "retry allowance",
+        minimum=1,
+        maximum=3,
+    )
+    retried_at = _as_utc(now or datetime.now(UTC))
+    await _require_active_owner(session, actor_user_id)
+
+    task = await session.scalar(
+        select(ReviewTask).where(ReviewTask.id == review_task_id).with_for_update()
+    )
+    if task is None:
+        raise DerivativePipelineNotFoundError("review task was not found")
+    if task.state != ReviewTaskState.COMPLETED:
+        raise DerivativePipelineConflictError("derivative retry requires a completed review task")
+    selections = await _load_and_validate_selections(session, task)
+    release_row = (
+        await session.execute(
+            select(Release, ReleaseVersion)
+            .join(ReleaseVersion, ReleaseVersion.release_id == Release.id)
+            .where(ReleaseVersion.id == task.release_version_id)
+            .with_for_update()
+        )
+    ).one_or_none()
+    if release_row is None:
+        raise DerivativePipelineConflictError("derivative retry release version is unavailable")
+    release, release_version = release_row
+    if (
+        release.current_version_no != release_version.version_no
+        or release.phase != ReleasePhase.RENDERING
+    ):
+        raise DerivativePipelineConflictError(
+            "derivative retry requires the current release version to be rendering"
+        )
+
+    expected_ids = (
+        tuple(sorted(set(expected_failed_job_ids), key=str))
+        if expected_failed_job_ids is not None
+        else None
+    )
+    request_sha256 = canonical_sha256(
+        {
+            "schema": "derivative-owner-retry-request/v1",
+            "review_task_id": str(task.id),
+            "release_version_id": str(task.release_version_id),
+            "actor_user_id": str(actor_user_id),
+            "target": normalized_target,
+            "retry_allowance": normalized_allowance,
+            "expected_failed_job_ids": (
+                [str(job_id) for job_id in expected_ids] if expected_ids is not None else None
+            ),
+        }
+    )
+    scope = f"review-task:{task.id}:derivative-retry:{normalized_target}"
+    replay = await _retry_replay(
+        session,
+        scope=scope,
+        idempotency_key=normalized_key,
+        request_sha256=request_sha256,
+    )
+    if replay is not None:
+        return replay
+
+    rows = (
+        await session.execute(
+            select(DerivativeJob, DerivativeRecipe)
+            .join(DerivativeRecipe, DerivativeRecipe.id == DerivativeJob.derivative_recipe_id)
+            .where(DerivativeJob.release_version_id == task.release_version_id)
+            .order_by(DerivativeJob.logical_key)
+            .with_for_update()
+        )
+    ).all()
+    selection_ids = {selection.id for selection in selections}
+    full_jobs: list[DerivativeJob] = []
+    for job, recipe in rows:
+        recipe_targets = _stored_targets(recipe)
+        job_targets = _job_targets(job.request_payload, recipe_targets=recipe_targets)
+        if job_targets != (_FULL_TARGET,):
+            continue
+        if (
+            recipe_targets != (_FULL_TARGET,)
+            or job.release_selection_id not in selection_ids
+            or job.release_version_id != task.release_version_id
+            or recipe.release_version_id != task.release_version_id
+            or job.expected_output_count != 1
+        ):
+            raise DerivativePipelineConflictError(
+                "full-output derivative job does not match the completed review"
+            )
+        full_jobs.append(job)
+    if (
+        len(full_jobs) != len(selections)
+        or {job.release_selection_id for job in full_jobs} != selection_ids
+    ):
+        raise DerivativePipelineConflictError(
+            "completed review does not have one frozen full-output job per selection"
+        )
+
+    failed_jobs = [job for job in full_jobs if job.state == DerivativeJobState.FAILED]
+    failed_ids = tuple(sorted((job.id for job in failed_jobs), key=str))
+    if expected_ids is not None and failed_ids != expected_ids:
+        raise DerivativePipelineConflictError(
+            "failed derivative job snapshot changed; reload before retrying"
+        )
+    if any(job.last_error_code == "output_object_conflict" for job in failed_jobs):
+        raise DerivativePipelineConflictError(
+            "an immutable derivative output object conflicts with its expected bytes"
+        )
+
+    retried_job_ids: list[UUID] = []
+    for job in failed_jobs:
+        next_max_attempts = min(10, job.max_attempts + normalized_allowance)
+        if next_max_attempts <= job.max_attempts:
+            raise DerivativePipelineConflictError(
+                "derivative job reached the owner retry attempt cap"
+            )
+        previous_lock_version = job.lock_version
+        previous_max_attempts = job.max_attempts
+        previous_error_code = job.last_error_code
+        updated_id = await session.scalar(
+            update(DerivativeJob)
+            .where(
+                DerivativeJob.id == job.id,
+                DerivativeJob.state == DerivativeJobState.FAILED,
+                DerivativeJob.lock_version == previous_lock_version,
+                DerivativeJob.max_attempts == previous_max_attempts,
+                or_(
+                    DerivativeJob.last_error_code.is_(None),
+                    DerivativeJob.last_error_code != "output_object_conflict",
+                ),
+            )
+            .values(
+                state=DerivativeJobState.RETRY_WAIT,
+                max_attempts=next_max_attempts,
+                retry_at=retried_at,
+                lease_owner=None,
+                lease_expires_at=None,
+                completed_at=None,
+                last_error_code=None,
+                last_error_detail=None,
+                lock_version=previous_lock_version + 1,
+            )
+            .returning(DerivativeJob.id)
+        )
+        if updated_id is None:
+            raise DerivativePipelineConflictError(
+                "failed derivative job changed while the retry was being scheduled"
+            )
+        await session.refresh(job)
+        retried_job_ids.append(job.id)
+        _record_job_transition(
+            session,
+            job=job,
+            actor=f"admin:{actor_user_id}",
+            action="derivative.job_owner_retry_scheduled",
+            occurred_at=retried_at,
+            detail={
+                "review_task_id": str(task.id),
+                "target": normalized_target,
+                "attempt_count": job.attempt_count,
+                "previous_error_code": previous_error_code,
+                "previous_max_attempts": previous_max_attempts,
+                "max_attempts": next_max_attempts,
+                "retry_at": retried_at.isoformat(),
+            },
+        )
+
+    ordered_job_ids = tuple(
+        job.id
+        for job in sorted(
+            full_jobs,
+            key=lambda item: next(
+                selection.display_order
+                for selection in selections
+                if selection.id == item.release_selection_id
+            ),
+        )
+    )
+    result = DerivativeRetryResult(
+        review_task_id=task.id,
+        release_version_id=task.release_version_id,
+        job_ids=ordered_job_ids,
+        retried_job_ids=tuple(retried_job_ids),
+        failed_jobs_found=len(failed_jobs),
+        jobs_retried=len(retried_job_ids),
+        replayed=False,
+    )
+    summary_action = (
+        "derivative.full_outputs_retry_requested"
+        if retried_job_ids
+        else "derivative.full_outputs_retry_noop"
+    )
+    session.add(
+        _audit(
+            actor=f"admin:{actor_user_id}",
+            action=summary_action,
+            resource_type="review_task",
+            resource_id=task.id,
+            correlation_id=normalized_key,
+            detail={
+                "release_version_id": str(task.release_version_id),
+                "failed_jobs_found": len(failed_jobs),
+                "jobs_retried": len(retried_job_ids),
+                "retried_job_ids": [str(job_id) for job_id in retried_job_ids],
+            },
+            occurred_at=retried_at,
+        )
+    )
+    if retried_job_ids:
+        session.add(
+            _outbox(
+                topic="derivative.full_outputs.retry_requested",
+                dedupe_key=(
+                    "derivative.full_outputs.retry_requested:"
+                    f"{canonical_sha256({'review_task_id': str(task.id), 'key': normalized_key})}"
+                ),
+                correlation_id=normalized_key,
+                aggregate_type="review_task",
+                aggregate_id=task.id,
+                payload={
+                    "review_task_id": str(task.id),
+                    "release_version_id": str(task.release_version_id),
+                    "job_ids": [str(job_id) for job_id in retried_job_ids],
+                },
+                occurred_at=retried_at,
+            )
+        )
+    session.add(
+        IdempotencyRecord(
+            scope=scope,
+            idempotency_key=normalized_key,
+            request_sha256=request_sha256,
+            response_status=200,
+            response_body=_retry_response_body(result),
+            created_at=retried_at,
+            expires_at=retried_at + timedelta(days=30),
+        )
+    )
+    await session.commit()
+    return result
+
+
 async def record_derivative_output(
     session: AsyncSession,
     *,
@@ -1594,6 +1870,42 @@ async def _plan_replay(
         ) from None
 
 
+async def _retry_replay(
+    session: AsyncSession,
+    *,
+    scope: str,
+    idempotency_key: str,
+    request_sha256: str,
+) -> DerivativeRetryResult | None:
+    record = await session.scalar(
+        select(IdempotencyRecord).where(
+            IdempotencyRecord.scope == scope,
+            IdempotencyRecord.idempotency_key == idempotency_key,
+        )
+    )
+    if record is None:
+        return None
+    if record.request_sha256 != request_sha256:
+        raise DerivativePipelineConflictError(
+            "idempotency key was already used for another derivative retry"
+        )
+    body = record.response_body
+    try:
+        return DerivativeRetryResult(
+            review_task_id=UUID(str(body["review_task_id"])),
+            release_version_id=UUID(str(body["release_version_id"])),
+            job_ids=tuple(UUID(str(value)) for value in body["job_ids"]),
+            retried_job_ids=tuple(UUID(str(value)) for value in body["retried_job_ids"]),
+            failed_jobs_found=int(body["failed_jobs_found"]),
+            jobs_retried=int(body["jobs_retried"]),
+            replayed=True,
+        )
+    except (KeyError, TypeError, ValueError):
+        raise DerivativePipelineConflictError(
+            "derivative retry idempotency response is invalid"
+        ) from None
+
+
 def _plan_response_body(result: DerivativePlanResult) -> dict[str, Any]:
     return {
         "review_task_id": str(result.review_task_id),
@@ -1602,6 +1914,17 @@ def _plan_response_body(result: DerivativePlanResult) -> dict[str, Any]:
         "job_ids": [str(job_id) for job_id in result.job_ids],
         "jobs_created": result.jobs_created,
         "total_jobs": result.total_jobs,
+    }
+
+
+def _retry_response_body(result: DerivativeRetryResult) -> dict[str, Any]:
+    return {
+        "review_task_id": str(result.review_task_id),
+        "release_version_id": str(result.release_version_id),
+        "job_ids": [str(job_id) for job_id in result.job_ids],
+        "retried_job_ids": [str(job_id) for job_id in result.retried_job_ids],
+        "failed_jobs_found": result.failed_jobs_found,
+        "jobs_retried": result.jobs_retried,
     }
 
 
@@ -1692,6 +2015,21 @@ async def _require_active_planner(
     )
     if actor_id is None:
         raise DerivativePipelineNotFoundError("authorized derivative planner was not found")
+
+
+async def _require_active_owner(
+    session: AsyncSession,
+    user_id: UUID,
+) -> None:
+    actor_id = await session.scalar(
+        select(AdminUser.id).where(
+            AdminUser.id == user_id,
+            AdminUser.is_active.is_(True),
+            AdminUser.role == AdminRole.OWNER,
+        )
+    )
+    if actor_id is None:
+        raise DerivativePipelineNotFoundError("active owner was not found")
 
 
 def _validate_available_asset(

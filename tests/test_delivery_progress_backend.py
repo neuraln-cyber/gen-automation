@@ -248,6 +248,10 @@ def test_derivative_progress_distinguishes_ready_failed_and_stalled_work() -> No
     assert failed.terminal_failures
     assert not failed.stalled
 
+    cancelled = replace(failed, cancelled=1)
+    assert not cancelled.terminal_failures
+    assert cancelled.stalled
+
     stalled = replace(failed, failed=0, succeeded=2)
     assert not stalled.terminal_failures
     assert stalled.stalled

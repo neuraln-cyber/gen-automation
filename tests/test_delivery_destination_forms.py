@@ -12,6 +12,7 @@ from gen_automation.api.browser_delivery_forms import (
     read_prepare_mega_form,
     read_prepare_patreon_form,
     read_prepare_x_form,
+    read_retry_output_form,
 )
 
 
@@ -94,6 +95,26 @@ async def test_mega_form_has_no_publication_fields() -> None:
     assert form.submission_id
     assert not hasattr(form, "patreon_title")
     assert not hasattr(form, "x_text")
+
+
+@pytest.mark.asyncio
+async def test_retry_output_form_accepts_only_the_signed_retry_identity() -> None:
+    fields = _common_fields()
+
+    form = await read_retry_output_form(_request(fields))
+
+    assert form.submission_id == UUID(fields["submission_id"])
+    assert form.idempotency_key == fields["idempotency_key"]
+
+
+@pytest.mark.asyncio
+async def test_retry_output_form_rejects_prepare_output_fields() -> None:
+    fields = {**_common_fields(), "watermark_asset_id": ""}
+
+    with pytest.raises(BrowserDeliveryFormError) as caught:
+        await read_retry_output_form(_request(fields))
+
+    assert caught.value.status_code == status.HTTP_400_BAD_REQUEST
 
 
 @pytest.mark.asyncio

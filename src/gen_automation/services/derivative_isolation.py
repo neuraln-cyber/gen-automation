@@ -673,16 +673,10 @@ def _decode_artifact(
 
     target = derivatives.DerivativeTarget(_text(wire.get("target")))
     maximum_bytes = limits.output_byte_limit(target)
-    try:
-        data = base64.b64decode(_text(wire.get("data")), validate=True)
-    except (binascii.Error, ValueError, UnicodeEncodeError):
-        raise DerivativeIsolationProtocolError(
-            "isolated renderer returned invalid artifact bytes"
-        ) from None
-    if not 0 < len(data) <= maximum_bytes:
-        raise DerivativeIsolationProtocolError(
-            "isolated renderer returned artifact bytes outside the output limit"
-        )
+    data = _bounded_base64_field(
+        wire.get("data"),
+        maximum_decoded_bytes=maximum_bytes,
+    )
     sha256 = _sha256_text(wire.get("sha256"))
     if hashlib.sha256(data).hexdigest() != sha256:
         raise DerivativeIsolationProtocolError(
@@ -833,6 +827,30 @@ def _mapping(value: object) -> Mapping[str, object]:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         raise DerivativeIsolationProtocolError("isolated renderer returned malformed IPC data")
     return cast(Mapping[str, object], value)
+
+
+def _bounded_base64_field(value: object, *, maximum_decoded_bytes: int) -> bytes:
+    if not isinstance(value, str) or not value:
+        raise DerivativeIsolationProtocolError("isolated renderer returned invalid artifact bytes")
+    maximum_encoded_characters = 4 * ((maximum_decoded_bytes + 2) // 3)
+    if len(value) > maximum_encoded_characters:
+        raise DerivativeIsolationProtocolError(
+            "isolated renderer returned artifact bytes outside the output limit"
+        )
+    try:
+        encoded = value.encode("ascii")
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError, UnicodeEncodeError):
+        raise DerivativeIsolationProtocolError(
+            "isolated renderer returned invalid artifact bytes"
+        ) from None
+    if not decoded:
+        raise DerivativeIsolationProtocolError("isolated renderer returned invalid artifact bytes")
+    if len(decoded) > maximum_decoded_bytes:
+        raise DerivativeIsolationProtocolError(
+            "isolated renderer returned artifact bytes outside the output limit"
+        )
+    return decoded
 
 
 def _text(value: object) -> str:

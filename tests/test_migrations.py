@@ -108,17 +108,79 @@ def test_semantic_feedback_report_uses_jsonb_on_postgresql() -> None:
     assert isinstance(report_type, postgresql.JSONB)
 
 
-def test_target_ready_publication_revision_is_the_migration_head() -> None:
+def test_derivative_owner_retry_revision_is_the_migration_head() -> None:
     configuration = Config("alembic.ini")
     scripts = ScriptDirectory.from_config(configuration)
     independent_targets_revision = scripts.get_revision("20260808_0024")
-    revision = scripts.get_revision("20260808_0025")
+    target_ready_revision = scripts.get_revision("20260808_0025")
+    revision = scripts.get_revision("20260808_0026")
 
     assert independent_targets_revision is not None
     assert independent_targets_revision.down_revision == "20260808_0023"
+    assert target_ready_revision is not None
+    assert target_ready_revision.down_revision == "20260808_0024"
     assert revision is not None
-    assert revision.down_revision == "20260808_0024"
-    assert scripts.get_current_head() == "20260808_0025"
+    assert revision.down_revision == "20260808_0025"
+    assert scripts.get_current_head() == "20260808_0026"
+
+
+def test_derivative_owner_retry_postgresql_guard_is_narrow_and_bounded(
+    monkeypatch,
+) -> None:
+    configuration = Config("alembic.ini")
+    revision = ScriptDirectory.from_config(configuration).get_revision("20260808_0026")
+    assert revision is not None
+
+    statements: list[str] = []
+    monkeypatch.setattr(
+        revision.module.op,
+        "get_bind",
+        lambda: SimpleNamespace(dialect=SimpleNamespace(name="postgresql")),
+    )
+    monkeypatch.setattr(
+        revision.module.op,
+        "execute",
+        lambda statement: statements.append(str(statement)),
+    )
+
+    revision.module.upgrade()
+
+    assert len(statements) == 1
+    guard = statements[0]
+    assert "OLD.state = 'failed' AND NEW.state = 'retry_wait'" in guard
+    assert "NEW.max_attempts <= 10" in guard
+    assert "NEW.max_attempts > OLD.max_attempts" in guard
+    assert "output_object_conflict" in guard
+    assert "retry_recipe.output_targets::jsonb = '[\"full\"]'::jsonb" in guard
+    assert "retry_release.phase = 'rendering'" in guard
+
+
+def test_derivative_owner_retry_downgrade_restores_terminal_failed_jobs(
+    monkeypatch,
+) -> None:
+    configuration = Config("alembic.ini")
+    revision = ScriptDirectory.from_config(configuration).get_revision("20260808_0026")
+    assert revision is not None
+
+    statements: list[str] = []
+    monkeypatch.setattr(
+        revision.module.op,
+        "get_bind",
+        lambda: SimpleNamespace(dialect=SimpleNamespace(name="postgresql")),
+    )
+    monkeypatch.setattr(
+        revision.module.op,
+        "execute",
+        lambda statement: statements.append(str(statement)),
+    )
+
+    revision.module.downgrade()
+
+    assert len(statements) == 1
+    guard = statements[0]
+    assert "OLD.state IN ('succeeded', 'failed', 'cancelled')" in guard
+    assert "OLD.max_attempts IS DISTINCT FROM NEW.max_attempts" in guard
+    assert "failed derivative job rearm is invalid" not in guard
 
 
 def test_target_ready_publication_postgresql_guards_allow_active_release_phases(

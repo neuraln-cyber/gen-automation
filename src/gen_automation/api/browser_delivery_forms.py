@@ -27,6 +27,13 @@ PREPARE_OUTPUT_FIELDS = frozenset(
         "watermark_asset_id",
     }
 )
+RETRY_OUTPUT_FIELDS = frozenset(
+    {
+        "csrf_token",
+        "idempotency_key",
+        "submission_id",
+    }
+)
 PREPARE_ARCHIVE_FIELDS = frozenset(
     {
         "csrf_token",
@@ -130,6 +137,13 @@ class PrepareOutputForm:
 
 
 @dataclass(frozen=True, slots=True)
+class RetryOutputForm:
+    csrf_token: str
+    idempotency_key: str
+    submission_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
 class PrepareArchiveForm:
     csrf_token: str
     idempotency_key: str
@@ -229,6 +243,15 @@ async def read_prepare_output_form(request: Request) -> PrepareOutputForm:
         idempotency_key=_idempotency_key(values["idempotency_key"]),
         submission_id=submission_id,
         watermark_asset_id=watermark_asset_id,
+    )
+
+
+async def read_retry_output_form(request: Request) -> RetryOutputForm:
+    values = await _read_form(request, expected_fields=RETRY_OUTPUT_FIELDS)
+    return RetryOutputForm(
+        csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
+        idempotency_key=_idempotency_key(values["idempotency_key"]),
+        submission_id=_uuid(values["submission_id"]),
     )
 
 

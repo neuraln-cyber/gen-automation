@@ -344,6 +344,121 @@ async def test_clean_full_output_route_never_plans_x_teasers(
 
 
 @pytest.mark.asyncio
+async def test_signed_retry_route_calls_only_full_output_retry_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    app = FastAPI()
+    app.state.settings = settings
+    owner = _owner()
+    review_task_id = uuid4()
+    session = object()
+    fields = _signed_fields(
+        settings,
+        owner,
+        review_task_id=review_task_id,
+        action="retry-full-outputs",
+    )
+    retry_calls: list[dict[str, object]] = []
+    prepare_calls: list[dict[str, object]] = []
+
+    async def verify_owner(*_args: object, **_kwargs: object) -> AuthenticatedPrincipal:
+        return owner
+
+    async def retry_full(_session: object, **kwargs: object) -> object:
+        assert _session is session
+        retry_calls.append(kwargs)
+        return object()
+
+    async def prepare_full(_session: object, **kwargs: object) -> object:
+        prepare_calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(delivery_routes, "_verified_mutation_owner", verify_owner)
+    monkeypatch.setattr(
+        delivery_routes,
+        "retry_failed_completed_review_full_outputs",
+        retry_full,
+    )
+    monkeypatch.setattr(delivery_routes, "prepare_completed_review_full_outputs", prepare_full)
+
+    response = await delivery_routes.dashboard_retry_full_outputs(
+        review_task_id,
+        _request(
+            app,
+            path=f"/dashboard/review-tasks/{review_task_id}/delivery:retry-full-outputs",
+            fields=fields,
+        ),
+        session,  # type: ignore[arg-type]
+        owner,
+    )
+
+    assert response.status_code == 303
+    assert retry_calls == [
+        {
+            "review_task_id": review_task_id,
+            "actor_user_id": owner.user_id,
+            "idempotency_key": fields["idempotency_key"],
+        }
+    ]
+    assert prepare_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("service_error", "expected_status"),
+    [
+        (delivery_routes.DerivativePipelineInputError("invalid retry"), 422),
+        (delivery_routes.DerivativePipelineNotFoundError("missing review"), 404),
+        (delivery_routes.DerivativePipelineConflictError("stale retry"), 409),
+    ],
+)
+async def test_retry_route_maps_typed_service_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    service_error: Exception,
+    expected_status: int,
+) -> None:
+    settings = _settings()
+    app = FastAPI()
+    app.state.settings = settings
+    owner = _owner()
+    review_task_id = uuid4()
+    session = object()
+    fields = _signed_fields(
+        settings,
+        owner,
+        review_task_id=review_task_id,
+        action="retry-full-outputs",
+    )
+
+    async def verify_owner(*_args: object, **_kwargs: object) -> AuthenticatedPrincipal:
+        return owner
+
+    async def retry_full(*_args: object, **_kwargs: object) -> object:
+        raise service_error
+
+    monkeypatch.setattr(delivery_routes, "_verified_mutation_owner", verify_owner)
+    monkeypatch.setattr(
+        delivery_routes,
+        "retry_failed_completed_review_full_outputs",
+        retry_full,
+    )
+
+    response = await delivery_routes.dashboard_retry_full_outputs(
+        review_task_id,
+        _request(
+            app,
+            path=f"/dashboard/review-tasks/{review_task_id}/delivery:retry-full-outputs",
+            fields=fields,
+        ),
+        session,  # type: ignore[arg-type]
+        owner,
+    )
+
+    assert response.status_code == expected_status
+
+
+@pytest.mark.asyncio
 async def test_x_teaser_output_route_never_plans_clean_full_outputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

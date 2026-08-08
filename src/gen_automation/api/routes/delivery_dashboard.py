@@ -32,6 +32,7 @@ from gen_automation.api.browser_delivery_forms import (
     read_prepare_patreon_form,
     read_prepare_x_form,
     read_publication_guard_form,
+    read_retry_output_form,
 )
 from gen_automation.api.security import (
     PublicationReader,
@@ -91,6 +92,7 @@ from gen_automation.services.publication import (
 from gen_automation.services.review_derivatives import (
     prepare_completed_review_full_outputs,
     prepare_completed_review_x_teasers,
+    retry_failed_completed_review_full_outputs,
 )
 from gen_automation.services.watermarks import (
     MAX_WATERMARK_BYTES,
@@ -165,6 +167,7 @@ async def dashboard_review_delivery(
     settings: Settings = request.app.state.settings
     requested_zip_archive = _requested_zip_archive(finished_set_archive)
     output_submission_id = uuid4()
+    retry_output_submission_id = uuid4()
     x_output_submission_id = uuid4()
     archive_submission_id = uuid4()
     patreon_destination_submission_id = uuid4()
@@ -177,6 +180,12 @@ async def dashboard_review_delivery(
         session_id=principal.session_id,
         action="prepare-outputs",
         parts=(str(review_task_id), str(output_submission_id)),
+    )
+    retry_output_key = delivery_form_key(
+        settings,
+        session_id=principal.session_id,
+        action="retry-full-outputs",
+        parts=(str(review_task_id), str(retry_output_submission_id)),
     )
     x_output_key = delivery_form_key(
         settings,
@@ -317,6 +326,7 @@ async def dashboard_review_delivery(
                 "previews": previews,
                 "csrf_token": csrf_token,
                 "output_submission_id": output_submission_id,
+                "retry_output_submission_id": retry_output_submission_id,
                 "x_output_submission_id": x_output_submission_id,
                 "archive_submission_id": archive_submission_id,
                 "patreon_destination_submission_id": patreon_destination_submission_id,
@@ -327,6 +337,7 @@ async def dashboard_review_delivery(
                 "watermark_submission_id": watermark_submission_id,
                 "guard_submission_id": guard_submission_id,
                 "output_idempotency_key": output_key,
+                "retry_output_idempotency_key": retry_output_key,
                 "x_output_idempotency_key": x_output_key,
                 "archive_idempotency_key": archive_key,
                 "patreon_destination_idempotency_key": patreon_destination_key,
@@ -541,6 +552,64 @@ async def dashboard_prepare_outputs(
             principal,
             status.HTTP_409_CONFLICT,
             "Outputs could not be prepared from the current review snapshot.",
+        )
+    return _redirect(review_task_id)
+
+
+@router.post(
+    "/review-tasks/{review_task_id}/delivery:retry-full-outputs",
+    response_class=HTMLResponse,
+    response_model=None,
+)
+async def dashboard_retry_full_outputs(
+    review_task_id: UUID,
+    request: Request,
+    session: Session,
+    principal: PublicationReader,
+) -> Response:
+    """Re-arm only the failed clean full-output jobs for a completed review."""
+
+    try:
+        form = await read_retry_output_form(request)
+        owner = await _verified_mutation_owner(request, session, principal, form.csrf_token)
+        expected_key = delivery_form_key(
+            request.app.state.settings,
+            session_id=owner.session_id,
+            action="retry-full-outputs",
+            parts=(str(review_task_id), str(form.submission_id)),
+        )
+        if not form_key_matches(form.idempotency_key, expected_key):
+            raise BrowserDeliveryFormError(status_code=status.HTTP_400_BAD_REQUEST)
+        await retry_failed_completed_review_full_outputs(
+            session,
+            review_task_id=review_task_id,
+            actor_user_id=owner.user_id,
+            idempotency_key=form.idempotency_key,
+        )
+    except BrowserDeliveryFormError as error:
+        return _form_error(request, principal, error.status_code, error.message)
+    except HTTPException as error:
+        return _owner_http_error(request, principal, error)
+    except DerivativePipelineInputError as error:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            str(error),
+        )
+    except DerivativePipelineNotFoundError:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_404_NOT_FOUND,
+            "The completed review could not be found.",
+        )
+    except DerivativePipelineConflictError:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_409_CONFLICT,
+            "Clean full-set copies could not be retried from the current state.",
         )
     return _redirect(review_task_id)
 

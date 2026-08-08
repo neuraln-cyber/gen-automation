@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -14,7 +15,9 @@ from gen_automation.db.models import ReviewXSelection
 from gen_automation.services.derivative_pipeline import (
     DerivativePipelineConflictError,
     DerivativePlanResult,
+    DerivativeRetryResult,
     create_derivative_recipe_and_plan,
+    retry_failed_completed_review_target,
 )
 from gen_automation.services.derivative_runtime import derivative_recipe_configuration
 from gen_automation.services.derivatives import (
@@ -83,6 +86,30 @@ async def prepare_completed_review_x_teasers(
         output_targets=("x_teaser",),
         watermark_asset_id=watermark_asset_id,
         max_attempts=max_attempts,
+        now=now,
+    )
+
+
+async def retry_failed_completed_review_full_outputs(
+    session: AsyncSession,
+    *,
+    review_task_id: UUID,
+    actor_user_id: UUID,
+    idempotency_key: str,
+    retry_allowance: int = 3,
+    expected_failed_job_ids: Sequence[UUID] | None = None,
+    now: datetime | None = None,
+) -> DerivativeRetryResult:
+    """Re-arm only failed clean full-output jobs without changing their recipe."""
+
+    return await retry_failed_completed_review_target(
+        session,
+        review_task_id=review_task_id,
+        actor_user_id=actor_user_id,
+        idempotency_key=idempotency_key,
+        target="full",
+        retry_allowance=retry_allowance,
+        expected_failed_job_ids=expected_failed_job_ids,
         now=now,
     )
 

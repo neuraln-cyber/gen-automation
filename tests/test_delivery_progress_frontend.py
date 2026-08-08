@@ -26,6 +26,7 @@ def test_delivery_progress_uses_json_polling_without_periodic_page_reloads() -> 
     assert handler.count("window.location.reload()") == 1
     assert "reloadForNewControls" in handler
     assert 'outputState === "ready"' in handler
+    assert 'initialOutputState !== "failed" && outputState === "failed"' in handler
     assert 'archiveState === "ready"' in handler
     assert 'initialArchiveState !== "failed" && archiveState === "failed"' in handler
     assert "const fullOutputsReady = output.full_outputs_ready === true;" in handler
@@ -81,6 +82,12 @@ def test_delivery_template_explains_copy_and_archive_work_truthfully() -> None:
     assert 'aria-live="polite"' in template
     assert '{% elif output_state == "failed" %}' in template
     assert '{% elif output_state == "stalled" %}' in template
+    assert "delivery:retry-full-outputs" in template
+    assert template.count("delivery:retry-full-outputs") == 1
+    assert "retry_output_idempotency_key" in template
+    assert "retry_output_submission_id" in template
+    assert "Retry clean full-set copies" in template
+    assert "operator repair is required" in template
     assert "data-delivery-auto-refresh" not in template
     assert 'data-delivery-progress-url="/dashboard/review-tasks/' in template
     assert "data-delivery-progress" in template

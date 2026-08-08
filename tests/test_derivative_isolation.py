@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import sys
 import time
 from io import BytesIO
@@ -14,6 +15,7 @@ from gen_automation.services.derivative_isolation import (
     DerivativeIsolationTimeoutError,
     DerivativeIsolationUnavailableError,
     _apply_linux_hard_limits,
+    _bounded_base64_field,
     _cleanup_process,
     _decode_child_response,
     _receive_child_message,
@@ -30,6 +32,19 @@ from gen_automation.services.derivatives import (
 
 def _master() -> bytes:
     image = Image.new("RGB", (16, 12), (20, 40, 80))
+    output = BytesIO()
+    try:
+        image.save(output, format="PNG")
+        return output.getvalue()
+    finally:
+        image.close()
+
+
+def _large_master() -> bytes:
+    width = 128
+    height = 128
+    pixels = bytes((index * 73 + index // 11) % 256 for index in range(width * height * 3))
+    image = Image.frombytes("RGB", (width, height), pixels)
     output = BytesIO()
     try:
         image.save(output, format="PNG")
@@ -427,6 +442,64 @@ def test_safe_bounded_response_accepts_the_expected_full_only_collection() -> No
     )
 
     assert decoded == expected
+
+
+def test_safe_bounded_response_accepts_artifact_base64_larger_than_text_metadata() -> None:
+    recipe = DerivativeRecipe()
+    expected = render_platform_derivatives(
+        _large_master(),
+        recipe=recipe,
+        targets=(DerivativeTarget.FULL_RESOLUTION,),
+    )
+    assert len(base64.b64encode(expected.artifacts[0].data)) > 1024
+
+    decoded = _decode_child_response(
+        _success_message(expected),
+        DEFAULT_DERIVATIVE_LIMITS,
+        expected_source_sha256=expected.source_sha256,
+        expected_recipe=recipe,
+        expected_target_values=(DerivativeTarget.FULL_RESOLUTION.value,),
+    )
+
+    assert decoded == expected
+
+
+def test_bounded_base64_field_accepts_exact_decoded_byte_limit() -> None:
+    payload = b"boundary"
+
+    assert (
+        _bounded_base64_field(
+            base64.b64encode(payload).decode("ascii"),
+            maximum_decoded_bytes=len(payload),
+        )
+        == payload
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, b"YQ==", "", "\N{SNOWMAN}", "not base64"],
+    ids=["non-string", "bytes", "empty", "non-ascii", "malformed"],
+)
+def test_bounded_base64_field_rejects_invalid_fields(value: object) -> None:
+    with pytest.raises(DerivativeIsolationProtocolError, match="invalid artifact bytes"):
+        _bounded_base64_field(value, maximum_decoded_bytes=16)
+
+
+@pytest.mark.parametrize(
+    "payload,maximum",
+    [(b"1234567", 6), (b"123456", 5)],
+    ids=["encoded-length-over-limit", "decoded-length-over-limit"],
+)
+def test_bounded_base64_field_rejects_oversized_payloads(
+    payload: bytes,
+    maximum: int,
+) -> None:
+    with pytest.raises(DerivativeIsolationProtocolError, match="outside the output limit"):
+        _bounded_base64_field(
+            base64.b64encode(payload).decode("ascii"),
+            maximum_decoded_bytes=maximum,
+        )
 
 
 @pytest.mark.skipif(

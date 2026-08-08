@@ -116,18 +116,26 @@
       <p class="terminal-state" role="status">All clean publishing copies are ready.</p>
     {% elif output_state == "failed" %}
       <p class="form-error" role="alert">
-        {% if delivery.progress.full_outputs_ready %}
-          Some destination copies failed, but the clean full set is ready and ZIP
-          preparation continues independently.
-        {% else %}
-          Clean full-set copy preparation ended with failures. Retry it before the ZIP
-          can be completed.
-        {% endif %}
+        Clean full-set copy preparation ended with failures.
+        Retry only the unfinished clean copies before completing a delivery.
       </p>
+      <form
+        method="post"
+        action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:retry-full-outputs"
+      >
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input
+          type="hidden"
+          name="idempotency_key"
+          value="{{ retry_output_idempotency_key }}"
+        >
+        <input type="hidden" name="submission_id" value="{{ retry_output_submission_id }}">
+        <button class="primary-button" type="submit">Retry clean full-set copies</button>
+      </form>
     {% elif output_state == "stalled" %}
       <p class="form-error" role="alert">
         Copy preparation is stalled. No job is active and the expected files are not
-        complete; operator repair or a retry is required.
+        complete; operator repair is required.
       </p>
     {% else %}
       <p class="terminal-state" role="status" data-delivery-live-status aria-live="polite">

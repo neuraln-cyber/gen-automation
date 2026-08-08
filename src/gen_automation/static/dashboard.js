@@ -1885,6 +1885,7 @@
       );
       if (
         (initialOutputState !== "ready" && outputState === "ready")
+        || (initialOutputState !== "failed" && outputState === "failed")
         || (!initialXOutputsReady && xOutputsReady)
         || (initialArchiveState !== "ready" && archiveState === "ready")
         || (initialArchiveState !== "failed" && archiveState === "failed")
