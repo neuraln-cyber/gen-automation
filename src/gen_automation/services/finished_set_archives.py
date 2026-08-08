@@ -19,7 +19,7 @@ from typing import Any
 from uuid import UUID
 from zipfile import ZIP_STORED, ZipFile, ZipInfo
 
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -136,6 +136,10 @@ class FinishedSetArchiveSnapshot:
     last_error_code: str | None
     last_error_detail: str | None
     parts: tuple[FinishedSetArchivePartSnapshot, ...]
+    requested_by_user_id: UUID | None = None
+    mega_requested_by_user_id: UUID | None = None
+    mega_requested_at: datetime | None = None
+    mega_requested_remote_root: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,6 +292,9 @@ async def request_finished_set_archive(
             release_version_id=version.id,
             selection_count=selection_count,
         )
+        if requested_by_user_id is not None and archive.requested_by_user_id is None:
+            archive.requested_by_user_id = requested_by_user_id
+            archive.updated_at = requested_at
         if archive.state == FinishedSetArchiveState.FAILED:
             archive.state = FinishedSetArchiveState.PENDING
             archive.attempts = 0
@@ -464,7 +471,7 @@ async def run_finished_set_archive_cycle(
     max_archive_bytes: int,
     now: datetime | None = None,
 ) -> FinishedSetArchiveCycleResult:
-    """Discover, claim, build, and atomically register at most one archive."""
+    """Claim, build, and atomically register at most one requested archive."""
 
     normalized_worker = _worker_id(worker_id)
     normalized_lease = _bounded_int(lease_seconds, "archive lease seconds", 30, 7200)
@@ -488,12 +495,9 @@ async def run_finished_set_archive_cycle(
     )
     cycle_at = _as_utc(now or datetime.now(UTC))
     async with sessions() as session:
-        created = await _ensure_next_archive(session, now=cycle_at)
-    async with sessions() as session:
         exhausted_id = await _fail_one_exhausted_lease(session, now=cycle_at)
     if exhausted_id is not None:
         return FinishedSetArchiveCycleResult(
-            created_archive=created,
             processed_archive=True,
             archive_id=exhausted_id,
             state=FinishedSetArchiveState.FAILED,
@@ -507,7 +511,7 @@ async def run_finished_set_archive_cycle(
             now=cycle_at,
         )
     if claim is None:
-        return FinishedSetArchiveCycleResult(created_archive=created)
+        return FinishedSetArchiveCycleResult()
 
     try:
         async with sessions() as session:
@@ -586,7 +590,6 @@ async def run_finished_set_archive_cycle(
             now=_runtime_now(now),
         )
         return FinishedSetArchiveCycleResult(
-            created_archive=created,
             processed_archive=True,
             archive_id=claim.archive_id,
             state=state,
@@ -608,7 +611,6 @@ async def run_finished_set_archive_cycle(
             now=_runtime_now(now),
         )
         return FinishedSetArchiveCycleResult(
-            created_archive=created,
             processed_archive=True,
             archive_id=claim.archive_id,
             state=state,
@@ -630,94 +632,17 @@ async def run_finished_set_archive_cycle(
             now=_runtime_now(now),
         )
         return FinishedSetArchiveCycleResult(
-            created_archive=created,
             processed_archive=True,
             archive_id=claim.archive_id,
             state=state,
             error_code=code,
         )
     return FinishedSetArchiveCycleResult(
-        created_archive=created,
         processed_archive=True,
         completed_archive=True,
         archive_id=claim.archive_id,
         state=FinishedSetArchiveState.READY,
     )
-
-
-async def _ensure_next_archive(session: AsyncSession, *, now: datetime) -> bool:
-    archive_exists = exists(
-        select(FinishedSetArchive.id).where(FinishedSetArchive.review_task_id == ReviewTask.id)
-    )
-    selection_count = (
-        select(func.count(ReleaseSelection.id))
-        .where(ReleaseSelection.review_task_id == ReviewTask.id)
-        .correlate(ReviewTask)
-        .scalar_subquery()
-    )
-    full_output_count = _succeeded_full_output_count(
-        review_task_id=ReviewTask.id,
-        release_version_id=ReleaseVersion.id,
-        distinct_selections=False,
-    )
-    full_selection_count = _succeeded_full_output_count(
-        review_task_id=ReviewTask.id,
-        release_version_id=ReleaseVersion.id,
-        distinct_selections=True,
-    )
-    candidate = (
-        await session.execute(
-            select(ReviewTask, ReleaseVersion, selection_count.label("selection_count"))
-            .join(ReleaseVersion, ReleaseVersion.id == ReviewTask.release_version_id)
-            .join(Release, Release.id == ReleaseVersion.release_id)
-            .where(
-                ReviewTask.state == ReviewTaskState.COMPLETED,
-                Release.phase.in_(_DOWNLOADABLE_RELEASE_PHASES),
-                Release.current_version_no == ReleaseVersion.version_no,
-                ~archive_exists,
-                selection_count >= 1,
-                selection_count <= MAX_ACCEPTED_IMAGES_PER_RELEASE,
-                full_output_count == selection_count,
-                full_selection_count == selection_count,
-            )
-            .order_by(ReviewTask.completed_at, ReviewTask.id)
-            .limit(1)
-            .with_for_update(skip_locked=True)
-        )
-    ).one_or_none()
-    if candidate is None:
-        await session.rollback()
-        return False
-    review, version, count = candidate
-    session.add(
-        FinishedSetArchive(
-            id=uuid7(),
-            review_task_id=review.id,
-            release_version_id=version.id,
-            requested_by_user_id=None,
-            state=FinishedSetArchiveState.PENDING,
-            selection_count=int(count),
-            manifest_sha256=None,
-            part_count=None,
-            attempts=0,
-            max_attempts=5,
-            available_at=now,
-            lease_owner=None,
-            lease_expires_at=None,
-            last_error_code=None,
-            last_error_detail=None,
-            created_at=now,
-            updated_at=now,
-            started_at=None,
-            completed_at=None,
-        )
-    )
-    try:
-        await session.commit()
-    except IntegrityError:
-        await session.rollback()
-        return False
-    return True
 
 
 async def _fail_one_exhausted_lease(
@@ -1605,6 +1530,10 @@ async def _snapshot(
         part_count=archive.part_count,
         attempts=archive.attempts,
         max_attempts=archive.max_attempts,
+        requested_by_user_id=archive.requested_by_user_id,
+        mega_requested_by_user_id=archive.mega_requested_by_user_id,
+        mega_requested_at=_optional_utc(archive.mega_requested_at),
+        mega_requested_remote_root=archive.mega_requested_remote_root,
         available_at=_as_utc(archive.available_at),
         created_at=_as_utc(archive.created_at),
         started_at=_optional_utc(archive.started_at),

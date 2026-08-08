@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.db.models import (
@@ -64,6 +64,16 @@ class OperatorDeliveryConflictError(OperatorDeliveryError):
 
 class OperatorDeliveryInputError(OperatorDeliveryError, ValueError):
     pass
+
+
+_TARGET_PUBLISHABLE_RELEASE_PHASES = frozenset(
+    {
+        ReleasePhase.RENDERING,
+        ReleasePhase.READY_TO_PUBLISH,
+        ReleasePhase.PUBLISHING,
+        ReleasePhase.PUBLISHED,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,23 +205,17 @@ class OperatorDeliverySnapshot:
     publishing_guard_changed_at: datetime | None
     destinations: tuple[DestinationState, ...]
 
-    @property
-    def destinations_prepared(self) -> bool:
-        by_key = {destination.key: destination for destination in self.destinations}
-        required = ("patreon", "x") if self.x_selected_count else ("patreon",)
-        return all(by_key[key].intent_id is not None for key in required)
-
-    @property
-    def destinations_need_retry(self) -> bool:
-        by_key = {destination.key: destination for destination in self.destinations}
-        required = ("patreon", "x") if self.x_selected_count else ("patreon",)
-        return any(by_key[key].state == "failed" for key in required)
-
 
 @dataclass(frozen=True, slots=True)
 class PreparedDestinations:
     patreon_intent_id: UUID
     x_intent_id: UUID | None
+    replayed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedDestination:
+    intent_id: UUID
     replayed: bool
 
 
@@ -324,6 +328,7 @@ async def load_operator_delivery(
         guard_changed_at = None
     destinations = await _destination_states(
         session,
+        release_id=release.id,
         release_version_id=release_version.id,
         x_selected_count=expected_x_count,
     )
@@ -486,6 +491,186 @@ async def prepare_operator_destinations(
     )
 
 
+async def prepare_operator_patreon_destination(
+    session: AsyncSession,
+    *,
+    review_task_id: UUID,
+    patreon_title: str,
+    patreon_body: str,
+    patreon_tier: str,
+    patreon_tags: tuple[str, ...],
+    public_preview_output_id: UUID,
+    public_preview_attester_name: str,
+    public_preview_attested_at: datetime | None = None,
+    actor_user_id: UUID,
+    actor_role: AdminRole,
+    idempotency_key: str,
+    now: datetime | None = None,
+) -> PreparedDestination:
+    """Freeze and authorize Patreon without creating or changing an X intent."""
+
+    prepared_at = _as_utc(now or datetime.now(UTC))
+    preview_attested_at = _as_utc(public_preview_attested_at or prepared_at)
+    snapshot = await load_operator_delivery(session, review_task_id=review_task_id)
+    _require_target_ready(snapshot, target=PublicationTarget.PATREON)
+    if public_preview_output_id not in {output.output_id for output in snapshot.full_outputs}:
+        raise OperatorDeliveryInputError(
+            "the Patreon public preview must be one accepted clean full output"
+        )
+
+    configuration = {
+        "title": patreon_title,
+        "body": patreon_body,
+        "tier": patreon_tier,
+        "tags": list(patreon_tags),
+    }
+    output_ids = tuple(output.output_id for output in snapshot.full_outputs)
+    try:
+        _normalize_configuration(PublicationTarget.PATREON, configuration)
+        await _load_frozen_outputs(
+            session,
+            release_version_id=snapshot.release_version_id,
+            target=PublicationTarget.PATREON,
+            derivative_output_ids=output_ids,
+            public_preview_output_id=public_preview_output_id,
+        )
+        result = await plan_publication_intent(
+            session,
+            release_version_id=snapshot.release_version_id,
+            target=PublicationTarget.PATREON,
+            configuration=configuration,
+            derivative_output_ids=output_ids,
+            planned_by_user_id=actor_user_id,
+            idempotency_key=f"{idempotency_key}:patreon:plan",
+            public_preview_output_id=public_preview_output_id,
+            public_preview_attester_name=public_preview_attester_name,
+            public_preview_attested_at=preview_attested_at,
+            public_preview_attestation_timezone="UTC",
+            now=prepared_at,
+        )
+        approved_replayed = await _approve_if_needed(
+            session,
+            result=result,
+            actor_user_id=actor_user_id,
+            actor_role=actor_role,
+            idempotency_key=f"{idempotency_key}:patreon:approve",
+            now=prepared_at,
+        )
+    except PublicationInputError as error:
+        raise OperatorDeliveryInputError(str(error)) from error
+    except (
+        PublicationNotFoundError,
+        PublicationConflictError,
+        PublicationDisabledError,
+    ) as error:
+        raise OperatorDeliveryConflictError(str(error)) from error
+    return PreparedDestination(
+        intent_id=result.intent_id,
+        replayed=result.replayed and approved_replayed,
+    )
+
+
+async def prepare_operator_x_destination(
+    session: AsyncSession,
+    *,
+    review_task_id: UUID,
+    x_text: str,
+    x_credential_reference: str | None,
+    actor_user_id: UUID,
+    actor_role: AdminRole,
+    idempotency_key: str,
+    now: datetime | None = None,
+) -> PreparedDestination:
+    """Freeze and authorize X without creating or changing a Patreon intent."""
+
+    prepared_at = _as_utc(now or datetime.now(UTC))
+    snapshot = await load_operator_delivery(session, review_task_id=review_task_id)
+    _require_target_ready(snapshot, target=PublicationTarget.X)
+    if not x_text.strip():
+        raise OperatorDeliveryInputError("X post text is required for selected teasers")
+    if x_credential_reference is None:
+        raise OperatorDeliveryConflictError("the X credential reference is not configured")
+
+    configuration = {"text": x_text}
+    output_ids = tuple(output.output_id for output in snapshot.x_outputs)
+    try:
+        _normalize_configuration(PublicationTarget.X, configuration)
+        _normalize_credential_reference(PublicationTarget.X, x_credential_reference)
+        await _load_frozen_outputs(
+            session,
+            release_version_id=snapshot.release_version_id,
+            target=PublicationTarget.X,
+            derivative_output_ids=output_ids,
+            public_preview_output_id=None,
+        )
+        result = await plan_publication_intent(
+            session,
+            release_version_id=snapshot.release_version_id,
+            target=PublicationTarget.X,
+            configuration=configuration,
+            derivative_output_ids=output_ids,
+            planned_by_user_id=actor_user_id,
+            idempotency_key=f"{idempotency_key}:x:plan",
+            credential_reference=x_credential_reference,
+            now=prepared_at,
+        )
+        approved_replayed = await _approve_if_needed(
+            session,
+            result=result,
+            actor_user_id=actor_user_id,
+            actor_role=actor_role,
+            idempotency_key=f"{idempotency_key}:x:approve",
+            now=prepared_at,
+        )
+    except PublicationInputError as error:
+        raise OperatorDeliveryInputError(str(error)) from error
+    except (
+        PublicationNotFoundError,
+        PublicationConflictError,
+        PublicationDisabledError,
+    ) as error:
+        raise OperatorDeliveryConflictError(str(error)) from error
+    return PreparedDestination(
+        intent_id=result.intent_id,
+        replayed=result.replayed and approved_replayed,
+    )
+
+
+def _require_target_ready(
+    snapshot: OperatorDeliverySnapshot,
+    *,
+    target: PublicationTarget,
+) -> None:
+    if snapshot.review_state != ReviewTaskState.COMPLETED:
+        raise OperatorDeliveryConflictError("complete the review before preparing destinations")
+    if snapshot.release_phase not in _TARGET_PUBLISHABLE_RELEASE_PHASES:
+        raise OperatorDeliveryConflictError("the current release is not publishable")
+    if not snapshot.publishing_guard_enabled:
+        raise OperatorDeliveryConflictError("the global publication guard is stopped")
+    if target == PublicationTarget.PATREON:
+        if not snapshot.progress.full_outputs_ready:
+            raise OperatorDeliveryConflictError("all clean full outputs must be ready")
+        return
+    if snapshot.x_selected_count < 1:
+        raise OperatorDeliveryInputError("select at least one X teaser before preparing X")
+    if len(snapshot.x_outputs) != snapshot.x_selected_count:
+        raise OperatorDeliveryConflictError("all selected X teaser outputs must be ready")
+
+
+def operator_target_is_ready(
+    snapshot: OperatorDeliverySnapshot,
+    *,
+    target: PublicationTarget,
+) -> bool:
+    """Return whether one target's exact inputs may be independently frozen."""
+
+    try:
+        _require_target_ready(snapshot, target=target)
+    except OperatorDeliveryError:
+        return False
+    return True
+
+
 async def _approve_if_needed(
     session: AsyncSession,
     *,
@@ -501,6 +686,7 @@ async def _approve_if_needed(
     if intent.state not in {
         PublicationIntentState.AWAITING_APPROVAL,
         PublicationIntentState.FAILED,
+        PublicationIntentState.CANCELLED,
     }:
         return True
     approval = await approve_publication_intent(
@@ -550,6 +736,7 @@ def _duplicate_selection_targets(outputs: tuple[DeliveryOutput, ...]) -> bool:
 async def _destination_states(
     session: AsyncSession,
     *,
+    release_id: UUID,
     release_version_id: UUID,
     x_selected_count: int,
 ) -> tuple[DestinationState, ...]:
@@ -557,8 +744,23 @@ async def _destination_states(
         (
             await session.scalars(
                 select(PublicationIntent)
-                .where(PublicationIntent.release_version_id == release_version_id)
-                .order_by(PublicationIntent.planned_at.desc(), PublicationIntent.id.desc())
+                .where(PublicationIntent.release_id == release_id)
+                .order_by(
+                    case(
+                        (
+                            PublicationIntent.state.in_(
+                                (
+                                    PublicationIntentState.FAILED,
+                                    PublicationIntentState.CANCELLED,
+                                )
+                            ),
+                            1,
+                        ),
+                        else_=0,
+                    ),
+                    PublicationIntent.planned_at.desc(),
+                    PublicationIntent.id.desc(),
+                )
             )
         ).all()
     )
@@ -666,14 +868,11 @@ def _publication_state(
             "A fresh approval is required. Prepare destinations again to authorize and "
             "resume delivery.",
         )
-    if (
-        intent.target == PublicationTarget.PATREON
-        and intent.state == PublicationIntentState.UNKNOWN
-    ):
+    if intent.state == PublicationIntentState.UNKNOWN:
         return (
             "unknown",
-            "The browser result is unknown. Confirm whether the Patreon post exists; "
-            "the system will not retry automatically.",
+            "The provider result is unknown. Confirm the outcome before any retry; "
+            "the system will not publish again automatically.",
         )
     if intent.state in {
         PublicationIntentState.PROCESSING,
@@ -711,7 +910,17 @@ async def _mega_destination(
             key="mega",
             label="MEGA",
             state="not_prepared",
-            detail="Waiting for the clean finished-set archive.",
+            detail="MEGA has not been requested.",
+        )
+    delivery = await session.scalar(
+        select(MegaSetDelivery).where(MegaSetDelivery.finished_set_archive_id == archive.id)
+    )
+    if getattr(archive, "mega_requested_at", None) is None and delivery is None:
+        return DestinationState(
+            key="mega",
+            label="MEGA",
+            state="not_prepared",
+            detail="MEGA has not been requested.",
         )
     if archive.state == FinishedSetArchiveState.FAILED:
         return DestinationState(
@@ -731,15 +940,12 @@ async def _mega_destination(
             completed_items=0,
             total_items=archive.selection_count,
         )
-    delivery = await session.scalar(
-        select(MegaSetDelivery).where(MegaSetDelivery.finished_set_archive_id == archive.id)
-    )
     if delivery is None:
         return DestinationState(
             key="mega",
             label="MEGA",
             state="queued",
-            detail="Clean set ready; the extracted MEGA upload will start automatically.",
+            detail="Clean set ready; the requested MEGA upload is queued.",
             completed_items=0,
             total_items=archive.selection_count,
         )

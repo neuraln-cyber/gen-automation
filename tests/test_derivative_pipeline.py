@@ -402,23 +402,24 @@ async def test_plan_is_idempotent_and_cas_promotes_only_current_release(
         )
 
     async with approved_context.database.sessions() as session:
-        with pytest.raises(
-            DerivativePipelineConflictError,
-            match="phase does not allow rendering",
-        ):
-            await create_derivative_recipe_and_plan(
-                session,
-                review_task_id=approved_context.review_task_id,
-                configuration={"full": {"format": "PNG"}},
-                recipe_version=1,
-                renderer_version="renderer-v1",
-                pillow_version="12.0.0",
-                created_by_user_id=approved_context.owner_id,
-                approved_by_user_id=approved_context.owner_id,
-                idempotency_key="different-plan-key",
-                output_targets=("full",),
-                now=PLAN_AT,
-            )
+        duplicate_safe = await create_derivative_recipe_and_plan(
+            session,
+            review_task_id=approved_context.review_task_id,
+            configuration={"full": {"format": "PNG"}},
+            recipe_version=1,
+            renderer_version="renderer-v1",
+            pillow_version="12.0.0",
+            created_by_user_id=approved_context.owner_id,
+            approved_by_user_id=approved_context.owner_id,
+            idempotency_key="different-plan-key",
+            output_targets=("full",),
+            now=PLAN_AT,
+        )
+        assert duplicate_safe.jobs_created == 0
+        assert duplicate_safe.total_jobs == 2
+        release = await session.get(Release, approved_context.release_id)
+        assert release is not None
+        assert release.phase == ReleasePhase.RENDERING
 
 
 @pytest.mark.asyncio

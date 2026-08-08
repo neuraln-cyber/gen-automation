@@ -124,21 +124,30 @@ def test_awaiting_approval_is_action_required_and_does_not_poll() -> None:
     snapshot = _snapshot(destination)
     settings = _settings()
 
-    assert snapshot.destinations_need_retry
-    assert delivery_routes._can_render_destination_form(snapshot, settings=settings)
+    assert destination.state == "failed"
+    assert delivery_routes._can_prepare_target_destination(
+        snapshot,
+        settings=settings,
+        target="patreon",
+    )
+    assert not delivery_routes._can_prepare_target_destination(
+        snapshot,
+        settings=settings,
+        target="x",
+    )
     payload = delivery_routes._delivery_progress_payload(
         snapshot,
         finished_set_archive=None,
     )
     assert payload["archive"] == {
         "state": "not_started",
-        "detail": "Waiting for automatic ZIP preparation or an explicit request.",
+        "detail": "ZIP preparation has not been requested.",
         "archive_id": None,
         "worker_state": None,
         "part_count": 0,
         "parts": [],
     }
-    assert payload["poll_after_ms"] == 3000
+    assert payload["poll_after_ms"] is None
 
 
 @pytest.mark.parametrize(
@@ -228,4 +237,4 @@ async def test_dashboard_does_not_treat_patreon_packages_as_finished_set_archive
         finished_set_archive=None,
     )
     assert progress["archive"]["state"] == "not_started"
-    assert progress["poll_after_ms"] == 3000
+    assert progress["poll_after_ms"] is None

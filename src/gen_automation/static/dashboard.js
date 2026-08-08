@@ -1653,6 +1653,13 @@
     const liveStatus = panel.querySelector("[data-delivery-live-status]");
     const archiveStatus = document.querySelector("[data-delivery-archive-status]");
     const archiveDetail = document.querySelector("[data-delivery-archive-detail]");
+    const archiveCardStatus = document.querySelector("[data-delivery-archive-card-status]");
+    const patreonCard = document.querySelector('[data-destination="patreon"]');
+    const patreonStatus = patreonCard?.querySelector("[data-destination-status]");
+    const patreonDetail = patreonCard?.querySelector("[data-destination-detail]");
+    const xCard = document.querySelector('[data-destination="x"]');
+    const xStatus = xCard?.querySelector("[data-destination-status]");
+    const xDetail = xCard?.querySelector("[data-destination-detail]");
     const megaCard = document.querySelector('[data-destination="mega"]');
     const megaStatus = megaCard?.querySelector("[data-destination-status]");
     const megaDetail = megaCard?.querySelector("[data-destination-detail]");
@@ -1662,7 +1669,11 @@
     const megaRemoteRow = megaCard?.querySelector("[data-mega-remote-row]");
     const megaRemotePath = megaCard?.querySelector("[data-mega-remote-path]");
     const initialOutputState = panel.dataset.deliveryOutputState || "not_started";
+    const initialXOutputsReady = panel.dataset.deliveryXOutputsReady === "true";
     const initialArchiveState = panel.dataset.deliveryArchiveState || "not_started";
+    const initialPatreonState = patreonCard?.dataset.destinationState || "not_prepared";
+    const initialXState = xCard?.dataset.destinationState || "not_prepared";
+    const initialMegaState = megaCard?.dataset.destinationState || "not_prepared";
     let timer = null;
     let requestInFlight = false;
     let stopped = false;
@@ -1725,7 +1736,10 @@
         progress.textContent = `${succeeded} / ${totalJobs}`;
       }
 
-      if (state === "ready") {
+      if (state === "not_started") {
+        setText(outputStatus, "Ready to prepare clean full-set copies.");
+        setText(liveStatus, "Nothing is running until you choose Prepare clean full set.");
+      } else if (state === "ready") {
         setText(outputStatus, "All clean publishing copies are ready.");
         setText(liveStatus, "Copy preparation finished. Loading the next controls once.");
       } else if (state === "failed") {
@@ -1761,6 +1775,12 @@
       const state = knownStates.includes(archive.state) ? archive.state : "failed";
       const partCount = count(archive.part_count);
       const serverDetail = typeof archive.detail === "string" ? archive.detail.trim() : "";
+      if (archiveCardStatus instanceof HTMLElement) {
+        archiveCardStatus.className = `status ${state}`;
+        archiveCardStatus.textContent = state === "not_started"
+          ? "not started"
+          : state === "failed" ? "needs attention" : state;
+      }
       if (state === "ready") {
         setText(
           archiveStatus,
@@ -1783,7 +1803,7 @@
         setText(archiveStatus, "ZIP creation has not started.");
         setText(
           archiveDetail,
-          serverDetail || "Automatic preparation will start, or use Prepare ZIP download now.",
+          serverDetail || "Use Prepare ZIP download when you want a downloadable archive.",
         );
       }
       return state;
@@ -1798,7 +1818,10 @@
 
       if (megaStatus instanceof HTMLElement) {
         megaStatus.className = `status ${state}`;
-        megaStatus.textContent = state.replaceAll("_", " ");
+        megaStatus.textContent = state === "not_prepared"
+          ? "not started"
+          : state === "published" ? "complete"
+            : state === "failed" ? "needs attention" : state.replaceAll("_", " ");
       }
       setText(megaDetail, detail || "MEGA delivery status is unavailable.");
       setText(megaProgressLabel, `${completed} / ${total} images uploaded`);
@@ -1812,6 +1835,23 @@
       if (megaRemoteRow instanceof HTMLElement) megaRemoteRow.hidden = !remotePath;
       return state;
     };
+    const renderPublicationDestination = (destination, statusNode, detailNode) => {
+      if (!isRecord(destination)) return null;
+      const knownStates = [
+        "not_prepared", "queued", "running", "ready", "published", "unknown", "failed",
+      ];
+      const state = knownStates.includes(destination.state) ? destination.state : "failed";
+      const detail = typeof destination.detail === "string" ? destination.detail.trim() : "";
+      if (statusNode instanceof HTMLElement) {
+        statusNode.className = `status ${state}`;
+        statusNode.textContent = state === "not_prepared"
+          ? "not started"
+          : state === "published" ? "complete"
+            : state === "failed" ? "needs attention" : state.replaceAll("_", " ");
+      }
+      setText(detailNode, detail || "Destination status is unavailable.");
+      return state;
+    };
     const render = (payload) => {
       if (
         !isRecord(payload)
@@ -1821,22 +1861,45 @@
         || !isRecord(payload.mega)
       ) return null;
       const fullOutputsReady = payload.outputs.full_outputs_ready === true;
+      const xOutputsReady = payload.outputs.x_outputs_ready === true;
       const outputState = renderOutput(payload.outputs);
       const archiveState = renderArchive(payload.archive);
-      renderMega(payload.mega);
+      const megaState = renderMega(payload.mega);
+      const patreonState = renderPublicationDestination(
+        payload.patreon,
+        patreonStatus,
+        patreonDetail,
+      );
+      const xState = renderPublicationDestination(payload.x, xStatus, xDetail);
+      const providerControlsChanged = (
+        megaState !== initialMegaState
+        && !["not_prepared", "queued", "running"].includes(megaState)
+      ) || (
+        patreonState !== null
+        && patreonState !== initialPatreonState
+        && !["not_prepared", "queued", "running"].includes(patreonState)
+      ) || (
+        xState !== null
+        && xState !== initialXState
+        && !["not_prepared", "queued", "running"].includes(xState)
+      );
       if (
         (initialOutputState !== "ready" && outputState === "ready")
+        || (!initialXOutputsReady && xOutputsReady)
         || (initialArchiveState !== "ready" && archiveState === "ready")
         || (initialArchiveState !== "failed" && archiveState === "failed")
+        || providerControlsChanged
       ) {
         reloadForNewControls();
         return { polling: false, delay: null };
       }
       return {
         polling: outputState === "rendering"
+          || count(payload.outputs.active_jobs) > 0
           || archiveState === "preparing"
-          || (archiveState === "not_started" && fullOutputsReady)
-          || payload.mega.active === true,
+          || payload.mega.active === true
+          || payload.patreon?.active === true
+          || payload.x?.active === true,
         delay: payload.poll_after_ms,
       };
     };

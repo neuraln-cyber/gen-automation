@@ -3,9 +3,11 @@
 ## Result
 
 MEGA delivery consumes the provider-independent `FinishedSetArchive`. It does
-not wait for Patreon and it does not upload Patreon ZIP files. As soon as a
+not wait for Patreon and it does not upload Patreon ZIP files. The dashboard's
+explicit **Upload full set to MEGA** action persists that choice; as soon as its
 finished archive is ready, the background controller uploads every accepted
-full-resolution image as an ordinary file in one MEGA folder.
+full-resolution image as an ordinary file in one MEGA folder. Preparing or
+downloading a ZIP alone never requests MEGA.
 
 The source archive already freezes the accepted set in generation-queue order.
 The MEGA folder preserves that order with zero-padded filenames:

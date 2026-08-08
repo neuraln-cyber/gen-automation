@@ -6,6 +6,7 @@ from uuid import UUID
 
 import pytest
 from fastapi import FastAPI, HTTPException, Response, UploadFile
+from PIL import Image
 from sqlalchemy import select
 from starlette.datastructures import Headers
 from starlette.requests import Request
@@ -33,6 +34,8 @@ from gen_automation.services.derivative_pipeline import (
 )
 from gen_automation.services.review_derivatives import (
     prepare_completed_review_derivatives,
+    prepare_completed_review_full_outputs,
+    prepare_completed_review_x_teasers,
 )
 from gen_automation.services.watermarks import (
     WatermarkConflictError,
@@ -82,7 +85,7 @@ def _upload(payload: bytes, *, content_type: str = "image/png") -> UploadFile:
 
 
 @pytest.mark.asyncio
-async def test_one_action_plans_full_set_and_only_selected_watermarked_teaser(
+async def test_full_outputs_and_x_teasers_are_planned_independently(
     derivative_approved_context: ApprovedContext,
 ) -> None:
     approved = derivative_approved_context
@@ -128,6 +131,21 @@ async def test_one_action_plans_full_set_and_only_selected_watermarked_teaser(
         assert tuple(item.asset_id for item in await list_registered_watermarks(session)) == (
             watermark.asset_id,
         )
+        alternate_payload = io.BytesIO()
+        with Image.open(io.BytesIO(_watermark_png())) as alternate_image:
+            alternate_image = alternate_image.convert("RGBA")
+            alternate_image.putpixel((4, 3), (254, 255, 255, 220))
+            alternate_image.save(alternate_payload, format="PNG")
+        alternate_watermark = await register_watermark(
+            session,
+            store,
+            release_id=library.id,
+            display_name="Alternate X watermark",
+            png_bytes=alternate_payload.getvalue(),
+            registered_by_user_id=approved.owner_id,
+            idempotency_key="register-alternate-watermark",
+            now=PLAN_AT,
+        )
 
         session.add(
             ReviewXSelection(
@@ -140,27 +158,79 @@ async def test_one_action_plans_full_set_and_only_selected_watermarked_teaser(
         )
         await session.commit()
 
-        plan = await prepare_completed_review_derivatives(
+        full_plan = await prepare_completed_review_full_outputs(
             session,
             review_task_id=approved.review_task_id,
             actor_user_id=approved.owner_id,
-            idempotency_key="prepare-reviewed-set",
-            watermark_asset_id=watermark.asset_id,
+            idempotency_key="prepare-reviewed-full-set",
             now=PLAN_AT + timedelta(minutes=1),
         )
-        assert plan.jobs_created == 3
-        assert plan.total_jobs == 3
-        replay_plan = await prepare_completed_review_derivatives(
+        assert full_plan.jobs_created == 2
+        assert full_plan.total_jobs == 2
+        full_replay = await prepare_completed_review_full_outputs(
             session,
             review_task_id=approved.review_task_id,
             actor_user_id=approved.owner_id,
-            idempotency_key="prepare-reviewed-set",
-            watermark_asset_id=watermark.asset_id,
+            idempotency_key="prepare-reviewed-full-set",
             now=PLAN_AT + timedelta(minutes=1),
+        )
+        assert full_replay.replayed is True
+        assert full_replay.job_ids == full_plan.job_ids
+
+        release = await session.get(Release, approved.release_id)
+        assert release is not None
+        release.phase = ReleasePhase.READY_TO_PUBLISH
+        release.lock_version += 1
+        await session.commit()
+
+        x_plan = await prepare_completed_review_x_teasers(
+            session,
+            review_task_id=approved.review_task_id,
+            actor_user_id=approved.owner_id,
+            idempotency_key="prepare-reviewed-x-teasers",
+            watermark_asset_id=watermark.asset_id,
+            now=PLAN_AT + timedelta(minutes=2),
+        )
+        assert x_plan.jobs_created == 1
+        assert x_plan.total_jobs == 1
+        release = await session.get(Release, approved.release_id)
+        assert release is not None
+        assert release.phase == ReleasePhase.RENDERING
+        replay_plan = await prepare_completed_review_x_teasers(
+            session,
+            review_task_id=approved.review_task_id,
+            actor_user_id=approved.owner_id,
+            idempotency_key="prepare-reviewed-x-teasers",
+            watermark_asset_id=watermark.asset_id,
+            now=PLAN_AT + timedelta(minutes=2),
         )
         assert replay_plan.replayed is True
-        assert replay_plan.job_ids == plan.job_ids
-        assert replay_plan.total_jobs == 3
+        assert replay_plan.job_ids == x_plan.job_ids
+        assert replay_plan.total_jobs == 1
+        with pytest.raises(
+            DerivativePipelineConflictError,
+            match="selection target already has a different frozen recipe",
+        ):
+            await prepare_completed_review_x_teasers(
+                session,
+                review_task_id=approved.review_task_id,
+                actor_user_id=approved.owner_id,
+                idempotency_key="prepare-reviewed-x-teasers-alternate",
+                watermark_asset_id=alternate_watermark.asset_id,
+                now=PLAN_AT + timedelta(minutes=3),
+            )
+        await session.rollback()
+
+        compatibility_plan = await prepare_completed_review_derivatives(
+            session,
+            review_task_id=approved.review_task_id,
+            actor_user_id=approved.owner_id,
+            idempotency_key="prepare-reviewed-compatible",
+            watermark_asset_id=watermark.asset_id,
+            now=PLAN_AT + timedelta(minutes=4),
+        )
+        assert compatibility_plan.jobs_created == 0
+        assert compatibility_plan.total_jobs == 3
 
         jobs = tuple(
             (await session.scalars(select(DerivativeJob).order_by(DerivativeJob.logical_key))).all()
@@ -187,7 +257,51 @@ async def test_one_action_plans_full_set_and_only_selected_watermarked_teaser(
         full_jobs = [
             job for job in jobs if tuple(job.request_payload["output_targets"]) == ("full",)
         ]
+        assert all(job.request_payload["recipe"]["watermark_asset_id"] is None for job in full_jobs)
         assert all(job.available_at < selected_x_job.available_at for job in full_jobs)
+
+
+@pytest.mark.asyncio
+async def test_x_teaser_plan_requires_selection_and_registered_watermark(
+    derivative_approved_context: ApprovedContext,
+) -> None:
+    approved = derivative_approved_context
+    async with approved.database.sessions() as session:
+        with pytest.raises(
+            DerivativePipelineConflictError,
+            match="requires selected X images",
+        ):
+            await prepare_completed_review_x_teasers(
+                session,
+                review_task_id=approved.review_task_id,
+                actor_user_id=approved.owner_id,
+                idempotency_key="x-without-selection",
+                watermark_asset_id=None,
+                now=PLAN_AT,
+            )
+
+        session.add(
+            ReviewXSelection(
+                id=uuid7(),
+                review_task_id=approved.review_task_id,
+                asset_id=approved.raw_asset_ids[0],
+                selected_by_user_id=approved.owner_id,
+                selected_at=PLAN_AT,
+            )
+        )
+        await session.commit()
+        with pytest.raises(
+            DerivativePipelineConflictError,
+            match="require a registered watermark",
+        ):
+            await prepare_completed_review_x_teasers(
+                session,
+                review_task_id=approved.review_task_id,
+                actor_user_id=approved.owner_id,
+                idempotency_key="x-without-watermark",
+                watermark_asset_id=None,
+                now=PLAN_AT,
+            )
 
 
 @pytest.mark.asyncio

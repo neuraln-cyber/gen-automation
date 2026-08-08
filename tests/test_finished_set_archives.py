@@ -21,6 +21,7 @@ from gen_automation.db.models import (
     FinishedSetArchive,
     FinishedSetArchivePart,
     GenerationJob,
+    MegaSetDelivery,
     PublicationIntent,
     PublicationPackage,
     Release,
@@ -42,6 +43,7 @@ from gen_automation.services.finished_set_archives import (
     request_finished_set_archive,
     run_finished_set_archive_cycle,
 )
+from gen_automation.services.mega_set_delivery import ensure_next_mega_set_delivery
 from gen_automation.storage.base import ObjectMetadata
 from gen_automation.storage.memory import MemoryObjectStore, StoredObject
 from tests.image_privacy_assertions import (
@@ -175,6 +177,16 @@ async def test_archive_is_available_without_preparing_any_destination(
     assert "finished-ranked-set" in download.url
     assert audit_count == 1
 
+    async with approved.database.sessions() as session:
+        mega_created = await ensure_next_mega_set_delivery(
+            session,
+            remote_root="/sets",
+            now=ARCHIVE_AT + timedelta(seconds=3),
+        )
+        mega_count = await session.scalar(select(func.count(MegaSetDelivery.id)))
+    assert not mega_created
+    assert mega_count == 0
+
     part_row = next(
         part for part in prepared.store.objects.values() if part.content_type == "application/zip"
     )
@@ -206,6 +218,13 @@ async def test_archive_adopts_a_completed_write_after_response_loss(
     prepared = await _prepare(approved, store=store)
     await _cycle(prepared, worker_id="archive-retry-derivative")
     await _cycle(prepared, worker_id="archive-retry-derivative")
+    async with approved.database.sessions() as session:
+        await request_finished_set_archive(
+            session,
+            review_task_id=approved.review_task_id,
+            requested_by_user_id=approved.owner_id,
+            now=ARCHIVE_AT,
+        )
     store.lose_next_write_response = True
 
     first = await run_finished_set_archive_cycle(
@@ -257,6 +276,13 @@ async def test_presign_fails_closed_for_actor_binding_parts_and_storage_tamper(
     prepared = await _prepare(approved)
     await _cycle(prepared, worker_id="archive-hardening-derivative")
     await _cycle(prepared, worker_id="archive-hardening-derivative")
+    async with approved.database.sessions() as session:
+        await request_finished_set_archive(
+            session,
+            review_task_id=approved.review_task_id,
+            requested_by_user_id=approved.owner_id,
+            now=ARCHIVE_AT,
+        )
     result = await run_finished_set_archive_cycle(
         approved.database.sessions,
         prepared.store,
@@ -383,6 +409,13 @@ async def test_cancelled_cycle_resumes_from_durable_part_checkpoint(
     prepared = await _prepare(approved, store=store)
     await _cycle(prepared, worker_id="archive-checkpoint-derivative")
     await _cycle(prepared, worker_id="archive-checkpoint-derivative")
+    async with approved.database.sessions() as session:
+        await request_finished_set_archive(
+            session,
+            review_task_id=approved.review_task_id,
+            requested_by_user_id=approved.owner_id,
+            now=ARCHIVE_AT,
+        )
     monkeypatch.setattr(archives, "_MAX_IMAGES_PER_PART", 1)
 
     task = asyncio.create_task(
@@ -480,6 +513,12 @@ async def test_planner_full_outputs_archive_while_x_teaser_job_failed(
             (("full",), DerivativeJobState.SUCCEEDED),
             (("x_teaser",), DerivativeJobState.FAILED),
         }
+        await request_finished_set_archive(
+            session,
+            review_task_id=approved.review_task_id,
+            requested_by_user_id=approved.owner_id,
+            now=ARCHIVE_AT,
+        )
 
     result = await run_finished_set_archive_cycle(
         approved.database.sessions,
@@ -538,6 +577,12 @@ async def test_archive_uses_frozen_generation_order_after_live_lineage_changes(
         source_assets[1].generation_job_id = earlier_job.id
         source_assets[1].output_index = 0
         await session.commit()
+        await request_finished_set_archive(
+            session,
+            review_task_id=approved.review_task_id,
+            requested_by_user_id=approved.owner_id,
+            now=ARCHIVE_AT,
+        )
 
     result = await run_finished_set_archive_cycle(
         approved.database.sessions,

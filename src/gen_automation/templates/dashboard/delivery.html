@@ -3,7 +3,6 @@
   {% set output_state = delivery_progress.outputs.state %}
   {% set archive_state = delivery_progress.archive.state %}
   {% set mega_state = delivery_progress.mega.state %}
-  {% set poll_delivery = delivery_progress.poll_after_ms is not none %}
   <a class="back" href="/dashboard/review-tasks/{{ delivery.review_task_id }}">
     &larr; Completed review
   </a>
@@ -21,24 +20,20 @@
   <section
     class="panel review-summary step-panel panel-accent"
     aria-labelledby="outputs-heading"
-    {% if poll_delivery %}
-      data-delivery-progress
-      data-delivery-progress-url="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/progress"
-      data-delivery-output-state="{{ output_state }}"
-      data-delivery-archive-state="{{ archive_state }}"
-      data-delivery-mega-state="{{ mega_state }}"
-    {% endif %}
+    data-delivery-progress
+    data-delivery-progress-url="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/progress"
+    data-delivery-output-state="{{ output_state }}"
+    data-delivery-x-outputs-ready="{{ 'true' if delivery.progress.expected_x_teasers == 0 or delivery.progress.ready_x_teasers == delivery.progress.expected_x_teasers else 'false' }}"
+    data-delivery-archive-state="{{ archive_state }}"
+    data-delivery-mega-state="{{ mega_state }}"
   >
     <div class="step-heading">
       <span class="step-number" aria-hidden="true">1</span>
       <div>
-        <h2 id="outputs-heading">Preparing clean publishing copies</h2>
+        <h2 id="outputs-heading">Prepare clean full-set copies</h2>
         <p class="muted">
-          Your AI images are already finished. This step creates one clean publishing
-          copy for every accepted image. Only the
-          {{ delivery.x_selected_count }} image{% if delivery.x_selected_count != 1 %}s{% endif %}
-          selected for X get a separate watermarked teaser. ZIP creation happens
-          afterward.
+          This creates one reusable, metadata-free copy for every accepted image. It
+          does not watermark teasers, upload, post, or start any destination.
         </p>
       </div>
     </div>
@@ -103,48 +98,20 @@
     </dl>
 
     {% if not delivery.progress.planned %}
-      {% if delivery.x_selected_count %}
-        <form
-          class="decision-form"
-          method="post"
-          action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:prepare-outputs"
+      <form
+        method="post"
+        action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:prepare-outputs"
+      >
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input
+          type="hidden"
+          name="idempotency_key"
+          value="{{ output_idempotency_key }}"
         >
-          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <input
-            type="hidden"
-            name="idempotency_key"
-            value="{{ output_idempotency_key }}"
-          >
-          <input type="hidden" name="submission_id" value="{{ output_submission_id }}">
-          <label for="watermark-asset">Watermark for selected X teasers</label>
-          <select id="watermark-asset" name="watermark_asset_id" required>
-            <option value="">Choose a registered watermark</option>
-            {% for watermark in watermarks %}
-              <option value="{{ watermark.asset_id }}">
-                {{ watermark.display_name }} · {{ watermark.width }} × {{ watermark.height }}
-              </option>
-            {% endfor %}
-          </select>
-          <button class="primary-button" type="submit" {% if not watermarks %}disabled{% endif %}>
-            Prepare publishing copies
-          </button>
-        </form>
-      {% else %}
-        <form
-          method="post"
-          action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:prepare-outputs"
-        >
-          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <input
-            type="hidden"
-            name="idempotency_key"
-            value="{{ output_idempotency_key }}"
-          >
-          <input type="hidden" name="submission_id" value="{{ output_submission_id }}">
-          <input type="hidden" name="watermark_asset_id" value="">
-          <button class="primary-button" type="submit">Prepare publishing copies</button>
-        </form>
-      {% endif %}
+        <input type="hidden" name="submission_id" value="{{ output_submission_id }}">
+        <input type="hidden" name="watermark_asset_id" value="">
+        <button class="primary-button" type="submit">Prepare clean full set</button>
+      </form>
     {% elif output_state == "ready" %}
       <p class="terminal-state" role="status">All clean publishing copies are ready.</p>
     {% elif output_state == "failed" %}
@@ -170,8 +137,13 @@
     {% endif %}
   </section>
 
-  <section class="panel review-entry" aria-labelledby="finished-set-heading">
-    <div class="step-heading">
+  <section
+    class="panel review-entry delivery-destination-card"
+    aria-labelledby="finished-set-heading"
+    data-delivery-card="zip"
+  >
+    <div class="delivery-card-heading">
+      <div class="step-heading">
         <span class="step-number" aria-hidden="true">ZIP</span>
         <div>
           <h2 id="finished-set-heading">Download finished set</h2>
@@ -180,6 +152,18 @@
             <code>content/</code>. Each ZIP also includes the shared ordered manifest.
           </p>
         </div>
+      </div>
+      <span class="status {{ archive_state }}" data-delivery-archive-card-status>
+        {% if finished_set_archive %}
+          ready
+        {% elif archive_state == "preparing" %}
+          preparing
+        {% elif archive_state == "failed" %}
+          needs attention
+        {% else %}
+          not started
+        {% endif %}
+      </span>
     </div>
     <p class="muted">
         This ZIP is independent of publishing and the extracted MEGA upload. You can
@@ -245,41 +229,46 @@
         {% else %}
           <p class="terminal-state" role="status" data-delivery-archive-status>
             {% if delivery.progress.full_outputs_ready %}
-              Automatic ZIP preparation has not started yet. Use the fallback below to
-              start it now.
+              ZIP preparation has not started. Use the button below when you want a
+              downloadable copy.
+            {% elif delivery.progress.planned %}
+              Queue the ZIP now. It will wait for the clean full-set copies without
+              starting Patreon, MEGA, or X.
             {% else %}
-              Queue the ZIP now. It will start automatically as soon as the clean full-set
-              copies are ready, without waiting for Patreon, MEGA, or X.
+              Prepare the clean full set first. That prerequisite does not start
+              Patreon, MEGA, X, or the ZIP itself.
             {% endif %}
           </p>
         {% endif %}
-        <form
-          method="post"
-          action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:prepare-archive"
-        >
-          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <input
-            type="hidden"
-            name="idempotency_key"
-            value="{{ archive_idempotency_key }}"
+        {% if delivery.progress.planned %}
+          <form
+            method="post"
+            action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:prepare-archive"
           >
-          <input type="hidden" name="submission_id" value="{{ archive_submission_id }}">
-          <button class="primary-button" type="submit" {% if not storage_available %}disabled{% endif %}>
-            {% if finished_set_archive_snapshot and
-              finished_set_archive_snapshot.state.value == "failed" %}
-              Retry ZIP preparation
-            {% else %}
-              Prepare ZIP download
-            {% endif %}
-          </button>
-        </form>
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input
+              type="hidden"
+              name="idempotency_key"
+              value="{{ archive_idempotency_key }}"
+            >
+            <input type="hidden" name="submission_id" value="{{ archive_submission_id }}">
+            <button class="primary-button" type="submit" {% if not storage_available %}disabled{% endif %}>
+              {% if finished_set_archive_snapshot and
+                finished_set_archive_snapshot.state.value == "failed" %}
+                Retry ZIP preparation
+              {% else %}
+                Prepare ZIP download
+              {% endif %}
+            </button>
+          </form>
+        {% endif %}
         {% if not storage_available %}
           <p class="form-error">Private object storage is not configured.</p>
         {% endif %}
     {% endif %}
   </section>
 
-  {% if delivery.x_selected_count and not delivery.progress.planned %}
+  {% if delivery.x_selected_count and delivery.progress.ready_x_teasers != delivery.progress.expected_x_teasers %}
     <section class="panel review-entry" aria-labelledby="watermark-heading">
       <h2 id="watermark-heading">Add a watermark</h2>
       <p class="muted">
@@ -318,33 +307,30 @@
     </section>
   {% endif %}
 
-  <section class="panel review-entry step-panel" aria-labelledby="destinations-heading">
+  <section class="panel review-entry step-panel delivery-destinations" aria-labelledby="destinations-heading">
     <div class="step-heading">
       <span class="step-number" aria-hidden="true">2</span>
       <div>
-        <h2 id="destinations-heading">Delivery destinations</h2>
+        <h2 id="destinations-heading">Choose where this set goes</h2>
         <p class="muted">
-          MEGA receives the clean, full-resolution images automatically in generation
-          order. The action below prepares Patreon and only the selected X teasers;
-          neither one blocks MEGA.
+          ZIP, MEGA, Patreon, and X are separate. Start only the destination you want;
+          every other destination stays unchanged.
         </p>
       </div>
     </div>
 
-    <div class="review-entry" aria-labelledby="publication-switch-heading">
-      <div class="panel-heading">
-        <div>
-          <h3 id="publication-switch-heading">Publication switch</h3>
-          <p class="muted">
-            This global switch is stopped by default. Enabling it allows every
-            currently approved Patreon or X publication intent to run, not only this
-            release. It does not pause the private MEGA upload.
-          </p>
-        </div>
+    <details class="decision-details delivery-publication-switch">
+      <summary id="publication-switch-heading">
+        <span>Account-wide publishing switch</span>
         <span class="status {{ 'ready' if delivery.publishing_guard_enabled else 'stopped' }}">
           {{ 'enabled' if delivery.publishing_guard_enabled else 'stopped' }}
         </span>
-      </div>
+      </summary>
+      <div class="decision-fields">
+        <p class="muted">
+          This affects Patreon and X across the whole account, not just this set.
+          It never starts ZIP or MEGA delivery.
+        </p>
       {% if delivery.publishing_guard_changed_at %}
         <p class="muted">
           Last changed
@@ -405,17 +391,51 @@
           </button>
         </form>
       {% endif %}
-    </div>
+      </div>
+    </details>
 
-    <ul class="release-list">
+    <ul class="delivery-destination-grid">
       {% for destination in delivery.destinations %}
-        <li class="release-card" data-destination="{{ destination.key }}">
-          <h2>{{ destination.label }}</h2>
-          <span class="status {{ destination.state }}" data-destination-status>
-            {{ destination.state.replace("_", " ") }}
-          </span>
-          <p class="muted" data-destination-detail>{{ destination.detail }}</p>
+        <li
+          class="release-card delivery-destination-card"
+          data-destination="{{ destination.key }}"
+          data-destination-state="{{ destination.state }}"
+          data-delivery-card="{{ destination.key }}"
+        >
+          <div class="delivery-card-heading">
+            <div>
+              <p class="release-meta">
+                {% if destination.key == "mega" %}Full set upload{% elif destination.key == "patreon" %}Member delivery{% else %}Watermarked teasers{% endif %}
+              </p>
+              <h2>{{ destination.label }}</h2>
+            </div>
+            <span class="status {{ destination.state }}" data-destination-status>
+              {% if destination.state == "not_prepared" %}
+                not started
+              {% elif destination.state == "published" %}
+                complete
+              {% elif destination.state == "failed" %}
+                needs attention
+              {% else %}
+                {{ destination.state.replace("_", " ") }}
+              {% endif %}
+            </span>
+          </div>
+          <p class="muted" data-destination-detail>
+            {% if destination.key == "mega" and destination.state in ["queued", "running"] and not mega_configured %}
+              Queued; the MEGA delivery worker is paused.
+            {% elif destination.key in ["patreon", "x"] and destination.state in ["queued", "running"] and (not publishing_enabled or not delivery.publishing_guard_enabled) %}
+              Queued; {{ destination.label }} publishing is paused.
+            {% else %}
+              {{ destination.detail }}
+            {% endif %}
+          </p>
+
           {% if destination.key == "mega" %}
+            <p class="delivery-effect">
+              Uploads only the clean set to MEGA as ordinary full-resolution image files
+              in generation order.
+            </p>
             <div
               class="review-target-progress"
               data-mega-progress-region
@@ -426,7 +446,7 @@
                   {{ destination.completed_items or 0 }} /
                   {{ destination.total_items or 0 }} images uploaded
                 </strong>
-                <span class="muted">Original image bytes; no watermark or recompression.</span>
+                <span class="muted">No watermark, resize, or recompression.</span>
               </div>
               <progress
                 data-mega-progress
@@ -445,265 +465,267 @@
             >
               Folder: <code data-mega-remote-path>{{ destination.remote_path or "" }}</code>
             </p>
-          {% endif %}
-          {% if patreon_download_destination and
-            destination.intent_id == patreon_download_destination.intent_id %}
-            <div class="decision-form" aria-label="Patreon manual handoff ZIP files">
-              {% for package_part in patreon_download_destination.package_parts %}
+            {% if destination.state in ["not_prepared", "failed"] %}
+              {% if not mega_configured %}
+                <p class="form-error">MEGA is not connected. ZIP, Patreon, and X remain available.</p>
+              {% elif not delivery.progress.planned %}
+                <p class="terminal-state">
+                  Prepare the clean full set first, then you can queue MEGA while it renders.
+                </p>
+              {% else %}
                 <form
+                  class="delivery-card-action"
                   method="post"
-                  action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/patreon/{{ destination.intent_id }}:download"
+                  action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:prepare-mega"
                 >
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                  <input
-                    type="hidden"
-                    name="expected_intent_digest"
-                    value="{{ destination.intent_digest }}"
-                  >
-                  <input
-                    type="hidden"
-                    name="expected_lock_version"
-                    value="{{ destination.intent_lock_version }}"
-                  >
-                  <input type="hidden" name="part_number" value="{{ package_part.part_number }}">
-                  <button class="secondary-button" type="submit">
-                    {% if package_part.part_count == 1 %}
-                      Download Patreon handoff ZIP
+                  <input type="hidden" name="idempotency_key" value="{{ mega_idempotency_key }}">
+                  <input type="hidden" name="submission_id" value="{{ mega_submission_id }}">
+                  <button class="primary-button" type="submit">
+                    {% if destination.state == "failed" %}
+                      Retry MEGA upload
+                    {% elif delivery.progress.full_outputs_ready %}
+                      Upload full set to MEGA
                     {% else %}
-                      Download Patreon handoff part {{ package_part.part_number }} /
-                      {{ package_part.part_count }}
+                      Queue full set for MEGA
                     {% endif %}
                   </button>
+                  {% if not delivery.progress.full_outputs_ready %}
+                    <p class="muted delivery-action-note">
+                      Your choice is saved now; upload starts when the clean copies are ready.
+                    </p>
+                  {% endif %}
                 </form>
-              {% endfor %}
-            </div>
-          {% endif %}
-          {% if destination.key == "patreon" and destination.state in ["ready", "unknown"] %}
-            <div class="decision-form">
-              <h3>
-                {% if destination.state == "unknown" %}
-                  Resolve the unknown browser result
+              {% endif %}
+            {% elif destination.state in ["queued", "running"] %}
+              <p class="terminal-state" role="status">
+                {% if mega_configured %}
+                  MEGA is working in the background. Other options remain available.
                 {% else %}
-                  Record the completed manual publish
+                  The MEGA upload is queued and will resume when its worker is enabled.
                 {% endif %}
-              </h3>
-              <p class="muted">
-                Check Patreon first. Confirming the post here never runs the browser
-                publisher again.
               </p>
-              <form
-                method="post"
-                action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/patreon/{{ destination.intent_id }}:confirm-present"
-                data-requires-recent-auth
-              >
-                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                <input
-                  type="hidden"
-                  name="idempotency_key"
-                  value="{{ patreon_present_idempotency_key }}"
-                >
-                <input
-                  type="hidden"
-                  name="expected_intent_digest"
-                  value="{{ destination.intent_digest }}"
-                >
-                <input
-                  type="hidden"
-                  name="expected_lock_version"
-                  value="{{ destination.intent_lock_version }}"
-                >
-                <input
-                  type="hidden"
-                  name="attestation"
-                  value="{{ patreon_present_attestation }}"
-                >
-                <label>
-                  Patreon post ID
-                  <input
-                    name="remote_identifier"
-                    inputmode="numeric"
-                    pattern="[0-9]{1,20}"
-                    maxlength="20"
-                    required
-                  >
-                </label>
-                <label>
-                  Confirmed Patreon post URL
-                  <input name="remote_url" type="url" maxlength="2048" required>
-                </label>
-                <label>
-                  Evidence checked
-                  <textarea name="evidence" maxlength="20000" rows="3" required></textarea>
-                </label>
-                <button class="primary-button" type="submit">Confirm post exists</button>
-              </form>
-              {% if destination.state == "unknown" %}
+            {% endif %}
+
+          {% elif destination.key == "patreon" %}
+            <p class="delivery-effect">
+              Prepares and sends only the clean member set to Patreon.
+            </p>
+            {% if destination.state in ["not_prepared", "failed"] %}
+              {% if not publishing_enabled %}
+                <p class="form-error">Patreon publishing is not enabled. Other options remain available.</p>
+              {% elif not delivery.publishing_guard_enabled %}
+                <p class="form-error">Turn on the account-wide publishing switch before sending to Patreon.</p>
+              {% elif not can_prepare_patreon_destination or not previews %}
+                <p class="terminal-state">Waiting for clean full-set copies and preview choices.</p>
+              {% else %}
                 <form
+                  class="set-form delivery-destination-form"
                   method="post"
-                  action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/patreon/{{ destination.intent_id }}:confirm-absent"
+                  action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:prepare-patreon"
                   data-requires-recent-auth
                 >
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                  <input
-                    type="hidden"
-                    name="idempotency_key"
-                    value="{{ patreon_absent_idempotency_key }}"
-                  >
-                  <input
-                    type="hidden"
-                    name="expected_intent_digest"
-                    value="{{ destination.intent_digest }}"
-                  >
-                  <input
-                    type="hidden"
-                    name="expected_lock_version"
-                    value="{{ destination.intent_lock_version }}"
-                  >
-                  <input
-                    type="hidden"
-                    name="attestation"
-                    value="{{ patreon_absent_attestation }}"
-                  >
-                  <label>
-                    Evidence the post was not created
-                    <textarea name="evidence" maxlength="20000" rows="3" required></textarea>
-                  </label>
-                  <button class="secondary-button" type="submit">
-                    Confirm absent and use manual package
+                  <input type="hidden" name="idempotency_key" value="{{ patreon_destination_idempotency_key }}">
+                  <input type="hidden" name="submission_id" value="{{ patreon_destination_submission_id }}">
+                  <input type="hidden" name="public_preview_attested_at" value="{{ public_preview_attested_at }}">
+                  <details class="decision-details">
+                    <summary>Patreon post settings</summary>
+                    <div class="decision-fields">
+                      <label>
+                        Title
+                        <input name="patreon_title" maxlength="500" value="{{ delivery.release_title }}" required>
+                      </label>
+                      <label>
+                        Body
+                        <textarea name="patreon_body" maxlength="20000" rows="4">Full image set: {{ delivery.release_title }}</textarea>
+                      </label>
+                      <div class="form-grid">
+                        <label>
+                          Tier / audience
+                          <input name="patreon_tier" maxlength="500" value="Paid members" required>
+                        </label>
+                        <label>
+                          Tags, comma separated
+                          <input name="patreon_tags" maxlength="2000" value="">
+                        </label>
+                      </div>
+                    </div>
+                  </details>
+                  <fieldset class="delivery-preview-fieldset">
+                    <legend>Public Patreon preview</legend>
+                    <p class="muted">Choose one image you have checked as safe for public Patreon surfaces.</p>
+                    <div class="delivery-preview-grid">
+                      {% for preview in previews %}
+                        <label class="delivery-preview-option">
+                          <img
+                            class="asset-preview"
+                            src="{{ preview.url }}"
+                            alt="Accepted clean output {{ preview.display_order }}"
+                            width="{{ preview.width }}"
+                            height="{{ preview.height }}"
+                            loading="lazy"
+                          >
+                          <span>
+                            <input
+                              type="radio"
+                              name="public_preview_output_id"
+                              value="{{ preview.output_id }}"
+                              {% if loop.first %}checked{% endif %}
+                              required
+                            >
+                            Image {{ preview.display_order }}
+                          </span>
+                        </label>
+                      {% endfor %}
+                    </div>
+                    <label class="delivery-attestation">
+                      <input type="checkbox" name="public_preview_safe" value="true" required>
+                      I checked this preview and confirm it is safe for public Patreon surfaces.
+                    </label>
+                  </fieldset>
+                  <button class="primary-button" type="submit">
+                    {{ "Retry Patreon delivery" if destination.state == "failed" else "Send full set to Patreon" }}
                   </button>
+                  <p class="muted delivery-action-note">This button does not start MEGA, X, or ZIP preparation.</p>
                 </form>
               {% endif %}
-            </div>
+            {% endif %}
+
+            {% if patreon_download_destination and destination.intent_id == patreon_download_destination.intent_id %}
+              <div class="decision-form" aria-label="Patreon manual handoff ZIP files">
+                {% for package_part in patreon_download_destination.package_parts %}
+                  <form
+                    method="post"
+                    action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/patreon/{{ destination.intent_id }}:download"
+                  >
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="expected_intent_digest" value="{{ destination.intent_digest }}">
+                    <input type="hidden" name="expected_lock_version" value="{{ destination.intent_lock_version }}">
+                    <input type="hidden" name="part_number" value="{{ package_part.part_number }}">
+                    <button class="secondary-button" type="submit">
+                      {% if package_part.part_count == 1 %}
+                        Download Patreon handoff ZIP
+                      {% else %}
+                        Download Patreon handoff part {{ package_part.part_number }} / {{ package_part.part_count }}
+                      {% endif %}
+                    </button>
+                  </form>
+                {% endfor %}
+              </div>
+            {% endif %}
+            {% if destination.state in ["ready", "unknown"] %}
+              <details class="decision-details delivery-recovery">
+                <summary>
+                  {% if destination.state == "unknown" %}Resolve unknown Patreon result{% else %}Record a manual Patreon publish{% endif %}
+                </summary>
+                <div class="decision-fields">
+                  <p class="muted">Check Patreon first. These controls never run the publisher again.</p>
+                  <form
+                    class="decision-form"
+                    method="post"
+                    action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/patreon/{{ destination.intent_id }}:confirm-present"
+                    data-requires-recent-auth
+                  >
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="idempotency_key" value="{{ patreon_present_idempotency_key }}">
+                    <input type="hidden" name="expected_intent_digest" value="{{ destination.intent_digest }}">
+                    <input type="hidden" name="expected_lock_version" value="{{ destination.intent_lock_version }}">
+                    <input type="hidden" name="attestation" value="{{ patreon_present_attestation }}">
+                    <label>Patreon post ID <input name="remote_identifier" inputmode="numeric" pattern="[0-9]{1,20}" maxlength="20" required></label>
+                    <label>Confirmed post URL <input name="remote_url" type="url" maxlength="2048" required></label>
+                    <label>Evidence checked <textarea name="evidence" maxlength="20000" rows="3" required></textarea></label>
+                    <button class="primary-button" type="submit">Confirm post exists</button>
+                  </form>
+                  {% if destination.state == "unknown" %}
+                    <form
+                      class="decision-form"
+                      method="post"
+                      action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/patreon/{{ destination.intent_id }}:confirm-absent"
+                      data-requires-recent-auth
+                    >
+                      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                      <input type="hidden" name="idempotency_key" value="{{ patreon_absent_idempotency_key }}">
+                      <input type="hidden" name="expected_intent_digest" value="{{ destination.intent_digest }}">
+                      <input type="hidden" name="expected_lock_version" value="{{ destination.intent_lock_version }}">
+                      <input type="hidden" name="attestation" value="{{ patreon_absent_attestation }}">
+                      <label>Evidence the post was not created <textarea name="evidence" maxlength="20000" rows="3" required></textarea></label>
+                      <button class="secondary-button" type="submit">Confirm absent and use manual package</button>
+                    </form>
+                  {% endif %}
+                </div>
+              </details>
+            {% endif %}
+
+          {% elif destination.key == "x" %}
+            <p class="delivery-effect">
+              Posts only the {{ delivery.x_selected_count }} selected, watermarked teaser{% if delivery.x_selected_count != 1 %}s{% endif %} to X.
+            </p>
+            {% if not delivery.x_selected_count %}
+              <p class="terminal-state">No teaser images were selected for this set.</p>
+            {% elif destination.state in ["not_prepared", "failed"] %}
+              {% set x_teasers_ready = delivery.progress.ready_x_teasers == delivery.progress.expected_x_teasers %}
+              {% if not x_teasers_ready %}
+                <form
+                  class="decision-form delivery-card-action"
+                  method="post"
+                  action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:prepare-x-outputs"
+                >
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="idempotency_key" value="{{ x_output_idempotency_key }}">
+                  <input type="hidden" name="submission_id" value="{{ x_output_submission_id }}">
+                  <label for="x-watermark-asset">Watermark for these X teasers</label>
+                  <select id="x-watermark-asset" name="watermark_asset_id" required>
+                    <option value="">Choose a registered watermark</option>
+                    {% for watermark in watermarks %}
+                      <option value="{{ watermark.asset_id }}">
+                        {{ watermark.display_name }} · {{ watermark.width }} × {{ watermark.height }}
+                      </option>
+                    {% endfor %}
+                  </select>
+                  <button class="secondary-button" type="submit" {% if not watermarks %}disabled{% endif %}>
+                    Prepare watermarked X teasers
+                  </button>
+                  {% if not watermarks %}
+                    <p class="form-error">Add a watermark in the section above before preparing X teasers.</p>
+                  {% endif %}
+                  <p class="muted delivery-action-note">
+                    This creates only the selected teaser copies. It does not post them.
+                  </p>
+                </form>
+              {% elif not publishing_enabled %}
+                <p class="form-error">X publishing is not enabled. Other options remain available.</p>
+              {% elif not delivery.publishing_guard_enabled %}
+                <p class="form-error">Turn on the account-wide publishing switch before posting to X.</p>
+              {% elif not x_configured %}
+                <p class="form-error">Connect the X account before posting. Other options remain available.</p>
+              {% elif not can_prepare_x_destination %}
+                <p class="terminal-state">Waiting for the selected watermarked teasers.</p>
+              {% else %}
+                <form
+                  class="set-form delivery-destination-form"
+                  method="post"
+                  action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:prepare-x"
+                  data-requires-recent-auth
+                >
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="idempotency_key" value="{{ x_destination_idempotency_key }}">
+                  <input type="hidden" name="submission_id" value="{{ x_destination_submission_id }}">
+                  <label>
+                    Post text
+                    <textarea name="x_text" maxlength="2000" rows="4" required>New set: {{ delivery.release_title }}</textarea>
+                  </label>
+                  <button class="primary-button" type="submit">
+                    {% if destination.state == "failed" %}Retry X post{% else %}Post {{ delivery.x_selected_count }} teaser{% if delivery.x_selected_count != 1 %}s{% endif %} to X{% endif %}
+                  </button>
+                  <p class="muted delivery-action-note">This button does not start MEGA, Patreon, or ZIP preparation.</p>
+                </form>
+              {% endif %}
+            {% endif %}
           {% endif %}
         </li>
       {% endfor %}
     </ul>
-
-    {% if not publishing_enabled %}
-      <p class="form-error">
-        Patreon and X publication workers are not enabled yet. Configure them before
-        live testing; the private MEGA upload is independent.
-      </p>
-    {% elif not delivery.publishing_guard_enabled %}
-      <p class="form-error">
-        The existing global publication guard is stopped. Enable it before preparing
-        Patreon or X; it does not stop MEGA.
-      </p>
-    {% elif delivery.x_selected_count and not x_configured %}
-      <p class="form-error">
-        Add the X OAuth secret reference before preparing destinations.
-      </p>
-    {% elif delivery.progress.ready_for_destinations and
-      (not delivery.destinations_prepared or delivery.destinations_need_retry) %}
-      <form
-        class="set-form"
-        method="post"
-        action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:prepare-destinations"
-        data-requires-recent-auth
-      >
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <input
-          type="hidden"
-          name="idempotency_key"
-          value="{{ destination_idempotency_key }}"
-        >
-        <input
-          type="hidden"
-          name="submission_id"
-          value="{{ destination_submission_id }}"
-        >
-        <input
-          type="hidden"
-          name="public_preview_attested_at"
-          value="{{ public_preview_attested_at }}"
-        >
-        <fieldset>
-          <legend>Patreon package</legend>
-          <label>
-            Title
-            <input name="patreon_title" maxlength="500" value="{{ delivery.release_title }}" required>
-          </label>
-          <label>
-            Body
-            <textarea name="patreon_body" maxlength="20000" rows="5">Full image set: {{ delivery.release_title }}</textarea>
-          </label>
-          <div class="form-grid">
-            <label>
-              Tier / audience
-              <input name="patreon_tier" maxlength="500" value="Paid members" required>
-            </label>
-            <label>
-              Tags, comma separated
-              <input name="patreon_tags" maxlength="2000" value="">
-            </label>
-          </div>
-        </fieldset>
-
-        <fieldset>
-          <legend>Public Patreon preview</legend>
-          <p class="muted">
-            Patreon requires one human-confirmed public-safe preview. It is copied
-            from a clean full output; the member set remains unwatermarked.
-          </p>
-          <div class="release-list">
-            {% for preview in previews %}
-              <label class="release-card">
-                <img
-                  class="asset-preview"
-                  src="{{ preview.url }}"
-                  alt="Accepted clean output {{ preview.display_order }}"
-                  width="{{ preview.width }}"
-                  height="{{ preview.height }}"
-                  loading="lazy"
-                >
-                <span>
-                  <input
-                    type="radio"
-                    name="public_preview_output_id"
-                    value="{{ preview.output_id }}"
-                    {% if loop.first %}checked{% endif %}
-                    required
-                  >
-                  Use image {{ preview.display_order }} as the public preview
-                </span>
-              </label>
-            {% endfor %}
-          </div>
-          <label>
-            <input type="checkbox" name="public_preview_safe" value="true" required>
-            I checked the selected preview and confirm it has no nudity or sexually
-            explicit content and is safe for public Patreon surfaces.
-          </label>
-        </fieldset>
-
-        <fieldset>
-          <legend>X teaser post</legend>
-          {% if delivery.x_selected_count %}
-            <label>
-              Post text
-              <textarea name="x_text" maxlength="2000" rows="3" required>New set: {{ delivery.release_title }}</textarea>
-            </label>
-          {% else %}
-            <input type="hidden" name="x_text" value="">
-            <p class="muted">No X teasers were selected for this set.</p>
-          {% endif %}
-        </fieldset>
-        <button class="primary-button" type="submit">Prepare Patreon and X</button>
-      </form>
-    {% endif %}
-
-    <p class="muted">
-      Patreon uses the configured persistent signed-in browser publisher when it is
-      enabled. Manual package download remains the fallback, and an unknown browser
-      result must be reconciled before it becomes available. MEGA independently uploads
-      the sorted set as ordinary full-resolution image files and writes its manifest last.
-    </p>
-    {% if not mega_configured %}
-      <p class="muted">
-        MEGA will remain queued until its pre-authenticated uploader is enabled; Patreon
-        and X can still proceed.
-      </p>
-    {% endif %}
   </section>
 
   <dialog

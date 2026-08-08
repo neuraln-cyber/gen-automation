@@ -115,6 +115,20 @@ _MAX_SAFE_ERROR_BYTES = 500
 _MAX_APPROVAL_SECONDS = 3_600
 _MIN_APPROVAL_SECONDS = 60
 _PLAN_IDEMPOTENCY_DAYS = 30
+_PUBLISHABLE_RELEASE_PHASES = frozenset(
+    {
+        ReleasePhase.RENDERING,
+        ReleasePhase.READY_TO_PUBLISH,
+        ReleasePhase.PUBLISHING,
+        ReleasePhase.PUBLISHED,
+    }
+)
+_SUPERSEDABLE_INTENT_STATES = frozenset(
+    {
+        PublicationIntentState.FAILED,
+        PublicationIntentState.CANCELLED,
+    }
+)
 
 type PublicationInputRole = Literal[
     "x_teaser",
@@ -318,7 +332,7 @@ async def plan_publication_intent(
     if release_row is None:
         raise PublicationNotFoundError("release version was not found")
     release, release_version = release_row
-    _require_current_ready_release(release, release_version)
+    _require_current_publishable_release(release, release_version)
     await _require_current_compliance_approvals(session, release_version)
 
     frozen_outputs = await _load_frozen_outputs(
@@ -368,6 +382,19 @@ async def plan_publication_intent(
     scope = (
         f"release-version:{release_version.id}:publication:{publication_target_value.value}:plan"
     )
+    target_intents = tuple(
+        (
+            await session.scalars(
+                select(PublicationIntent)
+                .where(
+                    PublicationIntent.release_id == release.id,
+                    PublicationIntent.target == publication_target_value,
+                )
+                .order_by(PublicationIntent.planned_at.desc(), PublicationIntent.id.desc())
+                .with_for_update()
+            )
+        ).all()
+    )
     replay = await _intent_replay(
         session,
         scope=scope,
@@ -375,14 +402,17 @@ async def plan_publication_intent(
         request_sha256=request_sha256,
     )
     if replay is not None:
-        return replay
-
-    existing = await session.scalar(
-        select(PublicationIntent).where(
-            PublicationIntent.release_version_id == release_version.id,
-            PublicationIntent.target == publication_target_value,
-            PublicationIntent.configuration_sha256 == configuration_sha256,
+        replay_intent = next(
+            (intent for intent in target_intents if intent.id == replay.intent_id),
+            None,
         )
+        if replay_intent is None:
+            raise PublicationConflictError("publication idempotency snapshot is unavailable")
+        _require_single_target_owner(target_intents, owner_intent_id=replay_intent.id)
+        return replay
+    existing = next(
+        (intent for intent in target_intents if intent.intent_digest == intent_digest),
+        None,
     )
     if existing is not None:
         if (
@@ -393,6 +423,7 @@ async def plan_publication_intent(
             raise PublicationConflictError(
                 "the provider/configuration identity is already frozen with different inputs"
             )
+        _require_single_target_owner(target_intents, owner_intent_id=existing.id)
         result = _intent_result(existing, replayed=True)
         session.add(
             _idempotency_record(
@@ -406,6 +437,11 @@ async def plan_publication_intent(
         )
         await session.commit()
         return result
+
+    if any(intent.state not in _SUPERSEDABLE_INTENT_STATES for intent in target_intents):
+        raise PublicationConflictError(
+            "another publication intent already owns this release target"
+        )
 
     intent = PublicationIntent(
         id=uuid7(),
@@ -585,11 +621,12 @@ async def approve_publication_intent(
     if intent.state not in {
         PublicationIntentState.AWAITING_APPROVAL,
         PublicationIntentState.FAILED,
+        PublicationIntentState.CANCELLED,
     }:
         raise PublicationConflictError("publication intent is not awaiting approval")
 
     release, release_version = await _load_intent_release(session, intent, lock=True)
-    _require_current_ready_release(release, release_version)
+    _require_current_publishable_release(release, release_version)
     await _require_current_compliance_approvals(session, release_version)
     inputs = tuple(
         (
@@ -828,7 +865,7 @@ async def revoke_publication_intent(
         PublicationIntentState.CANCELLED,
     }:
         raise PublicationConflictError("publication intent can no longer be revoked")
-    await _load_and_require_current_ready_intent_release(session, intent)
+    await _load_and_require_current_publishable_intent_release(session, intent)
 
     revision = (
         int(
@@ -1417,7 +1454,7 @@ async def presign_patreon_package_download(
         or intent.state != PublicationIntentState.AWAITING_HUMAN
     ):
         raise PublicationConflictError("Patreon package is not awaiting human handoff")
-    await _load_and_require_current_ready_intent_release(session, intent)
+    await _load_and_require_current_publishable_intent_release(session, intent)
     attempt = await session.scalar(
         select(PublicationAttempt)
         .where(PublicationAttempt.intent_id == intent.id)
@@ -1765,7 +1802,7 @@ async def require_effect_authorization(
 
     effective_at = _as_utc(now)
     release, release_version = await _load_intent_release(session, intent, lock=False)
-    _require_current_ready_release(release, release_version)
+    _require_current_publishable_release(release, release_version)
     await _require_current_compliance_approvals(session, release_version)
     if intent.state not in {
         PublicationIntentState.READY,
@@ -2199,27 +2236,41 @@ async def _load_intent_release(
     return row[0], row[1]
 
 
-async def _load_and_require_current_ready_intent_release(
+async def _load_and_require_current_publishable_intent_release(
     session: AsyncSession,
     intent: PublicationIntent,
 ) -> tuple[Release, ReleaseVersion]:
     release, version = await _load_intent_release(session, intent, lock=True)
-    _require_current_ready_release(release, version)
+    _require_current_publishable_release(release, version)
     await _require_current_compliance_approvals(session, version)
     return release, version
 
 
-def _require_current_ready_release(
+def _require_current_publishable_release(
     release: Release,
     version: ReleaseVersion,
 ) -> None:
     if (
         version.release_id != release.id
         or release.current_version_no != version.version_no
-        or release.phase != ReleasePhase.READY_TO_PUBLISH
+        or release.phase not in _PUBLISHABLE_RELEASE_PHASES
     ):
         raise PublicationConflictError(
-            "publication requires the exact current READY_TO_PUBLISH release version"
+            "publication requires the exact current publishable release version"
+        )
+
+
+def _require_single_target_owner(
+    intents: tuple[PublicationIntent, ...],
+    *,
+    owner_intent_id: UUID,
+) -> None:
+    if any(
+        intent.id != owner_intent_id and intent.state not in _SUPERSEDABLE_INTENT_STATES
+        for intent in intents
+    ):
+        raise PublicationConflictError(
+            "another publication intent already owns this release target"
         )
 
 

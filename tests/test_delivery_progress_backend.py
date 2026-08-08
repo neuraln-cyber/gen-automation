@@ -22,6 +22,7 @@ from gen_automation.services.finished_set_archives import (
     FinishedSetArchiveSnapshot,
 )
 from gen_automation.services.operator_delivery import (
+    DeliveryOutput,
     DerivativeProgress,
     DestinationState,
     OperatorDeliveryNotFoundError,
@@ -53,9 +54,11 @@ def _snapshot(
     progress: DerivativeProgress | None = None,
     patreon: DestinationState | None = None,
     mega: DestinationState | None = None,
+    x: DestinationState | None = None,
     publishing_guard_enabled: bool = True,
     x_selected_count: int = 0,
 ) -> OperatorDeliverySnapshot:
+    resolved_progress = progress or _progress()
     return OperatorDeliverySnapshot(
         review_task_id=uuid4(),
         review_state=ReviewTaskState.COMPLETED,
@@ -64,9 +67,21 @@ def _snapshot(
         release_title="Ranked set",
         release_phase=ReleasePhase.RENDERING,
         x_selected_count=x_selected_count,
-        progress=progress or _progress(),
+        progress=resolved_progress,
         full_outputs=(),
-        x_outputs=(),
+        x_outputs=tuple(
+            DeliveryOutput(
+                output_id=uuid4(),
+                selection_id=uuid4(),
+                display_order=index + 1,
+                target="x_teaser",
+                object_key=f"x/{index + 1}.png",
+                object_version_id="version",
+                width=1200,
+                height=1600,
+            )
+            for index in range(min(x_selected_count, resolved_progress.ready_x_teasers))
+        ),
         publishing_guard_enabled=publishing_guard_enabled,
         publishing_guard_epoch=4,
         publishing_guard_lock_version=8,
@@ -80,7 +95,7 @@ def _snapshot(
                 detail="Not prepared.",
             ),
             mega or DestinationState("mega", "MEGA", "not_prepared", "Not prepared."),
-            DestinationState("x", "X", "not_prepared", "Not prepared."),
+            x or DestinationState("x", "X", "not_prepared", "Not prepared."),
         ),
     )
 
@@ -143,6 +158,7 @@ def _archive(
             "Archive worker failed." if state == FinishedSetArchiveState.FAILED else None
         ),
         parts=parts,
+        requested_by_user_id=uuid4(),
     )
 
 
@@ -252,6 +268,7 @@ def test_delivery_progress_payload_reports_ready_archive_parts_in_global_order()
         "outputs": {
             "state": "ready",
             "full_outputs_ready": True,
+            "x_outputs_ready": True,
             "planned": True,
             "total_jobs": 3,
             "requested": 0,
@@ -294,6 +311,16 @@ def test_delivery_progress_payload_reports_ready_archive_parts_in_global_order()
             "total_items": None,
             "remote_path": None,
         },
+        "patreon": {
+            "state": "not_prepared",
+            "active": False,
+            "detail": "Not prepared.",
+        },
+        "x": {
+            "state": "not_prepared",
+            "active": False,
+            "detail": "Not prepared.",
+        },
         "poll_after_ms": None,
     }
 
@@ -330,6 +357,76 @@ def test_delivery_progress_keeps_polling_for_active_extracted_mega_upload() -> N
 
 
 @pytest.mark.parametrize(
+    ("target", "publishing_enabled", "guard_enabled", "expected_detail"),
+    [
+        ("patreon", False, True, "Queued; Patreon publishing is paused."),
+        ("patreon", True, False, "Queued; Patreon publishing is paused."),
+        ("x", False, True, "Queued; X publishing is paused."),
+        ("x", True, False, "Queued; X publishing is paused."),
+    ],
+)
+def test_delivery_progress_does_not_poll_for_paused_publication_workers(
+    target: str,
+    publishing_enabled: bool,
+    guard_enabled: bool,
+    expected_detail: str,
+) -> None:
+    queued = DestinationState(
+        target,
+        target.title(),
+        "queued",
+        "Approved publication is queued.",
+    )
+    snapshot = _snapshot(
+        patreon=queued if target == "patreon" else None,
+        x=queued if target == "x" else None,
+        publishing_guard_enabled=guard_enabled,
+    )
+
+    payload = delivery_routes._delivery_progress_payload(
+        snapshot,
+        finished_set_archive=None,
+        publishing_enabled=publishing_enabled,
+    )
+
+    destination = payload[target]
+    assert isinstance(destination, dict)
+    assert destination["active"] is False
+    assert destination["detail"] == expected_detail
+    assert payload["poll_after_ms"] is None
+
+
+def test_delivery_progress_does_not_poll_for_paused_mega_worker() -> None:
+    snapshot = _snapshot(
+        mega=DestinationState(
+            "mega",
+            "MEGA",
+            "queued",
+            "MEGA upload is queued.",
+            completed_items=0,
+            total_items=125,
+            remote_path="/Future/Example",
+        ),
+    )
+
+    payload = delivery_routes._delivery_progress_payload(
+        snapshot,
+        finished_set_archive=_archive(snapshot),
+        mega_enabled=False,
+    )
+
+    assert payload["mega"] == {
+        "state": "queued",
+        "active": False,
+        "detail": "Queued; the MEGA delivery worker is paused.",
+        "completed_items": 0,
+        "total_items": 125,
+        "remote_path": "/Future/Example",
+    }
+    assert payload["poll_after_ms"] is None
+
+
+@pytest.mark.parametrize(
     ("archive_state", "expected", "poll"),
     [
         (FinishedSetArchiveState.PENDING, "preparing", 3000),
@@ -356,7 +453,7 @@ def test_delivery_progress_archive_state_is_independent_of_publication_destinati
     assert payload["poll_after_ms"] == poll
 
 
-def test_delivery_progress_polls_for_auto_discovery_without_an_archive_row() -> None:
+def test_delivery_progress_does_not_poll_for_unrequested_archive() -> None:
     snapshot = _snapshot(publishing_guard_enabled=False)
 
     payload = delivery_routes._delivery_progress_payload(
@@ -366,7 +463,16 @@ def test_delivery_progress_polls_for_auto_discovery_without_an_archive_row() -> 
 
     assert payload["archive"]["state"] == "not_started"
     assert payload["archive"]["archive_id"] is None
-    assert payload["poll_after_ms"] == 3000
+    assert payload["archive"]["detail"] == "ZIP preparation has not been requested."
+    assert payload["poll_after_ms"] is None
+
+
+def test_mega_internal_archive_is_not_projected_as_a_requested_zip() -> None:
+    snapshot = _snapshot(publishing_guard_enabled=False)
+    internal_archive = replace(_archive(snapshot), requested_by_user_id=None)
+
+    assert delivery_routes._requested_zip_archive(internal_archive) is None
+    assert delivery_routes._requested_zip_archive(_archive(snapshot)) is not None
 
 
 def test_finished_set_archive_does_not_wait_for_failed_x_teasers() -> None:
@@ -387,10 +493,11 @@ def test_finished_set_archive_does_not_wait_for_failed_x_teasers() -> None:
 
     assert progress.full_outputs_ready
     assert not progress.outputs_ready
-    assert payload["outputs"]["state"] == "failed"
+    assert payload["outputs"]["state"] == "ready"
     assert payload["outputs"]["full_outputs_ready"] is True
+    assert payload["outputs"]["x_outputs_ready"] is False
     assert payload["archive"]["state"] == "not_started"
-    assert payload["poll_after_ms"] == 3000
+    assert payload["poll_after_ms"] is None
 
 
 @pytest.mark.asyncio
@@ -492,7 +599,7 @@ async def test_delivery_page_renders_prepare_zip_fallback_without_archive_row(
 
     html = bytes(response.body).decode()
     assert response.status_code == 200
-    assert "Automatic ZIP preparation has not started yet" in html
+    assert "ZIP preparation has not started" in html
     assert "delivery:prepare-archive" in html
     assert "Prepare ZIP download" in html
     assert "data-delivery-progress-url=" in html
@@ -538,7 +645,8 @@ async def test_delivery_page_exposes_zip_queue_while_destination_copies_render(
     html = bytes(response.body).decode()
     assert response.status_code == 200
     assert "Queue the ZIP now" in html
-    assert "without waiting for Patreon, MEGA, or X" in html
+    assert "without" in html
+    assert "starting Patreon, MEGA, or X" in html
     assert "delivery:prepare-archive" in html
     assert "Prepare ZIP download" in html
 
@@ -576,7 +684,7 @@ async def test_delivery_page_uses_shared_failed_archive_state_without_polling(
     assert response.status_code == 200
     assert "ZIP creation failed. Request a clean retry" in html
     assert "Retry ZIP preparation" in html
-    assert "data-delivery-progress-url=" not in html
+    assert "data-delivery-progress-url=" in html
 
 
 @pytest.mark.asyncio
@@ -612,11 +720,12 @@ async def test_delivery_page_uses_shared_ready_archive_state_without_polling(
     assert response.status_code == 200
     assert "Download ZIP part 1 / 2" in html
     assert "Download ZIP part 2 / 2" in html
-    assert "data-delivery-progress-url=" not in html
+    assert "data-delivery-progress-url=" in html
 
 
 @pytest.mark.parametrize(
     (
+        "target",
         "publishing_enabled",
         "guard_enabled",
         "x_selected_count",
@@ -627,17 +736,21 @@ async def test_delivery_page_uses_shared_ready_archive_state_without_polling(
         "expected",
     ),
     [
-        (True, True, 0, False, True, "not_prepared", False, True),
-        (False, True, 0, False, True, "not_prepared", False, False),
-        (True, False, 0, False, True, "not_prepared", False, False),
-        (True, True, 1, False, True, "not_prepared", False, False),
-        (True, True, 1, True, True, "not_prepared", False, True),
-        (True, True, 0, False, False, "not_prepared", False, False),
-        (True, True, 0, False, True, "queued", True, False),
-        (True, True, 0, False, True, "failed", True, True),
+        ("patreon", True, True, 0, False, True, "not_prepared", False, True),
+        ("patreon", False, True, 0, False, True, "not_prepared", False, False),
+        ("patreon", True, False, 0, False, True, "not_prepared", False, False),
+        ("patreon", True, True, 0, False, False, "not_prepared", False, False),
+        ("patreon", True, True, 0, False, True, "queued", True, False),
+        ("patreon", True, True, 0, False, True, "failed", True, True),
+        ("x", True, True, 0, True, True, "not_prepared", False, False),
+        ("x", True, True, 1, False, True, "not_prepared", False, False),
+        ("x", True, True, 1, True, True, "not_prepared", False, True),
+        ("x", True, True, 1, True, True, "queued", True, False),
+        ("x", True, True, 1, True, True, "failed", True, True),
     ],
 )
-def test_destination_previews_are_only_needed_when_the_form_can_render(
+def test_each_destination_form_is_available_only_for_its_target(
+    target: str,
     publishing_enabled: bool,
     guard_enabled: bool,
     x_selected_count: int,
@@ -647,15 +760,22 @@ def test_destination_previews_are_only_needed_when_the_form_can_render(
     has_intent: bool,
     expected: bool,
 ) -> None:
+    destination = DestinationState(
+        key=target,
+        label=target.title(),
+        state=destination_state,
+        detail="Destination detail.",
+        intent_id=uuid4() if has_intent else None,
+    )
+    progress = _progress(
+        ready_for_destinations=ready,
+        ready_full_outputs=2 if ready or target == "x" else 0,
+        ready_x_teasers=x_selected_count if ready and target == "x" else 0,
+    )
     snapshot = _snapshot(
-        progress=_progress(ready_for_destinations=ready),
-        patreon=DestinationState(
-            key="patreon",
-            label="Patreon",
-            state=destination_state,
-            detail="Destination detail.",
-            intent_id=uuid4() if has_intent else None,
-        ),
+        progress=progress,
+        patreon=destination if target == "patreon" else None,
+        x=destination if target == "x" else None,
         publishing_guard_enabled=guard_enabled,
         x_selected_count=x_selected_count,
     )
@@ -664,4 +784,11 @@ def test_destination_previews_are_only_needed_when_the_form_can_render(
         x_configured=x_configured,
     )
 
-    assert delivery_routes._can_render_destination_form(snapshot, settings=settings) is expected
+    assert (
+        delivery_routes._can_prepare_target_destination(
+            snapshot,
+            settings=settings,
+            target=target,
+        )
+        is expected
+    )

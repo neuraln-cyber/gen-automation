@@ -34,7 +34,14 @@ PREPARE_ARCHIVE_FIELDS = frozenset(
         "submission_id",
     }
 )
-PREPARE_DESTINATION_FIELDS = frozenset(
+PREPARE_MEGA_FIELDS = frozenset(
+    {
+        "csrf_token",
+        "idempotency_key",
+        "submission_id",
+    }
+)
+PREPARE_PATREON_FIELDS = frozenset(
     {
         "csrf_token",
         "idempotency_key",
@@ -46,6 +53,13 @@ PREPARE_DESTINATION_FIELDS = frozenset(
         "public_preview_output_id",
         "public_preview_attested_at",
         "public_preview_safe",
+    }
+)
+PREPARE_X_FIELDS = frozenset(
+    {
+        "csrf_token",
+        "idempotency_key",
+        "submission_id",
         "x_text",
     }
 )
@@ -123,7 +137,14 @@ class PrepareArchiveForm:
 
 
 @dataclass(frozen=True, slots=True)
-class PrepareDestinationForm:
+class PrepareMegaForm:
+    csrf_token: str
+    idempotency_key: str
+    submission_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class PreparePatreonForm:
     csrf_token: str
     idempotency_key: str
     submission_id: UUID
@@ -134,6 +155,13 @@ class PrepareDestinationForm:
     public_preview_output_id: UUID
     public_preview_attested_at: datetime
     public_preview_safe: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PrepareXForm:
+    csrf_token: str
+    idempotency_key: str
+    submission_id: UUID
     x_text: str
 
 
@@ -213,33 +241,41 @@ async def read_prepare_archive_form(request: Request) -> PrepareArchiveForm:
     )
 
 
-async def read_prepare_destination_form(request: Request) -> PrepareDestinationForm:
-    values = await _read_form(request, expected_fields=PREPARE_DESTINATION_FIELDS)
+async def read_prepare_mega_form(request: Request) -> PrepareMegaForm:
+    values = await _read_form(request, expected_fields=PREPARE_MEGA_FIELDS)
+    return PrepareMegaForm(
+        csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
+        idempotency_key=_idempotency_key(values["idempotency_key"]),
+        submission_id=_uuid(values["submission_id"]),
+    )
+
+
+async def read_prepare_patreon_form(request: Request) -> PreparePatreonForm:
+    values = await _read_form(request, expected_fields=PREPARE_PATREON_FIELDS)
     submission_id = _uuid(values["submission_id"])
-    try:
-        preview_output_id = UUID(values["public_preview_output_id"])
-    except ValueError:
-        raise _bad_request() from None
-    if str(preview_output_id) != values["public_preview_output_id"].lower():
-        raise _bad_request()
-    if values["public_preview_safe"] != "true":
-        raise BrowserDeliveryFormError(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            message="Confirm that the selected Patreon public preview is safe for public surfaces.",
-        )
-    tags = _tags(values["patreon_tags"])
-    return PrepareDestinationForm(
+    preview_output_id = _preview_output_id(values["public_preview_output_id"])
+    _require_safe_public_preview(values["public_preview_safe"])
+    return PreparePatreonForm(
         csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
         idempotency_key=_idempotency_key(values["idempotency_key"]),
         submission_id=submission_id,
         patreon_title=_bounded_text(values["patreon_title"], maximum=500, required=True),
         patreon_body=_bounded_text(values["patreon_body"], maximum=20_000, required=False),
         patreon_tier=_bounded_text(values["patreon_tier"], maximum=500, required=True),
-        patreon_tags=tags,
+        patreon_tags=_tags(values["patreon_tags"]),
         public_preview_output_id=preview_output_id,
         public_preview_attested_at=_datetime(values["public_preview_attested_at"]),
         public_preview_safe=True,
-        x_text=_bounded_text(values["x_text"], maximum=2_000, required=False),
+    )
+
+
+async def read_prepare_x_form(request: Request) -> PrepareXForm:
+    values = await _read_form(request, expected_fields=PREPARE_X_FIELDS)
+    return PrepareXForm(
+        csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
+        idempotency_key=_idempotency_key(values["idempotency_key"]),
+        submission_id=_uuid(values["submission_id"]),
+        x_text=_bounded_text(values["x_text"], maximum=2_000, required=True),
     )
 
 
@@ -420,6 +456,24 @@ def _tags(value: str) -> tuple[str, ...]:
     if len(tags) > 25:
         raise _bad_request()
     return tuple(tags)
+
+
+def _preview_output_id(value: str) -> UUID:
+    try:
+        output_id = UUID(value)
+    except ValueError:
+        raise _bad_request() from None
+    if str(output_id) != value.lower():
+        raise _bad_request()
+    return output_id
+
+
+def _require_safe_public_preview(value: str) -> None:
+    if value != "true":
+        raise BrowserDeliveryFormError(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            message="Confirm that the selected Patreon public preview is safe for public surfaces.",
+        )
 
 
 def _intent_identity(values: dict[str, str]) -> tuple[str, int]:

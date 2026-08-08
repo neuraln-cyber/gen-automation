@@ -3051,3 +3051,168 @@ body.asset-viewer-open { overflow: hidden; }
   .automation-create-form .batch-card-actions button { font-size: .62rem; }
   .automation-create-form .mobile-queue-dock > div > span { display: none; }
 }
+
+/* Independent finished-set delivery destinations. */
+.delivery-destinations { display: grid; gap: 1rem; }
+
+.delivery-destination-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: start;
+  gap: 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.delivery-destination-card {
+  min-width: 0;
+  scroll-margin-top: 5.5rem;
+}
+
+.release-card.delivery-destination-card {
+  min-height: 0;
+  gap: .75rem;
+}
+
+.release-card.delivery-destination-card:hover {
+  background: var(--surface-solid);
+  transform: none;
+}
+
+.delivery-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: .8rem;
+}
+
+.delivery-card-heading > div { min-width: 0; }
+.delivery-card-heading .status { flex: 0 0 auto; }
+.delivery-card-heading .release-meta { margin-bottom: .25rem !important; }
+
+.delivery-effect {
+  margin: 0 !important;
+  padding: .7rem .8rem;
+  border: 1px solid var(--border);
+  border-radius: .7rem;
+  background: rgba(255, 255, 255, .025);
+  color: var(--muted-strong);
+  font-size: .86rem;
+}
+
+.delivery-card-action,
+.delivery-destination-form {
+  display: grid;
+  gap: .7rem;
+  margin-top: auto;
+  padding-top: .35rem;
+}
+
+.delivery-card-action button,
+.delivery-destination-form > button { width: 100%; }
+
+.delivery-action-note {
+  margin: -.2rem 0 0 !important;
+  font-size: .76rem;
+  text-align: center;
+}
+
+.delivery-preview-fieldset { min-width: 0; }
+
+.delivery-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(6.5rem, 1fr));
+  max-height: 25rem;
+  gap: .6rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: .1rem .2rem .2rem .1rem;
+}
+
+.delivery-preview-option {
+  display: grid !important;
+  min-width: 0;
+  gap: .45rem !important;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: .65rem;
+  background: var(--surface-solid);
+  cursor: pointer;
+}
+
+.delivery-preview-option:has(input:checked) {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.delivery-preview-option .asset-preview {
+  max-height: 10rem;
+  aspect-ratio: auto;
+  height: auto;
+  object-fit: contain;
+}
+
+.delivery-preview-option span {
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  padding: 0 .5rem .5rem;
+}
+
+.delivery-preview-option input,
+.delivery-attestation input {
+  width: auto;
+  min-height: 0;
+}
+
+.delivery-attestation {
+  grid-template-columns: auto minmax(0, 1fr) !important;
+  align-items: start;
+}
+
+.delivery-recovery { margin-top: .25rem; }
+
+.delivery-publication-switch { margin: 0; }
+
+.delivery-publication-switch > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .8rem;
+}
+
+.delivery-publication-switch .decision-fields > p { margin: 0; }
+
+.delivery-destination-card .status.published {
+  border-color: rgba(110, 231, 183, .25);
+  background: var(--good-soft);
+  color: var(--good);
+}
+
+.delivery-destination-card .status.running {
+  border-color: rgba(125, 211, 252, .3);
+  background: rgba(125, 211, 252, .1);
+  color: var(--info);
+}
+
+@media (max-width: 1100px) {
+  .delivery-destination-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 720px) {
+  .delivery-destination-grid { grid-template-columns: minmax(0, 1fr); }
+  .delivery-card-heading { align-items: flex-start; }
+  .delivery-destination-card .primary-button,
+  .delivery-destination-card .secondary-button { width: 100%; }
+  .delivery-preview-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    max-height: 22rem;
+  }
+}
+
+@media (max-width: 420px) {
+  .delivery-card-heading { flex-direction: column; }
+  .delivery-preview-grid { grid-template-columns: minmax(0, 1fr); }
+  .delivery-preview-option .asset-preview { max-height: 14rem; }
+}

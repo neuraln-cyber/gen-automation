@@ -20,10 +20,13 @@ def test_delivery_marks_only_external_effect_actions_for_recent_authentication()
     assert "guard_target_enabled" in _form_tag(template, ":publication-guard")
     assert "data-requires-recent-auth" in _form_tag(template, ":confirm-present")
     assert "data-requires-recent-auth" in _form_tag(template, ":confirm-absent")
-    assert "data-requires-recent-auth" in _form_tag(template, ":prepare-destinations")
+    assert "data-requires-recent-auth" in _form_tag(template, ":prepare-patreon")
+    assert "data-requires-recent-auth" in _form_tag(template, ":prepare-x")
 
     for low_risk_action in (
         ":prepare-outputs",
+        ":prepare-archive",
+        ":prepare-mega",
         ":upload-watermark",
         ":download",
     ):

@@ -75,10 +75,10 @@ used as a completion claim.
   It fails closed on login, CAPTCHA/2FA, UI drift, and ambiguous outcomes. The
   deterministic ZIP download and manual official-UI handoff remain available
   as the fallback.
-- A pinned MEGAcmd-enabled controller image and restart-safe automatic delivery
-  of the accepted full-resolution files in generation order. Images are sent in
-  bounded batches and small remote control files are verified last; the private
-  asset bucket remains the source of truth.
+- A pinned MEGAcmd-enabled controller image and restart-safe, explicitly requested
+  delivery of the accepted full-resolution files in generation order. Images are
+  sent in bounded batches and small remote control files are verified last; the
+  private asset bucket remains the source of truth.
 - Reproducible AWS staging OpenTofu under `infra/aws-staging`: default
   `eu-central-1`, SSM-only EC2, EIP and 80/443 ingress, private RDS PostgreSQL,
   separate versioned asset/model buckets, encrypted root and integration-profile

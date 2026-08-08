@@ -27,8 +27,10 @@ from gen_automation.api.browser_delivery_forms import (
     read_patreon_confirm_absent_form,
     read_patreon_confirm_present_form,
     read_prepare_archive_form,
-    read_prepare_destination_form,
+    read_prepare_mega_form,
     read_prepare_output_form,
+    read_prepare_patreon_form,
+    read_prepare_x_form,
     read_publication_guard_form,
 )
 from gen_automation.api.security import (
@@ -39,7 +41,7 @@ from gen_automation.api.security import (
 )
 from gen_automation.config import Settings
 from gen_automation.db.session import get_session
-from gen_automation.domain.enums import AdminRole, FinishedSetArchiveState
+from gen_automation.domain.enums import AdminRole, FinishedSetArchiveState, PublicationTarget
 from gen_automation.middleware import content_security_policy
 from gen_automation.services.authentication import (
     AuthenticatedPrincipal,
@@ -59,6 +61,10 @@ from gen_automation.services.finished_set_archives import (
     presign_finished_set_archive_part,
     request_finished_set_archive,
 )
+from gen_automation.services.mega_set_delivery import (
+    MegaSetDeliveryContractError,
+    request_mega_set_delivery,
+)
 from gen_automation.services.operator_delivery import (
     DeliveryOutput,
     OperatorDeliveryConflictError,
@@ -66,8 +72,10 @@ from gen_automation.services.operator_delivery import (
     OperatorDeliveryNotFoundError,
     OperatorDeliverySnapshot,
     load_operator_delivery,
+    operator_target_is_ready,
     package_parts_ready,
-    prepare_operator_destinations,
+    prepare_operator_patreon_destination,
+    prepare_operator_x_destination,
 )
 from gen_automation.services.publication import (
     PUBLICATION_CONFIRM_PATREON_ABSENT_ATTESTATION,
@@ -81,7 +89,8 @@ from gen_automation.services.publication import (
     set_publication_guard,
 )
 from gen_automation.services.review_derivatives import (
-    prepare_completed_review_derivatives,
+    prepare_completed_review_full_outputs,
+    prepare_completed_review_x_teasers,
 )
 from gen_automation.services.watermarks import (
     MAX_WATERMARK_BYTES,
@@ -154,9 +163,13 @@ async def dashboard_review_delivery(
         )
 
     settings: Settings = request.app.state.settings
+    requested_zip_archive = _requested_zip_archive(finished_set_archive)
     output_submission_id = uuid4()
+    x_output_submission_id = uuid4()
     archive_submission_id = uuid4()
-    destination_submission_id = uuid4()
+    patreon_destination_submission_id = uuid4()
+    x_destination_submission_id = uuid4()
+    mega_submission_id = uuid4()
     watermark_submission_id = uuid4()
     guard_submission_id = uuid4()
     output_key = delivery_form_key(
@@ -165,17 +178,35 @@ async def dashboard_review_delivery(
         action="prepare-outputs",
         parts=(str(review_task_id), str(output_submission_id)),
     )
+    x_output_key = delivery_form_key(
+        settings,
+        session_id=principal.session_id,
+        action="prepare-x-outputs",
+        parts=(str(review_task_id), str(x_output_submission_id)),
+    )
     archive_key = delivery_form_key(
         settings,
         session_id=principal.session_id,
         action="prepare-archive",
         parts=(str(review_task_id), str(archive_submission_id)),
     )
-    destination_key = delivery_form_key(
+    patreon_destination_key = delivery_form_key(
         settings,
         session_id=principal.session_id,
-        action="prepare-destinations",
-        parts=(str(review_task_id), str(destination_submission_id)),
+        action="prepare-patreon",
+        parts=(str(review_task_id), str(patreon_destination_submission_id)),
+    )
+    x_destination_key = delivery_form_key(
+        settings,
+        session_id=principal.session_id,
+        action="prepare-x",
+        parts=(str(review_task_id), str(x_destination_submission_id)),
+    )
+    mega_key = delivery_form_key(
+        settings,
+        session_id=principal.session_id,
+        action="prepare-mega",
+        parts=(str(review_task_id), str(mega_submission_id)),
     )
     watermark_key = delivery_form_key(
         settings,
@@ -251,15 +282,26 @@ async def dashboard_review_delivery(
                 action="patreon-confirm-absent",
                 parts=recovery_parts,
             )
+    can_prepare_patreon_destination = _can_prepare_target_destination(
+        snapshot,
+        settings=settings,
+        target="patreon",
+    )
+    can_prepare_x_destination = _can_prepare_target_destination(
+        snapshot,
+        settings=settings,
+        target="x",
+    )
     previews = (
         await _preview_views(request, snapshot.full_outputs)
-        if _can_render_destination_form(snapshot, settings=settings)
+        if can_prepare_patreon_destination
         else ()
     )
     delivery_progress = _delivery_progress_payload(
         snapshot,
-        finished_set_archive=finished_set_archive,
+        finished_set_archive=requested_zip_archive,
         mega_enabled=settings.mega_delivery_enabled,
+        publishing_enabled=settings.publishing_enabled,
     )
     return _secure(
         request,
@@ -275,13 +317,25 @@ async def dashboard_review_delivery(
                 "previews": previews,
                 "csrf_token": csrf_token,
                 "output_submission_id": output_submission_id,
+                "x_output_submission_id": x_output_submission_id,
                 "archive_submission_id": archive_submission_id,
-                "destination_submission_id": destination_submission_id,
+                "patreon_destination_submission_id": patreon_destination_submission_id,
+                "x_destination_submission_id": x_destination_submission_id,
+                "patreon_submission_id": patreon_destination_submission_id,
+                "x_submission_id": x_destination_submission_id,
+                "mega_submission_id": mega_submission_id,
                 "watermark_submission_id": watermark_submission_id,
                 "guard_submission_id": guard_submission_id,
                 "output_idempotency_key": output_key,
+                "x_output_idempotency_key": x_output_key,
                 "archive_idempotency_key": archive_key,
-                "destination_idempotency_key": destination_key,
+                "patreon_destination_idempotency_key": patreon_destination_key,
+                "x_destination_idempotency_key": x_destination_key,
+                "patreon_idempotency_key": patreon_destination_key,
+                "x_idempotency_key": x_destination_key,
+                "mega_idempotency_key": mega_key,
+                "can_prepare_patreon_destination": can_prepare_patreon_destination,
+                "can_prepare_x_destination": can_prepare_x_destination,
                 "public_preview_attested_at": datetime.now(UTC).isoformat(),
                 "watermark_idempotency_key": watermark_key,
                 "guard_idempotency_key": guard_key,
@@ -292,11 +346,11 @@ async def dashboard_review_delivery(
                 "patreon_absent_attestation": (PUBLICATION_CONFIRM_PATREON_ABSENT_ATTESTATION),
                 "patreon_download_destination": patreon_download_destination,
                 "finished_set_archive": (
-                    finished_set_archive
-                    if _finished_set_archive_parts_ready(finished_set_archive)
+                    requested_zip_archive
+                    if _finished_set_archive_parts_ready(requested_zip_archive)
                     else None
                 ),
-                "finished_set_archive_snapshot": finished_set_archive,
+                "finished_set_archive_snapshot": requested_zip_archive,
                 "storage_available": _store(request) is not None,
                 "publishing_enabled": settings.publishing_enabled,
                 "x_configured": settings.x_oauth_secret_reference is not None,
@@ -346,8 +400,9 @@ async def dashboard_review_delivery_progress(
         JSONResponse(
             content=_delivery_progress_payload(
                 snapshot,
-                finished_set_archive=finished_set_archive,
+                finished_set_archive=_requested_zip_archive(finished_set_archive),
                 mega_enabled=request.app.state.settings.mega_delivery_enabled,
+                publishing_enabled=request.app.state.settings.publishing_enabled,
             )
         ),
     )
@@ -461,7 +516,63 @@ async def dashboard_prepare_outputs(
         )
         if not form_key_matches(form.idempotency_key, expected_key):
             raise BrowserDeliveryFormError(status_code=status.HTTP_400_BAD_REQUEST)
-        await prepare_completed_review_derivatives(
+        if form.watermark_asset_id is not None:
+            raise BrowserDeliveryFormError(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                message="Clean full-set preparation does not accept an X watermark.",
+            )
+        await prepare_completed_review_full_outputs(
+            session,
+            review_task_id=review_task_id,
+            actor_user_id=owner.user_id,
+            idempotency_key=form.idempotency_key,
+        )
+    except BrowserDeliveryFormError as error:
+        return _form_error(request, principal, error.status_code, error.message)
+    except HTTPException:
+        return _form_error(request, principal, status.HTTP_403_FORBIDDEN, "Request denied.")
+    except (
+        DerivativePipelineInputError,
+        DerivativePipelineNotFoundError,
+        DerivativePipelineConflictError,
+    ):
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_409_CONFLICT,
+            "Outputs could not be prepared from the current review snapshot.",
+        )
+    return _redirect(review_task_id)
+
+
+@router.post(
+    "/review-tasks/{review_task_id}/delivery:prepare-x-outputs",
+    response_class=HTMLResponse,
+    response_model=None,
+)
+async def dashboard_prepare_x_outputs(
+    review_task_id: UUID,
+    request: Request,
+    session: Session,
+    principal: PublicationReader,
+) -> Response:
+    try:
+        form = await read_prepare_output_form(request)
+        owner = await _verified_mutation_owner(request, session, principal, form.csrf_token)
+        expected_key = delivery_form_key(
+            request.app.state.settings,
+            session_id=owner.session_id,
+            action="prepare-x-outputs",
+            parts=(str(review_task_id), str(form.submission_id)),
+        )
+        if not form_key_matches(form.idempotency_key, expected_key):
+            raise BrowserDeliveryFormError(status_code=status.HTTP_400_BAD_REQUEST)
+        if form.watermark_asset_id is None:
+            raise BrowserDeliveryFormError(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                message="Choose a registered watermark for the X teasers.",
+            )
+        await prepare_completed_review_x_teasers(
             session,
             review_task_id=review_task_id,
             actor_user_id=owner.user_id,
@@ -481,7 +592,7 @@ async def dashboard_prepare_outputs(
             request,
             principal,
             status.HTTP_409_CONFLICT,
-            "Outputs could not be prepared from the current review snapshot.",
+            "X teasers could not be prepared from the current review snapshot.",
         )
     return _redirect(review_task_id)
 
@@ -534,6 +645,66 @@ async def dashboard_prepare_finished_set_archive(
             "The completed review could not be found.",
         )
     except FinishedSetArchiveConflictError as error:
+        return _form_error(request, principal, status.HTTP_409_CONFLICT, str(error))
+    return _redirect(review_task_id)
+
+
+@router.post(
+    "/review-tasks/{review_task_id}/delivery:prepare-mega",
+    response_class=HTMLResponse,
+    response_model=None,
+)
+async def dashboard_prepare_mega(
+    review_task_id: UUID,
+    request: Request,
+    session: Session,
+    principal: PublicationReader,
+) -> Response:
+    """Request only MEGA, persisting the choice while its clean archive is built."""
+
+    try:
+        form = await read_prepare_mega_form(request)
+        owner = await _verified_mutation_owner(request, session, principal, form.csrf_token)
+        expected_key = delivery_form_key(
+            request.app.state.settings,
+            session_id=owner.session_id,
+            action="prepare-mega",
+            parts=(str(review_task_id), str(form.submission_id)),
+        )
+        if not form_key_matches(form.idempotency_key, expected_key):
+            raise BrowserDeliveryFormError(status_code=status.HTTP_400_BAD_REQUEST)
+        settings: Settings = request.app.state.settings
+        if not settings.mega_delivery_enabled:
+            raise OperatorDeliveryConflictError("MEGA delivery is not configured")
+        await request_mega_set_delivery(
+            session,
+            review_task_id=review_task_id,
+            requested_by_user_id=owner.user_id,
+            remote_root=settings.mega_remote_root,
+        )
+    except BrowserDeliveryFormError as error:
+        return _form_error(request, principal, error.status_code, error.message)
+    except HTTPException:
+        return _form_error(request, principal, status.HTTP_403_FORBIDDEN, "Request denied.")
+    except FinishedSetArchiveInputError as error:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            str(error),
+        )
+    except FinishedSetArchiveNotFoundError:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_404_NOT_FOUND,
+            "The completed review could not be found.",
+        )
+    except (
+        FinishedSetArchiveConflictError,
+        MegaSetDeliveryContractError,
+        OperatorDeliveryConflictError,
+    ) as error:
         return _form_error(request, principal, status.HTTP_409_CONFLICT, str(error))
     return _redirect(review_task_id)
 
@@ -671,23 +842,25 @@ async def dashboard_confirm_patreon_absent(
 
 
 @router.post(
-    "/review-tasks/{review_task_id}/delivery:prepare-destinations",
+    "/review-tasks/{review_task_id}/delivery:prepare-patreon",
     response_class=HTMLResponse,
     response_model=None,
 )
-async def dashboard_prepare_destinations(
+async def dashboard_prepare_patreon_destination(
     review_task_id: UUID,
     request: Request,
     session: Session,
     principal: PublicationReader,
 ) -> Response:
+    """Prepare only Patreon; this action can never create an X intent."""
+
     try:
-        form = await read_prepare_destination_form(request)
+        form = await read_prepare_patreon_form(request)
         owner = await _verified_owner(request, session, principal, form.csrf_token)
         expected_key = delivery_form_key(
             request.app.state.settings,
             session_id=owner.session_id,
-            action="prepare-destinations",
+            action="prepare-patreon",
             parts=(str(review_task_id), str(form.submission_id)),
         )
         if not form_key_matches(form.idempotency_key, expected_key):
@@ -695,7 +868,7 @@ async def dashboard_prepare_destinations(
         settings: Settings = request.app.state.settings
         if not settings.publishing_enabled:
             raise OperatorDeliveryConflictError("publication runtime is not configured")
-        await prepare_operator_destinations(
+        await prepare_operator_patreon_destination(
             session,
             review_task_id=review_task_id,
             patreon_title=form.patreon_title,
@@ -705,6 +878,63 @@ async def dashboard_prepare_destinations(
             public_preview_output_id=form.public_preview_output_id,
             public_preview_attester_name=owner.display_name,
             public_preview_attested_at=form.public_preview_attested_at,
+            actor_user_id=owner.user_id,
+            actor_role=owner.role,
+            idempotency_key=form.idempotency_key,
+        )
+    except BrowserDeliveryFormError as error:
+        return _form_error(request, principal, error.status_code, error.message)
+    except HTTPException as error:
+        return _owner_http_error(request, principal, error)
+    except OperatorDeliveryNotFoundError:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_404_NOT_FOUND,
+            "The completed review could not be found.",
+        )
+    except OperatorDeliveryInputError as error:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            str(error),
+        )
+    except OperatorDeliveryConflictError as error:
+        return _form_error(request, principal, status.HTTP_409_CONFLICT, str(error))
+    return _redirect(review_task_id)
+
+
+@router.post(
+    "/review-tasks/{review_task_id}/delivery:prepare-x",
+    response_class=HTMLResponse,
+    response_model=None,
+)
+async def dashboard_prepare_x_destination(
+    review_task_id: UUID,
+    request: Request,
+    session: Session,
+    principal: PublicationReader,
+) -> Response:
+    """Prepare only X; this action can never create a Patreon intent."""
+
+    try:
+        form = await read_prepare_x_form(request)
+        owner = await _verified_owner(request, session, principal, form.csrf_token)
+        expected_key = delivery_form_key(
+            request.app.state.settings,
+            session_id=owner.session_id,
+            action="prepare-x",
+            parts=(str(review_task_id), str(form.submission_id)),
+        )
+        if not form_key_matches(form.idempotency_key, expected_key):
+            raise BrowserDeliveryFormError(status_code=status.HTTP_400_BAD_REQUEST)
+        settings: Settings = request.app.state.settings
+        if not settings.publishing_enabled:
+            raise OperatorDeliveryConflictError("publication runtime is not configured")
+        await prepare_operator_x_destination(
+            session,
+            review_task_id=review_task_id,
             x_text=form.x_text,
             x_credential_reference=settings.x_oauth_secret_reference,
             actor_user_id=owner.user_id,
@@ -715,6 +945,13 @@ async def dashboard_prepare_destinations(
         return _form_error(request, principal, error.status_code, error.message)
     except HTTPException as error:
         return _owner_http_error(request, principal, error)
+    except OperatorDeliveryNotFoundError:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_404_NOT_FOUND,
+            "The completed review could not be found.",
+        )
     except OperatorDeliveryInputError as error:
         return _form_error(
             request,
@@ -723,12 +960,7 @@ async def dashboard_prepare_destinations(
             str(error),
         )
     except OperatorDeliveryConflictError as error:
-        return _form_error(
-            request,
-            principal,
-            status.HTTP_409_CONFLICT,
-            str(error),
-        )
+        return _form_error(request, principal, status.HTTP_409_CONFLICT, str(error))
     return _redirect(review_task_id)
 
 
@@ -1104,9 +1336,10 @@ def _delivery_progress_payload(
     *,
     finished_set_archive: FinishedSetArchiveSnapshot | None,
     mega_enabled: bool = False,
+    publishing_enabled: bool = False,
 ) -> dict[str, object]:
     progress = snapshot.progress
-    if progress.outputs_ready:
+    if progress.full_outputs_ready:
         output_state = "ready"
     elif progress.terminal_failures:
         output_state = "failed"
@@ -1127,7 +1360,7 @@ def _delivery_progress_payload(
         archive_state = "ready"
     elif finished_set_archive is None:
         archive_state = "not_started"
-        archive_detail = "Waiting for automatic ZIP preparation or an explicit request."
+        archive_detail = "ZIP preparation has not been requested."
     elif finished_set_archive.state == FinishedSetArchiveState.FAILED:
         archive_state = "failed"
         archive_detail = finished_set_archive.last_error_detail
@@ -1144,13 +1377,34 @@ def _delivery_progress_payload(
         archive_detail = "The finished-set archive record is incomplete."
 
     mega = next(destination for destination in snapshot.destinations if destination.key == "mega")
-    mega_active = mega.state == "running" or (mega_enabled and mega.state == "queued")
+    patreon = next(
+        destination for destination in snapshot.destinations if destination.key == "patreon"
+    )
+    x = next(destination for destination in snapshot.destinations if destination.key == "x")
+    mega_active = mega_enabled and mega.state in {"queued", "running"}
+    publication_worker_available = publishing_enabled and snapshot.publishing_guard_enabled
+    patreon_active = publication_worker_available and patreon.state in {"queued", "running"}
+    x_active = publication_worker_available and x.state in {"queued", "running"}
+    mega_detail = mega.detail
+    if mega.state in {"queued", "running"} and not mega_enabled:
+        mega_detail = "Queued; the MEGA delivery worker is paused."
+    patreon_detail = patreon.detail
+    x_detail = x.detail
+    if not publication_worker_available:
+        if patreon.state in {"queued", "running"}:
+            patreon_detail = "Queued; Patreon publishing is paused."
+        if x.state in {"queued", "running"}:
+            x_detail = "Queued; X publishing is paused."
     payload: dict[str, object] = {
         "schema": "delivery-progress/v1",
         "review_task_id": str(snapshot.review_task_id),
         "outputs": {
             "state": output_state,
             "full_outputs_ready": progress.full_outputs_ready,
+            "x_outputs_ready": (
+                progress.expected_x_teasers == 0
+                or progress.ready_x_teasers == progress.expected_x_teasers
+            ),
             "planned": progress.planned,
             "total_jobs": progress.total_jobs,
             "requested": progress.requested,
@@ -1187,17 +1441,28 @@ def _delivery_progress_payload(
         "mega": {
             "state": mega.state,
             "active": mega_active,
-            "detail": mega.detail,
+            "detail": mega_detail,
             "completed_items": mega.completed_items,
             "total_items": mega.total_items,
             "remote_path": mega.remote_path,
         },
+        "patreon": {
+            "state": patreon.state,
+            "active": patreon_active,
+            "detail": patreon_detail,
+        },
+        "x": {
+            "state": x.state,
+            "active": x_active,
+            "detail": x_detail,
+        },
         "poll_after_ms": (
             3000
-            if output_state == "rendering"
+            if progress.active_jobs > 0
             or archive_state == "preparing"
-            or (archive_state == "not_started" and progress.full_outputs_ready)
             or mega_active
+            or patreon_active
+            or x_active
             else None
         ),
     }
@@ -1232,18 +1497,33 @@ def _finished_set_archive_parts_ready(
     )
 
 
-def _can_render_destination_form(
+def _requested_zip_archive(
+    archive: FinishedSetArchiveSnapshot | None,
+) -> FinishedSetArchiveSnapshot | None:
+    """Project only an explicitly requested ZIP, not MEGA's internal archive prerequisite."""
+
+    if archive is None or archive.requested_by_user_id is None:
+        return None
+    return archive
+
+
+def _can_prepare_target_destination(
     snapshot: OperatorDeliverySnapshot,
     *,
     settings: Settings,
+    target: str,
 ) -> bool:
-    return (
-        settings.publishing_enabled
-        and snapshot.publishing_guard_enabled
-        and (snapshot.x_selected_count == 0 or settings.x_oauth_secret_reference is not None)
-        and snapshot.progress.ready_for_destinations
-        and (not snapshot.destinations_prepared or snapshot.destinations_need_retry)
-    )
+    if target not in {"patreon", "x"}:
+        raise ValueError("delivery target is invalid")
+    destination = next(item for item in snapshot.destinations if item.key == target)
+    if destination.intent_id is not None and destination.state != "failed":
+        return False
+    if not settings.publishing_enabled or not snapshot.publishing_guard_enabled:
+        return False
+    publication_target = PublicationTarget.PATREON if target == "patreon" else PublicationTarget.X
+    if not operator_target_is_ready(snapshot, target=publication_target):
+        return False
+    return target == "patreon" or settings.x_oauth_secret_reference is not None
 
 
 def _store(request: Request) -> ObjectStore | None:

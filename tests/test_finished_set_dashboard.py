@@ -386,6 +386,7 @@ async def test_finished_set_archive_downloads_render_before_destinations_with_gu
         archive_id=archive_id,
         review_task_id=review_task_id,
         release_version_id=uuid4(),
+        requested_by_user_id=principal.user_id,
         state=FinishedSetArchiveState.READY,
         selection_count=125,
         manifest_sha256=manifest_sha256,
@@ -493,6 +494,6 @@ async def test_finished_set_archive_downloads_render_before_destinations_with_gu
     assert html.count(f"finished-set/{archive_id}:download") == 2
     assert 'name="part_number" value="1"' in html
     assert 'name="part_number" value="2"' in html
-    assert "Publication switch" in html
+    assert "Account-wide publishing switch" in html
     assert "stopped" in html
     assert "This ZIP is independent of publishing" in html

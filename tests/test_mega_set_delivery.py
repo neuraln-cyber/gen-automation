@@ -37,8 +37,16 @@ from gen_automation.integrations.mega import (
     MegaRemoteNode,
 )
 from gen_automation.integrations.mega.client import MegaCommandResult
+from gen_automation.services.finished_set_archives import (
+    load_finished_set_archive,
+    request_finished_set_archive,
+    run_finished_set_archive_cycle,
+)
 from gen_automation.services.mega_set_delivery import (
+    MegaSetDeliveryContractError,
     MegaSetDeliveryCycleResult,
+    ensure_next_mega_set_delivery,
+    request_mega_set_delivery,
     run_mega_set_delivery_cycle,
 )
 from gen_automation.storage.memory import StoredObject
@@ -196,6 +204,147 @@ async def test_megacmd_list_files_preserves_duplicates_and_filters_descendants(
         "/sets/ordered/001.jpg",
         "/sets/ordered/002.jpg",
     )
+
+
+@pytest.mark.asyncio
+async def test_unrequested_ready_archive_is_ignored_by_mega_discovery(
+    derivative_approved_context: ApprovedContext,
+) -> None:
+    approved = derivative_approved_context
+    _store, archive = await _prepare_archive(
+        approved,
+        part_sizes=(2,),
+        mega_requested=False,
+    )
+
+    async with approved.database.sessions() as session:
+        created = await ensure_next_mega_set_delivery(
+            session,
+            remote_root=_REMOTE_ROOT,
+            now=RUN_AT + timedelta(minutes=11),
+        )
+        delivery_count = await session.scalar(select(func.count(MegaSetDelivery.id)))
+        source = await session.get(FinishedSetArchive, archive.archive_id)
+
+    assert not created
+    assert delivery_count == 0
+    assert source is not None
+    assert source.mega_requested_at is None
+    assert source.mega_requested_by_user_id is None
+    assert source.mega_requested_remote_root is None
+
+
+@pytest.mark.asyncio
+async def test_early_mega_request_persists_until_archive_ready_and_queues_once(
+    derivative_approved_context: ApprovedContext,
+) -> None:
+    approved = derivative_approved_context
+    prepared = await _prepare(approved)
+    await _cycle(prepared, worker_id="early-mega-source-derivative")
+    await _cycle(prepared, worker_id="early-mega-source-derivative")
+    requested_at = RUN_AT + timedelta(minutes=2)
+
+    async with approved.database.sessions() as session:
+        requested = await request_mega_set_delivery(
+            session,
+            review_task_id=approved.review_task_id,
+            requested_by_user_id=approved.owner_id,
+            remote_root=_REMOTE_ROOT,
+            now=requested_at,
+        )
+        source = await session.get(FinishedSetArchive, requested.archive_id)
+        assert source is not None
+        assert source.state == FinishedSetArchiveState.PENDING
+        assert source.requested_by_user_id is None
+        assert source.mega_requested_at is not None
+        assert source.mega_requested_at.replace(tzinfo=UTC) == requested_at
+        assert source.mega_requested_by_user_id == approved.owner_id
+        assert source.mega_requested_remote_root == _REMOTE_ROOT
+        snapshot = await load_finished_set_archive(
+            session,
+            review_task_id=approved.review_task_id,
+        )
+        assert snapshot is not None
+        assert snapshot.requested_by_user_id is None
+        assert snapshot.mega_requested_remote_root == _REMOTE_ROOT
+        assert requested.delivery_id is None
+        assert not requested.replayed
+
+        replay = await request_mega_set_delivery(
+            session,
+            review_task_id=approved.review_task_id,
+            requested_by_user_id=approved.owner_id,
+            remote_root=_REMOTE_ROOT,
+            now=requested_at + timedelta(milliseconds=1),
+        )
+        assert replay.replayed
+        with pytest.raises(
+            MegaSetDeliveryContractError,
+            match="existing MEGA request uses a different destination root",
+        ):
+            await request_mega_set_delivery(
+                session,
+                review_task_id=approved.review_task_id,
+                requested_by_user_id=approved.owner_id,
+                remote_root="/changed-request-root",
+                now=requested_at + timedelta(milliseconds=2),
+            )
+        await session.rollback()
+
+        created_early = await ensure_next_mega_set_delivery(
+            session,
+            remote_root=_REMOTE_ROOT,
+            now=requested_at,
+        )
+
+    assert not created_early
+
+    archive_result = await run_finished_set_archive_cycle(
+        approved.database.sessions,
+        prepared.store,
+        worker_id="early-mega-finished-set",
+        lease_seconds=300,
+        retry_base_seconds=5,
+        retry_max_seconds=60,
+        max_archive_bytes=_MAX_PART_BYTES,
+        now=requested_at + timedelta(seconds=1),
+    )
+    assert archive_result.completed_archive
+    assert archive_result.archive_id == requested.archive_id
+
+    async with approved.database.sessions() as session:
+        mega_only_source = await session.get(FinishedSetArchive, requested.archive_id)
+        assert mega_only_source is not None
+        assert mega_only_source.state == FinishedSetArchiveState.READY
+        assert mega_only_source.requested_by_user_id is None
+        zip_request = await request_finished_set_archive(
+            session,
+            review_task_id=approved.review_task_id,
+            requested_by_user_id=approved.owner_id,
+            now=requested_at + timedelta(seconds=2),
+        )
+        assert zip_request.requested_by_user_id == approved.owner_id
+        assert zip_request.mega_requested_remote_root == _REMOTE_ROOT
+
+    async with approved.database.sessions() as session:
+        created = await ensure_next_mega_set_delivery(
+            session,
+            remote_root="/changed-runtime-root",
+            now=requested_at + timedelta(seconds=3),
+        )
+    async with approved.database.sessions() as session:
+        duplicate = await ensure_next_mega_set_delivery(
+            session,
+            remote_root=_REMOTE_ROOT,
+            now=requested_at + timedelta(seconds=4),
+        )
+        deliveries = tuple((await session.scalars(select(MegaSetDelivery))).all())
+
+    assert created
+    assert not duplicate
+    assert len(deliveries) == 1
+    assert deliveries[0].finished_set_archive_id == requested.archive_id
+    assert deliveries[0].remote_root == _REMOTE_ROOT
 
 
 @pytest.mark.asyncio
@@ -403,6 +552,7 @@ async def _prepare_archive(
     approved: ApprovedContext,
     *,
     part_sizes: tuple[int, ...],
+    mega_requested: bool = True,
 ) -> tuple[TrackingObjectStore, _ArchiveFixture]:
     prepared = await _prepare(approved)
     await _cycle(prepared, worker_id="mega-source-derivative")
@@ -467,6 +617,9 @@ async def _prepare_archive(
         review_task_id=approved.review_task_id,
         release_version_id=approved.release_version_id,
         requested_by_user_id=approved.owner_id,
+        mega_requested_by_user_id=(approved.owner_id if mega_requested else None),
+        mega_requested_at=(now if mega_requested else None),
+        mega_requested_remote_root=(_REMOTE_ROOT if mega_requested else None),
         state=FinishedSetArchiveState.READY,
         selection_count=len(outputs),
         manifest_sha256=manifest_sha256,

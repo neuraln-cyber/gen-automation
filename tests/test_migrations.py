@@ -108,6 +108,75 @@ def test_semantic_feedback_report_uses_jsonb_on_postgresql() -> None:
     assert isinstance(report_type, postgresql.JSONB)
 
 
+def test_target_ready_publication_revision_is_the_migration_head() -> None:
+    configuration = Config("alembic.ini")
+    scripts = ScriptDirectory.from_config(configuration)
+    independent_targets_revision = scripts.get_revision("20260808_0024")
+    revision = scripts.get_revision("20260808_0025")
+
+    assert independent_targets_revision is not None
+    assert independent_targets_revision.down_revision == "20260808_0023"
+    assert revision is not None
+    assert revision.down_revision == "20260808_0024"
+    assert scripts.get_current_head() == "20260808_0025"
+
+
+def test_target_ready_publication_postgresql_guards_allow_active_release_phases(
+    monkeypatch,
+) -> None:
+    configuration = Config("alembic.ini")
+    revision = ScriptDirectory.from_config(configuration).get_revision("20260808_0025")
+    assert revision is not None
+
+    statements: list[str] = []
+    monkeypatch.setattr(
+        revision.module.op,
+        "get_bind",
+        lambda: SimpleNamespace(dialect=SimpleNamespace(name="postgresql")),
+    )
+    monkeypatch.setattr(
+        revision.module.op,
+        "execute",
+        lambda statement: statements.append(str(statement)),
+    )
+
+    revision.module._replace_guards(revision.module._TARGET_READY)
+
+    assert len(statements) == 2
+    for statement in statements:
+        assert "__RELEASE_PHASE_PREDICATE__" not in statement
+        assert (
+            "release.phase IN ('rendering', 'ready_to_publish', 'publishing', 'published')"
+        ) in statement
+
+
+def test_target_ready_publication_postgresql_downgrade_restores_ready_only_guard(
+    monkeypatch,
+) -> None:
+    configuration = Config("alembic.ini")
+    revision = ScriptDirectory.from_config(configuration).get_revision("20260808_0025")
+    assert revision is not None
+
+    statements: list[str] = []
+    monkeypatch.setattr(
+        revision.module.op,
+        "get_bind",
+        lambda: SimpleNamespace(dialect=SimpleNamespace(name="postgresql")),
+    )
+    monkeypatch.setattr(
+        revision.module.op,
+        "execute",
+        lambda statement: statements.append(str(statement)),
+    )
+
+    revision.module._replace_guards(revision.module._READY_ONLY)
+
+    assert len(statements) == 2
+    for statement in statements:
+        assert "release.phase = 'ready_to_publish'" in statement
+        assert "release.phase IN" not in statement
+
+
 def test_foundation_migration_round_trip(
     tmp_path: Path,
     monkeypatch,
@@ -188,6 +257,36 @@ def test_foundation_migration_round_trip(
         "source_generation_ordinal",
         "source_generation_queue_position",
     } <= {column["name"] for column in inspect(engine).get_columns("release_selections")}
+    assert {
+        "mega_requested_at",
+        "mega_requested_by_user_id",
+        "mega_requested_remote_root",
+    } <= {column["name"] for column in inspect(engine).get_columns("finished_set_archives")}
+    mega_request_contract = next(
+        constraint
+        for constraint in inspect(engine).get_check_constraints("finished_set_archives")
+        if constraint["name"] == "ck_finished_set_archives_mega_request_pair"
+    )
+    assert "mega_requested_at IS NULL" in mega_request_contract["sqltext"]
+    assert "mega_requested_by_user_id IS NULL" in mega_request_contract["sqltext"]
+    assert "mega_requested_remote_root IS NULL" in mega_request_contract["sqltext"]
+    assert "mega_requested_remote_root IS NOT NULL" in mega_request_contract["sqltext"]
+    assert "ix_finished_set_archives_mega_request" in {
+        index["name"] for index in inspect(engine).get_indexes("finished_set_archives")
+    }
+    publication_intent_indexes = {
+        index["name"]: index for index in inspect(engine).get_indexes("publication_intents")
+    }
+    canonical_index = publication_intent_indexes["uq_publication_intents_release_target_canonical"]
+    assert canonical_index["unique"] == 1
+    assert canonical_index["column_names"] == ["release_id", "target"]
+    assert "state NOT IN ('failed', 'cancelled')" in str(
+        canonical_index["dialect_options"]["sqlite_where"]
+    )
+    assert "uq_publication_intents_version_target_config" not in {
+        constraint["name"]
+        for constraint in inspect(engine).get_unique_constraints("publication_intents")
+    }
     with engine.connect() as connection:
         trigger_names = set(
             connection.execute(

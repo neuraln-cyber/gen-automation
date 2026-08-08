@@ -2669,12 +2669,6 @@ class PublicationIntent(UuidPrimaryKeyMixin, Base):
     __tablename__ = "publication_intents"
     __table_args__ = (
         UniqueConstraint(
-            "release_version_id",
-            "target",
-            "configuration_sha256",
-            name="uq_publication_intents_version_target_config",
-        ),
-        UniqueConstraint(
             "intent_digest",
             name="uq_publication_intents_digest",
         ),
@@ -2715,6 +2709,14 @@ class PublicationIntent(UuidPrimaryKeyMixin, Base):
             "state",
             "scheduled_at",
             "planned_at",
+        ),
+        Index(
+            "uq_publication_intents_release_target_canonical",
+            "release_id",
+            "target",
+            unique=True,
+            sqlite_where=text("state NOT IN ('failed', 'cancelled')"),
+            postgresql_where=text("state NOT IN ('failed', 'cancelled')"),
         ),
     )
 
@@ -3291,6 +3293,13 @@ class FinishedSetArchive(UuidPrimaryKeyMixin, Base):
             "manifest_sha256 IS NULL OR length(manifest_sha256) = 64",
             name="valid_manifest_sha256",
         ),
+        CheckConstraint(
+            "(mega_requested_at IS NULL AND mega_requested_by_user_id IS NULL "
+            "AND mega_requested_remote_root IS NULL) OR "
+            "(mega_requested_at IS NOT NULL AND mega_requested_by_user_id IS NOT NULL "
+            "AND mega_requested_remote_root IS NOT NULL)",
+            name="mega_request_pair",
+        ),
         CheckConstraint("part_count IS NULL OR part_count > 0", name="positive_part_count"),
         CheckConstraint(
             "(state = 'ready' AND manifest_sha256 IS NOT NULL AND part_count IS NOT NULL "
@@ -3305,6 +3314,12 @@ class FinishedSetArchive(UuidPrimaryKeyMixin, Base):
             "available_at",
             "lease_expires_at",
             "created_at",
+        ),
+        Index(
+            "ix_finished_set_archives_mega_request",
+            "mega_requested_at",
+            "state",
+            "completed_at",
         ),
     )
 
@@ -3321,6 +3336,11 @@ class FinishedSetArchive(UuidPrimaryKeyMixin, Base):
     requested_by_user_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("admin_users.id", ondelete="RESTRICT"),
     )
+    mega_requested_by_user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"),
+    )
+    mega_requested_remote_root: Mapped[str | None] = mapped_column(String(1024))
+    mega_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     state: Mapped[FinishedSetArchiveState] = mapped_column(
         Enum(
             FinishedSetArchiveState,
@@ -5577,7 +5597,7 @@ for _statement in (
     "AND intent.state = 'awaiting_approval' "
     "AND version.release_id = release.id "
     "AND release.current_version_no = version.version_no "
-    "AND release.phase = 'ready_to_publish' "
+    "AND release.phase IN ('rendering', 'ready_to_publish', 'publishing', 'published') "
     "AND job.release_version_id = version.id "
     "AND output.derivative_recipe_id = NEW.derivative_recipe_id "
     "AND output.asset_id = NEW.asset_id "
@@ -5638,7 +5658,7 @@ for _statement in (
     "AND actor.role = NEW.actor_role "
     "AND version.release_id = release.id "
     "AND release.current_version_no = version.version_no "
-    "AND release.phase = 'ready_to_publish' "
+    "AND release.phase IN ('rendering', 'ready_to_publish', 'publishing', 'published') "
     "AND (SELECT count(*) FROM publication_inputs AS input "
     "WHERE input.intent_id = intent.id) = intent.input_count "
     "AND ("

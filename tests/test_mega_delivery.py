@@ -374,41 +374,19 @@ async def _seed_api_deliveries(settings: Settings) -> tuple[UUID, tuple[UUID, UU
     database = Database(settings.database_url)
     await database.create_schema()
     try:
-        await _insert_package(database, b"first clean package")
+        await _insert_package(database, b"first clean package", part_count=2)
         now = datetime.now(UTC)
         async with database.sessions() as session:
             first_intent = await session.scalar(select(PublicationIntent))
             assert first_intent is not None
-            second_intent = PublicationIntent(
-                release_id=first_intent.release_id,
-                release_version_id=first_intent.release_version_id,
-                target=PublicationTarget.PATREON,
-                state=PublicationIntentState.AWAITING_HUMAN,
-                configuration={"package": 2},
-                configuration_sha256="1" * 64,
-                input_manifest_sha256="2" * 64,
-                intent_digest="3" * 64,
-                input_count=1,
-                credential_reference=None,
-                scheduled_at=None,
-                public_preview_attester_name=first_intent.public_preview_attester_name,
-                public_preview_attester_user_id=(first_intent.public_preview_attester_user_id),
-                public_preview_attested_at=now,
-                public_preview_attestation_timezone="UTC",
-                public_preview_attestation_sha256="4" * 64,
-                planned_by_user_id=first_intent.planned_by_user_id,
-                planned_at=now,
-                lock_version=1,
-                completed_at=None,
-                last_error_code=None,
-                last_error_detail=None,
-            )
-            session.add(second_intent)
-            await session.flush()
             second_payload = b"second clean package"
             session.add(
                 PublicationPackage(
-                    intent_id=second_intent.id,
+                    intent_id=first_intent.id,
+                    part_number=2,
+                    part_count=2,
+                    first_ordinal=2,
+                    last_ordinal=2,
                     storage_backend="memory",
                     storage_bucket="asset-bucket",
                     object_key="packages/set-2.zip",
@@ -457,7 +435,12 @@ async def _seed_api_deliveries(settings: Settings) -> tuple[UUID, tuple[UUID, UU
         await database.dispose()
 
 
-async def _insert_package(database: Database, payload: bytes) -> None:
+async def _insert_package(
+    database: Database,
+    payload: bytes,
+    *,
+    part_count: int = 1,
+) -> None:
     now = datetime.now(UTC)
     sha256 = hashlib.sha256(payload).hexdigest()
     async with database.sessions() as session:
@@ -535,6 +518,10 @@ async def _insert_package(database: Database, payload: bytes) -> None:
         session.add(
             PublicationPackage(
                 intent_id=intent.id,
+                part_number=1,
+                part_count=part_count,
+                first_ordinal=1,
+                last_ordinal=1,
                 storage_backend="memory",
                 storage_bucket="asset-bucket",
                 object_key="packages/set.zip",

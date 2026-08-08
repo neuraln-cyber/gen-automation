@@ -48,6 +48,7 @@ from gen_automation.integrations.mega.client import (
     validate_remote_filename,
     validate_remote_path,
 )
+from gen_automation.services.finished_set_archives import request_finished_set_archive
 from gen_automation.services.outbound_image_privacy import (
     OutboundImagePrivacyError,
     require_metadata_free_image,
@@ -130,6 +131,13 @@ class MegaSetDeliveryCycleResult:
 
 
 @dataclass(frozen=True, slots=True)
+class MegaSetDeliveryRequestResult:
+    archive_id: UUID
+    delivery_id: UUID | None
+    replayed: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _SourcePart:
     id: UUID
     part_number: int
@@ -189,7 +197,9 @@ async def ensure_next_mega_set_delivery(
 ) -> bool:
     """Create one independent MEGA delivery for a ready finished-set archive."""
 
-    normalized_root = validate_remote_path(remote_root, allow_root=True)
+    # Keep validating the live controller setting, but never use it to retarget
+    # an explicit request. The request row is the durable destination authority.
+    validate_remote_path(remote_root, allow_root=True)
     created_at = _as_utc(now or datetime.now(UTC))
     delivery_exists = exists(
         select(MegaSetDelivery.id).where(
@@ -209,6 +219,9 @@ async def ensure_next_mega_set_delivery(
             .join(Release, Release.id == ReleaseVersion.release_id)
             .where(
                 FinishedSetArchive.state == FinishedSetArchiveState.READY,
+                FinishedSetArchive.mega_requested_at.is_not(None),
+                FinishedSetArchive.mega_requested_by_user_id.is_not(None),
+                FinishedSetArchive.mega_requested_remote_root.is_not(None),
                 FinishedSetArchive.manifest_sha256.is_not(None),
                 FinishedSetArchive.part_count.is_not(None),
                 ~delivery_exists,
@@ -222,6 +235,13 @@ async def ensure_next_mega_set_delivery(
         await session.rollback()
         return False
     archive, release_title = candidate
+    requested_root = archive.mega_requested_remote_root
+    if requested_root is None:
+        raise MegaSetDeliveryContractError("MEGA request destination root is missing")
+    try:
+        normalized_root = validate_remote_path(requested_root, allow_root=True)
+    except ValueError as error:
+        raise MegaSetDeliveryContractError("MEGA request destination root is invalid") from error
     manifest_sha256 = archive.manifest_sha256
     if manifest_sha256 is None or _SHA256.fullmatch(manifest_sha256) is None:
         raise MegaSetDeliveryContractError("finished-set manifest identity is invalid")
@@ -262,6 +282,82 @@ async def ensure_next_mega_set_delivery(
         await session.rollback()
         return False
     return True
+
+
+async def request_mega_set_delivery(
+    session: AsyncSession,
+    *,
+    review_task_id: UUID,
+    requested_by_user_id: UUID,
+    remote_root: str,
+    now: datetime | None = None,
+) -> MegaSetDeliveryRequestResult:
+    """Persist one explicit MEGA request without selecting any other target."""
+
+    normalized_root = validate_remote_path(remote_root, allow_root=True)
+    requested_at = _as_utc(now or datetime.now(UTC))
+    snapshot = await request_finished_set_archive(
+        session,
+        review_task_id=review_task_id,
+        requested_by_user_id=None,
+        now=requested_at,
+    )
+    archive = await session.scalar(
+        select(FinishedSetArchive)
+        .where(FinishedSetArchive.id == snapshot.archive_id)
+        .with_for_update()
+    )
+    if archive is None:
+        raise MegaSetDeliveryContractError("finished-set archive disappeared during request")
+
+    delivery = await session.scalar(
+        select(MegaSetDelivery)
+        .where(MegaSetDelivery.finished_set_archive_id == archive.id)
+        .with_for_update()
+    )
+    request_fields = (
+        archive.mega_requested_at,
+        archive.mega_requested_by_user_id,
+        archive.mega_requested_remote_root,
+    )
+    request_is_absent = all(value is None for value in request_fields)
+    if not request_is_absent and any(value is None for value in request_fields):
+        raise MegaSetDeliveryContractError("stored MEGA request identity is incomplete")
+    if not request_is_absent and archive.mega_requested_remote_root != normalized_root:
+        raise MegaSetDeliveryContractError(
+            "the existing MEGA request uses a different destination root"
+        )
+    if delivery is not None and delivery.remote_root != normalized_root:
+        raise MegaSetDeliveryContractError(
+            "the existing MEGA delivery uses a different destination root"
+        )
+    changed = request_is_absent
+    if request_is_absent:
+        archive.mega_requested_at = requested_at
+        archive.mega_requested_by_user_id = requested_by_user_id
+        archive.mega_requested_remote_root = normalized_root
+        archive.updated_at = requested_at
+    if delivery is not None and delivery.state in {
+        MegaDeliveryState.FAILED,
+        MegaDeliveryState.RETRY_WAIT,
+    }:
+        delivery.state = MegaDeliveryState.PENDING
+        delivery.available_at = requested_at
+        delivery.lease_owner = None
+        delivery.lease_expires_at = None
+        delivery.completion_marker_node_handle = None
+        delivery.verified_at = None
+        delivery.completed_at = None
+        delivery.last_error_code = None
+        delivery.last_error_detail = None
+        delivery.updated_at = requested_at
+        changed = True
+    await session.commit()
+    return MegaSetDeliveryRequestResult(
+        archive_id=archive.id,
+        delivery_id=delivery.id if delivery is not None else None,
+        replayed=not changed,
+    )
 
 
 async def claim_mega_set_delivery(

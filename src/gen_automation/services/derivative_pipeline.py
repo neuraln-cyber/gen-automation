@@ -143,10 +143,6 @@ async def create_derivative_recipe_and_plan(
 
     normalized_configuration = _normalize_configuration(configuration)
     normalized_targets = _normalize_targets(output_targets)
-    if _FULL_TARGET not in normalized_targets:
-        raise DerivativePipelineInputError(
-            "the clean full target is required for every accepted image"
-        )
     normalized_renderer = _bounded_text(renderer_version, "renderer version", 100)
     normalized_pillow = _bounded_text(pillow_version, "Pillow version", 50)
     normalized_key = _bounded_text(idempotency_key, "idempotency key", 200)
@@ -230,15 +226,18 @@ async def _create_plan_once(
         full_output_byte_budget = patreon_full_output_byte_budget(len(selections))
     except DeliverabilityError as error:
         raise DerivativePipelineConflictError(str(error)) from None
-    x_selected_asset_ids = await _load_x_selected_asset_ids(
-        session,
-        task=task,
-        selections=selections,
-    )
-    if x_selected_asset_ids and _X_TARGET not in output_targets:
-        raise DerivativePipelineConflictError(
-            "the approved recipe omits the selected X teaser target"
+    plans_x_teasers = _X_TARGET in output_targets
+    x_selected_asset_ids = (
+        await _load_x_selected_asset_ids(
+            session,
+            task=task,
+            selections=selections,
         )
+        if plans_x_teasers
+        else frozenset()
+    )
+    if plans_x_teasers and not x_selected_asset_ids and _FULL_TARGET not in output_targets:
+        raise DerivativePipelineConflictError("X teaser preparation requires selected X images")
     if x_selected_asset_ids and watermark_asset_id is None:
         raise DerivativePipelineConflictError(
             "selected X images require an approved watermark asset"
@@ -247,10 +246,20 @@ async def _create_plan_once(
         raise DerivativePipelineConflictError(
             "selected X images require a canonical watermark recipe"
         )
-    watermark = await _load_watermark_snapshot(
-        session,
-        release_version_id=task.release_version_id,
-        watermark_asset_id=watermark_asset_id,
+    if not plans_x_teasers and (
+        watermark_asset_id is not None or configuration.get("watermark") is not None
+    ):
+        raise DerivativePipelineConflictError(
+            "clean full-output preparation does not accept a watermark"
+        )
+    watermark = (
+        await _load_watermark_snapshot(
+            session,
+            release_version_id=task.release_version_id,
+            watermark_asset_id=watermark_asset_id,
+        )
+        if plans_x_teasers
+        else None
     )
 
     config_sha256 = canonical_sha256(configuration)
@@ -260,10 +269,10 @@ async def _create_plan_once(
     # Keep the clean member copy independent from every destination-specific
     # transform.  In particular, a watermark or teaser failure must not make
     # the already-approved full set unavailable for its owner.
-    target_groups: list[tuple[tuple[str, ...], list[ReleaseSelection]]] = [
-        ((_FULL_TARGET,), selections)
-    ]
-    if selected_selections:
+    target_groups: list[tuple[tuple[str, ...], list[ReleaseSelection]]] = []
+    if _FULL_TARGET in output_targets:
+        target_groups.append(((_FULL_TARGET,), selections))
+    if _X_TARGET in output_targets and selected_selections:
         target_groups.append(((_X_TARGET,), selected_selections))
     recipe_plans: list[
         tuple[
@@ -334,61 +343,44 @@ async def _create_plan_once(
     if release_row is None:
         raise DerivativePipelineConflictError("derivative plan release version is unavailable")
     release, release_version = release_row
-    if (
-        release.current_version_no != release_version.version_no
-        or release.phase != ReleasePhase.APPROVED
-    ):
+    if release.current_version_no != release_version.version_no or release.phase not in {
+        ReleasePhase.APPROVED,
+        ReleasePhase.RENDERING,
+        ReleasePhase.READY_TO_PUBLISH,
+    }:
         raise DerivativePipelineConflictError(
             "derivative plan is stale or the release phase does not allow rendering"
         )
-    promoted_release_id = await session.scalar(
-        update(Release)
-        .where(
-            Release.id == release.id,
-            Release.current_version_no == release_version.version_no,
-            Release.phase == ReleasePhase.APPROVED,
-            Release.lock_version == release.lock_version,
+    resume_before_new_job = release.phase == ReleasePhase.READY_TO_PUBLISH
+    if release.phase == ReleasePhase.APPROVED:
+        await _transition_release_to_rendering(
+            session,
+            release=release,
+            release_version=release_version,
+            task=task,
+            approved_by_user_id=approved_by_user_id,
+            idempotency_key=idempotency_key,
+            planned_at=planned_at,
+            resumed=False,
         )
-        .values(
-            phase=ReleasePhase.RENDERING,
-            lock_version=Release.lock_version + 1,
+
+    target_owners: dict[tuple[UUID, str], tuple[DerivativeJob, DerivativeRecipe]] = {}
+    existing_target_rows = (
+        await session.execute(
+            select(DerivativeJob, DerivativeRecipe)
+            .join(DerivativeRecipe, DerivativeRecipe.id == DerivativeJob.derivative_recipe_id)
+            .where(DerivativeJob.release_version_id == task.release_version_id)
         )
-        .returning(Release.id)
-    )
-    if promoted_release_id is None:
-        raise DerivativePipelineConflictError(
-            "derivative plan release phase compare-and-swap failed"
-        )
-    session.add(
-        _audit(
-            actor=f"admin:{approved_by_user_id}",
-            action="release.derivative_rendering_started",
-            resource_type="release",
-            resource_id=release.id,
-            correlation_id=idempotency_key,
-            detail={
-                "review_task_id": str(task.id),
-                "release_version_id": str(task.release_version_id),
-                "phase": ReleasePhase.RENDERING.value,
-            },
-            occurred_at=planned_at,
-        )
-    )
-    session.add(
-        _outbox(
-            topic="release.derivative_rendering_started",
-            dedupe_key=f"release.derivative_rendering_started:{task.id}",
-            correlation_id=idempotency_key,
-            aggregate_type="release",
-            aggregate_id=release.id,
-            payload={
-                "release_id": str(release.id),
-                "release_version_id": str(task.release_version_id),
-                "review_task_id": str(task.id),
-            },
-            occurred_at=planned_at,
-        )
-    )
+    ).all()
+    for existing_job, existing_recipe in existing_target_rows:
+        for target in _stored_targets(existing_recipe):
+            owner_key = (existing_job.release_selection_id, target)
+            previous = target_owners.get(owner_key)
+            if previous is not None and previous[0].id != existing_job.id:
+                raise DerivativePipelineConflictError(
+                    "multiple derivative jobs already own the same selection target"
+                )
+            target_owners[owner_key] = (existing_job, existing_recipe)
 
     recipes: list[DerivativeRecipe] = []
     job_ids: list[UUID] = []
@@ -401,6 +393,13 @@ async def _create_plan_once(
         recipe_identity,
         recipe_logical_key,
     ) in enumerate(recipe_plans):
+        group_target = group_targets[0]
+        for selection in group_selections:
+            target_owner = target_owners.get((selection.id, group_target))
+            if target_owner is not None and target_owner[1].logical_key != recipe_logical_key:
+                raise DerivativePipelineConflictError(
+                    "the derivative selection target already has a different frozen recipe"
+                )
         # Full outputs are the owner's durable set and should drain before
         # destination-only work even when every job shares the same caller
         # priority and request timestamp.
@@ -525,6 +524,18 @@ async def _create_plan_once(
                 job_order.append((selection.display_order, group_order, existing.id))
                 continue
 
+            if resume_before_new_job:
+                await _transition_release_to_rendering(
+                    session,
+                    release=release,
+                    release_version=release_version,
+                    task=task,
+                    approved_by_user_id=approved_by_user_id,
+                    idempotency_key=idempotency_key,
+                    planned_at=planned_at,
+                    resumed=True,
+                )
+                resume_before_new_job = False
             job = DerivativeJob(
                 id=uuid7(),
                 release_selection_id=selection.id,
@@ -616,6 +627,85 @@ async def _create_plan_once(
     )
     await session.commit()
     return result
+
+
+async def _transition_release_to_rendering(
+    session: AsyncSession,
+    *,
+    release: Release,
+    release_version: ReleaseVersion,
+    task: ReviewTask,
+    approved_by_user_id: UUID,
+    idempotency_key: str,
+    planned_at: datetime,
+    resumed: bool,
+) -> None:
+    expected_phase = ReleasePhase.READY_TO_PUBLISH if resumed else ReleasePhase.APPROVED
+    promoted_release_id = await session.scalar(
+        update(Release)
+        .where(
+            Release.id == release.id,
+            Release.current_version_no == release_version.version_no,
+            Release.phase == expected_phase,
+            Release.lock_version == release.lock_version,
+        )
+        .values(
+            phase=ReleasePhase.RENDERING,
+            lock_version=Release.lock_version + 1,
+        )
+        .returning(Release.id)
+    )
+    if promoted_release_id is None:
+        raise DerivativePipelineConflictError(
+            "derivative plan release phase compare-and-swap failed"
+        )
+    await session.refresh(release)
+    event_name = (
+        "release.derivative_rendering_resumed"
+        if resumed
+        else "release.derivative_rendering_started"
+    )
+    resume_identity = canonical_sha256(
+        {
+            "review_task_id": str(task.id),
+            "idempotency_key": idempotency_key,
+        }
+    )
+    dedupe_key = (
+        f"release.derivative_rendering_resumed:{resume_identity}"
+        if resumed
+        else f"release.derivative_rendering_started:{task.id}"
+    )
+    session.add(
+        _audit(
+            actor=f"admin:{approved_by_user_id}",
+            action=event_name,
+            resource_type="release",
+            resource_id=release.id,
+            correlation_id=idempotency_key,
+            detail={
+                "review_task_id": str(task.id),
+                "release_version_id": str(task.release_version_id),
+                "phase": ReleasePhase.RENDERING.value,
+            },
+            occurred_at=planned_at,
+        )
+    )
+    session.add(
+        _outbox(
+            topic=event_name,
+            dedupe_key=dedupe_key,
+            correlation_id=idempotency_key,
+            aggregate_type="release",
+            aggregate_id=release.id,
+            payload={
+                "release_id": str(release.id),
+                "release_version_id": str(task.release_version_id),
+                "review_task_id": str(task.id),
+            },
+            occurred_at=planned_at,
+        )
+    )
 
 
 async def claim_derivative_jobs(
