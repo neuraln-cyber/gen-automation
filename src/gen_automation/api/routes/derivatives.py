@@ -60,6 +60,10 @@ class _StrictRequest(BaseModel):
 class PrepareDerivativesRequest(_StrictRequest):
     watermark_asset_id: UUID | None = None
     watermark_position: WatermarkPosition = WatermarkPosition.BOTTOM_RIGHT
+    watermark_positions_by_asset_id: dict[UUID, WatermarkPosition] = Field(
+        default_factory=dict,
+        max_length=4,
+    )
     max_attempts: int = Field(default=3, ge=1, le=10)
 
 
@@ -173,6 +177,7 @@ async def post_review_derivative_plan(
             idempotency_key=idempotency_key,
             watermark_asset_id=command.watermark_asset_id,
             watermark_position=command.watermark_position,
+            watermark_positions_by_asset_id=command.watermark_positions_by_asset_id,
             max_attempts=command.max_attempts,
         )
     except (

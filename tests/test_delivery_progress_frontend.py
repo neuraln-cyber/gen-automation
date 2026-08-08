@@ -1,9 +1,32 @@
+from html.parser import HTMLParser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "src" / "gen_automation" / "static" / "dashboard.js"
 DELIVERY_TEMPLATE = ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "delivery.html"
 REVIEW_TEMPLATE = ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "review_task.html"
+
+
+class _BrowserSuccessfulControls(HTMLParser):
+    """Collect names that a browser includes in a non-clicked form submission."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.names: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag not in {"input", "select", "textarea"}:
+            return
+        values = dict(attrs)
+        name = values.get("name")
+        if not name or "disabled" in values:
+            return
+        control_type = (values.get("type") or "text").lower()
+        if control_type in {"button", "submit", "reset", "image", "file"}:
+            return
+        if control_type in {"radio", "checkbox"} and "checked" not in values:
+            return
+        self.names.append(name)
 
 
 def _delivery_progress_handler() -> str:
@@ -107,9 +130,11 @@ def test_delivery_template_exposes_four_independent_target_actions() -> None:
     assert template.count('delivery:prepare-x-outputs"') == 1
     assert "Prepare watermarked X teasers" in template
     assert "This creates only the selected teaser copies. It does not post them." in template
-    assert template.count('name="watermark_position"') == 5
+    assert template.count('name="watermark_position"') == 2
+    assert 'name="watermark_placements"' in template
+    assert "data-watermark-corner" in template
     for position in ("top_left", "top_right", "bottom_left", "bottom_right"):
-        assert f'value="{position}"' in template
+        assert f"'{position}'" in template
     assert 'name="x_adult_content" value="true" checked' in template
     assert 'name="x_adult_content" value="false"' in template
     assert 'name="x_scheduled_local"' in template
@@ -122,6 +147,61 @@ def test_delivery_template_exposes_four_independent_target_actions() -> None:
     assert 'data-destination-state="{{ destination.state }}"' in template
     assert "This button does not start MEGA, X, or ZIP preparation." in template
     assert "This button does not start MEGA, Patreon, or ZIP preparation." in template
+
+
+def test_x_watermark_composer_previews_each_image_and_preserves_individual_corners() -> None:
+    template = DELIVERY_TEMPLATE.read_text(encoding="utf-8")
+    script = SCRIPT.read_text(encoding="utf-8")
+    handler = script.split("function initializeWatermarkComposers()", maxsplit=1)[1]
+    handler = handler.split("function initializeXPublishingControls()", maxsplit=1)[0]
+
+    assert "Upload once and it stays securely available for future sets." in template
+    assert "data-watermark-composer" in template
+    assert "Image 1 of {{ x_previews|length }}" in template
+    assert "data-watermark-thumbnail" in template
+    assert "data-watermark-overlay" in template
+    assert "data-watermark-placements" in template
+    assert "{% if not watermarks or not x_previews %}disabled{% endif %}" in template
+    assert "x_output_downloads" in template
+    assert "Download any teaser now" in template
+    assert "Download teaser {{ loop.index }}" in template
+    assert "JSON.stringify(placements)" in handler
+    assert "placements[slide.dataset.assetId]" in handler
+    assert "candidate.checked = false" in handler
+    assert "overlay.dataset.position = input.value" in handler
+    assert 'event.key === "ArrowLeft"' in handler
+    assert 'event.key === "ArrowRight"' in handler
+    assert "trimTransparentCanvas(previewUrl)" in handler
+    assert "HTMLCanvasElement" in handler
+    assert "URL.createObjectURL" not in handler
+    assert "Math.min(width, height) * watermarkMargin / relativeScale" in handler
+    assert "imageWidth * watermarkWidth / relativeScale" in handler
+    assert "targetHeight > availableHeight" in handler
+    assert "prepared.width * targetHeight / prepared.height" in handler
+    assert "slides.forEach((slide) => paintWatermarkOverlay(slide, prepared))" in handler
+    assert "scopedStorageKey(X_WATERMARK_ASSET_STORAGE_KEY)" in handler
+
+
+def test_x_watermark_corner_controls_do_not_leak_strict_form_fields() -> None:
+    template = DELIVERY_TEMPLATE.read_text(encoding="utf-8")
+    action = template.index("delivery:prepare-x-outputs")
+    form_start = template.rindex("<form", 0, action)
+    form_end = template.index("</form>", action) + len("</form>")
+    form = template[form_start:form_end]
+    controls = _BrowserSuccessfulControls()
+    controls.feed(form)
+
+    assert set(controls.names) == {
+        "csrf_token",
+        "idempotency_key",
+        "submission_id",
+        "watermark_asset_id",
+        "watermark_position",
+        "watermark_placements",
+    }
+    assert "watermark_corner_" not in form
+    assert 'name="watermark_placements"' in form
+    assert 'name="watermark_position" value="bottom_right"' in form
 
 
 def test_x_composer_tracks_caption_timezone_and_optional_schedule() -> None:

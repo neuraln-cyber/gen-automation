@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -28,6 +29,7 @@ PREPARE_OUTPUT_FIELDS = frozenset(
         "submission_id",
         "watermark_asset_id",
         "watermark_position",
+        "watermark_placements",
     }
 )
 RETRY_OUTPUT_FIELDS = frozenset(
@@ -141,6 +143,7 @@ class PrepareOutputForm:
     submission_id: UUID
     watermark_asset_id: UUID | None
     watermark_position: WatermarkPosition | None
+    watermark_placements: tuple[tuple[UUID, WatermarkPosition], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,7 +239,11 @@ class PublicationGuardForm:
 
 
 async def read_prepare_output_form(request: Request) -> PrepareOutputForm:
-    values = await _read_form(request, expected_fields=PREPARE_OUTPUT_FIELDS)
+    values = await _read_form(
+        request,
+        expected_fields=PREPARE_OUTPUT_FIELDS,
+        optional_fields=frozenset({"watermark_placements"}),
+    )
     submission_id = _uuid(values["submission_id"])
     raw_watermark = values["watermark_asset_id"]
     watermark_asset_id: UUID | None = None
@@ -259,12 +266,19 @@ async def read_prepare_output_form(request: Request) -> PrepareOutputForm:
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             message="Choose both a watermark and its corner placement.",
         )
+    watermark_placements = _watermark_placements(values["watermark_placements"])
+    if watermark_placements and watermark_asset_id is None:
+        raise BrowserDeliveryFormError(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            message="Choose a watermark before assigning image placements.",
+        )
     return PrepareOutputForm(
         csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
         idempotency_key=_idempotency_key(values["idempotency_key"]),
         submission_id=submission_id,
         watermark_asset_id=watermark_asset_id,
         watermark_position=watermark_position,
+        watermark_placements=watermark_placements,
     )
 
 
@@ -444,7 +458,10 @@ async def _read_form(
     request: Request,
     *,
     expected_fields: frozenset[str],
+    optional_fields: frozenset[str] = frozenset(),
 ) -> dict[str, str]:
+    if not optional_fields.issubset(expected_fields):
+        raise AssertionError("optional browser form fields must be expected")
     content_type = request.headers.get("content-type", "")
     if content_type.partition(";")[0].strip().lower() != _FORM_CONTENT_TYPE:
         raise BrowserDeliveryFormError(
@@ -487,9 +504,45 @@ async def _read_form(
         )
     except (UnicodeDecodeError, ValueError):
         raise _bad_request() from None
-    if set(parsed) != expected_fields or any(len(parsed[field]) != 1 for field in expected_fields):
+    required_fields = expected_fields - optional_fields
+    if (
+        not required_fields.issubset(parsed)
+        or not set(parsed).issubset(expected_fields)
+        or any(len(values) != 1 for values in parsed.values())
+    ):
         raise _bad_request()
-    return {field: parsed[field][0] for field in expected_fields}
+    return {field: parsed[field][0] if field in parsed else "" for field in expected_fields}
+
+
+def _watermark_placements(value: str) -> tuple[tuple[UUID, WatermarkPosition], ...]:
+    if value == "":
+        return ()
+    if len(value.encode("utf-8")) > 2_000:
+        raise _bad_request()
+    try:
+        pairs = json.loads(value, object_pairs_hook=lambda items: items)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        raise _bad_request() from None
+    if not isinstance(pairs, list) or not 1 <= len(pairs) <= 4:
+        raise _bad_request()
+    placements: list[tuple[UUID, WatermarkPosition]] = []
+    seen: set[UUID] = set()
+    for pair in pairs:
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise _bad_request()
+        raw_asset_id, raw_position = pair
+        if not isinstance(raw_asset_id, str) or not isinstance(raw_position, str):
+            raise _bad_request()
+        asset_id = _uuid(raw_asset_id)
+        if asset_id in seen:
+            raise _bad_request()
+        try:
+            position = WatermarkPosition(raw_position)
+        except ValueError:
+            raise _bad_request() from None
+        seen.add(asset_id)
+        placements.append((asset_id, position))
+    return tuple(sorted(placements, key=lambda item: str(item[0])))
 
 
 def _tags(value: str) -> tuple[str, ...]:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -30,8 +32,10 @@ from gen_automation.services.derivatives import (
 from gen_automation.storage.base import (
     ObjectAlreadyExistsError,
     ObjectMetadata,
+    ObjectNotFoundError,
     ObjectStore,
     ObjectStoreError,
+    ObjectTooLargeError,
 )
 
 MAX_WATERMARK_BYTES = 4 * 1024 * 1024
@@ -74,6 +78,16 @@ class RegisteredWatermark:
     byte_size: int
     registered_at: datetime
     replayed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RegisteredWatermarkPayload:
+    asset_id: UUID
+    display_name: str
+    sha256: str
+    width: int
+    height: int
+    data: bytes
 
 
 async def register_watermark(
@@ -292,6 +306,52 @@ async def list_registered_watermarks(
             continue
         results.append(_result(asset, replayed=False))
     return tuple(results)
+
+
+async def read_registered_watermark(
+    session: AsyncSession,
+    store: ObjectStore,
+    *,
+    asset_id: UUID,
+) -> RegisteredWatermarkPayload:
+    """Read one exact reusable watermark without exposing arbitrary derivatives."""
+
+    asset = await session.get(Asset, asset_id)
+    if asset is None or not is_registered_watermark(asset):
+        raise WatermarkNotFoundError("registered watermark was not found")
+    _validate_registry_asset(asset)
+    if asset.storage_backend != store.backend or asset.storage_bucket != store.bucket:
+        raise WatermarkConflictError("watermark belongs to another object store")
+    assert asset.object_key is not None
+    assert asset.object_version_id is not None
+    assert asset.byte_size is not None
+    assert asset.sha256 is not None
+    try:
+        data = await store.read_bytes(
+            asset.object_key,
+            max_bytes=asset.byte_size,
+            version_id=asset.object_version_id,
+        )
+    except (ObjectNotFoundError, ObjectTooLargeError) as error:
+        raise WatermarkConflictError("watermark object identity changed") from error
+    except ObjectStoreError as error:
+        raise WatermarkStorageError("watermark storage is unavailable") from error
+    if len(data) != asset.byte_size or not hmac.compare_digest(
+        hashlib.sha256(data).hexdigest(),
+        asset.sha256,
+    ):
+        raise WatermarkConflictError("watermark object identity changed")
+    display_name = asset.asset_metadata.get("display_name")
+    return RegisteredWatermarkPayload(
+        asset_id=asset.id,
+        display_name=(
+            display_name if isinstance(display_name, str) and display_name else "Watermark"
+        ),
+        sha256=asset.sha256,
+        width=asset.width or 0,
+        height=asset.height or 0,
+        data=data,
+    )
 
 
 def is_registered_watermark(asset: Asset) -> bool:

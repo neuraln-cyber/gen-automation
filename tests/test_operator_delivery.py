@@ -139,6 +139,10 @@ async def _prepare_independent_destination_inputs(
         )
     assert snapshot.progress.full_outputs_ready
     assert len(snapshot.x_outputs) == snapshot.x_selected_count == 1
+    assert tuple(source.asset_id for source in snapshot.x_selected_sources) == (
+        approved.raw_asset_ids[0],
+    )
+    assert snapshot.x_selected_sources[0].sha256
     return snapshot
 
 

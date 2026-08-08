@@ -91,6 +91,15 @@ class DeliveryOutput:
 
 
 @dataclass(frozen=True, slots=True)
+class DeliverySource:
+    asset_id: UUID
+    display_order: int
+    width: int
+    height: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class DerivativeProgress:
     planned: bool
     total_jobs: int
@@ -208,6 +217,7 @@ class OperatorDeliverySnapshot:
     publishing_guard_lock_version: int | None
     publishing_guard_changed_at: datetime | None
     destinations: tuple[DestinationState, ...]
+    x_selected_sources: tuple[DeliverySource, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,6 +306,17 @@ async def load_operator_delivery(
         selection_sources=selection_sources,
     )
     expected_x_count = sum(selection.asset_id in x_selected_asset_ids for selection in selections)
+    x_selected_sources = tuple(
+        DeliverySource(
+            asset_id=selection.asset_id,
+            display_order=selection.display_order,
+            width=selection.source_width,
+            height=selection.source_height,
+            sha256=selection.source_sha256,
+        )
+        for selection in selections
+        if selection.asset_id in x_selected_asset_ids
+    )
     state_counts = {state: sum(job.state == state for job in jobs) for state in DerivativeJobState}
     ready_for_destinations = (
         review_task.state == ReviewTaskState.COMPLETED
@@ -358,6 +379,7 @@ async def load_operator_delivery(
         publishing_guard_lock_version=guard_lock_version,
         publishing_guard_changed_at=guard_changed_at,
         destinations=destinations,
+        x_selected_sources=x_selected_sources,
     )
 
 

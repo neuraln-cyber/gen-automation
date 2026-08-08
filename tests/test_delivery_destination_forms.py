@@ -10,10 +10,12 @@ from starlette.requests import Request
 from gen_automation.api.browser_delivery_forms import (
     BrowserDeliveryFormError,
     read_prepare_mega_form,
+    read_prepare_output_form,
     read_prepare_patreon_form,
     read_prepare_x_form,
     read_retry_output_form,
 )
+from gen_automation.services.derivatives import WatermarkPosition
 
 
 def _request(fields: dict[str, str]) -> Request:
@@ -65,6 +67,78 @@ def _x_fields() -> dict[str, str]:
         "x_scheduled_local": "",
         "x_timezone": "Europe/Sofia",
     }
+
+
+def _x_output_fields() -> dict[str, str]:
+    return {
+        **_common_fields(),
+        "watermark_asset_id": str(uuid4()),
+        "watermark_position": "bottom_right",
+    }
+
+
+@pytest.mark.asyncio
+async def test_output_form_accepts_exact_per_image_watermark_placements() -> None:
+    first = uuid4()
+    second = uuid4()
+    fields = {
+        **_x_output_fields(),
+        "watermark_placements": (f'{{"{first}":"top_left","{second}":"bottom_right"}}'),
+    }
+
+    form = await read_prepare_output_form(_request(fields))
+
+    assert dict(form.watermark_placements) == {
+        first: WatermarkPosition.TOP_LEFT,
+        second: WatermarkPosition.BOTTOM_RIGHT,
+    }
+
+
+@pytest.mark.asyncio
+async def test_output_form_keeps_legacy_single_corner_fallback() -> None:
+    form = await read_prepare_output_form(_request(_x_output_fields()))
+
+    assert form.watermark_position == WatermarkPosition.BOTTOM_RIGHT
+    assert form.watermark_placements == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "placements",
+    [
+        "{}",
+        '{"not-a-uuid":"top_left"}',
+        None,
+    ],
+)
+async def test_output_form_rejects_invalid_watermark_placement_maps(
+    placements: str | None,
+) -> None:
+    fields = _x_output_fields()
+    if placements is None:
+        asset_id = uuid4()
+        fields["watermark_placements"] = f'{{"{asset_id}":"top_left","{asset_id}":"bottom_right"}}'
+    else:
+        fields["watermark_placements"] = placements
+
+    with pytest.raises(BrowserDeliveryFormError) as caught:
+        await read_prepare_output_form(_request(fields))
+
+    assert caught.value.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.asyncio
+async def test_output_form_rejects_more_than_four_watermark_placements() -> None:
+    placements = ",".join(f'"{uuid4()}":"top_left"' for _index in range(5))
+    fields = {
+        **_x_output_fields(),
+        "watermark_placements": "{" + placements + "}",
+    }
+
+    with pytest.raises(BrowserDeliveryFormError) as caught:
+        await read_prepare_output_form(_request(fields))
+
+    assert caught.value.status_code == status.HTTP_400_BAD_REQUEST
 
 
 @pytest.mark.asyncio

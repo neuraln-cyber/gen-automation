@@ -22,6 +22,7 @@
   const AUTOMATION_DRAFT_SUBMISSION_KEY = "gen-automation:automation-draft-submission:v1";
   const PENDING_IMAGE_PROFILE_KEY = "gen-automation:reuse-image-settings:v1";
   const SAME_PAGE_SCROLL_STORAGE_KEY = "gen-automation:same-page-scroll:v1";
+  const X_WATERMARK_ASSET_STORAGE_KEY = "gen-automation:x-watermark-asset:v1";
   const REVIEW_COMPLETION_TIMEOUT_MS = 25000;
   const REVIEW_DECISION_REQUEST_TIMEOUT_MS = 10000;
   const REVIEW_DECISION_RETRY_DELAYS_MS = Object.freeze([400, 900, 1800, 3500, 5000]);
@@ -6301,6 +6302,290 @@
     window.requestAnimationFrame(submit);
   }
 
+  function initializeWatermarkComposers() {
+    const trimmedWatermarks = new Map();
+
+    const trimTransparentCanvas = async (url) => {
+      if (trimmedWatermarks.has(url)) return trimmedWatermarks.get(url);
+      const pending = (async () => {
+        const image = new Image();
+        image.src = url;
+        await image.decode();
+        if (!image.naturalWidth || !image.naturalHeight) throw new Error("empty watermark");
+
+        const canvas = document.createElement("canvas");
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        if (!context) throw new Error("watermark preview is unavailable");
+        context.drawImage(image, 0, 0);
+        const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+        let left = canvas.width;
+        let right = -1;
+        let top = canvas.height;
+        let bottom = -1;
+        for (let y = 0; y < canvas.height; y += 1) {
+          for (let x = 0; x < canvas.width; x += 1) {
+            if (pixels[(y * canvas.width + x) * 4 + 3] === 0) continue;
+            left = Math.min(left, x);
+            right = Math.max(right, x);
+            top = Math.min(top, y);
+            bottom = Math.max(bottom, y);
+          }
+        }
+        if (right < left || bottom < top) throw new Error("watermark has no visible pixels");
+
+        const cropped = document.createElement("canvas");
+        cropped.width = right - left + 1;
+        cropped.height = bottom - top + 1;
+        const croppedContext = cropped.getContext("2d");
+        if (!croppedContext) throw new Error("watermark preview is unavailable");
+        croppedContext.drawImage(
+          canvas,
+          left,
+          top,
+          cropped.width,
+          cropped.height,
+          0,
+          0,
+          cropped.width,
+          cropped.height,
+        );
+        return Object.freeze({
+          canvas: cropped,
+          width: cropped.width,
+          height: cropped.height,
+        });
+      })();
+      trimmedWatermarks.set(url, pending);
+      return pending;
+    };
+
+    document.querySelectorAll("[data-watermark-composer]").forEach((composer) => {
+      if (!(composer instanceof HTMLElement)) return;
+      const form = composer.closest("form");
+      if (!(form instanceof HTMLFormElement)) return;
+      const assetSelect = form.querySelector("[data-watermark-asset-select]");
+      const placementsField = form.querySelector("[data-watermark-placements]");
+      const globalPosition = form.querySelector('input[name="watermark_position"]');
+      const completeStatus = form.querySelector("[data-watermark-complete-status]");
+      const renderStatus = composer.querySelector("[data-watermark-render-status]");
+      const step = composer.querySelector("[data-watermark-step]");
+      const previous = composer.querySelector("[data-watermark-previous]");
+      const next = composer.querySelector("[data-watermark-next]");
+      const slides = Array.from(composer.querySelectorAll("[data-watermark-slide]"));
+      const thumbnails = Array.from(composer.querySelectorAll("[data-watermark-thumbnail]"));
+      if (
+        !(assetSelect instanceof HTMLSelectElement)
+        || !(placementsField instanceof HTMLInputElement)
+        || !(globalPosition instanceof HTMLInputElement)
+        || !(previous instanceof HTMLButtonElement)
+        || !(next instanceof HTMLButtonElement)
+        || !slides.length
+      ) return;
+
+      let currentIndex = 0;
+      let watermarkRequest = 0;
+      const placements = {};
+      const relativeScale = 1_000_000;
+      const watermarkWidth = Number.parseInt(composer.dataset.watermarkWidth || "264000", 10);
+      const watermarkMargin = Number.parseInt(composer.dataset.watermarkMargin || "12000", 10);
+      composer.style.setProperty(
+        "--watermark-width",
+        `${(watermarkWidth / relativeScale) * 100}%`,
+      );
+
+      try {
+        const savedAssetId = window.localStorage.getItem(
+          scopedStorageKey(X_WATERMARK_ASSET_STORAGE_KEY),
+        );
+        if (savedAssetId && Array.from(assetSelect.options).some(
+          (option) => option.value === savedAssetId,
+        )) {
+          assetSelect.value = savedAssetId;
+        } else if (!assetSelect.value && assetSelect.options.length > 1) {
+          assetSelect.selectedIndex = 1;
+        }
+      } catch (_error) {
+        if (!assetSelect.value && assetSelect.options.length > 1) assetSelect.selectedIndex = 1;
+      }
+      slides.forEach((slide) => {
+        if (!(slide instanceof HTMLElement) || !slide.dataset.assetId) return;
+        const source = slide.querySelector(".x-watermark-source");
+        if (source instanceof HTMLImageElement) {
+          const width = Number.parseFloat(source.getAttribute("width") || "0");
+          const height = Number.parseFloat(source.getAttribute("height") || "0");
+          if (width > 0 && height > 0) {
+            const margin = Math.floor(
+              Math.min(width, height) * watermarkMargin / relativeScale,
+            );
+            slide.style.setProperty("--watermark-inset-x", `${(margin / width) * 100}%`);
+            slide.style.setProperty("--watermark-inset-y", `${(margin / height) * 100}%`);
+          }
+        }
+        const checked = slide.querySelector("[data-watermark-corner]:checked");
+        placements[slide.dataset.assetId] = checked instanceof HTMLInputElement
+          ? checked.value
+          : "bottom_right";
+      });
+
+      const updatePlacementPayload = () => {
+        placementsField.value = JSON.stringify(placements);
+        if (completeStatus instanceof HTMLElement) {
+          completeStatus.textContent = `${Object.keys(placements).length} placements ready`;
+        }
+      };
+      const showSlide = (requestedIndex) => {
+        currentIndex = Math.max(0, Math.min(slides.length - 1, requestedIndex));
+        slides.forEach((slide, index) => {
+          if (!(slide instanceof HTMLElement)) return;
+          slide.hidden = index !== currentIndex;
+          slide.setAttribute("aria-hidden", index === currentIndex ? "false" : "true");
+        });
+        thumbnails.forEach((thumbnail, index) => {
+          if (!(thumbnail instanceof HTMLButtonElement)) return;
+          if (index === currentIndex) thumbnail.setAttribute("aria-current", "true");
+          else thumbnail.removeAttribute("aria-current");
+        });
+        previous.disabled = currentIndex === 0;
+        next.disabled = currentIndex === slides.length - 1;
+        if (step instanceof HTMLElement) {
+          step.textContent = `Image ${currentIndex + 1} of ${slides.length}`;
+        }
+      };
+      const paintWatermarkOverlay = (slide, prepared) => {
+        if (!(slide instanceof HTMLElement)) throw new Error("invalid watermark slide");
+        const source = slide.querySelector(".x-watermark-source");
+        const overlay = slide.querySelector("[data-watermark-overlay]");
+        if (!(source instanceof HTMLImageElement) || !(overlay instanceof HTMLCanvasElement)) {
+          throw new Error("watermark preview is unavailable");
+        }
+        const imageWidth = Number.parseInt(source.getAttribute("width") || "0", 10);
+        const imageHeight = Number.parseInt(source.getAttribute("height") || "0", 10);
+        if (imageWidth <= 0 || imageHeight <= 0) {
+          throw new Error("watermark preview dimensions are invalid");
+        }
+        const margin = Math.floor(
+          Math.min(imageWidth, imageHeight) * watermarkMargin / relativeScale,
+        );
+        const availableWidth = imageWidth - 2 * margin;
+        const availableHeight = imageHeight - 2 * margin;
+        let targetWidth = Math.max(
+          1,
+          Math.floor(imageWidth * watermarkWidth / relativeScale),
+        );
+        targetWidth = Math.min(targetWidth, availableWidth);
+        let targetHeight = Math.max(1, Math.floor(prepared.height * targetWidth / prepared.width));
+        if (targetHeight > availableHeight) {
+          targetHeight = availableHeight;
+          targetWidth = Math.max(1, Math.floor(prepared.width * targetHeight / prepared.height));
+        }
+        if (targetWidth <= 0 || targetHeight <= 0) {
+          throw new Error("watermark does not fit this teaser");
+        }
+        overlay.width = targetWidth;
+        overlay.height = targetHeight;
+        overlay.style.width = `${(targetWidth / imageWidth) * 100}%`;
+        overlay.style.height = `${(targetHeight / imageHeight) * 100}%`;
+        const context = overlay.getContext("2d");
+        if (!context) throw new Error("watermark preview is unavailable");
+        context.clearRect(0, 0, targetWidth, targetHeight);
+        context.drawImage(prepared.canvas, 0, 0, targetWidth, targetHeight);
+        overlay.hidden = false;
+      };
+      const updateWatermarkPreview = async () => {
+        const request = ++watermarkRequest;
+        const option = assetSelect.selectedOptions[0];
+        const previewUrl = option?.dataset.watermarkPreviewUrl || "";
+        const overlays = composer.querySelectorAll("[data-watermark-overlay]");
+        if (!previewUrl) {
+          overlays.forEach((overlay) => {
+            if (overlay instanceof HTMLCanvasElement) overlay.hidden = true;
+          });
+          if (renderStatus instanceof HTMLElement) {
+            renderStatus.textContent = "Choose a saved watermark to see the final placement.";
+          }
+          return;
+        }
+        if (renderStatus instanceof HTMLElement) renderStatus.textContent = "Loading watermark preview…";
+        try {
+          const prepared = await trimTransparentCanvas(previewUrl);
+          if (request !== watermarkRequest) return;
+          slides.forEach((slide) => paintWatermarkOverlay(slide, prepared));
+          if (renderStatus instanceof HTMLElement) {
+            renderStatus.textContent = "Preview ready · final downloads use the same placement.";
+          }
+        } catch (_error) {
+          if (request !== watermarkRequest) return;
+          overlays.forEach((overlay) => {
+            if (overlay instanceof HTMLCanvasElement) overlay.hidden = true;
+          });
+          if (renderStatus instanceof HTMLElement) {
+            renderStatus.textContent = "The watermark preview could not load. Reload before preparing teasers.";
+          }
+        }
+      };
+
+      slides.forEach((slide) => {
+        if (!(slide instanceof HTMLElement) || !slide.dataset.assetId) return;
+        slide.querySelectorAll("[data-watermark-corner]").forEach((input) => {
+          if (!(input instanceof HTMLInputElement)) return;
+          input.addEventListener("change", () => {
+            if (!input.checked) return;
+            slide.querySelectorAll("[data-watermark-corner]").forEach((candidate) => {
+              if (candidate instanceof HTMLInputElement && candidate !== input) {
+                candidate.checked = false;
+              }
+            });
+            placements[slide.dataset.assetId] = input.value;
+            const overlay = slide.querySelector("[data-watermark-overlay]");
+            if (overlay instanceof HTMLElement) overlay.dataset.position = input.value;
+            globalPosition.value = input.value;
+            updatePlacementPayload();
+          });
+        });
+      });
+      thumbnails.forEach((thumbnail) => {
+        if (!(thumbnail instanceof HTMLButtonElement)) return;
+        thumbnail.addEventListener("click", () => {
+          showSlide(Number.parseInt(thumbnail.dataset.slideIndex || "0", 10));
+        });
+      });
+      previous.addEventListener("click", () => showSlide(currentIndex - 1));
+      next.addEventListener("click", () => showSlide(currentIndex + 1));
+      composer.addEventListener("keydown", (event) => {
+        if (!(event instanceof KeyboardEvent)) return;
+        const target = event.target;
+        if (target instanceof HTMLInputElement || target instanceof HTMLSelectElement) return;
+        if (event.key === "ArrowLeft") {
+          event.preventDefault();
+          showSlide(currentIndex - 1);
+        } else if (event.key === "ArrowRight") {
+          event.preventDefault();
+          showSlide(currentIndex + 1);
+        }
+      });
+      assetSelect.addEventListener("change", () => {
+        try {
+          if (assetSelect.value) {
+            window.localStorage.setItem(
+              scopedStorageKey(X_WATERMARK_ASSET_STORAGE_KEY),
+              assetSelect.value,
+            );
+          }
+        } catch (_error) {
+          // The selected watermark still works when private browsing blocks storage.
+        }
+        updateWatermarkPreview();
+      });
+      form.addEventListener("submit", updatePlacementPayload);
+      updatePlacementPayload();
+      showSlide(0);
+      updateWatermarkPreview();
+    });
+
+  }
+
   function initializeXPublishingControls() {
     document.querySelectorAll("[data-local-datetime]").forEach((node) => {
       if (!(node instanceof HTMLTimeElement)) return;
@@ -6380,6 +6665,7 @@
   initializeGenerationProgress();
   initializeDeliveryReauthentication();
   initializeDeliveryProgress();
+  initializeWatermarkComposers();
   initializeXPublishingControls();
   initializeExperimentLab();
   initializeExperimentWarmSession();

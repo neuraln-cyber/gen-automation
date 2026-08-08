@@ -279,10 +279,16 @@
 
   {% if delivery.x_selected_count and delivery.progress.ready_x_teasers != delivery.progress.expected_x_teasers %}
     <section class="panel review-entry" aria-labelledby="watermark-heading">
-      <h2 id="watermark-heading">Add a watermark</h2>
+      <div class="delivery-card-heading">
+        <div>
+          <p class="page-kicker">Watermark library</p>
+          <h2 id="watermark-heading">Add or replace a watermark</h2>
+        </div>
+        {% if watermarks %}<span class="status ready">{{ watermarks|length }} saved</span>{% endif %}
+      </div>
       <p class="muted">
-        Upload once, then reuse it for future X teasers. Full Patreon and MEGA
-        images never use this watermark.
+        Upload once and it stays securely available for future sets. Add another only
+        when you want a different logo; full Patreon and MEGA images never use it.
       </p>
       {% if storage_available %}
         <form
@@ -681,9 +687,45 @@
             </p>
             {% if not delivery.x_selected_count %}
               <p class="terminal-state">No teaser images were selected for this set.</p>
-            {% elif destination.state in ["not_prepared", "failed"] %}
+            {% else %}
               {% set x_teasers_ready = delivery.progress.ready_x_teasers == delivery.progress.expected_x_teasers %}
-              {% if not x_teasers_ready %}
+              {% if x_output_downloads %}
+                <section class="x-watermarked-downloads" aria-labelledby="x-downloads-heading">
+                  <div class="x-watermark-composer-heading">
+                    <div>
+                      <p class="page-kicker">Ready to use</p>
+                      <h3 id="x-downloads-heading">Watermarked teasers</h3>
+                    </div>
+                    <span class="status ready">{{ x_output_downloads|length }} ready</span>
+                  </div>
+                  <p class="muted delivery-action-note">
+                    Download any teaser now, even if you do not post it through X.
+                  </p>
+                  <div class="x-watermarked-download-grid">
+                    {% for teaser in x_output_downloads %}
+                      <article class="x-watermarked-download">
+                        <img
+                          src="{{ teaser.preview_url }}"
+                          alt="Watermarked X teaser {{ loop.index }}"
+                          width="{{ teaser.width }}"
+                          height="{{ teaser.height }}"
+                          loading="lazy"
+                        >
+                        <a
+                          class="secondary-button"
+                          href="{{ teaser.download_url }}"
+                          download
+                        >
+                          Download teaser {{ loop.index }}
+                        </a>
+                      </article>
+                    {% endfor %}
+                  </div>
+                </section>
+              {% endif %}
+
+              {% if destination.state in ["not_prepared", "failed"] %}
+                {% if not x_teasers_ready %}
                 <form
                   class="decision-form delivery-card-action"
                   method="post"
@@ -692,37 +734,169 @@
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                   <input type="hidden" name="idempotency_key" value="{{ x_output_idempotency_key }}">
                   <input type="hidden" name="submission_id" value="{{ x_output_submission_id }}">
-                  <label for="x-watermark-asset">Watermark for these X teasers</label>
-                  <select id="x-watermark-asset" name="watermark_asset_id" required>
+                  <div class="x-watermark-composer-heading">
+                    <div>
+                      <p class="page-kicker">Teaser preview</p>
+                      <h3>Place each watermark</h3>
+                    </div>
+                    <span class="status ready" data-watermark-complete-status>
+                      {{ delivery.x_selected_count }} ready
+                    </span>
+                  </div>
+                  <p class="muted x-watermark-intro">
+                    Check each selected teaser in order and choose the corner that keeps
+                    the artwork clear. Every image can use a different corner.
+                  </p>
+                  <label for="x-watermark-asset">Saved watermark</label>
+                  <select
+                    id="x-watermark-asset"
+                    name="watermark_asset_id"
+                    required
+                    data-watermark-asset-select
+                  >
                     <option value="">Choose a registered watermark</option>
                     {% for watermark in watermarks %}
-                      <option value="{{ watermark.asset_id }}">
+                      <option
+                        value="{{ watermark.asset_id }}"
+                        data-watermark-preview-url="{{ watermark.preview_url }}"
+                        {% if watermarks|length == 1 and loop.first %}selected{% endif %}
+                      >
                         {{ watermark.display_name }} · {{ watermark.width }} × {{ watermark.height }}
                       </option>
                     {% endfor %}
                   </select>
-                  <fieldset class="watermark-corner-picker">
-                    <legend>Place the watermark</legend>
-                    <div class="watermark-corner-options">
-                      <label>
-                        <input type="radio" name="watermark_position" value="top_left" checked>
-                        <span aria-hidden="true">TL</span> Top left
-                      </label>
-                      <label>
-                        <input type="radio" name="watermark_position" value="top_right">
-                        <span aria-hidden="true">TR</span> Top right
-                      </label>
-                      <label>
-                        <input type="radio" name="watermark_position" value="bottom_left">
-                        <span aria-hidden="true">BL</span> Bottom left
-                      </label>
-                      <label>
-                        <input type="radio" name="watermark_position" value="bottom_right">
-                        <span aria-hidden="true">BR</span> Bottom right
-                      </label>
-                    </div>
-                  </fieldset>
-                  <button class="secondary-button" type="submit" {% if not watermarks %}disabled{% endif %}>
+                  <input type="hidden" name="watermark_position" value="bottom_right">
+                  <input
+                    type="hidden"
+                    name="watermark_placements"
+                    value=""
+                    data-watermark-placements
+                  >
+
+                  {% if x_previews %}
+                    <section
+                      class="x-watermark-composer"
+                      data-watermark-composer
+                      data-watermark-width="264000"
+                      data-watermark-margin="12000"
+                      tabindex="0"
+                      aria-label="Choose watermark placement for each X teaser"
+                    >
+                      <div class="x-watermark-progress-row">
+                        <strong data-watermark-step aria-live="polite">Image 1 of {{ x_previews|length }}</strong>
+                        <span class="muted">Use ← and → to move</span>
+                      </div>
+
+                      <div class="x-watermark-slides">
+                        {% for preview in x_previews %}
+                          <article
+                            class="x-watermark-slide"
+                            data-watermark-slide
+                            data-asset-id="{{ preview.asset_id }}"
+                            data-slide-index="{{ loop.index0 }}"
+                            {% if not loop.first %}hidden{% endif %}
+                          >
+                            <figure class="x-watermark-figure">
+                              <div class="x-watermark-stage">
+                                <div class="x-watermark-canvas">
+                                  <img
+                                    class="x-watermark-source"
+                                    src="{{ preview.url }}"
+                                    alt="Selected X teaser {{ loop.index }} of {{ x_previews|length }}"
+                                    width="{{ preview.width }}"
+                                    height="{{ preview.height }}"
+                                    {% if not loop.first %}loading="lazy"{% endif %}
+                                  >
+                                  <canvas
+                                    class="x-watermark-overlay"
+                                    aria-hidden="true"
+                                    data-watermark-overlay
+                                    data-position="bottom_right"
+                                    hidden
+                                  ></canvas>
+                                </div>
+                              </div>
+                              <figcaption>
+                                Teaser {{ loop.index }} · generation image {{ preview.display_order }}
+                              </figcaption>
+                            </figure>
+
+                            <fieldset class="watermark-corner-picker">
+                              <legend>Corner for teaser {{ loop.index }}</legend>
+                              <div class="watermark-corner-options">
+                                {% for value, short, label in [
+                                  ('top_left', 'TL', 'Top left'),
+                                  ('top_right', 'TR', 'Top right'),
+                                  ('bottom_left', 'BL', 'Bottom left'),
+                                  ('bottom_right', 'BR', 'Bottom right')
+                                ] %}
+                                  <label>
+                                    <input
+                                      type="radio"
+                                      value="{{ value }}"
+                                      data-watermark-corner
+                                      {% if value == 'bottom_right' %}checked{% endif %}
+                                    >
+                                    <span aria-hidden="true">{{ short }}</span> {{ label }}
+                                  </label>
+                                {% endfor %}
+                              </div>
+                            </fieldset>
+                          </article>
+                        {% endfor %}
+                      </div>
+
+                      <div class="x-watermark-navigation">
+                        <button
+                          class="secondary-button"
+                          type="button"
+                          data-watermark-previous
+                          aria-label="Show previous teaser"
+                        >
+                          Previous
+                        </button>
+                        <div class="x-watermark-filmstrip" role="list" aria-label="Selected X teasers">
+                          {% for preview in x_previews %}
+                            <button
+                              type="button"
+                              class="x-watermark-thumbnail"
+                              data-watermark-thumbnail
+                              data-slide-index="{{ loop.index0 }}"
+                              aria-label="Show teaser {{ loop.index }}"
+                              {% if loop.first %}aria-current="true"{% endif %}
+                            >
+                              <img
+                                src="{{ preview.url }}"
+                                alt=""
+                                width="{{ preview.width }}"
+                                height="{{ preview.height }}"
+                                loading="lazy"
+                              >
+                              <span>{{ loop.index }}</span>
+                            </button>
+                          {% endfor %}
+                        </div>
+                        <button
+                          class="secondary-button"
+                          type="button"
+                          data-watermark-next
+                          aria-label="Show next teaser"
+                        >
+                          Next
+                        </button>
+                      </div>
+                      <p class="muted x-watermark-render-status" data-watermark-render-status aria-live="polite"></p>
+                    </section>
+                  {% else %}
+                    <p class="form-error">
+                      Selected teaser previews are temporarily unavailable. Reload this page before preparing them.
+                    </p>
+                  {% endif %}
+                  <button
+                    class="secondary-button"
+                    type="submit"
+                    {% if not watermarks or not x_previews %}disabled{% endif %}
+                  >
                     Prepare watermarked X teasers
                   </button>
                   {% if not watermarks %}
@@ -731,12 +905,9 @@
                   <p class="muted delivery-action-note">
                     This creates only the selected teaser copies. It does not post them.
                   </p>
-                  <p class="muted delivery-action-note">
-                    The calibrated logo uses about 26% of the image width with a small
-                    edge inset.
-                  </p>
+                  <p class="muted delivery-action-note">The preview uses the same calibrated size and inset as the final teaser.</p>
                 </form>
-              {% elif not publishing_enabled %}
+                {% elif not publishing_enabled %}
                 <p class="form-error">X publishing is not enabled. Other options remain available.</p>
               {% elif not delivery.publishing_guard_enabled %}
                 <p class="form-error">Turn on the account-wide publishing switch before posting to X.</p>
@@ -744,7 +915,7 @@
                 <p class="form-error">Connect the X account before posting. Other options remain available.</p>
               {% elif not can_prepare_x_destination %}
                 <p class="terminal-state">Waiting for the selected watermarked teasers.</p>
-              {% else %}
+                {% else %}
                 <form
                   class="set-form delivery-destination-form"
                   method="post"
@@ -795,6 +966,7 @@
                   </button>
                   <p class="muted delivery-action-note">This button does not start MEGA, Patreon, or ZIP preparation.</p>
                 </form>
+                {% endif %}
               {% endif %}
             {% endif %}
           {% endif %}

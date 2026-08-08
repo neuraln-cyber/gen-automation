@@ -475,6 +475,7 @@ async def test_x_teaser_output_route_never_plans_clean_full_outputs(
     owner = _owner()
     review_task_id = uuid4()
     watermark_asset_id = uuid4()
+    selected_asset_id = uuid4()
     session = object()
     fields = {
         **_signed_fields(
@@ -485,6 +486,7 @@ async def test_x_teaser_output_route_never_plans_clean_full_outputs(
         ),
         "watermark_asset_id": str(watermark_asset_id),
         "watermark_position": "top_left",
+        "watermark_placements": f'{{"{selected_asset_id}":"bottom_right"}}',
     }
     full_calls: list[dict[str, object]] = []
     x_calls: list[dict[str, object]] = []
@@ -521,6 +523,9 @@ async def test_x_teaser_output_route_never_plans_clean_full_outputs(
     assert x_calls[0]["review_task_id"] == review_task_id
     assert x_calls[0]["watermark_asset_id"] == watermark_asset_id
     assert x_calls[0]["watermark_position"] == WatermarkPosition.TOP_LEFT
+    assert x_calls[0]["watermark_positions_by_asset_id"] == {
+        selected_asset_id: WatermarkPosition.BOTTOM_RIGHT,
+    }
     assert full_calls == []
 
 

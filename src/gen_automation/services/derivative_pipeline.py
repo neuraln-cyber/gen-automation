@@ -146,6 +146,7 @@ async def create_derivative_recipe_and_plan(
     idempotency_key: str,
     output_targets: Sequence[str] = ("full", "x_teaser"),
     watermark_asset_id: UUID | None = None,
+    x_teaser_asset_ids: Sequence[UUID] | None = None,
     max_attempts: int = 3,
     priority: int = 100,
     now: datetime | None = None,
@@ -154,6 +155,11 @@ async def create_derivative_recipe_and_plan(
 
     normalized_configuration = _normalize_configuration(configuration)
     normalized_targets = _normalize_targets(output_targets)
+    normalized_x_teaser_asset_ids = _normalize_x_teaser_asset_ids(x_teaser_asset_ids)
+    if normalized_x_teaser_asset_ids is not None and _X_TARGET not in normalized_targets:
+        raise DerivativePipelineInputError(
+            "X teaser asset filtering requires the X teaser output target"
+        )
     normalized_renderer = _bounded_text(renderer_version, "renderer version", 100)
     normalized_pillow = _bounded_text(pillow_version, "Pillow version", 50)
     normalized_key = _bounded_text(idempotency_key, "idempotency key", 200)
@@ -193,6 +199,7 @@ async def create_derivative_recipe_and_plan(
                 idempotency_key=normalized_key,
                 output_targets=normalized_targets,
                 watermark_asset_id=watermark_asset_id,
+                x_teaser_asset_ids=normalized_x_teaser_asset_ids,
                 max_attempts=normalized_max_attempts,
                 priority=normalized_priority,
                 planned_at=planned_at,
@@ -219,6 +226,7 @@ async def _create_plan_once(
     idempotency_key: str,
     output_targets: tuple[str, ...],
     watermark_asset_id: UUID | None,
+    x_teaser_asset_ids: frozenset[UUID] | None,
     max_attempts: int,
     priority: int,
     planned_at: datetime,
@@ -238,7 +246,7 @@ async def _create_plan_once(
     except DeliverabilityError as error:
         raise DerivativePipelineConflictError(str(error)) from None
     plans_x_teasers = _X_TARGET in output_targets
-    x_selected_asset_ids = (
+    frozen_x_selected_asset_ids = (
         await _load_x_selected_asset_ids(
             session,
             task=task,
@@ -247,6 +255,14 @@ async def _create_plan_once(
         if plans_x_teasers
         else frozenset()
     )
+    if x_teaser_asset_ids is not None:
+        if not x_teaser_asset_ids.issubset(frozen_x_selected_asset_ids):
+            raise DerivativePipelineConflictError(
+                "requested X teaser images do not match the frozen X selections"
+            )
+        x_selected_asset_ids = x_teaser_asset_ids
+    else:
+        x_selected_asset_ids = frozen_x_selected_asset_ids
     if plans_x_teasers and not x_selected_asset_ids and _FULL_TARGET not in output_targets:
         raise DerivativePipelineConflictError("X teaser preparation requires selected X images")
     if x_selected_asset_ids and watermark_asset_id is None:
@@ -2101,6 +2117,24 @@ def _normalize_configuration(value: Mapping[str, Any]) -> dict[str, Any]:
     if len(serialized) > _MAX_CONFIGURATION_BYTES:
         raise DerivativePipelineInputError("derivative configuration is too large")
     return normalized
+
+
+def _normalize_x_teaser_asset_ids(
+    values: Sequence[UUID] | None,
+) -> frozenset[UUID] | None:
+    if values is None:
+        return None
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise DerivativePipelineInputError("X teaser asset ids must be a sequence")
+    normalized = tuple(values)
+    if not 1 <= len(normalized) <= 4:
+        raise DerivativePipelineInputError("X teaser asset ids must contain between 1 and 4 values")
+    if any(not isinstance(value, UUID) for value in normalized):
+        raise DerivativePipelineInputError("X teaser asset id is invalid")
+    selected = frozenset(normalized)
+    if len(selected) != len(normalized):
+        raise DerivativePipelineInputError("X teaser asset ids must be unique")
+    return selected
 
 
 def _normalize_targets(values: Sequence[str]) -> tuple[str, ...]:

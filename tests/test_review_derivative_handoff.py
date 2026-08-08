@@ -2,7 +2,7 @@
 
 import io
 from datetime import UTC, datetime, timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import FastAPI, HTTPException, Response, UploadFile
@@ -27,11 +27,13 @@ from gen_automation.db.models import (
 )
 from gen_automation.domain.enums import AdminRole, ReleasePhase
 from gen_automation.domain.ids import uuid7
+from gen_automation.services import review_derivatives as review_derivative_service
 from gen_automation.services.authentication import AuthenticatedPrincipal
 from gen_automation.services.derivative_pipeline import (
     DerivativePipelineConflictError,
     DerivativePipelineInputError,
     DerivativePipelineNotFoundError,
+    DerivativePlanResult,
 )
 from gen_automation.services.derivatives import WatermarkPosition
 from gen_automation.services.review_derivatives import (
@@ -53,6 +55,132 @@ from tests.test_derivative_pipeline import (
     approved_context as derivative_approved_context,  # noqa: F401
 )
 from tests.test_derivative_runtime import _watermark_png
+
+
+@pytest.mark.asyncio
+async def test_four_corner_plan_recovers_idempotently_after_partial_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    review_task_id = uuid4()
+    release_version_id = uuid4()
+    actor_id = uuid4()
+    watermark_id = uuid4()
+    asset_ids = tuple(uuid4() for _ in range(4))
+    placements = dict(zip(asset_ids, tuple(WatermarkPosition), strict=True))
+    stored: dict[
+        str,
+        tuple[tuple[str, tuple[UUID, ...]], DerivativePlanResult],
+    ] = {}
+    failed_once = False
+
+    async def selected(*_args: object, **_kwargs: object) -> tuple[UUID, ...]:
+        return asset_ids
+
+    async def plan(_session: object, **kwargs: object) -> DerivativePlanResult:
+        nonlocal failed_once
+        key = str(kwargs["idempotency_key"])
+        position = str(kwargs["configuration"]["watermark"]["position"])  # type: ignore[index]
+        requested = tuple(kwargs["x_teaser_asset_ids"])  # type: ignore[arg-type]
+        identity = (position, requested)
+        previous = stored.get(key)
+        if previous is not None:
+            if previous[0] != identity:
+                raise DerivativePipelineConflictError(
+                    "idempotency key was already used for another derivative plan"
+                )
+            result = previous[1]
+            return DerivativePlanResult(
+                review_task_id=result.review_task_id,
+                recipe_id=result.recipe_id,
+                release_version_id=result.release_version_id,
+                job_ids=result.job_ids,
+                jobs_created=result.jobs_created,
+                total_jobs=result.total_jobs,
+                replayed=True,
+            )
+        if position == WatermarkPosition.BOTTOM_LEFT.value and not failed_once:
+            failed_once = True
+            raise RuntimeError("simulated interruption after two frozen recipes")
+        result = DerivativePlanResult(
+            review_task_id=review_task_id,
+            recipe_id=uuid4(),
+            release_version_id=release_version_id,
+            job_ids=(uuid4(),),
+            jobs_created=1,
+            total_jobs=1,
+            replayed=False,
+        )
+        stored[key] = (identity, result)
+        return result
+
+    monkeypatch.setattr(review_derivative_service, "_x_selected_asset_ids", selected)
+    monkeypatch.setattr(
+        review_derivative_service,
+        "create_derivative_recipe_and_plan",
+        plan,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        await prepare_completed_review_x_teasers(
+            object(),  # type: ignore[arg-type]
+            review_task_id=review_task_id,
+            actor_user_id=actor_id,
+            idempotency_key="four-corner-plan",
+            watermark_asset_id=watermark_id,
+            watermark_positions_by_asset_id=placements,
+            now=PLAN_AT,
+        )
+    assert len(stored) == 2
+
+    recovered = await prepare_completed_review_x_teasers(
+        object(),  # type: ignore[arg-type]
+        review_task_id=review_task_id,
+        actor_user_id=actor_id,
+        idempotency_key="four-corner-plan",
+        watermark_asset_id=watermark_id,
+        watermark_positions_by_asset_id=placements,
+        now=PLAN_AT,
+    )
+    assert recovered.total_jobs == 4
+    assert recovered.jobs_created == 4
+    assert recovered.replayed is False
+    assert {identity[0] for identity, _result in stored.values()} == {
+        position.value for position in WatermarkPosition
+    }
+    assert {identity[1] for identity, _result in stored.values()} == {
+        (asset_id,) for asset_id in asset_ids
+    }
+
+    replay = await prepare_completed_review_x_teasers(
+        object(),  # type: ignore[arg-type]
+        review_task_id=review_task_id,
+        actor_user_id=actor_id,
+        idempotency_key="four-corner-plan",
+        watermark_asset_id=watermark_id,
+        watermark_positions_by_asset_id=placements,
+        now=PLAN_AT,
+    )
+    assert replay.replayed is True
+    assert replay.job_ids == recovered.job_ids
+
+    swapped = dict(placements)
+    swapped[asset_ids[0]], swapped[asset_ids[1]] = (
+        swapped[asset_ids[1]],
+        swapped[asset_ids[0]],
+    )
+    with pytest.raises(
+        DerivativePipelineConflictError,
+        match="idempotency key was already used",
+    ):
+        await prepare_completed_review_x_teasers(
+            object(),  # type: ignore[arg-type]
+            review_task_id=review_task_id,
+            actor_user_id=actor_id,
+            idempotency_key="four-corner-plan",
+            watermark_asset_id=watermark_id,
+            watermark_positions_by_asset_id=swapped,
+            now=PLAN_AT,
+        )
 
 
 def _principal(user_id: UUID) -> AuthenticatedPrincipal:
@@ -309,6 +437,158 @@ async def test_x_teaser_plan_requires_selection_and_registered_watermark(
                 actor_user_id=approved.owner_id,
                 idempotency_key="x-without-watermark",
                 watermark_asset_id=None,
+                now=PLAN_AT,
+            )
+
+
+@pytest.mark.asyncio
+async def test_x_teasers_freeze_per_image_watermark_positions_and_replay(
+    derivative_approved_context: ApprovedContext,
+) -> None:
+    approved = derivative_approved_context
+    store = MemoryObjectStore(bucket="watermark-position-registry")
+    async with approved.database.sessions() as session:
+        watermark = await register_watermark(
+            session,
+            store,
+            release_id=approved.release_id,
+            display_name="Reusable placement watermark",
+            png_bytes=_watermark_png(),
+            registered_by_user_id=approved.owner_id,
+            idempotency_key="register-placement-watermark",
+            now=PLAN_AT,
+        )
+        session.add_all(
+            [
+                ReviewXSelection(
+                    id=uuid7(),
+                    review_task_id=approved.review_task_id,
+                    asset_id=asset_id,
+                    selected_by_user_id=approved.owner_id,
+                    selected_at=PLAN_AT + timedelta(seconds=index),
+                )
+                for index, asset_id in enumerate(approved.raw_asset_ids)
+            ]
+        )
+        await session.commit()
+        placements = {
+            approved.raw_asset_ids[0]: WatermarkPosition.TOP_LEFT,
+            approved.raw_asset_ids[1]: WatermarkPosition.BOTTOM_RIGHT,
+        }
+
+        plan = await prepare_completed_review_x_teasers(
+            session,
+            review_task_id=approved.review_task_id,
+            actor_user_id=approved.owner_id,
+            idempotency_key="prepare-per-image-watermarks",
+            watermark_asset_id=watermark.asset_id,
+            watermark_positions_by_asset_id=placements,
+            now=PLAN_AT + timedelta(minutes=1),
+        )
+
+        assert plan.jobs_created == 2
+        assert plan.total_jobs == 2
+        jobs = tuple(
+            (
+                await session.scalars(
+                    select(DerivativeJob).where(DerivativeJob.id.in_(plan.job_ids))
+                )
+            ).all()
+        )
+        assert len(jobs) == 2
+        positions_by_asset: dict[UUID, str] = {}
+        for job in jobs:
+            recipe = await session.get(DerivativeRecipe, job.derivative_recipe_id)
+            assert recipe is not None
+            positions_by_asset[UUID(job.request_payload["source"]["asset_id"])] = (
+                recipe.configuration["watermark"]["position"]
+            )
+            assert recipe.watermark_asset_id == watermark.asset_id
+        assert positions_by_asset == {
+            asset_id: position.value for asset_id, position in placements.items()
+        }
+
+        replay = await prepare_completed_review_x_teasers(
+            session,
+            review_task_id=approved.review_task_id,
+            actor_user_id=approved.owner_id,
+            idempotency_key="prepare-per-image-watermarks",
+            watermark_asset_id=watermark.asset_id,
+            watermark_positions_by_asset_id=placements,
+            now=PLAN_AT + timedelta(minutes=1),
+        )
+        assert replay.replayed is True
+        assert replay.job_ids == plan.job_ids
+
+        with pytest.raises(
+            DerivativePipelineConflictError,
+            match="idempotency key was already used",
+        ):
+            await prepare_completed_review_x_teasers(
+                session,
+                review_task_id=approved.review_task_id,
+                actor_user_id=approved.owner_id,
+                idempotency_key="prepare-per-image-watermarks",
+                watermark_asset_id=watermark.asset_id,
+                watermark_positions_by_asset_id={
+                    approved.raw_asset_ids[0]: WatermarkPosition.BOTTOM_RIGHT,
+                    approved.raw_asset_ids[1]: WatermarkPosition.TOP_LEFT,
+                },
+                now=PLAN_AT + timedelta(minutes=1),
+            )
+        await session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_per_image_watermark_positions_require_exact_x_selection_coverage(
+    derivative_approved_context: ApprovedContext,
+) -> None:
+    approved = derivative_approved_context
+    async with approved.database.sessions() as session:
+        session.add_all(
+            [
+                ReviewXSelection(
+                    id=uuid7(),
+                    review_task_id=approved.review_task_id,
+                    asset_id=asset_id,
+                    selected_by_user_id=approved.owner_id,
+                    selected_at=PLAN_AT,
+                )
+                for asset_id in approved.raw_asset_ids
+            ]
+        )
+        await session.commit()
+
+        with pytest.raises(
+            DerivativePipelineConflictError,
+            match="cover the frozen X selections exactly",
+        ):
+            await prepare_completed_review_x_teasers(
+                session,
+                review_task_id=approved.review_task_id,
+                actor_user_id=approved.owner_id,
+                idempotency_key="incomplete-watermark-placements",
+                watermark_asset_id=uuid4(),
+                watermark_positions_by_asset_id={
+                    approved.raw_asset_ids[0]: WatermarkPosition.TOP_LEFT,
+                },
+                now=PLAN_AT,
+            )
+
+        with pytest.raises(
+            DerivativePipelineConflictError,
+            match="cover the frozen X selections exactly",
+        ):
+            await prepare_completed_review_x_teasers(
+                session,
+                review_task_id=approved.review_task_id,
+                actor_user_id=approved.owner_id,
+                idempotency_key="unknown-watermark-placement",
+                watermark_asset_id=uuid4(),
+                watermark_positions_by_asset_id={
+                    approved.raw_asset_ids[0]: WatermarkPosition.TOP_LEFT,
+                    uuid4(): WatermarkPosition.TOP_RIGHT,
+                },
                 now=PLAN_AT,
             )
 

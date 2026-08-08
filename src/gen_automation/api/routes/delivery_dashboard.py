@@ -97,12 +97,20 @@ from gen_automation.services.review_derivatives import (
 )
 from gen_automation.services.watermarks import (
     MAX_WATERMARK_BYTES,
+    RegisteredWatermark,
     WatermarkConflictError,
     WatermarkInputError,
     WatermarkNotFoundError,
     WatermarkStorageError,
     list_registered_watermarks,
+    read_registered_watermark,
     register_watermark,
+)
+from gen_automation.services.x_teaser_access import (
+    XTeaserAccessConflictError,
+    XTeaserAccessNotFoundError,
+    XTeaserAccessStorageError,
+    read_review_x_teaser,
 )
 from gen_automation.storage.base import ObjectStore, ObjectStoreError
 
@@ -119,6 +127,34 @@ class PreviewView:
     width: int
     height: int
     url: str
+
+
+@dataclass(frozen=True, slots=True)
+class XPreviewView:
+    asset_id: UUID
+    display_order: int
+    width: int
+    height: int
+    url: str
+
+
+@dataclass(frozen=True, slots=True)
+class WatermarkView:
+    asset_id: UUID
+    display_name: str
+    width: int
+    height: int
+    preview_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class XOutputDownloadView:
+    output_id: UUID
+    display_order: int
+    width: int
+    height: int
+    preview_url: str
+    download_url: str
 
 
 @router.get(
@@ -147,7 +183,10 @@ async def dashboard_review_delivery(
             review_task_id=review_task_id,
         )
         csrf_token = _csrf_token(request, principal)
-        watermarks = await list_registered_watermarks(session)
+        registered_watermarks = await list_registered_watermarks(session)
+        watermarks = _watermark_views(review_task_id, registered_watermarks)
+        x_previews = _x_preview_views(snapshot)
+        x_output_downloads = _x_output_download_views(snapshot)
     except (OperatorDeliveryNotFoundError, FinishedSetArchiveNotFoundError):
         return _error(
             request,
@@ -325,6 +364,8 @@ async def dashboard_review_delivery(
                 "delivery_progress": delivery_progress,
                 "watermarks": watermarks,
                 "previews": previews,
+                "x_previews": x_previews,
+                "x_output_downloads": x_output_downloads,
                 "csrf_token": csrf_token,
                 "output_submission_id": output_submission_id,
                 "retry_output_submission_id": retry_output_submission_id,
@@ -369,6 +410,105 @@ async def dashboard_review_delivery(
                 "mega_configured": settings.mega_delivery_enabled,
             },
         ),
+    )
+
+
+@router.get(
+    "/review-tasks/{review_task_id}/delivery/watermarks/{asset_id}/preview",
+    response_class=Response,
+    response_model=None,
+    name="dashboard_delivery_watermark_preview",
+)
+async def dashboard_delivery_watermark_preview(
+    review_task_id: UUID,
+    asset_id: UUID,
+    request: Request,
+    session: Session,
+    principal: PublicationReader,
+) -> Response:
+    """Serve one reusable transparent watermark to its owner without making it public."""
+
+    if principal.role != AdminRole.OWNER:
+        return _private_media_error(request, status.HTTP_403_FORBIDDEN, "Access denied.")
+    store = _store(request)
+    if store is None:
+        return _private_media_error(
+            request,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Private storage is unavailable.",
+        )
+    try:
+        # Keep the globally reusable watermark preview scoped to a real delivery
+        # workspace instead of exposing a generic derivative-by-UUID endpoint.
+        await load_operator_delivery(session, review_task_id=review_task_id)
+        payload = await read_registered_watermark(session, store, asset_id=asset_id)
+    except (OperatorDeliveryNotFoundError, WatermarkNotFoundError):
+        return _private_media_error(request, status.HTTP_404_NOT_FOUND, "Preview not found.")
+    except WatermarkConflictError:
+        return _private_media_error(
+            request,
+            status.HTTP_409_CONFLICT,
+            "The saved watermark is not currently available.",
+        )
+    except (WatermarkStorageError, ObjectStoreError):
+        return _private_media_error(
+            request,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Private storage is temporarily unavailable.",
+        )
+    return _private_image_response(
+        request,
+        data=payload.data,
+        content_type="image/png",
+        disposition=f'inline; filename="watermark-{payload.asset_id}.png"',
+    )
+
+
+@router.get(
+    "/review-tasks/{review_task_id}/delivery/x-teasers/{output_id}/preview",
+    response_class=Response,
+    response_model=None,
+    name="dashboard_delivery_x_teaser_preview",
+)
+async def dashboard_delivery_x_teaser_preview(
+    review_task_id: UUID,
+    output_id: UUID,
+    request: Request,
+    session: Session,
+    principal: PublicationReader,
+) -> Response:
+    return await _x_teaser_response(
+        review_task_id,
+        output_id,
+        request=request,
+        session=session,
+        principal=principal,
+        as_attachment=False,
+    )
+
+
+@router.get(
+    "/review-tasks/{review_task_id}/delivery/x-teasers/{output_id}/download",
+    response_class=Response,
+    response_model=None,
+    name="dashboard_delivery_x_teaser_download",
+)
+async def dashboard_delivery_x_teaser_download(
+    review_task_id: UUID,
+    output_id: UUID,
+    request: Request,
+    session: Session,
+    principal: PublicationReader,
+) -> Response:
+    """Download one exact rendered teaser independently of X publication."""
+
+    return await _x_teaser_response(
+        review_task_id,
+        output_id,
+        request=request,
+        session=session,
+        principal=principal,
+        as_attachment=True,
     )
 
 
@@ -654,6 +794,9 @@ async def dashboard_prepare_x_outputs(
             idempotency_key=form.idempotency_key,
             watermark_asset_id=form.watermark_asset_id,
             watermark_position=form.watermark_position,
+            watermark_positions_by_asset_id=(
+                dict(form.watermark_placements) if form.watermark_placements else None
+            ),
         )
     except BrowserDeliveryFormError as error:
         return _form_error(request, principal, error.status_code, error.message)
@@ -1404,6 +1547,138 @@ async def _preview_views(
             )
         )
     return tuple(previews)
+
+
+def _x_preview_views(snapshot: OperatorDeliverySnapshot) -> tuple[XPreviewView, ...]:
+    return tuple(
+        XPreviewView(
+            asset_id=source.asset_id,
+            display_order=source.display_order,
+            width=source.width,
+            height=source.height,
+            url=dashboard_preview_url(
+                asset_id=source.asset_id,
+                source_sha256=source.sha256,
+            ),
+        )
+        for source in snapshot.x_selected_sources
+    )
+
+
+def _watermark_views(
+    review_task_id: UUID,
+    watermarks: tuple[RegisteredWatermark, ...],
+) -> tuple[WatermarkView, ...]:
+    return tuple(
+        WatermarkView(
+            asset_id=watermark.asset_id,
+            display_name=watermark.display_name,
+            width=watermark.width,
+            height=watermark.height,
+            preview_url=(
+                f"/dashboard/review-tasks/{review_task_id}/delivery/watermarks/"
+                f"{watermark.asset_id}/preview"
+            ),
+        )
+        for watermark in watermarks
+    )
+
+
+def _x_output_download_views(
+    snapshot: OperatorDeliverySnapshot,
+) -> tuple[XOutputDownloadView, ...]:
+    base = f"/dashboard/review-tasks/{snapshot.review_task_id}/delivery/x-teasers"
+    return tuple(
+        XOutputDownloadView(
+            output_id=output.output_id,
+            display_order=output.display_order,
+            width=output.width,
+            height=output.height,
+            preview_url=f"{base}/{output.output_id}/preview",
+            download_url=f"{base}/{output.output_id}/download",
+        )
+        for output in snapshot.x_outputs
+    )
+
+
+async def _x_teaser_response(
+    review_task_id: UUID,
+    output_id: UUID,
+    *,
+    request: Request,
+    session: AsyncSession,
+    principal: AuthenticatedPrincipal,
+    as_attachment: bool,
+) -> Response:
+    if principal.role != AdminRole.OWNER:
+        return _private_media_error(request, status.HTTP_403_FORBIDDEN, "Access denied.")
+    store = _store(request)
+    if store is None:
+        return _private_media_error(
+            request,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Private storage is unavailable.",
+        )
+    try:
+        payload = await read_review_x_teaser(
+            session,
+            store,
+            review_task_id=review_task_id,
+            output_id=output_id,
+        )
+    except XTeaserAccessNotFoundError:
+        return _private_media_error(request, status.HTTP_404_NOT_FOUND, "Teaser not found.")
+    except XTeaserAccessConflictError:
+        return _private_media_error(
+            request,
+            status.HTTP_409_CONFLICT,
+            "The rendered teaser is not currently available.",
+        )
+    except XTeaserAccessStorageError:
+        return _private_media_error(
+            request,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Private storage is temporarily unavailable.",
+        )
+    disposition = (
+        f'attachment; filename="{payload.download_name}"'
+        if as_attachment
+        else f'inline; filename="{payload.download_name}"'
+    )
+    return _private_image_response(
+        request,
+        data=payload.data,
+        content_type=payload.content_type,
+        disposition=disposition,
+    )
+
+
+def _private_image_response(
+    request: Request,
+    *,
+    data: bytes,
+    content_type: str,
+    disposition: str,
+) -> Response:
+    response = Response(
+        content=data,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": disposition,
+            "X-Content-Type-Options": "nosniff",
+            "Cross-Origin-Resource-Policy": "same-origin",
+            "Referrer-Policy": "no-referrer",
+            "Vary": "Cookie",
+        },
+    )
+    return _secure(request, response)
+
+
+def _private_media_error(request: Request, status_code: int, detail: str) -> Response:
+    response = JSONResponse(status_code=status_code, content={"detail": detail})
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Vary"] = "Cookie"
+    return _secure(request, response)
 
 
 def _delivery_progress_payload(

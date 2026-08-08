@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from gen_automation.db.models import ReviewXSelection
 from gen_automation.services.derivative_pipeline import (
     DerivativePipelineConflictError,
+    DerivativePipelineInputError,
     DerivativePlanResult,
     DerivativeRetryResult,
     create_derivative_recipe_and_plan,
@@ -65,30 +66,70 @@ async def prepare_completed_review_x_teasers(
     idempotency_key: str,
     watermark_asset_id: UUID | None,
     watermark_position: WatermarkPosition = WatermarkPosition.BOTTOM_RIGHT,
+    watermark_positions_by_asset_id: Mapping[UUID, WatermarkPosition] | None = None,
     max_attempts: int = 3,
     now: datetime | None = None,
 ) -> DerivativePlanResult:
     """Plan only the explicitly selected, watermarked X teaser outputs."""
 
-    if await _x_selected_count(session, review_task_id=review_task_id) == 0:
+    selected_asset_ids = await _x_selected_asset_ids(
+        session,
+        review_task_id=review_task_id,
+    )
+    if not selected_asset_ids:
         raise DerivativePipelineConflictError("X teaser preparation requires selected X images")
     if watermark_asset_id is None:
         raise DerivativePipelineConflictError("selected X images require a registered watermark")
-    recipe = DerivativeRecipe(watermark=WatermarkSpec(position=watermark_position))
-    return await create_derivative_recipe_and_plan(
-        session,
-        review_task_id=review_task_id,
-        configuration=derivative_recipe_configuration(recipe),
-        recipe_version=1,
-        renderer_version=DERIVATIVE_RENDERER_VERSION,
-        pillow_version=PIL.__version__,
-        created_by_user_id=actor_user_id,
-        approved_by_user_id=actor_user_id,
-        idempotency_key=idempotency_key,
-        output_targets=("x_teaser",),
-        watermark_asset_id=watermark_asset_id,
-        max_attempts=max_attempts,
-        now=now,
+    positions = _resolved_watermark_positions(
+        selected_asset_ids=selected_asset_ids,
+        default_position=watermark_position,
+        positions_by_asset_id=watermark_positions_by_asset_id,
+    )
+    groups: dict[WatermarkPosition, list[UUID]] = {}
+    for asset_id in selected_asset_ids:
+        groups.setdefault(positions[asset_id], []).append(asset_id)
+
+    planned_at = now or datetime.now(UTC)
+    results: list[DerivativePlanResult] = []
+    multiple_recipes = len(groups) > 1
+    for offset, position in enumerate(WatermarkPosition):
+        asset_ids = groups.get(position)
+        if not asset_ids:
+            continue
+        recipe = DerivativeRecipe(watermark=WatermarkSpec(position=position))
+        result = await create_derivative_recipe_and_plan(
+            session,
+            review_task_id=review_task_id,
+            configuration=derivative_recipe_configuration(recipe),
+            recipe_version=1,
+            renderer_version=DERIVATIVE_RENDERER_VERSION,
+            pillow_version=PIL.__version__,
+            created_by_user_id=actor_user_id,
+            approved_by_user_id=actor_user_id,
+            idempotency_key=(
+                _target_idempotency_key(idempotency_key, f"watermark-{position.value}")
+                if multiple_recipes
+                else idempotency_key
+            ),
+            output_targets=("x_teaser",),
+            watermark_asset_id=watermark_asset_id,
+            x_teaser_asset_ids=tuple(asset_ids) if multiple_recipes else None,
+            max_attempts=max_attempts,
+            now=planned_at + timedelta(microseconds=offset),
+        )
+        results.append(result)
+
+    first = results[0]
+    if any(result.release_version_id != first.release_version_id for result in results[1:]):
+        raise DerivativePipelineConflictError("X teaser plans do not share a release version")
+    return DerivativePlanResult(
+        review_task_id=first.review_task_id,
+        recipe_id=first.recipe_id,
+        release_version_id=first.release_version_id,
+        job_ids=tuple(job_id for result in results for job_id in result.job_ids),
+        jobs_created=sum(result.jobs_created for result in results),
+        total_jobs=sum(result.total_jobs for result in results),
+        replayed=all(result.replayed for result in results),
     )
 
 
@@ -124,6 +165,7 @@ async def prepare_completed_review_derivatives(
     idempotency_key: str,
     watermark_asset_id: UUID | None = None,
     watermark_position: WatermarkPosition = WatermarkPosition.BOTTOM_RIGHT,
+    watermark_positions_by_asset_id: Mapping[UUID, WatermarkPosition] | None = None,
     max_attempts: int = 3,
     now: datetime | None = None,
 ) -> DerivativePlanResult:
@@ -155,6 +197,7 @@ async def prepare_completed_review_derivatives(
         idempotency_key=_target_idempotency_key(idempotency_key, "x_teaser"),
         watermark_asset_id=watermark_asset_id,
         watermark_position=watermark_position,
+        watermark_positions_by_asset_id=watermark_positions_by_asset_id,
         max_attempts=max_attempts,
         now=planned_at + timedelta(microseconds=1),
     )
@@ -178,6 +221,48 @@ async def _x_selected_count(session: AsyncSession, *, review_task_id: UUID) -> i
         )
         or 0
     )
+
+
+async def _x_selected_asset_ids(
+    session: AsyncSession,
+    *,
+    review_task_id: UUID,
+) -> tuple[UUID, ...]:
+    return tuple(
+        (
+            await session.scalars(
+                select(ReviewXSelection.asset_id)
+                .where(ReviewXSelection.review_task_id == review_task_id)
+                .order_by(ReviewXSelection.selected_at, ReviewXSelection.asset_id)
+            )
+        ).all()
+    )
+
+
+def _resolved_watermark_positions(
+    *,
+    selected_asset_ids: Sequence[UUID],
+    default_position: WatermarkPosition,
+    positions_by_asset_id: Mapping[UUID, WatermarkPosition] | None,
+) -> dict[UUID, WatermarkPosition]:
+    if not isinstance(default_position, WatermarkPosition):
+        raise DerivativePipelineInputError("default watermark position is invalid")
+    selected = frozenset(selected_asset_ids)
+    overrides: dict[UUID, WatermarkPosition] = {}
+    if positions_by_asset_id is not None:
+        if not isinstance(positions_by_asset_id, Mapping):
+            raise DerivativePipelineInputError("watermark placements must be a mapping")
+        if len(positions_by_asset_id) > 4:
+            raise DerivativePipelineInputError("at most four watermark placements are allowed")
+        for asset_id, position in positions_by_asset_id.items():
+            if not isinstance(asset_id, UUID) or not isinstance(position, WatermarkPosition):
+                raise DerivativePipelineInputError("watermark placement is invalid")
+            overrides[asset_id] = position
+    if overrides and set(overrides) != selected:
+        raise DerivativePipelineConflictError(
+            "watermark placements must cover the frozen X selections exactly"
+        )
+    return {asset_id: overrides.get(asset_id, default_position) for asset_id in selected_asset_ids}
 
 
 def _target_idempotency_key(idempotency_key: str, target: str) -> str:
