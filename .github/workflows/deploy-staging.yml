@@ -252,10 +252,38 @@ jobs:
             exit 0
           fi
 
+          # Routine image rollout does not rerun the first-install host bundle.
+          # Resolve the two credential-free MEGA bootstrap files from the exact
+          # reviewed image revision, then make the host independently verify
+          # those bytes before installing them.
+          host_bundle_dir="$RUNNER_TEMP/staging-host-bootstrap"
+          mkdir --parents "$host_bundle_dir"
+          for relative_path in \
+            infra/aws-staging/deploy/bootstrap-mega-profile.sh \
+            infra/aws-staging/deploy/compose.bootstrap.yaml; do
+            gh api \
+              --header 'Accept: application/vnd.github.raw+json' \
+              "repos/${GITHUB_REPOSITORY}/contents/${relative_path}?ref=${SOURCE_REVISION}" \
+              >"$host_bundle_dir/${relative_path##*/}"
+          done
+          bash -n "$host_bundle_dir/bootstrap-mega-profile.sh"
+          bootstrap_helper_sha256="$(sha256sum "$host_bundle_dir/bootstrap-mega-profile.sh" | cut -d' ' -f1)"
+          bootstrap_compose_sha256="$(sha256sum "$host_bundle_dir/compose.bootstrap.yaml" | cut -d' ' -f1)"
+          bootstrap_helper_base64="$(base64 --wrap=0 "$host_bundle_dir/bootstrap-mega-profile.sh")"
+          bootstrap_compose_base64="$(base64 --wrap=0 "$host_bundle_dir/compose.bootstrap.yaml")"
+          [[ "$bootstrap_helper_sha256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$bootstrap_compose_sha256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$bootstrap_helper_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
+          [[ "$bootstrap_compose_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
+
           parameters_file="$RUNNER_TEMP/ssm-parameters.json"
           SSM_IMAGE_REF="$IMAGE_REF" \
           SSM_WORKER_IMAGE_REF="$WORKER_IMAGE_REF" \
           SSM_SOURCE_REVISION="$SOURCE_REVISION" \
+          SSM_BOOTSTRAP_HELPER_SHA256="$bootstrap_helper_sha256" \
+          SSM_BOOTSTRAP_COMPOSE_SHA256="$bootstrap_compose_sha256" \
+          SSM_BOOTSTRAP_HELPER_BASE64="$bootstrap_helper_base64" \
+          SSM_BOOTSTRAP_COMPOSE_BASE64="$bootstrap_compose_base64" \
             python3 -c '
           import json
           import os
@@ -264,6 +292,10 @@ jobs:
           image = os.environ["SSM_IMAGE_REF"]
           worker_image = os.environ["SSM_WORKER_IMAGE_REF"]
           revision = os.environ["SSM_SOURCE_REVISION"]
+          bootstrap_helper_sha256 = os.environ["SSM_BOOTSTRAP_HELPER_SHA256"]
+          bootstrap_compose_sha256 = os.environ["SSM_BOOTSTRAP_COMPOSE_SHA256"]
+          bootstrap_helper_base64 = os.environ["SSM_BOOTSTRAP_HELPER_BASE64"]
+          bootstrap_compose_base64 = os.environ["SSM_BOOTSTRAP_COMPOSE_BASE64"]
           runtime_env = "/etc/gen-automation/control-plane.env"
           runtime_env_backup = f"{runtime_env}.{revision}.rollback"
           worker_image_key = "GEN_AUTOMATION_SALAD_WORKER_IMAGE"
@@ -308,6 +340,40 @@ jobs:
               f" {shlex.quote(worker_image)}"
           )
           remove_runtime_backup = f"sudo /usr/bin/rm -f -- {shlex.quote(runtime_env_backup)}"
+          refresh_host_bootstrap = (
+              "bundle_root=$(/usr/bin/mktemp --directory "
+              "/tmp/gen-automation-host-bootstrap.XXXXXX)"
+              " && trap '\''/usr/bin/rm -rf -- \"$bundle_root\"'\'' EXIT"
+              " && /usr/bin/printf '\''%s'\''"
+              f" {shlex.quote(bootstrap_helper_base64)}"
+              " | /usr/bin/base64 --decode"
+              " >\"$bundle_root/bootstrap-mega-profile.sh\""
+              " && /usr/bin/printf '\''%s'\''"
+              f" {shlex.quote(bootstrap_compose_base64)}"
+              " | /usr/bin/base64 --decode"
+              " >\"$bundle_root/compose.bootstrap.yaml\""
+              " && /usr/bin/printf '\''%s  %s\\n'\''"
+              f" {shlex.quote(bootstrap_helper_sha256)}"
+              " \"$bundle_root/bootstrap-mega-profile.sh\""
+              " | /usr/bin/sha256sum --check --status"
+              " && /usr/bin/printf '\''%s  %s\\n'\''"
+              f" {shlex.quote(bootstrap_compose_sha256)}"
+              " \"$bundle_root/compose.bootstrap.yaml\""
+              " | /usr/bin/sha256sum --check --status"
+              " && /usr/bin/bash -n \"$bundle_root/bootstrap-mega-profile.sh\""
+              " && sudo /usr/bin/docker compose"
+              " --env-file /etc/gen-automation/deploy.env"
+              " --project-directory /opt/gen-automation/deploy"
+              " --file /opt/gen-automation/deploy/compose.yaml"
+              " --file \"$bundle_root/compose.bootstrap.yaml\""
+              " --profile bootstrap config --quiet"
+              " && sudo /usr/bin/install -o root -g root -m 0644"
+              " \"$bundle_root/compose.bootstrap.yaml\""
+              " /opt/gen-automation/deploy/compose.bootstrap.yaml"
+              " && sudo /usr/bin/install -o root -g root -m 0755"
+              " \"$bundle_root/bootstrap-mega-profile.sh\""
+              " /usr/local/sbin/gen-automation-bootstrap-mega-profile"
+          )
           restore_runtime_env = (
               "sudo /usr/bin/install -o root -g root -m 0600"
               f" {shlex.quote(runtime_env_backup)} {shlex.quote(runtime_env)}"
@@ -337,7 +403,8 @@ jobs:
               f" --image {shlex.quote(image)} --revision {shlex.quote(revision)}"
           )
           command = (
-              f"{migration_preflight} && {backup_runtime_env} && {update_worker_reference} && "
+              f"{migration_preflight} && {refresh_host_bootstrap} && "
+              f"{backup_runtime_env} && {update_worker_reference} && "
               f"( ( {migration_command} && {rollout_command} && {remove_runtime_backup} ) || "
               f"( {restore_runtime_env}; false ) )"
           )

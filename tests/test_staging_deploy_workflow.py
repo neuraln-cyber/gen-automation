@@ -1,5 +1,10 @@
+import base64
+import json
+import os
 import re
 import shlex
+import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -26,6 +31,18 @@ def _semantic_activator() -> str:
 
 def _semantic_promoter() -> str:
     return (DEPLOY / "promote-semantic-anatomy.sh").read_text(encoding="utf-8")
+
+
+def _rollout_command_program() -> str:
+    rollout = _workflow().split("      - name: Roll out through AWS Systems Manager\n", maxsplit=1)[
+        1
+    ]
+    embedded = textwrap.dedent(
+        rollout.split("python3 -c '", maxsplit=1)[1].split('\' >"$parameters_file"', maxsplit=1)[0]
+    )
+    command = shlex.split(f"python3 -c '{embedded}'", posix=True)
+    assert command[:2] == ["python3", "-c"]
+    return command[2]
 
 
 def test_staging_rollout_follows_only_successful_immutable_publication() -> None:
@@ -176,6 +193,67 @@ def test_ssm_command_contains_only_public_immutable_coordinates() -> None:
         "DATABASE",
     ):
         assert prohibited not in command_block.upper()
+
+
+def test_routine_rollout_refreshes_the_mega_bootstrap_bundle_safely() -> None:
+    workflow = _workflow()
+    helper = (DEPLOY / "bootstrap-mega-profile.sh").read_bytes()
+    compose = (DEPLOY / "compose.bootstrap.yaml").read_bytes()
+
+    assert "repos/${GITHUB_REPOSITORY}/contents/${relative_path}?ref=${SOURCE_REVISION}" in workflow
+    assert "infra/aws-staging/deploy/bootstrap-mega-profile.sh" in workflow
+    assert "infra/aws-staging/deploy/compose.bootstrap.yaml" in workflow
+    assert 'bash -n "$host_bundle_dir/bootstrap-mega-profile.sh"' in workflow
+    assert 'base64 --wrap=0 "$host_bundle_dir/bootstrap-mega-profile.sh"' in workflow
+    assert 'base64 --wrap=0 "$host_bundle_dir/compose.bootstrap.yaml"' in workflow
+
+    program = _rollout_command_program()
+    compile(program, "staging-rollout-ssm-command", "exec")
+    environment = {
+        "SSM_IMAGE_REF": (
+            "ghcr.io/neuraln-cyber/gen-automation/control-plane-mega@sha256:" + "a" * 64
+        ),
+        "SSM_WORKER_IMAGE_REF": (
+            "ghcr.io/neuraln-cyber/gen-automation/gpu-worker@sha256:" + "b" * 64
+        ),
+        "SSM_SOURCE_REVISION": "c" * 40,
+        "SSM_BOOTSTRAP_HELPER_SHA256": "d" * 64,
+        "SSM_BOOTSTRAP_COMPOSE_SHA256": "e" * 64,
+        "SSM_BOOTSTRAP_HELPER_BASE64": base64.b64encode(helper).decode("ascii"),
+        "SSM_BOOTSTRAP_COMPOSE_BASE64": base64.b64encode(compose).decode("ascii"),
+    }
+    result = subprocess.run(  # noqa: S603 - executes the repository-owned rollout fixture.
+        [sys.executable, "-c", program],
+        check=True,
+        capture_output=True,
+        env={**os.environ, **environment},
+        text=True,
+    )
+    command = json.loads(result.stdout)["commands"][0]
+
+    assert len(command) < 24_000
+    assert "/usr/bin/base64 --decode" in command
+    assert command.count("/usr/bin/sha256sum --check --status") == 2
+    assert '/usr/bin/bash -n "$bundle_root/bootstrap-mega-profile.sh"' in command
+    assert "--profile bootstrap config --quiet" in command
+    assert (
+        "sudo /usr/bin/install -o root -g root -m 0644 "
+        '"$bundle_root/compose.bootstrap.yaml" '
+        "/opt/gen-automation/deploy/compose.bootstrap.yaml"
+    ) in command
+    assert (
+        "sudo /usr/bin/install -o root -g root -m 0755 "
+        '"$bundle_root/bootstrap-mega-profile.sh" '
+        "/usr/local/sbin/gen-automation-bootstrap-mega-profile"
+    ) in command
+    assert "raw.githubusercontent.com" not in command
+    assert "/usr/bin/curl" not in command
+    assert command.index("--profile bootstrap config --quiet") < command.index(
+        "/opt/gen-automation/deploy/compose.bootstrap.yaml"
+    )
+    assert command.index("/usr/local/sbin/gen-automation-bootstrap-mega-profile") < command.index(
+        "/etc/gen-automation/control-plane.env"
+    )
 
 
 def test_migration_environment_is_private_separate_and_tls_verified() -> None:

@@ -45,8 +45,10 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-[ "$(id -u)" -eq 0 ] || fail "run this command as root from an interactive SSM shell"
-[ -t 0 ] && [ -t 1 ] || fail "an interactive terminal is required"
+[ "$(id -u)" -eq 0 ] || fail "run this command as root"
+if [ "$verify_only" = false ]; then
+  [ -t 0 ] && [ -t 1 ] || fail "an interactive terminal is required for MEGA login"
+fi
 [ -r "$config_root/deploy.env" ] || fail "missing $config_root/deploy.env"
 [ -r "$config_root/control-plane.env" ] || fail "missing $config_root/control-plane.env"
 [ -r "$deploy_root/compose.yaml" ] || fail "missing deployed compose.yaml"

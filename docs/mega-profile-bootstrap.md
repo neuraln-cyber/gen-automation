@@ -50,6 +50,11 @@ opening the login shell, run:
 sudo /usr/local/sbin/gen-automation-bootstrap-mega-profile --verify-only
 ```
 
+`--verify-only` does not require a terminal and is safe to invoke with an
+unattended Systems Manager Run Command. The login mode still refuses to run
+without an interactive terminal so credentials cannot be fed through command
+arguments, environment variables, or a captured automation transcript.
+
 The wrapper currently supports a normal MEGA account login. The official
 writable-folder login syntax places the link key and write authorization key in
 the command itself, so it is intentionally not accepted by this no-secret-args

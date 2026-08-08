@@ -440,7 +440,14 @@ def test_mega_profile_has_a_private_interactive_bootstrap_path() -> None:
     assert "privileged:" not in bootstrap_compose
     assert "/var/run/docker.sock" not in bootstrap_compose
 
-    assert "[ -t 0 ] && [ -t 1 ]" in bootstrap_command
+    interactive_guard = bootstrap_command.split('if [ "$verify_only" = false ]; then', maxsplit=1)[
+        1
+    ].split("fi", maxsplit=1)[0]
+    assert "[ -t 0 ] && [ -t 1 ]" in interactive_guard
+    assert "interactive terminal is required for MEGA login" in interactive_guard
+    assert bootstrap_command.index('if [ "$verify_only" = false ]; then') < bootstrap_command.index(
+        "require_private_profile"
+    )
     assert "control-plane-mega@sha256:[0-9a-f]{64}" in bootstrap_command
     assert "systemctl stop" in bootstrap_command
     assert "trap restore_runtime" in bootstrap_command
@@ -463,6 +470,7 @@ def test_mega_profile_has_a_private_interactive_bootstrap_path() -> None:
     assert '"$source_dir/bootstrap-mega-profile.sh"' in installer
     assert "quit --only-shell" in runbook
     assert "--verify-only" in runbook
+    assert "does not require a terminal" in runbook
     assert "Do not run `logout`" in runbook
 
 
