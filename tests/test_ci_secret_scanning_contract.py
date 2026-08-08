@@ -69,7 +69,7 @@ def test_secret_scanner_extends_defaults_with_only_narrow_fixture_exceptions() -
     config = CONFIG_PATH.read_text(encoding="utf-8")
 
     assert "useDefault = true" in config
-    assert config.count("[[rules.allowlists]]") == 1
+    assert config.count("[[rules.allowlists]]") == 2
     assert 'id = "generic-api-key"' in config
     assert 'condition = "AND"' in config
     assert 'regexTarget = "line"' in config
@@ -78,6 +78,7 @@ def test_secret_scanner_extends_defaults_with_only_narrow_fixture_exceptions() -
         "tests/test_compliance_api",
         "tests/test_compliance_registry",
         "tests/test_salad_service",
+        "tests/test_x_teaser_revisions",
     ):
         assert path in config
     for fixture in (
@@ -87,6 +88,8 @@ def test_secret_scanner_extends_defaults_with_only_narrow_fixture_exceptions() -
         "approve-subject-v1",
         "revoke-subject-v1",
         "v1\\.key-1\\.corrupt",
+        "x-idempotency-k[12]",
+        "x-idempotency-k2",
     ):
         assert fixture in config
     assert "[[allowlists]]" not in config

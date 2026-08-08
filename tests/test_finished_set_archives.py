@@ -481,7 +481,7 @@ async def test_planner_full_outputs_archive_while_x_teaser_job_failed(
         x_selected_asset_ids=(selected_asset_id,),
         max_attempts=1,
     )
-    assert prepared.plan.total_jobs == 3
+    assert prepared.plan.total_jobs == 2
     assert prepared.watermark_key is not None
     watermark = prepared.store.objects[prepared.watermark_key]
     corrupted_watermark = bytearray(watermark.body)
@@ -507,7 +507,7 @@ async def test_planner_full_outputs_archive_while_x_teaser_job_failed(
         release = await session.get(Release, approved.release_id)
         jobs = tuple((await session.scalars(select(DerivativeJob))).all())
         assert release is not None
-        assert release.phase == ReleasePhase.RENDERING
+        assert release.phase == ReleasePhase.READY_TO_PUBLISH
         assert len(jobs) == 3
         assert {(tuple(job.request_payload["output_targets"]), job.state) for job in jobs} == {
             (("full",), DerivativeJobState.SUCCEEDED),
