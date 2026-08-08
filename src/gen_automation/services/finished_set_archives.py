@@ -53,6 +53,10 @@ from gen_automation.services.generation_positions import (
     generation_ordinal,
     generation_queue_offsets,
 )
+from gen_automation.services.outbound_image_privacy import (
+    OutboundImagePrivacyError,
+    require_metadata_free_image,
+)
 from gen_automation.storage.base import (
     ObjectAlreadyExistsError,
     ObjectMetadata,
@@ -1118,6 +1122,12 @@ async def _build_part(
             raise _FinishedSetArchiveContractError(
                 "a finished-set derivative no longer matches its frozen bytes"
             )
+        try:
+            require_metadata_free_image(body, content_type=output.content_type)
+        except OutboundImagePrivacyError as error:
+            raise _FinishedSetArchiveContractError(
+                "a finished-set derivative contains embedded metadata"
+            ) from error
         image_entries.append((output.path, body))
     part_manifest = _part_manifest(
         plan,

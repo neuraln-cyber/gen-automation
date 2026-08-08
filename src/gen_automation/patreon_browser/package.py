@@ -27,6 +27,10 @@ from gen_automation.integrations.patreon.handoff import (
     PATREON_PUBLIC_PREVIEW_ATTESTATION,
     PATREON_SET_MANIFEST_SCHEMA,
 )
+from gen_automation.services.outbound_image_privacy import (
+    OutboundImagePrivacyError,
+    require_metadata_free_image,
+)
 from gen_automation.storage.images import (
     FORMAT_CONTENT_TYPES,
     ImageVerificationError,
@@ -520,5 +524,11 @@ def _extract_verified_image(
         not in _FORMAT_EXTENSIONS.get(verified.image_format, frozenset())
     ):
         raise PatreonBrowserPackageError("Patreon image metadata does not match decoded bytes")
+    try:
+        require_metadata_free_image(body, content_type=verified.content_type)
+    except OutboundImagePrivacyError as error:
+        raise PatreonBrowserPackageError(
+            "Patreon image entry contains embedded metadata"
+        ) from error
     target.write_bytes(body)
     return target

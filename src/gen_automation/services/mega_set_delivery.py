@@ -48,6 +48,10 @@ from gen_automation.integrations.mega.client import (
     validate_remote_filename,
     validate_remote_path,
 )
+from gen_automation.services.outbound_image_privacy import (
+    OutboundImagePrivacyError,
+    require_metadata_free_image,
+)
 from gen_automation.storage.base import ObjectStore, ObjectStoreError
 
 _SOURCE_MANIFEST_SCHEMA = "finished-set-manifest/v1"
@@ -1240,6 +1244,15 @@ def _stage_items(
                     or digest.hexdigest() != expected.source_sha256
                 ):
                     raise MegaSetDeliveryContractError("finished-set image bytes changed")
+                try:
+                    require_metadata_free_image(
+                        destination.read_bytes(),
+                        content_type=expected.source_content_type,
+                    )
+                except OutboundImagePrivacyError as error:
+                    raise MegaSetDeliveryContractError(
+                        "finished-set image contains embedded metadata"
+                    ) from error
                 staged.append(_StagedItem(item_id=item.id, path=destination))
             return tuple(staged)
     except (BadZipFile, KeyError, RuntimeError, ValueError, json.JSONDecodeError) as error:

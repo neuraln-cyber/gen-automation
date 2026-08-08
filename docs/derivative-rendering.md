@@ -158,6 +158,12 @@ software paths, ICC payloads, PNG text chunks, and other source-private metadata
 are not copied. JPEG files may still contain standard encoder/JFIF structural
 fields, which carry no source-private content.
 
+The same container-level privacy check runs when the derivative is registered,
+when a finished-set ZIP is built, and immediately before Patreon, X, or MEGA
+delivery. A metadata-bearing derivative fails closed at any of those boundaries.
+The private raw-master object is never rewritten, so its prompt and generation
+settings remain available in the authenticated library.
+
 ## Automatic durable execution
 
 `gen_automation.services.derivative_runtime` connects the isolated renderer to

@@ -10,6 +10,7 @@ from uuid import uuid4
 from zipfile import ZipFile
 
 import pytest
+from PIL import Image
 from sqlalchemy import func, select
 
 from gen_automation.db.models import (
@@ -43,6 +44,10 @@ from gen_automation.services.finished_set_archives import (
 )
 from gen_automation.storage.base import ObjectMetadata
 from gen_automation.storage.memory import MemoryObjectStore, StoredObject
+from tests.image_privacy_assertions import (
+    assert_delivery_metadata_absent,
+    assert_private_master_metadata_present,
+)
 from tests.test_derivative_pipeline import ApprovedContext
 from tests.test_derivative_pipeline import (
     approved_context as derivative_approved_context,  # noqa: F401
@@ -95,6 +100,9 @@ async def test_archive_is_available_without_preparing_any_destination(
     prepared = await _prepare(approved)
     await _cycle(prepared, worker_id="archive-derivative")
     await _cycle(prepared, worker_id="archive-derivative")
+    for asset_id, source in zip(approved.raw_asset_ids, approved.raw_payloads, strict=True):
+        assert_private_master_metadata_present(source)
+        assert prepared.store.objects[f"raw/{asset_id}.png"].body == source
 
     async with approved.database.sessions() as session:
         assert (
@@ -181,6 +189,11 @@ async def test_archive_is_available_without_preparing_any_destination(
         assert manifest["schema"] == "finished-set-manifest/v1"
         assert manifest["ordering"] == "frozen_generation_queue"
         assert [item["ordinal"] for item in manifest["outputs"]] == [1, 2]
+        for path in ("content/001.jpg", "content/002.jpg"):
+            assert_delivery_metadata_absent(archive.read(path))
+    for asset_id, source in zip(approved.raw_asset_ids, approved.raw_payloads, strict=True):
+        assert prepared.store.objects[f"raw/{asset_id}.png"].body == source
+        assert_private_master_metadata_present(source)
 
 
 @pytest.mark.asyncio
@@ -557,8 +570,11 @@ async def test_multipart_archive_preserves_order_and_one_shared_manifest() -> No
     review_task_id = uuid4()
     release_version_id = uuid4()
     outputs: list[archives._OutputRecord] = []
+    image_buffer = BytesIO()
+    with Image.new("RGB", (1, 1), color=(12, 34, 56)) as image:
+        image.save(image_buffer, format="PNG")
+    body = image_buffer.getvalue()
     for ordinal in range(1, 102):
-        body = f"image-{ordinal:03d}".encode()
         key = f"full/{ordinal:03d}.png"
         version_id = f"version-{ordinal:03d}"
         store.objects[key] = StoredObject(

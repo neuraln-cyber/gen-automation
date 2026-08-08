@@ -60,6 +60,10 @@ from gen_automation.integrations.x.errors import (
     XTerminalError,
 )
 from gen_automation.integrations.x.models import XPost, XUploadedMedia
+from gen_automation.services.outbound_image_privacy import (
+    OutboundImagePrivacyError,
+    require_metadata_free_image,
+)
 from gen_automation.services.publication import (
     PublicationConflictError,
     PublicationDisabledError,
@@ -1633,6 +1637,15 @@ async def _read_exact_input(
         raise PublicationRuntimeContractError(
             "publication input bytes do not match the frozen snapshot"
         )
+    try:
+        require_metadata_free_image(
+            body,
+            content_type=publication_input.asset_content_type,
+        )
+    except OutboundImagePrivacyError as error:
+        raise PublicationRuntimeContractError(
+            "publication input contains embedded image metadata"
+        ) from error
     return body
 
 

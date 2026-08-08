@@ -1,6 +1,8 @@
 # ruff: noqa: F811
 
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
+from zipfile import ZipFile
 
 import pytest
 from sqlalchemy import select
@@ -11,11 +13,20 @@ from gen_automation.db.models import (
     ReleaseSelection,
 )
 from gen_automation.domain.enums import PublicationTarget
+from gen_automation.integrations.patreon import (
+    PatreonPackageImage,
+    PublicPreviewSafetyAttestation,
+    build_patreon_handoff_package,
+)
 from gen_automation.services import publication
 from gen_automation.services.publication import (
     PublicationInputError,
     _initial_attempt_available_at,
     _load_frozen_outputs,
+)
+from tests.image_privacy_assertions import (
+    assert_delivery_metadata_absent,
+    assert_private_master_metadata_present,
 )
 from tests.test_derivative_pipeline import ApprovedContext
 from tests.test_derivative_pipeline import (
@@ -74,6 +85,9 @@ async def test_publication_uses_exact_selected_x_and_only_clean_patreon_inputs(
     await _cycle(prepared, worker_id="derivative-controller")
     await _cycle(prepared, worker_id="derivative-controller")
     await _cycle(prepared, worker_id="derivative-controller")
+    for asset_id, source in zip(approved.raw_asset_ids, approved.raw_payloads, strict=True):
+        assert_private_master_metadata_present(source)
+        assert prepared.store.objects[f"raw/{asset_id}.png"].body == source
 
     async with approved.database.sessions() as session:
         rows = (
@@ -125,6 +139,11 @@ async def test_publication_uses_exact_selected_x_and_only_clean_patreon_inputs(
         )
         assert [item.output.id for item in x_inputs] == list(x_ids)
         assert all(item.output.target == "x_teaser" for item in x_inputs)
+        x_payloads = tuple(
+            prepared.store.objects[item.output.asset_object_key].body for item in x_inputs
+        )
+        for payload in x_payloads:
+            assert_delivery_metadata_absent(payload)
 
         with pytest.raises(PublicationInputError, match="all accepted full outputs"):
             await _load_frozen_outputs(
@@ -148,6 +167,39 @@ async def test_publication_uses_exact_selected_x_and_only_clean_patreon_inputs(
             "patreon_preview",
         ]
         assert all(item.output.target == "full" for item in patreon_inputs)
+        patreon_payloads = tuple(
+            prepared.store.objects[item.output.asset_object_key].body for item in patreon_inputs
+        )
+        for payload in patreon_payloads:
+            assert_delivery_metadata_absent(payload)
+
+    package = build_patreon_handoff_package(
+        approved_derivatives=tuple(
+            PatreonPackageImage(f"content-{index}.jpg", payload)
+            for index, payload in enumerate(patreon_payloads[:2], start=1)
+        ),
+        public_preview=PatreonPackageImage("preview.jpg", patreon_payloads[2]),
+        title="Metadata boundary",
+        body="",
+        tier="Members",
+        tags=(),
+        scheduled_at=None,
+        public_preview_attestation=PublicPreviewSafetyAttestation(
+            safe_for_public=True,
+            attested_by="test-owner",
+            attested_at=datetime(2026, 8, 1, 12, tzinfo=UTC),
+        ),
+    )
+    with ZipFile(BytesIO(package.archive_bytes)) as archive:
+        packaged_payloads = tuple(
+            archive.read(path) for path in ("content/001.jpg", "content/002.jpg")
+        )
+        assert packaged_payloads == patreon_payloads[:2]
+        for payload in (*packaged_payloads, archive.read("public-preview/preview.jpg")):
+            assert_delivery_metadata_absent(payload)
+    for asset_id, source in zip(approved.raw_asset_ids, approved.raw_payloads, strict=True):
+        assert prepared.store.objects[f"raw/{asset_id}.png"].body == source
+        assert_private_master_metadata_present(source)
 
 
 @pytest.mark.asyncio

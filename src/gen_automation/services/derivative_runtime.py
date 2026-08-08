@@ -83,6 +83,10 @@ from gen_automation.services.derivatives import (
     XTeaserSpec,
     derivative_recipe_sha256,
 )
+from gen_automation.services.outbound_image_privacy import (
+    OutboundImagePrivacyError,
+    require_metadata_free_image,
+)
 from gen_automation.storage.base import (
     ObjectAlreadyExistsError,
     ObjectMetadata,
@@ -722,6 +726,15 @@ def _validate_artifact(
         expected_format=artifact.image_format.value,
         label="derivative output",
     )
+    try:
+        require_metadata_free_image(
+            artifact.data,
+            content_type=artifact.content_type,
+        )
+    except OutboundImagePrivacyError as error:
+        raise DerivativeRuntimeContractError(
+            "derivative output contains embedded metadata"
+        ) from error
 
 
 async def _write_or_adopt_output(

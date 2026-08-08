@@ -27,8 +27,13 @@ already belong to that exact in-progress delivery. Unexpected, duplicate, or
 mismatched files stop the delivery for attention instead of being mixed,
 renamed, or overwritten; use a unique set name for a later replacement.
 
-The image bytes are copied exactly. They are not resized, watermarked,
-recompressed, or stripped of metadata. X teaser derivatives are not included.
+The image bytes are copied exactly from the clean, full-resolution derivative
+archive. They are not resized, watermarked, or recompressed during MEGA
+delivery. The derivative boundary has already removed EXIF, GPS, prompts,
+generation settings, software paths, ICC/XMP payloads, comments, and PNG text;
+the uploader verifies that privacy contract again before transfer. Private raw
+masters retain their original metadata and are never used as MEGA inputs. X
+teaser derivatives are not included.
 `set-manifest.json` records the immutable source identity, filename, ordinal,
 byte length, SHA-256, and generation-queue ordering for every image.
 `upload-complete.json` is written and verified last, so its presence means the
@@ -174,6 +179,9 @@ No MEGA credential belongs in `.env`.
   expected filename fails closed for operator attention.
 - The source object version, archive SHA-256, manifest SHA-256, individual
   image SHA-256, and byte lengths are checked before progress is recorded.
+- Every staged image must pass the metadata-free outbound-media contract;
+  metadata-bearing or malformed legacy derivatives fail closed instead of
+  being uploaded.
 - Temporary files use a mode-`0700` directory and mode-`0600` files and are
   removed after every bounded cycle.
 - MEGA is optional and is not probed during API startup. A missing profile only

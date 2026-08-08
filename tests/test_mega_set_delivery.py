@@ -42,6 +42,10 @@ from gen_automation.services.mega_set_delivery import (
     run_mega_set_delivery_cycle,
 )
 from gen_automation.storage.memory import StoredObject
+from tests.image_privacy_assertions import (
+    assert_delivery_metadata_absent,
+    assert_private_master_metadata_present,
+)
 from tests.test_derivative_pipeline import ApprovedContext
 from tests.test_derivative_pipeline import (
     approved_context as derivative_approved_context,  # noqa: F401
@@ -202,6 +206,11 @@ async def test_provider_independent_multipart_upload_preserves_bytes_order_and_s
     store, archive = await _prepare_archive(approved, part_sizes=(1, 1))
     mega = _RecordingMegaClient()
     read_cursor = len(store.read_requests)
+    for asset_id, source in zip(approved.raw_asset_ids, approved.raw_payloads, strict=True):
+        assert_private_master_metadata_present(source)
+        assert store.objects[f"raw/{asset_id}.png"].body == source
+    for payload in archive.image_payloads:
+        assert_delivery_metadata_absent(payload)
 
     created = await _cycle_mega(approved, store, mega)
     first_part = await _cycle_mega(approved, store, mega)
@@ -275,6 +284,8 @@ async def test_provider_independent_multipart_upload_preserves_bytes_order_and_s
 
     image_paths = [item.remote_path for item in items]
     assert [mega.remote[path] for path in image_paths] == list(archive.image_payloads)
+    for path in image_paths:
+        assert_delivery_metadata_absent(mega.remote[path])
     assert all(mega.write_counts[path] == 1 for path in image_paths)
     remote_manifest_path = f"{delivery.remote_folder}/set-manifest.json"
     completion_path = f"{delivery.remote_folder}/upload-complete.json"
@@ -297,6 +308,9 @@ async def test_provider_independent_multipart_upload_preserves_bytes_order_and_s
     assert "lease_owner" not in safe_status
     assert "last_error_detail" not in safe_status
     assert all("last_error_detail" not in item for item in safe_status["items"])
+    for asset_id, source in zip(approved.raw_asset_ids, approved.raw_payloads, strict=True):
+        assert store.objects[f"raw/{asset_id}.png"].body == source
+        assert_private_master_metadata_present(source)
 
 
 @pytest.mark.asyncio

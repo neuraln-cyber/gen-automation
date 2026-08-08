@@ -8,7 +8,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
-from PIL import Image
+from PIL import Image, PngImagePlugin
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
@@ -59,6 +59,7 @@ from gen_automation.services.review import (
     create_review_task,
     transition_review_task,
 )
+from tests.image_privacy_assertions import PRIVATE_MASTER_PROMPT
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
 PLAN_AT = NOW + timedelta(minutes=10)
@@ -92,11 +93,16 @@ def _owner() -> AdminUser:
 
 def _raw_png(index: int) -> bytes:
     output = io.BytesIO()
-    Image.new(
+    image = Image.new(
         "RGB",
         (64, 64),
         color=(32 + index * 32, 64 + index * 32, 96 + index * 32),
-    ).save(output, format="PNG")
+    )
+    metadata = PngImagePlugin.PngInfo()
+    metadata.add_text("prompt", PRIVATE_MASTER_PROMPT)
+    metadata.add_text("Software", "/private/generator/workstation")
+    image.save(output, format="PNG", pnginfo=metadata)
+    image.close()
     return output.getvalue()
 
 
