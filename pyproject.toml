@@ -55,7 +55,7 @@ gen_automation = [
 ]
 
 [tool.pytest.ini_options]
-addopts = "-ra --strict-config --strict-markers"
+addopts = "-ra --strict-config --strict-markers --basetemp=.pytest-tmp"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 

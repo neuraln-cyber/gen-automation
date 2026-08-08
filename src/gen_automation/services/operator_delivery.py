@@ -12,7 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from gen_automation.db.models import (
     DerivativeJob,
     DerivativeOutput,
-    MegaDelivery,
+    FinishedSetArchive,
+    MegaSetDelivery,
     PublicationAttempt,
     PublicationIntent,
     PublicationPackage,
@@ -25,6 +26,7 @@ from gen_automation.db.models import (
 from gen_automation.domain.enums import (
     AdminRole,
     DerivativeJobState,
+    FinishedSetArchiveState,
     MegaDeliveryState,
     PublicationAttemptState,
     PublicationIntentState,
@@ -149,6 +151,9 @@ class DestinationState:
     intent_lock_version: int | None = None
     package_id: UUID | None = None
     package_parts: tuple[DeliveryPackagePart, ...] = ()
+    completed_items: int | None = None
+    total_items: int | None = None
+    remote_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,7 +324,6 @@ async def load_operator_delivery(
         guard_changed_at = None
     destinations = await _destination_states(
         session,
-        release_id=release.id,
         release_version_id=release_version.id,
         x_selected_count=expected_x_count,
     )
@@ -546,7 +550,6 @@ def _duplicate_selection_targets(outputs: tuple[DeliveryOutput, ...]) -> bool:
 async def _destination_states(
     session: AsyncSession,
     *,
-    release_id: UUID,
     release_version_id: UUID,
     x_selected_count: int,
 ) -> tuple[DestinationState, ...]:
@@ -583,8 +586,7 @@ async def _destination_states(
     )
     mega = await _mega_destination(
         session,
-        release_id=release_id,
-        patreon_intent=patreon_intent,
+        release_version_id=release_version_id,
     )
     return (patreon, mega, x)
 
@@ -696,79 +698,77 @@ def _publication_state(
 async def _mega_destination(
     session: AsyncSession,
     *,
-    release_id: UUID,
-    patreon_intent: PublicationIntent | None,
+    release_version_id: UUID,
 ) -> DestinationState:
-    if patreon_intent is None:
+    archive = await session.scalar(
+        select(FinishedSetArchive)
+        .where(FinishedSetArchive.release_version_id == release_version_id)
+        .order_by(FinishedSetArchive.created_at.desc(), FinishedSetArchive.id.desc())
+        .limit(1)
+    )
+    if archive is None:
         return DestinationState(
             key="mega",
             label="MEGA",
             state="not_prepared",
-            detail="MEGA mirrors the exact Patreon full-set package.",
+            detail="Waiting for the clean finished-set archive.",
         )
-    packages = tuple(
-        (
-            await session.scalars(
-                select(PublicationPackage)
-                .where(PublicationPackage.intent_id == patreon_intent.id)
-                .order_by(PublicationPackage.part_number)
-            )
-        ).all()
-    )
-    if not packages:
+    if archive.state == FinishedSetArchiveState.FAILED:
+        return DestinationState(
+            key="mega",
+            label="MEGA",
+            state="failed",
+            detail="The clean finished-set archive failed before MEGA delivery.",
+            completed_items=0,
+            total_items=archive.selection_count,
+        )
+    if archive.state != FinishedSetArchiveState.READY:
         return DestinationState(
             key="mega",
             label="MEGA",
             state="queued",
-            detail="Waiting for the exact full-set package.",
-            intent_id=patreon_intent.id,
+            detail="Waiting for the clean finished-set archive.",
+            completed_items=0,
+            total_items=archive.selection_count,
         )
-    deliveries = tuple(
-        (
-            await session.scalars(
-                select(MegaDelivery)
-                .join(
-                    PublicationPackage,
-                    PublicationPackage.id == MegaDelivery.publication_package_id,
-                )
-                .join(
-                    PublicationIntent,
-                    PublicationIntent.id == PublicationPackage.intent_id,
-                )
-                .where(
-                    PublicationIntent.release_id == release_id,
-                    MegaDelivery.publication_package_id.in_(tuple(item.id for item in packages)),
-                )
-                .order_by(MegaDelivery.created_at, MegaDelivery.id)
-            )
-        ).all()
+    delivery = await session.scalar(
+        select(MegaSetDelivery).where(MegaSetDelivery.finished_set_archive_id == archive.id)
     )
-    first_package = packages[0]
-    if len(deliveries) < len(packages):
+    if delivery is None:
         return DestinationState(
             key="mega",
             label="MEGA",
             state="queued",
-            detail=(f"Package set ready; {len(deliveries)} / {len(packages)} MEGA parts queued."),
-            intent_id=patreon_intent.id,
-            package_id=first_package.id,
+            detail="Clean set ready; the extracted MEGA upload will start automatically.",
+            completed_items=0,
+            total_items=archive.selection_count,
         )
-    if all(delivery.state == MegaDeliveryState.SUCCEEDED for delivery in deliveries):
+    if delivery.state == MegaDeliveryState.SUCCEEDED:
         state = "published"
-        detail = f"All {len(deliveries)} full-set package parts are verified on MEGA."
-    elif any(delivery.state == MegaDeliveryState.FAILED for delivery in deliveries):
+        detail = (
+            "Every full-resolution image is accounted for and the completion manifest "
+            "is verified on MEGA."
+        )
+    elif delivery.state == MegaDeliveryState.FAILED:
         state, detail = "failed", "MEGA delivery needs operator attention."
-    elif any(delivery.state == MegaDeliveryState.CLAIMED for delivery in deliveries):
-        state, detail = "running", "MEGA upload and checksum verification are running."
+    elif delivery.state == MegaDeliveryState.CLAIMED:
+        state = "running"
+        detail = (
+            f"Uploading full-resolution images ({delivery.uploaded_item_count} / "
+            f"{delivery.total_item_count})."
+        )
+    elif delivery.state == MegaDeliveryState.RETRY_WAIT:
+        state, detail = "queued", "MEGA upload will retry automatically."
     else:
-        state, detail = "queued", "MEGA delivery is queued."
+        state, detail = "queued", "MEGA upload is queued."
     return DestinationState(
         key="mega",
         label="MEGA",
         state=state,
         detail=detail,
-        intent_id=patreon_intent.id,
-        package_id=first_package.id,
+        completed_items=delivery.uploaded_item_count,
+        total_items=delivery.total_item_count,
+        remote_path=delivery.remote_folder,
     )
 
 

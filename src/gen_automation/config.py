@@ -399,6 +399,7 @@ class Settings(BaseSettings):
         ge=1024,
         le=512 * 1024 * 1024,
     )
+    background_mega_batch_size: int = Field(default=100, ge=1, le=100)
     background_outbox_lease_seconds: int = Field(default=300, ge=10, le=3600)
     background_inbox_lease_seconds: int = Field(default=120, ge=10, le=3600)
     background_collection_lease_seconds: int = Field(default=900, ge=60, le=3600)
@@ -726,8 +727,6 @@ class Settings(BaseSettings):
         ):
             errors.append("publication retry maximum cannot be lower than its base delay")
         if self.mega_delivery_enabled:
-            if not self.publishing_enabled:
-                errors.append("MEGA completed-set delivery requires publication orchestration")
             if not self.storage_enabled:
                 errors.append("MEGA completed-set delivery requires private object storage")
             if not self.background_runtime_enabled:
@@ -742,10 +741,13 @@ class Settings(BaseSettings):
                     errors.append("MEGA profile HOME must be an absolute non-root directory")
             if not _valid_mega_remote_root(self.mega_remote_root):
                 errors.append("MEGA remote root must be a normalized absolute remote path")
-            if self.background_mega_max_package_bytes < PATREON_MAX_ARCHIVE_BYTES:
+            if (
+                self.background_mega_max_package_bytes
+                < self.background_finished_set_archive_max_archive_bytes
+            ):
                 errors.append(
-                    "MEGA package capacity must cover the "
-                    f"{PATREON_MAX_ARCHIVE_BYTES}-byte Patreon archive contract"
+                    "MEGA source-part capacity must cover the configured "
+                    "finished-set archive part capacity"
                 )
         if self.background_mega_retry_max_seconds < self.background_mega_retry_base_seconds:
             errors.append("MEGA retry maximum cannot be lower than its base delay")
@@ -755,7 +757,8 @@ class Settings(BaseSettings):
             < (2 * self.background_mega_command_timeout_seconds) + 60
         ):
             errors.append(
-                "MEGA cycle timeout must cover one upload, one verification download, and cleanup"
+                "MEGA cycle timeout must cover one batched upload, control-file verification, "
+                "and cleanup"
             )
         if self.gpu_allocation_enabled and not self.salad_enabled:
             errors.append("GPU allocation requires the SaladCloud integration")

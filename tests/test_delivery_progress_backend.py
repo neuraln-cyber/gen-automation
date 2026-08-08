@@ -52,6 +52,7 @@ def _snapshot(
     *,
     progress: DerivativeProgress | None = None,
     patreon: DestinationState | None = None,
+    mega: DestinationState | None = None,
     publishing_guard_enabled: bool = True,
     x_selected_count: int = 0,
 ) -> OperatorDeliverySnapshot:
@@ -78,7 +79,7 @@ def _snapshot(
                 state="not_prepared",
                 detail="Not prepared.",
             ),
-            DestinationState("mega", "MEGA", "not_prepared", "Not prepared."),
+            mega or DestinationState("mega", "MEGA", "not_prepared", "Not prepared."),
             DestinationState("x", "X", "not_prepared", "Not prepared."),
         ),
     )
@@ -285,8 +286,47 @@ def test_delivery_progress_payload_reports_ready_archive_parts_in_global_order()
                 },
             ],
         },
+        "mega": {
+            "state": "not_prepared",
+            "active": False,
+            "detail": "Not prepared.",
+            "completed_items": None,
+            "total_items": None,
+            "remote_path": None,
+        },
         "poll_after_ms": None,
     }
+
+
+def test_delivery_progress_keeps_polling_for_active_extracted_mega_upload() -> None:
+    snapshot = _snapshot(
+        publishing_guard_enabled=False,
+        mega=DestinationState(
+            "mega",
+            "MEGA",
+            "running",
+            "Uploading full-resolution images (20 / 125).",
+            completed_items=20,
+            total_items=125,
+            remote_path="/Finished Sets/Example/v01-deadbeef",
+        ),
+    )
+
+    payload = delivery_routes._delivery_progress_payload(
+        snapshot,
+        finished_set_archive=_archive(snapshot),
+        mega_enabled=True,
+    )
+
+    assert payload["mega"] == {
+        "state": "running",
+        "active": True,
+        "detail": "Uploading full-resolution images (20 / 125).",
+        "completed_items": 20,
+        "total_items": 125,
+        "remote_path": "/Finished Sets/Example/v01-deadbeef",
+    }
+    assert payload["poll_after_ms"] == 3000
 
 
 @pytest.mark.parametrize(

@@ -259,6 +259,7 @@ async def dashboard_review_delivery(
     delivery_progress = _delivery_progress_payload(
         snapshot,
         finished_set_archive=finished_set_archive,
+        mega_enabled=settings.mega_delivery_enabled,
     )
     return _secure(
         request,
@@ -316,7 +317,7 @@ async def dashboard_review_delivery_progress(
     session: Session,
     principal: PublicationReader,
 ) -> Response:
-    """Return lightweight output and archive progress for one completed review."""
+    """Return lightweight output, archive, and MEGA progress for one completed review."""
 
     if principal.role != AdminRole.OWNER:
         return _secure(
@@ -346,6 +347,7 @@ async def dashboard_review_delivery_progress(
             content=_delivery_progress_payload(
                 snapshot,
                 finished_set_archive=finished_set_archive,
+                mega_enabled=request.app.state.settings.mega_delivery_enabled,
             )
         ),
     )
@@ -1101,6 +1103,7 @@ def _delivery_progress_payload(
     snapshot: OperatorDeliverySnapshot,
     *,
     finished_set_archive: FinishedSetArchiveSnapshot | None,
+    mega_enabled: bool = False,
 ) -> dict[str, object]:
     progress = snapshot.progress
     if progress.outputs_ready:
@@ -1140,6 +1143,8 @@ def _delivery_progress_payload(
         archive_state = "failed"
         archive_detail = "The finished-set archive record is incomplete."
 
+    mega = next(destination for destination in snapshot.destinations if destination.key == "mega")
+    mega_active = mega.state == "running" or (mega_enabled and mega.state == "queued")
     payload: dict[str, object] = {
         "schema": "delivery-progress/v1",
         "review_task_id": str(snapshot.review_task_id),
@@ -1179,11 +1184,20 @@ def _delivery_progress_payload(
                 for part in parts
             ],
         },
+        "mega": {
+            "state": mega.state,
+            "active": mega_active,
+            "detail": mega.detail,
+            "completed_items": mega.completed_items,
+            "total_items": mega.total_items,
+            "remote_path": mega.remote_path,
+        },
         "poll_after_ms": (
             3000
             if output_state == "rendering"
             or archive_state == "preparing"
             or (archive_state == "not_started" and progress.full_outputs_ready)
+            or mega_active
             else None
         ),
     }

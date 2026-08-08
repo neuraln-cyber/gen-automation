@@ -66,7 +66,8 @@ use `sslmode=verify-full` and
 It does not start the application. Re-running the installer re-verifies the
 installed plugin and downloads it only when the reviewed binary is absent.
 It also installs
-`/usr/local/sbin/gen-automation-bootstrap-patreon-profile` and the atomic
+`/usr/local/sbin/gen-automation-bootstrap-mega-profile`,
+`/usr/local/sbin/gen-automation-bootstrap-patreon-profile`, and the atomic
 `/usr/local/sbin/gen-automation-activate-semantic-gateway` command. The semantic
 activator installs the private gateway with anatomy disabled, a zero assessment
 cap, and the bounded staging cold-start policy of five total attempts with
@@ -75,6 +76,21 @@ the immutable images and environment files, use that one-time command with an
 AWS SSM port-forward to `127.0.0.1:6080` to complete Patreon login in the
 cloud-hosted browser. The executable sequence is in
 `docs/patreon-browser-publisher.md`; no public VNC/noVNC ingress is required.
+
+The MEGA bootstrap wrapper opens only the official MEGAcmd shell against the
+encrypted persistent profile. It accepts no MEGA credential through an
+argument, environment file, or host-shell history, enables HTTPS transfers,
+verifies the retained session without printing remote filenames, and restores
+the application afterward. Run it once from an interactive SSM shell:
+
+```console
+sudo /usr/local/sbin/gen-automation-bootstrap-mega-profile
+```
+
+Enter the email in the MEGAcmd shell, then enter the password and MFA code only
+at MEGAcmd's prompts. Use `quit --only-shell` after login and never use
+`logout`. See `docs/mega-profile-bootstrap.md` for the exact flow and the
+non-interactive `--verify-only` check.
 
 ### Promote semantic anatomy beyond the canary
 

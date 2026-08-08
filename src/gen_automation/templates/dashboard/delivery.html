@@ -2,6 +2,7 @@
 {% block content %}
   {% set output_state = delivery_progress.outputs.state %}
   {% set archive_state = delivery_progress.archive.state %}
+  {% set mega_state = delivery_progress.mega.state %}
   {% set poll_delivery = delivery_progress.poll_after_ms is not none %}
   <a class="back" href="/dashboard/review-tasks/{{ delivery.review_task_id }}">
     &larr; Completed review
@@ -25,6 +26,7 @@
       data-delivery-progress-url="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/progress"
       data-delivery-output-state="{{ output_state }}"
       data-delivery-archive-state="{{ archive_state }}"
+      data-delivery-mega-state="{{ mega_state }}"
     {% endif %}
   >
     <div class="step-heading">
@@ -180,8 +182,8 @@
         </div>
     </div>
     <p class="muted">
-        This ZIP is independent of publishing. You can download it before or while
-        Patreon, MEGA, and X preparation is running.
+        This ZIP is independent of publishing and the extracted MEGA upload. You can
+        download it before or while any destination is running.
     </p>
     {% if finished_set_archive %}
         <div class="decision-form" aria-label="Finished set ZIP files">
@@ -320,10 +322,11 @@
     <div class="step-heading">
       <span class="step-number" aria-hidden="true">2</span>
       <div>
-        <h2 id="destinations-heading">Prepare destinations</h2>
+        <h2 id="destinations-heading">Delivery destinations</h2>
         <p class="muted">
-          One action freezes the exact clean Patreon set, queues its automatic MEGA
-          mirror, and queues only the selected X teasers.
+          MEGA receives the clean, full-resolution images automatically in generation
+          order. The action below prepares Patreon and only the selected X teasers;
+          neither one blocks MEGA.
         </p>
       </div>
     </div>
@@ -334,7 +337,8 @@
           <h3 id="publication-switch-heading">Publication switch</h3>
           <p class="muted">
             This global switch is stopped by default. Enabling it allows every
-            currently approved publication intent to run, not only this release.
+            currently approved Patreon or X publication intent to run, not only this
+            release. It does not pause the private MEGA upload.
           </p>
         </div>
         <span class="status {{ 'ready' if delivery.publishing_guard_enabled else 'stopped' }}">
@@ -356,8 +360,8 @@
         </p>
       {% elif guard_target_enabled and not publishing_enabled %}
         <p class="form-error">
-          Publication workers are disabled. Enable the publishing runtime before
-          opening the global switch.
+          Patreon and X publication workers are disabled. Enable their publishing
+          runtime before opening the global switch; MEGA continues independently.
         </p>
       {% elif guard_idempotency_key %}
         <form
@@ -407,10 +411,41 @@
       {% for destination in delivery.destinations %}
         <li class="release-card" data-destination="{{ destination.key }}">
           <h2>{{ destination.label }}</h2>
-          <span class="status {{ destination.state }}">
+          <span class="status {{ destination.state }}" data-destination-status>
             {{ destination.state.replace("_", " ") }}
           </span>
-          <p class="muted">{{ destination.detail }}</p>
+          <p class="muted" data-destination-detail>{{ destination.detail }}</p>
+          {% if destination.key == "mega" %}
+            <div
+              class="review-target-progress"
+              data-mega-progress-region
+              {% if destination.total_items is none %}hidden{% endif %}
+            >
+              <div class="review-target-progress-copy">
+                <strong data-mega-progress-label aria-live="polite">
+                  {{ destination.completed_items or 0 }} /
+                  {{ destination.total_items or 0 }} images uploaded
+                </strong>
+                <span class="muted">Original image bytes; no watermark or recompression.</span>
+              </div>
+              <progress
+                data-mega-progress
+                value="{{ destination.completed_items or 0 }}"
+                max="{{ destination.total_items or 1 }}"
+                aria-label="MEGA image upload progress"
+              >
+                {{ destination.completed_items or 0 }} /
+                {{ destination.total_items or 0 }}
+              </progress>
+            </div>
+            <p
+              class="muted"
+              data-mega-remote-row
+              {% if not destination.remote_path %}hidden{% endif %}
+            >
+              Folder: <code data-mega-remote-path>{{ destination.remote_path or "" }}</code>
+            </p>
+          {% endif %}
           {% if patreon_download_destination and
             destination.intent_id == patreon_download_destination.intent_id %}
             <div class="decision-form" aria-label="Patreon manual handoff ZIP files">
@@ -546,12 +581,13 @@
 
     {% if not publishing_enabled %}
       <p class="form-error">
-        Publication workers are not enabled yet. Configure them before live testing.
+        Patreon and X publication workers are not enabled yet. Configure them before
+        live testing; the private MEGA upload is independent.
       </p>
     {% elif not delivery.publishing_guard_enabled %}
       <p class="form-error">
         The existing global publication guard is stopped. Enable it before preparing
-        live destinations.
+        Patreon or X; it does not stop MEGA.
       </p>
     {% elif delivery.x_selected_count and not x_configured %}
       <p class="form-error">
@@ -652,18 +688,21 @@
             <p class="muted">No X teasers were selected for this set.</p>
           {% endif %}
         </fieldset>
-        <button class="primary-button" type="submit">Prepare destinations</button>
+        <button class="primary-button" type="submit">Prepare Patreon and X</button>
       </form>
     {% endif %}
 
     <p class="muted">
       Patreon uses the configured persistent signed-in browser publisher when it is
       enabled. Manual package download remains the fallback, and an unknown browser
-      result must be reconciled before it becomes available. MEGA mirrors the same
-      immutable full-set ZIP.
+      result must be reconciled before it becomes available. MEGA independently uploads
+      the sorted set as ordinary full-resolution image files and writes its manifest last.
     </p>
     {% if not mega_configured %}
-      <p class="muted">MEGA will remain queued until its pre-authenticated uploader is enabled.</p>
+      <p class="muted">
+        MEGA will remain queued until its pre-authenticated uploader is enabled; Patreon
+        and X can still proceed.
+      </p>
     {% endif %}
   </section>
 

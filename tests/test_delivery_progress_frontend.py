@@ -30,6 +30,9 @@ def test_delivery_progress_uses_json_polling_without_periodic_page_reloads() -> 
     assert 'initialArchiveState !== "failed" && archiveState === "failed"' in handler
     assert "const fullOutputsReady = output.full_outputs_ready === true;" in handler
     assert 'archiveState === "not_started" && fullOutputsReady' in handler
+    assert "payload.mega.active === true" in handler
+    assert "renderMega(payload.mega)" in handler
+    assert "data-mega-progress" in handler
 
 
 def test_delivery_progress_stops_polling_when_the_session_expires() -> None:
@@ -62,7 +65,7 @@ def test_delivery_template_explains_copy_and_archive_work_truthfully() -> None:
     assert "Creating ZIP parts in the background" in template
     assert "This ZIP is independent of publishing" in template
     assert "before or while" in template
-    assert "Patreon, MEGA, and X preparation is running" in template
+    assert "independent of publishing and the extracted MEGA upload" in template
     assert "delivery:prepare-archive" in template
     assert "Prepare ZIP download" in template
     assert "Retry ZIP preparation" in template
@@ -76,6 +79,9 @@ def test_delivery_template_explains_copy_and_archive_work_truthfully() -> None:
     assert 'data-delivery-progress-url="/dashboard/review-tasks/' in template
     assert "poll_delivery" in template
     assert "Prepare or download finished set" in review_template
+    assert "ordinary full-resolution image files" in template
+    assert "data-mega-progress" in template
+    assert "data-mega-remote-path" in template
 
 
 def test_ready_archive_is_excluded_from_delivery_polling_condition() -> None:

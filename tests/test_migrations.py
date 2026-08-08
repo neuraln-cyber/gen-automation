@@ -144,6 +144,8 @@ def test_foundation_migration_round_trip(
         "idempotency_records",
         "login_throttles",
         "mega_deliveries",
+        "mega_set_deliveries",
+        "mega_set_delivery_items",
         "model_artifact_approvals",
         "outbox_events",
         "provider_budget_guards",

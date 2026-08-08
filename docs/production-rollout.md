@@ -109,15 +109,16 @@ and external publishing remain disabled until their individual gates pass.
 - Require a fresh human approval immediately before any external post. An
   ambiguous create-post timeout enters `UNKNOWN` and is reconciled instead of
   being blindly retried.
-- If the optional MEGA mirror is enabled, build `Dockerfile.mega` with the
+- If the optional MEGA destination is enabled, build `Dockerfile.mega` with the
   pinned official MEGAcmd Linux-repository URL and its independently recorded
   SHA-256. Mount one
   mode-`0700`, pre-authenticated writable-folder profile volume into exactly one
-  controller replica. Canary one small clean Patreon ZIP and require the stored
-  remote handle, exact byte length, and full re-download SHA-256 to match before
-  enabling normal deliveries. Then simulate a lost upload response and confirm
-  the next lease adopts the existing content-addressed node without uploading a
-  duplicate. See `docs/mega-delivery.md`.
+  controller replica. Canary one small finished set and require ordered
+  full-resolution files, matching image/byte progress, and verified manifest
+  and completion-marker control files before enabling normal deliveries. Then
+  simulate a lost batch-upload response and confirm the next lease hashes and
+  adopts only the ambiguous remote files without uploading duplicates. See
+  `docs/mega-delivery.md`.
 - MEGA remains a secondary completed-set destination. Salad S4 is temporary
   storage (30-day retention and a 100 MB object limit), not the authoritative
   archive. Use only a private, persistent S3-compatible bucket that passes the

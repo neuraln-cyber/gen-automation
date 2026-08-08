@@ -1,6 +1,37 @@
 name: gen-automation-staging
 
 services:
+  mega-profile-bootstrap:
+    profiles:
+      - bootstrap
+    image: "${GEN_AUTOMATION_CONTROL_PLANE_MEGA_IMAGE:?set a repository@sha256:64-hex digest}"
+    user: "10001:10001"
+    init: true
+    stdin_open: true
+    tty: true
+    read_only: true
+    restart: "no"
+    environment:
+      HOME: /run/gen-automation/mega-profile
+    entrypoint:
+      - /bin/sh
+      - -c
+    command:
+      - umask 077; exec mega-cmd
+    networks:
+      - mega-bootstrap-egress
+    volumes:
+      - type: bind
+        source: /var/lib/gen-automation/integration-profiles/mega
+        target: /run/gen-automation/mega-profile
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=1770
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+
   patreon-browser-bootstrap:
     profiles:
       - bootstrap
@@ -38,6 +69,10 @@ services:
     pids_limit: 512
 
 networks:
+  mega-bootstrap-egress:
+    name: gen-automation-mega-bootstrap-egress
+    driver: bridge
+    attachable: false
   patreon-bootstrap-egress:
     name: gen-automation-patreon-bootstrap-egress
     driver: bridge

@@ -20,7 +20,7 @@ workers:
 - Non-destructive watermarking and platform-specific derivatives
 - Official X API publishing and an isolated official-UI Patreon browser publisher
 - Private versioned archive storage, deterministic clean Patreon handoff
-  packages, and restart-safe verified MEGA mirroring
+  packages, and restart-safe extracted full-resolution MEGA delivery
 - Reproducible checkpoint/LoRA/detector/workflow onboarding with exact hashes
 - Credential-free OpenTofu for the cost-efficient AWS staging substrate
 
@@ -30,7 +30,8 @@ The control plane, immutable raw-master storage, signed GPU worker, SaladCloud
 orchestration, authentication/TOTP/RBAC, compliance registry, quality ranking,
 ranked dashboard, durable human review, automatic derivative rendering,
 restart-safe publication orchestration, Patreon browser/manual publishing,
-verified MEGA delivery, and the concrete X OAuth/posting path are implemented.
+  verified extracted-set MEGA delivery, and the concrete X OAuth/posting path
+  are implemented.
 AWS staging, live S3 conformance, the RDS restore drill, exact checkpoint/LoRA/
 detector/workflow onboarding, and bounded live SaladCloud generation are
 complete. Semantic-anatomy, review/derivative, Patreon, MEGA, and X destination

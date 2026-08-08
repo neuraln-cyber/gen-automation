@@ -31,8 +31,9 @@ rejected in the batch card before submission.
 The configured final-set size is a maximum review goal, not a requirement to keep
 every generated master. An open review can be completed with any non-empty accepted
 subset up to that goal. Completion atomically freezes only those accepted masters
-and records their actual count as the exact downstream Patreon/MEGA package size;
-unaccepted and undecided raw masters remain available in private storage.
+and records their actual count for both the deterministic Patreon handoff and
+the extracted full-resolution MEGA folder; unaccepted and undecided raw masters
+remain available in private storage.
 
 Named settings presets are stored on the current device. They include the
 approved subject or ordered two-character composition and prompts, checkpoint,

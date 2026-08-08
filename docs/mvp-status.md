@@ -75,10 +75,10 @@ used as a completion claim.
   It fails closed on login, CAPTCHA/2FA, UI drift, and ambiguous outcomes. The
   deterministic ZIP download and manual official-UI handoff remain available
   as the fallback.
-- A pinned MEGAcmd-enabled controller image and restart-safe automatic mirror of
-  every exact clean Patreon archive part. Success requires a verification download with
-  matching byte length and SHA-256; the private asset bucket remains the source
-  of truth.
+- A pinned MEGAcmd-enabled controller image and restart-safe automatic delivery
+  of the accepted full-resolution files in generation order. Images are sent in
+  bounded batches and small remote control files are verified last; the private
+  asset bucket remains the source of truth.
 - Reproducible AWS staging OpenTofu under `infra/aws-staging`: default
   `eu-central-1`, SSM-only EC2, EIP and 80/443 ingress, private RDS PostgreSQL,
   separate versioned asset/model buckets, encrypted root and integration-profile
@@ -146,8 +146,9 @@ Destination-specific Patreon package parts remain private and separate:
 publication-packages/{publication_intent_id}/part-NNN-of-NNN/{sha256}.zip
 ```
 
-Each exact Patreon package can be downloaded for the manual fallback and is
-mirrored to MEGA. Every part carries the same release-wide ordered manifest.
+Each exact Patreon package can be downloaded for the manual fallback. MEGA
+independently expands the provider-neutral finished set into ordered ordinary
+files and adds its verified manifest and completion marker last.
 Single-part sets can also be published through the Patreon browser sidecar; a
 multipart set waits for the operator so the official UI is not driven with an
 incomplete subset. Raw masters are never
@@ -174,7 +175,8 @@ watermarked, moved, overwritten, or made public.
 3. Review one generated release, accept a bounded set, render its clean Patreon
    outputs, and select/render only the watermarked X teasers.
 4. Bootstrap the persistent Patreon and MEGA profiles through owner-controlled
-   sessions, then run one low-risk Patreon publish and MEGA mirror canary.
+   sessions, then run one low-risk Patreon publish and extracted-folder MEGA
+   canary.
    Exercise the Patreon manual ZIP fallback as part of the canary.
 5. Add the exact X secret ARN to the instance role, authorize the creator, and
    run one approved X canary with sensitive-media handling enabled.
@@ -200,7 +202,7 @@ resource identifiers or confirmation here.
 | Before enabling semantic anatomy QC | Private OpenAI-compatible vision-model endpoint, exact model identifier and immutable revision, private network route, and an upstream API key only if that model server requires one | Deploy the pinned upstream plus `Dockerfile.semantic-gateway`, configure the same model/revision on both sides, run semantic canaries, then set `GEN_AUTOMATION_SEMANTIC_ANATOMY_ENABLED=true`. The controller-to-gateway contract itself requires no API key and must not be exposed publicly without a separate authenticated boundary. |
 | After AWS exists, before the X canary | X developer Project/App, confidential client ID/secret, creator refresh token, exact numeric creator user ID, account authorization for `tweet.read tweet.write users.read media.write offline.access`, API billing cap, and sensitive-media configuration | Create one AWS Secrets Manager JSON secret outside OpenTofu. Re-plan with only its complete ARN as `x_oauth_secret_arn` so IAM is limited to that secret, configure the same non-secret ARN reference and creator ID in the app, then run one freshly approved canary. |
 | After the Patreon sidecar and encrypted profile/state mounts exist | Existing Adult/18+ Patreon creator account, completed identity/age checks, exact tier/tag choices, and one owner-controlled headed Chromium login with password/2FA/CAPTCHA | Persist only the signed-in Chromium profile under `/profiles` and idempotency SQLite state under `/state`. Generate the controller/sidecar shared secret in the deployment secret store; it is not a Patreon credential. No Patreon API key is required. If login expires, UI selectors change, or the result is ambiguous, the intent needs operator reconciliation and the manual package remains available. |
-| After the MEGAcmd-enabled image and encrypted profile mount exist | Dedicated MEGA account or writable destination folder with quota, plus one owner-controlled MEGAcmd profile bootstrap | Store the authenticated MEGAcmd profile only on the encrypted persistent volume and run the verified upload/download canary. The application receives a profile path and remote root, not a MEGA email, password, session, folder key, write auth-key, or API token. |
+| After the MEGAcmd-enabled image and encrypted profile mount exist | Dedicated MEGA account or writable destination folder with quota, exact remote destination path, plus one owner-controlled MEGAcmd profile bootstrap | Store the authenticated MEGAcmd profile only on the encrypted persistent volume and run an extracted-folder canary that checks order, exact bytes, progress, marker-last completion, and ambiguous-response recovery. The application receives a profile path and remote root, not a MEGA email, password, session, folder key, write auth-key, or API token. |
 | Production rollout | Separate production AWS resources, provider projects, model/object identities, OAuth grants, profiles, secrets, DNS, budgets, and notification recipients | Re-run the staging gates with production-scoped access. Never copy a staging database credential, X grant, Patreon profile, MEGA profile, or worker credential into production. |
 
 Application session/TOTP keys, worker-signing keys, and the Patreon internal
@@ -216,6 +218,6 @@ The MVP is complete only when the final integrated local suite and GitHub
 Actions CI pass, AWS staging and restore checks pass, one bounded generation
 travels from approved artifacts through ranking/review and derivative rendering,
 the semantic terminal gate behaves fail-closed, Patreon automatic publishing
-and its manual fallback are both exercised, the exact full-set ZIP is verified
-on MEGA, and only the owner-selected watermarked teasers reach the authorized X
-account.
+and its manual fallback are both exercised, the ordered full-resolution set is
+verified as extracted files on MEGA, and only the owner-selected watermarked
+teasers reach the authorized X account.

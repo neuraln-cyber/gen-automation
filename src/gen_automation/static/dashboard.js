@@ -1650,6 +1650,14 @@
     const liveStatus = panel.querySelector("[data-delivery-live-status]");
     const archiveStatus = document.querySelector("[data-delivery-archive-status]");
     const archiveDetail = document.querySelector("[data-delivery-archive-detail]");
+    const megaCard = document.querySelector('[data-destination="mega"]');
+    const megaStatus = megaCard?.querySelector("[data-destination-status]");
+    const megaDetail = megaCard?.querySelector("[data-destination-detail]");
+    const megaProgressRegion = megaCard?.querySelector("[data-mega-progress-region]");
+    const megaProgressLabel = megaCard?.querySelector("[data-mega-progress-label]");
+    const megaProgress = megaCard?.querySelector("[data-mega-progress]");
+    const megaRemoteRow = megaCard?.querySelector("[data-mega-remote-row]");
+    const megaRemotePath = megaCard?.querySelector("[data-mega-remote-path]");
     const initialOutputState = panel.dataset.deliveryOutputState || "not_started";
     const initialArchiveState = panel.dataset.deliveryArchiveState || "not_started";
     let timer = null;
@@ -1687,7 +1695,7 @@
       stopped = true;
       if (timer !== null) window.clearTimeout(timer);
       timer = null;
-      setText(liveStatus || archiveStatus || outputStatus, message);
+      setText(liveStatus || megaDetail || archiveStatus || outputStatus, message);
     };
     const renderOutput = (output) => {
       const knownStates = ["not_started", "rendering", "ready", "failed", "stalled"];
@@ -1777,16 +1785,42 @@
       }
       return state;
     };
+    const renderMega = (mega) => {
+      const knownStates = ["not_prepared", "queued", "running", "published", "failed"];
+      const state = knownStates.includes(mega.state) ? mega.state : "failed";
+      const completed = count(mega.completed_items);
+      const total = count(mega.total_items);
+      const detail = typeof mega.detail === "string" ? mega.detail.trim() : "";
+      const remotePath = typeof mega.remote_path === "string" ? mega.remote_path.trim() : "";
+
+      if (megaStatus instanceof HTMLElement) {
+        megaStatus.className = `status ${state}`;
+        megaStatus.textContent = state.replaceAll("_", " ");
+      }
+      setText(megaDetail, detail || "MEGA delivery status is unavailable.");
+      setText(megaProgressLabel, `${completed} / ${total} images uploaded`);
+      if (megaProgress instanceof HTMLProgressElement) {
+        megaProgress.max = Math.max(1, total);
+        megaProgress.value = Math.min(completed, Math.max(1, total));
+        megaProgress.textContent = `${completed} / ${total}`;
+      }
+      if (megaProgressRegion instanceof HTMLElement) megaProgressRegion.hidden = total < 1;
+      setText(megaRemotePath, remotePath);
+      if (megaRemoteRow instanceof HTMLElement) megaRemoteRow.hidden = !remotePath;
+      return state;
+    };
     const render = (payload) => {
       if (
         !isRecord(payload)
         || payload.schema !== "delivery-progress/v1"
         || !isRecord(payload.outputs)
         || !isRecord(payload.archive)
+        || !isRecord(payload.mega)
       ) return null;
       const fullOutputsReady = payload.outputs.full_outputs_ready === true;
       const outputState = renderOutput(payload.outputs);
       const archiveState = renderArchive(payload.archive);
+      renderMega(payload.mega);
       if (
         (initialOutputState !== "ready" && outputState === "ready")
         || (initialArchiveState !== "ready" && archiveState === "ready")
@@ -1798,7 +1832,8 @@
       return {
         polling: outputState === "rendering"
           || archiveState === "preparing"
-          || (archiveState === "not_started" && fullOutputsReady),
+          || (archiveState === "not_started" && fullOutputsReady)
+          || payload.mega.active === true,
         delay: payload.poll_after_ms,
       };
     };
@@ -1833,7 +1868,7 @@
           return;
         }
         setText(
-          liveStatus || archiveStatus || outputStatus,
+          liveStatus || megaDetail || archiveStatus || outputStatus,
           "Network interrupted live progress; retrying without reloading the page.",
         );
         const backoff = Math.min(60000, 3000 * (2 ** Math.min(4, consecutiveFailures)));

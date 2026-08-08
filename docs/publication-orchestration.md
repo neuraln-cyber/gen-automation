@@ -9,10 +9,11 @@ from durable, short-lived human authorization. Its two MVP destinations are:
   signed-in browser publisher using Patreon's official creator UI. The same ZIP
   remains available as a manual fallback.
 
-MEGA delivery is an optional automatic downstream mirror of the Patreon ZIP.
-It uses a pre-authenticated official MEGAcmd writable-folder profile, verifies
-the remote ZIP by full SHA-256 download, and stores only an opaque node handle.
-See `docs/mega-delivery.md`.
+MEGA delivery runs independently from Patreon. It expands the
+provider-independent finished-set archive into ordinary full-resolution files,
+preserves generation-queue order, and uploads them in bounded batches through a
+pre-authenticated official MEGAcmd profile. A remote manifest and completion
+marker are verified last. See `docs/mega-delivery.md`.
 MEGA is a secondary completed-set destination; the private object store remains
 the source of truth for masters, derivatives, and publication packages.
 

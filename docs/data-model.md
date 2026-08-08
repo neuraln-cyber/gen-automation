@@ -96,6 +96,10 @@ delete or mutate it.
   `UNKNOWN`, never retried.
 - `publication_packages`: immutable storage identity and hashes for the deterministic
   Patreon ZIP.
+- `mega_set_deliveries`: one immutable finished-set/archive-to-folder identity,
+  aggregate image/byte progress, retry lease, and verified completion marker.
+- `mega_set_delivery_items`: every ordered full-resolution image's immutable
+  source hash/size, deterministic remote path, and restart-safe transfer state.
 - `publication_reconciliations`: append-only human/provider evidence confirming an
   unknown X result present or absent.
 - `publication_provider_guards`: the durable global kill switch. The migration and

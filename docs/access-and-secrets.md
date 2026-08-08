@@ -250,11 +250,13 @@ optional read-only OAuth, and visually approve the public preview. See
 ### MEGA completed-set destination
 
 Create a dedicated MEGA account or destination folder with enough quota and
-install a pinned official MEGAcmd build in the controller/uploader image.
-Create a writable-folder export, then use its folder URL and separate write
-auth-key only in a one-time interactive profile bootstrap. The persistent
-MEGAcmd profile volume is secret session material and must be mode `0700`,
-mounted only into the uploader, and excluded from logs and ordinary backups.
+install a pinned official MEGAcmd build in the controller/uploader image. In a
+one-time interactive bootstrap, either sign in to the dedicated account or use
+a writable-folder URL and its separate write auth-key. Enter the password,
+MFA, URL, or auth-key only in the secure prompt, never in chat or application
+configuration. The persistent MEGAcmd profile volume is secret session material
+and must be mode `0700`, mounted only into the uploader, and excluded from logs
+and ordinary backups.
 
 The application receives only:
 

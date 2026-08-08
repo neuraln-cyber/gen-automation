@@ -3482,6 +3482,231 @@ class MegaDelivery(UuidPrimaryKeyMixin, TimestampMixin, Base):
     last_error_detail: Mapped[str | None] = mapped_column(Text)
 
 
+class MegaSetDelivery(UuidPrimaryKeyMixin, TimestampMixin, Base):
+    """Durable extracted-folder delivery of one immutable finished set."""
+
+    __tablename__ = "mega_set_deliveries"
+    __table_args__ = (
+        UniqueConstraint(
+            "finished_set_archive_id",
+            name="uq_mega_set_deliveries_finished_set_archive",
+        ),
+        CheckConstraint("length(manifest_sha256) = 64", name="valid_manifest_sha256"),
+        CheckConstraint("total_item_count > 0", name="positive_total_item_count"),
+        CheckConstraint(
+            "uploaded_item_count >= 0 AND uploaded_item_count <= total_item_count",
+            name="valid_uploaded_item_count",
+        ),
+        CheckConstraint(
+            "total_byte_size IS NULL OR total_byte_size > 0",
+            name="positive_optional_total_byte_size",
+        ),
+        CheckConstraint(
+            "uploaded_byte_size >= 0 "
+            "AND (total_byte_size IS NULL OR uploaded_byte_size <= total_byte_size)",
+            name="valid_uploaded_byte_size",
+        ),
+        CheckConstraint(
+            "(total_byte_size IS NULL AND source_manifest_json IS NULL "
+            "AND planned_at IS NULL AND uploaded_byte_size = 0) OR "
+            "(total_byte_size IS NOT NULL AND source_manifest_json IS NOT NULL "
+            "AND length(source_manifest_json) > 0 AND planned_at IS NOT NULL)",
+            name="planning_contract",
+        ),
+        CheckConstraint("attempts >= 0", name="nonnegative_attempts"),
+        CheckConstraint(
+            "length(trim(remote_root)) > 0 AND length(trim(remote_folder)) > 0",
+            name="complete_remote_identity",
+        ),
+        CheckConstraint(
+            "(lease_owner IS NULL AND lease_expires_at IS NULL) OR "
+            "(lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)",
+            name="lease_pair",
+        ),
+        CheckConstraint(
+            "(state = 'claimed' AND lease_owner IS NOT NULL) OR "
+            "(state <> 'claimed' AND lease_owner IS NULL)",
+            name="state_lease_contract",
+        ),
+        CheckConstraint(
+            "(state = 'succeeded' AND uploaded_item_count = total_item_count "
+            "AND total_byte_size IS NOT NULL AND uploaded_byte_size = total_byte_size "
+            "AND completion_marker_node_handle IS NOT NULL "
+            "AND verified_at IS NOT NULL AND completed_at IS NOT NULL "
+            "AND last_error_code IS NULL) OR "
+            "(state = 'failed' AND completion_marker_node_handle IS NULL "
+            "AND verified_at IS NULL AND completed_at IS NOT NULL "
+            "AND last_error_code IS NOT NULL) OR "
+            "(state IN ('pending', 'claimed', 'retry_wait') "
+            "AND completion_marker_node_handle IS NULL "
+            "AND verified_at IS NULL AND completed_at IS NULL)",
+            name="terminal_result_contract",
+        ),
+        CheckConstraint(
+            "started_at IS NULL OR started_at >= created_at",
+            name="start_after_creation",
+        ),
+        CheckConstraint(
+            "planned_at IS NULL OR planned_at >= created_at",
+            name="plan_after_creation",
+        ),
+        CheckConstraint(
+            "verified_at IS NULL OR verified_at >= created_at",
+            name="verification_after_creation",
+        ),
+        CheckConstraint(
+            "completed_at IS NULL OR completed_at >= created_at",
+            name="completion_after_creation",
+        ),
+        Index(
+            "ix_mega_set_deliveries_claim",
+            "state",
+            "available_at",
+            "lease_expires_at",
+            "created_at",
+        ),
+    )
+
+    finished_set_archive_id: Mapped[UUID] = mapped_column(
+        ForeignKey("finished_set_archives.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    state: Mapped[MegaDeliveryState] = mapped_column(
+        Enum(
+            MegaDeliveryState,
+            name="mega_delivery_state",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=10,
+        ),
+        nullable=False,
+        default=MegaDeliveryState.PENDING,
+    )
+    remote_root: Mapped[str] = mapped_column(String(1024), nullable=False)
+    remote_folder: Mapped[str] = mapped_column(String(1024), nullable=False)
+    manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    total_item_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    uploaded_item_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    source_manifest_json: Mapped[str | None] = mapped_column(Text)
+    uploaded_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(200))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completion_marker_node_handle: Mapped[str | None] = mapped_column(String(80))
+    planned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(String(100))
+    last_error_detail: Mapped[str | None] = mapped_column(Text)
+
+    items: Mapped[list["MegaSetDeliveryItem"]] = relationship(
+        back_populates="delivery",
+        order_by="MegaSetDeliveryItem.ordinal",
+    )
+
+
+class MegaSetDeliveryItem(UuidPrimaryKeyMixin, TimestampMixin, Base):
+    """One ordered, restart-safe image transfer within a MEGA set folder."""
+
+    __tablename__ = "mega_set_delivery_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "delivery_id",
+            "ordinal",
+            name="uq_mega_set_delivery_items_delivery_ordinal",
+        ),
+        UniqueConstraint(
+            "delivery_id",
+            "source_derivative_output_id",
+            name="uq_mega_set_delivery_items_delivery_source",
+        ),
+        UniqueConstraint("remote_path", name="uq_mega_set_delivery_items_remote_path"),
+        CheckConstraint("ordinal > 0", name="positive_ordinal"),
+        CheckConstraint("length(source_sha256) = 64", name="valid_source_sha256"),
+        CheckConstraint("source_byte_size > 0", name="positive_source_byte_size"),
+        CheckConstraint(
+            "length(trim(source_content_type)) > 0 AND length(trim(remote_path)) > 0",
+            name="complete_item_identity",
+        ),
+        CheckConstraint("attempts >= 0", name="nonnegative_attempts"),
+        CheckConstraint(
+            "(remote_node_handle IS NULL AND verified_at IS NULL) OR "
+            "(remote_node_handle IS NOT NULL AND verified_at IS NOT NULL)",
+            name="verified_node_pair",
+        ),
+        CheckConstraint(
+            "(state = 'succeeded' AND uploaded_at IS NOT NULL "
+            "AND completed_at IS NOT NULL AND last_error_code IS NULL) OR "
+            "(state = 'failed' AND completed_at IS NOT NULL "
+            "AND last_error_code IS NOT NULL) OR "
+            "(state IN ('pending', 'claimed', 'retry_wait') AND completed_at IS NULL)",
+            name="terminal_result_contract",
+        ),
+        CheckConstraint(
+            "uploaded_at IS NULL OR uploaded_at >= created_at",
+            name="upload_after_creation",
+        ),
+        CheckConstraint(
+            "verified_at IS NULL OR verified_at >= created_at",
+            name="verification_after_creation",
+        ),
+        CheckConstraint(
+            "completed_at IS NULL OR completed_at >= created_at",
+            name="completion_after_creation",
+        ),
+        Index(
+            "ix_mega_set_delivery_items_progress",
+            "delivery_id",
+            "state",
+            "available_at",
+            "ordinal",
+        ),
+    )
+
+    delivery_id: Mapped[UUID] = mapped_column(
+        ForeignKey("mega_set_deliveries.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_derivative_output_id: Mapped[UUID] = mapped_column(
+        ForeignKey("derivative_outputs.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    source_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_content_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    remote_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    state: Mapped[MegaDeliveryState] = mapped_column(
+        Enum(
+            MegaDeliveryState,
+            name="mega_delivery_state",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=10,
+        ),
+        nullable=False,
+        default=MegaDeliveryState.PENDING,
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    remote_node_handle: Mapped[str | None] = mapped_column(String(80))
+    uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(String(100))
+    last_error_detail: Mapped[str | None] = mapped_column(Text)
+
+    delivery: Mapped[MegaSetDelivery] = relationship(back_populates="items")
+
+
 class PublicationProviderGuard(UuidPrimaryKeyMixin, Base):
     __tablename__ = "publication_provider_guards"
     __table_args__ = (
@@ -4880,6 +5105,113 @@ for _statement in (
 ):
     event.listen(
         DerivativeOutput.__table__,
+        "after_create",
+        _ddl(_statement).execute_if(dialect="postgresql"),
+    )
+
+
+# Extracted MEGA set records retain immutable source and destination identities
+# while allowing only their operational state, counters, leases, and recovery
+# references to advance. A delivery's byte plan may be frozen exactly once
+# after its archive manifest has been expanded into item rows.
+for _statement in (
+    "CREATE TRIGGER mega_set_deliveries_guard_update "
+    "BEFORE UPDATE ON mega_set_deliveries BEGIN "
+    "SELECT CASE WHEN "
+    "OLD.id IS NOT NEW.id "
+    "OR OLD.finished_set_archive_id IS NOT NEW.finished_set_archive_id "
+    "OR OLD.remote_root IS NOT NEW.remote_root "
+    "OR OLD.remote_folder IS NOT NEW.remote_folder "
+    "OR OLD.manifest_sha256 IS NOT NEW.manifest_sha256 "
+    "OR OLD.total_item_count IS NOT NEW.total_item_count "
+    "OR OLD.created_at IS NOT NEW.created_at "
+    "OR (OLD.total_byte_size IS NOT NEW.total_byte_size "
+    "AND NOT (OLD.total_byte_size IS NULL AND NEW.total_byte_size IS NOT NULL)) "
+    "OR (OLD.source_manifest_json IS NOT NEW.source_manifest_json "
+    "AND NOT (OLD.source_manifest_json IS NULL AND NEW.source_manifest_json IS NOT NULL)) "
+    "OR (OLD.planned_at IS NOT NEW.planned_at "
+    "AND NOT (OLD.planned_at IS NULL AND NEW.planned_at IS NOT NULL)) "
+    "THEN RAISE(ABORT, 'MEGA set delivery identity is immutable') END; END",
+    "CREATE TRIGGER mega_set_deliveries_reject_delete "
+    "BEFORE DELETE ON mega_set_deliveries BEGIN "
+    "SELECT RAISE(ABORT, 'MEGA set deliveries cannot be deleted'); END",
+    "CREATE TRIGGER mega_set_delivery_items_guard_update "
+    "BEFORE UPDATE ON mega_set_delivery_items BEGIN "
+    "SELECT CASE WHEN "
+    "OLD.id IS NOT NEW.id "
+    "OR OLD.delivery_id IS NOT NEW.delivery_id "
+    "OR OLD.ordinal IS NOT NEW.ordinal "
+    "OR OLD.source_derivative_output_id IS NOT NEW.source_derivative_output_id "
+    "OR OLD.source_sha256 IS NOT NEW.source_sha256 "
+    "OR OLD.source_byte_size IS NOT NEW.source_byte_size "
+    "OR OLD.source_content_type IS NOT NEW.source_content_type "
+    "OR OLD.remote_path IS NOT NEW.remote_path "
+    "OR OLD.created_at IS NOT NEW.created_at "
+    "THEN RAISE(ABORT, 'MEGA set delivery item identity is immutable') END; END",
+    "CREATE TRIGGER mega_set_delivery_items_reject_delete "
+    "BEFORE DELETE ON mega_set_delivery_items BEGIN "
+    "SELECT RAISE(ABORT, 'MEGA set delivery items cannot be deleted'); END",
+):
+    event.listen(
+        MegaSetDeliveryItem.__table__,
+        "after_create",
+        _ddl(_statement).execute_if(dialect="sqlite"),
+    )
+
+for _statement in (
+    "CREATE OR REPLACE FUNCTION "
+    "gen_automation_guard_mega_set_delivery_mutation() "
+    "RETURNS trigger AS $$ BEGIN "
+    "IF TG_OP = 'DELETE' THEN "
+    "RAISE EXCEPTION 'MEGA set deliveries cannot be deleted'; END IF; "
+    "IF OLD.id IS DISTINCT FROM NEW.id "
+    "OR OLD.finished_set_archive_id IS DISTINCT FROM NEW.finished_set_archive_id "
+    "OR OLD.remote_root IS DISTINCT FROM NEW.remote_root "
+    "OR OLD.remote_folder IS DISTINCT FROM NEW.remote_folder "
+    "OR OLD.manifest_sha256 IS DISTINCT FROM NEW.manifest_sha256 "
+    "OR OLD.total_item_count IS DISTINCT FROM NEW.total_item_count "
+    "OR OLD.created_at IS DISTINCT FROM NEW.created_at "
+    "OR (OLD.total_byte_size IS DISTINCT FROM NEW.total_byte_size "
+    "AND NOT (OLD.total_byte_size IS NULL AND NEW.total_byte_size IS NOT NULL)) "
+    "OR (OLD.source_manifest_json IS DISTINCT FROM NEW.source_manifest_json "
+    "AND NOT (OLD.source_manifest_json IS NULL AND NEW.source_manifest_json IS NOT NULL)) "
+    "OR (OLD.planned_at IS DISTINCT FROM NEW.planned_at "
+    "AND NOT (OLD.planned_at IS NULL AND NEW.planned_at IS NOT NULL)) THEN "
+    "RAISE EXCEPTION 'MEGA set delivery identity is immutable'; END IF; "
+    "RETURN NEW; END; $$ LANGUAGE plpgsql",
+    "CREATE OR REPLACE FUNCTION "
+    "gen_automation_guard_mega_set_delivery_item_mutation() "
+    "RETURNS trigger AS $$ BEGIN "
+    "IF TG_OP = 'DELETE' THEN "
+    "RAISE EXCEPTION 'MEGA set delivery items cannot be deleted'; END IF; "
+    "IF OLD.id IS DISTINCT FROM NEW.id "
+    "OR OLD.delivery_id IS DISTINCT FROM NEW.delivery_id "
+    "OR OLD.ordinal IS DISTINCT FROM NEW.ordinal "
+    "OR OLD.source_derivative_output_id IS DISTINCT FROM NEW.source_derivative_output_id "
+    "OR OLD.source_sha256 IS DISTINCT FROM NEW.source_sha256 "
+    "OR OLD.source_byte_size IS DISTINCT FROM NEW.source_byte_size "
+    "OR OLD.source_content_type IS DISTINCT FROM NEW.source_content_type "
+    "OR OLD.remote_path IS DISTINCT FROM NEW.remote_path "
+    "OR OLD.created_at IS DISTINCT FROM NEW.created_at THEN "
+    "RAISE EXCEPTION 'MEGA set delivery item identity is immutable'; END IF; "
+    "RETURN NEW; END; $$ LANGUAGE plpgsql",
+):
+    event.listen(
+        MegaSetDeliveryItem.__table__,
+        "after_create",
+        _ddl(_statement).execute_if(dialect="postgresql"),
+    )
+
+for _statement in (
+    "CREATE TRIGGER mega_set_deliveries_guard_mutation "
+    "BEFORE UPDATE OR DELETE ON mega_set_deliveries FOR EACH ROW "
+    "EXECUTE FUNCTION gen_automation_guard_mega_set_delivery_mutation()",
+    "CREATE TRIGGER mega_set_delivery_items_guard_mutation "
+    "BEFORE UPDATE OR DELETE ON mega_set_delivery_items FOR EACH ROW "
+    "EXECUTE FUNCTION gen_automation_guard_mega_set_delivery_item_mutation()",
+):
+    event.listen(
+        MegaSetDeliveryItem.__table__,
         "after_create",
         _ddl(_statement).execute_if(dialect="postgresql"),
     )

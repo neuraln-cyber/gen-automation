@@ -66,9 +66,9 @@ from gen_automation.services.generation_control import (
     GENERATION_STOPPED_ACTION,
     settle_stopped_generation_once,
 )
-from gen_automation.services.mega_delivery import (
-    MegaDeliveryClient,
-    run_mega_delivery_cycle,
+from gen_automation.services.mega_set_delivery import (
+    MegaSetDeliveryClient,
+    run_mega_set_delivery_cycle,
 )
 from gen_automation.services.outbox import (
     GENERATION_ATTEMPT_AGGREGATE,
@@ -627,7 +627,7 @@ class ControllerWorkloads:
         object_store: ObjectStore | None,
         secret_resolver: RuntimeSecretResolver | None = None,
         x_oauth_provider: XOAuthProvider | None = None,
-        mega_client: MegaDeliveryClient | None = None,
+        mega_client: MegaSetDeliveryClient | None = None,
         semantic_vlm_client: SemanticVlmClient | None = None,
         patreon_driver: PatreonPublicationDriver | None = None,
     ) -> None:
@@ -1308,7 +1308,7 @@ class ControllerWorkloads:
             or not self.settings.mega_delivery_enabled
         ):
             return False
-        result = await run_mega_delivery_cycle(
+        result = await run_mega_set_delivery_cycle(
             self.sessions,
             store=self.object_store,
             client=self.mega_client,
@@ -1317,7 +1317,8 @@ class ControllerWorkloads:
             lease_seconds=self.settings.background_mega_lease_seconds,
             retry_base_seconds=self.settings.background_mega_retry_base_seconds,
             retry_max_seconds=self.settings.background_mega_retry_max_seconds,
-            max_package_bytes=self.settings.background_mega_max_package_bytes,
+            max_part_bytes=self.settings.background_mega_max_package_bytes,
+            batch_size=self.settings.background_mega_batch_size,
         )
         return result.did_work
 
@@ -1765,7 +1766,7 @@ def build_controller_runtime(
     object_store: ObjectStore | None,
     secret_resolver: RuntimeSecretResolver | None = None,
     x_oauth_provider: XOAuthProvider | None = None,
-    mega_client: MegaDeliveryClient | None = None,
+    mega_client: MegaSetDeliveryClient | None = None,
     semantic_vlm_client: SemanticVlmClient | None = None,
     patreon_driver: PatreonPublicationDriver | None = None,
 ) -> ControllerRuntime:

@@ -267,9 +267,15 @@ forwarding-header replacement, and IPv4 IMDS owner blocks are active.
 ## 5. MEGA and destination canaries
 
 Authenticate the official pinned MEGAcmd build once into the encrypted mounted
-profile. Never place a MEGA email, password, session, folder key, or write key
-in application configuration. Run the deterministic package upload/download
-verification canary before enabling the MEGA destination.
+profile. From an interactive SSM shell run
+`sudo /usr/local/sbin/gen-automation-bootstrap-mega-profile`, enter the account
+password and MFA code only at MEGAcmd's hidden prompts, then leave with
+`quit --only-shell`. The wrapper stops concurrent access, enables HTTPS,
+validates the private profile and retained session, and restores the service.
+Never place a MEGA email, password, session, folder key, or write key in
+application configuration. The complete operator flow is in
+`docs/mega-profile-bootstrap.md`. Run the deterministic extracted-folder canary
+before enabling the MEGA destination.
 
 Open the pinned Patreon browser sidecar only through an SSM-controlled
 operator flow and sign in once using the persistent `/profiles` mount. Run

@@ -113,8 +113,8 @@ Acceptance criteria:
 1. Implement immutable derivative recipes.
 2. Add watermark, resize, crop, blur/obscure, contact-sheet, and archive steps.
 3. Use the private versioned asset archive plus checksum-verified handoff
-   packages and mirror completed clean packages through the official MEGAcmd
-   adapter.
+   packages, and deliver completed clean full-resolution sets as ordered files
+   through the official MEGAcmd adapter.
 4. Add X media upload and scheduled post creation.
 5. Generate Patreon-ready copy, tier mapping, attachments, and publication
    checklist.

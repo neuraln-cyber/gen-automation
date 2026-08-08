@@ -13,7 +13,7 @@ import asyncio
 import os
 import re
 import stat
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Final
@@ -26,6 +26,7 @@ from gen_automation.integrations.mega.errors import (
 )
 
 _MAX_CAPTURE_BYTES: Final = 64 * 1024
+_MAX_BATCH_FILES: Final = 100
 _HANDLE_PATTERN: Final = re.compile(r"^H:[A-Za-z0-9_-]{8,64}$")
 _SAFE_FILENAME_PATTERN: Final = re.compile(r"^[a-z0-9][a-z0-9._-]{0,199}$")
 _MEGA_URL_PATTERN: Final = re.compile(
@@ -141,6 +142,41 @@ class MegaCmdClient:
             MegaRemoteNode(handle=handle, remote_path=normalized) for handle in sorted(handles)
         )
 
+    async def list_files(self, remote_folder: str) -> tuple[str, ...]:
+        """List direct child files without downloading their encrypted content.
+
+        MEGA permits duplicate names.  The tuple intentionally preserves
+        duplicate paths so the durable delivery layer can treat them as a
+        conflict rather than silently adopting one.
+        """
+
+        normalized_folder = validate_remote_path(remote_folder, allow_root=True)
+        result = await self._run(
+            ("mega-find", normalized_folder, "--type=f"),
+            mutation=False,
+        )
+        paths: list[str] = []
+        for raw_line in result.stdout.splitlines():
+            try:
+                line = raw_line.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                raise MegaProtocolError("MEGAcmd returned malformed remote paths") from None
+            if not line:
+                continue
+            try:
+                normalized = validate_remote_path(line, allow_root=False)
+            except ValueError:
+                raise MegaProtocolError("MEGAcmd returned malformed remote paths") from None
+            path = PurePosixPath(normalized)
+            if str(path.parent) != normalized_folder:
+                continue
+            try:
+                validate_remote_filename(path.name)
+            except ValueError:
+                raise MegaProtocolError("MEGAcmd returned an unsafe remote filename") from None
+            paths.append(normalized)
+        return tuple(paths)
+
     async def upload_file(self, local_file: Path, remote_folder: str) -> None:
         """Upload once; ambiguity is resolved by the durable caller on its next pass."""
 
@@ -149,6 +185,39 @@ class MegaCmdClient:
         validate_remote_filename(normalized_local.name)
         await self._run(
             ("mega-put", str(normalized_local), normalized_folder),
+            mutation=True,
+        )
+
+    async def upload_files(
+        self,
+        local_files: Sequence[Path],
+        remote_folder: str,
+    ) -> None:
+        """Upload one bounded batch through one long-lived MEGAcmd server.
+
+        A single command lets the official client schedule parallel encrypted
+        transfers without starting one process per image.  The durable caller
+        reconciles an ambiguous partial result before submitting another batch.
+        """
+
+        if not 1 <= len(local_files) <= _MAX_BATCH_FILES:
+            raise ValueError(f"MEGA upload batch must contain 1 to {_MAX_BATCH_FILES} files")
+        normalized_folder = validate_remote_path(remote_folder, allow_root=True)
+        normalized_files: list[Path] = []
+        names: set[str] = set()
+        for local_file in local_files:
+            normalized = await asyncio.to_thread(_validated_local_file, local_file)
+            name = validate_remote_filename(normalized.name)
+            if name in names:
+                raise ValueError("MEGA upload batch filenames must be unique")
+            names.add(name)
+            normalized_files.append(normalized)
+        await self._run(
+            (
+                "mega-put",
+                *(str(path) for path in normalized_files),
+                normalized_folder,
+            ),
             mutation=True,
         )
 

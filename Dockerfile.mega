@@ -51,6 +51,9 @@ RUN test -n "${MEGACMD_DEB_URL}" \
     && command -v mega-find \
     && command -v mega-put \
     && command -v mega-get \
+    && command -v mega-cmd \
+    && command -v mega-whoami \
+    && command -v mega-https \
     && rm -f /tmp/megacmd.deb \
     && rm -rf /var/lib/apt/lists/* \
     && python3.12 -m pip install \

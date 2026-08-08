@@ -416,6 +416,56 @@ def test_patreon_profile_has_an_ssm_only_cloud_bootstrap_path() -> None:
     assert "127.0.0.1:6080/vnc.html" in runbook
 
 
+def test_mega_profile_has_a_private_interactive_bootstrap_path() -> None:
+    bootstrap_compose = _text("compose.bootstrap.yaml")
+    bootstrap_command = _text("bootstrap-mega-profile.sh")
+    installer = _text("install.sh")
+    runbook = (ROOT / "docs" / "mega-profile-bootstrap.md").read_text(encoding="utf-8")
+
+    assert "mega-profile-bootstrap:" in bootstrap_compose
+    assert "GEN_AUTOMATION_CONTROL_PLANE_MEGA_IMAGE" in bootstrap_compose
+    assert "HOME: /run/gen-automation/mega-profile" in bootstrap_compose
+    assert "umask 077; exec mega-cmd" in bootstrap_compose
+    assert "stdin_open: true" in bootstrap_compose
+    assert "tty: true" in bootstrap_compose
+    assert "mega-bootstrap-egress" in bootstrap_compose
+    assert "/var/lib/gen-automation/integration-profiles/mega" in bootstrap_compose
+    assert (
+        "env_file:"
+        not in bootstrap_compose.split("  mega-profile-bootstrap:", maxsplit=1)[1].split(
+            "  patreon-browser-bootstrap:", maxsplit=1
+        )[0]
+    )
+    assert "network_mode: host" not in bootstrap_compose
+    assert "privileged:" not in bootstrap_compose
+    assert "/var/run/docker.sock" not in bootstrap_compose
+
+    assert "[ -t 0 ] && [ -t 1 ]" in bootstrap_command
+    assert "control-plane-mega@sha256:[0-9a-f]{64}" in bootstrap_command
+    assert "systemctl stop" in bootstrap_command
+    assert "trap restore_runtime" in bootstrap_command
+    assert "mega-whoami" in bootstrap_command
+    assert "mega-https on" in bootstrap_command
+    assert 'mega-ls "$remote_root"' in bootstrap_command
+    assert "GEN_AUTOMATION_MEGA_REMOTE_ROOT" in bootstrap_command
+    assert "--verify-only" in bootstrap_command
+    assert "--skip-https" in bootstrap_command
+    assert "mega-logout" in bootstrap_command
+    assert "mega-login" not in bootstrap_command
+    assert "read -" not in bootstrap_command
+    assert "PASSWORD" not in bootstrap_command
+    assert "SESSION" not in bootstrap_command
+    assert "AUTH_KEY" not in bootstrap_command
+    assert 'find "$profile_cache" -xdev' in bootstrap_command
+    assert "-perm /077" in bootstrap_command
+
+    assert "gen-automation-bootstrap-mega-profile" in installer
+    assert '"$source_dir/bootstrap-mega-profile.sh"' in installer
+    assert "quit --only-shell" in runbook
+    assert "--verify-only" in runbook
+    assert "Do not run `logout`" in runbook
+
+
 def test_owner_bootstrap_wrapper_is_tty_only_and_digest_pinned() -> None:
     bootstrap = _text("bootstrap-owner.sh")
     installer = _text("install.sh")

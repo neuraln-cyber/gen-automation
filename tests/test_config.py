@@ -635,13 +635,28 @@ def test_enabled_delivery_paths_cover_the_internal_patreon_archive_cap() -> None
             background_publication_max_package_bytes=PATREON_MAX_ARCHIVE_BYTES + 1,
         )
 
-    with pytest.raises(ValidationError, match="MEGA package capacity"):
+    with pytest.raises(ValidationError, match="MEGA source-part capacity"):
         Settings(
             **common,  # type: ignore[arg-type]
             mega_delivery_enabled=True,
             mega_profile_home="/var/lib/mega-profile",
             background_mega_max_package_bytes=PATREON_MAX_ARCHIVE_BYTES - 1,
         )
+
+
+def test_mega_extracted_set_delivery_does_not_require_publishing() -> None:
+    settings = Settings(
+        environment=Environment.TEST,
+        background_runtime_enabled=True,
+        storage_enabled=True,
+        storage_bucket="private-assets",
+        publishing_enabled=False,
+        mega_delivery_enabled=True,
+        mega_profile_home="D:/mega-profile",
+    )
+
+    assert settings.mega_delivery_enabled is True
+    assert settings.publishing_enabled is False
 
 
 @pytest.mark.parametrize(

@@ -1,6 +1,8 @@
 # ruff: noqa: F811
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
@@ -28,6 +30,8 @@ from gen_automation.db.models import (
 from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import (
     AdminRole,
+    FinishedSetArchiveState,
+    MegaDeliveryState,
     PublicationAttemptState,
     PublicationIntentState,
     PublicationTarget,
@@ -35,6 +39,7 @@ from gen_automation.domain.enums import (
 from gen_automation.domain.release_spec import ReleaseSpecification
 from gen_automation.services.authentication import AuthenticatedPrincipal
 from gen_automation.services.operator_delivery import (
+    _mega_destination,
     load_operator_delivery,
     prepare_operator_destinations,
 )
@@ -121,6 +126,67 @@ def _publication_guard_fields(
         "expected_lock_version": str(lock_version),
         "reason": "Focused browser publication guard test",
     }
+
+
+@pytest.mark.asyncio
+async def test_mega_projection_is_independent_and_reports_extracted_image_progress() -> None:
+    archive_id = uuid4()
+    session = SimpleNamespace(
+        scalar=AsyncMock(
+            side_effect=[
+                SimpleNamespace(
+                    id=archive_id,
+                    state=FinishedSetArchiveState.READY,
+                    selection_count=250,
+                ),
+                SimpleNamespace(
+                    state=MegaDeliveryState.CLAIMED,
+                    uploaded_item_count=90,
+                    total_item_count=250,
+                    remote_folder="/Finished Sets/Yoruichi/v01-deadbeef",
+                ),
+            ]
+        )
+    )
+
+    destination = await _mega_destination(  # type: ignore[arg-type]
+        session,
+        release_version_id=uuid4(),
+    )
+
+    assert destination.state == "running"
+    assert destination.completed_items == 90
+    assert destination.total_items == 250
+    assert destination.remote_path == "/Finished Sets/Yoruichi/v01-deadbeef"
+    assert "90 / 250" in destination.detail
+    assert destination.intent_id is None
+    assert session.scalar.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_mega_projection_auto_queues_ready_archive_without_patreon() -> None:
+    session = SimpleNamespace(
+        scalar=AsyncMock(
+            side_effect=[
+                SimpleNamespace(
+                    id=uuid4(),
+                    state=FinishedSetArchiveState.READY,
+                    selection_count=400,
+                ),
+                None,
+            ]
+        )
+    )
+
+    destination = await _mega_destination(  # type: ignore[arg-type]
+        session,
+        release_version_id=uuid4(),
+    )
+
+    assert destination.state == "queued"
+    assert destination.completed_items == 0
+    assert destination.total_items == 400
+    assert "automatically" in destination.detail
 
 
 @pytest.mark.asyncio
@@ -494,7 +560,8 @@ async def test_completed_review_prepares_exact_patreon_mega_and_x_destinations(
         )
         assert page.status_code == 200
         html = bytes(page.body).decode()
-        assert "Prepare destinations" in html
+        assert "Delivery destinations" in html
+        assert "MEGA receives the clean, full-resolution images automatically" in html
         assert "Patreon" in html
         assert "MEGA" in html
         assert "X" in html

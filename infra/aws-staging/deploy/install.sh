@@ -47,6 +47,9 @@ install -o root -g root -m 0755 \
   "$source_dir/bootstrap-patreon-profile.sh" \
   /usr/local/sbin/gen-automation-bootstrap-patreon-profile
 install -o root -g root -m 0755 \
+  "$source_dir/bootstrap-mega-profile.sh" \
+  /usr/local/sbin/gen-automation-bootstrap-mega-profile
+install -o root -g root -m 0755 \
   "$source_dir/bootstrap-owner.sh" \
   /usr/local/sbin/gen-automation-bootstrap-owner
 install -o root -g root -m 0755 \
