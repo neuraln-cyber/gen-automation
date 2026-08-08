@@ -36,6 +36,7 @@ from gen_automation.services.authentication import (
     AuthenticatedPrincipal,
     CsrfValidationError,
 )
+from gen_automation.services.dashboard_previews import dashboard_preview_url
 from gen_automation.services.generation import GenerationPlanConflictError
 from gen_automation.services.generation_control import (
     GenerationControlConflictError,
@@ -493,6 +494,10 @@ async def dashboard_release_generated_assets(
             "batch_index": asset.batch_index,
             "batch_name": asset.batch_name,
             "batch_image_number": asset.batch_image_number,
+            "preview_url": dashboard_preview_url(
+                asset_id=asset.asset_id,
+                source_sha256=asset.source_sha256,
+            ),
             "view_url": f"/dashboard/assets/{asset.asset_id}/view",
             "download_url": f"/dashboard/assets/{asset.asset_id}/download",
             "generation_details_url": (f"/dashboard/assets/{asset.asset_id}/generation-details"),

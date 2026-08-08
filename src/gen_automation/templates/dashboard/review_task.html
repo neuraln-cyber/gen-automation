@@ -611,6 +611,7 @@
         data-batch-index="{{ item.master.batch_index }}"
         data-batch-image-number="{{ item.master.batch_image_number }}"
         data-decision="{{ decision_value }}"
+        data-asset-view-url="{{ item.master.view_url }}"
         data-inspected="{{ 'true' if item.inspected else 'false' }}"
         data-selected-for-x="{{ 'true' if item.current.selected_for_x else 'false' }}"
         {% if item.semantic_flagged %}data-semantic-flagged="true"{% endif %}
@@ -632,7 +633,7 @@
           {% endif %}
           <img
             class="asset-preview"
-            src="{{ item.master.view_url }}"
+            src="{{ item.master.preview_url }}"
             alt="Rank {{ item.master.rank }} generated image"
             width="{{ item.master.width }}"
             height="{{ item.master.height }}"

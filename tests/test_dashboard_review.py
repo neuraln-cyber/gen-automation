@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode
 from uuid import UUID
 
 import pytest
@@ -459,7 +459,11 @@ def test_browser_review_detail_is_owner_or_reviewer_only(
 
     if allowed:
         assert detail.status_code == 200
-        assert store.download_calls == 4
+        assert store.download_calls == 0
+        assert "/previews/" in detail.text
+        assert "/view" in detail.text
+        assert "/download" in detail.text
+        assert "/private-review/" not in detail.text
         assert mutation.status_code == 415
         assert "submitted form type is not supported" in mutation.text
     else:
@@ -1000,7 +1004,12 @@ def test_browser_review_decisions_lock_replay_actor_and_exact_completion(
         assert '<script src="/static/asset_viewer.js" defer></script>' in page.text
         image_sources = re.findall(r'<img[^>]+src="([^"]+)"', page.text)
         assert image_sources
-        assert all(urlsplit(source).netloc == "testserver" for source in image_sources)
+        assert all(
+            source.startswith("/dashboard/assets/")
+            and "/previews/" in source
+            and source.endswith(".jpg")
+            for source in image_sources
+        )
 
         decision_forms = _forms(page.text, decision_action)
         assert len(decision_forms) == 2

@@ -39,6 +39,7 @@ class ProgressiveAssetIntegrityError(ProgressiveAssetError):
 @dataclass(frozen=True, slots=True)
 class AvailableRawMaster:
     asset_id: UUID
+    source_sha256: str
     available_at: datetime
     width: int
     height: int
@@ -199,6 +200,7 @@ async def list_available_raw_masters(
         assets.append(
             AvailableRawMaster(
                 asset_id=asset.id,
+                source_sha256=asset.sha256,
                 available_at=normalized_available_at,
                 width=asset.width,
                 height=asset.height,

@@ -518,7 +518,7 @@ def test_dashboard_requires_authentication_before_loading_private_state(
         (AdminRole.PUBLISHER, False),
     ],
 )
-def test_raw_master_access_is_least_privilege_and_precedes_signing(
+def test_raw_master_access_is_least_privilege_without_eager_signing(
     tmp_path: Path,
     role: AdminRole,
     may_view_raw_masters: bool,
@@ -572,7 +572,12 @@ def test_raw_master_access_is_least_privilege_and_precedes_signing(
         assert created.headers["location"] == f"/dashboard/releases/{RELEASE_ID}"
         assert canonical.status_code == 200
         assert "data-review-workspace" in canonical.text
-        assert len(store.calls) == 4
+        assert store.calls == []
+        assert f"/dashboard/assets/{ASSET_A_ID}/view" in canonical.text
+        assert f"/dashboard/assets/{ASSET_A_ID}/download" in canonical.text
+        assert (
+            f"/dashboard/assets/{ASSET_A_ID}/previews/dashboard-preview-v1/{'a' * 16}.jpg"
+        ) in canonical.text
         assert "Download exact raw master" in canonical.text
     else:
         assert detail.status_code == 403
@@ -582,7 +587,7 @@ def test_raw_master_access_is_least_privilege_and_precedes_signing(
         assert "exact-version" not in detail.text
 
 
-def test_ranked_dashboard_orders_assets_and_signs_exact_frozen_versions(
+def test_ranked_dashboard_orders_assets_and_uses_stable_private_routes(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path / "ranked.db", auth_enabled=True)
@@ -646,20 +651,17 @@ def test_ranked_dashboard_orders_assets_and_signs_exact_frozen_versions(
     assert "script-src 'self'" in detail.headers["content-security-policy"]
     assert "img-src 'self' https: http:" in detail.headers["content-security-policy"]
 
-    expected_frozen = {
-        ("frozen/private-master-a.png", "exact-version-a-secret"),
-        ("frozen/private-master-b.png", "exact-version-b-secret"),
-    }
-    assert {(call.key, call.version_id) for call in store.calls} == expected_frozen
-    assert len(store.calls) == 4
-    assert all(call.expires_in == 900 for call in store.calls)
-    for key, version in expected_frozen:
-        matching = [call for call in store.calls if call.key == key and call.version_id == version]
-        assert len(matching) == 2
-        assert sum(call.download_name is None for call in matching) == 1
-        attachment = next(call for call in matching if call.download_name is not None)
-        assert attachment.download_name is not None
-        assert attachment.download_name.endswith(".png")
+    assert store.calls == []
+    for asset_id, digest_character in (
+        (ASSET_A_ID, "a"),
+        (ASSET_B_ID, "b"),
+    ):
+        assert f"/dashboard/assets/{asset_id}/view" in detail.text
+        assert f"/dashboard/assets/{asset_id}/download" in detail.text
+        assert (
+            f"/dashboard/assets/{asset_id}/previews/dashboard-preview-v1/"
+            f"{digest_character * 16}.jpg"
+        ) in detail.text
 
 
 def test_missing_or_incomplete_ranking_fails_clearly_without_signing(

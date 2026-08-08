@@ -43,6 +43,16 @@ audience before creating the role.
 For an AWS Organizations member account, set `budget_enabled = false`. Create
 the monthly budget in the management account with a linked-account filter for
 the staging account; AWS Budgets does not support cross-account SNS topics.
+The budget sends actual-spend notifications at 50%, 80%, and 100%, plus a
+forecast notification at 100%. The subscription must be confirmed before any
+of those notifications can arrive.
+
+The asset bucket automatically removes only abandoned upload attempts under
+`staging/` after `abandoned_staging_retention_days` (seven days by default),
+including their noncurrent versions. Lifecycle expiry never targets
+`masters/`, `derivatives/`, `finished-set-archives/`, or
+`publication-packages/`; those immutable, version-pinned objects remain
+available to the application and operator.
 
 Use the operational sequence and acceptance gates in
 [the AWS staging runbook](../../docs/aws-staging-runbook.md).

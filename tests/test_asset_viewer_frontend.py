@@ -19,7 +19,9 @@ def test_asset_viewer_is_safe_progressive_enhancement() -> None:
     assert 'event.key === "Backspace"' not in script
     assert "isEditableTarget(event.target)" in script
     assert "returnFocus.focus()" in script
-    assert "new Image()" in script
+    assert "new Image()" not in script
+    assert "preloadedSources" not in script
+    assert "preload(sourceFor" not in script
     assert "visibleCards()" in script
     assert "Download exact raw master" in script
     assert "assetViewerSelect" in script
@@ -293,6 +295,10 @@ def test_live_generation_surfaces_latest_without_reordering_the_canonical_grid()
     assert "grid.prepend" not in live_assets
     assert "assets.get(latestAssetId)?.card" in live_assets
     assert 'card.querySelector("[data-asset-viewer-trigger], .asset-preview")' in live_assets
+    assert "const previewUrl = safeAssetUrl(item.preview_url, assetId);" in live_assets
+    assert "image.src = asset.previewUrl;" in live_assets
+    assert "latestImage.src = asset.previewUrl;" in live_assets
+    assert "card.dataset.assetViewUrl = asset.viewUrl;" in live_assets
 
     assert ".live-generation-latest" in styles
     assert "max-height: min(62dvh, 44rem)" in styles
@@ -307,6 +313,20 @@ def test_review_filter_hides_empty_ai_excluded_separator() -> None:
     assert 'document.querySelectorAll(".ai-excluded-heading")' in script
     assert "grid.querySelectorAll('.asset-card[data-ai-excluded=\"true\"]')" in script
     assert "heading.hidden = !hasVisibleExcluded" in script
+
+
+def test_review_grid_uses_cached_previews_but_fullscreen_keeps_exact_master() -> None:
+    template = (
+        ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "review_task.html"
+    ).read_text(encoding="utf-8")
+    viewer = (ROOT / "src" / "gen_automation" / "static" / "asset_viewer.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'src="{{ item.master.preview_url }}"' in template
+    assert 'data-asset-view-url="{{ item.master.view_url }}"' in template
+    assert "card.dataset.assetViewUrl" in viewer
+    assert "|| (image && (image.currentSrc || image.src))" in viewer
 
 
 def test_review_ui_treats_the_configured_size_as_a_maximum_goal() -> None:

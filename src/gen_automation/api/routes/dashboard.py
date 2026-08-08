@@ -51,6 +51,16 @@ from gen_automation.services.authentication import (
     AuthenticatedPrincipal,
     CsrfValidationError,
 )
+from gen_automation.services.dashboard_previews import (
+    DASHBOARD_PREVIEW_CACHE_CONTROL,
+    DASHBOARD_PREVIEW_CONTENT_TYPE,
+    DASHBOARD_PREVIEW_VERSION,
+    DashboardPreviewConflictError,
+    DashboardPreviewNotFoundError,
+    DashboardPreviewRenderError,
+    DashboardPreviewStorageError,
+    load_or_create_dashboard_preview,
+)
 from gen_automation.services.generation_details import (
     GenerationDetailsNotFoundError,
     load_generation_details,
@@ -154,6 +164,12 @@ def _secure_response(request: Request, response: Response) -> Response:
     return response
 
 
+def _etag_matches(if_none_match: str | None, expected: str) -> bool:
+    if not if_none_match or len(if_none_match) > 4096:
+        return False
+    return any(candidate.strip() in {"*", expected} for candidate in if_none_match.split(","))
+
+
 @router.get(
     "/assets/{asset_id}/generation-details",
     response_class=JSONResponse,
@@ -179,6 +195,81 @@ async def dashboard_asset_generation_details(
     return _secure_response(
         request,
         JSONResponse(content=details or unavailable_generation_details()),
+    )
+
+
+@router.get(
+    f"/assets/{{asset_id}}/previews/{DASHBOARD_PREVIEW_VERSION}/{{source_token}}.jpg",
+    response_class=Response,
+    response_model=None,
+    name="dashboard_asset_preview",
+)
+async def dashboard_asset_preview(
+    asset_id: UUID,
+    source_token: str,
+    request: Request,
+    session: Session,
+    _principal: RawMasterReader,
+) -> Response:
+    """Serve a small immutable grid preview without exposing master metadata."""
+
+    store = _object_store(request)
+    if store is None:
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"detail": "private storage is unavailable"},
+            ),
+        )
+    settings: Settings = request.app.state.settings
+    try:
+        preview = await load_or_create_dashboard_preview(
+            session,
+            store,
+            asset_id=asset_id,
+            source_token=source_token,
+            max_master_bytes=settings.storage_max_image_bytes,
+        )
+    except DashboardPreviewNotFoundError:
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"detail": "dashboard preview not found"},
+            ),
+        )
+    except DashboardPreviewConflictError:
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={"detail": "dashboard preview source is unavailable"},
+            ),
+        )
+    except (DashboardPreviewStorageError, DashboardPreviewRenderError):
+        return _secure_response(
+            request,
+            JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"detail": "dashboard preview is temporarily unavailable"},
+            ),
+        )
+
+    headers = {
+        "Cache-Control": DASHBOARD_PREVIEW_CACHE_CONTROL,
+        "Content-Disposition": "inline",
+        "ETag": preview.etag,
+        "Vary": "Cookie",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": content_security_policy(settings.environment),
+    }
+    if _etag_matches(request.headers.get("if-none-match"), preview.etag):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    return Response(
+        content=preview.data,
+        media_type=DASHBOARD_PREVIEW_CONTENT_TYPE,
+        headers=headers,
     )
 
 

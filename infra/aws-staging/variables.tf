@@ -285,6 +285,21 @@ variable "budget_enabled" {
   default     = true
 }
 
+variable "abandoned_staging_retention_days" {
+  description = "Days to retain abandoned presigned-upload objects under staging/. Immutable masters and durable outputs are never covered by this lifecycle rule."
+  type        = number
+  default     = 7
+
+  validation {
+    condition = (
+      var.abandoned_staging_retention_days >= 1
+      && var.abandoned_staging_retention_days <= 30
+      && floor(var.abandoned_staging_retention_days) == var.abandoned_staging_retention_days
+    )
+    error_message = "abandoned_staging_retention_days must be a whole number from 1 through 30."
+  }
+}
+
 variable "log_retention_days" {
   description = "CloudWatch application/bootstrap log retention."
   type        = number

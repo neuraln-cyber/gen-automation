@@ -118,3 +118,20 @@ S3-compatible provider.
   cache the bytes.
 
 Signed URLs and POST fields are never persisted or logged.
+
+## Cost and retention guardrails
+
+The AWS staging bucket lifecycle is intentionally narrow. Current and
+noncurrent objects under `staging/` are eligible for deletion only after the
+configured abandoned-upload grace period (seven days by default). A normal
+successful collection promotes the exact bytes to `masters/` and deletes its
+staging version immediately, so the lifecycle rule primarily collects uploads
+left behind by interrupted workers or controller failures.
+
+No lifecycle expiry applies to `masters/`, `derivatives/`,
+`finished-set-archives/`, or `publication-packages/`. Database records pin
+those objects by key and version, so deleting a noncurrent version merely
+because S3 calls it noncurrent could break review, download, or delivery.
+Storage-cost cleanup for durable outputs must therefore be an application-aware
+operation that first proves no live database lineage references the exact
+version; a bucket-wide age rule is not acceptable.

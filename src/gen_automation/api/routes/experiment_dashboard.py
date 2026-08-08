@@ -41,6 +41,7 @@ from gen_automation.domain.enums import (
 )
 from gen_automation.middleware import content_security_policy
 from gen_automation.services.authentication import AuthenticatedPrincipal, CsrfValidationError
+from gen_automation.services.dashboard_previews import dashboard_preview_url
 from gen_automation.services.experiment_support import (
     classify_experiment_model_readiness,
     estimate_experiment_session_cost_from_settings,
@@ -688,6 +689,10 @@ def _asset_payload(asset: AvailableRawMaster) -> dict[str, object]:
         "ordinal": asset.ordinal,
         "output_index": asset.output_index,
         "queue_position": asset.queue_position,
+        "preview_url": dashboard_preview_url(
+            asset_id=asset.asset_id,
+            source_sha256=asset.source_sha256,
+        ),
         "view_url": f"/dashboard/assets/{asset.asset_id}/view",
         "download_url": f"/dashboard/assets/{asset.asset_id}/download",
         "generation_details_url": f"/dashboard/assets/{asset.asset_id}/generation-details",

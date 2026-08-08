@@ -1,3 +1,4 @@
+import asyncio
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -255,6 +256,36 @@ def test_derivative_progress_distinguishes_ready_failed_and_stalled_work() -> No
     stalled = replace(failed, failed=0, succeeded=2)
     assert not stalled.terminal_failures
     assert stalled.stalled
+
+
+def test_patreon_picker_uses_raw_source_thumbnail_instead_of_full_derivative() -> None:
+    source_asset_id = uuid4()
+    output = DeliveryOutput(
+        output_id=uuid4(),
+        selection_id=uuid4(),
+        display_order=7,
+        target="full",
+        object_key="derivatives/full.jpg",
+        object_version_id="full-version",
+        width=1150,
+        height=1487,
+        source_asset_id=source_asset_id,
+        source_sha256="a" * 64,
+    )
+
+    views = asyncio.run(
+        delivery_routes._preview_views(
+            _delivery_request(_settings(publishing_enabled=True), uuid4()),
+            (output,),
+        )
+    )
+
+    assert len(views) == 1
+    assert views[0].output_id == output.output_id
+    assert views[0].url == (
+        f"/dashboard/assets/{source_asset_id}/previews/dashboard-preview-v1/{'a' * 16}.jpg"
+    )
+    assert output.object_key not in views[0].url
 
 
 def test_delivery_progress_payload_reports_ready_archive_parts_in_global_order() -> None:

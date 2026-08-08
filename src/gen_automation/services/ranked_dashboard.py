@@ -1,12 +1,9 @@
-import asyncio
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from itertools import batched
 from types import MappingProxyType
 from typing import cast
-from urllib.parse import urlsplit
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -24,19 +21,17 @@ from gen_automation.db.models import (
     ScoringRun,
 )
 from gen_automation.domain.enums import AssetKind, AssetScoreState, ScoringRunState
+from gen_automation.services.dashboard_previews import dashboard_preview_url
 from gen_automation.services.generation_positions import generation_position
 from gen_automation.services.ranking_manifest import (
     RankingManifestIntegrityError,
     validate_completed_ranking_manifest,
 )
-from gen_automation.storage.base import ObjectStore, ObjectStoreError
+from gen_automation.storage.base import ObjectStore
 
-_MAX_SIGNING_CONCURRENCY = 32
-_MAX_SIGNED_URL_LENGTH = 16_384
 _SAFE_FILENAME_PART = re.compile(r"[^a-zA-Z0-9_-]+")
 _SAFE_IMAGE_FORMAT = re.compile(r"^[a-zA-Z0-9]{1,10}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_ALLOWED_SIGNED_URL_SCHEMES = frozenset({"http", "https", "memory"})
 _RANKABLE_SCORE_STATES = frozenset(
     {
         AssetScoreState.SCORED,
@@ -96,6 +91,7 @@ class RankedMaster:
     image_format: str
     byte_size: int
     checksum_prefix: str
+    preview_url: str
     view_url: str
     download_url: str
     download_name: str
@@ -400,27 +396,16 @@ async def _load_ranked_snapshot(
     rows = [(ranking, score, asset) for ranking, score, asset, _job in ranked_rows]
     _validate_ranked_rows(rows, run=run, store=store)
 
-    signed_assets: list[RankedMaster] = []
-    try:
-        for row_batch in batched(ranked_rows, _MAX_SIGNING_CONCURRENCY):
-            signed_assets.extend(
-                await asyncio.gather(
-                    *(
-                        _sign_ranked_master(
-                            store,
-                            release_slug=release.slug,
-                            ranking=ranking,
-                            score=score,
-                            asset=asset,
-                            job=job,
-                            expires_in=expires_in,
-                        )
-                        for ranking, score, asset, job in row_batch
-                    )
-                )
-            )
-    except ObjectStoreError as error:
-        raise RankingStorageError("raw-master access could not be signed") from error
+    signed_assets = [
+        _ranked_master(
+            release_slug=release.slug,
+            ranking=ranking,
+            score=score,
+            asset=asset,
+            job=job,
+        )
+        for ranking, score, asset, job in ranked_rows
+    ]
 
     return RankedRelease(
         release_id=release.id,
@@ -514,15 +499,13 @@ def _validate_ranked_rows(
         raise RankingIntegrityError("the completed ranking manifest changed") from error
 
 
-async def _sign_ranked_master(
-    store: ObjectStore,
+def _ranked_master(
     *,
     release_slug: str,
     ranking: AssetRanking,
     score: AssetScore,
     asset: Asset,
     job: GenerationJob,
-    expires_in: int,
 ) -> RankedMaster:
     download_name = _download_name(
         release_slug=release_slug,
@@ -530,21 +513,6 @@ async def _sign_ranked_master(
         asset_id=ranking.asset_id,
         image_format=score.asset_image_format,
     )
-    view_url, download_url = await asyncio.gather(
-        store.presign_download(
-            key=score.asset_object_key,
-            version_id=score.asset_object_version_id,
-            expires_in=expires_in,
-        ),
-        store.presign_download(
-            key=score.asset_object_key,
-            version_id=score.asset_object_version_id,
-            expires_in=expires_in,
-            download_name=download_name,
-        ),
-    )
-    _validate_signed_url(view_url)
-    _validate_signed_url(download_url)
     explanation = dict(ranking.explanation)
     position = generation_position(job, asset)
     return RankedMaster(
@@ -560,8 +528,12 @@ async def _sign_ranked_master(
         image_format=score.asset_image_format,
         byte_size=score.asset_byte_size,
         checksum_prefix=score.asset_sha256[:12],
-        view_url=view_url,
-        download_url=download_url,
+        preview_url=dashboard_preview_url(
+            asset_id=ranking.asset_id,
+            source_sha256=score.asset_sha256,
+        ),
+        view_url=f"/dashboard/assets/{ranking.asset_id}/view",
+        download_url=f"/dashboard/assets/{ranking.asset_id}/download",
         download_name=download_name,
         batch_index=position.batch_index,
         batch_name=position.batch_name,
@@ -580,24 +552,6 @@ def _download_name(
     safe_format = image_format.lower()
     extension = safe_format if _SAFE_IMAGE_FORMAT.fullmatch(safe_format) else "img"
     return f"{safe_slug}-rank-{rank:04d}-{str(asset_id)[:8]}.{extension}"
-
-
-def _validate_signed_url(url: str) -> None:
-    if (
-        not isinstance(url, str)
-        or not url
-        or len(url) > _MAX_SIGNED_URL_LENGTH
-        or any(ord(character) < 32 for character in url)
-    ):
-        raise RankingStorageError("object storage returned an invalid signed URL")
-    parsed = urlsplit(url)
-    if (
-        parsed.scheme not in _ALLOWED_SIGNED_URL_SCHEMES
-        or not parsed.netloc
-        or parsed.username is not None
-        or parsed.password is not None
-    ):
-        raise RankingStorageError("object storage returned an invalid signed URL")
 
 
 def _explanation_summary(explanation: Mapping[str, object]) -> tuple[str, ...]:

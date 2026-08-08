@@ -11,6 +11,12 @@ from gen_automation.config import Environment, Settings
 
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 CSP_CONNECT_SOURCE_PATTERN = re.compile(r"^https?://[A-Za-z0-9.-]+(?::[0-9]{1,5})?$")
+DASHBOARD_PREVIEW_PATH_PATTERN = re.compile(
+    r"^/dashboard/assets/"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/"
+    r"previews/dashboard-preview-v[0-9]+/[0-9a-f]{16}\.jpg$",
+    re.IGNORECASE,
+)
 
 
 def asset_connection_source(settings: Settings) -> str | None:
@@ -82,7 +88,8 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
             structlog.contextvars.clear_contextvars()
 
         response.headers["X-Request-ID"] = request_id
-        response.headers["Cache-Control"] = "no-store"
+        if not _is_private_revalidated_preview_response(request, response):
+            response.headers["Cache-Control"] = "no-store"
         response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
         response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
         settings: Settings = request.app.state.settings
@@ -107,3 +114,26 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         if settings.environment in {Environment.STAGING, Environment.PRODUCTION}:
             response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
         return response
+
+
+def _is_private_revalidated_preview_response(request: Request, response: Response) -> bool:
+    """Preserve only the private, auth-revalidated JPEG cache contract."""
+
+    cache_control = response.headers.get("cache-control", "").lower()
+    vary = {
+        value.strip().lower()
+        for value in response.headers.get("vary", "").split(",")
+        if value.strip()
+    }
+    content_type = response.headers.get("content-type", "").partition(";")[0].lower()
+    return (
+        request.method in {"GET", "HEAD"}
+        and DASHBOARD_PREVIEW_PATH_PATTERN.fullmatch(request.url.path) is not None
+        and response.status_code in {200, 304}
+        and (response.status_code == 304 or content_type == "image/jpeg")
+        and "private" in {part.strip() for part in cache_control.split(",")}
+        and "no-cache" in {part.strip() for part in cache_control.split(",")}
+        and "must-revalidate" in {part.strip() for part in cache_control.split(",")}
+        and "cookie" in vary
+        and response.headers.get("x-content-type-options", "").lower() == "nosniff"
+    )

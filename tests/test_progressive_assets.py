@@ -281,6 +281,11 @@ def test_generated_asset_feed_pages_without_duplicates_and_preserves_queue_order
     assert first.json()["assets"][0]["batch_name"] == "NNSFW"
     assert first.json()["assets"][0]["ordinal"] == 1
     assert first.json()["assets"][0]["output_index"] == 2
+    assert first.json()["assets"][0]["preview_url"] == (
+        f"/dashboard/assets/{ASSET_IDS[0]}/previews/dashboard-preview-v1/"
+        f"{str(ASSET_IDS[0]).replace('-', '')[:16]}.jpg"
+    )
+    assert first.json()["assets"][0]["view_url"] == (f"/dashboard/assets/{ASSET_IDS[0]}/view")
 
     second = client.get(
         f"/dashboard/releases/{RELEASE_ID}/generated-assets",

@@ -30,6 +30,40 @@ def test_aws_staging_topology_and_cost_defaults_are_explicit() -> None:
     assert source.count('resource "aws_s3_bucket_server_side_encryption_configuration"') == 2
 
 
+def test_asset_lifecycle_expires_only_abandoned_staging_uploads() -> None:
+    storage = (INFRA / "storage.tf").read_text(encoding="utf-8")
+    variables = (INFRA / "variables.tf").read_text(encoding="utf-8")
+
+    assert 'variable "abandoned_staging_retention_days"' in variables
+    assert 'id     = "expire-abandoned-staging-uploads"' in storage
+    assert 'prefix = "staging/"' in storage
+    assert "days = var.abandoned_staging_retention_days" in storage
+    assert "noncurrent_days = var.abandoned_staging_retention_days" in storage
+    for durable_prefix in (
+        'prefix = "masters/"',
+        'prefix = "derivatives/"',
+        'prefix = "finished-set-archives/"',
+        'prefix = "publication-packages/"',
+    ):
+        assert durable_prefix not in storage
+
+
+def test_budget_notifies_before_and_at_the_limit() -> None:
+    monitoring = (INFRA / "monitoring.tf").read_text(encoding="utf-8")
+
+    for threshold in (50, 80, 100):
+        assert re.search(
+            rf"threshold\s*=\s*{threshold}.*?notification_type\s*=\s*\"ACTUAL\"",
+            monitoring,
+            re.DOTALL,
+        )
+    assert re.search(
+        r'threshold\s*=\s*100.*?notification_type\s*=\s*"FORECASTED"',
+        monitoring,
+        re.DOTALL,
+    )
+
+
 def test_aws_staging_has_no_ssh_or_secret_value_resources() -> None:
     source = _terraform_source()
     cloud_init = (INFRA / "cloud-init.yaml.tftpl").read_text(encoding="utf-8")

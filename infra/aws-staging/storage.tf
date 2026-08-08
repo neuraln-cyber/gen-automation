@@ -56,6 +56,29 @@ resource "aws_s3_bucket_lifecycle_configuration" "assets" {
       days_after_initiation = 7
     }
   }
+
+  # A successful collector promotes the exact upload version into masters/ and
+  # deletes that staging version. Anything left under staging/ after this
+  # bounded grace period is an abandoned upload attempt, not a raw master or a
+  # user-facing derivative/package. Prefix scoping is deliberately explicit:
+  # masters/, derivatives/, finished-set-archives/, and publication-packages/
+  # have no expiry rule.
+  rule {
+    id     = "expire-abandoned-staging-uploads"
+    status = "Enabled"
+
+    filter {
+      prefix = "staging/"
+    }
+
+    expiration {
+      days = var.abandoned_staging_retention_days
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = var.abandoned_staging_retention_days
+    }
+  }
 }
 
 resource "aws_s3_bucket_cors_configuration" "assets" {

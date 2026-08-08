@@ -75,7 +75,12 @@ Confirm the plan contains exactly:
 When staging is an AWS Organizations member account, set
 `budget_enabled = false` and create the budget in the management account with
 a linked-account filter for staging. Budget SNS topics cannot be cross-account;
-use a management-account topic or direct email notification.
+use a management-account topic or direct email notification. The linked-account
+budget is required for this deployment because the staging member-account
+module cannot create it on the payer's behalf. Match the module's alert profile:
+actual spend at 50%, 80%, and 100%, plus forecast spend at 100%. Confirm the
+email/SNS subscription and trigger a test notification; an unconfirmed
+subscription provides no protection.
 
 Do not apply until this review and a cost estimate are approved. Plan files can
 contain sensitive infrastructure data and are gitignored; delete them securely
@@ -112,6 +117,11 @@ alarm notification.
 Verify both buckets have `Enabled` versioning, AES256 default encryption, all
 four public-access blocks, and a TLS-only bucket policy. Run the repository's
 opt-in S3 conformance canary against the asset bucket before any paid GPU job.
+Verify the asset lifecycle has one prefix-scoped expiry for `staging/` and that
+there is no expiry for `masters/`, `derivatives/`,
+`finished-set-archives/`, or `publication-packages/`. The staging rule removes
+abandoned presigned-upload attempts after seven days; normal collection already
+deletes the exact promoted staging version immediately.
 
 Verify RDS has no public address, is in the two-subnet DB subnet group, accepts
 5432 only from the EC2 security group, and exposes an active

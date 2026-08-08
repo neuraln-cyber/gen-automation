@@ -48,6 +48,7 @@ from gen_automation.services.authentication import (
     AuthenticatedPrincipal,
     CsrfValidationError,
 )
+from gen_automation.services.dashboard_previews import dashboard_preview_url
 from gen_automation.services.derivative_pipeline import (
     DerivativePipelineConflictError,
     DerivativePipelineInputError,
@@ -1375,25 +1376,22 @@ def _form_text(value: object, maximum: int) -> str:
 
 
 async def _preview_views(
-    request: Request,
+    _request: Request,
     outputs: tuple[DeliveryOutput, ...],
 ) -> tuple[PreviewView, ...]:
-    store = _store(request)
-    if store is None:
-        return ()
-    settings: Settings = request.app.state.settings
     previews: list[PreviewView] = []
     for output in outputs:
+        if output.source_asset_id is None or output.source_sha256 is None:
+            continue
         previews.append(
             PreviewView(
                 output_id=output.output_id,
                 display_order=output.display_order,
                 width=output.width,
                 height=output.height,
-                url=await store.presign_download(
-                    key=output.object_key,
-                    version_id=output.object_version_id,
-                    expires_in=min(settings.storage_presign_ttl_seconds, 900),
+                url=dashboard_preview_url(
+                    asset_id=output.source_asset_id,
+                    source_sha256=output.source_sha256,
                 ),
             )
         )

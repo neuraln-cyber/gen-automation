@@ -86,6 +86,8 @@ class DeliveryOutput:
     object_version_id: str
     width: int
     height: int
+    source_asset_id: UUID | None = None
+    source_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,15 +279,20 @@ async def load_operator_delivery(
         output for output, job in output_rows if job.state == DerivativeJobState.SUCCEEDED
     ]
     selection_order = {selection.id: selection.display_order for selection in selections}
+    selection_sources = {
+        selection.id: (selection.asset_id, selection.source_sha256) for selection in selections
+    }
     full_outputs = _ordered_outputs(
         succeeded_outputs,
         target="full",
         selection_order=selection_order,
+        selection_sources=selection_sources,
     )
     x_outputs = _ordered_outputs(
         succeeded_outputs,
         target="x_teaser",
         selection_order=selection_order,
+        selection_sources=selection_sources,
     )
     expected_x_count = sum(selection.asset_id in x_selected_asset_ids for selection in selections)
     state_counts = {state: sum(job.state == state for job in jobs) for state in DerivativeJobState}
@@ -711,9 +718,16 @@ def _ordered_outputs(
     *,
     target: str,
     selection_order: dict[UUID, int],
+    selection_sources: dict[UUID, tuple[UUID, str]],
 ) -> tuple[DeliveryOutput, ...]:
     matching = sorted(
-        (output for output in outputs if output.target == target),
+        (
+            output
+            for output in outputs
+            if output.target == target
+            and output.release_selection_id in selection_sources
+            and output.release_selection_id in selection_order
+        ),
         key=lambda output: (selection_order.get(output.release_selection_id, 2**31), output.id),
     )
     return tuple(
@@ -726,6 +740,8 @@ def _ordered_outputs(
             object_version_id=output.asset_object_version_id,
             width=output.asset_width,
             height=output.asset_height,
+            source_asset_id=selection_sources[output.release_selection_id][0],
+            source_sha256=selection_sources[output.release_selection_id][1],
         )
         for output in matching
     )

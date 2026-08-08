@@ -46,6 +46,7 @@ from gen_automation.services.operator_delivery import (
     OperatorDeliveryConflictError,
     OperatorDeliverySnapshot,
     _mega_destination,
+    _ordered_outputs,
     load_operator_delivery,
     prepare_operator_destinations,
     prepare_operator_patreon_destination,
@@ -58,6 +59,44 @@ from tests.test_derivative_pipeline import (
     approved_context as derivative_approved_context,  # noqa: F401
 )
 from tests.test_derivative_runtime import _cycle, _prepare
+
+
+def test_ordered_outputs_ignore_outputs_from_another_review_selection() -> None:
+    current_selection_id = uuid4()
+    stale_selection_id = uuid4()
+    source_asset_id = uuid4()
+    current_output_id = uuid4()
+    outputs = [
+        SimpleNamespace(
+            id=current_output_id,
+            release_selection_id=current_selection_id,
+            target="full",
+            asset_object_key="derivatives/current.png",
+            asset_object_version_id="current-version",
+            asset_width=768,
+            asset_height=1024,
+        ),
+        SimpleNamespace(
+            id=uuid4(),
+            release_selection_id=stale_selection_id,
+            target="full",
+            asset_object_key="derivatives/stale.png",
+            asset_object_version_id="stale-version",
+            asset_width=768,
+            asset_height=1024,
+        ),
+    ]
+
+    ordered = _ordered_outputs(  # type: ignore[arg-type]
+        outputs,
+        target="full",
+        selection_order={current_selection_id: 3},
+        selection_sources={current_selection_id: (source_asset_id, "a" * 64)},
+    )
+
+    assert len(ordered) == 1
+    assert ordered[0].output_id == current_output_id
+    assert ordered[0].source_asset_id == source_asset_id
 
 
 async def _prepare_independent_destination_inputs(

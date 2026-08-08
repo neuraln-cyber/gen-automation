@@ -4841,7 +4841,8 @@
           || !assetIdPattern.test(item.asset_id)) return null;
       const assetId = item.asset_id.toLowerCase();
       const viewUrl = safeAssetUrl(item.view_url, assetId);
-      if (!viewUrl) return null;
+      const previewUrl = safeAssetUrl(item.preview_url, assetId);
+      if (!viewUrl || !previewUrl) return null;
       const ordinal = Math.max(0, integerValue(item.ordinal, 0));
       const outputIndex = Math.max(0, integerValue(item.output_index, 0));
       const suppliedPosition = positiveInteger(item.queue_position, 0)
@@ -4861,6 +4862,7 @@
         ordinal,
         outputIndex,
         position,
+        previewUrl,
         viewUrl,
         width: positiveInteger(item.width, 1),
       };
@@ -4911,7 +4913,7 @@
 
       const media = createNode("div", "asset-media");
       const image = createNode("img", "asset-preview");
-      image.src = asset.viewUrl;
+      image.src = asset.previewUrl;
       image.alt = `${label} generated image`;
       image.width = asset.width;
       image.height = asset.height;
@@ -4970,7 +4972,7 @@
       if (!(latest instanceof HTMLElement) || !(latestImage instanceof HTMLImageElement)) return;
       latestAssetId = asset.assetId;
       const label = assetLabel(asset);
-      latestImage.src = asset.viewUrl;
+      latestImage.src = asset.previewUrl;
       latestImage.alt = `${label} latest generated image`;
       latestImage.width = asset.width;
       latestImage.height = asset.height;
@@ -6174,7 +6176,8 @@
     const assetCard = (asset) => {
       const id = typeof asset.asset_id === "string" ? asset.asset_id : "";
       const view = assetUrl(asset.view_url, id);
-      if (!id || !view) return null;
+      const preview = assetUrl(asset.preview_url, id);
+      if (!id || !view || !preview) return null;
       const card = createNode("article", "asset-card experiment-asset-card");
       card.dataset.assetCard = "";
       card.dataset.assetId = id;
@@ -6182,7 +6185,7 @@
       const link = createNode("a", "asset-preview-link");
       link.href = view;
       const image = document.createElement("img");
-      image.src = view;
+      image.src = preview;
       image.alt = `Generated sample ${Math.max(0, integerValue(asset.output_index, 0)) + 1}`;
       image.loading = "lazy";
       image.width = Math.max(1, integerValue(asset.width, 1));

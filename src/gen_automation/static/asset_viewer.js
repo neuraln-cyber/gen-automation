@@ -10,7 +10,6 @@
   const INSPECTION_IDLE_FLUSH_MS = 5000;
   const INSPECTION_RETRY_MS = 2500;
   const INSPECTION_REQUEST_TIMEOUT_MS = 8000;
-  const preloadedSources = new Set();
 
   const createElement = (tagName, className, text) => {
     const element = document.createElement(tagName);
@@ -338,14 +337,6 @@
       status,
       title,
     };
-  }
-
-  function preload(source) {
-    if (!source || preloadedSources.has(source)) return;
-    preloadedSources.add(source);
-    const neighbor = new Image();
-    neighbor.decoding = "async";
-    neighbor.src = source;
   }
 
   function initializeAssetViewer() {
@@ -948,8 +939,6 @@
         const nextCard = available[(index + 1) % available.length];
         viewer.previous.setAttribute("aria-label", `View previous image, ${cardRank(previousCard)}`);
         viewer.next.setAttribute("aria-label", `View next image, ${cardRank(nextCard)}`);
-        preload(sourceFor(previousCard));
-        preload(sourceFor(nextCard));
       }
     };
 
