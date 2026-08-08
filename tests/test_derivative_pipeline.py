@@ -44,6 +44,7 @@ from gen_automation.domain.enums import (
 )
 from gen_automation.services.derivative_pipeline import (
     DerivativePipelineConflictError,
+    DerivativePipelineInputError,
     DerivativePipelineLeaseError,
     DerivativePlanResult,
     claim_derivative_jobs,
@@ -323,6 +324,30 @@ async def _plan(
             max_attempts=3,
             now=PLAN_AT,
         )
+
+
+@pytest.mark.asyncio
+async def test_x_teaser_planning_requires_revision_ownership(
+    approved_context: ApprovedContext,
+) -> None:
+    async with approved_context.database.sessions() as session:
+        with pytest.raises(
+            DerivativePipelineInputError,
+            match="requires an owned X teaser revision",
+        ):
+            await create_derivative_recipe_and_plan(
+                session,
+                review_task_id=approved_context.review_task_id,
+                configuration={"watermark": {"position": "top_left"}},
+                recipe_version=1,
+                renderer_version="renderer-v1",
+                pillow_version="12.0.0",
+                created_by_user_id=approved_context.owner_id,
+                approved_by_user_id=approved_context.owner_id,
+                idempotency_key="unowned-x-plan",
+                output_targets=("x_teaser",),
+                now=PLAN_AT,
+            )
 
 
 @pytest.mark.asyncio

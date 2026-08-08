@@ -1715,10 +1715,10 @@
     const renderOutput = (output) => {
       const knownStates = ["not_started", "rendering", "ready", "failed", "stalled"];
       const state = knownStates.includes(output.state) ? output.state : "stalled";
-      const succeeded = count(output.succeeded);
-      const totalJobs = count(output.total_jobs);
-      const failed = count(output.failed);
-      const active = count(output.active_jobs);
+      const succeeded = count(output.full_succeeded);
+      const totalJobs = count(output.full_total_jobs);
+      const failed = count(output.full_failed);
+      const active = count(output.full_active_jobs);
       const readyFull = count(output.ready_full_outputs);
       const expectedFull = count(output.expected_full_outputs);
       const readyTeasers = count(output.ready_x_teasers);
@@ -6395,19 +6395,29 @@
         `${(watermarkWidth / relativeScale) * 100}%`,
       );
 
-      try {
-        const savedAssetId = window.localStorage.getItem(
-          scopedStorageKey(X_WATERMARK_ASSET_STORAGE_KEY),
-        );
-        if (savedAssetId && Array.from(assetSelect.options).some(
-          (option) => option.value === savedAssetId,
-        )) {
-          assetSelect.value = savedAssetId;
-        } else if (!assetSelect.value && assetSelect.options.length > 1) {
-          assetSelect.selectedIndex = 1;
+      const currentAssetId = assetSelect.dataset.watermarkCurrentAssetId || "";
+      const hasCurrentAsset = currentAssetId && Array.from(assetSelect.options).some(
+        (option) => option.value === currentAssetId,
+      );
+      if (hasCurrentAsset) {
+        // A rendered revision is authoritative. Never let a browser preference silently
+        // replace the watermark the operator is currently previewing.
+        assetSelect.value = currentAssetId;
+      } else {
+        try {
+          const savedAssetId = window.localStorage.getItem(
+            scopedStorageKey(X_WATERMARK_ASSET_STORAGE_KEY),
+          );
+          if (savedAssetId && Array.from(assetSelect.options).some(
+            (option) => option.value === savedAssetId,
+          )) {
+            assetSelect.value = savedAssetId;
+          } else if (!assetSelect.value && assetSelect.options.length > 1) {
+            assetSelect.selectedIndex = 1;
+          }
+        } catch (_error) {
+          if (!assetSelect.value && assetSelect.options.length > 1) assetSelect.selectedIndex = 1;
         }
-      } catch (_error) {
-        if (!assetSelect.value && assetSelect.options.length > 1) assetSelect.selectedIndex = 1;
       }
       slides.forEach((slide) => {
         if (!(slide instanceof HTMLElement) || !slide.dataset.assetId) return;

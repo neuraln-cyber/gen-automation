@@ -57,6 +57,7 @@ from gen_automation.services.derivatives import (
     WatermarkSpec,
     render_platform_derivatives,
 )
+from gen_automation.services.review_derivatives import prepare_completed_review_x_teasers
 from gen_automation.storage.base import ObjectMetadata, ObjectStoreError
 from gen_automation.storage.memory import MemoryObjectStore, StoredObject
 from tests.test_derivative_pipeline import PLAN_AT, ApprovedContext
@@ -299,18 +300,31 @@ async def _prepare(
         plan = await create_derivative_recipe_and_plan(
             session,
             review_task_id=approved.review_task_id,
-            configuration=derivative_recipe_configuration(recipe),
+            configuration=derivative_recipe_configuration(DerivativeRecipe(watermark=None)),
             recipe_version=1,
             renderer_version=renderer_version,
             pillow_version=PIL.__version__,
             created_by_user_id=approved.owner_id,
             approved_by_user_id=approved.owner_id,
             idempotency_key="runtime-derivative-plan",
-            output_targets=("full", "x_teaser"),
-            watermark_asset_id=watermark_asset_id,
+            output_targets=("full",),
+            watermark_asset_id=None,
             max_attempts=max_attempts,
             now=PLAN_AT,
         )
+    if x_selected_asset_ids:
+        assert watermark_asset_id is not None
+        async with approved.database.sessions() as session:
+            await prepare_completed_review_x_teasers(
+                session,
+                review_task_id=approved.review_task_id,
+                actor_user_id=approved.owner_id,
+                idempotency_key="runtime-x-teaser-plan",
+                watermark_asset_id=watermark_asset_id,
+                max_attempts=max_attempts,
+                now=PLAN_AT + timedelta(microseconds=1),
+                require_active_revision=False,
+            )
     return PreparedRuntime(
         approved=approved,
         store=selected_store,
@@ -423,8 +437,6 @@ async def test_cycle_executes_a_frozen_legacy_renderer_recipe(
     approved = derivative_approved_context
     prepared = await _prepare(
         approved,
-        with_watermark=True,
-        x_selected_asset_ids=(approved.raw_asset_ids[0],),
         renderer_version=LEGACY_DERIVATIVE_RENDERER_VERSION,
     )
 
@@ -456,24 +468,11 @@ async def test_cycle_executes_a_frozen_legacy_renderer_recipe(
         worker_id="derivative-controller-legacy-v4",
         renderer=legacy_renderer,
     )
-    third = await _cycle(
-        prepared,
-        worker_id="derivative-controller-legacy-v4",
-        renderer=legacy_renderer,
-    )
-
     assert first.execution is not None
     assert second.execution is not None
-    assert third.execution is not None
     assert first.execution.state == DerivativeJobState.SUCCEEDED
     assert second.execution.state == DerivativeJobState.SUCCEEDED
-    assert third.execution.state == DerivativeJobState.SUCCEEDED
-    assert (
-        first.execution.outputs_registered
-        + second.execution.outputs_registered
-        + third.execution.outputs_registered
-        == 3
-    )
+    assert first.execution.outputs_registered + second.execution.outputs_registered == 2
 
 
 @pytest.mark.asyncio

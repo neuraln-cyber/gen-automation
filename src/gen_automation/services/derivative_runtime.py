@@ -12,7 +12,7 @@ from typing import Any, cast
 from uuid import UUID, uuid5
 
 import PIL
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -24,6 +24,7 @@ from gen_automation.db.models import (
     ReleaseSelection,
     ReleaseVersion,
     ReviewTask,
+    XTeaserRevisionHead,
 )
 from gen_automation.db.models import (
     DerivativeRecipe as StoredDerivativeRecipe,
@@ -524,7 +525,12 @@ async def _load_execution_snapshot(
             "derivative execution lease or claim identity is stale"
         )
     if (
-        release.phase != ReleasePhase.RENDERING
+        not await _job_release_phase_is_valid(
+            session,
+            job=job,
+            release=release,
+            require_pending_revision=True,
+        )
         or release.current_version_no != release_version.version_no
         or selection.release_version_id != release_version.id
         or selection.review_task_id != review_task.id
@@ -1042,7 +1048,12 @@ async def _completed_replay(
             or job.request_sha256 != claim.request_sha256
             or job.request_payload != claim.request_payload
             or release.current_version_no != release_version.version_no
-            or release.phase not in (ReleasePhase.RENDERING, ReleasePhase.READY_TO_PUBLISH)
+            or not await _job_release_phase_is_valid(
+                session,
+                job=job,
+                release=release,
+                require_pending_revision=False,
+            )
         ):
             raise DerivativeOutputConflictError("completed derivative replay identity is invalid")
         expected_targets = _job_output_targets(
@@ -1067,6 +1078,51 @@ async def _completed_replay(
             state=DerivativeJobState.SUCCEEDED,
             replayed=True,
         )
+
+
+async def _job_release_phase_is_valid(
+    session: AsyncSession,
+    *,
+    job: DerivativeJob,
+    release: Release,
+    require_pending_revision: bool,
+) -> bool:
+    if job.gates_release:
+        return release.phase == ReleasePhase.RENDERING
+    if release.phase not in {
+        ReleasePhase.RENDERING,
+        ReleasePhase.READY_TO_PUBLISH,
+        ReleasePhase.PUBLISHING,
+        ReleasePhase.PUBLISHED,
+    }:
+        return False
+    if job.x_teaser_revision_id is None:
+        return False
+    pointer_predicate = (
+        XTeaserRevisionHead.pending_revision_id == job.x_teaser_revision_id
+        if require_pending_revision
+        else or_(
+            XTeaserRevisionHead.active_revision_id == job.x_teaser_revision_id,
+            XTeaserRevisionHead.pending_revision_id == job.x_teaser_revision_id,
+        )
+    )
+    head = await session.scalar(
+        select(XTeaserRevisionHead)
+        .join(
+            ReleaseSelection,
+            ReleaseSelection.review_task_id == XTeaserRevisionHead.review_task_id,
+        )
+        .where(
+            ReleaseSelection.id == job.release_selection_id,
+            XTeaserRevisionHead.release_version_id == job.release_version_id,
+            pointer_predicate,
+        )
+    )
+    if head is None or (
+        head.active_revision_id is None and release.phase == ReleasePhase.RENDERING
+    ):
+        return False
+    return True
 
 
 async def _transition_execution_failure(

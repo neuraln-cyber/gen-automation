@@ -43,8 +43,8 @@
           {% if output_state == "ready" %}
             All clean publishing copies are ready.
           {% elif output_state == "failed" %}
-            Copy preparation stopped with {{ delivery.progress.failed }} failed
-            job{% if delivery.progress.failed != 1 %}s{% endif %}.
+            Copy preparation stopped with {{ delivery.progress.full_failed }} failed
+            job{% if delivery.progress.full_failed != 1 %}s{% endif %}.
           {% elif output_state == "stalled" %}
             Copy preparation is stalled with no active jobs.
           {% elif output_state == "rendering" %}
@@ -54,23 +54,23 @@
           {% endif %}
         </strong>
         <span class="muted" data-delivery-output-progress-label>
-          {{ delivery.progress.succeeded }} / {{ delivery.progress.total_jobs }} jobs complete
+          {{ delivery.progress.full_succeeded }} / {{ delivery.progress.full_total_jobs }} jobs complete
         </span>
       </div>
       <progress
         data-delivery-output-progress
-        value="{{ delivery.progress.succeeded }}"
-        max="{{ [delivery.progress.total_jobs, 1] | max }}"
+        value="{{ delivery.progress.full_succeeded }}"
+        max="{{ [delivery.progress.full_total_jobs, 1] | max }}"
         aria-label="Clean publishing copy preparation progress"
       >
-        {{ delivery.progress.succeeded }} / {{ delivery.progress.total_jobs }}
+        {{ delivery.progress.full_succeeded }} / {{ delivery.progress.full_total_jobs }}
       </progress>
     </div>
     <dl class="count-grid">
       <div>
         <dt>Jobs complete</dt>
         <dd data-delivery-jobs-complete>
-          {{ delivery.progress.succeeded }} / {{ delivery.progress.total_jobs }}
+          {{ delivery.progress.full_succeeded }} / {{ delivery.progress.full_total_jobs }}
         </dd>
       </div>
       <div>
@@ -89,15 +89,15 @@
       </div>
       <div>
         <dt>Failures</dt>
-        <dd data-delivery-failures>{{ delivery.progress.failed }}</dd>
+        <dd data-delivery-failures>{{ delivery.progress.full_failed }}</dd>
       </div>
       <div>
         <dt>Active jobs</dt>
-        <dd data-delivery-active-jobs>{{ delivery.progress.active_jobs }}</dd>
+        <dd data-delivery-active-jobs>{{ delivery.progress.full_active_jobs }}</dd>
       </div>
     </dl>
 
-    {% if not delivery.progress.planned %}
+    {% if not delivery.progress.full_planned %}
       <form
         method="post"
         action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:prepare-outputs"
@@ -240,7 +240,7 @@
             {% if delivery.progress.full_outputs_ready %}
               ZIP preparation has not started. Use the button below when you want a
               downloadable copy.
-            {% elif delivery.progress.planned %}
+            {% elif delivery.progress.full_planned %}
               Queue the ZIP now. It will wait for the clean full-set copies without
               starting Patreon, MEGA, or X.
             {% else %}
@@ -249,7 +249,7 @@
             {% endif %}
           </p>
         {% endif %}
-        {% if delivery.progress.planned %}
+        {% if delivery.progress.full_planned %}
           <form
             method="post"
             action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:prepare-archive"
@@ -492,7 +492,7 @@
             {% if destination.state in ["not_prepared", "failed"] %}
               {% if not mega_configured %}
                 <p class="form-error">MEGA is not connected. ZIP, Patreon, and X remain available.</p>
-              {% elif not delivery.progress.planned %}
+              {% elif not delivery.progress.full_planned %}
                 <p class="terminal-state">
                   Prepare the clean full set first, then you can queue MEGA while it renders.
                 </p>
@@ -689,6 +689,8 @@
               <p class="terminal-state">No teaser images were selected for this set.</p>
             {% else %}
               {% set x_teasers_ready = delivery.progress.ready_x_teasers == delivery.progress.expected_x_teasers %}
+              {% set replacing_x_teasers = x_output_downloads|length > 0 %}
+              {% set replacement_allowed = x_teaser_revision and x_teaser_revision.can_replace %}
               {% if x_output_downloads %}
                 <section class="x-watermarked-downloads" aria-labelledby="x-downloads-heading">
                   <div class="x-watermark-composer-heading">
@@ -724,20 +726,83 @@
                 </section>
               {% endif %}
 
-              {% if destination.state in ["not_prepared", "failed"] %}
-                {% if not x_teasers_ready %}
+              {% if x_teaser_revision and x_teaser_revision.pending_revision_id %}
+                <section
+                  class="x-watermark-revision-progress"
+                  aria-labelledby="x-revision-progress-heading"
+                  data-x-revision-pending
+                >
+                  <div class="x-watermark-composer-heading">
+                    <div>
+                      <p class="page-kicker">Replacement rendering</p>
+                      <h3 id="x-revision-progress-heading">
+                        {{ x_teaser_revision.pending_succeeded }} / {{ x_teaser_revision.pending_total }} teasers ready
+                      </h3>
+                    </div>
+                    <span class="status {{ 'failed' if x_teaser_revision.pending_failed else 'running' }}">
+                      {{ x_teaser_revision.pending_state|replace('_', ' ') }}
+                    </span>
+                  </div>
+                  <progress
+                    value="{{ x_teaser_revision.pending_succeeded }}"
+                    max="{{ [x_teaser_revision.pending_total, 1] | max }}"
+                    aria-label="Replacement teaser rendering progress"
+                  >
+                    {{ x_teaser_revision.pending_succeeded }} / {{ x_teaser_revision.pending_total }}
+                  </progress>
+                  <p class="muted">
+                    The current watermarked teasers above remain available to preview and
+                    download until every replacement is safely finished.
+                  </p>
+                  {% if x_teaser_revision.pending_failed %}
+                    <p class="form-error" role="alert">
+                      {{ x_teaser_revision.pending_failed }} replacement teaser{% if x_teaser_revision.pending_failed != 1 %}s{% endif %}
+                      need attention. The current teasers were not replaced.
+                    </p>
+                  {% endif %}
+                </section>
+              {% endif %}
+
+              {% if not x_teasers_ready or replacing_x_teasers %}
+                {% if replacing_x_teasers %}
+                  <details class="decision-details x-watermark-revision-editor" open>
+                    <summary>
+                      <span>Change watermark corners</span>
+                      {% if x_teaser_revision and x_teaser_revision.active_revision_no %}
+                        <span class="status ready">revision {{ x_teaser_revision.active_revision_no }}</span>
+                      {% endif %}
+                    </summary>
+                    <div class="decision-fields">
+                {% endif %}
                 <form
                   class="decision-form delivery-card-action"
                   method="post"
-                  action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:prepare-x-outputs"
+                  {% if replacing_x_teasers %}
+                    action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:replace-x-outputs"
+                  {% else %}
+                    action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery:prepare-x-outputs"
+                  {% endif %}
+                  data-watermark-mode="{{ 'replacement' if replacing_x_teasers else 'initial' }}"
                 >
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                  <input type="hidden" name="idempotency_key" value="{{ x_output_idempotency_key }}">
-                  <input type="hidden" name="submission_id" value="{{ x_output_submission_id }}">
+                  <input
+                    type="hidden"
+                    name="idempotency_key"
+                    value="{{ x_replace_output_idempotency_key if replacing_x_teasers else x_output_idempotency_key }}"
+                  >
+                  <input
+                    type="hidden"
+                    name="submission_id"
+                    value="{{ x_replace_output_submission_id if replacing_x_teasers else x_output_submission_id }}"
+                  >
                   <div class="x-watermark-composer-heading">
                     <div>
-                      <p class="page-kicker">Teaser preview</p>
-                      <h3>Place each watermark</h3>
+                      <p class="page-kicker">
+                        {{ 'Replacement preview' if replacing_x_teasers else 'Teaser preview' }}
+                      </p>
+                      <h3>
+                        {{ 'Choose new corners' if replacing_x_teasers else 'Place each watermark' }}
+                      </h3>
                     </div>
                     <span class="status ready" data-watermark-complete-status>
                       {{ delivery.x_selected_count }} ready
@@ -747,19 +812,37 @@
                     Check each selected teaser in order and choose the corner that keeps
                     the artwork clear. Every image can use a different corner.
                   </p>
+                  {% if replacing_x_teasers %}
+                    <p class="muted x-watermark-replacement-note">
+                      Your current downloads stay available while the replacement renders.
+                      Nothing is overwritten until the complete replacement is ready.
+                    </p>
+                  {% endif %}
+                  {% if replacing_x_teasers and not replacement_allowed %}
+                    <p class="form-error" role="alert">
+                      {{ x_teaser_revision.blocked_reason if x_teaser_revision and x_teaser_revision.blocked_reason else 'Watermark replacement is temporarily unavailable.' }}
+                    </p>
+                  {% endif %}
                   <label for="x-watermark-asset">Saved watermark</label>
                   <select
                     id="x-watermark-asset"
                     name="watermark_asset_id"
                     required
                     data-watermark-asset-select
+                    data-watermark-current-asset-id="{{ x_teaser_revision.current_watermark_asset_id if replacing_x_teasers and x_teaser_revision and x_teaser_revision.current_watermark_asset_id else '' }}"
+                    {% if replacing_x_teasers and not replacement_allowed %}disabled{% endif %}
                   >
                     <option value="">Choose a registered watermark</option>
                     {% for watermark in watermarks %}
                       <option
                         value="{{ watermark.asset_id }}"
                         data-watermark-preview-url="{{ watermark.preview_url }}"
-                        {% if watermarks|length == 1 and loop.first %}selected{% endif %}
+                        {% if replacing_x_teasers and x_teaser_revision and
+                          (watermark.asset_id|string) == (x_teaser_revision.current_watermark_asset_id|string) %}
+                          selected
+                        {% elif not replacing_x_teasers and watermarks|length == 1 and loop.first %}
+                          selected
+                        {% endif %}
                       >
                         {{ watermark.display_name }} · {{ watermark.width }} × {{ watermark.height }}
                       </option>
@@ -789,6 +872,13 @@
 
                       <div class="x-watermark-slides">
                         {% for preview in x_previews %}
+                          {% set current_corner = 'bottom_right' %}
+                          {% if replacing_x_teasers and x_teaser_revision and x_teaser_revision.current_positions_by_asset_id %}
+                            {% set current_corner = x_teaser_revision.current_positions_by_asset_id.get(
+                              preview.asset_id,
+                              x_teaser_revision.current_positions_by_asset_id.get(preview.asset_id|string, 'bottom_right')
+                            ) %}
+                          {% endif %}
                           <article
                             class="x-watermark-slide"
                             data-watermark-slide
@@ -811,7 +901,7 @@
                                     class="x-watermark-overlay"
                                     aria-hidden="true"
                                     data-watermark-overlay
-                                    data-position="bottom_right"
+                                    data-position="{{ current_corner }}"
                                     hidden
                                   ></canvas>
                                 </div>
@@ -835,7 +925,8 @@
                                       type="radio"
                                       value="{{ value }}"
                                       data-watermark-corner
-                                      {% if value == 'bottom_right' %}checked{% endif %}
+                                      {% if value == current_corner %}checked{% endif %}
+                                      {% if replacing_x_teasers and not replacement_allowed %}disabled{% endif %}
                                     >
                                     <span aria-hidden="true">{{ short }}</span> {{ label }}
                                   </label>
@@ -895,18 +986,31 @@
                   <button
                     class="secondary-button"
                     type="submit"
-                    {% if not watermarks or not x_previews %}disabled{% endif %}
+                    {% if not watermarks or not x_previews or (replacing_x_teasers and not replacement_allowed) %}disabled{% endif %}
                   >
-                    Prepare watermarked X teasers
+                    {% if replacing_x_teasers %}Render replacement teasers{% else %}Prepare watermarked X teasers{% endif %}
                   </button>
                   {% if not watermarks %}
                     <p class="form-error">Add a watermark in the section above before preparing X teasers.</p>
                   {% endif %}
                   <p class="muted delivery-action-note">
-                    This creates only the selected teaser copies. It does not post them.
+                    {% if replacing_x_teasers %}
+                      This renders a complete replacement revision. It does not post to X.
+                    {% else %}
+                      This creates only the selected teaser copies. It does not post them.
+                    {% endif %}
                   </p>
                   <p class="muted delivery-action-note">The preview uses the same calibrated size and inset as the final teaser.</p>
                 </form>
+                {% if replacing_x_teasers %}
+                    </div>
+                  </details>
+                {% endif %}
+              {% endif %}
+
+              {% if destination.state in ["not_prepared", "failed"] %}
+                {% if not x_teasers_ready %}
+                  <p class="terminal-state">Prepare the selected watermarked teasers above before posting.</p>
                 {% elif not publishing_enabled %}
                 <p class="form-error">X publishing is not enabled. Other options remain available.</p>
               {% elif not delivery.publishing_guard_enabled %}

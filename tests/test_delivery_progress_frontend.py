@@ -53,6 +53,10 @@ def test_delivery_progress_uses_json_polling_without_periodic_page_reloads() -> 
     assert 'archiveState === "ready"' in handler
     assert 'initialArchiveState !== "failed" && archiveState === "failed"' in handler
     assert "const fullOutputsReady = output.full_outputs_ready === true;" in handler
+    assert "const succeeded = count(output.full_succeeded);" in handler
+    assert "const totalJobs = count(output.full_total_jobs);" in handler
+    assert "const failed = count(output.full_failed);" in handler
+    assert "const active = count(output.full_active_jobs);" in handler
     assert 'archiveState === "not_started" && fullOutputsReady' not in handler
     assert "payload.mega.active === true" in handler
     assert "renderMega(payload.mega)" in handler
@@ -106,6 +110,10 @@ def test_delivery_template_explains_copy_and_archive_work_truthfully() -> None:
     assert '{% elif output_state == "failed" %}' in template
     assert '{% elif output_state == "stalled" %}' in template
     assert "delivery:retry-full-outputs" in template
+    assert "{% if not delivery.progress.full_planned %}" in template
+    assert "delivery.progress.full_succeeded" in template
+    assert "delivery.progress.full_total_jobs" in template
+    assert "delivery.progress.full_active_jobs" in template
     assert template.count("delivery:retry-full-outputs") == 1
     assert "retry_output_idempotency_key" in template
     assert "retry_output_submission_id" in template
@@ -128,7 +136,9 @@ def test_delivery_template_exposes_four_independent_target_actions() -> None:
     assert template.count("delivery:prepare-patreon") == 1
     assert template.count('delivery:prepare-x"') == 1
     assert template.count('delivery:prepare-x-outputs"') == 1
+    assert template.count('delivery:replace-x-outputs"') == 1
     assert "Prepare watermarked X teasers" in template
+    assert "Render replacement teasers" in template
     assert "This creates only the selected teaser copies. It does not post them." in template
     assert template.count('name="watermark_position"') == 2
     assert 'name="watermark_placements"' in template
@@ -161,7 +171,10 @@ def test_x_watermark_composer_previews_each_image_and_preserves_individual_corne
     assert "data-watermark-thumbnail" in template
     assert "data-watermark-overlay" in template
     assert "data-watermark-placements" in template
-    assert "{% if not watermarks or not x_previews %}disabled{% endif %}" in template
+    assert (
+        "{% if not watermarks or not x_previews or "
+        "(replacing_x_teasers and not replacement_allowed) %}disabled{% endif %}" in template
+    )
     assert "x_output_downloads" in template
     assert "Download any teaser now" in template
     assert "Download teaser {{ loop.index }}" in template
@@ -180,6 +193,19 @@ def test_x_watermark_composer_previews_each_image_and_preserves_individual_corne
     assert "prepared.width * targetHeight / prepared.height" in handler
     assert "slides.forEach((slide) => paintWatermarkOverlay(slide, prepared))" in handler
     assert "scopedStorageKey(X_WATERMARK_ASSET_STORAGE_KEY)" in handler
+    assert "data-watermark-current-asset-id" in template
+    assert "current_positions_by_asset_id.get(" in template
+    assert "preview.asset_id," in template
+    assert "preview.asset_id|string" in template
+    assert "Change watermark corners" in template
+    assert "Render replacement teasers" in template
+    assert "data-x-revision-pending" in template
+    assert "current watermarked teasers above remain available" in template
+    assert "Nothing is overwritten until the complete replacement is ready." in template
+    assert "x_teaser_revision.can_replace" in template
+    assert "x_teaser_revision.blocked_reason" in template
+    assert "const currentAssetId = assetSelect.dataset.watermarkCurrentAssetId" in handler
+    assert handler.index("if (hasCurrentAsset)") < handler.index("window.localStorage.getItem")
 
 
 def test_x_watermark_corner_controls_do_not_leak_strict_form_fields() -> None:
@@ -202,6 +228,8 @@ def test_x_watermark_corner_controls_do_not_leak_strict_form_fields() -> None:
     assert "watermark_corner_" not in form
     assert 'name="watermark_placements"' in form
     assert 'name="watermark_position" value="bottom_right"' in form
+    assert "x_replace_output_idempotency_key" in form
+    assert "x_replace_output_submission_id" in form
 
 
 def test_x_composer_tracks_caption_timezone_and_optional_schedule() -> None:

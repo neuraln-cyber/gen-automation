@@ -5,9 +5,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from gen_automation.db.models import (
     AdminUser,
@@ -24,6 +25,7 @@ from gen_automation.db.models import (
     ReleaseVersion,
     ReviewTask,
     ReviewXSelection,
+    XTeaserRevisionHead,
 )
 from gen_automation.domain.canonical import canonical_json_bytes, canonical_sha256
 from gen_automation.domain.deliverability import (
@@ -57,6 +59,61 @@ _TERMINAL_STATES = frozenset(
         DerivativeJobState.CANCELLED,
     }
 )
+
+
+def current_release_gating_job_predicate() -> ColumnElement[bool]:
+    """Keep full jobs and only the X revision owned by the current head gating."""
+
+    exact_x_revision_job = (
+        select(XTeaserRevisionHead.id)
+        .join(
+            ReleaseSelection,
+            ReleaseSelection.review_task_id == XTeaserRevisionHead.review_task_id,
+        )
+        .where(
+            ReleaseSelection.id == DerivativeJob.release_selection_id,
+            XTeaserRevisionHead.release_version_id == DerivativeJob.release_version_id,
+            or_(
+                XTeaserRevisionHead.active_revision_id == DerivativeJob.x_teaser_revision_id,
+                XTeaserRevisionHead.pending_revision_id == DerivativeJob.x_teaser_revision_id,
+            ),
+        )
+        .exists()
+    )
+    any_x_revision_head = (
+        select(XTeaserRevisionHead.id)
+        .join(
+            ReleaseSelection,
+            ReleaseSelection.review_task_id == XTeaserRevisionHead.review_task_id,
+        )
+        .where(
+            ReleaseSelection.id == DerivativeJob.release_selection_id,
+            XTeaserRevisionHead.release_version_id == DerivativeJob.release_version_id,
+        )
+        .exists()
+    )
+    legacy_job_has_full_target = (
+        select(DerivativeRecipe.id)
+        .where(
+            DerivativeRecipe.id == DerivativeJob.derivative_recipe_id,
+            or_(
+                DerivativeRecipe.output_targets == [_FULL_TARGET],
+                DerivativeRecipe.output_targets == [_FULL_TARGET, _X_TARGET],
+                DerivativeRecipe.output_targets == [_X_TARGET, _FULL_TARGET],
+            ),
+        )
+        .exists()
+    )
+    return or_(
+        and_(
+            DerivativeJob.x_teaser_revision_id.is_(None),
+            or_(legacy_job_has_full_target, ~any_x_revision_head),
+        ),
+        and_(
+            DerivativeJob.x_teaser_revision_id.is_not(None),
+            exact_x_revision_job,
+        ),
+    )
 
 
 class DerivativePipelineError(Exception):
@@ -144,11 +201,14 @@ async def create_derivative_recipe_and_plan(
     created_by_user_id: UUID,
     approved_by_user_id: UUID,
     idempotency_key: str,
-    output_targets: Sequence[str] = ("full", "x_teaser"),
+    output_targets: Sequence[str] = ("full",),
     watermark_asset_id: UUID | None = None,
     x_teaser_asset_ids: Sequence[UUID] | None = None,
+    x_teaser_revision_id: UUID | None = None,
     max_attempts: int = 3,
     priority: int = 100,
+    gates_release: bool = True,
+    commit: bool = True,
     now: datetime | None = None,
 ) -> DerivativePlanResult:
     """Approve immutable recipes and plan target-isolated jobs for each selection."""
@@ -159,6 +219,16 @@ async def create_derivative_recipe_and_plan(
     if normalized_x_teaser_asset_ids is not None and _X_TARGET not in normalized_targets:
         raise DerivativePipelineInputError(
             "X teaser asset filtering requires the X teaser output target"
+        )
+    if x_teaser_revision_id is not None and normalized_targets != (_X_TARGET,):
+        raise DerivativePipelineInputError("X teaser revisions may only plan the X teaser target")
+    if _X_TARGET in normalized_targets and x_teaser_revision_id is None:
+        raise DerivativePipelineInputError(
+            "X teaser derivative work requires an owned X teaser revision"
+        )
+    if not gates_release and x_teaser_revision_id is None:
+        raise DerivativePipelineInputError(
+            "non-gating derivative work requires an X teaser revision"
         )
     normalized_renderer = _bounded_text(renderer_version, "renderer version", 100)
     normalized_pillow = _bounded_text(pillow_version, "Pillow version", 50)
@@ -185,6 +255,37 @@ async def create_derivative_recipe_and_plan(
     await _require_active_planner(session, created_by_user_id)
     await _require_active_planner(session, approved_by_user_id)
 
+    if not commit:
+        try:
+            # A caller-owned revision transaction must survive a planner
+            # uniqueness race.  Limit any rollback to this savepoint; never
+            # silently erase the pending revision/head reservation.
+            async with session.begin_nested():
+                return await _create_plan_once(
+                    session,
+                    review_task_id=review_task_id,
+                    configuration=normalized_configuration,
+                    recipe_version=normalized_recipe_version,
+                    renderer_version=normalized_renderer,
+                    pillow_version=normalized_pillow,
+                    created_by_user_id=created_by_user_id,
+                    approved_by_user_id=approved_by_user_id,
+                    idempotency_key=normalized_key,
+                    output_targets=normalized_targets,
+                    watermark_asset_id=watermark_asset_id,
+                    x_teaser_asset_ids=normalized_x_teaser_asset_ids,
+                    x_teaser_revision_id=x_teaser_revision_id,
+                    max_attempts=normalized_max_attempts,
+                    priority=normalized_priority,
+                    gates_release=gates_release,
+                    commit=False,
+                    planned_at=planned_at,
+                )
+        except IntegrityError as error:
+            raise DerivativePipelineConflictError(
+                "derivative plan was created concurrently"
+            ) from error
+
     for attempt in range(2):
         try:
             return await _create_plan_once(
@@ -200,8 +301,11 @@ async def create_derivative_recipe_and_plan(
                 output_targets=normalized_targets,
                 watermark_asset_id=watermark_asset_id,
                 x_teaser_asset_ids=normalized_x_teaser_asset_ids,
+                x_teaser_revision_id=x_teaser_revision_id,
                 max_attempts=normalized_max_attempts,
                 priority=normalized_priority,
+                gates_release=gates_release,
+                commit=True,
                 planned_at=planned_at,
             )
         except IntegrityError as error:
@@ -227,8 +331,11 @@ async def _create_plan_once(
     output_targets: tuple[str, ...],
     watermark_asset_id: UUID | None,
     x_teaser_asset_ids: frozenset[UUID] | None,
+    x_teaser_revision_id: UUID | None,
     max_attempts: int,
     priority: int,
+    gates_release: bool,
+    commit: bool,
     planned_at: datetime,
 ) -> DerivativePlanResult:
     task = await session.scalar(
@@ -345,6 +452,10 @@ async def _create_plan_once(
             "max_attempts": max_attempts,
             "priority": priority,
             "x_selected_asset_ids": sorted(str(asset_id) for asset_id in x_selected_asset_ids),
+            "x_teaser_revision_id": (
+                str(x_teaser_revision_id) if x_teaser_revision_id is not None else None
+            ),
+            "gates_release": gates_release,
         }
     )
     replay = await _plan_replay(
@@ -356,29 +467,35 @@ async def _create_plan_once(
     if replay is not None:
         return replay
 
-    release_row = (
-        await session.execute(
-            select(Release, ReleaseVersion)
-            .join(
-                ReleaseVersion,
-                ReleaseVersion.release_id == Release.id,
-            )
-            .where(ReleaseVersion.id == task.release_version_id)
-            .with_for_update()
-        )
-    ).one_or_none()
-    if release_row is None:
+    release_version = await session.scalar(
+        select(ReleaseVersion).where(ReleaseVersion.id == task.release_version_id).with_for_update()
+    )
+    if release_version is None:
         raise DerivativePipelineConflictError("derivative plan release version is unavailable")
-    release, release_version = release_row
-    if release.current_version_no != release_version.version_no or release.phase not in {
+    release = await session.scalar(
+        select(Release).where(Release.id == release_version.release_id).with_for_update()
+    )
+    if release is None:
+        raise DerivativePipelineConflictError("derivative plan release is unavailable")
+    allowed_phases = {
         ReleasePhase.APPROVED,
         ReleasePhase.RENDERING,
         ReleasePhase.READY_TO_PUBLISH,
-    }:
+    }
+    if not gates_release:
+        allowed_phases.update({ReleasePhase.PUBLISHING, ReleasePhase.PUBLISHED})
+    if (
+        release.current_version_no != release_version.version_no
+        or release.phase not in allowed_phases
+    ):
         raise DerivativePipelineConflictError(
             "derivative plan is stale or the release phase does not allow rendering"
         )
-    resume_before_new_job = release.phase == ReleasePhase.READY_TO_PUBLISH
+    resume_before_new_job = gates_release and release.phase == ReleasePhase.READY_TO_PUBLISH
+    if release.phase == ReleasePhase.APPROVED and not gates_release:
+        raise DerivativePipelineConflictError(
+            "replacement X teaser work requires an already rendered release"
+        )
     if release.phase == ReleasePhase.APPROVED:
         await _transition_release_to_rendering(
             session,
@@ -391,7 +508,7 @@ async def _create_plan_once(
             resumed=False,
         )
 
-    target_owners: dict[tuple[UUID, str], tuple[DerivativeJob, DerivativeRecipe]] = {}
+    target_owners: dict[tuple[UUID, str, UUID | None], tuple[DerivativeJob, DerivativeRecipe]] = {}
     existing_target_rows = (
         await session.execute(
             select(DerivativeJob, DerivativeRecipe)
@@ -401,7 +518,11 @@ async def _create_plan_once(
     ).all()
     for existing_job, existing_recipe in existing_target_rows:
         for target in _stored_targets(existing_recipe):
-            owner_key = (existing_job.release_selection_id, target)
+            owner_key = (
+                existing_job.release_selection_id,
+                target,
+                existing_job.x_teaser_revision_id if target == _X_TARGET else None,
+            )
             previous = target_owners.get(owner_key)
             if previous is not None and previous[0].id != existing_job.id:
                 raise DerivativePipelineConflictError(
@@ -422,7 +543,13 @@ async def _create_plan_once(
     ) in enumerate(recipe_plans):
         group_target = group_targets[0]
         for selection in group_selections:
-            target_owner = target_owners.get((selection.id, group_target))
+            target_owner = target_owners.get(
+                (
+                    selection.id,
+                    group_target,
+                    x_teaser_revision_id if group_target == _X_TARGET else None,
+                )
+            )
             if target_owner is not None and target_owner[1].logical_key != recipe_logical_key:
                 raise DerivativePipelineConflictError(
                     "the derivative selection target already has a different frozen recipe"
@@ -523,6 +650,10 @@ async def _create_plan_once(
                     "release_selection_id": str(selection.id),
                     "recipe_logical_key": recipe.logical_key,
                     "output_targets": list(group_targets),
+                    "x_teaser_revision_id": (
+                        str(x_teaser_revision_id) if x_teaser_revision_id is not None else None
+                    ),
+                    "gates_release": gates_release,
                 }
             )
             request_payload = _job_request_payload(
@@ -538,6 +669,8 @@ async def _create_plan_once(
                 if (
                     existing.release_selection_id != selection.id
                     or existing.release_version_id != task.release_version_id
+                    or existing.x_teaser_revision_id != x_teaser_revision_id
+                    or existing.gates_release != gates_release
                     or existing.request_sha256 != job_request_sha256
                     or existing.request_payload != request_payload
                     or existing.expected_output_count != len(group_targets)
@@ -567,6 +700,8 @@ async def _create_plan_once(
                 id=uuid7(),
                 release_selection_id=selection.id,
                 derivative_recipe_id=recipe.id,
+                x_teaser_revision_id=x_teaser_revision_id,
+                gates_release=gates_release,
                 release_version_id=task.release_version_id,
                 logical_key=logical_key,
                 request_payload=request_payload,
@@ -652,7 +787,10 @@ async def _create_plan_once(
             expires_at=planned_at + timedelta(days=30),
         )
     )
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     return result
 
 
@@ -987,17 +1125,16 @@ async def retry_failed_completed_review_target(
     if task.state != ReviewTaskState.COMPLETED:
         raise DerivativePipelineConflictError("derivative retry requires a completed review task")
     selections = await _load_and_validate_selections(session, task)
-    release_row = (
-        await session.execute(
-            select(Release, ReleaseVersion)
-            .join(ReleaseVersion, ReleaseVersion.release_id == Release.id)
-            .where(ReleaseVersion.id == task.release_version_id)
-            .with_for_update()
-        )
-    ).one_or_none()
-    if release_row is None:
+    release_version = await session.scalar(
+        select(ReleaseVersion).where(ReleaseVersion.id == task.release_version_id).with_for_update()
+    )
+    if release_version is None:
         raise DerivativePipelineConflictError("derivative retry release version is unavailable")
-    release, release_version = release_row
+    release = await session.scalar(
+        select(Release).where(Release.id == release_version.release_id).with_for_update()
+    )
+    if release is None:
+        raise DerivativePipelineConflictError("derivative retry release is unavailable")
     if (
         release.current_version_no != release_version.version_no
         or release.phase != ReleasePhase.RENDERING
@@ -1394,6 +1531,9 @@ async def succeed_derivative_job(
     completed_at = _as_utc(now or datetime.now(UTC))
     worker = _bounded_text(worker_id, "worker id", 200)
     expected = _positive_lock_version(expected_lock_version)
+    # Every successful gating job can make its DB trigger lock Release. Take
+    # Version first to match publication's Version -> Release order.
+    await _prelock_job_release_version(session, job_id=job_id, x_revision_only=False)
     row = (
         await session.execute(
             select(DerivativeJob, DerivativeRecipe)
@@ -1454,59 +1594,86 @@ async def succeed_derivative_job(
         raise DerivativePipelineConflictError(
             "derivative job completion snapshot is invalid"
         ) from error
+    if job.x_teaser_revision_id is not None:
+        # Imported lazily to keep the revision orchestrator free to reuse the
+        # immutable derivative planner without a module import cycle.
+        from gen_automation.services.x_teaser_revisions import (
+            activate_ready_x_teaser_revision,
+        )
+
+        await activate_ready_x_teaser_revision(
+            session,
+            revision_id=job.x_teaser_revision_id,
+            activated_at=completed_at,
+        )
     remaining_jobs = int(
         await session.scalar(
             select(func.count())
             .select_from(DerivativeJob)
             .where(
                 DerivativeJob.release_version_id == job.release_version_id,
+                DerivativeJob.gates_release.is_(True),
                 DerivativeJob.state != DerivativeJobState.SUCCEEDED,
+                current_release_gating_job_predicate(),
             )
         )
         or 0
     )
-    if remaining_jobs == 0:
+    if job.gates_release and remaining_jobs == 0:
+        release_version = await session.scalar(
+            select(ReleaseVersion)
+            .where(ReleaseVersion.id == job.release_version_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if release_version is None:
+            await session.rollback()
+            raise DerivativePipelineConflictError("release version is unavailable")
         release = await session.scalar(
             select(Release)
-            .join(
-                ReleaseVersion,
-                ReleaseVersion.release_id == Release.id,
-            )
-            .where(ReleaseVersion.id == job.release_version_id)
+            .where(Release.id == release_version.release_id)
             .execution_options(populate_existing=True)
             .with_for_update()
         )
         if release is None or release.phase != ReleasePhase.READY_TO_PUBLISH:
             await session.rollback()
             raise DerivativePipelineConflictError("release readiness transition did not complete")
-        session.add(
-            _audit(
-                actor=worker,
-                action="release.ready_to_publish",
-                resource_type="release",
-                resource_id=release.id,
-                correlation_id=str(job.id),
-                detail={
-                    "release_version_id": str(job.release_version_id),
-                    "phase": ReleasePhase.READY_TO_PUBLISH.value,
-                },
-                occurred_at=completed_at,
+        readiness_dedupe_key = f"release.ready_to_publish:{job.release_version_id}"
+        existing_readiness_event = await session.scalar(
+            select(OutboxEvent.id).where(
+                OutboxEvent.topic == "release.ready_to_publish",
+                OutboxEvent.dedupe_key == readiness_dedupe_key,
             )
         )
-        session.add(
-            _outbox(
-                topic="release.ready_to_publish",
-                dedupe_key=f"release.ready_to_publish:{job.release_version_id}",
-                correlation_id=str(job.id),
-                aggregate_type="release",
-                aggregate_id=release.id,
-                payload={
-                    "release_id": str(release.id),
-                    "release_version_id": str(job.release_version_id),
-                },
-                occurred_at=completed_at,
+        if existing_readiness_event is None:
+            session.add(
+                _audit(
+                    actor=worker,
+                    action="release.ready_to_publish",
+                    resource_type="release",
+                    resource_id=release.id,
+                    correlation_id=str(job.id),
+                    detail={
+                        "release_version_id": str(job.release_version_id),
+                        "phase": ReleasePhase.READY_TO_PUBLISH.value,
+                    },
+                    occurred_at=completed_at,
+                )
             )
-        )
+            session.add(
+                _outbox(
+                    topic="release.ready_to_publish",
+                    dedupe_key=readiness_dedupe_key,
+                    correlation_id=str(job.id),
+                    aggregate_type="release",
+                    aggregate_id=release.id,
+                    payload={
+                        "release_id": str(release.id),
+                        "release_version_id": str(job.release_version_id),
+                    },
+                    occurred_at=completed_at,
+                )
+            )
     await session.commit()
     return _job_result(job)
 
@@ -1526,6 +1693,7 @@ async def fail_derivative_job(
     expected = _positive_lock_version(expected_lock_version)
     code = _error_code(error_code)
     detail = _error_detail(error_detail)
+    await _prelock_job_release_version(session, job_id=job_id, x_revision_only=True)
     job = await _load_job_locked(session, job_id)
     _require_active_lease(
         job,
@@ -1553,6 +1721,18 @@ async def fail_derivative_job(
         occurred_at=failed_at,
         detail={"error_code": code, "attempt_count": job.attempt_count},
     )
+    if job.x_teaser_revision_id is not None:
+        from gen_automation.services.x_teaser_revisions import (
+            discard_failed_pending_x_teaser_revision,
+        )
+
+        await session.flush()
+        await discard_failed_pending_x_teaser_revision(
+            session,
+            revision_id=job.x_teaser_revision_id,
+            discarded_at=failed_at,
+            actor=worker,
+        )
     await session.commit()
     return _job_result(job)
 
@@ -1568,6 +1748,7 @@ async def expire_exhausted_derivative_job(
 
     expired_at = _as_utc(now or datetime.now(UTC))
     expected = _positive_lock_version(expected_lock_version)
+    await _prelock_job_release_version(session, job_id=job_id, x_revision_only=True)
     job = await _load_job_locked(session, job_id)
     lease_expires_at = _as_utc(job.lease_expires_at) if job.lease_expires_at is not None else None
     if (
@@ -1598,6 +1779,18 @@ async def expire_exhausted_derivative_job(
             "attempt_count": job.attempt_count,
         },
     )
+    if job.x_teaser_revision_id is not None:
+        from gen_automation.services.x_teaser_revisions import (
+            discard_failed_pending_x_teaser_revision,
+        )
+
+        await session.flush()
+        await discard_failed_pending_x_teaser_revision(
+            session,
+            revision_id=job.x_teaser_revision_id,
+            discarded_at=expired_at,
+            actor="derivative-lease-recovery",
+        )
     await session.commit()
     return _job_result(job)
 
@@ -1615,6 +1808,7 @@ async def cancel_derivative_job(
     expected = _positive_lock_version(expected_lock_version)
     code = _error_code(reason_code)
     await _require_active_planner(session, cancelled_by_user_id)
+    await _prelock_job_release_version(session, job_id=job_id, x_revision_only=True)
     job = await _load_job_locked(session, job_id)
     if job.state in _TERMINAL_STATES:
         raise DerivativePipelineConflictError("derivative job is already terminal")
@@ -1636,6 +1830,18 @@ async def cancel_derivative_job(
         occurred_at=cancelled_at,
         detail={"reason_code": code},
     )
+    if job.x_teaser_revision_id is not None:
+        from gen_automation.services.x_teaser_revisions import (
+            discard_failed_pending_x_teaser_revision,
+        )
+
+        await session.flush()
+        await discard_failed_pending_x_teaser_revision(
+            session,
+            revision_id=job.x_teaser_revision_id,
+            discarded_at=cancelled_at,
+            actor=f"admin:{cancelled_by_user_id}",
+        )
     await session.commit()
     return _job_result(job)
 
@@ -1942,6 +2148,32 @@ def _retry_response_body(result: DerivativeRetryResult) -> dict[str, Any]:
         "failed_jobs_found": result.failed_jobs_found,
         "jobs_retried": result.jobs_retried,
     }
+
+
+async def _prelock_job_release_version(
+    session: AsyncSession,
+    *,
+    job_id: UUID,
+    x_revision_only: bool,
+) -> None:
+    snapshot = (
+        await session.execute(
+            select(
+                DerivativeJob.release_version_id,
+                DerivativeJob.x_teaser_revision_id,
+            ).where(DerivativeJob.id == job_id)
+        )
+    ).one_or_none()
+    if snapshot is None:
+        raise DerivativePipelineNotFoundError("derivative job was not found")
+    release_version_id, revision_id = snapshot
+    if x_revision_only and revision_id is None:
+        return
+    version = await session.scalar(
+        select(ReleaseVersion).where(ReleaseVersion.id == release_version_id).with_for_update()
+    )
+    if version is None:
+        raise DerivativePipelineConflictError("release version is unavailable")
 
 
 async def _load_job_locked(

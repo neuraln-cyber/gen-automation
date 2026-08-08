@@ -416,46 +416,41 @@ async def _load_generation_stop_context(
         .with_for_update()
     )
 
-    rows = list(
+    current_version_no = await session.scalar(
+        select(Release.current_version_no).where(Release.id == release_id)
+    )
+    if current_version_no is None:
+        raise GenerationControlNotFoundError("release was not found")
+    version = await session.scalar(
+        select(ReleaseVersion)
+        .where(
+            ReleaseVersion.release_id == release_id,
+            ReleaseVersion.version_no == current_version_no,
+        )
+        .with_for_update()
+    )
+    if version is None:
+        raise GenerationControlConflictError("current release version is unavailable")
+    release = await session.scalar(
+        select(Release)
+        .where(Release.id == release_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if release is None:
+        raise GenerationControlNotFoundError("release was not found")
+    if release.current_version_no != version.version_no:
+        raise GenerationControlConflictError("current release version changed concurrently")
+    jobs = tuple(
         (
-            await session.execute(
-                select(Release, ReleaseVersion, GenerationJob)
-                .join(
-                    ReleaseVersion,
-                    (ReleaseVersion.release_id == Release.id)
-                    & (ReleaseVersion.version_no == Release.current_version_no),
-                )
-                .join(
-                    GenerationJob,
-                    GenerationJob.release_version_id == ReleaseVersion.id,
-                )
-                .where(Release.id == release_id)
+            await session.scalars(
+                select(GenerationJob)
+                .where(GenerationJob.release_version_id == version.id)
                 .order_by(GenerationJob.id)
-                .with_for_update(of=(Release, ReleaseVersion, GenerationJob))
+                .with_for_update()
             )
         ).all()
     )
-    if rows:
-        release = rows[0][0]
-        version = rows[0][1]
-        jobs = tuple(row[2] for row in rows)
-    else:
-        row = (
-            await session.execute(
-                select(Release, ReleaseVersion)
-                .join(
-                    ReleaseVersion,
-                    (ReleaseVersion.release_id == Release.id)
-                    & (ReleaseVersion.version_no == Release.current_version_no),
-                )
-                .where(Release.id == release_id)
-                .with_for_update(of=(Release, ReleaseVersion))
-            )
-        ).one_or_none()
-        if row is None:
-            raise GenerationControlNotFoundError("release was not found")
-        release, version = row
-        jobs = ()
 
     job_ids = tuple(job.id for job in jobs)
     attempts = (

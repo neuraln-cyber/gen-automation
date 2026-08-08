@@ -25,6 +25,27 @@ from gen_automation.services.operator_delivery import (
     _publication_state,
     package_parts_ready,
 )
+from gen_automation.services.x_teaser_revisions import XTeaserRevisionStatus
+
+
+@pytest.fixture(autouse=True)
+def _stub_x_teaser_revision_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def no_revision(*_args: object, **_kwargs: object) -> XTeaserRevisionStatus:
+        return XTeaserRevisionStatus(
+            active_revision_id=None,
+            active_revision_no=None,
+            pending_revision_id=None,
+            pending_state=None,
+            pending_total=0,
+            pending_succeeded=0,
+            pending_failed=0,
+            can_replace=False,
+            blocked_reason=None,
+            current_watermark_asset_id=None,
+            current_positions_by_asset_id={},
+        )
+
+    monkeypatch.setattr(delivery_routes, "x_teaser_revision_status", no_revision)
 
 
 def _principal() -> AuthenticatedPrincipal:
@@ -76,6 +97,8 @@ def _snapshot(patreon: DestinationState) -> OperatorDeliverySnapshot:
             expected_x_teasers=0,
             ready_x_teasers=0,
             ready_for_destinations=True,
+            full_total_jobs=2,
+            full_succeeded=2,
         ),
         full_outputs=(),
         x_outputs=(),

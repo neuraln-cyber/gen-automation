@@ -2418,6 +2418,54 @@ class DerivativeRecipe(UuidPrimaryKeyMixin, Base):
     approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class XTeaserRevision(UuidPrimaryKeyMixin, Base):
+    """Immutable desired X-teaser set; a mutable head chooses the visible revision."""
+
+    __tablename__ = "x_teaser_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "review_task_id",
+            "revision_no",
+            name="uq_x_teaser_revisions_task_revision",
+        ),
+        UniqueConstraint(
+            "id",
+            "review_task_id",
+            "release_version_id",
+            name="uq_x_teaser_revisions_identity",
+        ),
+        CheckConstraint("revision_no > 0", name="positive_revision"),
+        CheckConstraint("length(request_sha256) = 64", name="valid_request_sha256"),
+        Index(
+            "ix_x_teaser_revisions_task_created",
+            "review_task_id",
+            "created_at",
+        ),
+    )
+
+    review_task_id: Mapped[UUID] = mapped_column(
+        ForeignKey("review_tasks.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    release_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("release_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    watermark_asset_id: Mapped[UUID] = mapped_column(
+        ForeignKey("assets.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class DerivativeJob(UuidPrimaryKeyMixin, Base):
     __tablename__ = "derivative_jobs"
     __table_args__ = (
@@ -2425,10 +2473,22 @@ class DerivativeJob(UuidPrimaryKeyMixin, Base):
             "logical_key",
             name="uq_derivative_jobs_logical_key",
         ),
-        UniqueConstraint(
+        Index(
+            "uq_derivative_jobs_selection_recipe_legacy",
             "release_selection_id",
             "derivative_recipe_id",
-            name="uq_derivative_jobs_selection_recipe",
+            unique=True,
+            sqlite_where=text("x_teaser_revision_id IS NULL"),
+            postgresql_where=text("x_teaser_revision_id IS NULL"),
+        ),
+        Index(
+            "uq_derivative_jobs_selection_recipe_revision",
+            "release_selection_id",
+            "derivative_recipe_id",
+            "x_teaser_revision_id",
+            unique=True,
+            sqlite_where=text("x_teaser_revision_id IS NOT NULL"),
+            postgresql_where=text("x_teaser_revision_id IS NOT NULL"),
         ),
         UniqueConstraint(
             "id",
@@ -2466,6 +2526,10 @@ class DerivativeJob(UuidPrimaryKeyMixin, Base):
         ),
         CheckConstraint("expected_output_count > 0", name="positive_output_count"),
         CheckConstraint("lock_version > 0", name="positive_lock_version"),
+        CheckConstraint(
+            "gates_release = true OR x_teaser_revision_id IS NOT NULL",
+            name="nongating_job_requires_x_revision",
+        ),
         CheckConstraint(
             "(state IN ('claimed', 'processing') "
             "AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL) "
@@ -2525,6 +2589,11 @@ class DerivativeJob(UuidPrimaryKeyMixin, Base):
         nullable=False,
         index=True,
     )
+    x_teaser_revision_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("x_teaser_revisions.id", ondelete="RESTRICT"),
+        index=True,
+    )
+    gates_release: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     release_version_id: Mapped[UUID] = mapped_column(
         ForeignKey("release_versions.id", ondelete="RESTRICT"),
         nullable=False,
@@ -2663,6 +2732,150 @@ class DerivativeOutput(UuidPrimaryKeyMixin, Base):
     lineage_recipe_version: Mapped[str] = mapped_column(String(100), nullable=False)
     recorded_by: Mapped[str] = mapped_column(String(200), nullable=False)
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class XTeaserRevisionMember(UuidPrimaryKeyMixin, Base):
+    """Immutable resolution of one selected image in an X-teaser revision."""
+
+    __tablename__ = "x_teaser_revision_members"
+    __table_args__ = (
+        UniqueConstraint(
+            "revision_id",
+            "release_selection_id",
+            name="uq_x_teaser_revision_members_selection",
+        ),
+        UniqueConstraint(
+            "revision_id",
+            "display_order",
+            name="uq_x_teaser_revision_members_order",
+        ),
+        ForeignKeyConstraint(
+            ["revision_id", "review_task_id", "release_version_id"],
+            [
+                "x_teaser_revisions.id",
+                "x_teaser_revisions.review_task_id",
+                "x_teaser_revisions.release_version_id",
+            ],
+            name="fk_x_teaser_revision_members_revision_identity",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["release_selection_id", "source_asset_id"],
+            ["release_selections.id", "release_selections.asset_id"],
+            name="fk_x_teaser_revision_members_selection_source",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("display_order > 0", name="positive_display_order"),
+        CheckConstraint(
+            "watermark_position IN ('top_left', 'top_right', 'bottom_left', 'bottom_right')",
+            name="valid_watermark_position",
+        ),
+        CheckConstraint(
+            "(derivative_job_id IS NOT NULL AND derivative_output_id IS NULL) OR "
+            "(derivative_job_id IS NULL AND derivative_output_id IS NOT NULL)",
+            name="job_or_reused_output",
+        ),
+        Index(
+            "ix_x_teaser_revision_members_revision_order",
+            "revision_id",
+            "display_order",
+        ),
+    )
+
+    revision_id: Mapped[UUID] = mapped_column(
+        ForeignKey("x_teaser_revisions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    review_task_id: Mapped[UUID] = mapped_column(
+        ForeignKey("review_tasks.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    release_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("release_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    release_selection_id: Mapped[UUID] = mapped_column(
+        ForeignKey("release_selections.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    source_asset_id: Mapped[UUID] = mapped_column(
+        ForeignKey("assets.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    watermark_position: Mapped[str] = mapped_column(String(20), nullable=False)
+    derivative_recipe_id: Mapped[UUID] = mapped_column(
+        ForeignKey("derivative_recipes.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    derivative_job_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("derivative_jobs.id", ondelete="RESTRICT"),
+        index=True,
+    )
+    derivative_output_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("derivative_outputs.id", ondelete="RESTRICT"),
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class XTeaserRevisionHead(UuidPrimaryKeyMixin, Base):
+    """Narrow mutable pointer which atomically publishes one complete revision."""
+
+    __tablename__ = "x_teaser_revision_heads"
+    __table_args__ = (
+        UniqueConstraint(
+            "review_task_id",
+            name="uq_x_teaser_revision_heads_review_task",
+        ),
+        CheckConstraint("lock_version > 0", name="positive_lock_version"),
+        CheckConstraint(
+            "active_revision_id IS NULL OR pending_revision_id IS NULL "
+            "OR active_revision_id <> pending_revision_id",
+            name="distinct_revision_pointers",
+        ),
+        ForeignKeyConstraint(
+            ["active_revision_id", "review_task_id", "release_version_id"],
+            [
+                "x_teaser_revisions.id",
+                "x_teaser_revisions.review_task_id",
+                "x_teaser_revisions.release_version_id",
+            ],
+            name="fk_x_teaser_revision_heads_active_identity",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["pending_revision_id", "review_task_id", "release_version_id"],
+            [
+                "x_teaser_revisions.id",
+                "x_teaser_revisions.review_task_id",
+                "x_teaser_revisions.release_version_id",
+            ],
+            name="fk_x_teaser_revision_heads_pending_identity",
+            ondelete="RESTRICT",
+        ),
+    )
+
+    review_task_id: Mapped[UUID] = mapped_column(
+        ForeignKey("review_tasks.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    release_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("release_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    active_revision_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("x_teaser_revisions.id", ondelete="RESTRICT"),
+    )
+    pending_revision_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("x_teaser_revisions.id", ondelete="RESTRICT"),
+    )
+    lock_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class PublicationIntent(UuidPrimaryKeyMixin, Base):
@@ -4709,7 +4922,14 @@ for _statement in (
     "AND recipe.release_version_id = NEW.release_version_id "
     "AND recipe.expected_output_count = NEW.expected_output_count "
     "AND release.current_version_no = version.version_no "
-    "AND release.phase = 'rendering'"
+    "AND ((NEW.gates_release = 1 AND release.phase = 'rendering') OR "
+    "(NEW.gates_release = 0 AND release.phase IN "
+    "('rendering', 'ready_to_publish', 'publishing', 'published') "
+    "AND EXISTS (SELECT 1 FROM x_teaser_revision_heads AS head WHERE "
+    "head.review_task_id = selection.review_task_id "
+    "AND head.release_version_id = NEW.release_version_id "
+    "AND (head.active_revision_id IS NOT NULL OR release.phase <> 'rendering') "
+    "AND head.pending_revision_id = NEW.x_teaser_revision_id)))"
     ") THEN RAISE(ABORT, 'derivative job release snapshot is invalid') END; END",
     "CREATE TRIGGER derivative_jobs_guard_update "
     "BEFORE UPDATE ON derivative_jobs BEGIN "
@@ -4718,6 +4938,8 @@ for _statement in (
     "OR OLD.id IS NOT NEW.id "
     "OR OLD.release_selection_id IS NOT NEW.release_selection_id "
     "OR OLD.derivative_recipe_id IS NOT NEW.derivative_recipe_id "
+    "OR OLD.x_teaser_revision_id IS NOT NEW.x_teaser_revision_id "
+    "OR OLD.gates_release IS NOT NEW.gates_release "
     "OR OLD.release_version_id IS NOT NEW.release_version_id "
     "OR OLD.logical_key IS NOT NEW.logical_key "
     "OR OLD.request_payload IS NOT NEW.request_payload "
@@ -4780,9 +5002,17 @@ for _statement in (
     "SELECT CASE WHEN NEW.state = 'succeeded' AND NOT EXISTS ("
     "SELECT 1 FROM release_versions AS version "
     "JOIN releases AS release ON release.id = version.release_id "
+    "JOIN release_selections AS selection ON selection.id = OLD.release_selection_id "
     "WHERE version.id = OLD.release_version_id "
     "AND release.current_version_no = version.version_no "
-    "AND release.phase = 'rendering') "
+    "AND ((NEW.gates_release = 1 AND release.phase = 'rendering') OR "
+    "(NEW.gates_release = 0 AND release.phase IN "
+    "('rendering', 'ready_to_publish', 'publishing', 'published') "
+    "AND EXISTS (SELECT 1 FROM x_teaser_revision_heads AS head WHERE "
+    "head.review_task_id = selection.review_task_id "
+    "AND head.release_version_id = NEW.release_version_id "
+    "AND (head.active_revision_id IS NOT NULL OR release.phase <> 'rendering') "
+    "AND head.pending_revision_id = NEW.x_teaser_revision_id)))) "
     "THEN RAISE(ABORT, 'derivative job release phase is invalid') END; END",
     "CREATE TRIGGER derivative_jobs_reject_delete "
     "BEFORE DELETE ON derivative_jobs "
@@ -4790,9 +5020,29 @@ for _statement in (
     "CREATE TRIGGER derivative_jobs_promote_release_after_success "
     "AFTER UPDATE ON derivative_jobs "
     "WHEN OLD.state <> 'succeeded' AND NEW.state = 'succeeded' "
+    "AND NEW.gates_release = 1 "
     "AND NOT EXISTS (SELECT 1 FROM derivative_jobs AS pending "
     "WHERE pending.release_version_id = NEW.release_version_id "
-    "AND pending.state <> 'succeeded') BEGIN "
+    "AND pending.gates_release = 1 "
+    "AND pending.state <> 'succeeded' "
+    "AND ((pending.x_teaser_revision_id IS NULL AND ("
+    "EXISTS (SELECT 1 FROM derivative_recipes AS pending_recipe "
+    "WHERE pending_recipe.id = pending.derivative_recipe_id "
+    "AND EXISTS (SELECT 1 FROM json_each(pending_recipe.output_targets) "
+    "AS pending_target WHERE pending_target.value = 'full')) "
+    "OR NOT EXISTS (SELECT 1 FROM release_selections AS pending_selection "
+    "JOIN x_teaser_revision_heads AS pending_head "
+    "ON pending_head.review_task_id = pending_selection.review_task_id "
+    "WHERE pending_selection.id = pending.release_selection_id "
+    "AND pending_head.release_version_id = pending.release_version_id))) "
+    "OR (pending.x_teaser_revision_id IS NOT NULL AND EXISTS ("
+    "SELECT 1 FROM release_selections AS pending_selection "
+    "JOIN x_teaser_revision_heads AS pending_head "
+    "ON pending_head.review_task_id = pending_selection.review_task_id "
+    "WHERE pending_selection.id = pending.release_selection_id "
+    "AND pending_head.release_version_id = pending.release_version_id "
+    "AND (pending_head.active_revision_id = pending.x_teaser_revision_id "
+    "OR pending_head.pending_revision_id = pending.x_teaser_revision_id))))) BEGIN "
     "UPDATE releases SET phase = 'ready_to_publish', "
     "lock_version = lock_version + 1 "
     "WHERE phase = 'rendering' AND id = ("
@@ -4860,6 +5110,148 @@ for _statement in (
         DerivativeOutput.__table__,
         "after_create",
         _ddl(_statement).execute_if(dialect="sqlite"),
+    )
+
+
+for _table, _statements in (
+    (
+        XTeaserRevision.__table__,
+        (
+            "CREATE TRIGGER x_teaser_revisions_reject_update BEFORE UPDATE ON "
+            "x_teaser_revisions BEGIN SELECT RAISE(ABORT, 'X teaser revisions are "
+            "append-only'); END",
+            "CREATE TRIGGER x_teaser_revisions_reject_delete BEFORE DELETE ON "
+            "x_teaser_revisions BEGIN SELECT RAISE(ABORT, 'X teaser revisions are "
+            "append-only'); END",
+        ),
+    ),
+    (
+        XTeaserRevisionMember.__table__,
+        (
+            "CREATE TRIGGER x_teaser_revision_members_guard_insert BEFORE INSERT ON "
+            "x_teaser_revision_members BEGIN SELECT CASE WHEN NOT EXISTS (SELECT 1 "
+            "FROM x_teaser_revisions AS revision JOIN release_selections AS selection "
+            "ON selection.id = NEW.release_selection_id JOIN derivative_recipes AS recipe "
+            "ON recipe.id = NEW.derivative_recipe_id WHERE revision.id = NEW.revision_id "
+            "AND revision.review_task_id = NEW.review_task_id AND "
+            "revision.release_version_id = NEW.release_version_id AND "
+            "selection.review_task_id = NEW.review_task_id AND "
+            "selection.release_version_id = NEW.release_version_id AND "
+            "selection.asset_id = NEW.source_asset_id AND recipe.release_version_id = "
+            "NEW.release_version_id AND recipe.watermark_asset_id = "
+            "revision.watermark_asset_id AND json_extract(recipe.configuration, "
+            "'$.watermark.position') = NEW.watermark_position AND ((NEW.derivative_job_id "
+            "IS NOT NULL AND EXISTS (SELECT 1 FROM derivative_jobs AS job WHERE job.id = "
+            "NEW.derivative_job_id AND job.release_selection_id = NEW.release_selection_id "
+            "AND job.derivative_recipe_id = NEW.derivative_recipe_id AND "
+            "job.x_teaser_revision_id = NEW.revision_id)) OR (NEW.derivative_output_id IS "
+            "NOT NULL AND EXISTS (SELECT 1 FROM derivative_outputs AS output WHERE "
+            "output.id = NEW.derivative_output_id AND output.release_selection_id = "
+            "NEW.release_selection_id AND output.derivative_recipe_id = "
+            "NEW.derivative_recipe_id AND output.target = 'x_teaser')))) THEN "
+            "RAISE(ABORT, 'X teaser revision member is invalid') END; END",
+            "CREATE TRIGGER x_teaser_revision_members_reject_update BEFORE UPDATE ON "
+            "x_teaser_revision_members BEGIN SELECT RAISE(ABORT, 'X teaser revision "
+            "members are append-only'); END",
+            "CREATE TRIGGER x_teaser_revision_members_reject_delete BEFORE DELETE ON "
+            "x_teaser_revision_members BEGIN SELECT RAISE(ABORT, 'X teaser revision "
+            "members are append-only'); END",
+        ),
+    ),
+    (
+        XTeaserRevisionHead.__table__,
+        (
+            "CREATE TRIGGER x_teaser_revision_heads_guard_update BEFORE UPDATE ON "
+            "x_teaser_revision_heads BEGIN SELECT CASE WHEN OLD.id IS NOT NEW.id OR "
+            "OLD.review_task_id IS NOT NEW.review_task_id OR OLD.release_version_id IS "
+            "NOT NEW.release_version_id OR NEW.lock_version <> OLD.lock_version + 1 OR "
+            "NOT ((OLD.pending_revision_id IS NULL AND NEW.pending_revision_id IS NOT NULL "
+            "AND NEW.active_revision_id IS OLD.active_revision_id) OR "
+            "(OLD.pending_revision_id IS NOT NULL AND NEW.pending_revision_id IS NULL AND "
+            "(NEW.active_revision_id IS OLD.pending_revision_id OR "
+            "NEW.active_revision_id IS OLD.active_revision_id))) THEN RAISE(ABORT, "
+            "'X teaser revision head transition is invalid') END; END",
+            "CREATE TRIGGER x_teaser_revision_heads_reject_delete BEFORE DELETE ON "
+            "x_teaser_revision_heads BEGIN SELECT RAISE(ABORT, 'X teaser revision head "
+            "cannot be deleted'); END",
+        ),
+    ),
+):
+    for _statement in _statements:
+        event.listen(
+            _table,
+            "after_create",
+            _ddl(_statement).execute_if(dialect="sqlite"),
+        )
+
+
+for _table, _function, _trigger in (
+    (
+        XTeaserRevision.__table__,
+        "CREATE OR REPLACE FUNCTION gen_automation_guard_x_teaser_revision_mutation() "
+        "RETURNS trigger AS $$ BEGIN IF TG_OP <> 'INSERT' THEN RAISE EXCEPTION "
+        "'X teaser revisions are append-only'; END IF; RETURN NEW; END; $$ LANGUAGE plpgsql",
+        "CREATE TRIGGER x_teaser_revisions_guard BEFORE UPDATE OR DELETE ON "
+        "x_teaser_revisions FOR EACH ROW EXECUTE FUNCTION "
+        "gen_automation_guard_x_teaser_revision_mutation()",
+    ),
+    (
+        XTeaserRevisionMember.__table__,
+        "CREATE OR REPLACE FUNCTION gen_automation_guard_x_teaser_revision_member_mutation() "
+        "RETURNS trigger AS $$ BEGIN IF TG_OP <> 'INSERT' THEN RAISE EXCEPTION "
+        "'X teaser revision members are append-only'; END IF; IF NOT EXISTS (SELECT 1 "
+        "FROM x_teaser_revisions AS revision JOIN release_selections AS selection ON "
+        "selection.id = NEW.release_selection_id JOIN derivative_recipes AS recipe ON "
+        "recipe.id = NEW.derivative_recipe_id WHERE revision.id = NEW.revision_id AND "
+        "revision.review_task_id = NEW.review_task_id AND revision.release_version_id = "
+        "NEW.release_version_id AND selection.review_task_id = NEW.review_task_id AND "
+        "selection.release_version_id = NEW.release_version_id AND selection.asset_id = "
+        "NEW.source_asset_id AND recipe.release_version_id = NEW.release_version_id AND "
+        "recipe.watermark_asset_id = revision.watermark_asset_id AND "
+        "recipe.configuration #>> '{watermark,position}' = NEW.watermark_position AND "
+        "((NEW.derivative_job_id IS NOT NULL AND EXISTS (SELECT 1 FROM derivative_jobs "
+        "AS job WHERE job.id = NEW.derivative_job_id AND job.release_selection_id = "
+        "NEW.release_selection_id AND job.derivative_recipe_id = NEW.derivative_recipe_id "
+        "AND job.x_teaser_revision_id = NEW.revision_id)) OR "
+        "(NEW.derivative_output_id IS NOT NULL AND EXISTS (SELECT 1 FROM "
+        "derivative_outputs AS output WHERE output.id = NEW.derivative_output_id AND "
+        "output.release_selection_id = NEW.release_selection_id AND "
+        "output.derivative_recipe_id = NEW.derivative_recipe_id AND output.target = "
+        "'x_teaser')))) THEN RAISE EXCEPTION 'X teaser revision member is invalid'; END IF; "
+        "RETURN NEW; END; $$ LANGUAGE plpgsql",
+        "CREATE TRIGGER x_teaser_revision_members_guard BEFORE INSERT OR UPDATE OR DELETE ON "
+        "x_teaser_revision_members FOR EACH ROW EXECUTE FUNCTION "
+        "gen_automation_guard_x_teaser_revision_member_mutation()",
+    ),
+    (
+        XTeaserRevisionHead.__table__,
+        "CREATE OR REPLACE FUNCTION gen_automation_guard_x_teaser_revision_head_mutation() "
+        "RETURNS trigger AS $$ BEGIN IF TG_OP = 'DELETE' THEN RAISE EXCEPTION "
+        "'X teaser revision head cannot be deleted'; END IF; IF TG_OP = 'UPDATE' AND "
+        "(OLD.id IS DISTINCT FROM NEW.id OR OLD.review_task_id IS DISTINCT FROM "
+        "NEW.review_task_id OR OLD.release_version_id IS DISTINCT FROM "
+        "NEW.release_version_id OR NEW.lock_version <> OLD.lock_version + 1 OR NOT "
+        "((OLD.pending_revision_id IS NULL AND NEW.pending_revision_id IS NOT NULL AND "
+        "NEW.active_revision_id IS NOT DISTINCT FROM OLD.active_revision_id) OR "
+        "(OLD.pending_revision_id IS NOT NULL AND NEW.pending_revision_id IS NULL AND "
+        "(NEW.active_revision_id IS NOT DISTINCT FROM OLD.pending_revision_id OR "
+        "NEW.active_revision_id IS NOT DISTINCT FROM OLD.active_revision_id)))) THEN "
+        "RAISE EXCEPTION 'X teaser revision head transition is invalid'; END IF; RETURN NEW; "
+        "END; $$ LANGUAGE plpgsql",
+        "CREATE TRIGGER x_teaser_revision_heads_guard BEFORE UPDATE OR DELETE ON "
+        "x_teaser_revision_heads FOR EACH ROW EXECUTE FUNCTION "
+        "gen_automation_guard_x_teaser_revision_head_mutation()",
+    ),
+):
+    event.listen(
+        _table,
+        "after_create",
+        _ddl(_function).execute_if(dialect="postgresql"),
+    )
+    event.listen(
+        _table,
+        "after_create",
+        _ddl(_trigger).execute_if(dialect="postgresql"),
     )
 
 for _statement in (
@@ -5032,7 +5424,14 @@ for _statement in (
     "AND recipe.release_version_id = NEW.release_version_id "
     "AND recipe.expected_output_count = NEW.expected_output_count "
     "AND release.current_version_no = version.version_no "
-    "AND release.phase = 'rendering'"
+    "AND ((NEW.gates_release AND release.phase = 'rendering') OR "
+    "(NOT NEW.gates_release AND release.phase IN "
+    "('rendering', 'ready_to_publish', 'publishing', 'published') "
+    "AND EXISTS (SELECT 1 FROM x_teaser_revision_heads AS head WHERE "
+    "head.review_task_id = selection.review_task_id "
+    "AND head.release_version_id = NEW.release_version_id "
+    "AND (head.active_revision_id IS NOT NULL OR release.phase <> 'rendering') "
+    "AND head.pending_revision_id = NEW.x_teaser_revision_id)))"
     ") THEN RAISE EXCEPTION 'derivative job release snapshot is invalid'; END IF; "
     "RETURN NEW; END; $$ LANGUAGE plpgsql",
     "CREATE OR REPLACE FUNCTION gen_automation_guard_derivative_job_mutation() "
@@ -5044,6 +5443,8 @@ for _statement in (
     "OR OLD.id IS DISTINCT FROM NEW.id "
     "OR OLD.release_selection_id IS DISTINCT FROM NEW.release_selection_id "
     "OR OLD.derivative_recipe_id IS DISTINCT FROM NEW.derivative_recipe_id "
+    "OR OLD.x_teaser_revision_id IS DISTINCT FROM NEW.x_teaser_revision_id "
+    "OR OLD.gates_release IS DISTINCT FROM NEW.gates_release "
     "OR OLD.release_version_id IS DISTINCT FROM NEW.release_version_id "
     "OR OLD.logical_key IS DISTINCT FROM NEW.logical_key "
     "OR OLD.request_payload IS DISTINCT FROM NEW.request_payload "
@@ -5104,17 +5505,44 @@ for _statement in (
     "IF NEW.state = 'succeeded' AND NOT EXISTS ("
     "SELECT 1 FROM release_versions AS version "
     "JOIN releases AS release ON release.id = version.release_id "
+    "JOIN release_selections AS selection ON selection.id = OLD.release_selection_id "
     "WHERE version.id = OLD.release_version_id "
     "AND release.current_version_no = version.version_no "
-    "AND release.phase = 'rendering') THEN "
+    "AND ((NEW.gates_release AND release.phase = 'rendering') OR "
+    "(NOT NEW.gates_release AND release.phase IN "
+    "('rendering', 'ready_to_publish', 'publishing', 'published') "
+    "AND EXISTS (SELECT 1 FROM x_teaser_revision_heads AS head WHERE "
+    "head.review_task_id = selection.review_task_id "
+    "AND head.release_version_id = NEW.release_version_id "
+    "AND (head.active_revision_id IS NOT NULL OR release.phase <> 'rendering') "
+    "AND head.pending_revision_id = NEW.x_teaser_revision_id)))) THEN "
     "RAISE EXCEPTION 'derivative job release phase is invalid'; END IF; "
     "RETURN NEW; END; $$ LANGUAGE plpgsql",
     "CREATE OR REPLACE FUNCTION gen_automation_promote_rendered_release() "
     "RETURNS trigger AS $$ DECLARE changed_count integer; BEGIN "
     "IF OLD.state <> 'succeeded' AND NEW.state = 'succeeded' "
+    "AND NEW.gates_release "
     "AND NOT EXISTS (SELECT 1 FROM derivative_jobs AS pending "
     "WHERE pending.release_version_id = NEW.release_version_id "
-    "AND pending.state <> 'succeeded') THEN "
+    "AND pending.gates_release "
+    "AND pending.state <> 'succeeded' "
+    "AND ((pending.x_teaser_revision_id IS NULL AND ("
+    "EXISTS (SELECT 1 FROM derivative_recipes AS pending_recipe "
+    "WHERE pending_recipe.id = pending.derivative_recipe_id "
+    "AND pending_recipe.output_targets::jsonb ? 'full') "
+    "OR NOT EXISTS (SELECT 1 FROM release_selections AS pending_selection "
+    "JOIN x_teaser_revision_heads AS pending_head "
+    "ON pending_head.review_task_id = pending_selection.review_task_id "
+    "WHERE pending_selection.id = pending.release_selection_id "
+    "AND pending_head.release_version_id = pending.release_version_id))) "
+    "OR (pending.x_teaser_revision_id IS NOT NULL AND EXISTS ("
+    "SELECT 1 FROM release_selections AS pending_selection "
+    "JOIN x_teaser_revision_heads AS pending_head "
+    "ON pending_head.review_task_id = pending_selection.review_task_id "
+    "WHERE pending_selection.id = pending.release_selection_id "
+    "AND pending_head.release_version_id = pending.release_version_id "
+    "AND (pending_head.active_revision_id = pending.x_teaser_revision_id "
+    "OR pending_head.pending_revision_id = pending.x_teaser_revision_id))))) THEN "
     "UPDATE releases SET phase = 'ready_to_publish', "
     "lock_version = lock_version + 1 "
     "WHERE phase = 'rendering' AND id = ("

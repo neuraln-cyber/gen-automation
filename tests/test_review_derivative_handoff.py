@@ -27,13 +27,11 @@ from gen_automation.db.models import (
 )
 from gen_automation.domain.enums import AdminRole, ReleasePhase
 from gen_automation.domain.ids import uuid7
-from gen_automation.services import review_derivatives as review_derivative_service
 from gen_automation.services.authentication import AuthenticatedPrincipal
 from gen_automation.services.derivative_pipeline import (
     DerivativePipelineConflictError,
     DerivativePipelineInputError,
     DerivativePipelineNotFoundError,
-    DerivativePlanResult,
 )
 from gen_automation.services.derivatives import WatermarkPosition
 from gen_automation.services.review_derivatives import (
@@ -55,132 +53,6 @@ from tests.test_derivative_pipeline import (
     approved_context as derivative_approved_context,  # noqa: F401
 )
 from tests.test_derivative_runtime import _watermark_png
-
-
-@pytest.mark.asyncio
-async def test_four_corner_plan_recovers_idempotently_after_partial_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    review_task_id = uuid4()
-    release_version_id = uuid4()
-    actor_id = uuid4()
-    watermark_id = uuid4()
-    asset_ids = tuple(uuid4() for _ in range(4))
-    placements = dict(zip(asset_ids, tuple(WatermarkPosition), strict=True))
-    stored: dict[
-        str,
-        tuple[tuple[str, tuple[UUID, ...]], DerivativePlanResult],
-    ] = {}
-    failed_once = False
-
-    async def selected(*_args: object, **_kwargs: object) -> tuple[UUID, ...]:
-        return asset_ids
-
-    async def plan(_session: object, **kwargs: object) -> DerivativePlanResult:
-        nonlocal failed_once
-        key = str(kwargs["idempotency_key"])
-        position = str(kwargs["configuration"]["watermark"]["position"])  # type: ignore[index]
-        requested = tuple(kwargs["x_teaser_asset_ids"])  # type: ignore[arg-type]
-        identity = (position, requested)
-        previous = stored.get(key)
-        if previous is not None:
-            if previous[0] != identity:
-                raise DerivativePipelineConflictError(
-                    "idempotency key was already used for another derivative plan"
-                )
-            result = previous[1]
-            return DerivativePlanResult(
-                review_task_id=result.review_task_id,
-                recipe_id=result.recipe_id,
-                release_version_id=result.release_version_id,
-                job_ids=result.job_ids,
-                jobs_created=result.jobs_created,
-                total_jobs=result.total_jobs,
-                replayed=True,
-            )
-        if position == WatermarkPosition.BOTTOM_LEFT.value and not failed_once:
-            failed_once = True
-            raise RuntimeError("simulated interruption after two frozen recipes")
-        result = DerivativePlanResult(
-            review_task_id=review_task_id,
-            recipe_id=uuid4(),
-            release_version_id=release_version_id,
-            job_ids=(uuid4(),),
-            jobs_created=1,
-            total_jobs=1,
-            replayed=False,
-        )
-        stored[key] = (identity, result)
-        return result
-
-    monkeypatch.setattr(review_derivative_service, "_x_selected_asset_ids", selected)
-    monkeypatch.setattr(
-        review_derivative_service,
-        "create_derivative_recipe_and_plan",
-        plan,
-    )
-
-    with pytest.raises(RuntimeError, match="simulated interruption"):
-        await prepare_completed_review_x_teasers(
-            object(),  # type: ignore[arg-type]
-            review_task_id=review_task_id,
-            actor_user_id=actor_id,
-            idempotency_key="four-corner-plan",
-            watermark_asset_id=watermark_id,
-            watermark_positions_by_asset_id=placements,
-            now=PLAN_AT,
-        )
-    assert len(stored) == 2
-
-    recovered = await prepare_completed_review_x_teasers(
-        object(),  # type: ignore[arg-type]
-        review_task_id=review_task_id,
-        actor_user_id=actor_id,
-        idempotency_key="four-corner-plan",
-        watermark_asset_id=watermark_id,
-        watermark_positions_by_asset_id=placements,
-        now=PLAN_AT,
-    )
-    assert recovered.total_jobs == 4
-    assert recovered.jobs_created == 4
-    assert recovered.replayed is False
-    assert {identity[0] for identity, _result in stored.values()} == {
-        position.value for position in WatermarkPosition
-    }
-    assert {identity[1] for identity, _result in stored.values()} == {
-        (asset_id,) for asset_id in asset_ids
-    }
-
-    replay = await prepare_completed_review_x_teasers(
-        object(),  # type: ignore[arg-type]
-        review_task_id=review_task_id,
-        actor_user_id=actor_id,
-        idempotency_key="four-corner-plan",
-        watermark_asset_id=watermark_id,
-        watermark_positions_by_asset_id=placements,
-        now=PLAN_AT,
-    )
-    assert replay.replayed is True
-    assert replay.job_ids == recovered.job_ids
-
-    swapped = dict(placements)
-    swapped[asset_ids[0]], swapped[asset_ids[1]] = (
-        swapped[asset_ids[1]],
-        swapped[asset_ids[0]],
-    )
-    with pytest.raises(
-        DerivativePipelineConflictError,
-        match="idempotency key was already used",
-    ):
-        await prepare_completed_review_x_teasers(
-            object(),  # type: ignore[arg-type]
-            review_task_id=review_task_id,
-            actor_user_id=actor_id,
-            idempotency_key="four-corner-plan",
-            watermark_asset_id=watermark_id,
-            watermark_positions_by_asset_id=swapped,
-            now=PLAN_AT,
-        )
 
 
 def _principal(user_id: UUID) -> AuthenticatedPrincipal:
@@ -327,9 +199,12 @@ async def test_full_outputs_and_x_teasers_are_planned_independently(
         x_recipe = await session.get(DerivativeRecipe, x_plan.recipe_id)
         assert x_recipe is not None
         assert x_recipe.configuration["watermark"]["position"] == "top_left"
+        x_job = await session.get(DerivativeJob, x_plan.job_ids[0])
+        assert x_job is not None
+        assert x_job.gates_release is False
         release = await session.get(Release, approved.release_id)
         assert release is not None
-        assert release.phase == ReleasePhase.RENDERING
+        assert release.phase == ReleasePhase.READY_TO_PUBLISH
         replay_plan = await prepare_completed_review_x_teasers(
             session,
             review_task_id=approved.review_task_id,
@@ -344,7 +219,7 @@ async def test_full_outputs_and_x_teasers_are_planned_independently(
         assert replay_plan.total_jobs == 1
         with pytest.raises(
             DerivativePipelineConflictError,
-            match="selection target already has a different frozen recipe",
+            match="an X teaser replacement is already in progress",
         ):
             await prepare_completed_review_x_teasers(
                 session,

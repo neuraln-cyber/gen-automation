@@ -29,6 +29,27 @@ from gen_automation.services.operator_delivery import (
     OperatorDeliveryNotFoundError,
     OperatorDeliverySnapshot,
 )
+from gen_automation.services.x_teaser_revisions import XTeaserRevisionStatus
+
+
+@pytest.fixture(autouse=True)
+def _stub_x_teaser_revision_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def no_revision(*_args: object, **_kwargs: object) -> XTeaserRevisionStatus:
+        return XTeaserRevisionStatus(
+            active_revision_id=None,
+            active_revision_no=None,
+            pending_revision_id=None,
+            pending_state=None,
+            pending_total=0,
+            pending_succeeded=0,
+            pending_failed=0,
+            can_replace=False,
+            blocked_reason=None,
+            current_watermark_asset_id=None,
+            current_positions_by_asset_id={},
+        )
+
+    monkeypatch.setattr(delivery_routes, "x_teaser_revision_status", no_revision)
 
 
 def _progress(**overrides: object) -> DerivativeProgress:
@@ -45,6 +66,13 @@ def _progress(**overrides: object) -> DerivativeProgress:
         "expected_x_teasers": 1,
         "ready_x_teasers": 1,
         "ready_for_destinations": True,
+        "full_total_jobs": 2,
+        "full_requested": 0,
+        "full_running": 0,
+        "full_retrying": 0,
+        "full_succeeded": 2,
+        "full_failed": 0,
+        "full_cancelled": 0,
     }
     values.update(overrides)
     return DerivativeProgress(**values)  # type: ignore[arg-type]
@@ -258,6 +286,37 @@ def test_derivative_progress_distinguishes_ready_failed_and_stalled_work() -> No
     assert stalled.stalled
 
 
+def test_clean_output_progress_ignores_completed_x_only_jobs() -> None:
+    x_only = _progress(
+        total_jobs=4,
+        succeeded=4,
+        expected_full_outputs=199,
+        ready_full_outputs=0,
+        expected_x_teasers=4,
+        ready_x_teasers=4,
+        ready_for_destinations=False,
+        full_total_jobs=0,
+        full_succeeded=0,
+    )
+
+    assert x_only.planned
+    assert x_only.outputs_ready is False
+    assert x_only.stalled
+    assert x_only.full_planned is False
+    assert x_only.full_active_jobs == 0
+    assert x_only.full_terminal_failures is False
+    assert x_only.full_stalled is False
+
+    payload = delivery_routes._delivery_progress_payload(
+        _snapshot(progress=x_only, publishing_guard_enabled=False),
+        finished_set_archive=None,
+    )
+    assert payload["outputs"]["state"] == "not_started"
+    assert payload["outputs"]["planned"] is True
+    assert payload["outputs"]["full_planned"] is False
+    assert payload["outputs"]["full_total_jobs"] == 0
+
+
 def test_patreon_picker_uses_raw_source_thumbnail_instead_of_full_derivative() -> None:
     source_asset_id = uuid4()
     output = DeliveryOutput(
@@ -312,6 +371,14 @@ def test_delivery_progress_payload_reports_ready_archive_parts_in_global_order()
             "succeeded": 3,
             "failed": 0,
             "active_jobs": 0,
+            "full_planned": True,
+            "full_total_jobs": 2,
+            "full_requested": 0,
+            "full_running": 0,
+            "full_retrying": 0,
+            "full_succeeded": 2,
+            "full_failed": 0,
+            "full_active_jobs": 0,
             "expected_full_outputs": 2,
             "ready_full_outputs": 2,
             "expected_x_teasers": 1,
@@ -543,6 +610,8 @@ async def test_delivery_progress_endpoint_is_owner_only_private_and_no_store(
         progress=_progress(
             requested=1,
             succeeded=2,
+            full_requested=1,
+            full_succeeded=1,
             ready_full_outputs=1,
             ready_x_teasers=1,
             ready_for_destinations=False,
@@ -570,6 +639,7 @@ async def test_delivery_progress_endpoint_is_owner_only_private_and_no_store(
     payload = json.loads(response.body)
     assert payload["outputs"]["state"] == "rendering"
     assert payload["outputs"]["active_jobs"] == 1
+    assert payload["outputs"]["full_active_jobs"] == 1
     assert payload["poll_after_ms"] == 3000
 
     forbidden = await delivery_routes.dashboard_review_delivery_progress(
@@ -641,6 +711,53 @@ async def test_delivery_page_renders_prepare_zip_fallback_without_archive_row(
 
 
 @pytest.mark.asyncio
+async def test_delivery_page_can_prepare_full_set_after_x_only_jobs_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x_only = _progress(
+        total_jobs=4,
+        succeeded=4,
+        expected_full_outputs=199,
+        ready_full_outputs=0,
+        expected_x_teasers=4,
+        ready_x_teasers=4,
+        ready_for_destinations=False,
+        full_total_jobs=0,
+        full_succeeded=0,
+    )
+    snapshot = _snapshot(progress=x_only, publishing_guard_enabled=False)
+
+    async def load(*_args: object, **_kwargs: object) -> OperatorDeliverySnapshot:
+        return snapshot
+
+    async def no_archive(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def no_watermarks(*_args: object, **_kwargs: object) -> tuple[()]:
+        return ()
+
+    monkeypatch.setattr(delivery_routes, "load_operator_delivery", load)
+    monkeypatch.setattr(delivery_routes, "load_finished_set_archive", no_archive)
+    monkeypatch.setattr(delivery_routes, "list_registered_watermarks", no_watermarks)
+    response = await delivery_routes.dashboard_review_delivery(
+        snapshot.review_task_id,
+        _delivery_request(
+            _settings(publishing_enabled=False),
+            snapshot.review_task_id,
+        ),
+        SimpleNamespace(),  # type: ignore[arg-type]
+        _principal(),
+    )
+
+    html = bytes(response.body).decode()
+    assert response.status_code == 200
+    assert "Ready to prepare clean publishing copies" in html
+    assert "Prepare clean full set" in html
+    assert "delivery:prepare-outputs" in html
+    assert "operator repair is required" not in html
+
+
+@pytest.mark.asyncio
 async def test_delivery_page_exposes_zip_queue_while_destination_copies_render(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -648,6 +765,8 @@ async def test_delivery_page_exposes_zip_queue_while_destination_copies_render(
         progress=_progress(
             requested=1,
             succeeded=2,
+            full_requested=1,
+            full_succeeded=1,
             ready_full_outputs=1,
             ready_x_teasers=1,
             ready_for_destinations=False,

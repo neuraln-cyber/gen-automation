@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from gen_automation.db.models import (
     DerivativeJob,
     DerivativeOutput,
+    DerivativeRecipe,
     FinishedSetArchive,
     MegaSetDelivery,
     PublicationAttempt,
@@ -22,6 +23,7 @@ from gen_automation.db.models import (
     ReleaseVersion,
     ReviewTask,
     ReviewXSelection,
+    XTeaserRevisionHead,
 )
 from gen_automation.domain.enums import (
     AdminRole,
@@ -34,6 +36,7 @@ from gen_automation.domain.enums import (
     ReleasePhase,
     ReviewTaskState,
 )
+from gen_automation.services.derivative_pipeline import DerivativePipelineConflictError
 from gen_automation.services.publication import (
     PUBLICATION_EFFECT_APPROVAL_ATTESTATION,
     PublicationConflictError,
@@ -48,6 +51,7 @@ from gen_automation.services.publication import (
     get_publication_guard,
     plan_publication_intent,
 )
+from gen_automation.services.x_teaser_revisions import active_x_teaser_outputs
 
 
 class OperatorDeliveryError(Exception):
@@ -114,6 +118,13 @@ class DerivativeProgress:
     ready_x_teasers: int
     ready_for_destinations: bool
     cancelled: int = 0
+    full_total_jobs: int = 0
+    full_requested: int = 0
+    full_running: int = 0
+    full_retrying: int = 0
+    full_succeeded: int = 0
+    full_failed: int = 0
+    full_cancelled: int = 0
 
     @property
     def active_jobs(self) -> int:
@@ -139,9 +150,38 @@ class DerivativeProgress:
         """Whether clean full-set copies are ready, independent of X teasers."""
 
         return (
-            self.planned
+            self.full_planned
             and self.expected_full_outputs > 0
             and self.ready_full_outputs == self.expected_full_outputs
+        )
+
+    @property
+    def full_planned(self) -> bool:
+        """Whether clean full-output work has actually been planned."""
+
+        return self.full_total_jobs > 0
+
+    @property
+    def full_active_jobs(self) -> int:
+        """Clean full-output jobs which can still make progress automatically."""
+
+        return self.full_requested + self.full_running + self.full_retrying
+
+    @property
+    def full_terminal_failures(self) -> bool:
+        """Whether clean full-output work ended with a non-cancellation failure."""
+
+        return self.full_failed - self.full_cancelled > 0 and self.full_active_jobs == 0
+
+    @property
+    def full_stalled(self) -> bool:
+        """Whether planned clean full-output work stopped without a retryable failure."""
+
+        return (
+            self.full_planned
+            and not self.full_outputs_ready
+            and self.full_active_jobs == 0
+            and not self.full_terminal_failures
         )
 
     @property
@@ -270,14 +310,22 @@ async def load_operator_delivery(
             )
         ).all()
     )
-    jobs = tuple(
+    job_rows = tuple(
         (
-            await session.scalars(
-                select(DerivativeJob)
+            await session.execute(
+                select(DerivativeJob, DerivativeRecipe.output_targets)
+                .join(
+                    DerivativeRecipe,
+                    DerivativeRecipe.id == DerivativeJob.derivative_recipe_id,
+                )
                 .where(DerivativeJob.release_version_id == release_version.id)
                 .order_by(DerivativeJob.requested_at, DerivativeJob.id)
             )
         ).all()
+    )
+    jobs = tuple(job for job, _targets in job_rows)
+    full_jobs = tuple(
+        job for job, targets in job_rows if isinstance(targets, list) and "full" in targets
     )
     output_rows = (
         await session.execute(
@@ -299,8 +347,22 @@ async def load_operator_delivery(
         selection_order=selection_order,
         selection_sources=selection_sources,
     )
+    revision_head = await session.scalar(
+        select(XTeaserRevisionHead).where(XTeaserRevisionHead.review_task_id == review_task.id)
+    )
+    active_revision_outputs: tuple[DerivativeOutput, ...] = ()
+    if revision_head is not None and revision_head.active_revision_id is not None:
+        try:
+            active_revision_outputs = await active_x_teaser_outputs(
+                session,
+                review_task_id=review_task.id,
+            )
+        except DerivativePipelineConflictError:
+            # A damaged X snapshot must fail closed for X without blocking
+            # independently prepared full-set delivery targets.
+            active_revision_outputs = ()
     x_outputs = _ordered_outputs(
-        succeeded_outputs,
+        list(active_revision_outputs),
         target="x_teaser",
         selection_order=selection_order,
         selection_sources=selection_sources,
@@ -318,6 +380,9 @@ async def load_operator_delivery(
         if selection.asset_id in x_selected_asset_ids
     )
     state_counts = {state: sum(job.state == state for job in jobs) for state in DerivativeJobState}
+    full_state_counts = {
+        state: sum(job.state == state for job in full_jobs) for state in DerivativeJobState
+    }
     ready_for_destinations = (
         review_task.state == ReviewTaskState.COMPLETED
         and release.phase == ReleasePhase.READY_TO_PUBLISH
@@ -344,6 +409,19 @@ async def load_operator_delivery(
         ready_x_teasers=len(x_outputs),
         ready_for_destinations=ready_for_destinations,
         cancelled=state_counts[DerivativeJobState.CANCELLED],
+        full_total_jobs=len(full_jobs),
+        full_requested=full_state_counts[DerivativeJobState.REQUESTED],
+        full_running=(
+            full_state_counts[DerivativeJobState.CLAIMED]
+            + full_state_counts[DerivativeJobState.PROCESSING]
+        ),
+        full_retrying=full_state_counts[DerivativeJobState.RETRY_WAIT],
+        full_succeeded=full_state_counts[DerivativeJobState.SUCCEEDED],
+        full_failed=(
+            full_state_counts[DerivativeJobState.FAILED]
+            + full_state_counts[DerivativeJobState.CANCELLED]
+        ),
+        full_cancelled=full_state_counts[DerivativeJobState.CANCELLED],
     )
 
     try:

@@ -112,6 +112,7 @@ from gen_automation.services.x_teaser_access import (
     XTeaserAccessStorageError,
     read_review_x_teaser,
 )
+from gen_automation.services.x_teaser_revisions import x_teaser_revision_status
 from gen_automation.storage.base import ObjectStore, ObjectStoreError
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"], include_in_schema=False)
@@ -187,6 +188,10 @@ async def dashboard_review_delivery(
         watermarks = _watermark_views(review_task_id, registered_watermarks)
         x_previews = _x_preview_views(snapshot)
         x_output_downloads = _x_output_download_views(snapshot)
+        x_teaser_revision = await x_teaser_revision_status(
+            session,
+            review_task_id=review_task_id,
+        )
     except (OperatorDeliveryNotFoundError, FinishedSetArchiveNotFoundError):
         return _error(
             request,
@@ -209,6 +214,7 @@ async def dashboard_review_delivery(
     output_submission_id = uuid4()
     retry_output_submission_id = uuid4()
     x_output_submission_id = uuid4()
+    x_replace_output_submission_id = uuid4()
     archive_submission_id = uuid4()
     patreon_destination_submission_id = uuid4()
     x_destination_submission_id = uuid4()
@@ -232,6 +238,12 @@ async def dashboard_review_delivery(
         session_id=principal.session_id,
         action="prepare-x-outputs",
         parts=(str(review_task_id), str(x_output_submission_id)),
+    )
+    x_replace_output_key = delivery_form_key(
+        settings,
+        session_id=principal.session_id,
+        action="replace-x-outputs",
+        parts=(str(review_task_id), str(x_replace_output_submission_id)),
     )
     archive_key = delivery_form_key(
         settings,
@@ -366,10 +378,12 @@ async def dashboard_review_delivery(
                 "previews": previews,
                 "x_previews": x_previews,
                 "x_output_downloads": x_output_downloads,
+                "x_teaser_revision": x_teaser_revision,
                 "csrf_token": csrf_token,
                 "output_submission_id": output_submission_id,
                 "retry_output_submission_id": retry_output_submission_id,
                 "x_output_submission_id": x_output_submission_id,
+                "x_replace_output_submission_id": x_replace_output_submission_id,
                 "archive_submission_id": archive_submission_id,
                 "patreon_destination_submission_id": patreon_destination_submission_id,
                 "x_destination_submission_id": x_destination_submission_id,
@@ -381,6 +395,7 @@ async def dashboard_review_delivery(
                 "output_idempotency_key": output_key,
                 "retry_output_idempotency_key": retry_output_key,
                 "x_output_idempotency_key": x_output_key,
+                "x_replace_output_idempotency_key": x_replace_output_key,
                 "archive_idempotency_key": archive_key,
                 "patreon_destination_idempotency_key": patreon_destination_key,
                 "x_destination_idempotency_key": x_destination_key,
@@ -797,6 +812,7 @@ async def dashboard_prepare_x_outputs(
             watermark_positions_by_asset_id=(
                 dict(form.watermark_placements) if form.watermark_placements else None
             ),
+            require_active_revision=False,
         )
     except BrowserDeliveryFormError as error:
         return _form_error(request, principal, error.status_code, error.message)
@@ -812,6 +828,65 @@ async def dashboard_prepare_x_outputs(
             principal,
             status.HTTP_409_CONFLICT,
             "X teasers could not be prepared from the current review snapshot.",
+        )
+    return _redirect(review_task_id)
+
+
+@router.post(
+    "/review-tasks/{review_task_id}/delivery:replace-x-outputs",
+    response_class=HTMLResponse,
+    response_model=None,
+)
+async def dashboard_replace_x_outputs(
+    review_task_id: UUID,
+    request: Request,
+    session: Session,
+    principal: PublicationReader,
+) -> Response:
+    """Render a new X-only revision while the active teasers remain usable."""
+
+    try:
+        form = await read_prepare_output_form(request)
+        owner = await _verified_mutation_owner(request, session, principal, form.csrf_token)
+        expected_key = delivery_form_key(
+            request.app.state.settings,
+            session_id=owner.session_id,
+            action="replace-x-outputs",
+            parts=(str(review_task_id), str(form.submission_id)),
+        )
+        if not form_key_matches(form.idempotency_key, expected_key):
+            raise BrowserDeliveryFormError(status_code=status.HTTP_400_BAD_REQUEST)
+        if form.watermark_asset_id is None or form.watermark_position is None:
+            raise BrowserDeliveryFormError(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                message="Choose a saved watermark and a corner for every X teaser.",
+            )
+        await prepare_completed_review_x_teasers(
+            session,
+            review_task_id=review_task_id,
+            actor_user_id=owner.user_id,
+            idempotency_key=form.idempotency_key,
+            watermark_asset_id=form.watermark_asset_id,
+            watermark_position=form.watermark_position,
+            watermark_positions_by_asset_id=(
+                dict(form.watermark_placements) if form.watermark_placements else None
+            ),
+            require_active_revision=True,
+        )
+    except BrowserDeliveryFormError as error:
+        return _form_error(request, principal, error.status_code, error.message)
+    except HTTPException:
+        return _form_error(request, principal, status.HTTP_403_FORBIDDEN, "Request denied.")
+    except (
+        DerivativePipelineInputError,
+        DerivativePipelineNotFoundError,
+        DerivativePipelineConflictError,
+    ) as error:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_409_CONFLICT,
+            str(error) or "X teaser replacement could not be started.",
         )
     return _redirect(review_task_id)
 
@@ -1691,11 +1766,11 @@ def _delivery_progress_payload(
     progress = snapshot.progress
     if progress.full_outputs_ready:
         output_state = "ready"
-    elif progress.terminal_failures:
+    elif progress.full_terminal_failures:
         output_state = "failed"
-    elif progress.stalled:
+    elif progress.full_stalled:
         output_state = "stalled"
-    elif progress.planned:
+    elif progress.full_planned:
         output_state = "rendering"
     else:
         output_state = "not_started"
@@ -1763,6 +1838,14 @@ def _delivery_progress_payload(
             "succeeded": progress.succeeded,
             "failed": progress.failed,
             "active_jobs": progress.active_jobs,
+            "full_planned": progress.full_planned,
+            "full_total_jobs": progress.full_total_jobs,
+            "full_requested": progress.full_requested,
+            "full_running": progress.full_running,
+            "full_retrying": progress.full_retrying,
+            "full_succeeded": progress.full_succeeded,
+            "full_failed": progress.full_failed,
+            "full_active_jobs": progress.full_active_jobs,
             "expected_full_outputs": progress.expected_full_outputs,
             "ready_full_outputs": progress.ready_full_outputs,
             "expected_x_teasers": progress.expected_x_teasers,

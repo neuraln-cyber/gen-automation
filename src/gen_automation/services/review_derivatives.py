@@ -11,7 +11,13 @@ import PIL
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from gen_automation.db.models import ReviewXSelection
+from gen_automation.db.models import (
+    DerivativeJob,
+    ReviewXSelection,
+    XTeaserRevisionMember,
+)
+from gen_automation.domain.canonical import canonical_sha256
+from gen_automation.domain.ids import uuid7
 from gen_automation.services.derivative_pipeline import (
     DerivativePipelineConflictError,
     DerivativePipelineInputError,
@@ -26,6 +32,10 @@ from gen_automation.services.derivatives import (
     DerivativeRecipe,
     WatermarkPosition,
     WatermarkSpec,
+)
+from gen_automation.services.x_teaser_revisions import (
+    activate_ready_x_teaser_revision,
+    create_pending_x_teaser_revision,
 )
 
 
@@ -69,6 +79,7 @@ async def prepare_completed_review_x_teasers(
     watermark_positions_by_asset_id: Mapping[UUID, WatermarkPosition] | None = None,
     max_attempts: int = 3,
     now: datetime | None = None,
+    require_active_revision: bool | None = None,
 ) -> DerivativePlanResult:
     """Plan only the explicitly selected, watermarked X teaser outputs."""
 
@@ -89,7 +100,68 @@ async def prepare_completed_review_x_teasers(
     for asset_id in selected_asset_ids:
         groups.setdefault(positions[asset_id], []).append(asset_id)
 
+    render_profile_sha256 = canonical_sha256(
+        {
+            "schema": "x-teaser-render-profile/v1",
+            "recipe_version": 1,
+            "renderer_version": DERIVATIVE_RENDERER_VERSION,
+            "pillow_version": PIL.__version__,
+            "configurations": {
+                position.value: derivative_recipe_configuration(
+                    DerivativeRecipe(watermark=WatermarkSpec(position=position))
+                )
+                for position in sorted(groups, key=lambda value: value.value)
+            },
+        }
+    )
+
     planned_at = now or datetime.now(UTC)
+    (
+        revision,
+        _revision_head,
+        selections,
+        revision_replayed,
+        gates_release,
+    ) = await create_pending_x_teaser_revision(
+        session,
+        review_task_id=review_task_id,
+        watermark_asset_id=watermark_asset_id,
+        positions_by_asset_id={
+            asset_id: position.value for asset_id, position in positions.items()
+        },
+        actor_user_id=actor_user_id,
+        idempotency_key=idempotency_key,
+        created_at=planned_at,
+        require_active_revision=require_active_revision,
+        render_profile_sha256=render_profile_sha256,
+    )
+    if revision_replayed:
+        members = tuple(
+            (
+                await session.scalars(
+                    select(XTeaserRevisionMember)
+                    .where(XTeaserRevisionMember.revision_id == revision.id)
+                    .order_by(XTeaserRevisionMember.display_order)
+                )
+            ).all()
+        )
+        if not members:
+            raise DerivativePipelineConflictError("replayed X teaser revision is incomplete")
+        await session.commit()
+        return DerivativePlanResult(
+            review_task_id=review_task_id,
+            recipe_id=members[0].derivative_recipe_id,
+            release_version_id=revision.release_version_id,
+            job_ids=tuple(
+                member.derivative_job_id
+                for member in members
+                if member.derivative_job_id is not None
+            ),
+            jobs_created=0,
+            total_jobs=sum(member.derivative_job_id is not None for member in members),
+            replayed=True,
+        )
+
     results: list[DerivativePlanResult] = []
     multiple_recipes = len(groups) > 1
     for offset, position in enumerate(WatermarkPosition):
@@ -113,23 +185,70 @@ async def prepare_completed_review_x_teasers(
             ),
             output_targets=("x_teaser",),
             watermark_asset_id=watermark_asset_id,
-            x_teaser_asset_ids=tuple(asset_ids) if multiple_recipes else None,
+            x_teaser_asset_ids=tuple(asset_ids),
+            x_teaser_revision_id=revision.id,
+            gates_release=gates_release,
             max_attempts=max_attempts,
+            commit=False,
             now=planned_at + timedelta(microseconds=offset),
         )
         results.append(result)
 
-    first = results[0]
-    if any(result.release_version_id != first.release_version_id for result in results[1:]):
-        raise DerivativePipelineConflictError("X teaser plans do not share a release version")
+    planned_jobs = tuple(
+        (
+            await session.scalars(
+                select(DerivativeJob).where(DerivativeJob.x_teaser_revision_id == revision.id)
+            )
+        ).all()
+    )
+    jobs_by_asset = {UUID(job.request_payload["source"]["asset_id"]): job for job in planned_jobs}
+    recipe_ids: list[UUID] = []
+    for selection in selections:
+        job = jobs_by_asset.get(selection.asset_id)
+        if job is not None:
+            recipe_id = job.derivative_recipe_id
+            output_id = None
+            job_id = job.id
+        else:
+            raise DerivativePipelineConflictError("X teaser revision member was not planned")
+        recipe_ids.append(recipe_id)
+        session.add(
+            XTeaserRevisionMember(
+                id=uuid7(),
+                revision_id=revision.id,
+                review_task_id=review_task_id,
+                release_version_id=revision.release_version_id,
+                release_selection_id=selection.id,
+                source_asset_id=selection.asset_id,
+                display_order=selection.display_order,
+                watermark_position=positions[selection.asset_id].value,
+                derivative_recipe_id=recipe_id,
+                derivative_job_id=job_id,
+                derivative_output_id=output_id,
+                created_at=planned_at,
+            )
+        )
+    await session.flush()
+    if not planned_jobs:
+        activated = await activate_ready_x_teaser_revision(
+            session,
+            revision_id=revision.id,
+            activated_at=planned_at,
+        )
+        if not activated:
+            raise DerivativePipelineConflictError("X teaser revision did not activate")
+    await session.commit()
+    if not recipe_ids:
+        raise DerivativePipelineConflictError("X teaser revision has no recipes")
+    first_result = results[0] if results else None
     return DerivativePlanResult(
-        review_task_id=first.review_task_id,
-        recipe_id=first.recipe_id,
-        release_version_id=first.release_version_id,
-        job_ids=tuple(job_id for result in results for job_id in result.job_ids),
+        review_task_id=review_task_id,
+        recipe_id=recipe_ids[0],
+        release_version_id=revision.release_version_id,
+        job_ids=tuple(job.id for job in planned_jobs),
         jobs_created=sum(result.jobs_created for result in results),
-        total_jobs=sum(result.total_jobs for result in results),
-        replayed=all(result.replayed for result in results),
+        total_jobs=len(planned_jobs),
+        replayed=(first_result.replayed if first_result is not None else False),
     )
 
 
@@ -200,6 +319,7 @@ async def prepare_completed_review_derivatives(
         watermark_positions_by_asset_id=watermark_positions_by_asset_id,
         max_attempts=max_attempts,
         now=planned_at + timedelta(microseconds=1),
+        require_active_revision=False,
     )
     return DerivativePlanResult(
         review_task_id=full.review_task_id,

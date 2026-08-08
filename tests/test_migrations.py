@@ -1,4 +1,5 @@
 import hashlib
+import inspect as python_inspect
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -108,20 +109,23 @@ def test_semantic_feedback_report_uses_jsonb_on_postgresql() -> None:
     assert isinstance(report_type, postgresql.JSONB)
 
 
-def test_derivative_owner_retry_revision_is_the_migration_head() -> None:
+def test_x_teaser_revision_is_the_migration_head() -> None:
     configuration = Config("alembic.ini")
     scripts = ScriptDirectory.from_config(configuration)
     independent_targets_revision = scripts.get_revision("20260808_0024")
     target_ready_revision = scripts.get_revision("20260808_0025")
-    revision = scripts.get_revision("20260808_0026")
+    owner_retry_revision = scripts.get_revision("20260808_0026")
+    revision = scripts.get_revision("20260808_0027")
 
     assert independent_targets_revision is not None
     assert independent_targets_revision.down_revision == "20260808_0023"
     assert target_ready_revision is not None
     assert target_ready_revision.down_revision == "20260808_0024"
+    assert owner_retry_revision is not None
+    assert owner_retry_revision.down_revision == "20260808_0025"
     assert revision is not None
-    assert revision.down_revision == "20260808_0025"
-    assert scripts.get_current_head() == "20260808_0026"
+    assert revision.down_revision == "20260808_0026"
+    assert scripts.get_current_head() == "20260808_0027"
 
 
 def test_derivative_owner_retry_postgresql_guard_is_narrow_and_bounded(
@@ -153,6 +157,43 @@ def test_derivative_owner_retry_postgresql_guard_is_narrow_and_bounded(
     assert "output_object_conflict" in guard
     assert "retry_recipe.output_targets::jsonb = '[\"full\"]'::jsonb" in guard
     assert "retry_release.phase = 'rendering'" in guard
+
+
+def test_x_teaser_revision_postgresql_backfill_disables_legacy_job_guards(
+    monkeypatch,
+) -> None:
+    configuration = Config("alembic.ini")
+    revision = ScriptDirectory.from_config(configuration).get_revision("20260808_0027")
+    assert revision is not None
+
+    statements: list[str] = []
+    monkeypatch.setattr(
+        revision.module.op,
+        "execute",
+        lambda statement: statements.append(str(statement)),
+    )
+    revision.module._drop_postgresql_job_triggers()
+    revision.module._create_postgresql_job_triggers()
+
+    assert statements[:3] == [
+        "DROP TRIGGER IF EXISTS derivative_jobs_guard_insert ON derivative_jobs",
+        "DROP TRIGGER IF EXISTS derivative_jobs_guard_mutation ON derivative_jobs",
+        "DROP TRIGGER IF EXISTS derivative_jobs_promote_release_after_success ON derivative_jobs",
+    ]
+    assert statements[3:] == [
+        "CREATE TRIGGER derivative_jobs_guard_insert BEFORE INSERT ON derivative_jobs "
+        "FOR EACH ROW EXECUTE FUNCTION gen_automation_guard_derivative_job_insert()",
+        "CREATE TRIGGER derivative_jobs_guard_mutation BEFORE UPDATE OR DELETE ON derivative_jobs "
+        "FOR EACH ROW EXECUTE FUNCTION gen_automation_guard_derivative_job_mutation()",
+        "CREATE TRIGGER derivative_jobs_promote_release_after_success AFTER UPDATE ON "
+        "derivative_jobs FOR EACH ROW EXECUTE FUNCTION "
+        "gen_automation_promote_rendered_release()",
+    ]
+    upgrade_source = python_inspect.getsource(revision.module.upgrade)
+    drop_offset = upgrade_source.index("_drop_postgresql_job_triggers()")
+    backfill_offset = upgrade_source.index("UPDATE derivative_jobs SET gates_release = true")
+    recreate_offset = upgrade_source.index("_create_postgresql_job_triggers()")
+    assert drop_offset < backfill_offset < recreate_offset
 
 
 def test_derivative_owner_retry_downgrade_restores_terminal_failed_jobs(
@@ -311,8 +352,15 @@ def test_foundation_migration_round_trip(
         "workflow_approvals",
         "wildcard_libraries",
         "wildcard_library_versions",
+        "x_teaser_revision_heads",
+        "x_teaser_revision_members",
+        "x_teaser_revisions",
     }
     assert set(inspect(engine).get_table_names()) == expected_tables
+    assert {
+        "gates_release",
+        "x_teaser_revision_id",
+    } <= {column["name"] for column in inspect(engine).get_columns("derivative_jobs")}
     assert {
         "source_generation_job_id",
         "source_output_index",

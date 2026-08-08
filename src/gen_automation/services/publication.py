@@ -12,7 +12,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import ValidationError
-from sqlalchemy import and_, func, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,7 +35,7 @@ from gen_automation.db.models import (
     ReleaseSelection,
     ReleaseVersion,
     ReviewTask,
-    ReviewXSelection,
+    XTeaserRevisionHead,
 )
 from gen_automation.domain.canonical import canonical_json_bytes, canonical_sha256
 from gen_automation.domain.deliverability import (
@@ -78,6 +78,7 @@ from gen_automation.services.compliance import (
     ReleaseApprovalError,
     validate_release_approvals,
 )
+from gen_automation.services.x_teaser_revisions import active_x_teaser_outputs
 from gen_automation.storage.base import ObjectStore
 
 PUBLICATION_EFFECT_APPROVAL_ATTESTATION = (
@@ -325,17 +326,19 @@ async def plan_publication_intent(
         credential_reference,
     )
 
-    release_row = (
-        await session.execute(
-            select(Release, ReleaseVersion)
-            .join(ReleaseVersion, ReleaseVersion.release_id == Release.id)
-            .where(ReleaseVersion.id == release_version_id)
-            .with_for_update()
-        )
-    ).one_or_none()
-    if release_row is None:
+    # X teaser replacement takes the version mutex first as well.  Keep one
+    # explicit order so publication cannot race a zero-row intent check or
+    # deadlock against a revision activation.
+    release_version = await session.scalar(
+        select(ReleaseVersion).where(ReleaseVersion.id == release_version_id).with_for_update()
+    )
+    if release_version is None:
         raise PublicationNotFoundError("release version was not found")
-    release, release_version = release_row
+    release = await session.scalar(
+        select(Release).where(Release.id == release_version.release_id).with_for_update()
+    )
+    if release is None:
+        raise PublicationNotFoundError("release was not found")
     _require_current_publishable_release(release, release_version)
     await _require_current_compliance_approvals(session, release_version)
 
@@ -615,11 +618,9 @@ async def approve_publication_intent(
     if replay is not None:
         return replay
 
-    intent = await session.scalar(
-        select(PublicationIntent).where(PublicationIntent.id == intent_id).with_for_update()
+    intent, release, release_version, revision_head = await _lock_intent_release_ordered(
+        session, intent_id=intent_id
     )
-    if intent is None:
-        raise PublicationNotFoundError("publication intent was not found")
     if intent.intent_digest != normalized_digest or intent.lock_version != normalized_lock:
         raise PublicationConflictError("publication intent digest or lock is stale")
     if intent.state not in {
@@ -629,7 +630,6 @@ async def approve_publication_intent(
     }:
         raise PublicationConflictError("publication intent is not awaiting approval")
 
-    release, release_version = await _load_intent_release(session, intent, lock=True)
     _require_current_publishable_release(release, release_version)
     await _require_current_compliance_approvals(session, release_version)
     inputs = tuple(
@@ -642,6 +642,13 @@ async def approve_publication_intent(
         ).all()
     )
     _validate_frozen_input_set(intent, inputs)
+    if intent.target == PublicationTarget.X:
+        await _require_x_intent_matches_active_revision(
+            session,
+            intent=intent,
+            inputs=inputs,
+            revision_head=revision_head,
+        )
     available_at = _initial_attempt_available_at(
         target=intent.target,
         scheduled_at=intent.scheduled_at,
@@ -863,11 +870,9 @@ async def revoke_publication_intent(
     if replay is not None:
         return replay
 
-    intent = await session.scalar(
-        select(PublicationIntent).where(PublicationIntent.id == intent_id).with_for_update()
+    intent, release, release_version, _revision_head = await _lock_intent_release_ordered(
+        session, intent_id=intent_id
     )
-    if intent is None:
-        raise PublicationNotFoundError("publication intent was not found")
     if intent.intent_digest != normalized_digest or intent.lock_version != normalized_lock:
         raise PublicationConflictError("publication intent digest or lock is stale")
     if intent.state in {
@@ -875,7 +880,8 @@ async def revoke_publication_intent(
         PublicationIntentState.CANCELLED,
     }:
         raise PublicationConflictError("publication intent can no longer be revoked")
-    await _load_and_require_current_publishable_intent_release(session, intent)
+    _require_current_publishable_release(release, release_version)
+    await _require_current_compliance_approvals(session, release_version)
 
     revision = (
         int(
@@ -1160,7 +1166,10 @@ async def reconcile_publication_present(
     actor = await _require_publisher(session, actor_user_id, asserted_role=actor_role)
 
     intent = await session.scalar(
-        select(PublicationIntent).where(PublicationIntent.id == intent_id).with_for_update()
+        select(PublicationIntent)
+        .where(PublicationIntent.id == intent_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
     )
     if intent is None:
         raise PublicationNotFoundError("publication intent was not found")
@@ -1298,7 +1307,10 @@ async def reconcile_publication_absent(
     )
     actor = await _require_publisher(session, actor_user_id, asserted_role=actor_role)
     intent = await session.scalar(
-        select(PublicationIntent).where(PublicationIntent.id == intent_id).with_for_update()
+        select(PublicationIntent)
+        .where(PublicationIntent.id == intent_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
     )
     if intent is None:
         raise PublicationNotFoundError("publication intent was not found")
@@ -1927,33 +1939,41 @@ async def _load_frozen_outputs(
             raise PublicationInputError(
                 f"X intents require 1 to {X_MAX_MEDIA_PER_POST} teaser outputs"
             )
-        selected_output_ids = tuple(
+        review_task_ids = set(
             (
                 await session.scalars(
-                    select(DerivativeOutput.id)
+                    select(ReleaseSelection.review_task_id)
                     .join(
-                        DerivativeJob,
-                        DerivativeJob.id == DerivativeOutput.derivative_job_id,
+                        DerivativeOutput,
+                        DerivativeOutput.release_selection_id == ReleaseSelection.id,
                     )
-                    .join(
-                        ReleaseSelection,
-                        ReleaseSelection.id == DerivativeJob.release_selection_id,
-                    )
-                    .join(
-                        ReviewXSelection,
-                        and_(
-                            ReviewXSelection.review_task_id == ReleaseSelection.review_task_id,
-                            ReviewXSelection.asset_id == ReleaseSelection.asset_id,
-                        ),
-                    )
-                    .where(
-                        DerivativeJob.release_version_id == release_version_id,
-                        DerivativeJob.state == DerivativeJobState.SUCCEEDED,
-                        DerivativeOutput.target == "x_teaser",
-                    )
-                    .order_by(ReleaseSelection.display_order)
+                    .where(DerivativeOutput.id.in_(derivative_output_ids))
                 )
             ).all()
+        )
+        if len(review_task_ids) != 1:
+            raise PublicationConflictError("X teaser revision ownership is ambiguous")
+        review_task_id = next(iter(review_task_ids))
+        revision_head = await session.scalar(
+            select(XTeaserRevisionHead)
+            .where(
+                XTeaserRevisionHead.review_task_id == review_task_id,
+                XTeaserRevisionHead.release_version_id == release_version_id,
+            )
+            .with_for_update()
+        )
+        if revision_head is None or revision_head.active_revision_id is None:
+            raise PublicationConflictError("X teasers do not have an active revision")
+        if revision_head.pending_revision_id is not None:
+            raise PublicationConflictError(
+                "X teasers cannot be published while a replacement is rendering"
+            )
+        selected_output_ids = tuple(
+            output.id
+            for output in await active_x_teaser_outputs(
+                session,
+                review_task_id=review_task_id,
+            )
         )
         if derivative_output_ids != selected_output_ids:
             raise PublicationInputError(
@@ -2235,6 +2255,24 @@ async def _load_intent_release(
     *,
     lock: bool,
 ) -> tuple[Release, ReleaseVersion]:
+    if lock:
+        version = await session.scalar(
+            select(ReleaseVersion)
+            .where(ReleaseVersion.id == intent.release_version_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if version is None or version.release_id != intent.release_id:
+            raise PublicationConflictError("publication release snapshot is unavailable")
+        release = await session.scalar(
+            select(Release)
+            .where(Release.id == version.release_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if release is None:
+            raise PublicationConflictError("publication release snapshot is unavailable")
+        return release, version
     query = (
         select(Release, ReleaseVersion)
         .join(ReleaseVersion, ReleaseVersion.release_id == Release.id)
@@ -2243,12 +2281,121 @@ async def _load_intent_release(
             ReleaseVersion.id == intent.release_version_id,
         )
     )
-    if lock:
-        query = query.with_for_update()
     row = (await session.execute(query)).one_or_none()
     if row is None:
         raise PublicationConflictError("publication release snapshot is unavailable")
     return row[0], row[1]
+
+
+async def _lock_intent_release_ordered(
+    session: AsyncSession,
+    *,
+    intent_id: UUID,
+) -> tuple[
+    PublicationIntent,
+    Release,
+    ReleaseVersion,
+    XTeaserRevisionHead | None,
+]:
+    """Lock publication ownership in the same order as X teaser revisions."""
+
+    snapshot = await session.scalar(
+        select(PublicationIntent).where(PublicationIntent.id == intent_id)
+    )
+    if snapshot is None:
+        raise PublicationNotFoundError("publication intent was not found")
+    release_version = await session.scalar(
+        select(ReleaseVersion)
+        .where(ReleaseVersion.id == snapshot.release_version_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if release_version is None:
+        raise PublicationConflictError("publication release snapshot is unavailable")
+    release = await session.scalar(
+        select(Release)
+        .where(Release.id == release_version.release_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if release is None or release.id != snapshot.release_id:
+        raise PublicationConflictError("publication release snapshot is unavailable")
+
+    revision_head: XTeaserRevisionHead | None = None
+    if snapshot.target == PublicationTarget.X:
+        review_task_ids = set(
+            (
+                await session.scalars(
+                    select(ReleaseSelection.review_task_id)
+                    .join(
+                        DerivativeOutput,
+                        DerivativeOutput.release_selection_id == ReleaseSelection.id,
+                    )
+                    .join(
+                        PublicationInput,
+                        PublicationInput.derivative_output_id == DerivativeOutput.id,
+                    )
+                    .where(PublicationInput.intent_id == snapshot.id)
+                )
+            ).all()
+        )
+        if len(review_task_ids) != 1:
+            raise PublicationConflictError("X teaser revision ownership is ambiguous")
+        revision_head = await session.scalar(
+            select(XTeaserRevisionHead)
+            .where(
+                XTeaserRevisionHead.review_task_id == next(iter(review_task_ids)),
+                XTeaserRevisionHead.release_version_id == release_version.id,
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if revision_head is None:
+            raise PublicationConflictError("X teasers do not have an active revision")
+
+    intent = await session.scalar(
+        select(PublicationIntent)
+        .where(PublicationIntent.id == intent_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if (
+        intent is None
+        or intent.release_version_id != release_version.id
+        or intent.release_id != release.id
+        or intent.target != snapshot.target
+    ):
+        raise PublicationConflictError("publication intent identity changed concurrently")
+    return intent, release, release_version, revision_head
+
+
+async def _require_x_intent_matches_active_revision(
+    session: AsyncSession,
+    *,
+    intent: PublicationIntent,
+    inputs: tuple[PublicationInput, ...],
+    revision_head: XTeaserRevisionHead | None,
+) -> None:
+    if (
+        revision_head is None
+        or revision_head.active_revision_id is None
+        or revision_head.pending_revision_id is not None
+    ):
+        raise PublicationConflictError(
+            "X publication approval is blocked while teaser replacement is pending"
+        )
+    active_output_ids = tuple(
+        output.id
+        for output in await active_x_teaser_outputs(
+            session,
+            review_task_id=revision_head.review_task_id,
+        )
+    )
+    frozen_output_ids = tuple(input_item.derivative_output_id for input_item in inputs)
+    if frozen_output_ids != active_output_ids:
+        raise PublicationConflictError(
+            "X publication inputs no longer match the active teaser revision"
+        )
 
 
 async def _load_and_require_current_publishable_intent_release(

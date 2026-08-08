@@ -449,17 +449,16 @@ async def _load_candidates_locked(
     session: AsyncSession,
     release_version_id: UUID,
 ) -> list[_CandidateSnapshot]:
-    row = (
-        await session.execute(
-            select(ReleaseVersion, Release)
-            .join(Release, Release.id == ReleaseVersion.release_id)
-            .where(ReleaseVersion.id == release_version_id)
-            .with_for_update()
-        )
-    ).one_or_none()
-    if row is None:
+    release_version = await session.scalar(
+        select(ReleaseVersion).where(ReleaseVersion.id == release_version_id).with_for_update()
+    )
+    if release_version is None:
         raise QualityRunNotFoundError("release version was not found")
-    release_version, release = row
+    release = await session.scalar(
+        select(Release).where(Release.id == release_version.release_id).with_for_update()
+    )
+    if release is None:
+        raise QualityRunNotFoundError("release was not found")
     if (
         release.phase != ReleasePhase.REVIEWING
         or release.current_version_no != release_version.version_no

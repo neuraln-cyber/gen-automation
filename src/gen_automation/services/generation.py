@@ -316,21 +316,31 @@ async def approve_and_expand_generation_plan(
 ) -> GenerationPlanResult:
     """Revalidate a frozen release and expand it into deterministic jobs."""
     scope = f"release:{release_id}:approve-generation"
-    row = (
-        await session.execute(
-            select(Release, ReleaseVersion)
-            .join(
-                ReleaseVersion,
-                (ReleaseVersion.release_id == Release.id)
-                & (ReleaseVersion.version_no == Release.current_version_no),
-            )
-            .where(Release.id == release_id)
-            .with_for_update()
-        )
-    ).one_or_none()
-    if row is None:
+    current_version_no = await session.scalar(
+        select(Release.current_version_no).where(Release.id == release_id)
+    )
+    if current_version_no is None:
         raise GenerationPlanNotFoundError("release not found")
-    release, version = row
+    version = await session.scalar(
+        select(ReleaseVersion)
+        .where(
+            ReleaseVersion.release_id == release_id,
+            ReleaseVersion.version_no == current_version_no,
+        )
+        .with_for_update()
+    )
+    if version is None:
+        raise GenerationPlanConflictError("current release version is unavailable")
+    release = await session.scalar(
+        select(Release)
+        .where(Release.id == release_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if release is None:
+        raise GenerationPlanNotFoundError("release not found")
+    if release.current_version_no != version.version_no:
+        raise GenerationPlanConflictError("current release version changed concurrently")
 
     request_sha256 = canonical_sha256(
         {

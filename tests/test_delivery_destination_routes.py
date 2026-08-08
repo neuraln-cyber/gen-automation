@@ -11,6 +11,11 @@ from gen_automation.api.routes import delivery_dashboard as delivery_routes
 from gen_automation.config import Environment, Settings
 from gen_automation.domain.enums import AdminRole
 from gen_automation.services.authentication import AuthenticatedPrincipal
+from gen_automation.services.derivative_pipeline import (
+    DerivativePipelineConflictError,
+    DerivativePipelineInputError,
+    DerivativePipelineNotFoundError,
+)
 from gen_automation.services.derivatives import WatermarkPosition
 
 
@@ -526,7 +531,190 @@ async def test_x_teaser_output_route_never_plans_clean_full_outputs(
     assert x_calls[0]["watermark_positions_by_asset_id"] == {
         selected_asset_id: WatermarkPosition.BOTTOM_RIGHT,
     }
+    assert x_calls[0]["require_active_revision"] is False
     assert full_calls == []
+
+
+@pytest.mark.asyncio
+async def test_x_teaser_replacement_route_propagates_exact_placements_and_replays(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    app = FastAPI()
+    app.state.settings = settings
+    owner = _owner()
+    review_task_id = uuid4()
+    watermark_asset_id = uuid4()
+    asset_ids = tuple(uuid4() for _ in range(4))
+    placements = dict(
+        zip(
+            asset_ids,
+            ("top_left", "top_right", "bottom_left", "bottom_right"),
+            strict=True,
+        )
+    )
+    session = object()
+    fields = {
+        **_signed_fields(
+            settings,
+            owner,
+            review_task_id=review_task_id,
+            action="replace-x-outputs",
+        ),
+        "watermark_asset_id": str(watermark_asset_id),
+        "watermark_position": "top_left",
+        "watermark_placements": "{"
+        + ",".join(f'"{asset_id}":"{position}"' for asset_id, position in placements.items())
+        + "}",
+    }
+    calls: list[dict[str, object]] = []
+
+    async def verify_owner(
+        _request: Request,
+        _session: object,
+        principal: AuthenticatedPrincipal,
+        csrf_token: str,
+    ) -> AuthenticatedPrincipal:
+        assert principal == owner
+        assert _session is session
+        assert csrf_token == delivery_csrf_token(settings, session_id=owner.session_id)
+        return owner
+
+    async def prepare_x(_session: object, **kwargs: object) -> object:
+        assert _session is session
+        calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(delivery_routes, "_verified_mutation_owner", verify_owner)
+    monkeypatch.setattr(delivery_routes, "prepare_completed_review_x_teasers", prepare_x)
+
+    for _attempt in range(2):
+        response = await delivery_routes.dashboard_replace_x_outputs(
+            review_task_id,
+            _request(
+                app,
+                path=f"/dashboard/review-tasks/{review_task_id}/delivery:replace-x-outputs",
+                fields=fields,
+            ),
+            session,  # type: ignore[arg-type]
+            owner,
+        )
+        assert response.status_code == 303
+        assert response.headers["location"] == (
+            f"/dashboard/review-tasks/{review_task_id}/delivery"
+        )
+
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert calls[0]["review_task_id"] == review_task_id
+    assert calls[0]["actor_user_id"] == owner.user_id
+    assert calls[0]["idempotency_key"] == fields["idempotency_key"]
+    assert calls[0]["watermark_asset_id"] == watermark_asset_id
+    assert calls[0]["watermark_position"] == WatermarkPosition.TOP_LEFT
+    assert calls[0]["watermark_positions_by_asset_id"] == {
+        asset_id: WatermarkPosition(position) for asset_id, position in placements.items()
+    }
+    assert calls[0]["require_active_revision"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "service_error",
+    (
+        DerivativePipelineInputError("bad placements"),
+        DerivativePipelineNotFoundError("missing review"),
+        DerivativePipelineConflictError("X delivery is already prepared"),
+    ),
+)
+async def test_x_teaser_replacement_route_maps_service_failures_without_hiding_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    service_error: Exception,
+) -> None:
+    settings = _settings()
+    app = FastAPI()
+    app.state.settings = settings
+    owner = _owner()
+    review_task_id = uuid4()
+    fields = {
+        **_signed_fields(
+            settings,
+            owner,
+            review_task_id=review_task_id,
+            action="replace-x-outputs",
+        ),
+        "watermark_asset_id": str(uuid4()),
+        "watermark_position": "top_left",
+        "watermark_placements": f'{{"{uuid4()}":"top_left"}}',
+    }
+
+    async def verify_owner(*_args: object, **_kwargs: object) -> AuthenticatedPrincipal:
+        return owner
+
+    async def prepare_x(*_args: object, **_kwargs: object) -> object:
+        raise service_error
+
+    monkeypatch.setattr(delivery_routes, "_verified_mutation_owner", verify_owner)
+    monkeypatch.setattr(delivery_routes, "prepare_completed_review_x_teasers", prepare_x)
+    response = await delivery_routes.dashboard_replace_x_outputs(
+        review_task_id,
+        _request(
+            app,
+            path=f"/dashboard/review-tasks/{review_task_id}/delivery:replace-x-outputs",
+            fields=fields,
+        ),
+        object(),  # type: ignore[arg-type]
+        owner,
+    )
+
+    assert response.status_code == 409
+    assert str(service_error).encode() in response.body
+
+
+@pytest.mark.asyncio
+async def test_x_teaser_replacement_rejects_a_cross_action_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    app = FastAPI()
+    app.state.settings = settings
+    owner = _owner()
+    review_task_id = uuid4()
+    fields = {
+        **_signed_fields(
+            settings,
+            owner,
+            review_task_id=review_task_id,
+            action="prepare-x-outputs",
+        ),
+        "watermark_asset_id": str(uuid4()),
+        "watermark_position": "top_left",
+        "watermark_placements": f'{{"{uuid4()}":"top_left"}}',
+    }
+    calls = 0
+
+    async def verify_owner(*_args: object, **_kwargs: object) -> AuthenticatedPrincipal:
+        return owner
+
+    async def prepare_x(*_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return object()
+
+    monkeypatch.setattr(delivery_routes, "_verified_mutation_owner", verify_owner)
+    monkeypatch.setattr(delivery_routes, "prepare_completed_review_x_teasers", prepare_x)
+    response = await delivery_routes.dashboard_replace_x_outputs(
+        review_task_id,
+        _request(
+            app,
+            path=f"/dashboard/review-tasks/{review_task_id}/delivery:replace-x-outputs",
+            fields=fields,
+        ),
+        object(),  # type: ignore[arg-type]
+        owner,
+    )
+
+    assert response.status_code == 400
+    assert calls == 0
 
 
 @pytest.mark.asyncio

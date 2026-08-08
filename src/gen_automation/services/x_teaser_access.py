@@ -23,6 +23,8 @@ from gen_automation.db.models import (
     DerivativeOutput,
     ReleaseSelection,
     ReviewXSelection,
+    XTeaserRevisionHead,
+    XTeaserRevisionMember,
 )
 from gen_automation.domain.deliverability import X_STATIC_IMAGE_MAX_BYTES
 from gen_automation.domain.enums import AssetKind, AssetState, DerivativeJobState
@@ -104,6 +106,21 @@ async def read_review_x_teaser(
     if row is None:
         raise XTeaserAccessNotFoundError("X teaser was not found")
     output, job, selection, asset = row
+    revision_head = await session.scalar(
+        select(XTeaserRevisionHead).where(XTeaserRevisionHead.review_task_id == review_task_id)
+    )
+    if revision_head is None or revision_head.active_revision_id is None:
+        raise XTeaserAccessNotFoundError("X teaser was not found")
+    active_member = await session.scalar(
+        select(XTeaserRevisionMember).where(
+            XTeaserRevisionMember.revision_id == revision_head.active_revision_id,
+            XTeaserRevisionMember.release_selection_id == selection.id,
+        )
+    )
+    if active_member is None or not (
+        active_member.derivative_output_id == output.id or active_member.derivative_job_id == job.id
+    ):
+        raise XTeaserAccessNotFoundError("X teaser was not found")
     _validate_snapshot(output=output, job=job, selection=selection, asset=asset, store=store)
 
     try:
