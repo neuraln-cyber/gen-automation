@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -644,7 +646,7 @@ def test_enabled_delivery_paths_cover_the_internal_patreon_archive_cap() -> None
         )
 
 
-def test_mega_extracted_set_delivery_does_not_require_publishing() -> None:
+def test_mega_extracted_set_delivery_does_not_require_publishing(tmp_path: Path) -> None:
     settings = Settings(
         environment=Environment.TEST,
         background_runtime_enabled=True,
@@ -652,7 +654,7 @@ def test_mega_extracted_set_delivery_does_not_require_publishing() -> None:
         storage_bucket="private-assets",
         publishing_enabled=False,
         mega_delivery_enabled=True,
-        mega_profile_home="D:/mega-profile",
+        mega_profile_home=str(tmp_path / "mega-profile"),
     )
 
     assert settings.mega_delivery_enabled is True
