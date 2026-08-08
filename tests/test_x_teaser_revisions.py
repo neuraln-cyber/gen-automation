@@ -596,13 +596,13 @@ async def test_matching_current_request_reserves_each_new_idempotency_key(
     positions = {asset_id: WatermarkPosition.TOP_LEFT for asset_id in fixture.context.raw_asset_ids}
     initial = await _prepare(
         fixture,
-        key="x-idempotency-k1",
+        key="repeat-a",
         positions=positions,
         minute=1,
     )
     replay = await _prepare(
         fixture,
-        key="x-idempotency-k2",
+        key="repeat-b",
         positions=positions,
         minute=2,
     )
@@ -615,7 +615,7 @@ async def test_matching_current_request_reserves_each_new_idempotency_key(
             select(IdempotencyRecord).where(
                 IdempotencyRecord.scope
                 == f"review-task:{fixture.context.review_task_id}:x-teaser-revision",
-                IdempotencyRecord.idempotency_key == "x-idempotency-k2",
+                IdempotencyRecord.idempotency_key == "repeat-b",
             )
         )
         assert record is not None
@@ -628,7 +628,7 @@ async def test_matching_current_request_reserves_each_new_idempotency_key(
     ):
         await _prepare(
             fixture,
-            key="x-idempotency-k2",
+            key="repeat-b",
             positions=changed,
             minute=3,
         )

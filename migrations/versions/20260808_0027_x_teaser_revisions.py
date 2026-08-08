@@ -1128,7 +1128,7 @@ AND job.x_teaser_revision_id = NEW.revision_id)) OR
 WHERE output.id = NEW.derivative_output_id
 AND output.release_selection_id = NEW.release_selection_id
 AND output.derivative_recipe_id = NEW.derivative_recipe_id
-AND output.target = 'x_teaser'))) THEN
+AND output.target = 'x_teaser')))) THEN
 RAISE EXCEPTION 'X teaser revision member is invalid'; END IF;
 RETURN NEW; END; $$ LANGUAGE plpgsql""",
         """CREATE TRIGGER x_teaser_revision_members_guard BEFORE INSERT OR UPDATE OR DELETE ON

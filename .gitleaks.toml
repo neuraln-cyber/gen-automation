@@ -28,3 +28,13 @@ regexes = [
   '''^\s*"Idempotency-Key": "revoke-subject-v1",\s*$''',
   '''^\s*user\.totp_secret_ciphertext = "v1\.key-1\.corrupt"\s+# noqa: S105\s*$''',
 ]
+
+[[rules.allowlists]]
+description = "Known non-secret X teaser idempotency fixtures in commit 6c7f4ef"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)tests/test_x_teaser_revisions\.py$''']
+regexes = [
+  '''^\s*key="x-idempotency-k[12]",\s*$''',
+  '''^\s*IdempotencyRecord\.idempotency_key == "x-idempotency-k2",\s*$''',
+]

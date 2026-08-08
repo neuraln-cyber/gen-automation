@@ -196,6 +196,31 @@ def test_x_teaser_revision_postgresql_backfill_disables_legacy_job_guards(
     assert drop_offset < backfill_offset < recreate_offset
 
 
+def test_x_teaser_revision_postgresql_member_guard_closes_not_exists(
+    monkeypatch,
+) -> None:
+    configuration = Config("alembic.ini")
+    revision = ScriptDirectory.from_config(configuration).get_revision("20260808_0027")
+    assert revision is not None
+
+    statements: list[str] = []
+    monkeypatch.setattr(
+        revision.module.op,
+        "execute",
+        lambda statement: statements.append(str(statement)),
+    )
+    revision.module._create_postgresql_revision_guards()
+
+    guard = next(
+        statement
+        for statement in statements
+        if "gen_automation_guard_x_teaser_revision_member_mutation()" in statement
+        and "CREATE OR REPLACE FUNCTION" in statement
+    )
+    assert "AND output.target = 'x_teaser')))) THEN" in guard
+    assert guard.count("(") == guard.count(")")
+
+
 def test_derivative_owner_retry_downgrade_restores_terminal_failed_jobs(
     monkeypatch,
 ) -> None:
