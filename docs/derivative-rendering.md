@@ -96,6 +96,20 @@ lineage, and upgrades require golden test review.
   Unselected accepted images are rendered with `targets=("full",)` and never
   render or persist an X teaser. A watermark must contain transparent and
   visible alpha and produce an observable pixel change on the X teaser.
+- Before scaling or positioning a watermark, the renderer trims only its outer
+  fully transparent canvas to the non-zero alpha bounding box. The configured
+  width therefore describes the visible watermark bounds, not transparent file
+  padding, and the selected corner anchors those visible bounds. Transparent
+  holes and partial alpha inside the bounds are preserved.
+- The calibrated defaults render the visible bounds at 264,000 millionths
+  (26.4%) of the final teaser width with a 12,000-millionth (1.2%) margin based
+  on the teaser's shorter edge. Opacity 255 preserves the PNG's authored alpha;
+  it does not make partially transparent artwork opaque. The four positions are
+  `top_left`, `top_right`, `bottom_left`, and `bottom_right`.
+- New recipes freeze renderer `pillow-derivative-v5`. The runtime continues to
+  execute already-frozen `pillow-derivative-v4` jobs with their original
+  full-canvas watermark geometry, so deployment cannot strand or silently
+  change an in-flight derivative plan.
 
 ## Parser and resource boundaries
 

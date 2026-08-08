@@ -72,7 +72,6 @@ from gen_automation.integrations.patreon.handoff import (
 )
 from gen_automation.integrations.x.client import (
     X_MAX_MEDIA_PER_POST,
-    X_MAX_POST_TEXT_BYTES,
     X_MAX_STATIC_IMAGE_BYTES,
 )
 from gen_automation.services.compliance import (
@@ -92,6 +91,8 @@ PUBLICATION_CONFIRM_PRESENT_ATTESTATION = (
     "I manually verified that this exact publication exists at the recorded "
     "provider post ID and URL."
 )
+X_STANDARD_POST_TEXT_MAX_BYTES = 280
+X_MAX_SCHEDULE_HORIZON = timedelta(days=366)
 PUBLICATION_CONFIRM_ABSENT_ATTESTATION = (
     "I manually investigated the unknown X outcome and found evidence that the "
     "post was not created. I understand this confirmation does not publish or retry it."
@@ -303,6 +304,9 @@ async def plan_publication_intent(
         scheduled_at,
         now=planned_at,
         label="scheduled_at",
+        maximum_future=(
+            X_MAX_SCHEDULE_HORIZON if publication_target_value == PublicationTarget.X else None
+        ),
     )
     normalized_outputs = _normalize_output_ids(derivative_output_ids)
     actor = await _require_publisher(session, planned_by_user_id)
@@ -638,14 +642,20 @@ async def approve_publication_intent(
         ).all()
     )
     _validate_frozen_input_set(intent, inputs)
-    expires_at = approved_at + timedelta(seconds=normalized_approval_seconds)
     available_at = _initial_attempt_available_at(
         target=intent.target,
         scheduled_at=intent.scheduled_at,
         approved_at=approved_at,
     )
-    if available_at >= expires_at:
-        raise PublicationConflictError("approval would expire before the scheduled external effect")
+    # A scheduled X post is approved now but its provider attempt is deliberately
+    # unavailable until the requested time.  Keep the bounded approval window
+    # relative to that due time so unattended schedules beyond one hour remain
+    # authorized without asking the owner to return and approve again.
+    expires_at = _approval_expires_at(
+        approved_at=approved_at,
+        available_at=available_at,
+        approval_seconds=normalized_approval_seconds,
+    )
     revision = (
         int(
             await session.scalar(
@@ -728,7 +738,7 @@ async def approve_publication_intent(
                 kind=PublicationStepKind.X_CREATE_POST,
                 state=PublicationStepState.PENDING,
                 retry_count=0,
-                max_retries=0,
+                max_retries=normalized_upload_retries,
                 lock_version=1,
                 updated_at=approved_at,
             )
@@ -2064,16 +2074,21 @@ def _normalize_configuration(
         raise PublicationInputError("publication configuration keys must be strings")
 
     if target == PublicationTarget.X:
-        if set(normalized) != {"text"}:
-            raise PublicationInputError("X configuration must contain only text")
+        if "text" not in normalized or not set(normalized).issubset({"text", "adult_content"}):
+            raise PublicationInputError(
+                "X configuration must contain text and optional adult_content"
+            )
         text_value = normalized["text"]
         if not isinstance(text_value, str) or not text_value.strip():
             raise PublicationInputError("X post text must not be empty")
-        if len(text_value.encode("utf-8")) > X_MAX_POST_TEXT_BYTES:
+        if len(text_value.encode("utf-8")) > X_STANDARD_POST_TEXT_MAX_BYTES:
             raise PublicationInputError(
-                f"X post text must not exceed {X_MAX_POST_TEXT_BYTES} UTF-8 bytes"
+                f"X post text must not exceed {X_STANDARD_POST_TEXT_MAX_BYTES} UTF-8 bytes"
             )
-        return {"text": text_value}
+        adult_content = normalized.get("adult_content", True)
+        if not isinstance(adult_content, bool):
+            raise PublicationInputError("X adult_content must be a boolean")
+        return {"text": text_value, "adult_content": adult_content}
 
     if set(normalized) != {"title", "body", "tier", "tags"}:
         raise PublicationInputError(
@@ -2939,6 +2954,7 @@ def _optional_future_datetime(
     *,
     now: datetime,
     label: str,
+    maximum_future: timedelta | None = None,
 ) -> datetime | None:
     if value is None:
         return None
@@ -2947,6 +2963,8 @@ def _optional_future_datetime(
     normalized = value.astimezone(UTC)
     if normalized < now:
         raise PublicationInputError(f"{label} must not be in the past")
+    if maximum_future is not None and normalized > now + maximum_future:
+        raise PublicationInputError(f"{label} is too far in the future")
     return normalized
 
 
@@ -2970,6 +2988,17 @@ def _initial_attempt_available_at(
     if scheduled_at is None:
         return normalized_approval
     return max(normalized_approval, _as_utc(scheduled_at))
+
+
+def _approval_expires_at(
+    *,
+    approved_at: datetime,
+    available_at: datetime,
+    approval_seconds: int,
+) -> datetime:
+    """Keep a bounded effect window after an immediate or scheduled attempt is due."""
+
+    return max(_as_utc(approved_at), _as_utc(available_at)) + timedelta(seconds=approval_seconds)
 
 
 def _utc_now(value: datetime | None) -> datetime:

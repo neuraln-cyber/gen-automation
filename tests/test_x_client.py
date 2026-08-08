@@ -126,6 +126,28 @@ async def test_upload_image_uses_official_v2_contract_and_attaches_adult_warning
 
 
 @pytest.mark.asyncio
+async def test_upload_image_skips_metadata_when_adult_warning_is_disabled() -> None:
+    request_count = 0
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        nonlocal request_count
+        request_count += 1
+        assert request.method == "POST"
+        assert str(request.url) == f"{X_API_BASE_URL}/2/media/upload"
+        return httpx2.Response(200, json=upload_payload())
+
+    async with mocked_x_client(handler) as client:
+        uploaded = await client.upload_image(
+            image=IMAGE,
+            media_type="image/png",
+            adult_content=False,
+        )
+
+    assert request_count == 1
+    assert uploaded.id == MEDIA_ID
+
+
+@pytest.mark.asyncio
 async def test_create_post_uses_ai_label_and_at_most_four_media_ids() -> None:
     media_ids = (MEDIA_ID, SECOND_MEDIA_ID, THIRD_MEDIA_ID, FOURTH_MEDIA_ID)
     request_count = 0
@@ -177,6 +199,12 @@ async def test_image_and_post_limits_fail_before_network_io() -> None:
             await client.upload_image(
                 image=IMAGE,
                 media_type=cast(XStaticImageMediaType, "image/gif"),
+            )
+        with pytest.raises(TypeError, match="adult_content must be a boolean"):
+            await client.upload_image(
+                image=IMAGE,
+                media_type="image/png",
+                adult_content=cast(bool, 1),
             )
         with pytest.raises(ValueError, match="between 1 and 4"):
             await client.create_post(

@@ -231,8 +231,9 @@ class XClient:
         *,
         image: bytes,
         media_type: XStaticImageMediaType,
+        adult_content: bool = True,
     ) -> XUploadedMedia:
-        """Upload one static image and require confirmation of its adult warning."""
+        """Upload one static image and optionally attach its adult warning."""
         if not isinstance(image, bytes):
             raise TypeError("X image must be supplied as bytes")
         if not image:
@@ -241,6 +242,8 @@ class XClient:
             raise ValueError(f"X static images must not exceed {X_MAX_STATIC_IMAGE_BYTES} bytes")
         if media_type not in _STATIC_IMAGE_MEDIA_TYPES:
             raise ValueError("X static image media type must be JPEG, PNG, or WEBP")
+        if not isinstance(adult_content, bool):
+            raise TypeError("X adult_content must be a boolean")
 
         upload_response = await self._request_json(
             path="/2/media/upload",
@@ -271,20 +274,21 @@ class XClient:
         except ValueError as error:
             raise XProtocolError(str(error)) from error
 
-        metadata_response = await self._request_json(
-            path="/2/media/metadata",
-            expected_status=200,
-            json_body={
-                "id": media_id,
-                "metadata": {
-                    "sensitive_media_warning": {
-                        "adult_content": True,
-                    }
+        if adult_content:
+            metadata_response = await self._request_json(
+                path="/2/media/metadata",
+                expected_status=200,
+                json_body={
+                    "id": media_id,
+                    "metadata": {
+                        "sensitive_media_warning": {
+                            "adult_content": True,
+                        }
+                    },
                 },
-            },
-            operation="adult-content metadata attachment",
-        )
-        self._validate_adult_metadata(metadata_response, media_id)
+                operation="adult-content metadata attachment",
+            )
+            self._validate_adult_metadata(metadata_response, media_id)
         return XUploadedMedia(
             id=media_id,
             media_key=media_key,

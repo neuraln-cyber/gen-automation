@@ -167,6 +167,7 @@ class DestinationState:
     completed_items: int | None = None
     total_items: int | None = None
     remote_path: str | None = None
+    scheduled_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -588,6 +589,8 @@ async def prepare_operator_x_destination(
     actor_user_id: UUID,
     actor_role: AdminRole,
     idempotency_key: str,
+    x_adult_content: bool = True,
+    scheduled_at: datetime | None = None,
     now: datetime | None = None,
 ) -> PreparedDestination:
     """Freeze and authorize X without creating or changing a Patreon intent."""
@@ -600,7 +603,7 @@ async def prepare_operator_x_destination(
     if x_credential_reference is None:
         raise OperatorDeliveryConflictError("the X credential reference is not configured")
 
-    configuration = {"text": x_text}
+    configuration = {"text": x_text, "adult_content": x_adult_content}
     output_ids = tuple(output.output_id for output in snapshot.x_outputs)
     try:
         _normalize_configuration(PublicationTarget.X, configuration)
@@ -620,6 +623,7 @@ async def prepare_operator_x_destination(
             derivative_output_ids=output_ids,
             planned_by_user_id=actor_user_id,
             idempotency_key=f"{idempotency_key}:x:plan",
+            scheduled_at=scheduled_at,
             credential_reference=x_credential_reference,
             now=prepared_at,
         )
@@ -866,6 +870,7 @@ async def _publication_destination(
             )
             for item in packages
         ),
+        scheduled_at=intent.scheduled_at,
     )
 
 

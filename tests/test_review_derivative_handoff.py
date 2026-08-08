@@ -21,6 +21,7 @@ from gen_automation.api.routes.derivatives import (
 )
 from gen_automation.db.models import (
     DerivativeJob,
+    DerivativeRecipe,
     Release,
     ReviewXSelection,
 )
@@ -32,6 +33,7 @@ from gen_automation.services.derivative_pipeline import (
     DerivativePipelineInputError,
     DerivativePipelineNotFoundError,
 )
+from gen_automation.services.derivatives import WatermarkPosition
 from gen_automation.services.review_derivatives import (
     prepare_completed_review_derivatives,
     prepare_completed_review_full_outputs,
@@ -189,10 +191,14 @@ async def test_full_outputs_and_x_teasers_are_planned_independently(
             actor_user_id=approved.owner_id,
             idempotency_key="prepare-reviewed-x-teasers",
             watermark_asset_id=watermark.asset_id,
+            watermark_position=WatermarkPosition.TOP_LEFT,
             now=PLAN_AT + timedelta(minutes=2),
         )
         assert x_plan.jobs_created == 1
         assert x_plan.total_jobs == 1
+        x_recipe = await session.get(DerivativeRecipe, x_plan.recipe_id)
+        assert x_recipe is not None
+        assert x_recipe.configuration["watermark"]["position"] == "top_left"
         release = await session.get(Release, approved.release_id)
         assert release is not None
         assert release.phase == ReleasePhase.RENDERING
@@ -202,6 +208,7 @@ async def test_full_outputs_and_x_teasers_are_planned_independently(
             actor_user_id=approved.owner_id,
             idempotency_key="prepare-reviewed-x-teasers",
             watermark_asset_id=watermark.asset_id,
+            watermark_position=WatermarkPosition.TOP_LEFT,
             now=PLAN_AT + timedelta(minutes=2),
         )
         assert replay_plan.replayed is True
@@ -217,6 +224,7 @@ async def test_full_outputs_and_x_teasers_are_planned_independently(
                 actor_user_id=approved.owner_id,
                 idempotency_key="prepare-reviewed-x-teasers-alternate",
                 watermark_asset_id=alternate_watermark.asset_id,
+                watermark_position=WatermarkPosition.TOP_LEFT,
                 now=PLAN_AT + timedelta(minutes=3),
             )
         await session.rollback()
@@ -227,6 +235,7 @@ async def test_full_outputs_and_x_teasers_are_planned_independently(
             actor_user_id=approved.owner_id,
             idempotency_key="prepare-reviewed-compatible",
             watermark_asset_id=watermark.asset_id,
+            watermark_position=WatermarkPosition.TOP_LEFT,
             now=PLAN_AT + timedelta(minutes=4),
         )
         assert compatibility_plan.jobs_created == 0

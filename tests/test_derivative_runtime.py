@@ -50,6 +50,7 @@ from gen_automation.services.derivative_runtime import (
 )
 from gen_automation.services.derivatives import (
     DERIVATIVE_RENDERER_VERSION,
+    LEGACY_DERIVATIVE_RENDERER_VERSION,
     DerivativeBundle,
     DerivativeRecipe,
     DerivativeSafetyLimits,
@@ -224,6 +225,7 @@ async def _prepare(
     with_watermark: bool = False,
     x_selected_asset_ids: tuple[UUID, ...] = (),
     max_attempts: int = 3,
+    renderer_version: str = DERIVATIVE_RENDERER_VERSION,
 ) -> PreparedRuntime:
     selected_store = store or TrackingObjectStore()
     for index, (asset_id, payload) in enumerate(
@@ -299,7 +301,7 @@ async def _prepare(
             review_task_id=approved.review_task_id,
             configuration=derivative_recipe_configuration(recipe),
             recipe_version=1,
-            renderer_version=DERIVATIVE_RENDERER_VERSION,
+            renderer_version=renderer_version,
             pillow_version=PIL.__version__,
             created_by_user_id=approved.owner_id,
             approved_by_user_id=approved.owner_id,
@@ -412,6 +414,66 @@ async def test_cycle_renders_only_clean_full_outputs_without_x_selection(
         )
         assert f"/{asset.sha256}." in asset.object_key
         assert asset.object_version_id
+
+
+@pytest.mark.asyncio
+async def test_cycle_executes_a_frozen_legacy_renderer_recipe(
+    derivative_approved_context: ApprovedContext,
+) -> None:
+    approved = derivative_approved_context
+    prepared = await _prepare(
+        approved,
+        with_watermark=True,
+        x_selected_asset_ids=(approved.raw_asset_ids[0],),
+        renderer_version=LEGACY_DERIVATIVE_RENDERER_VERSION,
+    )
+
+    async def legacy_renderer(
+        source: bytes,
+        recipe: DerivativeRecipe,
+        watermark: bytes | None,
+        targets: tuple[str, ...],
+        limits: DerivativeSafetyLimits,
+        policy: DerivativeIsolationPolicy,
+    ) -> DerivativeBundle:
+        assert policy.wall_timeout_seconds >= 1
+        return render_platform_derivatives(
+            source,
+            recipe=recipe,
+            watermark_png=watermark,
+            targets=targets,
+            limits=limits,
+            renderer_version=LEGACY_DERIVATIVE_RENDERER_VERSION,
+        )
+
+    first = await _cycle(
+        prepared,
+        worker_id="derivative-controller-legacy-v4",
+        renderer=legacy_renderer,
+    )
+    second = await _cycle(
+        prepared,
+        worker_id="derivative-controller-legacy-v4",
+        renderer=legacy_renderer,
+    )
+    third = await _cycle(
+        prepared,
+        worker_id="derivative-controller-legacy-v4",
+        renderer=legacy_renderer,
+    )
+
+    assert first.execution is not None
+    assert second.execution is not None
+    assert third.execution is not None
+    assert first.execution.state == DerivativeJobState.SUCCEEDED
+    assert second.execution.state == DerivativeJobState.SUCCEEDED
+    assert third.execution.state == DerivativeJobState.SUCCEEDED
+    assert (
+        first.execution.outputs_registered
+        + second.execution.outputs_registered
+        + third.execution.outputs_registered
+        == 3
+    )
 
 
 @pytest.mark.asyncio

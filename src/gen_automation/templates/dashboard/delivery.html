@@ -110,6 +110,7 @@
         >
         <input type="hidden" name="submission_id" value="{{ output_submission_id }}">
         <input type="hidden" name="watermark_asset_id" value="">
+        <input type="hidden" name="watermark_position" value="">
         <button class="primary-button" type="submit">Prepare clean full set</button>
       </form>
     {% elif output_state == "ready" %}
@@ -438,6 +439,15 @@
               {{ destination.detail }}
             {% endif %}
           </p>
+          {% if destination.key == "x" and destination.scheduled_at %}
+            <p class="delivery-schedule" role="status">
+              Scheduled for
+              <time
+                datetime="{{ destination.scheduled_at.isoformat() }}"
+                data-local-datetime
+              >{{ destination.scheduled_at.isoformat() }}</time>
+            </p>
+          {% endif %}
 
           {% if destination.key == "mega" %}
             <p class="delivery-effect">
@@ -691,6 +701,27 @@
                       </option>
                     {% endfor %}
                   </select>
+                  <fieldset class="watermark-corner-picker">
+                    <legend>Place the watermark</legend>
+                    <div class="watermark-corner-options">
+                      <label>
+                        <input type="radio" name="watermark_position" value="top_left" checked>
+                        <span aria-hidden="true">TL</span> Top left
+                      </label>
+                      <label>
+                        <input type="radio" name="watermark_position" value="top_right">
+                        <span aria-hidden="true">TR</span> Top right
+                      </label>
+                      <label>
+                        <input type="radio" name="watermark_position" value="bottom_left">
+                        <span aria-hidden="true">BL</span> Bottom left
+                      </label>
+                      <label>
+                        <input type="radio" name="watermark_position" value="bottom_right">
+                        <span aria-hidden="true">BR</span> Bottom right
+                      </label>
+                    </div>
+                  </fieldset>
                   <button class="secondary-button" type="submit" {% if not watermarks %}disabled{% endif %}>
                     Prepare watermarked X teasers
                   </button>
@@ -699,6 +730,10 @@
                   {% endif %}
                   <p class="muted delivery-action-note">
                     This creates only the selected teaser copies. It does not post them.
+                  </p>
+                  <p class="muted delivery-action-note">
+                    The calibrated logo uses about 26% of the image width with a small
+                    edge inset.
                   </p>
                 </form>
               {% elif not publishing_enabled %}
@@ -720,10 +755,42 @@
                   <input type="hidden" name="idempotency_key" value="{{ x_destination_idempotency_key }}">
                   <input type="hidden" name="submission_id" value="{{ x_destination_submission_id }}">
                   <label>
-                    Post text
-                    <textarea name="x_text" maxlength="2000" rows="4" required>New set: {{ delivery.release_title }}</textarea>
+                    Caption
+                    <textarea name="x_text" maxlength="280" rows="4" required data-x-caption>New set: {{ delivery.release_title }}</textarea>
                   </label>
-                  <button class="primary-button" type="submit">
+                  <p class="muted x-caption-count" aria-live="polite" data-x-caption-count></p>
+                  <fieldset class="x-adult-toggle">
+                    <legend>Adult/sensitive-media label</legend>
+                    <div class="segmented-options">
+                      <label>
+                        <input type="radio" name="x_adult_content" value="true" checked>
+                        <span>On</span>
+                      </label>
+                      <label>
+                        <input type="radio" name="x_adult_content" value="false">
+                        <span>Off &middot; fully SFW</span>
+                      </label>
+                    </div>
+                    <p class="muted delivery-action-note">
+                      Turn this off only when every selected teaser is completely SFW.
+                      The AI-generated disclosure remains on either way.
+                    </p>
+                  </fieldset>
+                  <label>
+                    Schedule <span class="muted">(optional)</span>
+                    <input
+                      type="datetime-local"
+                      name="x_scheduled_local"
+                      step="60"
+                      data-x-scheduled-local
+                    >
+                  </label>
+                  <input type="hidden" name="x_timezone" value="Europe/Sofia" data-x-timezone>
+                  <p class="muted delivery-action-note">
+                    Leave blank to post as soon as you approve. Scheduled times use
+                    <span data-x-timezone-label>Europe/Sofia</span>.
+                  </p>
+                  <button class="primary-button" type="submit" data-x-submit-label>
                     {% if destination.state == "failed" %}Retry X post{% else %}Post {{ delivery.x_selected_count }} teaser{% if delivery.x_selected_count != 1 %}s{% endif %} to X{% endif %}
                   </button>
                   <p class="muted delivery-action-note">This button does not start MEGA, Patreon, or ZIP preparation.</p>

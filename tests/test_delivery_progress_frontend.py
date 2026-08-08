@@ -107,6 +107,14 @@ def test_delivery_template_exposes_four_independent_target_actions() -> None:
     assert template.count('delivery:prepare-x-outputs"') == 1
     assert "Prepare watermarked X teasers" in template
     assert "This creates only the selected teaser copies. It does not post them." in template
+    assert template.count('name="watermark_position"') == 5
+    for position in ("top_left", "top_right", "bottom_left", "bottom_right"):
+        assert f'value="{position}"' in template
+    assert 'name="x_adult_content" value="true" checked' in template
+    assert 'name="x_adult_content" value="false"' in template
+    assert 'name="x_scheduled_local"' in template
+    assert 'name="x_timezone"' in template
+    assert "The AI-generated disclosure remains on either way." in template
     assert "delivery:prepare-destinations" not in template
     assert "Prepare Patreon and X" not in template
     assert 'data-delivery-card="zip"' in template
@@ -114,6 +122,23 @@ def test_delivery_template_exposes_four_independent_target_actions() -> None:
     assert 'data-destination-state="{{ destination.state }}"' in template
     assert "This button does not start MEGA, X, or ZIP preparation." in template
     assert "This button does not start MEGA, Patreon, or ZIP preparation." in template
+
+
+def test_x_composer_tracks_caption_timezone_and_optional_schedule() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+    handler = script.split("function initializeXPublishingControls()", maxsplit=1)[1]
+    handler = handler.split("const experimentFormPresent", maxsplit=1)[0]
+
+    assert 'form[action$="delivery:prepare-x"]' in handler
+    assert "Intl.DateTimeFormat().resolvedOptions().timeZone" in handler
+    assert "timezone.value = browserTimezone" in handler
+    assert "new TextEncoder().encode(caption.value).length" in handler
+    assert 'byteLength > 280 ? "Keep the X caption within 280 UTF-8 bytes."' in handler
+    assert "Math.ceil((Date.now() + 60_000) / 60_000) * 60_000" in handler
+    assert "schedule.min = localMinimum.toISOString().slice(0, 16)" in handler
+    assert "schedule.max = localMaximum.toISOString().slice(0, 16)" in handler
+    assert 'schedule.addEventListener("input", updateSchedule)' in handler
+    assert '"Approve and schedule X post"' in handler
 
 
 def test_ready_archive_is_excluded_from_delivery_polling_condition() -> None:

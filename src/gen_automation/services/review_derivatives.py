@@ -23,6 +23,7 @@ from gen_automation.services.derivative_runtime import derivative_recipe_configu
 from gen_automation.services.derivatives import (
     DERIVATIVE_RENDERER_VERSION,
     DerivativeRecipe,
+    WatermarkPosition,
     WatermarkSpec,
 )
 
@@ -63,6 +64,7 @@ async def prepare_completed_review_x_teasers(
     actor_user_id: UUID,
     idempotency_key: str,
     watermark_asset_id: UUID | None,
+    watermark_position: WatermarkPosition = WatermarkPosition.BOTTOM_RIGHT,
     max_attempts: int = 3,
     now: datetime | None = None,
 ) -> DerivativePlanResult:
@@ -72,7 +74,7 @@ async def prepare_completed_review_x_teasers(
         raise DerivativePipelineConflictError("X teaser preparation requires selected X images")
     if watermark_asset_id is None:
         raise DerivativePipelineConflictError("selected X images require a registered watermark")
-    recipe = DerivativeRecipe(watermark=WatermarkSpec())
+    recipe = DerivativeRecipe(watermark=WatermarkSpec(position=watermark_position))
     return await create_derivative_recipe_and_plan(
         session,
         review_task_id=review_task_id,
@@ -121,6 +123,7 @@ async def prepare_completed_review_derivatives(
     actor_user_id: UUID,
     idempotency_key: str,
     watermark_asset_id: UUID | None = None,
+    watermark_position: WatermarkPosition = WatermarkPosition.BOTTOM_RIGHT,
     max_attempts: int = 3,
     now: datetime | None = None,
 ) -> DerivativePlanResult:
@@ -151,6 +154,7 @@ async def prepare_completed_review_derivatives(
         actor_user_id=actor_user_id,
         idempotency_key=_target_idempotency_key(idempotency_key, "x_teaser"),
         watermark_asset_id=watermark_asset_id,
+        watermark_position=watermark_position,
         max_attempts=max_attempts,
         now=planned_at + timedelta(microseconds=1),
     )

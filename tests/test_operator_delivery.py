@@ -1,6 +1,6 @@
 # ruff: noqa: F811
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from urllib.parse import urlencode
@@ -24,9 +24,11 @@ from gen_automation.api.routes.delivery_dashboard import (
 from gen_automation.config import Environment, Settings
 from gen_automation.db.models import (
     DerivativeOutput,
+    PublicationApproval,
     PublicationAttempt,
     PublicationInput,
     PublicationIntent,
+    PublicationStep,
     Release,
     ReleaseVersion,
 )
@@ -37,6 +39,7 @@ from gen_automation.domain.enums import (
     MegaDeliveryState,
     PublicationAttemptState,
     PublicationIntentState,
+    PublicationStepKind,
     PublicationTarget,
     ReleasePhase,
 )
@@ -700,12 +703,15 @@ async def test_x_only_preparation_creates_no_patreon_intent(
     approved = derivative_approved_context
     await _prepare_independent_destination_inputs(approved)
     action_at = datetime.now(UTC)
+    scheduled_at = action_at + timedelta(days=14)
 
     async with approved.database.sessions() as session:
         result = await prepare_operator_x_destination(
             session,
             review_task_id=approved.review_task_id,
             x_text="X only",
+            x_adult_content=False,
+            scheduled_at=scheduled_at,
             x_credential_reference="test://x/oauth",
             actor_user_id=approved.owner_id,
             actor_role=AdminRole.OWNER,
@@ -716,6 +722,8 @@ async def test_x_only_preparation_creates_no_patreon_intent(
             (await session.scalars(select(PublicationIntent).order_by(PublicationIntent.id))).all()
         )
         attempts = tuple((await session.scalars(select(PublicationAttempt))).all())
+        approvals = tuple((await session.scalars(select(PublicationApproval))).all())
+        steps = tuple((await session.scalars(select(PublicationStep))).all())
         roles = tuple(
             (
                 await session.scalars(
@@ -729,8 +737,16 @@ async def test_x_only_preparation_creates_no_patreon_intent(
     assert len(intents) == 1
     assert intents[0].id == result.intent_id
     assert intents[0].target == PublicationTarget.X
+    assert intents[0].configuration == {"text": "X only", "adult_content": False}
+    assert intents[0].scheduled_at is not None
+    assert intents[0].scheduled_at.replace(tzinfo=UTC) == scheduled_at
     assert len(attempts) == 1
     assert attempts[0].intent_id == result.intent_id
+    assert attempts[0].available_at.replace(tzinfo=UTC) == scheduled_at
+    assert len(approvals) == 1
+    assert approvals[0].expires_at.replace(tzinfo=UTC) > scheduled_at
+    create_step = next(step for step in steps if step.kind == PublicationStepKind.X_CREATE_POST)
+    assert create_step.max_retries == 3
     assert roles == ("x_teaser",)
 
 

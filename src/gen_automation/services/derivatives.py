@@ -25,7 +25,11 @@ from gen_automation.domain.deliverability import (
     X_STATIC_IMAGE_MAX_BYTES,
 )
 
-DERIVATIVE_RENDERER_VERSION = "pillow-derivative-v4"
+DERIVATIVE_RENDERER_VERSION = "pillow-derivative-v5"
+LEGACY_DERIVATIVE_RENDERER_VERSION = "pillow-derivative-v4"
+SUPPORTED_DERIVATIVE_RENDERER_VERSIONS = frozenset(
+    {LEGACY_DERIVATIVE_RENDERER_VERSION, DERIVATIVE_RENDERER_VERSION}
+)
 RELATIVE_SCALE = 1_000_000
 SUPPORTED_MASTER_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
 _ABSOLUTE_RECIPE_DIMENSION_LIMIT = 16_384
@@ -187,9 +191,9 @@ type Censor = MosaicCensor | BlurCensor
 
 @dataclass(frozen=True, slots=True)
 class WatermarkSpec:
-    width: int = 220_000
-    margin: int = 25_000
-    opacity: int = 220
+    width: int = 264_000
+    margin: int = 12_000
+    opacity: int = 255
     position: WatermarkPosition = WatermarkPosition.BOTTOM_RIGHT
 
     def __post_init__(self) -> None:
@@ -593,6 +597,7 @@ def render_platform_derivatives(
     watermark_png: ImageBytes | None = None,
     targets: Sequence[DerivativeTarget | str] | None = None,
     limits: DerivativeSafetyLimits | None = None,
+    renderer_version: str = DERIVATIVE_RENDERER_VERSION,
 ) -> DerivativeBundle:
     """Render without mutating inputs.
 
@@ -607,6 +612,8 @@ def render_platform_derivatives(
         limits = DEFAULT_DERIVATIVE_LIMITS
     if not isinstance(limits, DerivativeSafetyLimits):
         raise DerivativeRecipeError("derivative safety limits are invalid")
+    if renderer_version not in SUPPORTED_DERIVATIVE_RENDERER_VERSIONS:
+        raise DerivativeRecipeError("derivative renderer version is unsupported")
     recipe_payload = canonical_json_bytes(asdict(recipe))
     if len(recipe_payload) > limits.max_recipe_bytes:
         raise DerivativeRecipeError("serialized derivative recipe exceeds the safety limit")
@@ -655,6 +662,7 @@ def render_platform_derivatives(
                     recipe=recipe,
                     recipe_sha256=recipe_sha256,
                     limits=limits,
+                    renderer_version=renderer_version,
                 )
             )
         if DerivativeTarget.X_TEASER in selected_targets:
@@ -667,6 +675,7 @@ def render_platform_derivatives(
                     watermark=watermark,
                     watermark_sha256=watermark_sha256,
                     limits=limits,
+                    renderer_version=renderer_version,
                 )
             )
     finally:
@@ -919,6 +928,7 @@ def _render_full(
     recipe: DerivativeRecipe,
     recipe_sha256: str,
     limits: DerivativeSafetyLimits,
+    renderer_version: str,
 ) -> RenderedDerivative:
     resized = _resize_to_box(
         source_image,
@@ -944,6 +954,7 @@ def _render_full(
             watermark_sha256=None,
             operations=(*operations, f"encode:{recipe.full.encoding.image_format.value}"),
             limits=limits,
+            renderer_version=renderer_version,
         )
     finally:
         resized.close()
@@ -958,6 +969,7 @@ def _render_teaser(
     watermark: Image.Image | None,
     watermark_sha256: str | None,
     limits: DerivativeSafetyLimits,
+    renderer_version: str,
 ) -> RenderedDerivative:
     fitted = _fit_teaser(source_image, recipe.x_teaser, recipe.background_rgb)
     operations = [
@@ -976,6 +988,7 @@ def _render_teaser(
             censored,
             watermark=watermark,
             spec=recipe.watermark,
+            renderer_version=renderer_version,
         )
     finally:
         censored.close()
@@ -994,6 +1007,7 @@ def _render_teaser(
             watermark_sha256=watermark_sha256,
             operations=(*operations, f"encode:{recipe.x_teaser.encoding.image_format.value}"),
             limits=limits,
+            renderer_version=renderer_version,
         )
     finally:
         rendered.close()
@@ -1115,6 +1129,7 @@ def _apply_watermark(
     *,
     watermark: Image.Image | None,
     spec: WatermarkSpec | None,
+    renderer_version: str,
 ) -> Image.Image:
     if watermark is None or spec is None:
         return image.copy()
@@ -1123,61 +1138,82 @@ def _apply_watermark(
     available_height = image.height - 2 * margin
     if available_width <= 0 or available_height <= 0:
         raise DerivativeRenderError("watermark margin leaves no drawable canvas")
-    target_width = max(1, image.width * spec.width // RELATIVE_SCALE)
-    target_width = min(target_width, available_width)
-    target_height = max(1, watermark.height * target_width // watermark.width)
-    if target_height > available_height:
-        target_height = available_height
-        target_width = max(1, watermark.width * target_height // watermark.height)
-    resized = watermark.resize(
-        (target_width, target_height),
-        resample=Image.Resampling.LANCZOS,
+    prepared = (
+        _trim_watermark_to_visible_alpha(watermark)
+        if renderer_version == DERIVATIVE_RENDERER_VERSION
+        else watermark.copy()
     )
     try:
-        alpha = resized.getchannel("A")
-        try:
-            alpha_table = tuple((value * spec.opacity + 127) // 255 for value in range(256))
-            adjusted_alpha = alpha.point(alpha_table)
-        finally:
-            alpha.close()
-        try:
-            resized.putalpha(adjusted_alpha)
-        finally:
-            adjusted_alpha.close()
-
-        left = (
-            margin
-            if spec.position in {WatermarkPosition.TOP_LEFT, WatermarkPosition.BOTTOM_LEFT}
-            else image.width - margin - resized.width
+        target_width = max(1, image.width * spec.width // RELATIVE_SCALE)
+        target_width = min(target_width, available_width)
+        target_height = max(1, prepared.height * target_width // prepared.width)
+        if target_height > available_height:
+            target_height = available_height
+            target_width = max(1, prepared.width * target_height // prepared.height)
+        resized = prepared.resize(
+            (target_width, target_height),
+            resample=Image.Resampling.LANCZOS,
         )
-        top = (
-            margin
-            if spec.position in {WatermarkPosition.TOP_LEFT, WatermarkPosition.TOP_RIGHT}
-            else image.height - margin - resized.height
-        )
-        base = image.convert("RGBA")
         try:
-            composited = base.copy()
-            composited.alpha_composite(resized, dest=(left, top))
-            output = composited.convert("RGB")
-            output.info.clear()
+            alpha = resized.getchannel("A")
             try:
-                difference = ImageChops.difference(image, output)
-                try:
-                    if difference.getbbox() is None:
-                        raise DerivativeRenderError("watermark is not visible on the derivative")
-                finally:
-                    difference.close()
-                return output
-            except BaseException:
-                output.close()
-                raise
+                alpha_table = tuple((value * spec.opacity + 127) // 255 for value in range(256))
+                adjusted_alpha = alpha.point(alpha_table)
             finally:
-                composited.close()
+                alpha.close()
+            try:
+                resized.putalpha(adjusted_alpha)
+            finally:
+                adjusted_alpha.close()
+
+            left = (
+                margin
+                if spec.position in {WatermarkPosition.TOP_LEFT, WatermarkPosition.BOTTOM_LEFT}
+                else image.width - margin - resized.width
+            )
+            top = (
+                margin
+                if spec.position in {WatermarkPosition.TOP_LEFT, WatermarkPosition.TOP_RIGHT}
+                else image.height - margin - resized.height
+            )
+            base = image.convert("RGBA")
+            try:
+                composited = base.copy()
+                composited.alpha_composite(resized, dest=(left, top))
+                output = composited.convert("RGB")
+                output.info.clear()
+                try:
+                    difference = ImageChops.difference(image, output)
+                    try:
+                        if difference.getbbox() is None:
+                            raise DerivativeRenderError(
+                                "watermark is not visible on the derivative"
+                            )
+                    finally:
+                        difference.close()
+                    return output
+                except BaseException:
+                    output.close()
+                    raise
+                finally:
+                    composited.close()
+            finally:
+                base.close()
         finally:
-            base.close()
+            resized.close()
     finally:
-        resized.close()
+        prepared.close()
+
+
+def _trim_watermark_to_visible_alpha(watermark: Image.Image) -> Image.Image:
+    alpha = watermark.getchannel("A")
+    try:
+        bounds = alpha.getbbox()
+    finally:
+        alpha.close()
+    if bounds is None:
+        raise DerivativeRenderError("watermark has no visible alpha bounds")
+    return watermark.crop(bounds)
 
 
 def _build_artifact(
@@ -1192,6 +1228,7 @@ def _build_artifact(
     watermark_sha256: str | None,
     operations: tuple[str, ...],
     limits: DerivativeSafetyLimits,
+    renderer_version: str,
 ) -> RenderedDerivative:
     _assert_output_geometry(image.size, limits)
     maximum_bytes = limits.output_byte_limit(target)
@@ -1227,7 +1264,7 @@ def _build_artifact(
         recipe_version=recipe.version,
         recipe_sha256=recipe_sha256,
         watermark_sha256=watermark_sha256,
-        renderer_version=DERIVATIVE_RENDERER_VERSION,
+        renderer_version=renderer_version,
         pillow_version=PIL.__version__,
         operations=lineage_operations,
     )

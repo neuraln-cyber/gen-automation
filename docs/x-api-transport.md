@@ -33,17 +33,24 @@ Official contracts checked on 2026-07-28:
   <https://raw.githubusercontent.com/xdevplatform/xdk/main/latest-openapi.json>.
 
 The transport sends JSON base64 for the documented one-shot image-upload flow
-and requires exact HTTP 200 responses for both upload and metadata. It also
-requires the upload response fields needed to publish safely (`id`, `media_key`,
-`expires_after_secs`, and `size`) and refuses to return an uploaded-media object
-unless X echoes `adult_content: true`. These runtime requirements are stricter
-than optionality in parts of X's generated OpenAPI schema. GIF/video upload and
-asynchronous media processing are intentionally out of scope. Their contracts
-require the chunked initialize/append/finalize/status flow.
+and requires exact HTTP 200 responses for upload and, when requested, metadata.
+It also requires the upload response fields needed to publish safely (`id`,
+`media_key`, `expires_after_secs`, and `size`). When `adult_content` is true (the
+default), it attaches the warning and refuses to return an uploaded-media object
+unless X echoes `adult_content: true`. When false, it deliberately skips the
+metadata endpoint. GIF/video upload and asynchronous media processing are
+intentionally out of scope. Their contracts require the chunked
+initialize/append/finalize/status flow.
+
+Post creation always sends `made_with_ai: true`, independently of the adult-media
+choice.
 
 Post text is capped at 4,096 UTF-8 bytes before request construction. This is a
 transport/request-size bound, not an attempt to duplicate X's weighted text
 validation, and it does not guarantee X will accept a post of that size.
+The publication workflow applies a stricter 280 UTF-8-byte preflight before
+uploading media, targeting ordinary X accounts; this wider transport bound is
+only a defense-in-depth protocol ceiling.
 
 X's create-post reference does not document an idempotency-key field or header.
 Consequently every operation in this client is attempted exactly once. A

@@ -149,12 +149,14 @@ class _XPublicationClientAdapter:
         *,
         image: bytes,
         media_type: str,
+        adult_content: bool = True,
     ) -> XUploadedMedia:
         if media_type not in {"image/jpeg", "image/png", "image/webp"}:
             raise ValueError("X static image media type must be JPEG, PNG, or WEBP")
         return await self._client.upload_image(
             image=image,
             media_type=cast(XStaticImageMediaType, media_type),
+            adult_content=adult_content,
         )
 
     async def create_post(

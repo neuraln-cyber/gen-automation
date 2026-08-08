@@ -57,6 +57,7 @@ from gen_automation.integrations.x.errors import (
     XAmbiguousError,
     XProtocolError,
     XRetryableError,
+    XRetryableTransportError,
     XTerminalError,
 )
 from gen_automation.integrations.x.models import XPost, XUploadedMedia
@@ -110,6 +111,7 @@ class XPublicationClient(Protocol):
         *,
         image: bytes,
         media_type: str,
+        adult_content: bool = True,
     ) -> XUploadedMedia: ...
 
     async def create_post(
@@ -179,6 +181,18 @@ class _EffectContext:
     guard_epoch: int
     credential_reference: str | None
     configuration: dict[str, object]
+
+
+def _x_configuration(configuration: dict[str, object]) -> tuple[str, bool]:
+    """Read a frozen X configuration, including legacy text-only snapshots."""
+
+    if "text" not in configuration or not set(configuration).issubset({"text", "adult_content"}):
+        raise PublicationRuntimeContractError("frozen X configuration is invalid")
+    text = configuration["text"]
+    adult_content = configuration.get("adult_content", True)
+    if not isinstance(text, str) or not text.strip() or not isinstance(adult_content, bool):
+        raise PublicationRuntimeContractError("frozen X configuration is invalid")
+    return text, adult_content
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,6 +374,17 @@ async def _execute_claimed_attempt(
                     lease_seconds=lease_seconds,
                     now=effect_at,
                 )
+                try:
+                    _, adult_content = _x_configuration(context.configuration)
+                except PublicationRuntimeContractError:
+                    return await _mark_failed_result(
+                        sessions,
+                        attempt_id=claimed.attempt_id,
+                        step_id=snapshot.step_id,
+                        worker_id=claimed.worker_id,
+                        error_code="x_configuration_invalid",
+                        now=_clock_now(clock),
+                    )
                 if (
                     x_oauth_provider is None
                     or context.credential_reference is None
@@ -405,6 +430,7 @@ async def _execute_claimed_attempt(
                         uploaded = await oauth.client.upload_image(
                             image=input_bytes.body,
                             media_type=input_bytes.publication_input.asset_content_type,
+                            adult_content=adult_content,
                         )
                         provider_returned = True
                 except XCredentialUnavailableError:
@@ -593,8 +619,9 @@ async def _execute_claimed_attempt(
                         state=PublicationAttemptState.RETRY_WAIT,
                         error_code="x_credentials_unavailable",
                     )
-                text_value = context.configuration.get("text")
-                if not isinstance(text_value, str):
+                try:
+                    text_value, _ = _x_configuration(context.configuration)
+                except PublicationRuntimeContractError:
                     return await _mark_failed_result(
                         sessions,
                         attempt_id=claimed.attempt_id,
@@ -669,9 +696,27 @@ async def _execute_claimed_attempt(
                             now=_clock_now(clock),
                         )
                     raise
+                except XRetryableTransportError:
+                    await _schedule_retry(
+                        sessions,
+                        attempt_id=claimed.attempt_id,
+                        step_id=snapshot.step_id,
+                        worker_id=claimed.worker_id,
+                        error_code="x_create_post_not_sent",
+                        retry_base_seconds=retry_base_seconds,
+                        retry_max_seconds=retry_max_seconds,
+                        provider_request_no=provider_request_no,
+                        now=_clock_now(clock),
+                    )
+                    return PublicationCycleResult(
+                        claimed_attempt=True,
+                        attempt_id=claimed.attempt_id,
+                        state=PublicationAttemptState.RETRY_WAIT,
+                        error_code="x_create_post_not_sent",
+                    )
                 except (XRetryableError, XAmbiguousError):
                     # X does not document an idempotency key for POST /2/tweets.
-                    # Any transport, timeout, 408/429, or 5xx outcome is UNKNOWN.
+                    # A timeout, ambiguous transport, 408/429, or 5xx outcome is UNKNOWN.
                     return await _mark_unknown_result(
                         sessions,
                         attempt_id=claimed.attempt_id,

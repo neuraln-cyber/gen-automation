@@ -8,7 +8,7 @@ type JSONObject = dict[str, JSONValue]
 
 @dataclass(frozen=True)
 class XUploadedMedia:
-    """A static image uploaded to X with adult-content metadata attached."""
+    """A static image uploaded to X."""
 
     id: str
     media_key: str

@@ -26,6 +26,7 @@ from gen_automation.services.derivative_pipeline import (
     DerivativePipelineInputError,
     DerivativePipelineNotFoundError,
 )
+from gen_automation.services.derivatives import WatermarkPosition
 from gen_automation.services.review_derivatives import (
     prepare_completed_review_derivatives,
 )
@@ -58,6 +59,7 @@ class _StrictRequest(BaseModel):
 
 class PrepareDerivativesRequest(_StrictRequest):
     watermark_asset_id: UUID | None = None
+    watermark_position: WatermarkPosition = WatermarkPosition.BOTTOM_RIGHT
     max_attempts: int = Field(default=3, ge=1, le=10)
 
 
@@ -170,6 +172,7 @@ async def post_review_derivative_plan(
             actor_user_id=principal.user_id,
             idempotency_key=idempotency_key,
             watermark_asset_id=command.watermark_asset_id,
+            watermark_position=command.watermark_position,
             max_attempts=command.max_attempts,
         )
     except (

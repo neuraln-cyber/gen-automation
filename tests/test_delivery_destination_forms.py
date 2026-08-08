@@ -61,6 +61,9 @@ def _x_fields() -> dict[str, str]:
     return {
         **_common_fields(),
         "x_text": "New teaser set",
+        "x_adult_content": "true",
+        "x_scheduled_local": "",
+        "x_timezone": "Europe/Sofia",
     }
 
 
@@ -84,6 +87,8 @@ async def test_x_form_is_complete_without_any_patreon_fields() -> None:
     form = await read_prepare_x_form(_request(fields))
 
     assert form.x_text == "New teaser set"
+    assert form.adult_content
+    assert form.scheduled_at is None
     assert not hasattr(form, "patreon_title")
     assert not hasattr(form, "public_preview_output_id")
 
@@ -150,3 +155,59 @@ async def test_patreon_preview_attestation_is_not_required_by_x() -> None:
         await read_prepare_patreon_form(_request(unsafe))
 
     assert caught.value.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+
+
+@pytest.mark.asyncio
+async def test_x_form_accepts_sfw_scheduled_post_in_browser_timezone() -> None:
+    fields = _x_fields()
+    fields["x_adult_content"] = "false"
+    fields["x_scheduled_local"] = "2026-08-10T18:30"
+
+    form = await read_prepare_x_form(_request(fields))
+
+    assert not form.adult_content
+    assert form.scheduled_at == datetime(2026, 8, 10, 15, 30, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_x_form_ignores_timezone_when_schedule_is_blank() -> None:
+    fields = _x_fields()
+    fields["x_scheduled_local"] = ""
+    fields["x_timezone"] = "not/a-timezone"
+
+    form = await read_prepare_x_form(_request(fields))
+
+    assert form.scheduled_at is None
+
+
+@pytest.mark.asyncio
+async def test_x_form_rejects_an_unrecognized_adult_toggle_value() -> None:
+    fields = _x_fields()
+    fields["x_adult_content"] = "sometimes"
+
+    with pytest.raises(BrowserDeliveryFormError) as caught:
+        await read_prepare_x_form(_request(fields))
+
+    assert caught.value.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("local_value", "expected_message"),
+    [
+        ("2026-03-29T03:30", "does not exist"),
+        ("2026-10-25T03:30", "is ambiguous"),
+    ],
+)
+async def test_x_form_rejects_dst_gap_and_overlap(
+    local_value: str,
+    expected_message: str,
+) -> None:
+    fields = _x_fields()
+    fields["x_scheduled_local"] = local_value
+
+    with pytest.raises(BrowserDeliveryFormError) as caught:
+        await read_prepare_x_form(_request(fields))
+
+    assert caught.value.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+    assert expected_message in caught.value.message

@@ -11,6 +11,7 @@ from gen_automation.api.routes import delivery_dashboard as delivery_routes
 from gen_automation.config import Environment, Settings
 from gen_automation.domain.enums import AdminRole
 from gen_automation.services.authentication import AuthenticatedPrincipal
+from gen_automation.services.derivatives import WatermarkPosition
 
 
 def _settings() -> Settings:
@@ -175,6 +176,9 @@ async def test_signed_x_route_calls_only_x_service(
             action="prepare-x",
         ),
         "x_text": "X only",
+        "x_adult_content": "false",
+        "x_scheduled_local": "2026-08-10T18:30",
+        "x_timezone": "Europe/Sofia",
     }
     patreon_calls: list[dict[str, object]] = []
     x_calls: list[dict[str, object]] = []
@@ -220,6 +224,8 @@ async def test_signed_x_route_calls_only_x_service(
     assert len(x_calls) == 1
     assert x_calls[0]["review_task_id"] == review_task_id
     assert x_calls[0]["x_text"] == "X only"
+    assert x_calls[0]["x_adult_content"] is False
+    assert x_calls[0]["scheduled_at"] == datetime(2026, 8, 10, 15, 30, tzinfo=UTC)
     assert patreon_calls == []
     assert mega_calls == []
 
@@ -306,6 +312,7 @@ async def test_clean_full_output_route_never_plans_x_teasers(
             action="prepare-outputs",
         ),
         "watermark_asset_id": "",
+        "watermark_position": "",
     }
     full_calls: list[dict[str, object]] = []
     x_calls: list[dict[str, object]] = []
@@ -477,6 +484,7 @@ async def test_x_teaser_output_route_never_plans_clean_full_outputs(
             action="prepare-x-outputs",
         ),
         "watermark_asset_id": str(watermark_asset_id),
+        "watermark_position": "top_left",
     }
     full_calls: list[dict[str, object]] = []
     x_calls: list[dict[str, object]] = []
@@ -512,6 +520,7 @@ async def test_x_teaser_output_route_never_plans_clean_full_outputs(
     assert len(x_calls) == 1
     assert x_calls[0]["review_task_id"] == review_task_id
     assert x_calls[0]["watermark_asset_id"] == watermark_asset_id
+    assert x_calls[0]["watermark_position"] == WatermarkPosition.TOP_LEFT
     assert full_calls == []
 
 
@@ -533,6 +542,9 @@ async def test_stale_cross_target_signature_cannot_start_x(
             action="prepare-patreon",
         ),
         "x_text": "must not post",
+        "x_adult_content": "true",
+        "x_scheduled_local": "",
+        "x_timezone": "Europe/Sofia",
     }
     x_calls: list[dict[str, object]] = []
 

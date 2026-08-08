@@ -9,10 +9,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import parse_qs
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import Request, status
 
 from gen_automation.config import Settings
+from gen_automation.services.derivatives import WatermarkPosition
 
 _FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
 _MAX_FORM_BODY_BYTES = 64 * 1024
@@ -25,6 +27,7 @@ PREPARE_OUTPUT_FIELDS = frozenset(
         "idempotency_key",
         "submission_id",
         "watermark_asset_id",
+        "watermark_position",
     }
 )
 RETRY_OUTPUT_FIELDS = frozenset(
@@ -68,6 +71,9 @@ PREPARE_X_FIELDS = frozenset(
         "idempotency_key",
         "submission_id",
         "x_text",
+        "x_adult_content",
+        "x_scheduled_local",
+        "x_timezone",
     }
 )
 PACKAGE_DOWNLOAD_FIELDS = frozenset(
@@ -134,6 +140,7 @@ class PrepareOutputForm:
     idempotency_key: str
     submission_id: UUID
     watermark_asset_id: UUID | None
+    watermark_position: WatermarkPosition | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +184,8 @@ class PrepareXForm:
     idempotency_key: str
     submission_id: UUID
     x_text: str
+    adult_content: bool
+    scheduled_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,11 +247,24 @@ async def read_prepare_output_form(request: Request) -> PrepareOutputForm:
             raise _bad_request() from None
         if str(watermark_asset_id) != raw_watermark.lower():
             raise _bad_request()
+    raw_position = values["watermark_position"]
+    watermark_position: WatermarkPosition | None = None
+    if raw_position:
+        try:
+            watermark_position = WatermarkPosition(raw_position)
+        except ValueError:
+            raise _bad_request() from None
+    if (watermark_asset_id is None) != (watermark_position is None):
+        raise BrowserDeliveryFormError(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            message="Choose both a watermark and its corner placement.",
+        )
     return PrepareOutputForm(
         csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
         idempotency_key=_idempotency_key(values["idempotency_key"]),
         submission_id=submission_id,
         watermark_asset_id=watermark_asset_id,
+        watermark_position=watermark_position,
     )
 
 
@@ -298,7 +320,12 @@ async def read_prepare_x_form(request: Request) -> PrepareXForm:
         csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
         idempotency_key=_idempotency_key(values["idempotency_key"]),
         submission_id=_uuid(values["submission_id"]),
-        x_text=_bounded_text(values["x_text"], maximum=2_000, required=True),
+        x_text=_bounded_text(values["x_text"], maximum=280, required=True),
+        adult_content=_strict_bool(values["x_adult_content"]),
+        scheduled_at=_optional_local_datetime(
+            values["x_scheduled_local"],
+            timezone_name=values["x_timezone"],
+        ),
     )
 
 
@@ -549,6 +576,60 @@ def _uuid(value: str) -> UUID:
     if str(parsed) != value.lower():
         raise _bad_request()
     return parsed
+
+
+def _strict_bool(value: str) -> bool:
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise _bad_request()
+
+
+def _optional_local_datetime(value: str, *, timezone_name: str) -> datetime | None:
+    if value == "":
+        return None
+    if not 1 <= len(timezone_name) <= 100 or any(
+        ord(character) < 33 for character in timezone_name
+    ):
+        raise _bad_request()
+    try:
+        timezone = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise BrowserDeliveryFormError(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            message="The selected scheduling timezone is unavailable.",
+        ) from None
+    if len(value) > 32:
+        raise _bad_request()
+    try:
+        local = datetime.fromisoformat(value)
+    except ValueError:
+        raise _bad_request() from None
+    if local.tzinfo is not None or local.second != 0 or local.microsecond != 0:
+        raise _bad_request()
+    first = local.replace(tzinfo=timezone, fold=0)
+    second = local.replace(tzinfo=timezone, fold=1)
+    first_utc = first.astimezone(UTC)
+    second_utc = second.astimezone(UTC)
+    first_valid = first_utc.astimezone(timezone).replace(tzinfo=None) == local
+    second_valid = second_utc.astimezone(timezone).replace(tzinfo=None) == local
+    if not first_valid and not second_valid:
+        raise BrowserDeliveryFormError(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            message=(
+                "That local time does not exist because of daylight saving time. "
+                "Choose another time."
+            ),
+        )
+    if first_valid and second_valid and first.utcoffset() != second.utcoffset():
+        raise BrowserDeliveryFormError(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            message=(
+                "That local time is ambiguous because of daylight saving time. Choose another time."
+            ),
+        )
+    return first_utc if first_valid else second_utc
 
 
 def _datetime(value: str) -> datetime:

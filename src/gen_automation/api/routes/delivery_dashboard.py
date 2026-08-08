@@ -642,12 +642,18 @@ async def dashboard_prepare_x_outputs(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 message="Choose a registered watermark for the X teasers.",
             )
+        if form.watermark_position is None:
+            raise BrowserDeliveryFormError(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                message="Choose a corner for the X watermark.",
+            )
         await prepare_completed_review_x_teasers(
             session,
             review_task_id=review_task_id,
             actor_user_id=owner.user_id,
             idempotency_key=form.idempotency_key,
             watermark_asset_id=form.watermark_asset_id,
+            watermark_position=form.watermark_position,
         )
     except BrowserDeliveryFormError as error:
         return _form_error(request, principal, error.status_code, error.message)
@@ -1006,6 +1012,8 @@ async def dashboard_prepare_x_destination(
             session,
             review_task_id=review_task_id,
             x_text=form.x_text,
+            x_adult_content=form.adult_content,
+            scheduled_at=form.scheduled_at,
             x_credential_reference=settings.x_oauth_secret_reference,
             actor_user_id=owner.user_id,
             actor_role=owner.role,

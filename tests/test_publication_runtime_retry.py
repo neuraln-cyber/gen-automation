@@ -21,8 +21,8 @@ from gen_automation.integrations.patreon import (
     PatreonDriverRequest,
     PatreonDriverResult,
 )
-from gen_automation.integrations.x.errors import XProtocolError
-from gen_automation.integrations.x.models import XPost
+from gen_automation.integrations.x.errors import XProtocolError, XRetryableTransportError
+from gen_automation.integrations.x.models import XPost, XUploadedMedia
 from gen_automation.services import publication_runtime
 
 
@@ -101,6 +101,241 @@ async def test_exhausted_retry_fails_without_exceeding_database_limit(
     assert attempt.state == PublicationAttemptState.FAILED
     assert intent.state == PublicationIntentState.FAILED
     session.commit.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("configuration", "expected_adult_content"),
+    (
+        ({"text": "legacy copy"}, True),
+        ({"text": "safe copy", "adult_content": False}, False),
+    ),
+)
+async def test_x_upload_uses_frozen_adult_toggle_for_every_image(
+    monkeypatch: pytest.MonkeyPatch,
+    configuration: dict[str, object],
+    expected_adult_content: bool,
+) -> None:
+    now = datetime(2026, 8, 8, 12, tzinfo=UTC)
+    attempt_id = uuid4()
+    intent_id = uuid4()
+    step_ids = (uuid4(), uuid4())
+    snapshots = [
+        publication_runtime._EffectContext(
+            attempt_id=attempt_id,
+            intent_id=intent_id,
+            approval_id=uuid4(),
+            step_id=step_id,
+            kind=PublicationStepKind.X_MEDIA_UPLOAD,
+            guard_epoch=1,
+            credential_reference="test://x/creator",
+            configuration=configuration,
+        )
+        for step_id in step_ids
+    ]
+    uploaded_adult_content: list[bool] = []
+
+    class FakeClient:
+        async def upload_image(
+            self,
+            *,
+            image: bytes,
+            media_type: str,
+            adult_content: bool = True,
+        ) -> XUploadedMedia:
+            assert image == b"clean-image"
+            assert media_type == "image/png"
+            uploaded_adult_content.append(adult_content)
+            suffix = len(uploaded_adult_content)
+            return XUploadedMedia(
+                id=f"100{suffix}",
+                media_key=f"3_100{suffix}",
+                expires_after_seconds=86_400,
+                size=len(image),
+            )
+
+        async def create_post(self, *, text: str, media_ids: object) -> XPost:
+            raise AssertionError("the focused upload test must not create a post")
+
+    class FakeLease:
+        creator_user_id = "42"
+        client = FakeClient()
+
+    class FakeProvider:
+        def open_for_effect(self, credential_reference: str) -> object:
+            assert credential_reference == "test://x/creator"
+
+            @asynccontextmanager
+            async def lease() -> object:
+                yield FakeLease()
+
+            return lease()
+
+    async def next_snapshot(*_args: object, **_kwargs: object) -> object:
+        return snapshots.pop(0) if snapshots else None
+
+    async def read_input(*_args: object, **_kwargs: object) -> object:
+        return publication_runtime._InputBytes(
+            publication_input=SimpleNamespace(asset_content_type="image/png"),
+            body=b"clean-image",
+        )
+
+    async def begin_effect(*_args: object, **kwargs: object) -> object:
+        step_id = kwargs["step_id"]
+        assert isinstance(step_id, type(step_ids[0]))
+        return publication_runtime._EffectContext(
+            attempt_id=attempt_id,
+            intent_id=intent_id,
+            approval_id=uuid4(),
+            step_id=step_id,
+            kind=PublicationStepKind.X_MEDIA_UPLOAD,
+            guard_epoch=1,
+            credential_reference="test://x/creator",
+            configuration=configuration,
+        )
+
+    request_no = 0
+
+    async def mark_started(*_args: object, **_kwargs: object) -> int:
+        nonlocal request_no
+        request_no += 1
+        return request_no
+
+    completed_uploads: list[str] = []
+
+    async def finish_upload(*_args: object, **kwargs: object) -> None:
+        uploaded = kwargs["uploaded"]
+        assert isinstance(uploaded, XUploadedMedia)
+        completed_uploads.append(uploaded.id)
+
+    async def attempt_state(*_args: object, **_kwargs: object) -> PublicationAttemptState:
+        return PublicationAttemptState.SUCCEEDED
+
+    monkeypatch.setattr(publication_runtime, "_next_step_snapshot", next_snapshot)
+    monkeypatch.setattr(publication_runtime, "_read_step_input", read_input)
+    monkeypatch.setattr(publication_runtime, "_begin_effect", begin_effect)
+    monkeypatch.setattr(publication_runtime, "_mark_provider_request_started", mark_started)
+    monkeypatch.setattr(publication_runtime, "_finish_x_media_upload", finish_upload)
+    monkeypatch.setattr(publication_runtime, "_attempt_state", attempt_state)
+
+    result = await publication_runtime._execute_claimed_attempt(
+        Mock(),
+        Mock(),
+        claimed=publication_runtime._ClaimedAttempt(
+            attempt_id=attempt_id,
+            worker_id="controller:test:publication",
+        ),
+        x_oauth_provider=FakeProvider(),  # type: ignore[arg-type]
+        expected_x_creator_user_id="42",
+        retry_base_seconds=30,
+        retry_max_seconds=900,
+        max_package_bytes=1024,
+        patreon_driver=None,
+        patreon_browser_profile_reference=None,
+        lease_seconds=1200,
+        clock=lambda: now,
+    )
+
+    assert result.state == PublicationAttemptState.SUCCEEDED
+    assert completed_uploads == ["1001", "1002"]
+    assert uploaded_adult_content == [expected_adult_content, expected_adult_content]
+
+
+async def test_x_create_post_retries_only_when_transport_proves_request_was_not_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 8, 8, 12, tzinfo=UTC)
+    attempt_id = uuid4()
+    intent_id = uuid4()
+    step_id = uuid4()
+    scheduled_errors: list[str] = []
+    client_calls = 0
+
+    class FakeClient:
+        async def create_post(self, *, text: str, media_ids: object) -> XPost:
+            nonlocal client_calls
+            client_calls += 1
+            assert text == "approved copy"
+            assert media_ids == ("1001",)
+            raise XRetryableTransportError("request bytes were not sent")
+
+    class FakeLease:
+        creator_user_id = "42"
+        client = FakeClient()
+
+    class FakeProvider:
+        def open_for_effect(self, credential_reference: str) -> object:
+            assert credential_reference == "test://x/creator"
+
+            @asynccontextmanager
+            async def lease() -> object:
+                yield FakeLease()
+
+            return lease()
+
+    async def no_recovery(*_args: object, **_kwargs: object) -> bool:
+        return False
+
+    async def claim_once(*_args: object, **_kwargs: object) -> object:
+        return publication_runtime._ClaimedAttempt(
+            attempt_id=attempt_id,
+            worker_id="controller:test:publication",
+        )
+
+    async def snapshot(*_args: object, **_kwargs: object) -> object:
+        return publication_runtime._EffectContext(
+            attempt_id=attempt_id,
+            intent_id=intent_id,
+            approval_id=uuid4(),
+            step_id=step_id,
+            kind=PublicationStepKind.X_CREATE_POST,
+            guard_epoch=1,
+            credential_reference="test://x/creator",
+            configuration={"text": "approved copy", "adult_content": False},
+        )
+
+    async def media_ids(*_args: object, **_kwargs: object) -> tuple[str, ...]:
+        return ("1001",)
+
+    async def request_started(*_args: object, **_kwargs: object) -> int:
+        return 1
+
+    async def schedule_retry(*_args: object, **kwargs: object) -> None:
+        scheduled_errors.append(str(kwargs["error_code"]))
+        assert kwargs["provider_request_no"] == 1
+
+    async def must_not_mark_unknown(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("a proven pre-send failure must remain safely retryable")
+
+    monkeypatch.setattr(publication_runtime, "_recover_one_expired_lease", no_recovery)
+    monkeypatch.setattr(publication_runtime, "_claim_one_attempt", claim_once)
+    monkeypatch.setattr(
+        publication_runtime,
+        "_patreon_package_part_count",
+        lambda *_args, **_kwargs: _async_value(1),
+    )
+    monkeypatch.setattr(publication_runtime, "_next_step_snapshot", snapshot)
+    monkeypatch.setattr(publication_runtime, "_load_x_media_ids", media_ids)
+    monkeypatch.setattr(publication_runtime, "_begin_effect", snapshot)
+    monkeypatch.setattr(publication_runtime, "_mark_provider_request_started", request_started)
+    monkeypatch.setattr(publication_runtime, "_schedule_retry", schedule_retry)
+    monkeypatch.setattr(publication_runtime, "_mark_unknown_result", must_not_mark_unknown)
+
+    result = await publication_runtime.run_publication_cycle(
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        worker_id="controller:test:publication",
+        x_oauth_provider=FakeProvider(),  # type: ignore[arg-type]
+        expected_x_creator_user_id="42",
+        lease_seconds=600,
+        retry_base_seconds=30,
+        retry_max_seconds=900,
+        now=now,
+    )
+
+    assert result.state == PublicationAttemptState.RETRY_WAIT
+    assert result.error_code == "x_create_post_not_sent"
+    assert scheduled_errors == ["x_create_post_not_sent"]
+    assert client_calls == 1
 
 
 @pytest.mark.parametrize("failure_mode", ("protocol", "completion"))

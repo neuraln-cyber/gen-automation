@@ -49,17 +49,24 @@ reference such as `aws-secrets-manager://...`, never a token.
 For X:
 
 - only one to four `x_teaser` derivatives may be used;
+- dashboard captions are conservatively limited to 280 UTF-8 bytes before any
+  media upload, avoiding late provider rejection on ordinary accounts;
+- schedules must be timezone-aware and no more than 366 days ahead;
 - a future-scheduled attempt remains unavailable until its requested post time,
   because this workflow performs the X create-post effect at that instant;
 - the ordered inputs must exactly match the owner's image selections frozen at
   review completion; omitted, additional, or reordered outputs are rejected;
-- each upload includes the adult-content metadata supported by the transport;
+- each upload follows the intent's frozen `adult_content` choice; text-only
+  legacy intents default to `true`, while `false` skips adult-warning metadata;
+- post creation always sends X's `made_with_ai: true` label regardless of that
+  adult-content choice;
 - an ambiguous upload is retried with a new request and its unconfirmed media ID
   is never stored or reused;
 - each provider request has append-only started/completion evidence;
-- create-post transport errors, timeouts, 408/429/5xx responses, malformed
-  success responses, context-exit uncertainty, process loss, and durable
-  completion failures all become `UNKNOWN`;
+- a transport error proven to occur before any create-post request bytes were
+  sent is retried with bounded backoff; timeouts, ambiguous transport,
+  408/429/5xx responses, malformed success responses, context-exit uncertainty,
+  process loss, and durable completion failures become `UNKNOWN`;
 - an unknown create is never retried automatically;
 - confirming the post present records the exact post ID and HTTPS X URL;
 - confirming it absent records evidence and returns the intent to

@@ -16,6 +16,7 @@ from gen_automation.domain.deliverability import (
 from gen_automation.services.derivatives import (
     DEFAULT_DERIVATIVE_LIMITS,
     DERIVATIVE_RENDERER_VERSION,
+    LEGACY_DERIVATIVE_RENDERER_VERSION,
     BlurCensor,
     DerivativeInputError,
     DerivativeRecipe,
@@ -702,6 +703,113 @@ def test_watermark_is_applied_only_to_x_teaser_after_censorship() -> None:
         for index, operation in enumerate(teaser_operations)
         if operation.startswith("watermark:")
     )
+
+
+def test_watermark_defaults_match_reference_calibration() -> None:
+    specification = WatermarkSpec()
+
+    assert specification.width == 264_000
+    assert specification.margin == 12_000
+    assert specification.opacity == 255
+    assert specification.position is WatermarkPosition.BOTTOM_RIGHT
+
+
+@pytest.mark.parametrize(
+    ("position", "expected_bounds"),
+    [
+        (WatermarkPosition.TOP_LEFT, (10, 10, 60, 26)),
+        (WatermarkPosition.TOP_RIGHT, (140, 10, 190, 26)),
+        (WatermarkPosition.BOTTOM_LEFT, (10, 74, 60, 90)),
+        (WatermarkPosition.BOTTOM_RIGHT, (140, 74, 190, 90)),
+    ],
+)
+def test_watermark_trims_outer_alpha_padding_and_anchors_visible_bounds(
+    position: WatermarkPosition,
+    expected_bounds: tuple[int, int, int, int],
+) -> None:
+    source_image = Image.new("RGB", (200, 100), (10, 40, 180))
+    master = _encode(source_image)
+    source_image.close()
+    padded_watermark = Image.new("RGBA", (100, 80), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(padded_watermark)
+    draw.rectangle((20, 30, 79, 49), fill=(255, 32, 32, 255))
+    watermark = _encode(padded_watermark)
+    padded_watermark.close()
+    recipe = _png_recipe(
+        teaser=XTeaserSpec(
+            output_filename="teaser.png",
+            width=200,
+            height=100,
+            encoding=PngEncoding(),
+        ),
+        watermark=WatermarkSpec(
+            width=250_000,
+            margin=100_000,
+            opacity=255,
+            position=position,
+        ),
+    )
+
+    rendered = _artifact(
+        render_platform_derivatives(
+            master,
+            recipe=recipe,
+            watermark_png=watermark,
+            targets=(DerivativeTarget.X_TEASER,),
+        ),
+        DerivativeTarget.X_TEASER,
+    )
+
+    with _decoded(rendered.data) as marked, _decoded(master) as plain:
+        difference = ImageChops.difference(plain, marked)
+        try:
+            assert difference.getbbox() == expected_bounds
+        finally:
+            difference.close()
+
+
+def test_legacy_renderer_preserves_full_watermark_canvas_geometry() -> None:
+    source_image = Image.new("RGB", (400, 200), (10, 40, 180))
+    master = _encode(source_image)
+    source_image.close()
+    padded_watermark = Image.new("RGBA", (100, 80), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(padded_watermark)
+    draw.rectangle((20, 30, 79, 49), fill=(255, 32, 32, 255))
+    watermark = _encode(padded_watermark)
+    padded_watermark.close()
+    recipe = _png_recipe(
+        teaser=XTeaserSpec(
+            output_filename="teaser.png",
+            width=400,
+            height=200,
+            encoding=PngEncoding(),
+        ),
+        watermark=WatermarkSpec(
+            width=250_000,
+            margin=100_000,
+            opacity=255,
+            position=WatermarkPosition.TOP_LEFT,
+        ),
+    )
+
+    rendered = _artifact(
+        render_platform_derivatives(
+            master,
+            recipe=recipe,
+            watermark_png=watermark,
+            targets=(DerivativeTarget.X_TEASER,),
+            renderer_version=LEGACY_DERIVATIVE_RENDERER_VERSION,
+        ),
+        DerivativeTarget.X_TEASER,
+    )
+
+    assert rendered.lineage.renderer_version == LEGACY_DERIVATIVE_RENDERER_VERSION
+    with _decoded(rendered.data) as marked, _decoded(master) as plain:
+        difference = ImageChops.difference(plain, marked)
+        try:
+            assert difference.getbbox() == (40, 50, 100, 70)
+        finally:
+            difference.close()
 
 
 @pytest.mark.parametrize(

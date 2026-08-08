@@ -3118,6 +3118,88 @@ body.asset-viewer-open { overflow: hidden; }
   text-align: center;
 }
 
+.watermark-corner-picker,
+.x-adult-toggle {
+  min-width: 0;
+  margin: 0;
+  padding: .7rem;
+  border: 1px solid var(--border);
+  border-radius: .7rem;
+  background: rgba(255, 255, 255, .02);
+}
+
+.watermark-corner-picker legend,
+.x-adult-toggle legend {
+  padding: 0 .25rem;
+  color: var(--muted-strong);
+  font-size: .76rem;
+  font-weight: 750;
+}
+
+.watermark-corner-options,
+.segmented-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: .45rem;
+}
+
+.watermark-corner-options label,
+.segmented-options label {
+  display: flex !important;
+  min-width: 0;
+  min-height: 2.65rem;
+  flex-direction: row !important;
+  align-items: center;
+  justify-content: center;
+  gap: .4rem !important;
+  padding: .5rem .6rem;
+  border: 1px solid var(--border);
+  border-radius: .6rem;
+  background: var(--surface-solid);
+  color: var(--muted-strong);
+  cursor: pointer;
+  text-align: center;
+}
+
+.watermark-corner-options label:has(input:checked),
+.segmented-options label:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+  box-shadow: 0 0 0 1px var(--accent-soft);
+}
+
+.watermark-corner-options input,
+.segmented-options input {
+  width: auto;
+  min-height: 0;
+  margin: 0;
+}
+
+.watermark-corner-options span {
+  display: inline-grid;
+  min-width: 1.7rem;
+  min-height: 1.7rem;
+  place-items: center;
+  border-radius: .4rem;
+  background: rgba(255, 255, 255, .06);
+  font-size: .65rem;
+  font-weight: 850;
+}
+
+.x-adult-toggle .delivery-action-note { margin-top: .55rem !important; }
+.x-caption-count { margin: -.45rem 0 0 !important; text-align: right; }
+.delivery-schedule {
+  margin: 0 !important;
+  padding: .55rem .65rem;
+  border: 1px solid rgba(125, 211, 252, .22);
+  border-radius: .6rem;
+  background: rgba(125, 211, 252, .08);
+  color: var(--info);
+  font-size: .8rem;
+  font-weight: 700;
+}
+
 .delivery-preview-fieldset { min-width: 0; }
 
 .delivery-preview-grid {

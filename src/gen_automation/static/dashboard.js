@@ -6301,6 +6301,62 @@
     window.requestAnimationFrame(submit);
   }
 
+  function initializeXPublishingControls() {
+    document.querySelectorAll("[data-local-datetime]").forEach((node) => {
+      if (!(node instanceof HTMLTimeElement)) return;
+      const value = node.dateTime || node.textContent || "";
+      const parsed = new Date(value);
+      if (!Number.isNaN(parsed.valueOf())) {
+        node.textContent = parsed.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+      }
+    });
+
+    document.querySelectorAll('form[action$="delivery:prepare-x"]').forEach((form) => {
+      if (!(form instanceof HTMLFormElement)) return;
+      const caption = form.querySelector("[data-x-caption]");
+      const count = form.querySelector("[data-x-caption-count]");
+      const schedule = form.querySelector("[data-x-scheduled-local]");
+      const timezone = form.querySelector("[data-x-timezone]");
+      const timezoneLabel = form.querySelector("[data-x-timezone-label]");
+      const submit = form.querySelector("[data-x-submit-label]");
+      const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "Europe/Sofia";
+      if (timezone instanceof HTMLInputElement) timezone.value = browserTimezone;
+      if (timezoneLabel) timezoneLabel.textContent = browserTimezone;
+
+      const updateCaptionCount = () => {
+        if (!(caption instanceof HTMLTextAreaElement) || !count) return;
+        const byteLength = new TextEncoder().encode(caption.value).length;
+        count.textContent = `${byteLength.toLocaleString()} / 280 UTF-8 bytes`;
+        caption.setCustomValidity(
+          byteLength > 280 ? "Keep the X caption within 280 UTF-8 bytes." : "",
+        );
+      };
+      if (caption instanceof HTMLTextAreaElement) {
+        caption.addEventListener("input", updateCaptionCount);
+        updateCaptionCount();
+      }
+
+      if (schedule instanceof HTMLInputElement && submit instanceof HTMLButtonElement) {
+        const minimum = new Date(Math.ceil((Date.now() + 60_000) / 60_000) * 60_000);
+        const localMinimum = new Date(
+          minimum.getTime() - minimum.getTimezoneOffset() * 60_000,
+        );
+        const maximum = new Date(Date.now() + 366 * 24 * 60 * 60_000);
+        const localMaximum = new Date(
+          maximum.getTime() - maximum.getTimezoneOffset() * 60_000,
+        );
+        schedule.min = localMinimum.toISOString().slice(0, 16);
+        schedule.max = localMaximum.toISOString().slice(0, 16);
+        const immediateLabel = submit.textContent.trim();
+        const updateSchedule = () => {
+          submit.textContent = schedule.value ? "Approve and schedule X post" : immediateLabel;
+        };
+        schedule.addEventListener("input", updateSchedule);
+        updateSchedule();
+      }
+    });
+  }
+
   const experimentFormPresent = Boolean(document.querySelector("[data-experiment-form]"));
   const reusedImageSettings = consumePendingImageProfile();
   if (!reusedImageSettings && !experimentFormPresent) restoreAutomationDraft();
@@ -6324,6 +6380,7 @@
   initializeGenerationProgress();
   initializeDeliveryReauthentication();
   initializeDeliveryProgress();
+  initializeXPublishingControls();
   initializeExperimentLab();
   initializeExperimentWarmSession();
   initializeExperimentResults();

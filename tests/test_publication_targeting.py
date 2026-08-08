@@ -21,6 +21,7 @@ from gen_automation.integrations.patreon import (
 from gen_automation.services import publication
 from gen_automation.services.publication import (
     PublicationInputError,
+    _approval_expires_at,
     _initial_attempt_available_at,
     _load_frozen_outputs,
 )
@@ -55,6 +56,11 @@ def test_scheduled_patreon_creation_is_due_at_approval_while_x_waits() -> None:
         )
         == scheduled_at
     )
+    assert _approval_expires_at(
+        approved_at=approved_at,
+        available_at=scheduled_at,
+        approval_seconds=900,
+    ) == scheduled_at + timedelta(minutes=15)
 
 
 def test_immediate_publication_attempts_remain_due_at_approval() -> None:
@@ -68,6 +74,45 @@ def test_immediate_publication_attempts_remain_due_at_approval() -> None:
                 approved_at=approved_at,
             )
             == approved_at
+        )
+
+
+def test_x_schedule_horizon_rejects_distant_typographical_dates() -> None:
+    now = datetime(2026, 8, 8, 12, tzinfo=UTC)
+
+    with pytest.raises(PublicationInputError, match="too far in the future"):
+        publication._optional_future_datetime(
+            now + timedelta(days=367),
+            now=now,
+            label="scheduled_at",
+            maximum_future=publication.X_MAX_SCHEDULE_HORIZON,
+        )
+
+
+def test_x_configuration_freezes_explicit_adult_toggle_and_defaults_legacy_true() -> None:
+    assert publication._normalize_configuration(
+        PublicationTarget.X,
+        {"text": "Adult preview", "adult_content": False},
+    ) == {"text": "Adult preview", "adult_content": False}
+    assert publication._normalize_configuration(
+        PublicationTarget.X,
+        {"text": "Legacy preview"},
+    ) == {"text": "Legacy preview", "adult_content": True}
+
+    with pytest.raises(PublicationInputError, match="adult_content must be a boolean"):
+        publication._normalize_configuration(
+            PublicationTarget.X,
+            {"text": "Invalid preview", "adult_content": 1},
+        )
+    with pytest.raises(PublicationInputError, match="optional adult_content"):
+        publication._normalize_configuration(
+            PublicationTarget.X,
+            {"text": "Unexpected option", "unrecognized": False},
+        )
+    with pytest.raises(PublicationInputError, match="280 UTF-8 bytes"):
+        publication._normalize_configuration(
+            PublicationTarget.X,
+            {"text": "界" * 94, "adult_content": False},
         )
 
 

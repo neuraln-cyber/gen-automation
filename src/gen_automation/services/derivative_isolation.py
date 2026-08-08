@@ -111,6 +111,7 @@ async def render_platform_derivatives_isolated(
     targets: Sequence[str] | None = None,
     limits: DerivativeSafetyLimits | None = None,
     policy: DerivativeIsolationPolicy | None = None,
+    renderer_version: str | None = None,
 ) -> DerivativeBundle:
     """Render once in a new, memory-limited Linux child process.
 
@@ -123,12 +124,15 @@ async def render_platform_derivatives_isolated(
 
     selected_limits = limits or derivatives.DEFAULT_DERIVATIVE_LIMITS
     selected_policy = policy or DerivativeIsolationPolicy()
+    selected_renderer_version = renderer_version or derivatives.DERIVATIVE_RENDERER_VERSION
     if not isinstance(recipe, derivatives.DerivativeRecipe):
         raise derivatives.DerivativeRecipeError("derivative recipe is invalid")
     if not isinstance(selected_limits, derivatives.DerivativeSafetyLimits):
         raise derivatives.DerivativeRecipeError("derivative safety limits are invalid")
     if not isinstance(selected_policy, DerivativeIsolationPolicy):
         raise ValueError("derivative isolation policy is invalid")
+    if selected_renderer_version not in derivatives.SUPPORTED_DERIVATIVE_RENDERER_VERSIONS:
+        raise derivatives.DerivativeRecipeError("derivative renderer version is unsupported")
     if targets is None:
         target_values = tuple(target.value for target in derivatives.DerivativeTarget)
     else:
@@ -177,7 +181,14 @@ async def render_platform_derivatives_isolated(
             "serialized derivative recipe exceeds the safety limit"
         )
     request_payload = pickle.dumps(
-        (master_payload, recipe, watermark_payload, selected_limits, expected_target_values),
+        (
+            master_payload,
+            recipe,
+            watermark_payload,
+            selected_limits,
+            expected_target_values,
+            selected_renderer_version,
+        ),
         protocol=5,
     )
     maximum_request_bytes = (
@@ -436,7 +447,7 @@ def _isolated_renderer_child(
             request = pickle.loads(request_payload)  # noqa: S301 - trusted parent request
             if (
                 not isinstance(request, tuple)
-                or len(request) != 5
+                or len(request) != 6
                 or not isinstance(request[0], bytes)
                 or (request[2] is not None and not isinstance(request[2], bytes))
                 or not isinstance(request[1], derivatives.DerivativeRecipe)
@@ -444,15 +455,20 @@ def _isolated_renderer_child(
                 or not isinstance(request[4], tuple)
                 or not request[4]
                 or any(not isinstance(target, str) for target in request[4])
+                or not isinstance(request[5], str)
+                or request[5] not in derivatives.SUPPORTED_DERIVATIVE_RENDERER_VERSIONS
             ):
                 raise DerivativeIsolationProtocolError("isolated renderer request is invalid")
-            master_payload, recipe, watermark_payload, limits, target_values = request
+            master_payload, recipe, watermark_payload, limits, target_values, renderer_version = (
+                request
+            )
             bundle = derivatives.render_platform_derivatives(
                 master_payload,
                 recipe=recipe,
                 watermark_png=watermark_payload,
                 targets=target_values,
                 limits=limits,
+                renderer_version=renderer_version,
             )
             response = _success_message(bundle)
         except derivatives.DerivativeInputError as error:

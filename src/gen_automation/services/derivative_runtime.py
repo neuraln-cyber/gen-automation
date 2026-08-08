@@ -62,6 +62,7 @@ from gen_automation.services.derivative_pipeline import (
 from gen_automation.services.derivatives import (
     DEFAULT_DERIVATIVE_LIMITS,
     DERIVATIVE_RENDERER_VERSION,
+    SUPPORTED_DERIVATIVE_RENDERER_VERSIONS,
     BlurCensor,
     DerivativeBundle,
     DerivativeInputError,
@@ -127,6 +128,7 @@ class DerivativeExecutionSnapshot:
     output_targets: tuple[str, ...]
     full_output_byte_budget: int
     recipe_config_sha256: str
+    renderer_version: str
     recipe: DerivativeRecipe
     source_asset_id: UUID
     source_storage_backend: str
@@ -312,7 +314,6 @@ async def process_claimed_derivative_job(
     operation_at = _as_utc(now or datetime.now(UTC))
     _validate_retry_bounds(retry_base_seconds, retry_max_seconds)
     selected_policy = isolation_policy or DerivativeIsolationPolicy()
-    selected_renderer = renderer or _render_isolated
 
     replay = await _completed_replay(
         sessions,
@@ -353,14 +354,25 @@ async def process_claimed_derivative_job(
             snapshot=snapshot,
             limits=execution_limits,
         )
-        bundle = await selected_renderer(
-            source_bytes,
-            snapshot.recipe,
-            watermark_bytes,
-            snapshot.output_targets,
-            execution_limits,
-            selected_policy,
-        )
+        if renderer is None:
+            bundle = await _render_isolated(
+                source_bytes,
+                snapshot.recipe,
+                watermark_bytes,
+                snapshot.output_targets,
+                execution_limits,
+                selected_policy,
+                renderer_version=snapshot.renderer_version,
+            )
+        else:
+            bundle = await renderer(
+                source_bytes,
+                snapshot.recipe,
+                watermark_bytes,
+                snapshot.output_targets,
+                execution_limits,
+                selected_policy,
+            )
         artifacts = _validate_rendered_bundle(
             snapshot,
             bundle=bundle,
@@ -439,6 +451,8 @@ async def _render_isolated(
     targets: tuple[str, ...],
     limits: DerivativeSafetyLimits,
     policy: DerivativeIsolationPolicy,
+    *,
+    renderer_version: str = DERIVATIVE_RENDERER_VERSION,
 ) -> DerivativeBundle:
     return await render_platform_derivatives_isolated(
         source,
@@ -447,6 +461,7 @@ async def _render_isolated(
         targets=targets,
         limits=limits,
         policy=policy,
+        renderer_version=renderer_version,
     )
 
 
@@ -550,7 +565,7 @@ async def _load_execution_snapshot(
         expected_version=f"derivative-v{stored_recipe.recipe_version}",
     )
     if (
-        stored_recipe.renderer_version != DERIVATIVE_RENDERER_VERSION
+        stored_recipe.renderer_version not in SUPPORTED_DERIVATIVE_RENDERER_VERSIONS
         or stored_recipe.pillow_version != PIL.__version__
     ):
         raise DerivativeRuntimeContractError(
@@ -577,6 +592,7 @@ async def _load_execution_snapshot(
         output_targets=targets,
         full_output_byte_budget=full_output_byte_budget,
         recipe_config_sha256=stored_recipe.config_sha256,
+        renderer_version=stored_recipe.renderer_version,
         recipe=recipe,
         source_asset_id=selection.asset_id,
         source_storage_backend=selection.source_storage_backend,
@@ -712,7 +728,7 @@ def _validate_artifact(
         or artifact.lineage.source_height != snapshot.source_height
         or artifact.lineage.watermark_sha256
         != (snapshot.watermark_sha256 if artifact.target == DerivativeTarget.X_TEASER else None)
-        or artifact.lineage.renderer_version != DERIVATIVE_RENDERER_VERSION
+        or artifact.lineage.renderer_version != snapshot.renderer_version
         or artifact.lineage.pillow_version != PIL.__version__
     ):
         raise DerivativeRuntimeContractError(
