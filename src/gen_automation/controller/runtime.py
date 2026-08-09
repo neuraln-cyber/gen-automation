@@ -1639,12 +1639,14 @@ class ControllerWorkloads:
                         experiment_warm_lease_id=str(warm_lease.id),
                         experiment_warm_lease_state=warm_lease.state.value,
                     )
-                elif not runtime_matches and active_attempt_id is None:
+                elif active_attempt_id is None:
                     # Bootstrap credentials are refreshed only at an idle-to-active
                     # boundary. PATCHing the container environment creates a Salad
                     # version and restarts every replica, so doing this per batch
                     # defeats warm GPU/model reuse. Subsequent ordered jobs reuse
                     # the running deployment while any durable provider work exists.
+                    # A matching artifact digest does not prove that the independent,
+                    # short-lived bootstrap credential set is still fresh.
                     logger.info(
                         "salad_runtime_refresh_at_work_boundary",
                         salad_deployment_id=str(deployment.id),

@@ -184,6 +184,10 @@ def test_worker_image_copies_only_its_runtime_package_and_direct_domain_imports(
         "COPY src/gen_automation/gpu_worker ./src/gen_automation/gpu_worker",
         "COPY src/gen_automation/domain/__init__.py ./src/gen_automation/domain/__init__.py",
         (
+            "COPY src/gen_automation/domain/controlled_duo.py "
+            "./src/gen_automation/domain/controlled_duo.py"
+        ),
+        (
             "COPY src/gen_automation/domain/deliverability.py "
             "./src/gen_automation/domain/deliverability.py"
         ),
@@ -196,23 +200,37 @@ def test_worker_image_copies_only_its_runtime_package_and_direct_domain_imports(
     assert "COPY src ./src" not in dockerfile
 
 
-def test_worker_domain_copy_contract_matches_the_runtime_import_graph() -> None:
+def test_worker_domain_copy_contract_matches_the_transitive_runtime_import_graph() -> None:
     worker_package = ROOT / "src" / "gen_automation" / "gpu_worker"
-    direct_domain_imports: set[str] = set()
+    pending_domain_imports: set[str] = set()
     for source_path in worker_package.glob("*.py"):
         module = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
         for node in ast.walk(module):
             if isinstance(node, ast.ImportFrom) and node.module is not None:
                 if node.module.startswith("gen_automation.domain."):
-                    direct_domain_imports.add(node.module)
+                    pending_domain_imports.add(node.module)
 
-    assert direct_domain_imports == {
+    transitive_domain_imports: set[str] = set()
+    while pending_domain_imports:
+        module_name = pending_domain_imports.pop()
+        if module_name in transitive_domain_imports:
+            continue
+        transitive_domain_imports.add(module_name)
+        source_path = ROOT / "src" / Path(*module_name.split(".")).with_suffix(".py")
+        module = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+        for node in ast.walk(module):
+            if isinstance(node, ast.ImportFrom) and node.module is not None:
+                if node.module.startswith("gen_automation.domain."):
+                    pending_domain_imports.add(node.module)
+
+    assert transitive_domain_imports == {
+        "gen_automation.domain.controlled_duo",
         "gen_automation.domain.deliverability",
         "gen_automation.domain.generation_limits",
         "gen_automation.domain.signing",
     }
     dockerfile = _dockerfile()
-    for module_name in direct_domain_imports:
+    for module_name in transitive_domain_imports:
         source_path = module_name.replace(".", "/") + ".py"
         assert f"COPY src/{source_path} ./src/{source_path}" in dockerfile
 
@@ -277,4 +295,6 @@ def test_ci_builds_the_contract_dockerfile_without_pin_overrides() -> None:
     command = "docker build --file Dockerfile.worker --tag gen-automation-gpu-worker:test ."
 
     assert command in ci
+    assert "Smoke-test GPU worker Python runtime" in ci
+    assert "import gen_automation.gpu_worker.main" in ci
     assert "build-arg" not in ci.casefold()
