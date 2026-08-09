@@ -124,6 +124,24 @@ function ConvertTo-PosixLiteral {
     return "'$Value'"
 }
 
+function ConvertTo-AwsCliWindowsFileReference {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $absolutePath = [IO.Path]::GetFullPath($Path)
+    if ($absolutePath -notmatch "^[A-Za-z]:\\") {
+        throw "The private parameter path must be an absolute Windows drive path."
+    }
+    $normalizedPath = $absolutePath.Replace("\", "/")
+    $fileReference = "file://$normalizedPath"
+    if ([Text.Encoding]::UTF8.GetByteCount($fileReference) -gt 4096) {
+        throw "The private parameter file reference exceeds its bounded size."
+    }
+    return $fileReference
+}
+
 function Get-Sha256Hex {
     param(
         [Parameter(Mandatory = $true)]
@@ -338,7 +356,7 @@ payload_dir=$(/usr/bin/mktemp --directory /tmp/gen-automation-x-oauth1.XXXXXX) &
     [IO.File]::WriteAllText($parametersPath, $parametersJson, [Text.UTF8Encoding]::new($false))
     $parametersJson = "[cleared]"
     $remoteCommand = "[cleared]"
-    $parametersUri = [Uri]::new($parametersPath).AbsoluteUri
+    $parametersUri = ConvertTo-AwsCliWindowsFileReference -Path $parametersPath
 
     $sendInvocation = @{
         Executable = $awsExecutable
