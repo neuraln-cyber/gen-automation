@@ -1,4 +1,6 @@
 import base64
+import gzip
+import hashlib
 import json
 import os
 import re
@@ -249,17 +251,41 @@ def test_post_migration_updater_failure_restores_files_but_never_restarts_old_co
     assert "wait_for_control_plane" not in leave_stopped
 
 
-def test_routine_rollout_refreshes_the_mega_bootstrap_bundle_safely() -> None:
+def test_routine_rollout_refreshes_the_host_deployment_bundle_safely() -> None:
     workflow = _workflow()
     helper = (DEPLOY / "bootstrap-mega-profile.sh").read_bytes()
     compose = (DEPLOY / "compose.bootstrap.yaml").read_bytes()
+    updater = (DEPLOY / "update-control-plane.sh").read_bytes()
+    helper_sha256 = hashlib.sha256(helper).hexdigest()
+    compose_sha256 = hashlib.sha256(compose).hexdigest()
+    updater_sha256 = hashlib.sha256(updater).hexdigest()
+    helper_payload = base64.b64encode(gzip.compress(helper, compresslevel=9, mtime=0)).decode(
+        "ascii"
+    )
+    compose_payload = base64.b64encode(gzip.compress(compose, compresslevel=9, mtime=0)).decode(
+        "ascii"
+    )
+    updater_payload = base64.b64encode(gzip.compress(updater, compresslevel=9, mtime=0)).decode(
+        "ascii"
+    )
 
     assert "repos/${GITHUB_REPOSITORY}/contents/${relative_path}?ref=${SOURCE_REVISION}" in workflow
     assert "infra/aws-staging/deploy/bootstrap-mega-profile.sh" in workflow
     assert "infra/aws-staging/deploy/compose.bootstrap.yaml" in workflow
+    assert "infra/aws-staging/deploy/update-control-plane.sh" in workflow
     assert 'bash -n "$host_bundle_dir/bootstrap-mega-profile.sh"' in workflow
-    assert 'base64 --wrap=0 "$host_bundle_dir/bootstrap-mega-profile.sh"' in workflow
-    assert 'base64 --wrap=0 "$host_bundle_dir/compose.bootstrap.yaml"' in workflow
+    assert 'bash -n "$host_bundle_dir/update-control-plane.sh"' in workflow
+    assert (
+        'gzip --best --no-name --stdout "$host_bundle_dir/bootstrap-mega-profile.sh"'
+        " | base64 --wrap=0"
+    ) in workflow
+    assert (
+        'gzip --best --no-name --stdout "$host_bundle_dir/compose.bootstrap.yaml" | base64 --wrap=0'
+    ) in workflow
+    assert (
+        'gzip --best --no-name --stdout "$host_bundle_dir/update-control-plane.sh"'
+        " | base64 --wrap=0"
+    ) in workflow
 
     program = _rollout_command_program()
     compile(program, "staging-rollout-ssm-command", "exec")
@@ -271,10 +297,12 @@ def test_routine_rollout_refreshes_the_mega_bootstrap_bundle_safely() -> None:
             "ghcr.io/neuraln-cyber/gen-automation/gpu-worker@sha256:" + "b" * 64
         ),
         "SSM_SOURCE_REVISION": "c" * 40,
-        "SSM_BOOTSTRAP_HELPER_SHA256": "d" * 64,
-        "SSM_BOOTSTRAP_COMPOSE_SHA256": "e" * 64,
-        "SSM_BOOTSTRAP_HELPER_BASE64": base64.b64encode(helper).decode("ascii"),
-        "SSM_BOOTSTRAP_COMPOSE_BASE64": base64.b64encode(compose).decode("ascii"),
+        "SSM_BOOTSTRAP_HELPER_SHA256": helper_sha256,
+        "SSM_BOOTSTRAP_COMPOSE_SHA256": compose_sha256,
+        "SSM_CONTROL_PLANE_UPDATER_SHA256": updater_sha256,
+        "SSM_BOOTSTRAP_HELPER_GZIP_BASE64": helper_payload,
+        "SSM_BOOTSTRAP_COMPOSE_GZIP_BASE64": compose_payload,
+        "SSM_CONTROL_PLANE_UPDATER_GZIP_BASE64": updater_payload,
     }
     result = subprocess.run(  # noqa: S603 - executes the repository-owned rollout fixture.
         [sys.executable, "-c", program],
@@ -298,10 +326,19 @@ def test_routine_rollout_refreshes_the_mega_bootstrap_bundle_safely() -> None:
         )
         assert syntax.returncode == 0, syntax.stderr
 
-    assert len(command) < 24_000
+    assert len(command.encode("utf-8")) <= 24_000
+    assert "if command_size > 24_000:" in program
+    assert helper_payload in command
+    assert compose_payload in command
+    assert updater_payload in command
+    assert helper_sha256 in command
+    assert compose_sha256 in command
+    assert updater_sha256 in command
     assert "/usr/bin/base64 --decode" in command
-    assert command.count("/usr/bin/sha256sum --check --status") == 2
+    assert command.count("/usr/bin/gzip --decompress") == 3
+    assert command.count("/usr/bin/sha256sum --check --status") == 4
     assert '/usr/bin/bash -n "$bundle_root/bootstrap-mega-profile.sh"' in command
+    assert '/usr/bin/bash -n "$bundle_root/update-control-plane.sh"' in command
     assert "--profile bootstrap config --quiet" in command
     assert (
         "sudo /usr/bin/install -o root -g root -m 0644 "
@@ -313,6 +350,16 @@ def test_routine_rollout_refreshes_the_mega_bootstrap_bundle_safely() -> None:
         '"$bundle_root/bootstrap-mega-profile.sh" '
         "/usr/local/sbin/gen-automation-bootstrap-mega-profile"
     ) in command
+    updater_install = (
+        "sudo /usr/bin/install -o root -g root -m 0755 "
+        '"$bundle_root/update-control-plane.sh" '
+        "/usr/local/sbin/gen-automation-update-control-plane"
+    )
+    assert updater_install in command
+    post_updater_install = command.split(updater_install, maxsplit=1)[1]
+    assert updater_sha256 in post_updater_install
+    assert "/usr/local/sbin/gen-automation-update-control-plane" in post_updater_install
+    assert command.count(updater_sha256) == 2
     assert "raw.githubusercontent.com" not in command
     assert "/usr/bin/curl" not in command
     assert command.index("--profile bootstrap config --quiet") < command.index(
@@ -320,6 +367,14 @@ def test_routine_rollout_refreshes_the_mega_bootstrap_bundle_safely() -> None:
     )
     assert command.index("/usr/local/sbin/gen-automation-bootstrap-mega-profile") < command.index(
         "/etc/gen-automation/control-plane.env"
+    )
+    updater_install_index = command.index(updater_install)
+    assert updater_install_index < command.index(
+        "sudo /usr/bin/systemctl stop gen-automation-staging.service"
+    )
+    assert updater_install_index < command.index("python3.12 -m alembic upgrade head")
+    assert updater_install_index < command.index(
+        "sudo /usr/local/sbin/gen-automation-update-control-plane --image"
     )
 
 
