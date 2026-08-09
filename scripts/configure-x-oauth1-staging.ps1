@@ -36,6 +36,58 @@ $safeConfigureOutput = "X OAuth 1.0a runtime settings were configured and the st
 $alreadyConfiguredOutput = "The exact OAuth 1.0a runtime settings are already configured and healthy."
 $canaryOutput = "X OAuth 1.0a account binding passed. No media was uploaded and no post was created."
 
+function Invoke-CapturedNative {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Executable,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    $nativeOutput = @()
+    $standardOutput = [Collections.Generic.List[string]]::new()
+    $standardError = [Collections.Generic.List[string]]::new()
+    $nativeErrorRecords = [Collections.Generic.List[Management.Automation.ErrorRecord]]::new()
+    $savedErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell converts redirected native stderr into ErrorRecord objects.
+        # Capture them without allowing the script-wide Stop preference to terminate
+        # before the native exit code can be checked.
+        $ErrorActionPreference = "Continue"
+        $nativeOutput = @(& $Executable @Arguments 2>&1)
+        $nativeExitCode = $LASTEXITCODE
+        foreach ($outputItem in $nativeOutput) {
+            if ($outputItem -is [Management.Automation.ErrorRecord]) {
+                $standardError.Add($outputItem.ToString())
+                $nativeErrorRecords.Add($outputItem)
+            }
+            else {
+                $standardOutput.Add($outputItem.ToString())
+            }
+        }
+    }
+    finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+        foreach ($nativeErrorRecord in $nativeErrorRecords) {
+            for ($errorIndex = 0; $errorIndex -lt $Error.Count; $errorIndex++) {
+                if ([object]::ReferenceEquals($Error[$errorIndex], $nativeErrorRecord)) {
+                    $Error.RemoveAt($errorIndex)
+                    break
+                }
+            }
+        }
+    }
+
+    $nativeOutput = @()
+    $nativeErrorRecords.Clear()
+    return [pscustomobject]@{
+        ExitCode = $nativeExitCode
+        StandardOutput = ($standardOutput -join "`n").Trim()
+        StandardError = ($standardError -join "`n").Trim()
+    }
+}
+
 function Invoke-CheckedNative {
     param(
         [Parameter(Mandatory = $true)]
@@ -48,15 +100,16 @@ function Invoke-CheckedNative {
         [string]$FailureMessage
     )
 
-    $nativeOutput = @(& $Executable @Arguments 2>&1)
-    $nativeExitCode = $LASTEXITCODE
-    if ($nativeExitCode -ne 0) {
-        $nativeOutput = @()
+    $nativeResult = Invoke-CapturedNative -Executable $Executable -Arguments $Arguments
+    if ($nativeResult.ExitCode -ne 0) {
+        $nativeResult.StandardOutput = "[cleared]"
+        $nativeResult.StandardError = "[cleared]"
         throw $FailureMessage
     }
-    $resolvedOutput = ($nativeOutput | ForEach-Object { $_.ToString() }) -join "`n"
-    $nativeOutput = @()
-    return $resolvedOutput.Trim()
+    $resolvedOutput = $nativeResult.StandardOutput
+    $nativeResult.StandardOutput = "[cleared]"
+    $nativeResult.StandardError = "[cleared]"
+    return $resolvedOutput
 }
 
 function ConvertTo-PosixLiteral {
@@ -313,8 +366,7 @@ payload_dir=$(/usr/bin/mktemp --directory /tmp/gen-automation-x-oauth1.XXXXXX) &
 
     $deadline = [DateTime]::UtcNow.AddMinutes(25)
     while ([DateTime]::UtcNow -lt $deadline) {
-        $invocationOutput = @(
-            & $awsExecutable @(
+        $invocationResult = Invoke-CapturedNative -Executable $awsExecutable -Arguments @(
                 "ssm", "get-command-invocation",
                 "--profile", $awsProfile,
                 "--region", $awsRegion,
@@ -323,12 +375,11 @@ payload_dir=$(/usr/bin/mktemp --directory /tmp/gen-automation-x-oauth1.XXXXXX) &
                 "--query", "{CommandId:CommandId,InstanceId:InstanceId,Status:Status,ResponseCode:ResponseCode,Output:StandardOutputContent}",
                 "--output", "json",
                 "--no-cli-pager"
-            ) 2>&1
         )
-        $invocationExitCode = $LASTEXITCODE
-        if ($invocationExitCode -ne 0) {
-            $invocationError = ($invocationOutput | ForEach-Object { $_.ToString() }) -join "`n"
-            $invocationOutput = @()
+        if ($invocationResult.ExitCode -ne 0) {
+            $invocationError = $invocationResult.StandardError
+            $invocationResult.StandardOutput = "[cleared]"
+            $invocationResult.StandardError = "[cleared]"
             if ($invocationError -notmatch "InvocationDoesNotExist") {
                 $invocationError = "[cleared]"
                 throw "The bounded staging command status could not be read."
@@ -338,12 +389,13 @@ payload_dir=$(/usr/bin/mktemp --directory /tmp/gen-automation-x-oauth1.XXXXXX) &
             continue
         }
         try {
-            $invocation = (($invocationOutput | ForEach-Object { $_.ToString() }) -join "`n") | ConvertFrom-Json
+            $invocation = $invocationResult.StandardOutput | ConvertFrom-Json
         }
         catch {
             throw "AWS returned an invalid command status."
         }
-        $invocationOutput = @()
+        $invocationResult.StandardOutput = "[cleared]"
+        $invocationResult.StandardError = "[cleared]"
         if ($invocation.CommandId -ne $commandId -or $invocation.InstanceId -ne $instanceId) {
             throw "AWS returned status for an unexpected command target."
         }
