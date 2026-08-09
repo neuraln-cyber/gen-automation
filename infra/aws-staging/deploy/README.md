@@ -217,25 +217,34 @@ migration container is read-only, non-root, capability-free, time-limited,
 isolated from the EC2 instance role by bridge networking, and receives no
 secret value in the SSM command. A root-owned preflight requires
 `migration.env` to contain only one TLS-verified database URL and proves its
-username differs from the continuously running application role. Only after the
-migration succeeds does the workflow invoke this root-owned host command
-through SSM:
+username differs from the continuously running application role. Before the
+service is stopped, the workflow transfers the updater and MEGA bootstrap files
+from the exact reviewed source revision as a bounded compressed payload, verifies
+their SHA-256 hashes and syntax on the host, and installs the updater as
+`root:root` mode `0755`. The shared update lock then covers the service stop,
+worker-image environment update, migration, and activation. Only after the
+migration succeeds does the workflow invoke this root-owned host command through
+SSM:
 
 ```shell
 sudo /usr/local/sbin/gen-automation-update-control-plane \
   --image ghcr.io/neuraln-cyber/gen-automation/control-plane-mega@sha256:<64-hex> \
-  --revision <40-hex-main-revision>
+  --revision <40-hex-main-revision> \
+  --rollback-mode leave-stopped \
+  --external-lock-held
 ```
 
 The update command accepts no credentials. It serializes updates with `flock`,
 pulls and verifies the immutable linux/amd64 image and revision label,
 atomically changes only `GEN_AUTOMATION_CONTROL_PLANE_MEGA_IMAGE`, validates
 Compose, restarts the staging unit, and waits for local readiness. Any failed
-validation or readiness check restores the previous environment atomically and
-restarts the previous image. The update command itself never runs database
-migrations or changes external-effect settings. Schema changes must remain
-backward-compatible with the previous application image for the rollback
-window; destructive changes require an expand-and-contract release sequence.
+validation or readiness check restores the previous deployment files atomically.
+The routine workflow deliberately leaves the service stopped after any
+post-migration ambiguity instead of reactivating older code against a newer
+schema. The update command itself never runs database migrations or changes
+external-effect settings. Schema changes must remain backward-compatible with
+the previous application image for the rollback window; destructive changes
+require an expand-and-contract release sequence.
 
 Set these non-secret GitHub repository variables once:
 

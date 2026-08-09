@@ -253,28 +253,35 @@ jobs:
           fi
 
           # Routine image rollout does not rerun the first-install host bundle.
-          # Resolve the two credential-free MEGA bootstrap files from the exact
+          # Resolve the credential-free host deployment files from the exact
           # reviewed image revision, then make the host independently verify
-          # those bytes before installing them.
+          # those bytes before installing them. Compress the payloads
+          # deterministically to stay comfortably inside the SSM command limit.
           host_bundle_dir="$RUNNER_TEMP/staging-host-bootstrap"
           mkdir --parents "$host_bundle_dir"
           for relative_path in \
             infra/aws-staging/deploy/bootstrap-mega-profile.sh \
-            infra/aws-staging/deploy/compose.bootstrap.yaml; do
+            infra/aws-staging/deploy/compose.bootstrap.yaml \
+            infra/aws-staging/deploy/update-control-plane.sh; do
             gh api \
               --header 'Accept: application/vnd.github.raw+json' \
               "repos/${GITHUB_REPOSITORY}/contents/${relative_path}?ref=${SOURCE_REVISION}" \
               >"$host_bundle_dir/${relative_path##*/}"
           done
           bash -n "$host_bundle_dir/bootstrap-mega-profile.sh"
+          bash -n "$host_bundle_dir/update-control-plane.sh"
           bootstrap_helper_sha256="$(sha256sum "$host_bundle_dir/bootstrap-mega-profile.sh" | cut -d' ' -f1)"
           bootstrap_compose_sha256="$(sha256sum "$host_bundle_dir/compose.bootstrap.yaml" | cut -d' ' -f1)"
-          bootstrap_helper_base64="$(base64 --wrap=0 "$host_bundle_dir/bootstrap-mega-profile.sh")"
-          bootstrap_compose_base64="$(base64 --wrap=0 "$host_bundle_dir/compose.bootstrap.yaml")"
+          control_plane_updater_sha256="$(sha256sum "$host_bundle_dir/update-control-plane.sh" | cut -d' ' -f1)"
+          bootstrap_helper_gzip_base64="$(gzip --best --no-name --stdout "$host_bundle_dir/bootstrap-mega-profile.sh" | base64 --wrap=0)"
+          bootstrap_compose_gzip_base64="$(gzip --best --no-name --stdout "$host_bundle_dir/compose.bootstrap.yaml" | base64 --wrap=0)"
+          control_plane_updater_gzip_base64="$(gzip --best --no-name --stdout "$host_bundle_dir/update-control-plane.sh" | base64 --wrap=0)"
           [[ "$bootstrap_helper_sha256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$bootstrap_compose_sha256" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$bootstrap_helper_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
-          [[ "$bootstrap_compose_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
+          [[ "$control_plane_updater_sha256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$bootstrap_helper_gzip_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
+          [[ "$bootstrap_compose_gzip_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
+          [[ "$control_plane_updater_gzip_base64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
 
           parameters_file="$RUNNER_TEMP/ssm-parameters.json"
           SSM_IMAGE_REF="$IMAGE_REF" \
@@ -282,8 +289,10 @@ jobs:
           SSM_SOURCE_REVISION="$SOURCE_REVISION" \
           SSM_BOOTSTRAP_HELPER_SHA256="$bootstrap_helper_sha256" \
           SSM_BOOTSTRAP_COMPOSE_SHA256="$bootstrap_compose_sha256" \
-          SSM_BOOTSTRAP_HELPER_BASE64="$bootstrap_helper_base64" \
-          SSM_BOOTSTRAP_COMPOSE_BASE64="$bootstrap_compose_base64" \
+          SSM_CONTROL_PLANE_UPDATER_SHA256="$control_plane_updater_sha256" \
+          SSM_BOOTSTRAP_HELPER_GZIP_BASE64="$bootstrap_helper_gzip_base64" \
+          SSM_BOOTSTRAP_COMPOSE_GZIP_BASE64="$bootstrap_compose_gzip_base64" \
+          SSM_CONTROL_PLANE_UPDATER_GZIP_BASE64="$control_plane_updater_gzip_base64" \
             python3 -c '
           import json
           import os
@@ -294,8 +303,12 @@ jobs:
           revision = os.environ["SSM_SOURCE_REVISION"]
           bootstrap_helper_sha256 = os.environ["SSM_BOOTSTRAP_HELPER_SHA256"]
           bootstrap_compose_sha256 = os.environ["SSM_BOOTSTRAP_COMPOSE_SHA256"]
-          bootstrap_helper_base64 = os.environ["SSM_BOOTSTRAP_HELPER_BASE64"]
-          bootstrap_compose_base64 = os.environ["SSM_BOOTSTRAP_COMPOSE_BASE64"]
+          control_plane_updater_sha256 = os.environ["SSM_CONTROL_PLANE_UPDATER_SHA256"]
+          bootstrap_helper_gzip_base64 = os.environ["SSM_BOOTSTRAP_HELPER_GZIP_BASE64"]
+          bootstrap_compose_gzip_base64 = os.environ["SSM_BOOTSTRAP_COMPOSE_GZIP_BASE64"]
+          control_plane_updater_gzip_base64 = os.environ[
+              "SSM_CONTROL_PLANE_UPDATER_GZIP_BASE64"
+          ]
           runtime_env = "/etc/gen-automation/control-plane.env"
           runtime_env_backup = f"{runtime_env}.{revision}.rollback"
           worker_image_key = "GEN_AUTOMATION_SALAD_WORKER_IMAGE"
@@ -345,13 +358,17 @@ jobs:
               "/tmp/gen-automation-host-bootstrap.XXXXXX)"
               " && trap '\''/usr/bin/rm -rf -- \"$bundle_root\"'\'' EXIT"
               " && /usr/bin/printf '\''%s'\''"
-              f" {shlex.quote(bootstrap_helper_base64)}"
-              " | /usr/bin/base64 --decode"
+              f" {shlex.quote(bootstrap_helper_gzip_base64)}"
+              " | /usr/bin/base64 --decode | /usr/bin/gzip --decompress"
               " >\"$bundle_root/bootstrap-mega-profile.sh\""
               " && /usr/bin/printf '\''%s'\''"
-              f" {shlex.quote(bootstrap_compose_base64)}"
-              " | /usr/bin/base64 --decode"
+              f" {shlex.quote(bootstrap_compose_gzip_base64)}"
+              " | /usr/bin/base64 --decode | /usr/bin/gzip --decompress"
               " >\"$bundle_root/compose.bootstrap.yaml\""
+              " && /usr/bin/printf '\''%s'\''"
+              f" {shlex.quote(control_plane_updater_gzip_base64)}"
+              " | /usr/bin/base64 --decode | /usr/bin/gzip --decompress"
+              " >\"$bundle_root/update-control-plane.sh\""
               " && /usr/bin/printf '\''%s  %s\\n'\''"
               f" {shlex.quote(bootstrap_helper_sha256)}"
               " \"$bundle_root/bootstrap-mega-profile.sh\""
@@ -360,7 +377,12 @@ jobs:
               f" {shlex.quote(bootstrap_compose_sha256)}"
               " \"$bundle_root/compose.bootstrap.yaml\""
               " | /usr/bin/sha256sum --check --status"
+              " && /usr/bin/printf '\''%s  %s\\n'\''"
+              f" {shlex.quote(control_plane_updater_sha256)}"
+              " \"$bundle_root/update-control-plane.sh\""
+              " | /usr/bin/sha256sum --check --status"
               " && /usr/bin/bash -n \"$bundle_root/bootstrap-mega-profile.sh\""
+              " && /usr/bin/bash -n \"$bundle_root/update-control-plane.sh\""
               " && sudo /usr/bin/docker compose"
               " --env-file /etc/gen-automation/deploy.env"
               " --project-directory /opt/gen-automation/deploy"
@@ -373,6 +395,13 @@ jobs:
               " && sudo /usr/bin/install -o root -g root -m 0755"
               " \"$bundle_root/bootstrap-mega-profile.sh\""
               " /usr/local/sbin/gen-automation-bootstrap-mega-profile"
+              " && sudo /usr/bin/install -o root -g root -m 0755"
+              " \"$bundle_root/update-control-plane.sh\""
+              " /usr/local/sbin/gen-automation-update-control-plane"
+              " && /usr/bin/printf '\''%s  %s\\n'\''"
+              f" {shlex.quote(control_plane_updater_sha256)}"
+              " /usr/local/sbin/gen-automation-update-control-plane"
+              " | sudo /usr/bin/sha256sum --check --status"
           )
           restore_runtime_env = (
               "sudo /usr/bin/install -o root -g root -m 0600"
@@ -433,6 +462,9 @@ jobs:
               " /usr/bin/bash -c"
               f" {shlex.quote(unlocked_command)}"
           )
+          command_size = len(command.encode("utf-8"))
+          if command_size > 24_000:
+              raise SystemExit(f"SSM command is too large: {command_size} bytes")
           print(json.dumps({"commands": [command]}))
           ' >"$parameters_file"
 
