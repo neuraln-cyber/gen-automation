@@ -4,7 +4,8 @@ The canonical input is the provider-independent ``FinishedSetArchive`` rather
 than a Patreon package.  Each deterministic archive part is verified and
 opened in a bounded temporary directory, while the original full-resolution
 image bytes are uploaded unchanged into one flat, numerically ordered MEGA
-folder.  The ordered manifest and completion marker are uploaded last.
+folder.  Finished-set manifests remain private control-plane records and are
+never copied into the outward-facing MEGA folder.
 """
 
 from __future__ import annotations
@@ -40,7 +41,6 @@ from gen_automation.db.models import (
     ReleaseSelection,
     ReleaseVersion,
 )
-from gen_automation.domain.canonical import canonical_json_bytes
 from gen_automation.domain.enums import FinishedSetArchiveState, MegaDeliveryState
 from gen_automation.domain.mega import LEGACY_MEGA_SET_RETIREMENT_ERROR_CODE
 from gen_automation.integrations.mega import (
@@ -63,13 +63,9 @@ _LEGACY_SOURCE_MANIFEST_SCHEMA = "finished-set-manifest/v1"
 _PUBLIC_SOURCE_MANIFEST_SCHEMA = "finished-set-manifest/v2"
 _LEGACY_SOURCE_PART_SCHEMA = "finished-set-part-manifest/v1"
 _PUBLIC_SOURCE_PART_SCHEMA = "finished-set-part-manifest/v2"
-_LEGACY_REMOTE_MANIFEST_SCHEMA = "mega-extracted-set-manifest/v1"
-_PUBLIC_REMOTE_MANIFEST_SCHEMA = "mega-extracted-set-manifest/v2"
 _LEGACY_MEDIA_PROFILE = "legacy-full-derivative-v1"
 _PUBLIC_MEDIA_PROFILE = "public-png-v1"
-_COMPLETION_SCHEMA = "mega-extracted-set-completion/v1"
-_REMOTE_MANIFEST_FILENAME = "set-manifest.json"
-_COMPLETION_FILENAME = "upload-complete.json"
+_ARCHIVE_MANIFEST_FILENAME = "set-manifest.json"
 _SAFE_FAILURE_DETAIL = "MEGA extracted-set delivery failed inside the isolated uploader."
 _MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 _HASH_BUFFER_BYTES = 1024 * 1024
@@ -100,8 +96,6 @@ class MegaSetDeliveryClient(Protocol):
     async def list_files(self, remote_folder: str) -> tuple[str, ...]: ...
 
     async def find_file(self, remote_path: str) -> tuple[MegaRemoteNode, ...]: ...
-
-    async def upload_file(self, local_file: Path, remote_folder: str) -> None: ...
 
     async def upload_files(self, local_files: tuple[Path, ...], remote_folder: str) -> None: ...
 
@@ -495,12 +489,6 @@ async def process_claimed_mega_set_delivery(
     async with sessions() as session:
         current_items = await _load_items(session, claim=claim)
     expected_paths = {item.remote_path for item in current_items}
-    expected_paths.update(
-        {
-            _remote_child(claim.remote_folder, _REMOTE_MANIFEST_FILENAME),
-            _remote_child(claim.remote_folder, _COMPLETION_FILENAME),
-        }
-    )
     if any(path not in expected_paths for path in remote_files):
         raise MegaRemoteConflictError("MEGA set folder contains unexpected files")
     if any(remote_files[path] > 1 for path in expected_paths):
@@ -871,7 +859,7 @@ async def _load_manifest_plan(
         try:
             with ZipFile(BytesIO(body), mode="r") as archive:
                 _validate_zip_contract(archive, max_part_bytes=max_part_bytes)
-                manifest_bytes = _read_small_entry(archive, _REMOTE_MANIFEST_FILENAME)
+                manifest_bytes = _read_small_entry(archive, _ARCHIVE_MANIFEST_FILENAME)
         except (BadZipFile, KeyError, RuntimeError, ValueError) as error:
             raise MegaSetDeliveryContractError(
                 "finished-set archive manifest is unreadable"
@@ -1361,31 +1349,12 @@ async def _finalize_remote_folder(
     plan: _ManifestPlan,
     now: datetime,
 ) -> bool:
-    remote_manifest = _remote_manifest_bytes(plan, claim=claim)
-    manifest_node = await _ensure_remote_control_file(
-        client,
-        remote_folder=claim.remote_folder,
-        filename=_REMOTE_MANIFEST_FILENAME,
-        body=remote_manifest,
-    )
-    marker = canonical_json_bytes(
-        {
-            "schema": _COMPLETION_SCHEMA,
-            "delivery_id": str(claim.delivery_id),
-            "finished_set_archive_id": str(claim.archive_id),
-            "source_manifest_sha256": claim.manifest_sha256,
-            "remote_manifest_sha256": hashlib.sha256(remote_manifest).hexdigest(),
-            "image_count": claim.total_item_count,
-            "total_byte_size": plan.total_byte_size,
-            "manifest_node_handle": manifest_node.handle,
-        }
-    )
-    marker_node = await _ensure_remote_control_file(
-        client,
-        remote_folder=claim.remote_folder,
-        filename=_COMPLETION_FILENAME,
-        body=marker,
-    )
+    expected_paths = {item.remote_path for item in plan.items}
+    if len(expected_paths) != claim.total_item_count:
+        raise MegaSetDeliveryContractError("MEGA set image-only layout is incomplete")
+    remote_files = Counter(await client.list_files(claim.remote_folder))
+    if set(remote_files) != expected_paths or any(count != 1 for count in remote_files.values()):
+        raise MegaRemoteConflictError("MEGA set image-only folder is incomplete or ambiguous")
     completed_at = now
     async with sessions() as session:
         delivery = await _locked_owned_delivery(
@@ -1403,7 +1372,7 @@ async def _finalize_remote_folder(
         delivery.state = MegaDeliveryState.SUCCEEDED
         delivery.lease_owner = None
         delivery.lease_expires_at = None
-        delivery.completion_marker_node_handle = marker_node.handle
+        delivery.completion_marker_node_handle = None
         delivery.verified_at = completed_at
         delivery.completed_at = completed_at
         delivery.last_error_code = None
@@ -1411,35 +1380,6 @@ async def _finalize_remote_folder(
         delivery.updated_at = completed_at
         await session.commit()
     return True
-
-
-async def _ensure_remote_control_file(
-    client: MegaSetDeliveryClient,
-    *,
-    remote_folder: str,
-    filename: str,
-    body: bytes,
-) -> MegaRemoteNode:
-    remote_path = _remote_child(remote_folder, filename)
-    nodes = await client.find_file(remote_path)
-    if not nodes:
-        with tempfile.TemporaryDirectory(prefix="gen-automation-mega-control-") as temporary:
-            root = Path(temporary)
-            os.chmod(root, 0o700)
-            local_file = root / filename
-            _write_private_file(local_file, body)
-            await client.upload_file(local_file, remote_folder)
-        nodes = await client.find_file(remote_path)
-    if len(nodes) != 1:
-        raise MegaRemoteConflictError("MEGA control-file path is ambiguous")
-    with tempfile.TemporaryDirectory(prefix="gen-automation-mega-control-verify-") as temporary:
-        root = Path(temporary)
-        os.chmod(root, 0o700)
-        downloaded = await client.download_node(nodes[0], root)
-        existing = await asyncio.to_thread(downloaded.read_bytes)
-    if existing != body:
-        raise MegaRemoteConflictError("MEGA control-file bytes conflict with the delivery")
-    return nodes[0]
 
 
 async def _locked_owned_delivery(
@@ -1499,7 +1439,7 @@ def _stage_items(
     try:
         with ZipFile(BytesIO(body), mode="r") as archive:
             _validate_zip_contract(archive, max_part_bytes=len(body))
-            source_manifest = _read_small_entry(archive, _REMOTE_MANIFEST_FILENAME)
+            source_manifest = _read_small_entry(archive, _ARCHIVE_MANIFEST_FILENAME)
             part_manifest_bytes = _read_small_entry(archive, "part-manifest.json")
             if source_manifest != plan.source_bytes:
                 raise MegaSetDeliveryContractError("archive parts do not share one manifest")
@@ -1560,7 +1500,7 @@ def _validate_zip_contract(archive: ZipFile, *, max_part_bytes: int) -> None:
     if (
         not infos
         or len(names) != len(set(names))
-        or _REMOTE_MANIFEST_FILENAME not in names
+        or _ARCHIVE_MANIFEST_FILENAME not in names
         or "part-manifest.json" not in names
     ):
         raise MegaSetDeliveryContractError("finished-set archive entries are incomplete")
@@ -1631,36 +1571,6 @@ def _validate_image_info(info: ZipInfo, *, expected: _ManifestItem) -> None:
         raise MegaSetDeliveryContractError("finished-set image entry is invalid")
 
 
-def _remote_manifest_bytes(
-    plan: _ManifestPlan,
-    *,
-    claim: ClaimedMegaSetDelivery,
-) -> bytes:
-    payload = dict(plan.source_payload)
-    raw_outputs = payload.get("outputs")
-    if not isinstance(raw_outputs, list):
-        raise MegaSetDeliveryContractError("finished-set manifest outputs are invalid")
-    outputs: list[dict[str, Any]] = []
-    for raw in raw_outputs:
-        if not isinstance(raw, dict) or not isinstance(raw.get("path"), str):
-            raise MegaSetDeliveryContractError("finished-set manifest output is invalid")
-        output = dict(raw)
-        output["source_archive_path"] = output["path"]
-        output["path"] = PurePosixPath(output["path"]).name
-        outputs.append(output)
-    payload["schema"] = (
-        _PUBLIC_REMOTE_MANIFEST_SCHEMA
-        if plan.source_schema == _PUBLIC_SOURCE_MANIFEST_SCHEMA
-        else _LEGACY_REMOTE_MANIFEST_SCHEMA
-    )
-    payload["source_manifest_schema"] = plan.source_schema
-    payload["source_manifest_sha256"] = claim.manifest_sha256
-    payload["delivery_id"] = str(claim.delivery_id)
-    payload["remote_layout"] = "flat_generation_queue"
-    payload["outputs"] = outputs
-    return canonical_json_bytes(payload)
-
-
 def _item_matches(item: MegaSetDeliveryItem, expected: _ManifestItem) -> bool:
     return (
         item.ordinal == expected.ordinal
@@ -1712,21 +1622,6 @@ def _remote_folder(
 def _remote_child(remote_folder: str, filename: str) -> str:
     validate_remote_filename(filename)
     return validate_remote_path(f"{remote_folder}/{filename}", allow_root=False)
-
-
-def _write_private_file(path: Path, body: bytes) -> None:
-    descriptor = os.open(
-        path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
-        0o600,
-    )
-    try:
-        view = memoryview(body)
-        while view:
-            written = os.write(descriptor, view)
-            view = view[written:]
-    finally:
-        os.close(descriptor)
 
 
 def _file_identity(path: Path) -> tuple[int, str]:
