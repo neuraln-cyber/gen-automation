@@ -190,6 +190,7 @@ async def seed_release_approvals(
                 version=workflow.version,
                 object_key=workflow.object_key,
                 reviewed_node_classes=["CheckpointLoaderSimple", "KSampler", "SaveImage"],
+                capabilities=[str(item) for item in workflow.capabilities],
                 evidence=evidence,
                 evidence_sha256=canonical_sha256(evidence),
                 status=ApprovalStatus.APPROVED,

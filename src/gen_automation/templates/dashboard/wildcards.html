@@ -52,57 +52,120 @@
       </label>
       <output class="library-filter-status muted" data-wildcard-filter-status aria-live="polite"></output>
     </section>
-    <ul class="release-list" data-wildcard-library-list>
+    <ul class="release-list wildcard-library-list" data-wildcard-library-list>
       {% for library in libraries %}
-        <li class="release-card wildcard-card" data-wildcard-card data-wildcard-search-text="{{ library.name }}">
-          <p class="muted">Version {{ library.current_version_no }} &middot; {{ library.entries | length }} entries</p>
-          <div class="wildcard-token-row">
-            <h2><code>__{{ library.name }}__</code></h2>
-            <button class="secondary-button compact-action" type="button" data-copy-text="__{{ library.name }}__" hidden>Copy token</button>
-          </div>
-          <p class="muted">Digest {{ library.entries_sha256[:12] }}&hellip;</p>
-          {% if can_manage %}
-            <details class="form-disclosure wildcard-editor">
-              <summary>Update library <span>Append or replace</span></summary>
-              <div class="disclosure-body">
-                <form class="decision-form wildcard-form" method="post" action="/dashboard/wildcards">
-                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                  <input type="hidden" name="action" value="append">
-                  <input type="hidden" name="name" value="{{ library.name }}">
-                  <input type="hidden" name="expected_version_no" value="{{ library.current_version_no }}">
-                  <label for="append-{{ library.id }}">Append entries, one per line</label>
-                  <textarea id="append-{{ library.id }}" name="entries" required rows="5" maxlength="524288"></textarea>
-                  <div class="wildcard-form-actions">
-                    <button class="secondary-button file-button" type="button" data-wildcard-file-button data-wildcard-file-input-id="append-file-{{ library.id }}" hidden>Load .txt file</button>
-                    <input id="append-file-{{ library.id }}" type="file" accept=".txt,text/plain" data-wildcard-file-input data-wildcard-file-target="append-{{ library.id }}" hidden>
-                    <button class="primary-button" type="submit">Append entries</button>
-                  </div>
-                </form>
-                <details class="compact-disclosure wildcard-replace">
-                  <summary>Replace or download the complete file</summary>
-                  <form class="decision-form wildcard-form" method="post" action="/dashboard/wildcards">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                    <input type="hidden" name="action" value="replace">
-                    <input type="hidden" name="name" value="{{ library.name }}">
-                    <input type="hidden" name="expected_version_no" value="{{ library.current_version_no }}">
-                    <label for="entries-{{ library.id }}">Complete file</label>
-                    <textarea id="entries-{{ library.id }}" name="entries" required rows="10" maxlength="524288">{{ library.entries | join("\n") }}</textarea>
-                    <div class="wildcard-form-actions">
-                      <button class="secondary-button" type="button" data-wildcard-download data-wildcard-download-target="entries-{{ library.id }}" data-wildcard-download-name="{{ library.name }}.txt" hidden>Download .txt</button>
-                      <button class="secondary-button file-button" type="button" data-wildcard-file-button data-wildcard-file-input-id="replace-file-{{ library.id }}" hidden>Load .txt file</button>
-                      <input id="replace-file-{{ library.id }}" type="file" accept=".txt,text/plain" data-wildcard-file-input data-wildcard-file-target="entries-{{ library.id }}" hidden>
-                      <button class="secondary-button" type="submit">Save replacement</button>
-                    </div>
-                  </form>
-                </details>
+        <li
+          id="wildcard-library-{{ library.id }}"
+          class="release-card wildcard-card wildcard-file-row"
+          data-wildcard-card
+          data-wildcard-file-row
+          data-wildcard-search-text="{{ library.name }}"
+        >
+          <header class="wildcard-file-header">
+            <div class="wildcard-file-identity">
+              <p class="page-kicker">Wildcard file</p>
+              <h2 id="wildcard-heading-{{ library.id }}">{{ library.name }}.txt</h2>
+              <div class="wildcard-token-row">
+                <code>__{{ library.name }}__</code>
+                <button
+                  class="secondary-button compact-action"
+                  type="button"
+                  data-copy-text="__{{ library.name }}__"
+                  aria-label="Copy token for {{ library.name }}.txt"
+                  hidden
+                >Copy token</button>
               </div>
-            </details>
+            </div>
+            <p class="wildcard-file-meta muted">
+              <span>Version {{ library.current_version_no }}</span>
+              <span>{{ library.entries | length }} rows</span>
+              <span>Digest {{ library.entries_sha256[:12] }}&hellip;</span>
+            </p>
+          </header>
+          {% if can_manage %}
+            <form
+              class="decision-form wildcard-form wildcard-file-form"
+              method="post"
+              action="/dashboard/wildcards#wildcard-library-{{ library.id }}"
+              aria-labelledby="wildcard-heading-{{ library.id }}"
+              data-wildcard-direct-editor
+            >
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="action" value="replace">
+              <input type="hidden" name="name" value="{{ library.name }}">
+              <input type="hidden" name="expected_version_no" value="{{ library.current_version_no }}">
+              <label for="entries-{{ library.id }}">Contents of {{ library.name }}.txt &mdash; one wildcard choice per row</label>
+              <textarea
+                id="entries-{{ library.id }}"
+                class="wildcard-file-textarea"
+                name="entries"
+                required
+                rows="16"
+                maxlength="524288"
+                aria-describedby="wildcard-help-{{ library.id }} wildcard-status-{{ library.id }}"
+                data-wildcard-editor
+                data-wildcard-editor-status="wildcard-status-{{ library.id }}"
+                data-wildcard-saved-version="{{ library.current_version_no }}"
+              >{{ library.entries | join("\n") }}</textarea>
+              <p id="wildcard-help-{{ library.id }}" class="wildcard-file-help muted">
+                Edit the complete file here. Saving creates a new immutable version; existing generation plans keep their frozen version.
+              </p>
+              <div class="wildcard-form-actions wildcard-file-actions">
+                <output
+                  id="wildcard-status-{{ library.id }}"
+                  class="wildcard-editor-status muted"
+                  aria-live="polite"
+                >{{ library.entries | length }} rows &middot; saved version {{ library.current_version_no }}</output>
+                <div class="wildcard-file-buttons">
+                  <button
+                    class="secondary-button"
+                    type="button"
+                    data-wildcard-download
+                    data-wildcard-download-target="entries-{{ library.id }}"
+                    data-wildcard-download-name="{{ library.name }}.txt"
+                    aria-label="Download {{ library.name }}.txt"
+                    hidden
+                  >Download .txt</button>
+                  <button
+                    class="secondary-button file-button"
+                    type="button"
+                    data-wildcard-file-button
+                    data-wildcard-file-input-id="replace-file-{{ library.id }}"
+                    aria-label="Load a .txt file into {{ library.name }}.txt"
+                    hidden
+                  >Load .txt file</button>
+                  <input
+                    id="replace-file-{{ library.id }}"
+                    type="file"
+                    accept=".txt,text/plain"
+                    data-wildcard-file-input
+                    data-wildcard-file-target="entries-{{ library.id }}"
+                    hidden
+                  >
+                  <button class="primary-button" type="submit">Save {{ library.name }}.txt</button>
+                </div>
+              </div>
+            </form>
           {% else %}
-            <ul class="notes">
-              {% for entry in library.entries %}
-                <li>{{ entry }}</li>
-              {% endfor %}
-            </ul>
+            <label for="entries-{{ library.id }}">Contents of {{ library.name }}.txt</label>
+            <textarea
+              id="entries-{{ library.id }}"
+              class="wildcard-file-textarea"
+              rows="16"
+              readonly
+            >{{ library.entries | join("\n") }}</textarea>
+            <div class="wildcard-form-actions wildcard-file-actions">
+              <span class="muted">Read-only</span>
+              <button
+                class="secondary-button"
+                type="button"
+                data-wildcard-download
+                data-wildcard-download-target="entries-{{ library.id }}"
+                data-wildcard-download-name="{{ library.name }}.txt"
+                aria-label="Download {{ library.name }}.txt"
+                hidden
+              >Download .txt</button>
+            </div>
           {% endif %}
         </li>
       {% endfor %}

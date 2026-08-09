@@ -82,6 +82,7 @@ from gen_automation.services.derivatives import (
     TeaserFitMode,
     WatermarkPosition,
     WatermarkSpec,
+    XStaticImagePngTooLargeError,
     XTeaserSpec,
     derivative_recipe_sha256,
 )
@@ -1267,6 +1268,8 @@ def _classify_failure(error: Exception) -> _ExecutionFailure:
         return _ExecutionFailure("derivative_input_invalid", True)
     if isinstance(error, DerivativeRecipeError):
         return _ExecutionFailure("derivative_recipe_invalid", True)
+    if isinstance(error, XStaticImagePngTooLargeError):
+        return _ExecutionFailure("x_lossless_png_too_large", True)
     if isinstance(error, DerivativeRenderError):
         return _ExecutionFailure("derivative_render_invalid", True)
     if isinstance(error, ObjectNotFoundError):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -46,6 +46,9 @@ from gen_automation.integrations.salad.models import (
     JSONObject,
     JSONValue,
     SaladContainerGroup,
+    SaladContainerGroupInstance,
+    SaladContainerGroupInstancePage,
+    SaladContainerGroupInstanceState,
     SaladQueue,
 )
 from gen_automation.services.budgets import (
@@ -226,6 +229,11 @@ class SaladDeploymentClient(Protocol):
         container_group_name: str,
     ) -> SaladContainerGroup: ...
 
+    async def list_container_group_instances(
+        self,
+        container_group_name: str,
+    ) -> SaladContainerGroupInstancePage: ...
+
     async def update_container_group(
         self,
         container_group_name: str,
@@ -279,6 +287,7 @@ async def provision_deployment_step(
     client: SaladDeploymentClient,
     secret_resolver: RuntimeSecretResolver | None = None,
     now: datetime | None = None,
+    billing_observation_clock: Callable[[], datetime] | None = None,
 ) -> DeploymentResult:
     """Advance provisioning by at most one remote mutation.
 
@@ -289,6 +298,11 @@ async def provision_deployment_step(
     """
 
     observed_at = _as_utc(now or datetime.now(UTC))
+    billing_observation_clock = _resolve_billing_observation_clock(
+        explicit_now=now,
+        observed_at=observed_at,
+        clock=billing_observation_clock,
+    )
     budget_guard_available = await _lock_budget_guard(session)
     deployment = await _load_deployment_locked(session, deployment_id)
     _validate_local_deployment(deployment)
@@ -301,10 +315,22 @@ async def provision_deployment_step(
         observed_at,
         guard_available=budget_guard_available,
     ):
-        return await _budget_blocked_result(session, deployment, client, observed_at)
+        return await _budget_blocked_result(
+            session,
+            deployment,
+            client,
+            observed_at,
+            billing_observation_clock=billing_observation_clock,
+        )
 
     if _stop_is_desired(deployment):
-        return await _request_stop(session, deployment, client, observed_at)
+        return await _request_stop(
+            session,
+            deployment,
+            client,
+            observed_at,
+            billing_observation_clock=billing_observation_clock,
+        )
     if deployment.is_current and await _has_unstopped_superseded_group(
         session,
         deployment.id,
@@ -461,6 +487,7 @@ async def provision_deployment_step(
         client,
         observed_at,
         guard_available=budget_guard_available,
+        billing_observation_clock=billing_observation_clock,
     )
 
 
@@ -470,10 +497,16 @@ async def reconcile_deployment(
     deployment_id: UUID,
     client: SaladDeploymentClient,
     now: datetime | None = None,
+    billing_observation_clock: Callable[[], datetime] | None = None,
 ) -> DeploymentResult:
     """Reconcile durable IDs, provider state, runtime cost, and the kill switch."""
 
     observed_at = _as_utc(now or datetime.now(UTC))
+    billing_observation_clock = _resolve_billing_observation_clock(
+        explicit_now=now,
+        observed_at=observed_at,
+        clock=billing_observation_clock,
+    )
     budget_guard_available = await _lock_budget_guard(session)
     deployment = await _load_deployment_locked(session, deployment_id)
     _validate_local_deployment(deployment)
@@ -491,6 +524,7 @@ async def reconcile_deployment(
         client,
         observed_at,
         guard_available=budget_guard_available,
+        billing_observation_clock=billing_observation_clock,
     )
 
 
@@ -501,6 +535,7 @@ async def _reconcile_locked(
     observed_at: datetime,
     *,
     guard_available: bool,
+    billing_observation_clock: Callable[[], datetime],
 ) -> DeploymentResult:
     budget_open = await _budget_allows_provider_work(
         session,
@@ -509,12 +544,22 @@ async def _reconcile_locked(
         guard_available=guard_available,
     )
     if not budget_open or _stop_is_desired(deployment):
-        return await _request_stop(session, deployment, client, observed_at)
+        return await _request_stop(
+            session,
+            deployment,
+            client,
+            observed_at,
+            billing_observation_clock=billing_observation_clock,
+        )
 
     try:
         queue = await client.get_queue(deployment.queue_name)
         group = await client.get_container_group(deployment.container_group_name)
     except (SaladAPIError, SaladProtocolError, SaladTransportError) as error:
+        # Queue/group read failure makes instance billing unobservable too.
+        # Surface that ambiguity immediately, including before the first exact
+        # running-instance observation.
+        deployment.billing_observation_stale = True
         return await _handle_read_error(
             session,
             deployment,
@@ -527,6 +572,18 @@ async def _reconcile_locked(
         session,
         salad_deployment_id=deployment.id,
         now=observed_at,
+    )
+    await _refresh_billing_observation(
+        session,
+        deployment,
+        client,
+        group,
+        observed_at=observed_at,
+        end_session=_is_true_scale_to_zero(
+            group,
+            effective_min_replicas=effective_min_replicas,
+        ),
+        billing_observation_clock=billing_observation_clock,
     )
     drift_code = _remote_drift_code(
         deployment,
@@ -557,7 +614,13 @@ async def _reconcile_locked(
             occurred_at=observed_at,
         )
         await session.flush()
-        return await _request_stop(session, deployment, client, observed_at)
+        return await _request_stop(
+            session,
+            deployment,
+            client,
+            observed_at,
+            billing_observation_clock=billing_observation_clock,
+        )
 
     previous_provider_status = deployment.provider_status
     deployment.observed_replicas = current_replicas
@@ -569,7 +632,13 @@ async def _reconcile_locked(
     # Recording an interval can engage the budget service's durable kill switch.
     if _stop_is_desired(deployment):
         await session.flush()
-        stop_result = await _request_stop(session, deployment, client, observed_at)
+        stop_result = await _request_stop(
+            session,
+            deployment,
+            client,
+            observed_at,
+            billing_observation_clock=billing_observation_clock,
+        )
         return DeploymentResult(
             deployment_id=stop_result.deployment_id,
             action=stop_result.action,
@@ -878,8 +947,16 @@ async def _budget_blocked_result(
     deployment: SaladDeployment,
     client: SaladDeploymentClient,
     observed_at: datetime,
+    *,
+    billing_observation_clock: Callable[[], datetime],
 ) -> DeploymentResult:
-    return await _request_stop(session, deployment, client, observed_at)
+    return await _request_stop(
+        session,
+        deployment,
+        client,
+        observed_at,
+        billing_observation_clock=billing_observation_clock,
+    )
 
 
 async def _request_stop(
@@ -887,8 +964,61 @@ async def _request_stop(
     deployment: SaladDeployment,
     client: SaladDeploymentClient,
     observed_at: datetime,
+    *,
+    billing_observation_clock: Callable[[], datetime],
 ) -> DeploymentResult:
-    if deployment.provider_queue_id is None:
+    group_read_failed = False
+    try:
+        group = await _get_group_or_none(client, deployment.container_group_name)
+    except (SaladAPIError, SaladProtocolError, SaladTransportError):
+        group = None
+        group_read_failed = True
+        deployment.billing_observation_stale = True
+    if group is not None:
+        if group.name != deployment.container_group_name:
+            return await _mark_failed(
+                session,
+                deployment,
+                error_code="stop_container_group_name_collision",
+                observed_at=observed_at,
+            )
+        if deployment.provider_container_group_id != str(group.id):
+            deployment.provider_container_group_id = str(group.id)
+            _touch(deployment)
+            _audit(
+                session,
+                deployment,
+                action="salad_deployment.stop_container_group_recovered",
+                detail={
+                    "container_group_id": str(group.id),
+                    "container_group_name": group.name,
+                },
+                occurred_at=observed_at,
+            )
+    stop_converged = False
+    if group is not None:
+        state = group.current_state
+        stop_converged = (
+            deployment.state == SaladDeploymentState.DRAINING
+            and not group.status.strip()
+            and not group.pending_change
+            and group.replicas == 0
+            and state.allocating_count == 0
+            and state.creating_count == 0
+            and state.running_count == 0
+            and state.stopping_count == 0
+        )
+    terminal_group = bool(
+        group is not None and (group.status.strip().lower() == "stopped" or stop_converged)
+    )
+
+    # A live-group stop cycle is capped at exactly three provider requests:
+    # group read, instance read, and stop mutation. Queue identity is not needed
+    # for the mutation, so recover it only once the group is absent or terminal
+    # and no stop mutation will be made in the same cycle.
+    if deployment.provider_queue_id is None and (
+        (group is None and not group_read_failed) or terminal_group
+    ):
         try:
             queue = await _get_queue_or_none(client, deployment.queue_name)
         except (SaladAPIError, SaladProtocolError, SaladTransportError):
@@ -911,34 +1041,7 @@ async def _request_stop(
                 occurred_at=observed_at,
             )
 
-    group_read_failed = False
-    try:
-        group = await _get_group_or_none(client, deployment.container_group_name)
-    except (SaladAPIError, SaladProtocolError, SaladTransportError):
-        group = None
-        group_read_failed = True
-    if group is not None:
-        if group.name != deployment.container_group_name:
-            return await _mark_failed(
-                session,
-                deployment,
-                error_code="stop_container_group_name_collision",
-                observed_at=observed_at,
-            )
-        if deployment.provider_container_group_id != str(group.id):
-            deployment.provider_container_group_id = str(group.id)
-            _touch(deployment)
-            _audit(
-                session,
-                deployment,
-                action="salad_deployment.stop_container_group_recovered",
-                detail={
-                    "container_group_id": str(group.id),
-                    "container_group_name": group.name,
-                },
-                occurred_at=observed_at,
-            )
-    elif not group_read_failed:
+    if group is None and not group_read_failed:
         return await _confirm_provider_group_stopped(
             session,
             deployment,
@@ -948,7 +1051,17 @@ async def _request_stop(
         )
 
     metered = 0
+    billing_observation: _BillingObservation | None = None
     if group is not None:
+        billing_observation = await _refresh_billing_observation(
+            session,
+            deployment,
+            client,
+            group,
+            observed_at=observed_at,
+            end_session=False,
+            billing_observation_clock=billing_observation_clock,
+        )
         current_replicas = _observed_replicas(group)
         try:
             metered = await _meter_runtime_interval(
@@ -974,26 +1087,32 @@ async def _request_stop(
         deployment.observed_replicas = current_replicas
         deployment.ready_replicas = group.current_state.running_count
         deployment.last_observed_at = observed_at
-    stop_converged = False
-    if group is not None:
-        state = group.current_state
-        stop_converged = (
-            deployment.state == SaladDeploymentState.DRAINING
-            and not group.status.strip()
-            and not group.pending_change
-            and group.replicas == 0
-            and state.allocating_count == 0
-            and state.creating_count == 0
-            and state.running_count == 0
-            and state.stopping_count == 0
+    if group is not None and terminal_group:
+        if billing_observation is not None and billing_observation.running_instances == 0:
+            return await _confirm_provider_group_stopped(
+                session,
+                deployment,
+                observed_at=(group.current_state.finish_time or observed_at),
+                status="stopped",
+                metered_microusd=metered,
+            )
+        # Salad documents that a group can report stopped while an individual
+        # instance is still running. Keep reconciling until the instance list
+        # authoritatively shows zero billable instances. A failed instance read
+        # is likewise unresolved and must never stop the billing clock.
+        deployment.state = SaladDeploymentState.DRAINING
+        deployment.reconcile_after = observed_at + _RECONCILE_DELAY
+        deployment.last_error_code = "billing_instance_stop_unconfirmed"
+        deployment.last_error_detail = (
+            "Provider group stop is visible, but running-instance shutdown is unconfirmed."
         )
-    if group is not None and (group.status.strip().lower() == "stopped" or stop_converged):
-        return await _confirm_provider_group_stopped(
-            session,
+        _touch(deployment)
+        await session.flush()
+        return _result(
             deployment,
-            observed_at=(group.current_state.finish_time or observed_at),
-            status="stopped",
+            DeploymentAction.DEFERRED,
             metered_microusd=metered,
+            error_code=deployment.last_error_code,
         )
 
     try:
@@ -1043,6 +1162,15 @@ async def _confirm_provider_group_stopped(
     status: str,
     metered_microusd: int,
 ) -> DeploymentResult:
+    billing_ended_at = _as_utc(observed_at)
+    if deployment.billing_observed_at is not None:
+        billing_ended_at = max(
+            billing_ended_at,
+            _stored_as_utc(deployment.billing_observed_at),
+        )
+    _end_billing_session(deployment, ended_at=billing_ended_at)
+    deployment.billing_observed_at = billing_ended_at
+    deployment.billing_observation_stale = False
     has_complete_identity = (
         deployment.provider_queue_id is not None
         and deployment.provider_container_group_id is not None
@@ -1430,6 +1558,258 @@ def _contains_sensitive_configuration(value: object) -> bool:
     elif isinstance(value, list):
         return any(_contains_sensitive_configuration(item) for item in value)
     return False
+
+
+@dataclass(frozen=True)
+class _BillingObservation:
+    running_instances: int
+    observed_at: datetime
+
+
+async def _refresh_billing_observation(
+    session: AsyncSession,
+    deployment: SaladDeployment,
+    client: SaladDeploymentClient,
+    group: SaladContainerGroup,
+    *,
+    observed_at: datetime,
+    end_session: bool,
+    billing_observation_clock: Callable[[], datetime],
+) -> _BillingObservation | None:
+    """Persist provider-running time without treating free preparation as billable.
+
+    Salad bills an instance only in its documented ``running`` state. The
+    instance ``update_time`` is the provider timestamp for that state
+    transition. A failed instance read deliberately leaves the previous open
+    segment untouched so network ambiguity can never make a live cost clock
+    disappear.
+    """
+
+    try:
+        page = await client.list_container_group_instances(deployment.container_group_name)
+    except (SaladAPIError, SaladProtocolError, SaladTransportError):
+        # An open segment is always unresolved. Before a first observation or
+        # after a completed session, aggregate activity proves a new lifecycle
+        # may be charging, but still cannot provide an exact instance start.
+        deployment.billing_observation_stale = bool(
+            deployment.billing_observation_stale
+            or (
+                deployment.billing_session_started_at is not None
+                and deployment.billing_session_ended_at is None
+            )
+            or _group_has_instance_activity(group)
+        )
+        await session.flush()
+        return None
+
+    received_at = max(
+        _as_utc(observed_at),
+        _as_utc(billing_observation_clock()),
+    )
+    instances = page.instances
+    running = tuple(
+        instance
+        for instance in instances
+        if instance.state == SaladContainerGroupInstanceState.RUNNING
+    )
+    _apply_billing_observation(
+        deployment,
+        instances=instances,
+        running=running,
+        observed_at=received_at,
+        end_session=end_session,
+    )
+    await session.flush()
+    return _BillingObservation(running_instances=len(running), observed_at=received_at)
+
+
+def _apply_billing_observation(
+    deployment: SaladDeployment,
+    *,
+    instances: tuple[SaladContainerGroupInstance, ...],
+    running: tuple[SaladContainerGroupInstance, ...],
+    observed_at: datetime,
+    end_session: bool,
+) -> None:
+    observed_at = _as_utc(observed_at)
+    deployment.billing_observed_at = observed_at
+    deployment.billing_observation_stale = False
+
+    preparing = any(
+        instance.state
+        in {
+            SaladContainerGroupInstanceState.ALLOCATING,
+            SaladContainerGroupInstanceState.DOWNLOADING,
+            SaladContainerGroupInstanceState.CREATING,
+        }
+        for instance in instances
+    )
+    if deployment.billing_session_ended_at is not None and preparing:
+        # The same deployment is reused after true scale-to-zero. A new free
+        # preparation lifecycle is a new session, but billing has not started.
+        deployment.billing_session_started_at = None
+        deployment.billing_session_ended_at = None
+        deployment.billing_accumulated_microseconds = 0
+        deployment.billing_active_instance_id = None
+        deployment.billing_active_started_at = None
+        deployment.billing_estimated = False
+
+    untracked_stopping = any(
+        instance.state == SaladContainerGroupInstanceState.STOPPING
+        and str(instance.id) != deployment.billing_active_instance_id
+        for instance in instances
+    )
+    if untracked_stopping:
+        # A billable interval may have started and stopped wholly between
+        # controller polls. Without the matching persisted running segment its
+        # duration cannot be reconstructed, so never present this as exact zero.
+        deployment.billing_observation_stale = True
+        deployment.billing_estimated = True
+
+    if running:
+        # The database and deployment contract cap this creator worker at one
+        # replica. Retain a conservative, visibly estimated clock if provider
+        # drift ever reports more than one instead of silently hiding cost.
+        selected = min(running, key=lambda item: (_stored_as_utc(item.update_time), item.id))
+        selected_started_at = _stored_as_utc(selected.update_time)
+        start_was_estimated = len(running) != 1
+        if len(running) != 1:
+            # Multiple creator instances violate the durable replica ceiling.
+            # Freeze the public clock as stale/estimated; the conservative
+            # budget meter still charges every observed group replica while
+            # ordinary reconciliation converges the provider drift.
+            deployment.billing_observation_stale = True
+        if selected_started_at > observed_at:
+            selected_started_at = observed_at
+            start_was_estimated = True
+
+        active_id = deployment.billing_active_instance_id
+        active_started_at = deployment.billing_active_started_at
+        same_segment = (
+            active_id == str(selected.id)
+            and active_started_at is not None
+            and _stored_as_utc(active_started_at) == selected_started_at
+        )
+        if not same_segment and active_started_at is not None:
+            _close_active_billing_segment(
+                deployment,
+                instances=instances,
+                observed_at=observed_at,
+                fallback_end=min(selected_started_at, observed_at),
+            )
+
+        if deployment.billing_session_started_at is None or (
+            deployment.billing_session_ended_at is not None
+        ):
+            deployment.billing_session_started_at = selected_started_at
+            deployment.billing_session_ended_at = None
+            deployment.billing_accumulated_microseconds = 0
+            deployment.billing_estimated = start_was_estimated
+        elif selected_started_at < _stored_as_utc(deployment.billing_session_started_at):
+            selected_started_at = _stored_as_utc(deployment.billing_session_started_at)
+            deployment.billing_estimated = True
+
+        if not same_segment:
+            deployment.billing_active_instance_id = str(selected.id)
+            deployment.billing_active_started_at = selected_started_at
+        deployment.billing_estimated = deployment.billing_estimated or start_was_estimated
+        return
+
+    if deployment.billing_active_started_at is not None:
+        _close_active_billing_segment(
+            deployment,
+            instances=instances,
+            observed_at=observed_at,
+            fallback_end=observed_at,
+        )
+    if end_session:
+        _end_billing_session(deployment, ended_at=observed_at)
+
+
+def _close_active_billing_segment(
+    deployment: SaladDeployment,
+    *,
+    instances: tuple[SaladContainerGroupInstance, ...],
+    observed_at: datetime,
+    fallback_end: datetime,
+) -> None:
+    active_id = deployment.billing_active_instance_id
+    active_started = deployment.billing_active_started_at
+    if active_id is None or active_started is None:
+        deployment.billing_active_instance_id = None
+        deployment.billing_active_started_at = None
+        return
+
+    active_started = _stored_as_utc(active_started)
+    exact_transition = next(
+        (
+            instance
+            for instance in instances
+            if str(instance.id) == active_id
+            and instance.state != SaladContainerGroupInstanceState.RUNNING
+        ),
+        None,
+    )
+    ended_at = (
+        _stored_as_utc(exact_transition.update_time)
+        if exact_transition is not None
+        else _as_utc(fallback_end)
+    )
+    if ended_at < active_started or ended_at > observed_at:
+        ended_at = observed_at
+        deployment.billing_estimated = True
+    elif exact_transition is None:
+        deployment.billing_estimated = True
+    deployment.billing_accumulated_microseconds += _timedelta_microseconds(
+        ended_at - active_started
+    )
+    deployment.billing_active_instance_id = None
+    deployment.billing_active_started_at = None
+
+
+def _end_billing_session(deployment: SaladDeployment, *, ended_at: datetime) -> None:
+    if (
+        deployment.billing_session_started_at is None
+        or deployment.billing_session_ended_at is not None
+    ):
+        return
+    ended_at = _as_utc(ended_at)
+    if deployment.billing_active_started_at is not None:
+        _close_active_billing_segment(
+            deployment,
+            instances=(),
+            observed_at=ended_at,
+            fallback_end=ended_at,
+        )
+    started_at = _stored_as_utc(deployment.billing_session_started_at)
+    deployment.billing_session_ended_at = max(started_at, ended_at)
+
+
+def _is_true_scale_to_zero(
+    group: SaladContainerGroup,
+    *,
+    effective_min_replicas: int,
+) -> bool:
+    state = group.current_state
+    return bool(
+        effective_min_replicas == 0
+        and group.replicas == 0
+        and state.allocating_count == 0
+        and state.creating_count == 0
+        and state.running_count == 0
+        and state.stopping_count == 0
+    )
+
+
+def _group_has_instance_activity(group: SaladContainerGroup) -> bool:
+    state = group.current_state
+    return bool(
+        group.replicas > 0
+        or state.allocating_count > 0
+        or state.creating_count > 0
+        or state.running_count > 0
+        or state.stopping_count > 0
+    )
 
 
 async def _meter_runtime_interval(
@@ -2134,6 +2514,25 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise SaladDeploymentValidationError("deployment timestamps must include a timezone")
     return value.astimezone(UTC)
+
+
+def _resolve_billing_observation_clock(
+    *,
+    explicit_now: datetime | None,
+    observed_at: datetime,
+    clock: Callable[[], datetime] | None,
+) -> Callable[[], datetime]:
+    if clock is not None:
+        return clock
+    if explicit_now is not None:
+        # ``now`` is the service's deterministic test/replay boundary. Preserve
+        # that behavior unless a post-response clock is supplied explicitly.
+        return lambda: observed_at
+    return _utc_now
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 def _stored_as_utc(value: datetime) -> datetime:

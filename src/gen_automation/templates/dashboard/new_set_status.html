@@ -1,6 +1,11 @@
 {% extends "dashboard/base.html" %}
 
 {% block content %}
+  {% set initial_gpu_billing = release.gpu_billing|default(none) %}
+  {% set initial_gpu_billing_state = (initial_gpu_billing.state.value|default(initial_gpu_billing.state)) if initial_gpu_billing else 'not_started' %}
+  {% set initial_gpu_billing_elapsed = initial_gpu_billing.elapsed_seconds if initial_gpu_billing else 0 %}
+  {% set initial_gpu_billing_instances = initial_gpu_billing.running_instances if initial_gpu_billing else 0 %}
+  {% set initial_gpu_billing_fresh_for = initial_gpu_billing.fresh_for_seconds if initial_gpu_billing else 0 %}
   <a class="back" href="/dashboard">&larr; Automation library</a>
   <section class="page-header" aria-labelledby="page-heading">
     <div class="page-header-row">
@@ -96,6 +101,44 @@
     </ol>
 
     <dl class="generation-progress-stats">
+      <div
+        class="shared-gpu-billing generation-gpu-billing"
+        data-gpu-billing
+        data-gpu-billing-initial-state="{{ initial_gpu_billing_state }}"
+        data-gpu-billing-initial-elapsed="{{ initial_gpu_billing_elapsed }}"
+        data-gpu-billing-initial-instances="{{ initial_gpu_billing_instances }}"
+        data-gpu-billing-initial-fresh-for="{{ initial_gpu_billing_fresh_for }}"
+        data-gpu-billing-initial-started-at="{{ initial_gpu_billing.session_started_at.isoformat() if initial_gpu_billing and initial_gpu_billing.session_started_at else '' }}"
+        data-gpu-billing-initial-observed-at="{{ initial_gpu_billing.observed_at.isoformat() if initial_gpu_billing and initial_gpu_billing.observed_at else '' }}"
+        data-gpu-billing-initial-estimated="{{ 'true' if initial_gpu_billing and initial_gpu_billing.estimated else 'false' }}"
+      >
+        <dt>Current shared GPU billing session</dt>
+        <dd>
+          <time
+            class="shared-gpu-billing-time"
+            datetime="PT{{ initial_gpu_billing_elapsed }}S"
+            data-gpu-billing-time
+          >{{ "%02d:%02d:%02d"|format(initial_gpu_billing_elapsed // 3600, (initial_gpu_billing_elapsed % 3600) // 60, initial_gpu_billing_elapsed % 60) }}</time>
+          <span
+            class="shared-gpu-billing-state"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            data-gpu-billing-state
+          >{% if initial_gpu_billing_state == 'charging' %}Charging &middot; {{ initial_gpu_billing_instances }} running GPU{{ '' if initial_gpu_billing_instances == 1 else 's' }}{% elif initial_gpu_billing_state == 'stopping' %}{% if initial_gpu_billing_instances > 0 %}Stopping &middot; {{ initial_gpu_billing_instances }} running GPU{{ '' if initial_gpu_billing_instances == 1 else 's' }} still charging{% else %}Stopping &middot; waiting for provider confirmation{% endif %}{% elif initial_gpu_billing_state == 'paused' %}Not charging &middot; session paused{% elif initial_gpu_billing_state == 'ended' %}Session ended &middot; timer frozen{% elif initial_gpu_billing_state == 'stale' %}Provider status delayed &middot; timer frozen{% else %}Not charging{% endif %}</span>
+          <span
+            class="shared-gpu-billing-estimate"
+            data-gpu-billing-estimate
+            {% if not initial_gpu_billing or not initial_gpu_billing.estimated %}hidden{% endif %}
+          >
+            Estimated from the latest provider observation
+          </span>
+          <span class="shared-gpu-billing-note">
+            Shared across generation and Experiment Lab work; not attributed to one set.
+            Starts only when Salad reports a running GPU instance.
+          </span>
+        </dd>
+      </div>
       <div>
         <dt>GPU jobs</dt>
         <dd data-progress-job-count>{{ release.jobs.completed }} / {{ release.jobs.total }} complete</dd>

@@ -25,6 +25,14 @@ from gen_automation.db.models import (
     SubjectApproval,
     WorkflowApproval,
 )
+from gen_automation.domain.controlled_duo import (
+    DuoCompositionPreset,
+    DuoIsolationMode,
+    DuoQualityMode,
+    WorkflowCapability,
+    effective_workflow_capabilities,
+    require_controlled_duo_capabilities,
+)
 from gen_automation.domain.deliverability import (
     MAX_ACCEPTED_IMAGES_PER_RELEASE,
     DeliverabilityError,
@@ -42,10 +50,7 @@ from gen_automation.domain.enums import (
     SaladDeploymentState,
     ScoringRunState,
 )
-from gen_automation.domain.generation_limits import (
-    MAX_OUTPUTS_PER_GENERATION_JOB,
-    REGIONAL_PROMPT_NODE_CLASSES,
-)
+from gen_automation.domain.generation_limits import MAX_OUTPUTS_PER_GENERATION_JOB
 from gen_automation.domain.release_spec import (
     ArtifactSpecification,
     GenerationBatchSpecification,
@@ -63,6 +68,12 @@ from gen_automation.services.generation import approve_and_expand_generation_pla
 from gen_automation.services.generation_control import (
     GENERATION_STOP_REQUESTED_ACTION,
     GENERATION_STOPPED_ACTION,
+)
+from gen_automation.services.gpu_billing import (
+    GpuBillingSnapshot,
+    gpu_billing_payload,
+    gpu_billing_poll_after_ms,
+    load_shared_gpu_billing_snapshot,
 )
 from gen_automation.services.releases import create_project, create_release
 from gen_automation.services.wildcards import list_wildcard_libraries
@@ -151,8 +162,16 @@ class NewSetSubmission(BaseModel):
     subject_approval_id: UUID
     secondary_subject_approval_id: UUID | None = None
     composition_mode: Literal["single", "duo"] = "single"
+    duo_contract_version: Literal[1, 2] = 1
+    composition_preset_id: DuoCompositionPreset | None = None
     character_a_prompt: str = Field(default="", max_length=20_000)
     character_b_prompt: str = Field(default="", max_length=20_000)
+    character_a_negative_prompt: str = Field(default="", max_length=20_000)
+    character_b_negative_prompt: str = Field(default="", max_length=20_000)
+    interaction_prompt: str = Field(default="", max_length=20_000)
+    camera_prompt: str = Field(default="", max_length=20_000)
+    duo_isolation_mode: DuoIsolationMode = DuoIsolationMode.BALANCED
+    duo_quality_mode: DuoQualityMode = DuoQualityMode.STANDARD
     checkpoint_approval_id: UUID
     loras: tuple[NewSetLoraSelection, ...] = Field(default=(), max_length=8)
     workflow_approval_id: UUID
@@ -201,8 +220,21 @@ class NewSetSubmission(BaseModel):
         if self.composition_mode == "single":
             if self.secondary_subject_approval_id is not None:
                 raise ValueError("single-character composition cannot include a second subject")
-            if self.character_a_prompt.strip() or self.character_b_prompt.strip():
-                raise ValueError("single-character composition cannot include regional prompts")
+            if (
+                self.duo_contract_version != 1
+                or self.composition_preset_id is not None
+                or self.character_a_prompt.strip()
+                or self.character_b_prompt.strip()
+                or self.character_a_negative_prompt.strip()
+                or self.character_b_negative_prompt.strip()
+                or self.interaction_prompt.strip()
+                or self.camera_prompt.strip()
+                or self.duo_isolation_mode != DuoIsolationMode.BALANCED
+                or self.duo_quality_mode != DuoQualityMode.STANDARD
+            ):
+                raise ValueError(
+                    "single-character composition cannot include Controlled Duo fields"
+                )
         else:
             if self.secondary_subject_approval_id is None:
                 raise ValueError("two-character composition requires a second subject")
@@ -210,6 +242,19 @@ class NewSetSubmission(BaseModel):
                 raise ValueError("two-character composition requires two different subjects")
             if not self.character_a_prompt.strip() or not self.character_b_prompt.strip():
                 raise ValueError("two-character composition requires both character prompts")
+            if self.duo_contract_version == 1:
+                if (
+                    self.composition_preset_id is not None
+                    or self.character_a_negative_prompt
+                    or self.character_b_negative_prompt
+                    or self.interaction_prompt
+                    or self.camera_prompt
+                    or self.duo_isolation_mode != DuoIsolationMode.BALANCED
+                    or self.duo_quality_mode != DuoQualityMode.STANDARD
+                ):
+                    raise ValueError("Controlled Duo fields require duo contract version 2")
+            elif self.composition_preset_id is None:
+                raise ValueError("Controlled Duo v2 requires a composition preset")
         lora_ids = [selection.approval_id for selection in self.loras]
         if len(lora_ids) != len(set(lora_ids)):
             raise ValueError("a LoRA can be selected only once")
@@ -265,6 +310,10 @@ class WorkflowOption:
     has_hires_pass: bool
     has_face_detailer: bool
     has_regional_prompting: bool
+    capabilities: tuple[WorkflowCapability, ...]
+    supports_controlled_duo_v2: bool
+    supports_duo_strict_isolation: bool
+    supports_duo_high_quality: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +334,26 @@ class NewSetOptions:
     @property
     def ready(self) -> bool:
         return bool(self.subjects and self.checkpoints and self.workflows)
+
+
+def _workflow_option(row: WorkflowApproval) -> WorkflowOption:
+    capabilities = effective_workflow_capabilities(
+        row.capabilities or (),
+        reviewed_node_classes=row.reviewed_node_classes,
+    )
+    return WorkflowOption(
+        approval_id=row.id,
+        name=row.name,
+        version=row.version,
+        sha256=row.workflow_sha256,
+        has_hires_pass="LatentUpscaleBy" in row.reviewed_node_classes,
+        has_face_detailer="FaceDetailer" in row.reviewed_node_classes,
+        has_regional_prompting=(WorkflowCapability.REGIONAL_PROMPTING_V1 in capabilities),
+        capabilities=tuple(sorted(capabilities, key=str)),
+        supports_controlled_duo_v2=(WorkflowCapability.CONTROLLED_DUO_V2 in capabilities),
+        supports_duo_strict_isolation=(WorkflowCapability.DUO_STRICT_ISOLATION in capabilities),
+        supports_duo_high_quality=(WorkflowCapability.DUO_HIGH_QUALITY in capabilities),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,6 +438,7 @@ class NewSetStatus:
     ready_for_review: bool
     next_url: str | None
     poll_after_ms: int
+    gpu_billing: GpuBillingSnapshot
     stop_requested: bool = False
     stop_settled: bool = False
     can_stop: bool = False
@@ -433,15 +503,7 @@ async def list_new_set_options(session: AsyncSession) -> NewSetOptions:
         if row.kind == ModelArtifactKind.LORA
     )
     workflows = tuple(
-        WorkflowOption(
-            approval_id=row.id,
-            name=row.name,
-            version=row.version,
-            sha256=row.workflow_sha256,
-            has_hires_pass="LatentUpscaleBy" in row.reviewed_node_classes,
-            has_face_detailer="FaceDetailer" in row.reviewed_node_classes,
-            has_regional_prompting=REGIONAL_PROMPT_NODE_CLASSES.issubset(row.reviewed_node_classes),
-        )
+        _workflow_option(row)
         for row in (
             await session.scalars(
                 select(WorkflowApproval)
@@ -503,12 +565,30 @@ async def create_and_approve_new_set(
         for selection in command.loras
     ]
     workflow = await _approved_workflow(session, command.workflow_approval_id)
-    workflow_has_regional_prompting = REGIONAL_PROMPT_NODE_CLASSES.issubset(
-        workflow.reviewed_node_classes
+    workflow_capabilities = effective_workflow_capabilities(
+        workflow.capabilities or (),
+        reviewed_node_classes=workflow.reviewed_node_classes,
     )
-    if command.composition_mode == "duo" and not workflow_has_regional_prompting:
-        raise NewSetInputError("two-character composition requires a couple workflow profile")
-    if command.composition_mode == "single" and workflow_has_regional_prompting:
+    if command.composition_mode == "duo" and command.duo_contract_version == 1:
+        if WorkflowCapability.REGIONAL_PROMPTING_V1 not in workflow_capabilities:
+            raise NewSetInputError(
+                "two-character composition requires a legacy regional workflow profile"
+            )
+    if command.composition_mode == "duo" and command.duo_contract_version == 2:
+        try:
+            require_controlled_duo_capabilities(
+                workflow_capabilities,
+                isolation_mode=command.duo_isolation_mode,
+                quality_mode=command.duo_quality_mode,
+            )
+        except ValueError as error:
+            raise NewSetInputError(str(error)) from error
+    if command.composition_mode == "single" and workflow_capabilities.intersection(
+        {
+            WorkflowCapability.REGIONAL_PROMPTING_V1,
+            WorkflowCapability.CONTROLLED_DUO_V2,
+        }
+    ):
         raise NewSetInputError("single-character composition requires a standard workflow profile")
     try:
         require_generation_deliverability(
@@ -545,8 +625,16 @@ async def create_and_approve_new_set(
         detailer_bbox_crop_factor=command.detailer_bbox_crop_factor,
         detailer_feather=command.detailer_feather,
         composition_mode=command.composition_mode,
+        duo_contract_version=command.duo_contract_version,
+        composition_preset_id=command.composition_preset_id,
         character_a_prompt=command.character_a_prompt,
         character_b_prompt=command.character_b_prompt,
+        character_a_negative_prompt=command.character_a_negative_prompt,
+        character_b_negative_prompt=command.character_b_negative_prompt,
+        interaction_prompt=command.interaction_prompt,
+        camera_prompt=command.camera_prompt,
+        duo_isolation_mode=command.duo_isolation_mode,
+        duo_quality_mode=command.duo_quality_mode,
     )
     generation_batches: list[GenerationBatchSpecification] = []
     implicit_seed_offset = 0
@@ -632,6 +720,7 @@ async def create_and_approve_new_set(
             version=workflow.version,
             object_key=workflow.object_key,
             sha256=workflow.workflow_sha256,
+            capabilities=tuple(sorted(workflow_capabilities, key=str)),
         ),
         generation=selected_generation,
         planned_job_count=command.effective_planned_job_count,
@@ -673,6 +762,7 @@ async def load_new_set_status(
     session: AsyncSession,
     *,
     release_id: UUID,
+    gpu_billing_snapshot: GpuBillingSnapshot | None = None,
 ) -> NewSetStatus:
     row = (
         await session.execute(
@@ -871,6 +961,7 @@ async def load_new_set_status(
         failed_jobs=failed_jobs,
         stop_requested=stop_requested,
     )
+    status_now = datetime.now(UTC)
     if stage.key in {GenerationProgressStage.QUEUED, GenerationProgressStage.GPU_STARTING}:
         current_deployment = await session.scalar(
             select(SaladDeployment).where(SaladDeployment.is_current.is_(True)).limit(1)
@@ -879,7 +970,7 @@ async def load_new_set_status(
             stage,
             progress_error,
             deployment=current_deployment,
-            now=datetime.now(UTC),
+            now=status_now,
         )
     if stage.key == GenerationProgressStage.SCORING and scoring_progress is None:
         scoring_progress = GenerationScoringProgress(
@@ -887,6 +978,21 @@ async def load_new_set_status(
             total=generated_outputs,
             percent=0.0,
         )
+    gpu_billing = gpu_billing_snapshot or await load_shared_gpu_billing_snapshot(
+        session,
+        now=status_now,
+    )
+    poll_after_ms = (
+        0
+        if stop_settled and release.phase == ReleasePhase.CANCELLED
+        else 3_000
+        if stop_requested and not stop_settled and release.phase == ReleasePhase.PAUSED
+        else _poll_after_ms(stage.key)
+    )
+    poll_after_ms = gpu_billing_poll_after_ms(
+        gpu_billing,
+        settled_poll_after_ms=poll_after_ms,
+    )
     return NewSetStatus(
         release_id=release.id,
         project_slug=project.slug,
@@ -919,13 +1025,8 @@ async def load_new_set_status(
         error=progress_error,
         ready_for_review=ready_for_review,
         next_url=(f"/dashboard/releases/{release.id}" if ready_for_review else None),
-        poll_after_ms=(
-            0
-            if stop_settled and release.phase == ReleasePhase.CANCELLED
-            else 3_000
-            if stop_requested and not stop_settled and release.phase == ReleasePhase.PAUSED
-            else _poll_after_ms(stage.key)
-        ),
+        poll_after_ms=poll_after_ms,
+        gpu_billing=gpu_billing,
         stop_requested=stop_requested,
         stop_settled=stop_settled,
         can_stop=can_stop,
@@ -933,7 +1034,11 @@ async def load_new_set_status(
     )
 
 
-def new_set_progress_payload(progress: NewSetStatus) -> dict[str, object]:
+def new_set_progress_payload(
+    progress: NewSetStatus,
+    *,
+    include_gpu_billing: bool = True,
+) -> dict[str, object]:
     scoring: dict[str, object] | None = None
     if progress.scoring is not None:
         scoring = {
@@ -948,8 +1053,8 @@ def new_set_progress_payload(progress: NewSetStatus) -> dict[str, object]:
             "message": progress.error.message,
             "retryable": progress.error.retryable,
         }
-    return {
-        "schema_version": 1,
+    payload: dict[str, object] = {
+        "schema_version": 2,
         "release_id": str(progress.release_id),
         "phase": progress.phase.value,
         "health": progress.health.value,
@@ -983,6 +1088,9 @@ def new_set_progress_payload(progress: NewSetStatus) -> dict[str, object]:
         "next_url": progress.next_url,
         "poll_after_ms": progress.poll_after_ms,
     }
+    if include_gpu_billing:
+        payload["gpu_billing"] = gpu_billing_payload(progress.gpu_billing)
+    return payload
 
 
 def _generation_progress_stage(

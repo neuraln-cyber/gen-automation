@@ -4,7 +4,7 @@ This module is an isolated, static-image-only transport. It does not contain
 publishing orchestration, persistence, routes, provider credentials, or live-call
 tests.
 
-Official contracts checked on 2026-07-28:
+Official contracts checked on 2026-08-09:
 
 - X documents OAuth user access tokens for posting and the `POST /2/tweets`
   endpoint: <https://docs.x.com/x-api/posts/create-post>.
@@ -47,6 +47,22 @@ initialize/append/finalize/status flow.
 
 Post creation always sends `made_with_ai: true`, independently of the adult-media
 choice.
+
+New and replacement X teaser revisions use a metadata-free, watermarked PNG at
+the admitted master's original pixel dimensions. The frozen profile encodes PNG
+compression level 6 first, then retries level 9 only as a lossless size
+optimization. If level 9 still exceeds 5 MiB, preparation fails terminally as
+`x_lossless_png_too_large` before upload; it never silently converts to JPEG or
+downscales. This behavior is frozen as renderer `pillow-derivative-v6`;
+already-frozen version 4/version 5 and JPEG recipes remain executable with
+their original recipe and renderer behavior.
+
+The uploaded PNG is the exact artifact approved by this application, but X may
+derive scaled or reformatted display variants after accepting it. Consequently
+X is a publishing destination, not the archival source of truth; provider-side
+display bytes, dimensions, transparency, and format are not guaranteed to match
+the upload exactly. See X's image guidance:
+<https://help.x.com/en/using-x/posting-gifs-and-pictures>.
 
 Post text is capped at 4,096 UTF-8 bytes before request construction. This is a
 transport/request-size bound, not an attempt to duplicate X's weighted text

@@ -17,6 +17,7 @@ from sqlalchemy import func, select
 from gen_automation.db.models import Asset, GenerationJob, Project, Release, ReleaseVersion
 from gen_automation.db.session import Database
 from gen_automation.domain.canonical import canonical_sha256
+from gen_automation.domain.controlled_duo import DuoCompositionPreset
 from gen_automation.domain.deliverability import require_comfy_workflow_deliverability
 from gen_automation.domain.enums import AssetState
 from gen_automation.domain.release_spec import GenerationParameters
@@ -40,8 +41,10 @@ from gen_automation.gpu_worker.security import verify_authorization
 from gen_automation.services.assets import finalize_raw_master
 from gen_automation.services.salad import SaladJobInputContext
 from gen_automation.services.worker_inputs import (
+    CONTROLLED_DUO_MARKER_NODE_CLASS,
     SaladWorkerJobInputProvider,
     WorkerInputError,
+    _controlled_duo_bindings,
 )
 from gen_automation.storage.base import PresignedUpload
 from gen_automation.storage.memory import MemoryObjectStore
@@ -76,6 +79,16 @@ COUPLE_HIRES_DETAILER_WORKFLOW_BODY = (
     Path(__file__).resolve().parents[1]
     / "workflows"
     / "illustrious-sdxl-couple-hires-detailer-v1.json"
+).read_bytes()
+CONTROLLED_DUO_BALANCED_WORKFLOW_BODY = (
+    Path(__file__).resolve().parents[1]
+    / "workflows"
+    / "illustrious-sdxl-controlled-duo-balanced-v2.json"
+).read_bytes()
+CONTROLLED_DUO_STRICT_WORKFLOW_BODY = (
+    Path(__file__).resolve().parents[1]
+    / "workflows"
+    / "illustrious-sdxl-controlled-duo-strict-v2.json"
 ).read_bytes()
 COUPLE_WORKFLOW_SHA256S = {
     "base": "539bfdf81d9668b6e0c60c77034ac5ff3c4d233e468c1f3dd1fe398415892923",
@@ -390,6 +403,62 @@ def _profile_context(
         workflow_body=workflow_body,
         job_context=job_context,
         artifact_manifest=manifest,
+    )
+
+
+def _controlled_duo_context(
+    context: WorkerInputContext,
+    *,
+    workflow_body: bytes,
+    isolation_mode: str,
+    preset: str = "close_portrait",
+    quality_mode: str = "standard",
+    capabilities: list[str] | None = None,
+) -> WorkerInputContext:
+    context.store.put_for_test(
+        context.workflow_key,
+        workflow_body,
+        content_type="application/json",
+    )
+    parameters = dict(context.job_context.parameters)
+    raw_workflow = parameters["workflow"]
+    raw_generation = parameters["generation"]
+    assert isinstance(raw_workflow, dict)
+    assert isinstance(raw_generation, dict)
+    if capabilities is None:
+        capabilities = ["controlled_duo_v2"]
+        if isolation_mode == "strict":
+            capabilities.append("duo_strict_isolation")
+    parameters["workflow"] = {
+        **raw_workflow,
+        "sha256": hashlib.sha256(workflow_body).hexdigest(),
+        "capabilities": capabilities,
+    }
+    parameters["generation"] = {
+        **raw_generation,
+        "composition_mode": "duo",
+        "duo_contract_version": 2,
+        "composition_preset_id": preset,
+        "character_a_prompt": "short copper bob, green eyes, teal aviator jacket",
+        "character_b_prompt": "long indigo braid, amber eyes, ivory tailored coat",
+        "character_a_negative_prompt": "indigo hair, ivory coat",
+        "character_b_negative_prompt": "copper hair, teal jacket",
+        "interaction_prompt": "back to back, opposing gazes",
+        "camera_prompt": "dynamic low camera, diagonal composition",
+        "duo_isolation_mode": isolation_mode,
+        "duo_quality_mode": quality_mode,
+    }
+    job_context = SaladJobInputContext(
+        **{
+            **context.job_context.__dict__,
+            "parameters": parameters,
+            "parameters_sha256": canonical_sha256(parameters),
+        }
+    )
+    return replace(
+        context,
+        workflow_body=workflow_body,
+        job_context=job_context,
     )
 
 
@@ -887,6 +956,363 @@ async def test_couple_profiles_render_two_overlapping_core_conditioning_regions(
     assert all(node["inputs"]["positive"] == ["23", 0] for node in samplers)
     assert require_comfy_workflow_deliverability(workflow)
     validate_approved_workflow(workflow, DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
+
+
+@pytest.mark.asyncio
+async def test_controlled_duo_balanced_renders_disjoint_masked_conditioning(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _controlled_duo_context(
+        worker_input_context,
+        workflow_body=CONTROLLED_DUO_BALANCED_WORKFLOW_BODY,
+        isolation_mode="balanced",
+    )
+
+    workflow = GenerateEnvelope.model_validate(
+        await _build(context),
+        strict=True,
+    ).payload.workflow
+
+    assert not any(
+        isinstance(node, dict) and node.get("class_type") == CONTROLLED_DUO_MARKER_NODE_CLASS
+        for node in workflow.values()
+    )
+    assert workflow["5"]["inputs"]["width"] == 448
+    assert workflow["8"]["inputs"]["width"] == 448
+    assert workflow["7"]["inputs"]["x"] == 40
+    assert workflow["7"]["inputs"]["y"] == 80
+    assert workflow["10"]["inputs"]["x"] == 536
+    assert workflow["10"]["inputs"]["y"] == 80
+    assert workflow["26"]["inputs"]["steps"] == 28
+    assert workflow["6"]["inputs"]["right"] == 16
+    assert workflow["9"]["inputs"]["left"] == 16
+    assert workflow["17"]["inputs"]["mask"] == ["7", 0]
+    assert workflow["18"]["inputs"]["mask"] == ["10", 0]
+    assert workflow["19"]["inputs"]["mask"] == ["7", 0]
+    assert workflow["20"]["inputs"]["mask"] == ["10", 0]
+    assert "short copper bob" in workflow["13"]["inputs"]["text"]
+    assert "long indigo braid" in workflow["14"]["inputs"]["text"]
+    assert "indigo hair" in workflow["15"]["inputs"]["text"]
+    assert "copper hair" in workflow["16"]["inputs"]["text"]
+    assert "the other character's hair traits" in workflow["15"]["inputs"]["text"]
+    assert "mixed hair color" not in workflow["15"]["inputs"]["text"]
+    assert "mixed outfit" not in workflow["15"]["inputs"]["text"]
+    assert (
+        sum(
+            isinstance(node, dict) and node.get("class_type") == "KSampler"
+            for node in workflow.values()
+        )
+        == 1
+    )
+    assert not any(
+        isinstance(node, dict) and node.get("class_type") == "FaceDetailer"
+        for node in workflow.values()
+    )
+    assert require_comfy_workflow_deliverability(workflow)
+    validate_approved_workflow(workflow, DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
+
+
+@pytest.mark.asyncio
+async def test_controlled_duo_strict_renders_two_sequential_region_refinements(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _controlled_duo_context(
+        worker_input_context,
+        workflow_body=CONTROLLED_DUO_STRICT_WORKFLOW_BODY,
+        isolation_mode="strict",
+        preset="diagonal_depth",
+    )
+
+    workflow = GenerateEnvelope.model_validate(
+        await _build(context),
+        strict=True,
+    ).payload.workflow
+
+    assert workflow["5"]["inputs"]["width"] == 536
+    assert workflow["7"]["inputs"]["x"] == 24
+    assert workflow["7"]["inputs"]["y"] == 304
+    assert workflow["8"]["inputs"]["width"] == 400
+    assert workflow["10"]["inputs"]["x"] == 592
+    assert workflow["10"]["inputs"]["y"] == 48
+    assert workflow["19"]["inputs"] == {
+        "samples": ["18", 0],
+        "mask": ["7", 0],
+    }
+    assert workflow["20"]["inputs"]["latent_image"] == ["19", 0]
+    assert workflow["20"]["inputs"]["steps"] == 14
+    assert workflow["20"]["inputs"]["denoise"] == 0.42
+    assert workflow["18"]["inputs"]["positive"] == ["34", 0]
+    assert workflow["18"]["inputs"]["negative"] == ["36", 0]
+    assert workflow["18"]["inputs"]["steps"] == 28
+    assert workflow["21"]["inputs"] == {
+        "samples": ["20", 0],
+        "mask": ["10", 0],
+    }
+    assert workflow["22"]["inputs"]["latent_image"] == ["21", 0]
+    assert workflow["22"]["inputs"]["steps"] == 14
+    assert "short copper bob" in workflow["13"]["inputs"]["text"]
+    assert "long indigo braid" in workflow["14"]["inputs"]["text"]
+    assert (
+        sum(
+            isinstance(node, dict) and node.get("class_type") == "KSampler"
+            for node in workflow.values()
+        )
+        == 3
+    )
+    assert (
+        sum(
+            isinstance(node, dict) and node.get("class_type") == "SetLatentNoiseMask"
+            for node in workflow.values()
+        )
+        == 2
+    )
+    assert not any(
+        isinstance(node, dict) and node.get("class_type") == "FaceDetailer"
+        for node in workflow.values()
+    )
+    assert require_comfy_workflow_deliverability(workflow)
+    validate_approved_workflow(workflow, DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
+
+
+@pytest.mark.asyncio
+async def test_controlled_duo_draft_reduces_real_sampler_steps(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    balanced_context = _controlled_duo_context(
+        worker_input_context,
+        workflow_body=CONTROLLED_DUO_BALANCED_WORKFLOW_BODY,
+        isolation_mode="balanced",
+        quality_mode="draft",
+    )
+    balanced = GenerateEnvelope.model_validate(
+        await _build(balanced_context),
+        strict=True,
+    ).payload.workflow
+    assert balanced["26"]["inputs"]["steps"] == 17
+
+    strict_context = _controlled_duo_context(
+        worker_input_context,
+        workflow_body=CONTROLLED_DUO_STRICT_WORKFLOW_BODY,
+        isolation_mode="strict",
+        quality_mode="draft",
+    )
+    strict = GenerateEnvelope.model_validate(
+        await _build(strict_context),
+        strict=True,
+    ).payload.workflow
+    assert strict["18"]["inputs"]["steps"] == 17
+    assert strict["20"]["inputs"]["steps"] == 7
+    assert strict["22"]["inputs"]["steps"] == 7
+    assert strict["20"]["inputs"]["denoise"] == 0.30
+
+
+@pytest.mark.asyncio
+async def test_controlled_duo_multi_output_keeps_each_prompt_lane_independent(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _controlled_duo_context(
+        worker_input_context,
+        workflow_body=CONTROLLED_DUO_BALANCED_WORKFLOW_BODY,
+        isolation_mode="balanced",
+    )
+    parameters = dict(context.job_context.parameters)
+    generation = dict(parameters["generation"])  # type: ignore[arg-type]
+    first = {**generation, "outputs_per_job": 1}
+    second = {
+        **first,
+        "character_a_prompt": "silver pixie cut, red coat",
+        "character_b_prompt": "dark green curls, gold dress",
+        "character_a_negative_prompt": "green curls",
+        "character_b_negative_prompt": "silver hair",
+        "interaction_prompt": "running in opposite directions",
+        "camera_prompt": "overhead action camera",
+        "seed": 43,
+    }
+    parameters.update(
+        {
+            "schema_version": 2,
+            "generation": {**first, "outputs_per_job": 2},
+            "output_generations": [first, second],
+            "output_prompt_resolutions": [{"seed": 42}, {"seed": 43}],
+        }
+    )
+    context = replace(
+        context,
+        job_context=SaladJobInputContext(
+            **{
+                **context.job_context.__dict__,
+                "parameters": parameters,
+                "parameters_sha256": canonical_sha256(parameters),
+            }
+        ),
+    )
+
+    workflow = GenerateEnvelope.model_validate(
+        await _build(context),
+        strict=True,
+    ).payload.workflow
+
+    assert "short copper bob" in workflow["output-00-13"]["inputs"]["text"]
+    assert "silver pixie cut" in workflow["output-01-13"]["inputs"]["text"]
+    assert "long indigo braid" in workflow["output-00-14"]["inputs"]["text"]
+    assert "dark green curls" in workflow["output-01-14"]["inputs"]["text"]
+    assert "dynamic low camera" in workflow["output-00-11"]["inputs"]["text"]
+    assert "overhead action camera" in workflow["output-01-11"]["inputs"]["text"]
+    assert workflow["output-00-26"]["inputs"]["seed"] == 42
+    assert workflow["output-01-26"]["inputs"]["seed"] == 43
+
+
+@pytest.mark.asyncio
+async def test_controlled_duo_marker_and_capabilities_fail_closed(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    graph = json.loads(CONTROLLED_DUO_BALANCED_WORKFLOW_BODY)
+    graph["99"]["inputs"]["character_a_mask_node_id"] = "10"
+    tampered = json.dumps(graph, separators=(",", ":")).encode()
+    context = _controlled_duo_context(
+        worker_input_context,
+        workflow_body=tampered,
+        isolation_mode="balanced",
+    )
+    with pytest.raises(WorkerInputError, match="workflow evidence is invalid"):
+        await _build(context)
+
+    missing_capability = _controlled_duo_context(
+        worker_input_context,
+        workflow_body=CONTROLLED_DUO_BALANCED_WORKFLOW_BODY,
+        isolation_mode="balanced",
+        capabilities=[],
+    )
+    with pytest.raises(WorkerInputError, match="workflow capability is invalid"):
+        await _build(missing_capability)
+
+    wrong_slot_graph = json.loads(CONTROLLED_DUO_STRICT_WORKFLOW_BODY)
+    wrong_slot_graph["22"]["inputs"]["positive"] = ["13", 0]
+    wrong_slot = json.dumps(wrong_slot_graph, separators=(",", ":")).encode()
+    wrong_slot_context = _controlled_duo_context(
+        worker_input_context,
+        workflow_body=wrong_slot,
+        isolation_mode="strict",
+    )
+    with pytest.raises(WorkerInputError, match="workflow evidence is invalid"):
+        await _build(wrong_slot_context)
+
+    extra_prompt_graph = json.loads(CONTROLLED_DUO_BALANCED_WORKFLOW_BODY)
+    extra_prompt_graph["98"] = {
+        "class_type": "CLIPTextEncode",
+        "inputs": {"clip": ["3", 0], "text": "unreviewed alternate conditioning"},
+    }
+    extra_prompt = json.dumps(extra_prompt_graph, separators=(",", ":")).encode()
+    extra_prompt_context = _controlled_duo_context(
+        worker_input_context,
+        workflow_body=extra_prompt,
+        isolation_mode="balanced",
+    )
+    with pytest.raises(WorkerInputError, match="workflow evidence is invalid"):
+        await _build(extra_prompt_context)
+
+    bypass_lora_graph = json.loads(CONTROLLED_DUO_BALANCED_WORKFLOW_BODY)
+    bypass_lora_graph["26"]["inputs"]["model"] = ["1", 0]
+    bypass_lora = json.dumps(bypass_lora_graph, separators=(",", ":")).encode()
+    bypass_lora_context = _controlled_duo_context(
+        worker_input_context,
+        workflow_body=bypass_lora,
+        isolation_mode="balanced",
+    )
+    with pytest.raises(WorkerInputError, match="workflow evidence is invalid"):
+        await _build(bypass_lora_context)
+
+    extra_output_graph = json.loads(CONTROLLED_DUO_BALANCED_WORKFLOW_BODY)
+    extra_output_graph["97"] = {
+        "class_type": "SaveImageWebsocket",
+        "inputs": {"images": ["27", 0]},
+    }
+    extra_output = json.dumps(extra_output_graph, separators=(",", ":")).encode()
+    extra_output_context = _controlled_duo_context(
+        worker_input_context,
+        workflow_body=extra_output,
+        isolation_mode="balanced",
+    )
+    with pytest.raises(WorkerInputError, match="workflow evidence is invalid"):
+        await _build(extra_output_context)
+
+
+@pytest.mark.parametrize("preset", list(DuoCompositionPreset))
+def test_controlled_duo_preset_bindings_are_disjoint_and_bounded(
+    preset: DuoCompositionPreset,
+) -> None:
+    generation = GenerationParameters(
+        composition_mode="duo",
+        duo_contract_version=2,
+        composition_preset_id=preset,
+        prompt="dynamic anime composition",
+        character_a_prompt="short copper hair, teal jacket",
+        character_b_prompt="long indigo hair, ivory coat",
+        interaction_prompt="back to back",
+        camera_prompt="dramatic camera",
+        seed=42,
+        width=1024,
+        height=1536,
+        steps=28,
+        sampler="euler",
+        scheduler="normal",
+    )
+
+    bindings = _controlled_duo_bindings(generation)
+    assert bindings is not None
+    character_a = bindings["character_a"]
+    character_b = bindings["character_b"]
+    assert isinstance(character_a, dict)
+    assert isinstance(character_b, dict)
+    expected_regions = {
+        DuoCompositionPreset.CLOSE_PORTRAIT: ((40, 120, 448, 1288), (536, 120, 448, 1288)),
+        DuoCompositionPreset.OVERHEAD: ((72, 184, 408, 1104), (552, 104, 400, 1168)),
+        DuoCompositionPreset.LOW_ANGLE: ((32, 336, 464, 1152), (536, 168, 464, 1320)),
+        DuoCompositionPreset.DIAGONAL_DEPTH: ((24, 464, 536, 1032), (592, 80, 400, 800)),
+        DuoCompositionPreset.BACK_TO_BACK: ((48, 136, 440, 1288), (536, 136, 440, 1288)),
+        DuoCompositionPreset.FULL_BODY: ((80, 48, 392, 1440), (552, 48, 392, 1440)),
+    }
+    assert (
+        character_a["x"],
+        character_a["y"],
+        character_a["width"],
+        character_a["height"],
+    ) == expected_regions[preset][0]
+    assert (
+        character_b["x"],
+        character_b["y"],
+        character_b["width"],
+        character_b["height"],
+    ) == expected_regions[preset][1]
+    for region in (character_a, character_b):
+        assert 0 <= region["x"] < generation.width
+        assert 0 <= region["y"] < generation.height
+        assert region["x"] + region["width"] <= generation.width
+        assert region["y"] + region["height"] <= generation.height
+    assert character_a["width"] % 8 == character_b["width"] % 8 == 0
+    horizontal_overlap = max(character_a["x"], character_b["x"]) < min(
+        character_a["x"] + character_a["width"],
+        character_b["x"] + character_b["width"],
+    )
+    vertical_overlap = max(character_a["y"], character_b["y"]) < min(
+        character_a["y"] + character_a["height"],
+        character_b["y"] + character_b["height"],
+    )
+    assert not (horizontal_overlap and vertical_overlap)
+    assert bindings["base_steps"] == 28
+    assert bindings["refinement_steps"] == 14
+    assert bindings["refinement_denoise"] == 0.42
+
+
+def test_controlled_duo_default_node_allowlist_is_core_only() -> None:
+    assert {
+        "ConditioningSetMask",
+        "FeatherMask",
+        "MaskComposite",
+        "SetLatentNoiseMask",
+        "SolidMask",
+    }.issubset(DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
+    assert CONTROLLED_DUO_MARKER_NODE_CLASS not in DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES
 
 
 def test_generation_parameters_keep_single_mode_backward_compatible_and_guard_duo() -> None:

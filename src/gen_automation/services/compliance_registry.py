@@ -357,6 +357,7 @@ async def approve_workflow(
         version=command.version,
         object_key=command.object_key,
         reviewed_node_classes=command.reviewed_node_classes,
+        capabilities=[str(item) for item in command.capabilities],
         evidence=evidence,
         evidence_sha256=evidence_sha256,
         status=ApprovalStatus.APPROVED,
@@ -783,6 +784,7 @@ def _workflow_matches(
         and approval.version == command.version
         and approval.object_key == command.object_key
         and approval.reviewed_node_classes == command.reviewed_node_classes
+        and approval.capabilities == [str(item) for item in command.capabilities]
         and approval.evidence == evidence
         and approval.evidence_sha256 == evidence_sha256
     )
@@ -849,6 +851,7 @@ def _validate_current_approval(
                 version=approval.version,
                 object_key=approval.object_key,
                 reviewed_node_classes=approval.reviewed_node_classes,
+                capabilities=approval.capabilities,
                 evidence=evidence,
             )
         else:

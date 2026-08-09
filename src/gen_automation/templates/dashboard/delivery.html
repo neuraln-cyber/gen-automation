@@ -431,6 +431,8 @@
                 complete
               {% elif destination.state == "failed" %}
                 needs attention
+              {% elif destination.state == "retired" %}
+                retired
               {% else %}
                 {{ destination.state.replace("_", " ") }}
               {% endif %}
@@ -489,7 +491,19 @@
             >
               Folder: <code data-mega-remote-path>{{ destination.remote_path or "" }}</code>
             </p>
-            {% if destination.state in ["not_prepared", "failed"] %}
+            <p
+              class="delivery-schedule"
+              data-mega-next-retry-row
+              {% if not destination.next_retry_at %}hidden{% endif %}
+            >
+              Next retry:
+              <time
+                data-mega-next-retry
+                data-local-datetime
+                datetime="{{ destination.next_retry_at.isoformat() if destination.next_retry_at else '' }}"
+              >{{ destination.next_retry_at.isoformat() if destination.next_retry_at else "" }}</time>
+            </p>
+            {% if destination.state in ["not_prepared", "failed", "retired"] %}
               {% if not mega_configured %}
                 <p class="form-error">MEGA is not connected. ZIP, Patreon, and X remain available.</p>
               {% elif not delivery.progress.full_planned %}
@@ -506,7 +520,9 @@
                   <input type="hidden" name="idempotency_key" value="{{ mega_idempotency_key }}">
                   <input type="hidden" name="submission_id" value="{{ mega_submission_id }}">
                   <button class="primary-button" type="submit">
-                    {% if destination.state == "failed" %}
+                    {% if destination.state == "retired" %}
+                      Start full-resolution PNG upload
+                    {% elif destination.state == "failed" %}
                       Retry MEGA upload
                     {% elif delivery.progress.full_outputs_ready %}
                       Upload full set to MEGA
@@ -688,6 +704,11 @@
             {% if not delivery.x_selected_count %}
               <p class="terminal-state">No teaser images were selected for this set.</p>
             {% else %}
+              {% if delivery.progress.x_action_message %}
+                <p class="form-error" role="alert" data-x-lossless-png-too-large>
+                  {{ delivery.progress.x_action_message }}
+                </p>
+              {% endif %}
               {% set x_teasers_ready = delivery.progress.ready_x_teasers == delivery.progress.expected_x_teasers %}
               {% set replacing_x_teasers = x_output_downloads|length > 0 %}
               {% set replacement_allowed = x_teaser_revision and x_teaser_revision.can_replace %}

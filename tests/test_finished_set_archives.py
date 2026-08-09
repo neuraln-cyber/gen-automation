@@ -2,10 +2,13 @@
 
 import asyncio
 import hashlib
+import inspect
 import json
+from collections.abc import Iterator
 from dataclasses import replace
 from datetime import timedelta
 from io import BytesIO
+from typing import Any
 from uuid import uuid4
 from zipfile import ZipFile
 
@@ -18,6 +21,7 @@ from gen_automation.db.models import (
     Asset,
     AuditEvent,
     DerivativeJob,
+    DerivativeOutput,
     FinishedSetArchive,
     FinishedSetArchivePart,
     GenerationJob,
@@ -25,6 +29,7 @@ from gen_automation.db.models import (
     PublicationIntent,
     PublicationPackage,
     Release,
+    ReleaseSelection,
 )
 from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import (
@@ -35,6 +40,10 @@ from gen_automation.domain.enums import (
     ReleasePhase,
 )
 from gen_automation.services import finished_set_archives as archives
+from gen_automation.services.derivatives import (
+    DerivativeBundle,
+    render_platform_derivatives,
+)
 from gen_automation.services.finished_set_archives import (
     FinishedSetArchiveConflictError,
     FinishedSetArchiveNotFoundError,
@@ -44,7 +53,7 @@ from gen_automation.services.finished_set_archives import (
     run_finished_set_archive_cycle,
 )
 from gen_automation.services.mega_set_delivery import ensure_next_mega_set_delivery
-from gen_automation.storage.base import ObjectMetadata
+from gen_automation.storage.base import ObjectMetadata, ObjectStoreError
 from gen_automation.storage.memory import MemoryObjectStore, StoredObject
 from tests.image_privacy_assertions import (
     assert_delivery_metadata_absent,
@@ -56,13 +65,27 @@ from tests.test_derivative_pipeline import (
 )
 from tests.test_derivative_runtime import (
     RUN_AT,
-    LostWriteResponseStore,
     TrackingObjectStore,
     _cycle,
     _prepare,
 )
 
 ARCHIVE_AT = RUN_AT + timedelta(minutes=2)
+
+
+@pytest.fixture(autouse=True)
+def _trusted_test_isolated_renderer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[list[tuple[bytes, dict[str, Any]]]]:
+    calls: list[tuple[bytes, dict[str, Any]]] = []
+
+    async def render(raw_master: bytes, **kwargs: Any) -> DerivativeBundle:
+        kwargs.pop("policy", None)
+        calls.append((raw_master, dict(kwargs)))
+        return render_platform_derivatives(raw_master, **kwargs)
+
+    monkeypatch.setattr(archives, "render_platform_derivatives_isolated", render)
+    yield calls
 
 
 class BlockingSecondArchiveWriteStore(TrackingObjectStore):
@@ -94,9 +117,44 @@ class BlockingSecondArchiveWriteStore(TrackingObjectStore):
         )
 
 
+class LostArchiveWriteResponseStore(TrackingObjectStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lose_next_archive_write_response = False
+
+    async def write_bytes_if_absent(
+        self,
+        *,
+        key: str,
+        body: bytes,
+        content_type: str,
+        metadata: dict[str, str],
+        max_bytes: int,
+    ) -> ObjectMetadata:
+        result = await super().write_bytes_if_absent(
+            key=key,
+            body=body,
+            content_type=content_type,
+            metadata=metadata,
+            max_bytes=max_bytes,
+        )
+        if content_type == "application/zip" and self.lose_next_archive_write_response:
+            self.lose_next_archive_write_response = False
+            raise ObjectStoreError("simulated archive response loss")
+        return result
+
+
+def test_archive_controller_never_decodes_raw_masters_in_process() -> None:
+    source = inspect.getsource(archives)
+    assert "Image.open" not in source
+    assert "_prepare_public_png" not in source
+    assert "render_platform_derivatives_isolated" in source
+
+
 @pytest.mark.asyncio
 async def test_archive_is_available_without_preparing_any_destination(
     derivative_approved_context: ApprovedContext,
+    _trusted_test_isolated_renderer: list[tuple[bytes, dict[str, Any]]],
 ) -> None:
     approved = derivative_approved_context
     prepared = await _prepare(approved)
@@ -105,6 +163,28 @@ async def test_archive_is_available_without_preparing_any_destination(
     for asset_id, source in zip(approved.raw_asset_ids, approved.raw_payloads, strict=True):
         assert_private_master_metadata_present(source)
         assert prepared.store.objects[f"raw/{asset_id}.png"].body == source
+    async with approved.database.sessions() as session:
+        full_rows = tuple(
+            (
+                await session.execute(
+                    select(DerivativeOutput, ReleaseSelection)
+                    .join(
+                        ReleaseSelection,
+                        ReleaseSelection.id == DerivativeOutput.release_selection_id,
+                    )
+                    .where(
+                        ReleaseSelection.review_task_id == approved.review_task_id,
+                        DerivativeOutput.target == "full",
+                    )
+                    .order_by(ReleaseSelection.source_generation_queue_position)
+                )
+            ).all()
+        )
+    assert len(full_rows) == 2
+    full_jpegs = tuple(
+        prepared.store.objects[output.asset_object_key].body for output, _ in full_rows
+    )
+    assert all(output.asset_content_type == "image/jpeg" for output, _ in full_rows)
 
     async with approved.database.sessions() as session:
         assert (
@@ -141,6 +221,13 @@ async def test_archive_is_available_without_preparing_any_destination(
     )
     assert result.completed_archive
     assert result.archive_id == requested.archive_id
+    assert len(_trusted_test_isolated_renderer) == 2
+    assert all(
+        kwargs["targets"] == ("full",)
+        and kwargs["watermark_png"] is None
+        and kwargs["recipe"].full.encoding.image_format.value == "PNG"
+        for _source, kwargs in _trusted_test_isolated_renderer
+    )
 
     async with approved.database.sessions() as session:
         snapshot = await load_finished_set_archive(
@@ -151,6 +238,7 @@ async def test_archive_is_available_without_preparing_any_destination(
         publication_packages = await session.scalar(select(func.count(PublicationPackage.id)))
         assert snapshot is not None
         assert snapshot.state == FinishedSetArchiveState.READY
+        assert snapshot.media_profile == "public-png-v1"
         assert snapshot.selection_count == 2
         assert snapshot.part_count == 1
         assert len(snapshot.parts) == 1
@@ -194,15 +282,50 @@ async def test_archive_is_available_without_preparing_any_destination(
         assert archive.namelist() == [
             "set-manifest.json",
             "part-manifest.json",
-            "content/001.jpg",
-            "content/002.jpg",
+            "content/001.png",
+            "content/002.png",
         ]
         manifest = json.loads(archive.read("set-manifest.json"))
-        assert manifest["schema"] == "finished-set-manifest/v1"
+        assert manifest["schema"] == "finished-set-manifest/v2"
+        assert manifest["media_profile"] == "public-png-v1"
         assert manifest["ordering"] == "frozen_generation_queue"
         assert [item["ordinal"] for item in manifest["outputs"]] == [1, 2]
-        for path in ("content/001.jpg", "content/002.jpg"):
-            assert_delivery_metadata_absent(archive.read(path))
+        assert [item["readiness_derivative_output_id"] for item in manifest["outputs"]] == [
+            str(output.id) for output, _selection in full_rows
+        ]
+        assert [item["source_asset_id"] for item in manifest["outputs"]] == [
+            str(selection.asset_id) for _output, selection in full_rows
+        ]
+        assert [item["content_type"] for item in manifest["outputs"]] == [
+            "image/png",
+            "image/png",
+        ]
+        assert [(item["width"], item["height"]) for item in manifest["outputs"]] == [
+            (64, 64),
+            (64, 64),
+        ]
+        packaged = tuple(archive.read(path) for path in ("content/001.png", "content/002.png"))
+        assert packaged != approved.raw_payloads
+        assert all(payload not in full_jpegs for payload in packaged)
+        cached_by_sha = {
+            hashlib.sha256(stored.body).hexdigest(): stored.body
+            for key, stored in prepared.store.objects.items()
+            if key.startswith("public-media/public-png-v1/")
+        }
+        assert len(cached_by_sha) == 2
+        for row, payload, source in zip(
+            manifest["outputs"], packaged, approved.raw_payloads, strict=True
+        ):
+            assert cached_by_sha[row["sha256"]] == payload
+            assert_delivery_metadata_absent(payload)
+            with (
+                Image.open(BytesIO(payload)) as public_image,
+                Image.open(BytesIO(source)) as source_image,
+            ):
+                assert public_image.size == source_image.size == (64, 64)
+                assert (
+                    public_image.convert("RGB").tobytes() == source_image.convert("RGB").tobytes()
+                )
     for asset_id, source in zip(approved.raw_asset_ids, approved.raw_payloads, strict=True):
         assert prepared.store.objects[f"raw/{asset_id}.png"].body == source
         assert_private_master_metadata_present(source)
@@ -211,10 +334,10 @@ async def test_archive_is_available_without_preparing_any_destination(
 @pytest.mark.asyncio
 async def test_archive_adopts_a_completed_write_after_response_loss(
     derivative_approved_context: ApprovedContext,
+    _trusted_test_isolated_renderer: list[tuple[bytes, dict[str, Any]]],
 ) -> None:
     approved = derivative_approved_context
-    store = LostWriteResponseStore()
-    store.lose_next_write_response = False
+    store = LostArchiveWriteResponseStore()
     prepared = await _prepare(approved, store=store)
     await _cycle(prepared, worker_id="archive-retry-derivative")
     await _cycle(prepared, worker_id="archive-retry-derivative")
@@ -225,7 +348,7 @@ async def test_archive_adopts_a_completed_write_after_response_loss(
             requested_by_user_id=approved.owner_id,
             now=ARCHIVE_AT,
         )
-    store.lose_next_write_response = True
+    store.lose_next_archive_write_response = True
 
     first = await run_finished_set_archive_cycle(
         approved.database.sessions,
@@ -241,6 +364,9 @@ async def test_archive_adopts_a_completed_write_after_response_loss(
     assert not first.completed_archive
     assert first.state == FinishedSetArchiveState.RETRY_WAIT
     assert first.error_code == "archive_storage_retryable"
+    assert len(_trusted_test_isolated_renderer) == 2
+    assert sum(key.startswith("public-media/public-png-v1/") for key in store.objects) == 2
+    store.read_requests.clear()
 
     second = await run_finished_set_archive_cycle(
         approved.database.sessions,
@@ -254,6 +380,8 @@ async def test_archive_adopts_a_completed_write_after_response_loss(
     )
     assert second.completed_archive
     assert second.archive_id == first.archive_id
+    assert len(_trusted_test_isolated_renderer) == 2
+    assert not any(key.startswith("raw/") for key, *_rest in store.read_requests)
 
     async with approved.database.sessions() as session:
         snapshot = await load_finished_set_archive(
@@ -622,10 +750,26 @@ async def test_multipart_archive_preserves_order_and_one_shared_manifest() -> No
     for ordinal in range(1, 102):
         key = f"full/{ordinal:03d}.png"
         version_id = f"version-{ordinal:03d}"
+        source_asset_id = uuid4()
+        source_object_version_id = f"source-version-{ordinal:03d}"
+        source_sha256 = hashlib.sha256(body).hexdigest()
+        lineage_sha256 = f"{ordinal:064x}"
         store.objects[key] = StoredObject(
             body=body,
             content_type="image/png",
-            metadata={"sha256": hashlib.sha256(body).hexdigest()},
+            metadata={
+                **archives._public_png_static_metadata(
+                    source_asset_id=source_asset_id,
+                    source_object_version_id=source_object_version_id,
+                    source_sha256=source_sha256,
+                    source_byte_size=len(body),
+                ),
+                "sha256": source_sha256,
+                "byte-size": str(len(body)),
+                "width": "1",
+                "height": "1",
+                "lineage-sha256": lineage_sha256,
+            },
             version_id=version_id,
         )
         outputs.append(
@@ -638,6 +782,10 @@ async def test_multipart_archive_preserves_order_and_one_shared_manifest() -> No
                 review_display_order=ordinal,
                 ranking_rank=ordinal,
                 selection_id=uuid4(),
+                source_asset_id=source_asset_id,
+                source_object_version_id=source_object_version_id,
+                source_sha256=source_sha256,
+                source_byte_size=len(body),
                 output_id=uuid4(),
                 object_key=key,
                 object_version_id=version_id,
@@ -648,6 +796,10 @@ async def test_multipart_archive_preserves_order_and_one_shared_manifest() -> No
                 height=1,
                 byte_size=len(body),
                 path=f"content/{ordinal:03d}.png",
+                public_recipe_sha256=archives._PUBLIC_PNG_RECIPE_SHA256,
+                public_lineage_sha256=lineage_sha256,
+                public_renderer_version=archives.DERIVATIVE_RENDERER_VERSION,
+                public_pillow_version=archives.PILLOW_VERSION,
             )
         )
     shared_manifest = json.dumps(

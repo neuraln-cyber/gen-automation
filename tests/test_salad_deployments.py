@@ -37,6 +37,9 @@ from gen_automation.integrations.salad.errors import (
 from gen_automation.integrations.salad.models import (
     JSONValue,
     SaladContainerGroup,
+    SaladContainerGroupInstance,
+    SaladContainerGroupInstancePage,
+    SaladContainerGroupInstanceState,
     SaladContainerGroupState,
     SaladQueue,
 )
@@ -64,6 +67,7 @@ IMAGE_DIGEST = "registry.example.test/worker@sha256:" + "c" * 64
 CONFIG_SHA256 = "a" * 64
 QUEUE_ID = UUID("7dcd6922-50e9-4d56-89b5-91cde26f0211")
 GROUP_ID = UUID("ab3a4591-efc3-46c0-b06a-3d820c0ec100")
+INSTANCE_ID = "instance-creator-1"
 LIVE_VALUE = "resolved-value-that-must-not-be-persisted"
 STARTUP_PROBE: dict[str, JSONValue] = {
     "http": {
@@ -227,7 +231,10 @@ class FakeClient:
         self.stop_error: Exception | None = None
         self.get_queue_error: Exception | None = None
         self.get_group_error: Exception | None = None
+        self.list_instances_error: Exception | None = None
         self.get_group_results: list[SaladContainerGroup] = []
+        self.instance_pages: dict[str, SaladContainerGroupInstancePage] = {}
+        self.last_group: SaladContainerGroup | None = None
         self.update_group_result: SaladContainerGroup | None = None
         self.created_queue_names: list[str] = []
         self.created_group_payloads: list[dict[str, JSONValue]] = []
@@ -297,11 +304,40 @@ class FakeClient:
         if self.get_group_error is not None:
             raise self.get_group_error
         if self.get_group_results:
-            return self.get_group_results.pop(0)
+            group = self.get_group_results.pop(0)
+            self.last_group = group
+            return group
         try:
-            return self.groups[container_group_name]
+            group = self.groups[container_group_name]
+            self.last_group = group
+            return group
         except KeyError:
             raise api_error(404) from None
+
+    async def list_container_group_instances(
+        self,
+        container_group_name: str,
+    ) -> SaladContainerGroupInstancePage:
+        self.calls.append(("list_instances", container_group_name))
+        if self.list_instances_error is not None:
+            raise self.list_instances_error
+        explicit = self.instance_pages.get(container_group_name)
+        if explicit is not None:
+            return explicit
+        group = self.last_group or self.groups.get(container_group_name)
+        if group is None or group.current_state.running_count == 0:
+            return SaladContainerGroupInstancePage(instances=())
+        return SaladContainerGroupInstancePage(
+            instances=(
+                SaladContainerGroupInstance(
+                    id=INSTANCE_ID,
+                    machine_id="machine-creator-1",
+                    state=SaladContainerGroupInstanceState.RUNNING,
+                    update_time=group.current_state.start_time or NOW,
+                    version=group.version,
+                ),
+            )
+        )
 
     async def update_container_group(
         self,
@@ -1084,10 +1120,13 @@ async def test_provider_read_errors_are_safely_classified(
             now=NOW + timedelta(minutes=1),
         )
         await session.commit()
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
 
     assert result.action == DeploymentAction.DEFERRED
     assert result.state == SaladDeploymentState.UNKNOWN
     assert result.error_code == expected_code
+    assert deployment.billing_observation_stale is True
 
 
 @pytest.mark.asyncio
@@ -1236,6 +1275,166 @@ async def make_fully_provisioned(
 
 
 @pytest.mark.asyncio
+async def test_running_transition_during_instance_read_uses_response_time_bound(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(deployment_context)
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    cycle_started_at = NOW + timedelta(seconds=10)
+    running_started_at = NOW + timedelta(seconds=20)
+    response_received_at = NOW + timedelta(seconds=30)
+    client.queues[queue_name] = make_queue(queue_name)
+    client.groups[group_name] = make_group(
+        group_name,
+        queue_name,
+        status="running",
+        replicas=1,
+        running=1,
+        start_time=running_started_at,
+    )
+    client.instance_pages[group_name] = SaladContainerGroupInstancePage(
+        instances=(
+            SaladContainerGroupInstance(
+                id=INSTANCE_ID,
+                machine_id="machine-creator-1",
+                state=SaladContainerGroupInstanceState.RUNNING,
+                update_time=running_started_at,
+                version=1,
+            ),
+        )
+    )
+
+    def billing_observation_clock() -> datetime:
+        assert client.calls[-1] == ("list_instances", group_name)
+        return response_received_at
+
+    async with deployment_context.database.sessions() as session:
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=cycle_started_at,
+            billing_observation_clock=billing_observation_clock,
+        )
+        await session.commit()
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+
+    assert result.state == SaladDeploymentState.ACTIVE
+    assert deployment.billing_session_started_at is not None
+    assert deployment.billing_session_started_at.replace(tzinfo=UTC) == running_started_at
+    assert deployment.billing_active_started_at is not None
+    assert deployment.billing_active_started_at.replace(tzinfo=UTC) == running_started_at
+    assert deployment.billing_observed_at is not None
+    assert deployment.billing_observed_at.replace(tzinfo=UTC) == response_received_at
+    assert deployment.billing_estimated is False
+
+
+@pytest.mark.asyncio
+async def test_first_untracked_stopping_instance_is_stale_instead_of_exact_zero(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(deployment_context)
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    observed_at = NOW + timedelta(seconds=30)
+    client.queues[queue_name] = make_queue(queue_name)
+    client.groups[group_name] = make_group(group_name, queue_name, status="running")
+    client.instance_pages[group_name] = SaladContainerGroupInstancePage(
+        instances=(
+            SaladContainerGroupInstance(
+                id=INSTANCE_ID,
+                machine_id="machine-creator-1",
+                state=SaladContainerGroupInstanceState.STOPPING,
+                update_time=NOW + timedelta(seconds=20),
+                version=1,
+            ),
+        )
+    )
+
+    async with deployment_context.database.sessions() as session:
+        await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=observed_at,
+        )
+        await session.commit()
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+
+    assert deployment.billing_session_started_at is None
+    assert deployment.billing_accumulated_microseconds == 0
+    assert deployment.billing_observation_stale is True
+    assert deployment.billing_estimated is True
+
+
+@pytest.mark.asyncio
+async def test_stop_transition_during_instance_read_closes_at_exact_provider_time(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(
+        deployment_context,
+        desired_state=DesiredDeploymentState.STOPPED,
+    )
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    cycle_started_at = NOW + timedelta(seconds=20)
+    stopped_at = NOW + timedelta(seconds=30)
+    response_received_at = NOW + timedelta(seconds=40)
+    client.groups[group_name] = make_group(
+        group_name,
+        queue_name,
+        status="stopped",
+        finish_time=stopped_at,
+    )
+    client.instance_pages[group_name] = SaladContainerGroupInstancePage(
+        instances=(
+            SaladContainerGroupInstance(
+                id=INSTANCE_ID,
+                machine_id="machine-creator-1",
+                state=SaladContainerGroupInstanceState.STOPPING,
+                update_time=stopped_at,
+                version=1,
+            ),
+        )
+    )
+
+    def billing_observation_clock() -> datetime:
+        assert client.calls[-1] == ("list_instances", group_name)
+        return response_received_at
+
+    async with deployment_context.database.sessions() as session:
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+        deployment.billing_session_started_at = NOW
+        deployment.billing_active_instance_id = INSTANCE_ID
+        deployment.billing_active_started_at = NOW
+        deployment.billing_observed_at = NOW
+        await session.commit()
+
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment.id,
+            client=client,
+            now=cycle_started_at,
+            billing_observation_clock=billing_observation_clock,
+        )
+        await session.commit()
+        await session.refresh(deployment)
+
+    assert result.action == DeploymentAction.STOPPED
+    assert deployment.billing_accumulated_microseconds == 30_000_000
+    assert deployment.billing_active_instance_id is None
+    assert deployment.billing_active_started_at is None
+    assert deployment.billing_observed_at is not None
+    assert deployment.billing_observed_at.replace(tzinfo=UTC) == response_received_at
+    assert deployment.billing_observation_stale is False
+    assert deployment.billing_estimated is False
+
+
+@pytest.mark.asyncio
 async def test_stopped_desire_only_invokes_stop_and_requires_observed_confirmation(
     deployment_context: DeploymentContext,
 ) -> None:
@@ -1270,6 +1469,8 @@ async def test_stopped_desire_only_invokes_stop_and_requires_observed_confirmati
             now=NOW + timedelta(minutes=2),
         )
         await session.commit()
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
         entries = list((await session.scalars(select(ProviderSpendEntry))).all())
 
     assert requested.action == DeploymentAction.STOP_REQUESTED
@@ -1281,6 +1482,9 @@ async def test_stopped_desire_only_invokes_stop_and_requires_observed_confirmati
     assert sum(entry.amount_microusd for entry in entries) == 120_000
     assert client.stop_names == [group_name]
     assert all(call[0] != "start_group" for call in client.calls)
+    assert deployment.billing_session_started_at is not None
+    assert deployment.billing_session_ended_at is not None
+    assert deployment.billing_active_instance_id is None
 
 
 @pytest.mark.asyncio
@@ -1312,6 +1516,174 @@ async def test_draining_stop_converges_when_idle_provider_status_is_empty(
     assert result.action == DeploymentAction.STOPPED
     assert result.state == SaladDeploymentState.STOPPED
     assert client.stop_names == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_group_waits_for_authoritative_instance_shutdown(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(
+        deployment_context,
+        desired_state=DesiredDeploymentState.STOPPED,
+    )
+    client = FakeClient()
+    _queue_name, group_name = remote_names()
+    client.groups[group_name] = make_group(
+        group_name,
+        remote_names()[0],
+        status="stopped",
+        finish_time=NOW + timedelta(seconds=20),
+    )
+    running = SaladContainerGroupInstance(
+        id=INSTANCE_ID,
+        machine_id="machine-creator-1",
+        state=SaladContainerGroupInstanceState.RUNNING,
+        update_time=NOW,
+        version=1,
+    )
+    client.instance_pages[group_name] = SaladContainerGroupInstancePage(instances=(running,))
+
+    async with deployment_context.database.sessions() as session:
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+        deployment.billing_session_started_at = NOW
+        deployment.billing_active_instance_id = INSTANCE_ID
+        deployment.billing_active_started_at = NOW
+        deployment.billing_observed_at = NOW + timedelta(seconds=5)
+        await session.commit()
+
+        still_running = await reconcile_deployment(
+            session,
+            deployment_id=deployment.id,
+            client=client,
+            now=NOW + timedelta(seconds=30),
+        )
+        await session.commit()
+        await session.refresh(deployment)
+        assert still_running.action == DeploymentAction.DEFERRED
+        assert still_running.error_code == "billing_instance_stop_unconfirmed"
+        assert deployment.state == SaladDeploymentState.DRAINING
+        assert deployment.billing_session_ended_at is None
+        assert deployment.billing_active_instance_id == INSTANCE_ID
+
+        client.list_instances_error = SaladTransportError("instance status unavailable")
+        unconfirmed = await reconcile_deployment(
+            session,
+            deployment_id=deployment.id,
+            client=client,
+            now=NOW + timedelta(seconds=40),
+        )
+        await session.commit()
+        await session.refresh(deployment)
+        assert unconfirmed.action == DeploymentAction.DEFERRED
+        assert deployment.billing_observation_stale is True
+        assert deployment.billing_session_ended_at is None
+
+        client.list_instances_error = None
+        client.instance_pages[group_name] = SaladContainerGroupInstancePage(instances=())
+        confirmed = await reconcile_deployment(
+            session,
+            deployment_id=deployment.id,
+            client=client,
+            now=NOW + timedelta(seconds=50),
+        )
+        await session.commit()
+        await session.refresh(deployment)
+
+    assert confirmed.action == DeploymentAction.STOPPED
+    assert deployment.billing_session_ended_at is not None
+    assert deployment.billing_active_instance_id is None
+    assert client.stop_names == []
+
+
+@pytest.mark.asyncio
+async def test_consecutive_instance_failures_never_clear_unresolved_stop(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(
+        deployment_context,
+        desired_state=DesiredDeploymentState.STOPPED,
+    )
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.groups[group_name] = make_group(
+        group_name,
+        queue_name,
+        status="running",
+        replicas=1,
+        running=1,
+    )
+    client.list_instances_error = SaladTransportError("instance status unavailable")
+
+    async with deployment_context.database.sessions() as session:
+        requested = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=NOW + timedelta(seconds=10),
+        )
+        await session.commit()
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+        assert requested.action == DeploymentAction.STOP_REQUESTED
+        assert deployment.billing_observation_stale is True
+        assert deployment.billing_session_started_at is None
+
+        client.groups[group_name] = make_group(
+            group_name,
+            queue_name,
+            status="stopped",
+            replicas=0,
+            running=0,
+            finish_time=NOW + timedelta(seconds=15),
+        )
+        unconfirmed = await reconcile_deployment(
+            session,
+            deployment_id=deployment.id,
+            client=client,
+            now=NOW + timedelta(seconds=20),
+        )
+        await session.commit()
+        await session.refresh(deployment)
+
+    assert unconfirmed.action == DeploymentAction.DEFERRED
+    assert unconfirmed.error_code == "billing_instance_stop_unconfirmed"
+    assert deployment.state == SaladDeploymentState.DRAINING
+    assert deployment.billing_observation_stale is True
+    assert deployment.billing_session_ended_at is None
+
+
+@pytest.mark.asyncio
+async def test_absent_group_ends_an_open_billing_session(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(
+        deployment_context,
+        desired_state=DesiredDeploymentState.STOPPED,
+    )
+    client = FakeClient()
+    async with deployment_context.database.sessions() as session:
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+        deployment.billing_session_started_at = NOW
+        deployment.billing_active_instance_id = INSTANCE_ID
+        deployment.billing_active_started_at = NOW
+        deployment.billing_observed_at = NOW + timedelta(seconds=5)
+        await session.commit()
+
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment.id,
+            client=client,
+            now=NOW + timedelta(seconds=30),
+        )
+        await session.commit()
+        await session.refresh(deployment)
+
+    assert result.action == DeploymentAction.STOPPED
+    assert deployment.billing_session_ended_at is not None
+    assert deployment.billing_active_instance_id is None
+    assert deployment.billing_estimated is True
 
 
 @pytest.mark.asyncio
@@ -1389,9 +1761,12 @@ async def test_stop_still_executes_when_status_read_fails(
             now=NOW + timedelta(minutes=1),
         )
         await session.commit()
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
 
     assert result.action == DeploymentAction.STOP_REQUESTED
     assert client.stop_names == [remote_names()[1]]
+    assert deployment.billing_observation_stale is True
 
 
 @pytest.mark.asyncio
@@ -1456,8 +1831,8 @@ async def test_stopped_unknown_deployment_recovers_missing_ids_before_stop(
         await session.refresh(deployment)
 
     assert result.action == DeploymentAction.STOP_REQUESTED
-    assert deployment.state == SaladDeploymentState.DRAINING
-    assert deployment.provider_queue_id == str(QUEUE_ID)
+    assert deployment.state == SaladDeploymentState.UNKNOWN
+    assert deployment.provider_queue_id is None
     assert deployment.provider_container_group_id == str(GROUP_ID)
     assert client.stop_names == [group_name]
     assert all(call[0] not in {"create_queue", "create_group"} for call in client.calls)
@@ -1640,6 +2015,14 @@ async def test_runtime_spend_engages_budget_kill_switch_and_provider_stop(
     assert deployment.desired_state == DesiredDeploymentState.STOPPED
     assert deployment.state == SaladDeploymentState.DRAINING
     assert client.stop_names == [group_name]
+    assert [call[0] for call in client.calls] == [
+        "get_queue",
+        "get_group",
+        "list_instances",
+        "get_group",
+        "list_instances",
+        "stop_group",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1719,8 +2102,8 @@ async def test_missing_budget_guard_fails_closed_before_provider_mutation(
         assert deployment.desired_state == DesiredDeploymentState.STOPPED
         assert deployment.last_error_code == "budget_guard_unavailable"
         assert client.calls == [
-            ("get_queue", remote_names()[0]),
             ("get_group", remote_names()[1]),
+            ("get_queue", remote_names()[0]),
         ]
     finally:
         await database.dispose()
@@ -1822,6 +2205,12 @@ async def test_reconciliation_repairs_missing_autoscaler_before_activation(
         }
     ]
     assert client.start_names == []
+    assert [call[0] for call in client.calls] == [
+        "get_queue",
+        "get_group",
+        "list_instances",
+        "update_group",
+    ]
 
 
 @pytest.mark.asyncio

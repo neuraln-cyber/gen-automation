@@ -12,6 +12,7 @@ from pydantic import (
 )
 
 from gen_automation.domain.compliance_registry import ApprovalEvidence
+from gen_automation.domain.controlled_duo import WorkflowCapability
 from gen_automation.gpu_worker.artifacts import (
     MAX_ARTIFACT_BYTES,
     MAX_ARTIFACTS,
@@ -130,7 +131,18 @@ class WorkflowOnboardingEntry(StrictOnboardingModel):
     version: str = Field(min_length=1, max_length=100)
     object_key: str = Field(min_length=1, max_length=1_024)
     local_path: LocalPath
+    capabilities: list[WorkflowCapability] = Field(default_factory=list, max_length=16)
     evidence: ApprovalEvidence
+
+    @field_validator("capabilities")
+    @classmethod
+    def validate_capabilities(
+        cls,
+        values: list[WorkflowCapability],
+    ) -> list[WorkflowCapability]:
+        if len(values) != len(set(values)):
+            raise ValueError("workflow capabilities must be unique")
+        return sorted(values, key=str)
 
     @field_validator("name", "version")
     @classmethod

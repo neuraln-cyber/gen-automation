@@ -135,7 +135,7 @@ async def test_derivative_workload_forwards_bounded_policy_and_retry_settings(
     settings = _enabled_settings(
         background_derivative_render_timeout_seconds=91,
         background_derivative_timeout_seconds=120,
-        background_derivative_memory_limit_bytes=640 * 1024 * 1024,
+        background_derivative_memory_limit_bytes=768 * 1024 * 1024,
         background_derivative_lease_seconds=240,
         background_derivative_retry_base_seconds=17,
         background_derivative_retry_max_seconds=301,
@@ -170,4 +170,4 @@ async def test_derivative_workload_forwards_bounded_policy_and_retry_settings(
     policy = kwargs["isolation_policy"]
     assert isinstance(policy, DerivativeIsolationPolicy)
     assert policy.wall_timeout_seconds == 91
-    assert policy.memory_limit_bytes == 640 * 1024 * 1024
+    assert policy.memory_limit_bytes == 768 * 1024 * 1024

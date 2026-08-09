@@ -3,6 +3,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -143,6 +144,13 @@ def test_host_updater_is_locked_atomic_validated_and_rolls_back() -> None:
     assert 'mv -- "$backup_env" "$deploy_env"' in updater
     assert "timeout --signal=TERM --kill-after=30s 600s" in updater
     assert 'systemctl restart --no-block "$service_name"' in updater
+    same_image_branch = updater.split('if [ "$new_image" = "$old_image" ]; then', maxsplit=1)[
+        1
+    ].split("fi", maxsplit=1)[0]
+    assert 'systemctl start --no-block "$service_name"' in same_image_branch
+    assert same_image_branch.index("systemctl start") < same_image_branch.index(
+        "wait_for_control_plane"
+    )
     assert "run database" not in updater.casefold()
     assert "gen-automation-update-control-plane" in installer
     assert '"$source_dir/update-control-plane.sh"' in installer
@@ -162,6 +170,10 @@ def test_ssm_command_contains_only_public_immutable_coordinates() -> None:
     assert "tempfile.mkstemp" in workflow
     assert "os.replace(temporary, path)" in workflow
     assert "restore_runtime_env" in workflow
+    assert "restore_runtime_env_stopped" in workflow
+    assert "stop_control_plane" in workflow
+    assert "systemctl stop gen-automation-staging.service" in workflow
+    assert "systemctl is-active --quiet" in workflow
     assert "systemctl restart --no-block gen-automation-staging.service" in workflow
     assert "/usr/bin/timeout --signal=TERM --kill-after=30s 600s" in command_block
     assert "/usr/bin/docker run --rm" in command_block
@@ -182,6 +194,31 @@ def test_ssm_command_contains_only_public_immutable_coordinates() -> None:
         "gen-automation-update-control-plane"
     )
     assert command_block.index(
+        "systemctl stop gen-automation-staging.service"
+    ) < command_block.index("python3.12 -m alembic upgrade head")
+    assert "--rollback-mode leave-stopped" in command_block
+    assert "--external-lock-held" in command_block
+    assert "unlocked_command = (" in command_block
+    assert "sudo /usr/bin/flock --exclusive --wait 120" in command_block
+    assert "/run/lock/gen-automation-control-plane-update.lock" in command_block
+    assert command_block.index("sudo /usr/bin/flock") < command_block.index(
+        "shlex.quote(unlocked_command)"
+    )
+    post_migration = command_block.split("if {migration_command}; then", maxsplit=1)[1].split(
+        "else ( {restore_runtime_env_stopped}; false )", maxsplit=1
+    )[0]
+    assert "restore_runtime_env_stopped" in post_migration
+    assert "restore_runtime_env};" not in post_migration
+    assert "systemctl restart" not in post_migration
+    stopped_restore_block = workflow.split("restore_runtime_env_stopped = (", maxsplit=1)[1].split(
+        "migration_preflight = (", maxsplit=1
+    )[0]
+    assert "systemctl stop gen-automation-staging.service" in stopped_restore_block
+    assert "systemctl is-active --quiet" in stopped_restore_block
+    assert "systemctl restart" not in stopped_restore_block
+    assert "else ( {restore_runtime_env_stopped}; false ); fi" in command_block
+    assert command_block.count("else ( {restore_runtime_env}; false ); fi") == 1
+    assert command_block.index(
         "gen-automation-validate-migration-environment"
     ) < command_block.index("python3.12 -m alembic upgrade head")
     for prohibited in (
@@ -193,6 +230,23 @@ def test_ssm_command_contains_only_public_immutable_coordinates() -> None:
         "DATABASE",
     ):
         assert prohibited not in command_block.upper()
+
+
+def test_post_migration_updater_failure_restores_files_but_never_restarts_old_code() -> None:
+    updater = _updater()
+
+    assert 'rollback_mode="restart"' in updater
+    assert "external_lock_held=0" in updater
+    assert "--external-lock-held)" in updater
+    assert 'if [ "$external_lock_held" -eq 0 ]; then' in updater
+    assert "restart|leave-stopped" in updater
+    leave_stopped = updater.split('if [ "$rollback_mode" = "leave-stopped" ]; then', maxsplit=1)[
+        1
+    ].split("else", maxsplit=1)[0]
+    assert 'systemctl stop "$service_name"' in leave_stopped
+    assert 'systemctl is-active --quiet "$service_name"' in leave_stopped
+    assert "systemctl restart" not in leave_stopped
+    assert "wait_for_control_plane" not in leave_stopped
 
 
 def test_routine_rollout_refreshes_the_mega_bootstrap_bundle_safely() -> None:
@@ -230,6 +284,19 @@ def test_routine_rollout_refreshes_the_mega_bootstrap_bundle_safely() -> None:
         text=True,
     )
     command = json.loads(result.stdout)["commands"][0]
+    bash = shutil.which("bash")
+    if bash is None:
+        git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+        bash = str(git_bash) if git_bash.exists() else None
+    if bash is not None:
+        syntax = subprocess.run(  # noqa: S603 - syntax-checks a repository-owned command only.
+            [bash, "-n"],
+            check=False,
+            capture_output=True,
+            input=command,
+            text=True,
+        )
+        assert syntax.returncode == 0, syntax.stderr
 
     assert len(command) < 24_000
     assert "/usr/bin/base64 --decode" in command

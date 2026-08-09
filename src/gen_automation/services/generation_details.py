@@ -37,6 +37,18 @@ _PROMPT_FIELDS = (
     "detailer_prompt",
     "detailer_negative_prompt",
 )
+_CONTROLLED_DUO_PROMPT_FIELDS = (
+    "prompt",
+    "character_a_prompt",
+    "character_b_prompt",
+    "character_a_negative_prompt",
+    "character_b_negative_prompt",
+    "interaction_prompt",
+    "camera_prompt",
+    "negative_prompt",
+    "detailer_prompt",
+    "detailer_negative_prompt",
+)
 
 
 class GenerationDetailsNotFoundError(Exception):
@@ -65,6 +77,10 @@ class _WildcardSelection(_FrozenModel):
         "prompt",
         "character_a_prompt",
         "character_b_prompt",
+        "character_a_negative_prompt",
+        "character_b_negative_prompt",
+        "interaction_prompt",
+        "camera_prompt",
         "negative_prompt",
         "detailer_prompt",
         "detailer_negative_prompt",
@@ -134,10 +150,43 @@ class _PromptResolutionV2(_PromptResolutionBase):
     @model_validator(mode="after")
     def validate_evidence(self) -> "_PromptResolutionV2":
         _validate_source_digests(self, _PROMPT_FIELDS)
+        if any(selection.field not in _PROMPT_FIELDS for selection in self.selections):
+            raise ValueError("prompt resolution contains an unsupported field")
         return self
 
 
-type _PromptResolution = _PromptResolutionV1 | _PromptResolutionV2
+class _PromptResolutionV3(_PromptResolutionBase):
+    schema_version: Literal[3]
+    source_character_a_prompt: str = Field(max_length=20_000)
+    source_character_b_prompt: str = Field(max_length=20_000)
+    source_character_a_negative_prompt: str = Field(max_length=20_000)
+    source_character_b_negative_prompt: str = Field(max_length=20_000)
+    source_interaction_prompt: str = Field(max_length=20_000)
+    source_camera_prompt: str = Field(max_length=20_000)
+    source_character_a_prompt_sha256: Sha256
+    source_character_b_prompt_sha256: Sha256
+    source_character_a_negative_prompt_sha256: Sha256
+    source_character_b_negative_prompt_sha256: Sha256
+    source_interaction_prompt_sha256: Sha256
+    source_camera_prompt_sha256: Sha256
+    resolved_character_a_prompt_sha256: Sha256
+    resolved_character_b_prompt_sha256: Sha256
+    resolved_character_a_negative_prompt_sha256: Sha256
+    resolved_character_b_negative_prompt_sha256: Sha256
+    resolved_interaction_prompt_sha256: Sha256
+    resolved_camera_prompt_sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_evidence(self) -> "_PromptResolutionV3":
+        _validate_source_digests(self, _CONTROLLED_DUO_PROMPT_FIELDS)
+        if any(
+            selection.field not in _CONTROLLED_DUO_PROMPT_FIELDS for selection in self.selections
+        ):
+            raise ValueError("Controlled Duo prompt resolution contains an unsupported field")
+        return self
+
+
+type _PromptResolution = _PromptResolutionV1 | _PromptResolutionV2 | _PromptResolutionV3
 
 
 def _validate_source_digests(
@@ -191,6 +240,10 @@ class _GenerationJobParametersV2(_FrozenModel):
             "prompt",
             "character_a_prompt",
             "character_b_prompt",
+            "character_a_negative_prompt",
+            "character_b_negative_prompt",
+            "interaction_prompt",
+            "camera_prompt",
             "negative_prompt",
             "detailer_prompt",
             "detailer_negative_prompt",
@@ -341,7 +394,7 @@ def _response_payload(
             {"name": subject.name, "canonical_age": subject.canonical_age}
             for subject in parameters.subjects
         ],
-        "composition": {"mode": generation.composition_mode},
+        "composition": _composition_payload(generation),
         "prompts": _prompt_payload(generation, resolution),
         "sampling": {
             "seed": str(generation.seed),
@@ -412,6 +465,24 @@ def _response_payload(
     }
 
 
+def _composition_payload(generation: GenerationParameters) -> dict[str, object]:
+    payload: dict[str, object] = {"mode": generation.composition_mode}
+    if generation.duo_contract_version == 2:
+        payload.update(
+            {
+                "contract_version": 2,
+                "preset_id": (
+                    generation.composition_preset_id.value
+                    if generation.composition_preset_id is not None
+                    else None
+                ),
+                "isolation_mode": generation.duo_isolation_mode.value,
+                "quality_mode": generation.duo_quality_mode.value,
+            }
+        )
+    return payload
+
+
 def _prompt_payload(
     generation: GenerationParameters,
     resolution: _PromptResolution,
@@ -422,7 +493,7 @@ def _prompt_payload(
         source_sha256=resolution.source_prompt_sha256,
         resolved_sha256=resolution.resolved_prompt_sha256,
     )
-    if isinstance(resolution, _PromptResolutionV2):
+    if isinstance(resolution, (_PromptResolutionV2, _PromptResolutionV3)):
         character_a = _prompt_pair(
             source=resolution.source_character_a_prompt,
             resolved=generation.character_a_prompt,
@@ -485,7 +556,7 @@ def _prompt_payload(
         ),
         inherited=not generation.detailer_negative_prompt,
     )
-    return {
+    payload: dict[str, object] = {
         "positive": positive,
         "character_a": character_a,
         "character_b": character_b,
@@ -493,6 +564,36 @@ def _prompt_payload(
         "detailer_positive": detailer_positive,
         "detailer_negative": detailer_negative,
     }
+    if isinstance(resolution, _PromptResolutionV3):
+        payload.update(
+            {
+                "character_a_negative": _prompt_pair(
+                    source=resolution.source_character_a_negative_prompt,
+                    resolved=generation.character_a_negative_prompt,
+                    source_sha256=resolution.source_character_a_negative_prompt_sha256,
+                    resolved_sha256=resolution.resolved_character_a_negative_prompt_sha256,
+                ),
+                "character_b_negative": _prompt_pair(
+                    source=resolution.source_character_b_negative_prompt,
+                    resolved=generation.character_b_negative_prompt,
+                    source_sha256=resolution.source_character_b_negative_prompt_sha256,
+                    resolved_sha256=resolution.resolved_character_b_negative_prompt_sha256,
+                ),
+                "interaction": _prompt_pair(
+                    source=resolution.source_interaction_prompt,
+                    resolved=generation.interaction_prompt,
+                    source_sha256=resolution.source_interaction_prompt_sha256,
+                    resolved_sha256=resolution.resolved_interaction_prompt_sha256,
+                ),
+                "camera": _prompt_pair(
+                    source=resolution.source_camera_prompt,
+                    resolved=generation.camera_prompt,
+                    source_sha256=resolution.source_camera_prompt_sha256,
+                    resolved_sha256=resolution.resolved_camera_prompt_sha256,
+                ),
+            }
+        )
+    return payload
 
 
 def _prompt_pair(
@@ -521,8 +622,12 @@ def _resolution_matches_generation(
         if generation.composition_mode != "single":
             return False
         field_names = _LEGACY_PROMPT_FIELDS
-    else:
+    elif isinstance(resolution, _PromptResolutionV2):
         field_names = _PROMPT_FIELDS
+    else:
+        if generation.duo_contract_version != 2:
+            return False
+        field_names = _CONTROLLED_DUO_PROMPT_FIELDS
     return resolution.seed == generation.seed and all(
         hmac.compare_digest(
             getattr(resolution, f"resolved_{field_name}_sha256"),

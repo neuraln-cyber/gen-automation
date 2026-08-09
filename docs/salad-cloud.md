@@ -7,6 +7,12 @@ Official documentation is the source of truth for this adapter:
   <https://docs.salad.com/container-engine/how-to-guides/ai-machine-learning/deploy-stable-diffusion-comfy>
 - Job queues:
   <https://docs.salad.com/container-engine/explanation/job-processing/job-queues>
+- Billing and instance lifecycle:
+  <https://docs.salad.com/container-engine/explanation/billing-pricing/billing>
+  and
+  <https://docs.salad.com/container-engine/explanation/container-groups/deployment-lifecycle>
+- Container-group instance observations:
+  <https://docs.salad.com/reference/saladcloud-api/container-groups/list-container-group-instances>
 - Webhook verification:
   <https://docs.salad.com/container-engine/how-to-guides/job-processing/webhook-signature>
 
@@ -124,6 +130,38 @@ The initial production posture is:
 Normal idle cost control uses queue autoscaling to zero. Explicit stop is for
 maintenance or the global kill switch because stop destroys runtime instances
 and their local data.
+
+### Live paid-GPU timer
+
+The generation and Experiment Lab dashboards show one shared paid-GPU runtime
+timer for the active worker billing session. During a rollout, an unresolved
+superseded worker that is still shutting down remains authoritative until Salad
+confirms it has stopped; the replacement must not hide those paid seconds. The
+timer is deliberately separate from release and generation-attempt timestamps:
+one worker can serve several batches, releases, or a warm Experiment Lab lease,
+so the reading is not a per-set cost allocation.
+
+The authoritative live boundary is the lifecycle of each provider instance:
+
+- `allocating`, `downloading`, and `creating` do not advance the timer;
+- `running` advances it, even before startup and readiness probes pass;
+- a stop request does not end the timer while the instance remains `running`;
+- the transition away from `running` closes the active interval at the
+  provider's `update_time`; and
+- a reallocation gap with no running instance pauses the total until a
+  replacement reaches `running`.
+
+The controller therefore lists container-group instances during its normal
+bounded reconciliation cycle and persists a restart-safe session total plus the
+current running interval. Browser progress polling reads that durable snapshot
+and advances the visible seconds locally between observations. A stale provider
+observation is shown as stale and does not silently extrapolate unobserved paid
+time. Salad Billing & Usage remains authoritative.
+
+Do not substitute the durable budget/spend meter for this display. That ledger
+is intentionally conservative: it reserves and meters an upper bound across
+additional lifecycle states so budget enforcement fails closed. The dashboard
+timer is the narrower provider-running estimate described above.
 
 ### Experiment Lab warm sessions
 

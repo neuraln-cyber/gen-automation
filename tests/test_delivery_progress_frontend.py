@@ -139,6 +139,8 @@ def test_delivery_template_exposes_four_independent_target_actions() -> None:
     assert template.count('delivery:replace-x-outputs"') == 1
     assert "Prepare watermarked X teasers" in template
     assert "Render replacement teasers" in template
+    assert "delivery.progress.x_action_message" in template
+    assert "data-x-lossless-png-too-large" in template
     assert "This creates only the selected teaser copies. It does not post them." in template
     assert template.count('name="watermark_position"') == 2
     assert 'name="watermark_placements"' in template

@@ -9,6 +9,9 @@ param(
     [Parameter(Mandatory = $true, ParameterSetName = "Canary")]
     [switch]$Canary,
 
+    [Parameter(Mandatory = $true, ParameterSetName = "EnablePublishing")]
+    [switch]$EnablePublishing,
+
     [Parameter(Mandatory = $true, ParameterSetName = "DryRun")]
     [Parameter(Mandatory = $true, ParameterSetName = "Configure")]
     [string]$SecretArn,
@@ -35,6 +38,8 @@ $operatorArnPattern = "^arn:aws:sts::861912887470:assumed-role/AWSReservedSSO_Ge
 $safeConfigureOutput = "X OAuth 1.0a runtime settings were configured and the stopped controller is healthy."
 $alreadyConfiguredOutput = "The exact OAuth 1.0a runtime settings are already configured and healthy."
 $canaryOutput = "X OAuth 1.0a account binding passed. No media was uploaded and no post was created."
+$publishingEnabledOutput = "Staging publication orchestration is enabled for the configured X runtime. Publication guard remains stopped and no publication effect is active."
+$publishingAlreadyEnabledOutput = "Staging publication orchestration was already enabled for the configured X runtime. Publication guard remains stopped and no publication effect is active."
 
 function Invoke-CapturedNative {
     param(
@@ -309,6 +314,12 @@ try {
         $executionTimeout = "300"
         $comment = "Zero-post X OAuth1 account-binding check"
         $expectedOutputs = @($canaryOutput)
+    }
+    elseif ($EnablePublishing) {
+        $remoteArguments = "--enable-publishing"
+        $executionTimeout = "1200"
+        $comment = "Enable staging publication orchestration for configured X runtime"
+        $expectedOutputs = @($publishingEnabledOutput, $publishingAlreadyEnabledOutput)
     }
     else {
         $validatorRemotePath = '"$payload_dir/validate-deployment.sh"'

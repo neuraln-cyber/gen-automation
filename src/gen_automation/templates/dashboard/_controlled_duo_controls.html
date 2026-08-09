@@ -1,0 +1,123 @@
+<div class="controlled-duo-workbench" data-duo-workbench hidden>
+  <input
+    type="hidden"
+    name="duo_contract_version"
+    value="{{ form_values.get('duo_contract_version', '1') }}"
+    data-duo-contract-version
+  >
+
+  <div class="controlled-duo-layout-grid">
+    <label class="controlled-duo-preset-field">
+      Composition preset
+      <select name="composition_preset_id" data-duo-preset data-duo-v2-control disabled>
+        <option value="" disabled {% if not form_values.get('composition_preset_id') %}selected{% endif %}>Choose a composition</option>
+        <option value="close_portrait" {% if form_values.get('composition_preset_id') == 'close_portrait' %}selected{% endif %}>Close portrait</option>
+        <option value="overhead" {% if form_values.get('composition_preset_id') == 'overhead' %}selected{% endif %}>Overhead / selfie</option>
+        <option value="low_angle" {% if form_values.get('composition_preset_id') == 'low_angle' %}selected{% endif %}>Low angle</option>
+        <option value="diagonal_depth" {% if form_values.get('composition_preset_id') == 'diagonal_depth' %}selected{% endif %}>Diagonal depth</option>
+        <option value="back_to_back" {% if form_values.get('composition_preset_id') == 'back_to_back' %}selected{% endif %}>Back-to-back</option>
+        <option value="full_body" {% if form_values.get('composition_preset_id') == 'full_body' %}selected{% endif %}>Full-body duo</option>
+      </select>
+      <small>Sets camera intent and two non-overlapping character masks.</small>
+    </label>
+
+    <figure class="controlled-duo-mask-preview" data-duo-mask-preview data-preset="close_portrait">
+      <div class="controlled-duo-mask-canvas" role="img" aria-label="Two non-overlapping character regions">
+        <span class="controlled-duo-mask-region controlled-duo-mask-a" data-duo-mask-a><b>A</b></span>
+        <span class="controlled-duo-mask-region controlled-duo-mask-b" data-duo-mask-b><b>B</b></span>
+      </div>
+      <figcaption>
+        <strong data-duo-preset-label>Close portrait</strong>
+        <span data-duo-preset-description>Tight shoulder-to-shoulder framing with separate face regions.</span>
+      </figcaption>
+    </figure>
+  </div>
+
+  <div class="controlled-duo-direction-grid">
+    <label>
+      Interaction
+      <textarea
+        name="interaction_prompt"
+        rows="2"
+        maxlength="20000"
+        spellcheck="false"
+        placeholder="A steadies B by the shoulder; both look toward camera"
+        data-duo-interaction
+        data-duo-v2-control
+        data-danbooru-autocomplete
+        disabled
+      >{{ form_values.get('interaction_prompt', '') }}</textarea>
+      <small>Describe only the action or contact between A and B.</small>
+    </label>
+    <label>
+      Camera and framing
+      <textarea
+        name="camera_prompt"
+        rows="2"
+        maxlength="20000"
+        spellcheck="false"
+        placeholder="tight two-shot portrait, eye-level camera"
+        data-duo-camera
+        data-duo-v2-control
+        data-danbooru-autocomplete
+        disabled
+      >{{ form_values.get('camera_prompt', '') }}</textarea>
+      <small>The preset suggests this text; you can refine it.</small>
+    </label>
+  </div>
+
+  <p class="controlled-duo-shared-note">
+    <strong>Shared scene and style stay shared.</strong>
+    Put location, lighting, medium, and overall style in the main positive prompt. Keep identity,
+    outfit, and each character's pose inside the A or B card. Do not add <code>solo</code>,
+    <code>1girl</code>, <code>2girls</code>, or other population tags; the controlled workflow owns
+    the exact-two instruction.
+  </p>
+  <p class="controlled-duo-lora-note">
+    <strong>LoRAs are shared model-wide.</strong>
+    The current LoRA stack affects both A and B. Character-specific identity LoRAs are not
+    slot-isolated in Controlled Duo v2 and must not be treated as character-local controls.
+  </p>
+
+  <div class="controlled-duo-mode-grid">
+    <label>
+      Isolation
+      <select name="duo_isolation_mode" data-duo-isolation data-duo-v2-control disabled>
+        <option value="balanced" {% if form_values.get('duo_isolation_mode', 'balanced') != 'strict' %}selected{% endif %}>Balanced &middot; fixed base path</option>
+        <option value="strict" data-duo-strict-option disabled {% if form_values.get('duo_isolation_mode') == 'strict' %}selected{% endif %}>Strict &middot; fixed isolated refinements</option>
+      </select>
+      <small data-duo-isolation-hint>The selected workflow locks its reviewed isolation topology.</small>
+    </label>
+    <label>
+      Quality
+      <select name="duo_quality_mode" data-duo-quality data-duo-v2-control disabled>
+        <option value="draft" {% if form_values.get('duo_quality_mode') == 'draft' %}selected{% endif %}>Draft &middot; lowest GPU work</option>
+        <option value="standard" {% if form_values.get('duo_quality_mode', 'standard') not in ['draft', 'high'] %}selected{% endif %}>Standard &middot; baseline</option>
+        <option value="high" data-duo-high-option disabled {% if form_values.get('duo_quality_mode') == 'high' %}selected{% endif %}>High &middot; additional refinement</option>
+      </select>
+      <small data-duo-quality-hint>High is reserved for a separately reviewed topology and is unavailable in the current v2 workflows.</small>
+    </label>
+  </div>
+
+  <p class="controlled-duo-cost-note" data-duo-cost-note>
+    Standard + balanced uses the baseline controlled-duo path. Exact billed time depends on the worker.
+  </p>
+  <p class="controlled-duo-test-note">
+    <strong>Pair test first.</strong>
+    Use <a href="/dashboard/experiments/new">Experiment Lab</a> with paired seeds and 1&ndash;2 images per
+    variant before committing to a large production set.
+  </p>
+
+  <div class="composition-actions" data-composition-actions>
+    <button class="secondary-button compact-action" type="button" data-swap-characters>
+      Swap complete A / B
+    </button>
+    <span>Moves the approved subject, positive prompt, and negative prompt together.</span>
+  </div>
+  <section class="controlled-duo-preflight" aria-label="Controlled duo preflight">
+    <strong>Pair preflight</strong>
+    <output class="controlled-duo-lint" data-duo-prompt-lint aria-live="polite"></output>
+    <output class="composition-status" data-composition-status aria-live="polite"></output>
+    <output class="controlled-duo-capability-status" data-duo-capability-status aria-live="polite"></output>
+  </section>
+</div>

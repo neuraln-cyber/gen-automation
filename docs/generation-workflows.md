@@ -162,7 +162,56 @@ The signed worker API independently permits only `FaceDetailer` and
 `UltralyticsDetectorProvider` from those packages. It does not permit arbitrary
 Impact Pack nodes.
 
-### Detector artifact
+## Controlled Duo v2 profiles
+
+Controlled Duo v2 is a separate, capability-gated contract. It does not replace
+or reinterpret the legacy couple workflows above. The bundled immutable
+templates and SHA-256 values are:
+
+- balanced, `workflows/illustrious-sdxl-controlled-duo-balanced-v2.json`:
+  `22b44fda25e43bf6b4bf7cc289d36c6aaa69eef3ef188d6f527a496c4d3f5205`;
+- strict, `workflows/illustrious-sdxl-controlled-duo-strict-v2.json`:
+  `3a8db7bbfc75f472d5a5048052773410bf202382c8b76b2a8241f5ad7a1495f2`.
+
+Both profiles use only nodes verified at the pinned ComfyUI revision. Each
+character has an independent positive prompt and negative prompt. Preset-specific,
+eight-pixel-aligned rectangles are rendered as disjoint feathered masks, and
+`ConditioningSetMask` confines each character's conditioning to its own mask.
+The full-frame scene, interaction, camera, and shared style conditioning remains
+global. Style LoRAs stay on the one shared model/CLIP path; these profiles do not
+claim spatially isolated identity LoRAs.
+
+The balanced profile combines shared conditioning with both masked positive and
+negative lanes, then runs one sampler. The strict profile uses that same
+identity-aware masked base pass, then performs two sequential
+`SetLatentNoiseMask` repair passes: character A first and character B second.
+Each repair has its own positive and negative text encodes. This bounds latent
+updates to the selected region and avoids the generic all-face detailer, but it
+does not promise mathematically perfect semantic isolation at mask boundaries.
+
+The checked-in `GenAutomationControlledDuoV2` node is an immutable evidence
+marker, not a ComfyUI node. Before rendering, the controller verifies the exact
+prompt encodes, masks, combine chains, sampler inputs, sequential strict latent
+chain, final decode/save path, and capability declarations. It rejects extra
+prompt/combine nodes and removes the marker before signing the worker request.
+The worker allowlist therefore contains only real core node classes.
+
+Draft quality lowers actual sampler work. If the requested base step count is
+`N`, balanced draft uses `min(N, max(8, ceil(0.60*N)))`; standard uses `N`.
+Strict standard adds two repair passes of
+`min(N, max(10, ceil(0.50*N)))` each. Strict draft instead uses the reduced base
+plus two repairs of `min(N, max(6, ceil(0.25*N)))`. At the current 28-step
+preset this is 17 steps for balanced draft, 28 for balanced standard, 31 total
+for strict draft, and 56 total for strict standard. A mask limits where a pass
+writes; it does not make an individual diffusion step cheaper. High quality is
+intentionally unsupported until a separately reviewed workflow declares
+`duo_high_quality`.
+
+Balanced approvals declare `controlled_duo_v2`. Strict approvals declare both
+`controlled_duo_v2` and `duo_strict_isolation`. Any marker/capability/topology
+mismatch fails before upload grants or provider submission.
+
+## Detector artifact
 
 The detector is not downloaded by ComfyUI, Impact Pack, or Ultralytics. Add one
 `detector` entry to the existing immutable worker artifact manifest. The entry
@@ -194,9 +243,10 @@ artifact bucket.
 Bundling a JSON template does not automatically make it selectable. Upload the
 exact template bytes to private workflow storage and create a current approved
 workflow registry record using the path's SHA-256 above. Register the base,
-base + detailer, hires, hires + detailer, and their four couple counterparts as
-eight separate workflow approvals. They
-then appear in the New Set workflow selector.
+base + detailer, hires, hires + detailer, their four couple counterparts, and
+the balanced and strict Controlled Duo v2 profiles as ten separate workflow
+approvals. They then appear in the New Set workflow selector according to their
+declared capabilities.
 
 Upstream contracts:
 [ComfyUI custom-node whitelist](https://github.com/Comfy-Org/ComfyUI/blob/700821e1364eaab0e8f21c538a2131719fec57bf/comfy/cli_args.py),

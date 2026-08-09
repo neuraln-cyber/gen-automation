@@ -90,6 +90,14 @@
     "composition_mode",
     "character_a_prompt",
     "character_b_prompt",
+    "duo_contract_version",
+    "composition_preset_id",
+    "character_a_negative_prompt",
+    "character_b_negative_prompt",
+    "duo_isolation_mode",
+    "duo_quality_mode",
+    "interaction_prompt",
+    "camera_prompt",
     "checkpoint_id",
     "workflow_id",
     "prompt",
@@ -117,6 +125,45 @@
   ]);
 
   const namedControl = (form, name) => form.querySelector(`[name="${name}"]`);
+
+  const CONTROLLED_DUO_PRESETS = Object.freeze({
+    close_portrait: Object.freeze({
+      label: "Close portrait",
+      description: "Tight shoulder-to-shoulder framing with separate face regions.",
+      camera: "tight two-shot portrait, eye-level camera, both faces fully visible",
+      interaction: "shoulder-to-shoulder, a clear gap between both faces",
+    }),
+    overhead: Object.freeze({
+      label: "Overhead / selfie",
+      description: "High camera with controlled foreshortening and two clear silhouettes.",
+      camera: "high-angle overhead view, wide-angle foreshortening, both faces visible",
+      interaction: "standing close together and looking up toward the camera",
+    }),
+    low_angle: Object.freeze({
+      label: "Low angle",
+      description: "Ground-up perspective with full, non-overlapping body lanes.",
+      camera: "dramatic low-angle view, full figures, strong perspective",
+      interaction: "standing side-by-side with contrasting poses and clear silhouettes",
+    }),
+    diagonal_depth: Object.freeze({
+      label: "Diagonal depth",
+      description: "A leads in the foreground while B remains distinct in the rear region.",
+      camera: "diagonal depth composition, character A foreground, character B background",
+      interaction: "moving in the same direction with offset depth and no body overlap",
+    }),
+    back_to_back: Object.freeze({
+      label: "Back-to-back",
+      description: "Opposing body angles create a strong shared silhouette without trait mixing.",
+      camera: "medium two-shot, opposing three-quarter angles, balanced negative space",
+      interaction: "back-to-back, looking in opposite directions, shoulders lightly touching",
+    }),
+    full_body: Object.freeze({
+      label: "Full-body duo",
+      description: "Head-to-toe framing with generous separation around both figures.",
+      camera: "full-body two-shot, head-to-toe framing, eye-level camera",
+      interaction: "standing together in complementary poses with space between limbs",
+    }),
+  });
 
   const readStoredAutomationPresets = () => {
     try {
@@ -1669,6 +1716,8 @@
     const megaProgress = megaCard?.querySelector("[data-mega-progress]");
     const megaRemoteRow = megaCard?.querySelector("[data-mega-remote-row]");
     const megaRemotePath = megaCard?.querySelector("[data-mega-remote-path]");
+    const megaNextRetryRow = megaCard?.querySelector("[data-mega-next-retry-row]");
+    const megaNextRetry = megaCard?.querySelector("[data-mega-next-retry]");
     const initialOutputState = panel.dataset.deliveryOutputState || "not_started";
     const initialXOutputsReady = panel.dataset.deliveryXOutputsReady === "true";
     const initialArchiveState = panel.dataset.deliveryArchiveState || "not_started";
@@ -1810,7 +1859,9 @@
       return state;
     };
     const renderMega = (mega) => {
-      const knownStates = ["not_prepared", "queued", "running", "published", "failed"];
+      const knownStates = [
+        "not_prepared", "queued", "running", "published", "failed", "retired",
+      ];
       const state = knownStates.includes(mega.state) ? mega.state : "failed";
       const completed = count(mega.completed_items);
       const total = count(mega.total_items);
@@ -1822,7 +1873,8 @@
         megaStatus.textContent = state === "not_prepared"
           ? "not started"
           : state === "published" ? "complete"
-            : state === "failed" ? "needs attention" : state.replaceAll("_", " ");
+            : state === "failed" ? "needs attention"
+              : state === "retired" ? "retired" : state.replaceAll("_", " ");
       }
       setText(megaDetail, detail || "MEGA delivery status is unavailable.");
       setText(megaProgressLabel, `${completed} / ${total} images uploaded`);
@@ -1834,6 +1886,18 @@
       if (megaProgressRegion instanceof HTMLElement) megaProgressRegion.hidden = total < 1;
       setText(megaRemotePath, remotePath);
       if (megaRemoteRow instanceof HTMLElement) megaRemoteRow.hidden = !remotePath;
+      const nextRetryValue = typeof mega.next_retry_at === "string"
+        ? mega.next_retry_at.trim()
+        : "";
+      const nextRetryDate = new Date(nextRetryValue);
+      const validNextRetry = nextRetryValue !== "" && !Number.isNaN(nextRetryDate.valueOf());
+      if (megaNextRetry instanceof HTMLTimeElement) {
+        megaNextRetry.dateTime = validNextRetry ? nextRetryValue : "";
+        megaNextRetry.textContent = validNextRetry
+          ? nextRetryDate.toLocaleString([], { dateStyle: "medium", timeStyle: "short" })
+          : "";
+      }
+      if (megaNextRetryRow instanceof HTMLElement) megaNextRetryRow.hidden = !validNextRetry;
       return state;
     };
     const renderPublicationDestination = (destination, statusNode, detailNode) => {
@@ -2527,6 +2591,7 @@
     const search = document.querySelector("[data-wildcard-search]");
     const status = document.querySelector("[data-wildcard-filter-status]");
     const empty = document.querySelector("[data-wildcard-filter-empty]");
+    const editors = Array.from(document.querySelectorAll("[data-wildcard-editor]"));
 
     const render = () => {
       if (!(search instanceof HTMLInputElement)) return;
@@ -2546,6 +2611,60 @@
       if (toolbar instanceof HTMLElement) toolbar.hidden = false;
       search.addEventListener("input", render);
       render();
+    }
+
+    const normalizedEditorValue = (value) => value.replace(/\r\n?/g, "\n");
+    const editorRowCount = (value) => normalizedEditorValue(value)
+      .split("\n")
+      .filter((line) => line.trim()).length;
+
+    editors.forEach((editor) => {
+      if (!(editor instanceof HTMLTextAreaElement)) return;
+      const initialValue = normalizedEditorValue(editor.defaultValue);
+      const editorStatus = document.getElementById(editor.dataset.wildcardEditorStatus || "");
+      const row = editor.closest("[data-wildcard-file-row]");
+      const form = editor.form;
+
+      const renderEditorStatus = () => {
+        const dirty = normalizedEditorValue(editor.value) !== initialValue;
+        const rows = editorRowCount(editor.value);
+        editor.dataset.wildcardDirty = String(dirty);
+        if (row instanceof HTMLElement) row.classList.toggle("is-dirty", dirty);
+        if (editorStatus instanceof HTMLOutputElement) {
+          const savedVersion = editor.dataset.wildcardSavedVersion || "";
+          editorStatus.textContent = dirty
+            ? `${rows} row${rows === 1 ? "" : "s"} · unsaved changes`
+            : `${rows} row${rows === 1 ? "" : "s"} · saved version ${savedVersion}`;
+        }
+      };
+
+      editor.addEventListener("input", renderEditorStatus);
+      if (form instanceof HTMLFormElement) {
+        form.addEventListener("submit", () => {
+          editor.dataset.wildcardSubmitting = "true";
+          if (row instanceof HTMLElement) row.classList.remove("is-dirty");
+          if (editorStatus instanceof HTMLOutputElement) editorStatus.textContent = "Saving…";
+          const submitButton = form.querySelector('button[type="submit"]');
+          if (submitButton instanceof HTMLButtonElement) {
+            submitButton.disabled = true;
+            submitButton.textContent = "Saving…";
+          }
+        });
+      }
+      renderEditorStatus();
+    });
+
+    if (editors.length > 0) {
+      window.addEventListener("beforeunload", (event) => {
+        const hasUnsavedChanges = editors.some((editor) => (
+          editor instanceof HTMLTextAreaElement
+          && editor.dataset.wildcardDirty === "true"
+          && editor.dataset.wildcardSubmitting !== "true"
+        ));
+        if (!hasUnsavedChanges) return;
+        event.preventDefault();
+        event.returnValue = "";
+      });
     }
 
     document.querySelectorAll("[data-copy-text]").forEach((button) => {
@@ -2614,8 +2733,9 @@
   function initializeBulkReview() {
     const form = document.querySelector("#bulk-action-form, [data-bulk-action-form]");
     if (!form) return;
+    const selectionRoot = form.closest("[data-review-workspace]") || document;
     const checkboxes = Array.from(
-      document.querySelectorAll('input[type="checkbox"][name="asset_id"]'),
+      selectionRoot.querySelectorAll('input[type="checkbox"][name="asset_id"]'),
     );
     if (checkboxes.length === 0) return;
     const actionButtons = Array.from(form.querySelectorAll('button[name="action"]'));
@@ -2630,26 +2750,30 @@
     const currentXCount = Math.max(0, integerValue(form.dataset.xSelectedCount, 0));
     const xCapacity = Math.max(1, integerValue(form.dataset.xCapacity, 4));
     const reviewTarget = Math.max(1, integerValue(form.dataset.reviewTarget, 1));
-    const acceptedCount = Math.max(0, integerValue(form.dataset.acceptedCount, 0));
-    const remainingReviewSlots = Math.max(0, reviewTarget - acceptedCount);
+    let acceptedCount = Math.max(0, integerValue(form.dataset.acceptedCount, 0));
+    let remainingReviewSlots = Math.max(0, reviewTarget - acceptedCount);
     let lastClickedCheckbox = null;
     document.querySelectorAll("[data-review-selection-controls], [data-review-tools]").forEach((item) => {
       item.hidden = false;
     });
 
-    selectToTargetButtons.forEach((button) => {
-      if (acceptedCount > reviewTarget) {
-        const excess = acceptedCount - reviewTarget;
-        button.textContent = `Goal exceeded by ${excess}`;
-        button.disabled = true;
-      } else if (remainingReviewSlots === 0) {
-        button.textContent = "Goal reached";
-        button.disabled = true;
-      } else {
-        button.textContent = `Select ${remainingReviewSlots} undecided to reach goal`;
-        button.disabled = false;
-      }
-    });
+    const updateTargetSelectionButtons = () => {
+      acceptedCount = Math.max(0, integerValue(form.dataset.acceptedCount, 0));
+      remainingReviewSlots = Math.max(0, reviewTarget - acceptedCount);
+      selectToTargetButtons.forEach((button) => {
+        if (acceptedCount > reviewTarget) {
+          const excess = acceptedCount - reviewTarget;
+          button.textContent = `Goal exceeded by ${excess}`;
+          button.disabled = true;
+        } else if (remainingReviewSlots === 0) {
+          button.textContent = "Goal reached";
+          button.disabled = true;
+        } else {
+          button.textContent = `Select ${remainingReviewSlots} undecided to reach goal`;
+          button.disabled = false;
+        }
+      });
+    };
 
     const updateExcludedHeadings = () => {
       document.querySelectorAll(".ai-excluded-heading").forEach((heading) => {
@@ -2662,6 +2786,7 @@
     };
 
     const updateSelection = () => {
+      updateTargetSelectionButtons();
       const selectedCheckboxes = checkboxes.filter((checkbox) => checkbox.checked);
       const selected = selectedCheckboxes.length;
       const hiddenSelected = selectedCheckboxes.filter((checkbox) => {
@@ -2730,15 +2855,25 @@
         selectionStatus.hidden = messages.length === 0;
         selectionStatus.textContent = messages.join(" ");
       }
+      document.dispatchEvent(new CustomEvent("gen-automation:bulk-selection-changed", {
+        detail: {
+          hiddenSelected,
+          selected,
+        },
+      }));
     };
+
+    const visibleCheckboxesInDomOrder = () => Array.from(
+      selectionRoot.querySelectorAll('input[type="checkbox"][name="asset_id"]'),
+    ).filter((item) => {
+      const card = item.closest(".asset-card");
+      return !card || !card.hidden;
+    });
 
     checkboxes.forEach((checkbox) => {
       checkbox.addEventListener("click", (event) => {
         if (event.shiftKey && lastClickedCheckbox && lastClickedCheckbox !== checkbox) {
-          const visible = checkboxes.filter((item) => {
-            const card = item.closest(".asset-card");
-            return !card || !card.hidden;
-          });
+          const visible = visibleCheckboxesInDomOrder();
           const start = visible.indexOf(lastClickedCheckbox);
           const end = visible.indexOf(checkbox);
           if (start >= 0 && end >= 0) {
@@ -3022,7 +3157,11 @@
         (button) => button.value === state.focusAction,
       );
     }
-    if (focusTarget instanceof HTMLElement && !focusTarget.closest("[hidden]")) {
+    if (
+      focusTarget instanceof HTMLElement
+      && !focusTarget.closest("[hidden]")
+      && !reviewViewerIsOpen()
+    ) {
       window.requestAnimationFrame(() => focusTarget.focus({ preventScroll: true }));
     }
   };
@@ -3260,6 +3399,12 @@
     if (workspace instanceof HTMLElement) {
       applyActiveReviewFilterToCard(workspace, card);
       refreshOptimisticReviewCounts(workspace);
+      const selectedCheckbox = workspace.querySelector(
+        'input[type="checkbox"][name="asset_id"]:checked',
+      );
+      if (selectedCheckbox instanceof HTMLInputElement) {
+        selectedCheckbox.dispatchEvent(new Event("change", { bubbles: true }));
+      }
     }
   };
 
@@ -4788,6 +4933,205 @@
     });
   }
 
+  const GPU_BILLING_STATES = new Set([
+    "not_started",
+    "charging",
+    "stopping",
+    "paused",
+    "ended",
+    "stale",
+  ]);
+  const GPU_BILLING_MAX_FRESH_SECONDS = 90;
+
+  const formatGpuBillingSeconds = (value) => {
+    const elapsed = Math.max(0, integerValue(value, 0));
+    const hours = Math.floor(elapsed / 3600);
+    const minutes = Math.floor((elapsed % 3600) / 60);
+    const seconds = elapsed % 60;
+    return [hours, minutes, seconds]
+      .map((part) => String(part).padStart(2, "0"))
+      .join(":");
+  };
+
+  const createGpuBillingTimer = (scope) => {
+    const container = scope?.querySelector?.("[data-gpu-billing]");
+    if (!(container instanceof HTMLElement)) return null;
+    const time = container.querySelector("[data-gpu-billing-time]");
+    const stateNode = container.querySelector("[data-gpu-billing-state]");
+    const estimate = container.querySelector("[data-gpu-billing-estimate]");
+    if (!(time instanceof HTMLTimeElement) || !(stateNode instanceof HTMLElement)) return null;
+
+    let billingState = "not_started";
+    let elapsedAtObservation = 0;
+    let runningInstances = 0;
+    let observedAtMonotonic = performance.now();
+    let staleAtMonotonic = observedAtMonotonic;
+    let tickTimer = null;
+    let freshnessTimer = null;
+
+    const isPending = () => (
+      billingState === "charging"
+      || billingState === "stopping"
+      || billingState === "paused"
+      || billingState === "stale"
+    );
+    const isTicking = () => (
+      (billingState === "charging" || billingState === "stopping") && runningInstances > 0
+    );
+    const needsFreshnessClock = () => (
+      billingState === "charging" || billingState === "stopping" || billingState === "paused"
+    );
+    const elapsedNow = () => {
+      if (!isTicking()) return elapsedAtObservation;
+      const monotonicDelta = Math.max(0, performance.now() - observedAtMonotonic);
+      return elapsedAtObservation + Math.floor(
+        (monotonicDelta * runningInstances) / 1000,
+      );
+    };
+    const renderTime = () => {
+      if (needsFreshnessClock() && performance.now() >= staleAtMonotonic) {
+        markStale(staleAtMonotonic);
+      }
+      const elapsed = elapsedNow();
+      time.textContent = formatGpuBillingSeconds(elapsed);
+      time.dateTime = `PT${elapsed}S`;
+    };
+    const stopTicking = () => {
+      if (tickTimer === null) return;
+      window.clearInterval(tickTimer);
+      tickTimer = null;
+    };
+    const stopFreshnessTimer = () => {
+      if (freshnessTimer === null) return;
+      window.clearTimeout(freshnessTimer);
+      freshnessTimer = null;
+    };
+    const syncTicker = () => {
+      if (isTicking()) {
+        if (tickTimer === null) tickTimer = window.setInterval(renderTime, 1000);
+      } else {
+        stopTicking();
+      }
+      stopFreshnessTimer();
+      if (!needsFreshnessClock()) return;
+      const freshForMilliseconds = Math.max(0, staleAtMonotonic - performance.now());
+      freshnessTimer = window.setTimeout(() => {
+        markStale(staleAtMonotonic);
+        renderTime();
+      }, freshForMilliseconds);
+    };
+    const stateLabel = () => {
+      const instanceLabel = `${runningInstances} running GPU${runningInstances === 1 ? "" : "s"}`;
+      if (billingState === "charging") return `Charging · ${instanceLabel}`;
+      if (billingState === "stopping") {
+        return runningInstances > 0
+          ? `Stopping · ${instanceLabel} still charging`
+          : "Stopping · waiting for provider confirmation";
+      }
+      if (billingState === "paused") return "Not charging · session paused";
+      if (billingState === "ended") return "Session ended · timer frozen";
+      if (billingState === "stale") return "Provider status delayed · timer frozen";
+      return "Not charging";
+    };
+    const markStale = (freezeAt = performance.now()) => {
+      if (!needsFreshnessClock()) return;
+      const boundedFreezeAt = Math.min(
+        staleAtMonotonic,
+        Math.max(observedAtMonotonic, freezeAt),
+      );
+      if (isTicking()) {
+        elapsedAtObservation += Math.floor(
+          ((boundedFreezeAt - observedAtMonotonic) * runningInstances) / 1000,
+        );
+      }
+      billingState = "stale";
+      runningInstances = 0;
+      observedAtMonotonic = boundedFreezeAt;
+      staleAtMonotonic = boundedFreezeAt;
+      container.dataset.gpuBillingState = billingState;
+      const label = stateLabel();
+      if (stateNode.textContent !== label) stateNode.textContent = label;
+      if (estimate instanceof HTMLElement) estimate.hidden = false;
+      stopTicking();
+      stopFreshnessTimer();
+    };
+    const render = (payload) => {
+      if (!isRecord(payload)
+          || !GPU_BILLING_STATES.has(payload.state)
+          || !Number.isInteger(payload.elapsed_seconds)
+          || payload.elapsed_seconds < 0
+          || !Number.isInteger(payload.running_instances)
+          || payload.running_instances < 0
+          || !Number.isInteger(payload.fresh_for_seconds)
+          || payload.fresh_for_seconds < 0) {
+        if (needsFreshnessClock()) {
+          markStale(performance.now());
+        } else {
+          billingState = "stale";
+          runningInstances = 0;
+          observedAtMonotonic = performance.now();
+          staleAtMonotonic = observedAtMonotonic;
+          container.dataset.gpuBillingState = billingState;
+          const label = stateLabel();
+          if (stateNode.textContent !== label) stateNode.textContent = label;
+          if (estimate instanceof HTMLElement) estimate.hidden = false;
+          stopTicking();
+          stopFreshnessTimer();
+        }
+        renderTime();
+        return false;
+      }
+
+      const freshForSeconds = Math.min(
+        payload.fresh_for_seconds,
+        GPU_BILLING_MAX_FRESH_SECONDS,
+      );
+      billingState = payload.state;
+      elapsedAtObservation = payload.elapsed_seconds;
+      runningInstances = payload.running_instances;
+      observedAtMonotonic = performance.now();
+      staleAtMonotonic = observedAtMonotonic + freshForSeconds * 1000;
+      container.dataset.gpuBillingState = billingState;
+      if (typeof payload.observed_at === "string") {
+        container.dataset.gpuBillingObservedAt = payload.observed_at;
+      } else {
+        delete container.dataset.gpuBillingObservedAt;
+      }
+      const label = stateLabel();
+      if (stateNode.textContent !== label) stateNode.textContent = label;
+      if (estimate instanceof HTMLElement) estimate.hidden = payload.estimated !== true;
+      renderTime();
+      syncTicker();
+      return true;
+    };
+    const destroy = () => {
+      stopTicking();
+      stopFreshnessTimer();
+    };
+
+    const initialState = container.dataset.gpuBillingInitialState || "";
+    const initialElapsed = integerValue(container.dataset.gpuBillingInitialElapsed, -1);
+    const initialInstances = integerValue(container.dataset.gpuBillingInitialInstances, -1);
+    const initialFreshFor = integerValue(container.dataset.gpuBillingInitialFreshFor, -1);
+    if (GPU_BILLING_STATES.has(initialState)
+        && initialElapsed >= 0
+        && initialInstances >= 0
+        && initialFreshFor >= 0) {
+      render({
+        state: initialState,
+        elapsed_seconds: initialElapsed,
+        running_instances: initialInstances,
+        fresh_for_seconds: initialFreshFor,
+        session_started_at: container.dataset.gpuBillingInitialStartedAt || null,
+        observed_at: container.dataset.gpuBillingInitialObservedAt || null,
+        estimated: container.dataset.gpuBillingInitialEstimated === "true",
+      });
+    }
+
+    window.addEventListener("pagehide", destroy, { once: true });
+    return { destroy, isPending, markStale, render };
+  };
+
   function initializeLiveGeneratedAssets() {
     const panel = document.querySelector("[data-live-generated-assets]");
     if (!(panel instanceof HTMLElement) || !panel.dataset.liveAssetsUrl) return;
@@ -5175,6 +5519,7 @@
     const stopConfirm = document.querySelector("[data-stop-generation-confirm]");
     const stopError = document.querySelector("[data-stop-generation-error]");
     const stopStatus = panel.querySelector("[data-stop-generation-status]");
+    const gpuBilling = createGpuBillingTimer(panel);
     let timer = null;
     let networkFailures = 0;
     let liveGenerated = 0;
@@ -5292,6 +5637,7 @@
       renderJobStates(payload.jobs.states);
       updatePipeline(stage);
       renderStopState(payload);
+      gpuBilling?.render(payload.gpu_billing);
 
       if (errorBox) {
         const message = isRecord(payload.error) && typeof payload.error.message === "string"
@@ -5332,9 +5678,10 @@
         const payload = await response.json();
         if (!render(payload)) throw new Error("invalid progress response");
         networkFailures = 0;
-        const terminal = payload.ready_for_review === true
+        const releaseTerminal = payload.ready_for_review === true
           || ["cancelled"].includes(payload.stage.key)
           || (payload.stage.key === "error" && payload.error && payload.error.retryable === false);
+        const terminal = releaseTerminal && gpuBilling?.isPending() !== true;
         document.dispatchEvent(new CustomEvent("gen-automation:generation-progress", {
           detail: {
             expected: safeCount(payload.images.expected),
@@ -5436,171 +5783,431 @@
     schedule(1500);
   }
 
-  const initializeCharacterComposition = () => {
-    const form = document.querySelector("[data-automation-form]");
-    const builder = document.querySelector("[data-composition-builder]");
-    const workflow = document.querySelector("[data-workflow-profile]");
-    if (!form || !(builder instanceof HTMLElement) || !(workflow instanceof HTMLSelectElement)) {
-      return;
-    }
-    const modeControls = Array.from(
-      builder.querySelectorAll('[name="composition_mode"]'),
-    ).filter((control) => control instanceof HTMLInputElement);
-    const firstSubject = namedControl(form, "subject_id");
-    const secondSubject = namedControl(form, "subject_2_id");
-    const firstPrompt = namedControl(form, "character_a_prompt");
-    const secondPrompt = namedControl(form, "character_b_prompt");
-    const secondCard = builder.querySelector('[data-character-card="b"]');
-    const promptFields = Array.from(builder.querySelectorAll("[data-character-prompt-field]"));
-    const actions = builder.querySelector("[data-composition-actions]");
-    const preview = builder.querySelector("[data-composition-preview]");
-    const previewA = builder.querySelector("[data-composition-preview-a]");
-    const previewB = builder.querySelector("[data-composition-preview-b]");
-    const firstSide = builder.querySelector("[data-character-side-a]");
-    const firstPosition = builder.querySelector("[data-character-position-a]");
-    const status = builder.querySelector("[data-composition-status]");
-    const swap = builder.querySelector("[data-swap-characters]");
-    if (!(firstSubject instanceof HTMLSelectElement)
-      || !(secondSubject instanceof HTMLSelectElement)
-      || !(firstPrompt instanceof HTMLTextAreaElement)
-      || !(secondPrompt instanceof HTMLTextAreaElement)) return;
-
-    const workflowOptions = Array.from(workflow.options).filter(
-      (option) => ["true", "false"].includes(option.dataset.regionalPrompting),
-    );
-    const workflowFamily = (option) => (option?.dataset.workflowName || "")
+  const initializeControlledDuoBuilders = () => {
+    const genericSharedTags = new Set([
+      "adult", "adult character", "adult woman", "adult man", "woman", "man",
+      "1girl", "1boy", "2girls", "2boys", "two characters", "detailed face",
+      "high quality", "best quality", "masterpiece",
+    ]);
+    const normalizedWords = (value) => String(value || "")
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
       .toLowerCase()
-      .replace(/\b(base|hires|highres|upscale|upscaler|couple|duo|regional)\b/g, " ")
       .replace(/[^a-z0-9]+/g, " ")
       .trim();
-    const pairedWorkflow = (current, desiredRegional) => {
-      const family = workflowFamily(current);
-      if (!family) return null;
-      return workflowOptions.find((option) => (
-        !option.disabled
-        && option !== current
-        && option.dataset.regionalPrompting === desiredRegional
-        && option.dataset.upscalerEnabled === current?.dataset.upscalerEnabled
-        && option.dataset.detailerEnabled === current?.dataset.detailerEnabled
-        && option.dataset.workflowVersion === current?.dataset.workflowVersion
-        && workflowFamily(option) === family
-      )) || null;
-    };
-    const selectedName = (control, fallback) => (
-      control.selectedOptions.item(0)?.dataset.subjectName || fallback
-    );
-    const suggestedPrompt = (control) => selectedName(control, "");
-    const setAutomaticPrompt = (control, subjectControl) => {
-      const previous = control.dataset.automaticCharacterPrompt || "";
-      const suggested = suggestedPrompt(subjectControl);
-      if (!control.value.trim() || control.value === previous) control.value = suggested;
-      control.dataset.automaticCharacterPrompt = suggested;
-    };
-    const activeMode = () => (
-      modeControls.find((control) => control.checked)?.value === "duo" ? "duo" : "single"
-    );
-    const cacheDuoValues = () => {
-      builder.dataset.duoSubjectId = secondSubject.value;
-      builder.dataset.duoFirstPrompt = firstPrompt.value;
-      builder.dataset.duoSecondPrompt = secondPrompt.value;
-    };
-    const restoreDuoValues = () => {
-      if (!secondSubject.value && builder.dataset.duoSubjectId) {
-        secondSubject.value = builder.dataset.duoSubjectId;
-      }
-      if (!firstPrompt.value && builder.dataset.duoFirstPrompt) {
-        firstPrompt.value = builder.dataset.duoFirstPrompt;
-      }
-      if (!secondPrompt.value && builder.dataset.duoSecondPrompt) {
-        secondPrompt.value = builder.dataset.duoSecondPrompt;
-      }
-      setAutomaticPrompt(firstPrompt, firstSubject);
-      setAutomaticPrompt(secondPrompt, secondSubject);
-    };
-    const clearSingleOnlyFields = () => {
-      cacheDuoValues();
-      secondSubject.value = "";
-      firstPrompt.value = "";
-      secondPrompt.value = "";
-    };
-    const pairWorkflow = (duo) => {
-      const selected = workflow.selectedOptions.item(0);
-      const desired = duo ? "true" : "false";
-      if (selected?.dataset.regionalPrompting === desired) return true;
-      const replacement = pairedWorkflow(selected, desired);
-      if (!replacement) return false;
-      workflow.value = replacement.value;
-      workflow.dispatchEvent(new Event("change", { bubbles: true }));
-      return true;
-    };
-    const render = ({ modeChanged = false } = {}) => {
-      const duo = activeMode() === "duo";
-      if (modeChanged) {
-        if (duo) restoreDuoValues();
-        else clearSingleOnlyFields();
-      }
-      if (secondCard instanceof HTMLElement) secondCard.hidden = !duo;
-      promptFields.forEach((field) => { field.hidden = !duo; });
-      if (actions instanceof HTMLElement) actions.hidden = !duo;
-      if (preview instanceof HTMLElement) preview.hidden = !duo;
-      if (firstSide instanceof HTMLElement) firstSide.textContent = duo ? "Character 1" : "Character";
-      if (firstPosition instanceof HTMLElement) firstPosition.hidden = !duo;
-      secondSubject.required = duo;
-      firstPrompt.required = duo;
-      secondPrompt.required = duo;
-      secondSubject.setCustomValidity(
-        duo && firstSubject.value === secondSubject.value
-          ? "Choose two different approved characters."
-          : "",
-      );
-      const paired = pairWorkflow(duo);
-      modeControls.forEach((control) => {
-        control.setCustomValidity(paired ? "" : "No matching workflow is available for this composition.");
-      });
-      if (previewA instanceof HTMLElement) {
-        previewA.textContent = selectedName(firstSubject, "Character 1");
-      }
-      if (previewB instanceof HTMLElement) {
-        previewB.textContent = selectedName(secondSubject, "Character 2");
-      }
-      if (status instanceof HTMLElement) {
-        status.textContent = !paired
-          ? "A matching standard/couple workflow with the same hires and detailer settings is unavailable."
-          : (duo
-            ? "Regional prompting keeps the first character on the left and the second on the right."
-            : "");
-        status.className = `composition-status${paired ? "" : " warning"}`;
-        status.hidden = paired && !duo;
-      }
-      form.dispatchEvent(new CustomEvent("gen-automation:profile-changed"));
-    };
+    const promptTags = (value) => new Set(String(value || "")
+      .split(/[,;\n]+/)
+      .map((tag) => tag
+        .trim()
+        .toLowerCase()
+        .replace(/^\(+|\)+$/g, "")
+        .replace(/:[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/, "")
+        .trim())
+      .filter((tag) => tag.length >= 3 && !genericSharedTags.has(tag)));
 
-    modeControls.forEach((control) => {
-      control.addEventListener("change", () => render({ modeChanged: true }));
-    });
-    firstSubject.addEventListener("change", () => {
-      if (activeMode() === "duo") setAutomaticPrompt(firstPrompt, firstSubject);
-      render();
-    });
-    secondSubject.addEventListener("change", () => {
-      if (activeMode() === "duo") setAutomaticPrompt(secondPrompt, secondSubject);
-      render();
-    });
-    workflow.addEventListener("change", () => render());
-    if (swap instanceof HTMLButtonElement) {
-      swap.addEventListener("click", () => {
-        const subjectValue = firstSubject.value;
-        const promptValue = firstPrompt.value;
-        firstSubject.value = secondSubject.value;
-        firstPrompt.value = secondPrompt.value;
-        secondSubject.value = subjectValue;
-        secondPrompt.value = promptValue;
-        firstPrompt.dataset.automaticCharacterPrompt = suggestedPrompt(firstSubject);
-        secondPrompt.dataset.automaticCharacterPrompt = suggestedPrompt(secondSubject);
+    document.querySelectorAll("[data-controlled-duo-builder]").forEach((builder) => {
+      if (!(builder instanceof HTMLElement) || builder.dataset.duoInitialized === "true") return;
+      const form = builder.closest("form");
+      if (!(form instanceof HTMLFormElement)) return;
+      const workflow = form.querySelector("[data-workflow-profile]");
+      const firstSubject = namedControl(form, "subject_id");
+      const secondSubject = namedControl(form, "subject_2_id");
+      const firstPrompt = namedControl(form, "character_a_prompt");
+      const secondPrompt = namedControl(form, "character_b_prompt");
+      const firstNegative = namedControl(form, "character_a_negative_prompt");
+      const secondNegative = namedControl(form, "character_b_negative_prompt");
+      const contractVersion = namedControl(form, "duo_contract_version");
+      const preset = namedControl(form, "composition_preset_id");
+      const interaction = namedControl(form, "interaction_prompt");
+      const camera = namedControl(form, "camera_prompt");
+      const isolation = namedControl(form, "duo_isolation_mode");
+      const quality = namedControl(form, "duo_quality_mode");
+      const sharedPrompt = namedControl(form, "prompt");
+      if (!(workflow instanceof HTMLSelectElement)
+          || !(firstSubject instanceof HTMLSelectElement)
+          || !(secondSubject instanceof HTMLSelectElement)
+          || !(firstPrompt instanceof HTMLTextAreaElement)
+          || !(secondPrompt instanceof HTMLTextAreaElement)
+          || !(firstNegative instanceof HTMLTextAreaElement)
+          || !(secondNegative instanceof HTMLTextAreaElement)
+          || !(contractVersion instanceof HTMLInputElement)
+          || !(preset instanceof HTMLSelectElement)
+          || !(interaction instanceof HTMLTextAreaElement)
+          || !(camera instanceof HTMLTextAreaElement)
+          || !(isolation instanceof HTMLSelectElement)
+          || !(quality instanceof HTMLSelectElement)
+          || !(sharedPrompt instanceof HTMLTextAreaElement)) return;
+
+      const modeControls = Array.from(form.querySelectorAll('[name="composition_mode"]'))
+        .filter((control) => control instanceof HTMLInputElement
+          || control instanceof HTMLSelectElement);
+      const workbench = builder.querySelector("[data-duo-workbench]");
+      const regionalContainer = builder.querySelector("[data-experiment-regional-prompts]");
+      const secondCard = builder.querySelector('[data-character-card="b"]');
+      const duoOnly = Array.from(builder.querySelectorAll("[data-duo-only]"));
+      const promptFields = Array.from(builder.querySelectorAll("[data-character-prompt-field]"));
+      const v2Controls = Array.from(builder.querySelectorAll("[data-duo-v2-control]"))
+        .filter((control) => control instanceof HTMLInputElement
+          || control instanceof HTMLTextAreaElement
+          || control instanceof HTMLSelectElement);
+      const strictOption = builder.querySelector("[data-duo-strict-option]");
+      const balancedOption = isolation.querySelector('option[value="balanced"]');
+      const highOption = builder.querySelector("[data-duo-high-option]");
+      const isolationHint = builder.querySelector("[data-duo-isolation-hint]");
+      const preview = builder.querySelector("[data-duo-mask-preview]");
+      const presetLabel = builder.querySelector("[data-duo-preset-label]");
+      const presetDescription = builder.querySelector("[data-duo-preset-description]");
+      const costNote = builder.querySelector("[data-duo-cost-note]");
+      const lint = builder.querySelector("[data-duo-prompt-lint]");
+      const capabilityStatus = builder.querySelector("[data-duo-capability-status]");
+      const compositionStatus = builder.querySelector("[data-composition-status]");
+      const swap = builder.querySelector("[data-swap-characters]");
+      const firstCard = builder.querySelector('[data-character-card="a"]');
+      const firstSide = builder.querySelector("[data-character-side-a]");
+      const firstPosition = builder.querySelector("[data-character-position-a]");
+
+      const activeMode = () => {
+        const checked = modeControls.find((control) => (
+          control instanceof HTMLInputElement && control.checked
+        ));
+        const select = modeControls.find((control) => control instanceof HTMLSelectElement);
+        return (checked?.value || select?.value) === "duo" ? "duo" : "single";
+      };
+      const selectedSubjectName = (control) => {
+        if (!control.value) return "";
+        return control.selectedOptions.item(0)?.dataset.subjectName
+          || control.selectedOptions.item(0)?.textContent?.split(" · ")[0].trim()
+          || "";
+      };
+      const selectedWorkflow = () => workflow.selectedOptions.item(0);
+      const capabilities = () => {
+        const option = selectedWorkflow();
+        return {
+          regional: option?.dataset.regionalPrompting === "true",
+          v2: option?.dataset.duoContractV2 === "true",
+          strict: option?.dataset.duoStrictIsolation === "true",
+          high: option?.dataset.duoQualityHigh === "true",
+        };
+      };
+      const supportsMode = (option, mode) => (mode === "duo"
+        ? option?.dataset.duoContractV2 === "true"
+          || option?.dataset.regionalPrompting === "true"
+        : option?.dataset.duoContractV2 !== "true"
+          && option?.dataset.regionalPrompting !== "true");
+      const selectWorkflowForMode = (mode) => {
+        const current = selectedWorkflow();
+        if (supportsMode(current, mode)) return true;
+        const candidates = Array.from(workflow.options).filter((option) => (
+          !option.disabled && supportsMode(option, mode)
+        ));
+        const score = (option) => {
+          let value = 0;
+          if (option.dataset.upscalerEnabled === current?.dataset.upscalerEnabled) value += 4;
+          if (option.dataset.detailerEnabled === current?.dataset.detailerEnabled) value += 4;
+          if (mode === "duo" && option.dataset.duoContractV2 === "true") value += 8;
+          if (mode === "duo" && option.dataset.duoStrictIsolation !== "true") value += 1;
+          return value;
+        };
+        candidates.sort((left, right) => score(right) - score(left));
+        const replacement = candidates[0];
+        if (!replacement) return false;
+        workflow.value = replacement.value;
+        workflow.dispatchEvent(new Event("change", { bubbles: true }));
+        return true;
+      };
+      const setAutomaticPrompt = (control, subjectControl) => {
+        const previous = control.dataset.automaticCharacterPrompt || "";
+        const suggested = selectedSubjectName(subjectControl);
+        if (!control.value.trim() || control.value === previous) control.value = suggested;
+        control.dataset.automaticCharacterPrompt = suggested;
+      };
+      const cacheDuoContract = () => {
+        builder.dataset.duoSubjectId = secondSubject.value;
+        builder.dataset.duoFirstPrompt = firstPrompt.value;
+        builder.dataset.duoSecondPrompt = secondPrompt.value;
+        builder.dataset.duoFirstNegative = firstNegative.value;
+        builder.dataset.duoSecondNegative = secondNegative.value;
+        builder.dataset.duoInteraction = interaction.value;
+        builder.dataset.duoCamera = camera.value;
+        if (preset.value) builder.dataset.duoPreset = preset.value;
+      };
+      const restoreDuoContract = () => {
+        if (!secondSubject.value && builder.dataset.duoSubjectId) {
+          secondSubject.value = builder.dataset.duoSubjectId;
+        }
+        const restoreText = (control, key) => {
+          if (!control.value && builder.dataset[key]) control.value = builder.dataset[key];
+        };
+        restoreText(firstPrompt, "duoFirstPrompt");
+        restoreText(secondPrompt, "duoSecondPrompt");
+        restoreText(firstNegative, "duoFirstNegative");
+        restoreText(secondNegative, "duoSecondNegative");
+        restoreText(interaction, "duoInteraction");
+        restoreText(camera, "duoCamera");
+        if (!preset.value && builder.dataset.duoPreset) {
+          preset.dataset.savedPreset = builder.dataset.duoPreset;
+        }
+        setAutomaticPrompt(firstPrompt, firstSubject);
+        setAutomaticPrompt(secondPrompt, secondSubject);
+      };
+      const clearDuoContractForSingle = () => {
+        cacheDuoContract();
+        secondSubject.value = "";
+        firstPrompt.value = "";
+        secondPrompt.value = "";
+        firstNegative.value = "";
+        secondNegative.value = "";
+        interaction.value = "";
+        camera.value = "";
+      };
+      const setSuggestedDirection = (control, key, suggested) => {
+        const previous = control.dataset[key] || "";
+        if (!control.value.trim() || control.value === previous) control.value = suggested;
+        control.dataset[key] = suggested;
+      };
+      const renderPreset = ({ suggest = false, enabled = false } = {}) => {
+        const requested = Object.hasOwn(CONTROLLED_DUO_PRESETS, preset.value)
+          ? preset.value : "";
+        if (!enabled && requested) preset.dataset.savedPreset = requested;
+        const value = enabled
+          ? (requested || preset.dataset.savedPreset || "close_portrait")
+          : "close_portrait";
+        preset.value = enabled ? value : "";
+        const definition = CONTROLLED_DUO_PRESETS[value];
+        if (preview instanceof HTMLElement) preview.dataset.preset = value;
+        if (presetLabel) presetLabel.textContent = definition.label;
+        if (presetDescription) presetDescription.textContent = definition.description;
+        if (suggest) {
+          setSuggestedDirection(camera, "automaticCameraPrompt", definition.camera);
+          setSuggestedDirection(interaction, "automaticInteractionPrompt", definition.interaction);
+          camera.dispatchEvent(new Event("input", { bubbles: true }));
+          interaction.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+      };
+      const renderLint = () => {
+        if (!lint) return;
+        if (activeMode() !== "duo") {
+          lint.textContent = "";
+          lint.className = "controlled-duo-lint";
+          firstCard?.classList.remove("has-lint-warning");
+          secondCard?.classList.remove("has-lint-warning");
+          return;
+        }
+        const warnings = [];
+        const aText = normalizedWords(firstPrompt.value);
+        const bText = normalizedWords(secondPrompt.value);
+        const sharedPromptControls = [
+          sharedPrompt,
+          ...Array.from(form.querySelectorAll('[data-batch-field="prompt"]'))
+            .filter((control) => control instanceof HTMLTextAreaElement),
+        ];
+        const sharedText = normalizedWords(
+          sharedPromptControls.map((control) => control.value).join("\n"),
+        );
+        const aSubject = normalizedWords(selectedSubjectName(firstSubject));
+        const bSubject = normalizedWords(selectedSubjectName(secondSubject));
+        if (aText && bText && aText === bText) {
+          warnings.push("A and B prompts are identical");
+        }
+        if (bSubject.length >= 3 && aText.includes(bSubject)) {
+          warnings.push("A mentions B's approved identity");
+        }
+        if (aSubject.length >= 3 && bText.includes(aSubject)) {
+          warnings.push("B mentions A's approved identity");
+        }
+        if (aSubject.length >= 3 && sharedText.includes(aSubject)) {
+          warnings.push("the shared prompt mentions A's approved identity");
+        }
+        if (bSubject.length >= 3 && sharedText.includes(bSubject)) {
+          warnings.push("the shared prompt mentions B's approved identity");
+        }
+        const populationTokens = Array.from(new Set(
+          sharedPromptControls.map((control) => control.value).join("\n").toLowerCase().match(
+            /\b(?:solo|1girl|1boy|2girls|2boys|3girls|3boys|three people|three characters|multiple girls|multiple boys)\b/g,
+          ) || [],
+        ));
+        if (populationTokens.length) {
+          warnings.push(
+            `shared population tags (${populationTokens.slice(0, 4).join(", ")}) conflict with system-owned exact-two composition`,
+          );
+        }
+        const aTags = promptTags(firstPrompt.value);
+        const duplicated = Array.from(promptTags(secondPrompt.value))
+          .filter((tag) => aTags.has(tag))
+          .slice(0, 4);
+        if (duplicated.length) warnings.push(`shared character-only tags: ${duplicated.join(", ")}`);
+        const warning = warnings.length > 0;
+        lint.textContent = warning
+          ? `Possible prompt bleed — ${warnings.join("; ")}. Keep identity/appearance/pose in A or B, and remove population tags from the shared prompt.`
+          : "Preflight clear: character cards are distinct and the shared prompt leaves exact-two composition to the controlled workflow.";
+        lint.className = `controlled-duo-lint ${warning ? "warning" : "success"}`;
+        firstCard?.classList.toggle("has-lint-warning", warning);
+        secondCard?.classList.toggle("has-lint-warning", warning);
+      };
+      const renderCost = (v2Enabled) => {
+        if (!costNote) return;
+        if (!v2Enabled) {
+          costNote.textContent = "Legacy v1 uses the baseline regional path; v2 isolation and quality controls are locked.";
+          return;
+        }
+        const strict = isolation.value === "strict";
+        const high = quality.value === "high";
+        const draft = quality.value === "draft";
+        const level = strict && high ? "Highest relative GPU work"
+          : strict ? "Significantly higher GPU work"
+            : high ? "Higher GPU work"
+              : draft ? "Lowest relative GPU work" : "Baseline controlled-duo GPU work";
+        const detail = strict
+          ? "Strict adds isolated refinement passes."
+          : "Balanced uses the base controlled-duo path.";
+        costNote.textContent = `${level}. ${detail} Exact billed time depends on image size, steps, and worker throughput.`;
+      };
+      const render = ({ presetChanged = false } = {}) => {
+        const duo = activeMode() === "duo";
+        const capability = capabilities();
+        const duoCapable = capability.regional || capability.v2;
+        const modeCompatible = supportsMode(selectedWorkflow(), duo ? "duo" : "single");
+        const v2Enabled = duo && capability.v2;
+        if (workbench instanceof HTMLElement) workbench.hidden = !duo;
+        if (regionalContainer instanceof HTMLElement) regionalContainer.hidden = !duo;
+        if (secondCard instanceof HTMLElement) secondCard.hidden = !duo;
+        duoOnly.forEach((node) => { node.hidden = !duo; });
+        promptFields.forEach((node) => { node.hidden = !duo; });
+        if (firstSide) firstSide.textContent = duo ? "Character A" : "Character";
+        if (firstPosition instanceof HTMLElement) firstPosition.hidden = !duo;
+        secondSubject.required = duo;
+        firstPrompt.required = duo;
+        secondPrompt.required = duo;
+        secondSubject.setCustomValidity(
+          duo && firstSubject.value && firstSubject.value === secondSubject.value
+            ? "Choose two different approved characters." : "",
+        );
+        modeControls.forEach((control) => {
+          control.setCustomValidity(
+            !modeCompatible
+              ? (duo
+                ? "Choose a reviewed workflow that declares a controlled-duo or regional capability."
+                : "Choose a standard single-character workflow without duo capabilities.")
+              : "",
+          );
+        });
+        contractVersion.value = v2Enabled ? "2" : "1";
+        v2Controls.forEach((control) => { control.disabled = !v2Enabled; });
+        if (balancedOption instanceof HTMLOptionElement) {
+          balancedOption.disabled = v2Enabled && capability.strict;
+        }
+        if (strictOption instanceof HTMLOptionElement) {
+          strictOption.disabled = !v2Enabled || !capability.strict;
+        }
+        if (highOption instanceof HTMLOptionElement) highOption.disabled = true;
+        isolation.value = v2Enabled && capability.strict ? "strict" : "balanced";
+        if (isolationHint) {
+          isolationHint.textContent = !v2Enabled
+            ? "Isolation unlocks only on a reviewed Controlled Duo v2 workflow."
+            : capability.strict
+              ? "Strict is locked because the selected workflow has fixed isolated-refinement topology."
+              : "Balanced is locked because the selected workflow has fixed base-path topology.";
+        }
+        if (quality.value === "high") quality.value = "standard";
+        renderPreset({
+          enabled: v2Enabled,
+          suggest: v2Enabled && (presetChanged || !camera.value.trim()),
+        });
+        renderCost(v2Enabled);
+        if (capabilityStatus) {
+          capabilityStatus.textContent = !duo ? ""
+            : !duoCapable
+              ? "Blocked: the selected workflow does not declare a controlled-duo or regional capability."
+              : !capability.v2
+                ? "Legacy v1 fallback: fixed regional prompts only. Choose a Controlled Duo v2 workflow for masks, per-character negatives, and isolation modes."
+                : `Controlled Duo v2 ready${capability.strict ? " · strict isolation" : ""}.`;
+          capabilityStatus.className = `controlled-duo-capability-status ${
+            !duo || capability.v2 ? "success" : "warning"
+          }`;
+        }
+        if (compositionStatus) {
+          const duplicateSubjects = duo && firstSubject.value
+            && firstSubject.value === secondSubject.value;
+          compositionStatus.textContent = !modeCompatible
+            ? (duo
+              ? "Select a compatible duo workflow before queueing."
+              : "Select a standard single-character workflow before queueing.")
+            : !duoCapable
+              ? ""
+              : duplicateSubjects
+                ? "A and B must use different approved subjects."
+                : (duo
+                  ? "A and B own separate prompt contracts; the preflight below checks obvious cross-slot conflicts."
+                  : "");
+          compositionStatus.className = `composition-status${
+            !modeCompatible || duplicateSubjects ? " warning" : ""
+          }`;
+        }
+        renderLint();
+        form.dispatchEvent(new CustomEvent("gen-automation:profile-changed"));
+      };
+
+      let previousMode = activeMode();
+      const handleModeChange = () => {
+        const nextMode = activeMode();
+        if (nextMode !== previousMode) {
+          if (nextMode === "duo") restoreDuoContract();
+          else clearDuoContractForSingle();
+          selectWorkflowForMode(nextMode);
+          previousMode = nextMode;
+        }
+        render({ presetChanged: nextMode === "duo" });
+      };
+      modeControls.forEach((control) => control.addEventListener("change", handleModeChange));
+      workflow.addEventListener("change", () => render());
+      preset.addEventListener("change", () => render({ presetChanged: true }));
+      isolation.addEventListener("change", () => renderCost(contractVersion.value === "2"));
+      quality.addEventListener("change", () => renderCost(contractVersion.value === "2"));
+      [firstPrompt, secondPrompt, sharedPrompt].forEach(
+        (control) => control.addEventListener("input", renderLint),
+      );
+      form.addEventListener("input", (event) => {
+        if (event.target instanceof HTMLTextAreaElement
+            && event.target.matches('[data-batch-field="prompt"]')) renderLint();
+      });
+      firstSubject.addEventListener("change", () => {
+        if (activeMode() === "duo") setAutomaticPrompt(firstPrompt, firstSubject);
         render();
       });
-    }
-    render();
+      secondSubject.addEventListener("change", () => {
+        if (activeMode() === "duo") setAutomaticPrompt(secondPrompt, secondSubject);
+        render();
+      });
+      if (swap instanceof HTMLButtonElement && swap.dataset.duoSwapBound !== "true") {
+        swap.dataset.duoSwapBound = "true";
+        swap.addEventListener("click", () => {
+          const subjectValue = firstSubject.value;
+          const positiveValue = firstPrompt.value;
+          const negativeValue = firstNegative.value;
+          firstSubject.value = secondSubject.value;
+          firstPrompt.value = secondPrompt.value;
+          firstNegative.value = secondNegative.value;
+          secondSubject.value = subjectValue;
+          secondPrompt.value = positiveValue;
+          secondNegative.value = negativeValue;
+          firstPrompt.dataset.automaticCharacterPrompt = selectedSubjectName(firstSubject);
+          secondPrompt.dataset.automaticCharacterPrompt = selectedSubjectName(secondSubject);
+          [firstSubject, secondSubject].forEach((control) => (
+            control.dispatchEvent(new Event("change", { bubbles: true }))
+          ));
+          [firstPrompt, secondPrompt, firstNegative, secondNegative].forEach((control) => (
+            control.dispatchEvent(new Event("input", { bubbles: true }))
+          ));
+          render();
+        });
+      }
+      builder.dataset.duoInitialized = "true";
+      if (previousMode === "duo") {
+        setAutomaticPrompt(firstPrompt, firstSubject);
+        setAutomaticPrompt(secondPrompt, secondSubject);
+      }
+      render();
+    });
   };
 
   const initializeWorkflowRefinement = () => {
@@ -5756,9 +6363,6 @@
     const submitStatus = form.querySelector("[data-experiment-submit-status]");
     const randomSeed = form.querySelector("[data-experiment-random-seed]");
     const baseSeed = form.querySelector("[data-experiment-base-seed]");
-    const composition = namedControl(form, "composition_mode");
-    const secondSubject = form.querySelector("[data-experiment-second-subject]");
-    const regionalPrompts = form.querySelector("[data-experiment-regional-prompts]");
     if (!(planField instanceof HTMLTextAreaElement)
         || !(list instanceof HTMLOListElement)
         || !(template instanceof HTMLTemplateElement)
@@ -5770,11 +6374,14 @@
       "seed", "width", "height", "cfg", "steps", "clip_skip", "hires_scale",
       "hires_denoise", "detailer_guide_size", "detailer_max_size", "detailer_denoise",
       "detailer_bbox_threshold", "detailer_bbox_dilation", "detailer_bbox_crop_factor",
-      "detailer_feather",
+      "detailer_feather", "duo_contract_version",
     ]);
     const profileNames = [
       "subject_id", "subject_2_id", "composition_mode", "character_a_prompt",
-      "character_b_prompt", "checkpoint_id", "workflow_id", "prompt", "negative_prompt",
+      "character_b_prompt", "duo_contract_version", "composition_preset_id",
+      "character_a_negative_prompt", "character_b_negative_prompt", "duo_isolation_mode",
+      "duo_quality_mode", "interaction_prompt", "camera_prompt", "checkpoint_id",
+      "workflow_id", "prompt", "negative_prompt",
       "detailer_prompt", "detailer_negative_prompt", "seed", "width", "height", "cfg",
       "steps", "sampler", "scheduler", "clip_skip", "hires_scale", "hires_denoise",
       "hires_upscale_method", "detailer_guide_size", "detailer_max_size",
@@ -5783,6 +6390,17 @@
     ];
     let variants = [];
     let editingIndex = null;
+    const profileDefaults = Object.freeze({
+      duo_contract_version: 1,
+      composition_preset_id: "",
+      character_a_negative_prompt: "",
+      character_b_negative_prompt: "",
+      duo_isolation_mode: "balanced",
+      duo_quality_mode: "standard",
+      interaction_prompt: "",
+      camera_prompt: "",
+    });
+    const controlledDuoPresetIds = new Set(Object.keys(CONTROLLED_DUO_PRESETS));
 
     const nextLabel = () => `Variant ${String.fromCharCode(65 + Math.min(variants.length, 25))}`;
     const setEditorStatus = (message, tone = "") => {
@@ -5803,6 +6421,16 @@
         const raw = formValue(name);
         result[name] = numericNames.has(name) ? Number(raw) : raw;
       });
+      if (result.composition_mode !== "duo" || result.duo_contract_version !== 2) {
+        result.duo_contract_version = 1;
+        result.composition_preset_id = "";
+        result.character_a_negative_prompt = "";
+        result.character_b_negative_prompt = "";
+        result.duo_isolation_mode = "balanced";
+        result.duo_quality_mode = "standard";
+        result.interaction_prompt = "";
+        result.camera_prompt = "";
+      }
       result.loras = Array.from(form.querySelectorAll("[data-lora-native-slot]")).flatMap((slot) => {
         const id = slot.querySelector("[data-lora-native-id]");
         const weight = slot.querySelector("[data-lora-native-weight]");
@@ -5811,17 +6439,43 @@
       });
       return result;
     };
-    const profileIsValid = (variant) => (
-      variant.label.length > 0
+    const profileIsValid = (variant) => {
+      const duo = variant.composition_mode === "duo";
+      const contractVersion = Number(variant.duo_contract_version ?? 1);
+      const workflowOption = Array.from(namedControl(form, "workflow_id")?.options || [])
+        .find((option) => option.value === variant.workflow_id);
+      const compositionValid = !duo ? (
+        workflowOption?.dataset.regionalPrompting !== "true"
+        && workflowOption?.dataset.duoContractV2 !== "true"
+      ) : (
+        variant.subject_2_id.length > 0
+        && variant.subject_id !== variant.subject_2_id
+        && variant.character_a_prompt.trim().length > 0
+        && variant.character_b_prompt.trim().length > 0
+        && ((contractVersion === 1
+          && workflowOption?.dataset.regionalPrompting === "true") || (
+          contractVersion === 2
+          && workflowOption?.dataset.duoContractV2 === "true"
+          && controlledDuoPresetIds.has(variant.composition_preset_id)
+          && variant.duo_isolation_mode === (
+            workflowOption?.dataset.duoStrictIsolation === "true" ? "strict" : "balanced"
+          )
+          && ["draft", "standard"].includes(variant.duo_quality_mode)
+          && (variant.duo_isolation_mode !== "strict"
+            || workflowOption?.dataset.duoStrictIsolation === "true")
+        ))
+      );
+      return variant.label.length > 0
       && variant.prompt.trim().length > 0
       && variant.subject_id.length > 0
       && variant.checkpoint_id.length > 0
       && variant.workflow_id.length > 0
+      && compositionValid
       && profileNames.filter((name) => numericNames.has(name)).every(
-        (name) => Number.isFinite(variant[name]),
+        (name) => Number.isFinite(Number(variant[name] ?? profileDefaults[name])),
       )
-      && variant.loras.every((item) => Number.isFinite(item.weight))
-    );
+      && variant.loras.every((item) => Number.isFinite(item.weight));
+    };
     const profileIsWarmReady = (variant) => {
       const checkpoint = Array.from(namedControl(form, "checkpoint_id")?.options || [])
         .find((option) => option.value === variant.checkpoint_id);
@@ -5837,7 +6491,7 @@
         if (!(control instanceof HTMLInputElement)
             && !(control instanceof HTMLTextAreaElement)
             && !(control instanceof HTMLSelectElement)) return;
-        control.value = String(variant[name] ?? "");
+        control.value = String(variant[name] ?? profileDefaults[name] ?? "");
         control.dispatchEvent(new Event("change", { bubbles: true }));
         control.dispatchEvent(new Event("input", { bubbles: true }));
       });
@@ -5872,6 +6526,17 @@
       if (stackKey(variant) !== stackKey(baseline)) diffs.push("LoRA stack");
       if (variant.prompt !== baseline.prompt) diffs.push("Prompt");
       if (variant.negative_prompt !== baseline.negative_prompt) diffs.push("Negative prompt");
+      if (variant.composition_preset_id !== baseline.composition_preset_id
+          || variant.camera_prompt !== baseline.camera_prompt) diffs.push("Duo composition");
+      if (variant.interaction_prompt !== baseline.interaction_prompt) diffs.push("Duo interaction");
+      if (variant.character_a_prompt !== baseline.character_a_prompt
+          || variant.character_b_prompt !== baseline.character_b_prompt
+          || variant.character_a_negative_prompt !== baseline.character_a_negative_prompt
+          || variant.character_b_negative_prompt !== baseline.character_b_negative_prompt) {
+        diffs.push("Character contracts");
+      }
+      if (variant.duo_isolation_mode !== baseline.duo_isolation_mode
+          || variant.duo_quality_mode !== baseline.duo_quality_mode) diffs.push("Duo quality");
       if (variant.steps !== baseline.steps) diffs.push(`Steps ${variant.steps}`);
       if (variant.cfg !== baseline.cfg) diffs.push(`CFG ${variant.cfg}`);
       if (variant.sampler !== baseline.sampler || variant.scheduler !== baseline.scheduler) {
@@ -6026,15 +6691,6 @@
         baseSeed.value = String((BigInt(values[0]) << 31n) | BigInt(values[1] >>> 1));
       });
     }
-    if (composition instanceof HTMLSelectElement) {
-      const renderComposition = () => {
-        const duo = composition.value === "duo";
-        if (secondSubject) secondSubject.hidden = !duo;
-        if (regionalPrompts) regionalPrompts.hidden = !duo;
-      };
-      composition.addEventListener("change", renderComposition);
-      renderComposition();
-    }
     form.addEventListener("submit", (event) => {
       variants.forEach((variant) => { variant.label = variant.label.trim(); });
       if (variants.length < 2 || variants.some((variant) => (
@@ -6160,6 +6816,7 @@
     const progressPercent = root.querySelector("[data-experiment-progress-percent]");
     const progressbar = root.querySelector("[data-experiment-progressbar]");
     const progressFill = root.querySelector("[data-experiment-progress-fill]");
+    const gpuBilling = createGpuBillingTimer(root);
     const known = new Set();
     let stopped = false;
     const safeUrl = (value) => {
@@ -6264,16 +6921,22 @@
           progressbar.setAttribute("aria-valuemax", String(expected));
           progressbar.setAttribute("aria-valuenow", String(generated));
         }
+        gpuBilling?.render(payload.gpu_billing);
         payload.variants.forEach((variant) => {
           if (!isRecord(variant) || !isRecord(variant.stage) || !isRecord(variant.images)) return;
           const node = root.querySelector(`[data-experiment-variant="${integerValue(variant.index, 0)}"] [data-experiment-variant-status]`);
           if (node) node.textContent = `${variant.stage.label || "Queued"} · ${integerValue(variant.images.generated, 0)}/${integerValue(variant.images.expected, 0)}`;
         });
         await refreshAssets();
-        if (payload.complete === true) {
+        const comparisonComplete = payload.complete === true;
+        if (comparisonComplete && gpuBilling?.isPending() !== true) {
           stopped = true;
           if (statusNode) statusNode.textContent = "Comparison complete. Open any image to inspect it at full size.";
           return;
+        }
+        if (comparisonComplete && statusNode) {
+          const message = "Comparison complete. Shared GPU billing has not settled; this timer will freeze after Salad confirms the session ended.";
+          if (statusNode.textContent !== message) statusNode.textContent = message;
         }
       } catch (_error) {
         if (statusNode) statusNode.textContent = "Network interrupted live progress; retrying automatically.";
@@ -6659,7 +7322,7 @@
   initializeLoraPicker();
   initializeAutomationBuilder();
   initializeWorkflowRefinement();
-  initializeCharacterComposition();
+  initializeControlledDuoBuilders();
   initializeImageSettingsSummary();
   initializeAutomationPresets();
   if (!experimentFormPresent) initializeAutomationDraft();

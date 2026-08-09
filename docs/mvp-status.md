@@ -59,8 +59,12 @@ used as a completion claim.
   `semantic_severe_override`, and a written audited justification.
 - Dynamic deliverability enforcement across generation, review, derivatives,
   and publication: at most 500 accepted images, post-hires masters bounded to
-  8192 by 8192 and 12 million pixels, and X outputs deterministically adapted to
-  the 5 MiB image ceiling through bounded JPEG quality/downscaling.
+  8192 by 8192 and 12 million pixels. Newly prepared X outputs retain those
+  admitted source dimensions as metadata-free watermarked PNGs: compression
+  level 6 first, then level 9 as a lossless size optimization. A PNG still over
+  X's 5 MiB ceiling fails terminally before upload with no JPEG or downscale
+  fallback; renderer v6 owns this behavior while frozen renderer v4/v5 and
+  legacy JPEG recipes remain executable with their original semantics.
 - Durable human decisions, clean unwatermarked member/Patreon derivatives, and
   owner-selected X-only watermark/teaser rendering. Raw masters remain
   unchanged.
@@ -127,18 +131,38 @@ derivatives/{release_id}/{release_version_id}/{job_id}/
   {target}/{output_sha256}.{extension}
 ```
 
+New X teaser revisions are full-dimension, metadata-free PNG artifacts. X may
+derive scaled or reformatted display variants after accepting an upload, so the
+private immutable object remains the authoritative publishing artifact rather
+than X's displayed copy.
+
 The destination-neutral finished-set ZIP parts are private:
 
 ```text
 finished-set-archives/{archive_id}/part-NNN-of-NNN/{sha256}.zip
 ```
 
-They are assembled from the exact clean `full` output for every accepted image,
-in frozen generation-queue order. ZIP preparation is checkpointed per part and
-runs independently of the publishing guard and Patreon, MEGA, or X state. The
-download controls therefore become available as soon as those clean full-set
-copies are ready, even while destination preparation continues or an unrelated
-X teaser fails. Every part includes the same set-wide manifest.
+New parts use the versioned `public-png-v1` profile. A succeeded Patreon `full`
+JPEG remains the readiness proof, but the archived media is a separate
+full-dimension, lossless PNG rendered from the frozen source in the isolated
+image worker. The raw master is never decoded by the controller or copied
+outward. Metadata-free PNG artifacts are durably checkpointed under
+`public-media/public-png-v1/<render-identity>/<source-sha256>/...` before the
+manifest is frozen, then assembled in generation-queue order. ZIP preparation
+is checkpointed per part and runs independently of the publishing guard and
+Patreon, MEGA, or X state. Every part includes the same v2 set-wide manifest
+with separate source Asset and readiness derivative provenance.
+
+Ready pre-profile archives remain immutable and readable as
+`legacy-full-derivative-v1`. A completed review can also create a new public
+PNG archive without replacing its legacy JPEG archive. MEGA sends the PNG
+profile to a distinct `<set-name> (PNG)` folder, preventing collision with a
+historical unsuffixed delivery.
+
+The `public-png-v1` recipe, renderer, Pillow version, encoder, and byte ceiling
+are immutable together. After in-flight work drains, any change requires a new
+media profile and a new MEGA folder suffix; the existing profile identity is
+never redefined in place.
 
 Destination-specific Patreon package parts remain private and separate:
 

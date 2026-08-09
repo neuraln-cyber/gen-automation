@@ -123,6 +123,7 @@ def _workflow() -> WorkflowApprovalCreate:
         version="1.0.0",
         object_key="workflows/production-v1.json",
         reviewed_node_classes=["VAEDecode", "KSampler", "CLIPTextEncode"],
+        capabilities=["controlled_duo_v2"],
         evidence=_evidence("Reviewed pinned workflow node graph."),
     )
 
@@ -264,6 +265,7 @@ async def test_artifact_workflow_and_actor_guards(
             "KSampler",
             "VAEDecode",
         ]
+        assert stored_workflow.capabilities == ["controlled_duo_v2"]
 
     async with database.sessions() as session:
         with pytest.raises(

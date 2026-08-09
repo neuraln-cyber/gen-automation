@@ -13,7 +13,7 @@ The source archive already freezes the accepted set in generation-queue order.
 The MEGA folder preserves that order with zero-padded filenames:
 
 ```text
-<remote-root>/<set-name>/
+<remote-root>/<set-name> (PNG)/
   001.png
   002.png
   ...
@@ -23,26 +23,66 @@ The MEGA folder preserves that order with zero-padded filenames:
 
 `<set-name>` is the set's visible title (trimmed only), so a title such as
 `Yoruichi - Bleach` is delivered directly to
-`/Future/Yoruichi - Bleach/` when `/Future` is configured as the remote root.
+`/Future/Yoruichi - Bleach (PNG)/` when `/Future` is configured as the remote
+root.
 No project, version, or hash folders are inserted. A set folder must be empty or
 already belong to that exact in-progress delivery. Unexpected, duplicate, or
 mismatched files stop the delivery for attention instead of being mixed,
 renamed, or overwritten; use a unique set name for a later replacement.
 
-The image bytes are copied exactly from the clean, full-resolution derivative
+The image bytes are copied exactly from the `public-png-v1` finished-set
 archive. They are not resized, watermarked, or recompressed during MEGA
-delivery. The derivative boundary has already removed EXIF, GPS, prompts,
-generation settings, software paths, ICC/XMP payloads, comments, and PNG text;
-the uploader verifies that privacy contract again before transfer. Private raw
-masters retain their original metadata and are never used as MEGA inputs. X
-teaser derivatives are not included.
+delivery. For that archive, each frozen PNG master is decoded only inside the
+one-shot, memory-limited image renderer and losslessly encoded at its original
+dimensions into a fresh PNG container. The boundary removes EXIF, GPS,
+prompts, generation settings, software paths, ICC/XMP payloads, comments, and
+PNG text; the archive builder and uploader verify the privacy contract again.
+Private raw masters retain their original metadata and are never copied
+directly to an archive or MEGA. Patreon `full` JPEG derivatives remain the
+readiness gate and Patreon artifact, but their lossy bytes are not included in
+the public PNG profile. X teaser derivatives are not included.
 `set-manifest.json` records the immutable source identity, filename, ordinal,
 byte length, SHA-256, and generation-queue ordering for every image.
+It separately records `source_asset_id` and
+`readiness_derivative_output_id`, so the PNG bytes and the Patreon readiness
+proof are never conflated.
 `upload-complete.json` is written and verified last, so its presence means the
 entire folder was transferred and accounted for.
 
 The deterministic ZIP download remains available separately in the dashboard.
 Preparing or retrying MEGA never blocks that local/S3 download.
+
+## Public PNG archive profile and legacy sets
+
+New requests select the versioned `public-png-v1` media profile. Before ZIP
+assembly, each isolated render is checkpointed once at a render-addressed key:
+
+```text
+public-media/public-png-v1/<render-identity>/<source-sha256>/
+  <source-asset-id>/<source-version-hash>.png
+```
+
+The render identity freezes the recipe, PNG compression policy, renderer and
+Pillow versions, and byte ceiling. Cache creation is conditional. A retry may
+adopt an existing immutable object only after its version, complete metadata,
+SHA-256, size, dimensions, PNG format, and metadata-free container all verify.
+This durable cache costs one full-resolution PNG per selected image, avoids
+re-rendering after a restart, and lets archive retries read exact checkpointed
+bytes. It does not duplicate images per destination.
+
+`public-png-v1` is an immutable operational contract. Any change to its PNG
+recipe, renderer, Pillow version, encoder behavior, or byte ceiling **must**
+wait for in-flight profile work to drain and ship as a new `media_profile`.
+That profile must also use a new, non-colliding MEGA folder suffix. Never change
+the render identity behind `public-png-v1` in place; doing so would make archive
+resume and cache adoption depend on deployment timing.
+
+Archives created before this profile are backfilled as
+`legacy-full-derivative-v1`. Ready legacy JPEG archives and their MEGA records
+remain immutable, downloadable, and readable. They keep their historical
+unsuffixed folder. The same completed review can create a separate
+`public-png-v1` archive and MEGA delivery in the `(PNG)` folder without deleting
+or overwriting the legacy delivery.
 
 ## Efficient transfer path
 
@@ -73,8 +113,9 @@ automation silently overwrites.
 ## Durable state and API
 
 One `MegaSetDelivery` row freezes the archive identity and remote folder. One
-ordered `MegaSetDeliveryItem` row records each image's source object identity,
-expected SHA-256/size, remote path, attempts, and completion state. Parent
+ordered `MegaSetDeliveryItem` row records each image's source Asset identity,
+separate readiness derivative identity, expected public SHA-256/size, remote
+path, attempts, and completion state. Parent
 counters provide live `uploaded / total` image and byte progress. Credentials,
 folder keys, exported links, and account sessions are never stored in these
 tables.

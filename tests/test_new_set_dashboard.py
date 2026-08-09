@@ -84,8 +84,9 @@ def test_new_set_builder_frontend_keeps_batch_edits_safe_and_actionable(
     assert "promptForSequenceWildcard" in script.text
     assert "lines.length > 50" in script.text
     assert "targetFollowsQueue" in script.text
-    assert "pairedWorkflow" in script.text
-    assert "initializeCharacterComposition" in script.text
+    assert "selectWorkflowForMode" in script.text
+    assert "initializeControlledDuoBuilders" in script.text
+    assert "initializeCharacterComposition" not in script.text
     assert "ConditioningSetAreaPercentage" not in script.text
     assert "dataset.regionalPrompting" in script.text
     assert "Swap left / right" not in script.text
@@ -150,7 +151,7 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert "Approved Adult Character" in page.text
     assert ">Characters</strong>" in page.text
     assert "Two characters" in page.text
-    assert "Swap left / right" in page.text
+    assert "Swap complete A / B" in page.text
     assert 'name="composition_mode"' in page.text
     assert 'name="subject_2_id"' in page.text
     assert 'name="character_a_prompt"' in page.text
@@ -354,7 +355,7 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert progress.status_code == 200
     assert "no-store" in progress.headers["cache-control"]
     assert progress.json() == {
-        "schema_version": 1,
+        "schema_version": 2,
         "release_id": str(releases[0].id),
         "phase": "ready",
         "health": "healthy",
@@ -383,6 +384,15 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
         "ready_for_review": False,
         "next_url": None,
         "poll_after_ms": 3000,
+        "gpu_billing": {
+            "state": "not_started",
+            "elapsed_seconds": 0,
+            "running_instances": 0,
+            "session_started_at": None,
+            "observed_at": None,
+            "estimated": False,
+            "fresh_for_seconds": 0,
+        },
     }
 
     async def seed_preparing_deployment() -> None:

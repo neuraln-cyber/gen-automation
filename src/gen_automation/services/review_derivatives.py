@@ -17,6 +17,10 @@ from gen_automation.db.models import (
     XTeaserRevisionMember,
 )
 from gen_automation.domain.canonical import canonical_sha256
+from gen_automation.domain.deliverability import (
+    MAX_PIPELINE_MASTER_HEIGHT,
+    MAX_PIPELINE_MASTER_WIDTH,
+)
 from gen_automation.domain.ids import uuid7
 from gen_automation.services.derivative_pipeline import (
     DerivativePipelineConflictError,
@@ -30,8 +34,11 @@ from gen_automation.services.derivative_runtime import derivative_recipe_configu
 from gen_automation.services.derivatives import (
     DERIVATIVE_RENDERER_VERSION,
     DerivativeRecipe,
+    PngEncoding,
+    TeaserFitMode,
     WatermarkPosition,
     WatermarkSpec,
+    XTeaserSpec,
 )
 from gen_automation.services.x_teaser_revisions import (
     activate_ready_x_teaser_revision,
@@ -108,7 +115,7 @@ async def prepare_completed_review_x_teasers(
             "pillow_version": PIL.__version__,
             "configurations": {
                 position.value: derivative_recipe_configuration(
-                    DerivativeRecipe(watermark=WatermarkSpec(position=position))
+                    _x_lossless_png_recipe(position=position)
                 )
                 for position in sorted(groups, key=lambda value: value.value)
             },
@@ -168,7 +175,7 @@ async def prepare_completed_review_x_teasers(
         asset_ids = groups.get(position)
         if not asset_ids:
             continue
-        recipe = DerivativeRecipe(watermark=WatermarkSpec(position=position))
+        recipe = _x_lossless_png_recipe(position=position)
         result = await create_derivative_recipe_and_plan(
             session,
             review_task_id=review_task_id,
@@ -340,6 +347,22 @@ async def _x_selected_count(session: AsyncSession, *, review_task_id: UUID) -> i
             .where(ReviewXSelection.review_task_id == review_task_id)
         )
         or 0
+    )
+
+
+def _x_lossless_png_recipe(*, position: WatermarkPosition) -> DerivativeRecipe:
+    """Build the frozen public X profile without a lossy or resizing fallback."""
+
+    return DerivativeRecipe(
+        x_teaser=XTeaserSpec(
+            output_filename="x-teaser.png",
+            width=MAX_PIPELINE_MASTER_WIDTH,
+            height=MAX_PIPELINE_MASTER_HEIGHT,
+            fit_mode=TeaserFitMode.DOWNSCALE,
+            allow_upscale=False,
+            encoding=PngEncoding(compress_level=6),
+        ),
+        watermark=WatermarkSpec(position=position),
     )
 
 

@@ -1850,6 +1850,7 @@ def _delivery_progress_payload(
             "ready_full_outputs": progress.ready_full_outputs,
             "expected_x_teasers": progress.expected_x_teasers,
             "ready_x_teasers": progress.ready_x_teasers,
+            "x_action_message": progress.x_action_message,
         },
         "archive": {
             "state": archive_state,
@@ -1878,6 +1879,10 @@ def _delivery_progress_payload(
             "completed_items": mega.completed_items,
             "total_items": mega.total_items,
             "remote_path": mega.remote_path,
+            "next_retry_at": (
+                mega.next_retry_at.isoformat() if mega.next_retry_at is not None else None
+            ),
+            "retired": mega.retired,
         },
         "patreon": {
             "state": patreon.state,

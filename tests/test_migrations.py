@@ -109,13 +109,17 @@ def test_semantic_feedback_report_uses_jsonb_on_postgresql() -> None:
     assert isinstance(report_type, postgresql.JSONB)
 
 
-def test_x_teaser_revision_is_the_migration_head() -> None:
+def test_legacy_mega_retirement_revision_is_the_migration_head() -> None:
     configuration = Config("alembic.ini")
     scripts = ScriptDirectory.from_config(configuration)
     independent_targets_revision = scripts.get_revision("20260808_0024")
     target_ready_revision = scripts.get_revision("20260808_0025")
     owner_retry_revision = scripts.get_revision("20260808_0026")
-    revision = scripts.get_revision("20260808_0027")
+    x_teaser_revision = scripts.get_revision("20260808_0027")
+    media_profile_revision = scripts.get_revision("20260809_0028")
+    workflow_capability_revision = scripts.get_revision("20260809_0029")
+    gpu_billing_revision = scripts.get_revision("20260809_0030")
+    revision = scripts.get_revision("20260809_0031")
 
     assert independent_targets_revision is not None
     assert independent_targets_revision.down_revision == "20260808_0023"
@@ -123,9 +127,17 @@ def test_x_teaser_revision_is_the_migration_head() -> None:
     assert target_ready_revision.down_revision == "20260808_0024"
     assert owner_retry_revision is not None
     assert owner_retry_revision.down_revision == "20260808_0025"
+    assert x_teaser_revision is not None
+    assert x_teaser_revision.down_revision == "20260808_0026"
+    assert media_profile_revision is not None
+    assert media_profile_revision.down_revision == "20260808_0027"
+    assert workflow_capability_revision is not None
+    assert workflow_capability_revision.down_revision == "20260809_0028"
+    assert gpu_billing_revision is not None
+    assert gpu_billing_revision.down_revision == "20260809_0029"
     assert revision is not None
-    assert revision.down_revision == "20260808_0026"
-    assert scripts.get_current_head() == "20260808_0027"
+    assert revision.down_revision == "20260809_0030"
+    assert scripts.get_current_head() == "20260809_0031"
 
 
 def test_derivative_owner_retry_postgresql_guard_is_narrow_and_bounded(
@@ -382,6 +394,25 @@ def test_foundation_migration_round_trip(
         "x_teaser_revisions",
     }
     assert set(inspect(engine).get_table_names()) == expected_tables
+    assert "capabilities" in {
+        column["name"] for column in inspect(engine).get_columns("workflow_approvals")
+    }
+    assert {
+        "billing_session_started_at",
+        "billing_session_ended_at",
+        "billing_accumulated_microseconds",
+        "billing_active_instance_id",
+        "billing_active_started_at",
+        "billing_observed_at",
+        "billing_observation_stale",
+        "billing_estimated",
+    } <= {column["name"] for column in inspect(engine).get_columns("salad_deployments")}
+    billing_constraint_names = {
+        constraint["name"]
+        for constraint in inspect(engine).get_check_constraints("salad_deployments")
+    }
+    assert "ck_salad_deployments_nonnegative_billing_runtime" in billing_constraint_names
+    assert "ck_salad_deployments_billing_active_pair" in billing_constraint_names
     assert {
         "gates_release",
         "x_teaser_revision_id",

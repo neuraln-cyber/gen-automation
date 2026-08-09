@@ -19,6 +19,16 @@ class SaladJobStatus(StrEnum):
     FAILED = "failed"
 
 
+class SaladContainerGroupInstanceState(StrEnum):
+    """Documented Salad container-instance lifecycle states."""
+
+    ALLOCATING = "allocating"
+    DOWNLOADING = "downloading"
+    CREATING = "creating"
+    RUNNING = "running"
+    STOPPING = "stopping"
+
+
 @dataclass(frozen=True)
 class SaladJobEvent:
     action: str
@@ -89,6 +99,22 @@ class SaladContainerGroup:
 @dataclass(frozen=True)
 class SaladContainerGroupPage:
     items: tuple[SaladContainerGroup, ...]
+
+
+@dataclass(frozen=True)
+class SaladContainerGroupInstance:
+    id: str
+    machine_id: str
+    state: SaladContainerGroupInstanceState
+    update_time: datetime
+    version: int
+    ready: bool | None = None
+    started: bool | None = None
+
+
+@dataclass(frozen=True)
+class SaladContainerGroupInstancePage:
+    instances: tuple[SaladContainerGroupInstance, ...]
 
 
 @dataclass(frozen=True)
@@ -177,6 +203,15 @@ def _required_bool(data: JSONObject, key: str, context: str) -> bool:
     value = _required_value(data, key, context)
     if not isinstance(value, bool):
         raise ValueError(f"{context}.{key} must be a boolean")
+    return value
+
+
+def _optional_bool(data: JSONObject, key: str, context: str) -> bool | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(f"{context}.{key} must be a boolean or null")
     return value
 
 
@@ -289,6 +324,25 @@ def parse_container_group(data: JSONObject) -> SaladContainerGroup:
         create_time=_required_datetime(data, "create_time", context),
         update_time=_required_datetime(data, "update_time", context),
         raw=data,
+    )
+
+
+def parse_container_group_instance(data: JSONObject) -> SaladContainerGroupInstance:
+    context = "container group instance"
+    try:
+        state = SaladContainerGroupInstanceState(_required_str(data, "state", context))
+    except ValueError as error:
+        raise ValueError(
+            "container group instance.state is not a documented Salad instance state"
+        ) from error
+    return SaladContainerGroupInstance(
+        id=_required_str(data, "id", context),
+        machine_id=_required_str(data, "machine_id", context),
+        state=state,
+        update_time=_required_datetime(data, "update_time", context),
+        version=_required_int(data, "version", context),
+        ready=_optional_bool(data, "ready", context),
+        started=_optional_bool(data, "started", context),
     )
 
 

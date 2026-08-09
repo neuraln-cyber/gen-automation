@@ -1,0 +1,42 @@
+{
+  "schema": "gen-automation/controlled-duo-reference-samples/v1",
+  "purpose": "visual acceptance targets, not production workflow canaries",
+  "cast": {
+    "character_a": "fair skin; copper-orange bob; green eyes; freckles; crescent hairpin; teal jacket; cream knitwear",
+    "character_b": "deep brown skin; indigo braid; amber eyes; geometric gold earrings; ivory/navy coat with gold trim"
+  },
+  "samples": [
+    {
+      "file": "controlled-duo-overhead.png",
+      "composition_preset_id": "overhead",
+      "width": 1024,
+      "height": 1536,
+      "bytes": 2586227,
+      "sha256": "3287db224867617b08cd1d00bd1534bb7a565aefe5bebc2c9a2b41013574227c"
+    },
+    {
+      "file": "controlled-duo-low-angle.png",
+      "composition_preset_id": "low_angle",
+      "width": 1024,
+      "height": 1536,
+      "bytes": 2225846,
+      "sha256": "74b40ef0f60036d8c41541c9f8abb2a2d6f3465b5cf611117eafd87d8df09c4d"
+    },
+    {
+      "file": "controlled-duo-back-to-back.png",
+      "composition_preset_id": "back_to_back",
+      "width": 1536,
+      "height": 1024,
+      "bytes": 2918004,
+      "sha256": "689628c2acb1bffaac085d313300fe28f96e950a52dcb352f01e9786dbf5af0a"
+    },
+    {
+      "file": "controlled-duo-diagonal-depth.png",
+      "composition_preset_id": "diagonal_depth",
+      "width": 1536,
+      "height": 1024,
+      "bytes": 2435449,
+      "sha256": "e3c7e442a1c519d8781dc1df297b31ce7e288de1a6972fa36a04a2ff6a2dc623"
+    }
+  ]
+}

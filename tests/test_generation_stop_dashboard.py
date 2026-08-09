@@ -450,7 +450,7 @@ def test_async_stop_returns_progress_in_place_and_replays_idempotently(
     assert "location" not in first.headers
     assert first.json() == replay.json()
     payload = first.json()
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["release_id"] == str(context.release_id)
     assert payload["phase"] == "paused"
     assert payload["stage"]["key"] == "paused"
@@ -600,7 +600,7 @@ def test_stop_javascript_posts_the_existing_form_and_updates_without_navigation(
 
     assert script.status_code == 200
     start = script.text.index("function initializeGenerationProgress()")
-    end = script.text.index("const initializeCharacterComposition", start)
+    end = script.text.index("const initializeControlledDuoBuilders", start)
     generation_progress = script.text[start:end]
     assert 'document.querySelector("[data-stop-generation-form]")' in generation_progress
     assert "new URL(stopForm.action, window.location.href)" in generation_progress

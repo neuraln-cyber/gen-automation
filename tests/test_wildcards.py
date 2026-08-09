@@ -1,4 +1,5 @@
 from copy import deepcopy
+from pathlib import Path
 from uuid import UUID
 
 from fastapi.testclient import TestClient
@@ -13,6 +14,8 @@ from gen_automation.db.models import (
 )
 from gen_automation.domain.canonical import canonical_sha256
 from tests.factories import seed_release_approvals, valid_release_payload
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_operator_can_version_and_append_wildcard_entries(client: TestClient) -> None:
@@ -62,6 +65,60 @@ def test_operator_can_version_and_append_wildcard_entries(client: TestClient) ->
     assert 'data-copy-text="__poses__"' in dashboard.text
     assert "data-wildcard-file-input" in dashboard.text
     assert "data-wildcard-download" in dashboard.text
+    assert "data-wildcard-file-row" in dashboard.text
+    assert "data-wildcard-direct-editor" in dashboard.text
+
+
+def test_wildcard_dashboard_renders_one_direct_file_editor_per_library(
+    client: TestClient,
+) -> None:
+    for name, entries in (
+        ("zeta-poses", ["standing", "sitting"]),
+        ("alpha-angles", ["low angle", "</textarea><script>unsafe()</script>"]),
+    ):
+        response = client.post(
+            "/api/v1/wildcards",
+            json={"name": name, "entries": entries},
+        )
+        assert response.status_code == 201
+
+    dashboard = client.get("/dashboard/wildcards")
+    assert dashboard.status_code == 200
+    markup = dashboard.text
+
+    assert markup.count("data-wildcard-file-row") == 2
+    assert markup.count("data-wildcard-direct-editor") == 2
+    assert markup.count('action="/dashboard/wildcards#wildcard-library-') == 2
+    assert markup.count('name="action" value="replace"') == 2
+    assert markup.count('class="wildcard-file-textarea"') == 2
+    assert markup.count('rows="16"') == 2
+    assert 'name="action" value="append"' not in markup
+    assert 'class="form-disclosure wildcard-editor"' not in markup
+    assert 'class="compact-disclosure wildcard-replace"' not in markup
+    assert markup.index("alpha-angles.txt") < markup.index("zeta-poses.txt")
+    assert "low angle" in markup
+    assert "standing\nsitting" in markup
+    assert "&lt;/textarea&gt;&lt;script&gt;unsafe()&lt;/script&gt;" in markup
+
+
+def test_wildcard_dashboard_frontend_keeps_large_scoped_file_rows() -> None:
+    script = (ROOT / "src/gen_automation/static/dashboard.js").read_text(encoding="utf-8")
+    styles = (ROOT / "src/gen_automation/static/dashboard_ux.css").read_text(encoding="utf-8")
+
+    assert 'document.querySelectorAll("[data-wildcard-editor]")' in script
+    assert ".filter((line) => line.trim()).length;" in script
+    assert "editor.dataset.wildcardDirty = String(dirty);" in script
+    assert 'window.addEventListener("beforeunload"' in script
+    assert 'submitButton.textContent = "Saving…";' in script
+    assert 'document.getElementById(input.dataset.wildcardFileTarget || "")' in script
+    assert 'document.getElementById(button.dataset.wildcardDownloadTarget || "")' in script
+
+    assert ".wildcard-library-list {\n  grid-template-columns: minmax(0, 1fr);" in styles
+    assert "min-height: clamp(20rem, 46vh, 34rem);" in styles
+    assert 'font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono"' in styles
+    assert ".wildcard-file-row:hover {" in styles
+    assert "transform: none;" in styles
+    assert ".wildcard-file-buttons button { width: 100%; }" in styles
 
 
 def test_wildcard_api_lists_reads_replaces_and_rejects_a_stale_editor(

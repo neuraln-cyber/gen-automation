@@ -20,7 +20,22 @@ def _read(path: Path) -> str:
     return raw.decode("utf-8", errors="strict")
 
 
-def test_host_helper_has_exact_staging_inputs_and_two_operations() -> None:
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash syntax probe")
+def test_host_helper_has_valid_bash_syntax() -> None:
+    bash = shutil.which("bash")
+    assert bash is not None
+    result = subprocess.run(  # noqa: S603 - executable is resolved by shutil.which.
+        [bash, "-n", str(HOST_HELPER)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_host_helper_has_exact_staging_inputs_and_three_operations() -> None:
     source = _read(HOST_HELPER)
 
     assert 'account_id="861912887470"' in source
@@ -32,8 +47,9 @@ def test_host_helper_has_exact_staging_inputs_and_two_operations() -> None:
     assert '"0:0:755"' in source
     assert "--configure)" in source
     assert "--canary)" in source
+    assert "--enable-publishing)" in source
     assert '[ "$#" -eq 4 ]' in source
-    assert '[ "$#" -eq 0 ]' in source
+    assert source.count('[ "$#" -eq 0 ]') == 2
     assert '*) fail "the requested operation is not allowed"' in source
 
 
@@ -108,7 +124,7 @@ def test_host_helper_validates_health_and_running_settings_before_success() -> N
 def test_host_canary_is_a_fixed_get_only_account_binding_check() -> None:
     source = _read(HOST_HELPER)
     canary = source[source.index('if [ "$operation" = "--canary" ]') :]
-    canary = canary[: canary.index("if runtime_values_match")]
+    canary = canary[: canary.index('if [ "$operation" = "--enable-publishing" ]')]
 
     assert "--account-binding" in canary
     assert 'run_container_check --account-binding "$binding_message"' in canary
@@ -130,10 +146,77 @@ def test_host_canary_is_a_fixed_get_only_account_binding_check() -> None:
         assert credential_field not in source
 
 
+def test_host_enablement_is_zero_post_and_fail_closed_for_configured_x() -> None:
+    source = _read(HOST_HELPER)
+    enablement = source[source.index('if [ "$operation" = "--enable-publishing" ]') :]
+    enablement = enablement[: enablement.index("if runtime_values_match")]
+
+    assert '"$(env_value GEN_AUTOMATION_ENVIRONMENT)" = "staging"' in enablement
+    assert '"$(env_value GEN_AUTOMATION_X_AUTH_MODE)" = "oauth1"' in enablement
+    assert "gen-automation-staging/x/oauth1-[A-Za-z0-9]{6}" in enablement
+    assert '"$(env_value GEN_AUTOMATION_PATREON_BROWSER_PUBLISHING_ENABLED)" = "false"' in (
+        enablement
+    )
+    assert "--assert-oauth1-configured" in enablement
+    assert enablement.index("--account-binding") < enablement.index('backup_env="$(/usr/bin/mktemp')
+    assert source.index('run_container_check --assert-safe-to-configure "$safe_message"') < (
+        source.index('if [ "$operation" = "--enable-publishing" ]')
+    )
+    assert enablement.index("--account-binding") < enablement.index(
+        'run_container_check --assert-safe-to-configure "$safe_message"'
+    )
+    assert "run_stopped_container_check --assert-safe-to-configure" in enablement
+    assert "--assert-publishing-enabled" in enablement
+    assert enablement.rindex("--assert-publishing-enabled") < enablement.rindex(
+        'run_container_check --assert-safe-to-configure "$safe_message"'
+    )
+    assert "/2/media" not in source
+    assert "/2/tweets" not in source
+    for forbidden in (
+        "set_publication_guard",
+        "create_publication_intent",
+        "create_publication_attempt",
+        "insert into publication",
+        "update publication_guard",
+    ):
+        assert forbidden not in source.lower()
+
+
+def test_host_enablement_changes_one_existing_env_assignment_atomically() -> None:
+    source = _read(HOST_HELPER)
+    enablement = source[source.index('if [ "$operation" = "--enable-publishing" ]') :]
+    enablement = enablement[: enablement.index("if runtime_values_match")]
+
+    assert 'mktemp "$config_root/.control-plane.env.x-publishing.rollback.XXXXXX"' in enablement
+    assert '/usr/bin/install -o root -g root -m 0600 "$controller_env" "$backup_env"' in (
+        enablement
+    )
+    assert 'key = "GEN_AUTOMATION_PUBLISHING_ENABLED"' in enablement
+    assert 'len(matches) != 1 or lines[matches[0]] != f"{key}=false"' in enablement
+    assert 'updated[matches[0]] = f"{key}=true"' in enablement
+    assert "len(lines) != len(updated)" in enablement
+    assert "enumerate(zip(lines, updated))" in enablement
+    assert "os.fchmod(descriptor, 0o600)" in enablement
+    assert "os.fchown(descriptor, 0, 0)" in enablement
+    assert "os.fsync(output.fileno())" in enablement
+    assert "os.replace(temporary, path)" in enablement
+    assert "os.fsync(directory)" in enablement
+    assert enablement.index('systemctl stop "$service_name"') < enablement.index(
+        "updated[matches[0]]"
+    )
+    assert enablement.index("updated[matches[0]]") < enablement.index(
+        'systemctl restart "$service_name"'
+    )
+    assert "rollback_armed=1" in enablement
+    assert "rollback_armed=0" in enablement
+    assert "GEN_AUTOMATION_PUBLISHING_ENABLED=false" in source
+    assert "wait_for_ready || rollback_failed=1" in source
+
+
 def test_powershell_helper_has_mutually_exclusive_validated_modes() -> None:
     source = _read(POWERSHELL_HELPER)
 
-    for name in ("DryRun", "Configure", "Canary"):
+    for name in ("DryRun", "Configure", "Canary", "EnablePublishing"):
         assert f'ParameterSetName = "{name}"' in source
     assert "ValueFromRemainingArguments = $true" in source
     assert "$RemainingArguments.Count -ne 0" in source
@@ -153,6 +236,32 @@ def test_powershell_helper_has_mutually_exclusive_validated_modes() -> None:
         "Authorization",
     ):
         assert credential_field not in source
+
+
+def test_powershell_enablement_submits_only_the_fixed_reviewed_operation() -> None:
+    source = _read(POWERSHELL_HELPER)
+    branch = source[source.index("elseif ($EnablePublishing)") :]
+    branch = branch[: branch.index("else {")]
+
+    assert '$remoteArguments = "--enable-publishing"' in branch
+    assert '$executionTimeout = "1200"' in branch
+    assert (
+        '$comment = "Enable staging publication orchestration for configured X runtime"' in branch
+    )
+    assert "$publishingEnabledOutput" in branch
+    assert "$publishingAlreadyEnabledOutput" in branch
+    assert "SecretArn" not in branch
+    assert "CreatorUserId" not in branch
+    assert (
+        '$publishingEnabledOutput = "Staging publication orchestration is enabled for the '
+        "configured X runtime. "
+        'Publication guard remains stopped and no publication effect is active."'
+    ) in source
+    assert (
+        '$publishingAlreadyEnabledOutput = "Staging publication orchestration was already '
+        "enabled for the configured X runtime. "
+        'Publication guard remains stopped and no publication effect is active."'
+    ) in source
 
 
 def test_powershell_helper_transfers_only_reviewed_bytes_with_integrity_check() -> None:

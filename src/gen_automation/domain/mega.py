@@ -6,6 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from gen_automation.domain.enums import MegaDeliveryState
 
+LEGACY_MEGA_SET_RETIREMENT_ERROR_CODE = "mega_set_legacy_media_retired"
+
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 
@@ -38,7 +40,8 @@ class MegaSetDeliveryItemRead(BaseModel):
     id: UUID
     delivery_id: UUID
     ordinal: int = Field(gt=0)
-    source_derivative_output_id: UUID
+    source_asset_id: UUID
+    readiness_derivative_output_id: UUID
     source_sha256: Sha256
     source_byte_size: int = Field(gt=0)
     source_content_type: str = Field(min_length=1, max_length=100)
@@ -72,6 +75,8 @@ class MegaSetDeliveryRead(BaseModel):
     uploaded_byte_size: int = Field(ge=0)
     attempts: int = Field(ge=0)
     available_at: datetime
+    next_retry_at: datetime | None = None
+    retired: bool = False
     completion_marker_node_handle: str | None = Field(default=None, max_length=80)
     planned_at: datetime | None = None
     started_at: datetime | None = None

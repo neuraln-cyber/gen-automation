@@ -16,7 +16,7 @@ import os
 import re
 import tempfile
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from itertools import pairwise
@@ -30,15 +30,19 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from gen_automation.db.models import (
+    Asset,
+    DerivativeOutput,
     FinishedSetArchive,
     FinishedSetArchivePart,
     MegaSetDelivery,
     MegaSetDeliveryItem,
     Release,
+    ReleaseSelection,
     ReleaseVersion,
 )
 from gen_automation.domain.canonical import canonical_json_bytes
 from gen_automation.domain.enums import FinishedSetArchiveState, MegaDeliveryState
+from gen_automation.domain.mega import LEGACY_MEGA_SET_RETIREMENT_ERROR_CODE
 from gen_automation.integrations.mega import (
     MegaError,
     MegaRemoteConflictError,
@@ -55,9 +59,14 @@ from gen_automation.services.outbound_image_privacy import (
 )
 from gen_automation.storage.base import ObjectStore, ObjectStoreError
 
-_SOURCE_MANIFEST_SCHEMA = "finished-set-manifest/v1"
-_SOURCE_PART_SCHEMA = "finished-set-part-manifest/v1"
-_REMOTE_MANIFEST_SCHEMA = "mega-extracted-set-manifest/v1"
+_LEGACY_SOURCE_MANIFEST_SCHEMA = "finished-set-manifest/v1"
+_PUBLIC_SOURCE_MANIFEST_SCHEMA = "finished-set-manifest/v2"
+_LEGACY_SOURCE_PART_SCHEMA = "finished-set-part-manifest/v1"
+_PUBLIC_SOURCE_PART_SCHEMA = "finished-set-part-manifest/v2"
+_LEGACY_REMOTE_MANIFEST_SCHEMA = "mega-extracted-set-manifest/v1"
+_PUBLIC_REMOTE_MANIFEST_SCHEMA = "mega-extracted-set-manifest/v2"
+_LEGACY_MEDIA_PROFILE = "legacy-full-derivative-v1"
+_PUBLIC_MEDIA_PROFILE = "public-png-v1"
 _COMPLETION_SCHEMA = "mega-extracted-set-completion/v1"
 _REMOTE_MANIFEST_FILENAME = "set-manifest.json"
 _COMPLETION_FILENAME = "upload-complete.json"
@@ -108,6 +117,8 @@ class ClaimedMegaSetDelivery:
     remote_root: str
     remote_folder: str
     attempt: int
+    uploaded_item_count_at_claim: int
+    prior_retry_delay_seconds: int
     lease_expires_at: datetime
 
 
@@ -155,7 +166,9 @@ class _SourcePart:
 @dataclass(frozen=True, slots=True)
 class _ManifestItem:
     ordinal: int
-    source_derivative_output_id: UUID
+    source_asset_id: UUID | None
+    readiness_derivative_output_id: UUID
+    frozen_source_sha256: str | None
     source_sha256: str
     source_byte_size: int
     source_content_type: str
@@ -170,6 +183,7 @@ class _DeliverySource:
     archive_id: UUID
     manifest_sha256: str
     selection_count: int
+    media_profile: str
     remote_folder: str
     source_manifest_bytes: bytes | None
     parts: tuple[_SourcePart, ...]
@@ -179,6 +193,7 @@ class _DeliverySource:
 class _ManifestPlan:
     source_bytes: bytes
     source_payload: dict[str, Any]
+    source_schema: str
     items: tuple[_ManifestItem, ...]
     total_byte_size: int
 
@@ -219,6 +234,7 @@ async def ensure_next_mega_set_delivery(
             .join(Release, Release.id == ReleaseVersion.release_id)
             .where(
                 FinishedSetArchive.state == FinishedSetArchiveState.READY,
+                FinishedSetArchive.media_profile == _PUBLIC_MEDIA_PROFILE,
                 FinishedSetArchive.mega_requested_at.is_not(None),
                 FinishedSetArchive.mega_requested_by_user_id.is_not(None),
                 FinishedSetArchive.mega_requested_remote_root.is_not(None),
@@ -247,8 +263,16 @@ async def ensure_next_mega_set_delivery(
         raise MegaSetDeliveryContractError("finished-set manifest identity is invalid")
     remote_folder = _remote_folder(
         normalized_root,
-        set_name=release_title,
+        set_name=(
+            f"{release_title} (PNG)"
+            if archive.media_profile == _PUBLIC_MEDIA_PROFILE
+            else release_title
+        ),
     )
+    if archive.media_profile != _PUBLIC_MEDIA_PROFILE:
+        raise MegaSetDeliveryContractError(
+            "legacy MEGA media is retired; start a full-resolution PNG delivery"
+        )
     session.add(
         MegaSetDelivery(
             finished_set_archive_id=archive.id,
@@ -309,6 +333,10 @@ async def request_mega_set_delivery(
     )
     if archive is None:
         raise MegaSetDeliveryContractError("finished-set archive disappeared during request")
+    if archive.media_profile != _PUBLIC_MEDIA_PROFILE:
+        raise MegaSetDeliveryContractError(
+            "legacy MEGA media is retired; start a full-resolution PNG delivery"
+        )
 
     delivery = await session.scalar(
         select(MegaSetDelivery)
@@ -330,6 +358,10 @@ async def request_mega_set_delivery(
     if delivery is not None and delivery.remote_root != normalized_root:
         raise MegaSetDeliveryContractError(
             "the existing MEGA delivery uses a different destination root"
+        )
+    if delivery is not None and delivery.last_error_code == LEGACY_MEGA_SET_RETIREMENT_ERROR_CODE:
+        raise MegaSetDeliveryContractError(
+            "legacy MEGA media is retired; start a full-resolution PNG delivery"
         )
     changed = request_is_absent
     if request_is_absent:
@@ -396,6 +428,8 @@ async def claim_mega_set_delivery(
     if delivery is None:
         await session.rollback()
         return None
+    prior_retry_delay_seconds = _stored_retry_delay_seconds(delivery)
+    uploaded_item_count_at_claim = delivery.uploaded_item_count
     delivery.state = MegaDeliveryState.CLAIMED
     delivery.attempts += 1
     delivery.lease_owner = normalized_worker
@@ -412,6 +446,8 @@ async def claim_mega_set_delivery(
         remote_root=delivery.remote_root,
         remote_folder=delivery.remote_folder,
         attempt=delivery.attempts,
+        uploaded_item_count_at_claim=uploaded_item_count_at_claim,
+        prior_retry_delay_seconds=prior_retry_delay_seconds,
         lease_expires_at=delivery.lease_expires_at,
     )
     await session.commit()
@@ -445,7 +481,7 @@ async def process_claimed_mega_set_delivery(
         max_part_bytes=max_part_bytes,
     )
     async with sessions() as session:
-        await _ensure_items_planned(
+        manifest_plan = await _ensure_items_planned(
             session,
             claim=claim,
             plan=manifest_plan,
@@ -672,11 +708,22 @@ async def run_mega_set_delivery_cycle(
             )
         return MegaSetDeliveryCycleResult(processed_delivery=True)
     except (MegaError, ObjectStoreError, OSError, BadZipFile, json.JSONDecodeError) as error:
-        retry_delay = min(
-            retry_max_seconds,
-            retry_base_seconds * (2 ** min(max(claim.attempt - 1, 0), 16)),
-        )
         async with sessions() as session:
+            uploaded_item_count = await session.scalar(
+                select(MegaSetDelivery.uploaded_item_count).where(
+                    MegaSetDelivery.id == claim.delivery_id
+                )
+            )
+            retry_delay = _next_retry_delay_seconds(
+                claim,
+                uploaded_item_count=(
+                    uploaded_item_count
+                    if uploaded_item_count is not None
+                    else claim.uploaded_item_count_at_claim
+                ),
+                retry_base_seconds=retry_base_seconds,
+                retry_max_seconds=retry_max_seconds,
+            )
             await fail_mega_set_delivery(
                 session,
                 claim=claim,
@@ -691,6 +738,30 @@ async def run_mega_set_delivery_cycle(
         completed_delivery=completed,
         uploaded_items=uploaded,
         adopted_items=adopted,
+    )
+
+
+def _stored_retry_delay_seconds(delivery: MegaSetDelivery) -> int:
+    if delivery.state != MegaDeliveryState.RETRY_WAIT:
+        return 0
+    delay = int((delivery.available_at - delivery.updated_at).total_seconds())
+    return min(max(delay, 0), 7 * 86400)
+
+
+def _next_retry_delay_seconds(
+    claim: ClaimedMegaSetDelivery,
+    *,
+    uploaded_item_count: int,
+    retry_base_seconds: int,
+    retry_max_seconds: int,
+) -> int:
+    if uploaded_item_count > claim.uploaded_item_count_at_claim:
+        return retry_base_seconds
+    if claim.prior_retry_delay_seconds <= 0:
+        return retry_base_seconds
+    return min(
+        retry_max_seconds,
+        max(retry_base_seconds, claim.prior_retry_delay_seconds * 2),
     )
 
 
@@ -723,6 +794,7 @@ async def _load_delivery_source(
         or archive.manifest_sha256 != claim.manifest_sha256
         or archive.selection_count != claim.total_item_count
         or archive.part_count is None
+        or archive.media_profile != _PUBLIC_MEDIA_PROFILE
     ):
         raise MegaSetDeliveryContractError("claimed MEGA set source changed")
     parts = tuple(
@@ -764,6 +836,7 @@ async def _load_delivery_source(
         archive_id=archive.id,
         manifest_sha256=claim.manifest_sha256,
         selection_count=archive.selection_count,
+        media_profile=archive.media_profile,
         remote_folder=claim.remote_folder,
         source_manifest_bytes=source_manifest_bytes,
         parts=tuple(
@@ -815,6 +888,12 @@ async def _load_manifest_plan(
         ) from error
     if not isinstance(payload, dict):
         raise MegaSetDeliveryContractError("finished-set archive manifest is invalid")
+    source_schema = payload.get("schema")
+    if source_schema not in {
+        _LEGACY_SOURCE_MANIFEST_SCHEMA,
+        _PUBLIC_SOURCE_MANIFEST_SCHEMA,
+    }:
+        raise MegaSetDeliveryContractError("finished-set archive manifest schema is unsupported")
     items = _manifest_items(
         payload,
         source=source,
@@ -822,6 +901,7 @@ async def _load_manifest_plan(
     return _ManifestPlan(
         source_bytes=manifest_bytes,
         source_payload=payload,
+        source_schema=source_schema,
         items=items,
         total_byte_size=sum(item.source_byte_size for item in items),
     )
@@ -832,14 +912,24 @@ def _manifest_items(
     *,
     source: _DeliverySource,
 ) -> tuple[_ManifestItem, ...]:
+    schema = payload.get("schema")
+    is_public = schema == _PUBLIC_SOURCE_MANIFEST_SCHEMA
     if (
-        payload.get("schema") != _SOURCE_MANIFEST_SCHEMA
+        schema not in {_LEGACY_SOURCE_MANIFEST_SCHEMA, _PUBLIC_SOURCE_MANIFEST_SCHEMA}
         or payload.get("archive_id") != str(source.archive_id)
         or payload.get("selection_count") != source.selection_count
         or payload.get("ordering") != "frozen_generation_queue"
         or payload.get("ordering_key") != ["generation_queue_position"]
     ):
         raise MegaSetDeliveryContractError("finished-set archive manifest identity is invalid")
+    if is_public:
+        if (
+            source.media_profile != _PUBLIC_MEDIA_PROFILE
+            or payload.get("media_profile") != _PUBLIC_MEDIA_PROFILE
+        ):
+            raise MegaSetDeliveryContractError("public PNG archive profile is invalid")
+    elif source.media_profile != _LEGACY_MEDIA_PROFILE:
+        raise MegaSetDeliveryContractError("legacy archive profile is invalid")
     raw_outputs = payload.get("outputs")
     if not isinstance(raw_outputs, list) or len(raw_outputs) != source.selection_count:
         raise MegaSetDeliveryContractError("finished-set archive manifest output count is invalid")
@@ -851,7 +941,11 @@ def _manifest_items(
         sha256 = raw.get("sha256")
         byte_size = raw.get("byte_size")
         content_type = raw.get("content_type")
-        output_id = raw.get("derivative_output_id")
+        output_id = raw.get(
+            "readiness_derivative_output_id" if is_public else "derivative_output_id"
+        )
+        source_asset_value = raw.get("source_asset_id") if is_public else None
+        frozen_source_sha256 = raw.get("source_sha256") if is_public else None
         if not isinstance(source_path, str):
             raise MegaSetDeliveryContractError("finished-set output path is invalid")
         path_match = _CONTENT_PATH.fullmatch(source_path)
@@ -860,22 +954,49 @@ def _manifest_items(
         extension = path_match.group(2)
         if content_type != _CONTENT_TYPES[extension]:
             raise MegaSetDeliveryContractError("finished-set output content type is invalid")
+        if is_public and (
+            extension != "png"
+            or content_type != "image/png"
+            or raw.get("image_format") != "PNG"
+            or isinstance(raw.get("width"), bool)
+            or not isinstance(raw.get("width"), int)
+            or raw["width"] <= 0
+            or isinstance(raw.get("height"), bool)
+            or not isinstance(raw.get("height"), int)
+            or raw["height"] <= 0
+        ):
+            raise MegaSetDeliveryContractError("public finished-set output is not a PNG master")
         if not isinstance(sha256, str) or _SHA256.fullmatch(sha256) is None:
             raise MegaSetDeliveryContractError("finished-set output checksum is invalid")
+        if is_public and (
+            not isinstance(frozen_source_sha256, str)
+            or _SHA256.fullmatch(frozen_source_sha256) is None
+        ):
+            raise MegaSetDeliveryContractError("finished-set frozen source checksum is invalid")
         if isinstance(byte_size, bool) or not isinstance(byte_size, int) or byte_size <= 0:
             raise MegaSetDeliveryContractError("finished-set output byte size is invalid")
         try:
-            derivative_output_id = UUID(str(output_id))
+            readiness_output_id = UUID(str(output_id))
         except (TypeError, ValueError):
             raise MegaSetDeliveryContractError(
                 "finished-set derivative output identity is invalid"
             ) from None
+        source_asset_id: UUID | None = None
+        if is_public:
+            try:
+                source_asset_id = UUID(str(source_asset_value))
+            except (TypeError, ValueError):
+                raise MegaSetDeliveryContractError(
+                    "finished-set source asset identity is invalid"
+                ) from None
         remote_filename = validate_remote_filename(PurePosixPath(source_path).name)
         part = _part_for_ordinal(source.parts, expected_ordinal)
         items.append(
             _ManifestItem(
                 ordinal=expected_ordinal,
-                source_derivative_output_id=derivative_output_id,
+                source_asset_id=source_asset_id,
+                readiness_derivative_output_id=readiness_output_id,
+                frozen_source_sha256=frozen_source_sha256,
                 source_sha256=sha256,
                 source_byte_size=byte_size,
                 source_content_type=content_type,
@@ -896,13 +1017,14 @@ async def _ensure_items_planned(
     worker_id: str,
     lease_seconds: int,
     now: datetime,
-) -> None:
+) -> _ManifestPlan:
     delivery = await _locked_owned_delivery(
         session,
         claim=claim,
         worker_id=worker_id,
         now=now,
     )
+    expected_items = await _resolve_manifest_source_assets(session, plan.items)
     existing = tuple(
         (
             await session.scalars(
@@ -917,10 +1039,10 @@ async def _ensure_items_planned(
             delivery.total_byte_size != plan.total_byte_size
             or delivery.source_manifest_json != plan.source_bytes.decode("utf-8")
             or delivery.planned_at is None
-            or len(existing) != len(plan.items)
+            or len(existing) != len(expected_items)
             or any(
                 not _item_matches(item, expected)
-                for item, expected in zip(existing, plan.items, strict=True)
+                for item, expected in zip(existing, expected_items, strict=True)
             )
         ):
             raise MegaSetDeliveryContractError("MEGA set transfer plan changed")
@@ -931,12 +1053,14 @@ async def _ensure_items_planned(
             or delivery.planned_at is not None
         ):
             raise MegaSetDeliveryContractError("MEGA set transfer plan is incomplete")
-        for expected in plan.items:
+        for expected in expected_items:
+            assert expected.source_asset_id is not None
             session.add(
                 MegaSetDeliveryItem(
                     delivery_id=delivery.id,
                     ordinal=expected.ordinal,
-                    source_derivative_output_id=expected.source_derivative_output_id,
+                    source_asset_id=expected.source_asset_id,
+                    readiness_derivative_output_id=expected.readiness_derivative_output_id,
                     source_sha256=expected.source_sha256,
                     source_byte_size=expected.source_byte_size,
                     source_content_type=expected.source_content_type,
@@ -964,6 +1088,79 @@ async def _ensure_items_planned(
     except IntegrityError as error:
         await session.rollback()
         raise MegaSetDeliveryContractError("MEGA set transfer plan conflicts") from error
+    return replace(plan, items=expected_items)
+
+
+async def _resolve_manifest_source_assets(
+    session: AsyncSession,
+    items: tuple[_ManifestItem, ...],
+) -> tuple[_ManifestItem, ...]:
+    readiness_ids = {item.readiness_derivative_output_id for item in items}
+    rows = (
+        await session.execute(
+            select(
+                DerivativeOutput.id,
+                DerivativeOutput.source_asset_id,
+                DerivativeOutput.target,
+                Asset.sha256,
+                ReleaseSelection.asset_id,
+                ReleaseSelection.source_sha256,
+            )
+            .join(Asset, Asset.id == DerivativeOutput.source_asset_id)
+            .join(
+                ReleaseSelection,
+                ReleaseSelection.id == DerivativeOutput.release_selection_id,
+            )
+            .where(DerivativeOutput.id.in_(readiness_ids))
+        )
+    ).all()
+    provenance = {
+        output_id: (
+            source_asset_id,
+            target,
+            asset_sha256,
+            selection_asset_id,
+            selection_source_sha256,
+        )
+        for (
+            output_id,
+            source_asset_id,
+            target,
+            asset_sha256,
+            selection_asset_id,
+            selection_source_sha256,
+        ) in rows
+    }
+    if set(provenance) != readiness_ids:
+        raise MegaSetDeliveryContractError(
+            "finished-set readiness derivative provenance is unavailable"
+        )
+    resolved: list[_ManifestItem] = []
+    for item in items:
+        (
+            source_asset_id,
+            target,
+            asset_sha256,
+            selection_asset_id,
+            selection_source_sha256,
+        ) = provenance[item.readiness_derivative_output_id]
+        if (
+            target != "full"
+            or selection_asset_id != source_asset_id
+            or (item.source_asset_id is not None and item.source_asset_id != source_asset_id)
+            or (
+                item.frozen_source_sha256 is not None
+                and (
+                    item.frozen_source_sha256 != asset_sha256
+                    or item.frozen_source_sha256 != selection_source_sha256
+                )
+            )
+        ):
+            raise MegaSetDeliveryContractError(
+                "finished-set readiness derivative does not match its frozen source asset"
+            )
+        resolved.append(replace(item, source_asset_id=source_asset_id))
+    return tuple(resolved)
 
 
 async def _load_items(
@@ -1404,8 +1601,13 @@ def _validate_part_manifest(
     if not isinstance(payload, dict):
         raise MegaSetDeliveryContractError("finished-set part manifest is invalid")
     expected_outputs = plan.source_payload["outputs"][part.first_ordinal - 1 : part.last_ordinal]
+    expected_schema = (
+        _PUBLIC_SOURCE_PART_SCHEMA
+        if plan.source_schema == _PUBLIC_SOURCE_MANIFEST_SCHEMA
+        else _LEGACY_SOURCE_PART_SCHEMA
+    )
     if (
-        payload.get("schema") != _SOURCE_PART_SCHEMA
+        payload.get("schema") != expected_schema
         or payload.get("archive_id") != str(plan.source_payload["archive_id"])
         or payload.get("set_manifest_sha256") != hashlib.sha256(plan.source_bytes).hexdigest()
         or payload.get("part_number") != part.part_number
@@ -1446,8 +1648,12 @@ def _remote_manifest_bytes(
         output["source_archive_path"] = output["path"]
         output["path"] = PurePosixPath(output["path"]).name
         outputs.append(output)
-    payload["schema"] = _REMOTE_MANIFEST_SCHEMA
-    payload["source_manifest_schema"] = _SOURCE_MANIFEST_SCHEMA
+    payload["schema"] = (
+        _PUBLIC_REMOTE_MANIFEST_SCHEMA
+        if plan.source_schema == _PUBLIC_SOURCE_MANIFEST_SCHEMA
+        else _LEGACY_REMOTE_MANIFEST_SCHEMA
+    )
+    payload["source_manifest_schema"] = plan.source_schema
     payload["source_manifest_sha256"] = claim.manifest_sha256
     payload["delivery_id"] = str(claim.delivery_id)
     payload["remote_layout"] = "flat_generation_queue"
@@ -1458,7 +1664,8 @@ def _remote_manifest_bytes(
 def _item_matches(item: MegaSetDeliveryItem, expected: _ManifestItem) -> bool:
     return (
         item.ordinal == expected.ordinal
-        and item.source_derivative_output_id == expected.source_derivative_output_id
+        and item.source_asset_id == expected.source_asset_id
+        and item.readiness_derivative_output_id == expected.readiness_derivative_output_id
         and item.source_sha256 == expected.source_sha256
         and item.source_byte_size == expected.source_byte_size
         and item.source_content_type == expected.source_content_type

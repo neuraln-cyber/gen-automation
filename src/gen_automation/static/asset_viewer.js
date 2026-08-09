@@ -274,6 +274,58 @@
     select.dataset.assetViewerSelect = "";
     select.setAttribute("aria-pressed", "false");
     select.hidden = true;
+    const bulk = createElement("section", "asset-viewer-bulk");
+    bulk.dataset.assetViewerBulk = "";
+    bulk.setAttribute("role", "group");
+    bulk.setAttribute("aria-label", "Actions for selected images");
+    bulk.hidden = true;
+    const bulkHeading = createElement("div", "asset-viewer-bulk-heading");
+    const bulkCount = createElement("strong", "asset-viewer-bulk-count", "0 images selected");
+    bulkCount.dataset.assetViewerBulkCount = "";
+    bulkCount.setAttribute("role", "status");
+    bulkCount.setAttribute("aria-live", "polite");
+    const bulkClear = createElement("button", "asset-viewer-bulk-clear", "Clear");
+    bulkClear.type = "button";
+    bulkClear.dataset.assetViewerBulkClear = "";
+    bulkClear.disabled = true;
+    bulkHeading.append(bulkCount, bulkClear);
+    const bulkWarning = createElement("p", "asset-viewer-bulk-warning");
+    bulkWarning.id = "asset-viewer-bulk-warning";
+    bulkWarning.dataset.assetViewerBulkWarning = "";
+    bulkWarning.setAttribute("role", "status");
+    bulkWarning.setAttribute("aria-live", "polite");
+    bulkWarning.hidden = true;
+    const bulkActions = createElement("div", "asset-viewer-bulk-actions");
+    const bulkAccept = createElement(
+      "button",
+      "asset-viewer-bulk-action accept",
+      "Accept selected",
+    );
+    bulkAccept.type = "button";
+    bulkAccept.dataset.assetViewerBulkAction = "accept";
+    const bulkReject = createElement(
+      "button",
+      "asset-viewer-bulk-action reject",
+      "Reject selected",
+    );
+    bulkReject.type = "button";
+    bulkReject.dataset.assetViewerBulkAction = "reject";
+    const bulkXAdd = createElement(
+      "button",
+      "asset-viewer-bulk-action x-add",
+      "Mark selected for X",
+    );
+    bulkXAdd.type = "button";
+    bulkXAdd.dataset.assetViewerBulkAction = "x_add";
+    const bulkXRemove = createElement(
+      "button",
+      "asset-viewer-bulk-action x-remove",
+      "Unmark selected from X",
+    );
+    bulkXRemove.type = "button";
+    bulkXRemove.dataset.assetViewerBulkAction = "x_remove";
+    bulkActions.append(bulkAccept, bulkReject, bulkXAdd, bulkXRemove);
+    bulk.append(bulkHeading, bulkWarning, bulkActions);
     const settings = createElement("button", "asset-viewer-settings", "Prompt & settings");
     settings.type = "button";
     settings.dataset.assetViewerSettings = "";
@@ -305,6 +357,7 @@
       anatomyReject,
       defectPicker,
       select,
+      bulk,
       more,
     );
 
@@ -314,6 +367,14 @@
     return {
       close,
       anatomyReject,
+      bulk,
+      bulkAccept,
+      bulkClear,
+      bulkCount,
+      bulkReject,
+      bulkWarning,
+      bulkXAdd,
+      bulkXRemove,
       copyClean,
       counter,
       dialog,
@@ -863,6 +924,86 @@
       );
     };
 
+    const viewerBulkButtons = Object.freeze({
+      accept: viewer.bulkAccept,
+      reject: viewer.bulkReject,
+      x_add: viewer.bulkXAdd,
+      x_remove: viewer.bulkXRemove,
+    });
+
+    const bulkActionForm = () => {
+      const form = document.querySelector("[data-bulk-action-form]");
+      return form instanceof HTMLFormElement ? form : null;
+    };
+
+    const bulkActionButton = (form, action) => {
+      const button = form?.querySelector(`button[name="action"][value="${action}"]`);
+      return button instanceof HTMLButtonElement ? button : null;
+    };
+
+    const selectedBulkInputs = (form) => Array.from(
+      document.querySelectorAll('input[type="checkbox"][name="asset_id"]:checked'),
+    ).filter((input) => input instanceof HTMLInputElement && input.form === form);
+
+    const syncViewerBulkControls = () => {
+      const form = bulkActionForm();
+      const currentSelection = activeCard?.querySelector(
+        'input[type="checkbox"][name="asset_id"]',
+      );
+      const selectedInputs = form ? selectedBulkInputs(form) : [];
+      const selected = selectedInputs.length;
+      const hiddenSelected = selectedInputs.filter((input) => {
+        const card = input.closest(".asset-card");
+        return card instanceof HTMLElement && card.hidden;
+      }).length;
+
+      viewer.select.hidden = !(currentSelection instanceof HTMLInputElement);
+      viewer.select.setAttribute(
+        "aria-pressed",
+        String(Boolean(currentSelection instanceof HTMLInputElement && currentSelection.checked)),
+      );
+      viewer.select.textContent = currentSelection instanceof HTMLInputElement && currentSelection.checked
+        ? "Remove current from selection"
+        : "Add current to selection";
+
+      viewer.bulk.hidden = !form;
+      if (!form) return;
+
+      const countMessage = (
+        `${selected} image${selected === 1 ? "" : "s"} selected`
+        + (hiddenSelected ? ` \u00b7 ${hiddenSelected} hidden by filter` : "")
+      );
+      if (viewer.bulkCount.textContent !== countMessage) {
+        viewer.bulkCount.textContent = countMessage;
+      }
+      viewer.bulkClear.disabled = selected === 0;
+
+      const sourceWarning = form.querySelector("[data-bulk-selection-status]");
+      const warning = sourceWarning instanceof HTMLElement && !sourceWarning.hidden
+        ? sourceWarning.textContent.trim()
+        : "";
+      if (viewer.bulkWarning.textContent !== warning) viewer.bulkWarning.textContent = warning;
+      viewer.bulkWarning.hidden = !warning;
+
+      Object.entries(viewerBulkButtons).forEach(([action, proxy]) => {
+        const original = bulkActionButton(form, action);
+        proxy.hidden = !original;
+        proxy.disabled = !original || original.disabled;
+        if (warning && proxy.disabled) {
+          proxy.setAttribute("aria-describedby", viewer.bulkWarning.id);
+        } else {
+          proxy.removeAttribute("aria-describedby");
+        }
+      });
+    };
+
+    const submitViewerBulkAction = (action) => {
+      const form = bulkActionForm();
+      const original = bulkActionButton(form, action);
+      if (!form || !original || original.disabled) return;
+      form.requestSubmit(original);
+    };
+
     const closeViewer = () => {
       if (!viewer.dialog.open) return;
       if (activeCard) queueInspection(activeCard);
@@ -921,12 +1062,7 @@
       }
       updateCleanControls(Boolean(details.source || details.downloadHref));
 
-      const selection = activeCard.querySelector('input[type="checkbox"][name="asset_id"]');
-      viewer.select.hidden = !selection;
-      viewer.select.setAttribute("aria-pressed", String(Boolean(selection && selection.checked)));
-      viewer.select.textContent = selection && selection.checked
-        ? "Selected for bulk action"
-        : "Select for bulk action";
+      syncViewerBulkControls();
       viewer.settings.hidden = !activeCard.querySelector("[data-generation-details]");
       viewer.more.open = false;
       updateRejectionControls();
@@ -1108,7 +1244,24 @@
           (candidate) => candidate.dataset.assetId === activeAssetId,
         );
         if (refreshedCard) renderCard(refreshedCard);
+        const focusCardIsUsable = activeCard instanceof HTMLElement
+          && activeCard.isConnected
+          && isVisible(activeCard);
+        const activeTrigger = focusCardIsUsable ? triggerFor(activeCard) : null;
+        const reviewLauncher = document.querySelector("[data-open-review-viewer]");
+        returnFocus = activeTrigger instanceof HTMLElement && activeTrigger.isConnected
+          ? activeTrigger
+          : reviewLauncher instanceof HTMLElement && reviewLauncher.isConnected
+            ? reviewLauncher
+            : null;
       }
+      syncViewerBulkControls();
+    });
+    document.addEventListener("gen-automation:bulk-selection-changed", syncViewerBulkControls);
+    document.addEventListener("submit", (event) => {
+      if (!(event.target instanceof HTMLFormElement)
+          || !event.target.matches("[data-bulk-action-form]")) return;
+      window.queueMicrotask(syncViewerBulkControls);
     });
     document.addEventListener("gen-automation:review-action-optimistic", (event) => {
       const detail = event.detail || {};
@@ -1118,6 +1271,7 @@
     });
     document.addEventListener("gen-automation:review-action-settled", (event) => {
       const detail = event.detail || {};
+      syncViewerBulkControls();
       if (detail.success) return;
       if (viewer.dialog.open) {
         announce(
@@ -1166,10 +1320,15 @@
       if (!selection) return;
       selection.checked = !selection.checked;
       selection.dispatchEvent(new Event("change", { bubbles: true }));
-      viewer.select.setAttribute("aria-pressed", String(selection.checked));
-      viewer.select.textContent = selection.checked
-        ? "Selected for bulk action"
-        : "Select for bulk action";
+      syncViewerBulkControls();
+    });
+    Object.entries(viewerBulkButtons).forEach(([action, button]) => {
+      button.addEventListener("click", () => submitViewerBulkAction(action));
+    });
+    viewer.bulkClear.addEventListener("click", () => {
+      const clear = bulkActionForm()?.querySelector("[data-clear-selection]");
+      if (clear instanceof HTMLButtonElement) clear.click();
+      syncViewerBulkControls();
     });
     viewer.settings.addEventListener("click", () => {
       if (!activeCard) return;

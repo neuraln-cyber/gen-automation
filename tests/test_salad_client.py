@@ -12,6 +12,7 @@ from gen_automation.integrations.salad import (
     JSONObject,
     SaladAPIError,
     SaladClient,
+    SaladContainerGroupInstanceState,
     SaladJobStatus,
     SaladProtocolError,
     SaladRateLimitError,
@@ -302,6 +303,43 @@ async def test_queue_and_container_group_mutations_use_documented_methods() -> N
             None,
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_list_container_instances_accepts_minimal_documented_payload() -> None:
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        assert request.method == "GET"
+        assert str(request.url) == (
+            f"{SALAD_API_BASE_URL}/organizations/creator-org/projects/production/"
+            "containers/worker%20v1/instances"
+        )
+        return httpx2.Response(
+            200,
+            json={
+                "instances": [
+                    {
+                        "id": "instance-provider-native-id",
+                        "machine_id": "machine-provider-native-id",
+                        "state": "running",
+                        "update_time": "2026-08-09T12:00:00Z",
+                        "version": 7,
+                    }
+                ]
+            },
+        )
+
+    async with mocked_salad_client(handler) as client:
+        page = await client.list_container_group_instances("worker v1")
+
+    assert len(page.instances) == 1
+    instance = page.instances[0]
+    assert instance.id == "instance-provider-native-id"
+    assert instance.machine_id == "machine-provider-native-id"
+    assert instance.state == SaladContainerGroupInstanceState.RUNNING
+    assert instance.update_time.isoformat() == "2026-08-09T12:00:00+00:00"
+    assert instance.version == 7
+    assert instance.ready is None
+    assert instance.started is None
 
 
 @pytest.mark.asyncio

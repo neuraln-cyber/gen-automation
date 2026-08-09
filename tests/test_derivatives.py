@@ -8,6 +8,8 @@ from PIL import Image, ImageChops, ImageDraw, PngImagePlugin
 
 from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.deliverability import (
+    MAX_PIPELINE_MASTER_HEIGHT,
+    MAX_PIPELINE_MASTER_WIDTH,
     PATREON_MAX_IMAGE_BYTES,
     PATREON_MAX_TOTAL_IMAGE_BYTES,
     DeliverabilityError,
@@ -17,6 +19,7 @@ from gen_automation.services.derivatives import (
     DEFAULT_DERIVATIVE_LIMITS,
     DERIVATIVE_RENDERER_VERSION,
     LEGACY_DERIVATIVE_RENDERER_VERSION,
+    PREVIOUS_DERIVATIVE_RENDERER_VERSION,
     BlurCensor,
     DerivativeInputError,
     DerivativeRecipe,
@@ -33,6 +36,7 @@ from gen_automation.services.derivatives import (
     TeaserFitMode,
     WatermarkPosition,
     WatermarkSpec,
+    XStaticImagePngTooLargeError,
     XTeaserSpec,
     derivative_recipe_sha256,
     estimate_derivative_peak_working_set_bytes,
@@ -114,6 +118,20 @@ def _png_recipe(
             encoding=PngEncoding(),
         ),
         watermark=watermark,
+    )
+
+
+def _x_lossless_png_recipe(position: WatermarkPosition) -> DerivativeRecipe:
+    return DerivativeRecipe(
+        x_teaser=XTeaserSpec(
+            output_filename="x-teaser.png",
+            width=MAX_PIPELINE_MASTER_WIDTH,
+            height=MAX_PIPELINE_MASTER_HEIGHT,
+            fit_mode=TeaserFitMode.DOWNSCALE,
+            allow_upscale=False,
+            encoding=PngEncoding(compress_level=6),
+        ),
+        watermark=WatermarkSpec(position=position),
     )
 
 
@@ -233,6 +251,168 @@ def test_default_jpeg_derivatives_are_byte_deterministic() -> None:
         artifact.sha256 for artifact in second.artifacts
     )
     assert all(artifact.image_format is OutputFormat.JPEG for artifact in first.artifacts)
+
+
+@pytest.mark.parametrize("position", tuple(WatermarkPosition))
+def test_lossless_x_profile_preserves_source_pixels_and_watermark_corner(
+    position: WatermarkPosition,
+) -> None:
+    source = Image.new("RGB", (1800, 900), (10, 40, 180))
+    master = _encode(source)
+    source.close()
+
+    artifact = _artifact(
+        render_platform_derivatives(
+            master,
+            recipe=_x_lossless_png_recipe(position),
+            watermark_png=_watermark(),
+            targets=(DerivativeTarget.X_TEASER,),
+        ),
+        DerivativeTarget.X_TEASER,
+    )
+
+    assert (artifact.width, artifact.height) == (1800, 900)
+    assert artifact.image_format is OutputFormat.PNG
+    assert artifact.content_type == "image/png"
+    assert artifact.extension == "png"
+    assert artifact.data.startswith(b"\x89PNG\r\n\x1a\n")
+    with _decoded(master) as plain, _decoded(artifact.data) as marked:
+        difference = ImageChops.difference(plain, marked)
+        try:
+            bounds = difference.getbbox()
+        finally:
+            difference.close()
+    assert bounds is not None
+    if position in {WatermarkPosition.TOP_LEFT, WatermarkPosition.BOTTOM_LEFT}:
+        assert bounds[0] < artifact.width // 2
+    else:
+        assert bounds[0] > artifact.width // 2
+    if position in {WatermarkPosition.TOP_LEFT, WatermarkPosition.TOP_RIGHT}:
+        assert bounds[1] < artifact.height // 2
+    else:
+        assert bounds[1] > artifact.height // 2
+
+
+def test_lossless_x_png_over_five_mib_fails_without_jpeg_or_downscale_fallback() -> None:
+    width = height = 1536
+    random_pixels = hashlib.shake_256(b"x-lossless-png-over-cap").digest(width * height * 3)
+    source = Image.frombytes("RGB", (width, height), random_pixels)
+    master = _encode(source)
+    source.close()
+    assert len(master) > DEFAULT_DERIVATIVE_LIMITS.max_x_teaser_bytes
+
+    with pytest.raises(
+        XStaticImagePngTooLargeError,
+        match="automatic JPEG conversion and downscaling are forbidden",
+    ):
+        render_platform_derivatives(
+            master,
+            recipe=_x_lossless_png_recipe(WatermarkPosition.BOTTOM_RIGHT),
+            watermark_png=_watermark(),
+            targets=(DerivativeTarget.X_TEASER,),
+        )
+
+
+def test_lossless_x_png_retries_maximum_lossless_compression_before_failing() -> None:
+    source = _pattern((512, 512))
+    master = _encode(source)
+    source.close()
+    watermark = _watermark()
+    level_six_recipe = _x_lossless_png_recipe(WatermarkPosition.BOTTOM_RIGHT)
+    level_nine_recipe = replace(
+        level_six_recipe,
+        x_teaser=replace(
+            level_six_recipe.x_teaser,
+            encoding=PngEncoding(compress_level=9),
+        ),
+    )
+    level_six = _artifact(
+        render_platform_derivatives(
+            master,
+            recipe=level_six_recipe,
+            watermark_png=watermark,
+            targets=(DerivativeTarget.X_TEASER,),
+        ),
+        DerivativeTarget.X_TEASER,
+    )
+    level_nine = _artifact(
+        render_platform_derivatives(
+            master,
+            recipe=level_nine_recipe,
+            watermark_png=watermark,
+            targets=(DerivativeTarget.X_TEASER,),
+        ),
+        DerivativeTarget.X_TEASER,
+    )
+    assert level_nine.byte_size < level_six.byte_size
+
+    optimized = _artifact(
+        render_platform_derivatives(
+            master,
+            recipe=level_six_recipe,
+            watermark_png=watermark,
+            targets=(DerivativeTarget.X_TEASER,),
+            limits=replace(
+                DEFAULT_DERIVATIVE_LIMITS,
+                max_x_teaser_bytes=level_nine.byte_size,
+            ),
+        ),
+        DerivativeTarget.X_TEASER,
+    )
+
+    assert optimized.data == level_nine.data
+    assert "x-cap-png-compress-level:9" in optimized.lineage.operations
+    assert not any(
+        operation.startswith("x-cap-downscale") for operation in optimized.lineage.operations
+    )
+    with pytest.raises(DerivativeRenderError, match="exceeds the output byte limit"):
+        render_platform_derivatives(
+            master,
+            recipe=level_six_recipe,
+            watermark_png=watermark,
+            targets=(DerivativeTarget.X_TEASER,),
+            limits=replace(
+                DEFAULT_DERIVATIVE_LIMITS,
+                max_x_teaser_bytes=level_nine.byte_size,
+            ),
+            renderer_version=PREVIOUS_DERIVATIVE_RENDERER_VERSION,
+        )
+
+
+@pytest.mark.parametrize(
+    "renderer_version",
+    (LEGACY_DERIVATIVE_RENDERER_VERSION, PREVIOUS_DERIVATIVE_RENDERER_VERSION),
+)
+def test_frozen_legacy_jpeg_x_recipe_still_executes(renderer_version: str) -> None:
+    source = _pattern((1800, 900))
+    master = _encode(source)
+    source.close()
+    legacy_recipe = DerivativeRecipe(
+        x_teaser=XTeaserSpec(
+            output_filename="x-teaser.jpg",
+            width=1600,
+            height=1600,
+            fit_mode=TeaserFitMode.DOWNSCALE,
+            encoding=JpegEncoding(quality=91),
+        ),
+        watermark=WatermarkSpec(position=WatermarkPosition.TOP_LEFT),
+    )
+
+    artifact = _artifact(
+        render_platform_derivatives(
+            master,
+            recipe=legacy_recipe,
+            watermark_png=_watermark(),
+            targets=(DerivativeTarget.X_TEASER,),
+            renderer_version=renderer_version,
+        ),
+        DerivativeTarget.X_TEASER,
+    )
+
+    assert artifact.image_format is OutputFormat.JPEG
+    assert artifact.content_type == "image/jpeg"
+    assert artifact.extension == "jpg"
+    assert (artifact.width, artifact.height) == (1600, 800)
 
 
 def test_x_jpeg_adapts_deterministically_to_the_media_byte_cap() -> None:
@@ -491,8 +671,18 @@ def test_peak_working_set_estimate_is_conservative_and_alpha_sensitive() -> None
         recipe=recipe,
         limits=DEFAULT_DERIVATIVE_LIMITS,
     )
-    oversized = estimate_derivative_peak_working_set_bytes(
+    maximum_admitted = estimate_derivative_peak_working_set_bytes(
         source_width=4000,
+        source_height=3000,
+        source_mode="RGBA",
+        source_has_alpha=True,
+        master_byte_size=32 * 1024 * 1024,
+        watermark_byte_size=4 * 1024 * 1024,
+        recipe=DerivativeRecipe(watermark=WatermarkSpec()),
+        limits=DEFAULT_DERIVATIVE_LIMITS,
+    )
+    oversized = estimate_derivative_peak_working_set_bytes(
+        source_width=5000,
         source_height=3000,
         source_mode="RGBA",
         source_has_alpha=True,
@@ -504,6 +694,7 @@ def test_peak_working_set_estimate_is_conservative_and_alpha_sensitive() -> None
 
     assert opaque <= DEFAULT_DERIVATIVE_LIMITS.max_peak_working_set_bytes
     assert opaque < alpha <= DEFAULT_DERIVATIVE_LIMITS.max_peak_working_set_bytes
+    assert maximum_admitted <= DEFAULT_DERIVATIVE_LIMITS.max_peak_working_set_bytes
     assert oversized > DEFAULT_DERIVATIVE_LIMITS.max_peak_working_set_bytes
 
 
@@ -810,6 +1001,54 @@ def test_legacy_renderer_preserves_full_watermark_canvas_geometry() -> None:
             assert difference.getbbox() == (40, 50, 100, 70)
         finally:
             difference.close()
+
+
+def test_previous_v5_renderer_preserves_trimmed_watermark_geometry() -> None:
+    source_image = Image.new("RGB", (400, 200), (10, 40, 180))
+    master = _encode(source_image)
+    source_image.close()
+    padded_watermark = Image.new("RGBA", (100, 80), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(padded_watermark)
+    draw.rectangle((20, 30, 79, 49), fill=(255, 32, 32, 255))
+    watermark = _encode(padded_watermark)
+    padded_watermark.close()
+    recipe = _png_recipe(
+        teaser=XTeaserSpec(
+            output_filename="teaser.png",
+            width=400,
+            height=200,
+            encoding=PngEncoding(),
+        ),
+        watermark=WatermarkSpec(
+            width=250_000,
+            margin=100_000,
+            opacity=255,
+            position=WatermarkPosition.TOP_LEFT,
+        ),
+    )
+
+    current = _artifact(
+        render_platform_derivatives(
+            master,
+            recipe=recipe,
+            watermark_png=watermark,
+            targets=(DerivativeTarget.X_TEASER,),
+        ),
+        DerivativeTarget.X_TEASER,
+    )
+    previous = _artifact(
+        render_platform_derivatives(
+            master,
+            recipe=recipe,
+            watermark_png=watermark,
+            targets=(DerivativeTarget.X_TEASER,),
+            renderer_version=PREVIOUS_DERIVATIVE_RENDERER_VERSION,
+        ),
+        DerivativeTarget.X_TEASER,
+    )
+
+    assert previous.data == current.data
+    assert previous.lineage.renderer_version == PREVIOUS_DERIVATIVE_RENDERER_VERSION
 
 
 @pytest.mark.parametrize(

@@ -16,6 +16,9 @@ region="eu-central-1"
 safe_message="Publication is stopped and no publication effect is active."
 configured_message="The running controller has the exact OAuth 1.0a runtime settings."
 binding_message="X OAuth 1.0a account binding passed. No media was uploaded and no post was created."
+publishing_runtime_message="The running controller has publication orchestration enabled and the Patreon browser driver disabled."
+publishing_enabled_message="Staging publication orchestration is enabled for the configured X runtime. Publication guard remains stopped and no publication effect is active."
+publishing_already_enabled_message="Staging publication orchestration was already enabled for the configured X runtime. Publication guard remains stopped and no publication effect is active."
 backup_env=""
 rollback_armed=0
 validator_backup=""
@@ -90,6 +93,19 @@ run_container_check() {
       python3.12 -m gen_automation.x_runtime_check_cli "$mode" "$@" 2>/dev/null
   )" || fail "the bounded controller check did not pass"
   [ "$output" = "$expected" ] || fail "the bounded controller check returned an invalid result"
+}
+
+run_stopped_container_check() {
+  local mode="$1"
+  local expected="$2"
+  local output
+  shift 2
+  output="$(
+    compose run --rm --no-deps --no-TTY control-plane-mega \
+      python3.12 -m gen_automation.x_runtime_check_cli "$mode" "$@" 2>/dev/null
+  )" || fail "the bounded stopped-controller check did not pass"
+  [ "$output" = "$expected" ] ||
+    fail "the bounded stopped-controller check returned an invalid result"
 }
 
 runtime_values_match() {
@@ -199,6 +215,11 @@ cleanup() {
   if [ "$status" -ne 0 ] && [ "$rollback_armed" -eq 1 ] && [ -n "$backup_env" ]; then
     printf '%s\n' "The configuration change did not become healthy; restoring the previous file." >&2
     restore_backup_atomically || rollback_failed=1
+    if [ "$rollback_failed" -eq 0 ] && [ "$operation" = "--enable-publishing" ]; then
+      [ "$(/usr/bin/grep -Fxc 'GEN_AUTOMATION_PUBLISHING_ENABLED=false' "$controller_env" || true)" -eq 1 ] &&
+        [ "$(/usr/bin/grep -Ec '^GEN_AUTOMATION_PUBLISHING_ENABLED=' "$controller_env" || true)" -eq 1 ] ||
+        rollback_failed=1
+    fi
     if [ "$rollback_failed" -eq 0 ]; then
       validate_deployment || rollback_failed=1
     fi
@@ -258,6 +279,13 @@ case "$operation" in
     validator_candidate=""
     validator_candidate_sha256=""
     ;;
+  --enable-publishing)
+    [ "$#" -eq 0 ] || fail "enable-publishing accepts no values"
+    secret_arn=""
+    creator_user_id=""
+    validator_candidate=""
+    validator_candidate_sha256=""
+    ;;
   *) fail "the requested operation is not allowed" ;;
 esac
 
@@ -311,6 +339,125 @@ if [ "$operation" = "--canary" ]; then
   [[ "$configured_id" =~ ^[1-9][0-9]{0,18}$ ]] || fail "the configured creator ID is invalid"
   run_container_check --account-binding "$binding_message"
   printf '%s\n' "$binding_message"
+  exit 0
+fi
+
+if [ "$operation" = "--enable-publishing" ]; then
+  [ "$(env_value GEN_AUTOMATION_ENVIRONMENT)" = "staging" ] ||
+    fail "the controller is not the exact staging environment"
+  [ "$(env_value GEN_AUTOMATION_X_AUTH_MODE)" = "oauth1" ] ||
+    fail "the controller is not configured for OAuth 1.0a"
+  configured_arn="$(env_value GEN_AUTOMATION_X_OAUTH_SECRET_REFERENCE)"
+  configured_id="$(env_value GEN_AUTOMATION_X_CREATOR_USER_ID)"
+  [[ "$configured_arn" =~ ^aws-secrets-manager://arn:aws:secretsmanager:${region}:${account_id}:secret:gen-automation-staging/x/oauth1-[A-Za-z0-9]{6}$ ]] ||
+    fail "the configured secret reference is outside the staging boundary"
+  [[ "$configured_id" =~ ^[1-9][0-9]{0,18}$ ]] || fail "the configured creator ID is invalid"
+  [ "$(env_value GEN_AUTOMATION_PATREON_BROWSER_PUBLISHING_ENABLED)" = "false" ] ||
+    fail "the Patreon publisher must remain disabled"
+  publishing_value="$(env_value GEN_AUTOMATION_PUBLISHING_ENABLED)"
+  case "$publishing_value" in
+    false|true) ;;
+    *) fail "the publishing runtime gate must be one exact boolean" ;;
+  esac
+
+  run_container_check \
+    --assert-oauth1-configured \
+    "$configured_message" \
+    "$configured_arn" \
+    "$configured_id"
+  run_container_check --account-binding "$binding_message"
+  run_container_check --assert-safe-to-configure "$safe_message"
+
+  if [ "$publishing_value" = "true" ]; then
+    run_container_check --assert-publishing-enabled "$publishing_runtime_message"
+    printf '%s\n' "$publishing_already_enabled_message"
+    exit 0
+  fi
+
+  backup_env="$(/usr/bin/mktemp "$config_root/.control-plane.env.x-publishing.rollback.XXXXXX")"
+  /usr/bin/install -o root -g root -m 0600 "$controller_env" "$backup_env"
+  rollback_armed=1
+
+  /usr/bin/systemctl stop "$service_name" >/dev/null
+  for _ in $(/usr/bin/seq 1 60); do
+    if ! /usr/bin/systemctl is-active --quiet "$service_name"; then
+      break
+    fi
+    /usr/bin/sleep 1
+  done
+  ! /usr/bin/systemctl is-active --quiet "$service_name" ||
+    fail "the controller did not stop for its bounded publishing update"
+
+  run_stopped_container_check --assert-safe-to-configure "$safe_message"
+
+  /usr/bin/python3 - "$controller_env" <<'PY'
+from __future__ import annotations
+
+import os
+import pathlib
+import sys
+import tempfile
+
+path = pathlib.Path(sys.argv[1])
+key = "GEN_AUTOMATION_PUBLISHING_ENABLED"
+raw = path.read_bytes()
+if len(raw) > 1024 * 1024 or b"\x00" in raw:
+    raise SystemExit("invalid controller environment")
+text = raw.decode("utf-8", errors="strict")
+if "\r" in text:
+    raise SystemExit("invalid controller environment")
+lines = text.splitlines()
+matches = [index for index, line in enumerate(lines) if line.startswith(f"{key}=")]
+if len(matches) != 1 or lines[matches[0]] != f"{key}=false":
+    raise SystemExit("publishing runtime gate is not exactly false")
+updated = list(lines)
+updated[matches[0]] = f"{key}=true"
+if len(lines) != len(updated) or [
+    index for index, values in enumerate(zip(lines, updated)) if values[0] != values[1]
+] != matches:
+    raise SystemExit("publishing update changed an unexpected assignment")
+
+descriptor, temporary = tempfile.mkstemp(prefix=".control-plane.env.x-publishing.", dir=path.parent)
+try:
+    os.fchmod(descriptor, 0o600)
+    os.fchown(descriptor, 0, 0)
+    with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
+        output.write("\n".join(updated) + "\n")
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, path)
+    directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
+
+  require_private_runtime_env
+  [ "$(env_value GEN_AUTOMATION_PUBLISHING_ENABLED)" = "true" ] ||
+    fail "the publishing runtime gate did not persist"
+  [ "$(env_value GEN_AUTOMATION_PATREON_BROWSER_PUBLISHING_ENABLED)" = "false" ] ||
+    fail "the Patreon publisher changed unexpectedly"
+  validate_deployment || fail "the publishing-enabled deployment inputs are invalid"
+  /usr/bin/systemctl restart "$service_name" >/dev/null
+  wait_for_ready || fail "the publishing-enabled controller did not become healthy"
+  run_container_check \
+    --assert-oauth1-configured \
+    "$configured_message" \
+    "$configured_arn" \
+    "$configured_id"
+  run_container_check --assert-publishing-enabled "$publishing_runtime_message"
+  run_container_check --assert-safe-to-configure "$safe_message"
+
+  rollback_armed=0
+  /usr/bin/rm -f -- "$backup_env"
+  backup_env=""
+  printf '%s\n' "$publishing_enabled_message"
   exit 0
 fi
 

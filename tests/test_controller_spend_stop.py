@@ -43,6 +43,9 @@ from gen_automation.integrations.salad.client import SaladClient
 from gen_automation.integrations.salad.models import (
     JSONValue,
     SaladContainerGroup,
+    SaladContainerGroupInstance,
+    SaladContainerGroupInstancePage,
+    SaladContainerGroupInstanceState,
     SaladContainerGroupState,
     SaladQueue,
 )
@@ -107,6 +110,25 @@ class DeploymentOnlyClient:
     ) -> SaladContainerGroup:
         assert container_group_name == self.group.name
         return self.group
+
+    async def list_container_group_instances(
+        self,
+        container_group_name: str,
+    ) -> SaladContainerGroupInstancePage:
+        assert container_group_name == self.group.name
+        if self.group.current_state.running_count == 0:
+            return SaladContainerGroupInstancePage(instances=())
+        return SaladContainerGroupInstancePage(
+            instances=(
+                SaladContainerGroupInstance(
+                    id="instance-creator-1",
+                    machine_id="machine-creator-1",
+                    state=SaladContainerGroupInstanceState.RUNNING,
+                    update_time=self.group.current_state.start_time or NOW,
+                    version=self.group.version,
+                ),
+            )
+        )
 
     async def stop_container_group(self, container_group_name: str) -> None:
         self.stop_names.append(container_group_name)
@@ -255,8 +277,8 @@ async def test_disabled_allocation_durably_stops_unknown_resource_with_missing_i
                 ).all()
             )
             assert deployment is not None
-            assert deployment.state == SaladDeploymentState.DRAINING
-            assert deployment.provider_queue_id == str(QUEUE_ID)
+            assert deployment.state == SaladDeploymentState.UNKNOWN
+            assert deployment.provider_queue_id is None
             assert deployment.provider_container_group_id == str(GROUP_ID)
             assert "salad_deployment.gpu_allocation_disabled" in actions
             assert "salad_deployment.stop_container_group_recovered" in actions
@@ -326,11 +348,60 @@ async def test_deployment_loop_reconciles_failed_stop_with_partial_identity(
         async with database.sessions() as session:
             deployment = await session.get(SaladDeployment, deployment_id)
             assert deployment is not None
-            assert deployment.state == SaladDeploymentState.DRAINING
-            assert deployment.provider_queue_id == str(QUEUE_ID)
+            assert deployment.state == SaladDeploymentState.UNKNOWN
+            assert deployment.provider_queue_id is None
             assert deployment.provider_container_group_id == str(GROUP_ID)
         assert client.stop_names == [group_name]
         assert client.create_calls == 0
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_outer_controller_failure_marks_billing_observation_stale(
+    tmp_path: Path,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'unknown-stale.db').as_posix()}")
+    await database.create_schema()
+    try:
+        async with database.sessions() as session:
+            deployment = SaladDeployment(
+                version_no=1,
+                config_sha256=CONFIG_SHA256,
+                provider_configuration=_provider_configuration(),
+                worker_image_digest=IMAGE_DIGEST,
+                organization_name="organization",
+                project_name="project",
+                queue_name="generation",
+                container_group_name="worker",
+                state=SaladDeploymentState.PROVISIONING,
+                desired_state=DesiredDeploymentState.ACTIVE,
+                is_current=True,
+                max_hourly_cost_microusd=3_600_000,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            session.add(deployment)
+            await session.commit()
+            deployment_id = deployment.id
+
+        workloads = ControllerWorkloads(
+            settings=Settings(),
+            sessions=database.sessions,
+            instance_id="controller-unknown-stale-test",
+            salad_client=None,
+            object_store=None,
+        )
+        await workloads._mark_deployment_unknown(
+            deployment_id,
+            error_code="controller_provider_operation_timed_out",
+        )
+
+        async with database.sessions() as session:
+            deployment = await session.get(SaladDeployment, deployment_id)
+            assert deployment is not None
+            assert deployment.state == SaladDeploymentState.UNKNOWN
+            assert deployment.billing_observation_stale is True
     finally:
         await database.dispose()
 

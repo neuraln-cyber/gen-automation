@@ -166,6 +166,30 @@ def test_asset_viewer_uses_delegated_image_clicks_after_workspace_refreshes() ->
     assert "openViewer(card, trigger)" in delegated
 
 
+def test_asset_viewer_repairs_return_focus_after_workspace_refresh() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+    refresh = script.split(
+        'document.addEventListener("gen-automation:assets-updated"',
+        1,
+    )[1].split(
+        'document.addEventListener("gen-automation:bulk-selection-changed"',
+        1,
+    )[0]
+
+    assert "const refreshedCard = assetCards().find" in refresh
+    assert "if (refreshedCard) renderCard(refreshedCard)" in refresh
+    assert "activeCard instanceof HTMLElement" in refresh
+    assert "activeCard.isConnected" in refresh
+    assert "isVisible(activeCard)" in refresh
+    assert "const activeTrigger = focusCardIsUsable ? triggerFor(activeCard) : null" in refresh
+    assert "triggerFor(refreshedCard)" not in refresh
+    assert 'document.querySelector("[data-open-review-viewer]")' in refresh
+    assert "activeTrigger instanceof HTMLElement && activeTrigger.isConnected" in refresh
+    assert "reviewLauncher instanceof HTMLElement && reviewLauncher.isConnected" in refresh
+    assert "returnFocus = activeTrigger" in refresh
+    assert refresh.index("renderCard(refreshedCard)") < refresh.index("triggerFor(activeCard)")
+
+
 def test_asset_viewer_delete_shortcuts_distinguish_plain_and_anatomy_rejection() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
     keyboard = script.split('viewer.dialog.addEventListener("keydown"', 1)[1].split(
@@ -196,6 +220,75 @@ def test_asset_viewer_rejects_immediately_through_the_active_cards_own_form() ->
     assert "context.form.requestSubmit(context.rejectButton)" in submission
     assert "bulkForm" not in submission
     assert "bulkReject" not in submission
+
+
+def test_fullscreen_bulk_actions_proxy_the_existing_atomic_form() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+    creation = script.split("function createViewer()", 1)[1].split(
+        "function initializeAssetViewer()",
+        1,
+    )[0]
+    synchronization = script.split("const syncViewerBulkControls", 1)[1].split(
+        "const submitViewerBulkAction",
+        1,
+    )[0]
+    submission = script.split("const submitViewerBulkAction", 1)[1].split(
+        "const closeViewer",
+        1,
+    )[0]
+
+    assert 'bulk.setAttribute("role", "group")' in creation
+    assert 'bulk.setAttribute("aria-label", "Actions for selected images")' in creation
+    assert 'bulkCount.setAttribute("role", "status")' in creation
+    assert 'bulkCount.setAttribute("aria-live", "polite")' in creation
+    assert 'bulkWarning.setAttribute("role", "status")' in creation
+    assert 'bulkWarning.setAttribute("aria-live", "polite")' in creation
+    assert "Accept selected" in creation
+    assert "Reject selected" in creation
+    assert "Mark selected for X" in creation
+    assert "Unmark selected from X" in creation
+    assert 'bulkClear.dataset.assetViewerBulkClear = ""' in creation
+
+    assert 'document.querySelector("[data-bulk-action-form]")' in script
+    assert 'button[name="action"][value="${action}"]' in script
+    assert "input.form === form" in script
+    assert 'form.querySelector("[data-bulk-selection-status]")' in synchronization
+    assert "sourceWarning.textContent.trim()" in synchronization
+    assert "proxy.hidden = !original" in synchronization
+    assert "proxy.disabled = !original || original.disabled" in synchronization
+    assert "aria-describedby" in synchronization
+    assert 'event.target.matches("[data-bulk-action-form]")' in script
+    assert "window.queueMicrotask(syncViewerBulkControls)" in script
+    assert "form.requestSubmit(original)" in submission
+    assert "fetch(" not in submission
+    assert "FormData" not in submission
+    assert "URLSearchParams" not in submission
+
+
+def test_fullscreen_bulk_selection_stays_synced_during_navigation_and_refresh() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+    render = script.split("const renderCard", 1)[1].split("const step", 1)[0]
+    step = script.split("const step", 1)[1].split("const submitRejection", 1)[0]
+    refreshed = script.split(
+        'document.addEventListener("gen-automation:assets-updated"',
+        1,
+    )[1].split(
+        'document.addEventListener("gen-automation:review-action-optimistic"',
+        1,
+    )[0]
+    selector = script.split('viewer.select.addEventListener("click"', 1)[1].split(
+        "Object.entries(viewerBulkButtons)",
+        1,
+    )[0]
+
+    assert "syncViewerBulkControls()" in render
+    assert "syncViewerBulkControls()" in refreshed
+    assert 'document.addEventListener("gen-automation:bulk-selection-changed"' in script
+    assert 'selection.dispatchEvent(new Event("change", { bubbles: true }))' in selector
+    assert "syncViewerBulkControls()" in selector
+    assert "checked = false" not in step
+    assert "Remove current from selection" in script
+    assert "Add current to selection" in script
 
 
 def test_asset_viewer_has_no_staged_exclusion_queue_or_save_step() -> None:
@@ -252,6 +345,13 @@ def test_asset_grid_uses_intrinsic_image_ratio_and_viewer_is_responsive() -> Non
     assert ".asset-viewer-anatomy-reject" in styles
     assert ".asset-viewer-copy-clean" in styles
     assert ".asset-viewer-download-clean" in styles
+    assert ".asset-viewer-bulk" in styles
+    assert ".asset-viewer-bulk-actions" in styles
+    assert ".asset-viewer-bulk-warning" in styles
+    assert "grid-template-columns: repeat(2, minmax(0, 1fr))" in styles
+    assert (
+        ".asset-viewer-bulk-action,\n  .asset-viewer-bulk-clear { min-height: 2.75rem; }" in styles
+    )
     assert ".asset-viewer-more-body" in styles
     assert ".asset-viewer-previous" in styles
     assert ".asset-viewer-next" in styles

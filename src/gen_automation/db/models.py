@@ -668,6 +668,38 @@ class SaladDeployment(UuidPrimaryKeyMixin, TimestampMixin, Base):
             name="positive_hourly_cost",
         ),
         CheckConstraint(
+            "billing_accumulated_microseconds >= 0",
+            name="nonnegative_billing_runtime",
+        ),
+        CheckConstraint(
+            "(billing_active_instance_id IS NULL AND billing_active_started_at IS NULL) "
+            "OR (billing_active_instance_id IS NOT NULL "
+            "AND billing_active_started_at IS NOT NULL)",
+            name="billing_active_pair",
+        ),
+        CheckConstraint(
+            "billing_session_started_at IS NOT NULL "
+            "OR (billing_session_ended_at IS NULL "
+            "AND billing_active_instance_id IS NULL "
+            "AND billing_active_started_at IS NULL "
+            "AND billing_accumulated_microseconds = 0)",
+            name="billing_session_required",
+        ),
+        CheckConstraint(
+            "billing_session_ended_at IS NULL OR billing_active_instance_id IS NULL",
+            name="ended_billing_not_active",
+        ),
+        CheckConstraint(
+            "billing_active_started_at IS NULL "
+            "OR billing_session_started_at <= billing_active_started_at",
+            name="billing_active_after_session_start",
+        ),
+        CheckConstraint(
+            "billing_session_ended_at IS NULL "
+            "OR billing_session_started_at <= billing_session_ended_at",
+            name="billing_end_after_session_start",
+        ),
+        CheckConstraint(
             "state NOT IN ('active', 'degraded', 'draining', 'stopped') "
             "OR (provider_queue_id IS NOT NULL "
             "AND provider_container_group_id IS NOT NULL)",
@@ -757,6 +789,22 @@ class SaladDeployment(UuidPrimaryKeyMixin, TimestampMixin, Base):
     lock_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    billing_session_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    billing_session_ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    billing_accumulated_microseconds: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+    )
+    billing_active_instance_id: Mapped[str | None] = mapped_column(String(200))
+    billing_active_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    billing_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    billing_observation_stale: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+    )
+    billing_estimated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class ExperimentWarmLease(UuidPrimaryKeyMixin, TimestampMixin, Base):
@@ -3487,7 +3535,12 @@ class FinishedSetArchive(UuidPrimaryKeyMixin, Base):
 
     __tablename__ = "finished_set_archives"
     __table_args__ = (
-        UniqueConstraint("review_task_id", name="uq_finished_set_archives_review_task"),
+        UniqueConstraint(
+            "review_task_id",
+            "media_profile",
+            name="uq_finished_set_archives_review_profile",
+        ),
+        CheckConstraint("length(trim(media_profile)) > 0", name="nonempty_media_profile"),
         CheckConstraint("selection_count > 0", name="positive_selection_count"),
         CheckConstraint("attempts >= 0", name="nonnegative_attempts"),
         CheckConstraint("max_attempts > 0", name="positive_max_attempts"),
@@ -3545,6 +3598,10 @@ class FinishedSetArchive(UuidPrimaryKeyMixin, Base):
         ForeignKey("release_versions.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
+    )
+    media_profile: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
     )
     requested_by_user_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("admin_users.id", ondelete="RESTRICT"),
@@ -3855,8 +3912,13 @@ class MegaSetDeliveryItem(UuidPrimaryKeyMixin, TimestampMixin, Base):
         ),
         UniqueConstraint(
             "delivery_id",
-            "source_derivative_output_id",
+            "source_asset_id",
             name="uq_mega_set_delivery_items_delivery_source",
+        ),
+        UniqueConstraint(
+            "delivery_id",
+            "readiness_derivative_output_id",
+            name="uq_mega_set_delivery_items_delivery_readiness",
         ),
         UniqueConstraint("remote_path", name="uq_mega_set_delivery_items_remote_path"),
         CheckConstraint("ordinal > 0", name="positive_ordinal"),
@@ -3907,7 +3969,12 @@ class MegaSetDeliveryItem(UuidPrimaryKeyMixin, TimestampMixin, Base):
         index=True,
     )
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
-    source_derivative_output_id: Mapped[UUID] = mapped_column(
+    source_asset_id: Mapped[UUID] = mapped_column(
+        ForeignKey("assets.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    readiness_derivative_output_id: Mapped[UUID] = mapped_column(
         ForeignKey("derivative_outputs.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
@@ -4265,6 +4332,7 @@ class WorkflowApproval(UuidPrimaryKeyMixin, TimestampMixin, Base):
     version: Mapped[str] = mapped_column(String(100), nullable=False)
     object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
     reviewed_node_classes: Mapped[list[str]] = mapped_column(JSON_TYPE, nullable=False)
+    capabilities: Mapped[list[str]] = mapped_column(JSON_TYPE, nullable=False, default=list)
     evidence: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, nullable=False)
     evidence_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[ApprovalStatus] = mapped_column(
@@ -5640,7 +5708,8 @@ for _statement in (
     "OLD.id IS NOT NEW.id "
     "OR OLD.delivery_id IS NOT NEW.delivery_id "
     "OR OLD.ordinal IS NOT NEW.ordinal "
-    "OR OLD.source_derivative_output_id IS NOT NEW.source_derivative_output_id "
+    "OR OLD.source_asset_id IS NOT NEW.source_asset_id "
+    "OR OLD.readiness_derivative_output_id IS NOT NEW.readiness_derivative_output_id "
     "OR OLD.source_sha256 IS NOT NEW.source_sha256 "
     "OR OLD.source_byte_size IS NOT NEW.source_byte_size "
     "OR OLD.source_content_type IS NOT NEW.source_content_type "
@@ -5686,7 +5755,9 @@ for _statement in (
     "IF OLD.id IS DISTINCT FROM NEW.id "
     "OR OLD.delivery_id IS DISTINCT FROM NEW.delivery_id "
     "OR OLD.ordinal IS DISTINCT FROM NEW.ordinal "
-    "OR OLD.source_derivative_output_id IS DISTINCT FROM NEW.source_derivative_output_id "
+    "OR OLD.source_asset_id IS DISTINCT FROM NEW.source_asset_id "
+    "OR OLD.readiness_derivative_output_id "
+    "IS DISTINCT FROM NEW.readiness_derivative_output_id "
     "OR OLD.source_sha256 IS DISTINCT FROM NEW.source_sha256 "
     "OR OLD.source_byte_size IS DISTINCT FROM NEW.source_byte_size "
     "OR OLD.source_content_type IS DISTINCT FROM NEW.source_content_type "

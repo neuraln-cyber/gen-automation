@@ -51,12 +51,15 @@ from gen_automation.services.derivative_runtime import (
 from gen_automation.services.derivatives import (
     DERIVATIVE_RENDERER_VERSION,
     LEGACY_DERIVATIVE_RENDERER_VERSION,
+    PREVIOUS_DERIVATIVE_RENDERER_VERSION,
     DerivativeBundle,
     DerivativeRecipe,
     DerivativeSafetyLimits,
     WatermarkSpec,
+    XStaticImagePngTooLargeError,
     render_platform_derivatives,
 )
+from gen_automation.services.operator_delivery import load_operator_delivery
 from gen_automation.services.review_derivatives import prepare_completed_review_x_teasers
 from gen_automation.storage.base import ObjectMetadata, ObjectStoreError
 from gen_automation.storage.memory import MemoryObjectStore, StoredObject
@@ -431,13 +434,18 @@ async def test_cycle_renders_only_clean_full_outputs_without_x_selection(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "renderer_version",
+    (LEGACY_DERIVATIVE_RENDERER_VERSION, PREVIOUS_DERIVATIVE_RENDERER_VERSION),
+)
 async def test_cycle_executes_a_frozen_legacy_renderer_recipe(
     derivative_approved_context: ApprovedContext,
+    renderer_version: str,
 ) -> None:
     approved = derivative_approved_context
     prepared = await _prepare(
         approved,
-        renderer_version=LEGACY_DERIVATIVE_RENDERER_VERSION,
+        renderer_version=renderer_version,
     )
 
     async def legacy_renderer(
@@ -455,17 +463,17 @@ async def test_cycle_executes_a_frozen_legacy_renderer_recipe(
             watermark_png=watermark,
             targets=targets,
             limits=limits,
-            renderer_version=LEGACY_DERIVATIVE_RENDERER_VERSION,
+            renderer_version=renderer_version,
         )
 
     first = await _cycle(
         prepared,
-        worker_id="derivative-controller-legacy-v4",
+        worker_id=f"derivative-controller-{renderer_version}",
         renderer=legacy_renderer,
     )
     second = await _cycle(
         prepared,
-        worker_id="derivative-controller-legacy-v4",
+        worker_id=f"derivative-controller-{renderer_version}",
         renderer=legacy_renderer,
     )
     assert first.execution is not None
@@ -549,11 +557,84 @@ async def test_only_owner_selected_image_gets_watermarked_x_teaser(
                 )
             )
         ).all()
+        x_output = await session.scalar(
+            select(DerivativeOutput).where(DerivativeOutput.target == "x_teaser")
+        )
+        assert x_output is not None
+        x_source = await session.get(Asset, x_output.source_asset_id)
+        assert x_source is not None
     targets_by_asset: dict[UUID, set[str]] = {}
     for asset_id, target in rows:
         targets_by_asset.setdefault(asset_id, set()).add(target)
     assert targets_by_asset[selected_asset_id] == {"full", "x_teaser"}
     assert targets_by_asset[approved.raw_asset_ids[1]] == {"full"}
+    assert x_output.asset_content_type == "image/png"
+    assert x_output.asset_image_format == "PNG"
+    assert (x_output.asset_width, x_output.asset_height) == (
+        x_source.width,
+        x_source.height,
+    )
+
+
+@pytest.mark.asyncio
+async def test_oversize_lossless_x_png_fails_terminally_before_output_write(
+    derivative_approved_context: ApprovedContext,
+) -> None:
+    approved = derivative_approved_context
+    selected_asset_id = approved.raw_asset_ids[0]
+    prepared = await _prepare(
+        approved,
+        with_watermark=True,
+        x_selected_asset_ids=(selected_asset_id,),
+    )
+    await _cycle(prepared, worker_id="derivative-controller-full-a")
+    await _cycle(prepared, worker_id="derivative-controller-full-b")
+    writes_before_x = tuple(prepared.store.write_attempts)
+
+    async def reject_oversize_png(
+        source: bytes,
+        recipe: DerivativeRecipe,
+        watermark: bytes | None,
+        targets: tuple[str, ...],
+        limits: DerivativeSafetyLimits,
+        policy: DerivativeIsolationPolicy,
+    ) -> DerivativeBundle:
+        del source, recipe, watermark, limits, policy
+        assert targets == ("x_teaser",)
+        raise XStaticImagePngTooLargeError(
+            "full-resolution lossless X PNG exceeds the static image byte limit; "
+            "automatic JPEG conversion and downscaling are forbidden"
+        )
+
+    failed = await _cycle(
+        prepared,
+        worker_id="derivative-controller-x-too-large",
+        renderer=reject_oversize_png,
+    )
+
+    assert failed.execution is not None
+    assert failed.execution.state == DerivativeJobState.FAILED
+    assert failed.execution.error_code == "x_lossless_png_too_large"
+    assert tuple(prepared.store.write_attempts) == writes_before_x
+    async with approved.database.sessions() as session:
+        job = await session.get(DerivativeJob, failed.execution.job_id)
+        x_output_count = await session.scalar(
+            select(func.count())
+            .select_from(DerivativeOutput)
+            .where(DerivativeOutput.target == "x_teaser")
+        )
+        delivery = await load_operator_delivery(
+            session,
+            review_task_id=approved.review_task_id,
+        )
+    assert job is not None
+    assert job.state == DerivativeJobState.FAILED
+    assert job.last_error_code == "x_lossless_png_too_large"
+    assert x_output_count == 0
+    assert delivery.progress.x_action_message is not None
+    assert "exceeds X's 5 MiB image limit" in delivery.progress.x_action_message
+    assert "Nothing was converted or downscaled" in delivery.progress.x_action_message
+    assert "choose a different image for X" in delivery.progress.x_action_message
 
 
 @pytest.mark.asyncio

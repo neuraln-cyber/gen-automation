@@ -19,10 +19,15 @@ from gen_automation.services.x_oauth1 import build_aws_secrets_manager_x_oauth1_
 ASSERT_SAFE_MODE = "--assert-safe-to-configure"
 ASSERT_CONFIGURED_MODE = "--assert-oauth1-configured"
 ACCOUNT_BINDING_MODE = "--account-binding"
+ASSERT_PUBLISHING_ENABLED_MODE = "--assert-publishing-enabled"
 SAFE_TO_CONFIGURE_MESSAGE = "Publication is stopped and no publication effect is active."
 CONFIGURED_MESSAGE = "The running controller has the exact OAuth 1.0a runtime settings."
 ACCOUNT_BINDING_MESSAGE = (
     "X OAuth 1.0a account binding passed. No media was uploaded and no post was created."
+)
+PUBLISHING_ENABLED_MESSAGE = (
+    "The running controller has publication orchestration enabled and the Patreon browser "
+    "driver disabled."
 )
 
 
@@ -90,11 +95,20 @@ def _assert_oauth1_configured(
         raise RuntimeError("the running OAuth 1.0a configuration does not match")
 
 
+def _assert_publishing_enabled(settings: Settings) -> None:
+    if not settings.publishing_enabled or settings.patreon_browser_publishing_enabled:
+        raise RuntimeError("the running publishing orchestration configuration does not match")
+
+
 def x_runtime_check_main(arguments: Sequence[str] | None = None) -> int:
     """Run exactly one non-mutating runtime check and emit only a fixed result."""
 
     resolved_arguments = list(sys.argv[1:] if arguments is None else arguments)
-    valid_simple_mode = resolved_arguments in ([ASSERT_SAFE_MODE], [ACCOUNT_BINDING_MODE])
+    valid_simple_mode = resolved_arguments in (
+        [ASSERT_SAFE_MODE],
+        [ACCOUNT_BINDING_MODE],
+        [ASSERT_PUBLISHING_ENABLED_MODE],
+    )
     valid_configured_mode = len(resolved_arguments) == 3 and resolved_arguments[0] == (
         ASSERT_CONFIGURED_MODE
     )
@@ -113,9 +127,12 @@ def x_runtime_check_main(arguments: Sequence[str] | None = None) -> int:
                 expected_creator_user_id=resolved_arguments[2],
             )
             print(CONFIGURED_MESSAGE)
-        else:
+        elif resolved_arguments == [ACCOUNT_BINDING_MODE]:
             asyncio.run(_check_account_binding(settings))
             print(ACCOUNT_BINDING_MESSAGE)
+        else:
+            _assert_publishing_enabled(settings)
+            print(PUBLISHING_ENABLED_MESSAGE)
     except Exception:
         print("The X runtime check failed safely.", file=sys.stderr)
         return 1

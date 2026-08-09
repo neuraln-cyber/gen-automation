@@ -16,6 +16,8 @@ old_image=""
 temporary_env=""
 backup_env=""
 rollback_armed=0
+rollback_mode="restart"
+external_lock_held=0
 
 fail() {
   printf '%s\n' "control-plane update failed: $*" >&2
@@ -109,11 +111,22 @@ restore_previous_deployment() {
     --env-file "$deploy_env" \
     -f "$compose_file" \
     config --quiet || rollback_status=1
-  systemctl restart --no-block "$service_name" || rollback_status=1
-  wait_for_control_plane "$old_image" || rollback_status=1
+  if [ "$rollback_mode" = "leave-stopped" ]; then
+    systemctl stop "$service_name" || rollback_status=1
+    if systemctl is-active --quiet "$service_name"; then
+      rollback_status=1
+    fi
+  else
+    systemctl restart --no-block "$service_name" || rollback_status=1
+    wait_for_control_plane "$old_image" || rollback_status=1
+  fi
 
   if [ "$rollback_status" -eq 0 ]; then
-    printf '%s\n' "Previous control-plane image restored and ready." >&2
+    if [ "$rollback_mode" = "leave-stopped" ]; then
+      printf '%s\n' "Previous control-plane configuration restored; service remains stopped." >&2
+    else
+      printf '%s\n' "Previous control-plane image restored and ready." >&2
+    fi
   else
     printf '%s\n' "Automatic rollback did not become healthy; operator attention is required." >&2
   fi
@@ -134,7 +147,8 @@ cleanup() {
 trap cleanup EXIT
 
 [ "$(id -u)" -eq 0 ] || fail "run as root through AWS Systems Manager"
-[ "$#" -eq 4 ] || fail "usage: $0 --image <immutable-image> --revision <40-hex-sha>"
+[ "$#" -ge 4 ] && [ "$#" -le 7 ] ||
+  fail "usage: $0 --image <immutable-image> --revision <40-hex-sha> [--rollback-mode restart|leave-stopped] [--external-lock-held]"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --image)
@@ -145,6 +159,14 @@ while [ "$#" -gt 0 ]; do
       source_revision="$2"
       shift 2
       ;;
+    --rollback-mode)
+      rollback_mode="$2"
+      shift 2
+      ;;
+    --external-lock-held)
+      external_lock_held=1
+      shift
+      ;;
     *) fail "unknown argument: $1" ;;
   esac
 done
@@ -153,11 +175,14 @@ done
   fail "image must be an immutable digest from $allowed_repository"
 [[ "$source_revision" =~ ^[0-9a-f]{40}$ ]] ||
   fail "source revision must be exactly 40 lowercase hexadecimal characters"
+case "$rollback_mode" in restart|leave-stopped) ;; *) fail "invalid rollback mode" ;; esac
 command -v flock >/dev/null || fail "flock is required"
 command -v timeout >/dev/null || fail "timeout is required"
 
-exec 9>"$lock_file"
-flock --exclusive --wait 120 9 || fail "another control-plane update holds the deployment lock"
+if [ "$external_lock_held" -eq 0 ]; then
+  exec 9>"$lock_file"
+  flock --exclusive --wait 120 9 || fail "another control-plane update holds the deployment lock"
+fi
 
 /usr/local/libexec/gen-automation-validate-deployment
 old_image="$(env_value "$image_key" "$deploy_env")"
@@ -166,6 +191,7 @@ old_image="$(env_value "$image_key" "$deploy_env")"
 
 verify_pulled_image "$new_image" "$source_revision"
 if [ "$new_image" = "$old_image" ]; then
+  systemctl start --no-block "$service_name"
   wait_for_control_plane "$new_image" ||
     fail "requested image is already configured but the deployment is not ready"
   printf '%s\n' "Requested control-plane digest is already deployed and ready."

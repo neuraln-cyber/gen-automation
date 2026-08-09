@@ -210,6 +210,50 @@ def test_review_refresh_restores_scroll_filters_sort_selection_and_focus() -> No
     assert "focus({ preventScroll: true })" in script
     assert 'new CustomEvent("gen-automation:assets-updated"' in script
     assert 'new CustomEvent("gen-automation:review-updated"' in script
+    assert "&& !reviewViewerIsOpen()" in script
+
+
+def test_bulk_shift_range_follows_the_current_visible_sorted_dom_order() -> None:
+    script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
+    bulk = script.split("function initializeBulkReview()", 1)[1].split(
+        "let reviewActionRequestActive",
+        1,
+    )[0]
+    range_selection = bulk.split('checkbox.addEventListener("click"', 1)[1].split(
+        'checkbox.addEventListener("change"',
+        1,
+    )[0]
+
+    assert 'const selectionRoot = form.closest("[data-review-workspace]") || document' in bulk
+    assert "const visibleCheckboxesInDomOrder" in bulk
+    assert "selectionRoot.querySelectorAll" in bulk
+    assert "const visible = visibleCheckboxesInDomOrder()" in range_selection
+    assert "const visible = checkboxes.filter" not in range_selection
+    assert 'new CustomEvent("gen-automation:bulk-selection-changed"' in bulk
+    assert "hiddenSelected," in bulk
+    assert "selected," in bulk
+
+
+def test_bulk_eligibility_reacts_to_optimistic_single_image_decisions() -> None:
+    script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
+    bulk = script.split("function initializeBulkReview()", 1)[1].split(
+        "let reviewActionRequestActive",
+        1,
+    )[0]
+    apply_decision = script.split("const applyReviewCardDecision", 1)[1].split(
+        "const restoreReviewCardSnapshot",
+        1,
+    )[0]
+
+    assert "let acceptedCount" in bulk
+    assert "let remainingReviewSlots" in bulk
+    assert "const updateTargetSelectionButtons" in bulk
+    assert "updateTargetSelectionButtons();" in bulk
+    assert "form.dataset.acceptedCount" in bulk
+    assert 'input[type="checkbox"][name="asset_id"]:checked' in apply_decision
+    assert (
+        'selectedCheckbox.dispatchEvent(new Event("change", { bubbles: true }))' in apply_decision
+    )
 
 
 def test_review_page_has_replaceable_workspace_and_live_action_status() -> None:
@@ -290,6 +334,22 @@ def test_finish_bulk_and_x_wait_for_authoritative_refresh_after_queued_decisions
     assert "await prepareReviewMutationForm(form, submitter)" in legacy_actions
     assert 'form.matches("[data-bulk-action-form]")' in script
     assert 'form.matches("[data-x-selection-form]")' in script
+
+
+def test_successful_bulk_refresh_clears_the_shared_grid_and_fullscreen_selection() -> None:
+    script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
+    capture = script.split("const captureReviewViewState", 1)[1].split(
+        "const preserveReviewMedia",
+        1,
+    )[0]
+    restore = script.split("const restoreReviewViewState", 1)[1].split(
+        "const showReviewActionStatus",
+        1,
+    )[0]
+
+    assert 'clearSelection: form.matches("[data-bulk-action-form]")' in capture
+    assert "if (!state.clearSelection)" in restore
+    assert 'new CustomEvent("gen-automation:assets-updated"' in restore
 
 
 def test_optimistic_review_updates_filters_finish_state_and_avoids_idle_full_refresh() -> None:

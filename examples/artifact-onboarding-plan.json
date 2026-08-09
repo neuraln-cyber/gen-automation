@@ -167,6 +167,47 @@
         ],
         "internal_reference": "WORKFLOW-COUPLE-HIRES-DETAILER-V1"
       }
+    },
+    {
+      "name": "Illustrious Controlled Duo balanced",
+      "version": "2",
+      "object_key": "workflows/by-sha256/22b44fda25e43bf6b4bf7cc289d36c6aaa69eef3ef188d6f527a496c4d3f5205.json",
+      "local_path": "../workflows/illustrious-sdxl-controlled-duo-balanced-v2.json",
+      "capabilities": [
+        "controlled_duo_v2"
+      ],
+      "evidence": {
+        "summary": "Reviewed the exact bundled core-only Controlled Duo graph: complementary feathered masks localize both characters' positive and negative conditioning, and no generic face detailer is present.",
+        "source_urls": [
+          "https://github.com/Comfy-Org/ComfyUI/blob/700821e1364eaab0e8f21c538a2131719fec57bf/nodes.py",
+          "https://github.com/Comfy-Org/ComfyUI/blob/700821e1364eaab0e8f21c538a2131719fec57bf/comfy_extras/nodes_mask.py"
+        ],
+        "document_sha256s": [
+          "22b44fda25e43bf6b4bf7cc289d36c6aaa69eef3ef188d6f527a496c4d3f5205"
+        ],
+        "internal_reference": "WORKFLOW-CONTROLLED-DUO-BALANCED-V2"
+      }
+    },
+    {
+      "name": "Illustrious Controlled Duo strict",
+      "version": "2",
+      "object_key": "workflows/by-sha256/3a8db7bbfc75f472d5a5048052773410bf202382c8b76b2a8241f5ad7a1495f2.json",
+      "local_path": "../workflows/illustrious-sdxl-controlled-duo-strict-v2.json",
+      "capabilities": [
+        "controlled_duo_v2",
+        "duo_strict_isolation"
+      ],
+      "evidence": {
+        "summary": "Reviewed the exact bundled core-only strict Controlled Duo graph: an identity-aware base pass uses disjoint positive and negative character masks, followed by two sequential noise-masked identity refinements with separate conditioning and no generic face detailer.",
+        "source_urls": [
+          "https://github.com/Comfy-Org/ComfyUI/blob/700821e1364eaab0e8f21c538a2131719fec57bf/nodes.py",
+          "https://github.com/Comfy-Org/ComfyUI/blob/700821e1364eaab0e8f21c538a2131719fec57bf/comfy_extras/nodes_mask.py"
+        ],
+        "document_sha256s": [
+          "3a8db7bbfc75f472d5a5048052773410bf202382c8b76b2a8241f5ad7a1495f2"
+        ],
+        "internal_reference": "WORKFLOW-CONTROLLED-DUO-STRICT-V2"
+      }
     }
   ]
 }
