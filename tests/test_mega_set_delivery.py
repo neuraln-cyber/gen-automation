@@ -2,7 +2,6 @@
 
 import asyncio
 import hashlib
-import json
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -860,16 +859,8 @@ async def test_public_png_archive_reaches_mega_exactly_without_full_jpeg(
             assert image.size == source_image.size == (64, 64)
             assert image.convert("RGB").tobytes() == source_image.convert("RGB").tobytes()
 
-    remote_manifest = json.loads(mega.remote["/sets/Derivative release (PNG)/set-manifest.json"])
-    assert remote_manifest["schema"] == "mega-extracted-set-manifest/v2"
-    assert remote_manifest["media_profile"] == "public-png-v1"
-    assert [row["path"] for row in remote_manifest["outputs"]] == [
-        "001.png",
-        "002.png",
-    ]
-    assert [row["readiness_derivative_output_id"] for row in remote_manifest["outputs"]] == [
-        str(output.id) for output, _selection in full_rows
-    ]
+    assert set(mega.remote) == set(image_paths)
+    assert not any(path.endswith(".json") for path in mega.remote)
 
 
 @pytest.mark.asyncio
@@ -946,7 +937,7 @@ async def test_provider_independent_multipart_upload_preserves_bytes_order_and_s
     assert delivery.uploaded_item_count == 2
     assert delivery.total_byte_size == sum(map(len, archive.image_payloads))
     assert delivery.uploaded_byte_size == delivery.total_byte_size
-    assert delivery.completion_marker_node_handle is not None
+    assert delivery.completion_marker_node_handle is None
     assert delivery.verified_at is not None
     assert delivery.completed_at is not None
     assert [item.ordinal for item in items] == [1, 2]
@@ -962,21 +953,8 @@ async def test_provider_independent_multipart_upload_preserves_bytes_order_and_s
     for path in image_paths:
         assert_delivery_metadata_absent(mega.remote[path])
     assert all(mega.write_counts[path] == 1 for path in image_paths)
-    remote_manifest_path = f"{delivery.remote_folder}/set-manifest.json"
-    completion_path = f"{delivery.remote_folder}/upload-complete.json"
-    remote_manifest = json.loads(mega.remote[remote_manifest_path])
-    completion = json.loads(mega.remote[completion_path])
-    assert remote_manifest["schema"] == "mega-extracted-set-manifest/v2"
-    assert remote_manifest["media_profile"] == "public-png-v1"
-    assert remote_manifest["source_manifest_sha256"] == archive.manifest_sha256
-    assert [row["path"] for row in remote_manifest["outputs"]] == [
-        "001.png",
-        "002.png",
-    ]
-    assert completion["schema"] == "mega-extracted-set-completion/v1"
-    assert completion["image_count"] == 2
-    assert completion["total_byte_size"] == sum(map(len, archive.image_payloads))
-    assert completion["source_manifest_sha256"] == archive.manifest_sha256
+    assert set(mega.remote) == set(image_paths)
+    assert not any(path.endswith(".json") for path in mega.remote)
 
     assert direct == listed[0]
     assert [item.ordinal for item in direct.items] == [1, 2]

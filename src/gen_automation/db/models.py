@@ -3821,7 +3821,6 @@ class MegaSetDelivery(UuidPrimaryKeyMixin, TimestampMixin, Base):
         CheckConstraint(
             "(state = 'succeeded' AND uploaded_item_count = total_item_count "
             "AND total_byte_size IS NOT NULL AND uploaded_byte_size = total_byte_size "
-            "AND completion_marker_node_handle IS NOT NULL "
             "AND verified_at IS NOT NULL AND completed_at IS NOT NULL "
             "AND last_error_code IS NULL) OR "
             "(state = 'failed' AND completion_marker_node_handle IS NULL "

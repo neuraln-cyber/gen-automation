@@ -17,8 +17,6 @@ The MEGA folder preserves that order with zero-padded filenames:
   001.png
   002.png
   ...
-  set-manifest.json
-  upload-complete.json
 ```
 
 `<set-name>` is the set's visible title (trimmed only), so a title such as
@@ -41,13 +39,13 @@ Private raw masters retain their original metadata and are never copied
 directly to an archive or MEGA. Patreon `full` JPEG derivatives remain the
 readiness gate and Patreon artifact, but their lossy bytes are not included in
 the public PNG profile. X teaser derivatives are not included.
-`set-manifest.json` records the immutable source identity, filename, ordinal,
-byte length, SHA-256, and generation-queue ordering for every image.
-It separately records `source_asset_id` and
+The private finished-set manifest still records the immutable source identity,
+filename, ordinal, byte length, SHA-256, and generation-queue ordering for every
+image. It separately records `source_asset_id` and
 `readiness_derivative_output_id`, so the PNG bytes and the Patreon readiness
-proof are never conflated.
-`upload-complete.json` is written and verified last, so its presence means the
-entire folder was transferred and accounted for.
+proof are never conflated. That manifest remains in private object storage and
+the delivery database; neither it nor a completion-marker JSON file is copied
+to MEGA. The outward folder contains image files only.
 
 The deterministic ZIP download remains available separately in the dashboard.
 Preparing or retrying MEGA never blocks that local/S3 download.
@@ -98,7 +96,9 @@ The controller uses the official, long-lived MEGAcmd service:
    per image and never holds a whole 250-image set in memory.
 4. Commit item and byte progress in the database, remove the temporary files,
    and continue with the next part.
-5. Upload and download-verify only the two small control files at completion.
+5. Re-list the direct remote children and require exactly one copy of every
+   expected numbered image, with no additional files, before recording durable
+   completion in the database.
 
 Normal delivery sends each image once and does not download it again. If a
 command times out or its response is lost, the next attempt reconciles only the
@@ -118,7 +118,8 @@ separate readiness derivative identity, expected public SHA-256/size, remote
 path, attempts, and completion state. Parent
 counters provide live `uploaded / total` image and byte progress. Credentials,
 folder keys, exported links, and account sessions are never stored in these
-tables.
+tables. Historical deliveries may retain a completion-marker node handle; new
+image-only deliveries complete with that legacy field unset.
 
 Authenticated operators can inspect the new extracted-folder delivery at:
 
@@ -220,8 +221,10 @@ No MEGA credential belongs in `.env`.
   backoff and remain restart-safe.
 - A frozen-source contract violation, mismatched remote bytes, or duplicate
   expected filename fails closed for operator attention.
-- The source object version, archive SHA-256, manifest SHA-256, individual
-  image SHA-256, and byte lengths are checked before progress is recorded.
+- The source object version, archive SHA-256, private manifest SHA-256,
+  individual image SHA-256, and byte lengths are checked before progress is
+  recorded. The final remote listing must contain only the expected numbered
+  images.
 - Every staged image must pass the metadata-free outbound-media contract;
   metadata-bearing or malformed legacy derivatives fail closed instead of
   being uploaded.
