@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 HOST_HELPER = ROOT / "infra" / "aws-staging" / "deploy" / "configure-x-oauth1.sh"
@@ -190,6 +195,122 @@ def test_powershell_ssm_submission_is_bounded_and_uses_private_json() -> None:
     assert "$parametersPath" in source
     assert "Remove-Item -LiteralPath $parametersPath -Force" in source
     assert "--no-cli-pager" in source
+
+
+def test_powershell_native_calls_use_bounded_capture() -> None:
+    source = _read(POWERSHELL_HELPER)
+
+    assert "function Invoke-CapturedNative" in source
+    assert '$ErrorActionPreference = "Continue"' in source
+    assert "[Management.Automation.ErrorRecord]" in source
+    assert "[object]::ReferenceEquals($Error[$errorIndex], $nativeErrorRecord)" in source
+    assert source.count("2>&1") == 1
+    poll = source[source.index("$deadline = [DateTime]::UtcNow.AddMinutes(25)") :]
+    assert "Invoke-CapturedNative -Executable $awsExecutable" in poll
+    assert "$invocationError = $invocationResult.StandardError" in poll
+    assert '$invocationError -notmatch "InvocationDoesNotExist"' in poll
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or shutil.which("powershell.exe") is None,
+    reason="Windows PowerShell native-stream regression probe",
+)
+def test_powershell_native_capture_is_windows_safe_and_redacted() -> None:
+    powershell = shutil.which("powershell.exe")
+    assert powershell is not None
+    probe = r"""
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+$tokens = $null
+$parseErrors = $null
+$helperPath = $env:GEN_AUTOMATION_TEST_POWERSHELL_HELPER
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $helperPath,
+    [ref]$tokens,
+    [ref]$parseErrors
+)
+if ($parseErrors.Count -ne 0) {
+    throw "The production helper did not parse."
+}
+foreach ($functionName in @("Invoke-CapturedNative", "Invoke-CheckedNative")) {
+    $functionAst = $ast.Find(
+        {
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq $functionName
+        },
+        $true
+    )
+    if ($null -eq $functionAst) {
+        throw "A required production function was not found."
+    }
+    . ([ScriptBlock]::Create($functionAst.Extent.Text))
+}
+
+$child = Join-Path $PSHOME "powershell.exe"
+$Error.Clear()
+$successOutput = Invoke-CheckedNative `
+    -Executable $child `
+    -Arguments @(
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "[Console]::Error.WriteLine('native-warning-marker'); " +
+            "[Console]::Out.WriteLine('bounded-output'); exit 0"
+    ) `
+    -FailureMessage "bounded success failure"
+if ($successOutput -ne "bounded-output") {
+    throw "Successful native stderr contaminated stdout."
+}
+if ($Error.Count -ne 0) {
+    throw "Successful native stderr remained in the automatic error collection."
+}
+if ($ErrorActionPreference -ne "Stop") {
+    throw "The error preference was not restored after success."
+}
+
+$Error.Clear()
+$caughtMessage = $null
+try {
+    Invoke-CheckedNative `
+        -Executable $child `
+        -Arguments @(
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Console]::Error.WriteLine(''); " +
+                "[Console]::Error.WriteLine('native-secret-marker'); exit 7"
+        ) `
+        -FailureMessage "bounded native failure"
+}
+catch {
+    $caughtMessage = $_.Exception.Message
+}
+if ($caughtMessage -ne "bounded native failure") {
+    throw "A native failure escaped the bounded error contract."
+}
+$retainedErrors = ($Error | ForEach-Object { $_.ToString() }) -join "`n"
+if ($retainedErrors.Contains("native-secret-marker")) {
+    throw "Native stderr remained in the automatic error collection."
+}
+if ($ErrorActionPreference -ne "Stop") {
+    throw "The error preference was not restored after failure."
+}
+Write-Output "native-capture-probe-passed"
+"""
+    environment = os.environ.copy()
+    environment["GEN_AUTOMATION_TEST_POWERSHELL_HELPER"] = str(POWERSHELL_HELPER)
+    result = subprocess.run(  # noqa: S603 - executable is resolved by shutil.which.
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", probe],
+        check=False,
+        capture_output=True,
+        env=environment,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "native-capture-probe-passed"
 
 
 def test_powershell_poll_accepts_only_exact_success_and_is_locally_bounded() -> None:
