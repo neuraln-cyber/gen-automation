@@ -191,10 +191,76 @@ def test_powershell_ssm_submission_is_bounded_and_uses_private_json() -> None:
     assert '$executionTimeout = "300"' in source
     assert '$executionTimeout = "1200"' in source
     assert "[Text.UTF8Encoding]::new($false)" in source
+    assert "[Uri]::new($parametersPath).AbsoluteUri" not in source
+    assert "file:///C:/" not in source
+    assert '$absolutePath -notmatch "^[A-Za-z]:\\\\"' in source
+    assert '$normalizedPath = $absolutePath.Replace("\\", "/")' in source
+    assert '$fileReference = "file://$normalizedPath"' in source
+    assert "UTF8.GetByteCount($fileReference) -gt 4096" in source
+    assert "$parametersUri = ConvertTo-AwsCliWindowsFileReference -Path $parametersPath" in source
     assert '"--parameters", $parametersUri' in source
     assert "$parametersPath" in source
     assert "Remove-Item -LiteralPath $parametersPath -Force" in source
     assert "--no-cli-pager" in source
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or shutil.which("powershell.exe") is None,
+    reason="Windows PowerShell AWS CLI parameter-file regression probe",
+)
+def test_powershell_uses_windows_compatible_aws_cli_file_reference() -> None:
+    powershell = shutil.which("powershell.exe")
+    assert powershell is not None
+    probe = r"""
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+$tokens = $null
+$parseErrors = $null
+$helperPath = $env:GEN_AUTOMATION_TEST_POWERSHELL_HELPER
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $helperPath,
+    [ref]$tokens,
+    [ref]$parseErrors
+)
+if ($parseErrors.Count -ne 0) {
+    throw "The production helper did not parse."
+}
+$functionAst = $ast.Find(
+    {
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq "ConvertTo-AwsCliWindowsFileReference"
+    },
+    $true
+)
+if ($null -eq $functionAst) {
+    throw "The AWS CLI file-reference function was not found."
+}
+. ([ScriptBlock]::Create($functionAst.Extent.Text))
+
+$reference = ConvertTo-AwsCliWindowsFileReference `
+    -Path "C:\Temp\folder with spaces\parameters.json"
+if ($reference -ne "file://C:/Temp/folder with spaces/parameters.json") {
+    throw "The AWS CLI file reference was not converted exactly."
+}
+if ($reference.StartsWith("file:///C:/")) {
+    throw "The RFC file URI form is incompatible with AWS CLI on Windows."
+}
+Write-Output $reference
+"""
+    environment = os.environ.copy()
+    environment["GEN_AUTOMATION_TEST_POWERSHELL_HELPER"] = str(POWERSHELL_HELPER)
+    result = subprocess.run(  # noqa: S603 - executable is resolved by shutil.which.
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", probe],
+        check=False,
+        capture_output=True,
+        env=environment,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "file://C:/Temp/folder with spaces/parameters.json"
 
 
 def test_powershell_native_calls_use_bounded_capture() -> None:
