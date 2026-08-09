@@ -3555,7 +3555,8 @@ body.asset-viewer-open { overflow: hidden; }
 }
 
 .watermark-corner-picker,
-.x-adult-toggle {
+.x-adult-toggle,
+.x-ai-toggle {
   min-width: 0;
   margin: 0;
   padding: .7rem;
@@ -3565,7 +3566,8 @@ body.asset-viewer-open { overflow: hidden; }
 }
 
 .watermark-corner-picker legend,
-.x-adult-toggle legend {
+.x-adult-toggle legend,
+.x-ai-toggle legend {
   padding: 0 .25rem;
   color: var(--muted-strong);
   font-size: .76rem;
@@ -3899,7 +3901,8 @@ body.asset-viewer-open { overflow: hidden; }
   font-size: .76rem;
 }
 
-.x-adult-toggle .delivery-action-note { margin-top: .55rem !important; }
+.x-adult-toggle .delivery-action-note,
+.x-ai-toggle .delivery-action-note { margin-top: .55rem !important; }
 .x-caption-count { margin: -.45rem 0 0 !important; text-align: right; }
 .delivery-schedule {
   margin: 0 !important;

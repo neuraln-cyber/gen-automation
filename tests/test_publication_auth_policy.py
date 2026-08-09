@@ -38,6 +38,7 @@ def test_publication_routes_apply_recent_auth_only_to_external_effects() -> None
     mutation_routes = (
         publications.post_publication_intent,
         publications.post_publication_revocation,
+        publications.post_publication_cancellation,
         publications.post_patreon_package_download,
     )
     recent_routes = (

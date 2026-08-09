@@ -25,6 +25,7 @@ from gen_automation.db.models import (
     IdempotencyRecord,
     PublicationApproval,
     PublicationAttempt,
+    PublicationEffectEvent,
     PublicationInput,
     PublicationIntent,
     PublicationPackage,
@@ -87,6 +88,12 @@ PUBLICATION_EFFECT_APPROVAL_ATTESTATION = (
 )
 PUBLICATION_REVOCATION_ATTESTATION = (
     "I revoke external-effect authorization for this exact publication intent."
+)
+PUBLICATION_PRE_EFFECT_CANCELLATION_ATTESTATION = (
+    "I cancel this exact publication intent after verifying that no provider request "
+    "can still have created the publication. "
+    "I understand cancellation is final and a changed schedule or caption requires "
+    "a new intent."
 )
 PUBLICATION_CONFIRM_PRESENT_ATTESTATION = (
     "I manually verified that this exact publication exists at the recorded "
@@ -192,6 +199,14 @@ class PublicationRevocationResult:
     intent_id: UUID
     approval_id: UUID
     approval_revision: int
+    intent_lock_version: int
+    state: PublicationIntentState
+    replayed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationCancellationResult:
+    intent_id: UUID
     intent_lock_version: int
     state: PublicationIntentState
     replayed: bool
@@ -626,7 +641,6 @@ async def approve_publication_intent(
     if intent.state not in {
         PublicationIntentState.AWAITING_APPROVAL,
         PublicationIntentState.FAILED,
-        PublicationIntentState.CANCELLED,
     }:
         raise PublicationConflictError("publication intent is not awaiting approval")
 
@@ -870,6 +884,7 @@ async def revoke_publication_intent(
     if replay is not None:
         return replay
 
+    attempts = await _lock_active_attempts_before_intent(session, intent_id=intent_id)
     intent, release, release_version, _revision_head = await _lock_intent_release_ordered(
         session, intent_id=intent_id
     )
@@ -880,8 +895,54 @@ async def revoke_publication_intent(
         PublicationIntentState.CANCELLED,
     }:
         raise PublicationConflictError("publication intent can no longer be revoked")
+    if intent.state in {
+        PublicationIntentState.AWAITING_HUMAN,
+        PublicationIntentState.UNKNOWN,
+    }:
+        raise PublicationConflictError(
+            "publication outcome requires reconciliation before authorization can be revoked"
+        )
     _require_current_publishable_release(release, release_version)
     await _require_current_compliance_approvals(session, release_version)
+
+    unresolved_attempt_id = await session.scalar(
+        select(PublicationAttempt.id)
+        .where(
+            PublicationAttempt.intent_id == intent.id,
+            PublicationAttempt.state.in_(
+                (
+                    PublicationAttemptState.AWAITING_HUMAN,
+                    PublicationAttemptState.UNKNOWN,
+                )
+            ),
+        )
+        .limit(1)
+    )
+    if unresolved_attempt_id is not None:
+        raise PublicationConflictError(
+            "publication outcome requires reconciliation before authorization can be revoked"
+        )
+    active_attempt_ids = tuple(
+        (
+            await session.scalars(
+                select(PublicationAttempt.id)
+                .where(
+                    PublicationAttempt.intent_id == intent.id,
+                    PublicationAttempt.state.in_(
+                        (
+                            PublicationAttemptState.QUEUED,
+                            PublicationAttemptState.CLAIMED,
+                            PublicationAttemptState.PROCESSING,
+                            PublicationAttemptState.RETRY_WAIT,
+                        )
+                    ),
+                )
+                .order_by(PublicationAttempt.attempt_no, PublicationAttempt.id)
+            )
+        ).all()
+    )
+    if active_attempt_ids != tuple(attempt.id for attempt in attempts):
+        raise PublicationConflictError("publication active-attempt state changed concurrently")
 
     revision = (
         int(
@@ -914,26 +975,7 @@ async def revoke_publication_intent(
         await session.rollback()
         raise PublicationConflictError("publication revocation snapshot is invalid") from error
 
-    attempts = tuple(
-        (
-            await session.scalars(
-                select(PublicationAttempt)
-                .where(
-                    PublicationAttempt.intent_id == intent.id,
-                    PublicationAttempt.state.in_(
-                        (
-                            PublicationAttemptState.QUEUED,
-                            PublicationAttemptState.CLAIMED,
-                            PublicationAttemptState.PROCESSING,
-                            PublicationAttemptState.RETRY_WAIT,
-                        )
-                    ),
-                )
-                .with_for_update()
-            )
-        ).all()
-    )
-    ambiguous = False
+    requires_reconciliation = False
     for attempt in attempts:
         steps = tuple(
             (
@@ -944,15 +986,21 @@ async def revoke_publication_intent(
                 )
             ).all()
         )
+        unsafe_step_ids = await _unsafe_provider_request_step_ids(
+            session,
+            steps=steps,
+        )
+        attempt_ambiguous = False
         for step in steps:
-            if step.effect_started_at is not None and step.effect_completed_at is None:
+            if step.id in unsafe_step_ids:
                 step.state = PublicationStepState.UNKNOWN
                 step.last_error_code = "revoked_during_effect"
                 step.last_error_detail = "external effect outcome requires reconciliation"
                 step.retry_at = None
                 step.updated_at = revoked_at
                 step.lock_version += 1
-                ambiguous = True
+                attempt_ambiguous = True
+                requires_reconciliation = True
             elif step.state in {
                 PublicationStepState.PENDING,
                 PublicationStepState.PROCESSING,
@@ -963,27 +1011,33 @@ async def revoke_publication_intent(
                 step.updated_at = revoked_at
                 step.lock_version += 1
         attempt.state = (
-            PublicationAttemptState.UNKNOWN if ambiguous else PublicationAttemptState.CANCELLED
+            PublicationAttemptState.UNKNOWN
+            if attempt_ambiguous
+            else PublicationAttemptState.CANCELLED
         )
         attempt.lease_owner = None
         attempt.lease_expires_at = None
         attempt.retry_at = None
-        attempt.completed_at = None if ambiguous else revoked_at
-        attempt.last_error_code = "revoked_during_effect" if ambiguous else "approval_revoked"
+        attempt.completed_at = None if attempt_ambiguous else revoked_at
+        attempt.last_error_code = (
+            "revoked_during_effect" if attempt_ambiguous else "approval_revoked"
+        )
         attempt.last_error_detail = (
             "external effect outcome requires reconciliation"
-            if ambiguous
+            if attempt_ambiguous
             else "external-effect authorization was revoked"
         )
         attempt.lock_version += 1
 
     intent.state = (
-        PublicationIntentState.UNKNOWN if ambiguous else PublicationIntentState.AWAITING_APPROVAL
+        PublicationIntentState.UNKNOWN
+        if requires_reconciliation
+        else PublicationIntentState.AWAITING_APPROVAL
     )
     intent.lock_version += 1
-    intent.last_error_code = "revoked_during_effect" if ambiguous else None
+    intent.last_error_code = "revoked_during_effect" if requires_reconciliation else None
     intent.last_error_detail = (
-        "external effect outcome requires reconciliation" if ambiguous else None
+        "external effect outcome requires reconciliation" if requires_reconciliation else None
     )
     result = PublicationRevocationResult(
         intent_id=intent.id,
@@ -1005,7 +1059,7 @@ async def revoke_publication_intent(
                 "intent_lock_version": intent.lock_version,
                 "approval_id": str(revocation.id),
                 "approval_revision": revocation.revision,
-                "requires_reconciliation": ambiguous,
+                "requires_reconciliation": requires_reconciliation,
             },
             now=revoked_at,
         )
@@ -1018,6 +1072,202 @@ async def revoke_publication_intent(
             status=200,
             response=_revocation_response(result),
             now=revoked_at,
+        )
+    )
+    await session.commit()
+    return result
+
+
+async def cancel_publication_intent(
+    session: AsyncSession,
+    *,
+    intent_id: UUID,
+    expected_intent_digest: str,
+    expected_lock_version: int,
+    actor_user_id: UUID,
+    actor_role: AdminRole | str,
+    attestation: str,
+    idempotency_key: str,
+    now: datetime | None = None,
+) -> PublicationCancellationResult:
+    """Cancel only when no provider request can still have created the publication."""
+
+    cancelled_at = _utc_now(now)
+    normalized_key = _bounded_text(idempotency_key, "idempotency key", 200)
+    normalized_digest = _sha256(expected_intent_digest, "intent digest")
+    normalized_lock = _positive_int(expected_lock_version, "expected lock version", 1_000_000_000)
+    if attestation != PUBLICATION_PRE_EFFECT_CANCELLATION_ATTESTATION:
+        raise PublicationInputError("the exact pre-effect cancellation attestation is required")
+    actor = await _require_publisher(session, actor_user_id, asserted_role=actor_role)
+    request_sha256 = canonical_sha256(
+        {
+            "schema": "publication-pre-effect-cancellation-request/v1",
+            "intent_id": str(intent_id),
+            "intent_digest": normalized_digest,
+            "expected_lock_version": normalized_lock,
+            "actor_user_id": str(actor.id),
+            "actor_role": actor.role.value,
+            "attestation_sha256": canonical_sha256(attestation),
+        }
+    )
+    scope = f"publication-intent:{intent_id}:cancel-before-effect"
+    replay = await _cancellation_replay(
+        session,
+        scope=scope,
+        idempotency_key=normalized_key,
+        request_sha256=request_sha256,
+    )
+    if replay is not None:
+        return replay
+
+    locked_active_attempts = await _lock_active_attempts_before_intent(session, intent_id=intent_id)
+    intent, _release, _release_version, _revision_head = await _lock_intent_release_ordered(
+        session, intent_id=intent_id
+    )
+    if intent.intent_digest != normalized_digest or intent.lock_version != normalized_lock:
+        raise PublicationConflictError("publication intent digest or lock is stale")
+    if intent.state not in {
+        PublicationIntentState.AWAITING_APPROVAL,
+        PublicationIntentState.READY,
+    }:
+        raise PublicationConflictError(
+            "publication intent can no longer be cancelled before effect"
+        )
+    attempt_snapshots = tuple(
+        (
+            await session.execute(
+                select(PublicationAttempt.id, PublicationAttempt.state)
+                .where(PublicationAttempt.intent_id == intent.id)
+                .order_by(PublicationAttempt.attempt_no)
+            )
+        ).all()
+    )
+    if any(
+        state
+        in {
+            PublicationAttemptState.CLAIMED,
+            PublicationAttemptState.PROCESSING,
+            PublicationAttemptState.AWAITING_HUMAN,
+            PublicationAttemptState.UNKNOWN,
+            PublicationAttemptState.SUCCEEDED,
+        }
+        for _attempt_id, state in attempt_snapshots
+    ):
+        raise PublicationConflictError(
+            "publication attempt has started or requires reconciliation and cannot be cancelled"
+        )
+    active_attempt_ids = tuple(
+        attempt_id
+        for attempt_id, state in attempt_snapshots
+        if state
+        in {
+            PublicationAttemptState.QUEUED,
+            PublicationAttemptState.RETRY_WAIT,
+        }
+    )
+    if active_attempt_ids != tuple(attempt.id for attempt in locked_active_attempts):
+        raise PublicationConflictError("publication active-attempt state changed concurrently")
+    active_attempts = tuple(
+        attempt
+        for attempt in locked_active_attempts
+        if attempt.state
+        in {
+            PublicationAttemptState.QUEUED,
+            PublicationAttemptState.RETRY_WAIT,
+        }
+    )
+    if len(active_attempts) > 1 or (
+        intent.state == PublicationIntentState.READY and len(active_attempts) != 1
+    ):
+        raise PublicationConflictError("publication active-attempt state is inconsistent")
+
+    active_steps: list[PublicationStep] = []
+    for attempt in active_attempts:
+        steps = tuple(
+            (
+                await session.scalars(
+                    select(PublicationStep)
+                    .where(PublicationStep.attempt_id == attempt.id)
+                    .order_by(PublicationStep.ordinal)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        if not steps or any(
+            step.state
+            not in {
+                PublicationStepState.PENDING,
+                PublicationStepState.RETRY_WAIT,
+            }
+            for step in steps
+        ):
+            raise PublicationConflictError(
+                "publication step has started or requires reconciliation and cannot be cancelled"
+            )
+        active_steps.extend(steps)
+
+    if active_steps:
+        unsafe_step_ids = await _unsafe_provider_request_step_ids(
+            session,
+            steps=active_steps,
+        )
+        if unsafe_step_ids:
+            raise PublicationConflictError(
+                "publication provider effect has started and cannot be cancelled"
+            )
+
+    for step in active_steps:
+        step.state = PublicationStepState.CANCELLED
+        step.retry_at = None
+        step.updated_at = cancelled_at
+        step.last_error_code = "intent_cancelled_before_effect"
+        step.last_error_detail = "publication intent was cancelled before provider effect"
+        step.lock_version += 1
+    for attempt in active_attempts:
+        attempt.state = PublicationAttemptState.CANCELLED
+        attempt.lease_owner = None
+        attempt.lease_expires_at = None
+        attempt.retry_at = None
+        attempt.completed_at = cancelled_at
+        attempt.last_error_code = "intent_cancelled_before_effect"
+        attempt.last_error_detail = "publication intent was cancelled before provider effect"
+        attempt.lock_version += 1
+
+    intent.state = PublicationIntentState.CANCELLED
+    intent.lock_version += 1
+    intent.completed_at = cancelled_at
+    intent.last_error_code = "intent_cancelled_before_effect"
+    intent.last_error_detail = "publication intent was cancelled before provider effect"
+    result = PublicationCancellationResult(
+        intent_id=intent.id,
+        intent_lock_version=intent.lock_version,
+        state=intent.state,
+        replayed=False,
+    )
+    session.add(
+        _audit(
+            actor_id=actor.id,
+            action="publication.intent_cancelled_before_effect",
+            resource_id=intent.id,
+            correlation_id=normalized_key,
+            detail={
+                "target": intent.target.value,
+                "intent_digest": intent.intent_digest,
+                "intent_lock_version": intent.lock_version,
+                "cancelled_attempt_count": len(active_attempts),
+                "cancelled_step_count": len(active_steps),
+            },
+            now=cancelled_at,
+        )
+    )
+    session.add(
+        _idempotency_record(
+            scope=scope,
+            key=normalized_key,
+            request_sha256=request_sha256,
+            status=200,
+            response=_cancellation_response(result),
+            now=cancelled_at,
         )
     )
     await session.commit()
@@ -1372,6 +1622,11 @@ async def reconcile_publication_absent(
         intent.last_error_detail = "Confirmed absent; manual package handoff is available."
         audit_action = "publication.patreon_outcome_confirmed_absent"
     else:
+        await _mark_x_confirmed_absent_attempt(
+            session,
+            intent=intent,
+            now=recorded_at,
+        )
         intent.state = PublicationIntentState.AWAITING_APPROVAL
         intent.last_error_code = None
         intent.last_error_detail = None
@@ -2094,9 +2349,11 @@ def _normalize_configuration(
         raise PublicationInputError("publication configuration keys must be strings")
 
     if target == PublicationTarget.X:
-        if "text" not in normalized or not set(normalized).issubset({"text", "adult_content"}):
+        if "text" not in normalized or not set(normalized).issubset(
+            {"text", "adult_content", "made_with_ai"}
+        ):
             raise PublicationInputError(
-                "X configuration must contain text and optional adult_content"
+                "X configuration must contain text and optional adult_content and made_with_ai"
             )
         text_value = normalized["text"]
         if not isinstance(text_value, str) or not text_value.strip():
@@ -2108,7 +2365,14 @@ def _normalize_configuration(
         adult_content = normalized.get("adult_content", True)
         if not isinstance(adult_content, bool):
             raise PublicationInputError("X adult_content must be a boolean")
-        return {"text": text_value, "adult_content": adult_content}
+        made_with_ai = normalized.get("made_with_ai", True)
+        if not isinstance(made_with_ai, bool):
+            raise PublicationInputError("X made_with_ai must be a boolean")
+        return {
+            "text": text_value,
+            "adult_content": adult_content,
+            "made_with_ai": made_with_ai,
+        }
 
     if set(normalized) != {"title", "body", "tier", "tags"}:
         raise PublicationInputError(
@@ -2367,6 +2631,36 @@ async def _lock_intent_release_ordered(
     ):
         raise PublicationConflictError("publication intent identity changed concurrently")
     return intent, release, release_version, revision_head
+
+
+async def _lock_active_attempts_before_intent(
+    session: AsyncSession,
+    *,
+    intent_id: UUID,
+) -> tuple[PublicationAttempt, ...]:
+    """Match the publication worker's attempt-before-intent lock order."""
+
+    return tuple(
+        (
+            await session.scalars(
+                select(PublicationAttempt)
+                .where(
+                    PublicationAttempt.intent_id == intent_id,
+                    PublicationAttempt.state.in_(
+                        (
+                            PublicationAttemptState.QUEUED,
+                            PublicationAttemptState.CLAIMED,
+                            PublicationAttemptState.PROCESSING,
+                            PublicationAttemptState.RETRY_WAIT,
+                        )
+                    ),
+                )
+                .order_by(PublicationAttempt.attempt_no, PublicationAttempt.id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+        ).all()
+    )
 
 
 async def _require_x_intent_matches_active_revision(
@@ -2651,6 +2945,114 @@ async def _mark_patreon_confirmed_absent_handoff(
     attempt.lock_version += 1
 
 
+async def _mark_x_confirmed_absent_attempt(
+    session: AsyncSession,
+    *,
+    intent: PublicationIntent,
+    now: datetime,
+) -> None:
+    attempts = tuple(
+        (
+            await session.scalars(
+                select(PublicationAttempt)
+                .where(
+                    PublicationAttempt.intent_id == intent.id,
+                    PublicationAttempt.state == PublicationAttemptState.UNKNOWN,
+                )
+                .order_by(PublicationAttempt.attempt_no)
+                .with_for_update()
+            )
+        ).all()
+    )
+    if len(attempts) != 1:
+        raise PublicationConflictError("unknown X publication attempt is unavailable")
+    attempt = attempts[0]
+    steps = tuple(
+        (
+            await session.scalars(
+                select(PublicationStep)
+                .where(PublicationStep.attempt_id == attempt.id)
+                .order_by(PublicationStep.ordinal)
+                .with_for_update()
+            )
+        ).all()
+    )
+    unknown_steps = tuple(step for step in steps if step.state == PublicationStepState.UNKNOWN)
+    if len(unknown_steps) != 1:
+        raise PublicationConflictError("unknown X publication step is unavailable")
+    for step in steps:
+        if step.state == PublicationStepState.UNKNOWN:
+            step.state = PublicationStepState.FAILED
+            step.retry_class = PublicationRetryClass.TERMINAL
+            if step.effect_started_at is not None:
+                step.effect_completed_at = step.effect_completed_at or now
+            step.last_error_code = "x_outcome_confirmed_absent"
+            step.last_error_detail = "Provider outcome was manually confirmed absent."
+        elif step.state in {
+            PublicationStepState.PENDING,
+            PublicationStepState.PROCESSING,
+            PublicationStepState.RETRY_WAIT,
+        }:
+            step.state = PublicationStepState.CANCELLED
+            step.last_error_code = "x_attempt_superseded_after_confirmed_absent"
+            step.last_error_detail = (
+                "The resolved attempt will not perform another provider effect."
+            )
+        else:
+            continue
+        step.retry_at = None
+        step.updated_at = now
+        step.lock_version += 1
+    attempt.state = PublicationAttemptState.FAILED
+    attempt.lease_owner = None
+    attempt.lease_expires_at = None
+    attempt.retry_at = None
+    attempt.completed_at = now
+    attempt.last_error_code = "x_outcome_confirmed_absent"
+    attempt.last_error_detail = "Provider outcome was manually confirmed absent."
+    attempt.lock_version += 1
+
+
+async def _unsafe_provider_request_step_ids(
+    session: AsyncSession,
+    *,
+    steps: Sequence[PublicationStep],
+) -> frozenset[UUID]:
+    step_ids = tuple(step.id for step in steps)
+    if not step_ids:
+        return frozenset()
+    events = tuple(
+        (
+            await session.execute(
+                select(
+                    PublicationEffectEvent.step_id,
+                    PublicationEffectEvent.request_no,
+                    PublicationEffectEvent.event_type,
+                    PublicationEffectEvent.is_completion,
+                ).where(PublicationEffectEvent.step_id.in_(step_ids))
+            )
+        ).all()
+    )
+    started = {
+        (step_id, request_no)
+        for step_id, request_no, event_type, is_completion in events
+        if event_type == "started" and not is_completion
+    }
+    completion_types = {
+        (step_id, request_no): event_type
+        for step_id, request_no, event_type, is_completion in events
+        if is_completion
+    }
+    safe_completion_types = frozenset({"retryable", "terminal"})
+    steps_by_id = {step.id: step for step in steps}
+    return frozenset(
+        step_id
+        for step_id, request_no in started
+        if completion_types.get((step_id, request_no)) not in safe_completion_types
+        and steps_by_id[step_id].kind != PublicationStepKind.X_MEDIA_UPLOAD
+    )
+
+
 def validate_patreon_post_identity(
     remote_identifier: str,
     remote_url: str,
@@ -2659,13 +3061,20 @@ def validate_patreon_post_identity(
     if not identifier.isdecimal() or len(identifier) > 20:
         raise PublicationInputError("Patreon post ID must contain decimal digits")
     normalized_url = _bounded_text(remote_url, "Patreon post URL", 2048)
-    parsed = urlsplit(normalized_url)
+    try:
+        parsed = urlsplit(normalized_url)
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
+        port = parsed.port
+    except ValueError:
+        raise PublicationInputError("Patreon post URL must be an exact HTTPS Patreon URL") from None
     if (
         parsed.scheme != "https"
-        or parsed.hostname not in {"patreon.com", "www.patreon.com"}
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.port not in {None, 443}
+        or hostname not in {"patreon.com", "www.patreon.com"}
+        or username is not None
+        or password is not None
+        or port not in {None, 443}
         or parsed.query
         or parsed.fragment
     ):
@@ -2687,13 +3096,20 @@ def _validate_x_post_identity(
     if _SNOWFLAKE.fullmatch(identifier) is None:
         raise PublicationInputError("X post ID must contain 1 to 19 decimal digits")
     normalized_url = _bounded_text(remote_url, "X post URL", 2048)
-    parsed = urlsplit(normalized_url)
+    try:
+        parsed = urlsplit(normalized_url)
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
+        port = parsed.port
+    except ValueError:
+        raise PublicationInputError("X post URL must be an exact HTTPS X URL") from None
     if (
         parsed.scheme != "https"
-        or parsed.hostname not in {"x.com", "www.x.com"}
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.port not in {None, 443}
+        or hostname not in {"x.com", "www.x.com"}
+        or username is not None
+        or password is not None
+        or port not in {None, 443}
         or parsed.query
         or parsed.fragment
     ):
@@ -2797,6 +3213,32 @@ async def _revocation_replay(
             intent_id=UUID(str(body["intent_id"])),
             approval_id=UUID(str(body["approval_id"])),
             approval_revision=int(body["approval_revision"]),
+            intent_lock_version=int(body["intent_lock_version"]),
+            state=PublicationIntentState(str(body["state"])),
+            replayed=True,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise PublicationConflictError("publication idempotency record is invalid") from error
+
+
+async def _cancellation_replay(
+    session: AsyncSession,
+    *,
+    scope: str,
+    idempotency_key: str,
+    request_sha256: str,
+) -> PublicationCancellationResult | None:
+    body = await _idempotency_body(
+        session,
+        scope=scope,
+        key=idempotency_key,
+        request_sha256=request_sha256,
+    )
+    if body is None:
+        return None
+    try:
+        return PublicationCancellationResult(
+            intent_id=UUID(str(body["intent_id"])),
             intent_lock_version=int(body["intent_lock_version"]),
             state=PublicationIntentState(str(body["state"])),
             replayed=True,
@@ -2956,6 +3398,14 @@ def _revocation_response(result: PublicationRevocationResult) -> dict[str, Any]:
         "intent_id": str(result.intent_id),
         "approval_id": str(result.approval_id),
         "approval_revision": result.approval_revision,
+        "intent_lock_version": result.intent_lock_version,
+        "state": result.state.value,
+    }
+
+
+def _cancellation_response(result: PublicationCancellationResult) -> dict[str, Any]:
+    return {
+        "intent_id": str(result.intent_id),
         "intent_lock_version": result.intent_lock_version,
         "state": result.state.value,
     }

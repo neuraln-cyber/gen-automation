@@ -25,6 +25,8 @@ from gen_automation.domain.publication import (
     PublicationApprovalCreate,
     PublicationApprovalRead,
     PublicationAttemptRead,
+    PublicationCancellationCreate,
+    PublicationCancellationRead,
     PublicationConfirmAbsent,
     PublicationConfirmPresent,
     PublicationGuardChange,
@@ -42,6 +44,7 @@ from gen_automation.domain.publication import (
 from gen_automation.services.publication import (
     PatreonPackageDownloadResult,
     PublicationApprovalResult,
+    PublicationCancellationResult,
     PublicationConflictError,
     PublicationDisabledError,
     PublicationGuardResult,
@@ -51,6 +54,7 @@ from gen_automation.services.publication import (
     PublicationReconciliationResult,
     PublicationRevocationResult,
     approve_publication_intent,
+    cancel_publication_intent,
     get_publication_guard,
     plan_publication_intent,
     presign_patreon_package_download,
@@ -210,6 +214,39 @@ async def post_publication_revocation(
         raise _http_error(error) from error
     response.headers["Idempotency-Replayed"] = str(result.replayed).lower()
     return _revocation_read(result)
+
+
+@router.post(
+    "/publication-intents/{intent_id}:cancel",
+    response_model=PublicationCancellationRead,
+)
+async def post_publication_cancellation(
+    intent_id: UUID,
+    command: PublicationCancellationCreate,
+    session: Session,
+    principal: PublicationMutationPrincipal,
+    idempotency_key: IdempotencyKey,
+    response: Response,
+) -> PublicationCancellationRead:
+    try:
+        result = await cancel_publication_intent(
+            session,
+            intent_id=intent_id,
+            expected_intent_digest=command.expected_intent_digest,
+            expected_lock_version=command.expected_lock_version,
+            actor_user_id=principal.user_id,
+            actor_role=principal.role,
+            attestation=command.attestation,
+            idempotency_key=idempotency_key,
+        )
+    except (
+        PublicationInputError,
+        PublicationNotFoundError,
+        PublicationConflictError,
+    ) as error:
+        raise _http_error(error) from error
+    response.headers["Idempotency-Replayed"] = str(result.replayed).lower()
+    return _cancellation_read(result)
 
 
 @router.post(
@@ -550,6 +587,17 @@ def _revocation_read(
         intent_id=result.intent_id,
         approval_id=result.approval_id,
         approval_revision=result.approval_revision,
+        intent_lock_version=result.intent_lock_version,
+        state=result.state,
+        replayed=result.replayed,
+    )
+
+
+def _cancellation_read(
+    result: PublicationCancellationResult,
+) -> PublicationCancellationRead:
+    return PublicationCancellationRead(
+        intent_id=result.intent_id,
         intent_lock_version=result.intent_lock_version,
         state=result.state,
         replayed=result.replayed,

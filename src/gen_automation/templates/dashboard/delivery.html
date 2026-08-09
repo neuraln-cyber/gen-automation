@@ -455,6 +455,27 @@
                 data-local-datetime
               >{{ destination.scheduled_at.isoformat() }}</time>
             </p>
+            {% if x_cancel_idempotency_key and destination.intent_id %}
+              <form
+                class="delivery-card-action"
+                method="post"
+                action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/x/{{ destination.intent_id }}:cancel"
+                data-requires-recent-auth
+              >
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="idempotency_key" value="{{ x_cancel_idempotency_key }}">
+                <input type="hidden" name="expected_intent_digest" value="{{ destination.intent_digest }}">
+                <input type="hidden" name="expected_lock_version" value="{{ destination.intent_lock_version }}">
+                <input type="hidden" name="attestation" value="{{ x_cancel_attestation }}">
+                <button class="secondary-button stop-button" type="submit">
+                  Cancel scheduled X post
+                </button>
+                <p class="muted delivery-action-note">
+                  Cancels only when no X request can still have created a post.
+                  You can then enter a new caption or schedule.
+                </p>
+              </form>
+            {% endif %}
           {% endif %}
 
           {% if destination.key == "mega" %}
@@ -1069,7 +1090,24 @@
                     </div>
                     <p class="muted delivery-action-note">
                       Turn this off only when every selected teaser is completely SFW.
-                      The AI-generated disclosure remains on either way.
+                      This setting is independent from the AI-generated disclosure.
+                    </p>
+                  </fieldset>
+                  <fieldset class="x-ai-toggle">
+                    <legend>AI-generated media label</legend>
+                    <div class="segmented-options">
+                      <label>
+                        <input type="radio" name="x_made_with_ai" value="true" checked>
+                        <span>On &middot; AI-generated</span>
+                      </label>
+                      <label>
+                        <input type="radio" name="x_made_with_ai" value="false">
+                        <span>Off &middot; not AI-generated</span>
+                      </label>
+                    </div>
+                    <p class="muted delivery-action-note">
+                      Controls X's AI-generated label independently. Turn it off only when
+                      the selected media was not generated or materially edited with AI.
                     </p>
                   </fieldset>
                   <label>
@@ -1092,6 +1130,47 @@
                   <p class="muted delivery-action-note">This button does not start MEGA, Patreon, or ZIP preparation.</p>
                 </form>
                 {% endif %}
+              {% endif %}
+              {% if destination.state == "unknown" and x_present_idempotency_key and x_absent_idempotency_key %}
+                <details class="decision-details delivery-recovery">
+                  <summary>Resolve unknown X result</summary>
+                  <div class="decision-fields">
+                    <p class="muted">
+                      Check the connected X account first. These controls record what
+                      happened and never post or retry by themselves.
+                    </p>
+                    <form
+                      class="decision-form"
+                      method="post"
+                      action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/x/{{ destination.intent_id }}:confirm-present"
+                      data-requires-recent-auth
+                    >
+                      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                      <input type="hidden" name="idempotency_key" value="{{ x_present_idempotency_key }}">
+                      <input type="hidden" name="expected_intent_digest" value="{{ destination.intent_digest }}">
+                      <input type="hidden" name="expected_lock_version" value="{{ destination.intent_lock_version }}">
+                      <input type="hidden" name="attestation" value="{{ x_present_attestation }}">
+                      <label>X post ID <input name="remote_identifier" inputmode="numeric" pattern="[0-9]{1,19}" maxlength="19" required></label>
+                      <label>Confirmed post URL <input name="remote_url" type="url" maxlength="2048" required></label>
+                      <label>Evidence checked <textarea name="evidence" maxlength="20000" rows="3" required></textarea></label>
+                      <button class="primary-button" type="submit">Confirm X post exists</button>
+                    </form>
+                    <form
+                      class="decision-form"
+                      method="post"
+                      action="/dashboard/review-tasks/{{ delivery.review_task_id }}/delivery/x/{{ destination.intent_id }}:confirm-absent"
+                      data-requires-recent-auth
+                    >
+                      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                      <input type="hidden" name="idempotency_key" value="{{ x_absent_idempotency_key }}">
+                      <input type="hidden" name="expected_intent_digest" value="{{ destination.intent_digest }}">
+                      <input type="hidden" name="expected_lock_version" value="{{ destination.intent_lock_version }}">
+                      <input type="hidden" name="attestation" value="{{ x_absent_attestation }}">
+                      <label>Evidence the post was not created <textarea name="evidence" maxlength="20000" rows="3" required></textarea></label>
+                      <button class="secondary-button" type="submit">Confirm X post is absent</button>
+                    </form>
+                  </div>
+                </details>
               {% endif %}
             {% endif %}
           {% endif %}

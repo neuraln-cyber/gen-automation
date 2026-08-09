@@ -90,6 +90,35 @@ def _signed_fields(
     }
 
 
+def _signed_intent_fields(
+    settings: Settings,
+    owner: AuthenticatedPrincipal,
+    *,
+    review_task_id: UUID,
+    intent_id: UUID,
+    action: str,
+    digest: str = "d" * 64,
+    lock_version: int = 5,
+) -> dict[str, str]:
+    return {
+        "csrf_token": delivery_csrf_token(settings, session_id=owner.session_id),
+        "idempotency_key": delivery_form_key(
+            settings,
+            session_id=owner.session_id,
+            action=action,
+            parts=(str(review_task_id), str(intent_id), digest, str(lock_version)),
+        ),
+        "expected_intent_digest": digest,
+        "expected_lock_version": str(lock_version),
+    }
+
+
+def test_x_schedule_comparison_normalizes_sqlite_naive_datetimes() -> None:
+    naive = datetime(2026, 8, 10, 15, 30)
+
+    assert delivery_routes._as_utc(naive) == datetime(2026, 8, 10, 15, 30, tzinfo=UTC)
+
+
 @pytest.mark.asyncio
 async def test_signed_patreon_route_calls_only_patreon_service(
     monkeypatch: pytest.MonkeyPatch,
@@ -182,6 +211,7 @@ async def test_signed_x_route_calls_only_x_service(
         ),
         "x_text": "X only",
         "x_adult_content": "false",
+        "x_made_with_ai": "false",
         "x_scheduled_local": "2026-08-10T18:30",
         "x_timezone": "Europe/Sofia",
     }
@@ -230,6 +260,7 @@ async def test_signed_x_route_calls_only_x_service(
     assert x_calls[0]["review_task_id"] == review_task_id
     assert x_calls[0]["x_text"] == "X only"
     assert x_calls[0]["x_adult_content"] is False
+    assert x_calls[0]["x_made_with_ai"] is False
     assert x_calls[0]["scheduled_at"] == datetime(2026, 8, 10, 15, 30, tzinfo=UTC)
     assert patreon_calls == []
     assert mega_calls == []
@@ -736,6 +767,7 @@ async def test_stale_cross_target_signature_cannot_start_x(
         ),
         "x_text": "must not post",
         "x_adult_content": "true",
+        "x_made_with_ai": "true",
         "x_scheduled_local": "",
         "x_timezone": "Europe/Sofia",
     }
@@ -764,3 +796,177 @@ async def test_stale_cross_target_signature_cannot_start_x(
 
     assert response.status_code == 400
     assert x_calls == []
+
+
+@pytest.mark.asyncio
+async def test_signed_scheduled_x_cancel_requires_recent_owner_and_exact_x_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    app = FastAPI()
+    app.state.settings = settings
+    owner = _owner()
+    review_task_id = uuid4()
+    intent_id = uuid4()
+    session = object()
+    fields = {
+        **_signed_intent_fields(
+            settings,
+            owner,
+            review_task_id=review_task_id,
+            intent_id=intent_id,
+            action="x-cancel",
+        ),
+        "attestation": delivery_routes.PUBLICATION_PRE_EFFECT_CANCELLATION_ATTESTATION,
+    }
+    verified = 0
+    bound = 0
+    calls: list[dict[str, object]] = []
+
+    async def verify_owner(*_args: object, **_kwargs: object) -> AuthenticatedPrincipal:
+        nonlocal verified
+        verified += 1
+        return owner
+
+    async def require_x(
+        _session: object,
+        *,
+        review_task_id: UUID,
+        intent_id: UUID,
+    ) -> None:
+        nonlocal bound
+        assert _session is session
+        assert review_task_id == locals_review_task_id
+        assert intent_id == locals_intent_id
+        bound += 1
+
+    async def cancel(_session: object, **kwargs: object) -> object:
+        assert _session is session
+        calls.append(kwargs)
+        return object()
+
+    locals_review_task_id = review_task_id
+    locals_intent_id = intent_id
+    monkeypatch.setattr(delivery_routes, "_verified_owner", verify_owner)
+    monkeypatch.setattr(delivery_routes, "_require_review_x_intent", require_x)
+    monkeypatch.setattr(delivery_routes, "cancel_publication_intent", cancel)
+
+    response = await delivery_routes.dashboard_cancel_x_publication(
+        review_task_id,
+        intent_id,
+        _request(
+            app,
+            path=(f"/dashboard/review-tasks/{review_task_id}/delivery/x/{intent_id}:cancel"),
+            fields=fields,
+        ),
+        session,  # type: ignore[arg-type]
+        owner,
+    )
+
+    assert response.status_code == 303
+    assert verified == 1
+    assert bound == 1
+    assert calls == [
+        {
+            "intent_id": intent_id,
+            "expected_intent_digest": "d" * 64,
+            "expected_lock_version": 5,
+            "actor_user_id": owner.user_id,
+            "actor_role": AdminRole.OWNER,
+            "attestation": delivery_routes.PUBLICATION_PRE_EFFECT_CANCELLATION_ATTESTATION,
+            "idempotency_key": fields["idempotency_key"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["present", "absent"])
+async def test_signed_x_reconciliation_routes_are_recent_owner_only_and_never_publish(
+    outcome: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    app = FastAPI()
+    app.state.settings = settings
+    owner = _owner()
+    review_task_id = uuid4()
+    intent_id = uuid4()
+    session = object()
+    action = f"x-confirm-{outcome}"
+    fields = _signed_intent_fields(
+        settings,
+        owner,
+        review_task_id=review_task_id,
+        intent_id=intent_id,
+        action=action,
+    )
+    fields.update(
+        {
+            "evidence": "Checked the connected X account and exact frozen post.",
+            "attestation": (
+                delivery_routes.PUBLICATION_CONFIRM_PRESENT_ATTESTATION
+                if outcome == "present"
+                else delivery_routes.PUBLICATION_CONFIRM_ABSENT_ATTESTATION
+            ),
+        }
+    )
+    if outcome == "present":
+        fields.update(
+            {
+                "remote_identifier": "1234567890",
+                "remote_url": "https://x.com/example/status/1234567890",
+            }
+        )
+    verified = 0
+    bound = 0
+    present_calls: list[dict[str, object]] = []
+    absent_calls: list[dict[str, object]] = []
+
+    async def verify_owner(*_args: object, **_kwargs: object) -> AuthenticatedPrincipal:
+        nonlocal verified
+        verified += 1
+        return owner
+
+    async def require_x(_session: object, **kwargs: object) -> None:
+        nonlocal bound
+        assert _session is session
+        assert kwargs == {"review_task_id": review_task_id, "intent_id": intent_id}
+        bound += 1
+
+    async def confirm_present(_session: object, **kwargs: object) -> object:
+        present_calls.append(kwargs)
+        return object()
+
+    async def confirm_absent(_session: object, **kwargs: object) -> object:
+        absent_calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(delivery_routes, "_verified_owner", verify_owner)
+    monkeypatch.setattr(delivery_routes, "_require_review_x_intent", require_x)
+    monkeypatch.setattr(delivery_routes, "reconcile_publication_present", confirm_present)
+    monkeypatch.setattr(delivery_routes, "reconcile_publication_absent", confirm_absent)
+
+    route = (
+        delivery_routes.dashboard_confirm_x_present
+        if outcome == "present"
+        else delivery_routes.dashboard_confirm_x_absent
+    )
+    response = await route(
+        review_task_id,
+        intent_id,
+        _request(
+            app,
+            path=(
+                f"/dashboard/review-tasks/{review_task_id}/delivery/x/{intent_id}:confirm-{outcome}"
+            ),
+            fields=fields,
+        ),
+        session,  # type: ignore[arg-type]
+        owner,
+    )
+
+    assert response.status_code == 303
+    assert verified == 1
+    assert bound == 1
+    assert len(present_calls) == (1 if outcome == "present" else 0)
+    assert len(absent_calls) == (1 if outcome == "absent" else 0)

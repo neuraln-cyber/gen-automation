@@ -54,12 +54,15 @@ For X:
 - schedules must be timezone-aware and no more than 366 days ahead;
 - a future-scheduled attempt remains unavailable until its requested post time,
   because this workflow performs the X create-post effect at that instant;
+- a queued future post can be cancelled before any potentially successful or
+  unresolved provider request; changing its caption or time then creates a new
+  immutable intent and requires fresh approval;
 - the ordered inputs must exactly match the owner's image selections frozen at
   review completion; omitted, additional, or reordered outputs are rejected;
 - each upload follows the intent's frozen `adult_content` choice; text-only
   legacy intents default to `true`, while `false` skips adult-warning metadata;
-- post creation always sends X's `made_with_ai: true` label regardless of that
-  adult-content choice;
+- post creation sends the intent's independently frozen `made_with_ai` choice;
+  generated-teaser and legacy intents default it to `true`;
 - an ambiguous upload is retried with a new request and its unconfirmed media ID
   is never stored or reused;
 - each provider request has append-only started/completion evidence;
@@ -68,6 +71,9 @@ For X:
   408/429/5xx responses, malformed success responses, context-exit uncertainty,
   process loss, and durable completion failures become `UNKNOWN`;
 - an unknown create is never retried automatically;
+- owners can resolve an unknown X result from the dashboard as confirmed present
+  or confirmed absent; confirmed-absent attempts are terminalized before any
+  fresh approval is allowed;
 - confirming the post present records the exact post ID and HTTPS X URL;
 - confirming it absent records evidence and returns the intent to
   `AWAITING_APPROVAL`. It does not post or create a new attempt.

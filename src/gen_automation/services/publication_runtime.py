@@ -119,6 +119,7 @@ class XPublicationClient(Protocol):
         *,
         text: str,
         media_ids: Sequence[str],
+        made_with_ai: bool = True,
     ) -> XPost: ...
 
 
@@ -184,16 +185,24 @@ class _EffectContext:
     configuration: dict[str, object]
 
 
-def _x_configuration(configuration: dict[str, object]) -> tuple[str, bool]:
+def _x_configuration(configuration: dict[str, object]) -> tuple[str, bool, bool]:
     """Read a frozen X configuration, including legacy text-only snapshots."""
 
-    if "text" not in configuration or not set(configuration).issubset({"text", "adult_content"}):
+    if "text" not in configuration or not set(configuration).issubset(
+        {"text", "adult_content", "made_with_ai"}
+    ):
         raise PublicationRuntimeContractError("frozen X configuration is invalid")
     text = configuration["text"]
     adult_content = configuration.get("adult_content", True)
-    if not isinstance(text, str) or not text.strip() or not isinstance(adult_content, bool):
+    made_with_ai = configuration.get("made_with_ai", True)
+    if (
+        not isinstance(text, str)
+        or not text.strip()
+        or not isinstance(adult_content, bool)
+        or not isinstance(made_with_ai, bool)
+    ):
         raise PublicationRuntimeContractError("frozen X configuration is invalid")
-    return text, adult_content
+    return text, adult_content, made_with_ai
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,7 +385,7 @@ async def _execute_claimed_attempt(
                     now=effect_at,
                 )
                 try:
-                    _, adult_content = _x_configuration(context.configuration)
+                    _, adult_content, _ = _x_configuration(context.configuration)
                 except PublicationRuntimeContractError:
                     return await _mark_failed_result(
                         sessions,
@@ -621,7 +630,7 @@ async def _execute_claimed_attempt(
                         error_code="x_credentials_unavailable",
                     )
                 try:
-                    text_value, _ = _x_configuration(context.configuration)
+                    text_value, _, made_with_ai = _x_configuration(context.configuration)
                 except PublicationRuntimeContractError:
                     return await _mark_failed_result(
                         sessions,
@@ -656,6 +665,7 @@ async def _execute_claimed_attempt(
                         post = await oauth.client.create_post(
                             text=text_value,
                             media_ids=media_ids,
+                            made_with_ai=made_with_ai,
                         )
                         provider_returned = True
                 except XCredentialUnavailableError:

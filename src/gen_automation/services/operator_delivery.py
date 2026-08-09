@@ -727,6 +727,7 @@ async def prepare_operator_x_destination(
     actor_role: AdminRole,
     idempotency_key: str,
     x_adult_content: bool = True,
+    x_made_with_ai: bool = True,
     scheduled_at: datetime | None = None,
     now: datetime | None = None,
 ) -> PreparedDestination:
@@ -740,7 +741,11 @@ async def prepare_operator_x_destination(
     if x_credential_reference is None:
         raise OperatorDeliveryConflictError("the X credential reference is not configured")
 
-    configuration = {"text": x_text, "adult_content": x_adult_content}
+    configuration = {
+        "text": x_text,
+        "adult_content": x_adult_content,
+        "made_with_ai": x_made_with_ai,
+    }
     output_ids = tuple(output.output_id for output in snapshot.x_outputs)
     try:
         _normalize_configuration(PublicationTarget.X, configuration)

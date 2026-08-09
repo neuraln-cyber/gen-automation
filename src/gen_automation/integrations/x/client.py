@@ -458,8 +458,14 @@ class XClient:
         except ValueError as error:
             raise XProtocolError(str(error)) from error
 
-    async def create_post(self, *, text: str, media_ids: Sequence[str]) -> XPost:
-        """Create one AI-labelled image post, without any automatic retry."""
+    async def create_post(
+        self,
+        *,
+        text: str,
+        media_ids: Sequence[str],
+        made_with_ai: bool = True,
+    ) -> XPost:
+        """Create one image post, without any automatic retry."""
         if not isinstance(text, str) or not text.strip():
             raise ValueError("X post text must not be empty")
         text_bytes = text.encode("utf-8")
@@ -467,6 +473,8 @@ class XClient:
             raise ValueError(f"X post text must not exceed {X_MAX_POST_TEXT_BYTES} UTF-8 bytes")
         if isinstance(media_ids, (str, bytes)):
             raise TypeError("X media IDs must be a sequence of strings")
+        if not isinstance(made_with_ai, bool):
+            raise TypeError("made_with_ai must be a boolean")
         normalized_media_ids = tuple(media_ids)
         if not 1 <= len(normalized_media_ids) <= X_MAX_MEDIA_PER_POST:
             raise ValueError(f"X posts require between 1 and {X_MAX_MEDIA_PER_POST} media IDs")
@@ -483,7 +491,7 @@ class XClient:
             expected_status=201,
             json_body={
                 "text": text,
-                "made_with_ai": True,
+                "made_with_ai": made_with_ai,
                 "media": {"media_ids": list(normalized_media_ids)},
             },
             operation="post creation",

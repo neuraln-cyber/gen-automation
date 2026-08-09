@@ -63,6 +63,12 @@ class PublicationRevocationCreate(StrictPublicationModel):
     attestation: str = Field(min_length=1, max_length=500)
 
 
+class PublicationCancellationCreate(StrictPublicationModel):
+    expected_intent_digest: Sha256
+    expected_lock_version: int = Field(ge=1)
+    attestation: str = Field(min_length=1, max_length=500)
+
+
 class PublicationGuardChange(StrictPublicationModel):
     enabled: bool
     expected_epoch: int = Field(ge=1)
@@ -123,6 +129,13 @@ class PublicationRevocationRead(StrictPublicationModel):
     intent_id: UUID
     approval_id: UUID
     approval_revision: int
+    intent_lock_version: int
+    state: PublicationIntentState
+    replayed: bool
+
+
+class PublicationCancellationRead(StrictPublicationModel):
+    intent_id: UUID
     intent_lock_version: int
     state: PublicationIntentState
     replayed: bool
