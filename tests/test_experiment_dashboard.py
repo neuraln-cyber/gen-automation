@@ -109,6 +109,8 @@ def _configure_worker_manifest(client: TestClient, options: object) -> None:
     client.app.state.settings.salad_worker_model_manifest_sha256 = SecretStr(
         manifest.manifest_sha256
     )
+    client.app.state.settings.salad_worker_artifact_bucket = SecretStr("test-artifact-bucket")
+    client.app.state.settings.salad_container_storage_bytes = 10 * 1024**3
 
 
 def _seed_warm_deployment(client: TestClient) -> None:

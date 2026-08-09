@@ -43,6 +43,9 @@ from gen_automation.domain.enums import (
     GenerationAttemptState,
     GenerationState,
     InboxStatus,
+    LoraImportJobState,
+    LoraImportSource,
+    ManagedLoraLifecycle,
     MegaDeliveryState,
     ModelArtifactKind,
     OutboxStatus,
@@ -70,6 +73,16 @@ from gen_automation.domain.enums import (
     SemanticVerdict,
     SpendEntryType,
 )
+
+
+def _lower_hex_check(column_name: str) -> str:
+    expression = column_name
+    for character in "0123456789abcdef":
+        expression = f"replace({expression}, '{character}', '')"
+    return (
+        f"length({column_name}) = 64 AND {column_name} = lower({column_name}) "
+        f"AND length({expression}) = 0"
+    )
 
 
 class Project(UuidPrimaryKeyMixin, TimestampMixin, Base):
@@ -647,6 +660,12 @@ class SaladDeployment(UuidPrimaryKeyMixin, TimestampMixin, Base):
             name="positive_desired_queue_length",
         ),
         CheckConstraint(
+            "runtime_artifact_manifest_sha256 IS NULL OR ("
+            + _lower_hex_check("runtime_artifact_manifest_sha256")
+            + ")",
+            name="valid_runtime_artifact_manifest_sha256",
+        ),
+        CheckConstraint(
             "max_replicas <= 1",
             name="single_creator_replica_limit",
         ),
@@ -720,6 +739,8 @@ class SaladDeployment(UuidPrimaryKeyMixin, TimestampMixin, Base):
         unique=True,
     )
     config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    runtime_artifact_manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    runtime_managed_lora_sha256s: Mapped[list[str] | None] = mapped_column(JSON_TYPE)
     provider_configuration: Mapped[dict[str, Any]] = mapped_column(
         JSON_TYPE,
         nullable=False,
@@ -4297,6 +4318,344 @@ class ModelArtifactApproval(UuidPrimaryKeyMixin, TimestampMixin, Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class ManagedLoraArtifact(UuidPrimaryKeyMixin, TimestampMixin, Base):
+    """One immutable, content-addressed LoRA and its deployment lifecycle."""
+
+    __tablename__ = "managed_lora_artifacts"
+    __table_args__ = (
+        UniqueConstraint(
+            "storage_bucket",
+            "object_key",
+            "object_version_id",
+            name="uq_managed_lora_artifacts_storage_version",
+        ),
+        Index(
+            "uq_managed_lora_artifacts_live_sha256",
+            "artifact_sha256",
+            unique=True,
+            postgresql_where=text("lifecycle <> 'purged'"),
+            sqlite_where=text("lifecycle <> 'purged'"),
+        ),
+        Index(
+            "uq_managed_lora_artifacts_live_approval",
+            "approval_id",
+            unique=True,
+            postgresql_where=text("lifecycle <> 'purged'"),
+            sqlite_where=text("lifecycle <> 'purged'"),
+        ),
+        Index(
+            "uq_managed_lora_artifacts_live_target_filename",
+            "target_filename",
+            unique=True,
+            postgresql_where=text("lifecycle <> 'purged'"),
+            sqlite_where=text("lifecycle <> 'purged'"),
+        ),
+        CheckConstraint(
+            _lower_hex_check("artifact_sha256"),
+            name="valid_artifact_sha256",
+        ),
+        CheckConstraint("byte_size > 0", name="positive_byte_size"),
+        CheckConstraint("lock_version > 0", name="positive_lock_version"),
+        CheckConstraint(
+            "lifecycle_error_count >= 0",
+            name="nonnegative_lifecycle_error_count",
+        ),
+        CheckConstraint(
+            "(lifecycle_error_code IS NULL AND lifecycle_error_detail IS NULL) "
+            "OR (lifecycle_error_code IS NOT NULL AND lifecycle_error_detail IS NOT NULL)",
+            name="complete_lifecycle_error",
+        ),
+        CheckConstraint(
+            "length(trim(display_name)) > 0 "
+            "AND length(trim(canonical_source_url)) > 0 "
+            "AND length(trim(license_url)) > 0 "
+            "AND length(trim(storage_bucket)) > 0 "
+            "AND length(trim(object_key)) > 0 "
+            "AND length(trim(object_version_id)) > 0 "
+            "AND length(trim(object_etag)) > 0 "
+            "AND length(trim(target_filename)) > 0",
+            name="complete_identity",
+        ),
+        CheckConstraint(
+            "lower(target_filename) LIKE '%.safetensors'",
+            name="safetensors_target",
+        ),
+        CheckConstraint(
+            "object_key = 'worker/managed-loras/sha256/' || artifact_sha256 || '.safetensors'",
+            name="content_addressed_object_key",
+        ),
+        CheckConstraint(
+            "(lifecycle = 'active' AND activated_at IS NOT NULL) OR lifecycle <> 'active'",
+            name="active_timestamp",
+        ),
+        CheckConstraint(
+            "(lifecycle IN ('retiring', 'retired', 'purged') "
+            "AND retirement_requested_at IS NOT NULL) "
+            "OR lifecycle IN ('pending_activation', 'active')",
+            name="retirement_timestamp",
+        ),
+        CheckConstraint(
+            "(lifecycle = 'purged' AND purge_requested = true "
+            "AND retired_at IS NOT NULL AND purged_at IS NOT NULL) "
+            "OR (lifecycle <> 'purged' AND purged_at IS NULL)",
+            name="purge_state",
+        ),
+        Index(
+            "ix_managed_lora_artifacts_lifecycle_created",
+            "lifecycle",
+            "lifecycle_retry_at",
+            "created_at",
+        ),
+    )
+
+    artifact_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    source_type: Mapped[LoraImportSource] = mapped_column(
+        Enum(
+            LoraImportSource,
+            name="lora_import_source",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=7,
+        ),
+        nullable=False,
+    )
+    canonical_source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    license_url: Mapped[str] = mapped_column(Text, nullable=False)
+    civitai_model_id: Mapped[int | None] = mapped_column(BigInteger)
+    civitai_version_id: Mapped[int | None] = mapped_column(BigInteger)
+    civitai_file_id: Mapped[int | None] = mapped_column(BigInteger)
+    provenance: Mapped[dict[str, Any]] = mapped_column(
+        JSON_TYPE,
+        nullable=False,
+        default=dict,
+    )
+    storage_bucket: Mapped[str] = mapped_column(String(255), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    object_version_id: Mapped[str] = mapped_column(String(1024), nullable=False)
+    object_etag: Mapped[str] = mapped_column(String(80), nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    target_filename: Mapped[str] = mapped_column(String(236), nullable=False)
+    approval_id: Mapped[UUID] = mapped_column(
+        ForeignKey("model_artifact_approvals.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    trigger_words: Mapped[list[str]] = mapped_column(JSON_TYPE, nullable=False, default=list)
+    lifecycle: Mapped[ManagedLoraLifecycle] = mapped_column(
+        Enum(
+            ManagedLoraLifecycle,
+            name="managed_lora_lifecycle",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=18,
+        ),
+        nullable=False,
+        default=ManagedLoraLifecycle.PENDING_ACTIVATION,
+    )
+    purge_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    registered_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    retirement_requested_by_user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"),
+    )
+    restored_by_user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"),
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retirement_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    restored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lifecycle_error_code: Mapped[str | None] = mapped_column(String(100))
+    lifecycle_error_detail: Mapped[str | None] = mapped_column(Text)
+    lifecycle_error_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    lifecycle_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lock_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+
+class LoraImportJob(UuidPrimaryKeyMixin, TimestampMixin, Base):
+    """Restart-safe manual or Civitai import request; rows are never deleted."""
+
+    __tablename__ = "lora_import_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "staging_bucket",
+            "staging_object_key",
+            name="uq_lora_import_jobs_staging_object",
+        ),
+        CheckConstraint("attempts >= 0", name="nonnegative_attempts"),
+        CheckConstraint("max_attempts > 0", name="positive_max_attempts"),
+        CheckConstraint("attempts <= max_attempts", name="attempts_within_limit"),
+        CheckConstraint(
+            "commercial_use_attested = true AND adult_use_attested = true",
+            name="rights_attested",
+        ),
+        CheckConstraint("lock_version > 0", name="positive_lock_version"),
+        CheckConstraint("progress_bytes >= 0", name="nonnegative_progress"),
+        CheckConstraint(
+            "total_bytes IS NULL OR total_bytes > 0",
+            name="positive_total_bytes",
+        ),
+        CheckConstraint(
+            "total_bytes IS NULL OR progress_bytes <= total_bytes",
+            name="progress_within_total",
+        ),
+        CheckConstraint(
+            "expected_sha256 IS NULL OR (" + _lower_hex_check("expected_sha256") + ")",
+            name="valid_expected_sha256",
+        ),
+        CheckConstraint(
+            "expected_byte_size IS NULL OR expected_byte_size > 0",
+            name="positive_expected_byte_size",
+        ),
+        CheckConstraint(
+            "(source_type = 'manual' AND staging_bucket IS NOT NULL "
+            "AND staging_object_key IS NOT NULL "
+            "AND civitai_model_id IS NULL AND civitai_version_id IS NULL "
+            "AND civitai_file_id IS NULL) "
+            "OR (source_type = 'civitai' AND staging_bucket IS NULL "
+            "AND staging_object_key IS NULL)",
+            name="source_contract",
+        ),
+        CheckConstraint(
+            "(staging_object_version_id IS NULL AND staging_object_etag IS NULL "
+            "AND staging_byte_size IS NULL) OR "
+            "(staging_object_version_id IS NOT NULL AND staging_object_etag IS NOT NULL "
+            "AND staging_byte_size IS NOT NULL AND staging_byte_size > 0)",
+            name="staging_version_tuple",
+        ),
+        CheckConstraint(
+            "source_type = 'manual' OR staging_object_version_id IS NULL",
+            name="manual_staging_version_only",
+        ),
+        CheckConstraint(
+            "state <> 'awaiting_upload' OR (source_type = 'manual' "
+            "AND staging_object_version_id IS NULL)",
+            name="awaiting_manual_upload",
+        ),
+        CheckConstraint(
+            "state NOT IN ('queued', 'claimed', 'retry_wait', 'failed') "
+            "OR source_type = 'civitai' OR staging_object_version_id IS NOT NULL",
+            name="manual_processing_has_version",
+        ),
+        CheckConstraint(
+            "(state = 'claimed' AND lease_owner IS NOT NULL "
+            "AND lease_expires_at IS NOT NULL) OR "
+            "(state <> 'claimed' AND lease_owner IS NULL AND lease_expires_at IS NULL)",
+            name="lease_state",
+        ),
+        CheckConstraint(
+            "(state = 'completed' AND result_artifact_id IS NOT NULL "
+            "AND completed_at IS NOT NULL AND last_error_code IS NULL) OR "
+            "(state = 'duplicate' AND completed_at IS NOT NULL AND ("
+            "(result_artifact_id IS NOT NULL AND last_error_code IS NULL) OR "
+            "(result_artifact_id IS NULL "
+            "AND last_error_code = 'already_available_static' "
+            "AND last_error_detail IS NOT NULL))) OR "
+            "(state = 'failed' AND result_artifact_id IS NULL "
+            "AND completed_at IS NOT NULL AND last_error_code IS NOT NULL) OR "
+            "(state = 'cancelled' AND result_artifact_id IS NULL "
+            "AND completed_at IS NOT NULL) OR "
+            "(state NOT IN ('completed', 'duplicate', 'failed', 'cancelled') "
+            "AND result_artifact_id IS NULL AND completed_at IS NULL)",
+            name="terminal_result",
+        ),
+        Index(
+            "ix_lora_import_jobs_claim",
+            "state",
+            "available_at",
+            "lease_expires_at",
+            "created_at",
+        ),
+        Index(
+            "ix_lora_import_jobs_requester_created",
+            "requested_by_user_id",
+            "created_at",
+        ),
+    )
+
+    source_type: Mapped[LoraImportSource] = mapped_column(
+        Enum(
+            LoraImportSource,
+            name="lora_import_source",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=7,
+        ),
+        nullable=False,
+    )
+    state: Mapped[LoraImportJobState] = mapped_column(
+        Enum(
+            LoraImportJobState,
+            name="lora_import_job_state",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=15,
+        ),
+        nullable=False,
+    )
+    display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    canonical_source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    license_url: Mapped[str] = mapped_column(Text, nullable=False)
+    commercial_use_attested: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    adult_use_attested: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    civitai_model_id: Mapped[int | None] = mapped_column(BigInteger)
+    civitai_version_id: Mapped[int | None] = mapped_column(BigInteger)
+    civitai_file_id: Mapped[int | None] = mapped_column(BigInteger)
+    staging_bucket: Mapped[str | None] = mapped_column(String(255))
+    staging_object_key: Mapped[str | None] = mapped_column(String(1024))
+    staging_object_version_id: Mapped[str | None] = mapped_column(String(1024))
+    staging_object_etag: Mapped[str | None] = mapped_column(String(80))
+    staging_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    target_filename: Mapped[str] = mapped_column(String(236), nullable=False)
+    expected_sha256: Mapped[str | None] = mapped_column(String(64))
+    expected_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    expected_metadata: Mapped[dict[str, Any]] = mapped_column(
+        JSON_TYPE,
+        nullable=False,
+        default=dict,
+    )
+    trigger_words: Mapped[list[str]] = mapped_column(JSON_TYPE, nullable=False, default=list)
+    progress_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    total_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(200))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(String(100))
+    last_error_detail: Mapped[str | None] = mapped_column(Text)
+    result_artifact_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("managed_lora_artifacts.id", ondelete="RESTRICT"),
+        index=True,
+    )
+    requested_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    cancelled_by_user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"),
+    )
+    lock_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class WorkflowApproval(UuidPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "workflow_approvals"
     __table_args__ = (
@@ -5671,6 +6030,159 @@ for _statement in (
 ):
     event.listen(
         DerivativeOutput.__table__,
+        "after_create",
+        _ddl(_statement).execute_if(dialect="postgresql"),
+    )
+
+
+# Managed LoRA provenance and import identities are durable compliance facts.
+# Operational state may advance, but neither table may be hard-deleted and
+# immutable identities may only acquire their one-time result/version fields.
+for _statement in (
+    "CREATE TRIGGER managed_lora_artifacts_guard_update "
+    "BEFORE UPDATE ON managed_lora_artifacts BEGIN SELECT CASE WHEN "
+    "OLD.id IS NOT NEW.id OR OLD.artifact_sha256 IS NOT NEW.artifact_sha256 "
+    "OR OLD.display_name IS NOT NEW.display_name "
+    "OR OLD.source_type IS NOT NEW.source_type "
+    "OR OLD.canonical_source_url IS NOT NEW.canonical_source_url "
+    "OR OLD.license_url IS NOT NEW.license_url "
+    "OR OLD.civitai_model_id IS NOT NEW.civitai_model_id "
+    "OR OLD.civitai_version_id IS NOT NEW.civitai_version_id "
+    "OR OLD.civitai_file_id IS NOT NEW.civitai_file_id "
+    "OR OLD.provenance IS NOT NEW.provenance "
+    "OR OLD.storage_bucket IS NOT NEW.storage_bucket "
+    "OR OLD.object_key IS NOT NEW.object_key "
+    "OR OLD.object_version_id IS NOT NEW.object_version_id "
+    "OR OLD.object_etag IS NOT NEW.object_etag "
+    "OR OLD.byte_size IS NOT NEW.byte_size "
+    "OR OLD.target_filename IS NOT NEW.target_filename "
+    "OR OLD.approval_id IS NOT NEW.approval_id "
+    "OR OLD.trigger_words IS NOT NEW.trigger_words "
+    "OR OLD.registered_by_user_id IS NOT NEW.registered_by_user_id "
+    "OR OLD.created_at IS NOT NEW.created_at "
+    "THEN RAISE(ABORT, 'managed LoRA identity is immutable') END; END",
+    "CREATE TRIGGER managed_lora_artifacts_reject_delete "
+    "BEFORE DELETE ON managed_lora_artifacts BEGIN "
+    "SELECT RAISE(ABORT, 'managed LoRAs cannot be deleted'); END",
+    "CREATE TRIGGER lora_import_jobs_guard_update "
+    "BEFORE UPDATE ON lora_import_jobs BEGIN SELECT CASE WHEN "
+    "OLD.id IS NOT NEW.id OR OLD.source_type IS NOT NEW.source_type "
+    "OR OLD.display_name IS NOT NEW.display_name "
+    "OR OLD.canonical_source_url IS NOT NEW.canonical_source_url "
+    "OR OLD.license_url IS NOT NEW.license_url "
+    "OR OLD.commercial_use_attested IS NOT NEW.commercial_use_attested "
+    "OR OLD.adult_use_attested IS NOT NEW.adult_use_attested "
+    "OR OLD.civitai_model_id IS NOT NEW.civitai_model_id "
+    "OR OLD.civitai_version_id IS NOT NEW.civitai_version_id "
+    "OR OLD.civitai_file_id IS NOT NEW.civitai_file_id "
+    "OR OLD.staging_bucket IS NOT NEW.staging_bucket "
+    "OR OLD.staging_object_key IS NOT NEW.staging_object_key "
+    "OR (OLD.staging_object_version_id IS NOT NEW.staging_object_version_id "
+    "AND NOT (OLD.staging_object_version_id IS NULL "
+    "AND NEW.staging_object_version_id IS NOT NULL)) "
+    "OR (OLD.staging_object_etag IS NOT NEW.staging_object_etag "
+    "AND NOT (OLD.staging_object_etag IS NULL "
+    "AND NEW.staging_object_etag IS NOT NULL)) "
+    "OR (OLD.staging_byte_size IS NOT NEW.staging_byte_size "
+    "AND NOT (OLD.staging_byte_size IS NULL AND NEW.staging_byte_size IS NOT NULL)) "
+    "OR OLD.target_filename IS NOT NEW.target_filename "
+    "OR OLD.expected_sha256 IS NOT NEW.expected_sha256 "
+    "OR OLD.expected_byte_size IS NOT NEW.expected_byte_size "
+    "OR OLD.expected_metadata IS NOT NEW.expected_metadata "
+    "OR OLD.trigger_words IS NOT NEW.trigger_words "
+    "OR OLD.max_attempts IS NOT NEW.max_attempts "
+    "OR OLD.requested_by_user_id IS NOT NEW.requested_by_user_id "
+    "OR OLD.created_at IS NOT NEW.created_at "
+    "OR (OLD.result_artifact_id IS NOT NEW.result_artifact_id "
+    "AND NOT (OLD.result_artifact_id IS NULL AND NEW.result_artifact_id IS NOT NULL)) "
+    "THEN RAISE(ABORT, 'LoRA import identity is immutable') END; END",
+    "CREATE TRIGGER lora_import_jobs_reject_delete "
+    "BEFORE DELETE ON lora_import_jobs BEGIN "
+    "SELECT RAISE(ABORT, 'LoRA import jobs cannot be deleted'); END",
+):
+    event.listen(
+        LoraImportJob.__table__,
+        "after_create",
+        _ddl(_statement).execute_if(dialect="sqlite"),
+    )
+
+for _statement in (
+    "CREATE OR REPLACE FUNCTION gen_automation_guard_managed_lora_mutation() "
+    "RETURNS trigger AS $$ BEGIN IF TG_OP = 'DELETE' THEN "
+    "RAISE EXCEPTION 'managed LoRAs cannot be deleted'; END IF; "
+    "IF OLD.id IS DISTINCT FROM NEW.id "
+    "OR OLD.artifact_sha256 IS DISTINCT FROM NEW.artifact_sha256 "
+    "OR OLD.display_name IS DISTINCT FROM NEW.display_name "
+    "OR OLD.source_type IS DISTINCT FROM NEW.source_type "
+    "OR OLD.canonical_source_url IS DISTINCT FROM NEW.canonical_source_url "
+    "OR OLD.license_url IS DISTINCT FROM NEW.license_url "
+    "OR OLD.civitai_model_id IS DISTINCT FROM NEW.civitai_model_id "
+    "OR OLD.civitai_version_id IS DISTINCT FROM NEW.civitai_version_id "
+    "OR OLD.civitai_file_id IS DISTINCT FROM NEW.civitai_file_id "
+    "OR OLD.provenance IS DISTINCT FROM NEW.provenance "
+    "OR OLD.storage_bucket IS DISTINCT FROM NEW.storage_bucket "
+    "OR OLD.object_key IS DISTINCT FROM NEW.object_key "
+    "OR OLD.object_version_id IS DISTINCT FROM NEW.object_version_id "
+    "OR OLD.object_etag IS DISTINCT FROM NEW.object_etag "
+    "OR OLD.byte_size IS DISTINCT FROM NEW.byte_size "
+    "OR OLD.target_filename IS DISTINCT FROM NEW.target_filename "
+    "OR OLD.approval_id IS DISTINCT FROM NEW.approval_id "
+    "OR OLD.trigger_words IS DISTINCT FROM NEW.trigger_words "
+    "OR OLD.registered_by_user_id IS DISTINCT FROM NEW.registered_by_user_id "
+    "OR OLD.created_at IS DISTINCT FROM NEW.created_at THEN "
+    "RAISE EXCEPTION 'managed LoRA identity is immutable'; END IF; "
+    "RETURN NEW; END; $$ LANGUAGE plpgsql",
+    "CREATE OR REPLACE FUNCTION gen_automation_guard_lora_import_mutation() "
+    "RETURNS trigger AS $$ BEGIN IF TG_OP = 'DELETE' THEN "
+    "RAISE EXCEPTION 'LoRA import jobs cannot be deleted'; END IF; "
+    "IF OLD.id IS DISTINCT FROM NEW.id "
+    "OR OLD.source_type IS DISTINCT FROM NEW.source_type "
+    "OR OLD.display_name IS DISTINCT FROM NEW.display_name "
+    "OR OLD.canonical_source_url IS DISTINCT FROM NEW.canonical_source_url "
+    "OR OLD.license_url IS DISTINCT FROM NEW.license_url "
+    "OR OLD.commercial_use_attested IS DISTINCT FROM NEW.commercial_use_attested "
+    "OR OLD.adult_use_attested IS DISTINCT FROM NEW.adult_use_attested "
+    "OR OLD.civitai_model_id IS DISTINCT FROM NEW.civitai_model_id "
+    "OR OLD.civitai_version_id IS DISTINCT FROM NEW.civitai_version_id "
+    "OR OLD.civitai_file_id IS DISTINCT FROM NEW.civitai_file_id "
+    "OR OLD.staging_bucket IS DISTINCT FROM NEW.staging_bucket "
+    "OR OLD.staging_object_key IS DISTINCT FROM NEW.staging_object_key "
+    "OR (OLD.staging_object_version_id IS DISTINCT FROM NEW.staging_object_version_id "
+    "AND NOT (OLD.staging_object_version_id IS NULL "
+    "AND NEW.staging_object_version_id IS NOT NULL)) "
+    "OR (OLD.staging_object_etag IS DISTINCT FROM NEW.staging_object_etag "
+    "AND NOT (OLD.staging_object_etag IS NULL AND NEW.staging_object_etag IS NOT NULL)) "
+    "OR (OLD.staging_byte_size IS DISTINCT FROM NEW.staging_byte_size "
+    "AND NOT (OLD.staging_byte_size IS NULL AND NEW.staging_byte_size IS NOT NULL)) "
+    "OR OLD.target_filename IS DISTINCT FROM NEW.target_filename "
+    "OR OLD.expected_sha256 IS DISTINCT FROM NEW.expected_sha256 "
+    "OR OLD.expected_byte_size IS DISTINCT FROM NEW.expected_byte_size "
+    "OR OLD.expected_metadata IS DISTINCT FROM NEW.expected_metadata "
+    "OR OLD.trigger_words IS DISTINCT FROM NEW.trigger_words "
+    "OR OLD.max_attempts IS DISTINCT FROM NEW.max_attempts "
+    "OR OLD.requested_by_user_id IS DISTINCT FROM NEW.requested_by_user_id "
+    "OR OLD.created_at IS DISTINCT FROM NEW.created_at "
+    "OR (OLD.result_artifact_id IS DISTINCT FROM NEW.result_artifact_id "
+    "AND NOT (OLD.result_artifact_id IS NULL AND NEW.result_artifact_id IS NOT NULL)) THEN "
+    "RAISE EXCEPTION 'LoRA import identity is immutable'; END IF; "
+    "RETURN NEW; END; $$ LANGUAGE plpgsql",
+):
+    event.listen(
+        LoraImportJob.__table__,
+        "after_create",
+        _ddl(_statement).execute_if(dialect="postgresql"),
+    )
+
+for _statement in (
+    "CREATE TRIGGER managed_lora_artifacts_guard_mutation "
+    "BEFORE UPDATE OR DELETE ON managed_lora_artifacts FOR EACH ROW "
+    "EXECUTE FUNCTION gen_automation_guard_managed_lora_mutation()",
+    "CREATE TRIGGER lora_import_jobs_guard_mutation "
+    "BEFORE UPDATE OR DELETE ON lora_import_jobs FOR EACH ROW "
+    "EXECUTE FUNCTION gen_automation_guard_lora_import_mutation()",
+):
+    event.listen(
+        LoraImportJob.__table__,
         "after_create",
         _ddl(_statement).execute_if(dialect="postgresql"),
     )

@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from gen_automation.config import Settings
 from gen_automation.db.models import (
     AuditEvent,
     ComplianceCheck,
@@ -31,11 +32,16 @@ from gen_automation.domain.generation_limits import (
     MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB,
 )
 from gen_automation.domain.release_spec import GenerationParameters, ReleaseSpecification
+from gen_automation.gpu_worker.artifacts import ArtifactKind
 from gen_automation.schemas import GenerationPlanRead
 from gen_automation.services.compliance import (
     ReleaseApprovalError,
     ReleaseApprovalSnapshot,
     validate_release_approvals,
+)
+from gen_automation.services.managed_artifact_manifest import (
+    ManagedArtifactManifestError,
+    effective_artifact_manifest_from_settings,
 )
 from gen_automation.services.wildcards import (
     FrozenWildcardCatalog,
@@ -320,6 +326,7 @@ async def approve_and_expand_generation_plan(
     *,
     release_id: UUID,
     idempotency_key: str,
+    settings: Settings,
     actor: str = "owner",
 ) -> GenerationPlanResult:
     """Revalidate a frozen release and expand it into deterministic jobs."""
@@ -392,6 +399,25 @@ async def approve_and_expand_generation_plan(
         approval_snapshot = await validate_release_approvals(session, specification)
     except ReleaseApprovalError as error:
         raise GenerationPlanConflictError(str(error)) from error
+    if settings.lora_manager_enabled:
+        try:
+            effective_manifest = await effective_artifact_manifest_from_settings(
+                session,
+                settings=settings,
+                required_lora_sha256s=tuple(lora.sha256 for lora in specification.loras),
+            )
+        except (ManagedArtifactManifestError, ValueError) as error:
+            raise GenerationPlanConflictError(
+                "selected model stack does not fit the safe worker runtime"
+            ) from error
+        if not any(
+            artifact.kind == ArtifactKind.CHECKPOINT
+            and artifact.sha256 == specification.checkpoint.sha256
+            for artifact in effective_manifest.manifest.artifacts
+        ):
+            raise GenerationPlanConflictError(
+                "selected checkpoint is not present in the pinned worker runtime"
+            )
     workflow_check = approval_snapshot.checks["workflow_integrity_gate"]["workflow"]
     workflow_node_classes = workflow_check["reviewed_node_classes"]
     try:

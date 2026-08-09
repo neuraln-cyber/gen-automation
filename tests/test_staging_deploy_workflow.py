@@ -24,6 +24,10 @@ def _updater() -> str:
     return (DEPLOY / "update-control-plane.sh").read_text(encoding="utf-8")
 
 
+def _lora_configurator() -> str:
+    return (DEPLOY / "configure-lora-manager.sh").read_text(encoding="utf-8")
+
+
 def _migration_validator() -> str:
     return (DEPLOY / "validate-migration-environment.sh").read_text(encoding="utf-8")
 
@@ -42,6 +46,26 @@ def _rollout_command_program() -> str:
     ]
     embedded = textwrap.dedent(
         rollout.split("python3 -c '", maxsplit=1)[1].split('\' >"$parameters_file"', maxsplit=1)[0]
+    )
+    command = shlex.split(f"python3 -c '{embedded}'", posix=True)
+    assert command[:2] == ["python3", "-c"]
+    return command[2]
+
+
+def _lora_command_program() -> str:
+    operation = (
+        _workflow()
+        .split("  lora-manager:\n", maxsplit=1)[1]
+        .split(
+            "      - name: Run the pinned LoRA-manager operation through Systems Manager\n",
+            maxsplit=1,
+        )[1]
+    )
+    embedded = textwrap.dedent(
+        operation.split("python3 -c '", maxsplit=1)[1].split(
+            '\' >"$parameters_file"',
+            maxsplit=1,
+        )[0]
     )
     command = shlex.split(f"python3 -c '{embedded}'", posix=True)
     assert command[:2] == ["python3", "-c"]
@@ -105,6 +129,129 @@ def test_staging_rollout_uses_short_lived_oidc_and_ssm_without_user_keys() -> No
     assert "AWS_SECRET_ACCESS_KEY" not in workflow
     assert "secrets.AWS" not in workflow
     assert "secrets.SALAD" not in workflow
+
+
+def test_lora_promotion_is_explicit_gated_reversible_and_keyless() -> None:
+    workflow = _workflow()
+    routine = workflow.split("  deploy:\n", maxsplit=1)[1].split(
+        "  semantic-anatomy:\n", maxsplit=1
+    )[0]
+
+    assert "name: Deploy staging control plane" in workflow
+    assert "workflow_dispatch:" in workflow
+    assert "component:" in workflow
+    assert "- semantic-anatomy\n          - lora-manager" in workflow
+    assert "  lora-manager:" in workflow
+    assert "inputs.component == 'lora-manager'" in workflow
+    assert "github.ref == 'refs/heads/main'" in workflow
+    assert "group: deploy-staging-control-plane" in workflow
+    assert "id-token: write" in workflow
+    assert "contents: read" in workflow
+    assert "contents: write" not in workflow
+    assert "role-to-assume: ${{ vars.AWS_STAGING_DEPLOY_ROLE_ARN }}" in workflow
+    assert 'allowed-account-ids: "861912887470"' in workflow
+    assert "AWS_STAGING_INSTANCE_ID: ${{ vars.AWS_STAGING_INSTANCE_ID }}" in workflow
+    assert (
+        "AWS_STAGING_CIVITAI_API_SECRET_ARN: ${{ vars.AWS_STAGING_CIVITAI_API_SECRET_ARN }}"
+    ) in workflow
+    assert (
+        "AWS_STAGING_LORA_MANAGER_PREREQUISITES_APPLIED: "
+        "${{ vars.AWS_STAGING_LORA_MANAGER_PREREQUISITES_APPLIED }}"
+    ) in workflow
+    validation = workflow.split(
+        "- name: Validate non-secret LoRA-manager promotion coordinates", maxsplit=1
+    )[1].split("- name: Exchange GitHub OIDC identity", maxsplit=1)[0]
+    enable_branch = validation.split('if [ "$OPERATION" = "enable" ]; then', maxsplit=1)[1]
+    assert "gen-automation/staging/civitai-[A-Za-z0-9]{6}" in enable_branch
+    assert '[ "$AWS_STAGING_LORA_MANAGER_PREREQUISITES_APPLIED" = "true" ]' in enable_branch
+    assert "CORS/IAM/secret infrastructure apply is attested" in enable_branch
+    assert "aws ssm send-command" in workflow
+    assert "AWS-RunShellScript" in workflow
+    assert "aws ssm get-command-invocation" in workflow
+    assert "AWS_ACCESS_KEY_ID" not in workflow
+    assert "AWS_SECRET_ACCESS_KEY" not in workflow
+    assert "secrets.AWS" not in workflow
+    assert "GEN_AUTOMATION_LORA_MANAGER_ENABLED" not in routine
+    assert "gen-automation-configure-lora-manager" not in routine
+    assert not (ROOT / ".github" / "workflows" / "configure-lora-manager-staging.yml").exists()
+
+
+def test_lora_promotion_embeds_only_verified_scripts_and_disable_needs_no_arn() -> None:
+    workflow = _workflow()
+    lora_job = workflow.split("  lora-manager:\n", maxsplit=1)[1]
+    configurator = (DEPLOY / "configure-lora-manager.sh").read_bytes()
+    validator = (DEPLOY / "validate-deployment.sh").read_bytes()
+    configurator_sha256 = hashlib.sha256(configurator).hexdigest()
+    validator_sha256 = hashlib.sha256(validator).hexdigest()
+    configurator_payload = base64.b64encode(
+        gzip.compress(configurator, compresslevel=9, mtime=0)
+    ).decode("ascii")
+    validator_payload = base64.b64encode(gzip.compress(validator, compresslevel=9, mtime=0)).decode(
+        "ascii"
+    )
+    program = _lora_command_program()
+    compile(program, "staging-lora-manager-ssm-command", "exec")
+    civitai_arn = (
+        "arn:aws:secretsmanager:eu-central-1:861912887470:"
+        "secret:gen-automation/staging/civitai-Ab12Cd"
+    )
+
+    commands: dict[str, str] = {}
+    for operation in ("status", "disable", "enable"):
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, "-c", program],
+            check=True,
+            capture_output=True,
+            env={
+                **os.environ,
+                "SSM_OPERATION": operation,
+                "SSM_CIVITAI_API_SECRET_ARN": civitai_arn,
+                "SSM_SOURCE_REVISION": "c" * 40,
+                "SSM_CONFIGURATOR_SHA256": configurator_sha256,
+                "SSM_VALIDATOR_SHA256": validator_sha256,
+                "SSM_CONFIGURATOR_PAYLOAD": configurator_payload,
+                "SSM_VALIDATOR_PAYLOAD": validator_payload,
+            },
+            text=True,
+        )
+        commands[operation] = json.loads(result.stdout)["commands"][0]
+
+    for command in commands.values():
+        assert len(command.encode("utf-8")) <= 24_000
+        assert configurator_payload in command
+        assert validator_payload in command
+        assert configurator_sha256 in command
+        assert validator_sha256 in command
+        assert command.count("/usr/bin/gzip --decompress") == 2
+        assert command.count("/usr/bin/sha256sum --check --status") == 2
+        assert '/usr/bin/bash -n "$payload_root/configure-lora-manager.sh"' in command
+        assert '/usr/bin/bash -n "$payload_root/validate-deployment.sh"' in command
+        bash = shutil.which("bash")
+        if bash is not None:
+            syntax = subprocess.run(  # noqa: S603
+                [bash, "-n"],
+                check=False,
+                capture_output=True,
+                input=command,
+                text=True,
+            )
+            assert syntax.returncode == 0, syntax.stderr
+
+    assert "--status" in commands["status"]
+    assert "--validator" not in commands["status"]
+    assert civitai_arn not in commands["status"]
+    assert "--disable" in commands["disable"]
+    assert "--validator" in commands["disable"]
+    assert civitai_arn not in commands["disable"]
+    assert "--enable" in commands["enable"]
+    assert "--civitai-secret-arn" in commands["enable"]
+    assert "--expected-control-plane-revision" in commands["enable"]
+    assert "c" * 40 in commands["enable"]
+    assert civitai_arn in commands["enable"]
+    assert "c" * 40 not in commands["status"]
+    assert "c" * 40 not in commands["disable"]
+    assert 'if len(command.encode("utf-8")) > 24_000' in program
+    assert "raw.githubusercontent.com" not in lora_job
 
 
 def test_publication_exports_its_exact_ci_source_for_nested_workflow_run() -> None:
@@ -249,6 +396,155 @@ def test_post_migration_updater_failure_restores_files_but_never_restarts_old_co
     assert 'systemctl is-active --quiet "$service_name"' in leave_stopped
     assert "systemctl restart" not in leave_stopped
     assert "wait_for_control_plane" not in leave_stopped
+
+
+def test_lora_configurator_is_atomic_idempotent_and_requires_manifest_trust_anchor(
+    tmp_path: Path,
+) -> None:
+    configurator = _lora_configurator()
+    installer = (DEPLOY / "install.sh").read_text(encoding="utf-8")
+    program = configurator.split("<<'PY'\n", maxsplit=1)[1].split("\nPY\n", maxsplit=1)[0]
+    compile(program, "configure-lora-manager-environment", "exec")
+
+    assert "root:root" in configurator
+    assert "mode 0400 or 0600" in configurator
+    assert "flock --exclusive --wait 120" in configurator
+    assert "--external-lock-held" in configurator
+    assert "--status|--enable|--disable" in configurator
+    assert "--expected-control-plane-revision" in configurator
+    assert "control_plane_revision" in configurator
+    assert "org.opencontainers.image.revision" in configurator
+    assert "running control-plane revision $actual_revision does not match $expected_revision" in (
+        configurator
+    )
+    assert "restore_previous_configuration" in configurator
+    assert "wait_for_control_plane" in configurator
+    assert ".control-plane.env.lora.rollback." in configurator
+    assert ".gen-automation-validate-deployment.lora.rollback." in configurator
+    assert ".gen-automation-configure-lora-manager.update." in configurator
+    assert 'mv -f -- "$helper_temporary" "$installed_helper"' in configurator
+    assert "systemctl is-active --quiet" in configurator
+    assert "gen-automation/staging/civitai-[A-Za-z0-9]{6}" in configurator
+    assert "GEN_AUTOMATION_CIVITAI_API_KEY" in configurator
+    assert "a direct Civitai API key is forbidden in staging" in configurator
+    assert "gen-automation-configure-lora-manager" in installer
+    assert '"$source_dir/configure-lora-manager.sh"' in installer
+
+    manifest_sha256 = "a" * 64
+    manifest_json = json.dumps(
+        {"manifest_sha256": manifest_sha256, "artifacts": []},
+        separators=(",", ":"),
+    )
+    environment_path = tmp_path / "control-plane.env"
+    environment_path.write_text(
+        "\n".join(
+            (
+                "GEN_AUTOMATION_ENVIRONMENT=staging",
+                "GEN_AUTOMATION_BACKGROUND_RUNTIME_ENABLED=true",
+                "GEN_AUTOMATION_SALAD_WORKER_ARTIFACT_BUCKET=model-bucket",
+                "GEN_AUTOMATION_SALAD_WORKER_ARTIFACT_REGION=eu-central-1",
+                f"GEN_AUTOMATION_SALAD_WORKER_MODEL_MANIFEST_JSON={manifest_json}",
+                "GEN_AUTOMATION_SALAD_WORKER_MODEL_MANIFEST_SHA256=" + manifest_sha256,
+                "GEN_AUTOMATION_QUALITY_SCORING_ENABLED=true",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    civitai_arn = (
+        "arn:aws:secretsmanager:eu-central-1:861912887470:"
+        "secret:gen-automation/staging/civitai-Ab12Cd"
+    )
+    command = [
+        sys.executable,
+        "-c",
+        program,
+        str(environment_path),
+        "enable",
+        civitai_arn,
+    ]
+    subprocess.run(command, check=True, capture_output=True, text=True)  # noqa: S603
+    configured = environment_path.read_text(encoding="utf-8")
+    assert configured.count("GEN_AUTOMATION_LORA_MANAGER_ENABLED=true\n") == 1
+    assert (
+        configured.count(
+            f"GEN_AUTOMATION_CIVITAI_API_SECRET_REFERENCE=aws-secrets-manager://{civitai_arn}\n"
+        )
+        == 1
+    )
+    assert "GEN_AUTOMATION_QUALITY_SCORING_ENABLED=true\n" in configured
+    assert "GEN_AUTOMATION_CIVITAI_API_KEY=" not in configured
+
+    before_replay = environment_path.read_bytes()
+    subprocess.run(command, check=True, capture_output=True, text=True)  # noqa: S603
+    assert environment_path.read_bytes() == before_replay
+
+    missing_anchor = tmp_path / "missing-anchor.env"
+    missing_anchor.write_text(
+        configured.replace(
+            f"GEN_AUTOMATION_SALAD_WORKER_MODEL_MANIFEST_SHA256={manifest_sha256}\n",
+            "",
+        ),
+        encoding="utf-8",
+    )
+    before_failure = missing_anchor.read_bytes()
+    failed = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", program, str(missing_anchor), "enable", civitai_arn],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert failed.returncode != 0
+    assert "MODEL_MANIFEST_SHA256 exactly once" in failed.stderr
+    assert missing_anchor.read_bytes() == before_failure
+
+    mismatched_anchor = tmp_path / "mismatched-anchor.env"
+    mismatched_anchor.write_text(
+        configured.replace(
+            f'"manifest_sha256":"{manifest_sha256}"',
+            f'"manifest_sha256":"{"b" * 64}"',
+        ),
+        encoding="utf-8",
+    )
+    mismatch_before = mismatched_anchor.read_bytes()
+    mismatch = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            program,
+            str(mismatched_anchor),
+            "enable",
+            civitai_arn,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert mismatch.returncode != 0
+    assert "does not match its independent trust anchor" in mismatch.stderr
+    assert mismatched_anchor.read_bytes() == mismatch_before
+
+    disabled_without_credential = tmp_path / "disabled.env"
+    disabled_without_credential.write_text(
+        "GEN_AUTOMATION_LORA_MANAGER_ENABLED=true\n",
+        encoding="utf-8",
+    )
+    subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            program,
+            str(disabled_without_credential),
+            "disable",
+            "",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert disabled_without_credential.read_text(encoding="utf-8") == (
+        "GEN_AUTOMATION_LORA_MANAGER_ENABLED=false\nGEN_AUTOMATION_CIVITAI_API_SECRET_REFERENCE=\n"
+    )
 
 
 def test_routine_rollout_refreshes_the_host_deployment_bundle_safely() -> None:

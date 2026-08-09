@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import random
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -33,7 +33,11 @@ from gen_automation.domain.enums import (
     GenerationState,
     SaladDeploymentState,
 )
-from gen_automation.gpu_worker.bootstrap import load_artifact_manifest
+from gen_automation.domain.runtime_bindings import (
+    WORKER_MODEL_MANIFEST_JSON_BINDING,
+    WORKER_MODEL_MANIFEST_SHA256_BINDING,
+)
+from gen_automation.integrations.civitai.client import CivitaiClient
 from gen_automation.integrations.mega import MegaCmdClient
 from gen_automation.integrations.patreon import PatreonPublicationDriver
 from gen_automation.integrations.salad.client import SaladClient
@@ -66,6 +70,12 @@ from gen_automation.services.generation_control import (
     GENERATION_STOPPED_ACTION,
     settle_stopped_generation_once,
 )
+from gen_automation.services.lora_runtime import LoraRuntime
+from gen_automation.services.managed_artifact_manifest import (
+    EffectiveArtifactManifest,
+    ManagedArtifactManifestError,
+    effective_artifact_manifest_from_settings,
+)
 from gen_automation.services.mega_set_delivery import (
     MegaSetDeliveryClient,
     run_mega_set_delivery_cycle,
@@ -77,6 +87,7 @@ from gen_automation.services.outbox import (
     ExternalEffect,
     OutboxError,
     claim_outbox_events,
+    defer_unstarted_outbox_event,
     fail_outbox_event,
     succeed_outbox_event,
 )
@@ -112,7 +123,10 @@ from gen_automation.services.salad_inbox import (
     fail_salad_webhook_receipt,
     process_salad_webhook_receipt,
 )
-from gen_automation.services.scheduling import dispatch_generation_jobs
+from gen_automation.services.scheduling import (
+    dispatch_generation_jobs,
+    has_dispatchable_generation_job,
+)
 from gen_automation.services.semantic_anatomy import (
     SemanticAssessmentProfile,
     run_semantic_assessment_cycle,
@@ -123,6 +137,7 @@ from gen_automation.services.semantic_review_reconciliation import (
 )
 from gen_automation.services.worker_inputs import SaladWorkerJobInputProvider
 from gen_automation.storage.base import ObjectStore
+from gen_automation.storage.model_artifacts import ModelArtifactStore
 
 logger = structlog.get_logger(__name__)
 
@@ -154,6 +169,46 @@ _DEPLOYMENT_WORK_STATES = (
     SaladDeploymentState.UNKNOWN,
     SaladDeploymentState.FAILED,
 )
+
+
+class _RuntimeArtifactManifestBusyError(RuntimeError):
+    """A different immutable worker manifest is still serving active work."""
+
+
+def _required_lora_sha256s(parameters: Mapping[str, object]) -> frozenset[str]:
+    raw_loras = parameters.get("loras")
+    if not isinstance(raw_loras, list):
+        raise RuntimeError("generation LoRA parameters are invalid")
+    hashes: set[str] = set()
+    for raw_lora in raw_loras:
+        if not isinstance(raw_lora, dict):
+            raise RuntimeError("generation LoRA parameters are invalid")
+        sha256 = raw_lora.get("sha256")
+        if (
+            not isinstance(sha256, str)
+            or len(sha256) != 64
+            or sha256 != sha256.lower()
+            or any(character not in "0123456789abcdef" for character in sha256)
+        ):
+            raise RuntimeError("generation LoRA identity is invalid")
+        hashes.add(sha256)
+    return frozenset(hashes)
+
+
+def _resident_managed_lora_sha256s(value: object) -> frozenset[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or any(
+        not isinstance(item, str)
+        or len(item) != 64
+        or item != item.lower()
+        or any(character not in "0123456789abcdef" for character in item)
+        for item in value
+    ):
+        raise RuntimeError("stored worker LoRA manifest identity is invalid")
+    if len(set(value)) != len(value) or value != sorted(value):
+        raise RuntimeError("stored worker LoRA manifest identity is not canonical")
+    return frozenset(value)
 
 
 def salad_deployment_config_from_settings(settings: Settings) -> SaladDeploymentConfig:
@@ -630,6 +685,8 @@ class ControllerWorkloads:
         mega_client: MegaSetDeliveryClient | None = None,
         semantic_vlm_client: SemanticVlmClient | None = None,
         patreon_driver: PatreonPublicationDriver | None = None,
+        model_artifact_store: ModelArtifactStore | None = None,
+        civitai_client: CivitaiClient | None = None,
     ) -> None:
         self.settings = settings
         self.sessions = sessions
@@ -641,8 +698,44 @@ class ControllerWorkloads:
         self.mega_client = mega_client
         self.semantic_vlm_client = semantic_vlm_client
         self.patreon_driver = patreon_driver
+        self.lora_runtime = (
+            LoraRuntime(
+                settings=settings,
+                sessions=sessions,
+                store=model_artifact_store,
+                civitai=civitai_client,
+                worker_id=f"{instance_id}:lora-manager",
+            )
+            if settings.lora_manager_enabled
+            and model_artifact_store is not None
+            and civitai_client is not None
+            else None
+        )
+        if settings.lora_manager_enabled and self.lora_runtime is None:
+            raise RuntimeError("validated LoRA runtime dependencies are unavailable")
         self._next_attempt_reconciliation: dict[UUID, float] = {}
         self._generation_stop_settlement_cursor: UUID | None = None
+
+    async def _effective_artifact_manifest(
+        self,
+        session: AsyncSession,
+        *,
+        required_lora_sha256s: Sequence[str] = (),
+    ) -> EffectiveArtifactManifest:
+        return await effective_artifact_manifest_from_settings(
+            session,
+            settings=self.settings,
+            required_lora_sha256s=required_lora_sha256s,
+        )
+
+    @staticmethod
+    def _manifest_environment(
+        effective: EffectiveArtifactManifest,
+    ) -> dict[str, str]:
+        return {
+            WORKER_MODEL_MANIFEST_JSON_BINDING: effective.manifest_json,
+            WORKER_MODEL_MANIFEST_SHA256_BINDING: effective.sha256,
+        }
 
     async def initialize(self) -> None:
         if self.salad_client is None:
@@ -678,6 +771,16 @@ class ControllerWorkloads:
             )
             await session.commit()
         return False
+
+    async def lora_import_once(self) -> bool:
+        if self.lora_runtime is None:
+            return False
+        return await self.lora_runtime.import_once()
+
+    async def lora_lifecycle_once(self) -> bool:
+        if self.lora_runtime is None:
+            return False
+        return await self.lora_runtime.lifecycle_once()
 
     async def deployment_once(self) -> bool:
         if self.salad_client is None:
@@ -876,10 +979,51 @@ class ControllerWorkloads:
             if deployment is None or lease is None:
                 await session.rollback()
                 return housekeeping_worked
+            active_attempt_id = await session.scalar(
+                select(GenerationAttempt.id)
+                .where(
+                    GenerationAttempt.salad_deployment_id == deployment.id,
+                    GenerationAttempt.state.in_(_RUNTIME_REFRESH_BLOCKING_ATTEMPT_STATES),
+                )
+                .limit(1)
+            )
+            if active_attempt_id is not None:
+                await session.rollback()
+                return housekeeping_worked
+            pending_parameters = await session.scalar(
+                select(GenerationJob.parameters)
+                .join(GenerationAttempt, GenerationAttempt.job_id == GenerationJob.id)
+                .where(
+                    GenerationAttempt.salad_deployment_id == deployment.id,
+                    GenerationAttempt.state == GenerationAttemptState.CREATED,
+                )
+                .order_by(GenerationAttempt.created_at, GenerationAttempt.id)
+                .limit(1)
+            )
+            if pending_parameters is None and await has_dispatchable_generation_job(
+                session,
+                scheduled_at=now,
+            ):
+                await session.rollback()
+                return housekeeping_worked
+            required_lora_sha256s = (
+                _required_lora_sha256s(pending_parameters)
+                if pending_parameters is not None
+                else frozenset()
+            )
+            effective_manifest = await self._effective_artifact_manifest(
+                session,
+                required_lora_sha256s=tuple(sorted(required_lora_sha256s)),
+            )
             refreshed = await refresh_container_group_runtime(
                 deployment,
                 self.salad_client,
                 self.secret_resolver,
+                environment_overrides=self._manifest_environment(effective_manifest),
+            )
+            deployment.runtime_artifact_manifest_sha256 = effective_manifest.sha256
+            deployment.runtime_managed_lora_sha256s = sorted(
+                effective_manifest.managed_lora_sha256s
             )
             mark_experiment_warm_runtime_refreshed_locked(
                 session,
@@ -933,6 +1077,22 @@ class ControllerWorkloads:
                     result=result,
                     worker_id=worker_id,
                 )
+        except _RuntimeArtifactManifestBusyError:
+            async with self.sessions() as session:
+                await defer_unstarted_outbox_event(
+                    session,
+                    event_id=event.id,
+                    worker_id=worker_id,
+                    retry_not_before=(
+                        datetime.now(UTC)
+                        + timedelta(seconds=self.settings.background_retry_delay_seconds)
+                    ),
+                    reason_code="worker_artifact_manifest_busy",
+                )
+            logger.info(
+                "salad_submission_deferred_for_worker_artifacts",
+                salad_generation_attempt_id=str(event.aggregate_id),
+            )
         except asyncio.CancelledError:
             if progress.provider_post_started:
                 await self._fail_submit_lease(
@@ -1334,16 +1494,8 @@ class ControllerWorkloads:
             raise RuntimeError("Salad submission dependencies are unavailable")
         signing_key_id = self.settings.worker_signing_key_id
         signing_private_key = self.settings.worker_signing_private_key
-        manifest_json = self.settings.salad_worker_model_manifest_json
-        manifest_sha256 = self.settings.salad_worker_model_manifest_sha256
-        if (
-            signing_key_id is None
-            or signing_private_key is None
-            or manifest_json is None
-            or manifest_sha256 is None
-        ):
+        if signing_key_id is None or signing_private_key is None:
             raise RuntimeError("worker signing configuration is unavailable")
-        artifact_manifest = load_artifact_manifest(manifest_json.get_secret_value())
 
         async with self.sessions() as session:
             # Keep the established guard -> deployment/attempt lock order used
@@ -1366,32 +1518,21 @@ class ControllerWorkloads:
             )
             if deployment is None:
                 raise RuntimeError("generation attempt deployment is unavailable")
-            input_provider = SaladWorkerJobInputProvider(
-                session=session,
-                store=self.object_store,
-                signing_key_id=signing_key_id,
-                signing_private_key=signing_private_key,
-                artifact_manifest=artifact_manifest,
-                artifact_manifest_sha256=manifest_sha256.get_secret_value(),
-                signature_ttl_seconds=self.settings.worker_signature_ttl_seconds,
-                upload_grant_ttl_seconds=self.settings.worker_upload_grant_ttl_seconds,
-                max_upload_bytes=self.settings.storage_max_image_bytes,
-            )
-            attempt_state = await session.scalar(
-                select(GenerationAttempt.state)
-                .where(GenerationAttempt.id == event.aggregate_id)
-                .with_for_update()
-            )
-            if attempt_state is None:
-                raise RuntimeError("generation attempt is unavailable")
-            if attempt_state != GenerationAttemptState.CREATED:
-                logger.info(
-                    "salad_runtime_refresh_skipped_for_recorded_attempt",
-                    salad_deployment_id=str(deployment.id),
-                    generation_attempt_id=str(event.aggregate_id),
-                    generation_attempt_state=attempt_state.value,
+            attempt_context = (
+                await session.execute(
+                    select(GenerationAttempt.state, GenerationJob.parameters)
+                    .join(GenerationJob, GenerationJob.id == GenerationAttempt.job_id)
+                    .where(GenerationAttempt.id == event.aggregate_id)
+                    .with_for_update(of=GenerationAttempt)
                 )
-            else:
+            ).one_or_none()
+            if attempt_context is None:
+                raise RuntimeError("generation attempt is unavailable")
+            attempt_state, job_parameters = attempt_context
+            required_lora_sha256s = _required_lora_sha256s(job_parameters)
+            active_attempt_id: UUID | None = None
+            resident = _resident_managed_lora_sha256s(deployment.runtime_managed_lora_sha256s)
+            if attempt_state == GenerationAttemptState.CREATED:
                 active_attempt_id = await session.scalar(
                     select(GenerationAttempt.id)
                     .where(
@@ -1400,19 +1541,65 @@ class ControllerWorkloads:
                     )
                     .limit(1)
                 )
+            try:
+                effective_manifest = await self._effective_artifact_manifest(
+                    session,
+                    required_lora_sha256s=tuple(
+                        sorted(required_lora_sha256s | (resident or frozenset()))
+                    ),
+                )
+            except ManagedArtifactManifestError:
+                if active_attempt_id is not None:
+                    raise _RuntimeArtifactManifestBusyError from None
+                effective_manifest = await self._effective_artifact_manifest(
+                    session,
+                    required_lora_sha256s=tuple(sorted(required_lora_sha256s)),
+                )
+            if (
+                attempt_state == GenerationAttemptState.CREATED
+                and active_attempt_id is None
+                and resident is not None
+                and effective_manifest.sha256 != deployment.runtime_artifact_manifest_sha256
+            ):
+                effective_manifest = await self._effective_artifact_manifest(
+                    session,
+                    required_lora_sha256s=tuple(sorted(required_lora_sha256s)),
+                )
+            if attempt_state != GenerationAttemptState.CREATED:
+                if deployment.runtime_artifact_manifest_sha256 != effective_manifest.sha256:
+                    raise RuntimeError(
+                        "recorded generation attempt no longer matches the worker manifest"
+                    )
+                logger.info(
+                    "salad_runtime_refresh_skipped_for_recorded_attempt",
+                    salad_deployment_id=str(deployment.id),
+                    generation_attempt_id=str(event.aggregate_id),
+                    generation_attempt_state=attempt_state.value,
+                )
+            else:
                 warm_lease = await load_live_experiment_warm_lease_for_update(
                     session,
                     salad_deployment_id=deployment.id,
+                )
+                runtime_matches = (
+                    deployment.runtime_artifact_manifest_sha256 == effective_manifest.sha256
                 )
                 if warm_lease is not None:
                     if (
                         warm_lease.state == ExperimentWarmLeaseState.STARTING
                         and warm_lease.provider_version is None
                     ):
+                        if active_attempt_id is not None:
+                            raise _RuntimeArtifactManifestBusyError
                         refreshed = await refresh_container_group_runtime(
                             deployment,
                             self.salad_client,
                             self.secret_resolver,
+                            environment_overrides=self._manifest_environment(effective_manifest),
+                        )
+                        deployment.runtime_artifact_manifest_sha256 = effective_manifest.sha256
+                        deployment.runtime_managed_lora_sha256s = sorted(
+                            effective_manifest.managed_lora_sha256s
                         )
                         mark_experiment_warm_runtime_refreshed_locked(
                             session,
@@ -1420,6 +1607,23 @@ class ControllerWorkloads:
                             provider_version=refreshed.version,
                             actor=self._worker_id("submit"),
                         )
+                        deployment.ready_replicas = 0
+                        deployment.reconcile_after = datetime.now(UTC)
+                    elif not runtime_matches:
+                        if active_attempt_id is not None:
+                            raise _RuntimeArtifactManifestBusyError
+                        refreshed = await refresh_container_group_runtime(
+                            deployment,
+                            self.salad_client,
+                            self.secret_resolver,
+                            environment_overrides=self._manifest_environment(effective_manifest),
+                        )
+                        deployment.runtime_artifact_manifest_sha256 = effective_manifest.sha256
+                        deployment.runtime_managed_lora_sha256s = sorted(
+                            effective_manifest.managed_lora_sha256s
+                        )
+                        warm_lease.provider_version = refreshed.version
+                        warm_lease.lock_version += 1
                         deployment.ready_replicas = 0
                         deployment.reconcile_after = datetime.now(UTC)
                     if warm_lease.state == ExperimentWarmLeaseState.ACTIVE:
@@ -1435,7 +1639,7 @@ class ControllerWorkloads:
                         experiment_warm_lease_id=str(warm_lease.id),
                         experiment_warm_lease_state=warm_lease.state.value,
                     )
-                elif active_attempt_id is None:
+                elif not runtime_matches and active_attempt_id is None:
                     # Bootstrap credentials are refreshed only at an idle-to-active
                     # boundary. PATCHing the container environment creates a Salad
                     # version and restarts every replica, so doing this per batch
@@ -1450,7 +1654,14 @@ class ControllerWorkloads:
                         deployment,
                         self.salad_client,
                         self.secret_resolver,
+                        environment_overrides=self._manifest_environment(effective_manifest),
                     )
+                    deployment.runtime_artifact_manifest_sha256 = effective_manifest.sha256
+                    deployment.runtime_managed_lora_sha256s = sorted(
+                        effective_manifest.managed_lora_sha256s
+                    )
+                elif not runtime_matches:
+                    raise _RuntimeArtifactManifestBusyError
                 else:
                     logger.debug(
                         "salad_runtime_reused_for_batch",
@@ -1458,6 +1669,17 @@ class ControllerWorkloads:
                         generation_attempt_id=str(event.aggregate_id),
                         active_generation_attempt_id=str(active_attempt_id),
                     )
+            input_provider = SaladWorkerJobInputProvider(
+                session=session,
+                store=self.object_store,
+                signing_key_id=signing_key_id,
+                signing_private_key=signing_private_key,
+                artifact_manifest=effective_manifest.manifest,
+                artifact_manifest_sha256=effective_manifest.sha256,
+                signature_ttl_seconds=self.settings.worker_signature_ttl_seconds,
+                upload_grant_ttl_seconds=self.settings.worker_upload_grant_ttl_seconds,
+                max_upload_bytes=self.settings.storage_max_image_bytes,
+            )
             return await submit_prepared_attempt(
                 session,
                 self.salad_client,
@@ -1772,6 +1994,8 @@ def build_controller_runtime(
     mega_client: MegaSetDeliveryClient | None = None,
     semantic_vlm_client: SemanticVlmClient | None = None,
     patreon_driver: PatreonPublicationDriver | None = None,
+    model_artifact_store: ModelArtifactStore | None = None,
+    civitai_client: CivitaiClient | None = None,
 ) -> ControllerRuntime:
     instance_id = f"controller-{uuid4()}"
     resolved_mega_client = mega_client
@@ -1794,9 +2018,28 @@ def build_controller_runtime(
         mega_client=resolved_mega_client,
         semantic_vlm_client=semantic_vlm_client,
         patreon_driver=patreon_driver,
+        model_artifact_store=model_artifact_store,
+        civitai_client=civitai_client,
     )
     poll = settings.background_poll_interval_seconds
     loops: list[LoopSpec] = []
+    if settings.lora_manager_enabled:
+        loops.extend(
+            (
+                LoopSpec(
+                    name="lora-imports",
+                    cycle=workloads.lora_import_once,
+                    idle_interval_seconds=poll,
+                    timeout_seconds=(settings.background_lora_import_timeout_seconds + 5),
+                ),
+                LoopSpec(
+                    name="lora-lifecycle",
+                    cycle=workloads.lora_lifecycle_once,
+                    idle_interval_seconds=max(poll, 5),
+                    timeout_seconds=60,
+                ),
+            )
+        )
     if salad_client is not None:
         loops.extend(
             (

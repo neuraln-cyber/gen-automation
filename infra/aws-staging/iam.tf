@@ -184,6 +184,15 @@ data "aws_iam_policy_document" "salad_worker_artifact_reader" {
       }
     }
   }
+
+  # Managed LoRAs are immutable, content-addressed objects. The signed worker
+  # manifest still pins the exact key, VersionId, byte size, and SHA-256; this
+  # prefix grant removes the need for an OpenTofu/IAM rollout per LoRA.
+  statement {
+    sid       = "ReadVersionPinnedManagedLoras"
+    actions   = ["s3:GetObjectVersion"]
+    resources = ["${aws_s3_bucket.models.arn}/worker/managed-loras/sha256/*"]
+  }
 }
 
 resource "aws_iam_role_policy" "salad_worker_artifact_reader" {
@@ -226,6 +235,21 @@ data "aws_iam_policy_document" "runtime" {
   }
 
   statement {
+    sid = "ManagedLoraObjects"
+    actions = [
+      "s3:AbortMultipartUpload",
+      "s3:DeleteObjectVersion",
+      "s3:GetObject",
+      "s3:GetObjectVersion",
+      "s3:PutObject",
+    ]
+    resources = [
+      "${aws_s3_bucket.models.arn}/onboarding/loras/*",
+      "${aws_s3_bucket.models.arn}/worker/managed-loras/sha256/*",
+    ]
+  }
+
+  statement {
     sid = "RdsManagedMasterSecretRead"
     actions = [
       "secretsmanager:DescribeSecret",
@@ -249,6 +273,20 @@ data "aws_iam_policy_document" "runtime" {
           "secretsmanager:UpdateSecretVersionStage",
         ] : []
       )
+      resources = [statement.value]
+    }
+  }
+
+
+  dynamic "statement" {
+    for_each = var.civitai_api_secret_arn == null ? [] : [var.civitai_api_secret_arn]
+
+    content {
+      sid = "CivitaiApiSecretRead"
+      actions = [
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:GetSecretValue",
+      ]
       resources = [statement.value]
     }
   }

@@ -73,6 +73,64 @@ class DispatchResult:
     dispatched: tuple[PreparedAttempt, ...]
 
 
+async def has_dispatchable_generation_job(
+    session: AsyncSession,
+    *,
+    scheduled_at: datetime | None = None,
+) -> bool:
+    """Return whether a Salad job can enter dispatch now.
+
+    The warm-loop uses this exact static eligibility boundary to avoid starting
+    a baseline-only worker immediately before dispatch creates an attempt with
+    a managed-LoRA manifest. Full approval currency is still revalidated by
+    ``dispatch_generation_jobs`` before any attempt is created.
+    """
+
+    due_at = scheduled_at or datetime.now(UTC)
+    job_id = await session.scalar(
+        select(GenerationJob.id)
+        .join(ReleaseVersion, ReleaseVersion.id == GenerationJob.release_version_id)
+        .join(Release, Release.id == ReleaseVersion.release_id)
+        .where(
+            GenerationJob.provider == "salad",
+            GenerationJob.attempt_count < GenerationJob.max_attempts,
+            or_(
+                GenerationJob.state == GenerationState.QUEUED,
+                (
+                    (GenerationJob.state == GenerationState.RETRY_WAIT)
+                    & or_(
+                        GenerationJob.retry_at.is_(None),
+                        GenerationJob.retry_at <= due_at,
+                    )
+                ),
+            ),
+            Release.phase.in_(_DISPATCHABLE_RELEASE_PHASES),
+            Release.health == ResourceHealth.HEALTHY,
+            Release.current_version_no == ReleaseVersion.version_no,
+            ~exists(
+                select(AuditEvent.id).where(
+                    AuditEvent.resource_type == "release",
+                    AuditEvent.resource_id == Release.id,
+                    AuditEvent.action == GENERATION_STOP_REQUESTED_ACTION,
+                )
+            ),
+            (
+                select(func.count(func.distinct(ComplianceCheck.check_type)))
+                .where(
+                    ComplianceCheck.release_version_id == ReleaseVersion.id,
+                    ComplianceCheck.check_type.in_(_REQUIRED_COMPLIANCE_CHECKS),
+                    ComplianceCheck.result == ComplianceResult.PASSED,
+                )
+                .correlate(ReleaseVersion)
+                .scalar_subquery()
+                == len(_REQUIRED_COMPLIANCE_CHECKS)
+            ),
+        )
+        .limit(1)
+    )
+    return job_id is not None
+
+
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)

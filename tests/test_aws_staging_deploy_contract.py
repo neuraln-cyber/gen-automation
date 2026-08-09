@@ -105,6 +105,37 @@ def test_staging_salad_attempt_watchdog_is_pinned_before_signature_expiry() -> N
     assert "attempt watchdog must be exactly 6300 seconds" in validator
 
 
+def test_staging_lora_manager_requires_exact_secret_reference_and_manifest_anchor() -> None:
+    controller = _text("control-plane.env.example")
+    validator = _text("validate-deployment.sh")
+    configurator = _text("configure-lora-manager.sh")
+    local_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+
+    assert re.search(r"(?m)^GEN_AUTOMATION_LORA_MANAGER_ENABLED=false$", controller)
+    assert re.search(
+        r"(?m)^GEN_AUTOMATION_CIVITAI_API_SECRET_REFERENCE=$",
+        controller,
+    )
+    assert "GEN_AUTOMATION_CIVITAI_API_KEY=" not in controller
+    assert re.search(r"(?m)^GEN_AUTOMATION_LORA_MANAGER_ENABLED=false$", local_example)
+    assert re.search(r"(?m)^GEN_AUTOMATION_CIVITAI_API_KEY=$", local_example)
+    assert re.search(
+        r"(?m)^GEN_AUTOMATION_CIVITAI_API_SECRET_REFERENCE=$",
+        local_example,
+    )
+    assert 'case "$lora_manager_enabled" in' in validator
+    assert "true)" in validator
+    assert "false)" in validator
+    for source in (validator, configurator):
+        assert "gen-automation/staging/civitai-[A-Za-z0-9]{6}" in source
+        assert "GEN_AUTOMATION_SALAD_WORKER_MODEL_MANIFEST_SHA256" in source
+        assert "64" in source
+    assert "GEN_AUTOMATION_SALAD_WORKER_MODEL_MANIFEST_JSON" in validator
+    assert 'GEN_AUTOMATION_LORA_MANAGER_ENABLED", "true"' in configurator
+    assert 'GEN_AUTOMATION_LORA_MANAGER_ENABLED", "false"' in configurator
+    assert "aws-secrets-manager://{secret_arn}" in configurator
+
+
 def test_imds_network_boundary_and_loopback_ingress_are_explicit() -> None:
     compose = _text("compose.yaml")
     caddyfile = _text("Caddyfile")
@@ -351,6 +382,7 @@ def test_environment_templates_contain_placeholders_not_secret_values() -> None:
         "GEN_AUTOMATION_WORKER_SIGNING_PRIVATE_KEY",
         "GEN_AUTOMATION_PATREON_BROWSER_SHARED_SECRET",
         "GEN_AUTOMATION_X_OAUTH_SECRET_REFERENCE",
+        "GEN_AUTOMATION_CIVITAI_API_SECRET_REFERENCE",
     ):
         assert re.search(rf"(?m)^{key}=$", controller)
     assert re.search(r"(?m)^GEN_AUTOMATION_X_AUTH_MODE=oauth2$", controller)
@@ -529,3 +561,24 @@ def test_runbook_activates_only_after_local_validation_and_keeps_effects_off() -
         "Keep GPU allocation, Patreon publication, MEGA delivery, and X publication\n"
         "disabled until their individual canaries pass."
     ) in runbook
+
+
+def test_lora_rollout_documentation_requires_iac_before_enablement() -> None:
+    rollout = (ROOT / "docs" / "lora-manager-staging-rollout.md").read_text(encoding="utf-8")
+    runbook = (ROOT / "docs" / "aws-staging-runbook.md").read_text(encoding="utf-8")
+    deploy_readme = _text("README.md")
+
+    assert "Apply that reviewed infrastructure plan" in rollout
+    assert "verify CORS and IAM before" in rollout
+    assert "AWS_STAGING_CIVITAI_API_SECRET_ARN" in rollout
+    assert "AWS_STAGING_LORA_MANAGER_PREREQUISITES_APPLIED=true" in rollout
+    assert "blocks the rollout before it\n   obtains AWS credentials" in rollout
+    assert "GEN_AUTOMATION_LORA_MANAGER_ENABLED=true" in rollout
+    assert "aws-secrets-manager://<exact-configured-arn>" in rollout
+    assert "does not derive or repair an absent anchor" in rollout
+    assert "Deploy staging control plane" in rollout
+    assert "component=lora-manager" in rollout
+    assert "exact workflow-name\n   claim" in rollout
+    assert "same exact\n   source-revision label" in rollout
+    assert "lora-manager-staging-rollout.md" in runbook
+    assert "lora-manager-staging-rollout.md" in deploy_readme

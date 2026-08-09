@@ -10,6 +10,7 @@ from starlette.requests import Request
 
 from gen_automation.api.browser_experiment_forms import _decode_variant_plan
 from gen_automation.api.browser_new_set_forms import read_new_set_form
+from gen_automation.config import Settings
 from gen_automation.db.models import GenerationJob, ReleaseVersion
 from gen_automation.db.session import Database
 from gen_automation.domain.controlled_duo import (
@@ -248,6 +249,7 @@ async def test_new_set_service_freezes_the_controlled_duo_contract(tmp_path: Pat
                     desired_accepted_count=1,
                 ),
                 idempotency_key="controlled-duo-contract",
+                settings=Settings(),
                 actor="fixture-owner",
             )
         async with database.sessions() as session:

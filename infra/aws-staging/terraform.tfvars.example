@@ -17,11 +17,16 @@ abandoned_staging_retention_days = 7
 # before Caddy obtains a public certificate and the dashboard uses S3 CORS.
 route53_zone_id = null
 hostname        = null
+browser_upload_origin = null
 
 # Reference an existing complete secret only after its JSON has been created
 # outside OpenTofu. Never put the X OAuth JSON or token values in tfvars.
 x_oauth_secret_arn = null
 x_oauth_auth_mode  = "oauth2"
+
+# Existing API-key secret used only by the CPU-side Civitai importer. The
+# secret value never enters OpenTofu state or the browser.
+civitai_api_secret_arn = null
 
 # Empty is disabled by default. After artifact onboarding, map only the exact
 # immutable S3 object versions present in the signed worker manifest.

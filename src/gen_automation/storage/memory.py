@@ -4,12 +4,18 @@ from urllib.parse import quote
 
 from gen_automation.domain.ids import uuid7
 from gen_automation.storage.base import (
+    MultipartPart,
+    MultipartUpload,
     ObjectAlreadyExistsError,
+    ObjectConflictError,
+    ObjectDigest,
     ObjectMetadata,
     ObjectNotFoundError,
     ObjectTooLargeError,
     PresignedUpload,
 )
+
+MIN_MULTIPART_PART_BYTES = 5 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -20,12 +26,21 @@ class StoredObject:
     version_id: str
 
 
+@dataclass
+class _MemoryMultipartUpload:
+    key: str
+    content_type: str
+    metadata: dict[str, str]
+    parts: dict[int, bytes]
+
+
 class MemoryObjectStore:
     backend = "memory"
 
     def __init__(self, bucket: str = "test-assets") -> None:
         self.bucket = bucket
         self.objects: dict[str, StoredObject] = {}
+        self._multipart_uploads: dict[str, _MemoryMultipartUpload] = {}
 
     async def ping(self) -> None:
         return None
@@ -70,9 +85,16 @@ class MemoryObjectStore:
         version = f"&version={quote(version_id)}" if version_id else ""
         return f"memory://{self.bucket}/{quote(key)}?expires={expires_in}{name}{version}"
 
-    async def head(self, key: str) -> ObjectMetadata | None:
+    async def head(
+        self,
+        key: str,
+        *,
+        version_id: str | None = None,
+    ) -> ObjectMetadata | None:
         stored = self.objects.get(key)
         if stored is None:
+            return None
+        if version_id is not None and stored.version_id != version_id:
             return None
         return ObjectMetadata(
             key=key,
@@ -149,7 +171,9 @@ class MemoryObjectStore:
         metadata: dict[str, str],
         source_version_id: str | None = None,
         source_etag: str | None = None,
+        storage_class: str | None = None,
     ) -> ObjectMetadata:
+        del storage_class
         source = self.objects.get(source_key)
         if source is None:
             raise ObjectNotFoundError(source_key)
@@ -174,6 +198,130 @@ class MemoryObjectStore:
         if result is None:
             raise ObjectNotFoundError(destination_key)
         return result
+
+    async def read_range(
+        self,
+        key: str,
+        *,
+        start: int,
+        length: int,
+        version_id: str,
+        etag: str | None = None,
+    ) -> bytes:
+        if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+            raise ValueError("range start must be a non-negative integer")
+        if isinstance(length, bool) or not isinstance(length, int) or length <= 0:
+            raise ValueError("range length must be a positive integer")
+        body = await self.read_bytes(
+            key,
+            max_bytes=2**63 - 1,
+            version_id=version_id,
+            etag=etag,
+        )
+        end = start + length
+        if start >= len(body) or end > len(body):
+            raise ObjectConflictError("object range is outside the exact version")
+        return body[start:end]
+
+    async def sha256(
+        self,
+        key: str,
+        *,
+        max_bytes: int,
+        version_id: str,
+        etag: str | None = None,
+    ) -> ObjectDigest:
+        body = await self.read_bytes(
+            key,
+            max_bytes=max_bytes,
+            version_id=version_id,
+            etag=etag,
+        )
+        return ObjectDigest(sha256=hashlib.sha256(body).hexdigest(), byte_size=len(body))
+
+    async def create_multipart_upload(
+        self,
+        *,
+        key: str,
+        content_type: str,
+        metadata: dict[str, str],
+        storage_class: str | None = None,
+    ) -> MultipartUpload:
+        del storage_class
+        upload_id = str(uuid7())
+        self._multipart_uploads[upload_id] = _MemoryMultipartUpload(
+            key=key,
+            content_type=content_type,
+            metadata=dict(metadata),
+            parts={},
+        )
+        return MultipartUpload(key=key, upload_id=upload_id)
+
+    async def upload_part(
+        self,
+        upload: MultipartUpload,
+        *,
+        part_number: int,
+        body: bytes,
+    ) -> MultipartPart:
+        pending = self._require_multipart(upload)
+        if (
+            isinstance(part_number, bool)
+            or not isinstance(part_number, int)
+            or not 1 <= part_number <= 10_000
+        ):
+            raise ValueError("multipart part number must be between 1 and 10000")
+        if not isinstance(body, bytes) or not body:
+            raise ValueError("multipart part body must be non-empty bytes")
+        pending.parts[part_number] = body
+        return MultipartPart(
+            part_number=part_number,
+            etag=hashlib.md5(body, usedforsecurity=False).hexdigest(),
+        )
+
+    async def complete_multipart_upload(
+        self,
+        upload: MultipartUpload,
+        *,
+        parts: tuple[MultipartPart, ...],
+        total_bytes: int,
+    ) -> ObjectMetadata:
+        pending = self._require_multipart(upload)
+        if upload.key in self.objects:
+            raise ObjectAlreadyExistsError(upload.key)
+        if not parts or tuple(part.part_number for part in parts) != tuple(
+            range(1, len(parts) + 1)
+        ):
+            raise ValueError("multipart parts must be contiguous and ordered")
+        bodies: list[bytes] = []
+        for index, part in enumerate(parts):
+            body = pending.parts.get(part.part_number)
+            if body is None:
+                raise ObjectConflictError("multipart upload is missing a part")
+            if hashlib.md5(body, usedforsecurity=False).hexdigest() != part.etag:
+                raise ObjectConflictError("multipart part ETag changed")
+            if index < len(parts) - 1 and len(body) < MIN_MULTIPART_PART_BYTES:
+                raise ObjectConflictError("non-final multipart part is too small")
+            bodies.append(body)
+        combined = b"".join(bodies)
+        if len(combined) != total_bytes:
+            raise ObjectConflictError("multipart byte count changed")
+        self.put_for_test(
+            upload.key,
+            combined,
+            content_type=pending.content_type,
+            metadata=pending.metadata,
+        )
+        del self._multipart_uploads[upload.upload_id]
+        result = await self.head(upload.key)
+        if result is None:
+            raise ObjectNotFoundError(upload.key)
+        return result
+
+    async def abort_multipart_upload(self, upload: MultipartUpload) -> None:
+        pending = self._multipart_uploads.get(upload.upload_id)
+        if pending is not None and pending.key == upload.key:
+            del self._multipart_uploads[upload.upload_id]
 
     async def delete(self, key: str, *, version_id: str | None = None) -> None:
         stored = self.objects.get(key)
@@ -200,3 +348,9 @@ class MemoryObjectStore:
             metadata=metadata or {},
             version_id=str(uuid7()),
         )
+
+    def _require_multipart(self, upload: MultipartUpload) -> _MemoryMultipartUpload:
+        pending = self._multipart_uploads.get(upload.upload_id)
+        if pending is None or pending.key != upload.key:
+            raise ObjectNotFoundError("multipart upload does not exist")
+        return pending

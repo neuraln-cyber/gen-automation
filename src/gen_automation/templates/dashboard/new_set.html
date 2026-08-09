@@ -328,6 +328,7 @@
                 {% if options.loras %}
                   <ul class="lora-catalog" data-lora-catalog aria-label="Available LoRAs">
                     {% for lora in options.loras %}
+                      {% set readiness_status = lora.readiness_status | default('', true) %}
                       <li>
                         <button
                           class="lora-option"
@@ -336,11 +337,14 @@
                           data-lora-id="{{ lora.approval_id }}"
                           data-lora-name="{{ lora.name }}"
                           data-lora-sha256="{{ lora.sha256 }}"
+                          {% if readiness_status %}data-lora-readiness="{{ readiness_status }}"{% endif %}
                           aria-pressed="false"
                         >
                           <span class="lora-option-copy">
                             <strong>{{ lora.name }}</strong>
-                            <small>{{ lora.sha256[:12] }}</small>
+                            <small>
+                              {{ lora.sha256[:12] }}{% if readiness_status %} &middot; {{ readiness_status | replace('_', ' ') }}{% endif %}
+                            </small>
                           </span>
                           <span class="lora-option-action" data-lora-option-action>Add</span>
                         </button>
@@ -357,7 +361,11 @@
                 <div class="lora-stack-heading">
                   <div>
                     <h3>Selected stack</h3>
+                    <p class="muted">Order matters when several LoRAs affect the same model.</p>
                   </div>
+                  {% if principal.role.value in ["owner", "admin"] %}
+                    <a class="secondary-button lora-manage-link" href="/dashboard/loras">Manage LoRAs</a>
+                  {% endif %}
                 </div>
                 <ol class="lora-selected-list" data-lora-selected aria-live="polite"></ol>
                 <p class="lora-stack-empty muted" data-lora-stack-empty>
@@ -374,10 +382,12 @@
                       <select name="lora_{{ slot }}_id" data-lora-native-id>
                         <option value="">None</option>
                         {% for lora in options.loras %}
+                          {% set readiness_status = lora.readiness_status | default('', true) %}
                           <option
                             value="{{ lora.approval_id }}"
+                            {% if readiness_status %}data-lora-readiness="{{ readiness_status }}"{% endif %}
                             {% if form_values['lora_' ~ slot ~ '_id'] == lora.approval_id|string %}selected{% endif %}
-                          >{{ lora.name }} &middot; {{ lora.sha256[:12] }}</option>
+                          >{{ lora.name }} &middot; {{ lora.sha256[:12] }}{% if readiness_status %} &middot; {{ readiness_status | replace('_', ' ') }}{% endif %}</option>
                         {% endfor %}
                       </select>
                     </label>

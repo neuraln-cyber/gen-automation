@@ -1336,6 +1336,13 @@
             href="/dashboard/experiments/new"
             {% if request.url.path.startswith("/dashboard/experiments") %}aria-current="page"{% endif %}
           >Experiment Lab</a>
+          {% if principal.role.value in ["owner", "admin"] %}
+            <a
+              class="nav-link"
+              href="/dashboard/loras"
+              {% if request.url.path.startswith("/dashboard/loras") %}aria-current="page"{% endif %}
+            >LoRAs</a>
+          {% endif %}
           <a
             class="nav-link"
             href="/dashboard/wildcards"
@@ -1366,5 +1373,6 @@
     <script src="/static/dashboard.js" defer></script>
     <script src="/static/tag_autocomplete.js" defer></script>
     <script src="/static/asset_viewer.js" defer></script>
+    {% block page_scripts %}{% endblock %}
   </body>
 </html>

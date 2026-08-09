@@ -173,7 +173,7 @@ The installer creates this wrapper alongside the Patreon bootstrap command.
 The password, one-time TOTP provisioning data, and confirmation code remain
 inside that terminal and are never accepted as command arguments.
 
-Populate the five files out-of-band. Keep external effects disabled through the
+Populate the six files out-of-band. Keep external effects disabled through the
 first health, storage, MEGA, Patreon, and X canaries. The validator reads only
 the minimum non-secret deployment invariants and never sources an environment
 file. The systemd unit validates inputs, renders Compose, pulls the four exact
@@ -222,7 +222,8 @@ service is stopped, the workflow transfers the updater and MEGA bootstrap files
 from the exact reviewed source revision as a bounded compressed payload, verifies
 their SHA-256 hashes and syntax on the host, and installs the updater as
 `root:root` mode `0755`. The shared update lock then covers the service stop,
-worker-image environment update, migration, and activation. Only after the
+worker-image environment update, migration, and activation. Routine deployment
+preserves the LoRA manager toggle and secret reference exactly. Only after the
 migration succeeds does the workflow invoke this root-owned host command through
 SSM:
 
@@ -252,14 +253,36 @@ Set these non-secret GitHub repository variables once:
   immutable owner ID `310034173`, immutable repository ID `1314605368`, exact
   `neuraln-cyber/gen-automation` name claim, deployment workflow, and `main`
   branch;
-- `AWS_STAGING_INSTANCE_ID`: the staging EC2 instance ID.
+- `AWS_STAGING_INSTANCE_ID`: the staging EC2 instance ID;
+- `AWS_STAGING_CIVITAI_API_SECRET_ARN`: the exact non-secret ARN already applied
+  to the staging control-plane IAM policy. It must remain in account
+  `861912887470`, region `eu-central-1`, and the
+  `gen-automation/staging/civitai-<AWS suffix>` namespace;
+- `AWS_STAGING_LORA_MANAGER_PREREQUISITES_APPLIED`: set to exactly `true` only
+  after the reviewed model-bucket CORS, managed-prefix IAM, and Civitai secret
+  grant have been applied and verified. Until then, the explicit enable operation
+  fails before AWS authentication or host mutation.
 
 The role needs only `ssm:SendCommand` for that instance and the
 `AWS-RunShellScript` document, plus the read APIs required to poll its own
 command. Do not configure IAM-user access keys as repository secrets. The
-instance continues to pull with its existing host-side registry access; no
-registry token, application secret, or integration credential is placed in SSM
-command text.
+instance continues to pull with its existing host-side registry access. The full
+Civitai ARN is a non-secret deployment coordinate; the API key, registry token,
+and other integration credentials are never placed in SSM command text.
+
+Apply the model-bucket CORS and bounded IAM/secret-read changes before setting
+the LoRA repository variable or deploying the enabled flag. The complete
+fail-closed order is in
+[`docs/lora-manager-staging-rollout.md`](../../../docs/lora-manager-staging-rollout.md).
+The manual `lora-manager` component of the existing `Deploy staging control
+plane` workflow provides `status`, `enable`, and credential-independent `disable`
+operations. Reusing that workflow is required by the exact workflow-name claim in
+the staging OIDC trust policy. The job transfers checksum-pinned helper and
+validator bytes from its exact `main` revision, updates the root-owned environment
+atomically, and restores both environment and validator if readiness fails.
+Enablement additionally requires the running immutable control-plane image's
+`org.opencontainers.image.revision` label to equal the dispatch revision, so the
+feature cannot race ahead of the schema and application rollout.
 
 Before enabling the repository variables, verify the host can pull the current
 immutable `control-plane-mega` digest as root. The package may be public, or the

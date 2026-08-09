@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from gen_automation.config import Settings
 from gen_automation.db.models import (
     Asset,
     AssetRanking,
@@ -16,6 +17,7 @@ from gen_automation.db.models import (
     AuditEvent,
     GenerationAttempt,
     GenerationJob,
+    ManagedLoraArtifact,
     ModelArtifactApproval,
     Project,
     Release,
@@ -44,6 +46,7 @@ from gen_automation.domain.enums import (
     AssetState,
     GenerationAttemptState,
     GenerationState,
+    ManagedLoraLifecycle,
     ModelArtifactKind,
     ReleasePhase,
     ResourceHealth,
@@ -484,6 +487,17 @@ async def list_new_set_options(session: AsyncSession) -> NewSetOptions:
             )
         ).all()
     )
+    managed_lora_lifecycles: dict[UUID, ManagedLoraLifecycle] = {
+        approval_id: lifecycle
+        for approval_id, lifecycle in (
+            await session.execute(
+                select(
+                    ManagedLoraArtifact.approval_id,
+                    ManagedLoraArtifact.lifecycle,
+                )
+            )
+        ).all()
+    }
     checkpoints = tuple(
         ArtifactOption(
             approval_id=row.id,
@@ -501,6 +515,13 @@ async def list_new_set_options(session: AsyncSession) -> NewSetOptions:
         )
         for row in artifacts
         if row.kind == ModelArtifactKind.LORA
+        and (
+            (
+                row.id not in managed_lora_lifecycles
+                and not row.storage_key.startswith("worker/managed-loras/sha256/")
+            )
+            or managed_lora_lifecycles.get(row.id) == ManagedLoraLifecycle.ACTIVE
+        )
     )
     workflows = tuple(
         _workflow_option(row)
@@ -538,6 +559,7 @@ async def create_and_approve_new_set(
     *,
     command: NewSetSubmission,
     idempotency_key: str,
+    settings: Settings,
     actor: str,
 ) -> NewSetResult:
     if not 8 <= len(idempotency_key) <= 200 or any(
@@ -747,6 +769,7 @@ async def create_and_approve_new_set(
         session,
         release_id=release_result.response.id,
         idempotency_key=f"{idempotency_key}:generation-plan",
+        settings=settings,
         actor=actor,
     )
     return NewSetResult(
@@ -1531,6 +1554,16 @@ async def _approved_artifact(
     )
     if artifact is None:
         raise NewSetInputError(f"the selected {expected_kind.value} is no longer approved")
+    if expected_kind == ModelArtifactKind.LORA:
+        lifecycle = await session.scalar(
+            select(ManagedLoraArtifact.lifecycle)
+            .where(ManagedLoraArtifact.approval_id == artifact.id)
+            .with_for_update(read=True)
+        )
+        if (
+            lifecycle is None and artifact.storage_key.startswith("worker/managed-loras/sha256/")
+        ) or (lifecycle is not None and lifecycle != ManagedLoraLifecycle.ACTIVE):
+            raise NewSetInputError("the selected lora is not active on the worker")
     return artifact
 
 

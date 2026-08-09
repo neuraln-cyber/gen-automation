@@ -160,6 +160,7 @@ async def submit_dashboard_new_set(
             session,
             command=form.command,
             idempotency_key=form.idempotency_key,
+            settings=settings,
             actor=str(manager.user_id),
         )
     except HTTPException as error:

@@ -116,6 +116,7 @@ async def read_release(
 )
 async def approve_generation_plan(
     release_id: UUID,
+    request: Request,
     session: Session,
     idempotency_key: IdempotencyKey,
     response: Response,
@@ -126,6 +127,7 @@ async def approve_generation_plan(
             session,
             release_id=release_id,
             idempotency_key=idempotency_key,
+            settings=request.app.state.settings,
             actor=str(principal.user_id),
         )
     except GenerationPlanNotFoundError as error:

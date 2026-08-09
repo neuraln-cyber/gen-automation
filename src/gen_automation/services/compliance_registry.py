@@ -12,6 +12,7 @@ from gen_automation.db.models import (
     AdminUser,
     AuditEvent,
     IdempotencyRecord,
+    ManagedLoraArtifact,
     ModelArtifactApproval,
     SubjectApproval,
     WorkflowApproval,
@@ -24,7 +25,7 @@ from gen_automation.domain.compliance_registry import (
     SubjectApprovalCreate,
     WorkflowApprovalCreate,
 )
-from gen_automation.domain.enums import AdminRole, ApprovalStatus
+from gen_automation.domain.enums import AdminRole, ApprovalStatus, ManagedLoraLifecycle
 from gen_automation.services.compliance import canonical_source_sha256
 
 RegistryName = Literal["subject", "model_artifact", "workflow"]
@@ -196,6 +197,7 @@ async def approve_model_artifact(
     command: ModelArtifactApprovalCreate,
     actor_user_id: UUID,
     idempotency_key: str,
+    allow_managed_registration: bool = False,
     now: datetime | None = None,
 ) -> ApprovalMutationResult:
     approved_at = _as_utc(now or datetime.now(UTC))
@@ -216,6 +218,27 @@ async def approve_model_artifact(
         return replay
 
     await _require_actor(session, actor_user_id)
+    managed_lifecycles = list(
+        (
+            await session.scalars(
+                select(ManagedLoraArtifact.lifecycle)
+                .where(ManagedLoraArtifact.artifact_sha256 == command.artifact_sha256)
+                .with_for_update()
+            )
+        ).all()
+    )
+    if managed_lifecycles and (
+        not allow_managed_registration
+        or any(lifecycle != ManagedLoraLifecycle.PURGED for lifecycle in managed_lifecycles)
+    ):
+        raise ComplianceRegistryConflictError(
+            "managed LoRA approvals can only change through the LoRA manager"
+        )
+    managed_storage = command.storage_key.startswith("worker/managed-loras/sha256/")
+    if managed_storage and not allow_managed_registration:
+        raise ComplianceRegistryConflictError(
+            "managed LoRA approvals can only be created by the onboarding runtime"
+        )
     evidence = command.evidence.model_dump(mode="json")
     evidence_sha256 = canonical_sha256(evidence)
     rows = list(
@@ -232,6 +255,14 @@ async def approve_model_artifact(
         if row.is_current:
             _validate_current_approval(row, registry="model_artifact")
     current = next((row for row in rows if row.is_current), None)
+    if (
+        allow_managed_registration
+        and current is not None
+        and not current.storage_key.startswith("worker/managed-loras/sha256/")
+    ):
+        raise ComplianceRegistryConflictError(
+            "a protected static LoRA approval already owns this artifact"
+        )
     if current is not None and _artifact_matches(
         current,
         command=command,
@@ -411,6 +442,13 @@ async def revoke_model_artifact(
     idempotency_key: str,
     now: datetime | None = None,
 ) -> ApprovalMutationResult:
+    managed = await session.scalar(
+        select(ManagedLoraArtifact.id)
+        .where(ManagedLoraArtifact.approval_id == approval_id)
+        .limit(1)
+    )
+    if managed is not None:
+        raise ComplianceRegistryConflictError("managed LoRAs must be deleted from the LoRA manager")
     return await _revoke(
         session,
         model=ModelArtifactApproval,

@@ -202,11 +202,19 @@ def _safe_object_key(value: str, *, required_suffix: str) -> str:
 
 
 def _safe_evidence_url(value: AnyHttpUrl) -> AnyHttpUrl:
+    path = value.path or ""
+    query = value.query
+    exact_civitai_version = bool(
+        (value.host or "").casefold() == "civitai.com"
+        and re.fullmatch(r"/models/[1-9][0-9]*", path)
+        and query is not None
+        and re.fullmatch(r"modelVersionId=[1-9][0-9]*", query)
+    )
     if (
         value.scheme != "https"
         or value.username is not None
         or value.password is not None
-        or value.query is not None
+        or (query is not None and not exact_civitai_version)
         or value.fragment is not None
     ):
         raise ValueError("evidence URLs must be credential-free canonical HTTPS URLs")
