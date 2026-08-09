@@ -164,8 +164,13 @@ class _XPublicationClientAdapter:
         *,
         text: str,
         media_ids: Sequence[str],
+        made_with_ai: bool = True,
     ) -> XPost:
-        return await self._client.create_post(text=text, media_ids=media_ids)
+        return await self._client.create_post(
+            text=text,
+            media_ids=media_ids,
+            made_with_ai=made_with_ai,
+        )
 
     def clear_authorization(self) -> None:
         self._client.clear_authorization()

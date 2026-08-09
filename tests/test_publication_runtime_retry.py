@@ -153,7 +153,13 @@ async def test_x_upload_uses_frozen_adult_toggle_for_every_image(
                 size=len(image),
             )
 
-        async def create_post(self, *, text: str, media_ids: object) -> XPost:
+        async def create_post(
+            self,
+            *,
+            text: str,
+            media_ids: object,
+            made_with_ai: bool = True,
+        ) -> XPost:
             raise AssertionError("the focused upload test must not create a post")
 
     class FakeLease:
@@ -251,11 +257,18 @@ async def test_x_create_post_retries_only_when_transport_proves_request_was_not_
     client_calls = 0
 
     class FakeClient:
-        async def create_post(self, *, text: str, media_ids: object) -> XPost:
+        async def create_post(
+            self,
+            *,
+            text: str,
+            media_ids: object,
+            made_with_ai: bool = True,
+        ) -> XPost:
             nonlocal client_calls
             client_calls += 1
             assert text == "approved copy"
             assert media_ids == ("1001",)
+            assert made_with_ai is False
             raise XRetryableTransportError("request bytes were not sent")
 
     class FakeLease:
@@ -290,7 +303,11 @@ async def test_x_create_post_retries_only_when_transport_proves_request_was_not_
             kind=PublicationStepKind.X_CREATE_POST,
             guard_epoch=1,
             credential_reference="test://x/creator",
-            configuration={"text": "approved copy", "adult_content": False},
+            configuration={
+                "text": "approved copy",
+                "adult_content": False,
+                "made_with_ai": False,
+            },
         )
 
     async def media_ids(*_args: object, **_kwargs: object) -> tuple[str, ...]:
@@ -352,11 +369,18 @@ async def test_x_post_ambiguity_is_unknown_and_never_retried(
     unknown_codes: list[str] = []
 
     class FakeClient:
-        async def create_post(self, *, text: str, media_ids: object) -> XPost:
+        async def create_post(
+            self,
+            *,
+            text: str,
+            media_ids: object,
+            made_with_ai: bool = True,
+        ) -> XPost:
             nonlocal client_calls
             client_calls += 1
             assert text == "approved copy"
             assert media_ids == ("1001",)
+            assert made_with_ai is True
             if failure_mode == "protocol":
                 raise XProtocolError("HTTP 201 response could not prove the created post")
             return XPost(id="2002", text=text)

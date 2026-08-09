@@ -179,6 +179,30 @@ async def test_create_post_uses_ai_label_and_at_most_four_media_ids() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_post_can_explicitly_disable_ai_label() -> None:
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        body: object = json.loads(request.content)
+        assert body == {
+            "text": "Human-made promotion",
+            "made_with_ai": False,
+            "media": {"media_ids": [MEDIA_ID]},
+        }
+        return httpx2.Response(
+            201,
+            json={"data": {"id": POST_ID, "text": "Human-made promotion"}},
+        )
+
+    async with mocked_x_client(handler) as client:
+        post = await client.create_post(
+            text="Human-made promotion",
+            media_ids=[MEDIA_ID],
+            made_with_ai=False,
+        )
+
+    assert post.id == POST_ID
+
+
+@pytest.mark.asyncio
 async def test_image_and_post_limits_fail_before_network_io() -> None:
     request_count = 0
 

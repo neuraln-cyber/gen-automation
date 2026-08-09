@@ -74,6 +74,7 @@ PREPARE_X_FIELDS = frozenset(
         "submission_id",
         "x_text",
         "x_adult_content",
+        "x_made_with_ai",
         "x_scheduled_local",
         "x_timezone",
     }
@@ -111,6 +112,37 @@ PATREON_CONFIRM_ABSENT_FIELDS = frozenset(
         "expected_intent_digest",
         "expected_lock_version",
         "evidence",
+        "attestation",
+    }
+)
+X_CONFIRM_PRESENT_FIELDS = frozenset(
+    {
+        "csrf_token",
+        "idempotency_key",
+        "expected_intent_digest",
+        "expected_lock_version",
+        "remote_identifier",
+        "remote_url",
+        "evidence",
+        "attestation",
+    }
+)
+X_CONFIRM_ABSENT_FIELDS = frozenset(
+    {
+        "csrf_token",
+        "idempotency_key",
+        "expected_intent_digest",
+        "expected_lock_version",
+        "evidence",
+        "attestation",
+    }
+)
+PUBLICATION_CANCEL_FIELDS = frozenset(
+    {
+        "csrf_token",
+        "idempotency_key",
+        "expected_intent_digest",
+        "expected_lock_version",
         "attestation",
     }
 )
@@ -188,6 +220,7 @@ class PrepareXForm:
     submission_id: UUID
     x_text: str
     adult_content: bool
+    made_with_ai: bool
     scheduled_at: datetime | None
 
 
@@ -224,6 +257,37 @@ class PatreonConfirmAbsentForm:
     expected_intent_digest: str
     expected_lock_version: int
     evidence: str
+    attestation: str
+
+
+@dataclass(frozen=True, slots=True)
+class XConfirmPresentForm:
+    csrf_token: str
+    idempotency_key: str
+    expected_intent_digest: str
+    expected_lock_version: int
+    remote_identifier: str
+    remote_url: str
+    evidence: str
+    attestation: str
+
+
+@dataclass(frozen=True, slots=True)
+class XConfirmAbsentForm:
+    csrf_token: str
+    idempotency_key: str
+    expected_intent_digest: str
+    expected_lock_version: int
+    evidence: str
+    attestation: str
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationCancelForm:
+    csrf_token: str
+    idempotency_key: str
+    expected_intent_digest: str
+    expected_lock_version: int
     attestation: str
 
 
@@ -329,13 +393,20 @@ async def read_prepare_patreon_form(request: Request) -> PreparePatreonForm:
 
 
 async def read_prepare_x_form(request: Request) -> PrepareXForm:
-    values = await _read_form(request, expected_fields=PREPARE_X_FIELDS)
+    values = await _read_form(
+        request,
+        expected_fields=PREPARE_X_FIELDS,
+        optional_fields=frozenset({"x_made_with_ai"}),
+    )
     return PrepareXForm(
         csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
         idempotency_key=_idempotency_key(values["idempotency_key"]),
         submission_id=_uuid(values["submission_id"]),
         x_text=_bounded_text(values["x_text"], maximum=280, required=True),
         adult_content=_strict_bool(values["x_adult_content"]),
+        made_with_ai=(
+            True if values["x_made_with_ai"] == "" else _strict_bool(values["x_made_with_ai"])
+        ),
         scheduled_at=_optional_local_datetime(
             values["x_scheduled_local"],
             timezone_name=values["x_timezone"],
@@ -401,6 +472,50 @@ async def read_patreon_confirm_absent_form(
         expected_intent_digest=digest,
         expected_lock_version=lock_version,
         evidence=_bounded_text(values["evidence"], maximum=20_000, required=True),
+        attestation=_bounded_text(values["attestation"], maximum=500, required=True),
+    )
+
+
+async def read_x_confirm_present_form(request: Request) -> XConfirmPresentForm:
+    values = await _read_form(request, expected_fields=X_CONFIRM_PRESENT_FIELDS)
+    digest, lock_version = _intent_identity(values)
+    return XConfirmPresentForm(
+        csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
+        idempotency_key=_idempotency_key(values["idempotency_key"]),
+        expected_intent_digest=digest,
+        expected_lock_version=lock_version,
+        remote_identifier=_bounded_text(
+            values["remote_identifier"],
+            maximum=19,
+            required=True,
+        ),
+        remote_url=_bounded_text(values["remote_url"], maximum=2_048, required=True),
+        evidence=_bounded_text(values["evidence"], maximum=20_000, required=True),
+        attestation=_bounded_text(values["attestation"], maximum=500, required=True),
+    )
+
+
+async def read_x_confirm_absent_form(request: Request) -> XConfirmAbsentForm:
+    values = await _read_form(request, expected_fields=X_CONFIRM_ABSENT_FIELDS)
+    digest, lock_version = _intent_identity(values)
+    return XConfirmAbsentForm(
+        csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
+        idempotency_key=_idempotency_key(values["idempotency_key"]),
+        expected_intent_digest=digest,
+        expected_lock_version=lock_version,
+        evidence=_bounded_text(values["evidence"], maximum=20_000, required=True),
+        attestation=_bounded_text(values["attestation"], maximum=500, required=True),
+    )
+
+
+async def read_publication_cancel_form(request: Request) -> PublicationCancelForm:
+    values = await _read_form(request, expected_fields=PUBLICATION_CANCEL_FIELDS)
+    digest, lock_version = _intent_identity(values)
+    return PublicationCancelForm(
+        csrf_token=_bounded_nonempty(values["csrf_token"], maximum=200),
+        idempotency_key=_idempotency_key(values["idempotency_key"]),
+        expected_intent_digest=digest,
+        expected_lock_version=lock_version,
         attestation=_bounded_text(values["attestation"], maximum=500, required=True),
     )
 

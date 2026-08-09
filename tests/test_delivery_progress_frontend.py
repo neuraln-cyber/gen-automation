@@ -149,9 +149,21 @@ def test_delivery_template_exposes_four_independent_target_actions() -> None:
         assert f"'{position}'" in template
     assert 'name="x_adult_content" value="true" checked' in template
     assert 'name="x_adult_content" value="false"' in template
+    assert 'name="x_made_with_ai" value="true" checked' in template
+    assert 'name="x_made_with_ai" value="false"' in template
     assert 'name="x_scheduled_local"' in template
     assert 'name="x_timezone"' in template
-    assert "The AI-generated disclosure remains on either way." in template
+    assert "This setting is independent from the AI-generated disclosure." in template
+    assert "Controls X's AI-generated label independently." in template
+    assert "Cancel scheduled X post" in template
+    assert "You can then enter a new" in template
+    assert "Resolve unknown X result" in template
+    assert "These controls record what" in template
+    assert ":confirm-present" in template
+    assert ":confirm-absent" in template
+    assert 'name="attestation" value="{{ x_cancel_attestation }}"' in template
+    assert 'name="attestation" value="{{ x_present_attestation }}"' in template
+    assert 'name="attestation" value="{{ x_absent_attestation }}"' in template
     assert "delivery:prepare-destinations" not in template
     assert "Prepare Patreon and X" not in template
     assert 'data-delivery-card="zip"' in template

@@ -89,22 +89,27 @@ def test_x_schedule_horizon_rejects_distant_typographical_dates() -> None:
         )
 
 
-def test_x_configuration_freezes_explicit_adult_toggle_and_defaults_legacy_true() -> None:
+def test_x_configuration_freezes_independent_labels_and_defaults_legacy_true() -> None:
     assert publication._normalize_configuration(
         PublicationTarget.X,
-        {"text": "Adult preview", "adult_content": False},
-    ) == {"text": "Adult preview", "adult_content": False}
+        {"text": "Adult preview", "adult_content": False, "made_with_ai": False},
+    ) == {"text": "Adult preview", "adult_content": False, "made_with_ai": False}
     assert publication._normalize_configuration(
         PublicationTarget.X,
         {"text": "Legacy preview"},
-    ) == {"text": "Legacy preview", "adult_content": True}
+    ) == {"text": "Legacy preview", "adult_content": True, "made_with_ai": True}
 
     with pytest.raises(PublicationInputError, match="adult_content must be a boolean"):
         publication._normalize_configuration(
             PublicationTarget.X,
             {"text": "Invalid preview", "adult_content": 1},
         )
-    with pytest.raises(PublicationInputError, match="optional adult_content"):
+    with pytest.raises(PublicationInputError, match="made_with_ai must be a boolean"):
+        publication._normalize_configuration(
+            PublicationTarget.X,
+            {"text": "Invalid preview", "made_with_ai": 1},
+        )
+    with pytest.raises(PublicationInputError, match="optional adult_content and made_with_ai"):
         publication._normalize_configuration(
             PublicationTarget.X,
             {"text": "Unexpected option", "unrecognized": False},
@@ -114,6 +119,45 @@ def test_x_configuration_freezes_explicit_adult_toggle_and_defaults_legacy_true(
             PublicationTarget.X,
             {"text": "界" * 94, "adult_content": False},
         )
+
+
+@pytest.mark.parametrize(
+    ("validator", "identifier", "remote_url", "message"),
+    (
+        (
+            publication._validate_x_post_identity,
+            "1",
+            "https://x.com:bad/example/status/1",
+            "exact HTTPS X URL",
+        ),
+        (
+            publication._validate_x_post_identity,
+            "1",
+            "https://x.com:99999/example/status/1",
+            "exact HTTPS X URL",
+        ),
+        (
+            publication._validate_x_post_identity,
+            "1",
+            "https://[not-an-ipv6]/example/status/1",
+            "exact HTTPS X URL",
+        ),
+        (
+            publication.validate_patreon_post_identity,
+            "1",
+            "https://patreon.com:bad/posts/example-1",
+            "exact HTTPS Patreon URL",
+        ),
+    ),
+)
+def test_post_reconciliation_rejects_malformed_urls_without_server_errors(
+    validator,
+    identifier: str,
+    remote_url: str,
+    message: str,
+) -> None:
+    with pytest.raises(PublicationInputError, match=message):
+        validator(identifier, remote_url)
 
 
 @pytest.mark.asyncio

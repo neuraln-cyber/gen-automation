@@ -31,8 +31,11 @@ from gen_automation.api.browser_delivery_forms import (
     read_prepare_output_form,
     read_prepare_patreon_form,
     read_prepare_x_form,
+    read_publication_cancel_form,
     read_publication_guard_form,
     read_retry_output_form,
+    read_x_confirm_absent_form,
+    read_x_confirm_present_form,
 )
 from gen_automation.api.security import (
     PublicationReader,
@@ -80,11 +83,14 @@ from gen_automation.services.operator_delivery import (
     prepare_operator_x_destination,
 )
 from gen_automation.services.publication import (
+    PUBLICATION_CONFIRM_ABSENT_ATTESTATION,
     PUBLICATION_CONFIRM_PATREON_ABSENT_ATTESTATION,
     PUBLICATION_CONFIRM_PRESENT_ATTESTATION,
+    PUBLICATION_PRE_EFFECT_CANCELLATION_ATTESTATION,
     PublicationConflictError,
     PublicationInputError,
     PublicationNotFoundError,
+    cancel_publication_intent,
     presign_patreon_package_download,
     reconcile_publication_absent,
     reconcile_publication_present,
@@ -210,6 +216,7 @@ async def dashboard_review_delivery(
         )
 
     settings: Settings = request.app.state.settings
+    rendered_at = datetime.now(UTC)
     requested_zip_archive = _requested_zip_archive(finished_set_archive)
     output_submission_id = uuid4()
     retry_output_submission_id = uuid4()
@@ -343,6 +350,72 @@ async def dashboard_review_delivery(
                 action="patreon-confirm-absent",
                 parts=recovery_parts,
             )
+    x_confirmation = next(
+        (
+            destination
+            for destination in snapshot.destinations
+            if destination.key == "x"
+            and destination.state == "unknown"
+            and destination.intent_id is not None
+            and destination.intent_digest is not None
+            and destination.intent_lock_version is not None
+        ),
+        None,
+    )
+    x_cancellation = next(
+        (
+            destination
+            for destination in snapshot.destinations
+            if destination.key == "x"
+            and destination.state == "queued"
+            and destination.scheduled_at is not None
+            and _as_utc(destination.scheduled_at) > rendered_at
+            and destination.intent_id is not None
+            and destination.intent_digest is not None
+            and destination.intent_lock_version is not None
+        ),
+        None,
+    )
+    x_present_key = None
+    x_absent_key = None
+    if x_confirmation is not None:
+        assert x_confirmation.intent_id is not None
+        assert x_confirmation.intent_digest is not None
+        assert x_confirmation.intent_lock_version is not None
+        x_recovery_parts = (
+            str(review_task_id),
+            str(x_confirmation.intent_id),
+            x_confirmation.intent_digest,
+            str(x_confirmation.intent_lock_version),
+        )
+        x_present_key = delivery_form_key(
+            settings,
+            session_id=principal.session_id,
+            action="x-confirm-present",
+            parts=x_recovery_parts,
+        )
+        x_absent_key = delivery_form_key(
+            settings,
+            session_id=principal.session_id,
+            action="x-confirm-absent",
+            parts=x_recovery_parts,
+        )
+    x_cancel_key = None
+    if x_cancellation is not None:
+        assert x_cancellation.intent_id is not None
+        assert x_cancellation.intent_digest is not None
+        assert x_cancellation.intent_lock_version is not None
+        x_cancel_key = delivery_form_key(
+            settings,
+            session_id=principal.session_id,
+            action="x-cancel",
+            parts=(
+                str(review_task_id),
+                str(x_cancellation.intent_id),
+                x_cancellation.intent_digest,
+                str(x_cancellation.intent_lock_version),
+            ),
+        )
     can_prepare_patreon_destination = _can_prepare_target_destination(
         snapshot,
         settings=settings,
@@ -404,7 +477,7 @@ async def dashboard_review_delivery(
                 "mega_idempotency_key": mega_key,
                 "can_prepare_patreon_destination": can_prepare_patreon_destination,
                 "can_prepare_x_destination": can_prepare_x_destination,
-                "public_preview_attested_at": datetime.now(UTC).isoformat(),
+                "public_preview_attested_at": rendered_at.isoformat(),
                 "watermark_idempotency_key": watermark_key,
                 "guard_idempotency_key": guard_key,
                 "guard_target_enabled": guard_target_enabled,
@@ -412,6 +485,12 @@ async def dashboard_review_delivery(
                 "patreon_absent_idempotency_key": patreon_absent_key,
                 "patreon_present_attestation": PUBLICATION_CONFIRM_PRESENT_ATTESTATION,
                 "patreon_absent_attestation": (PUBLICATION_CONFIRM_PATREON_ABSENT_ATTESTATION),
+                "x_present_idempotency_key": x_present_key,
+                "x_absent_idempotency_key": x_absent_key,
+                "x_cancel_idempotency_key": x_cancel_key,
+                "x_present_attestation": PUBLICATION_CONFIRM_PRESENT_ATTESTATION,
+                "x_absent_attestation": PUBLICATION_CONFIRM_ABSENT_ATTESTATION,
+                "x_cancel_attestation": PUBLICATION_PRE_EFFECT_CANCELLATION_ATTESTATION,
                 "patreon_download_destination": patreon_download_destination,
                 "finished_set_archive": (
                     requested_zip_archive
@@ -1200,6 +1279,202 @@ async def dashboard_prepare_patreon_destination(
 
 
 @router.post(
+    "/review-tasks/{review_task_id}/delivery/x/{intent_id}:confirm-present",
+    response_class=HTMLResponse,
+    response_model=None,
+)
+async def dashboard_confirm_x_present(
+    review_task_id: UUID,
+    intent_id: UUID,
+    request: Request,
+    session: Session,
+    principal: PublicationReader,
+) -> Response:
+    try:
+        form = await read_x_confirm_present_form(request)
+        owner = await _verified_owner(request, session, principal, form.csrf_token)
+        await _require_review_x_intent(
+            session,
+            review_task_id=review_task_id,
+            intent_id=intent_id,
+        )
+        expected_key = delivery_form_key(
+            request.app.state.settings,
+            session_id=owner.session_id,
+            action="x-confirm-present",
+            parts=(
+                str(review_task_id),
+                str(intent_id),
+                form.expected_intent_digest,
+                str(form.expected_lock_version),
+            ),
+        )
+        if not form_key_matches(form.idempotency_key, expected_key):
+            raise BrowserDeliveryFormError(status_code=status.HTTP_400_BAD_REQUEST)
+        await reconcile_publication_present(
+            session,
+            intent_id=intent_id,
+            expected_intent_digest=form.expected_intent_digest,
+            expected_lock_version=form.expected_lock_version,
+            remote_identifier=form.remote_identifier,
+            remote_url=form.remote_url,
+            evidence=form.evidence,
+            attestation=form.attestation,
+            actor_user_id=owner.user_id,
+            actor_role=owner.role,
+            idempotency_key=form.idempotency_key,
+        )
+    except BrowserDeliveryFormError as error:
+        return _form_error(request, principal, error.status_code, error.message)
+    except HTTPException as error:
+        return _owner_http_error(request, principal, error)
+    except OperatorDeliveryNotFoundError:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_404_NOT_FOUND,
+            "The completed review could not be found.",
+        )
+    except (PublicationInputError, PublicationNotFoundError, PublicationConflictError):
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_409_CONFLICT,
+            "The X outcome could not be confirmed from the current state.",
+        )
+    return _redirect(review_task_id)
+
+
+@router.post(
+    "/review-tasks/{review_task_id}/delivery/x/{intent_id}:confirm-absent",
+    response_class=HTMLResponse,
+    response_model=None,
+)
+async def dashboard_confirm_x_absent(
+    review_task_id: UUID,
+    intent_id: UUID,
+    request: Request,
+    session: Session,
+    principal: PublicationReader,
+) -> Response:
+    try:
+        form = await read_x_confirm_absent_form(request)
+        owner = await _verified_owner(request, session, principal, form.csrf_token)
+        await _require_review_x_intent(
+            session,
+            review_task_id=review_task_id,
+            intent_id=intent_id,
+        )
+        expected_key = delivery_form_key(
+            request.app.state.settings,
+            session_id=owner.session_id,
+            action="x-confirm-absent",
+            parts=(
+                str(review_task_id),
+                str(intent_id),
+                form.expected_intent_digest,
+                str(form.expected_lock_version),
+            ),
+        )
+        if not form_key_matches(form.idempotency_key, expected_key):
+            raise BrowserDeliveryFormError(status_code=status.HTTP_400_BAD_REQUEST)
+        await reconcile_publication_absent(
+            session,
+            intent_id=intent_id,
+            expected_intent_digest=form.expected_intent_digest,
+            expected_lock_version=form.expected_lock_version,
+            evidence=form.evidence,
+            attestation=form.attestation,
+            actor_user_id=owner.user_id,
+            actor_role=owner.role,
+            idempotency_key=form.idempotency_key,
+        )
+    except BrowserDeliveryFormError as error:
+        return _form_error(request, principal, error.status_code, error.message)
+    except HTTPException as error:
+        return _owner_http_error(request, principal, error)
+    except OperatorDeliveryNotFoundError:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_404_NOT_FOUND,
+            "The completed review could not be found.",
+        )
+    except (PublicationInputError, PublicationNotFoundError, PublicationConflictError):
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_409_CONFLICT,
+            "The X outcome could not be confirmed from the current state.",
+        )
+    return _redirect(review_task_id)
+
+
+@router.post(
+    "/review-tasks/{review_task_id}/delivery/x/{intent_id}:cancel",
+    response_class=HTMLResponse,
+    response_model=None,
+)
+async def dashboard_cancel_x_publication(
+    review_task_id: UUID,
+    intent_id: UUID,
+    request: Request,
+    session: Session,
+    principal: PublicationReader,
+) -> Response:
+    try:
+        form = await read_publication_cancel_form(request)
+        owner = await _verified_owner(request, session, principal, form.csrf_token)
+        await _require_review_x_intent(
+            session,
+            review_task_id=review_task_id,
+            intent_id=intent_id,
+        )
+        expected_key = delivery_form_key(
+            request.app.state.settings,
+            session_id=owner.session_id,
+            action="x-cancel",
+            parts=(
+                str(review_task_id),
+                str(intent_id),
+                form.expected_intent_digest,
+                str(form.expected_lock_version),
+            ),
+        )
+        if not form_key_matches(form.idempotency_key, expected_key):
+            raise BrowserDeliveryFormError(status_code=status.HTTP_400_BAD_REQUEST)
+        await cancel_publication_intent(
+            session,
+            intent_id=intent_id,
+            expected_intent_digest=form.expected_intent_digest,
+            expected_lock_version=form.expected_lock_version,
+            actor_user_id=owner.user_id,
+            actor_role=owner.role,
+            attestation=form.attestation,
+            idempotency_key=form.idempotency_key,
+        )
+    except BrowserDeliveryFormError as error:
+        return _form_error(request, principal, error.status_code, error.message)
+    except HTTPException as error:
+        return _owner_http_error(request, principal, error)
+    except OperatorDeliveryNotFoundError:
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_404_NOT_FOUND,
+            "The completed review could not be found.",
+        )
+    except (PublicationInputError, PublicationNotFoundError, PublicationConflictError):
+        return _form_error(
+            request,
+            principal,
+            status.HTTP_409_CONFLICT,
+            "The scheduled X post could not be cancelled from the current state.",
+        )
+    return _redirect(review_task_id)
+
+
+@router.post(
     "/review-tasks/{review_task_id}/delivery:prepare-x",
     response_class=HTMLResponse,
     response_model=None,
@@ -1231,6 +1506,7 @@ async def dashboard_prepare_x_destination(
             review_task_id=review_task_id,
             x_text=form.x_text,
             x_adult_content=form.adult_content,
+            x_made_with_ai=form.made_with_ai,
             scheduled_at=form.scheduled_at,
             x_credential_reference=settings.x_oauth_secret_reference,
             actor_user_id=owner.user_id,
@@ -1460,6 +1736,20 @@ async def _require_review_patreon_intent(
         for destination in snapshot.destinations
     ):
         raise PublicationConflictError("Patreon intent does not belong to this review")
+
+
+async def _require_review_x_intent(
+    session: AsyncSession,
+    *,
+    review_task_id: UUID,
+    intent_id: UUID,
+) -> None:
+    snapshot = await load_operator_delivery(session, review_task_id=review_task_id)
+    if not any(
+        destination.key == "x" and destination.intent_id == intent_id
+        for destination in snapshot.destinations
+    ):
+        raise PublicationConflictError("X intent does not belong to this review")
 
 
 async def _verified_owner(
@@ -1962,6 +2252,12 @@ def _can_prepare_target_destination(
     if not operator_target_is_ready(snapshot, target=publication_target):
         return False
     return target == "patreon" or settings.x_oauth_secret_reference is not None
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _store(request: Request) -> ObjectStore | None:

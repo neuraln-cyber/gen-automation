@@ -45,8 +45,10 @@ metadata endpoint. GIF/video upload and asynchronous media processing are
 intentionally out of scope. Their contracts require the chunked
 initialize/append/finalize/status flow.
 
-Post creation always sends `made_with_ai: true`, independently of the adult-media
-choice.
+Post creation sends the intent's frozen `made_with_ai` choice independently of
+the adult-media choice. The dashboard defaults this disclosure to `true` for
+generated teaser media, while legacy intents without the field retain the safe
+`true` default.
 
 New and replacement X teaser revisions use a metadata-free, watermarked PNG at
 the admitted master's original pixel dimensions. The frozen profile encodes PNG

@@ -22,6 +22,15 @@ def test_delivery_marks_only_external_effect_actions_for_recent_authentication()
     assert "data-requires-recent-auth" in _form_tag(template, ":confirm-absent")
     assert "data-requires-recent-auth" in _form_tag(template, ":prepare-patreon")
     assert "data-requires-recent-auth" in _form_tag(template, ":prepare-x")
+    assert "data-requires-recent-auth" in _form_tag(
+        template, "/x/{{ destination.intent_id }}:cancel"
+    )
+    assert "data-requires-recent-auth" in _form_tag(
+        template, "/x/{{ destination.intent_id }}:confirm-present"
+    )
+    assert "data-requires-recent-auth" in _form_tag(
+        template, "/x/{{ destination.intent_id }}:confirm-absent"
+    )
 
     for low_risk_action in (
         ":prepare-outputs",

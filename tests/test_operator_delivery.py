@@ -775,6 +775,7 @@ async def test_x_only_preparation_creates_no_patreon_intent(
             review_task_id=approved.review_task_id,
             x_text="X only",
             x_adult_content=False,
+            x_made_with_ai=False,
             scheduled_at=scheduled_at,
             x_credential_reference="test://x/oauth",
             actor_user_id=approved.owner_id,
@@ -801,7 +802,11 @@ async def test_x_only_preparation_creates_no_patreon_intent(
     assert len(intents) == 1
     assert intents[0].id == result.intent_id
     assert intents[0].target == PublicationTarget.X
-    assert intents[0].configuration == {"text": "X only", "adult_content": False}
+    assert intents[0].configuration == {
+        "text": "X only",
+        "adult_content": False,
+        "made_with_ai": False,
+    }
     assert intents[0].scheduled_at is not None
     assert intents[0].scheduled_at.replace(tzinfo=UTC) == scheduled_at
     assert len(attempts) == 1
@@ -1101,12 +1106,9 @@ async def test_terminal_x_intent_can_be_safely_superseded(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("intent_state", "attempt_state"),
-    (
-        (PublicationIntentState.FAILED, PublicationAttemptState.FAILED),
-        (PublicationIntentState.CANCELLED, PublicationAttemptState.CANCELLED),
-    ),
+    ((PublicationIntentState.FAILED, PublicationAttemptState.FAILED),),
 )
-async def test_exact_terminal_x_intent_retries_in_place(
+async def test_exact_failed_x_intent_retries_in_place(
     derivative_approved_context: ApprovedContext,
     intent_state: PublicationIntentState,
     attempt_state: PublicationAttemptState,
