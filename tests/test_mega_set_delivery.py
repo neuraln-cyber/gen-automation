@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 from zipfile import ZIP_STORED, ZipFile
@@ -18,6 +19,7 @@ from PIL import Image
 from sqlalchemy import func, select
 
 from gen_automation.api.routes.mega_deliveries import (
+    _read_set,
     get_mega_set_delivery,
     get_release_mega_set_deliveries,
 )
@@ -36,7 +38,9 @@ from gen_automation.domain.enums import FinishedSetArchiveState, MegaDeliverySta
 from gen_automation.integrations.mega import (
     MegaAmbiguousError,
     MegaCmdClient,
+    MegaRemoteConflictError,
     MegaRemoteNode,
+    MegaRetryableError,
 )
 from gen_automation.integrations.mega.client import MegaCommandResult
 from gen_automation.services import finished_set_archives as archives
@@ -50,8 +54,10 @@ from gen_automation.services.finished_set_archives import (
     run_finished_set_archive_cycle,
 )
 from gen_automation.services.mega_set_delivery import (
+    ClaimedMegaSetDelivery,
     MegaSetDeliveryContractError,
     MegaSetDeliveryCycleResult,
+    _next_retry_delay_seconds,
     ensure_next_mega_set_delivery,
     request_mega_set_delivery,
     run_mega_set_delivery_cycle,
@@ -145,6 +151,270 @@ class _RecordingMegaClient:
     def _node(remote_path: str) -> MegaRemoteNode:
         handle = f"H:{hashlib.sha256(remote_path.encode()).hexdigest()[:12]}"
         return MegaRemoteNode(handle=handle, remote_path=remote_path)
+
+
+def test_set_retry_backoff_counts_consecutive_no_progress_failures() -> None:
+    claim = ClaimedMegaSetDelivery(
+        delivery_id=uuid4(),
+        archive_id=uuid4(),
+        manifest_sha256="a" * 64,
+        total_item_count=199,
+        remote_root="/Future",
+        remote_folder="/Future/Akali (NSFW) (PNG)",
+        attempt=14,
+        uploaded_item_count_at_claim=100,
+        prior_retry_delay_seconds=20,
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+
+    assert (
+        _next_retry_delay_seconds(
+            claim,
+            uploaded_item_count=100,
+            retry_base_seconds=5,
+            retry_max_seconds=60,
+        )
+        == 40
+    )
+    assert (
+        _next_retry_delay_seconds(
+            claim,
+            uploaded_item_count=101,
+            retry_base_seconds=5,
+            retry_max_seconds=60,
+        )
+        == 5
+    )
+
+
+def test_set_status_api_distinguishes_retry_wait_from_retired_legacy() -> None:
+    retry_at = datetime(2026, 8, 9, 12, 30, tzinfo=UTC)
+    common = {
+        "id": uuid4(),
+        "finished_set_archive_id": uuid4(),
+        "remote_root": "/Future",
+        "remote_folder": "/Future/Akali (NSFW) (PNG)",
+        "manifest_sha256": "a" * 64,
+        "total_item_count": 199,
+        "uploaded_item_count": 100,
+        "total_byte_size": None,
+        "uploaded_byte_size": 0,
+        "attempts": 14,
+        "available_at": retry_at,
+        "completion_marker_node_handle": None,
+        "planned_at": None,
+        "started_at": retry_at - timedelta(minutes=10),
+        "verified_at": None,
+        "completed_at": None,
+        "created_at": retry_at - timedelta(hours=1),
+        "updated_at": retry_at - timedelta(seconds=30),
+        "items": (),
+    }
+    retry = _read_set(
+        SimpleNamespace(
+            **common,
+            state=MegaDeliveryState.RETRY_WAIT,
+            last_error_code="mega_set_transport_retryable",
+        )
+    )
+    retired = _read_set(
+        SimpleNamespace(
+            **{
+                **common,
+                "state": MegaDeliveryState.FAILED,
+                "completed_at": retry_at,
+                "last_error_code": "mega_set_legacy_media_retired",
+            }
+        )
+    )
+
+    assert retry.next_retry_at == retry_at
+    assert not retry.retired
+    assert retired.next_retry_at is None
+    assert retired.retired
+
+
+@pytest.mark.asyncio
+async def test_megacmd_existing_folder_is_adopted_without_mkdir(tmp_path: Path) -> None:
+    profile = _mega_profile(tmp_path)
+    commands: list[tuple[str, ...]] = []
+
+    async def runner(
+        command: tuple[str, ...],
+        profile_home: Path,
+        timeout_seconds: float,
+    ) -> MegaCommandResult:
+        commands.append(command)
+        return MegaCommandResult(return_code=0, stdout=b"/Future/Akali (NSFW)\n")
+
+    client = MegaCmdClient(profile_home=profile, command_timeout_seconds=30, runner=runner)
+    await client.ensure_folder("/Future/Akali (NSFW)")
+
+    assert commands == [
+        (
+            "mega-find",
+            "/Future",
+            "--pattern=Akali (NSFW)",
+            "--type=d",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_megacmd_missing_folder_is_created_once(tmp_path: Path) -> None:
+    profile = _mega_profile(tmp_path)
+    commands: list[tuple[str, ...]] = []
+
+    async def runner(
+        command: tuple[str, ...],
+        profile_home: Path,
+        timeout_seconds: float,
+    ) -> MegaCommandResult:
+        commands.append(command)
+        if len(commands) == 3:
+            return MegaCommandResult(return_code=0, stdout=b"/sets/fresh\n")
+        return MegaCommandResult(return_code=0, stdout=b"")
+
+    client = MegaCmdClient(profile_home=profile, command_timeout_seconds=30, runner=runner)
+    await client.ensure_folder("/sets/fresh")
+
+    assert commands == [
+        (
+            "mega-find",
+            "/sets",
+            "--pattern=fresh",
+            "--type=d",
+        ),
+        ("mega-mkdir", "/sets/fresh"),
+        (
+            "mega-find",
+            "/sets",
+            "--pattern=fresh",
+            "--type=d",
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_megacmd_folder_read_failure_never_attempts_mkdir(tmp_path: Path) -> None:
+    profile = _mega_profile(tmp_path)
+    commands: list[tuple[str, ...]] = []
+
+    async def runner(
+        command: tuple[str, ...],
+        profile_home: Path,
+        timeout_seconds: float,
+    ) -> MegaCommandResult:
+        commands.append(command)
+        return MegaCommandResult(return_code=9, stdout=b"credential-or-network-detail")
+
+    client = MegaCmdClient(profile_home=profile, command_timeout_seconds=30, runner=runner)
+    with pytest.raises(MegaRetryableError):
+        await client.ensure_folder("/sets/closed")
+
+    assert len(commands) == 1
+    assert commands[0][0] == "mega-find"
+
+
+@pytest.mark.asyncio
+async def test_megacmd_ambiguous_mkdir_is_adopted_only_after_exact_read(
+    tmp_path: Path,
+) -> None:
+    profile = _mega_profile(tmp_path)
+    commands: list[tuple[str, ...]] = []
+
+    async def runner(
+        command: tuple[str, ...],
+        profile_home: Path,
+        timeout_seconds: float,
+    ) -> MegaCommandResult:
+        commands.append(command)
+        if len(commands) == 1:
+            return MegaCommandResult(return_code=0, stdout=b"")
+        if command[0] == "mega-mkdir":
+            raise TimeoutError
+        return MegaCommandResult(return_code=0, stdout=b"/sets/reconciled\n")
+
+    client = MegaCmdClient(profile_home=profile, command_timeout_seconds=30, runner=runner)
+    await client.ensure_folder("/sets/reconciled")
+
+    assert [command[0] for command in commands] == ["mega-find", "mega-mkdir", "mega-find"]
+
+
+@pytest.mark.asyncio
+async def test_megacmd_same_named_nested_folder_is_not_adopted(tmp_path: Path) -> None:
+    profile = _mega_profile(tmp_path)
+    commands: list[tuple[str, ...]] = []
+
+    async def runner(
+        command: tuple[str, ...],
+        profile_home: Path,
+        timeout_seconds: float,
+    ) -> MegaCommandResult:
+        commands.append(command)
+        if command[0] == "mega-find":
+            if len(commands) == 3:
+                return MegaCommandResult(return_code=0, stdout=b"/sets/fresh\n")
+            return MegaCommandResult(
+                return_code=0,
+                stdout=b"/sets/archive/fresh\n",
+            )
+        return MegaCommandResult(return_code=0, stdout=b"")
+
+    client = MegaCmdClient(profile_home=profile, command_timeout_seconds=30, runner=runner)
+    await client.ensure_folder("/sets/fresh")
+
+    assert [command[0] for command in commands] == ["mega-find", "mega-mkdir", "mega-find"]
+
+
+@pytest.mark.asyncio
+async def test_megacmd_successful_mkdir_rejects_racing_duplicate_folders(
+    tmp_path: Path,
+) -> None:
+    profile = _mega_profile(tmp_path)
+    commands: list[tuple[str, ...]] = []
+
+    async def runner(
+        command: tuple[str, ...],
+        profile_home: Path,
+        timeout_seconds: float,
+    ) -> MegaCommandResult:
+        commands.append(command)
+        if len(commands) < 3:
+            return MegaCommandResult(return_code=0, stdout=b"")
+        return MegaCommandResult(
+            return_code=0,
+            stdout=b"/sets/raced\n/sets/raced\n",
+        )
+
+    client = MegaCmdClient(profile_home=profile, command_timeout_seconds=30, runner=runner)
+    with pytest.raises(MegaRemoteConflictError):
+        await client.ensure_folder("/sets/raced")
+
+    assert [command[0] for command in commands] == ["mega-find", "mega-mkdir", "mega-find"]
+
+
+@pytest.mark.asyncio
+async def test_megacmd_duplicate_exact_folders_are_terminal_conflict(tmp_path: Path) -> None:
+    profile = _mega_profile(tmp_path)
+    commands: list[tuple[str, ...]] = []
+
+    async def runner(
+        command: tuple[str, ...],
+        profile_home: Path,
+        timeout_seconds: float,
+    ) -> MegaCommandResult:
+        commands.append(command)
+        return MegaCommandResult(
+            return_code=0,
+            stdout=b"/sets/duplicate\n/sets/duplicate\n",
+        )
+
+    client = MegaCmdClient(profile_home=profile, command_timeout_seconds=30, runner=runner)
+    with pytest.raises(MegaRemoteConflictError):
+        await client.ensure_folder("/sets/duplicate")
+
+    assert [command[0] for command in commands] == ["mega-find"]
 
 
 @pytest.mark.asyncio
@@ -249,6 +519,152 @@ async def test_unrequested_ready_archive_is_ignored_by_mega_discovery(
     assert source.mega_requested_at is None
     assert source.mega_requested_by_user_id is None
     assert source.mega_requested_remote_root is None
+
+
+@pytest.mark.asyncio
+async def test_retired_legacy_delivery_is_not_reopened_by_a_new_png_request(
+    derivative_approved_context: ApprovedContext,
+) -> None:
+    approved = derivative_approved_context
+    _store, legacy_archive = await _prepare_archive(
+        approved,
+        part_sizes=(2,),
+        mega_requested=True,
+        media_profile="legacy-full-derivative-v1",
+    )
+    retired_at = RUN_AT + timedelta(minutes=15)
+    async with approved.database.sessions() as session:
+        legacy_delivery = MegaSetDelivery(
+            finished_set_archive_id=legacy_archive.archive_id,
+            state=MegaDeliveryState.FAILED,
+            remote_root=_REMOTE_ROOT,
+            remote_folder=f"{_REMOTE_ROOT}/legacy-retired",
+            manifest_sha256=legacy_archive.manifest_sha256,
+            total_item_count=2,
+            uploaded_item_count=0,
+            total_byte_size=None,
+            source_manifest_json=None,
+            uploaded_byte_size=0,
+            attempts=0,
+            available_at=retired_at,
+            lease_owner=None,
+            lease_expires_at=None,
+            completion_marker_node_handle=None,
+            planned_at=None,
+            started_at=None,
+            verified_at=None,
+            completed_at=retired_at,
+            last_error_code="mega_set_legacy_media_retired",
+            last_error_detail="Legacy delivery retired safely.",
+            created_at=retired_at,
+            updated_at=retired_at,
+        )
+        session.add(legacy_delivery)
+        await session.commit()
+        legacy_delivery_id = legacy_delivery.id
+
+    async with approved.database.sessions() as session:
+        requested = await request_mega_set_delivery(
+            session,
+            review_task_id=approved.review_task_id,
+            requested_by_user_id=approved.owner_id,
+            remote_root=_REMOTE_ROOT,
+            now=retired_at + timedelta(seconds=1),
+        )
+    async with approved.database.sessions() as session:
+        legacy_delivery = await session.get(MegaSetDelivery, legacy_delivery_id)
+        public_archive = await session.get(FinishedSetArchive, requested.archive_id)
+
+    assert legacy_delivery is not None
+    assert legacy_delivery.state == MegaDeliveryState.FAILED
+    assert legacy_delivery.last_error_code == "mega_set_legacy_media_retired"
+    assert requested.archive_id != legacy_archive.archive_id
+    assert requested.delivery_id is None
+    assert public_archive is not None
+    assert public_archive.media_profile == "public-png-v1"
+
+
+@pytest.mark.asyncio
+async def test_requested_ready_legacy_archive_is_never_discovered(
+    derivative_approved_context: ApprovedContext,
+) -> None:
+    approved = derivative_approved_context
+    _store, legacy_archive = await _prepare_archive(
+        approved,
+        part_sizes=(2,),
+        mega_requested=True,
+        media_profile="legacy-full-derivative-v1",
+    )
+
+    async with approved.database.sessions() as session:
+        created = await ensure_next_mega_set_delivery(
+            session,
+            remote_root=_REMOTE_ROOT,
+            now=RUN_AT + timedelta(minutes=15),
+        )
+        delivery_count = await session.scalar(select(func.count(MegaSetDelivery.id)))
+        archive = await session.get(FinishedSetArchive, legacy_archive.archive_id)
+
+    assert not created
+    assert delivery_count == 0
+    assert archive is not None
+    assert archive.media_profile == "legacy-full-derivative-v1"
+    assert archive.mega_requested_at is not None
+
+
+@pytest.mark.asyncio
+async def test_escaped_legacy_delivery_fails_before_any_mega_call(
+    derivative_approved_context: ApprovedContext,
+) -> None:
+    approved = derivative_approved_context
+    store, legacy_archive = await _prepare_archive(
+        approved,
+        part_sizes=(2,),
+        mega_requested=True,
+        media_profile="legacy-full-derivative-v1",
+    )
+    queued_at = RUN_AT + timedelta(minutes=15)
+    async with approved.database.sessions() as session:
+        delivery = MegaSetDelivery(
+            finished_set_archive_id=legacy_archive.archive_id,
+            state=MegaDeliveryState.PENDING,
+            remote_root=_REMOTE_ROOT,
+            remote_folder=f"{_REMOTE_ROOT}/escaped-legacy",
+            manifest_sha256=legacy_archive.manifest_sha256,
+            total_item_count=2,
+            uploaded_item_count=0,
+            total_byte_size=None,
+            source_manifest_json=None,
+            uploaded_byte_size=0,
+            attempts=0,
+            available_at=queued_at,
+            lease_owner=None,
+            lease_expires_at=None,
+            completion_marker_node_handle=None,
+            planned_at=None,
+            started_at=None,
+            verified_at=None,
+            completed_at=None,
+            last_error_code=None,
+            last_error_detail=None,
+            created_at=queued_at,
+            updated_at=queued_at,
+        )
+        session.add(delivery)
+        await session.commit()
+        delivery_id = delivery.id
+
+    mega = _RecordingMegaClient()
+    result = await _cycle_mega(approved, store, mega)
+    async with approved.database.sessions() as session:
+        failed = await session.get(MegaSetDelivery, delivery_id)
+
+    assert result.processed_delivery
+    assert failed is not None
+    assert failed.state == MegaDeliveryState.FAILED
+    assert failed.last_error_code == "mega_set_contract"
+    assert mega.remote == {}
+    assert mega.upload_files_calls == []
 
 
 @pytest.mark.asyncio
@@ -479,7 +895,7 @@ async def test_provider_independent_multipart_upload_preserves_bytes_order_and_s
     assert not first_part.completed_delivery
     assert second_part.uploaded_items == 1
     assert second_part.completed_delivery
-    assert mega.upload_files_calls == [("001.jpg",), ("002.jpg",)]
+    assert mega.upload_files_calls == [("001.png",), ("002.png",)]
     archive_reads = Counter(
         key
         for key, _max_bytes, _version_id, _etag in store.read_requests[read_cursor:]
@@ -523,7 +939,7 @@ async def test_provider_independent_multipart_upload_preserves_bytes_order_and_s
     assert publication_intents == 0
     assert publication_packages == 0
     assert delivery.finished_set_archive_id == archive.archive_id
-    assert delivery.remote_folder == "/sets/Derivative release"
+    assert delivery.remote_folder == "/sets/Derivative release (PNG)"
     assert delivery.manifest_sha256 == archive.manifest_sha256
     assert delivery.state == MegaDeliveryState.SUCCEEDED
     assert delivery.total_item_count == 2
@@ -550,12 +966,12 @@ async def test_provider_independent_multipart_upload_preserves_bytes_order_and_s
     completion_path = f"{delivery.remote_folder}/upload-complete.json"
     remote_manifest = json.loads(mega.remote[remote_manifest_path])
     completion = json.loads(mega.remote[completion_path])
-    assert remote_manifest["schema"] == "mega-extracted-set-manifest/v1"
-    assert "media_profile" not in remote_manifest
+    assert remote_manifest["schema"] == "mega-extracted-set-manifest/v2"
+    assert remote_manifest["media_profile"] == "public-png-v1"
     assert remote_manifest["source_manifest_sha256"] == archive.manifest_sha256
     assert [row["path"] for row in remote_manifest["outputs"]] == [
-        "001.jpg",
-        "002.jpg",
+        "001.png",
+        "002.png",
     ]
     assert completion["schema"] == "mega-extracted-set-completion/v1"
     assert completion["image_count"] == 2
@@ -564,6 +980,8 @@ async def test_provider_independent_multipart_upload_preserves_bytes_order_and_s
 
     assert direct == listed[0]
     assert [item.ordinal for item in direct.items] == [1, 2]
+    assert direct.next_retry_at is None
+    assert not direct.retired
     safe_status = direct.model_dump(mode="json")
     assert "lease_owner" not in safe_status
     assert "last_error_detail" not in safe_status
@@ -588,7 +1006,7 @@ async def test_ambiguous_partial_batch_is_adopted_without_duplicate_uploads(
     assert ambiguous.processed_delivery
     assert not ambiguous.completed_delivery
     assert ambiguous.uploaded_items == 0
-    assert mega.upload_files_calls == [("001.jpg", "002.jpg")]
+    assert mega.upload_files_calls == [("001.png", "002.png")]
 
     async with approved.database.sessions() as session:
         delivery = await session.scalar(select(MegaSetDelivery))
@@ -604,8 +1022,8 @@ async def test_ambiguous_partial_batch_is_adopted_without_duplicate_uploads(
     assert recovered.adopted_items == 1
     assert recovered.uploaded_items == 1
     assert mega.upload_files_calls == [
-        ("001.jpg", "002.jpg"),
-        ("002.jpg",),
+        ("001.png", "002.png"),
+        ("002.png",),
     ]
 
     async with approved.database.sessions() as session:
@@ -664,7 +1082,9 @@ async def _prepare_archive(
     *,
     part_sizes: tuple[int, ...],
     mega_requested: bool = True,
+    media_profile: str = "public-png-v1",
 ) -> tuple[TrackingObjectStore, _ArchiveFixture]:
+    assert media_profile in {"public-png-v1", "legacy-full-derivative-v1"}
     prepared = await _prepare(approved)
     await _cycle(prepared, worker_id="mega-source-derivative")
     await _cycle(prepared, worker_id="mega-source-derivative")
@@ -692,44 +1112,72 @@ async def _prepare_archive(
     derivative_output_ids: list[UUID] = []
     source_asset_ids: list[UUID] = []
     for ordinal, (output, selection) in enumerate(rows, start=1):
-        stored = prepared.store.objects[output.asset_object_key]
-        extension = {
-            "image/jpeg": "jpg",
-            "image/png": "png",
-            "image/webp": "webp",
-        }[output.asset_content_type]
-        image_payloads.append(stored.body)
+        if media_profile == "public-png-v1":
+            private_source = prepared.store.objects[f"raw/{selection.asset_id}.png"].body
+            public_buffer = BytesIO()
+            with Image.open(BytesIO(private_source)) as source_image:
+                width, height = source_image.size
+                source_image.convert("RGB").save(public_buffer, format="PNG", compress_level=6)
+            payload = public_buffer.getvalue()
+            extension = "png"
+            content_type = "image/png"
+        else:
+            stored = prepared.store.objects[output.asset_object_key]
+            payload = stored.body
+            extension = {
+                "image/jpeg": "jpg",
+                "image/png": "png",
+                "image/webp": "webp",
+            }[output.asset_content_type]
+            content_type = output.asset_content_type
+        image_payloads.append(payload)
         derivative_output_ids.append(output.id)
         source_asset_ids.append(selection.asset_id)
-        outputs.append(
-            {
-                "ordinal": ordinal,
-                "generation_queue_position": selection.source_generation_queue_position,
-                "derivative_output_id": str(output.id),
-                "path": f"content/{ordinal:03d}.{extension}",
-                "sha256": hashlib.sha256(stored.body).hexdigest(),
-                "byte_size": len(stored.body),
-                "content_type": output.asset_content_type,
-            }
-        )
-
-    manifest = canonical_json_bytes(
-        {
-            "schema": "finished-set-manifest/v1",
-            "archive_id": str(archive_id),
-            "selection_count": len(outputs),
-            "ordering": "frozen_generation_queue",
-            "ordering_key": ["generation_queue_position"],
-            "outputs": outputs,
+        item: dict[str, object] = {
+            "ordinal": ordinal,
+            "generation_queue_position": selection.source_generation_queue_position,
+            "path": f"content/{ordinal:03d}.{extension}",
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "byte_size": len(payload),
+            "content_type": content_type,
         }
-    )
+        if media_profile == "public-png-v1":
+            item.update(
+                {
+                    "source_asset_id": str(selection.asset_id),
+                    "source_sha256": selection.source_sha256,
+                    "readiness_derivative_output_id": str(output.id),
+                    "image_format": "PNG",
+                    "width": width,
+                    "height": height,
+                }
+            )
+        else:
+            item["derivative_output_id"] = str(output.id)
+        outputs.append(item)
+
+    manifest_payload: dict[str, object] = {
+        "schema": (
+            "finished-set-manifest/v2"
+            if media_profile == "public-png-v1"
+            else "finished-set-manifest/v1"
+        ),
+        "archive_id": str(archive_id),
+        "selection_count": len(outputs),
+        "ordering": "frozen_generation_queue",
+        "ordering_key": ["generation_queue_position"],
+        "outputs": outputs,
+    }
+    if media_profile == "public-png-v1":
+        manifest_payload["media_profile"] = media_profile
+    manifest = canonical_json_bytes(manifest_payload)
     manifest_sha256 = hashlib.sha256(manifest).hexdigest()
     now = RUN_AT + timedelta(minutes=10)
     archive = FinishedSetArchive(
         id=archive_id,
         review_task_id=approved.review_task_id,
         release_version_id=approved.release_version_id,
-        media_profile="legacy-full-derivative-v1",
+        media_profile=media_profile,
         requested_by_user_id=approved.owner_id,
         mega_requested_by_user_id=(approved.owner_id if mega_requested else None),
         mega_requested_at=(now if mega_requested else None),
@@ -757,7 +1205,11 @@ async def _prepare_archive(
         part_outputs = outputs[first_ordinal - 1 : last_ordinal]
         part_manifest = canonical_json_bytes(
             {
-                "schema": "finished-set-part-manifest/v1",
+                "schema": (
+                    "finished-set-part-manifest/v2"
+                    if media_profile == "public-png-v1"
+                    else "finished-set-part-manifest/v1"
+                ),
                 "archive_id": str(archive_id),
                 "set_manifest_sha256": manifest_sha256,
                 "part_number": part_number,

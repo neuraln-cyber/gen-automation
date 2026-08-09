@@ -21,6 +21,8 @@ def _settings(**updates: object) -> Settings:
         "x_oauth_secret_reference": REFERENCE,
         "x_creator_user_id": CREATOR_ID,
         "x_oauth_request_timeout_seconds": 30,
+        "publishing_enabled": False,
+        "patreon_browser_publishing_enabled": False,
     }
     values.update(updates)
     return cast(Settings, SimpleNamespace(**values))
@@ -99,11 +101,23 @@ def test_exact_configured_check_rejects_each_mismatch() -> None:
             )
 
 
+def test_publishing_enabled_check_requires_x_only_runtime_gate() -> None:
+    x_runtime_check_cli._assert_publishing_enabled(_settings(publishing_enabled=True))
+
+    for settings in (
+        _settings(publishing_enabled=False),
+        _settings(publishing_enabled=True, patreon_browser_publishing_enabled=True),
+    ):
+        with pytest.raises(RuntimeError, match="publishing orchestration configuration"):
+            x_runtime_check_cli._assert_publishing_enabled(settings)
+
+
 @pytest.mark.parametrize(
     "arguments",
     (
         [],
         ["--account-binding", "unexpected"],
+        ["--assert-publishing-enabled", "unexpected"],
         ["--assert-oauth1-configured", REFERENCE],
         ["--unknown"],
     ),
@@ -131,6 +145,22 @@ def test_cli_emits_only_fixed_success_output(
     assert x_runtime_check_cli.x_runtime_check_main(["--account-binding"]) == 0
     captured = capsys.readouterr()
     assert captured.out == f"{x_runtime_check_cli.ACCOUNT_BINDING_MESSAGE}\n"
+    assert captured.err == ""
+
+
+def test_cli_emits_only_fixed_publishing_assertion_output(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        x_runtime_check_cli,
+        "Settings",
+        lambda: _settings(publishing_enabled=True),
+    )
+
+    assert x_runtime_check_cli.x_runtime_check_main(["--assert-publishing-enabled"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == f"{x_runtime_check_cli.PUBLISHING_ENABLED_MESSAGE}\n"
     assert captured.err == ""
 
 

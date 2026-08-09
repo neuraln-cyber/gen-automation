@@ -42,6 +42,7 @@ from gen_automation.db.models import (
 )
 from gen_automation.domain.canonical import canonical_json_bytes
 from gen_automation.domain.enums import FinishedSetArchiveState, MegaDeliveryState
+from gen_automation.domain.mega import LEGACY_MEGA_SET_RETIREMENT_ERROR_CODE
 from gen_automation.integrations.mega import (
     MegaError,
     MegaRemoteConflictError,
@@ -116,6 +117,8 @@ class ClaimedMegaSetDelivery:
     remote_root: str
     remote_folder: str
     attempt: int
+    uploaded_item_count_at_claim: int
+    prior_retry_delay_seconds: int
     lease_expires_at: datetime
 
 
@@ -231,6 +234,7 @@ async def ensure_next_mega_set_delivery(
             .join(Release, Release.id == ReleaseVersion.release_id)
             .where(
                 FinishedSetArchive.state == FinishedSetArchiveState.READY,
+                FinishedSetArchive.media_profile == _PUBLIC_MEDIA_PROFILE,
                 FinishedSetArchive.mega_requested_at.is_not(None),
                 FinishedSetArchive.mega_requested_by_user_id.is_not(None),
                 FinishedSetArchive.mega_requested_remote_root.is_not(None),
@@ -265,8 +269,10 @@ async def ensure_next_mega_set_delivery(
             else release_title
         ),
     )
-    if archive.media_profile not in {_LEGACY_MEDIA_PROFILE, _PUBLIC_MEDIA_PROFILE}:
-        raise MegaSetDeliveryContractError("finished-set media profile is unsupported")
+    if archive.media_profile != _PUBLIC_MEDIA_PROFILE:
+        raise MegaSetDeliveryContractError(
+            "legacy MEGA media is retired; start a full-resolution PNG delivery"
+        )
     session.add(
         MegaSetDelivery(
             finished_set_archive_id=archive.id,
@@ -327,6 +333,10 @@ async def request_mega_set_delivery(
     )
     if archive is None:
         raise MegaSetDeliveryContractError("finished-set archive disappeared during request")
+    if archive.media_profile != _PUBLIC_MEDIA_PROFILE:
+        raise MegaSetDeliveryContractError(
+            "legacy MEGA media is retired; start a full-resolution PNG delivery"
+        )
 
     delivery = await session.scalar(
         select(MegaSetDelivery)
@@ -348,6 +358,10 @@ async def request_mega_set_delivery(
     if delivery is not None and delivery.remote_root != normalized_root:
         raise MegaSetDeliveryContractError(
             "the existing MEGA delivery uses a different destination root"
+        )
+    if delivery is not None and delivery.last_error_code == LEGACY_MEGA_SET_RETIREMENT_ERROR_CODE:
+        raise MegaSetDeliveryContractError(
+            "legacy MEGA media is retired; start a full-resolution PNG delivery"
         )
     changed = request_is_absent
     if request_is_absent:
@@ -414,6 +428,8 @@ async def claim_mega_set_delivery(
     if delivery is None:
         await session.rollback()
         return None
+    prior_retry_delay_seconds = _stored_retry_delay_seconds(delivery)
+    uploaded_item_count_at_claim = delivery.uploaded_item_count
     delivery.state = MegaDeliveryState.CLAIMED
     delivery.attempts += 1
     delivery.lease_owner = normalized_worker
@@ -430,6 +446,8 @@ async def claim_mega_set_delivery(
         remote_root=delivery.remote_root,
         remote_folder=delivery.remote_folder,
         attempt=delivery.attempts,
+        uploaded_item_count_at_claim=uploaded_item_count_at_claim,
+        prior_retry_delay_seconds=prior_retry_delay_seconds,
         lease_expires_at=delivery.lease_expires_at,
     )
     await session.commit()
@@ -690,11 +708,22 @@ async def run_mega_set_delivery_cycle(
             )
         return MegaSetDeliveryCycleResult(processed_delivery=True)
     except (MegaError, ObjectStoreError, OSError, BadZipFile, json.JSONDecodeError) as error:
-        retry_delay = min(
-            retry_max_seconds,
-            retry_base_seconds * (2 ** min(max(claim.attempt - 1, 0), 16)),
-        )
         async with sessions() as session:
+            uploaded_item_count = await session.scalar(
+                select(MegaSetDelivery.uploaded_item_count).where(
+                    MegaSetDelivery.id == claim.delivery_id
+                )
+            )
+            retry_delay = _next_retry_delay_seconds(
+                claim,
+                uploaded_item_count=(
+                    uploaded_item_count
+                    if uploaded_item_count is not None
+                    else claim.uploaded_item_count_at_claim
+                ),
+                retry_base_seconds=retry_base_seconds,
+                retry_max_seconds=retry_max_seconds,
+            )
             await fail_mega_set_delivery(
                 session,
                 claim=claim,
@@ -709,6 +738,30 @@ async def run_mega_set_delivery_cycle(
         completed_delivery=completed,
         uploaded_items=uploaded,
         adopted_items=adopted,
+    )
+
+
+def _stored_retry_delay_seconds(delivery: MegaSetDelivery) -> int:
+    if delivery.state != MegaDeliveryState.RETRY_WAIT:
+        return 0
+    delay = int((delivery.available_at - delivery.updated_at).total_seconds())
+    return min(max(delay, 0), 7 * 86400)
+
+
+def _next_retry_delay_seconds(
+    claim: ClaimedMegaSetDelivery,
+    *,
+    uploaded_item_count: int,
+    retry_base_seconds: int,
+    retry_max_seconds: int,
+) -> int:
+    if uploaded_item_count > claim.uploaded_item_count_at_claim:
+        return retry_base_seconds
+    if claim.prior_retry_delay_seconds <= 0:
+        return retry_base_seconds
+    return min(
+        retry_max_seconds,
+        max(retry_base_seconds, claim.prior_retry_delay_seconds * 2),
     )
 
 
@@ -741,7 +794,7 @@ async def _load_delivery_source(
         or archive.manifest_sha256 != claim.manifest_sha256
         or archive.selection_count != claim.total_item_count
         or archive.part_count is None
-        or archive.media_profile not in {_LEGACY_MEDIA_PROFILE, _PUBLIC_MEDIA_PROFILE}
+        or archive.media_profile != _PUBLIC_MEDIA_PROFILE
     ):
         raise MegaSetDeliveryContractError("claimed MEGA set source changed")
     parts = tuple(

@@ -1,9 +1,13 @@
 # Staging X OAuth 1.0a runtime operations
 
 This procedure attaches an existing staging OAuth 1.0a secret to the running
-controller. It does not collect or transfer any X credential value. The only
-command-line inputs are the complete Secrets Manager ARN and the expected
-numeric X user ID; both are non-secret identifiers.
+controller, checks its account binding, and provides a separate fail-closed
+operation for enabling publication orchestration for the configured X runtime.
+The orchestration gate is shared, so the operation separately requires the
+Patreon browser driver to remain disabled. It does
+not collect or transfer any X credential value. Configuration accepts only the
+complete Secrets Manager ARN and expected numeric X user ID; both are non-secret
+identifiers. The canary and publishing-enablement operations accept no values.
 
 Use this procedure only for staging account `861912887470` in
 `eu-central-1`. The helper rejects every other account, region, secret name,
@@ -133,6 +137,61 @@ successful result is:
 ```text
 X OAuth 1.0a account binding passed. No media was uploaded and no post was created.
 ```
+
+## 4. Enable publication orchestration for X
+
+Run this only after configuration and the zero-post canary have passed on the
+reviewed staging revision:
+
+```powershell
+.\scripts\configure-x-oauth1-staging.ps1 -EnablePublishing
+```
+
+This is not a post canary and does not open the durable publication guard. The
+`GEN_AUTOMATION_PUBLISHING_ENABLED` setting is the shared publication
+orchestration gate, not an X-only switch. This operation makes it available for
+the already configured X runtime while requiring the separate Patreon browser
+driver setting to remain false. The durable database guard remains the hard
+external-effect gate. The
+operation accepts no ARN, user ID, credential, caption, media path, publication
+intent, or destination argument. It targets only the instance resolved from the
+reviewed staging OpenTofu state and fails unless all of these conditions hold:
+
+- `GEN_AUTOMATION_ENVIRONMENT` is exactly `staging`;
+- the runtime has the exact staging OAuth 1.0a secret reference and numeric
+  creator binding;
+- Patreon browser publishing remains disabled;
+- the durable database publication guard is stopped; and
+- no publication attempt is claimed or processing and no publication step is
+  processing.
+
+Before changing the environment, the helper verifies the parsed running OAuth
+settings, performs the signed zero-post `GET /2/users/me` binding canary, and
+rechecks the stopped database state. It then stops the sole staging controller
+and repeats the database safety check in a bounded one-off container. Only then
+does it atomically replace the single existing
+`GEN_AUTOMATION_PUBLISHING_ENABLED=false` assignment with exactly one `true`
+assignment in the root-owned mode-`0600` `control-plane.env` file. Every other
+line must remain byte-for-byte equivalent apart from the final normalized LF.
+
+The helper validates the deployment, restarts the controller, waits for
+readiness, verifies the parsed X-only publishing setting, and confirms that the
+database guard is still stopped with zero active effects. Any failure after the
+edit restores the root-only backup atomically, validates it, restarts the prior
+configuration, and waits for readiness. SSM success output is accepted only
+when it is one of these fixed messages:
+
+```text
+Staging publication orchestration is enabled for the configured X runtime. Publication guard remains stopped and no publication effect is active.
+Staging publication orchestration was already enabled for the configured X runtime. Publication guard remains stopped and no publication effect is active.
+```
+
+The second message is the idempotent result when the runtime gate was already
+true and every safety and account-binding check still passed. Neither result
+enables or edits the durable database guard, creates a publication intent or
+attempt, uploads media, or creates an X post. Opening the durable publication
+guard remains a later, distinct owner action requiring its own review and fresh
+authentication.
 
 ## What the zero-post checks do not prove
 

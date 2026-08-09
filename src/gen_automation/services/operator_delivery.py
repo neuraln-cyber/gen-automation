@@ -36,6 +36,7 @@ from gen_automation.domain.enums import (
     ReleasePhase,
     ReviewTaskState,
 )
+from gen_automation.domain.mega import LEGACY_MEGA_SET_RETIREMENT_ERROR_CODE
 from gen_automation.services.derivative_pipeline import DerivativePipelineConflictError
 from gen_automation.services.publication import (
     PUBLICATION_EFFECT_APPROVAL_ATTESTATION,
@@ -223,6 +224,8 @@ class DestinationState:
     total_items: int | None = None
     remote_path: str | None = None
     scheduled_at: datetime | None = None
+    next_retry_at: datetime | None = None
+    retired: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1066,6 +1069,34 @@ async def _mega_destination(
         .limit(1)
     )
     if archive is None:
+        retired_delivery = await session.scalar(
+            select(MegaSetDelivery)
+            .join(
+                FinishedSetArchive,
+                FinishedSetArchive.id == MegaSetDelivery.finished_set_archive_id,
+            )
+            .where(
+                FinishedSetArchive.release_version_id == release_version_id,
+                FinishedSetArchive.media_profile == "legacy-full-derivative-v1",
+                MegaSetDelivery.last_error_code == LEGACY_MEGA_SET_RETIREMENT_ERROR_CODE,
+            )
+            .order_by(MegaSetDelivery.created_at.desc(), MegaSetDelivery.id.desc())
+            .limit(1)
+        )
+        if retired_delivery is not None:
+            return DestinationState(
+                key="mega",
+                label="MEGA",
+                state="retired",
+                detail=(
+                    "The legacy JPEG upload was stopped safely. Existing MEGA files were "
+                    "left untouched; start a new full-resolution PNG upload."
+                ),
+                completed_items=retired_delivery.uploaded_item_count,
+                total_items=retired_delivery.total_item_count,
+                remote_path=retired_delivery.remote_folder,
+                retired=True,
+            )
         return DestinationState(
             key="mega",
             label="MEGA",
@@ -1135,6 +1166,12 @@ async def _mega_destination(
         completed_items=delivery.uploaded_item_count,
         total_items=delivery.total_item_count,
         remote_path=delivery.remote_folder,
+        next_retry_at=(
+            delivery.available_at if delivery.state == MegaDeliveryState.RETRY_WAIT else None
+        ),
+        retired=(
+            getattr(delivery, "last_error_code", None) == LEGACY_MEGA_SET_RETIREMENT_ERROR_CODE
+        ),
     )
 
 

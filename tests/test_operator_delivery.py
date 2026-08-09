@@ -284,6 +284,66 @@ async def test_mega_projection_keeps_unrequested_ready_archive_idle() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mega_projection_exposes_exact_next_retry_time() -> None:
+    retry_at = datetime(2026, 8, 9, 12, 30, tzinfo=UTC)
+    session = SimpleNamespace(
+        scalar=AsyncMock(
+            side_effect=[
+                SimpleNamespace(
+                    id=uuid4(),
+                    state=FinishedSetArchiveState.READY,
+                    selection_count=199,
+                ),
+                SimpleNamespace(
+                    state=MegaDeliveryState.RETRY_WAIT,
+                    uploaded_item_count=100,
+                    total_item_count=199,
+                    remote_folder="/Future/Akali (NSFW) (PNG)",
+                    available_at=retry_at,
+                    last_error_code="mega_set_transport_retryable",
+                ),
+            ]
+        )
+    )
+
+    destination = await _mega_destination(  # type: ignore[arg-type]
+        session,
+        release_version_id=uuid4(),
+    )
+
+    assert destination.state == "queued"
+    assert destination.next_retry_at == retry_at
+    assert not destination.retired
+
+
+@pytest.mark.asyncio
+async def test_mega_projection_surfaces_retired_legacy_without_hiding_progress() -> None:
+    session = SimpleNamespace(
+        scalar=AsyncMock(
+            side_effect=[
+                None,
+                SimpleNamespace(
+                    uploaded_item_count=100,
+                    total_item_count=199,
+                    remote_folder="/Future/Akali (NSFW)",
+                ),
+            ]
+        )
+    )
+
+    destination = await _mega_destination(  # type: ignore[arg-type]
+        session,
+        release_version_id=uuid4(),
+    )
+
+    assert destination.state == "retired"
+    assert destination.retired
+    assert destination.completed_items == 100
+    assert destination.total_items == 199
+    assert "full-resolution PNG" in destination.detail
+
+
+@pytest.mark.asyncio
 async def test_owner_can_toggle_publication_guard_from_delivery_dashboard(
     derivative_approved_context: ApprovedContext,
     monkeypatch: pytest.MonkeyPatch,

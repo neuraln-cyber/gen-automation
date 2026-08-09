@@ -1716,6 +1716,8 @@
     const megaProgress = megaCard?.querySelector("[data-mega-progress]");
     const megaRemoteRow = megaCard?.querySelector("[data-mega-remote-row]");
     const megaRemotePath = megaCard?.querySelector("[data-mega-remote-path]");
+    const megaNextRetryRow = megaCard?.querySelector("[data-mega-next-retry-row]");
+    const megaNextRetry = megaCard?.querySelector("[data-mega-next-retry]");
     const initialOutputState = panel.dataset.deliveryOutputState || "not_started";
     const initialXOutputsReady = panel.dataset.deliveryXOutputsReady === "true";
     const initialArchiveState = panel.dataset.deliveryArchiveState || "not_started";
@@ -1857,7 +1859,9 @@
       return state;
     };
     const renderMega = (mega) => {
-      const knownStates = ["not_prepared", "queued", "running", "published", "failed"];
+      const knownStates = [
+        "not_prepared", "queued", "running", "published", "failed", "retired",
+      ];
       const state = knownStates.includes(mega.state) ? mega.state : "failed";
       const completed = count(mega.completed_items);
       const total = count(mega.total_items);
@@ -1869,7 +1873,8 @@
         megaStatus.textContent = state === "not_prepared"
           ? "not started"
           : state === "published" ? "complete"
-            : state === "failed" ? "needs attention" : state.replaceAll("_", " ");
+            : state === "failed" ? "needs attention"
+              : state === "retired" ? "retired" : state.replaceAll("_", " ");
       }
       setText(megaDetail, detail || "MEGA delivery status is unavailable.");
       setText(megaProgressLabel, `${completed} / ${total} images uploaded`);
@@ -1881,6 +1886,18 @@
       if (megaProgressRegion instanceof HTMLElement) megaProgressRegion.hidden = total < 1;
       setText(megaRemotePath, remotePath);
       if (megaRemoteRow instanceof HTMLElement) megaRemoteRow.hidden = !remotePath;
+      const nextRetryValue = typeof mega.next_retry_at === "string"
+        ? mega.next_retry_at.trim()
+        : "";
+      const nextRetryDate = new Date(nextRetryValue);
+      const validNextRetry = nextRetryValue !== "" && !Number.isNaN(nextRetryDate.valueOf());
+      if (megaNextRetry instanceof HTMLTimeElement) {
+        megaNextRetry.dateTime = validNextRetry ? nextRetryValue : "";
+        megaNextRetry.textContent = validNextRetry
+          ? nextRetryDate.toLocaleString([], { dateStyle: "medium", timeStyle: "short" })
+          : "";
+      }
+      if (megaNextRetryRow instanceof HTMLElement) megaNextRetryRow.hidden = !validNextRetry;
       return state;
     };
     const renderPublicationDestination = (destination, statusNode, detailNode) => {

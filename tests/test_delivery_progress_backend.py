@@ -414,6 +414,8 @@ def test_delivery_progress_payload_reports_ready_archive_parts_in_global_order()
             "completed_items": None,
             "total_items": None,
             "remote_path": None,
+            "next_retry_at": None,
+            "retired": False,
         },
         "patreon": {
             "state": "not_prepared",
@@ -480,6 +482,8 @@ def test_delivery_progress_keeps_polling_for_active_extracted_mega_upload() -> N
         "completed_items": 20,
         "total_items": 125,
         "remote_path": "/Finished Sets/Example/v01-deadbeef",
+        "next_retry_at": None,
+        "retired": False,
     }
     assert payload["poll_after_ms"] == 3000
 
@@ -525,6 +529,7 @@ def test_delivery_progress_does_not_poll_for_paused_publication_workers(
 
 
 def test_delivery_progress_does_not_poll_for_paused_mega_worker() -> None:
+    retry_at = datetime(2026, 8, 9, 12, 30, tzinfo=UTC)
     snapshot = _snapshot(
         mega=DestinationState(
             "mega",
@@ -534,6 +539,7 @@ def test_delivery_progress_does_not_poll_for_paused_mega_worker() -> None:
             completed_items=0,
             total_items=125,
             remote_path="/Future/Example",
+            next_retry_at=retry_at,
         ),
     )
 
@@ -550,6 +556,8 @@ def test_delivery_progress_does_not_poll_for_paused_mega_worker() -> None:
         "completed_items": 0,
         "total_items": 125,
         "remote_path": "/Future/Example",
+        "next_retry_at": retry_at.isoformat(),
+        "retired": False,
     }
     assert payload["poll_after_ms"] is None
 

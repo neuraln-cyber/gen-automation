@@ -109,7 +109,7 @@ def test_semantic_feedback_report_uses_jsonb_on_postgresql() -> None:
     assert isinstance(report_type, postgresql.JSONB)
 
 
-def test_gpu_billing_revision_is_the_migration_head() -> None:
+def test_legacy_mega_retirement_revision_is_the_migration_head() -> None:
     configuration = Config("alembic.ini")
     scripts = ScriptDirectory.from_config(configuration)
     independent_targets_revision = scripts.get_revision("20260808_0024")
@@ -118,7 +118,8 @@ def test_gpu_billing_revision_is_the_migration_head() -> None:
     x_teaser_revision = scripts.get_revision("20260808_0027")
     media_profile_revision = scripts.get_revision("20260809_0028")
     workflow_capability_revision = scripts.get_revision("20260809_0029")
-    revision = scripts.get_revision("20260809_0030")
+    gpu_billing_revision = scripts.get_revision("20260809_0030")
+    revision = scripts.get_revision("20260809_0031")
 
     assert independent_targets_revision is not None
     assert independent_targets_revision.down_revision == "20260808_0023"
@@ -132,9 +133,11 @@ def test_gpu_billing_revision_is_the_migration_head() -> None:
     assert media_profile_revision.down_revision == "20260808_0027"
     assert workflow_capability_revision is not None
     assert workflow_capability_revision.down_revision == "20260809_0028"
+    assert gpu_billing_revision is not None
+    assert gpu_billing_revision.down_revision == "20260809_0029"
     assert revision is not None
-    assert revision.down_revision == "20260809_0029"
-    assert scripts.get_current_head() == "20260809_0030"
+    assert revision.down_revision == "20260809_0030"
+    assert scripts.get_current_head() == "20260809_0031"
 
 
 def test_derivative_owner_retry_postgresql_guard_is_narrow_and_bounded(

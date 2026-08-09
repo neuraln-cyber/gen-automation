@@ -380,9 +380,22 @@ jobs:
               " && sudo /usr/bin/systemctl restart --no-block gen-automation-staging.service"
               f" && {remove_runtime_backup}"
           )
+          restore_runtime_env_stopped = (
+              "sudo /usr/bin/systemctl stop gen-automation-staging.service"
+              " && ! sudo /usr/bin/systemctl is-active --quiet"
+              " gen-automation-staging.service"
+              " && sudo /usr/bin/install -o root -g root -m 0600"
+              f" {shlex.quote(runtime_env_backup)} {shlex.quote(runtime_env)}"
+              f" && {remove_runtime_backup}"
+          )
           migration_preflight = (
               "sudo /usr/local/libexec/"
               "gen-automation-validate-migration-environment"
+          )
+          stop_control_plane = (
+              "sudo /usr/bin/systemctl stop gen-automation-staging.service"
+              " && ! sudo /usr/bin/systemctl is-active --quiet"
+              " gen-automation-staging.service"
           )
           migration_command = (
               "sudo /usr/bin/timeout --signal=TERM --kill-after=30s 600s"
@@ -401,12 +414,24 @@ jobs:
           rollout_command = (
               "sudo /usr/local/sbin/gen-automation-update-control-plane"
               f" --image {shlex.quote(image)} --revision {shlex.quote(revision)}"
+              " --rollback-mode leave-stopped"
+              " --external-lock-held"
+          )
+          unlocked_command = (
+              f"{migration_preflight} && {refresh_host_bootstrap} && "
+              f"{backup_runtime_env} && "
+              f"( if {stop_control_plane} && {update_worker_reference}; then "
+              f"if {migration_command}; then "
+              f"( {rollout_command} && {remove_runtime_backup} ) || "
+              f"( {restore_runtime_env_stopped}; false ); "
+              f"else ( {restore_runtime_env_stopped}; false ); fi; "
+              f"else ( {restore_runtime_env}; false ); fi )"
           )
           command = (
-              f"{migration_preflight} && {refresh_host_bootstrap} && "
-              f"{backup_runtime_env} && {update_worker_reference} && "
-              f"( ( {migration_command} && {rollout_command} && {remove_runtime_backup} ) || "
-              f"( {restore_runtime_env}; false ) )"
+              "sudo /usr/bin/flock --exclusive --wait 120"
+              " /run/lock/gen-automation-control-plane-update.lock"
+              " /usr/bin/bash -c"
+              f" {shlex.quote(unlocked_command)}"
           )
           print(json.dumps({"commands": [command]}))
           ' >"$parameters_file"

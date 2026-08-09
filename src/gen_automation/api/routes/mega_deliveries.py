@@ -14,7 +14,9 @@ from gen_automation.db.models import (
     PublicationPackage,
     ReleaseVersion,
 )
+from gen_automation.domain.enums import MegaDeliveryState
 from gen_automation.domain.mega import (
+    LEGACY_MEGA_SET_RETIREMENT_ERROR_CODE,
     MegaDeliveryRead,
     MegaSetDeliveryItemRead,
     MegaSetDeliveryRead,
@@ -151,6 +153,10 @@ def _read_set(delivery: MegaSetDelivery) -> MegaSetDeliveryRead:
         uploaded_byte_size=delivery.uploaded_byte_size,
         attempts=delivery.attempts,
         available_at=delivery.available_at,
+        next_retry_at=(
+            delivery.available_at if delivery.state == MegaDeliveryState.RETRY_WAIT else None
+        ),
+        retired=(delivery.last_error_code == LEGACY_MEGA_SET_RETIREMENT_ERROR_CODE),
         completion_marker_node_handle=delivery.completion_marker_node_handle,
         planned_at=delivery.planned_at,
         started_at=delivery.started_at,

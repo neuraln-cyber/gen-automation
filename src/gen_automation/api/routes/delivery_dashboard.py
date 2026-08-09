@@ -1879,6 +1879,10 @@ def _delivery_progress_payload(
             "completed_items": mega.completed_items,
             "total_items": mega.total_items,
             "remote_path": mega.remote_path,
+            "next_retry_at": (
+                mega.next_retry_at.isoformat() if mega.next_retry_at is not None else None
+            ),
+            "retired": mega.retired,
         },
         "patreon": {
             "state": patreon.state,

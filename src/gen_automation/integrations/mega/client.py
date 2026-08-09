@@ -22,6 +22,7 @@ from gen_automation.integrations.mega.errors import (
     MegaAmbiguousError,
     MegaConfigurationError,
     MegaProtocolError,
+    MegaRemoteConflictError,
     MegaRetryableError,
 )
 
@@ -108,7 +109,74 @@ class MegaCmdClient:
         normalized = validate_remote_path(remote_folder, allow_root=True)
         if normalized == "/":
             return
-        await self._run(("mega-mkdir", "-p", normalized), mutation=True)
+        existing = await self.find_folder(normalized)
+        if len(existing) == 1:
+            return
+        if len(existing) > 1:
+            raise MegaRemoteConflictError("MEGA destination folder name is ambiguous")
+        try:
+            await self._run(("mega-mkdir", normalized), mutation=True)
+        except MegaAmbiguousError as mutation_error:
+            # A timed-out or disconnected mutation may still have succeeded.
+            # Adopt it only after an exact, authenticated read proves that one
+            # unambiguous folder now exists; every other outcome remains a
+            # failure for the durable caller to retry safely.
+            try:
+                reconciled = await self.find_folder(normalized)
+            except (MegaConfigurationError, MegaProtocolError, MegaRetryableError):
+                raise mutation_error from None
+            if len(reconciled) == 1:
+                return
+            if len(reconciled) > 1:
+                raise MegaRemoteConflictError("MEGA destination folder name is ambiguous") from None
+            raise mutation_error from None
+        reconciled = await self.find_folder(normalized)
+        if len(reconciled) == 1:
+            return
+        if len(reconciled) > 1:
+            raise MegaRemoteConflictError("MEGA destination folder name is ambiguous")
+        raise MegaProtocolError("MEGA destination folder creation could not be verified")
+
+    async def find_folder(self, remote_folder: str) -> tuple[str, ...]:
+        """Return exact direct-child folder paths below one exact parent.
+
+        ``mega-find`` is recursive.  Its handle-only form loses the path needed
+        to distinguish a direct child from a same-named nested folder, so this
+        boundary deliberately parses full paths and filters by the exact
+        parent.  Duplicate paths are preserved and remain an ambiguity.
+        """
+
+        normalized = validate_remote_path(remote_folder, allow_root=False)
+        path = PurePosixPath(normalized)
+        folder_name = path.name
+        if folder_name in {"", ".", ".."}:
+            raise ValueError("MEGA remote folder name is invalid")
+        parent = str(path.parent)
+        result = await self._run(
+            (
+                "mega-find",
+                parent,
+                f"--pattern={folder_name}",
+                "--type=d",
+            ),
+            mutation=False,
+        )
+        paths: list[str] = []
+        for raw_line in result.stdout.splitlines():
+            try:
+                line = raw_line.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                raise MegaProtocolError("MEGAcmd returned malformed remote paths") from None
+            if not line:
+                continue
+            try:
+                matched = validate_remote_path(line, allow_root=False)
+            except ValueError:
+                raise MegaProtocolError("MEGAcmd returned malformed remote paths") from None
+            matched_path = PurePosixPath(matched)
+            if str(matched_path.parent) == parent and matched_path.name == folder_name:
+                paths.append(matched)
+        return tuple(paths)
 
     async def find_file(self, remote_path: str) -> tuple[MegaRemoteNode, ...]:
         """Return exact-name files below one exact parent folder."""
@@ -127,19 +195,9 @@ class MegaCmdClient:
             ),
             mutation=False,
         )
-        handles: set[str] = set()
-        for raw_line in result.stdout.splitlines():
-            try:
-                line = raw_line.decode("ascii").strip()
-            except UnicodeDecodeError:
-                raise MegaProtocolError("MEGAcmd returned malformed node handles") from None
-            if not line:
-                continue
-            if _HANDLE_PATTERN.fullmatch(line) is None:
-                raise MegaProtocolError("MEGAcmd returned malformed node handles")
-            handles.add(line)
         return tuple(
-            MegaRemoteNode(handle=handle, remote_path=normalized) for handle in sorted(handles)
+            MegaRemoteNode(handle=handle, remote_path=normalized)
+            for handle in _parse_node_handles(result.stdout)
         )
 
     async def list_files(self, remote_folder: str) -> tuple[str, ...]:
@@ -322,6 +380,21 @@ def validate_remote_filename(value: str) -> str:
     if _SAFE_FILENAME_PATTERN.fullmatch(value) is None or value in {".", ".."}:
         raise ValueError("MEGA remote filename is invalid")
     return value
+
+
+def _parse_node_handles(stdout: bytes) -> tuple[str, ...]:
+    handles: set[str] = set()
+    for raw_line in stdout.splitlines():
+        try:
+            line = raw_line.decode("ascii").strip()
+        except UnicodeDecodeError:
+            raise MegaProtocolError("MEGAcmd returned malformed node handles") from None
+        if not line:
+            continue
+        if _HANDLE_PATTERN.fullmatch(line) is None:
+            raise MegaProtocolError("MEGAcmd returned malformed node handles")
+        handles.add(line)
+    return tuple(sorted(handles))
 
 
 def _assert_private_profile_directory(
