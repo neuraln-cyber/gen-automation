@@ -22,6 +22,7 @@ from gen_automation.integrations.x.errors import (
     XTerminalError,
 )
 from gen_automation.integrations.x.models import XPost, XUploadedMedia
+from gen_automation.integrations.x.oauth1 import XOAuth1Authorization, XOAuth1Credentials
 
 __all__ = [
     "X_API_BASE_URL",
@@ -36,6 +37,8 @@ __all__ = [
     "XAmbiguousTransportError",
     "XClient",
     "XError",
+    "XOAuth1Authorization",
+    "XOAuth1Credentials",
     "XPost",
     "XProtocolError",
     "XRetryableAPIError",

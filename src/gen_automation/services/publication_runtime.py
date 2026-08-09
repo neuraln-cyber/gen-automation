@@ -125,13 +125,12 @@ class XPublicationClient(Protocol):
 class XOAuthEffectLease(Protocol):
     """One just-in-time, redacted X credential lease.
 
-    Implementations must resolve an approved secret immediately before yielding
-    ``client`` and refresh when its access token is missing or near expiry.
-    Access-token caching is allowed only inside that approved secret store, never
-    in application tables. Any new access token and replacement refresh token must
-    be durably persisted before yielding. Implementations must raise
-    ``XOAuthRotationError`` rather than discard a replacement token. Tokens must
-    never appear in ``repr``, logs, exceptions, database state, or audit data.
+    Implementations resolve an approved secret immediately before yielding
+    ``client`` and verify the exact creator binding. Rotating OAuth 2.0
+    implementations must durably persist replacement tokens before yielding;
+    static OAuth 1.0a implementations must read their current secret version for
+    every lease. Credentials must never appear in ``repr``, logs, exceptions,
+    database state, or audit data.
     """
 
     @property
@@ -150,6 +149,8 @@ class XOAuthProvider(Protocol):
         self,
         credential_reference: str,
     ) -> AbstractAsyncContextManager[XOAuthEffectLease]: ...
+
+    async def aclose(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)

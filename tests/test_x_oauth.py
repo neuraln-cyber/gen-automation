@@ -3,6 +3,7 @@ import json
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from types import TracebackType
 from typing import ClassVar
 from urllib.parse import parse_qs
 
@@ -28,6 +29,77 @@ REPLACEMENT_REFRESH_TOKEN = "replacement-refresh-token"  # noqa: S105
 ACCESS_TOKEN = "creator-access-token"  # noqa: S105
 OLD_VERSION = "a" * 32
 PENDING_VERSION = "b" * 32
+
+
+def _direct_security_surface(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, bytes):
+        return [value.decode("latin-1", errors="replace")]
+    if isinstance(value, httpx2.Request):
+        return [
+            repr(value),
+            repr(dict(value.headers)),
+            value.content.decode("latin-1", errors="replace"),
+        ]
+    if isinstance(value, Mapping):
+        result: list[str] = []
+        for key, item in value.items():
+            result.extend(_direct_security_surface(key))
+            result.extend(_direct_security_surface(item))
+        return result
+    if isinstance(value, (list, tuple, set, frozenset)):
+        result = []
+        for item in value:
+            result.extend(_direct_security_surface(item))
+        return result
+    if isinstance(value, BaseException):
+        result = [repr(value), str(value)]
+        result.extend(_direct_security_surface(getattr(value, "request", None)))
+        return result
+    return [repr(value)]
+
+
+def _exception_security_surface(error: BaseException) -> str:
+    rendered: list[str] = []
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        rendered.extend(_direct_security_surface(current))
+        for linked in (current.__cause__, current.__context__):
+            if linked is not None:
+                pending.append(linked)
+        traceback: TracebackType | None = current.__traceback__
+        while traceback is not None:
+            frame = traceback.tb_frame
+            if frame.f_globals.get("__name__") == "gen_automation.services.x_oauth":
+                for name, value in frame.f_locals.items():
+                    rendered.append(name)
+                    rendered.extend(_direct_security_surface(value))
+            traceback = traceback.tb_next
+    return "\n".join(rendered)
+
+
+def _exception_chain(error: BaseException) -> tuple[BaseException, ...]:
+    found: list[BaseException] = []
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        found.append(current)
+        for linked in (current.__cause__, current.__context__):
+            if linked is not None:
+                pending.append(linked)
+    return tuple(found)
 
 
 class _StageMissingError(Exception):
@@ -250,6 +322,45 @@ async def test_pending_rotation_is_recovered_without_duplicate_refresh() -> None
         assert secrets.promote_count == 1
     finally:
         await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_oauth2_runtime_refresh_error_detaches_basic_and_form_secrets() -> None:
+    lock = _CredentialLock()
+    secrets = _SecretsManager(
+        lock=lock,
+        current=(OLD_VERSION, _initial_secret()),
+    )
+    requests: list[tuple[str, bytes]] = []
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        requests.append((request.headers["Authorization"], request.content))
+        raise httpx2.RemoteProtocolError("connection closed", request=request)
+
+    provider = _provider(secrets=secrets, lock=lock, handler=handler)
+    try:
+        with pytest.raises(XCredentialUnavailableError) as captured:
+            async with provider.open_for_effect(REFERENCE):
+                pytest.fail("a failed refresh must not yield")
+    finally:
+        await provider.aclose()
+
+    error = captured.value
+    assert requests
+    authorization_header, request_body = requests[0]
+    expected_basic = base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
+    assert authorization_header == f"Basic {expected_basic}"
+    assert REFRESH_TOKEN.encode() in request_body
+    assert not any(isinstance(item, httpx2.RequestError) for item in _exception_chain(error))
+    surface = _exception_security_surface(error)
+    for sensitive in (
+        CLIENT_ID,
+        CLIENT_SECRET,
+        REFRESH_TOKEN,
+        expected_basic,
+        request_body.decode(),
+    ):
+        assert sensitive not in surface
 
 
 @pytest.mark.parametrize("failure_mode", ("token_rejected", "wrong_account"))

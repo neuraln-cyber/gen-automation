@@ -353,6 +353,7 @@ def test_environment_templates_contain_placeholders_not_secret_values() -> None:
         "GEN_AUTOMATION_X_OAUTH_SECRET_REFERENCE",
     ):
         assert re.search(rf"(?m)^{key}=$", controller)
+    assert re.search(r"(?m)^GEN_AUTOMATION_X_AUTH_MODE=oauth2$", controller)
     assert re.search(r"(?m)^GEN_AUTOMATION_PATREON_BROWSER_SHARED_SECRET=$", patreon)
     assert re.search(
         r"(?m)^GEN_AUTOMATION_SEMANTIC_GATEWAY_UPSTREAM_API_KEY=$",

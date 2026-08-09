@@ -167,6 +167,9 @@ class _XPublicationClientAdapter:
     ) -> XPost:
         return await self._client.create_post(text=text, media_ids=media_ids)
 
+    def clear_authorization(self) -> None:
+        self._client.clear_authorization()
+
 
 class PostgresXOAuthCredentialLock:
     """A bounded transaction-scoped advisory lock.
@@ -284,6 +287,9 @@ class AwsSecretsManagerXOAuthProvider:
         if not hmac.compare_digest(credential_reference, self._reference):
             raise XCredentialUnavailableError("X OAuth credential reference is not approved")
 
+        current: _SecretVersion | None = None
+        token: _TokenResult | None = None
+        access_token: str | None = None
         try:
             async with self._credential_lock.hold(self._reference):
                 current = await self._read_current()
@@ -302,24 +308,44 @@ class AwsSecretsManagerXOAuthProvider:
                 if access_token is None:
                     raise XCredentialUnavailableError("X OAuth access token is unavailable")
         except (XCredentialUnavailableError, XOAuthRotationError):
+            current = None
+            token = None
+            access_token = None
             raise
         except Exception:
+            current = None
+            token = None
+            access_token = None
             raise XCredentialUnavailableError("X OAuth credential is unavailable") from None
 
-        creator_user_id = await self._load_creator_user_id(access_token)
+        current = None
+        token = None
+        try:
+            creator_user_id = await self._load_creator_user_id(access_token)
+        except XCredentialUnavailableError:
+            access_token = None
+            raise
         if not hmac.compare_digest(creator_user_id, self._expected_creator_user_id):
+            access_token = None
             raise XCredentialUnavailableError("X credential account binding failed")
+        x_client = XClient(
+            http_client=self._http_client,
+            bearer_token=access_token,
+            timeout=self._request_timeout,
+        )
+        access_token = None
+        adapter = _XPublicationClientAdapter(x_client)
         lease = _EffectLease(
-            client=_XPublicationClientAdapter(
-                XClient(
-                    http_client=self._http_client,
-                    bearer_token=access_token,
-                    timeout=self._request_timeout,
-                )
-            ),
+            client=adapter,
             creator_user_id=creator_user_id,
         )
-        yield lease
+        try:
+            yield lease
+        finally:
+            adapter.clear_authorization()
+            del lease
+            del adapter
+            del x_client
 
     async def aclose(self) -> None:
         if self._closed:
@@ -467,6 +493,9 @@ class AwsSecretsManagerXOAuthProvider:
         *,
         allow_missing: bool,
     ) -> _SecretVersion | None:
+        read_failed = False
+        missing = False
+        response: Mapping[str, object] | None = None
         try:
             response = await asyncio.to_thread(
                 self._secrets.get_secret_value,
@@ -475,10 +504,17 @@ class AwsSecretsManagerXOAuthProvider:
             )
         except Exception as error:
             if allow_missing and _aws_error_code(error) == "ResourceNotFoundException":
-                return None
-            raise XCredentialUnavailableError(
-                "X OAuth credential secret store is unavailable"
-            ) from None
+                missing = True
+            else:
+                read_failed = True
+        if missing:
+            return None
+        if read_failed or response is None:
+            raise XCredentialUnavailableError("X OAuth credential secret store is unavailable")
+        invalid = False
+        raw: object = None
+        version_id: object = None
+        credential: _StoredCredential | None = None
         try:
             raw = response.get("SecretString")
             version_id = response.get("VersionId")
@@ -488,12 +524,16 @@ class AwsSecretsManagerXOAuthProvider:
                 raise ValueError
             if _VERSION_ID.fullmatch(version_id) is None:
                 raise ValueError
-            return _SecretVersion(
-                version_id=version_id,
-                credential=_parse_credential(raw),
-            )
+            credential = _parse_credential(raw)
         except (TypeError, ValueError):
-            raise XCredentialUnavailableError("X OAuth credential secret is invalid") from None
+            invalid = True
+        if invalid or not isinstance(version_id, str) or credential is None:
+            raw = None
+            version_id = None
+            credential = None
+            response = None
+            raise XCredentialUnavailableError("X OAuth credential secret is invalid")
+        return _SecretVersion(version_id=version_id, credential=credential)
 
     async def _refresh(
         self,
@@ -501,6 +541,8 @@ class AwsSecretsManagerXOAuthProvider:
         *,
         now: datetime,
     ) -> _TokenResult:
+        request_failed = False
+        response: httpx2.Response | None = None
         try:
             response = await self._http_client.request(
                 "POST",
@@ -521,9 +563,19 @@ class AwsSecretsManagerXOAuthProvider:
                 timeout=self._request_timeout,
             )
         except httpx2.RequestError:
-            raise XCredentialUnavailableError("X OAuth token endpoint is unavailable") from None
+            request_failed = True
+        credential = cast(_StoredCredential, None)
+        if request_failed or response is None:
+            raise XCredentialUnavailableError("X OAuth token endpoint is unavailable")
         if response.status_code != 200 or len(response.content) > _RESPONSE_MAX_BYTES:
+            _scrub_response_request(response)
+            del response
             raise XCredentialUnavailableError("X OAuth token refresh was rejected")
+        invalid_response = False
+        payload: dict[str, object] | None = None
+        access_token: str | None = None
+        replacement: str | None = None
+        expires_in: object = None
         try:
             payload = _json_object(response.content)
             access_token = _secret_text(
@@ -559,7 +611,20 @@ class AwsSecretsManagerXOAuthProvider:
                 if not _REQUIRED_X_SCOPES.issubset(scopes):
                     raise ValueError
         except (TypeError, ValueError):
-            raise XCredentialUnavailableError("X OAuth token response is invalid") from None
+            invalid_response = True
+        if (
+            invalid_response
+            or access_token is None
+            or not isinstance(expires_in, int)
+            or isinstance(expires_in, bool)
+        ):
+            _scrub_response_request(response)
+            del response
+            payload = None
+            access_token = None
+            replacement = None
+            expires_in = None
+            raise XCredentialUnavailableError("X OAuth token response is invalid")
         return _TokenResult(
             access_token=access_token,
             expires_at=now + timedelta(seconds=expires_in),
@@ -567,31 +632,51 @@ class AwsSecretsManagerXOAuthProvider:
         )
 
     async def _load_creator_user_id(self, access_token: str) -> str:
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+        }
+        request_failed = False
+        response: httpx2.Response | None = None
         try:
             response = await self._http_client.request(
                 "GET",
                 X_OAUTH_CREATOR_URL,
-                headers={
-                    "Accept": "application/json",
-                    "Authorization": f"Bearer {access_token}",
-                },
+                headers=headers,
                 follow_redirects=False,
                 timeout=self._request_timeout,
             )
         except httpx2.RequestError:
-            raise XCredentialUnavailableError("X account binding is unavailable") from None
+            request_failed = True
+        access_token = ""
+        headers["Authorization"] = "[redacted]"
+        if request_failed or response is None:
+            raise XCredentialUnavailableError("X account binding is unavailable")
         if response.status_code != 200 or len(response.content) > _RESPONSE_MAX_BYTES:
+            _scrub_response_request(response)
+            del response
             raise XCredentialUnavailableError("X account binding failed")
+        invalid_response = False
+        payload: dict[str, object] | None = None
+        data_value: object = None
+        creator_id: object = None
         try:
             payload = _json_object(response.content)
-            data = payload.get("data")
-            if not isinstance(data, Mapping):
+            data_value = payload.get("data")
+            if not isinstance(data_value, Mapping):
                 raise ValueError
-            creator_id = data.get("id")
+            creator_id = data_value.get("id")
             if not isinstance(creator_id, str) or _CREATOR_ID.fullmatch(creator_id) is None:
                 raise ValueError
         except (TypeError, ValueError):
-            raise XCredentialUnavailableError("X account binding response is invalid") from None
+            invalid_response = True
+        if invalid_response or not isinstance(creator_id, str):
+            _scrub_response_request(response)
+            del response
+            payload = None
+            data_value = None
+            creator_id = None
+            raise XCredentialUnavailableError("X account binding response is invalid")
         return creator_id
 
     def _now(self) -> datetime:
@@ -637,6 +722,8 @@ def build_aws_secrets_manager_x_oauth_provider(
         read_timeout=request_timeout_seconds,
         retries={"mode": "standard", "max_attempts": 3},
         max_pool_connections=4,
+        ignore_configured_endpoint_urls=True,
+        proxies={},
         user_agent_extra="gen-automation-x-oauth/1",
     )
     secrets_client = cast(
@@ -645,6 +732,7 @@ def build_aws_secrets_manager_x_oauth_provider(
             "secretsmanager",
             region_name=parsed.region,
             config=boto_config,
+            verify=True,
         ),
     )
     http_client = httpx2.AsyncClient(
@@ -796,3 +884,15 @@ def _aws_error_code(error: Exception) -> str | None:
         return None
     code = detail.get("Code")
     return code if isinstance(code, str) else None
+
+
+def _scrub_response_request(response: httpx2.Response) -> None:
+    try:
+        request = response.request
+        response.request = httpx2.Request(
+            request.method,
+            request.url,
+            headers={"Authorization": "[redacted]"},
+        )
+    except RuntimeError:
+        return

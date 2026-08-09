@@ -104,6 +104,7 @@ def test_aws_staging_examples_and_state_safety_are_non_secret() -> None:
     assert "refresh_token" not in tfvars
     assert "client_secret" not in tfvars
     assert "x_oauth_secret_arn = null" in tfvars
+    assert 'x_oauth_auth_mode  = "oauth2"' in tfvars
     assert "budget_enabled" in tfvars
     assert "count = var.budget_enabled ? 1 : 0" in _terraform_source()
     assert "infra/aws-staging/backend.s3.tfbackend" in gitignore
@@ -121,6 +122,88 @@ def test_aws_staging_examples_and_state_safety_are_non_secret() -> None:
     )
     assert "never use host networking for them" in runbook
     assert "prevents a bridged sidecar from obtaining the EC2 instance role" in runbook
+
+
+def test_x_oauth1_uses_the_exact_secret_arn_with_read_only_runtime_iam() -> None:
+    iam = (INFRA / "iam.tf").read_text(encoding="utf-8")
+    variables = (INFRA / "variables.tf").read_text(encoding="utf-8")
+    tfvars = (INFRA / "terraform.tfvars.example").read_text(encoding="utf-8")
+    controller = (INFRA / "deploy" / "control-plane.env.example").read_text(encoding="utf-8")
+    statement = iam.split(
+        "for_each = var.x_oauth_secret_arn == null ? [] : [var.x_oauth_secret_arn]",
+        maxsplit=1,
+    )[1].split("\n  }", maxsplit=1)[0]
+    secret_variable = variables.split('variable "x_oauth_secret_arn"', maxsplit=1)[1].split(
+        'variable "x_oauth_auth_mode"', maxsplit=1
+    )[0]
+    oauth2_regex = (
+        "^arn:aws:secretsmanager:eu-central-1:861912887470:secret:"
+        "gen-automation-staging/x/oauth-[A-Za-z0-9]{6}$"
+    )
+    oauth1_regex = (
+        "^arn:aws:secretsmanager:eu-central-1:861912887470:secret:"
+        "gen-automation-staging/x/oauth1-[A-Za-z0-9]{6}$"
+    )
+
+    assert 'variable "x_oauth_auth_mode"' in variables
+    assert re.search(
+        r'variable "x_oauth_auth_mode"\s*\{.*?default\s*=\s*"oauth2"',
+        variables,
+        re.DOTALL,
+    )
+    assert 'contains(["oauth1", "oauth2"], var.x_oauth_auth_mode)' in variables
+    assert f'"{oauth2_regex}"' in secret_variable
+    assert f'"{oauth1_regex}"' in secret_variable
+    assert re.search(
+        rf'var\.x_oauth_auth_mode == "oauth2".*?"{re.escape(oauth2_regex)}"',
+        secret_variable,
+        re.DOTALL,
+    )
+    assert re.search(
+        rf'var\.x_oauth_auth_mode == "oauth1".*?"{re.escape(oauth1_regex)}"',
+        secret_variable,
+        re.DOTALL,
+    )
+    assert "arn:[^:]+" not in secret_variable
+    assert "secret:.+" not in secret_variable
+    assert 'x_oauth_auth_mode  = "oauth2"' in tfvars
+    assert "GEN_AUTOMATION_X_AUTH_MODE=oauth2" in controller
+    assert 'sid = "XOAuthSecretAccess"' in statement
+    assert '"secretsmanager:DescribeSecret"' in statement
+    assert '"secretsmanager:GetSecretValue"' in statement
+    assert 'var.x_oauth_auth_mode == "oauth2" ? [' in statement
+    assert '"secretsmanager:PutSecretValue"' in statement
+    assert '"secretsmanager:UpdateSecretVersionStage"' in statement
+    assert "resources = [statement.value]" in statement
+    assert "*" not in statement
+
+    valid_oauth2 = (
+        "arn:aws:secretsmanager:eu-central-1:861912887470:secret:"
+        "gen-automation-staging/x/oauth-AbCd12"
+    )
+    valid_oauth1 = (
+        "arn:aws:secretsmanager:eu-central-1:861912887470:secret:"
+        "gen-automation-staging/x/oauth1-AbCd12"
+    )
+    assert re.fullmatch(oauth2_regex, valid_oauth2)
+    assert re.fullmatch(oauth1_regex, valid_oauth1)
+    for invalid in (
+        valid_oauth1,
+        valid_oauth2.replace("861912887470", "123456789012"),
+        valid_oauth2.replace("eu-central-1", "us-east-1"),
+        valid_oauth2.replace("arn:aws:", "arn:aws-us-gov:"),
+        valid_oauth2.replace("oauth-AbCd12", "oauth-*"),
+        valid_oauth2.replace("oauth-AbCd12", "oauth-AbCd123"),
+    ):
+        assert re.fullmatch(oauth2_regex, invalid) is None
+    for invalid in (
+        valid_oauth2,
+        valid_oauth1.replace("861912887470", "123456789012"),
+        valid_oauth1.replace("eu-central-1", "us-east-1"),
+        valid_oauth1.replace("oauth1-AbCd12", "oauth1-*"),
+        valid_oauth1.replace("oauth1-AbCd12", "oauth1-AbCd123"),
+    ):
+        assert re.fullmatch(oauth1_regex, invalid) is None
 
 
 def test_salad_artifact_reader_is_disabled_and_exact_version_only() -> None:

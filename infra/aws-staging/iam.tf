@@ -238,13 +238,17 @@ data "aws_iam_policy_document" "runtime" {
     for_each = var.x_oauth_secret_arn == null ? [] : [var.x_oauth_secret_arn]
 
     content {
-      sid = "XOAuthSecretRotation"
-      actions = [
-        "secretsmanager:DescribeSecret",
-        "secretsmanager:GetSecretValue",
-        "secretsmanager:PutSecretValue",
-        "secretsmanager:UpdateSecretVersionStage",
-      ]
+      sid = "XOAuthSecretAccess"
+      actions = concat(
+        [
+          "secretsmanager:DescribeSecret",
+          "secretsmanager:GetSecretValue",
+        ],
+        var.x_oauth_auth_mode == "oauth2" ? [
+          "secretsmanager:PutSecretValue",
+          "secretsmanager:UpdateSecretVersionStage",
+        ] : []
+      )
       resources = [statement.value]
     }
   }
@@ -268,8 +272,8 @@ resource "aws_iam_role_policy" "runtime" {
 
 data "aws_iam_policy_document" "runpod_inference_key_read" {
   statement {
-    sid       = "ReadRunPodInferenceKey"
-    actions   = ["ssm:GetParameter"]
+    sid     = "ReadRunPodInferenceKey"
+    actions = ["ssm:GetParameter"]
     resources = [
       "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${local.name}/runpod/inference-api-key",
     ]

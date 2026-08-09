@@ -166,9 +166,33 @@ variable "x_oauth_secret_arn" {
   validation {
     condition = (
       var.x_oauth_secret_arn == null
-      || can(regex("^arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:.+$", var.x_oauth_secret_arn))
+      || (
+        var.x_oauth_auth_mode == "oauth2"
+        && can(regex(
+          "^arn:aws:secretsmanager:eu-central-1:861912887470:secret:gen-automation-staging/x/oauth-[A-Za-z0-9]{6}$",
+          var.x_oauth_secret_arn
+        ))
+      )
+      || (
+        var.x_oauth_auth_mode == "oauth1"
+        && can(regex(
+          "^arn:aws:secretsmanager:eu-central-1:861912887470:secret:gen-automation-staging/x/oauth1-[A-Za-z0-9]{6}$",
+          var.x_oauth_secret_arn
+        ))
+      )
     )
-    error_message = "x_oauth_secret_arn must be a complete Secrets Manager secret ARN."
+    error_message = "x_oauth_secret_arn must be the exact staging X secret ARN for x_oauth_auth_mode."
+  }
+}
+
+variable "x_oauth_auth_mode" {
+  description = "X user-context authentication mode. OAuth 1.0a credentials are static and read-only."
+  type        = string
+  default     = "oauth2"
+
+  validation {
+    condition     = contains(["oauth1", "oauth2"], var.x_oauth_auth_mode)
+    error_message = "x_oauth_auth_mode must be oauth1 or oauth2."
   }
 }
 

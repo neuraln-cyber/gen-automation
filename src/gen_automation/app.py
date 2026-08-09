@@ -32,7 +32,7 @@ from gen_automation.auth.runtime import (
     assert_authentication_bootstrapped,
     build_authentication_runtime,
 )
-from gen_automation.config import Environment, Settings, get_settings
+from gen_automation.config import Environment, Settings, XAuthMode, get_settings
 from gen_automation.controller.runtime import ControllerRuntime, build_controller_runtime
 from gen_automation.db import models as _models  # noqa: F401
 from gen_automation.db.session import Database
@@ -46,14 +46,15 @@ from gen_automation.middleware import RequestContextMiddleware
 from gen_automation.services.admin_enrollment import AdminEnrollmentService
 from gen_automation.services.authentication import AuthenticationService
 from gen_automation.services.danbooru_tags import DanbooruTagAutocompleteService
+from gen_automation.services.publication_runtime import XOAuthProvider
 from gen_automation.services.runtime_secrets import (
     RuntimeSecretResolver,
     build_runtime_secret_resolver,
 )
 from gen_automation.services.x_oauth import (
-    AwsSecretsManagerXOAuthProvider,
     build_aws_secrets_manager_x_oauth_provider,
 )
+from gen_automation.services.x_oauth1 import build_aws_secrets_manager_x_oauth1_provider
 from gen_automation.storage.s3 import build_object_store
 
 
@@ -103,7 +104,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         patreon_driver: PatreonSidecarDriver | None = None
         controller_runtime: ControllerRuntime | None = None
         runtime_secret_resolver: RuntimeSecretResolver | None = None
-        x_oauth_provider: AwsSecretsManagerXOAuthProvider | None = None
+        x_oauth_provider: XOAuthProvider | None = None
         authentication_service: AuthenticationService | None = None
         admin_enrollment_service: AdminEnrollmentService | None = None
         if resolved_settings.salad_enabled:
@@ -194,14 +195,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     creator_user_id = resolved_settings.x_creator_user_id
                     if creator_user_id is None:
                         raise RuntimeError("validated X OAuth settings are incomplete")
-                    x_oauth_provider = build_aws_secrets_manager_x_oauth_provider(
-                        engine=database.engine,
-                        configured_reference=resolved_settings.x_oauth_secret_reference,
-                        expected_creator_user_id=creator_user_id,
-                        request_timeout_seconds=(resolved_settings.x_oauth_request_timeout_seconds),
-                        lock_timeout_seconds=resolved_settings.x_oauth_lock_timeout_seconds,
-                        refresh_margin_seconds=(resolved_settings.x_oauth_refresh_margin_seconds),
-                    )
+                    if resolved_settings.x_auth_mode == XAuthMode.OAUTH1:
+                        x_oauth_provider = build_aws_secrets_manager_x_oauth1_provider(
+                            configured_reference=resolved_settings.x_oauth_secret_reference,
+                            expected_creator_user_id=creator_user_id,
+                            request_timeout_seconds=(
+                                resolved_settings.x_oauth_request_timeout_seconds
+                            ),
+                        )
+                    else:
+                        x_oauth_provider = build_aws_secrets_manager_x_oauth_provider(
+                            engine=database.engine,
+                            configured_reference=resolved_settings.x_oauth_secret_reference,
+                            expected_creator_user_id=creator_user_id,
+                            request_timeout_seconds=(
+                                resolved_settings.x_oauth_request_timeout_seconds
+                            ),
+                            lock_timeout_seconds=resolved_settings.x_oauth_lock_timeout_seconds,
+                            refresh_margin_seconds=(
+                                resolved_settings.x_oauth_refresh_margin_seconds
+                            ),
+                        )
                     app.state.x_oauth_provider = x_oauth_provider
                 controller_runtime = build_controller_runtime(
                     settings=resolved_settings,

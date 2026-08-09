@@ -66,6 +66,11 @@ class SaladContainerPriority(StrEnum):
     BATCH = "batch"
 
 
+class XAuthMode(StrEnum):
+    OAUTH2 = "oauth2"
+    OAUTH1 = "oauth1"
+
+
 def _secret_value(value: SecretStr | None) -> str | None:
     if value is None:
         return None
@@ -431,6 +436,7 @@ class Settings(BaseSettings):
         pattern=X_OAUTH_SECRET_REFERENCE_PATTERN,
         max_length=500,
     )
+    x_auth_mode: XAuthMode = XAuthMode.OAUTH2
     x_oauth_request_timeout_seconds: float = Field(default=30, gt=0, le=60)
     x_oauth_lock_timeout_seconds: float = Field(default=15, gt=0, le=60)
     x_oauth_refresh_margin_seconds: int = Field(default=300, ge=30, le=1800)
@@ -717,8 +723,10 @@ class Settings(BaseSettings):
             errors.append(
                 "X OAuth secret reference and creator user ID must be configured together"
             )
-        if x_oauth_reference_configured and not self.database_url.startswith(
-            "postgresql+psycopg://"
+        if (
+            x_oauth_reference_configured
+            and self.x_auth_mode == XAuthMode.OAUTH2
+            and not self.database_url.startswith("postgresql+psycopg://")
         ):
             errors.append("X OAuth credential serialization requires PostgreSQL via psycopg")
         if (

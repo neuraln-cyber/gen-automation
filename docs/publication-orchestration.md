@@ -151,6 +151,10 @@ GEN_AUTOMATION_PATREON_BROWSER_PUBLISHING_ENABLED=false
 GEN_AUTOMATION_PATREON_BROWSER_SIDECAR_URL=http://patreon-browser:8090/v1/publish
 GEN_AUTOMATION_PATREON_BROWSER_PROFILE_REFERENCE=creator-main
 GEN_AUTOMATION_PATREON_BROWSER_TIMEOUT_SECONDS=240
+# Configure these together when the X destination is enabled:
+# GEN_AUTOMATION_X_AUTH_MODE=oauth2
+# GEN_AUTOMATION_X_OAUTH_SECRET_REFERENCE=aws-secrets-manager://<exact-arn>
+# GEN_AUTOMATION_X_CREATOR_USER_ID=<numeric-id>
 ```
 
 `PUBLISHING_ENABLED` only registers the bounded controller loop. The object
@@ -163,8 +167,10 @@ The controller injects the AWS Secrets Manager adapter when
 `GEN_AUTOMATION_X_OAUTH_SECRET_REFERENCE` and
 `GEN_AUTOMATION_X_CREATOR_USER_ID` are both configured. The reference must
 contain one complete secret ARN and must exactly match the frozen intent.
+`GEN_AUTOMATION_X_AUTH_MODE` selects `oauth2` (default rotating credential) or
+`oauth1` (static owner credential read from the separate OAuth 1.0a schema).
 
-For each effect the adapter:
+For each OAuth 2.0 effect the adapter:
 
 1. takes a bounded PostgreSQL advisory transaction lock derived from the exact
    reference;
@@ -177,6 +183,12 @@ For each effect the adapter:
 5. calls `GET /2/users/me`, retains only the verified numeric ID, and fails
    closed if it differs from the configured creator ID; and
 6. yields the existing single-attempt X transport.
+
+For OAuth 1.0a it instead reads `AWSCURRENT` without a database lock or secret
+write, validates the strict static schema, signs `GET /2/users/me`, and yields
+the same single-attempt transport with per-request signatures. Scheduling,
+captions, adult metadata, `made_with_ai`, durable idempotency, and unknown-outcome
+handling are authentication-independent.
 
 Tokens exist only in the designated Secrets Manager secret and short-lived
 process memory, never in publication tables, audits, exceptions, or logs.

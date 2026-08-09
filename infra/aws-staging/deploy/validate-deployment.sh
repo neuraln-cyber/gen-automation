@@ -127,6 +127,24 @@ semantic_upstream="$(env_value GEN_AUTOMATION_SEMANTIC_GATEWAY_UPSTREAM_CHAT_COM
 [ "$(env_value GEN_AUTOMATION_INGRESS_REQUEST_GUARDS_CONFIGURED "$config_root/control-plane.env")" = "true" ] ||
   fail "control-plane must assert the validated nginx request guards"
 
+x_auth_mode="$(env_value GEN_AUTOMATION_X_AUTH_MODE "$config_root/control-plane.env")"
+x_creator_user_id="$(env_value GEN_AUTOMATION_X_CREATOR_USER_ID "$config_root/control-plane.env")"
+x_secret_reference="$(env_value GEN_AUTOMATION_X_OAUTH_SECRET_REFERENCE "$config_root/control-plane.env")"
+case "$x_auth_mode" in oauth1|oauth2) ;; *) fail "X authentication mode must be oauth1 or oauth2" ;; esac
+if [ -z "$x_creator_user_id" ] || [ -z "$x_secret_reference" ]; then
+  [ -z "$x_creator_user_id" ] && [ -z "$x_secret_reference" ] ||
+    fail "X creator ID and secret reference must be configured together"
+else
+  [[ "$x_creator_user_id" =~ ^[1-9][0-9]{0,18}$ ]] || fail "X creator ID must be numeric"
+  if [ "$x_auth_mode" = "oauth1" ]; then
+    [[ "$x_secret_reference" =~ ^aws-secrets-manager://arn:aws:secretsmanager:eu-central-1:861912887470:secret:gen-automation-staging/x/oauth1-[A-Za-z0-9]{6}$ ]] ||
+      fail "X OAuth 1.0a reference must be the exact staging secret ARN"
+  else
+    [[ "$x_secret_reference" =~ ^aws-secrets-manager://arn:aws:secretsmanager:eu-central-1:861912887470:secret:gen-automation-staging/x/oauth-[A-Za-z0-9]{6}$ ]] ||
+      fail "X OAuth 2.0 reference must be the exact staging secret ARN"
+  fi
+fi
+
 hostname="$(env_value GEN_AUTOMATION_HOSTNAME "$config_root/caddy.env")"
 [[ "$hostname" =~ ^[A-Za-z0-9.-]+$ ]] || fail "Caddy hostname is missing or invalid"
 
