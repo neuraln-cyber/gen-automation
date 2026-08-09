@@ -152,6 +152,12 @@ jobs:
         run: docker build --tag gen-automation-control-plane:test .
       - name: Build digest-pinned GPU worker image
         run: docker build --file Dockerfile.worker --tag gen-automation-gpu-worker:test .
+      - name: Smoke-test GPU worker Python runtime
+        run: >-
+          docker run --rm
+          --entrypoint /opt/worker-venv/bin/python
+          gen-automation-gpu-worker:test
+          -c 'import gen_automation.gpu_worker.main'
       - name: Build semantic gateway image
         run: >-
           docker build

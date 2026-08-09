@@ -75,6 +75,7 @@ def test_worker_publication_is_keyed_only_by_the_exact_worker_inputs() -> None:
         "src/gen_automation/__init__.py",
         "src/gen_automation/gpu_worker",
         "src/gen_automation/domain/__init__.py",
+        "src/gen_automation/domain/controlled_duo.py",
         "src/gen_automation/domain/deliverability.py",
         "src/gen_automation/domain/generation_limits.py",
         "src/gen_automation/domain/signing.py",

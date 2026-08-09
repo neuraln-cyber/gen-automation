@@ -523,7 +523,7 @@ async def _seed_submission_database(database: Database) -> SubmissionContext:
 
 
 @pytest.mark.asyncio
-async def test_submit_refreshes_runtime_only_at_same_deployment_idle_boundary(
+async def test_submit_reuses_active_runtime_then_refreshes_same_manifest_at_idle_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -637,12 +637,9 @@ async def test_submit_refreshes_runtime_only_at_same_deployment_idle_boundary(
 
         async with database.sessions() as session:
             first_attempt = await session.get(GenerationAttempt, first.attempt_id)
-            deployment = await session.get(SaladDeployment, deployment_id)
             assert first_attempt is not None
-            assert deployment is not None
             first_attempt.state = GenerationAttemptState.FAILED
             first_attempt.completed_at = NOW
-            deployment.runtime_artifact_manifest_sha256 = "1" * 64
             await session.commit()
 
         # With no other active provider attempt, this is the idle-to-active
@@ -658,7 +655,7 @@ async def test_submit_refreshes_runtime_only_at_same_deployment_idle_boundary(
 
 
 @pytest.mark.asyncio
-async def test_submit_reuses_a_safe_resident_lora_superset_without_restart(
+async def test_submit_refreshes_idle_resident_lora_superset_without_evicting_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -683,9 +680,10 @@ async def test_submit_reuses_a_safe_resident_lora_superset_without_restart(
             deployment.runtime_managed_lora_sha256s = [lora_a, lora_b]
             deployment.runtime_artifact_manifest_sha256 = resident_digest
             await session.commit()
+            deployment_id = deployment.id
             outbox_id = outbox.id
 
-        refreshes: list[UUID] = []
+        refreshes: list[tuple[UUID, Mapping[str, str] | None]] = []
         submissions: list[UUID] = []
 
         async def fake_refresh(
@@ -695,8 +693,8 @@ async def test_submit_reuses_a_safe_resident_lora_superset_without_restart(
             *,
             environment_overrides: Mapping[str, str] | None = None,
         ) -> SaladContainerGroup:
-            del client, resolver, environment_overrides
-            refreshes.append(deployment.id)
+            del client, resolver
+            refreshes.append((deployment.id, environment_overrides))
             return _group(deployment.container_group_name, deployment.queue_name)
 
         async def fake_submit(
@@ -750,7 +748,17 @@ async def test_submit_reuses_a_safe_resident_lora_superset_without_restart(
         )
 
         await workloads._submit_event(event, progress=_SubmissionProgress())
-        assert refreshes == []
+        assert refreshes == [
+            (
+                deployment_id,
+                {
+                    "GEN_WORKER_MODEL_MANIFEST_JSON": (
+                        '{"artifacts":[],"manifest_sha256":"' + resident_digest + '"}'
+                    ),
+                    "GEN_WORKER_MODEL_MANIFEST_SHA256": resident_digest,
+                },
+            )
+        ]
         assert submissions == [context.attempt_id]
     finally:
         await database.dispose()
