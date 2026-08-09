@@ -18,14 +18,17 @@ from gen_automation.services.derivative_isolation import (
     _bounded_base64_field,
     _cleanup_process,
     _decode_child_response,
+    _error_message,
     _receive_child_message,
     _success_message,
     render_platform_derivatives_isolated,
 )
 from gen_automation.services.derivatives import (
     DEFAULT_DERIVATIVE_LIMITS,
+    PREVIOUS_DERIVATIVE_RENDERER_VERSION,
     DerivativeRecipe,
     DerivativeTarget,
+    XStaticImagePngTooLargeError,
     render_platform_derivatives,
 )
 
@@ -326,7 +329,7 @@ async def test_hard_limit_must_cover_explicit_working_set_plus_process_reserve(
             _master(),
             recipe=DerivativeRecipe(),
             policy=DerivativeIsolationPolicy(
-                memory_limit_bytes=511 * 1024 * 1024,
+                memory_limit_bytes=703 * 1024 * 1024,
             ),
         )
 
@@ -444,6 +447,28 @@ def test_safe_bounded_response_accepts_the_expected_full_only_collection() -> No
     assert decoded == expected
 
 
+def test_safe_bounded_response_accepts_frozen_previous_renderer_lineage() -> None:
+    master = _master()
+    recipe = DerivativeRecipe()
+    expected = render_platform_derivatives(
+        master,
+        recipe=recipe,
+        targets=(DerivativeTarget.FULL_RESOLUTION,),
+        renderer_version=PREVIOUS_DERIVATIVE_RENDERER_VERSION,
+    )
+
+    decoded = _decode_child_response(
+        _success_message(expected),
+        DEFAULT_DERIVATIVE_LIMITS,
+        expected_source_sha256=expected.source_sha256,
+        expected_recipe=recipe,
+        expected_target_values=(DerivativeTarget.FULL_RESOLUTION.value,),
+        expected_renderer_version=PREVIOUS_DERIVATIVE_RENDERER_VERSION,
+    )
+
+    assert decoded == expected
+
+
 def test_safe_bounded_response_accepts_artifact_base64_larger_than_text_metadata() -> None:
     recipe = DerivativeRecipe()
     expected = render_platform_derivatives(
@@ -462,6 +487,21 @@ def test_safe_bounded_response_accepts_artifact_base64_larger_than_text_metadata
     )
 
     assert decoded == expected
+
+
+def test_isolated_response_preserves_lossless_x_png_size_failure() -> None:
+    with pytest.raises(
+        XStaticImagePngTooLargeError,
+        match="automatic JPEG conversion and downscaling are forbidden",
+    ):
+        _decode_child_response(
+            _error_message(
+                "x_lossless_png_too_large",
+                "full-resolution lossless X PNG exceeds the static image byte limit; "
+                "automatic JPEG conversion and downscaling are forbidden",
+            ),
+            DEFAULT_DERIVATIVE_LIMITS,
+        )
 
 
 def test_bounded_base64_field_accepts_exact_decoded_byte_limit() -> None:
@@ -517,7 +557,7 @@ async def test_real_linux_spawn_installs_limits_and_round_trips_bundle() -> None
         recipe=recipe,
         policy=DerivativeIsolationPolicy(
             wall_timeout_seconds=30,
-            memory_limit_bytes=512 * 1024 * 1024,
+            memory_limit_bytes=704 * 1024 * 1024,
         ),
     )
 

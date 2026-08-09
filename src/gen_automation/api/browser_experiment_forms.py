@@ -37,8 +37,16 @@ _EDITOR_FIELDS = frozenset(
         "subject_id",
         "subject_2_id",
         "composition_mode",
+        "duo_contract_version",
+        "composition_preset_id",
         "character_a_prompt",
         "character_b_prompt",
+        "character_a_negative_prompt",
+        "character_b_negative_prompt",
+        "interaction_prompt",
+        "camera_prompt",
+        "duo_isolation_mode",
+        "duo_quality_mode",
         "checkpoint_id",
         "workflow_id",
         "prompt",
@@ -66,7 +74,7 @@ _EDITOR_FIELDS = frozenset(
         *(f"lora_{slot}_{suffix}" for slot in range(1, 9) for suffix in ("id", "weight")),
     }
 )
-_VARIANT_KEYS = frozenset(
+_LEGACY_VARIANT_KEYS = frozenset(
     {
         "label",
         "subject_id",
@@ -101,6 +109,16 @@ _VARIANT_KEYS = frozenset(
         "loras",
     }
 )
+_CONTROLLED_DUO_VARIANT_KEYS = _LEGACY_VARIANT_KEYS | {
+    "duo_contract_version",
+    "composition_preset_id",
+    "character_a_negative_prompt",
+    "character_b_negative_prompt",
+    "interaction_prompt",
+    "camera_prompt",
+    "duo_isolation_mode",
+    "duo_quality_mode",
+}
 
 
 class BrowserExperimentFormError(ValueError):
@@ -260,7 +278,10 @@ def _decode_variant_plan(
         raise _unprocessable("Variant queue must contain between 2 and 12 variants.")
     variants: list[ExperimentVariantSubmission] = []
     for index, item in enumerate(decoded):
-        if not isinstance(item, dict) or set(item) != _VARIANT_KEYS:
+        if not isinstance(item, dict) or frozenset(item) not in {
+            _LEGACY_VARIANT_KEYS,
+            _CONTROLLED_DUO_VARIANT_KEYS,
+        }:
             raise _unprocessable(f"Variant {index + 1} has invalid fields.")
         loras_value = item["loras"]
         if not isinstance(loras_value, list) or len(loras_value) > 8:
@@ -290,8 +311,38 @@ def _decode_variant_plan(
                 else None
             ),
             composition_mode=_string(item["composition_mode"], label="Composition"),
+            duo_contract_version=_whole(
+                item.get("duo_contract_version", 1),
+                label="Duo contract version",
+            ),
+            composition_preset_id=(
+                _string(item["composition_preset_id"], label="Composition preset")
+                if item.get("composition_preset_id")
+                else None
+            ),
             character_a_prompt=_string(item["character_a_prompt"], label="Character prompt"),
             character_b_prompt=_string(item["character_b_prompt"], label="Character prompt"),
+            character_a_negative_prompt=_string(
+                item.get("character_a_negative_prompt", ""),
+                label="Character exclusions",
+            ),
+            character_b_negative_prompt=_string(
+                item.get("character_b_negative_prompt", ""),
+                label="Character exclusions",
+            ),
+            interaction_prompt=_string(
+                item.get("interaction_prompt", ""),
+                label="Interaction",
+            ),
+            camera_prompt=_string(item.get("camera_prompt", ""), label="Camera"),
+            duo_isolation_mode=_string(
+                item.get("duo_isolation_mode", "balanced"),
+                label="Duo isolation",
+            ),
+            duo_quality_mode=_string(
+                item.get("duo_quality_mode", "standard"),
+                label="Duo quality",
+            ),
             checkpoint_approval_id=_uuid_string(item["checkpoint_id"], label="Checkpoint"),
             loras=tuple(loras),
             workflow_approval_id=_uuid_string(item["workflow_id"], label="Workflow"),

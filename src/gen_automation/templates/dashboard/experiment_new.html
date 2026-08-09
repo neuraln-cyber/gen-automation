@@ -138,28 +138,10 @@
 
         <div class="form-grid experiment-profile-grid">
           <label>
-            Character
-            <select name="subject_id" required>
-              {% if not options.subjects %}<option value="">No approved subjects</option>{% endif %}
-              {% for subject in options.subjects %}
-                <option value="{{ subject.approval_id }}" {% if form_values['subject_id'] == subject.approval_id|string %}selected{% endif %}>{{ subject.name }} &middot; age {{ subject.canonical_age }}</option>
-              {% endfor %}
-            </select>
-          </label>
-          <label>
             Composition
             <select name="composition_mode" data-experiment-composition>
               <option value="single" {% if form_values['composition_mode'] != 'duo' %}selected{% endif %}>One character</option>
               <option value="duo" {% if form_values['composition_mode'] == 'duo' %}selected{% endif %} {% if options.subjects|length < 2 %}disabled{% endif %}>Two characters</option>
-            </select>
-          </label>
-          <label data-experiment-second-subject {% if form_values['composition_mode'] != 'duo' %}hidden{% endif %}>
-            Second character
-            <select name="subject_2_id">
-              <option value="">Choose character</option>
-              {% for subject in options.subjects %}
-                <option value="{{ subject.approval_id }}" {% if form_values['subject_2_id'] == subject.approval_id|string %}selected{% endif %}>{{ subject.name }}</option>
-              {% endfor %}
             </select>
           </label>
           <label>
@@ -190,6 +172,9 @@
                   data-upscaler-enabled="{{ 'true' if workflow.has_hires_pass else 'false' }}"
                   data-detailer-enabled="{{ 'true' if workflow.has_face_detailer else 'false' }}"
                   data-regional-prompting="{{ 'true' if workflow.has_regional_prompting else 'false' }}"
+                  data-duo-contract-v2="{{ 'true' if workflow.supports_controlled_duo_v2|default(false) else 'false' }}"
+                  data-duo-strict-isolation="{{ 'true' if workflow.supports_duo_strict_isolation|default(false) else 'false' }}"
+                  data-duo-quality-high="{{ 'true' if workflow.supports_duo_high_quality|default(false) else 'false' }}"
                   {% if form_values['workflow_id'] == workflow.approval_id|string %}selected{% endif %}
                 >{{ workflow.name }} &middot; v{{ workflow.version }}</option>
               {% endfor %}
@@ -197,17 +182,60 @@
           </label>
         </div>
 
-        <div class="experiment-regional-prompts" data-experiment-regional-prompts {% if form_values['composition_mode'] != 'duo' %}hidden{% endif %}>
-          <label>Character A prompt<textarea name="character_a_prompt" rows="2" maxlength="20000" spellcheck="false" data-danbooru-autocomplete>{{ form_values['character_a_prompt'] }}</textarea></label>
-          <label>Character B prompt<textarea name="character_b_prompt" rows="2" maxlength="20000" spellcheck="false" data-danbooru-autocomplete>{{ form_values['character_b_prompt'] }}</textarea></label>
-        </div>
+        <section class="composition-builder experiment-controlled-duo" data-controlled-duo-builder>
+          <div class="character-composition-grid">
+            <article class="character-composition-card" data-character-card="a">
+              <div class="character-card-heading"><strong>Character A</strong><span data-duo-only {% if form_values['composition_mode'] != 'duo' %}hidden{% endif %}>Region A</span></div>
+              <label>
+                Approved subject
+                <select name="subject_id" data-character-subject="a" required>
+                  {% if not options.subjects %}<option value="">No approved subjects</option>{% endif %}
+                  {% for subject in options.subjects %}
+                    <option value="{{ subject.approval_id }}" data-subject-name="{{ subject.name }}" data-subject-slug="{{ subject.slug }}" {% if form_values['subject_id'] == subject.approval_id|string %}selected{% endif %}>{{ subject.name }} &middot; age {{ subject.canonical_age }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label class="character-region-prompt" data-character-prompt-field data-duo-only {% if form_values['composition_mode'] != 'duo' %}hidden{% endif %}>
+                A &middot; identity, appearance &amp; pose
+                <textarea name="character_a_prompt" rows="3" maxlength="20000" spellcheck="false" placeholder="adult character A, copper hair, teal jacket, leaning toward camera" data-character-prompt="a" data-danbooru-autocomplete>{{ form_values['character_a_prompt'] }}</textarea>
+              </label>
+              <label class="character-region-prompt" data-duo-only {% if form_values['composition_mode'] != 'duo' %}hidden{% endif %}>
+                A &middot; negative / exclude
+                <textarea name="character_a_negative_prompt" rows="2" maxlength="20000" spellcheck="false" data-character-negative-prompt="a" data-duo-v2-control data-danbooru-autocomplete disabled>{{ form_values.get('character_a_negative_prompt', '') }}</textarea>
+              </label>
+            </article>
+            <article class="character-composition-card" data-character-card="b" data-experiment-second-subject {% if form_values['composition_mode'] != 'duo' %}hidden{% endif %}>
+              <div class="character-card-heading"><strong>Character B</strong><span>Region B</span></div>
+              <label>
+                Approved subject
+                <select name="subject_2_id" data-character-subject="b">
+                  <option value="">Choose character</option>
+                  {% for subject in options.subjects %}
+                    <option value="{{ subject.approval_id }}" data-subject-name="{{ subject.name }}" data-subject-slug="{{ subject.slug }}" {% if form_values['subject_2_id'] == subject.approval_id|string %}selected{% endif %}>{{ subject.name }} &middot; age {{ subject.canonical_age }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label class="character-region-prompt">
+                B &middot; identity, appearance &amp; pose
+                <textarea name="character_b_prompt" rows="3" maxlength="20000" spellcheck="false" placeholder="adult character B, indigo braid, ivory coat, upright three-quarter pose" data-character-prompt="b" data-danbooru-autocomplete>{{ form_values['character_b_prompt'] }}</textarea>
+              </label>
+              <label class="character-region-prompt">
+                B &middot; negative / exclude
+                <textarea name="character_b_negative_prompt" rows="2" maxlength="20000" spellcheck="false" data-character-negative-prompt="b" data-duo-v2-control data-danbooru-autocomplete disabled>{{ form_values.get('character_b_negative_prompt', '') }}</textarea>
+              </label>
+            </article>
+          </div>
+          <div data-experiment-regional-prompts {% if form_values['composition_mode'] != 'duo' %}hidden{% endif %}>
+            {% include "dashboard/_controlled_duo_controls.html" %}
+          </div>
+        </section>
 
         <label class="experiment-prompt-field">
-          Positive prompt
+          Shared scene &amp; style &middot; positive
           <textarea name="prompt" rows="7" maxlength="20000" spellcheck="false" data-danbooru-autocomplete required>{{ form_values['prompt'] }}</textarea>
         </label>
         <label class="experiment-prompt-field">
-          Negative prompt
+          Shared scene &amp; style &middot; negative
           <textarea name="negative_prompt" rows="5" maxlength="20000" spellcheck="false" data-danbooru-autocomplete>{{ form_values['negative_prompt'] }}</textarea>
         </label>
 

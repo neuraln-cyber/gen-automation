@@ -260,8 +260,14 @@ def test_experiment_submission_creates_one_release_job_per_variant_with_paired_s
     assert "More steps" in results.text
     assert "data-experiment-results" in results.text
     assert progress.status_code == 200
-    assert progress.json()["expected"] == 4
-    assert len(progress.json()["variants"]) == 2
+    progress_payload = progress.json()
+    assert progress_payload["schema_version"] == 2
+    assert progress_payload["expected"] == 4
+    assert progress_payload["gpu_billing"]["state"] == "stale"
+    assert progress_payload["gpu_billing"]["estimated"] is True
+    assert progress_payload["poll_after_ms"] == 3000
+    assert len(progress_payload["variants"]) == 2
+    assert all("gpu_billing" not in variant for variant in progress_payload["variants"])
 
 
 def test_failed_experiment_creation_rolls_back_the_uncommitted_warm_lease(

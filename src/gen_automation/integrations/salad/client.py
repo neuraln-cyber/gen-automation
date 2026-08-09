@@ -20,6 +20,7 @@ from gen_automation.integrations.salad.models import (
     JSONObject,
     JSONValue,
     SaladContainerGroup,
+    SaladContainerGroupInstancePage,
     SaladContainerGroupPage,
     SaladGpuAvailability,
     SaladGpuClass,
@@ -29,6 +30,7 @@ from gen_automation.integrations.salad.models import (
     SaladQueueJobPage,
     as_json_object,
     parse_container_group,
+    parse_container_group_instance,
     parse_gpu_availability,
     parse_gpu_class,
     parse_organization_quotas,
@@ -411,6 +413,34 @@ class SaladClient:
         items = self._collection_items(data, "container group collection")
         return SaladContainerGroupPage(
             items=tuple(_parse_model(item, parse_container_group) for item in items)
+        )
+
+    async def list_container_group_instances(
+        self,
+        container_group_name: str,
+    ) -> SaladContainerGroupInstancePage:
+        group_segment = _path_segment(container_group_name, "container group name")
+        data = await self._request_json(
+            "GET",
+            f"{self._project_path}/containers/{group_segment}/instances",
+            expected_status=200,
+        )
+        values = data.get("instances")
+        if not isinstance(values, list):
+            raise SaladProtocolError(
+                "container group instance collection.instances must be an array"
+            )
+        try:
+            instances = tuple(
+                as_json_object(item, f"container group instance collection.instances[{index}]")
+                for index, item in enumerate(values)
+            )
+        except ValueError as error:
+            raise SaladProtocolError(str(error)) from error
+        return SaladContainerGroupInstancePage(
+            instances=tuple(
+                _parse_model(item, parse_container_group_instance) for item in instances
+            )
         )
 
     async def update_container_group(

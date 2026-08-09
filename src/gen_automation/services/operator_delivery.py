@@ -78,6 +78,11 @@ _TARGET_PUBLISHABLE_RELEASE_PHASES = frozenset(
         ReleasePhase.PUBLISHED,
     }
 )
+_X_LOSSLESS_PNG_TOO_LARGE_MESSAGE = (
+    "A selected full-resolution PNG exceeds X's 5 MiB image limit. "
+    "Nothing was converted or downscaled. Start a new review version, choose a "
+    "different image for X, then prepare the watermarked images again."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +130,7 @@ class DerivativeProgress:
     full_succeeded: int = 0
     full_failed: int = 0
     full_cancelled: int = 0
+    x_action_message: str | None = None
 
     @property
     def active_jobs(self) -> int:
@@ -310,6 +316,9 @@ async def load_operator_delivery(
             )
         ).all()
     )
+    x_selected_selection_ids = frozenset(
+        selection.id for selection in selections if selection.asset_id in x_selected_asset_ids
+    )
     job_rows = tuple(
         (
             await session.execute(
@@ -326,6 +335,13 @@ async def load_operator_delivery(
     jobs = tuple(job for job, _targets in job_rows)
     full_jobs = tuple(
         job for job, targets in job_rows if isinstance(targets, list) and "full" in targets
+    )
+    x_jobs = tuple(
+        job
+        for job, targets in job_rows
+        if isinstance(targets, list)
+        and "x_teaser" in targets
+        and job.release_selection_id in x_selected_selection_ids
     )
     output_rows = (
         await session.execute(
@@ -383,6 +399,23 @@ async def load_operator_delivery(
     full_state_counts = {
         state: sum(job.state == state for job in full_jobs) for state in DerivativeJobState
     }
+    x_has_active_jobs = any(
+        job.state
+        in {
+            DerivativeJobState.REQUESTED,
+            DerivativeJobState.CLAIMED,
+            DerivativeJobState.PROCESSING,
+            DerivativeJobState.RETRY_WAIT,
+        }
+        for job in x_jobs
+    )
+    x_action_message = (
+        _X_LOSSLESS_PNG_TOO_LARGE_MESSAGE
+        if len(x_outputs) != expected_x_count
+        and not x_has_active_jobs
+        and any(job.last_error_code == "x_lossless_png_too_large" for job in x_jobs)
+        else None
+    )
     ready_for_destinations = (
         review_task.state == ReviewTaskState.COMPLETED
         and release.phase == ReleasePhase.READY_TO_PUBLISH
@@ -422,6 +455,7 @@ async def load_operator_delivery(
             + full_state_counts[DerivativeJobState.CANCELLED]
         ),
         full_cancelled=full_state_counts[DerivativeJobState.CANCELLED],
+        x_action_message=x_action_message,
     )
 
     try:
@@ -1024,7 +1058,10 @@ async def _mega_destination(
 ) -> DestinationState:
     archive = await session.scalar(
         select(FinishedSetArchive)
-        .where(FinishedSetArchive.release_version_id == release_version_id)
+        .where(
+            FinishedSetArchive.release_version_id == release_version_id,
+            FinishedSetArchive.media_profile == "public-png-v1",
+        )
         .order_by(FinishedSetArchive.created_at.desc(), FinishedSetArchive.id.desc())
         .limit(1)
     )

@@ -1,6 +1,7 @@
 import re
 import unicodedata
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -8,6 +9,16 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.db.models import Release
+from gen_automation.domain.controlled_duo import (
+    WorkflowCapability,
+    require_controlled_duo_capabilities,
+)
+from gen_automation.services.gpu_billing import (
+    GpuBillingSnapshot,
+    gpu_billing_payload,
+    gpu_billing_poll_after_ms,
+    load_shared_gpu_billing_snapshot,
+)
 from gen_automation.services.new_sets import (
     NewSetOptions,
     NewSetResult,
@@ -96,6 +107,7 @@ class ExperimentStatus:
     group_slug: str
     title: str
     variants: tuple[ExperimentVariantStatus, ...]
+    gpu_billing: GpuBillingSnapshot
 
     @property
     def expected_outputs(self) -> int:
@@ -188,9 +200,17 @@ async def load_experiment_status(
     )
     if not releases:
         raise ExperimentNotFoundError("experiment was not found")
+    variant_gpu_billing = await load_shared_gpu_billing_snapshot(
+        session,
+        now=datetime.now(UTC),
+    )
     variants: list[ExperimentVariantStatus] = []
     for index, release in enumerate(releases):
-        current = await load_new_set_status(session, release_id=release.id)
+        current = await load_new_set_status(
+            session,
+            release_id=release.id,
+            gpu_billing_snapshot=variant_gpu_billing,
+        )
         variants.append(
             ExperimentVariantStatus(
                 index=index,
@@ -201,31 +221,47 @@ async def load_experiment_status(
             )
         )
     title = releases[0].title.rsplit(" · ", 1)[0]
+    gpu_billing = await load_shared_gpu_billing_snapshot(
+        session,
+        now=datetime.now(UTC),
+    )
     return ExperimentStatus(
         group_slug=group_slug,
         title=title,
         variants=tuple(variants),
+        gpu_billing=gpu_billing,
     )
 
 
 def experiment_progress_payload(current: ExperimentStatus) -> dict[str, object]:
     generated = current.generated_outputs
     expected = current.expected_outputs
+    complete = bool(expected and generated >= expected)
+    settled_poll_after_ms = (
+        3_000
+        if not complete or any(variant.status.poll_after_ms > 0 for variant in current.variants)
+        else 0
+    )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "group_slug": current.group_slug,
         "title": current.title,
         "generated": generated,
         "expected": expected,
         "percent": round(generated * 100 / expected, 1) if expected else 0.0,
-        "complete": bool(expected and generated >= expected),
+        "complete": complete,
+        "gpu_billing": gpu_billing_payload(current.gpu_billing),
+        "poll_after_ms": gpu_billing_poll_after_ms(
+            current.gpu_billing,
+            settled_poll_after_ms=settled_poll_after_ms,
+        ),
         "variants": [
             {
                 "index": variant.index,
                 "label": variant.label,
                 "release_id": str(variant.release_id),
                 "release_slug": variant.release_slug,
-                **new_set_progress_payload(variant.status),
+                **new_set_progress_payload(variant.status, include_gpu_billing=False),
             }
             for variant in current.variants
         ],
@@ -277,9 +313,24 @@ def _preflight(command: ExperimentSubmission, options: NewSetOptions) -> None:
         workflow = workflows.get(profile.workflow_approval_id)
         if workflow is None:
             raise ExperimentInputError(f"{variant.label}: the workflow is no longer approved")
-        if profile.composition_mode == "duo" and not workflow.has_regional_prompting:
-            raise ExperimentInputError(f"{variant.label}: two characters require a couple workflow")
-        if profile.composition_mode == "single" and workflow.has_regional_prompting:
+        if profile.composition_mode == "duo" and profile.duo_contract_version == 1:
+            if not workflow.has_regional_prompting:
+                raise ExperimentInputError(
+                    f"{variant.label}: two characters require a regional v1 workflow"
+                )
+        if profile.composition_mode == "duo" and profile.duo_contract_version == 2:
+            try:
+                require_controlled_duo_capabilities(
+                    frozenset(workflow.capabilities),
+                    isolation_mode=profile.duo_isolation_mode,
+                    quality_mode=profile.duo_quality_mode,
+                )
+            except ValueError as error:
+                raise ExperimentInputError(f"{variant.label}: {error}") from error
+        if profile.composition_mode == "single" and (
+            workflow.has_regional_prompting
+            or WorkflowCapability.CONTROLLED_DUO_V2 in workflow.capabilities
+        ):
             raise ExperimentInputError(
                 f"{variant.label}: one character requires a standard workflow"
             )

@@ -1850,6 +1850,7 @@ def _delivery_progress_payload(
             "ready_full_outputs": progress.ready_full_outputs,
             "expected_x_teasers": progress.expected_x_teasers,
             "ready_x_teasers": progress.ready_x_teasers,
+            "x_action_message": progress.x_action_message,
         },
         "archive": {
             "state": archive_state,

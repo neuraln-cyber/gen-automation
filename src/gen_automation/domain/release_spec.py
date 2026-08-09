@@ -7,9 +7,17 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    field_validator,
     model_validator,
 )
 
+from gen_automation.domain.controlled_duo import (
+    DuoCompositionPreset,
+    DuoIsolationMode,
+    DuoQualityMode,
+    WorkflowCapability,
+    require_controlled_duo_capabilities,
+)
 from gen_automation.domain.deliverability import MAX_ACCEPTED_IMAGES_PER_RELEASE
 from gen_automation.domain.generation_limits import (
     MAX_OUTPUTS_PER_GENERATION_JOB,
@@ -82,13 +90,32 @@ class WorkflowSpecification(StrictModel):
     version: str = Field(min_length=1, max_length=100)
     object_key: str = Field(min_length=1, max_length=1024)
     sha256: Sha256
+    capabilities: tuple[WorkflowCapability, ...] = Field(default=(), max_length=16)
+
+    @field_validator("capabilities")
+    @classmethod
+    def require_unique_capabilities(
+        cls,
+        values: tuple[WorkflowCapability, ...],
+    ) -> tuple[WorkflowCapability, ...]:
+        if len(values) != len(set(values)):
+            raise ValueError("workflow capabilities must be unique")
+        return tuple(sorted(values, key=str))
 
 
 class GenerationParameters(StrictModel):
     composition_mode: Literal["single", "duo"] = "single"
+    duo_contract_version: Literal[1, 2] = 1
+    composition_preset_id: DuoCompositionPreset | None = None
     prompt: str = Field(min_length=1, max_length=20000)
     character_a_prompt: str = Field(default="", max_length=20000)
     character_b_prompt: str = Field(default="", max_length=20000)
+    character_a_negative_prompt: str = Field(default="", max_length=20000)
+    character_b_negative_prompt: str = Field(default="", max_length=20000)
+    interaction_prompt: str = Field(default="", max_length=20000)
+    camera_prompt: str = Field(default="", max_length=20000)
+    duo_isolation_mode: DuoIsolationMode = DuoIsolationMode.BALANCED
+    duo_quality_mode: DuoQualityMode = DuoQualityMode.STANDARD
     negative_prompt: str = Field(default="", max_length=20000)
     detailer_prompt: str = Field(default="", max_length=20000)
     detailer_negative_prompt: str = Field(default="", max_length=20000)
@@ -127,14 +154,42 @@ class GenerationParameters(StrictModel):
         if self.composition_mode == "duo":
             if not self.character_a_prompt.strip() or not self.character_b_prompt.strip():
                 raise ValueError("two-character composition requires both character prompts")
-        elif self.character_a_prompt or self.character_b_prompt:
-            raise ValueError("character prompts require two-character composition")
+            if self.duo_contract_version == 1:
+                if (
+                    self.composition_preset_id is not None
+                    or self.character_a_negative_prompt
+                    or self.character_b_negative_prompt
+                    or self.interaction_prompt
+                    or self.camera_prompt
+                    or self.duo_isolation_mode != DuoIsolationMode.BALANCED
+                    or self.duo_quality_mode != DuoQualityMode.STANDARD
+                ):
+                    raise ValueError("Controlled Duo fields require duo contract version 2")
+            elif self.composition_preset_id is None:
+                raise ValueError("Controlled Duo v2 requires a composition preset")
+        elif (
+            self.duo_contract_version != 1
+            or self.composition_preset_id is not None
+            or self.character_a_prompt
+            or self.character_b_prompt
+            or self.character_a_negative_prompt
+            or self.character_b_negative_prompt
+            or self.interaction_prompt
+            or self.camera_prompt
+            or self.duo_isolation_mode != DuoIsolationMode.BALANCED
+            or self.duo_quality_mode != DuoQualityMode.STANDARD
+        ):
+            raise ValueError("Controlled Duo fields require two-character composition")
         prompt_bytes = sum(
             len(value.encode("utf-8"))
             for value in (
                 self.prompt,
                 self.character_a_prompt,
                 self.character_b_prompt,
+                self.character_a_negative_prompt,
+                self.character_b_negative_prompt,
+                self.interaction_prompt,
+                self.camera_prompt,
                 self.negative_prompt,
                 self.detailer_prompt,
                 self.detailer_negative_prompt,
@@ -203,11 +258,30 @@ class ReleaseSpecification(StrictModel):
             subject_urls = {str(subject.canonical_source_url) for subject in self.subjects}
             if len(self.subjects) != 2 or len(subject_urls) != 2:
                 raise ValueError("two-character composition requires exactly two distinct subjects")
+            if self.generation.duo_contract_version == 2:
+                require_controlled_duo_capabilities(
+                    frozenset(self.workflow.capabilities),
+                    isolation_mode=self.generation.duo_isolation_mode,
+                    quality_mode=self.generation.duo_quality_mode,
+                )
         if any(
             batch.generation.composition_mode != composition_mode
             for batch in self.generation_batches
         ):
             raise ValueError("all generation batches must use the same composition mode")
+        if any(
+            batch.generation.duo_contract_version != self.generation.duo_contract_version
+            for batch in self.generation_batches
+        ):
+            raise ValueError("all generation batches must use the same duo contract version")
+        if self.generation.duo_contract_version == 2:
+            capabilities = frozenset(self.workflow.capabilities)
+            for batch in self.generation_batches:
+                require_controlled_duo_capabilities(
+                    capabilities,
+                    isolation_mode=batch.generation.duo_isolation_mode,
+                    quality_mode=batch.generation.duo_quality_mode,
+                )
         if self.schema_version == 1:
             if self.generation_batches:
                 raise ValueError(

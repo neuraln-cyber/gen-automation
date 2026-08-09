@@ -12,8 +12,11 @@ from gen_automation.db.models import (
     WorkflowApproval,
 )
 from gen_automation.domain.canonical import canonical_sha256
+from gen_automation.domain.controlled_duo import (
+    WorkflowCapability,
+    effective_workflow_capabilities,
+)
 from gen_automation.domain.enums import ApprovalStatus, ModelArtifactKind
-from gen_automation.domain.generation_limits import REGIONAL_PROMPT_NODE_CLASSES
 from gen_automation.domain.release_spec import (
     ArtifactSpecification,
     ReleaseSpecification,
@@ -126,12 +129,25 @@ def _validate_workflow(
         or approval.revoked_by_user_id is not None
     ):
         raise _approval_error("workflow")
-    has_regional_prompting = REGIONAL_PROMPT_NODE_CLASSES.issubset(approval.reviewed_node_classes)
-    if specification.generation.composition_mode == "duo" and not has_regional_prompting:
+    capabilities = effective_workflow_capabilities(
+        approval.capabilities,
+        reviewed_node_classes=approval.reviewed_node_classes,
+    )
+    frozen_capabilities = frozenset(workflow.capabilities)
+    if frozen_capabilities and frozen_capabilities != capabilities:
+        raise ReleaseApprovalError("frozen workflow capabilities do not match the approval")
+    supports_legacy_duo = WorkflowCapability.REGIONAL_PROMPTING_V1 in capabilities
+    supports_controlled_duo = WorkflowCapability.CONTROLLED_DUO_V2 in capabilities
+    generation = specification.generation
+    if (
+        generation.composition_mode == "duo"
+        and generation.duo_contract_version == 1
+        and not supports_legacy_duo
+    ):
         raise ReleaseApprovalError(
             "two-character composition requires an approved regional workflow"
         )
-    if specification.generation.composition_mode == "single" and has_regional_prompting:
+    if generation.composition_mode == "single" and (supports_legacy_duo or supports_controlled_duo):
         raise ReleaseApprovalError(
             "single-character composition requires an approved standard workflow"
         )
@@ -142,6 +158,7 @@ def _validate_workflow(
         "approved_at": approval.approved_at.isoformat(),
         "workflow_sha256": approval.workflow_sha256,
         "evidence_sha256": approval.evidence_sha256,
+        "capabilities": sorted(str(item) for item in capabilities),
         "reviewed_node_classes": sorted(approval.reviewed_node_classes),
     }
 

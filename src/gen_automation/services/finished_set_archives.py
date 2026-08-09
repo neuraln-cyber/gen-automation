@@ -1,9 +1,9 @@
 """Provider-independent, restart-safe archives for completed ranked sets.
 
-The finished-set archive is intentionally separate from Patreon, MEGA, and X
-preparation. It freezes the clean ``full`` derivative outputs in generation-queue
-order and makes those bytes downloadable as soon as the derivative handoff is
-complete.
+A succeeded Patreon ``full`` derivative remains the readiness gate for every
+selection.  Public archives use a separately rendered, metadata-free,
+full-resolution PNG cached as an immutable object.  Raw masters are decoded
+only by the one-shot isolated renderer; the controller never opens them.
 """
 
 from __future__ import annotations
@@ -40,15 +40,35 @@ from gen_automation.db.models import (
 from gen_automation.domain.canonical import canonical_json_bytes
 from gen_automation.domain.deliverability import (
     MAX_ACCEPTED_IMAGES_PER_RELEASE,
+    MAX_PIPELINE_MASTER_HEIGHT,
+    MAX_PIPELINE_MASTER_WIDTH,
 )
 from gen_automation.domain.enums import (
     AdminRole,
+    AssetKind,
+    AssetState,
     DerivativeJobState,
     FinishedSetArchiveState,
     ReleasePhase,
     ReviewTaskState,
 )
 from gen_automation.domain.ids import uuid7
+from gen_automation.services.derivative_isolation import (
+    render_platform_derivatives_isolated,
+)
+from gen_automation.services.derivatives import (
+    DERIVATIVE_RENDERER_VERSION,
+    PILLOW_VERSION,
+    DerivativeInputError,
+    DerivativeRecipe,
+    DerivativeRecipeError,
+    DerivativeRenderError,
+    DerivativeSafetyLimits,
+    FullDerivativeSpec,
+    OutputFormat,
+    PngEncoding,
+    derivative_recipe_sha256,
+)
 from gen_automation.services.generation_positions import (
     generation_ordinal,
     generation_queue_offsets,
@@ -65,25 +85,52 @@ from gen_automation.storage.base import (
 )
 
 _ARCHIVE_CONTENT_TYPE = "application/zip"
-_ARCHIVE_SCHEMA = "finished-set-manifest/v1"
-_PART_SCHEMA = "finished-set-part-manifest/v1"
+_ARCHIVE_SCHEMA = "finished-set-manifest/v2"
+_PART_SCHEMA = "finished-set-part-manifest/v2"
+_PUBLIC_MEDIA_PROFILE = "public-png-v1"
+_LEGACY_MEDIA_PROFILE = "legacy-full-derivative-v1"
+_PUBLIC_PNG_ENCODER = "isolated-pillow-png6-v1"
+_MAX_PUBLIC_PNG_BYTES = 64 * 1024 * 1024
 _MAX_ARCHIVE_PARTS = MAX_ACCEPTED_IMAGES_PER_RELEASE
 _MAX_IMAGES_PER_PART = 100
 _MAX_SAFE_ERROR_BYTES = 500
 _MIN_ARCHIVE_BYTES = 1024
 _MAX_ARCHIVE_BYTES = 160 * 1024 * 1024
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
-_IMAGE_EXTENSIONS = {
-    "image/jpeg": "jpg",
-    "image/png": "png",
-    "image/webp": "webp",
-}
 _DOWNLOADABLE_RELEASE_PHASES = (
     ReleasePhase.RENDERING,
     ReleasePhase.READY_TO_PUBLISH,
     ReleasePhase.PUBLISHING,
     ReleasePhase.PUBLISHED,
 )
+
+_PUBLIC_PNG_RECIPE = DerivativeRecipe(
+    version=_PUBLIC_MEDIA_PROFILE,
+    full=FullDerivativeSpec(
+        output_filename="public.png",
+        max_width=MAX_PIPELINE_MASTER_WIDTH,
+        max_height=MAX_PIPELINE_MASTER_HEIGHT,
+        encoding=PngEncoding(compress_level=6),
+    ),
+    watermark=None,
+)
+_PUBLIC_PNG_RECIPE_SHA256 = derivative_recipe_sha256(_PUBLIC_PNG_RECIPE)
+_PUBLIC_PNG_LIMITS = DerivativeSafetyLimits(
+    max_output_bytes=_MAX_PUBLIC_PNG_BYTES,
+    max_full_output_bytes=_MAX_PUBLIC_PNG_BYTES,
+)
+_PUBLIC_PNG_RENDER_IDENTITY = hashlib.sha256(
+    canonical_json_bytes(
+        {
+            "media_profile": _PUBLIC_MEDIA_PROFILE,
+            "encoder": _PUBLIC_PNG_ENCODER,
+            "recipe_sha256": _PUBLIC_PNG_RECIPE_SHA256,
+            "renderer_version": DERIVATIVE_RENDERER_VERSION,
+            "pillow_version": PILLOW_VERSION,
+            "maximum_output_bytes": _MAX_PUBLIC_PNG_BYTES,
+        }
+    )
+).hexdigest()
 
 
 class FinishedSetArchiveError(Exception):
@@ -135,6 +182,7 @@ class FinishedSetArchiveSnapshot:
     completed_at: datetime | None
     last_error_code: str | None
     last_error_detail: str | None
+    media_profile: str
     parts: tuple[FinishedSetArchivePartSnapshot, ...]
     requested_by_user_id: UUID | None = None
     mega_requested_by_user_id: UUID | None = None
@@ -183,6 +231,10 @@ class _OutputRecord:
     review_display_order: int
     ranking_rank: int
     selection_id: UUID
+    source_asset_id: UUID
+    source_object_version_id: str
+    source_sha256: str
+    source_byte_size: int
     output_id: UUID
     object_key: str
     object_version_id: str
@@ -193,6 +245,24 @@ class _OutputRecord:
     height: int
     byte_size: int
     path: str
+    public_recipe_sha256: str
+    public_lineage_sha256: str
+    public_renderer_version: str
+    public_pillow_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedPublicPng:
+    object_key: str
+    object_version_id: str
+    sha256: str
+    byte_size: int
+    width: int
+    height: int
+    recipe_sha256: str
+    lineage_sha256: str
+    renderer_version: str
+    pillow_version: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,11 +312,13 @@ async def request_finished_set_archive(
     *,
     review_task_id: UUID,
     requested_by_user_id: UUID | None = None,
+    media_profile: str = _PUBLIC_MEDIA_PROFILE,
     now: datetime | None = None,
 ) -> FinishedSetArchiveSnapshot:
     """Idempotently request an archive for one completed, current review."""
 
     requested_at = _as_utc(now or datetime.now(UTC))
+    normalized_profile = _require_public_media_profile(media_profile)
     review, _release, version = await _load_completed_ready_review(
         session,
         review_task_id=review_task_id,
@@ -260,7 +332,10 @@ async def request_finished_set_archive(
     _require_selection_count(selection_count)
     archive = await session.scalar(
         select(FinishedSetArchive)
-        .where(FinishedSetArchive.review_task_id == review.id)
+        .where(
+            FinishedSetArchive.review_task_id == review.id,
+            FinishedSetArchive.media_profile == normalized_profile,
+        )
         .with_for_update()
     )
     if archive is None:
@@ -268,6 +343,7 @@ async def request_finished_set_archive(
             id=uuid7(),
             review_task_id=review.id,
             release_version_id=version.id,
+            media_profile=normalized_profile,
             requested_by_user_id=requested_by_user_id,
             state=FinishedSetArchiveState.PENDING,
             selection_count=selection_count,
@@ -291,6 +367,7 @@ async def request_finished_set_archive(
             archive,
             release_version_id=version.id,
             selection_count=selection_count,
+            media_profile=normalized_profile,
         )
         if requested_by_user_id is not None and archive.requested_by_user_id is None:
             archive.requested_by_user_id = requested_by_user_id
@@ -313,10 +390,19 @@ async def request_finished_set_archive(
     except IntegrityError:
         await session.rollback()
         archive = await session.scalar(
-            select(FinishedSetArchive).where(FinishedSetArchive.review_task_id == review_task_id)
+            select(FinishedSetArchive).where(
+                FinishedSetArchive.review_task_id == review_task_id,
+                FinishedSetArchive.media_profile == normalized_profile,
+            )
         )
         if archive is None:
             raise
+        _validate_archive_identity(
+            archive,
+            release_version_id=version.id,
+            selection_count=selection_count,
+            media_profile=normalized_profile,
+        )
     snapshot = await _snapshot(session, archive)
     return snapshot
 
@@ -325,11 +411,16 @@ async def load_finished_set_archive(
     session: AsyncSession,
     *,
     review_task_id: UUID,
+    media_profile: str = _PUBLIC_MEDIA_PROFILE,
 ) -> FinishedSetArchiveSnapshot | None:
     """Return the archive snapshot, or ``None`` before any archive is requested."""
 
+    normalized_profile = _normalize_media_profile(media_profile)
     archive = await session.scalar(
-        select(FinishedSetArchive).where(FinishedSetArchive.review_task_id == review_task_id)
+        select(FinishedSetArchive).where(
+            FinishedSetArchive.review_task_id == review_task_id,
+            FinishedSetArchive.media_profile == normalized_profile,
+        )
     )
     if archive is None:
         return None
@@ -515,7 +606,14 @@ async def run_finished_set_archive_cycle(
 
     try:
         async with sessions() as session:
-            plan = await _load_plan(session, archive_id=claim.archive_id, store=store)
+            plan = await _load_plan(
+                session,
+                archive_id=claim.archive_id,
+                store=store,
+                claim=claim,
+                lease_seconds=normalized_lease,
+                now_override=now,
+            )
         chunks = _partition_outputs(plan, max_archive_bytes=normalized_max_bytes)
         async with sessions() as session:
             checkpointed = await _prepare_checkpoint_resume(
@@ -653,6 +751,7 @@ async def _fail_one_exhausted_lease(
     archive = await session.scalar(
         select(FinishedSetArchive)
         .where(
+            FinishedSetArchive.media_profile == _PUBLIC_MEDIA_PROFILE,
             FinishedSetArchive.state == FinishedSetArchiveState.PROCESSING,
             FinishedSetArchive.lease_expires_at.is_not(None),
             FinishedSetArchive.lease_expires_at <= now,
@@ -714,6 +813,7 @@ async def _claim_archive(
         .join(Release, Release.id == ReleaseVersion.release_id)
         .where(
             due,
+            FinishedSetArchive.media_profile == _PUBLIC_MEDIA_PROFILE,
             FinishedSetArchive.attempts < FinishedSetArchive.max_attempts,
             ReviewTask.state == ReviewTaskState.COMPLETED,
             Release.current_version_no == ReleaseVersion.version_no,
@@ -781,13 +881,18 @@ async def _load_plan(
     *,
     archive_id: UUID,
     store: ObjectStore,
+    claim: _ClaimedArchive,
+    lease_seconds: int,
+    now_override: datetime | None,
 ) -> _ArchivePlan:
     archive = await session.get(FinishedSetArchive, archive_id)
     if archive is None:
         raise _FinishedSetArchiveContractError("claimed archive no longer exists")
     if archive.state != FinishedSetArchiveState.PROCESSING:
         raise _FinishedSetArchiveContractError("claimed archive is no longer processing")
-    review, _release, version = await _load_completed_ready_review(
+    if archive.media_profile != _PUBLIC_MEDIA_PROFILE:
+        raise _FinishedSetArchiveContractError("claimed archive has an unsupported media profile")
+    review, release, version = await _load_completed_ready_review(
         session,
         review_task_id=archive.review_task_id,
         lock=False,
@@ -925,18 +1030,80 @@ async def _load_plan(
             selection.release_version_id != version.id
             or job.release_selection_id != selection.id
             or output.release_selection_id != selection.id
+            or output.source_asset_id != selection.asset_id
             or source_asset.id != selection.asset_id
-            or output.asset_storage_backend != store.backend
-            or output.asset_storage_bucket != store.bucket
+            or source_asset.release_id != release.id
+            or source_asset.kind != AssetKind.RAW_MASTER
+            or source_asset.state != AssetState.AVAILABLE
+            or selection.source_storage_backend != source_asset.storage_backend
+            or selection.source_storage_bucket != source_asset.storage_bucket
+            or selection.source_object_key != source_asset.object_key
+            or selection.source_object_version_id != source_asset.object_version_id
+            or selection.source_sha256 != source_asset.sha256
+            or selection.source_content_type != source_asset.content_type
+            or selection.source_image_format != source_asset.image_format
+            or selection.source_width != source_asset.width
+            or selection.source_height != source_asset.height
+            or selection.source_byte_size != source_asset.byte_size
+            or source_asset.available_at is None
+            or _as_utc(selection.source_available_at) != _as_utc(source_asset.available_at)
+            or selection.source_storage_backend != store.backend
+            or selection.source_storage_bucket != store.bucket
         ):
             raise _FinishedSetArchiveContractError(
-                "finished-set derivative storage snapshot is inconsistent"
+                "finished-set source snapshot or full-derivative provenance is inconsistent"
             )
-        extension = _IMAGE_EXTENSIONS.get(output.asset_content_type.lower())
-        if extension is None:
+        if (
+            selection.source_content_type.strip().lower() != "image/png"
+            or selection.source_image_format.strip().upper() != "PNG"
+        ):
             raise _FinishedSetArchiveContractError(
-                "finished-set outputs must be JPEG, PNG, or WebP images"
+                "public finished-set sources must be full-resolution PNG masters"
             )
+        await _renew_claim_lease(
+            session,
+            claim=claim,
+            lease_seconds=lease_seconds,
+            now=_runtime_now(now_override),
+        )
+        public_png = await _adopt_public_png_if_present(
+            store,
+            source_asset_id=selection.asset_id,
+            source_object_version_id=selection.source_object_version_id,
+            source_sha256=selection.source_sha256,
+            source_byte_size=selection.source_byte_size,
+            source_width=selection.source_width,
+            source_height=selection.source_height,
+        )
+        if public_png is None:
+            source_body = await store.read_bytes(
+                selection.source_object_key,
+                version_id=selection.source_object_version_id,
+                max_bytes=selection.source_byte_size,
+            )
+            if (
+                len(source_body) != selection.source_byte_size
+                or hashlib.sha256(source_body).hexdigest() != selection.source_sha256
+            ):
+                raise _FinishedSetArchiveContractError(
+                    "a finished-set source no longer matches its frozen bytes"
+                )
+            public_png = await _render_or_adopt_public_png(
+                store,
+                source_body,
+                source_asset_id=selection.asset_id,
+                source_object_version_id=selection.source_object_version_id,
+                source_sha256=selection.source_sha256,
+                source_byte_size=selection.source_byte_size,
+                source_width=selection.source_width,
+                source_height=selection.source_height,
+            )
+        await _renew_claim_lease(
+            session,
+            claim=claim,
+            lease_seconds=lease_seconds,
+            now=_runtime_now(now_override),
+        )
         outputs.append(
             _OutputRecord(
                 ordinal=archive_ordinal,
@@ -947,22 +1114,31 @@ async def _load_plan(
                 review_display_order=selection.display_order,
                 ranking_rank=selection.ranking_rank,
                 selection_id=selection.id,
+                source_asset_id=selection.asset_id,
+                source_object_version_id=selection.source_object_version_id,
+                source_sha256=selection.source_sha256,
+                source_byte_size=selection.source_byte_size,
                 output_id=output.id,
-                object_key=output.asset_object_key,
-                object_version_id=output.asset_object_version_id,
-                sha256=output.asset_sha256,
-                content_type=output.asset_content_type,
-                image_format=output.asset_image_format,
-                width=output.asset_width,
-                height=output.asset_height,
-                byte_size=output.asset_byte_size,
-                path=f"content/{archive_ordinal:03d}.{extension}",
+                object_key=public_png.object_key,
+                object_version_id=public_png.object_version_id,
+                sha256=public_png.sha256,
+                content_type="image/png",
+                image_format="PNG",
+                width=public_png.width,
+                height=public_png.height,
+                byte_size=public_png.byte_size,
+                path=f"content/{archive_ordinal:03d}.png",
+                public_recipe_sha256=public_png.recipe_sha256,
+                public_lineage_sha256=public_png.lineage_sha256,
+                public_renderer_version=public_png.renderer_version,
+                public_pillow_version=public_png.pillow_version,
             )
         )
     _validate_archive_identity(
         archive,
         release_version_id=version.id,
         selection_count=len(outputs),
+        media_profile=_PUBLIC_MEDIA_PROFILE,
     )
     manifest = canonical_json_bytes(
         {
@@ -971,6 +1147,9 @@ async def _load_plan(
             "review_task_id": str(review.id),
             "release_version_id": str(version.id),
             "selection_count": len(outputs),
+            "media_profile": _PUBLIC_MEDIA_PROFILE,
+            "public_png_encoder": _PUBLIC_PNG_ENCODER,
+            "public_render_identity": _PUBLIC_PNG_RENDER_IDENTITY,
             "max_images_per_part": _MAX_IMAGES_PER_PART,
             "ordering": "frozen_generation_queue",
             "ordering_key": [
@@ -1038,21 +1217,36 @@ async def _build_part(
 ) -> _BuiltPart:
     image_entries: list[tuple[str, bytes]] = []
     for output in outputs:
-        body = await store.read_bytes(
-            output.object_key,
-            version_id=output.object_version_id,
-            max_bytes=output.byte_size,
-        )
-        if len(body) != output.byte_size or hashlib.sha256(body).hexdigest() != output.sha256:
+        metadata = await store.head(output.object_key)
+        if metadata is None or metadata.version_id != output.object_version_id:
             raise _FinishedSetArchiveContractError(
-                "a finished-set derivative no longer matches its frozen bytes"
+                "a cached public PNG version no longer matches the archive plan"
             )
-        try:
-            require_metadata_free_image(body, content_type=output.content_type)
-        except OutboundImagePrivacyError as error:
+        cached, body = await _load_cached_public_png(
+            store,
+            key=output.object_key,
+            metadata=metadata,
+            static_metadata=_public_png_static_metadata(
+                source_asset_id=output.source_asset_id,
+                source_object_version_id=output.source_object_version_id,
+                source_sha256=output.source_sha256,
+                source_byte_size=output.source_byte_size,
+            ),
+            expected_width=output.width,
+            expected_height=output.height,
+        )
+        if (
+            cached.object_version_id != output.object_version_id
+            or cached.sha256 != output.sha256
+            or cached.byte_size != output.byte_size
+            or cached.recipe_sha256 != output.public_recipe_sha256
+            or cached.lineage_sha256 != output.public_lineage_sha256
+            or cached.renderer_version != output.public_renderer_version
+            or cached.pillow_version != output.public_pillow_version
+        ):
             raise _FinishedSetArchiveContractError(
-                "a finished-set derivative contains embedded metadata"
-            ) from error
+                "a cached public PNG no longer matches the archive manifest"
+            )
         image_entries.append((output.path, body))
     part_manifest = _part_manifest(
         plan,
@@ -1524,6 +1718,7 @@ async def _snapshot(
         archive_id=archive.id,
         review_task_id=archive.review_task_id,
         release_version_id=archive.release_version_id,
+        media_profile=archive.media_profile,
         state=archive.state,
         selection_count=archive.selection_count,
         manifest_sha256=archive.manifest_sha256,
@@ -1621,15 +1816,33 @@ def _validate_archive_identity(
     *,
     release_version_id: UUID,
     selection_count: int,
+    media_profile: str | None = None,
 ) -> None:
     _require_selection_count(selection_count)
     if (
         archive.release_version_id != release_version_id
         or archive.selection_count != selection_count
+        or (media_profile is not None and archive.media_profile != media_profile)
     ):
         raise FinishedSetArchiveConflictError(
             "finished-set archive no longer matches the completed review"
         )
+
+
+def _normalize_media_profile(media_profile: str) -> str:
+    if not isinstance(media_profile, str):
+        raise FinishedSetArchiveInputError("finished-set media profile is invalid")
+    normalized = media_profile.strip()
+    if normalized not in {_PUBLIC_MEDIA_PROFILE, _LEGACY_MEDIA_PROFILE}:
+        raise FinishedSetArchiveInputError("finished-set media profile is unsupported")
+    return normalized
+
+
+def _require_public_media_profile(media_profile: str) -> str:
+    normalized = _normalize_media_profile(media_profile)
+    if normalized != _PUBLIC_MEDIA_PROFILE:
+        raise FinishedSetArchiveInputError("new archives require the public PNG media profile")
+    return normalized
 
 
 def _require_selection_count(selection_count: int) -> None:
@@ -1650,7 +1863,13 @@ def _manifest_record(output: _OutputRecord) -> dict[str, Any]:
         "review_display_order": output.review_display_order,
         "ranking_rank": output.ranking_rank,
         "selection_id": str(output.selection_id),
-        "derivative_output_id": str(output.output_id),
+        "source_asset_id": str(output.source_asset_id),
+        "source_sha256": output.source_sha256,
+        "readiness_derivative_output_id": str(output.output_id),
+        "public_recipe_sha256": output.public_recipe_sha256,
+        "public_lineage_sha256": output.public_lineage_sha256,
+        "public_renderer_version": output.public_renderer_version,
+        "public_pillow_version": output.public_pillow_version,
         "path": output.path,
         "sha256": output.sha256,
         "content_type": output.content_type,
@@ -1659,6 +1878,330 @@ def _manifest_record(output: _OutputRecord) -> dict[str, Any]:
         "height": output.height,
         "byte_size": output.byte_size,
     }
+
+
+async def _adopt_public_png_if_present(
+    store: ObjectStore,
+    *,
+    source_asset_id: UUID,
+    source_object_version_id: str,
+    source_sha256: str,
+    source_byte_size: int,
+    source_width: int,
+    source_height: int,
+) -> _CachedPublicPng | None:
+    key = _public_png_cache_key(
+        source_asset_id=source_asset_id,
+        source_object_version_id=source_object_version_id,
+        source_sha256=source_sha256,
+    )
+    existing = await store.head(key)
+    if existing is None:
+        return None
+    cached, _body = await _load_cached_public_png(
+        store,
+        key=key,
+        metadata=existing,
+        static_metadata=_public_png_static_metadata(
+            source_asset_id=source_asset_id,
+            source_object_version_id=source_object_version_id,
+            source_sha256=source_sha256,
+            source_byte_size=source_byte_size,
+        ),
+        expected_width=source_width,
+        expected_height=source_height,
+    )
+    return cached
+
+
+async def _render_or_adopt_public_png(
+    store: ObjectStore,
+    source: bytes,
+    *,
+    source_asset_id: UUID,
+    source_object_version_id: str,
+    source_sha256: str,
+    source_byte_size: int,
+    source_width: int,
+    source_height: int,
+) -> _CachedPublicPng:
+    """Render in isolation once, or adopt a strictly verified durable cache object."""
+
+    cached = await _adopt_public_png_if_present(
+        store,
+        source_asset_id=source_asset_id,
+        source_object_version_id=source_object_version_id,
+        source_sha256=source_sha256,
+        source_byte_size=source_byte_size,
+        source_width=source_width,
+        source_height=source_height,
+    )
+    if cached is not None:
+        return cached
+    key = _public_png_cache_key(
+        source_asset_id=source_asset_id,
+        source_object_version_id=source_object_version_id,
+        source_sha256=source_sha256,
+    )
+    static_metadata = _public_png_static_metadata(
+        source_asset_id=source_asset_id,
+        source_object_version_id=source_object_version_id,
+        source_sha256=source_sha256,
+        source_byte_size=source_byte_size,
+    )
+    try:
+        bundle = await render_platform_derivatives_isolated(
+            source,
+            recipe=_PUBLIC_PNG_RECIPE,
+            watermark_png=None,
+            targets=("full",),
+            limits=_PUBLIC_PNG_LIMITS,
+            renderer_version=DERIVATIVE_RENDERER_VERSION,
+        )
+    except (DerivativeInputError, DerivativeRecipeError, DerivativeRenderError) as error:
+        raise _FinishedSetArchiveContractError(
+            "the frozen source cannot produce a valid public PNG"
+        ) from error
+    if (
+        bundle.source_sha256 != source_sha256
+        or bundle.recipe_sha256 != _PUBLIC_PNG_RECIPE_SHA256
+        or len(bundle.artifacts) != 1
+    ):
+        raise _FinishedSetArchiveContractError(
+            "the isolated public PNG renderer returned inconsistent lineage"
+        )
+    artifact = bundle.artifacts[0]
+    if (
+        artifact.target.value != "full"
+        or artifact.output_filename != "public.png"
+        or artifact.content_type != "image/png"
+        or artifact.image_format is not OutputFormat.PNG
+        or artifact.extension != "png"
+        or artifact.recipe_sha256 != _PUBLIC_PNG_RECIPE_SHA256
+        or artifact.lineage.source_sha256 != source_sha256
+        or artifact.lineage.source_byte_size != source_byte_size
+        or artifact.lineage.source_format != "PNG"
+        or artifact.lineage.source_width != source_width
+        or artifact.lineage.source_height != source_height
+        or artifact.lineage.renderer_version != DERIVATIVE_RENDERER_VERSION
+        or artifact.lineage.pillow_version != PILLOW_VERSION
+        or artifact.width != source_width
+        or artifact.height != source_height
+        or artifact.byte_size != len(artifact.data)
+        or artifact.byte_size <= 0
+        or artifact.byte_size > _MAX_PUBLIC_PNG_BYTES
+        or artifact.sha256 != hashlib.sha256(artifact.data).hexdigest()
+    ):
+        raise _FinishedSetArchiveContractError(
+            "the isolated public PNG renderer returned an invalid full-resolution artifact"
+        )
+    _validate_public_png_bytes(
+        artifact.data,
+        sha256=artifact.sha256,
+        width=source_width,
+        height=source_height,
+    )
+    expected_metadata = {
+        **static_metadata,
+        "sha256": artifact.sha256,
+        "byte-size": str(artifact.byte_size),
+        "width": str(artifact.width),
+        "height": str(artifact.height),
+        "lineage-sha256": artifact.lineage_sha256,
+    }
+    stored: ObjectMetadata | None
+    try:
+        stored = await store.write_bytes_if_absent(
+            key=key,
+            body=artifact.data,
+            content_type="image/png",
+            metadata=expected_metadata,
+            max_bytes=_MAX_PUBLIC_PNG_BYTES,
+        )
+    except ObjectAlreadyExistsError as error:
+        stored = await store.head(key)
+        if stored is None:
+            raise _FinishedSetArchiveContractError(
+                "a concurrent public PNG cache object could not be adopted"
+            ) from error
+        adopted, _body = await _load_cached_public_png(
+            store,
+            key=key,
+            metadata=stored,
+            static_metadata=static_metadata,
+            expected_width=source_width,
+            expected_height=source_height,
+        )
+        if adopted.sha256 != artifact.sha256:
+            raise _FinishedSetArchiveContractError(
+                "a concurrent public PNG cache object has different deterministic bytes"
+            ) from error
+        return adopted
+    assert stored is not None
+    cached, _body = await _load_cached_public_png(
+        store,
+        key=key,
+        metadata=stored,
+        static_metadata=static_metadata,
+        expected_width=source_width,
+        expected_height=source_height,
+    )
+    return cached
+
+
+async def _load_cached_public_png(
+    store: ObjectStore,
+    *,
+    key: str,
+    metadata: ObjectMetadata,
+    static_metadata: dict[str, str],
+    expected_width: int,
+    expected_height: int,
+) -> tuple[_CachedPublicPng, bytes]:
+    values = metadata.metadata
+    try:
+        sha256 = values["sha256"]
+        byte_size = int(values["byte-size"])
+        width = int(values["width"])
+        height = int(values["height"])
+        lineage_sha256 = values["lineage-sha256"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise _FinishedSetArchiveContractError(
+            "a cached public PNG has incomplete immutable metadata"
+        ) from error
+    if (
+        metadata.key != key
+        or metadata.version_id is None
+        or metadata.content_type != "image/png"
+        or metadata.byte_size != byte_size
+        or not 0 < byte_size <= _MAX_PUBLIC_PNG_BYTES
+        or not re.fullmatch(r"[0-9a-f]{64}", sha256)
+        or not re.fullmatch(r"[0-9a-f]{64}", lineage_sha256)
+        or (width, height) != (expected_width, expected_height)
+        or set(values)
+        != {
+            *static_metadata,
+            "sha256",
+            "byte-size",
+            "width",
+            "height",
+            "lineage-sha256",
+        }
+        or any(values.get(name) != value for name, value in static_metadata.items())
+    ):
+        raise _FinishedSetArchiveContractError(
+            "a cached public PNG does not match its frozen render identity"
+        )
+    body = await store.read_bytes(
+        key,
+        version_id=metadata.version_id,
+        max_bytes=_MAX_PUBLIC_PNG_BYTES,
+    )
+    _validate_public_png_bytes(
+        body,
+        sha256=sha256,
+        width=width,
+        height=height,
+    )
+    if len(body) != byte_size:
+        raise _FinishedSetArchiveContractError(
+            "a cached public PNG does not match its immutable byte size"
+        )
+    return (
+        _CachedPublicPng(
+            object_key=key,
+            object_version_id=metadata.version_id,
+            sha256=sha256,
+            byte_size=byte_size,
+            width=width,
+            height=height,
+            recipe_sha256=_PUBLIC_PNG_RECIPE_SHA256,
+            lineage_sha256=lineage_sha256,
+            renderer_version=DERIVATIVE_RENDERER_VERSION,
+            pillow_version=PILLOW_VERSION,
+        ),
+        body,
+    )
+
+
+def _public_png_cache_key(
+    *,
+    source_asset_id: UUID,
+    source_object_version_id: str,
+    source_sha256: str,
+) -> str:
+    version_identity = hashlib.sha256(source_object_version_id.encode("utf-8")).hexdigest()
+    return (
+        f"public-media/{_PUBLIC_MEDIA_PROFILE}/{_PUBLIC_PNG_RENDER_IDENTITY}/"
+        f"{source_sha256}/{source_asset_id}/{version_identity}.png"
+    )
+
+
+def _public_png_static_metadata(
+    *,
+    source_asset_id: UUID,
+    source_object_version_id: str,
+    source_sha256: str,
+    source_byte_size: int,
+) -> dict[str, str]:
+    return {
+        "media-profile": _PUBLIC_MEDIA_PROFILE,
+        "render-identity": _PUBLIC_PNG_RENDER_IDENTITY,
+        "encoder": _PUBLIC_PNG_ENCODER,
+        "recipe-sha256": _PUBLIC_PNG_RECIPE_SHA256,
+        "renderer-version": DERIVATIVE_RENDERER_VERSION,
+        "pillow-version": PILLOW_VERSION,
+        "source-asset-id": str(source_asset_id),
+        "source-object-version-id": source_object_version_id,
+        "source-sha256": source_sha256,
+        "source-byte-size": str(source_byte_size),
+        "image-format": "PNG",
+    }
+
+
+def _validate_public_png_bytes(
+    body: bytes,
+    *,
+    sha256: str,
+    width: int,
+    height: int,
+) -> None:
+    if not body or len(body) > _MAX_PUBLIC_PNG_BYTES or hashlib.sha256(body).hexdigest() != sha256:
+        raise _FinishedSetArchiveContractError(
+            "a public PNG does not match its immutable content identity"
+        )
+    try:
+        require_metadata_free_image(body, content_type="image/png")
+    except OutboundImagePrivacyError as error:
+        raise _FinishedSetArchiveContractError(
+            "a public PNG contains embedded private metadata"
+        ) from error
+    if _png_dimensions(body) != (width, height):
+        raise _FinishedSetArchiveContractError(
+            "a public PNG does not match its immutable dimensions"
+        )
+
+
+def _png_dimensions(payload: bytes) -> tuple[int, int]:
+    """Read dimensions from a PNG that already passed the strict privacy parser."""
+
+    return (
+        int.from_bytes(payload[16:20], "big"),
+        int.from_bytes(payload[20:24], "big"),
+    )
+
+
+async def _renew_claim_lease(
+    session: AsyncSession,
+    *,
+    claim: _ClaimedArchive,
+    lease_seconds: int,
+    now: datetime,
+) -> None:
+    archive = await _locked_claim_archive(session, claim=claim, now=now)
+    archive.lease_expires_at = now + timedelta(seconds=lease_seconds)
+    archive.updated_at = now
+    await session.commit()
 
 
 def _part_manifest(

@@ -688,6 +688,11 @@
             {% if not delivery.x_selected_count %}
               <p class="terminal-state">No teaser images were selected for this set.</p>
             {% else %}
+              {% if delivery.progress.x_action_message %}
+                <p class="form-error" role="alert" data-x-lossless-png-too-large>
+                  {{ delivery.progress.x_action_message }}
+                </p>
+              {% endif %}
               {% set x_teasers_ready = delivery.progress.ready_x_teasers == delivery.progress.expected_x_teasers %}
               {% set replacing_x_teasers = x_output_downloads|length > 0 %}
               {% set replacement_allowed = x_teaser_revision and x_teaser_revision.can_replace %}

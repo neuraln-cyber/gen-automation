@@ -25,10 +25,16 @@ from gen_automation.domain.deliverability import (
     X_STATIC_IMAGE_MAX_BYTES,
 )
 
-DERIVATIVE_RENDERER_VERSION = "pillow-derivative-v5"
+DERIVATIVE_RENDERER_VERSION = "pillow-derivative-v6"
+PILLOW_VERSION = PIL.__version__
 LEGACY_DERIVATIVE_RENDERER_VERSION = "pillow-derivative-v4"
+PREVIOUS_DERIVATIVE_RENDERER_VERSION = "pillow-derivative-v5"
 SUPPORTED_DERIVATIVE_RENDERER_VERSIONS = frozenset(
-    {LEGACY_DERIVATIVE_RENDERER_VERSION, DERIVATIVE_RENDERER_VERSION}
+    {
+        LEGACY_DERIVATIVE_RENDERER_VERSION,
+        PREVIOUS_DERIVATIVE_RENDERER_VERSION,
+        DERIVATIVE_RENDERER_VERSION,
+    }
 )
 RELATIVE_SCALE = 1_000_000
 SUPPORTED_MASTER_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
@@ -71,6 +77,10 @@ class DerivativeInputError(DerivativeError, ValueError):
 
 class DerivativeRenderError(DerivativeError):
     """A valid recipe and input could not produce a safe derivative."""
+
+
+class XStaticImagePngTooLargeError(DerivativeRenderError):
+    """A lossless, full-dimension X PNG cannot fit the provider byte cap."""
 
 
 class _OutputLimitExceededError(Exception):
@@ -282,14 +292,14 @@ class DerivativeSafetyLimits:
     max_input_height: int = MAX_PIPELINE_MASTER_HEIGHT
     max_input_pixels: int = MAX_PIPELINE_MASTER_PIXELS
     max_input_aspect_ratio: int = 20
-    max_output_width: int = 4096
-    max_output_height: int = 4096
-    max_output_pixels: int = 4096 * 4096
+    max_output_width: int = MAX_PIPELINE_MASTER_WIDTH
+    max_output_height: int = MAX_PIPELINE_MASTER_HEIGHT
+    max_output_pixels: int = MAX_PIPELINE_MASTER_PIXELS
     max_output_bytes: int = 16 * 1024 * 1024
     max_full_output_bytes: int = PATREON_MAX_IMAGE_BYTES
     max_x_teaser_bytes: int = X_STATIC_IMAGE_MAX_BYTES
     max_recipe_bytes: int = 16 * 1024
-    max_peak_working_set_bytes: int = 384 * 1024 * 1024
+    max_peak_working_set_bytes: int = 576 * 1024 * 1024
 
     def __post_init__(self) -> None:
         _strict_int(
@@ -356,7 +366,7 @@ class DerivativeSafetyLimits:
             self.max_full_output_bytes,
             "maximum full-output bytes",
             minimum=1024,
-            maximum=PATREON_MAX_IMAGE_BYTES,
+            maximum=64 * 1024 * 1024,
         )
         _strict_int(
             self.max_x_teaser_bytes,
@@ -1140,7 +1150,7 @@ def _apply_watermark(
         raise DerivativeRenderError("watermark margin leaves no drawable canvas")
     prepared = (
         _trim_watermark_to_visible_alpha(watermark)
-        if renderer_version == DERIVATIVE_RENDERER_VERSION
+        if renderer_version != LEGACY_DERIVATIVE_RENDERER_VERSION
         else watermark.copy()
     )
     try:
@@ -1243,6 +1253,7 @@ def _build_artifact(
             image,
             encoding,
             maximum_bytes=maximum_bytes,
+            renderer_version=renderer_version,
         )
     else:
         raise DerivativeRecipeError("derivative target is invalid")
@@ -1265,7 +1276,7 @@ def _build_artifact(
         recipe_sha256=recipe_sha256,
         watermark_sha256=watermark_sha256,
         renderer_version=renderer_version,
-        pillow_version=PIL.__version__,
+        pillow_version=PILLOW_VERSION,
         operations=lineage_operations,
     )
     image_format = encoding.image_format
@@ -1329,12 +1340,40 @@ def _encode_x_teaser(
     encoding: Encoding,
     *,
     maximum_bytes: int,
+    renderer_version: str,
 ) -> _EncodedImage:
     if not isinstance(encoding, JpegEncoding):
+        if renderer_version != DERIVATIVE_RENDERER_VERSION:
+            return _EncodedImage(
+                data=_encode_image(image, encoding, maximum_bytes=maximum_bytes),
+                width=image.width,
+                height=image.height,
+            )
+        payload = _try_encode_image(
+            image,
+            encoding,
+            maximum_bytes=maximum_bytes,
+        )
+        operations: tuple[str, ...] = ()
+        if payload is None and encoding.compress_level != 9:
+            payload = _try_encode_image(
+                image,
+                PngEncoding(compress_level=9),
+                maximum_bytes=maximum_bytes,
+            )
+            if payload is not None:
+                operations = ("x-cap-png-compress-level:9",)
+        if payload is None:
+            raise XStaticImagePngTooLargeError(
+                "full-resolution lossless X PNG exceeds the static image byte limit "
+                f"({maximum_bytes} bytes); automatic JPEG conversion and downscaling "
+                "are forbidden"
+            )
         return _EncodedImage(
-            data=_encode_image(image, encoding, maximum_bytes=maximum_bytes),
+            data=payload,
             width=image.width,
             height=image.height,
+            operations=operations,
         )
 
     return _encode_adaptive_jpeg(
@@ -1546,17 +1585,27 @@ def _validate_recipe_against_limits(
     recipe: DerivativeRecipe,
     limits: DerivativeSafetyLimits,
 ) -> None:
-    dimensions = (
-        (recipe.full.max_width, recipe.full.max_height),
-        (recipe.x_teaser.width, recipe.x_teaser.height),
-    )
-    for width, height in dimensions:
-        if (
-            width > limits.max_output_width
-            or height > limits.max_output_height
-            or width * height > limits.max_output_pixels
-        ):
-            raise DerivativeRecipeError("recipe output dimensions exceed the safety limit")
+    full_width, full_height = recipe.full.max_width, recipe.full.max_height
+    full_pixels = min(full_width * full_height, limits.max_input_pixels)
+    if (
+        full_width > limits.max_output_width
+        or full_height > limits.max_output_height
+        or full_pixels > limits.max_output_pixels
+    ):
+        raise DerivativeRecipeError("recipe output dimensions exceed the safety limit")
+
+    teaser_width, teaser_height = recipe.x_teaser.width, recipe.x_teaser.height
+    teaser_pixels = teaser_width * teaser_height
+    if recipe.x_teaser.fit_mode is TeaserFitMode.DOWNSCALE:
+        # A downscale box is only an axis ceiling. Its area can exceed the
+        # output-pixel cap because the admitted source is independently capped.
+        teaser_pixels = min(teaser_pixels, limits.max_input_pixels)
+    if (
+        teaser_width > limits.max_output_width
+        or teaser_height > limits.max_output_height
+        or teaser_pixels > limits.max_output_pixels
+    ):
+        raise DerivativeRecipeError("recipe output dimensions exceed the safety limit")
 
 
 def _validate_target_dimensions(width: int, height: int) -> None:

@@ -38,7 +38,8 @@ class MegaSetDeliveryItemRead(BaseModel):
     id: UUID
     delivery_id: UUID
     ordinal: int = Field(gt=0)
-    source_derivative_output_id: UUID
+    source_asset_id: UUID
+    readiness_derivative_output_id: UUID
     source_sha256: Sha256
     source_byte_size: int = Field(gt=0)
     source_content_type: str = Field(min_length=1, max_length=100)

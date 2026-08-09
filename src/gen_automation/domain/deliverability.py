@@ -196,6 +196,8 @@ def require_comfy_workflow_deliverability(
                     raise DeliverabilityError("rendered workflow geometry is invalid")
             elif node_class == "KSampler":
                 geometry = linked_geometry(inputs, "latent_image", expected="latent")
+            elif node_class == "SetLatentNoiseMask":
+                geometry = linked_geometry(inputs, "samples", expected="latent")
             elif node_class == "LatentUpscaleBy":
                 source = linked_geometry(inputs, "samples", expected="latent")
                 scale = _positive_comfy_scale(inputs.get("scale_by"))

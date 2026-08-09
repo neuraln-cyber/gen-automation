@@ -189,6 +189,24 @@ def _one_form(html: str, action: str) -> ParsedForm:
     return matching[0]
 
 
+def _rendered_bulk_action_fields(
+    html: str,
+    action_url: str,
+    *,
+    expected_lock_version: int,
+    asset_ids: tuple[UUID, ...],
+    action: str,
+) -> dict[str, str | list[str]]:
+    form = _one_form(html, action_url)
+    assert _FORM_KEY.fullmatch(form.fields["idempotency_key"])
+    assert form.fields["expected_lock_version"] == str(expected_lock_version)
+    return {
+        **form.fields,
+        "asset_id": [str(asset_id) for asset_id in asset_ids],
+        "action": action,
+    }
+
+
 async def _release_id(context: ReviewApiContext) -> UUID:
     database = Database(context.settings.database_url)
     try:
@@ -970,6 +988,170 @@ def test_browser_bulk_review_action_applies_repeated_selected_assets(tmp_path: P
     assert summary.status_code == 200
     assert summary.json()["rejected_count"] == len(context.asset_ids)
     assert summary.json()["lock_version"] == 2
+
+
+def test_browser_bulk_form_supports_multi_accept_and_mixed_x_add_remove_atomically(
+    tmp_path: Path,
+) -> None:
+    context = asyncio.run(_seed_review_api(_settings(tmp_path / "browser-bulk-x.db")))
+    asyncio.run(
+        _set_release_final_set_goal(
+            context,
+            desired_accepted_count=len(context.asset_ids),
+        )
+    )
+    task_id = asyncio.run(_create_task(context))
+    app = create_app(context.settings)
+    detail_action = f"/dashboard/review-tasks/{task_id}"
+    bulk_action = f"{detail_action}/bulk-actions"
+    first, second = context.asset_ids
+
+    with TestClient(
+        app,
+        base_url=ORIGIN,
+        client=("192.0.2.99", 50000),
+    ) as client:
+        app.state.object_store = SameOriginReviewStore()
+        _login(client, context.settings, context.users[AdminRole.OWNER])
+
+        page = client.get(detail_action)
+        accepted = client.post(
+            bulk_action,
+            data=_rendered_bulk_action_fields(
+                page.text,
+                bulk_action,
+                expected_lock_version=1,
+                asset_ids=(first, second),
+                action="accept",
+            ),
+            headers=_FORM_HEADERS,
+            follow_redirects=False,
+        )
+        accepted_summary = client.get(f"/api/v1/review-tasks/{task_id}")
+
+        page = client.get(detail_action)
+        seeded_x = client.post(
+            bulk_action,
+            data=_rendered_bulk_action_fields(
+                page.text,
+                bulk_action,
+                expected_lock_version=2,
+                asset_ids=(first,),
+                action="x_add",
+            ),
+            headers=_FORM_HEADERS,
+            follow_redirects=False,
+        )
+        seeded_x_summary = client.get(f"/api/v1/review-tasks/{task_id}")
+
+        page = client.get(detail_action)
+        mixed_x_add = client.post(
+            bulk_action,
+            data=_rendered_bulk_action_fields(
+                page.text,
+                bulk_action,
+                expected_lock_version=3,
+                asset_ids=(first, second),
+                action="x_add",
+            ),
+            headers=_FORM_HEADERS,
+            follow_redirects=False,
+        )
+        mixed_x_add_summary = client.get(f"/api/v1/review-tasks/{task_id}")
+
+        page = client.get(detail_action)
+        seeded_x_remove = client.post(
+            bulk_action,
+            data=_rendered_bulk_action_fields(
+                page.text,
+                bulk_action,
+                expected_lock_version=4,
+                asset_ids=(first,),
+                action="x_remove",
+            ),
+            headers=_FORM_HEADERS,
+            follow_redirects=False,
+        )
+        seeded_x_remove_summary = client.get(f"/api/v1/review-tasks/{task_id}")
+
+        page = client.get(detail_action)
+        mixed_x_remove = client.post(
+            bulk_action,
+            data=_rendered_bulk_action_fields(
+                page.text,
+                bulk_action,
+                expected_lock_version=5,
+                asset_ids=(first, second),
+                action="x_remove",
+            ),
+            headers=_FORM_HEADERS,
+            follow_redirects=False,
+        )
+        mixed_x_remove_summary = client.get(f"/api/v1/review-tasks/{task_id}")
+
+        page = client.get(detail_action)
+        invalid_member = UUID("20000000-0000-4000-8000-000000000099")
+        invalid_batch = client.post(
+            bulk_action,
+            data=_rendered_bulk_action_fields(
+                page.text,
+                bulk_action,
+                expected_lock_version=6,
+                asset_ids=(first, invalid_member),
+                action="x_add",
+            ),
+            headers=_FORM_HEADERS,
+            follow_redirects=False,
+        )
+        after_invalid_summary = client.get(f"/api/v1/review-tasks/{task_id}")
+
+    assert accepted.status_code == 303
+    assert accepted_summary.status_code == 200
+    assert accepted_summary.json()["lock_version"] == 2
+    assert accepted_summary.json()["accepted_count"] == 2
+    assert {asset["decision"] for asset in accepted_summary.json()["assets"]} == {
+        ReviewDecisionValue.ACCEPT.value
+    }
+    assert {asset["revision"] for asset in accepted_summary.json()["assets"]} == {1}
+
+    assert seeded_x.status_code == 303
+    assert seeded_x_summary.json()["lock_version"] == 3
+    assert seeded_x_summary.json()["x_selected_count"] == 1
+    assert {
+        UUID(asset["asset_id"])
+        for asset in seeded_x_summary.json()["assets"]
+        if asset["selected_for_x"]
+    } == {first}
+
+    assert mixed_x_add.status_code == 303
+    assert mixed_x_add_summary.json()["lock_version"] == 4
+    assert mixed_x_add_summary.json()["x_selected_count"] == 2
+    assert {
+        UUID(asset["asset_id"])
+        for asset in mixed_x_add_summary.json()["assets"]
+        if asset["selected_for_x"]
+    } == {first, second}
+
+    assert seeded_x_remove.status_code == 303
+    assert seeded_x_remove_summary.json()["lock_version"] == 5
+    assert seeded_x_remove_summary.json()["x_selected_count"] == 1
+    assert {
+        UUID(asset["asset_id"])
+        for asset in seeded_x_remove_summary.json()["assets"]
+        if asset["selected_for_x"]
+    } == {second}
+
+    assert mixed_x_remove.status_code == 303
+    assert mixed_x_remove_summary.json()["lock_version"] == 6
+    assert mixed_x_remove_summary.json()["x_selected_count"] == 0
+    assert not any(asset["selected_for_x"] for asset in mixed_x_remove_summary.json()["assets"])
+
+    assert invalid_batch.status_code == 404
+    assert after_invalid_summary.status_code == 200
+    assert after_invalid_summary.json()["lock_version"] == 6
+    assert after_invalid_summary.json()["accepted_count"] == 2
+    assert after_invalid_summary.json()["x_selected_count"] == 0
+    assert not any(asset["selected_for_x"] for asset in after_invalid_summary.json()["assets"])
 
 
 def test_browser_review_decisions_lock_replay_actor_and_exact_completion(

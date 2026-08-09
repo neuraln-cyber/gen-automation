@@ -8,11 +8,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path, PurePosixPath
+from typing import Any
 from uuid import UUID, uuid4
 from zipfile import ZIP_STORED, ZipFile
 
 import pytest
 from fastapi import HTTPException
+from PIL import Image
 from sqlalchemy import func, select
 
 from gen_automation.api.routes.mega_deliveries import (
@@ -37,6 +39,11 @@ from gen_automation.integrations.mega import (
     MegaRemoteNode,
 )
 from gen_automation.integrations.mega.client import MegaCommandResult
+from gen_automation.services import finished_set_archives as archives
+from gen_automation.services.derivatives import (
+    DerivativeBundle,
+    render_platform_derivatives,
+)
 from gen_automation.services.finished_set_archives import (
     load_finished_set_archive,
     request_finished_set_archive,
@@ -65,12 +72,22 @@ _REMOTE_ROOT = "/sets"
 _WORKER_ID = "test:mega-set"
 
 
+@pytest.fixture(autouse=True)
+def _trusted_test_isolated_renderer(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def render(raw_master: bytes, **kwargs: Any) -> DerivativeBundle:
+        kwargs.pop("policy", None)
+        return render_platform_derivatives(raw_master, **kwargs)
+
+    monkeypatch.setattr(archives, "render_platform_derivatives_isolated", render)
+
+
 @dataclass(frozen=True, slots=True)
 class _ArchiveFixture:
     archive_id: UUID
     manifest_sha256: str
     image_payloads: tuple[bytes, ...]
     derivative_output_ids: tuple[UUID, ...]
+    source_asset_ids: tuple[UUID, ...]
 
 
 class _RecordingMegaClient:
@@ -348,6 +365,98 @@ async def test_early_mega_request_persists_until_archive_ready_and_queues_once(
 
 
 @pytest.mark.asyncio
+async def test_public_png_archive_reaches_mega_exactly_without_full_jpeg(
+    derivative_approved_context: ApprovedContext,
+) -> None:
+    approved = derivative_approved_context
+    prepared = await _prepare(approved)
+    await _cycle(prepared, worker_id="mega-public-png-derivative")
+    await _cycle(prepared, worker_id="mega-public-png-derivative")
+
+    async with approved.database.sessions() as session:
+        full_rows = tuple(
+            (
+                await session.execute(
+                    select(DerivativeOutput, ReleaseSelection)
+                    .join(
+                        ReleaseSelection,
+                        ReleaseSelection.id == DerivativeOutput.release_selection_id,
+                    )
+                    .where(
+                        ReleaseSelection.review_task_id == approved.review_task_id,
+                        DerivativeOutput.target == "full",
+                    )
+                    .order_by(ReleaseSelection.source_generation_queue_position)
+                )
+            ).all()
+        )
+        requested = await request_mega_set_delivery(
+            session,
+            review_task_id=approved.review_task_id,
+            requested_by_user_id=approved.owner_id,
+            remote_root=_REMOTE_ROOT,
+            now=RUN_AT + timedelta(minutes=20),
+        )
+    assert len(full_rows) == 2
+    assert all(output.asset_content_type == "image/jpeg" for output, _ in full_rows)
+    full_jpegs = tuple(
+        prepared.store.objects[output.asset_object_key].body for output, _ in full_rows
+    )
+
+    archive_result = await run_finished_set_archive_cycle(
+        approved.database.sessions,
+        prepared.store,
+        worker_id="mega-public-png-archive",
+        lease_seconds=300,
+        retry_base_seconds=5,
+        retry_max_seconds=60,
+        max_archive_bytes=_MAX_PART_BYTES,
+        now=RUN_AT + timedelta(minutes=20, seconds=1),
+    )
+    assert archive_result.completed_archive
+    assert archive_result.archive_id == requested.archive_id
+
+    mega = _RecordingMegaClient()
+    created = await _cycle_mega(approved, prepared.store, mega)
+    delivered = await _cycle_mega(approved, prepared.store, mega)
+    assert created.created_delivery
+    assert delivered.completed_delivery
+    assert mega.upload_files_calls == [("001.png", "002.png")]
+
+    image_paths = (
+        "/sets/Derivative release (PNG)/001.png",
+        "/sets/Derivative release (PNG)/002.png",
+    )
+    delivered_pngs = tuple(mega.remote[path] for path in image_paths)
+    assert delivered_pngs != approved.raw_payloads
+    assert all(payload not in full_jpegs for payload in delivered_pngs)
+    cached_by_sha = {
+        hashlib.sha256(stored.body).hexdigest(): stored.body
+        for key, stored in prepared.store.objects.items()
+        if key.startswith("public-media/public-png-v1/")
+    }
+    for payload, source in zip(delivered_pngs, approved.raw_payloads, strict=True):
+        assert cached_by_sha[hashlib.sha256(payload).hexdigest()] == payload
+        assert_delivery_metadata_absent(payload)
+        assert_private_master_metadata_present(source)
+        with Image.open(BytesIO(payload)) as image, Image.open(BytesIO(source)) as source_image:
+            assert image.format == "PNG"
+            assert image.size == source_image.size == (64, 64)
+            assert image.convert("RGB").tobytes() == source_image.convert("RGB").tobytes()
+
+    remote_manifest = json.loads(mega.remote["/sets/Derivative release (PNG)/set-manifest.json"])
+    assert remote_manifest["schema"] == "mega-extracted-set-manifest/v2"
+    assert remote_manifest["media_profile"] == "public-png-v1"
+    assert [row["path"] for row in remote_manifest["outputs"]] == [
+        "001.png",
+        "002.png",
+    ]
+    assert [row["readiness_derivative_output_id"] for row in remote_manifest["outputs"]] == [
+        str(output.id) for output, _selection in full_rows
+    ]
+
+
+@pytest.mark.asyncio
 async def test_provider_independent_multipart_upload_preserves_bytes_order_and_status_api(
     derivative_approved_context: ApprovedContext,
 ) -> None:
@@ -425,9 +534,10 @@ async def test_provider_independent_multipart_upload_preserves_bytes_order_and_s
     assert delivery.verified_at is not None
     assert delivery.completed_at is not None
     assert [item.ordinal for item in items] == [1, 2]
-    assert [item.source_derivative_output_id for item in items] == list(
+    assert [item.readiness_derivative_output_id for item in items] == list(
         archive.derivative_output_ids
     )
+    assert [item.source_asset_id for item in items] == list(archive.source_asset_ids)
     assert all(item.state == MegaDeliveryState.SUCCEEDED for item in items)
     assert all(item.remote_node_handle is None for item in items)
 
@@ -441,6 +551,7 @@ async def test_provider_independent_multipart_upload_preserves_bytes_order_and_s
     remote_manifest = json.loads(mega.remote[remote_manifest_path])
     completion = json.loads(mega.remote[completion_path])
     assert remote_manifest["schema"] == "mega-extracted-set-manifest/v1"
+    assert "media_profile" not in remote_manifest
     assert remote_manifest["source_manifest_sha256"] == archive.manifest_sha256
     assert [row["path"] for row in remote_manifest["outputs"]] == [
         "001.jpg",
@@ -579,6 +690,7 @@ async def _prepare_archive(
     image_payloads: list[bytes] = []
     outputs: list[dict[str, object]] = []
     derivative_output_ids: list[UUID] = []
+    source_asset_ids: list[UUID] = []
     for ordinal, (output, selection) in enumerate(rows, start=1):
         stored = prepared.store.objects[output.asset_object_key]
         extension = {
@@ -588,6 +700,7 @@ async def _prepare_archive(
         }[output.asset_content_type]
         image_payloads.append(stored.body)
         derivative_output_ids.append(output.id)
+        source_asset_ids.append(selection.asset_id)
         outputs.append(
             {
                 "ordinal": ordinal,
@@ -616,6 +729,7 @@ async def _prepare_archive(
         id=archive_id,
         review_task_id=approved.review_task_id,
         release_version_id=approved.release_version_id,
+        media_profile="legacy-full-derivative-v1",
         requested_by_user_id=approved.owner_id,
         mega_requested_by_user_id=(approved.owner_id if mega_requested else None),
         mega_requested_at=(now if mega_requested else None),
@@ -699,6 +813,7 @@ async def _prepare_archive(
         manifest_sha256=manifest_sha256,
         image_payloads=tuple(image_payloads),
         derivative_output_ids=tuple(derivative_output_ids),
+        source_asset_ids=tuple(source_asset_ids),
     )
 
 

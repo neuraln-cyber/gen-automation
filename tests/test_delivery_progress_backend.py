@@ -186,6 +186,7 @@ def _archive(
         last_error_detail=(
             "Archive worker failed." if state == FinishedSetArchiveState.FAILED else None
         ),
+        media_profile="public-png-v1",
         parts=parts,
         requested_by_user_id=uuid4(),
     )
@@ -383,6 +384,7 @@ def test_delivery_progress_payload_reports_ready_archive_parts_in_global_order()
             "ready_full_outputs": 2,
             "expected_x_teasers": 1,
             "ready_x_teasers": 1,
+            "x_action_message": None,
         },
         "archive": {
             "state": "ready",
@@ -425,6 +427,30 @@ def test_delivery_progress_payload_reports_ready_archive_parts_in_global_order()
         },
         "poll_after_ms": None,
     }
+
+
+def test_delivery_progress_exposes_safe_x_png_size_action() -> None:
+    message = (
+        "A selected full-resolution PNG exceeds X's 5 MiB image limit. "
+        "Nothing was converted or downscaled. Start a new review version, choose a "
+        "different image for X, then prepare the watermarked images again."
+    )
+    snapshot = _snapshot(
+        progress=_progress(
+            expected_x_teasers=1,
+            ready_x_teasers=0,
+            ready_for_destinations=False,
+            x_action_message=message,
+        ),
+        x_selected_count=1,
+    )
+
+    payload = delivery_routes._delivery_progress_payload(
+        snapshot,
+        finished_set_archive=None,
+    )
+
+    assert payload["outputs"]["x_action_message"] == message
 
 
 def test_delivery_progress_keeps_polling_for_active_extracted_mega_upload() -> None:

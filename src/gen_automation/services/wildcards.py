@@ -85,6 +85,10 @@ class ResolvedWildcardPrompts:
     prompt: str
     character_a_prompt: str
     character_b_prompt: str
+    character_a_negative_prompt: str
+    character_b_negative_prompt: str
+    interaction_prompt: str
+    camera_prompt: str
     negative_prompt: str
     detailer_prompt: str
     detailer_negative_prompt: str
@@ -554,6 +558,34 @@ def resolve_wildcard_prompts(
         field_name="character_b_prompt",
         selections=selections,
     )
+    character_a_negative_prompt = _expand_text(
+        selected_generation.character_a_negative_prompt,
+        catalog=catalog.by_name,
+        seed=seed,
+        field_name="character_a_negative_prompt",
+        selections=selections,
+    )
+    character_b_negative_prompt = _expand_text(
+        selected_generation.character_b_negative_prompt,
+        catalog=catalog.by_name,
+        seed=seed,
+        field_name="character_b_negative_prompt",
+        selections=selections,
+    )
+    interaction_prompt = _expand_text(
+        selected_generation.interaction_prompt,
+        catalog=catalog.by_name,
+        seed=seed,
+        field_name="interaction_prompt",
+        selections=selections,
+    )
+    camera_prompt = _expand_text(
+        selected_generation.camera_prompt,
+        catalog=catalog.by_name,
+        seed=seed,
+        field_name="camera_prompt",
+        selections=selections,
+    )
     negative_prompt = _expand_text(
         selected_generation.negative_prompt,
         catalog=catalog.by_name,
@@ -577,7 +609,7 @@ def resolve_wildcard_prompts(
     )
     references = [reference.model_dump(mode="json") for reference in catalog.references]
     evidence: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3 if selected_generation.duo_contract_version == 2 else 2,
         "seed": seed,
         "source_prompt": selected_generation.prompt,
         "source_character_a_prompt": selected_generation.character_a_prompt,
@@ -602,10 +634,45 @@ def resolve_wildcard_prompts(
         "wildcard_versions": references,
         "selections": selections,
     }
+    if selected_generation.duo_contract_version == 2:
+        evidence.update(
+            {
+                "source_character_a_negative_prompt": (
+                    selected_generation.character_a_negative_prompt
+                ),
+                "source_character_b_negative_prompt": (
+                    selected_generation.character_b_negative_prompt
+                ),
+                "source_interaction_prompt": selected_generation.interaction_prompt,
+                "source_camera_prompt": selected_generation.camera_prompt,
+                "source_character_a_negative_prompt_sha256": _text_sha256(
+                    selected_generation.character_a_negative_prompt
+                ),
+                "source_character_b_negative_prompt_sha256": _text_sha256(
+                    selected_generation.character_b_negative_prompt
+                ),
+                "source_interaction_prompt_sha256": _text_sha256(
+                    selected_generation.interaction_prompt
+                ),
+                "source_camera_prompt_sha256": _text_sha256(selected_generation.camera_prompt),
+                "resolved_character_a_negative_prompt_sha256": _text_sha256(
+                    character_a_negative_prompt
+                ),
+                "resolved_character_b_negative_prompt_sha256": _text_sha256(
+                    character_b_negative_prompt
+                ),
+                "resolved_interaction_prompt_sha256": _text_sha256(interaction_prompt),
+                "resolved_camera_prompt_sha256": _text_sha256(camera_prompt),
+            }
+        )
     return ResolvedWildcardPrompts(
         prompt=prompt,
         character_a_prompt=character_a_prompt,
         character_b_prompt=character_b_prompt,
+        character_a_negative_prompt=character_a_negative_prompt,
+        character_b_negative_prompt=character_b_negative_prompt,
+        interaction_prompt=interaction_prompt,
+        camera_prompt=camera_prompt,
         negative_prompt=negative_prompt,
         detailer_prompt=detailer_prompt,
         detailer_negative_prompt=detailer_negative_prompt,
@@ -621,6 +688,10 @@ def _generation_wildcard_names(specification: ReleaseSpecification) -> set[str]:
             generation.prompt,
             generation.character_a_prompt,
             generation.character_b_prompt,
+            generation.character_a_negative_prompt,
+            generation.character_b_negative_prompt,
+            generation.interaction_prompt,
+            generation.camera_prompt,
             generation.negative_prompt,
             generation.detailer_prompt,
             generation.detailer_negative_prompt,

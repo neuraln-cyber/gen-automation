@@ -57,7 +57,7 @@ class DerivativeIsolationProtocolError(DerivativeIsolationError):
 @dataclass(frozen=True, slots=True)
 class DerivativeIsolationPolicy:
     wall_timeout_seconds: float = 120.0
-    memory_limit_bytes: int = 512 * _MEBIBYTE
+    memory_limit_bytes: int = 704 * _MEBIBYTE
     termination_grace_seconds: float = 1.0
 
     def __post_init__(self) -> None:
@@ -252,6 +252,7 @@ async def render_platform_derivatives_isolated(
             expected_source_sha256=hashlib.sha256(master_payload).hexdigest(),
             expected_recipe=recipe,
             expected_target_values=expected_target_values,
+            expected_renderer_version=selected_renderer_version,
         )
     finally:
         receive_connection.close()
@@ -475,6 +476,8 @@ def _isolated_renderer_child(
             response = _error_message("input", str(error))
         except derivatives.DerivativeRecipeError as error:
             response = _error_message("recipe", str(error))
+        except derivatives.XStaticImagePngTooLargeError as error:
+            response = _error_message("x_lossless_png_too_large", str(error))
         except derivatives.DerivativeRenderError as error:
             response = _error_message("render", str(error))
         except (DerivativeIsolationProtocolError, MemoryError):
@@ -570,6 +573,7 @@ def _decode_child_response(
     expected_source_sha256: str | None = None,
     expected_recipe: DerivativeRecipe | None = None,
     expected_target_values: tuple[str, ...] | None = None,
+    expected_renderer_version: str | None = None,
 ) -> DerivativeBundle:
     from gen_automation.services import derivatives
 
@@ -589,6 +593,8 @@ def _decode_child_response(
             raise derivatives.DerivativeInputError(message)
         if kind == "recipe":
             raise derivatives.DerivativeRecipeError(message)
+        if kind == "x_lossless_png_too_large":
+            raise derivatives.XStaticImagePngTooLargeError(message)
         if kind == "render":
             raise derivatives.DerivativeRenderError(message)
         if kind == "isolation_unavailable":
@@ -628,6 +634,9 @@ def _decode_child_response(
             )
         ):
             raise DerivativeIsolationProtocolError("expected isolated renderer targets are invalid")
+    selected_renderer_version = expected_renderer_version or derivatives.DERIVATIVE_RENDERER_VERSION
+    if selected_renderer_version not in derivatives.SUPPORTED_DERIVATIVE_RENDERER_VERSIONS:
+        raise DerivativeIsolationProtocolError("expected isolated renderer version is invalid")
     artifacts_wire = bundle_wire.get("artifacts")
     if not isinstance(artifacts_wire, list) or len(artifacts_wire) != len(expected_targets):
         raise DerivativeIsolationProtocolError(
@@ -640,6 +649,7 @@ def _decode_child_response(
                 limits=limits,
                 expected_source_sha256=source_sha256,
                 expected_recipe_sha256=recipe_sha256,
+                expected_renderer_version=selected_renderer_version,
             )
             for artifact_wire in artifacts_wire
         )
@@ -684,6 +694,7 @@ def _decode_artifact(
     limits: DerivativeSafetyLimits,
     expected_source_sha256: str,
     expected_recipe_sha256: str,
+    expected_renderer_version: str,
 ) -> Any:
     from gen_automation.services import derivatives
 
@@ -758,7 +769,7 @@ def _decode_artifact(
         or max(lineage.source_width, lineage.source_height)
         > min(lineage.source_width, lineage.source_height) * limits.max_input_aspect_ratio
         or lineage.source_format not in {"JPEG", "PNG", "WEBP"}
-        or lineage.renderer_version != derivatives.DERIVATIVE_RENDERER_VERSION
+        or lineage.renderer_version != expected_renderer_version
     ):
         raise DerivativeIsolationProtocolError("isolated renderer returned invalid source lineage")
     if (

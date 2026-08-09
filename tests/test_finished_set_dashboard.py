@@ -400,6 +400,7 @@ async def test_finished_set_archive_downloads_render_before_destinations_with_gu
         completed_at=now,
         last_error_code=None,
         last_error_detail=None,
+        media_profile="public-png-v1",
         parts=(
             FinishedSetArchivePartSnapshot(
                 part_id=uuid4(),

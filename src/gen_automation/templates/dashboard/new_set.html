@@ -125,7 +125,7 @@
             </details>
             <output class="settings-preset-status" data-automation-preset-status aria-live="polite" aria-atomic="true"></output>
           </section>
-          <section class="composition-builder" data-composition-builder>
+          <section class="composition-builder" data-composition-builder data-new-set-composition data-controlled-duo-builder>
             <div class="composition-heading">
               <strong>Characters</strong>
               <div class="composition-mode" role="radiogroup" aria-label="Character composition">
@@ -155,7 +155,7 @@
               <article class="character-composition-card" data-character-card="a">
                 <div class="character-card-heading">
                   <strong data-character-side-a>Character</strong>
-                  <span data-character-position-a hidden>Left side</span>
+                  <span data-character-position-a hidden>Region A</span>
                 </div>
                 <label>
                   <span class="visually-hidden">First adult fictional subject</span>
@@ -172,23 +172,37 @@
                   </select>
                 </label>
                 <label class="character-region-prompt" data-character-prompt-field hidden>
-                  Left character prompt
+                  A &middot; identity, appearance &amp; pose
                   <textarea
                     name="character_a_prompt"
                     rows="3"
                     maxlength="20000"
                     spellcheck="false"
-                    placeholder="nico robin (one piece), adult woman, black hair"
+                    placeholder="adult character A, short copper hair, teal jacket, leaning forward, left shoulder toward camera"
                     data-character-prompt="a"
                     data-danbooru-autocomplete
                   >{{ form_values['character_a_prompt'] }}</textarea>
+                </label>
+                <label class="character-region-prompt" data-character-prompt-field hidden>
+                  A &middot; negative / exclude
+                  <textarea
+                    name="character_a_negative_prompt"
+                    rows="2"
+                    maxlength="20000"
+                    spellcheck="false"
+                    placeholder="traits reserved for B, B's outfit, duplicate person"
+                    data-character-negative-prompt="a"
+                    data-duo-v2-control
+                    data-danbooru-autocomplete
+                    disabled
+                  >{{ form_values.get('character_a_negative_prompt', '') }}</textarea>
                 </label>
               </article>
 
               <article class="character-composition-card" data-character-card="b" hidden>
                 <div class="character-card-heading">
-                  <strong>Character 2</strong>
-                  <span>Right side</span>
+                  <strong>Character B</strong>
+                  <span>Region B</span>
                 </div>
                 <label>
                   <span class="visually-hidden">Second adult fictional subject</span>
@@ -205,25 +219,34 @@
                   </select>
                 </label>
                 <label class="character-region-prompt" data-character-prompt-field>
-                  Right character prompt
+                  B &middot; identity, appearance &amp; pose
                   <textarea
                     name="character_b_prompt"
                     rows="3"
                     maxlength="20000"
                     spellcheck="false"
-                    placeholder="boa hancock (one piece), adult woman, long black hair"
+                    placeholder="adult character B, long indigo braid, ivory coat, standing upright, right hand on hip"
                     data-character-prompt="b"
                     data-danbooru-autocomplete
                   >{{ form_values['character_b_prompt'] }}</textarea>
                 </label>
+                <label class="character-region-prompt" data-character-prompt-field>
+                  B &middot; negative / exclude
+                  <textarea
+                    name="character_b_negative_prompt"
+                    rows="2"
+                    maxlength="20000"
+                    spellcheck="false"
+                    placeholder="traits reserved for A, A's outfit, duplicate person"
+                    data-character-negative-prompt="b"
+                    data-duo-v2-control
+                    data-danbooru-autocomplete
+                    disabled
+                  >{{ form_values.get('character_b_negative_prompt', '') }}</textarea>
+                </label>
               </article>
             </div>
-            <div class="composition-actions" data-composition-actions hidden>
-              <button class="secondary-button compact-action" type="button" data-swap-characters>
-                Swap left / right
-              </button>
-            </div>
-            <output class="composition-status" data-composition-status aria-live="polite"></output>
+            {% include "dashboard/_controlled_duo_controls.html" %}
           </section>
 
           <div class="form-grid">
@@ -254,6 +277,9 @@
                     data-upscaler-enabled="{{ 'true' if workflow.has_hires_pass else 'false' }}"
                     data-detailer-enabled="{{ 'true' if workflow.has_face_detailer else 'false' }}"
                     data-regional-prompting="{{ 'true' if workflow.has_regional_prompting else 'false' }}"
+                    data-duo-contract-v2="{{ 'true' if workflow.supports_controlled_duo_v2|default(false) else 'false' }}"
+                    data-duo-strict-isolation="{{ 'true' if workflow.supports_duo_strict_isolation|default(false) else 'false' }}"
+                    data-duo-quality-high="{{ 'true' if workflow.supports_duo_high_quality|default(false) else 'false' }}"
                     {% if form_values['workflow_id'] == workflow.approval_id|string %}selected{% endif %}
                   >{{ workflow.name }} &middot; v{{ workflow.version }}</option>
                 {% endfor %}

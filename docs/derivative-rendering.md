@@ -106,9 +106,21 @@ lineage, and upgrades require golden test review.
   on the teaser's shorter edge. Opacity 255 preserves the PNG's authored alpha;
   it does not make partially transparent artwork opaque. The four positions are
   `top_left`, `top_right`, `bottom_left`, and `bottom_right`.
-- New recipes freeze renderer `pillow-derivative-v5`. The runtime continues to
-  execute already-frozen `pillow-derivative-v4` jobs with their original
-  full-canvas watermark geometry, so deployment cannot strand or silently
+- Newly prepared and replacement X revisions freeze an explicit public profile:
+  a metadata-free PNG named `x-teaser.png`, the original admitted source pixel
+  dimensions, no upscaling, and no lossy or resizing fallback. The 8192 x 8192
+  downscale box is an axis ceiling; the independent 12-million-pixel source and
+  output ceilings keep the actual canvas bounded.
+- That profile first encodes deterministic PNG compression level 6. If the
+  result exceeds X's 5 MiB static-image limit, it retries level 9 as a lossless
+  size optimization. If level 9 still does not fit, the job fails terminally as
+  `x_lossless_png_too_large`; it never converts to JPEG or reduces dimensions,
+  and therefore creates no uploadable derivative output.
+- New recipes freeze renderer `pillow-derivative-v6`. The runtime continues to
+  execute already-frozen `pillow-derivative-v4` and `pillow-derivative-v5` jobs,
+  including frozen JPEG X recipes, with their original encoding and watermark
+  geometry. Version 5 retains trimmed visible-alpha watermark placement but not
+  version 6's PNG compression retry, so deployment cannot strand or silently
   change an in-flight derivative plan.
 
 ## Parser and resource boundaries
@@ -133,19 +145,18 @@ has verified them:
   canvases; and
 - Pillow parser failures are redacted into typed derivative errors.
 
-The defaults are deliberately sized for the expected 1–8 megapixel workload:
-12 million input pixels are the absolute geometry ceiling, while the
-384 MiB estimated peak ceiling can reject a costly alpha/watermark recipe below
-that absolute ceiling. Defaults also cap masters at 32 MiB, each output at
-16 MiB, dimensions at 8192 input/4096 output, and the full output canvas at
-4096 × 4096. Raising a geometry or byte ceiling without raising and re-testing
+The defaults are deliberately sized for the admitted workload: 12 million
+input and output pixels are the absolute geometry ceiling, with a conservative
+576 MiB estimated peak ceiling that covers a watermarked maximum-size source.
+Defaults also cap masters at 32 MiB, each output at 16 MiB, and input/output
+axes at 8192. Raising a geometry or byte ceiling without raising and re-testing
 the working-set ceiling is an invalid production change.
 
 Pillow format plugins remain an untrusted native/parser boundary. The production
 entry point creates one fresh `spawn` child for one render and never reuses it.
 On Linux, that child installs and verifies hard `RLIMIT_AS` and `RLIMIT_RSS`
-limits before invoking Pillow decode. The default child limit is 512 MiB: the
-384 MiB renderer ceiling plus a 128 MiB interpreter/IPC reserve. Both the parent
+limits before invoking Pillow decode. The default child limit is 704 MiB: the
+576 MiB renderer ceiling plus a 128 MiB interpreter/IPC reserve. Both the parent
 and child fail closed if those limits cannot be established. Non-Linux
 environments may run direct unit tests, but cannot use the production entry
 point.
@@ -260,7 +271,7 @@ GEN_AUTOMATION_STORAGE_ENABLED=true
 GEN_AUTOMATION_DERIVATIVE_RENDERING_ENABLED=true
 GEN_AUTOMATION_BACKGROUND_DERIVATIVE_TIMEOUT_SECONDS=150
 GEN_AUTOMATION_BACKGROUND_DERIVATIVE_RENDER_TIMEOUT_SECONDS=120
-GEN_AUTOMATION_BACKGROUND_DERIVATIVE_MEMORY_LIMIT_BYTES=536870912
+GEN_AUTOMATION_BACKGROUND_DERIVATIVE_MEMORY_LIMIT_BYTES=738197504
 GEN_AUTOMATION_BACKGROUND_DERIVATIVE_LEASE_SECONDS=300
 GEN_AUTOMATION_BACKGROUND_DERIVATIVE_RETRY_BASE_SECONDS=30
 GEN_AUTOMATION_BACKGROUND_DERIVATIVE_RETRY_MAX_SECONDS=900
@@ -268,7 +279,7 @@ GEN_AUTOMATION_BACKGROUND_DERIVATIVE_RETRY_MAX_SECONDS=900
 
 The job lease must exceed the complete controller-cycle timeout. The cycle
 timeout must cover the isolated render timeout plus cleanup. The default
-512 MiB process limit is the 384 MiB renderer working-set ceiling plus the
+704 MiB process limit is the 576 MiB renderer working-set ceiling plus the
 128 MiB process and IPC reserve; lowering it is not a valid production
 configuration.
 

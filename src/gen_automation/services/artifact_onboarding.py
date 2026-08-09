@@ -3,6 +3,7 @@ import json
 import math
 import os
 import stat
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import NoReturn
@@ -46,6 +47,7 @@ from gen_automation.services.compliance_registry import (
     approve_workflow,
 )
 from gen_automation.services.worker_inputs import (
+    CONTROLLED_DUO_MARKER_NODE_CLASS,
     LORA_CHAIN_NODE_CLASS,
     MAX_WORKFLOW_BYTES,
     WorkerInputError,
@@ -62,7 +64,10 @@ from gen_automation.storage.base import (
 MAX_PLAN_BYTES = 256 * 1024
 MAX_PLAN_DEPTH = 32
 MAX_PLAN_ITEMS = 4_096
-_ONBOARDING_NODE_CLASSES = DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES | {LORA_CHAIN_NODE_CLASS}
+_ONBOARDING_NODE_CLASSES = DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES | {
+    CONTROLLED_DUO_MARKER_NODE_CLASS,
+    LORA_CHAIN_NODE_CLASS,
+}
 
 
 class ArtifactOnboardingError(Exception):
@@ -76,6 +81,7 @@ class OnboardedWorkflow:
     object_key: str
     sha256: str
     reviewed_node_classes: tuple[str, ...]
+    capabilities: tuple[str, ...]
     approval: ApprovalMutationResult
 
 
@@ -202,6 +208,7 @@ async def onboard_artifacts(
             version=workflow.entry.version,
             object_key=workflow.entry.object_key,
             reviewed_node_classes=list(workflow.node_classes),
+            capabilities=workflow.entry.capabilities,
             evidence=workflow.entry.evidence,
         )
         workflow_approval = await approve_workflow(
@@ -225,6 +232,7 @@ async def onboard_artifacts(
                 object_key=workflow.entry.object_key,
                 sha256=workflow.sha256,
                 reviewed_node_classes=workflow.node_classes,
+                capabilities=tuple(str(item) for item in workflow.entry.capabilities),
                 approval=workflow_approval,
             )
         )
@@ -350,6 +358,7 @@ def _validate_workflow(
     try:
         graph = _parse_workflow_template(body)
         validate_approved_workflow(graph, _ONBOARDING_NODE_CLASSES)
+        _validate_controlled_duo_onboarding_evidence(graph, entry=entry)
     except (WorkerInputError, ValueError):
         raise ArtifactOnboardingError(f"workflow {entry.name!r} failed graph validation") from None
     sha256 = hashlib.sha256(body).hexdigest()
@@ -362,7 +371,9 @@ def _validate_workflow(
             {
                 node["class_type"]
                 for node in graph.values()
-                if isinstance(node, dict) and isinstance(node.get("class_type"), str)
+                if isinstance(node, dict)
+                and isinstance(node.get("class_type"), str)
+                and node.get("class_type") != CONTROLLED_DUO_MARKER_NODE_CLASS
             }
         )
     )
@@ -372,6 +383,38 @@ def _validate_workflow(
         sha256=sha256,
         node_classes=node_classes,
     )
+
+
+def _validate_controlled_duo_onboarding_evidence(
+    graph: Mapping[str, object],
+    *,
+    entry: WorkflowOnboardingEntry,
+) -> None:
+    markers = [
+        node
+        for node in graph.values()
+        if isinstance(node, Mapping) and node.get("class_type") == CONTROLLED_DUO_MARKER_NODE_CLASS
+    ]
+    capabilities = {str(capability) for capability in entry.capabilities}
+    declares_controlled_duo = "controlled_duo_v2" in capabilities
+    if not declares_controlled_duo:
+        if markers or capabilities.intersection({"duo_strict_isolation", "duo_high_quality"}):
+            raise WorkerInputError("Controlled Duo onboarding evidence is invalid")
+        return
+    if len(markers) != 1:
+        raise WorkerInputError("Controlled Duo onboarding evidence is invalid")
+    inputs = markers[0].get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise WorkerInputError("Controlled Duo onboarding evidence is invalid")
+    isolation_mode = inputs.get("isolation_mode")
+    if (
+        inputs.get("contract_version") != 2
+        or inputs.get("mask_topology") != "disjoint_preset_rectangles_v1"
+        or isolation_mode not in {"balanced", "strict"}
+        or ("duo_strict_isolation" in capabilities) != (isolation_mode == "strict")
+        or "duo_high_quality" in capabilities
+    ):
+        raise WorkerInputError("Controlled Duo onboarding evidence is invalid")
 
 
 async def _ensure_workflow_object(
@@ -544,6 +587,7 @@ def _registry_state(
             "evidence": approval.evidence,
             "name": approval.name,
             "object_key": approval.object_key,
+            "capabilities": approval.capabilities,
             "reviewed_node_classes": approval.reviewed_node_classes,
             "version": approval.version,
             "workflow_sha256": approval.workflow_sha256,

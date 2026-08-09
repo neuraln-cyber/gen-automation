@@ -603,7 +603,7 @@ def test_salad_rejects_unknown_container_priority() -> None:
         Settings(salad_container_priority="urgent")  # type: ignore[arg-type]
 
 
-def test_salad_deployment_timeout_covers_full_three_request_provisioning_chain() -> None:
+def test_salad_deployment_timeout_covers_observe_then_immediate_stop_chain() -> None:
     values = {
         "environment": Environment.TEST,
         "salad_enabled": True,
@@ -615,16 +615,41 @@ def test_salad_deployment_timeout_covers_full_three_request_provisioning_chain()
         "salad_webhook_secret": "whsec_test",
         "salad_worker_image": f"registry.example/worker@sha256:{'a' * 64}",
         "salad_request_timeout_seconds": 60,
-        "background_deployment_timeout_seconds": 180,
+        "background_deployment_timeout_seconds": 360,
+        "background_reconcile_timeout_seconds": 185,
+        "session_secret": "test-session-secret-with-more-than-32-characters",
+    }
+
+    with pytest.raises(ValidationError, match="six bounded SaladCloud requests"):
+        Settings(**values)  # type: ignore[arg-type]
+
+    values["background_deployment_timeout_seconds"] = 365
+    settings = Settings(**values)  # type: ignore[arg-type]
+    assert settings.background_deployment_timeout_seconds == 365
+
+
+def test_salad_attempt_reconcile_timeout_covers_two_list_pages_then_cancel() -> None:
+    values = {
+        "environment": Environment.TEST,
+        "salad_enabled": True,
+        "salad_api_key": "test-key",
+        "salad_organization": "organization",
+        "salad_project": "project",
+        "salad_queue_name": "generation-queue",
+        "salad_container_group_name": "generation-workers",
+        "salad_webhook_secret": "whsec_test",
+        "salad_worker_image": f"registry.example/worker@sha256:{'a' * 64}",
+        "salad_request_timeout_seconds": 30,
+        "background_reconcile_timeout_seconds": 94,
         "session_secret": "test-session-secret-with-more-than-32-characters",
     }
 
     with pytest.raises(ValidationError, match="three bounded SaladCloud requests"):
         Settings(**values)  # type: ignore[arg-type]
 
-    values["background_deployment_timeout_seconds"] = 185
+    values["background_reconcile_timeout_seconds"] = 95
     settings = Settings(**values)  # type: ignore[arg-type]
-    assert settings.background_deployment_timeout_seconds == 185
+    assert settings.background_reconcile_timeout_seconds == 95
 
 
 def test_background_health_thresholds_and_staleness_are_ordered() -> None:

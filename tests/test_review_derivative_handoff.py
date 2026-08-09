@@ -25,6 +25,10 @@ from gen_automation.db.models import (
     Release,
     ReviewXSelection,
 )
+from gen_automation.domain.deliverability import (
+    MAX_PIPELINE_MASTER_HEIGHT,
+    MAX_PIPELINE_MASTER_WIDTH,
+)
 from gen_automation.domain.enums import AdminRole, ReleasePhase
 from gen_automation.domain.ids import uuid7
 from gen_automation.services.authentication import AuthenticatedPrincipal
@@ -33,7 +37,7 @@ from gen_automation.services.derivative_pipeline import (
     DerivativePipelineInputError,
     DerivativePipelineNotFoundError,
 )
-from gen_automation.services.derivatives import WatermarkPosition
+from gen_automation.services.derivatives import DERIVATIVE_RENDERER_VERSION, WatermarkPosition
 from gen_automation.services.review_derivatives import (
     prepare_completed_review_derivatives,
     prepare_completed_review_full_outputs,
@@ -198,7 +202,17 @@ async def test_full_outputs_and_x_teasers_are_planned_independently(
         assert x_plan.total_jobs == 1
         x_recipe = await session.get(DerivativeRecipe, x_plan.recipe_id)
         assert x_recipe is not None
+        assert x_recipe.renderer_version == DERIVATIVE_RENDERER_VERSION
         assert x_recipe.configuration["watermark"]["position"] == "top_left"
+        assert x_recipe.configuration["x_teaser"] == {
+            "output_filename": "x-teaser.png",
+            "width": MAX_PIPELINE_MASTER_WIDTH,
+            "height": MAX_PIPELINE_MASTER_HEIGHT,
+            "fit_mode": "downscale",
+            "allow_upscale": False,
+            "encoding": {"format": "PNG", "compress_level": 6},
+            "censor": None,
+        }
         x_job = await session.get(DerivativeJob, x_plan.job_ids[0])
         assert x_job is not None
         assert x_job.gates_release is False

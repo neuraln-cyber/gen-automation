@@ -743,6 +743,7 @@ class ControllerWorkloads:
                         deployment_id=deployment.id,
                         client=self.salad_client,  # type: ignore[arg-type]
                         now=now,
+                        billing_observation_clock=lambda: datetime.now(UTC),
                     )
                 else:
                     await provision_deployment_step(
@@ -751,6 +752,7 @@ class ControllerWorkloads:
                         client=self.salad_client,  # type: ignore[arg-type]
                         secret_resolver=self.secret_resolver,
                         now=now,
+                        billing_observation_clock=lambda: datetime.now(UTC),
                     )
                 await session.commit()
                 return True
@@ -1718,6 +1720,7 @@ class ControllerWorkloads:
                     await session.rollback()
                     return
                 deployment.state = SaladDeploymentState.UNKNOWN
+                deployment.billing_observation_stale = True
                 deployment.unknown_since = deployment.unknown_since or now
                 deployment.reconcile_after = now + timedelta(
                     seconds=self.settings.background_retry_delay_seconds

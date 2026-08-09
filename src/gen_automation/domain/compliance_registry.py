@@ -11,6 +11,7 @@ from pydantic import (
     model_validator,
 )
 
+from gen_automation.domain.controlled_duo import WorkflowCapability
 from gen_automation.domain.enums import ApprovalStatus, ModelArtifactKind
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -123,6 +124,7 @@ class WorkflowApprovalCreate(StrictComplianceModel):
     version: str = Field(min_length=1, max_length=100)
     object_key: str = Field(min_length=1, max_length=1_024)
     reviewed_node_classes: list[str] = Field(min_length=1, max_length=128)
+    capabilities: list[WorkflowCapability] = Field(default_factory=list, max_length=16)
     evidence: ApprovalEvidence
 
     @field_validator("name", "version")
@@ -143,6 +145,16 @@ class WorkflowApprovalCreate(StrictComplianceModel):
         if len(values) != len(set(values)):
             raise ValueError("reviewed node classes must be unique")
         return sorted(values)
+
+    @field_validator("capabilities")
+    @classmethod
+    def validate_capabilities(
+        cls,
+        values: list[WorkflowCapability],
+    ) -> list[WorkflowCapability]:
+        if len(values) != len(set(values)):
+            raise ValueError("workflow capabilities must be unique")
+        return sorted(values, key=str)
 
 
 class ApprovalRevoke(StrictComplianceModel):

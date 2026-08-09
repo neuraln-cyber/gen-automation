@@ -175,10 +175,26 @@ async def test_finished_set_archive_rejects_metadata_bearing_derivative() -> Non
     store = MemoryObjectStore(bucket="privacy-boundary")
     key = "full/private.png"
     version_id = "private-version"
+    source_asset_id = uuid4()
+    source_object_version_id = "private-source-version"
+    source_sha256 = hashlib.sha256(body).hexdigest()
+    lineage_sha256 = "a" * 64
     store.objects[key] = StoredObject(
         body=body,
         content_type="image/png",
-        metadata={"sha256": hashlib.sha256(body).hexdigest()},
+        metadata={
+            **archives._public_png_static_metadata(
+                source_asset_id=source_asset_id,
+                source_object_version_id=source_object_version_id,
+                source_sha256=source_sha256,
+                source_byte_size=len(body),
+            ),
+            "sha256": source_sha256,
+            "byte-size": str(len(body)),
+            "width": "8",
+            "height": "6",
+            "lineage-sha256": lineage_sha256,
+        },
         version_id=version_id,
     )
     output = archives._OutputRecord(
@@ -190,6 +206,10 @@ async def test_finished_set_archive_rejects_metadata_bearing_derivative() -> Non
         review_display_order=1,
         ranking_rank=1,
         selection_id=uuid4(),
+        source_asset_id=source_asset_id,
+        source_object_version_id=source_object_version_id,
+        source_sha256=source_sha256,
+        source_byte_size=len(body),
         output_id=uuid4(),
         object_key=key,
         object_version_id=version_id,
@@ -200,6 +220,10 @@ async def test_finished_set_archive_rejects_metadata_bearing_derivative() -> Non
         height=6,
         byte_size=len(body),
         path="content/001.png",
+        public_recipe_sha256=archives._PUBLIC_PNG_RECIPE_SHA256,
+        public_lineage_sha256=lineage_sha256,
+        public_renderer_version=archives.DERIVATIVE_RENDERER_VERSION,
+        public_pillow_version=archives.PILLOW_VERSION,
     )
     manifest = b'{"schema":"finished-set-manifest/v1"}'
     plan = archives._ArchivePlan(
@@ -212,7 +236,10 @@ async def test_finished_set_archive_rejects_metadata_bearing_derivative() -> Non
         manifest_sha256=hashlib.sha256(manifest).hexdigest(),
     )
 
-    with pytest.raises(archives._FinishedSetArchiveContractError, match="embedded metadata"):
+    with pytest.raises(
+        archives._FinishedSetArchiveContractError,
+        match="embedded private metadata",
+    ):
         await archives._build_part(
             store,
             plan=plan,

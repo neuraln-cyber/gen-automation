@@ -3,6 +3,7 @@ import hmac
 import json
 import math
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -11,6 +12,13 @@ from pydantic import SecretStr, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.domain.canonical import canonical_sha256
+from gen_automation.domain.controlled_duo import (
+    DuoCompositionPreset,
+    DuoIsolationMode,
+    DuoQualityMode,
+    WorkflowCapability,
+    require_controlled_duo_capabilities,
+)
 from gen_automation.domain.deliverability import (
     DeliverabilityError,
     require_comfy_workflow_deliverability,
@@ -48,9 +56,11 @@ MAX_JSON_ITEMS = 50_000
 MIN_POST_ACCEPTANCE_UPLOAD_SECONDS = 3600
 MAX_RUNTIME_LORAS = 8
 LORA_CHAIN_NODE_CLASS = "GenAutomationLoraChain"
+CONTROLLED_DUO_MARKER_NODE_CLASS = "GenAutomationControlledDuoV2"
 MULTI_PROMPT_SHARED_NODE_CLASSES = frozenset(
     {
         "CheckpointLoaderSimple",
+        CONTROLLED_DUO_MARKER_NODE_CLASS,
         LORA_CHAIN_NODE_CLASS,
         "CLIPSetLastLayer",
         "UltralyticsDetectorProvider",
@@ -99,6 +109,9 @@ class _ResolvedJobParameters:
             "workflow": self.workflow.model_dump(mode="json"),
             "generation": generation_binding,
         }
+        controlled_duo = _controlled_duo_bindings(selected_generation)
+        if controlled_duo is not None:
+            bindings["controlled_duo"] = controlled_duo
         if runtime.detector_filename is not None:
             bindings["detector"] = {
                 "runtime_filename": runtime.detector_filename,
@@ -120,6 +133,217 @@ class _RuntimeArtifactBindings:
     checkpoint_filename: str
     lora_filenames: tuple[str, ...]
     detector_filename: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _DuoMaskRegion:
+    x: int
+    y: int
+    width: int
+    height: int
+    feather_left: int
+    feather_top: int
+    feather_right: int
+    feather_bottom: int
+
+    def as_binding(self) -> dict[str, int]:
+        return {
+            "x": self.x,
+            "y": self.y,
+            "width": self.width,
+            "height": self.height,
+            "feather_left": self.feather_left,
+            "feather_top": self.feather_top,
+            "feather_right": self.feather_right,
+            "feather_bottom": self.feather_bottom,
+        }
+
+
+_DUO_PRESET_REGION_RATIOS: dict[
+    DuoCompositionPreset,
+    tuple[tuple[float, float, float, float], tuple[float, float, float, float]],
+] = {
+    DuoCompositionPreset.CLOSE_PORTRAIT: (
+        (0.04, 0.08, 0.44, 0.84),
+        (0.52, 0.08, 0.44, 0.84),
+    ),
+    DuoCompositionPreset.OVERHEAD: (
+        (0.07, 0.12, 0.40, 0.72),
+        (0.54, 0.07, 0.39, 0.76),
+    ),
+    DuoCompositionPreset.LOW_ANGLE: (
+        (0.03, 0.22, 0.45, 0.75),
+        (0.52, 0.11, 0.45, 0.86),
+    ),
+    DuoCompositionPreset.DIAGONAL_DEPTH: (
+        (0.02, 0.30, 0.52, 0.67),
+        (0.58, 0.05, 0.39, 0.52),
+    ),
+    DuoCompositionPreset.BACK_TO_BACK: (
+        (0.05, 0.09, 0.43, 0.84),
+        (0.52, 0.09, 0.43, 0.84),
+    ),
+    DuoCompositionPreset.FULL_BODY: (
+        (0.08, 0.03, 0.38, 0.94),
+        (0.54, 0.03, 0.38, 0.94),
+    ),
+}
+_DUO_POSITIVE_INVARIANT = "exactly two clearly adult characters, both visible, no other people"
+_DUO_NEGATIVE_INVARIANT = (
+    "third person, extra person, background person, duplicate character, cloned face, "
+    "merged bodies, fused faces, shared face, mixed identity, swapped clothing"
+)
+_DUO_LOCAL_NEGATIVE_INVARIANT = (
+    "extra face inside this region, duplicate subject inside this region, "
+    "the other character's hair traits, the other character's outfit, identity crossover"
+)
+
+
+def _join_prompt_parts(*parts: str) -> str:
+    return ", ".join(part.strip(" ,\n\t") for part in parts if part.strip(" ,\n\t"))
+
+
+def _aligned_duo_region(
+    *,
+    canvas_width: int,
+    canvas_height: int,
+    ratios: tuple[float, float, float, float],
+    feather: int,
+) -> _DuoMaskRegion:
+    x_ratio, y_ratio, width_ratio, height_ratio = ratios
+    x = min(canvas_width - 64, max(0, round((canvas_width * x_ratio) / 8.0) * 8))
+    y = min(canvas_height - 64, max(0, round((canvas_height * y_ratio) / 8.0) * 8))
+    width = min(
+        canvas_width - x,
+        max(64, round((canvas_width * width_ratio) / 8.0) * 8),
+    )
+    height = min(
+        canvas_height - y,
+        max(64, round((canvas_height * height_ratio) / 8.0) * 8),
+    )
+    return _DuoMaskRegion(
+        x=x,
+        y=y,
+        width=width,
+        height=height,
+        feather_left=min(feather, width // 4),
+        feather_top=min(feather, height // 4),
+        feather_right=min(feather, width // 4),
+        feather_bottom=min(feather, height // 4),
+    )
+
+
+def _controlled_duo_bindings(
+    generation: GenerationParameters,
+) -> dict[str, object] | None:
+    if generation.duo_contract_version != 2:
+        return None
+    preset = generation.composition_preset_id
+    if generation.composition_mode != "duo" or preset is None:
+        raise WorkerInputError("Controlled Duo generation parameters are invalid")
+
+    feather = min(32, max(8, generation.width // 64))
+    character_a_ratios, character_b_ratios = _DUO_PRESET_REGION_RATIOS[preset]
+    character_a = _aligned_duo_region(
+        canvas_width=generation.width,
+        canvas_height=generation.height,
+        ratios=character_a_ratios,
+        feather=feather,
+    )
+    character_b = _aligned_duo_region(
+        canvas_width=generation.width,
+        canvas_height=generation.height,
+        ratios=character_b_ratios,
+        feather=feather,
+    )
+    horizontal_overlap = max(character_a.x, character_b.x) < min(
+        character_a.x + character_a.width,
+        character_b.x + character_b.width,
+    )
+    vertical_overlap = max(character_a.y, character_b.y) < min(
+        character_a.y + character_a.height,
+        character_b.y + character_b.height,
+    )
+    if horizontal_overlap and vertical_overlap:
+        raise WorkerInputError("Controlled Duo preset masks must be disjoint")
+    shared_positive = _join_prompt_parts(
+        _DUO_POSITIVE_INVARIANT,
+        generation.prompt,
+        generation.interaction_prompt,
+        generation.camera_prompt,
+    )
+    shared_negative = _join_prompt_parts(
+        generation.negative_prompt,
+        _DUO_NEGATIVE_INVARIANT,
+    )
+    character_a_local_positive = _join_prompt_parts(
+        "left-side subject only, character A only",
+        generation.character_a_prompt,
+    )
+    character_b_local_positive = _join_prompt_parts(
+        "right-side subject only, character B only",
+        generation.character_b_prompt,
+    )
+    character_a_local_negative = _join_prompt_parts(
+        generation.character_a_negative_prompt,
+        _DUO_LOCAL_NEGATIVE_INVARIANT,
+    )
+    character_b_local_negative = _join_prompt_parts(
+        generation.character_b_negative_prompt,
+        _DUO_LOCAL_NEGATIVE_INVARIANT,
+    )
+    refinement_fraction = 0.25 if generation.duo_quality_mode == DuoQualityMode.DRAFT else 0.50
+    refinement_floor = 6 if generation.duo_quality_mode == DuoQualityMode.DRAFT else 10
+    base_steps = (
+        min(generation.steps, max(8, math.ceil(generation.steps * 0.60)))
+        if generation.duo_quality_mode == DuoQualityMode.DRAFT
+        else generation.steps
+    )
+    refinement_steps = min(
+        generation.steps,
+        max(
+            refinement_floor,
+            math.ceil(generation.steps * refinement_fraction),
+        ),
+    )
+    refinement_denoise = 0.30 if generation.duo_quality_mode == DuoQualityMode.DRAFT else 0.42
+    return {
+        "contract_version": 2,
+        "composition_preset_id": preset.value,
+        "isolation_mode": generation.duo_isolation_mode.value,
+        "quality_mode": generation.duo_quality_mode.value,
+        "shared_positive_prompt": shared_positive,
+        "shared_negative_prompt": shared_negative,
+        "character_a_local_positive_prompt": character_a_local_positive,
+        "character_b_local_positive_prompt": character_b_local_positive,
+        "character_a_local_negative_prompt": character_a_local_negative,
+        "character_b_local_negative_prompt": character_b_local_negative,
+        "character_a_refinement_positive_prompt": _join_prompt_parts(
+            "one subject only in this masked region, preserve the existing pose and framing",
+            generation.prompt,
+            generation.camera_prompt,
+            character_a_local_positive,
+        ),
+        "character_b_refinement_positive_prompt": _join_prompt_parts(
+            "one subject only in this masked region, preserve the existing pose and framing",
+            generation.prompt,
+            generation.camera_prompt,
+            character_b_local_positive,
+        ),
+        "character_a_refinement_negative_prompt": _join_prompt_parts(
+            shared_negative,
+            character_a_local_negative,
+        ),
+        "character_b_refinement_negative_prompt": _join_prompt_parts(
+            shared_negative,
+            character_b_local_negative,
+        ),
+        "character_a": character_a.as_binding(),
+        "character_b": character_b.as_binding(),
+        "base_steps": base_steps,
+        "refinement_steps": refinement_steps,
+        "refinement_denoise": refinement_denoise,
+    }
 
 
 def _resolve_manifest_artifact(
@@ -211,6 +435,15 @@ def _resolve_job_parameters(context: SaladJobInputContext) -> _ResolvedJobParame
             )
     except ValidationError:
         raise WorkerInputError("generation parameters are invalid") from None
+    if generation.duo_contract_version == 2:
+        try:
+            require_controlled_duo_capabilities(
+                frozenset(workflow.capabilities),
+                isolation_mode=generation.duo_isolation_mode,
+                quality_mode=generation.duo_quality_mode,
+            )
+        except ValueError:
+            raise WorkerInputError("Controlled Duo workflow capability is invalid") from None
     if generation.outputs_per_job != context.expected_output_count:
         raise WorkerInputError("generation output count is inconsistent")
     if output_generations:
@@ -224,6 +457,10 @@ def _resolve_job_parameters(context: SaladJobInputContext) -> _ResolvedJobParame
             "prompt",
             "character_a_prompt",
             "character_b_prompt",
+            "character_a_negative_prompt",
+            "character_b_negative_prompt",
+            "interaction_prompt",
+            "camera_prompt",
             "negative_prompt",
             "detailer_prompt",
             "detailer_negative_prompt",
@@ -250,6 +487,10 @@ def _resolve_job_parameters(context: SaladJobInputContext) -> _ResolvedJobParame
                 item.prompt,
                 item.character_a_prompt,
                 item.character_b_prompt,
+                item.character_a_negative_prompt,
+                item.character_b_negative_prompt,
+                item.interaction_prompt,
+                item.camera_prompt,
                 item.negative_prompt,
                 item.detailer_prompt,
                 item.detailer_negative_prompt,
@@ -315,6 +556,582 @@ def _parse_workflow_template(raw: bytes) -> dict[str, object]:
     if not isinstance(parsed, dict) or not parsed:
         raise WorkerInputError("workflow template is invalid")
     return parsed
+
+
+def _is_binding(value: object, path: str) -> bool:
+    return value == {"$gen": path}
+
+
+def _require_template_node(
+    template: Mapping[str, object],
+    node_id: object,
+    node_class: str,
+) -> Mapping[str, object]:
+    if not isinstance(node_id, str) or not node_id:
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    node = template.get(node_id)
+    if not isinstance(node, Mapping) or node.get("class_type") != node_class:
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    inputs = node.get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    return inputs
+
+
+def _require_template_link(value: object, node_id: str) -> None:
+    if value != [node_id, 0]:
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+
+
+def _validate_controlled_duo_mask_evidence(
+    template: Mapping[str, object],
+    *,
+    mask_node_id: str,
+    character: Literal["character_a", "character_b"],
+) -> str:
+    composite = _require_template_node(template, mask_node_id, "MaskComposite")
+    if (
+        set(composite) != {"destination", "source", "x", "y", "operation"}
+        or composite.get("operation") != "add"
+    ):
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    destination = composite.get("destination")
+    source = composite.get("source")
+    if (
+        not isinstance(destination, list)
+        or len(destination) != 2
+        or not isinstance(destination[0], str)
+        or destination[1] != 0
+        or not isinstance(source, list)
+        or len(source) != 2
+        or not isinstance(source[0], str)
+        or source[1] != 0
+    ):
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    full_mask = _require_template_node(template, destination[0], "SolidMask")
+    feather = _require_template_node(template, source[0], "FeatherMask")
+    region_link = feather.get("mask")
+    if (
+        not isinstance(region_link, list)
+        or len(region_link) != 2
+        or not isinstance(region_link[0], str)
+        or region_link[1] != 0
+    ):
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    region_mask = _require_template_node(template, region_link[0], "SolidMask")
+    if (
+        set(full_mask) != {"value", "width", "height"}
+        or set(region_mask) != {"value", "width", "height"}
+        or set(feather) != {"mask", "left", "top", "right", "bottom"}
+        or full_mask.get("value") != 0.0
+        or not _is_binding(full_mask.get("width"), "generation.width")
+        or not _is_binding(full_mask.get("height"), "generation.height")
+        or region_mask.get("value") != 1.0
+        or not _is_binding(
+            region_mask.get("width"),
+            f"controlled_duo.{character}.width",
+        )
+        or not _is_binding(
+            region_mask.get("height"),
+            f"controlled_duo.{character}.height",
+        )
+        or not _is_binding(composite.get("x"), f"controlled_duo.{character}.x")
+        or not _is_binding(composite.get("y"), f"controlled_duo.{character}.y")
+    ):
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    for edge in ("left", "top", "right", "bottom"):
+        if not _is_binding(
+            feather.get(edge),
+            f"controlled_duo.{character}.feather_{edge}",
+        ):
+            raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    return destination[0]
+
+
+def _validate_controlled_duo_prompt_evidence(
+    template: Mapping[str, object],
+    *,
+    isolation_mode: DuoIsolationMode,
+) -> dict[str, str]:
+    clip_nodes = [
+        node_id
+        for node_id, raw_node in template.items()
+        if isinstance(raw_node, Mapping) and raw_node.get("class_type") == "CLIPSetLastLayer"
+    ]
+    if len(clip_nodes) != 1:
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    prompt_nodes: dict[str, str] = {}
+    for node_id, raw_node in template.items():
+        if not isinstance(raw_node, Mapping) or raw_node.get("class_type") != "CLIPTextEncode":
+            continue
+        inputs = raw_node.get("inputs")
+        if not isinstance(inputs, Mapping):
+            raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+        text = inputs.get("text")
+        if (
+            not isinstance(text, Mapping)
+            or set(text) != {"$gen"}
+            or set(inputs) != {"clip", "text"}
+            or not isinstance(text["$gen"], str)
+            or text["$gen"] in prompt_nodes
+            or inputs.get("clip") != [clip_nodes[0], 0]
+        ):
+            raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+        prompt_nodes[text["$gen"]] = node_id
+    expected_paths = {
+        "controlled_duo.shared_positive_prompt",
+        "controlled_duo.shared_negative_prompt",
+    }
+    expected_paths.update(
+        {
+            "controlled_duo.character_a_local_positive_prompt",
+            "controlled_duo.character_b_local_positive_prompt",
+            "controlled_duo.character_a_local_negative_prompt",
+            "controlled_duo.character_b_local_negative_prompt",
+        }
+    )
+    if isolation_mode == DuoIsolationMode.STRICT:
+        expected_paths.update(
+            {
+                "controlled_duo.character_a_refinement_positive_prompt",
+                "controlled_duo.character_b_refinement_positive_prompt",
+                "controlled_duo.character_a_refinement_negative_prompt",
+                "controlled_duo.character_b_refinement_negative_prompt",
+            }
+        )
+    if set(prompt_nodes) != expected_paths:
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    return prompt_nodes
+
+
+def _find_conditioning_combine(
+    template: Mapping[str, object],
+    *,
+    conditioning_1: str,
+    conditioning_2: str,
+) -> str:
+    matches = []
+    for node_id, raw_node in template.items():
+        if not isinstance(raw_node, Mapping) or raw_node.get("class_type") != "ConditioningCombine":
+            continue
+        inputs = raw_node.get("inputs")
+        if isinstance(inputs, Mapping) and inputs == {
+            "conditioning_1": [conditioning_1, 0],
+            "conditioning_2": [conditioning_2, 0],
+        }:
+            matches.append(node_id)
+    if len(matches) != 1:
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    return matches[0]
+
+
+def _only_controlled_duo_node(
+    template: Mapping[str, object],
+    node_class: str,
+) -> tuple[str, Mapping[str, object]]:
+    matches = [
+        (node_id, raw_node)
+        for node_id, raw_node in template.items()
+        if isinstance(raw_node, Mapping) and raw_node.get("class_type") == node_class
+    ]
+    if len(matches) != 1:
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    node_id, raw_node = matches[0]
+    inputs = raw_node.get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    return node_id, inputs
+
+
+def _validate_controlled_duo_backbone_evidence(
+    template: Mapping[str, object],
+) -> tuple[str, str, str]:
+    checkpoint_node_id, checkpoint = _only_controlled_duo_node(
+        template,
+        "CheckpointLoaderSimple",
+    )
+    lora_chain_node_id, lora_chain = _only_controlled_duo_node(
+        template,
+        LORA_CHAIN_NODE_CLASS,
+    )
+    _clip_node_id, clip = _only_controlled_duo_node(template, "CLIPSetLastLayer")
+    latent_node_id, latent = _only_controlled_duo_node(template, "EmptyLatentImage")
+    if (
+        checkpoint != {"ckpt_name": {"$gen": "checkpoint.runtime_filename"}}
+        or lora_chain
+        != {
+            "model": [checkpoint_node_id, 0],
+            "clip": [checkpoint_node_id, 1],
+        }
+        or clip
+        != {
+            "clip": [lora_chain_node_id, 1],
+            "stop_at_clip_layer": {"$gen": "generation.clip_stop_at_layer"},
+        }
+        or latent
+        != {
+            "batch_size": {"$gen": "generation.outputs_per_job"},
+            "height": {"$gen": "generation.height"},
+            "width": {"$gen": "generation.width"},
+        }
+    ):
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    return checkpoint_node_id, lora_chain_node_id, latent_node_id
+
+
+def _validate_controlled_duo_sampler_common_inputs(
+    sampler: Mapping[str, object],
+    *,
+    lora_chain_node_id: str,
+) -> None:
+    if (
+        set(sampler)
+        != {
+            "cfg",
+            "denoise",
+            "latent_image",
+            "model",
+            "negative",
+            "positive",
+            "sampler_name",
+            "scheduler",
+            "seed",
+            "steps",
+        }
+        or sampler.get("cfg") != {"$gen": "generation.cfg"}
+        or sampler.get("model") != [lora_chain_node_id, 0]
+        or sampler.get("sampler_name") != {"$gen": "generation.sampler"}
+        or sampler.get("scheduler") != {"$gen": "generation.scheduler"}
+        or sampler.get("seed") != {"$gen": "generation.seed"}
+    ):
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+
+
+def _validate_controlled_duo_sampling_evidence(
+    template: Mapping[str, object],
+    *,
+    marker_inputs: Mapping[str, object],
+    isolation_mode: DuoIsolationMode,
+    character_a_mask_node_id: str,
+    character_b_mask_node_id: str,
+    prompt_node_ids: Mapping[str, str],
+    lora_chain_node_id: str,
+    base_latent_node_id: str,
+) -> None:
+    base_sampler_id = marker_inputs.get("base_sampler_node_id")
+    final_sampler_id = marker_inputs.get("final_sampler_node_id")
+    base_sampler = _require_template_node(template, base_sampler_id, "KSampler")
+    _validate_controlled_duo_sampler_common_inputs(
+        base_sampler,
+        lora_chain_node_id=lora_chain_node_id,
+    )
+    if isolation_mode == DuoIsolationMode.BALANCED and final_sampler_id != base_sampler_id:
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    set_masks = [
+        node
+        for node in template.values()
+        if isinstance(node, Mapping) and node.get("class_type") == "ConditioningSetMask"
+    ]
+    if len(set_masks) != 4:
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    expected_masked_prompts = {
+        "controlled_duo.character_a_local_positive_prompt": character_a_mask_node_id,
+        "controlled_duo.character_b_local_positive_prompt": character_b_mask_node_id,
+        "controlled_duo.character_a_local_negative_prompt": character_a_mask_node_id,
+        "controlled_duo.character_b_local_negative_prompt": character_b_mask_node_id,
+    }
+    masked_prompt_nodes: dict[str, str] = {}
+    for prompt_path, expected_mask_id in expected_masked_prompts.items():
+        encode_node_id = prompt_node_ids[prompt_path]
+        matches = []
+        for node_id, node in template.items():
+            if not isinstance(node, Mapping) or node.get("class_type") != "ConditioningSetMask":
+                continue
+            inputs = node.get("inputs")
+            if isinstance(inputs, Mapping) and inputs == {
+                "conditioning": [encode_node_id, 0],
+                "mask": [expected_mask_id, 0],
+                "strength": 1.0,
+                "set_cond_area": "default",
+            }:
+                matches.append(node_id)
+        if len(matches) != 1:
+            raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+        masked_prompt_nodes[prompt_path] = matches[0]
+    if len(set(masked_prompt_nodes.values())) != 4:
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    positive_a = _find_conditioning_combine(
+        template,
+        conditioning_1=prompt_node_ids["controlled_duo.shared_positive_prompt"],
+        conditioning_2=masked_prompt_nodes["controlled_duo.character_a_local_positive_prompt"],
+    )
+    positive_final = _find_conditioning_combine(
+        template,
+        conditioning_1=positive_a,
+        conditioning_2=masked_prompt_nodes["controlled_duo.character_b_local_positive_prompt"],
+    )
+    negative_a = _find_conditioning_combine(
+        template,
+        conditioning_1=prompt_node_ids["controlled_duo.shared_negative_prompt"],
+        conditioning_2=masked_prompt_nodes["controlled_duo.character_a_local_negative_prompt"],
+    )
+    negative_final = _find_conditioning_combine(
+        template,
+        conditioning_1=negative_a,
+        conditioning_2=masked_prompt_nodes["controlled_duo.character_b_local_negative_prompt"],
+    )
+    if (
+        base_sampler.get("positive") != [positive_final, 0]
+        or base_sampler.get("negative") != [negative_final, 0]
+        or base_sampler.get("latent_image") != [base_latent_node_id, 0]
+        or base_sampler.get("denoise") != 1.0
+        or not _is_binding(base_sampler.get("steps"), "controlled_duo.base_steps")
+    ):
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    if isolation_mode == DuoIsolationMode.BALANCED:
+        return
+
+    character_a_noise_mask_id = marker_inputs.get("character_a_noise_mask_node_id")
+    character_a_sampler_id = marker_inputs.get("character_a_sampler_node_id")
+    character_b_noise_mask_id = marker_inputs.get("character_b_noise_mask_node_id")
+    character_b_sampler_id = marker_inputs.get("character_b_sampler_node_id")
+    character_a_noise = _require_template_node(
+        template,
+        character_a_noise_mask_id,
+        "SetLatentNoiseMask",
+    )
+    character_a_sampler = _require_template_node(
+        template,
+        character_a_sampler_id,
+        "KSampler",
+    )
+    character_b_noise = _require_template_node(
+        template,
+        character_b_noise_mask_id,
+        "SetLatentNoiseMask",
+    )
+    character_b_sampler = _require_template_node(
+        template,
+        character_b_sampler_id,
+        "KSampler",
+    )
+    _validate_controlled_duo_sampler_common_inputs(
+        character_a_sampler,
+        lora_chain_node_id=lora_chain_node_id,
+    )
+    _validate_controlled_duo_sampler_common_inputs(
+        character_b_sampler,
+        lora_chain_node_id=lora_chain_node_id,
+    )
+    assert isinstance(base_sampler_id, str)
+    assert isinstance(character_a_noise_mask_id, str)
+    assert isinstance(character_a_sampler_id, str)
+    assert isinstance(character_b_noise_mask_id, str)
+    assert isinstance(character_b_sampler_id, str)
+    _require_template_link(character_a_noise.get("samples"), base_sampler_id)
+    _require_template_link(character_a_noise.get("mask"), character_a_mask_node_id)
+    _require_template_link(
+        character_a_sampler.get("latent_image"),
+        character_a_noise_mask_id,
+    )
+    _require_template_link(character_b_noise.get("samples"), character_a_sampler_id)
+    _require_template_link(character_b_noise.get("mask"), character_b_mask_node_id)
+    _require_template_link(
+        character_b_sampler.get("latent_image"),
+        character_b_noise_mask_id,
+    )
+    if set(character_a_noise) != {"samples", "mask"} or set(character_b_noise) != {
+        "samples",
+        "mask",
+    }:
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    if final_sampler_id != character_b_sampler_id:
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    for sampler in (character_a_sampler, character_b_sampler):
+        if not _is_binding(
+            sampler.get("steps"), "controlled_duo.refinement_steps"
+        ) or not _is_binding(
+            sampler.get("denoise"),
+            "controlled_duo.refinement_denoise",
+        ):
+            raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    if (
+        character_a_sampler.get("positive")
+        != [prompt_node_ids["controlled_duo.character_a_refinement_positive_prompt"], 0]
+        or character_a_sampler.get("negative")
+        != [prompt_node_ids["controlled_duo.character_a_refinement_negative_prompt"], 0]
+        or character_b_sampler.get("positive")
+        != [prompt_node_ids["controlled_duo.character_b_refinement_positive_prompt"], 0]
+        or character_b_sampler.get("negative")
+        != [prompt_node_ids["controlled_duo.character_b_refinement_negative_prompt"], 0]
+    ):
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+
+
+def _prepare_controlled_duo_template(
+    template: dict[str, object],
+    *,
+    specification: WorkflowSpecification,
+    generation: GenerationParameters,
+) -> dict[str, object]:
+    marker_nodes = [
+        (node_id, raw_node)
+        for node_id, raw_node in template.items()
+        if isinstance(raw_node, Mapping)
+        and raw_node.get("class_type") == CONTROLLED_DUO_MARKER_NODE_CLASS
+    ]
+    capabilities = frozenset(specification.capabilities)
+    declares_controlled_duo = WorkflowCapability.CONTROLLED_DUO_V2 in capabilities
+    if generation.duo_contract_version != 2:
+        if marker_nodes or declares_controlled_duo:
+            raise WorkerInputError("Controlled Duo workflow capability is invalid")
+        return template
+    if len(marker_nodes) != 1 or not declares_controlled_duo:
+        raise WorkerInputError("Controlled Duo workflow capability is invalid")
+
+    marker_node_id, marker = marker_nodes[0]
+    marker_inputs = marker.get("inputs")
+    if not isinstance(marker_inputs, Mapping):
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    isolation_value = marker_inputs.get("isolation_mode")
+    if not isinstance(isolation_value, str):
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    try:
+        isolation_mode = DuoIsolationMode(isolation_value)
+    except ValueError:
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid") from None
+    expected_keys = {
+        "contract_version",
+        "isolation_mode",
+        "mask_topology",
+        "character_a_mask_node_id",
+        "character_b_mask_node_id",
+        "base_sampler_node_id",
+        "final_sampler_node_id",
+    }
+    if isolation_mode == DuoIsolationMode.STRICT:
+        expected_keys.update(
+            {
+                "character_a_noise_mask_node_id",
+                "character_a_sampler_node_id",
+                "character_b_noise_mask_node_id",
+                "character_b_sampler_node_id",
+            }
+        )
+    if (
+        set(marker_inputs) != expected_keys
+        or marker_inputs.get("contract_version") != 2
+        or marker_inputs.get("mask_topology") != "disjoint_preset_rectangles_v1"
+        or generation.duo_isolation_mode != isolation_mode
+    ):
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    declares_strict = WorkflowCapability.DUO_STRICT_ISOLATION in capabilities
+    if declares_strict != (isolation_mode == DuoIsolationMode.STRICT):
+        raise WorkerInputError("Controlled Duo workflow capability is invalid")
+    if WorkflowCapability.DUO_HIGH_QUALITY in capabilities:
+        raise WorkerInputError("Controlled Duo high-quality workflow evidence is unavailable")
+
+    class_counts: Counter[object] = Counter(
+        raw_node.get("class_type")
+        for raw_node in template.values()
+        if isinstance(raw_node, Mapping)
+    )
+    expected_sampler_count = 1 if isolation_mode == DuoIsolationMode.BALANCED else 3
+    expected_noise_mask_count = 0 if isolation_mode == DuoIsolationMode.BALANCED else 2
+    expected_prompt_count = 6 if isolation_mode == DuoIsolationMode.BALANCED else 10
+    expected_class_counts: Counter[object] = Counter(
+        {
+            "CheckpointLoaderSimple": 1,
+            LORA_CHAIN_NODE_CLASS: 1,
+            "CLIPSetLastLayer": 1,
+            "SolidMask": 3,
+            "FeatherMask": 2,
+            "MaskComposite": 2,
+            "CLIPTextEncode": expected_prompt_count,
+            "ConditioningSetMask": 4,
+            "ConditioningCombine": 4,
+            "EmptyLatentImage": 1,
+            "KSampler": expected_sampler_count,
+            "SetLatentNoiseMask": expected_noise_mask_count,
+            "VAEDecode": 1,
+            "SaveImage": 1,
+            CONTROLLED_DUO_MARKER_NODE_CLASS: 1,
+        }
+    )
+    if class_counts != expected_class_counts:
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+
+    checkpoint_node_id, lora_chain_node_id, base_latent_node_id = (
+        _validate_controlled_duo_backbone_evidence(template)
+    )
+
+    character_a_mask_node_id = marker_inputs.get("character_a_mask_node_id")
+    character_b_mask_node_id = marker_inputs.get("character_b_mask_node_id")
+    if not isinstance(character_a_mask_node_id, str) or not isinstance(
+        character_b_mask_node_id,
+        str,
+    ):
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    character_a_full_mask = _validate_controlled_duo_mask_evidence(
+        template,
+        mask_node_id=character_a_mask_node_id,
+        character="character_a",
+    )
+    character_b_full_mask = _validate_controlled_duo_mask_evidence(
+        template,
+        mask_node_id=character_b_mask_node_id,
+        character="character_b",
+    )
+    if character_a_full_mask != character_b_full_mask:
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    prompt_node_ids = _validate_controlled_duo_prompt_evidence(
+        template,
+        isolation_mode=isolation_mode,
+    )
+    _validate_controlled_duo_sampling_evidence(
+        template,
+        marker_inputs=marker_inputs,
+        isolation_mode=isolation_mode,
+        character_a_mask_node_id=character_a_mask_node_id,
+        character_b_mask_node_id=character_b_mask_node_id,
+        prompt_node_ids=prompt_node_ids,
+        lora_chain_node_id=lora_chain_node_id,
+        base_latent_node_id=base_latent_node_id,
+    )
+    final_sampler_id = marker_inputs["final_sampler_node_id"]
+    decode_inputs = next(
+        raw_node["inputs"]
+        for raw_node in template.values()
+        if isinstance(raw_node, dict) and raw_node.get("class_type") == "VAEDecode"
+    )
+    save_inputs = next(
+        raw_node["inputs"]
+        for raw_node in template.values()
+        if isinstance(raw_node, dict) and raw_node.get("class_type") == "SaveImage"
+    )
+    if not isinstance(final_sampler_id, str):
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    decode_node_id = next(
+        node_id
+        for node_id, raw_node in template.items()
+        if isinstance(raw_node, dict) and raw_node.get("class_type") == "VAEDecode"
+    )
+    expected_filename_prefix = (
+        "gen-automation-controlled-duo-balanced-v2"
+        if isolation_mode == DuoIsolationMode.BALANCED
+        else "gen-automation-controlled-duo-strict-v2"
+    )
+    if decode_inputs != {
+        "samples": [final_sampler_id, 0],
+        "vae": [checkpoint_node_id, 2],
+    } or save_inputs != {
+        "filename_prefix": expected_filename_prefix,
+        "images": [decode_node_id, 0],
+    }:
+        raise WorkerInputError("Controlled Duo workflow evidence is invalid")
+    return {
+        node_id: raw_node for node_id, raw_node in template.items() if node_id != marker_node_id
+    }
 
 
 def _resolve_binding(path: str, bindings: Mapping[str, object]) -> object:
@@ -634,6 +1451,7 @@ async def _load_workflow(
     store: ObjectStore,
     *,
     specification: WorkflowSpecification,
+    generation: GenerationParameters,
     bindings: Mapping[str, object],
     output_bindings: tuple[Mapping[str, object], ...] = (),
     max_bytes: int,
@@ -653,6 +1471,11 @@ async def _load_workflow(
     if hashlib.sha256(raw).hexdigest() != specification.sha256:
         raise WorkerInputError("workflow template integrity check failed")
     template = _parse_workflow_template(raw)
+    template = _prepare_controlled_duo_template(
+        template,
+        specification=specification,
+        generation=generation,
+    )
     rendered = (
         _render_multi_prompt_workflow(template, output_bindings)
         if len(output_bindings) > 1
@@ -710,6 +1533,7 @@ class SaladWorkerJobInputProvider:
         workflow = await _load_workflow(
             self.store,
             specification=resolved.workflow,
+            generation=resolved.generation,
             bindings=resolved.bindings(runtime),
             output_bindings=resolved.output_bindings(runtime),
             max_bytes=self.max_workflow_bytes,

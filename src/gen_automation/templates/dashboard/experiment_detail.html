@@ -1,6 +1,11 @@
 {% extends "dashboard/base.html" %}
 
 {% block content %}
+  {% set initial_gpu_billing = experiment.gpu_billing|default(none) %}
+  {% set initial_gpu_billing_state = (initial_gpu_billing.state.value|default(initial_gpu_billing.state)) if initial_gpu_billing else 'not_started' %}
+  {% set initial_gpu_billing_elapsed = initial_gpu_billing.elapsed_seconds if initial_gpu_billing else 0 %}
+  {% set initial_gpu_billing_instances = initial_gpu_billing.running_instances if initial_gpu_billing else 0 %}
+  {% set initial_gpu_billing_fresh_for = initial_gpu_billing.fresh_for_seconds if initial_gpu_billing else 0 %}
   <a class="back" href="/dashboard/experiments/new">&larr; New experiment</a>
   <header class="page-header experiment-page-header">
     <div class="page-header-row">
@@ -26,7 +31,7 @@
     data-progress-url="/dashboard/experiments/{{ experiment.group_slug }}/progress"
     data-assets-url="/dashboard/experiments/{{ experiment.group_slug }}/generated-assets"
   >
-    <section class="experiment-progress panel" aria-live="polite">
+    <section class="experiment-progress panel">
       <div class="experiment-progress-copy">
         <div><span class="experiment-eyebrow">Comparison progress</span><strong data-experiment-progress-label>{{ experiment.generated_outputs }} / {{ experiment.expected_outputs }} images</strong></div>
         <span data-experiment-progress-percent>{{ ((experiment.generated_outputs * 100 / experiment.expected_outputs) if experiment.expected_outputs else 0)|round(1) }}%</span>
@@ -34,7 +39,50 @@
       <div class="experiment-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="{{ experiment.expected_outputs }}" aria-valuenow="{{ experiment.generated_outputs }}" data-experiment-progressbar>
         <span data-experiment-progress-fill style="width: {{ ((experiment.generated_outputs * 100 / experiment.expected_outputs) if experiment.expected_outputs else 0)|round(1) }}%"></span>
       </div>
-      <p class="muted" data-experiment-progress-status>Waiting for the queued GPU comparison.</p>
+      <div
+        class="shared-gpu-billing experiment-gpu-billing"
+        data-gpu-billing
+        data-gpu-billing-initial-state="{{ initial_gpu_billing_state }}"
+        data-gpu-billing-initial-elapsed="{{ initial_gpu_billing_elapsed }}"
+        data-gpu-billing-initial-instances="{{ initial_gpu_billing_instances }}"
+        data-gpu-billing-initial-fresh-for="{{ initial_gpu_billing_fresh_for }}"
+        data-gpu-billing-initial-started-at="{{ initial_gpu_billing.session_started_at.isoformat() if initial_gpu_billing and initial_gpu_billing.session_started_at else '' }}"
+        data-gpu-billing-initial-observed-at="{{ initial_gpu_billing.observed_at.isoformat() if initial_gpu_billing and initial_gpu_billing.observed_at else '' }}"
+        data-gpu-billing-initial-estimated="{{ 'true' if initial_gpu_billing and initial_gpu_billing.estimated else 'false' }}"
+      >
+        <span class="shared-gpu-billing-label">Current shared GPU billing session</span>
+        <div class="shared-gpu-billing-reading">
+          <time
+            class="shared-gpu-billing-time"
+            datetime="PT{{ initial_gpu_billing_elapsed }}S"
+            data-gpu-billing-time
+          >{{ "%02d:%02d:%02d"|format(initial_gpu_billing_elapsed // 3600, (initial_gpu_billing_elapsed % 3600) // 60, initial_gpu_billing_elapsed % 60) }}</time>
+          <span
+            class="shared-gpu-billing-state"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            data-gpu-billing-state
+          >{% if initial_gpu_billing_state == 'charging' %}Charging &middot; {{ initial_gpu_billing_instances }} running GPU{{ '' if initial_gpu_billing_instances == 1 else 's' }}{% elif initial_gpu_billing_state == 'stopping' %}{% if initial_gpu_billing_instances > 0 %}Stopping &middot; {{ initial_gpu_billing_instances }} running GPU{{ '' if initial_gpu_billing_instances == 1 else 's' }} still charging{% else %}Stopping &middot; waiting for provider confirmation{% endif %}{% elif initial_gpu_billing_state == 'paused' %}Not charging &middot; session paused{% elif initial_gpu_billing_state == 'ended' %}Session ended &middot; timer frozen{% elif initial_gpu_billing_state == 'stale' %}Provider status delayed &middot; timer frozen{% else %}Not charging{% endif %}</span>
+        </div>
+        <span
+          class="shared-gpu-billing-estimate"
+          data-gpu-billing-estimate
+          {% if not initial_gpu_billing or not initial_gpu_billing.estimated %}hidden{% endif %}
+        >
+          Estimated from the latest provider observation
+        </span>
+        <span class="shared-gpu-billing-note">
+          Shared across generation and Experiment Lab work; not attributed to one comparison.
+          Starts only when Salad reports a running GPU instance.
+        </span>
+      </div>
+      <p
+        class="muted"
+        role="status"
+        aria-live="polite"
+        data-experiment-progress-status
+      >Waiting for the queued GPU comparison.</p>
     </section>
 
     <section
