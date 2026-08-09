@@ -11,8 +11,11 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from gen_automation.config import Settings
 from gen_automation.storage.base import (
+    MultipartPart,
+    MultipartUpload,
     ObjectAlreadyExistsError,
     ObjectConflictError,
+    ObjectDigest,
     ObjectMetadata,
     ObjectNotFoundError,
     ObjectStore,
@@ -156,18 +159,23 @@ class S3ObjectStore:
         except (BotoCoreError, ClientError) as error:
             raise ObjectStoreError("S3 download signing failed") from error
 
-    async def head(self, key: str) -> ObjectMetadata | None:
+    async def head(
+        self,
+        key: str,
+        *,
+        version_id: str | None = None,
+    ) -> ObjectMetadata | None:
+        parameters: dict[str, Any] = {
+            "Bucket": self.bucket,
+            "Key": key,
+        }
+        if version_id is not None:
+            parameters["VersionId"] = version_id
         try:
-            response = await to_thread.run_sync(
-                partial(
-                    self.client.head_object,
-                    Bucket=self.bucket,
-                    Key=key,
-                )
-            )
+            response = await to_thread.run_sync(partial(self.client.head_object, **parameters))
         except ClientError as error:
             error_code = str(error.response.get("Error", {}).get("Code", ""))
-            if error_code in {"404", "NoSuchKey", "NotFound"}:
+            if error_code in {"404", "NoSuchKey", "NoSuchVersion", "NotFound"}:
                 return None
             raise ObjectStoreError("S3 head_object failed") from error
         except BotoCoreError as error:
@@ -294,10 +302,13 @@ class S3ObjectStore:
         except BotoCoreError as error:
             raise ObjectStoreError("S3 put_object failed") from error
 
-        result = await self.head(key)
+        response_version_id = response.get("VersionId")
+        result = await self.head(
+            key,
+            version_id=(response_version_id if isinstance(response_version_id, str) else None),
+        )
         if result is None:
             raise ObjectNotFoundError(key)
-        response_version_id = response.get("VersionId")
         if (
             response_version_id is not None
             and result.version_id is not None
@@ -321,6 +332,7 @@ class S3ObjectStore:
         metadata: dict[str, str],
         source_version_id: str | None = None,
         source_etag: str | None = None,
+        storage_class: str | None = None,
     ) -> ObjectMetadata:
         copy_source: dict[str, str] = {"Bucket": self.bucket, "Key": source_key}
         if source_version_id is not None:
@@ -328,8 +340,10 @@ class S3ObjectStore:
         copy_parameters: dict[str, Any] = {}
         if source_etag is not None:
             copy_parameters["CopySourceIfMatch"] = source_etag
+        if storage_class is not None:
+            copy_parameters["StorageClass"] = storage_class
         try:
-            await to_thread.run_sync(
+            response = await to_thread.run_sync(
                 partial(
                     self.client.copy_object,
                     Bucket=self.bucket,
@@ -359,10 +373,289 @@ class S3ObjectStore:
             raise ObjectStoreError("S3 copy_object failed") from error
         except BotoCoreError as error:
             raise ObjectStoreError("S3 copy_object failed") from error
-        result = await self.head(destination_key)
+        response_version_id = response.get("VersionId")
+        result = await self.head(
+            destination_key,
+            version_id=(response_version_id if isinstance(response_version_id, str) else None),
+        )
         if result is None:
             raise ObjectNotFoundError(destination_key)
         return result
+
+    async def read_range(
+        self,
+        key: str,
+        *,
+        start: int,
+        length: int,
+        version_id: str,
+        etag: str | None = None,
+    ) -> bytes:
+        if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+            raise ValueError("range start must be a non-negative integer")
+        if isinstance(length, bool) or not isinstance(length, int) or length <= 0:
+            raise ValueError("range length must be a positive integer")
+
+        def read_object_range() -> bytes:
+            body: Any | None = None
+            try:
+                parameters: dict[str, Any] = {
+                    "Bucket": self.bucket,
+                    "Key": key,
+                    "VersionId": version_id,
+                    "Range": f"bytes={start}-{start + length - 1}",
+                }
+                if etag is not None:
+                    parameters["IfMatch"] = etag
+                response = self.client.get_object(**parameters)
+                body = response["Body"]
+                expected_size = int(response["ContentLength"])
+                if expected_size != length:
+                    raise ObjectConflictError("S3 range length changed")
+                result = body.read(length + 1)
+                if len(result) != length or body.read(1):
+                    raise ObjectConflictError("S3 range body length changed")
+                return bytes(result)
+            except (ObjectConflictError, ObjectNotFoundError):
+                raise
+            except ClientError as error:
+                status_code = int(
+                    error.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0)
+                )
+                error_code = str(error.response.get("Error", {}).get("Code", ""))
+                if status_code == 404 or error_code in {
+                    "404",
+                    "NoSuchKey",
+                    "NoSuchVersion",
+                    "NotFound",
+                }:
+                    raise ObjectNotFoundError(key) from error
+                if status_code in {412, 416} or error_code in {
+                    "412",
+                    "416",
+                    "InvalidRange",
+                    "PreconditionFailed",
+                }:
+                    raise ObjectConflictError(
+                        "S3 exact-version range precondition failed"
+                    ) from error
+                raise ObjectStoreError("S3 get_object range failed") from error
+            except BotoCoreError as error:
+                raise ObjectStoreError("S3 get_object range failed") from error
+            finally:
+                if body is not None:
+                    body.close()
+
+        return await to_thread.run_sync(read_object_range)
+
+    async def sha256(
+        self,
+        key: str,
+        *,
+        max_bytes: int,
+        version_id: str,
+        etag: str | None = None,
+    ) -> ObjectDigest:
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+            raise ValueError("max_bytes must be a positive integer")
+
+        def hash_object() -> ObjectDigest:
+            body: Any | None = None
+            try:
+                parameters: dict[str, Any] = {
+                    "Bucket": self.bucket,
+                    "Key": key,
+                    "VersionId": version_id,
+                }
+                if etag is not None:
+                    parameters["IfMatch"] = etag
+                response = self.client.get_object(**parameters)
+                body = response["Body"]
+                expected_size = int(response["ContentLength"])
+                if expected_size > max_bytes:
+                    raise ObjectTooLargeError(f"{key} exceeds {max_bytes} bytes")
+                digest = hashlib.sha256()
+                total = 0
+                while chunk := body.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ObjectTooLargeError(f"{key} exceeds {max_bytes} bytes")
+                    digest.update(chunk)
+                if total != expected_size:
+                    raise ObjectConflictError("S3 object length changed while hashing")
+                return ObjectDigest(sha256=digest.hexdigest(), byte_size=total)
+            except (ObjectConflictError, ObjectTooLargeError):
+                raise
+            except ClientError as error:
+                status_code = int(
+                    error.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0)
+                )
+                error_code = str(error.response.get("Error", {}).get("Code", ""))
+                if status_code == 404 or error_code in {
+                    "404",
+                    "NoSuchKey",
+                    "NoSuchVersion",
+                    "NotFound",
+                }:
+                    raise ObjectNotFoundError(key) from error
+                if status_code == 412 or error_code in {"412", "PreconditionFailed"}:
+                    raise ObjectConflictError("S3 object hash precondition failed") from error
+                raise ObjectStoreError("S3 get_object hash failed") from error
+            except BotoCoreError as error:
+                raise ObjectStoreError("S3 get_object hash failed") from error
+            finally:
+                if body is not None:
+                    body.close()
+
+        return await to_thread.run_sync(hash_object)
+
+    async def create_multipart_upload(
+        self,
+        *,
+        key: str,
+        content_type: str,
+        metadata: dict[str, str],
+        storage_class: str | None = None,
+    ) -> MultipartUpload:
+        storage_parameters: dict[str, str] = {}
+        if storage_class is not None:
+            storage_parameters["StorageClass"] = storage_class
+        try:
+            response = await to_thread.run_sync(
+                partial(
+                    self.client.create_multipart_upload,
+                    Bucket=self.bucket,
+                    Key=key,
+                    ContentType=content_type,
+                    CacheControl=PRIVATE_NO_STORE_CACHE_CONTROL,
+                    Metadata=metadata,
+                    ServerSideEncryption="AES256",
+                    **storage_parameters,
+                )
+            )
+        except (BotoCoreError, ClientError) as error:
+            raise ObjectStoreError("S3 create_multipart_upload failed") from error
+        upload_id = response.get("UploadId")
+        if not isinstance(upload_id, str) or not upload_id:
+            raise ObjectStoreError("S3 multipart upload ID is missing")
+        return MultipartUpload(key=key, upload_id=upload_id)
+
+    async def upload_part(
+        self,
+        upload: MultipartUpload,
+        *,
+        part_number: int,
+        body: bytes,
+    ) -> MultipartPart:
+        if (
+            isinstance(part_number, bool)
+            or not isinstance(part_number, int)
+            or not 1 <= part_number <= 10_000
+        ):
+            raise ValueError("multipart part number must be between 1 and 10000")
+        if not isinstance(body, bytes) or not body:
+            raise ValueError("multipart part body must be non-empty bytes")
+        content_md5 = base64.b64encode(hashlib.md5(body, usedforsecurity=False).digest()).decode(
+            "ascii"
+        )
+        try:
+            response = await to_thread.run_sync(
+                partial(
+                    self.client.upload_part,
+                    Bucket=self.bucket,
+                    Key=upload.key,
+                    UploadId=upload.upload_id,
+                    PartNumber=part_number,
+                    Body=body,
+                    ContentLength=len(body),
+                    ContentMD5=content_md5,
+                )
+            )
+        except ClientError as error:
+            error_code = str(error.response.get("Error", {}).get("Code", ""))
+            if error_code in {"NoSuchUpload", "404"}:
+                raise ObjectNotFoundError("multipart upload does not exist") from error
+            raise ObjectStoreError("S3 upload_part failed") from error
+        except BotoCoreError as error:
+            raise ObjectStoreError("S3 upload_part failed") from error
+        part_etag = response.get("ETag")
+        if not isinstance(part_etag, str) or not part_etag:
+            raise ObjectStoreError("S3 multipart part ETag is missing")
+        return MultipartPart(part_number=part_number, etag=part_etag)
+
+    async def complete_multipart_upload(
+        self,
+        upload: MultipartUpload,
+        *,
+        parts: tuple[MultipartPart, ...],
+        total_bytes: int,
+    ) -> ObjectMetadata:
+        if not parts or tuple(part.part_number for part in parts) != tuple(
+            range(1, len(parts) + 1)
+        ):
+            raise ValueError("multipart parts must be contiguous and ordered")
+        if isinstance(total_bytes, bool) or not isinstance(total_bytes, int) or total_bytes <= 0:
+            raise ValueError("multipart total_bytes must be a positive integer")
+        try:
+            response = await to_thread.run_sync(
+                partial(
+                    self.client.complete_multipart_upload,
+                    Bucket=self.bucket,
+                    Key=upload.key,
+                    UploadId=upload.upload_id,
+                    MultipartUpload={
+                        "Parts": [
+                            {"PartNumber": part.part_number, "ETag": part.etag} for part in parts
+                        ]
+                    },
+                    IfNoneMatch="*",
+                    MpuObjectSize=total_bytes,
+                )
+            )
+        except ClientError as error:
+            status_code = int(error.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0))
+            error_code = str(error.response.get("Error", {}).get("Code", ""))
+            if status_code == 412 or error_code in {"PreconditionFailed", "412"}:
+                raise ObjectAlreadyExistsError(upload.key) from error
+            if status_code == 409 or error_code in {
+                "ConditionalRequestConflict",
+                "409",
+            }:
+                raise ObjectConflictError("conditional multipart completion conflict") from error
+            if status_code == 404 or error_code in {"NoSuchUpload", "404"}:
+                raise ObjectNotFoundError("multipart upload does not exist") from error
+            raise ObjectStoreError("S3 complete_multipart_upload failed") from error
+        except BotoCoreError as error:
+            raise ObjectStoreError("S3 complete_multipart_upload failed") from error
+
+        version_id = response.get("VersionId")
+        result = await self.head(
+            upload.key,
+            version_id=version_id if isinstance(version_id, str) else None,
+        )
+        if result is None:
+            raise ObjectNotFoundError(upload.key)
+        if result.byte_size != total_bytes:
+            raise ObjectConflictError("multipart write verification failed")
+        return result
+
+    async def abort_multipart_upload(self, upload: MultipartUpload) -> None:
+        try:
+            await to_thread.run_sync(
+                partial(
+                    self.client.abort_multipart_upload,
+                    Bucket=self.bucket,
+                    Key=upload.key,
+                    UploadId=upload.upload_id,
+                )
+            )
+        except ClientError as error:
+            error_code = str(error.response.get("Error", {}).get("Code", ""))
+            if error_code in {"NoSuchUpload", "404"}:
+                return
+            raise ObjectStoreError("S3 abort_multipart_upload failed") from error
+        except BotoCoreError as error:
+            raise ObjectStoreError("S3 abort_multipart_upload failed") from error
 
     async def delete(self, key: str, *, version_id: str | None = None) -> None:
         parameters: dict[str, Any] = {"Bucket": self.bucket, "Key": key}

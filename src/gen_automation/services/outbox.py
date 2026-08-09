@@ -640,6 +640,76 @@ async def succeed_outbox_event(
     return TransitionResult(status=OutboxStatus.SUCCEEDED, changed=True)
 
 
+async def defer_unstarted_outbox_event(
+    session: AsyncSession,
+    *,
+    event_id: UUID,
+    worker_id: str,
+    retry_not_before: datetime,
+    reason_code: str,
+    now: datetime | None = None,
+) -> TransitionResult:
+    """Release a lease without consuming an attempt before any effect can start.
+
+    This is intentionally narrower than a retryable failure.  Salad submission
+    uses it when the current worker runtime has a different immutable artifact
+    manifest and still has active work.  The prepared generation attempt must
+    remain in CREATED, proving that no provider request was started.  The claim
+    increment is returned so a long-running batch cannot exhaust the outbox
+    merely while a compatible idle boundary is awaited.
+    """
+
+    normalized_worker_id = _validate_nonempty(worker_id, name="worker_id", max_length=200)
+    normalized_reason = _validate_error_code(reason_code)
+    deferred_at = _as_utc(now or _now())
+    normalized_retry_at = _as_utc(retry_not_before)
+    if normalized_retry_at <= deferred_at:
+        raise OutboxValidationError("retry_not_before must be in the future")
+
+    event = await _locked_event(session, event_id)
+    _require_active_lease(event, worker_id=normalized_worker_id, now=deferred_at)
+    if (
+        event.topic != SALAD_JOB_SUBMIT_TOPIC
+        or event.aggregate_type != GENERATION_ATTEMPT_AGGREGATE
+    ):
+        raise OutboxConflictError("only a prepared Salad submission can be deferred")
+    attempt = await session.scalar(
+        select(GenerationAttempt)
+        .where(GenerationAttempt.id == event.aggregate_id)
+        .with_for_update()
+    )
+    if attempt is None or attempt.state != GenerationAttemptState.CREATED:
+        raise OutboxConflictError("Salad submission is no longer definitely unstarted")
+    if event.attempts <= 0:
+        raise OutboxConflictError("outbox claim attempt is invalid")
+
+    claimed_attempt = event.attempts
+    event.status = OutboxStatus.PENDING
+    event.attempts -= 1
+    event.available_at = normalized_retry_at
+    event.lease_owner = None
+    event.lease_expires_at = None
+    event.processed_at = None
+    event.last_error_code = normalized_reason
+    event.last_error_detail = (
+        "Submission is waiting for a compatible idle worker-artifact boundary."
+    )
+    _add_audit(
+        session,
+        event=event,
+        actor=normalized_worker_id,
+        action="outbox.deferred_before_effect",
+        detail={
+            "claimed_attempt": claimed_attempt,
+            "reason_code": normalized_reason,
+            "retry_not_before": normalized_retry_at.isoformat(),
+        },
+        occurred_at=deferred_at,
+    )
+    await session.commit()
+    return TransitionResult(status=OutboxStatus.PENDING, changed=True)
+
+
 async def fail_outbox_event(
     session: AsyncSession,
     *,

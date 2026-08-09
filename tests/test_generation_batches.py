@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import select
 
+from gen_automation.config import Settings
 from gen_automation.db.models import GenerationJob, ReleaseVersion, WorkflowApproval
 from gen_automation.db.session import Database
 from gen_automation.domain.release_spec import ProjectCreate, ReleaseCreate, ReleaseSpecification
@@ -307,6 +308,7 @@ async def test_generation_batches_split_exact_counts_and_keep_ordered_prompt_met
             session,
             release_id=result.response.id,
             idempotency_key="approve-batch-release",
+            settings=Settings(),
         )
         jobs = list(
             (
@@ -395,6 +397,7 @@ async def test_twenty_five_image_batch_expands_to_one_provider_job(
             session,
             release_id=result.response.id,
             idempotency_key="approve-one-job-release",
+            settings=Settings(),
         )
         jobs = list(
             (
@@ -474,11 +477,13 @@ async def test_random_seed_sentinel_resolves_unique_nonsequential_seeds_per_imag
             session,
             release_id=result.response.id,
             idempotency_key="approve-random-seed-release",
+            settings=Settings(),
         )
         replay = await approve_and_expand_generation_plan(
             session,
             release_id=result.response.id,
             idempotency_key="approve-random-seed-release",
+            settings=Settings(),
         )
         job = await session.scalar(
             select(GenerationJob).where(
@@ -544,6 +549,7 @@ async def test_new_set_service_freezes_a_batch_queue_with_inherited_prompt_setti
             session,
             command=command,
             idempotency_key="new-set-batch-queue",
+            settings=Settings(),
             actor="fixture-owner",
         )
 
@@ -630,6 +636,7 @@ async def test_new_set_service_freezes_two_subjects_and_regional_prompts_in_orde
                 desired_accepted_count=4,
             ),
             idempotency_key="new-set-regional-duo",
+            settings=Settings(),
             actor="fixture-owner",
         )
 

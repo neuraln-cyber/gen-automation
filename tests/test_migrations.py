@@ -109,7 +109,7 @@ def test_semantic_feedback_report_uses_jsonb_on_postgresql() -> None:
     assert isinstance(report_type, postgresql.JSONB)
 
 
-def test_image_only_mega_revision_is_the_migration_head() -> None:
+def test_lora_catalog_revision_is_the_migration_head() -> None:
     configuration = Config("alembic.ini")
     scripts = ScriptDirectory.from_config(configuration)
     independent_targets_revision = scripts.get_revision("20260808_0024")
@@ -120,7 +120,8 @@ def test_image_only_mega_revision_is_the_migration_head() -> None:
     workflow_capability_revision = scripts.get_revision("20260809_0029")
     gpu_billing_revision = scripts.get_revision("20260809_0030")
     legacy_retirement_revision = scripts.get_revision("20260809_0031")
-    revision = scripts.get_revision("20260809_0032")
+    image_only_revision = scripts.get_revision("20260809_0032")
+    revision = scripts.get_revision("20260809_0033")
 
     assert independent_targets_revision is not None
     assert independent_targets_revision.down_revision == "20260808_0023"
@@ -138,9 +139,11 @@ def test_image_only_mega_revision_is_the_migration_head() -> None:
     assert gpu_billing_revision.down_revision == "20260809_0029"
     assert legacy_retirement_revision is not None
     assert legacy_retirement_revision.down_revision == "20260809_0030"
+    assert image_only_revision is not None
+    assert image_only_revision.down_revision == "20260809_0031"
     assert revision is not None
-    assert revision.down_revision == "20260809_0031"
-    assert scripts.get_current_head() == "20260809_0032"
+    assert revision.down_revision == "20260809_0032"
+    assert scripts.get_current_head() == "20260809_0033"
 
 
 def test_derivative_owner_retry_postgresql_guard_is_narrow_and_bounded(
@@ -355,6 +358,8 @@ def test_foundation_migration_round_trip(
         "generation_jobs",
         "idempotency_records",
         "login_throttles",
+        "lora_import_jobs",
+        "managed_lora_artifacts",
         "mega_deliveries",
         "mega_set_deliveries",
         "mega_set_delivery_items",
@@ -409,6 +414,7 @@ def test_foundation_migration_round_trip(
         "billing_observed_at",
         "billing_observation_stale",
         "billing_estimated",
+        "runtime_artifact_manifest_sha256",
     } <= {column["name"] for column in inspect(engine).get_columns("salad_deployments")}
     billing_constraint_names = {
         constraint["name"]
@@ -416,6 +422,7 @@ def test_foundation_migration_round_trip(
     }
     assert "ck_salad_deployments_nonnegative_billing_runtime" in billing_constraint_names
     assert "ck_salad_deployments_billing_active_pair" in billing_constraint_names
+    assert "ck_salad_deployments_valid_runtime_artifact_manifest_sha256" in billing_constraint_names
     assert {
         "gates_release",
         "x_teaser_revision_id",

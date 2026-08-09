@@ -82,14 +82,14 @@ resource "aws_s3_bucket_lifecycle_configuration" "assets" {
 }
 
 resource "aws_s3_bucket_cors_configuration" "assets" {
-  count = local.dns_enabled ? 1 : 0
+  count = local.browser_upload_origin == null ? 0 : 1
 
   bucket = aws_s3_bucket.assets.id
 
   cors_rule {
     allowed_headers = ["*"]
     allowed_methods = ["GET", "HEAD", "POST", "PUT"]
-    allowed_origins = ["https://${var.hostname}"]
+    allowed_origins = [local.browser_upload_origin]
     expose_headers  = ["ETag", "x-amz-version-id"]
     max_age_seconds = 600
   }
@@ -183,6 +183,41 @@ resource "aws_s3_bucket_lifecycle_configuration" "models" {
     abort_incomplete_multipart_upload {
       days_after_initiation = 7
     }
+  }
+
+
+  # Browser uploads and interrupted provider imports are quarantine objects,
+  # never durable catalog entries. The controller normally deletes the exact
+  # version immediately after promotion; this bounds storage after a crash.
+  rule {
+    id     = "expire-abandoned-lora-onboarding"
+    status = "Enabled"
+
+    filter {
+      prefix = "onboarding/loras/"
+    }
+
+    expiration {
+      days = var.abandoned_staging_retention_days
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = var.abandoned_staging_retention_days
+    }
+  }
+}
+
+resource "aws_s3_bucket_cors_configuration" "models" {
+  count = local.browser_upload_origin == null ? 0 : 1
+
+  bucket = aws_s3_bucket.models.id
+
+  cors_rule {
+    allowed_headers = ["*"]
+    allowed_methods = ["POST"]
+    allowed_origins = [local.browser_upload_origin]
+    expose_headers  = ["ETag", "x-amz-version-id"]
+    max_age_seconds = 600
   }
 }
 

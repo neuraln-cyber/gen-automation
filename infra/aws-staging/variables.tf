@@ -50,6 +50,21 @@ variable "http_ingress_cidrs" {
   }
 }
 
+variable "browser_upload_origin" {
+  description = "Optional exact HTTPS dashboard origin allowed to upload directly to private S3 buckets."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = (
+      var.browser_upload_origin == null
+      || can(regex("^https://[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(?::[1-9][0-9]{0,4})?$", var.browser_upload_origin))
+    )
+    error_message = "browser_upload_origin must be one exact HTTPS origin without a path."
+  }
+}
+
 variable "instance_type" {
   description = "x86_64 EC2 control-plane instance type."
   type        = string
@@ -193,6 +208,24 @@ variable "x_oauth_auth_mode" {
   validation {
     condition     = contains(["oauth1", "oauth2"], var.x_oauth_auth_mode)
     error_message = "x_oauth_auth_mode must be oauth1 or oauth2."
+  }
+}
+
+variable "civitai_api_secret_arn" {
+  description = "Optional existing Civitai API-key Secrets Manager secret ARN. Never pass the API key itself."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = (
+      var.civitai_api_secret_arn == null
+      || can(regex(
+        "^arn:aws:secretsmanager:eu-central-1:861912887470:secret:gen-automation/staging/civitai-[A-Za-z0-9]{6}$",
+        var.civitai_api_secret_arn
+      ))
+    )
+    error_message = "civitai_api_secret_arn must be the exact staging Civitai API-key secret ARN."
   }
 }
 

@@ -76,6 +76,8 @@ class ExperimentSessionCostEstimate:
 def classify_experiment_model_readiness(
     settings: Settings,
     options: NewSetOptions,
+    *,
+    manifest_override: ArtifactManifest | None = None,
 ) -> ExperimentModelReadiness:
     """Classify catalog artifacts against the exact configured worker manifest.
 
@@ -84,7 +86,7 @@ def classify_experiment_model_readiness(
     under the expected kind. Any unavailable or inconsistent manifest fails closed.
     """
 
-    manifest = _configured_worker_manifest(settings)
+    manifest = manifest_override or _configured_worker_manifest(settings)
     manifest_sha256 = manifest.manifest_sha256 if manifest is not None else None
     checkpoint_hashes = _manifest_hashes(manifest, ArtifactKind.CHECKPOINT)
     lora_hashes = _manifest_hashes(manifest, ArtifactKind.LORA)

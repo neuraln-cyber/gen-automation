@@ -340,3 +340,29 @@ class ApprovalStatus(StrEnum):
 class ModelArtifactKind(StrEnum):
     CHECKPOINT = "checkpoint"
     LORA = "lora"
+
+
+class ManagedLoraLifecycle(StrEnum):
+    """Durable deployment lifecycle for one content-addressed LoRA."""
+
+    PENDING_ACTIVATION = "pending_activation"
+    ACTIVE = "active"
+    RETIRING = "retiring"
+    RETIRED = "retired"
+    PURGED = "purged"
+
+
+class LoraImportSource(StrEnum):
+    MANUAL = "manual"
+    CIVITAI = "civitai"
+
+
+class LoraImportJobState(StrEnum):
+    AWAITING_UPLOAD = "awaiting_upload"
+    QUEUED = "queued"
+    CLAIMED = "claimed"
+    RETRY_WAIT = "retry_wait"
+    FAILED = "failed"
+    DUPLICATE = "duplicate"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"

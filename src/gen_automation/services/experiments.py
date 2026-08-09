@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from gen_automation.config import Settings
 from gen_automation.db.models import Release
 from gen_automation.domain.controlled_duo import (
     WorkflowCapability,
@@ -131,6 +132,7 @@ async def create_experiment(
     *,
     command: ExperimentSubmission,
     idempotency_key: str,
+    settings: Settings,
     actor: str,
 ) -> ExperimentResult:
     """Create one ordinary release per variant and queue them in a warm-friendly order."""
@@ -172,6 +174,7 @@ async def create_experiment(
             session,
             command=profile,
             idempotency_key=f"{idempotency_key}:v{logical_index + 1:02d}",
+            settings=settings,
             actor=actor,
         )
         results.append((logical_index, result))

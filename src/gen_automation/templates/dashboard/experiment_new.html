@@ -245,7 +245,7 @@
             <section class="lora-picker" data-lora-picker data-max-selections="8" hidden>
               <div class="lora-picker-toolbar">
                 <label>Find a LoRA<input type="search" placeholder="Search by name or hash" autocomplete="off" data-lora-search></label>
-                <div class="lora-picker-status"><output data-lora-selection-count>0 of 8 selected</output><button class="secondary-button" type="button" data-lora-clear disabled>Clear</button></div>
+                <div class="lora-picker-status"><output data-lora-selection-count aria-live="polite">0 of 8 selected</output><button class="secondary-button" type="button" data-lora-clear disabled>Clear</button></div>
               </div>
               {% if options.loras %}
                 <ul class="lora-catalog" data-lora-catalog aria-label="Available LoRAs">
@@ -261,7 +261,13 @@
                 </ul>
                 <p class="lora-catalog-empty muted" data-lora-catalog-empty hidden>No LoRAs match this search.</p>
               {% else %}<p class="muted">No approved LoRAs are available.</p>{% endif %}
-              <h3>Selected stack</h3>
+              <div class="lora-stack-heading">
+                <div>
+                  <h3>Selected stack</h3>
+                  <p class="muted">A LoRA marked worker restart is loaded into the idle warm worker before its next batch.</p>
+                </div>
+                {% if principal.role.value in ["owner", "admin"] %}<a class="secondary-button lora-manage-link" href="/dashboard/loras">Manage LoRAs</a>{% endif %}
+              </div>
               <ol class="lora-selected-list" data-lora-selected aria-live="polite"></ol>
               <p class="lora-stack-empty muted" data-lora-stack-empty>No LoRAs selected.</p>
               <p class="lora-feedback" data-lora-feedback role="status"></p>

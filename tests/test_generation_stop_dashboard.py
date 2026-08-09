@@ -43,7 +43,6 @@ from gen_automation.domain.enums import (
     SaladDeploymentState,
 )
 from gen_automation.domain.release_spec import ReleaseSpecification
-from gen_automation.gpu_worker.artifacts import ArtifactManifest
 from gen_automation.integrations.salad.client import SaladClient
 from gen_automation.services.compliance import validate_release_approvals
 from gen_automation.services.generation_control import (
@@ -58,6 +57,7 @@ from tests.factories import seed_release_approvals, valid_release_payload
 from tests.test_controller_spend_stop import (
     RUNTIME_MANIFEST,
     WORKER_SIGNING_PRIVATE_KEY,
+    _empty_effective_artifact_manifest,
     _seed_submission_database,
 )
 from tests.test_review_api import (
@@ -664,13 +664,9 @@ async def test_cancelled_submit_outbox_never_refreshes_or_restarts_salad(
             fail_if_refreshed,
         )
         monkeypatch.setattr(
-            controller_runtime,
-            "load_artifact_manifest",
-            lambda _raw: ArtifactManifest.model_construct(
-                version="v1",
-                artifacts=(),
-                manifest_sha256="0" * 64,
-            ),
+            ControllerWorkloads,
+            "_effective_artifact_manifest",
+            _empty_effective_artifact_manifest,
         )
         workloads = ControllerWorkloads(
             settings=Settings(

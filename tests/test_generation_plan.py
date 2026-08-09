@@ -4,8 +4,10 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy import func, select
 
+from gen_automation.config import Settings
 from gen_automation.db.models import (
     ComplianceCheck,
     GenerationJob,
@@ -17,6 +19,11 @@ from gen_automation.db.models import (
 from gen_automation.db.session import Database
 from gen_automation.domain.enums import ReleasePhase
 from gen_automation.domain.release_spec import ProjectCreate, ReleaseCreate
+from gen_automation.gpu_worker.artifacts import (
+    ArtifactKind,
+    ModelArtifactSpec,
+    create_artifact_manifest,
+)
 from gen_automation.schemas import ProjectRead, ReleaseRead
 from gen_automation.services.generation import (
     GenerationPlanConflictError,
@@ -69,11 +76,13 @@ async def test_plan_expansion_is_deterministic_and_revalidated(
             session,
             release_id=release.id,
             idempotency_key="approve-generation-plan",
+            settings=Settings(),
         )
         replay = await approve_and_expand_generation_plan(
             session,
             release_id=release.id,
             idempotency_key="approve-generation-plan",
+            settings=Settings(),
         )
 
         jobs = list(
@@ -144,7 +153,48 @@ async def test_plan_approval_fails_closed_without_server_owned_approvals(
                 session,
                 release_id=release.id,
                 idempotency_key="missing-server-approval",
+                settings=Settings(),
             )
+
+
+async def test_plan_rejects_a_model_stack_over_the_safe_worker_capacity(
+    generation_database: Database,
+) -> None:
+    _project, release = await _create_release(generation_database)
+    baseline = create_artifact_manifest(
+        (
+            ModelArtifactSpec(
+                logical_name="oversized-checkpoint",
+                kind=ArtifactKind.CHECKPOINT,
+                source_object_id="models/oversized.safetensors",
+                source_object_version_id="version-1",
+                sha256="a" * 64,
+                exact_size_bytes=7 * 1024**3,
+                max_size_bytes=7 * 1024**3,
+                target_filename="oversized.safetensors",
+            ),
+        )
+    )
+    settings = Settings(
+        background_runtime_enabled=True,
+        lora_manager_enabled=True,
+        civitai_api_key=SecretStr("test-civitai-key"),
+        salad_worker_artifact_bucket=SecretStr("test-artifact-bucket"),
+        salad_worker_artifact_region=SecretStr("eu-central-1"),
+        salad_worker_model_manifest_json=SecretStr(baseline.model_dump_json()),
+        salad_worker_model_manifest_sha256=SecretStr(baseline.manifest_sha256),
+        salad_container_storage_bytes=10 * 1024**3,
+    )
+
+    async with generation_database.sessions() as session:
+        with pytest.raises(GenerationPlanConflictError, match="safe worker runtime"):
+            await approve_and_expand_generation_plan(
+                session,
+                release_id=release.id,
+                idempotency_key="oversized-model-stack",
+                settings=settings,
+            )
+        assert int(await session.scalar(select(func.count()).select_from(GenerationJob)) or 0) == 0
 
 
 async def test_duo_plan_rejects_a_standard_workflow_before_creating_jobs(
@@ -180,6 +230,7 @@ async def test_duo_plan_rejects_a_standard_workflow_before_creating_jobs(
                 session,
                 release_id=release.id,
                 idempotency_key="duo-with-standard-workflow",
+                settings=Settings(),
             )
         assert int(await session.scalar(select(func.count()).select_from(GenerationJob)) or 0) == 0
 
@@ -213,6 +264,7 @@ async def test_plan_rejects_post_hires_size_before_creating_gpu_jobs(
                 session,
                 release_id=release.id,
                 idempotency_key="post-hires-too-large",
+                settings=Settings(),
             )
         assert int(await session.scalar(select(func.count()).select_from(GenerationJob)) or 0) == 0
 
@@ -236,6 +288,7 @@ async def test_changed_approval_evidence_fails_closed(
                 session,
                 release_id=release.id,
                 idempotency_key="tampered-approval-evidence",
+                settings=Settings(),
             )
 
 
@@ -262,6 +315,7 @@ async def test_changed_frozen_specification_fails_digest_check(
                 session,
                 release_id=release.id,
                 idempotency_key="tampered-plan",
+                settings=Settings(),
             )
 
 
@@ -291,6 +345,7 @@ async def test_plan_approval_does_not_regress_an_advanced_release_phase(
                 session,
                 release_id=release.id,
                 idempotency_key=f"invalid-phase-{phase.value}",
+                settings=Settings(),
             )
 
 

@@ -34,6 +34,20 @@ env_value() {
   printf '%s' "${matches#*=}"
 }
 
+optional_env_value() {
+  local key="$1"
+  local file="$2"
+  local matches
+  local count
+  matches="$(grep -E "^${key}=" "$file" || true)"
+  count="$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l)"
+  [ "$count" -le 1 ] || fail "$file must define $key at most once"
+  if [ "$count" -eq 1 ]; then
+    printf '%s' "${matches#*=}"
+  fi
+  return 0
+}
+
 require_service_directory() {
   local path="$1"
   local owner="$2"
@@ -109,6 +123,50 @@ done
   fail "control-plane Salad monthly budget must be exactly 25.00 USD"
 [ "$(env_value GEN_AUTOMATION_SALAD_ATTEMPT_WATCHDOG_SECONDS "$config_root/control-plane.env")" = "6300" ] ||
   fail "control-plane Salad attempt watchdog must be exactly 6300 seconds"
+lora_manager_enabled="$(env_value GEN_AUTOMATION_LORA_MANAGER_ENABLED "$config_root/control-plane.env")"
+lora_secret_reference="$(env_value GEN_AUTOMATION_CIVITAI_API_SECRET_REFERENCE "$config_root/control-plane.env")"
+lora_inline_api_key="$(optional_env_value GEN_AUTOMATION_CIVITAI_API_KEY "$config_root/control-plane.env")"
+[ -z "$lora_inline_api_key" ] || fail "a direct Civitai API key is forbidden in staging"
+case "$lora_manager_enabled" in
+  true)
+    [[ "$lora_secret_reference" =~ ^aws-secrets-manager://arn:aws:secretsmanager:eu-central-1:861912887470:secret:gen-automation/staging/civitai-[A-Za-z0-9]{6}$ ]] ||
+      fail "Civitai reference must be the exact configured staging secret ARN"
+    lora_manifest_json="$(env_value GEN_AUTOMATION_SALAD_WORKER_MODEL_MANIFEST_JSON "$config_root/control-plane.env")"
+    lora_manifest_sha256="$(env_value GEN_AUTOMATION_SALAD_WORKER_MODEL_MANIFEST_SHA256 "$config_root/control-plane.env")"
+    [ -n "$lora_manifest_json" ] || fail "LoRA manager requires the pinned worker model manifest"
+    [[ "$lora_manifest_sha256" =~ ^[0-9a-f]{64}$ ]] ||
+      fail "LoRA manager requires a 64-hex worker model manifest trust anchor"
+    /usr/bin/python3 - "$config_root/control-plane.env" "$lora_manifest_sha256" <<'PY' ||
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+expected = sys.argv[2]
+matches = [
+    line.split("=", maxsplit=1)[1]
+    for line in path.read_text(encoding="utf-8").splitlines()
+    if line.startswith("GEN_AUTOMATION_SALAD_WORKER_MODEL_MANIFEST_JSON=")
+]
+if len(matches) != 1:
+    raise SystemExit(1)
+try:
+    manifest = json.loads(matches[0])
+except (TypeError, ValueError):
+    raise SystemExit(1)
+if not isinstance(manifest, dict) or manifest.get("manifest_sha256") != expected:
+    raise SystemExit(1)
+PY
+      fail "LoRA manager manifest does not match its independent trust anchor"
+    ;;
+  false)
+    if [ -n "$lora_secret_reference" ]; then
+      [[ "$lora_secret_reference" =~ ^aws-secrets-manager://arn:aws:secretsmanager:eu-central-1:861912887470:secret:gen-automation/staging/civitai-[A-Za-z0-9]{6}$ ]] ||
+        fail "configured Civitai reference must be the exact staging secret ARN"
+    fi
+    ;;
+  *) fail "control-plane LoRA manager flag must be true or false" ;;
+esac
 [ "$(env_value GEN_AUTOMATION_PATREON_BROWSER_SIDECAR_URL "$config_root/control-plane.env")" = "http://127.0.0.1:8090/v1/publish" ] ||
   fail "control-plane Patreon sidecar URL must remain loopback-only"
 [ "$(env_value GEN_AUTOMATION_SEMANTIC_ANATOMY_ENDPOINT_URL "$config_root/control-plane.env")" = "http://127.0.0.1:8091/v1/anatomy/assess" ] ||

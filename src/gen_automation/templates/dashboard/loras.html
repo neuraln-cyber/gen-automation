@@ -1,0 +1,450 @@
+{% extends "dashboard/base.html" %}
+
+{% macro readable_status(value) -%}
+  {{ (value or "unknown") | replace("_", " ") | replace("-", " ") }}
+{%- endmacro %}
+
+{% block content %}
+  <section
+    class="lora-manager"
+    data-lora-manager
+    data-list-url="/api/v1/loras"
+    data-resolve-url="/api/v1/loras/civitai:resolve"
+    data-manual-import-url="/api/v1/loras/imports/manual"
+    data-civitai-import-url="/api/v1/loras/imports/civitai"
+    data-csrf-token="{{ csrf_token }}"
+    data-can-manage="{{ 'true' if can_manage else 'false' }}"
+  >
+    <header class="lora-manager-hero">
+      <div>
+        <p class="page-kicker">Private model library</p>
+        <h1>LoRA manager</h1>
+        <p class="lede">
+          Add a LoRA from Civitai or upload a Safetensors file, then use it in New
+          Automation and Experiment Lab.
+        </p>
+      </div>
+      <div class="lora-gpu-note" aria-label="Import cost behavior">
+        <span aria-hidden="true">GPU</span>
+        <strong>Stays off during onboarding</strong>
+        <small>Imports use private storage and never warm a paid generation worker.</small>
+      </div>
+    </header>
+
+    <dl class="lora-manager-summary" aria-label="LoRA library summary">
+      <div>
+        <dt>Library</dt>
+        <dd><output data-lora-library-count>{{ entries | length }}</output> LoRAs</dd>
+      </div>
+      <div>
+        <dt>Ready</dt>
+        <dd><output data-lora-ready-count>0</output></dd>
+      </div>
+      <div>
+        <dt>Active transfers</dt>
+        <dd><output data-lora-active-count>{{ imports | length }}</output></dd>
+      </div>
+      <div>
+        <dt>Private storage</dt>
+        <dd><output data-lora-storage-total>Calculating&hellip;</output></dd>
+      </div>
+    </dl>
+
+    {% if can_manage %}
+      <details class="panel lora-onboarding" open>
+        <summary>
+          <span>
+            <strong>Add a LoRA</strong>
+            <small>Choose a Civitai page or a local .safetensors file</small>
+          </span>
+        </summary>
+        <div class="lora-onboarding-body">
+          <fieldset class="lora-source-choice" data-lora-source-choice>
+            <legend>Where is the LoRA?</legend>
+            <label>
+              <input type="radio" name="lora_source_mode" value="civitai" checked>
+              <span><strong>Civitai URL</strong><small>Fastest &mdash; metadata is filled in for you</small></span>
+            </label>
+            <label>
+              <input type="radio" name="lora_source_mode" value="manual">
+              <span><strong>Upload file</strong><small>Send a local Safetensors file directly to private storage</small></span>
+            </label>
+          </fieldset>
+
+          <section class="lora-source-panel" data-lora-source-panel="civitai">
+            <form class="lora-source-form" data-lora-civitai-resolve-form>
+              <label for="lora-civitai-url">
+                Civitai model or version URL
+                <span class="lora-inline-control">
+                  <input
+                    id="lora-civitai-url"
+                    name="civitai_url"
+                    type="url"
+                    inputmode="url"
+                    autocomplete="url"
+                    required
+                    maxlength="2048"
+                    pattern="https://(www\.)?civitai\.com/.*"
+                    placeholder="https://civitai.com/models/..."
+                    aria-describedby="lora-civitai-help lora-civitai-status"
+                  >
+                  <button class="secondary-button" type="submit">Check URL</button>
+                </span>
+              </label>
+              <small id="lora-civitai-help" class="muted">
+                Private or age-gated downloads use the server-side Civitai credential; it is never sent to this browser.
+              </small>
+              <div class="lora-version-choice" data-lora-version-choice hidden>
+                <label for="lora-civitai-version">
+                  Choose a model version
+                  <select
+                    id="lora-civitai-version"
+                    name="civitai_version_id"
+                    data-lora-version-select
+                    aria-describedby="lora-civitai-version-help"
+                  ></select>
+                </label>
+                <small id="lora-civitai-version-help" class="muted">
+                  Model pages can contain several LoRAs. Nothing is selected automatically.
+                </small>
+                <button class="secondary-button" type="submit">Check selected version</button>
+              </div>
+              <output
+                id="lora-civitai-status"
+                class="lora-operation-message"
+                data-lora-civitai-status
+                aria-live="polite"
+              ></output>
+            </form>
+
+            <form class="lora-resolved-card" data-lora-civitai-import-form hidden>
+              <header>
+                <div>
+                  <p class="page-kicker">Civitai result</p>
+                  <h2 data-lora-resolved-heading>Resolved LoRA</h2>
+                  <p class="muted" data-lora-resolved-meta></p>
+                </div>
+                <span class="status pending" data-lora-commercial-status>Checking rights</span>
+              </header>
+              <div class="lora-resolved-grid">
+                <label>
+                  Library name
+                  <input name="name" required maxlength="200" data-lora-resolved-name>
+                </label>
+                <label>
+                  Safetensors file
+                  <select name="file_id" required data-lora-resolved-file></select>
+                </label>
+              </div>
+              <dl class="lora-source-facts">
+                <div><dt>Base model</dt><dd data-lora-resolved-base-model>Unknown</dd></div>
+                <div><dt>SHA-256</dt><dd><code data-lora-resolved-sha>Pending verification</code></dd></div>
+                <div><dt>Source</dt><dd><a data-lora-resolved-source rel="noreferrer noopener" target="_blank">Open Civitai page</a></dd></div>
+                <div><dt>License</dt><dd><a data-lora-resolved-license rel="noreferrer noopener" target="_blank">Review terms</a></dd></div>
+              </dl>
+              <div class="lora-trigger-preview" data-lora-trigger-preview hidden>
+                <strong>Trigger words</strong>
+                <code data-lora-resolved-triggers></code>
+              </div>
+              <fieldset class="lora-rights-attestations">
+                <legend>Required rights confirmation</legend>
+                <label>
+                  <input type="checkbox" name="commercial_use_attested" required>
+                  <span>I confirm this version permits commercial image use.</span>
+                </label>
+                <label>
+                  <input type="checkbox" name="adult_use_attested" required>
+                  <span>I confirm its license permits use in this adult-content workflow.</span>
+                </label>
+                <p class="muted">
+                  Civitai&rsquo;s NSFW classification describes content; it is not a grant of adult-use rights.
+                </p>
+              </fieldset>
+              <input type="hidden" name="model_id" data-lora-resolved-model-id>
+              <input type="hidden" name="version_id" data-lora-resolved-version-id>
+              <div class="lora-submit-row">
+                <output class="lora-operation-message" data-lora-civitai-import-status aria-live="polite"></output>
+                <button class="primary-button" type="submit" data-lora-civitai-submit>Add to library</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="lora-source-panel" data-lora-source-panel="manual" hidden>
+            <form class="lora-source-form" data-lora-manual-import-form>
+              <div class="lora-upload-grid">
+                <label class="lora-file-input" for="lora-manual-file">
+                  Safetensors file
+                  <input
+                    id="lora-manual-file"
+                    name="file"
+                    type="file"
+                    accept=".safetensors,application/octet-stream"
+                    required
+                    aria-describedby="lora-manual-file-help"
+                  >
+                  <small id="lora-manual-file-help">
+                    The browser uploads directly to private S3 storage. The control plane does not proxy the file.
+                  </small>
+                </label>
+                <label>
+                  Library name
+                  <input name="name" required maxlength="200" autocomplete="off" placeholder="Character or style name">
+                </label>
+                <label>
+                  Source filename
+                  <input
+                    name="target_filename"
+                    required
+                    minlength="13"
+                    maxlength="236"
+                    autocomplete="off"
+                    spellcheck="false"
+                    pattern="[A-Za-z0-9][A-Za-z0-9._ -]*\.safetensors"
+                    aria-describedby="lora-manual-target-help"
+                    placeholder="character-style.safetensors"
+                  >
+                  <small id="lora-manual-target-help">Recorded as source metadata. Workers use an internal content-addressed filename.</small>
+                </label>
+                <label>
+                  Trigger words <span class="label-optional">optional</span>
+                  <input
+                    name="trigger_words"
+                    maxlength="20099"
+                    autocomplete="off"
+                    aria-describedby="lora-manual-triggers-help"
+                    placeholder="trigger one, trigger two"
+                  >
+                  <small id="lora-manual-triggers-help">Separate up to 100 unique trigger words with commas.</small>
+                </label>
+                <label>
+                  Canonical source URL
+                  <input name="source_url" type="url" inputmode="url" required maxlength="2048" placeholder="https://...">
+                </label>
+                <label>
+                  License or permissions URL
+                  <input name="license_url" type="url" inputmode="url" required maxlength="2048" placeholder="https://...">
+                </label>
+              </div>
+              <fieldset class="lora-rights-attestations">
+                <legend>Required rights confirmation</legend>
+                <label>
+                  <input type="checkbox" name="commercial_use_attested" required>
+                  <span>I confirm this file permits commercial image use.</span>
+                </label>
+                <label>
+                  <input type="checkbox" name="adult_use_attested" required>
+                  <span>I confirm its license permits use in this adult-content workflow.</span>
+                </label>
+              </fieldset>
+              <div class="lora-upload-progress" data-lora-upload-progress hidden>
+                <div>
+                  <strong data-lora-upload-label>Preparing upload&hellip;</strong>
+                  <output data-lora-upload-percent>0%</output>
+                </div>
+                <progress max="100" value="0" aria-label="LoRA upload progress" data-lora-upload-meter>0%</progress>
+              </div>
+              <div class="lora-submit-row">
+                <output class="lora-operation-message" data-lora-manual-status aria-live="polite"></output>
+                <button class="primary-button" type="submit">Upload and add</button>
+              </div>
+            </form>
+          </section>
+
+          <noscript>
+            <p class="form-error">
+              JavaScript is required only for the secure direct-upload/import controls. Your existing LoRA library remains readable below.
+            </p>
+          </noscript>
+        </div>
+      </details>
+    {% endif %}
+
+    <section class="lora-import-section" id="lora-imports" aria-labelledby="lora-imports-heading">
+      <div class="section-heading">
+        <div>
+          <p class="page-kicker">Background work</p>
+          <h2 id="lora-imports-heading">Transfers and activation</h2>
+          <p class="muted">You can leave this page. Progress is saved and resumes here.</p>
+        </div>
+      </div>
+      <div class="lora-import-list" data-lora-import-list>
+        {% for operation in imports %}
+          <article
+            class="lora-import-card"
+            data-lora-import
+            data-import-id="{{ operation.id }}"
+            data-import-status="{{ operation.status }}"
+          >
+            <div class="lora-import-copy">
+              <strong>{{ operation.name }}</strong>
+              <span>{{ readable_status(operation.status) }}</span>
+            </div>
+            <div class="lora-import-progress">
+              {% if operation.total_bytes %}
+                <progress
+                  max="{{ operation.total_bytes }}"
+                  value="{{ operation.bytes_transferred or 0 }}"
+                  aria-label="Transfer progress for {{ operation.name }}"
+                ></progress>
+              {% else %}
+                <progress aria-label="{{ readable_status(operation.status) }} for {{ operation.name }}"></progress>
+              {% endif %}
+              <small data-import-progress-copy>
+                {% if operation.total_bytes %}
+                  {{ operation.bytes_transferred or 0 }} of {{ operation.total_bytes }} bytes
+                {% else %}
+                  {{ readable_status(operation.status) }}
+                {% endif %}
+              </small>
+            </div>
+            {% if operation.error %}<p class="lora-import-error">{{ operation.error }}</p>{% endif %}
+            {% if can_manage and (operation.retryable or operation.cancellable) %}
+              <div class="lora-import-actions">
+                {% if operation.retryable %}<button class="secondary-button" type="button" data-lora-import-action="retry">Retry</button>{% endif %}
+                {% if operation.cancellable %}<button class="text-button" type="button" data-lora-import-action="cancel">Cancel</button>{% endif %}
+              </div>
+            {% endif %}
+          </article>
+        {% endfor %}
+      </div>
+      <p class="panel lora-import-empty" data-lora-import-empty {% if imports %}hidden{% endif %}>
+        No transfers are active. Adding a LoRA above will show each verification and activation step here.
+      </p>
+      <output class="lora-operation-message" data-lora-import-list-status aria-live="polite"></output>
+    </section>
+
+    <section class="lora-library-section" aria-labelledby="lora-library-heading">
+      <div class="section-heading lora-library-heading">
+        <div>
+          <p class="page-kicker">Available models</p>
+          <h2 id="lora-library-heading">LoRA library</h2>
+        </div>
+        <label class="lora-library-search">
+          <span class="visually-hidden">Search the LoRA library</span>
+          <input type="search" placeholder="Search name, source, or SHA" autocomplete="off" data-lora-library-search>
+        </label>
+      </div>
+      <div class="lora-filter-row" role="group" aria-label="Filter LoRA library by status" data-lora-filters>
+        <button class="filter-chip active" type="button" data-lora-filter="all" aria-pressed="true">All</button>
+        <button class="filter-chip" type="button" data-lora-filter="ready" aria-pressed="false">Ready</button>
+        <button class="filter-chip" type="button" data-lora-filter="activating" aria-pressed="false">Activating</button>
+        <button class="filter-chip" type="button" data-lora-filter="attention" aria-pressed="false">Needs attention</button>
+        <button class="filter-chip" type="button" data-lora-filter="deleting" aria-pressed="false">Deleting</button>
+        <button class="filter-chip" type="button" data-lora-filter="removed" aria-pressed="false">Removed</button>
+        <output class="lora-filter-result muted" data-lora-filter-result aria-live="polite"></output>
+      </div>
+
+      <ul class="lora-library-list" data-lora-library-list>
+        {% for entry in entries %}
+          {% set entry_status = entry.status or "unknown" %}
+          {% set readiness = entry.readiness_status or "unknown" %}
+          {% if entry_status in ["retired", "removed", "revoked", "purged"] %}
+            {% set filter_status = "removed" %}
+          {% elif entry_status in ["retiring", "deleting", "delete_pending"] %}
+            {% set filter_status = "deleting" %}
+          {% elif entry_status in ["failed", "blocked", "error", "attention"] or readiness in ["failed", "blocked", "unavailable"] %}
+            {% set filter_status = "attention" %}
+          {% elif readiness in ["ready", "warm_ready"] or entry_status == "active" %}
+            {% set filter_status = "ready" %}
+          {% else %}
+            {% set filter_status = "activating" %}
+          {% endif %}
+          <li
+            id="lora-entry-{{ entry.id }}"
+            class="lora-library-card"
+            data-lora-entry
+            data-lora-id="{{ entry.id }}"
+            data-lora-status="{{ filter_status }}"
+            data-lora-size="{{ entry.size_bytes or 0 }}"
+            data-lora-search-text="{{ entry.name }} {{ entry.sha256 }} {{ entry.source_label or '' }} {{ entry.version_name or '' }}"
+          >
+            <div class="lora-library-identity">
+              <div>
+                <p class="page-kicker">{{ entry.source_label or "Manual upload" }}</p>
+                <h3>{{ entry.name }}</h3>
+                {% if entry.version_name %}<p class="muted">{{ entry.version_name }}</p>{% endif %}
+              </div>
+              <span class="status {{ filter_status }}">{{ readable_status(readiness if readiness != "unknown" else entry_status) }}</span>
+            </div>
+            <dl class="lora-library-facts">
+              <div>
+                <dt>Size</dt>
+                <dd data-format-bytes="{{ entry.size_bytes or 0 }}">{{ entry.size_bytes or 0 }} bytes</dd>
+              </div>
+              <div>
+                <dt>SHA-256</dt>
+                <dd><code title="{{ entry.sha256 }}">{{ entry.sha256[:12] }}&hellip;</code></dd>
+              </div>
+              <div>
+                <dt>Source</dt>
+                <dd><a href="{{ entry.source_url }}" rel="noreferrer noopener" target="_blank">Open source</a></dd>
+              </div>
+              <div>
+                <dt>Updated</dt>
+                <dd>{{ entry.updated_at or "Unknown" }}</dd>
+              </div>
+            </dl>
+            {% if entry.trigger_words %}
+              <div class="lora-library-triggers">
+                <span>Trigger words</span>
+                <code>{{ entry.trigger_words | join(", ") }}</code>
+                <button class="text-button" type="button" data-copy-lora-triggers="{{ entry.trigger_words | join(', ') }}">Copy</button>
+              </div>
+            {% endif %}
+            {% if entry.storage_retained_reason %}
+              <p class="lora-storage-retained">{{ entry.storage_retained_reason }}</p>
+            {% endif %}
+            {% if entry.lifecycle_error and entry.lifecycle_error_code != "historical_reference_retained" %}
+              <p class="lora-operation-message error">{{ entry.lifecycle_error }}</p>
+            {% endif %}
+            {% if can_manage and (entry.can_retire or entry.can_restore) %}
+              <div class="lora-library-actions">
+                {% if entry.can_restore %}
+                  <button class="secondary-button" type="button" data-lora-restore>Restore</button>
+                {% endif %}
+                {% if entry.can_retire %}
+                  <button class="danger-button" type="button" data-lora-retire>Delete LoRA</button>
+                {% endif %}
+              </div>
+            {% endif %}
+          </li>
+        {% endfor %}
+      </ul>
+      <section class="panel lora-library-empty" data-lora-library-empty {% if entries %}hidden{% endif %}>
+        <h3>No LoRAs in this view</h3>
+        <p class="muted" data-lora-library-empty-copy>
+          Add one from Civitai or upload a Safetensors file above.
+        </p>
+      </section>
+      <output class="lora-operation-message" data-lora-library-status aria-live="polite"></output>
+    </section>
+
+    {% if can_manage %}
+      <dialog class="lora-delete-dialog" data-lora-delete-dialog aria-labelledby="lora-delete-heading" aria-describedby="lora-delete-description">
+        <form method="dialog" data-lora-delete-form>
+          <p class="page-kicker">Safe deletion</p>
+          <h2 id="lora-delete-heading">Delete <span data-lora-delete-name>this LoRA</span>?</h2>
+          <p id="lora-delete-description">
+            It will disappear from new selections immediately. Stored bytes are purged only after active work and the worker manifest no longer use this exact version.
+          </p>
+          <p class="muted">
+            Existing generated images remain. Old automations that depend on this LoRA may no longer be rerunnable after storage cleanup.
+          </p>
+          <label class="lora-delete-storage-choice">
+            <input type="checkbox" name="purge_when_safe" checked>
+            <span><strong>Delete the stored file when safe</strong><small data-lora-delete-size-copy>Reclaim its private-storage space after rollout.</small></span>
+          </label>
+          <div class="lora-delete-actions">
+            <button class="secondary-button" type="submit" value="cancel" autofocus>Keep LoRA</button>
+            <button class="danger-button" type="button" data-lora-delete-confirm>Delete LoRA</button>
+          </div>
+          <output class="lora-operation-message" data-lora-delete-status aria-live="polite"></output>
+        </form>
+      </dialog>
+    {% endif %}
+  </section>
+{% endblock %}
+
+{% block page_scripts %}
+  <script src="/static/lora_manager.js" defer></script>
+{% endblock %}

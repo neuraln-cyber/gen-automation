@@ -43,6 +43,7 @@ from gen_automation.middleware import content_security_policy
 from gen_automation.services.authentication import AuthenticatedPrincipal, CsrfValidationError
 from gen_automation.services.dashboard_previews import dashboard_preview_url
 from gen_automation.services.experiment_support import (
+    ExperimentModelReadiness,
     classify_experiment_model_readiness,
     estimate_experiment_session_cost_from_settings,
 )
@@ -65,6 +66,10 @@ from gen_automation.services.experiments import (
     load_experiment_status,
 )
 from gen_automation.services.generation import GenerationPlanConflictError
+from gen_automation.services.managed_artifact_manifest import (
+    ManagedArtifactManifestError,
+    effective_artifact_manifest_from_settings,
+)
 from gen_automation.services.new_sets import (
     NewSetInputError,
     NewSetOptions,
@@ -107,7 +112,12 @@ async def dashboard_new_experiment(
         )
     options = await list_new_set_options(session)
     try:
-        return _experiment_form_response(request, principal=principal, options=options)
+        return await _experiment_form_response(
+            request,
+            session=session,
+            principal=principal,
+            options=options,
+        )
     except (CsrfValidationError, HTTPException):
         return _error_response(
             request,
@@ -142,8 +152,9 @@ async def submit_dashboard_new_experiment(
         form = await read_experiment_form(request)
     except BrowserExperimentFormError as error:
         options = await list_new_set_options(session)
-        return _experiment_form_response(
+        return await _experiment_form_response(
             request,
+            session=session,
             principal=principal,
             options=options,
             values=error.values,
@@ -171,24 +182,34 @@ async def submit_dashboard_new_experiment(
         if not form_key_matches(form.idempotency_key, expected_key):
             raise HTTPException(status_code=400, detail="form idempotency validation failed")
         current_options = await list_new_set_options(session)
-        readiness = classify_experiment_model_readiness(settings, current_options)
-        warm_checkpoints = {
-            item.option.approval_id for item in readiness.checkpoints if item.warm_ready
-        }
-        warm_loras = {item.option.approval_id for item in readiness.loras if item.warm_ready}
-        restart_variants = [
-            variant.label
-            for variant in form.command.variants
-            if variant.profile.checkpoint_approval_id not in warm_checkpoints
-            or any(lora.approval_id not in warm_loras for lora in variant.profile.loras)
-        ]
-        if restart_variants:
-            labels = ", ".join(restart_variants[:3])
-            suffix = " and more" if len(restart_variants) > 3 else ""
-            raise ExperimentInputError(
-                f"{labels}{suffix}: onboard the checkpoint or LoRA into the worker manifest "
-                "and redeploy before queueing"
-            )
+        checkpoints_by_id = {option.approval_id: option for option in current_options.checkpoints}
+        loras_by_id = {option.approval_id: option for option in current_options.loras}
+        for variant in form.command.variants:
+            checkpoint = checkpoints_by_id.get(variant.profile.checkpoint_approval_id)
+            selected_loras = [loras_by_id.get(item.approval_id) for item in variant.profile.loras]
+            if checkpoint is None or any(item is None for item in selected_loras):
+                raise ExperimentInputError(
+                    f"{variant.label}: a selected model is no longer available"
+                )
+            assert all(item is not None for item in selected_loras)
+            required_lora_sha256s = tuple(item.sha256 for item in selected_loras if item)
+            try:
+                effective = await effective_artifact_manifest_from_settings(
+                    session,
+                    settings=settings,
+                    required_lora_sha256s=required_lora_sha256s,
+                )
+            except (ManagedArtifactManifestError, ValueError) as error:
+                raise ExperimentInputError(
+                    f"{variant.label}: the selected models do not fit the safe worker runtime"
+                ) from error
+            manifest_hashes = {artifact.sha256 for artifact in effective.manifest.artifacts}
+            if checkpoint.sha256 not in manifest_hashes or not set(required_lora_sha256s).issubset(
+                manifest_hashes
+            ):
+                raise ExperimentInputError(
+                    f"{variant.label}: onboard the selected model before queueing"
+                )
         if form.command.keep_warm:
             try:
                 await ensure_experiment_warm_lease(
@@ -206,6 +227,7 @@ async def submit_dashboard_new_experiment(
             session,
             command=form.command,
             idempotency_key=form.idempotency_key,
+            settings=settings,
             actor=str(manager.user_id),
         )
     except HTTPException as error:
@@ -548,8 +570,9 @@ async def _submission_error(
     message: str,
 ) -> Response:
     options = await list_new_set_options(session)
-    return _experiment_form_response(
+    return await _experiment_form_response(
         request,
+        session=session,
         principal=principal,
         options=options,
         values=form.values,
@@ -560,9 +583,10 @@ async def _submission_error(
     )
 
 
-def _experiment_form_response(
+async def _experiment_form_response(
     request: Request,
     *,
+    session: AsyncSession,
     principal: AuthenticatedPrincipal,
     options: NewSetOptions,
     values: dict[str, str] | None = None,
@@ -587,7 +611,7 @@ def _experiment_form_response(
                 if key not in {"csrf_token", "submission_id", "idempotency_key"}
             }
         )
-    readiness = classify_experiment_model_readiness(settings, options)
+    readiness = await _model_readiness(session, settings, options)
     cost_estimate = estimate_experiment_session_cost_from_settings(
         settings,
         idle_ttl_seconds=900,
@@ -622,6 +646,18 @@ def _experiment_form_response(
             status_code=status_code,
         ),
     )
+
+
+async def _model_readiness(
+    session: AsyncSession,
+    settings: Settings,
+    options: NewSetOptions,
+) -> ExperimentModelReadiness:
+    del session
+    # The configured baseline is resident for every worker. Managed LoRAs are
+    # loaded per compatible batch by the controller and are therefore shown as
+    # requiring a worker refresh instead of pretending the full library is warm.
+    return classify_experiment_model_readiness(settings, options)
 
 
 def _default_values(options: NewSetOptions) -> dict[str, str]:

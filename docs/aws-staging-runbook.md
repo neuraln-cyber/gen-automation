@@ -153,6 +153,21 @@ only the reviewed, root-owned host deployment helper with immutable image
 digests and then wait for its health-checked result. Infrastructure plans and
 applies remain a separate, explicitly authenticated operator action.
 
+The LoRA manager has an additional ordered handoff. Apply and verify the exact
+model-bucket CORS, managed-prefix IAM, and configured Civitai-secret grant
+before enabling its application flag. Then set the non-secret
+`AWS_STAGING_CIVITAI_API_SECRET_ARN` repository variable to the same full ARN.
+Only after that infrastructure apply is verified, set the non-secret
+`AWS_STAGING_LORA_MANAGER_PREREQUISITES_APPLIED=true` repository gate; an absent
+gate blocks the explicit `enable` operation before AWS authentication or host
+mutation. Routine image deployments preserve the current LoRA toggle. The
+manual `status` operation is read-only, while `disable` requires neither the ARN
+nor the prerequisite gate and cannot be undone by a routine deployment.
+The root-owned host helper fails closed unless the existing worker manifest JSON
+and its independent 64-hex trust anchor are both present and agree. See
+[`lora-manager-staging-rollout.md`](lora-manager-staging-rollout.md) for the
+review and verification checklist.
+
 ## 4. Database and application handoff
 
 Use the RDS-managed bootstrap secret only from a bounded one-off SSM operation

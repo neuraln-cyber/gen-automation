@@ -51,6 +51,7 @@ from gen_automation.integrations.salad.models import (
 )
 from gen_automation.services.budgets import ensure_budget_guard, reserve_attempt_budget
 from gen_automation.services.experiment_warm_leases import start_experiment_warm_lease
+from gen_automation.services.managed_artifact_manifest import EffectiveArtifactManifest
 from gen_automation.services.outbox import (
     GENERATION_ATTEMPT_AGGREGATE,
     SALAD_JOB_SUBMIT_TOPIC,
@@ -72,6 +73,45 @@ WORKER_SIGNING_PRIVATE_KEY = encode_base64url(bytes(range(1, 33)))
 RUNTIME_MANIFEST = '{"artifacts":[],"manifest_sha256":"' + ("0" * 64) + '"}'
 QUEUE_ID = UUID("3d59eff3-8f46-4743-ab42-c5bdd56a04ca")
 GROUP_ID = UUID("e1f35986-d00a-44d0-a0c6-59dda919b07b")
+
+
+async def _empty_effective_artifact_manifest(
+    _workloads: ControllerWorkloads,
+    _session: AsyncSession,
+    *,
+    required_lora_sha256s: tuple[str, ...] = (),
+) -> EffectiveArtifactManifest:
+    del required_lora_sha256s
+    manifest = ArtifactManifest.model_construct(
+        version="v1",
+        artifacts=(),
+        manifest_sha256="0" * 64,
+    )
+    return EffectiveArtifactManifest(
+        manifest=manifest,
+        manifest_json=RUNTIME_MANIFEST,
+        managed_lora_sha256s=frozenset(),
+    )
+
+
+async def _selected_effective_artifact_manifest(
+    _workloads: ControllerWorkloads,
+    _session: AsyncSession,
+    *,
+    required_lora_sha256s: tuple[str, ...] = (),
+) -> EffectiveArtifactManifest:
+    selected = tuple(sorted(required_lora_sha256s))
+    digest = canonical_sha256({"managed_loras": selected})
+    manifest = ArtifactManifest.model_construct(
+        version="v1",
+        artifacts=(),
+        manifest_sha256=digest,
+    )
+    return EffectiveArtifactManifest(
+        manifest=manifest,
+        manifest_json=('{"artifacts":[],"manifest_sha256":"' + digest + '"}'),
+        managed_lora_sha256s=frozenset(selected),
+    )
 
 
 class DeploymentOnlyClient:
@@ -448,6 +488,8 @@ async def _seed_submission_database(database: Database) -> SubmissionContext:
             state=SaladDeploymentState.ACTIVE,
             desired_state=DesiredDeploymentState.ACTIVE,
             is_current=True,
+            runtime_artifact_manifest_sha256="0" * 64,
+            runtime_managed_lora_sha256s=[],
             max_hourly_cost_microusd=2_000_000,
             created_at=NOW,
             updated_at=NOW,
@@ -457,8 +499,8 @@ async def _seed_submission_database(database: Database) -> SubmissionContext:
         job = GenerationJob(
             release_version_id=version.id,
             logical_key="d" * 64,
-            parameters={"seed": 1},
-            parameters_sha256=canonical_sha256({"seed": 1}),
+            parameters={"seed": 1, "loras": []},
+            parameters_sha256=canonical_sha256({"seed": 1, "loras": []}),
             provider="salad",
             state=GenerationState.QUEUED,
             expected_output_count=1,
@@ -500,8 +542,8 @@ async def test_submit_refreshes_runtime_only_at_same_deployment_idle_boundary(
             second_job = GenerationJob(
                 release_version_id=first_job.release_version_id,
                 logical_key="e" * 64,
-                parameters={"seed": 2},
-                parameters_sha256=canonical_sha256({"seed": 2}),
+                parameters={"seed": 2, "loras": []},
+                parameters_sha256=canonical_sha256({"seed": 2, "loras": []}),
                 provider="salad",
                 state=GenerationState.QUEUED,
                 expected_output_count=1,
@@ -527,8 +569,10 @@ async def test_submit_refreshes_runtime_only_at_same_deployment_idle_boundary(
             deployment: SaladDeployment,
             client: object,
             resolver: object,
+            *,
+            environment_overrides: Mapping[str, str] | None = None,
         ) -> SaladContainerGroup:
-            del client, resolver
+            del client, resolver, environment_overrides
             refreshes.append(deployment.id)
             return cast(SaladContainerGroup, object())
 
@@ -553,15 +597,10 @@ async def test_submit_refreshes_runtime_only_at_same_deployment_idle_boundary(
             "refresh_container_group_runtime",
             fake_refresh,
         )
-        artifact_manifest = ArtifactManifest.model_construct(
-            version="v1",
-            artifacts=(),
-            manifest_sha256="0" * 64,
-        )
         monkeypatch.setattr(
-            controller_runtime,
-            "load_artifact_manifest",
-            lambda _raw: artifact_manifest,
+            ControllerWorkloads,
+            "_effective_artifact_manifest",
+            _empty_effective_artifact_manifest,
         )
         monkeypatch.setattr(controller_runtime, "submit_prepared_attempt", fake_submit)
         workloads = ControllerWorkloads(
@@ -598,9 +637,12 @@ async def test_submit_refreshes_runtime_only_at_same_deployment_idle_boundary(
 
         async with database.sessions() as session:
             first_attempt = await session.get(GenerationAttempt, first.attempt_id)
+            deployment = await session.get(SaladDeployment, deployment_id)
             assert first_attempt is not None
+            assert deployment is not None
             first_attempt.state = GenerationAttemptState.FAILED
             first_attempt.completed_at = NOW
+            deployment.runtime_artifact_manifest_sha256 = "1" * 64
             await session.commit()
 
         # With no other active provider attempt, this is the idle-to-active
@@ -611,6 +653,185 @@ async def test_submit_refreshes_runtime_only_at_same_deployment_idle_boundary(
             second.generation_attempt_id,
             second.generation_attempt_id,
         ]
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_submit_reuses_a_safe_resident_lora_superset_without_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'resident-superset.db').as_posix()}")
+    await database.create_schema()
+    try:
+        context = await _seed_submission_database(database)
+        lora_a = "1" * 64
+        lora_b = "2" * 64
+        resident_digest = canonical_sha256({"managed_loras": (lora_a, lora_b)})
+        async with database.sessions() as session:
+            job = await session.get(GenerationJob, context.job_id)
+            deployment = await session.scalar(select(SaladDeployment))
+            outbox = await session.scalar(
+                select(OutboxEvent).where(OutboxEvent.aggregate_id == context.attempt_id)
+            )
+            assert job is not None
+            assert deployment is not None
+            assert outbox is not None
+            job.parameters = {"seed": 1, "loras": [{"sha256": lora_a}]}
+            job.parameters_sha256 = canonical_sha256(job.parameters)
+            deployment.runtime_managed_lora_sha256s = [lora_a, lora_b]
+            deployment.runtime_artifact_manifest_sha256 = resident_digest
+            await session.commit()
+            outbox_id = outbox.id
+
+        refreshes: list[UUID] = []
+        submissions: list[UUID] = []
+
+        async def fake_refresh(
+            deployment: SaladDeployment,
+            client: object,
+            resolver: object,
+            *,
+            environment_overrides: Mapping[str, str] | None = None,
+        ) -> SaladContainerGroup:
+            del client, resolver, environment_overrides
+            refreshes.append(deployment.id)
+            return _group(deployment.container_group_name, deployment.queue_name)
+
+        async def fake_submit(
+            *args: object,
+            generation_attempt_id: UUID,
+            **kwargs: object,
+        ) -> SubmissionResult:
+            del args, kwargs
+            submissions.append(generation_attempt_id)
+            return SubmissionResult(
+                generation_attempt_id=generation_attempt_id,
+                attempt_state=GenerationAttemptState.CREATED,
+                generation_job_state=GenerationState.CLAIMED,
+                disposition=SubmissionDisposition.SUBMITTED,
+                mutation_effect=MutationEffect.CONFIRMED,
+                provider_external_id="provider-job",
+            )
+
+        monkeypatch.setattr(
+            ControllerWorkloads,
+            "_effective_artifact_manifest",
+            _selected_effective_artifact_manifest,
+        )
+        monkeypatch.setattr(
+            controller_runtime,
+            "refresh_container_group_runtime",
+            fake_refresh,
+        )
+        monkeypatch.setattr(controller_runtime, "submit_prepared_attempt", fake_submit)
+        workloads = ControllerWorkloads(
+            settings=Settings(
+                worker_signing_key_id="worker-key-1",
+                worker_signing_private_key=WORKER_SIGNING_PRIVATE_KEY,
+            ),
+            sessions=database.sessions,
+            instance_id="controller-resident-superset-test",
+            salad_client=cast(SaladClient, object()),
+            object_store=cast(ObjectStore, object()),
+        )
+        event = ClaimedOutboxEvent(
+            id=outbox_id,
+            topic=SALAD_JOB_SUBMIT_TOPIC,
+            dedupe_key=f"{SALAD_JOB_SUBMIT_TOPIC}:{context.attempt_id}",
+            correlation_id=str(context.attempt_id),
+            aggregate_type=GENERATION_ATTEMPT_AGGREGATE,
+            aggregate_id=context.attempt_id,
+            payload={"generation_attempt_id": str(context.attempt_id)},
+            attempt=1,
+            max_attempts=3,
+            lease_expires_at=NOW + timedelta(minutes=5),
+        )
+
+        await workloads._submit_event(event, progress=_SubmissionProgress())
+        assert refreshes == []
+        assert submissions == [context.attempt_id]
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_submit_defers_an_incompatible_lora_rollout_while_work_is_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'active-manifest-defer.db').as_posix()}")
+    await database.create_schema()
+    try:
+        first = await _seed_submission_database(database)
+        lora_a = "3" * 64
+        lora_b = "4" * 64
+        async with database.sessions() as session:
+            deployment = await session.scalar(select(SaladDeployment))
+            first_job = await session.get(GenerationJob, first.job_id)
+            first_attempt = await session.get(GenerationAttempt, first.attempt_id)
+            assert deployment is not None
+            assert first_job is not None
+            assert first_attempt is not None
+            first_job.parameters = {"seed": 1, "loras": [{"sha256": lora_a}]}
+            first_job.parameters_sha256 = canonical_sha256(first_job.parameters)
+            first_attempt.state = GenerationAttemptState.RUNNING
+            first_attempt.provider_external_id = "provider-active-manifest-attempt"
+            deployment.runtime_managed_lora_sha256s = [lora_a]
+            deployment.runtime_artifact_manifest_sha256 = canonical_sha256(
+                {"managed_loras": (lora_a,)}
+            )
+            second_job = GenerationJob(
+                release_version_id=first_job.release_version_id,
+                logical_key="f" * 64,
+                parameters={"seed": 2, "loras": [{"sha256": lora_b}]},
+                parameters_sha256=canonical_sha256({"seed": 2, "loras": [{"sha256": lora_b}]}),
+                provider="salad",
+                state=GenerationState.QUEUED,
+                expected_output_count=1,
+            )
+            session.add(second_job)
+            await session.flush()
+            second = await prepare_generation_attempt(
+                session,
+                generation_job_id=second_job.id,
+                salad_deployment_id=deployment.id,
+                idempotency_key="active-manifest-second-attempt",
+                now=NOW,
+            )
+            await session.commit()
+
+        monkeypatch.setattr(
+            ControllerWorkloads,
+            "_effective_artifact_manifest",
+            _selected_effective_artifact_manifest,
+        )
+        workloads = ControllerWorkloads(
+            settings=Settings(
+                worker_signing_key_id="worker-key-1",
+                worker_signing_private_key=WORKER_SIGNING_PRIVATE_KEY,
+            ),
+            sessions=database.sessions,
+            instance_id="controller-active-manifest-test",
+            salad_client=cast(SaladClient, object()),
+            object_store=cast(ObjectStore, object()),
+        )
+        event = ClaimedOutboxEvent(
+            id=second.outbox_event_id,
+            topic=SALAD_JOB_SUBMIT_TOPIC,
+            dedupe_key=f"{SALAD_JOB_SUBMIT_TOPIC}:{second.generation_attempt_id}",
+            correlation_id=str(second.generation_attempt_id),
+            aggregate_type=GENERATION_ATTEMPT_AGGREGATE,
+            aggregate_id=second.generation_attempt_id,
+            payload={"generation_attempt_id": str(second.generation_attempt_id)},
+            attempt=1,
+            max_attempts=3,
+            lease_expires_at=NOW + timedelta(minutes=5),
+        )
+
+        with pytest.raises(controller_runtime._RuntimeArtifactManifestBusyError):
+            await workloads._submit_event(event, progress=_SubmissionProgress())
     finally:
         await database.dispose()
 
@@ -644,8 +865,10 @@ async def test_experiment_warm_lease_refreshes_first_submit_once_then_reuses_run
             deployment: SaladDeployment,
             client: object,
             resolver: object,
+            *,
+            environment_overrides: Mapping[str, str] | None = None,
         ) -> SaladContainerGroup:
-            del client, resolver
+            del client, resolver, environment_overrides
             refreshes.append(deployment.id)
             return _group(deployment.container_group_name, deployment.queue_name)
 
@@ -672,15 +895,10 @@ async def test_experiment_warm_lease_refreshes_first_submit_once_then_reuses_run
             "refresh_container_group_runtime",
             fake_refresh,
         )
-        artifact_manifest = ArtifactManifest.model_construct(
-            version="v1",
-            artifacts=(),
-            manifest_sha256="0" * 64,
-        )
         monkeypatch.setattr(
-            controller_runtime,
-            "load_artifact_manifest",
-            lambda _raw: artifact_manifest,
+            ControllerWorkloads,
+            "_effective_artifact_manifest",
+            _empty_effective_artifact_manifest,
         )
         monkeypatch.setattr(controller_runtime, "submit_prepared_attempt", fake_submit)
         workloads = ControllerWorkloads(

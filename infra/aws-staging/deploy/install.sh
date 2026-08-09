@@ -38,6 +38,9 @@ install -o root -g root -m 0755 \
   "$source_dir/validate-migration-environment.sh" \
   /usr/local/libexec/gen-automation-validate-migration-environment
 install -o root -g root -m 0755 \
+  "$source_dir/configure-lora-manager.sh" \
+  /usr/local/libexec/gen-automation-configure-lora-manager
+install -o root -g root -m 0755 \
   "$source_dir/install-compose-plugin.sh" \
   /usr/local/sbin/gen-automation-install-compose-plugin
 install -o root -g root -m 0755 \

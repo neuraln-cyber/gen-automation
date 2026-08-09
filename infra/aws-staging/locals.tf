@@ -2,6 +2,11 @@ locals {
   availability_zones = slice(sort(data.aws_availability_zones.available.names), 0, 2)
   name               = var.name_prefix
   dns_enabled        = var.route53_zone_id != null && var.hostname != null
+  browser_upload_origin = (
+    var.browser_upload_origin != null
+    ? var.browser_upload_origin
+    : (local.dns_enabled ? "https://${var.hostname}" : null)
+  )
 
   asset_bucket_name = lower(
     "${var.name_prefix}-${data.aws_caller_identity.current.account_id}-${var.aws_region}-assets"

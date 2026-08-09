@@ -17,6 +17,7 @@ from gen_automation.domain.runtime_bindings import (
     WORKER_ALLOWED_UPLOAD_ORIGIN_BINDING,
     WORKER_ARTIFACT_BUCKET_BINDING,
     WORKER_ARTIFACT_REGION_BINDING,
+    WORKER_DYNAMIC_MANIFEST_MAX_BYTES,
     WORKER_MODEL_MANIFEST_JSON_BINDING,
     WORKER_MODEL_MANIFEST_SHA256_BINDING,
 )
@@ -38,6 +39,11 @@ AWS_IAM_ROLE_ARN_PATTERN = (
 )
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 X_OAUTH_SECRET_REFERENCE_PATTERN = (
+    r"^aws-secrets-manager://arn:(?:aws|aws-us-gov|aws-cn):secretsmanager:"  # noqa: S105
+    r"[a-z0-9-]{3,32}:[0-9]{12}:secret:"
+    r"[A-Za-z0-9._/-]{1,400}-[A-Za-z0-9]{6}$"
+)
+CIVITAI_SECRET_REFERENCE_PATTERN = (
     r"^aws-secrets-manager://arn:(?:aws|aws-us-gov|aws-cn):secretsmanager:"  # noqa: S105
     r"[a-z0-9-]{3,32}:[0-9]{12}:secret:"
     r"[A-Za-z0-9._/-]{1,400}-[A-Za-z0-9]{6}$"
@@ -406,6 +412,19 @@ class Settings(BaseSettings):
         le=512 * 1024 * 1024,
     )
     background_mega_batch_size: int = Field(default=100, ge=1, le=100)
+    lora_manager_enabled: bool = False
+    civitai_api_key: SecretStr | None = None
+    civitai_api_secret_reference: str | None = Field(
+        default=None,
+        pattern=CIVITAI_SECRET_REFERENCE_PATTERN,
+        max_length=500,
+    )
+    lora_upload_presign_ttl_seconds: int = Field(default=900, ge=60, le=900)
+    background_lora_import_timeout_seconds: float = Field(default=840, ge=30, le=900)
+    background_lora_import_lease_seconds: int = Field(default=1200, ge=60, le=3600)
+    background_lora_import_max_attempts: int = Field(default=3, ge=1, le=10)
+    background_lora_import_retry_base_seconds: int = Field(default=30, ge=1, le=3600)
+    background_lora_import_retry_max_seconds: int = Field(default=900, ge=1, le=86400)
     background_outbox_lease_seconds: int = Field(default=300, ge=10, le=3600)
     background_inbox_lease_seconds: int = Field(default=120, ge=10, le=3600)
     background_collection_lease_seconds: int = Field(default=900, ge=60, le=3600)
@@ -769,6 +788,48 @@ class Settings(BaseSettings):
                 "MEGA cycle timeout must cover one batched upload, control-file verification, "
                 "and cleanup"
             )
+        if self.lora_manager_enabled:
+            if not self.background_runtime_enabled:
+                errors.append("LoRA management requires the background runtime")
+            artifact_bucket = _secret_value(self.salad_worker_artifact_bucket)
+            artifact_region = _secret_value(self.salad_worker_artifact_region)
+            if not artifact_bucket or not artifact_region:
+                errors.append("LoRA management requires the private worker artifact store")
+            manifest_json = _secret_value(self.salad_worker_model_manifest_json)
+            manifest_sha256 = _secret_value(self.salad_worker_model_manifest_sha256)
+            if manifest_json is None or manifest_sha256 is None:
+                errors.append("LoRA management requires the pinned worker artifact manifest")
+            else:
+                try:
+                    from gen_automation.gpu_worker.bootstrap import (
+                        WorkerBootstrapConfigurationError,
+                        load_artifact_manifest,
+                    )
+
+                    manifest = load_artifact_manifest(manifest_json)
+                except (TypeError, ValueError, WorkerBootstrapConfigurationError):
+                    errors.append("LoRA management worker artifact manifest is invalid")
+                else:
+                    if manifest.manifest_sha256 != manifest_sha256:
+                        errors.append("LoRA management worker manifest digest does not match")
+            if protected_environment and self.civitai_api_key is not None:
+                errors.append(
+                    "staging and production must load the Civitai API key from Secrets Manager"
+                )
+            if protected_environment and self.civitai_api_secret_reference is None:
+                errors.append("staging and production LoRA management requires a Civitai secret")
+            if self.civitai_api_key is None and self.civitai_api_secret_reference is None:
+                errors.append("LoRA management requires a Civitai API credential")
+            if (
+                self.background_lora_import_retry_max_seconds
+                < self.background_lora_import_retry_base_seconds
+            ):
+                errors.append("LoRA import retry maximum cannot be lower than its base delay")
+            if (
+                self.background_lora_import_lease_seconds
+                <= self.background_lora_import_timeout_seconds
+            ):
+                errors.append("LoRA import lease must exceed the supervised cycle timeout")
         if self.gpu_allocation_enabled and not self.salad_enabled:
             errors.append("GPU allocation requires the SaladCloud integration")
         if self.gpu_allocation_enabled and not self.storage_enabled:
@@ -939,6 +1000,13 @@ class Settings(BaseSettings):
                 cycle_timeouts.append(self.background_publication_timeout_seconds + 5)
             if self.storage_enabled and self.mega_delivery_enabled:
                 cycle_timeouts.append(self.background_mega_timeout_seconds + 5)
+            if self.lora_manager_enabled:
+                cycle_timeouts.extend(
+                    (
+                        self.background_lora_import_timeout_seconds + 5,
+                        60.0,
+                    )
+                )
             maximum_idle_interval = self.background_poll_interval_seconds
             if self.salad_enabled:
                 maximum_idle_interval = max(maximum_idle_interval, 30)
@@ -995,8 +1063,12 @@ class Settings(BaseSettings):
             errors.append("Salad worker upload origin must be an exact HTTPS origin")
 
         manifest_json = _secret_value(self.salad_worker_model_manifest_json)
-        if manifest_json is not None and len(manifest_json.encode("utf-8")) > 256 * 1024:
-            errors.append("Salad worker model manifest exceeds the runtime size limit")
+        if manifest_json is not None:
+            manifest_limit = (
+                WORKER_DYNAMIC_MANIFEST_MAX_BYTES if self.lora_manager_enabled else 256 * 1024
+            )
+            if len(manifest_json.encode("utf-8")) > manifest_limit:
+                errors.append("Salad worker model manifest exceeds the runtime size limit")
 
         manifest_sha256 = _secret_value(self.salad_worker_model_manifest_sha256)
         if manifest_sha256 is not None and SHA256_PATTERN.fullmatch(manifest_sha256) is None:

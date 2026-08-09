@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.db.models import (
+    ManagedLoraArtifact,
     ModelArtifactApproval,
     SubjectApproval,
     WorkflowApproval,
@@ -16,7 +17,11 @@ from gen_automation.domain.controlled_duo import (
     WorkflowCapability,
     effective_workflow_capabilities,
 )
-from gen_automation.domain.enums import ApprovalStatus, ModelArtifactKind
+from gen_automation.domain.enums import (
+    ApprovalStatus,
+    ManagedLoraLifecycle,
+    ModelArtifactKind,
+)
 from gen_automation.domain.release_spec import (
     ArtifactSpecification,
     ReleaseSpecification,
@@ -209,19 +214,40 @@ async def validate_release_approvals(
         ).all()
     )
     artifacts_by_hash = {approval.artifact_sha256: approval for approval in artifact_rows}
+    managed_active_hashes = frozenset(
+        (
+            await session.scalars(
+                select(ManagedLoraArtifact.artifact_sha256)
+                .where(
+                    ManagedLoraArtifact.artifact_sha256.in_(
+                        lora.sha256 for lora in specification.loras
+                    ),
+                    ManagedLoraArtifact.lifecycle == ManagedLoraLifecycle.ACTIVE,
+                )
+                .with_for_update(read=True)
+            )
+        ).all()
+    )
     checkpoint_evidence = _validate_artifact(
         specification.checkpoint,
         artifacts_by_hash.get(specification.checkpoint.sha256),
         expected_kind=ModelArtifactKind.CHECKPOINT,
     )
-    lora_evidence = [
-        _validate_artifact(
+    lora_evidence: list[dict[str, Any]] = []
+    for lora in specification.loras:
+        approval = artifacts_by_hash.get(lora.sha256)
+        evidence = _validate_artifact(
             lora,
-            artifacts_by_hash.get(lora.sha256),
+            approval,
             expected_kind=ModelArtifactKind.LORA,
         )
-        for lora in specification.loras
-    ]
+        if (
+            approval is not None
+            and approval.storage_key.startswith("worker/managed-loras/sha256/")
+            and lora.sha256 not in managed_active_hashes
+        ):
+            raise ReleaseApprovalError("managed LoRA is not active on the worker")
+        lora_evidence.append(evidence)
 
     workflow_approval = await session.scalar(
         select(WorkflowApproval)

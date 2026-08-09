@@ -7,6 +7,7 @@ from gen_automation.api.routes import (
     danbooru_tags,
     derivatives,
     health,
+    loras,
     mega_deliveries,
     publications,
     releases,
@@ -16,6 +17,7 @@ from gen_automation.api.routes import (
 
 api_router = APIRouter()
 api_router.include_router(health.router)
+api_router.include_router(loras.router)
 api_router.include_router(authentication.router)
 api_router.include_router(admin_enrollment.router)
 api_router.include_router(compliance.router)

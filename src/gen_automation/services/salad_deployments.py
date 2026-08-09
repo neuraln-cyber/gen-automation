@@ -35,6 +35,8 @@ from gen_automation.domain.enums import (
 from gen_automation.domain.runtime_bindings import (
     SALAD_WORKER_ALLOWED_RUNTIME_BINDINGS,
     SALAD_WORKER_RUNTIME_BINDING_REFERENCES,
+    WORKER_MODEL_MANIFEST_JSON_BINDING,
+    WORKER_MODEL_MANIFEST_SHA256_BINDING,
 )
 from gen_automation.integrations.salad.errors import (
     SaladAPIError,
@@ -1306,6 +1308,8 @@ def _matches_worker_contract(
 async def _container_group_payload(
     deployment: SaladDeployment,
     resolver: RuntimeSecretResolver | None,
+    *,
+    environment_overrides: Mapping[str, str] | None = None,
 ) -> JSONObject:
     configuration = deepcopy(deployment.provider_configuration)
     if not isinstance(configuration, dict) or not all(
@@ -1421,6 +1425,19 @@ async def _container_group_payload(
                 raise SaladDeploymentValidationError("runtime binding could not be resolved")
             environment[name] = value
 
+    overrides = dict(environment_overrides or {})
+    allowed_overrides = {
+        WORKER_MODEL_MANIFEST_JSON_BINDING,
+        WORKER_MODEL_MANIFEST_SHA256_BINDING,
+    }
+    if not set(overrides).issubset(allowed_overrides) or any(
+        not isinstance(value, str) or not value for value in overrides.values()
+    ):
+        raise SaladDeploymentValidationError("runtime environment override is invalid")
+    if bool(overrides) and set(overrides) != allowed_overrides:
+        raise SaladDeploymentValidationError("runtime manifest override is incomplete")
+    environment.update(overrides)
+
     container["image"] = deployment.worker_image_digest
     if environment:
         container["environment_variables"] = environment
@@ -1443,6 +1460,7 @@ async def refresh_container_group_runtime(
     client: SaladDeploymentClient,
     resolver: RuntimeSecretResolver | None,
     *,
+    environment_overrides: Mapping[str, str] | None = None,
     convergence_timeout_seconds: float = _RUNTIME_REFRESH_CONVERGENCE_TIMEOUT_SECONDS,
     poll_interval_seconds: float = _RUNTIME_REFRESH_POLL_SECONDS,
 ) -> SaladContainerGroup:
@@ -1466,7 +1484,11 @@ async def refresh_container_group_runtime(
     if preflight.pending_change:
         raise SaladDeploymentValidationError("container group has a pending change")
 
-    payload = await _container_group_payload(deployment, resolver)
+    payload = await _container_group_payload(
+        deployment,
+        resolver,
+        environment_overrides=environment_overrides,
+    )
     container = payload.get("container")
     if not isinstance(container, dict):
         raise SaladDeploymentValidationError("provider configuration.container is required")
