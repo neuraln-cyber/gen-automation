@@ -4,7 +4,8 @@ import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Literal, NoReturn
+from typing import Literal, Protocol
+from urllib.parse import quote
 
 import httpx2
 
@@ -12,6 +13,7 @@ from gen_automation.domain.deliverability import X_STATIC_IMAGE_MAX_BYTES
 from gen_automation.integrations.x.errors import (
     XAmbiguousTimeoutError,
     XAmbiguousTransportError,
+    XAPIError,
     XProtocolError,
     XRetryableAPIError,
     XRetryableTransportError,
@@ -46,6 +48,40 @@ _STATIC_IMAGE_MEDIA_TYPES: frozenset[str] = frozenset({"image/jpeg", "image/png"
 _SNOWFLAKE = re.compile(r"^[0-9]{1,19}$")
 _HTML_TAG = re.compile(r"<[^>]*>")
 _MAX_ERROR_BODY_LENGTH = 1_000
+
+
+class XRequestAuthorization(Protocol):
+    """Create and redact the Authorization header for one exact X request."""
+
+    def authorization_header(self, *, method: str, url: str) -> str: ...
+
+    def redact(self, value: str) -> str: ...
+
+    def clear(self) -> None: ...
+
+
+class _BearerAuthorization:
+    def __init__(self, bearer_token: str) -> None:
+        if not bearer_token or bearer_token.isspace():
+            raise ValueError("X OAuth bearer token must not be empty")
+        if "\r" in bearer_token or "\n" in bearer_token:
+            raise ValueError("X OAuth bearer token must not contain line breaks")
+        self.__bearer_token = bearer_token
+
+    def __repr__(self) -> str:
+        return "_BearerAuthorization(bearer_token=<redacted>)"
+
+    def authorization_header(self, *, method: str, url: str) -> str:
+        del method, url
+        if not self.__bearer_token:
+            raise ValueError("X OAuth bearer authorization has been cleared")
+        return f"Bearer {self.__bearer_token}"
+
+    def redact(self, value: str) -> str:
+        return value.replace(self.__bearer_token, "[redacted]")
+
+    def clear(self) -> None:
+        self.__bearer_token = ""
 
 
 def _bounded_timeout(timeout: httpx2.Timeout | float) -> httpx2.Timeout:
@@ -104,10 +140,10 @@ def _reject_embedded_errors(data: JSONObject, context: str) -> None:
 class XClient:
     """Isolated async transport for static-image publishing through X API v2.
 
-    The caller owns ``http_client`` and resolves the OAuth user access token
-    immediately before constructing this client. The token is held only in memory,
-    is redacted from representations and provider error bodies, and is never logged
-    or persisted by this adapter.
+    The caller owns ``http_client`` and resolves an OAuth user-context
+    authorization strategy immediately before constructing this client. Secret
+    material is held only in memory, redacted from representations and provider
+    error bodies, and never logged or persisted by this adapter.
 
     Every HTTP operation is attempted exactly once. In particular, ``create_post``
     never retries because X does not document an idempotency key for ``POST /2/tweets``.
@@ -117,45 +153,76 @@ class XClient:
         self,
         *,
         http_client: httpx2.AsyncClient,
-        bearer_token: str,
+        bearer_token: str | None = None,
+        authorization: XRequestAuthorization | None = None,
         timeout: httpx2.Timeout | float = X_DEFAULT_TIMEOUT,
     ) -> None:
-        if not bearer_token or bearer_token.isspace():
-            raise ValueError("X OAuth bearer token must not be empty")
-        if "\r" in bearer_token or "\n" in bearer_token:
-            raise ValueError("X OAuth bearer token must not contain line breaks")
+        if (bearer_token is None) == (authorization is None):
+            raise ValueError("X client requires exactly one user-context authorization method")
         self._http_client = http_client
-        self.__bearer_token = bearer_token
+        if bearer_token is not None:
+            self._authorization: XRequestAuthorization = _BearerAuthorization(bearer_token)
+        else:
+            if authorization is None:  # pragma: no cover - guarded above
+                raise ValueError("X client authorization is unavailable")
+            self._authorization = authorization
         self._timeout = _bounded_timeout(timeout)
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}(base_url={X_API_BASE_URL!r}, bearer_token=<redacted>)"
+        return f"{type(self).__name__}(base_url={X_API_BASE_URL!r}, authorization=<redacted>)"
 
     def _redact(self, value: str) -> str:
-        return value.replace(self.__bearer_token, "[redacted]")
+        return self._authorization.redact(value)
 
-    def _error_details(self, response: httpx2.Response) -> tuple[str, str]:
-        raw_body = self._redact(response.text)
-        normalized_body = " ".join(html.unescape(_HTML_TAG.sub(" ", raw_body)).split())[
-            :_MAX_ERROR_BODY_LENGTH
-        ]
+    def clear_authorization(self) -> None:
+        """Irreversibly remove this short-lived client's credential material."""
+
+        self._authorization.clear()
+
+    def _redact_response_text(self, value: str, request_authorization: str) -> str:
+        decoded = html.unescape(value)
+        if request_authorization:
+            decoded = decoded.replace(request_authorization, "[redacted]")
+            decoded = decoded.replace(quote(request_authorization, safe=""), "[redacted]")
+        return self._redact(decoded)
+
+    def _error_details(
+        self,
+        response: httpx2.Response,
+        *,
+        request_authorization: str,
+    ) -> tuple[str, str]:
+        raw_body = self._redact_response_text(response.text, request_authorization)
+        normalized_body = " ".join(_HTML_TAG.sub(" ", raw_body).split())[:_MAX_ERROR_BODY_LENGTH]
         message_parts: list[str] = []
         try:
-            payload: object = response.json()
+            payload = response.json()
         except ValueError:
             payload = None
         if isinstance(payload, dict):
             for key in ("title", "detail", "type", "message", "code"):
                 value = payload.get(key)
                 if isinstance(value, (str, int, float)):
-                    text = self._redact(str(value)).strip()
+                    text = self._redact_response_text(
+                        str(value),
+                        request_authorization,
+                    ).strip()
                     if text and text not in message_parts:
                         message_parts.append(text)
         message = ": ".join(message_parts) or normalized_body or response.reason_phrase
         return message[:_MAX_ERROR_BODY_LENGTH], normalized_body
 
-    def _raise_api_error(self, response: httpx2.Response) -> NoReturn:
-        message, response_body = self._error_details(response)
+    def _api_error(
+        self,
+        response: httpx2.Response,
+        *,
+        request_authorization: str,
+    ) -> XAPIError:
+        message, response_body = self._error_details(
+            response,
+            request_authorization=request_authorization,
+        )
+        status_code = response.status_code
         request_id = (
             response.headers.get("x-request-id")
             or response.headers.get("x-transaction-id")
@@ -163,16 +230,32 @@ class XClient:
         )
         error_type = (
             XRetryableAPIError
-            if response.status_code in {408, 429} or response.status_code >= 500
+            if status_code in {408, 429} or status_code >= 500
             else XTerminalAPIError
         )
-        raise error_type(
-            status_code=response.status_code,
+        retry_after_seconds = _retry_after_seconds(response)
+        self._scrub_request_authorization(response)
+        del response
+        request_authorization = ""
+        return error_type(
+            status_code=status_code,
             message=message,
             response_body=response_body,
             request_id=request_id,
-            retry_after_seconds=_retry_after_seconds(response),
+            retry_after_seconds=retry_after_seconds,
         )
+
+    @staticmethod
+    def _scrub_request_authorization(response: httpx2.Response) -> None:
+        try:
+            request = response.request
+            response.request = httpx2.Request(
+                request.method,
+                request.url,
+                headers={"Authorization": "[redacted]"},
+            )
+        except RuntimeError:
+            return
 
     async def _request_json(
         self,
@@ -182,49 +265,99 @@ class XClient:
         json_body: JSONObject | None,
         operation: str,
     ) -> JSONObject:
+        url = f"{X_API_BASE_URL}{path}"
+        request_authorization = self._authorization.authorization_header(
+            method="POST",
+            url=url,
+        )
         headers = {
             "Accept": "application/json",
-            "Authorization": f"Bearer {self.__bearer_token}",
+            "Authorization": request_authorization,
         }
+        response: httpx2.Response | None = None
+        transport_failure: Literal["retryable", "timeout", "ambiguous"] | None = None
         try:
             response = await self._http_client.request(
                 "POST",
-                f"{X_API_BASE_URL}{path}",
+                url,
                 headers=headers,
                 json=json_body,
                 follow_redirects=False,
                 timeout=self._timeout,
             )
-        except (httpx2.ConnectTimeout, httpx2.PoolTimeout, httpx2.ConnectError) as error:
+        except (httpx2.ConnectTimeout, httpx2.PoolTimeout, httpx2.ConnectError):
+            transport_failure = "retryable"
+        except httpx2.TimeoutException:
+            transport_failure = "timeout"
+        except httpx2.RequestError:
+            transport_failure = "ambiguous"
+        headers["Authorization"] = "[redacted]"
+
+        # Never retain httpx's credential-bearing RequestError as an exception
+        # cause/context. Raising only after the except scope has ended also lets
+        # Python release the provider request object before our safe error exists.
+        if transport_failure == "retryable":
+            request_authorization = ""
+            self.clear_authorization()
             raise XRetryableTransportError(
                 f"X API {operation} failed before request bytes were sent"
-            ) from error
-        except httpx2.TimeoutException as error:
+            )
+        if transport_failure == "timeout":
+            request_authorization = ""
+            self.clear_authorization()
             raise XAmbiguousTimeoutError(
                 f"X API {operation} timed out after request bytes may have been sent; "
                 "the outcome is unknown"
-            ) from error
-        except httpx2.RequestError as error:
+            )
+        if transport_failure == "ambiguous":
+            request_authorization = ""
+            self.clear_authorization()
             raise XAmbiguousTransportError(
                 f"X API {operation} failed after request bytes may have been sent; "
                 "the outcome is unknown"
-            ) from error
+            )
+        if response is None:  # pragma: no cover - all transport outcomes handled above
+            request_authorization = ""
+            self.clear_authorization()
+            raise XAmbiguousTransportError(f"X API {operation} outcome is unavailable")
 
         if response.status_code != expected_status:
             if 200 <= response.status_code < 300:
+                returned_status = response.status_code
+                self._scrub_request_authorization(response)
+                response = None
+                request_authorization = ""
+                self.clear_authorization()
                 raise XProtocolError(
-                    f"X API {operation} returned HTTP {response.status_code}; "
+                    f"X API {operation} returned HTTP {returned_status}; "
                     f"expected HTTP {expected_status}"
                 )
-            self._raise_api_error(response)
+            error = self._api_error(
+                response,
+                request_authorization=request_authorization,
+            )
+            response = None
+            request_authorization = ""
+            self.clear_authorization()
+            raise error
 
+        invalid_response = False
+        data: JSONObject | None = None
+        payload: object | None = None
         try:
-            payload: object = response.json()
+            payload = response.json()
             data = as_json_object(payload, f"X API {operation} response")
             _reject_embedded_errors(data, f"X API {operation} response")
-            return data
-        except ValueError as error:
-            raise XProtocolError(f"X API {operation} returned an invalid JSON response") from error
+        except ValueError:
+            invalid_response = True
+        if invalid_response or data is None:
+            self._scrub_request_authorization(response)
+            payload = None
+            response = None
+            request_authorization = ""
+            self.clear_authorization()
+            raise XProtocolError(f"X API {operation} returned an invalid JSON response")
+        return data
 
     async def upload_image(
         self,

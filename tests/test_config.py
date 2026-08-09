@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from gen_automation.config import Environment, SaladContainerPriority, Settings
+from gen_automation.config import Environment, SaladContainerPriority, Settings, XAuthMode
 from gen_automation.domain.deliverability import PATREON_MAX_ARCHIVE_BYTES
 from gen_automation.domain.enums import SemanticEnforcementMode
 from gen_automation.domain.signing import derive_public_key, encode_base64url
@@ -419,6 +419,34 @@ def test_x_oauth_requires_one_exact_arn_and_matching_numeric_creator_binding() -
             x_oauth_secret_reference="aws-secrets-manager://creator-secret",  # noqa: S106
             x_creator_user_id="2244994945",
         )
+
+
+def test_x_auth_mode_defaults_to_oauth2_and_oauth1_does_not_require_postgres_rotation() -> None:
+    reference = (
+        "aws-secrets-manager://arn:aws:secretsmanager:eu-central-1:"
+        "123456789012:secret:gen-automation-staging/x/oauth1-AbCdEf"
+    )
+
+    assert Settings().x_auth_mode == XAuthMode.OAUTH2
+    oauth1 = Settings(
+        environment=Environment.TEST,
+        database_url="sqlite+aiosqlite:///oauth1-test.db",
+        x_auth_mode=XAuthMode.OAUTH1,
+        x_oauth_secret_reference=reference,
+        x_creator_user_id="2244994945",
+    )
+    assert oauth1.x_auth_mode == XAuthMode.OAUTH1
+
+    with pytest.raises(ValidationError, match="serialization requires PostgreSQL"):
+        Settings(
+            environment=Environment.TEST,
+            database_url="sqlite+aiosqlite:///oauth2-test.db",
+            x_auth_mode=XAuthMode.OAUTH2,
+            x_oauth_secret_reference=reference,
+            x_creator_user_id="2244994945",
+        )
+    with pytest.raises(ValidationError):
+        Settings(x_auth_mode="implicit-or-unknown")
 
 
 def test_gpu_allocation_accepts_complete_worker_security_configuration() -> None:

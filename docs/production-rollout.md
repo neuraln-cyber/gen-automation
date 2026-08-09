@@ -100,9 +100,10 @@ and external publishing remain disabled until their individual gates pass.
   post. Verify package authentication, durable idempotency, exact tier/public
   preview/content ordering, confirmed post identity, and manual fallback.
   CAPTCHA/2FA and account verification remain owner actions.
-- Enable X only after its confidential-client JSON is stored in AWS Secrets
-  Manager, the exact full-ARN reference and creator ID are configured, and the
-  controller has narrow ambient IAM. Canary refresh rotation and
+- Enable X only after its selected OAuth 2.0 rotating JSON or OAuth 1.0a static
+  owner JSON is stored in AWS Secrets Manager, the exact mode-matched full-ARN
+  reference and creator ID are configured, and the controller has narrow
+  ambient IAM. Canary refresh rotation when using OAuth 2.0 and always verify
   `GET /2/users/me` binding before opening the publication guard. Every teaser
   upload receives the adult-content warning; every post is marked as
   AI-generated.

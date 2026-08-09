@@ -16,6 +16,9 @@ Official contracts checked on 2026-07-28:
   `media` as either OpenAPI `format: binary` or `format: byte`, requires
   `media_category`, and documents HTTP 200:
   <https://raw.githubusercontent.com/xdevplatform/xdk/main/latest-openapi.json>.
+  The current official OpenAPI also lists OAuth 1.0a `UserToken` as an
+  authorization alternative for `/2/media/upload`, `/2/media/metadata`, and
+  `/2/tweets`: <https://github.com/xdevplatform/docs/blob/main/openapi.json>.
   OpenAPI `format: byte` is a base64-encoded string, which is the JSON variant used
   here. X's media guidance also explicitly permits binary base64-encoded image
   content:
@@ -59,11 +62,16 @@ classified as retryable or terminal by status, and a timeout or transport
 failure after request bytes may have been sent is classified as ambiguous. An
 ambiguous post-creation result must be reconciled before any explicit retry.
 
-The OAuth token must be resolved externally and supplied when constructing a
-client. This module keeps it only in process memory, never persists or logs it,
-and redacts it from representations and provider error bodies. The caller-owned
-HTTP client must likewise avoid authorization-header logging.
+The user-context credential is resolved externally and supplied as either an
+OAuth 2.0 bearer strategy or an OAuth 1.0a HMAC-SHA1 signing strategy. OAuth
+1.0a is restricted to exactly `GET /2/users/me` and `POST` to
+`/2/media/upload`, `/2/media/metadata`, or `/2/tweets`; queries, redirects,
+other hosts, ports, methods, and paths are rejected before signing. A fresh
+nonce and timestamp are used for every request. Raw and RFC3986-encoded
+credential values, the exact request Authorization header, and HTML-entity
+forms are removed from provider errors. Short-lived clients irreversibly clear
+their authorization after an error or lease exit.
 
 All requests use bounded per-operation timeouts and explicitly disable redirect
-following so a bearer token cannot be forwarded by this adapter to a redirect
-target.
+following so neither a bearer token nor a signed OAuth 1.0a header can be
+forwarded by this adapter to a redirect target.

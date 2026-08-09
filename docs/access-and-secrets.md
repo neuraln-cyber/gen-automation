@@ -18,7 +18,7 @@ read-only reconciliation phase; the manual Patreon handoff needs no API token.
 | Source verification | GitHub repository access. GitHub Actions uses its own short-lived `GITHUB_TOKEN` for CI and GHCR publishing. | Cloud GPU, X, Patreon, and production data credentials. |
 | Private staging infrastructure | Control-plane host/project, PostgreSQL TLS URL, versioned S3 asset bucket and control-plane identity, DNS/TLS ingress, application authentication secrets. | Salad and social-publishing tokens may remain absent while GPU allocation and publishing are disabled. |
 | Zero-publish GPU canary | Salad organization/project/API key, provider webhook secret, immutable worker image digest, model-artifact bucket and read-only worker identity, approved model manifest, controller signing key. | X and Patreon API credentials. |
-| Destination canary | X OAuth client and creator refresh token. Patreon API v2 credentials are needed only for read reconciliation/webhooks. MEGA needs a dedicated destination plus a one-time pre-authenticated writable-folder profile volume, not an application credential. | Production credentials; use staging/test destinations first. |
+| Destination canary | X OAuth 2.0 client/refresh credentials or the owner account's OAuth 1.0a Consumer/API and Access Token pairs. Patreon API v2 credentials are needed only for read reconciliation/webhooks. MEGA needs a dedicated destination plus a one-time pre-authenticated writable-folder profile volume, not an application credential. | Production credentials; use staging/test destinations first. |
 | Production | A separate production instance of every database, bucket, provider project, identity, secret, OAuth grant, and publication target. | No staging credential is promoted into production. |
 
 ## Account and credential matrix
@@ -157,8 +157,8 @@ to the account owner out of band and are not stored in deployment logs.
 X is not required for generation, ranking, review, derivatives, or the Patreon
 handoff MVP. It is needed only when the X destination gate is activated.
 
-Create an X developer Project/App and use OAuth 2.0 Authorization Code with PKCE
-for the exact creator account. The minimal requested scopes are:
+Create an X developer Project/App for the exact creator account. OAuth 2.0
+Authorization Code with PKCE remains supported and requests this fixed scope set:
 
 ```text
 tweet.read tweet.write users.read media.write offline.access
@@ -167,13 +167,16 @@ tweet.read tweet.write users.read media.write offline.access
 `tweet.write` creates the post, `media.write` uploads/labels media, and
 `offline.access` permits a refresh token. X documents these scopes in its
 [OAuth 2.0 PKCE contract](https://docs.x.com/fundamentals/authentication/oauth-2-0/authorization-code).
-Do not use an app-only bearer token.
+If X does not grant `media.write` to the owner-account OAuth 2.0 token, use the
+OAuth 1.0a owner-account fallback described below. Do not use an app-only bearer
+token for either mode.
 
 | Value | Location | Handling |
 | --- | --- | --- |
-| OAuth client ID, client secret, and creator refresh token | One AWS Secrets Manager JSON secret | Use a confidential Automated App/bot. Never place these values in environment variables, application tables, logs, or conversation. |
+| Private credentials for the selected X user-authentication mode | One mode-specific AWS Secrets Manager JSON secret | Never place these values in environment variables, application tables, logs, or conversation. Do not mix the OAuth 2.0 and OAuth 1.0a schemas. |
 | Exact secret reference | `GEN_AUTOMATION_X_OAUTH_SECRET_REFERENCE` | Non-secret `aws-secrets-manager://` reference containing the complete secret ARN. |
 | Expected creator user ID | `GEN_AUTOMATION_X_CREATOR_USER_ID` | Non-secret binding used to prevent posting through the wrong authorized account. |
+| Authentication mode | `GEN_AUTOMATION_X_AUTH_MODE` | Set to `oauth2` for the rotating schema or `oauth1` for the static read-only schema. |
 
 The initial secret is:
 
@@ -186,16 +189,106 @@ The initial secret is:
 }
 ```
 
-The controller resolves this secret immediately before an X effect. It caches
-the current access token and expiry only in Secrets Manager, refreshes within
-the configured expiry margin, and atomically promotes a replacement version
-before yielding an X client. Access and refresh tokens are never stored in
-PostgreSQL or application logs. A short PostgreSQL advisory lock serializes
-refreshes across controller replicas; an explicit Secrets Manager version-stage
-compare-and-swap protects against stale writers and supports restart recovery.
-The ambient controller identity needs only `GetSecretValue`, `PutSecretValue`,
-and `UpdateSecretVersionStage` on the one complete secret ARN. Do not grant
-`ListSecrets`, create/delete access, or use static AWS access keys.
+The separate OAuth 1.0a fallback secret is
+`gen-automation-staging/x/oauth1` and contains exactly:
+
+```json
+{
+  "schema": "gen-automation/x-oauth1/v1",
+  "consumer_key": "CONSUMER_OR_API_KEY",
+  "consumer_secret": "CONSUMER_OR_API_SECRET",
+  "access_token": "OWNER_ACCESS_TOKEN",
+  "access_token_secret": "OWNER_ACCESS_TOKEN_SECRET"
+}
+```
+
+#### One-time staging authorization from Windows
+
+Configure the X Developer Portal app as an **Automated App or Bot** (a
+confidential OAuth 2.0 client) and register this callback URL exactly, with no
+trailing slash:
+
+```text
+http://127.0.0.1:8765/callback
+```
+
+The callback must use `127.0.0.1`, not `localhost`; X performs exact redirect
+URI matching. From an interactive Windows PowerShell in the repository, first
+authenticate the fixed staging AWS profile and then run:
+
+```powershell
+$env:AWS_CONFIG_FILE="$env:TEMP\gen-automation-staging-aws-config"
+aws sso login --profile gen-automation-staging
+.\scripts\bootstrap-x-oauth.ps1
+```
+
+The default helper flow accepts no arguments. It verifies AWS account
+`861912887470` and the `GenAutomationStagingDeployer` SSO assumed role before
+asking for either X value, reads the OAuth client ID and client secret without
+echo, opens the consent page, validates the loopback callback state and PKCE
+exchange, and verifies the authorized account with `GET /2/users/me`. It then
+creates `gen-automation-staging/x/oauth` directly in Secrets Manager with only
+the initial JSON schema above. It fails rather than overwriting an existing
+secret.
+
+If X's consent page cannot authorize the app, the Developer Portal can issue a
+credential for the app owner's account. Under **Keys & Tokens**, select
+**Generate** for the OAuth 2.0 Access Token, retain the generated **refresh
+token** (the access token is not used), and run:
+
+```powershell
+.\scripts\bootstrap-x-oauth.ps1 -PortalRefreshToken
+```
+
+This alternate mode reads the OAuth 2.0 client ID, client secret, and generated
+refresh token through three hidden prompts. No credential is passed on the
+process command line. The helper immediately submits the refresh token to X
+with confidential HTTP Basic client authentication, requires a bearer access
+token, a returned refresh token, and the complete fixed scope set, and checks
+the posting identity with `GET /2/users/me`. Only X's returned refresh token is
+stored; the copied portal token and short-lived access token are discarded.
+This binds the secret to the account shown beside the portal's Generate button
+without relying on the failing browser consent page.
+
+If the generated OAuth 2.0 token is missing `media.write`, switch to OAuth 1.0a.
+In the Developer Portal first select **Read and write** under App permissions,
+save the change, and only then generate or regenerate the owner account's OAuth
+1.0a **Access Token and Secret**. Use the **Consumer/API Key and Secret** plus
+that **Access Token and Secret**; do not enter the OAuth 2.0 Client ID/Secret,
+Bearer Token, or OAuth 2.0 access/refresh token. Run:
+
+```powershell
+.\scripts\bootstrap-x-oauth.ps1 -OAuth1
+```
+
+The four prompts do not echo. The helper signs `GET /2/users/me`, verifies the
+numeric creator identity, and only then creates the separate OAuth 1.0a secret.
+It fails instead of overwriting an existing secret. OAuth 1.0a uses no loopback
+callback and has no refresh token.
+
+Successful stdout contains exactly two lines: the complete secret ARN and the
+numeric creator user ID. It never prints an access token, refresh token, client
+credential, authorization code, or X response body. Keep the ARN and creator ID
+as non-secret deployment inputs, but do not copy any credential into tfvars,
+shell history, deployment logs, source control, or chat. The required scopes
+are requested as one fixed set:
+
+```text
+tweet.read tweet.write users.read media.write offline.access
+```
+
+The callback listener exists only for the authorization window and binds only
+to IPv4 loopback. The AWS profile needs `sts:GetCallerIdentity` plus permission
+to describe and create this exact staging secret (including its fixed tags).
+
+The controller resolves the selected secret immediately before every X effect.
+OAuth 2.0 caches its current access token and expiry only in Secrets Manager,
+uses the PostgreSQL lock and version-stage compare-and-swap, and therefore needs
+`GetSecretValue`, `PutSecretValue`, and `UpdateSecretVersionStage` on the exact
+ARN. OAuth 1.0a reads `AWSCURRENT` for every lease, never writes or rotates the
+static values, and receives only `DescribeSecret` and `GetSecretValue`. Neither
+mode stores credentials in PostgreSQL or logs. Do not grant `ListSecrets`,
+create/delete access, wildcard resources, or static AWS access keys.
 
 The creator must personally authorize the app, select an
 API plan/billing cap, configure the account's sensitive-media setting, and
@@ -211,7 +304,10 @@ enable external effects by itself: the durable database guard is initialized
 stopped and an authenticated OWNER must enable it with the current epoch and
 lock version. Do not enable X production publication until the OAuth adapter,
 exact secret reference, ambient IAM role, and
-`GEN_AUTOMATION_X_CREATOR_USER_ID` binding have passed a staging canary.
+`GEN_AUTOMATION_X_CREATOR_USER_ID` binding have passed a staging canary. For the
+OAuth 1.0a fallback set both `GEN_AUTOMATION_X_AUTH_MODE=oauth1` and OpenTofu
+`x_oauth_auth_mode = "oauth1"`; otherwise the app and least-privilege IAM modes
+will disagree.
 
 ### Patreon destination
 

@@ -21,6 +21,7 @@ hostname        = null
 # Reference an existing complete secret only after its JSON has been created
 # outside OpenTofu. Never put the X OAuth JSON or token values in tfvars.
 x_oauth_secret_arn = null
+x_oauth_auth_mode  = "oauth2"
 
 # Empty is disabled by default. After artifact onboarding, map only the exact
 # immutable S3 object versions present in the signed worker manifest.

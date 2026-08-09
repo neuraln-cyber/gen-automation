@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 import gen_automation.app as app_module
 from gen_automation.app import create_app
-from gen_automation.config import Environment, Settings
+from gen_automation.config import Environment, Settings, XAuthMode
 from gen_automation.integrations.salad.client import SaladClient
 from gen_automation.integrations.salad.webhooks import SaladWebhookVerifier
 from gen_automation.services.danbooru_tags import DanbooruTagAutocompleteService
@@ -143,6 +143,77 @@ def test_x_oauth_provider_is_injected_and_closed_without_startup_secret_read(
         environment=Environment.TEST,
         database_url="postgresql+psycopg://user:pass@db/example",
         background_runtime_enabled=True,
+        x_oauth_secret_reference=reference,
+        x_creator_user_id="2244994945",
+    )
+
+    with TestClient(create_app(settings)) as client:
+        assert client.app.state.x_oauth_provider is provider
+        assert captured_provider is provider
+        assert runtime.started
+        assert not provider.closed
+
+    assert runtime.stopped
+    assert provider.closed
+
+
+def test_x_oauth1_mode_selects_static_provider_without_rotation_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = (
+        "aws-secrets-manager://arn:aws:secretsmanager:eu-central-1:"
+        "123456789012:secret:gen-automation-staging/x/oauth1-AbCdEf"
+    )
+
+    class FakeProvider:
+        closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class FakeRuntime:
+        started = False
+        stopped = False
+
+        async def start(self) -> None:
+            self.started = True
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    provider = FakeProvider()
+    runtime = FakeRuntime()
+    captured_provider: object | None = None
+
+    def build_oauth1_provider(**kwargs: object) -> FakeProvider:
+        assert kwargs == {
+            "configured_reference": reference,
+            "expected_creator_user_id": "2244994945",
+            "request_timeout_seconds": 30,
+        }
+        return provider
+
+    def build_runtime(**kwargs: object) -> FakeRuntime:
+        nonlocal captured_provider
+        captured_provider = kwargs["x_oauth_provider"]
+        return runtime
+
+    monkeypatch.setattr(
+        app_module,
+        "build_aws_secrets_manager_x_oauth1_provider",
+        build_oauth1_provider,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "build_aws_secrets_manager_x_oauth_provider",
+        lambda **_kwargs: pytest.fail("OAuth2 rotation provider must not be built in OAuth1 mode"),
+    )
+    monkeypatch.setattr(app_module, "build_controller_runtime", build_runtime)
+    settings = Settings(
+        environment=Environment.TEST,
+        database_url="postgresql+psycopg://user:pass@db/example",
+        background_runtime_enabled=True,
+        x_auth_mode=XAuthMode.OAUTH1,
         x_oauth_secret_reference=reference,
         x_creator_user_id="2244994945",
     )

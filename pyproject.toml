@@ -31,6 +31,8 @@ gen-automation-auth = "gen_automation.cli:bootstrap_owner_main"
 gen-automation-artifacts = "gen_automation.artifact_onboarding_cli:artifact_onboarding_main"
 gen-automation-storage-conformance = "gen_automation.storage_conformance_cli:storage_conformance_main"
 gen-automation-wildcards = "gen_automation.wildcard_import_cli:wildcard_import_main"
+gen-automation-x-auth = "gen_automation.x_oauth_bootstrap_cli:x_oauth_bootstrap_main"
+gen-automation-x-runtime-check = "gen_automation.x_runtime_check_cli:x_runtime_check_main"
 
 [project.optional-dependencies]
 dev = [

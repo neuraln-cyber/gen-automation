@@ -163,7 +163,11 @@ long-running container.
 Create application-generated session, TOTP, and worker-signing secrets directly
 in the chosen runtime secret store outside OpenTofu. Create the optional X OAuth
 JSON outside OpenTofu, then set only its full ARN as `x_oauth_secret_arn` and
-re-plan. Secret values must not enter tfvars, environment files, user-data,
+re-plan. Set `x_oauth_auth_mode = "oauth2"` for the rotating OAuth 2.0 schema or
+`"oauth1"` for the static, read-only OAuth 1.0a schema; set the matching
+`GEN_AUTOMATION_X_AUTH_MODE` on the controller. The ARN is validated against the
+exact staging account, region, secret name, mode, and six-character AWS suffix.
+Secret values must not enter tfvars, environment files, user-data,
 plans, state, logs, issue trackers, or chat.
 
 Deploy Caddy, nginx, and the pinned application images as systemd units wanted by
