@@ -12,11 +12,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from gen_automation.db.models import (
     AdminUser,
     AuditEvent,
+    IdempotencyRecord,
     LoraImportJob,
     ManagedLoraArtifact,
     ModelArtifactApproval,
 )
 from gen_automation.db.session import Database
+from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import (
     AdminRole,
     ApprovalStatus,
@@ -26,6 +28,8 @@ from gen_automation.domain.enums import (
     ModelArtifactKind,
 )
 from gen_automation.domain.lora_catalog import (
+    CIVITAI_COMMERCIAL_USE_OVERRIDE_METADATA_KEY,
+    CIVITAI_COMMERCIAL_USE_OVERRIDE_SCHEMA,
     CivitaiLoraImportCreate,
     LoraDependencySummary,
     ManualLoraImportCreate,
@@ -34,6 +38,7 @@ from gen_automation.domain.lora_catalog import (
 )
 from gen_automation.services.lora_catalog import (
     LoraCatalogConflictError,
+    LoraCatalogInputError,
     cancel_lora_import_job,
     claim_next_lora_import_job,
     complete_lora_import_job,
@@ -123,6 +128,161 @@ def _civitai() -> CivitaiLoraImportCreate:
         expected_metadata={"provider": "civitai"},
         trigger_words=["akali"],
     )
+
+
+async def test_civitai_commercial_override_is_durable_and_audited(
+    lora_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, _reviewer_id = lora_database
+    command = _civitai().model_copy(update={"commercial_use_override_attested": True})
+    async with database.sessions() as session:
+        created = await create_civitai_import_job(
+            session,
+            command=command,
+            actor_user_id=owner_id,
+            idempotency_key="civitai-commercial-override",
+            now=NOW,
+        )
+        marker = created.job.expected_metadata[CIVITAI_COMMERCIAL_USE_OVERRIDE_METADATA_KEY]
+        assert created.job.commercial_use_override_attested is True
+        assert marker == {
+            "schema": CIVITAI_COMMERCIAL_USE_OVERRIDE_SCHEMA,
+            "attested": True,
+            "attested_by_user_id": str(owner_id),
+            "attested_at": NOW.isoformat(),
+        }
+        audit = await session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.resource_id == created.job.job_id,
+                AuditEvent.action == "lora.import.civitai_created",
+            )
+        )
+        assert audit is not None
+        assert audit.actor == str(owner_id)
+        assert audit.detail["commercial_use_override_attested"] is True
+
+        claim = await claim_next_lora_import_job(
+            session,
+            worker_id="override-test-worker",
+            lease_seconds=300,
+            now=NOW + timedelta(seconds=1),
+        )
+        assert claim is not None
+        approval = _approval(
+            owner_id,
+            source_url=claim.job.canonical_source_url,
+            license_url=claim.job.license_url,
+        )
+        session.add(approval)
+        await session.flush()
+        completed = await complete_lora_import_job(
+            session,
+            job_id=claim.job.job_id,
+            verified=VerifiedLoraArtifact(
+                artifact_sha256=SHA,
+                storage_bucket=MODEL_BUCKET,
+                object_key=FINAL_KEY,
+                object_version_id="override-object-version",
+                object_etag="1" * 32,
+                byte_size=1_024,
+                approval_id=approval.id,
+                provenance={
+                    "license_terms": {"commercial_use": ["Sell"]},
+                    "commercial_use_override_attested": True,
+                },
+            ),
+            worker_id="override-test-worker",
+            expected_attempt=1,
+            now=NOW + timedelta(seconds=2),
+        )
+        assert completed.job.result_artifact_id is not None
+        artifact = await session.get(
+            ManagedLoraArtifact,
+            completed.job.result_artifact_id,
+        )
+        assert artifact is not None
+        assert (
+            artifact.provenance["expected"][CIVITAI_COMMERCIAL_USE_OVERRIDE_METADATA_KEY] == marker
+        )
+        assert artifact.provenance["verified"]["commercial_use_override_attested"] is True
+
+
+async def test_civitai_default_hash_replays_requests_created_before_override_field(
+    lora_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, _reviewer_id = lora_database
+    command = _civitai()
+    legacy_command = command.model_dump(
+        mode="json",
+        exclude={"commercial_use_override_attested"},
+    )
+    legacy_command["max_attempts"] = 3
+    expected_legacy_hash = canonical_sha256(
+        {
+            "schema": "lora-catalog-command/v1",
+            "action": "create_civitai",
+            "actor_user_id": str(owner_id),
+            "command": legacy_command,
+        }
+    )
+
+    async with database.sessions() as session:
+        created = await create_civitai_import_job(
+            session,
+            command=command,
+            actor_user_id=owner_id,
+            idempotency_key="legacy-civitai-create-replay",
+            now=NOW,
+        )
+        record = await session.scalar(
+            select(IdempotencyRecord).where(
+                IdempotencyRecord.scope == "lora-catalog:create_civitai:v1",
+                IdempotencyRecord.idempotency_key == "legacy-civitai-create-replay",
+            )
+        )
+        assert record is not None
+        assert record.request_sha256 == expected_legacy_hash
+
+        replay = await create_civitai_import_job(
+            session,
+            command=command,
+            actor_user_id=owner_id,
+            idempotency_key="legacy-civitai-create-replay",
+            now=NOW + timedelta(seconds=1),
+        )
+        assert replay.replayed is True
+        assert replay.job.job_id == created.job.job_id
+
+
+async def test_civitai_override_revalidates_server_composed_metadata_size(
+    lora_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, _reviewer_id = lora_database
+    command = _civitai().model_copy(
+        update={
+            "commercial_use_override_attested": True,
+            "expected_metadata": {"note": "x" * 16_300},
+        }
+    )
+
+    async with database.sessions() as session:
+        with pytest.raises(LoraCatalogInputError, match="durable size limit"):
+            await create_civitai_import_job(
+                session,
+                command=command,
+                actor_user_id=owner_id,
+                idempotency_key="civitai-override-metadata-size",
+                now=NOW,
+            )
+
+
+def test_civitai_rejects_client_supplied_override_provenance() -> None:
+    payload = _civitai().model_dump()
+    payload["expected_metadata"] = {
+        CIVITAI_COMMERCIAL_USE_OVERRIDE_METADATA_KEY: {"attested": True}
+    }
+    with pytest.raises(ValidationError, match="server-managed"):
+        CivitaiLoraImportCreate.model_validate(payload)
 
 
 def _approval(

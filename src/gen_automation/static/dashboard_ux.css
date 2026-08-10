@@ -4327,6 +4327,7 @@ body.asset-viewer-open { overflow: hidden; }
 }
 
 .lora-source-choice input,
+.lora-license-override input,
 .lora-rights-attestations input,
 .lora-delete-storage-choice input {
   width: auto !important;
@@ -4336,6 +4337,20 @@ body.asset-viewer-open { overflow: hidden; }
 
 .lora-source-choice label span { display: grid; gap: .12rem; }
 .lora-source-choice label small { color: var(--muted, #a9abc2); line-height: 1.35; }
+
+.lora-license-override {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: .58rem;
+  padding: .72rem;
+  border: 1px solid rgba(251, 191, 119, .28);
+  border-radius: .72rem;
+  background: var(--warn-soft, rgba(251, 191, 119, .11));
+}
+
+.lora-license-override span { display: grid; gap: .18rem; }
+.lora-license-override small { color: var(--muted, #a9abc2); line-height: 1.4; }
 
 .lora-source-panel,
 .lora-source-form,

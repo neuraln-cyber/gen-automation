@@ -28,6 +28,8 @@ from gen_automation.domain.canonical import canonical_json_bytes
 MAX_MANAGED_LORA_BYTES = 4 * 1024 * 1024 * 1024
 MAX_LORA_METADATA_BYTES = 16 * 1024
 MAX_LORA_TRIGGER_WORDS = 100
+CIVITAI_COMMERCIAL_USE_OVERRIDE_METADATA_KEY = "civitai_commercial_use_override"
+CIVITAI_COMMERCIAL_USE_OVERRIDE_SCHEMA = "civitai-commercial-use-override/v1"
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 VisibleName = Annotated[str, StringConstraints(min_length=1, max_length=200)]
@@ -105,7 +107,7 @@ class _ImportCreateBase(StrictLoraCatalogModel):
     @field_validator("expected_metadata")
     @classmethod
     def validate_expected_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        _validate_durable_metadata(value)
+        validate_lora_durable_metadata(value)
         return value
 
     @field_validator("trigger_words")
@@ -134,6 +136,7 @@ class CivitaiLoraImportCreate(_ImportCreateBase):
     civitai_model_id: int | None = Field(default=None, ge=1)
     civitai_version_id: int | None = Field(default=None, ge=1)
     civitai_file_id: int | None = Field(default=None, ge=1)
+    commercial_use_override_attested: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -177,6 +180,8 @@ class CivitaiLoraImportCreate(_ImportCreateBase):
 
     @model_validator(mode="after")
     def validate_provider_ids(self) -> CivitaiLoraImportCreate:
+        if CIVITAI_COMMERCIAL_USE_OVERRIDE_METADATA_KEY in self.expected_metadata:
+            raise ValueError("Civitai commercial-use override metadata is server-managed")
         if (
             self.civitai_model_id is None
             or self.civitai_version_id is None
@@ -241,7 +246,7 @@ class VerifiedLoraArtifact(StrictLoraCatalogModel):
     @field_validator("provenance")
     @classmethod
     def validate_provenance(cls, value: dict[str, Any]) -> dict[str, Any]:
-        _validate_durable_metadata(value)
+        validate_lora_durable_metadata(value)
         return value
 
     @model_validator(mode="after")
@@ -313,7 +318,7 @@ def _validate_object_key(value: str) -> None:
         raise ValueError("S3 object key is invalid")
 
 
-def _validate_durable_metadata(value: dict[str, Any]) -> None:
+def validate_lora_durable_metadata(value: dict[str, Any]) -> None:
     def inspect(item: Any) -> None:
         if isinstance(item, dict):
             for key, child in item.items():

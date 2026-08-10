@@ -154,7 +154,9 @@ class _ResolvedCivitaiClient(CivitaiClient):
         source: str | CivitaiSourceRef,
         *,
         version_id: int | None = None,
+        allow_commercial_use_override: bool = False,
     ) -> CivitaiResolvedLora:
+        assert allow_commercial_use_override is False
         assert isinstance(source, CivitaiSourceRef)
         assert source.model_id == 196908
         assert (version_id or source.version_id) == 2372164

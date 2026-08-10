@@ -94,6 +94,15 @@
               <small id="lora-civitai-help" class="muted">
                 Civitai.com and Civitai.red links are accepted. Private or age-gated downloads use the server-side Civitai credential; it is never sent to this browser.
               </small>
+              <label class="lora-license-override">
+                <input type="checkbox" name="commercial_use_override_attested">
+                <span>
+                  <strong>Use my reviewed-license override</strong>
+                  <small>
+                    Leave this off by default. Turn it on only after independently checking the creator&rsquo;s current terms and confirming commercial image use is allowed. The decision is recorded with your account and the imported file&rsquo;s provenance; it does not change the license.
+                  </small>
+                </span>
+              </label>
               <div class="lora-version-choice" data-lora-version-choice hidden>
                 <label for="lora-civitai-version">
                   Choose a model version
@@ -141,6 +150,7 @@
                 <div><dt>SHA-256</dt><dd><code data-lora-resolved-sha>Pending verification</code></dd></div>
                 <div><dt>Source</dt><dd><a data-lora-resolved-source rel="noreferrer noopener" target="_blank">Open Civitai page</a></dd></div>
                 <div><dt>License</dt><dd><a data-lora-resolved-license rel="noreferrer noopener" target="_blank">Review terms</a></dd></div>
+                <div><dt>Civitai commercial metadata</dt><dd data-lora-provider-commercial-use>Not reported</dd></div>
               </dl>
               <div class="lora-trigger-preview" data-lora-trigger-preview hidden>
                 <strong>Trigger words</strong>
@@ -150,7 +160,7 @@
                 <legend>Required rights confirmation</legend>
                 <label>
                   <input type="checkbox" name="commercial_use_attested" required>
-                  <span>I confirm this version permits commercial image use.</span>
+                  <span data-lora-commercial-attestation-copy>I confirm this version permits commercial image use.</span>
                 </label>
                 <label>
                   <input type="checkbox" name="adult_use_attested" required>

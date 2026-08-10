@@ -179,12 +179,13 @@ async def test_version_choices_are_bounded_and_contain_no_download_handle() -> N
 
     async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http_client:
         client = CivitaiClient(api_token=TOKEN, http_client=http_client)
-        choices = await client.list_lora_versions("https://civitai.com/models/123")
+        listing = await client.list_lora_versions("https://civitai.com/models/123")
 
-    assert len(choices) == 1
-    assert choices[0].version_id == 456
-    assert choices[0].target_filename == "Creator-LoRA.safetensors"
-    assert "download" not in repr(choices[0]).casefold()
+    assert listing.license_terms.permits_commercial_images is True
+    assert len(listing.versions) == 1
+    assert listing.versions[0].version_id == 456
+    assert listing.versions[0].target_filename == "Creator-LoRA.safetensors"
+    assert "download" not in repr(listing.versions[0]).casefold()
     assert TOKEN not in repr(client)
     assert TOKEN not in repr(client.__dict__)
 
@@ -282,6 +283,43 @@ async def test_resolver_rejects_minor_disallowed_license_type_and_unscanned_file
         client = CivitaiClient(http_client=http_client)
         with pytest.raises(CivitaiSourceSelectionError, match=message):
             await client.resolve_lora("https://civitai.com/models/123?modelVersionId=456")
+
+
+@pytest.mark.asyncio
+async def test_commercial_metadata_override_is_explicit_and_does_not_weaken_file_checks() -> None:
+    async def allowed_handler(request: httpx2.Request) -> httpx2.Response:
+        payload = (
+            version_payload()
+            if "model-versions" in request.url.path
+            else model_payload(commercial_use="Sell")
+        )
+        return httpx2.Response(200, json=payload, request=request)
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(allowed_handler)) as http_client:
+        client = CivitaiClient(http_client=http_client)
+        resolved = await client.resolve_lora(
+            "https://civitai.com/models/123?modelVersionId=456",
+            allow_commercial_use_override=True,
+        )
+
+    assert resolved.license_terms.commercial_use == ("Sell",)
+    assert resolved.license_terms.permits_commercial_images is False
+
+    async def unscanned_handler(request: httpx2.Request) -> httpx2.Response:
+        payload = (
+            version_payload(scan="Pending")
+            if "model-versions" in request.url.path
+            else model_payload(commercial_use="Sell")
+        )
+        return httpx2.Response(200, json=payload, request=request)
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(unscanned_handler)) as http_client:
+        client = CivitaiClient(http_client=http_client)
+        with pytest.raises(CivitaiSourceSelectionError, match="scanned Safetensors"):
+            await client.resolve_lora(
+                "https://civitai.com/models/123?modelVersionId=456",
+                allow_commercial_use_override=True,
+            )
 
 
 def resolved_for_download(*, download_url: str) -> CivitaiResolvedLora:

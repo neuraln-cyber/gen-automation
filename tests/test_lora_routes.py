@@ -10,6 +10,12 @@ from pydantic import SecretStr
 from gen_automation.db.models import AdminUser, LoraImportJob
 from gen_automation.domain.enums import AdminRole
 from gen_automation.integrations.civitai.client import CivitaiClient
+from gen_automation.integrations.civitai.models import (
+    CivitaiLicenseTerms,
+    CivitaiLoraVersionChoice,
+    CivitaiLoraVersionListing,
+    CivitaiSourceRef,
+)
 from gen_automation.storage.memory import MemoryObjectStore
 from gen_automation.storage.model_artifacts import (
     QUARANTINE_CONTENT_TYPE,
@@ -33,10 +39,93 @@ def _safetensors_bytes() -> bytes:
     return len(header).to_bytes(8, "little") + header + data
 
 
+class _NoncommercialVersionListingClient(CivitaiClient):
+    def __init__(self) -> None:
+        pass
+
+    async def list_lora_versions(
+        self,
+        source: str | CivitaiSourceRef,
+        *,
+        allow_commercial_use_override: bool = False,
+    ) -> CivitaiLoraVersionListing:
+        assert isinstance(source, CivitaiSourceRef)
+        assert source.model_id == 123
+        assert allow_commercial_use_override is True
+        return CivitaiLoraVersionListing(
+            versions=(
+                CivitaiLoraVersionChoice(
+                    version_id=456,
+                    name="Reviewed version",
+                    base_model="Illustrious",
+                    target_filename="reviewed.safetensors",
+                    declared_size_bytes=1024,
+                    sha256="b" * 64,
+                ),
+            ),
+            license_terms=CivitaiLicenseTerms(
+                allow_no_credit=False,
+                commercial_use=("RentCivit",),
+                allow_derivatives=True,
+                allow_different_license=False,
+            ),
+        )
+
+
 def test_lora_routes_fail_closed_when_feature_is_disabled(client: TestClient) -> None:
     response = client.get("/api/v1/loras")
     assert response.status_code == 503
     assert response.json()["detail"] == "LoRA management is not enabled"
+
+
+def test_lora_dashboard_csp_allows_the_manual_upload_bucket(client: TestClient) -> None:
+    bucket = "test-lora-browser-upload-bucket"
+    client.app.state.settings.lora_manager_enabled = True
+    client.app.state.settings.salad_worker_artifact_bucket = SecretStr(bucket)
+    client.app.state.settings.salad_worker_artifact_region = SecretStr("eu-central-1")
+    database = client.app.state.database
+    assert client.portal is not None
+
+    async def seed_development_owner() -> None:
+        async with database.sessions() as session:
+            if await session.get(AdminUser, UUID(int=0)) is None:
+                session.add(
+                    AdminUser(
+                        id=UUID(int=0),
+                        username_normalized="local-developer",
+                        display_name="Local Developer",
+                        password_hash="disabled-test-password-hash",  # noqa: S106
+                        role=AdminRole.OWNER,
+                        is_active=True,
+                        failed_login_count=0,
+                        password_changed_at=datetime.now(UTC),
+                        credential_version=1,
+                        lock_version=1,
+                    )
+                )
+                await session.commit()
+
+    client.portal.call(seed_development_owner)
+
+    response = client.get("/dashboard/loras")
+
+    assert response.status_code == 200
+    connect_sources = (
+        response.headers["content-security-policy"]
+        .split("connect-src ", maxsplit=1)[1]
+        .split(";", maxsplit=1)[0]
+        .split()
+    )
+    assert f"https://{bucket}.s3.eu-central-1.amazonaws.com" in connect_sources
+
+    non_lora_response = client.get("/dashboard")
+    non_lora_connect_sources = (
+        non_lora_response.headers["content-security-policy"]
+        .split("connect-src ", maxsplit=1)[1]
+        .split(";", maxsplit=1)[0]
+        .split()
+    )
+    assert f"https://{bucket}.s3.eu-central-1.amazonaws.com" not in non_lora_connect_sources
 
 
 def test_manual_route_creates_idempotent_grant_and_freezes_exact_upload(
@@ -135,6 +224,27 @@ def test_civitai_route_rejects_an_invalid_url_as_input(client: TestClient) -> No
         json={"url": "https://attacker.example.test/models/1"},
     )
     assert response.status_code == 422
+
+
+def test_model_only_civitai_override_reports_provider_terms_truthfully(
+    client: TestClient,
+) -> None:
+    client.app.state.settings.lora_manager_enabled = True
+    client.app.state.civitai_client = _NoncommercialVersionListingClient()
+
+    response = client.post(
+        "/api/v1/loras/civitai:resolve",
+        json={
+            "url": "https://civitai.com/models/123",
+            "commercial_use_override_attested": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["commercial_image_allowed"] is False
+    assert response.json()["commercial_use_override_applied"] is True
+    assert response.json()["provider_commercial_use"] == ["RentCivit"]
+    assert response.json()["versions"][0]["version_id"] == 456
 
 
 def test_civitai_create_derives_provenance_and_replays_without_provider(

@@ -34,6 +34,12 @@ class CivitaiLicenseTerms:
     allow_derivatives: bool
     allow_different_license: bool
 
+    @property
+    def permits_commercial_images(self) -> bool:
+        """Whether Civitai explicitly reports commercial generated-image use."""
+
+        return any(value.casefold() == "image" for value in self.commercial_use)
+
     def as_json(self) -> dict[str, JSONValue]:
         return {
             "allow_no_credit": self.allow_no_credit,
@@ -63,6 +69,12 @@ class CivitaiLoraVersionChoice:
     target_filename: str
     declared_size_bytes: int
     sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class CivitaiLoraVersionListing:
+    versions: tuple[CivitaiLoraVersionChoice, ...]
+    license_terms: CivitaiLicenseTerms
 
 
 @dataclass(frozen=True, slots=True)

@@ -447,8 +447,10 @@ async def test_civitai_advisory_size_does_not_reject_verified_bytes(
             _source: object,
             *,
             version_id: int | None = None,
+            allow_commercial_use_override: bool = False,
         ) -> CivitaiResolvedLora:
             assert version_id == resolved.version_id
+            assert allow_commercial_use_override is False
             return resolved
 
         @asynccontextmanager
