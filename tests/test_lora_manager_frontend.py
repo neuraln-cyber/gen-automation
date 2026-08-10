@@ -98,6 +98,11 @@ def test_lora_manager_template_keeps_rights_and_provider_secrets_server_side() -
     assert 'name="trigger_words"' in source
     assert "Nothing is selected automatically" in source
     assert "data-lora-version-select" in source
+    assert 'pattern="https://(www\\.)?civitai\\.(com|red)/.*"' in source
+    assert "Paste a civitai.com or civitai.red model link" in source
+
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert '["civitai.com", "www.civitai.com", "civitai.red", "www.civitai.red"]' in script
 
 
 def test_lora_manager_javascript_uploads_directly_and_polls_durable_progress() -> None:

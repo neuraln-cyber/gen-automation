@@ -8,7 +8,10 @@ from gen_automation.integrations.civitai.models import CivitaiSourceKind, Civita
 
 MAX_CIVITAI_URL_LENGTH = 2_048
 _MAX_PROVIDER_ID = 2**63 - 1
-_CIVITAI_HOSTS = frozenset({"civitai.com", "www.civitai.com"})
+# Civitai uses ``.red`` as its adult-content front door.  Treat it only as an
+# exact, user-facing alias: parsed identifiers are normalized to the pinned
+# ``civitai.com`` API/durable URL below, so no pasted host is ever fetched.
+_CIVITAI_HOSTS = frozenset({"civitai.com", "www.civitai.com", "civitai.red", "www.civitai.red"})
 _MODEL_PATH = re.compile(r"^/models/(?P<id>[1-9][0-9]{0,18})(?:/[A-Za-z0-9._~-]{1,200})?/?$")
 _API_MODEL_PATH = re.compile(r"^/api/v1/models/(?P<id>[1-9][0-9]{0,18})/?$")
 _VERSION_PATH = re.compile(r"^/(?:api/v1/)?model-versions/(?P<id>[1-9][0-9]{0,18})/?$")
@@ -43,7 +46,9 @@ def parse_civitai_url(value: str) -> CivitaiSourceRef:
         or parsed.fragment
         or "%" in parsed.path
     ):
-        raise CivitaiURLValidationError("Civitai URL must use credential-free HTTPS on civitai.com")
+        raise CivitaiURLValidationError(
+            "Civitai URL must use credential-free HTTPS on civitai.com or civitai.red"
+        )
 
     model_match = _MODEL_PATH.fullmatch(parsed.path) or _API_MODEL_PATH.fullmatch(parsed.path)
     if model_match is not None:

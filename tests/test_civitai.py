@@ -69,14 +69,15 @@ def version_payload(
 
 def model_payload(
     *,
+    model_id: int = 123,
     model_type: str = "LORA",
     minor: bool = False,
     commercial_use: str | list[str] = "Image",
     version: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    selected_version = version or version_payload()
+    selected_version = version or version_payload(model_id=model_id)
     return {
-        "id": 123,
+        "id": model_id,
         "name": "Creator LoRA",
         "type": model_type,
         "nsfw": True,
@@ -128,6 +129,38 @@ def test_parse_civitai_url_accepts_only_known_contracts(
 
 
 @pytest.mark.parametrize(
+    ("value", "canonical_url", "model_id", "version_id"),
+    [
+        (
+            "https://civitai.red/models/196908/"
+            "disgusted-face-illustriousponysd15-or-goofy-ai?modelVersionId=2372164",
+            "https://civitai.com/models/196908?modelVersionId=2372164",
+            196908,
+            2372164,
+        ),
+        (
+            "https://civitai.red/models/2836680/biting-own-lips-or-goofy-ai",
+            "https://civitai.com/models/2836680",
+            2836680,
+            None,
+        ),
+    ],
+)
+def test_parse_civitai_red_user_links_as_canonical_provider_references(
+    value: str,
+    canonical_url: str,
+    model_id: int,
+    version_id: int | None,
+) -> None:
+    result = parse_civitai_url(value)
+
+    assert result.kind == CivitaiSourceKind.MODEL
+    assert result.canonical_url == canonical_url
+    assert result.model_id == model_id
+    assert result.version_id == version_id
+
+
+@pytest.mark.parametrize(
     "value",
     [
         "http://civitai.com/models/123",
@@ -135,7 +168,11 @@ def test_parse_civitai_url_accepts_only_known_contracts(
         "https://civitai.com:444/models/123",
         "https://civitai.com/models/%31%32%33",
         "https://civitai.example/models/123",
+        "https://civitai.red.evil.example/models/123",
+        "https://secret@civitai.red/models/123",
+        "https://civitai.red:444/models/123",
         "https://civitai.com/models/123?token=secret",
+        "https://civitai.red/models/123?token=secret",
         "https://civitai.com/models/123?modelVersionId=456&modelVersionId=457",
         "https://civitai.com/api/download/models/456?apiKey=secret",
         "https://civitai.com/other/123",
@@ -177,6 +214,29 @@ async def test_version_choices_are_bounded_and_contain_no_download_handle() -> N
 
 
 @pytest.mark.asyncio
+async def test_civitai_red_model_page_lists_versions_through_the_pinned_api_host() -> None:
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        assert request.url.host == "civitai.com"
+        assert request.url.path == "/api/v1/models/2836680"
+        return httpx2.Response(
+            200,
+            json=model_payload(
+                model_id=2836680,
+                version=version_payload(version_id=3201631, model_id=2836680),
+            ),
+            request=request,
+        )
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http_client:
+        client = CivitaiClient(api_token=TOKEN, http_client=http_client)
+        choices = await client.list_lora_versions(
+            "https://civitai.red/models/2836680/biting-own-lips-or-goofy-ai"
+        )
+
+    assert [choice.version_id for choice in choices] == [3201631]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("raw_type", "expected_type"),
     [
@@ -212,6 +272,37 @@ async def test_resolve_explicit_version_supports_managed_lora_types(
     assert all(request.headers["authorization"] == f"Bearer {TOKEN}" for request in requests)
     assert "downloadUrl" not in json.dumps(resolved.durable_provenance())
     assert "api/download" not in repr(resolved)
+
+
+@pytest.mark.asyncio
+async def test_civitai_red_exact_version_resolves_through_canonical_api_coordinates() -> None:
+    requests: list[httpx2.Request] = []
+    selected = version_payload(version_id=2372164, model_id=196908)
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        if request.url.path == "/api/v1/model-versions/2372164":
+            return httpx2.Response(200, json=selected, request=request)
+        assert request.url.path == "/api/v1/models/196908"
+        return httpx2.Response(
+            200,
+            json=model_payload(model_id=196908, version=selected),
+            request=request,
+        )
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http_client:
+        client = CivitaiClient(api_token=TOKEN, http_client=http_client)
+        resolved = await client.resolve_lora(
+            "https://civitai.red/models/196908/"
+            "disgusted-face-illustriousponysd15-or-goofy-ai?modelVersionId=2372164"
+        )
+
+    assert resolved.model_id == 196908
+    assert resolved.version_id == 2372164
+    assert resolved.canonical_source_url == (
+        "https://civitai.com/models/196908?modelVersionId=2372164"
+    )
+    assert {request.url.host for request in requests} == {"civitai.com"}
 
 
 @pytest.mark.asyncio

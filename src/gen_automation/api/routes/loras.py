@@ -8,7 +8,12 @@ from uuid import UUID
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
 from sqlalchemy import select
 
-from gen_automation.api.security import ComplianceManager, ComplianceReader, Session
+from gen_automation.api.security import (
+    ComplianceManager,
+    ComplianceMutationPrincipal,
+    ComplianceReader,
+    Session,
+)
 from gen_automation.config import Settings
 from gen_automation.db.models import ModelArtifactApproval
 from gen_automation.domain.enums import (
@@ -102,7 +107,7 @@ async def get_lora_library(
 async def resolve_civitai_lora(
     command: CivitaiResolveRequest,
     request: Request,
-    _principal: ComplianceManager,
+    _principal: ComplianceMutationPrincipal,
 ) -> CivitaiResolveRead:
     try:
         source = parse_civitai_url(command.url)
@@ -175,7 +180,7 @@ async def create_manual_lora_import(
     request: Request,
     response: Response,
     session: Session,
-    principal: ComplianceManager,
+    principal: ComplianceMutationPrincipal,
     idempotency_key: IdempotencyKey,
 ) -> ManualImportCreateRead:
     settings = _enabled_settings(request)
@@ -220,7 +225,7 @@ async def create_civitai_lora_import(
     request: Request,
     response: Response,
     session: Session,
-    principal: ComplianceManager,
+    principal: ComplianceMutationPrincipal,
     idempotency_key: IdempotencyKey,
 ) -> LoraMutationRead:
     settings = _enabled_settings(request)
@@ -262,7 +267,7 @@ async def complete_manual_lora_upload(
     request: Request,
     response: Response,
     session: Session,
-    principal: ComplianceManager,
+    principal: ComplianceMutationPrincipal,
     idempotency_key: IdempotencyKey,
 ) -> LoraMutationRead:
     _enabled_settings(request)
@@ -297,7 +302,7 @@ async def retry_lora_import(
     request: Request,
     response: Response,
     session: Session,
-    principal: ComplianceManager,
+    principal: ComplianceMutationPrincipal,
     idempotency_key: IdempotencyKey,
 ) -> LoraMutationRead:
     _enabled_settings(request)
@@ -327,7 +332,7 @@ async def cancel_lora_import(
     request: Request,
     response: Response,
     session: Session,
-    principal: ComplianceManager,
+    principal: ComplianceMutationPrincipal,
     idempotency_key: IdempotencyKey,
 ) -> LoraMutationRead:
     _enabled_settings(request)

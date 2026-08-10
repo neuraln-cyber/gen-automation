@@ -448,12 +448,12 @@ async def require_user_manager(
     return principal
 
 
-async def require_compliance_manager(
+async def require_compliance_mutation_principal(
     request: Request,
     session: Session,
     csrf_header: CsrfHeader = None,
 ) -> AuthenticatedPrincipal:
-    """Require a recently authenticated compliance administrator for mutations."""
+    """Require a compliance administrator and CSRF proof for a mutation."""
 
     principal = await require_authenticated_principal(request, session)
     _require_permission(principal, Permission.MANAGE_COMPLIANCE)
@@ -472,6 +472,24 @@ async def require_compliance_manager(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="CSRF validation failed",
             ) from error
+    return principal
+
+
+async def require_compliance_manager(
+    request: Request,
+    session: Session,
+    csrf_header: CsrfHeader = None,
+) -> AuthenticatedPrincipal:
+    """Require a recently authenticated compliance administrator for mutations."""
+
+    principal = await require_compliance_mutation_principal(
+        request,
+        session,
+        csrf_header,
+    )
+    settings: Settings = request.app.state.settings
+    if settings.auth_enabled:
+        service = authentication_service(request)
         try:
             service.require_recent_authentication(principal)
         except RecentAuthenticationRequiredError as error:
@@ -521,6 +539,10 @@ UserManager = Annotated[
 ComplianceManager = Annotated[
     AuthenticatedPrincipal,
     Depends(require_compliance_manager),
+]
+ComplianceMutationPrincipal = Annotated[
+    AuthenticatedPrincipal,
+    Depends(require_compliance_mutation_principal),
 ]
 PublicationMutationPrincipal = Annotated[
     AuthenticatedPrincipal,
