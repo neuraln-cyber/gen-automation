@@ -29,6 +29,7 @@ from gen_automation.domain.enums import (
     GenerationState,
     ReleasePhase,
     ResourceHealth,
+    SaladDeploymentPurpose,
     SaladDeploymentState,
     SpendEntryType,
 )
@@ -89,6 +90,7 @@ _RECONCILE_DELAY = timedelta(seconds=30)
 _MAX_PROVIDER_NAME_LENGTH = 63
 _MICROSECONDS_PER_HOUR = 3_600_000_000
 _RUNTIME_BINDINGS_KEY = "runtime_bindings"
+_RUNTIME_BINDING_CONTRACT_SHA256_KEY = "runtime_binding_contract_sha256"
 _WORKER_QUEUE_PATH = "/jobs/generate"
 _WORKER_PORT = 8000
 _WORKER_RESTART_POLICY = "on_failure"
@@ -336,6 +338,7 @@ async def provision_deployment_step(
     if deployment.is_current and await _has_unstopped_superseded_group(
         session,
         deployment.id,
+        deployment.purpose,
     ):
         return await _defer_rollout_overlap(session, deployment, observed_at)
 
@@ -726,6 +729,15 @@ async def effective_worker_min_replicas(
     now: datetime,
 ) -> int:
     """Keep one worker only while experiments or generation genuinely need it."""
+
+    purpose = await session.scalar(
+        select(SaladDeployment.purpose).where(SaladDeployment.id == salad_deployment_id)
+    )
+    if purpose is None or purpose == SaladDeploymentPurpose.VIDEO:
+        # The video lane is driven exclusively by its own Salad queue
+        # autoscaler. Image jobs and Experiment warm leases must never retain
+        # the much larger video worker at one replica.
+        return 0
 
     experiment_minimum = await effective_experiment_min_replicas(
         session,
@@ -1190,7 +1202,7 @@ async def _confirm_provider_group_stopped(
     if has_complete_identity:
         deployment.last_error_code = None
         deployment.last_error_detail = None
-    else:
+    elif not has_complete_identity:
         deployment.last_error_code = (
             deployment.last_error_code or "deployment_stopped_before_provisioning"
         )
@@ -1221,11 +1233,13 @@ async def _confirm_provider_group_stopped(
 async def _has_unstopped_superseded_group(
     session: AsyncSession,
     current_deployment_id: UUID,
+    purpose: SaladDeploymentPurpose,
 ) -> bool:
     blocker = await session.scalar(
         select(SaladDeployment.id)
         .where(
             SaladDeployment.id != current_deployment_id,
+            SaladDeployment.purpose == purpose,
             SaladDeployment.is_current.is_(False),
             SaladDeployment.provider_container_group_id.is_not(None),
             SaladDeployment.state != SaladDeploymentState.STOPPED,
@@ -1318,6 +1332,17 @@ async def _container_group_payload(
         raise SaladDeploymentValidationError("provider configuration must be an object")
     bindings_value = configuration.pop(_RUNTIME_BINDINGS_KEY, [])
     bindings = _parse_runtime_bindings(bindings_value)
+    binding_contract_sha256 = configuration.pop(
+        _RUNTIME_BINDING_CONTRACT_SHA256_KEY,
+        None,
+    )
+    if deployment.purpose == SaladDeploymentPurpose.VIDEO and (
+        not isinstance(binding_contract_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", binding_contract_sha256) is None
+    ):
+        raise SaladDeploymentValidationError("video runtime binding contract is invalid")
+    if deployment.purpose != SaladDeploymentPurpose.VIDEO and binding_contract_sha256 is not None:
+        raise SaladDeploymentValidationError("runtime binding contract is not allowed")
 
     if _contains_sensitive_configuration(configuration):
         raise SaladDeploymentValidationError(

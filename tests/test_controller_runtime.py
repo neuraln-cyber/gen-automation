@@ -1,5 +1,7 @@
 import asyncio
 from pathlib import Path
+from typing import cast
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,6 +17,8 @@ from gen_automation.controller.runtime import (
     build_controller_runtime,
 )
 from gen_automation.db.session import Database
+from gen_automation.domain.signing import encode_base64url
+from gen_automation.integrations.salad.client import SaladClient
 from gen_automation.storage.memory import MemoryObjectStore
 
 
@@ -266,6 +270,40 @@ def test_noncritical_background_loops_relax_initial_readiness_gate(tmp_path: Pat
         for name, spec in specs.items()
         if name not in {"semantic-anatomy-qc", "finished-set-archives"}
     )
+
+
+def test_disabled_video_feature_keeps_a_config_free_cancellation_loop(tmp_path: Path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'video-drain.db').as_posix()}")
+    settings = Settings(
+        environment=Environment.TEST,
+        background_runtime_enabled=True,
+        storage_enabled=True,
+        storage_bucket="video-drain",
+        salad_enabled=True,
+        gpu_allocation_enabled=True,
+        salad_api_key="test-key",
+        salad_organization="creator-org",
+        salad_project="production",
+        salad_queue_name="image-generation",
+        salad_container_group_name="image-worker",
+        salad_worker_image="registry.example.test/image@sha256:" + "a" * 64,
+        salad_gpu_class_ids=(UUID("3c90c3cc-0d44-4b50-8888-8dd25736052a"),),
+        salad_webhook_secret="whsec_test",  # noqa: S106
+        worker_signing_key_id="worker-key-1",
+        worker_signing_private_key=encode_base64url(bytes(range(1, 33))),
+        video_generation_enabled=False,
+    )
+
+    runtime = build_controller_runtime(
+        settings=settings,
+        sessions=database.sessions,
+        salad_client=cast(SaladClient, object()),
+        object_store=MemoryObjectStore(bucket="video-drain"),
+    )
+
+    specs = {spec.name: spec for spec in runtime._loop_specs}
+    assert "animation-video" in specs
+    assert specs["animation-video"].requires_initial_success_for_readiness is False
 
 
 @pytest.mark.asyncio

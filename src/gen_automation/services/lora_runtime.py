@@ -27,6 +27,7 @@ from gen_automation.domain.enums import (
     LoraImportSource,
     ManagedLoraLifecycle,
     ModelArtifactKind,
+    SaladDeploymentPurpose,
     SaladDeploymentState,
 )
 from gen_automation.domain.lora_catalog import VerifiedLoraArtifact
@@ -693,7 +694,12 @@ class LoraRuntime:
             .with_for_update()
         )
         deployment = await session.scalar(
-            select(SaladDeployment).where(SaladDeployment.is_current.is_(True)).with_for_update()
+            select(SaladDeployment)
+            .where(
+                SaladDeployment.is_current.is_(True),
+                SaladDeployment.purpose == SaladDeploymentPurpose.IMAGE,
+            )
+            .with_for_update()
         )
         artifact = await session.scalar(
             select(ManagedLoraArtifact)

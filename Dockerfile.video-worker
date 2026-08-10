@@ -1,0 +1,196 @@
+# syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+FROM golang:1.26.2-alpine@sha256:f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739500e08c86393a21b1 AS salad-queue-worker-builder
+
+ENV SALAD_QUEUE_WORKER_COMMIT=73d7a3c80a73f26339194e024cb47c8501c67f75 \
+    SALAD_QUEUE_WORKER_PATCH_SHA256=a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae
+
+RUN apk add --no-cache git \
+    && mkdir --parents /src \
+    && git -C /src init \
+    && git -C /src remote add origin \
+        https://github.com/SaladTechnologies/salad-cloud-job-queue-worker.git \
+    && git -C /src fetch --depth 1 origin "${SALAD_QUEUE_WORKER_COMMIT}" \
+    && git -C /src checkout --detach FETCH_HEAD \
+    && test "$(git -C /src rev-parse HEAD)" = "${SALAD_QUEUE_WORKER_COMMIT}"
+
+WORKDIR /src
+
+COPY patches/salad-queue-worker/strict-http-status.patch /tmp/strict-http-status.patch
+
+RUN printf '%s  %s\n' \
+        "${SALAD_QUEUE_WORKER_PATCH_SHA256}" \
+        /tmp/strict-http-status.patch \
+        | sha256sum -c - \
+    && git apply --unidiff-zero --check /tmp/strict-http-status.patch \
+    && git apply --unidiff-zero /tmp/strict-http-status.patch \
+    && git diff --check \
+    && go mod download \
+    && go mod verify \
+    && go test -mod=readonly ./cmd/salad-http-job-queue-worker \
+    && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+        -mod=readonly \
+        -trimpath \
+        -buildvcs=false \
+        -ldflags="-s -w -X github.com/saladtechnologies/salad-cloud-job-queue-worker/pkg/workers.Version=git-${SALAD_QUEUE_WORKER_COMMIT}" \
+        -o /out/salad-http-job-queue-worker \
+        ./cmd/salad-http-job-queue-worker
+
+FROM pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime@sha256:eee11b3b3872a8c838e35ef48f08b2d5def2080902c7f666831310ca1a0ef2be AS runtime-foundation
+
+LABEL org.opencontainers.image.title="gen-automation-video-worker" \
+      org.opencontainers.image.description="Signed one-image-to-MP4 Wan worker" \
+      org.opencontainers.image.source="https://github.com/neuraln-cyber/gen-automation" \
+      org.opencontainers.image.video-profile="wan2.2-ti2v-5b-comfy-v1" \
+      org.opencontainers.image.video-profile-sha256="a83c946f9a61bac7cf3794fc9aa4debacc2fc676c13957deaed42ecf82c7e2e4" \
+      org.opencontainers.image.video-workflow-sha256="ecba3eef1c14abcd4d0d2ba3cec1f53042767f1a177d833dcfd3fd6b11f09ab3" \
+      org.opencontainers.image.comfyui.revision="700821e1364eaab0e8f21c538a2131719fec57bf" \
+      org.opencontainers.image.salad-queue-worker.revision="73d7a3c80a73f26339194e024cb47c8501c67f75" \
+      org.opencontainers.image.salad-queue-worker.patch-sha256="a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    VIRTUAL_ENV=/opt/video-worker-venv \
+    PATH=/opt/video-worker-venv/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONNOUSERSITE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/opt/video-worker/src \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    VIDEO_WORKER_PROFILE_ID=wan2.2-ti2v-5b-comfy-v1 \
+    VIDEO_WORKER_MODEL_REVISION=fb1388adc906ab39ffc26ee40e96b22886b56bc4 \
+    VIDEO_WORKER_MODEL_MANIFEST=/opt/video-worker/model-manifest.json \
+    VIDEO_WORKER_STAGING_ROOT=/opt/video-worker/runtime \
+    COMFYUI_COMMIT=700821e1364eaab0e8f21c538a2131719fec57bf
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN mkdir --parents \
+        /opt/comfyui/models/diffusion_models \
+        /opt/comfyui/models/text_encoders \
+        /opt/comfyui/models/vae
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+        git \
+    && git -C /opt/comfyui init \
+    && git -C /opt/comfyui remote add origin https://github.com/Comfy-Org/ComfyUI.git \
+    && git -C /opt/comfyui fetch --depth 1 origin "${COMFYUI_COMMIT}" \
+    && git -C /opt/comfyui checkout --detach FETCH_HEAD \
+    && test "$(git -C /opt/comfyui rev-parse HEAD)" = "${COMFYUI_COMMIT}" \
+    && grep -R -Fq 'class Wan22ImageToVideoLatent' /opt/comfyui/comfy_extras \
+    && grep -Fq 'class SaveImage' /opt/comfyui/nodes.py \
+    && rm -rf /opt/comfyui/.git \
+    && apt-get purge --yes --auto-remove git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/video-worker
+
+COPY requirements.lock requirements-comfy.lock requirements-worker-base.txt \
+    requirements-video-worker.lock ./
+
+RUN python -c "import sys; assert sys.version_info[:2] == (3, 12)" \
+    && python -m venv \
+        --copies \
+        --without-pip \
+        --system-site-packages \
+        /opt/video-worker-venv \
+    && /opt/video-worker-venv/bin/python -m pip install \
+        --only-binary=:all: \
+        --require-hashes \
+        --no-deps \
+        -r requirements.lock \
+    && /opt/video-worker-venv/bin/python -m pip install \
+        --only-binary=:all: \
+        --require-hashes \
+        --no-deps \
+        -r requirements-comfy.lock \
+    && /opt/video-worker-venv/bin/python -m pip install \
+        --only-binary=:all: \
+        --require-hashes \
+        --no-deps \
+        -r requirements-video-worker.lock \
+    && /opt/video-worker-venv/bin/python -c \
+        "import av, fastapi, httpx2, PIL, torch, torchaudio, torchvision; assert av.__version__ == '18.0.0'; assert torch.__version__.split('+')[0] == '2.11.0'; assert torchvision.__version__.split('+')[0] == '0.26.0'; assert torchaudio.__version__.split('+')[0] == '2.11.0'" \
+    && /usr/bin/ffprobe -version \
+    && /usr/bin/ffmpeg -version
+
+COPY --from=salad-queue-worker-builder --chmod=0555 \
+    /out/salad-http-job-queue-worker \
+    /usr/local/bin/salad-http-job-queue-worker
+
+RUN groupadd --system --gid 10002 video-worker \
+    && useradd \
+        --system \
+        --create-home \
+        --uid 10002 \
+        --gid video-worker \
+        --home-dir /home/video-worker \
+        --shell /usr/sbin/nologin \
+        video-worker \
+    && mkdir --parents /opt/video-worker/runtime \
+    && chown 10002:10002 /opt/video-worker/runtime \
+    && chmod 0700 /opt/video-worker/runtime
+
+ENV HOME=/home/video-worker
+
+# CI/SBOM/smoke target: complete runtime contract, deliberately without the
+# 18.145-GB weights.  Production never inherits from this stage.
+FROM runtime-foundation AS runtime-contract
+
+LABEL org.opencontainers.image.video-runtime-contract="true"
+
+COPY video-models/wan2.2-ti2v-5b-comfy.json ./model-manifest.json
+COPY src/gen_automation/__init__.py ./src/gen_automation/__init__.py
+COPY src/gen_automation/video_worker ./src/gen_automation/video_worker
+COPY src/gen_automation/domain/__init__.py ./src/gen_automation/domain/__init__.py
+COPY src/gen_automation/domain/signing.py ./src/gen_automation/domain/signing.py
+
+USER 10002:10002
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=20s --timeout=3s --start-period=60m --retries=3 \
+    CMD ["/opt/video-worker-venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
+
+ENTRYPOINT ["/opt/video-worker-venv/bin/python", "-m", "gen_automation.video_worker.main"]
+
+# Production-only immutable model branch. BuildKit verifies every remote object
+# before committing the stable layer; no placeholder or runtime fetch exists.
+FROM runtime-foundation AS model-runtime
+
+ADD --checksum=sha256:456f901338bd9eadbded3828b819109a9b68e8a525ca5cf8d0049a69fcfeca1e --chmod=0444 \
+    https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/fb1388adc906ab39ffc26ee40e96b22886b56bc4/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors \
+    /opt/comfyui/models/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors
+ADD --checksum=sha256:c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68 --chmod=0444 \
+    https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/fb1388adc906ab39ffc26ee40e96b22886b56bc4/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors \
+    /opt/comfyui/models/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors
+ADD --checksum=sha256:e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156 --chmod=0444 \
+    https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/fb1388adc906ab39ffc26ee40e96b22886b56bc4/split_files/vae/wan2.2_vae.safetensors \
+    /opt/comfyui/models/vae/wan2.2_vae.safetensors
+
+RUN test "$(stat --format=%s /opt/comfyui/models/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors)" = 9999658848 \
+    && test "$(stat --format=%s /opt/comfyui/models/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors)" = 6735906897 \
+    && test "$(stat --format=%s /opt/comfyui/models/vae/wan2.2_vae.safetensors)" = 1409400960
+
+# Default/final target. Application source is copied only after the stable model
+# branch, so ordinary code edits do not invalidate the model layer.
+FROM model-runtime AS production
+
+LABEL org.opencontainers.image.model.repository="Comfy-Org/Wan_2.2_ComfyUI_Repackaged" \
+      org.opencontainers.image.model.revision="fb1388adc906ab39ffc26ee40e96b22886b56bc4" \
+      org.opencontainers.image.model.manifest-sha256="15ab9e6ee0dbdb03b81e40d14e1957be107be6312b3f1647883a56915d3b23b5"
+
+COPY --from=runtime-contract /opt/video-worker/model-manifest.json ./model-manifest.json
+COPY --from=runtime-contract /opt/video-worker/src ./src
+
+USER 10002:10002
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=20s --timeout=3s --start-period=60m --retries=3 \
+    CMD ["/opt/video-worker-venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
+
+ENTRYPOINT ["/opt/video-worker-venv/bin/python", "-m", "gen_automation.video_worker.main"]

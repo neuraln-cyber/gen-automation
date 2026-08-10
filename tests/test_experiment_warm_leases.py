@@ -31,6 +31,7 @@ from gen_automation.domain.enums import (
     GenerationState,
     ReleasePhase,
     ResourceHealth,
+    SaladDeploymentPurpose,
     SaladDeploymentState,
     SpendEntryType,
 )
@@ -374,6 +375,57 @@ async def test_dispatchable_generation_holds_worker_without_an_experiment_lease(
             await effective_worker_min_replicas(
                 session,
                 salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_dispatchable_image_job_never_retains_the_video_lane(
+    warm_context: WarmContext,
+) -> None:
+    async with warm_context.database.sessions() as session:
+        await _add_generation_job(
+            session,
+            warm_context,
+            suffix=101,
+            state=GenerationState.QUEUED,
+        )
+        video_deployment = SaladDeployment(
+            purpose=SaladDeploymentPurpose.VIDEO,
+            version_no=2,
+            config_sha256="d" * 64,
+            provider_configuration={
+                "container": {},
+                "queue_autoscaler": {"polling_period": 15},
+            },
+            worker_image_digest="registry.example.test/video-worker@sha256:" + "e" * 64,
+            organization_name="organization",
+            project_name="project",
+            queue_name="video-generation",
+            provider_queue_id="video-queue-id",
+            container_group_name="video-worker",
+            provider_container_group_id="video-group-id",
+            state=SaladDeploymentState.ACTIVE,
+            desired_state=DesiredDeploymentState.ACTIVE,
+            is_current=True,
+            min_replicas=0,
+            max_replicas=1,
+            desired_queue_length=1,
+            max_hourly_cost_microusd=350_000,
+            observed_replicas=0,
+            ready_replicas=0,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(video_deployment)
+        await session.flush()
+
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=video_deployment.id,
                 now=NOW,
             )
             == 0

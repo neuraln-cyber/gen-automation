@@ -95,6 +95,7 @@ The non-secret provider inputs are:
 | `GEN_AUTOMATION_SALAD_CONTAINER_PRIORITY` | `low` by default for backward compatibility; one of `high`, `medium`, `low`, or `batch`. Staging pins `high` to reduce scarce-capacity allocation delays. |
 | `GEN_AUTOMATION_SALAD_MAX_QUEUED_JOBS` | `3`; 1-100. This is the controller's ordered prefetch window: one running job plus two pending jobs by default. It does not increase the replica ceiling or the provider autoscaling target. |
 | `GEN_AUTOMATION_SALAD_ATTEMPT_WATCHDOG_SECONDS` | `6300` (105 minutes). Active attempts at or beyond this age are cancelled and retried only after Salad confirms cancellation. It must expire at least 300 seconds before the worker signature TTL. |
+| `GEN_AUTOMATION_WORKER_UPLOAD_GRANT_TTL_SECONDS` | `14400` (4 hours). The video lane requires enough time for one watchdog-bounded render plus pending/cancellation reconciliation; grants remain exact-object, exact-content-type, and single-attempt scoped. |
 | `GEN_AUTOMATION_SALAD_MAX_HOURLY_COST_USD` | `1.00`; positive, at most the daily budget, with micro-dollar precision. Configure it at or above the highest selected GPU rate because durable reservations and spend accounting use this ceiling. |
 | Staging Salad budget envelope | Pins maximum hourly cost to `$0.35`, daily spend to `$5.00`, and monthly spend to `$25.00`. This leaves room for three full `$0.35` attempt reservations while retaining bounded hard stops. |
 

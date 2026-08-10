@@ -102,6 +102,11 @@ class SaladDeploymentState(StrEnum):
     FAILED = "failed"
 
 
+class SaladDeploymentPurpose(StrEnum):
+    IMAGE = "image"
+    VIDEO = "video"
+
+
 class DesiredDeploymentState(StrEnum):
     ACTIVE = "active"
     STOPPED = "stopped"

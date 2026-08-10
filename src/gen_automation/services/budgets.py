@@ -19,6 +19,7 @@ from gen_automation.db.models import (
     ProviderBudgetGuard,
     ProviderSpendEntry,
     SaladDeployment,
+    VideoGenerationAttempt,
 )
 from gen_automation.domain.enums import (
     BudgetState,
@@ -27,6 +28,7 @@ from gen_automation.domain.enums import (
     GenerationAttemptState,
     SpendEntryType,
 )
+from gen_automation.domain.video import VideoGenerationAttemptState
 
 MICROUSD_PER_USD = 1_000_000
 MAX_BIGINT = (1 << 63) - 1
@@ -37,6 +39,16 @@ _TERMINAL_ATTEMPT_STATES = frozenset(
         GenerationAttemptState.SUCCEEDED,
         GenerationAttemptState.FAILED,
         GenerationAttemptState.CANCELLED,
+    }
+)
+_ACTIVE_VIDEO_ATTEMPT_STATES = frozenset(
+    {
+        VideoGenerationAttemptState.CREATED,
+        VideoGenerationAttemptState.SUBMITTING,
+        VideoGenerationAttemptState.SUBMITTED,
+        VideoGenerationAttemptState.RUNNING,
+        VideoGenerationAttemptState.UNKNOWN,
+        VideoGenerationAttemptState.CANCEL_REQUESTED,
     }
 )
 
@@ -560,7 +572,19 @@ async def _evaluate_locked(
             GenerationAttempt.reservation_released_at.is_(None),
         )
     )
-    active_reservations = int(reservations or 0)
+    video_reservations = await session.scalar(
+        select(
+            func.coalesce(
+                func.sum(VideoGenerationAttempt.reserved_cost_microusd),
+                0,
+            )
+        ).where(
+            VideoGenerationAttempt.provider == guard.provider,
+            VideoGenerationAttempt.reserved_cost_microusd > 0,
+            VideoGenerationAttempt.state.in_(_ACTIVE_VIDEO_ATTEMPT_STATES),
+        )
+    )
+    active_reservations = int(reservations or 0) + int(video_reservations or 0)
     active_warm_leases = 0
     if guard.provider == "salad":
         warm_leases = list(

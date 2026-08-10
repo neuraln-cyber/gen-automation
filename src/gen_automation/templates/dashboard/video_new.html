@@ -1,0 +1,221 @@
+{% extends "dashboard/base.html" %}
+
+{% block content %}
+  <section
+    class="video-studio"
+    data-video-studio
+    data-hourly-rate-usd="{{ hourly_rate_usd }}"
+  >
+    <header class="video-studio-hero">
+      <div>
+        <p class="page-kicker">Image to video</p>
+        <h1>Animation Studio</h1>
+        <p class="lede">
+          Turn one private library image into a short, loop-ready motion clip.
+          The fixed economical profile keeps the GPU job small and scales back down after work.
+        </p>
+      </div>
+      <aside class="video-cost-note" aria-label="Cost plan">
+        <span aria-hidden="true">GPU</span>
+        <strong>Starts near {{ default_estimate }}</strong>
+        <small>
+          Planning estimate for one 3-second variant at the configured
+          ${{ hourly_rate_usd }}/hour ceiling. Completed jobs show a conservative
+          wall-clock usage estimate; provider billing remains authoritative.
+        </small>
+      </aside>
+    </header>
+
+    {% if error_message %}
+      <div class="flash error" role="alert">{{ error_message }}</div>
+    {% endif %}
+
+    {% if sources %}
+      <form
+        method="post"
+        action="/dashboard/animations"
+        class="video-studio-form card"
+        data-video-studio-form
+      >
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="submission_id" value="{{ submission_id }}">
+        <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+
+        <section class="video-source-step" aria-labelledby="video-source-heading">
+          <div class="section-heading compact">
+            <div>
+              <p class="page-kicker">1 - Source</p>
+              <h2 id="video-source-heading">Choose a library image</h2>
+            </div>
+            <span class="status ready">Private</span>
+          </div>
+          <div class="video-source-layout">
+            <label class="video-field">
+              <span>Source image</span>
+              <select name="source_asset_id" required data-video-source-select>
+                {% for source in sources %}
+                  <option
+                    value="{{ source.asset_id }}"
+                    data-preview-url="{{ source.preview_url }}"
+                    data-source-size="{{ source.width }}x{{ source.height }} - {{ source.image_format | upper }}"
+                    {% if values.get("source_asset_id", "") == source.asset_id|string %}selected{% endif %}
+                  >{{ source.label }}</option>
+                {% endfor %}
+              </select>
+              <small>Only verified, available private masters are listed.</small>
+            </label>
+            <figure class="video-source-preview">
+              <img
+                src="{{ sources[0].preview_url }}"
+                alt="Selected source image preview"
+                data-video-source-preview
+              >
+              <figcaption data-video-source-caption>
+                {{ sources[0].width }}x{{ sources[0].height }} - {{ sources[0].image_format | upper }}
+              </figcaption>
+            </figure>
+          </div>
+        </section>
+
+        <section aria-labelledby="video-motion-heading">
+          <div class="section-heading compact">
+            <div>
+              <p class="page-kicker">2 - Motion</p>
+              <h2 id="video-motion-heading">Describe the movement</h2>
+            </div>
+            <span class="status">Optional prompt</span>
+          </div>
+          <label class="video-field">
+            <span>Motion prompt</span>
+            <textarea
+              name="prompt"
+              rows="4"
+              maxlength="4000"
+              placeholder="Subtle breathing, hair moving in a light breeze, gentle camera drift..."
+            >{{ values.get("prompt", "") }}</textarea>
+            <small>
+              Describe movement and camera behavior. Leave blank when the source already makes the motion obvious.
+            </small>
+          </label>
+          <div class="video-choice-grid">
+            <label class="video-field">
+              <span>Content rating</span>
+              {% set selected_rating = values.get("content_rating", "sfw") %}
+              <select name="content_rating" data-video-rating>
+                <option value="sfw" {% if selected_rating == "sfw" %}selected{% endif %}>SFW</option>
+                <option value="nsfw" {% if selected_rating == "nsfw" %}selected{% endif %}>NSFW</option>
+                <option value="explicit" {% if selected_rating == "explicit" %}selected{% endif %}>Explicit</option>
+              </select>
+            </label>
+            <label class="video-field">
+              <span>Base loop length</span>
+              {% set selected_duration = values.get("duration_seconds", "3") %}
+              <select name="duration_seconds" data-video-duration>
+                <option value="3" {% if selected_duration == "3" %}selected{% endif %}>3s motion -> about 6s seamless loop</option>
+                <option value="5" {% if selected_duration == "5" %}selected{% endif %}>5s motion -> about 10s seamless loop</option>
+              </select>
+            </label>
+            <label class="video-field">
+              <span>Variants</span>
+              {% set selected_variants = values.get("variant_count", "1") %}
+              <select name="variant_count" data-video-variants>
+                <option value="1" {% if selected_variants == "1" %}selected{% endif %}>1 variant</option>
+                <option value="2" {% if selected_variants == "2" %}selected{% endif %}>2 variants</option>
+                <option value="3" {% if selected_variants == "3" %}selected{% endif %}>3 variants</option>
+              </select>
+            </label>
+          </div>
+          <p class="video-profile-note">
+            Fixed profile: Wan 2.2 TI2V 5B - source orientation preserved at 832x480 or 480x832 - H.264 MP4 - ping-pong loop without extra diffusion.
+          </p>
+        </section>
+
+        <section aria-labelledby="video-confirm-heading">
+          <div class="section-heading compact">
+            <div>
+              <p class="page-kicker">3 - Confirm each submission</p>
+              <h2 id="video-confirm-heading">Rights and content attestations</h2>
+            </div>
+          </div>
+          <fieldset class="video-attestations">
+            <legend>Required for this job</legend>
+            <label>
+              <input
+                type="checkbox"
+                name="source_rights_confirmed"
+                required
+                {% if values.get("source_rights_confirmed") == "on" %}checked{% endif %}
+              >
+              <span>I have the rights or permission needed to animate this source image.</span>
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                name="lawful_use_confirmed"
+                required
+                {% if values.get("lawful_use_confirmed") == "on" %}checked{% endif %}
+              >
+              <span>This requested animation and its intended use are lawful.</span>
+            </label>
+          </fieldset>
+          <fieldset
+            class="video-attestations video-adult-attestations"
+            data-video-adult-attestations
+            {% if selected_rating == "sfw" %}hidden{% endif %}
+          >
+            <legend>Also required for NSFW or explicit jobs</legend>
+            <label>
+              <input
+                type="checkbox"
+                name="all_depicted_people_are_adults"
+                {% if selected_rating != "sfw" %}required{% endif %}
+                {% if values.get("all_depicted_people_are_adults") == "on" %}checked{% endif %}
+              >
+              <span>Every depicted person is an adult.</span>
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                name="consensual_adult_content_confirmed"
+                {% if selected_rating != "sfw" %}required{% endif %}
+                {% if values.get("consensual_adult_content_confirmed") == "on" %}checked{% endif %}
+              >
+              <span>Any sexual content depicts consensual adult activity.</span>
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                name="no_real_person_sexual_content"
+                {% if selected_rating != "sfw" %}required{% endif %}
+                {% if values.get("no_real_person_sexual_content") == "on" %}checked{% endif %}
+              >
+              <span>This does not create sexual content involving a real person.</span>
+            </label>
+          </fieldset>
+        </section>
+
+        <footer class="video-submit-row">
+          <div>
+            <span>Planning estimate</span>
+            <strong data-video-cost-estimate>{{ default_estimate }}</strong>
+            <small>Provider cost depends on running time; the status page stays conservative.</small>
+          </div>
+          <button class="primary-button" type="submit">Queue short animation</button>
+        </footer>
+      </form>
+    {% else %}
+      <section class="card empty-state video-empty-state">
+        <p class="page-kicker">No source images yet</p>
+        <h2>Finish an image generation first</h2>
+        <p>
+          Animation Studio only accepts verified, available images from your private library.
+        </p>
+        <a class="primary-button" href="/dashboard/new-set">Create images</a>
+      </section>
+    {% endif %}
+  </section>
+{% endblock %}
+
+{% block page_scripts %}
+  <script src="/static/video_studio.js" defer></script>
+{% endblock %}

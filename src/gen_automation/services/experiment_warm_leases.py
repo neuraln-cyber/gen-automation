@@ -18,6 +18,7 @@ from gen_automation.domain.enums import (
     DesiredDeploymentState,
     ExperimentWarmLeaseState,
     GenerationAttemptState,
+    SaladDeploymentPurpose,
     SaladDeploymentState,
 )
 from gen_automation.services.budgets import BudgetSnapshot, reevaluate_budget_guard
@@ -373,6 +374,7 @@ async def get_current_experiment_warm_lease_status(
             )
             .where(
                 SaladDeployment.is_current.is_(True),
+                SaladDeployment.purpose == SaladDeploymentPurpose.IMAGE,
                 ExperimentWarmLease.state.in_(_LIVE_STATES),
             )
             .order_by(ExperimentWarmLease.started_at.desc())
@@ -398,7 +400,12 @@ async def ensure_experiment_warm_lease(
     duration_seconds = _validate_duration(duration_seconds)
     actor = _validate_actor(actor)
     deployment_id = await session.scalar(
-        select(SaladDeployment.id).where(SaladDeployment.is_current.is_(True)).limit(1)
+        select(SaladDeployment.id)
+        .where(
+            SaladDeployment.is_current.is_(True),
+            SaladDeployment.purpose == SaladDeploymentPurpose.IMAGE,
+        )
+        .limit(1)
     )
     if deployment_id is None:
         raise ExperimentWarmLeaseNotFoundError("current Salad deployment was not found")
@@ -837,6 +844,7 @@ async def activate_ready_experiment_warm_leases(
                     ExperimentWarmLease.hard_expires_at > activated_at,
                     SaladDeployment.ready_replicas >= 1,
                     SaladDeployment.is_current.is_(True),
+                    SaladDeployment.purpose == SaladDeploymentPurpose.IMAGE,
                     SaladDeployment.state == SaladDeploymentState.ACTIVE,
                     SaladDeployment.desired_state == DesiredDeploymentState.ACTIVE,
                 )

@@ -24,6 +24,7 @@ from gen_automation.domain.enums import (
     AdminRole,
     DesiredDeploymentState,
     ExperimentWarmLeaseState,
+    SaladDeploymentPurpose,
     SaladDeploymentState,
 )
 from gen_automation.middleware import content_security_policy
@@ -499,7 +500,12 @@ async def _read_warm_request(request: Request, *, duration_required: bool) -> in
 
 async def _warm_deployment_available(session: AsyncSession) -> bool:
     deployment = await session.scalar(
-        select(SaladDeployment).where(SaladDeployment.is_current.is_(True)).limit(1)
+        select(SaladDeployment)
+        .where(
+            SaladDeployment.is_current.is_(True),
+            SaladDeployment.purpose == SaladDeploymentPurpose.IMAGE,
+        )
+        .limit(1)
     )
     return bool(
         deployment is not None
