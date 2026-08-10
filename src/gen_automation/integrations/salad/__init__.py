@@ -1,6 +1,7 @@
 from gen_automation.integrations.salad.client import (
     SALAD_API_BASE_URL,
     SALAD_DEFAULT_TIMEOUT,
+    SALAD_QUEUE_JOB_PAGE_SIZE,
     SALAD_REQUESTS_PER_MINUTE,
     SaladClient,
     SaladCloudClient,
@@ -37,6 +38,7 @@ from gen_automation.integrations.salad.models import (
 __all__ = [
     "SALAD_API_BASE_URL",
     "SALAD_DEFAULT_TIMEOUT",
+    "SALAD_QUEUE_JOB_PAGE_SIZE",
     "SALAD_REQUESTS_PER_MINUTE",
     "JSONObject",
     "JSONScalar",

@@ -30,6 +30,7 @@ from gen_automation.domain.enums import (
     GenerationState,
     SaladDeploymentState,
 )
+from gen_automation.integrations.salad.client import SALAD_QUEUE_JOB_PAGE_SIZE
 from gen_automation.integrations.salad.errors import (
     SaladAPIError,
     SaladProtocolError,
@@ -231,7 +232,7 @@ class FakeSaladClient:
         queue_name: str,
         *,
         page: int = 1,
-        page_size: int = 50,
+        page_size: int = SALAD_QUEUE_JOB_PAGE_SIZE,
     ) -> SaladQueueJobPage:
         self.list_calls.append((queue_name, page, page_size))
         if self.list_error is not None:
@@ -975,7 +976,7 @@ async def test_reconciliation_without_a_metadata_match_stays_unknown(
             session,
             FakeSaladClient(list_pages={1: ()}),
             generation_attempt_id=attempt_id,
-            list_page_size=10,
+            list_page_size=1,
             now=NOW + timedelta(minutes=1),
         )
 
@@ -983,6 +984,73 @@ async def test_reconciliation_without_a_metadata_match_stays_unknown(
     assert result.matched is False
     assert result.error_code == "salad_provider_job_not_found"
     assert result.observation.attempt_state == GenerationAttemptState.UNKNOWN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_page", [3, 8])
+async def test_reconciliation_preserves_the_200_job_scan_window(
+    database: Database,
+    target_page: int,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(create_error=SaladTimeoutError("timeout")),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+        pages = {
+            page_number: tuple(
+                remote_job(
+                    status=SaladJobStatus.PENDING,
+                    metadata={"generation_attempt_id": "another-attempt"},
+                    update_time=NOW + timedelta(minutes=1),
+                    job_id=uuid4(),
+                )
+                for _ in range(SALAD_QUEUE_JOB_PAGE_SIZE)
+            )
+            for page_number in range(1, target_page)
+        }
+        pages[target_page] = (
+            remote_job(
+                status=SaladJobStatus.RUNNING,
+                metadata=metadata,
+                update_time=NOW + timedelta(minutes=1),
+            ),
+        )
+        client = FakeSaladClient(list_pages=pages)
+
+        result = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            max_list_pages=8,
+            list_page_size=SALAD_QUEUE_JOB_PAGE_SIZE,
+            now=NOW + timedelta(minutes=1),
+        )
+        reconciled = await session.get(GenerationAttempt, attempt_id)
+
+    assert result.matched is True
+    assert result.observation.attempt_state == GenerationAttemptState.RUNNING
+    assert reconciled is not None
+    assert reconciled.provider_external_id == str(REMOTE_JOB_ID)
+    assert client.list_calls == [
+        ("generation-v1", page_number, SALAD_QUEUE_JOB_PAGE_SIZE)
+        for page_number in range(1, target_page + 1)
+    ]
 
 
 @pytest.mark.asyncio
@@ -1356,21 +1424,21 @@ async def test_operator_stop_list_absence_retires_after_three_confirmations(
             session,
             FakeSaladClient(list_pages={1: ()}),
             generation_attempt_id=attempt_id,
-            list_page_size=10,
+            list_page_size=SALAD_QUEUE_JOB_PAGE_SIZE,
             now=NOW + timedelta(minutes=1),
         )
         second = await reconcile_generation_attempt(
             session,
             FakeSaladClient(list_pages={1: ()}),
             generation_attempt_id=attempt_id,
-            list_page_size=10,
+            list_page_size=SALAD_QUEUE_JOB_PAGE_SIZE,
             now=NOW + timedelta(minutes=2),
         )
         third = await reconcile_generation_attempt(
             session,
             FakeSaladClient(list_pages={1: ()}),
             generation_attempt_id=attempt_id,
-            list_page_size=10,
+            list_page_size=SALAD_QUEUE_JOB_PAGE_SIZE,
             now=NOW + timedelta(minutes=3),
         )
         final_attempt = await session.get(GenerationAttempt, attempt_id)
@@ -1401,7 +1469,7 @@ async def test_operator_stop_list_absence_retires_after_three_confirmations(
 
 
 @pytest.mark.asyncio
-async def test_operator_stop_full_list_pages_are_inconclusive_and_do_not_count_absence(
+async def test_operator_stop_more_than_200_jobs_is_inconclusive_and_does_not_count_absence(
     database: Database,
 ) -> None:
     async with database.sessions() as session:
@@ -1417,25 +1485,26 @@ async def test_operator_stop_full_list_pages_are_inconclusive_and_do_not_count_a
             now=NOW,
         )
         await mark_operator_stop(session, context)
-        unrelated_one = remote_job(
-            status=SaladJobStatus.PENDING,
-            metadata={"generation_attempt_id": "another-attempt"},
-            update_time=NOW + timedelta(minutes=1),
-            job_id=uuid4(),
-        )
-        unrelated_two = remote_job(
-            status=SaladJobStatus.PENDING,
-            metadata={"generation_attempt_id": "another-attempt"},
-            update_time=NOW + timedelta(minutes=1),
-            job_id=uuid4(),
-        )
+        full_pages = {
+            page_number: tuple(
+                remote_job(
+                    status=SaladJobStatus.PENDING,
+                    metadata={"generation_attempt_id": "another-attempt"},
+                    update_time=NOW + timedelta(minutes=1),
+                    job_id=uuid4(),
+                )
+                for _ in range(SALAD_QUEUE_JOB_PAGE_SIZE)
+            )
+            for page_number in range(1, 9)
+        }
+        bounded_client = FakeSaladClient(list_pages=full_pages)
 
         inconclusive = await reconcile_generation_attempt(
             session,
-            FakeSaladClient(list_pages={1: (unrelated_one,), 2: (unrelated_two,)}),
+            bounded_client,
             generation_attempt_id=attempt_id,
-            max_list_pages=2,
-            list_page_size=1,
+            max_list_pages=8,
+            list_page_size=SALAD_QUEUE_JOB_PAGE_SIZE,
             now=NOW + timedelta(minutes=1),
         )
         after_inconclusive = await session.get(GenerationAttempt, attempt_id)
@@ -1448,7 +1517,7 @@ async def test_operator_stop_full_list_pages_are_inconclusive_and_do_not_count_a
             session,
             FakeSaladClient(list_pages={1: ()}),
             generation_attempt_id=attempt_id,
-            list_page_size=1,
+            list_page_size=SALAD_QUEUE_JOB_PAGE_SIZE,
             now=NOW + timedelta(minutes=2),
         )
         after_miss = await session.get(GenerationAttempt, attempt_id)
@@ -1459,6 +1528,9 @@ async def test_operator_stop_full_list_pages_are_inconclusive_and_do_not_count_a
 
     assert inconclusive.error_code == "operator_generation_stop_provider_scan_inconclusive"
     assert inconclusive.observation.attempt_state == GenerationAttemptState.UNKNOWN
+    assert bounded_client.list_calls == [
+        ("generation-v1", page_number, SALAD_QUEUE_JOB_PAGE_SIZE) for page_number in range(1, 9)
+    ]
     assert first_exhaustive_miss.error_code == ("operator_generation_stop_provider_absence_pending")
     assert tracker["source"] == ReconciliationSource.LIST.value
     assert tracker["count"] == 1
@@ -1487,7 +1559,7 @@ async def test_operator_stop_positive_match_resets_prior_misses_before_get_absen
                 session,
                 FakeSaladClient(list_pages={1: ()}),
                 generation_attempt_id=attempt_id,
-                list_page_size=10,
+                list_page_size=SALAD_QUEUE_JOB_PAGE_SIZE,
                 now=NOW + timedelta(minutes=minute),
             )
             assert miss.error_code == "operator_generation_stop_provider_absence_pending"
@@ -1512,7 +1584,7 @@ async def test_operator_stop_positive_match_resets_prior_misses_before_get_absen
                 cancel_error=SaladTransportError("connection reset"),
             ),
             generation_attempt_id=attempt_id,
-            list_page_size=10,
+            list_page_size=SALAD_QUEUE_JOB_PAGE_SIZE,
             now=NOW + timedelta(minutes=3),
         )
         after_match = await session.get(GenerationAttempt, attempt_id)
@@ -1869,7 +1941,7 @@ async def test_superseded_unknown_attempt_retries_only_after_confirmed_provider_
                 session,
                 FakeSaladClient(list_pages={1: ()}),
                 generation_attempt_id=attempt_id,
-                list_page_size=10,
+                list_page_size=SALAD_QUEUE_JOB_PAGE_SIZE,
                 now=NOW + timedelta(minutes=minute),
             )
             attempt = await session.get(GenerationAttempt, attempt_id)
@@ -1885,7 +1957,7 @@ async def test_superseded_unknown_attempt_retries_only_after_confirmed_provider_
             session,
             FakeSaladClient(list_error=SaladTransportError("temporary outage")),
             generation_attempt_id=attempt_id,
-            list_page_size=10,
+            list_page_size=SALAD_QUEUE_JOB_PAGE_SIZE,
             now=NOW + timedelta(minutes=3),
         )
         assert unavailable.error_code == "salad_reconciliation_unavailable"
@@ -1894,7 +1966,7 @@ async def test_superseded_unknown_attempt_retries_only_after_confirmed_provider_
             session,
             FakeSaladClient(list_pages={1: ()}),
             generation_attempt_id=attempt_id,
-            list_page_size=10,
+            list_page_size=SALAD_QUEUE_JOB_PAGE_SIZE,
             now=NOW + timedelta(minutes=4),
         )
         after_reset_attempt = await session.get(GenerationAttempt, attempt_id)
@@ -1911,7 +1983,7 @@ async def test_superseded_unknown_attempt_retries_only_after_confirmed_provider_
                 session,
                 FakeSaladClient(list_pages={1: ()}),
                 generation_attempt_id=attempt_id,
-                list_page_size=10,
+                list_page_size=SALAD_QUEUE_JOB_PAGE_SIZE,
                 now=NOW + timedelta(minutes=minute),
             )
             assert pending.error_code == ("salad_deployment_rollover_provider_absence_pending")
@@ -1920,7 +1992,7 @@ async def test_superseded_unknown_attempt_retries_only_after_confirmed_provider_
             session,
             FakeSaladClient(list_pages={1: ()}),
             generation_attempt_id=attempt_id,
-            list_page_size=10,
+            list_page_size=SALAD_QUEUE_JOB_PAGE_SIZE,
             now=NOW + timedelta(minutes=6),
         )
         final_attempt = await session.get(GenerationAttempt, attempt_id)
@@ -2010,7 +2082,7 @@ async def test_unknown_submission_reconciles_by_metadata_then_get_and_ignores_re
             session,
             list_client,
             generation_attempt_id=attempt_id,
-            list_page_size=10,
+            list_page_size=SALAD_QUEUE_JOB_PAGE_SIZE,
             now=NOW + timedelta(minutes=2),
         )
 

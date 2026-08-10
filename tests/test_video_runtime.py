@@ -48,11 +48,14 @@ from gen_automation.domain.video import (
     VideoGenerationState,
 )
 from gen_automation.integrations.salad import (
+    SALAD_QUEUE_JOB_PAGE_SIZE,
     JSONValue,
     SaladAPIError,
     SaladJobStatus,
+    SaladProtocolError,
     SaladQueueJob,
     SaladQueueJobPage,
+    SaladRateLimitError,
     SaladTransportError,
 )
 from gen_automation.services.budgets import reserve_attempt_budget
@@ -86,6 +89,12 @@ class FakeSalad:
         self.raise_unknown_after_create = False
         self.create_queue_names: list[str] = []
         self.list_queue_names: list[str] = []
+        self.list_calls: list[tuple[str, int, int]] = []
+        self.list_page_overrides: dict[int, tuple[SaladQueueJob, ...]] = {}
+        self.list_page_errors: dict[int, Exception] = {}
+        self.blocked_list_pages: set[int] = set()
+        self.list_block_started = asyncio.Event()
+        self.release_list_block = asyncio.Event()
         self.get_queue_names: list[str] = []
         self.cancel_error: Exception | None = None
         self.get_error: Exception | None = None
@@ -138,11 +147,19 @@ class FakeSalad:
         queue_name: str,
         *,
         page: int = 1,
-        page_size: int = 50,
+        page_size: int = SALAD_QUEUE_JOB_PAGE_SIZE,
     ) -> SaladQueueJobPage:
         if self.fail_if_list_called:
             raise AssertionError("pristine attempt must not scan retained queue history")
         self.list_queue_names.append(queue_name)
+        self.list_calls.append((queue_name, page, page_size))
+        if error := self.list_page_errors.get(page):
+            raise error
+        if page in self.blocked_list_pages:
+            self.list_block_started.set()
+            await self.release_list_block.wait()
+        if page in self.list_page_overrides:
+            return SaladQueueJobPage(items=self.list_page_overrides[page])
         if page <= self.saturated_history_pages:
             return SaladQueueJobPage(
                 items=tuple(
@@ -152,7 +169,7 @@ class FakeSalad:
                         input={},
                         metadata={"kind": "unrelated-history"},
                     )
-                    for index in range(100)
+                    for index in range(page_size)
                 )
             )
         items = tuple(self.jobs.values())
@@ -496,7 +513,9 @@ async def test_unknown_submit_reconciles_without_duplicate(runtime_context: Runt
 
     assert await runtime_context.runtime.submit_once(now=NOW + timedelta(seconds=31)) is True
     assert runtime_context.salad.create_calls == 1
-    assert runtime_context.salad.list_queue_names == ["animation-video-v1-a1b2c3d4"]
+    assert runtime_context.salad.list_calls == [
+        ("animation-video-v1-a1b2c3d4", page, SALAD_QUEUE_JOB_PAGE_SIZE) for page in range(1, 5)
+    ]
     async with runtime_context.database.sessions() as session:
         attempt = await session.scalar(
             select(VideoGenerationAttempt).where(
@@ -571,9 +590,12 @@ async def test_saturated_unknown_history_advances_cursor_and_resolves(
     runtime_context.salad.raise_unknown_after_create = True
     await runtime_context.runtime.submit_once(now=NOW)
     runtime_context.salad.jobs.clear()
-    runtime_context.salad.saturated_history_pages = 11
+    runtime_context.salad.saturated_history_pages = 41
 
     assert await runtime_context.runtime.submit_once(now=NOW + timedelta(seconds=31)) is True
+    assert runtime_context.salad.list_calls == [
+        ("animation-video-v1-a1b2c3d4", page, SALAD_QUEUE_JOB_PAGE_SIZE) for page in range(1, 41)
+    ]
     async with runtime_context.database.sessions() as session:
         attempt = await session.scalar(
             select(VideoGenerationAttempt).where(
@@ -581,15 +603,157 @@ async def test_saturated_unknown_history_advances_cursor_and_resolves(
             )
         )
         assert attempt is not None
+        assert attempt.request_metadata["reconciliation_next_offset"] == 1000
+        assert attempt.request_metadata["reconciliation_page_size"] == SALAD_QUEUE_JOB_PAGE_SIZE
         assert attempt.request_metadata["reconciliation_next_page"] == 11
 
     assert await runtime_context.runtime.submit_once(now=NOW + timedelta(seconds=62)) is False
+    expected_initial_scan = [
+        ("animation-video-v1-a1b2c3d4", page, SALAD_QUEUE_JOB_PAGE_SIZE) for page in range(1, 41)
+    ]
+    expected_tail_scan = [
+        ("animation-video-v1-a1b2c3d4", page, SALAD_QUEUE_JOB_PAGE_SIZE) for page in range(41, 45)
+    ]
+    assert runtime_context.salad.list_calls == expected_initial_scan + expected_tail_scan
     assert await runtime_context.runtime.submit_once(now=NOW + timedelta(seconds=331)) is True
+    assert runtime_context.salad.list_calls == expected_initial_scan + (expected_tail_scan * 2)
     async with runtime_context.database.sessions() as session:
         job = await session.get(VideoGenerationJob, job_id)
         assert job is not None and job.state == VideoGenerationState.FAILED
         assert job.last_error_code == "video_submission_outcome_unresolved"
         assert job.reserved_cost_microusd == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_page_cursor_resumes_at_the_same_absolute_offset(
+    runtime_context: RuntimeContext,
+) -> None:
+    job_id = await _add_job(runtime_context, max_attempts=1)
+    await runtime_context.runtime.claim_once(now=NOW)
+    runtime_context.salad.raise_unknown_after_create = True
+    await runtime_context.runtime.submit_once(now=NOW)
+    runtime_context.salad.jobs.clear()
+    async with runtime_context.database.sessions() as session:
+        attempt = await session.scalar(
+            select(VideoGenerationAttempt).where(
+                VideoGenerationAttempt.video_generation_job_id == job_id
+            )
+        )
+        assert attempt is not None
+        attempt.request_metadata = {
+            **attempt.request_metadata,
+            "reconciliation_next_page": 11,
+        }
+        await session.commit()
+
+    assert await runtime_context.runtime.submit_once(now=NOW + timedelta(seconds=31)) is False
+    assert sorted(page for _queue, page, _size in runtime_context.salad.list_calls) == list(
+        range(41, 45)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_error"),
+    [
+        ("transport", SaladTransportError),
+        ("rate_limit", SaladRateLimitError),
+        ("timeout", TimeoutError),
+        ("oversized", SaladProtocolError),
+        ("inconsistent", SaladProtocolError),
+    ],
+)
+async def test_scan_failure_degrades_health_without_advancing_cursor_or_claiming(
+    runtime_context: RuntimeContext,
+    failure_mode: str,
+    expected_error: type[BaseException],
+) -> None:
+    first_job_id = await _add_job(runtime_context, max_attempts=1, request_suffix="1")
+    second_job_id = await _add_job(runtime_context, max_attempts=1, request_suffix="2")
+    await runtime_context.runtime.claim_once(now=NOW)
+    runtime_context.salad.raise_unknown_after_create = True
+    await runtime_context.runtime.submit_once(now=NOW)
+    runtime_context.salad.jobs.clear()
+    async with runtime_context.database.sessions() as session:
+        attempt = await session.scalar(
+            select(VideoGenerationAttempt).where(
+                VideoGenerationAttempt.video_generation_job_id == first_job_id
+            )
+        )
+        assert attempt is not None
+        attempt.request_metadata = {
+            **attempt.request_metadata,
+            "reconciliation_next_offset": 1000,
+            "reconciliation_page_size": SALAD_QUEUE_JOB_PAGE_SIZE,
+            "reconciliation_next_page": 11,
+        }
+        await session.commit()
+
+    runtime = runtime_context.runtime
+    if failure_mode == "transport":
+        runtime_context.salad.list_page_errors[41] = SaladTransportError("connection reset")
+    elif failure_mode == "rate_limit":
+        runtime_context.salad.list_page_errors[41] = SaladRateLimitError(
+            message="rate limited",
+            response_body="",
+            request_id=None,
+            retry_after_seconds=30,
+        )
+    elif failure_mode == "timeout":
+        runtime_context.salad.blocked_list_pages.add(41)
+        runtime = VideoRuntime(
+            config=replace(
+                runtime_context.runtime.config,
+                reconciliation_batch_timeout_seconds=0.01,
+            ),
+            sessions=runtime_context.database.sessions,
+            salad=cast(Any, runtime_context.salad),
+            store=runtime_context.store,
+            worker_id="controller-test:video-list-timeout",
+        )
+    elif failure_mode == "oversized":
+        runtime_context.salad.list_page_overrides[41] = tuple(
+            _remote_job(
+                remote_id=UUID(int=40_000 + index),
+                status=SaladJobStatus.PENDING,
+                input={},
+                metadata={"kind": "unrelated-history"},
+            )
+            for index in range(SALAD_QUEUE_JOB_PAGE_SIZE + 1)
+        )
+    else:
+        runtime_context.salad.list_page_overrides[41] = ()
+        runtime_context.salad.list_page_overrides[42] = (
+            _remote_job(
+                remote_id=UUID(int=30_001),
+                status=SaladJobStatus.PENDING,
+                input={},
+                metadata={"kind": "unrelated-history"},
+            ),
+        )
+
+    with pytest.raises(expected_error):
+        await runtime.run_once()
+    async with runtime_context.database.sessions() as session:
+        attempt = await session.scalar(
+            select(VideoGenerationAttempt).where(
+                VideoGenerationAttempt.video_generation_job_id == first_job_id
+            )
+        )
+        second_job = await session.get(VideoGenerationJob, second_job_id)
+        second_attempt_count = await session.scalar(
+            select(func.count(VideoGenerationAttempt.id)).where(
+                VideoGenerationAttempt.video_generation_job_id == second_job_id
+            )
+        )
+
+    assert attempt is not None
+    assert attempt.provider_external_id is None
+    assert attempt.request_metadata["reconciliation_next_offset"] == 1000
+    assert attempt.request_metadata["reconciliation_page_size"] == SALAD_QUEUE_JOB_PAGE_SIZE
+    assert attempt.request_metadata["reconciliation_next_page"] == 11
+    assert second_job is not None and second_job.state == VideoGenerationState.QUEUED
+    assert second_attempt_count == 0
 
 
 @pytest.mark.asyncio
@@ -607,9 +771,24 @@ async def test_duplicate_provider_matches_are_all_cancelled_before_release(
         input=first.input,
         metadata=first.metadata,
     )
+    runtime_context.salad.saturated_history_pages = 40
+    for page, remote in ((3, first), (40, duplicate)):
+        unrelated = tuple(
+            _remote_job(
+                remote_id=UUID(int=(page * 1000) + index + 100),
+                status=SaladJobStatus.PENDING,
+                input={},
+                metadata={"kind": "unrelated-history"},
+            )
+            for index in range(SALAD_QUEUE_JOB_PAGE_SIZE - 1)
+        )
+        runtime_context.salad.list_page_overrides[page] = (*unrelated, remote)
     runtime_context.salad.jobs[duplicate.id] = duplicate
 
     assert await runtime_context.runtime.submit_once(now=NOW + timedelta(seconds=31)) is True
+    assert sorted(page for _queue, page, _size in runtime_context.salad.list_calls) == list(
+        range(1, 41)
+    )
     async with runtime_context.database.sessions() as session:
         job = await session.get(VideoGenerationJob, job_id)
         attempt = await session.scalar(
@@ -692,7 +871,9 @@ async def test_ambiguous_old_attempt_reconciles_on_frozen_queue_after_rollout(
     )
 
     assert await rolled_runtime.submit_once(now=NOW + timedelta(seconds=31)) is True
-    assert runtime_context.salad.list_queue_names == ["animation-video-v1-a1b2c3d4"]
+    assert runtime_context.salad.list_calls == [
+        ("animation-video-v1-a1b2c3d4", page, SALAD_QUEUE_JOB_PAGE_SIZE) for page in range(1, 5)
+    ]
     async with runtime_context.database.sessions() as session:
         job = await session.get(VideoGenerationJob, job_id)
         attempt = await session.scalar(
@@ -1466,6 +1647,8 @@ def test_video_runtime_config_rejects_ttls_shorter_than_provider_runway() -> Non
         replace(config, grant_ttl_seconds=1200)
     with pytest.raises(ValueError, match="grant TTL"):
         replace(config, grant_ttl_seconds=14_401)
+    with pytest.raises(ValueError, match="retry timing"):
+        replace(config, reconciliation_batch_timeout_seconds=30.1)
 
 
 @pytest.mark.asyncio
