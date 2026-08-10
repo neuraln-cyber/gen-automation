@@ -4,6 +4,7 @@ import math
 import os
 import stat
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import NoReturn
@@ -28,6 +29,7 @@ from gen_automation.domain.compliance_registry import (
     WorkflowApprovalCreate,
 )
 from gen_automation.domain.enums import AdminRole, ModelArtifactKind
+from gen_automation.domain.release_spec import GenerationParameters, WorkflowSpecification
 from gen_automation.gpu_worker.artifacts import (
     ArtifactBootstrapError,
     ArtifactKind,
@@ -46,12 +48,18 @@ from gen_automation.services.compliance_registry import (
     approve_model_artifact,
     approve_workflow,
 )
+from gen_automation.services.controlled_trio import (
+    CONTROLLED_TRIO_MARKER_NODE_CLASS,
+    ControlledTrioContractError,
+    prepare_controlled_trio_template,
+)
 from gen_automation.services.worker_inputs import (
     CONTROLLED_DUO_MARKER_NODE_CLASS,
     LORA_CHAIN_NODE_CLASS,
     MAX_WORKFLOW_BYTES,
     WorkerInputError,
     _parse_workflow_template,
+    _prepare_controlled_duo_template,
 )
 from gen_automation.storage.base import (
     ObjectAlreadyExistsError,
@@ -66,6 +74,7 @@ MAX_PLAN_DEPTH = 32
 MAX_PLAN_ITEMS = 4_096
 _ONBOARDING_NODE_CLASSES = DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES | {
     CONTROLLED_DUO_MARKER_NODE_CLASS,
+    CONTROLLED_TRIO_MARKER_NODE_CLASS,
     LORA_CHAIN_NODE_CLASS,
 }
 
@@ -358,7 +367,7 @@ def _validate_workflow(
     try:
         graph = _parse_workflow_template(body)
         validate_approved_workflow(graph, _ONBOARDING_NODE_CLASSES)
-        _validate_controlled_duo_onboarding_evidence(graph, entry=entry)
+        _validate_controlled_composition_onboarding_evidence(graph, entry=entry)
     except (WorkerInputError, ValueError):
         raise ArtifactOnboardingError(f"workflow {entry.name!r} failed graph validation") from None
     sha256 = hashlib.sha256(body).hexdigest()
@@ -373,7 +382,11 @@ def _validate_workflow(
                 for node in graph.values()
                 if isinstance(node, dict)
                 and isinstance(node.get("class_type"), str)
-                and node.get("class_type") != CONTROLLED_DUO_MARKER_NODE_CLASS
+                and node.get("class_type")
+                not in {
+                    CONTROLLED_DUO_MARKER_NODE_CLASS,
+                    CONTROLLED_TRIO_MARKER_NODE_CLASS,
+                }
             }
         )
     )
@@ -385,36 +398,123 @@ def _validate_workflow(
     )
 
 
-def _validate_controlled_duo_onboarding_evidence(
+def _validate_controlled_composition_onboarding_evidence(
     graph: Mapping[str, object],
     *,
     entry: WorkflowOnboardingEntry,
 ) -> None:
-    markers = [
+    duo_markers = [
         node
         for node in graph.values()
         if isinstance(node, Mapping) and node.get("class_type") == CONTROLLED_DUO_MARKER_NODE_CLASS
     ]
+    trio_markers = [
+        node
+        for node in graph.values()
+        if isinstance(node, Mapping) and node.get("class_type") == CONTROLLED_TRIO_MARKER_NODE_CLASS
+    ]
     capabilities = {str(capability) for capability in entry.capabilities}
     declares_controlled_duo = "controlled_duo_v2" in capabilities
+    declares_controlled_trio = "controlled_trio_v1" in capabilities
+    if declares_controlled_duo and declares_controlled_trio:
+        raise WorkerInputError("controlled composition onboarding evidence is invalid")
     if not declares_controlled_duo:
-        if markers or capabilities.intersection({"duo_strict_isolation", "duo_high_quality"}):
+        if duo_markers or capabilities.intersection({"duo_strict_isolation", "duo_high_quality"}):
             raise WorkerInputError("Controlled Duo onboarding evidence is invalid")
+    else:
+        if len(duo_markers) != 1 or trio_markers:
+            raise WorkerInputError("Controlled Duo onboarding evidence is invalid")
+        inputs = duo_markers[0].get("inputs")
+        if not isinstance(inputs, Mapping):
+            raise WorkerInputError("Controlled Duo onboarding evidence is invalid")
+        isolation_mode = inputs.get("isolation_mode")
+        if (
+            inputs.get("contract_version") != 2
+            or inputs.get("mask_topology") != "disjoint_preset_rectangles_v1"
+            or isolation_mode not in {"balanced", "strict"}
+            or ("duo_strict_isolation" in capabilities) != (isolation_mode == "strict")
+            or "duo_high_quality" in capabilities
+        ):
+            raise WorkerInputError("Controlled Duo onboarding evidence is invalid")
+        specification = _controlled_onboarding_workflow_specification(entry)
+        generation = _controlled_onboarding_generation(
+            composition_mode="duo",
+            isolation_mode=str(isolation_mode),
+        )
+        _prepare_controlled_duo_template(
+            deepcopy(dict(graph)),
+            specification=specification,
+            generation=generation,
+        )
         return
-    if len(markers) != 1:
-        raise WorkerInputError("Controlled Duo onboarding evidence is invalid")
-    inputs = markers[0].get("inputs")
+
+    if not declares_controlled_trio:
+        if trio_markers:
+            raise WorkerInputError("Controlled Trio onboarding evidence is invalid")
+        return
+    if len(trio_markers) != 1:
+        raise WorkerInputError("Controlled Trio onboarding evidence is invalid")
+    inputs = trio_markers[0].get("inputs")
     if not isinstance(inputs, Mapping):
-        raise WorkerInputError("Controlled Duo onboarding evidence is invalid")
-    isolation_mode = inputs.get("isolation_mode")
+        raise WorkerInputError("Controlled Trio onboarding evidence is invalid")
     if (
-        inputs.get("contract_version") != 2
-        or inputs.get("mask_topology") != "disjoint_preset_rectangles_v1"
-        or isolation_mode not in {"balanced", "strict"}
-        or ("duo_strict_isolation" in capabilities) != (isolation_mode == "strict")
-        or "duo_high_quality" in capabilities
+        inputs.get("contract_version") != 1
+        or inputs.get("mask_topology") != "three_disjoint_regions_v1"
+        or inputs.get("isolation_mode") != "balanced"
+        or capabilities.intersection({"duo_strict_isolation", "duo_high_quality"})
     ):
-        raise WorkerInputError("Controlled Duo onboarding evidence is invalid")
+        raise WorkerInputError("Controlled Trio onboarding evidence is invalid")
+    try:
+        prepare_controlled_trio_template(
+            deepcopy(dict(graph)),
+            specification=_controlled_onboarding_workflow_specification(entry),
+            generation=_controlled_onboarding_generation(
+                composition_mode="trio",
+                isolation_mode="balanced",
+            ),
+        )
+    except ControlledTrioContractError:
+        raise WorkerInputError("Controlled Trio onboarding evidence is invalid") from None
+
+
+def _controlled_onboarding_workflow_specification(
+    entry: WorkflowOnboardingEntry,
+) -> WorkflowSpecification:
+    return WorkflowSpecification(
+        name="Controlled composition onboarding validation",
+        version="1",
+        object_key="workflows/onboarding-validation.json",
+        sha256="0" * 64,
+        capabilities=tuple(entry.capabilities),
+    )
+
+
+def _controlled_onboarding_generation(
+    *,
+    composition_mode: str,
+    isolation_mode: str,
+) -> GenerationParameters:
+    trio = composition_mode == "trio"
+    return GenerationParameters.model_validate(
+        {
+            "composition_mode": composition_mode,
+            "duo_contract_version": 3 if trio else 2,
+            "composition_preset_id": "trio_flexible" if trio else "flexible",
+            "prompt": "controlled composition topology validation",
+            "character_a_prompt": "adult character A",
+            "character_b_prompt": "adult character B",
+            "character_c_prompt": "adult character C" if trio else "",
+            "duo_isolation_mode": isolation_mode,
+            "duo_quality_mode": "standard",
+            "seed": 1,
+            "width": 1024,
+            "height": 1024,
+            "steps": 20,
+            "sampler": "euler",
+            "scheduler": "normal",
+            "outputs_per_job": 1,
+        }
+    )
 
 
 async def _ensure_workflow_object(

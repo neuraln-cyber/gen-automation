@@ -4,7 +4,7 @@ from enum import StrEnum
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,9 +31,11 @@ from gen_automation.domain.controlled_duo import (
     DuoCompositionPreset,
     DuoIsolationMode,
     DuoQualityMode,
+    TrioCompositionPreset,
     WorkflowCapability,
     effective_workflow_capabilities,
     require_controlled_duo_capabilities,
+    require_controlled_trio_capabilities,
 )
 from gen_automation.domain.deliverability import (
     MAX_ACCEPTED_IMAGES_PER_RELEASE,
@@ -53,7 +55,10 @@ from gen_automation.domain.enums import (
     SaladDeploymentState,
     ScoringRunState,
 )
-from gen_automation.domain.generation_limits import MAX_OUTPUTS_PER_GENERATION_JOB
+from gen_automation.domain.generation_limits import (
+    MAX_OUTPUTS_PER_GENERATION_JOB,
+    effective_outputs_per_generation_job,
+)
 from gen_automation.domain.release_spec import (
     ArtifactSpecification,
     GenerationBatchSpecification,
@@ -138,6 +143,17 @@ class NewSetBatchSubmission(BaseModel):
     image_count: int = Field(ge=1, le=80_000)
     prompt: str = Field(min_length=1, max_length=20_000)
     negative_prompt: str | None = Field(default=None, max_length=20_000)
+    character_a_prompt: str | None = Field(default=None, max_length=20_000)
+    character_b_prompt: str | None = Field(default=None, max_length=20_000)
+    character_a_pose_prompt: str | None = Field(default=None, max_length=20_000)
+    character_b_pose_prompt: str | None = Field(default=None, max_length=20_000)
+    character_c_prompt: str | None = Field(default=None, max_length=20_000)
+    character_c_pose_prompt: str | None = Field(default=None, max_length=20_000)
+    character_a_negative_prompt: str | None = Field(default=None, max_length=20_000)
+    character_b_negative_prompt: str | None = Field(default=None, max_length=20_000)
+    character_c_negative_prompt: str | None = Field(default=None, max_length=20_000)
+    interaction_prompt: str | None = Field(default=None, max_length=20_000)
+    camera_prompt: str | None = Field(default=None, max_length=20_000)
     detailer_prompt: str | None = Field(default=None, max_length=20_000)
     detailer_negative_prompt: str | None = Field(default=None, max_length=20_000)
     seed: int | None = Field(default=None, ge=-1, le=(2**63) - 1)
@@ -164,13 +180,19 @@ class NewSetSubmission(BaseModel):
     title: str = Field(min_length=1, max_length=300)
     subject_approval_id: UUID
     secondary_subject_approval_id: UUID | None = None
-    composition_mode: Literal["single", "duo"] = "single"
-    duo_contract_version: Literal[1, 2] = 1
-    composition_preset_id: DuoCompositionPreset | None = None
+    tertiary_subject_approval_id: UUID | None = None
+    composition_mode: Literal["single", "duo", "trio"] = "single"
+    duo_contract_version: Literal[1, 2, 3] = 1
+    composition_preset_id: DuoCompositionPreset | TrioCompositionPreset | None = None
     character_a_prompt: str = Field(default="", max_length=20_000)
     character_b_prompt: str = Field(default="", max_length=20_000)
+    character_a_pose_prompt: str = Field(default="", max_length=20_000)
+    character_b_pose_prompt: str = Field(default="", max_length=20_000)
+    character_c_prompt: str = Field(default="", max_length=20_000)
+    character_c_pose_prompt: str = Field(default="", max_length=20_000)
     character_a_negative_prompt: str = Field(default="", max_length=20_000)
     character_b_negative_prompt: str = Field(default="", max_length=20_000)
+    character_c_negative_prompt: str = Field(default="", max_length=20_000)
     interaction_prompt: str = Field(default="", max_length=20_000)
     camera_prompt: str = Field(default="", max_length=20_000)
     duo_isolation_mode: DuoIsolationMode = DuoIsolationMode.BALANCED
@@ -221,15 +243,23 @@ class NewSetSubmission(BaseModel):
     @model_validator(mode="after")
     def validate_plan(self) -> "NewSetSubmission":
         if self.composition_mode == "single":
-            if self.secondary_subject_approval_id is not None:
-                raise ValueError("single-character composition cannot include a second subject")
+            if (
+                self.secondary_subject_approval_id is not None
+                or self.tertiary_subject_approval_id is not None
+            ):
+                raise ValueError("single-character composition cannot include extra subjects")
             if (
                 self.duo_contract_version != 1
                 or self.composition_preset_id is not None
                 or self.character_a_prompt.strip()
                 or self.character_b_prompt.strip()
+                or self.character_a_pose_prompt.strip()
+                or self.character_b_pose_prompt.strip()
+                or self.character_c_prompt.strip()
+                or self.character_c_pose_prompt.strip()
                 or self.character_a_negative_prompt.strip()
                 or self.character_b_negative_prompt.strip()
+                or self.character_c_negative_prompt.strip()
                 or self.interaction_prompt.strip()
                 or self.camera_prompt.strip()
                 or self.duo_isolation_mode != DuoIsolationMode.BALANCED
@@ -238,9 +268,11 @@ class NewSetSubmission(BaseModel):
                 raise ValueError(
                     "single-character composition cannot include Controlled Duo fields"
                 )
-        else:
+        elif self.composition_mode == "duo":
             if self.secondary_subject_approval_id is None:
                 raise ValueError("two-character composition requires a second subject")
+            if self.tertiary_subject_approval_id is not None:
+                raise ValueError("two-character composition cannot include a third subject")
             if self.secondary_subject_approval_id == self.subject_approval_id:
                 raise ValueError("two-character composition requires two different subjects")
             if not self.character_a_prompt.strip() or not self.character_b_prompt.strip():
@@ -248,6 +280,8 @@ class NewSetSubmission(BaseModel):
             if self.duo_contract_version == 1:
                 if (
                     self.composition_preset_id is not None
+                    or self.character_a_pose_prompt
+                    or self.character_b_pose_prompt
                     or self.character_a_negative_prompt
                     or self.character_b_negative_prompt
                     or self.interaction_prompt
@@ -256,8 +290,73 @@ class NewSetSubmission(BaseModel):
                     or self.duo_quality_mode != DuoQualityMode.STANDARD
                 ):
                     raise ValueError("Controlled Duo fields require duo contract version 2")
-            elif self.composition_preset_id is None:
+            elif self.duo_contract_version == 2 and self.composition_preset_id is None:
                 raise ValueError("Controlled Duo v2 requires a composition preset")
+            elif self.duo_contract_version != 2:
+                raise ValueError("two-character composition requires duo contract version 1 or 2")
+            elif not isinstance(self.composition_preset_id, DuoCompositionPreset):
+                raise ValueError("two-character composition requires a two-character layout")
+            if (
+                self.character_c_prompt
+                or self.character_c_pose_prompt
+                or self.character_c_negative_prompt
+            ):
+                raise ValueError("two-character composition cannot include Character C fields")
+        else:
+            subject_ids = (
+                self.subject_approval_id,
+                self.secondary_subject_approval_id,
+                self.tertiary_subject_approval_id,
+            )
+            if any(subject_id is None for subject_id in subject_ids):
+                raise ValueError("three-character composition requires three subjects")
+            if len(set(subject_ids)) != 3:
+                raise ValueError("three-character composition requires three different subjects")
+            if self.duo_contract_version != 3:
+                raise ValueError("three-character composition requires Controlled Trio contract v1")
+            if not all(
+                prompt.strip()
+                for prompt in (
+                    self.character_a_prompt,
+                    self.character_b_prompt,
+                    self.character_c_prompt,
+                )
+            ):
+                raise ValueError("three-character composition requires all three character prompts")
+            if not isinstance(self.composition_preset_id, TrioCompositionPreset):
+                raise ValueError("three-character composition requires a three-character layout")
+            if self.duo_isolation_mode != DuoIsolationMode.BALANCED:
+                raise ValueError("Controlled Trio v1 currently supports balanced isolation only")
+            if self.duo_quality_mode == DuoQualityMode.HIGH:
+                raise ValueError("high trio quality is not implemented")
+        if self.duo_contract_version not in {2, 3} and any(
+            override is not None
+            for batch in self.batches
+            for override in (
+                batch.character_a_prompt,
+                batch.character_b_prompt,
+                batch.character_a_pose_prompt,
+                batch.character_b_pose_prompt,
+                batch.character_c_prompt,
+                batch.character_c_pose_prompt,
+                batch.character_a_negative_prompt,
+                batch.character_b_negative_prompt,
+                batch.character_c_negative_prompt,
+                batch.interaction_prompt,
+                batch.camera_prompt,
+            )
+        ):
+            raise ValueError("multi-character batch fields require a controlled composition")
+        if self.composition_mode == "duo" and any(
+            override is not None
+            for batch in self.batches
+            for override in (
+                batch.character_c_prompt,
+                batch.character_c_pose_prompt,
+                batch.character_c_negative_prompt,
+            )
+        ):
+            raise ValueError("two-character batches cannot include Character C fields")
         lora_ids = [selection.approval_id for selection in self.loras]
         if len(lora_ids) != len(set(lora_ids)):
             raise ValueError("a LoRA can be selected only once")
@@ -280,12 +379,20 @@ class NewSetSubmission(BaseModel):
         return self
 
     @property
+    def effective_outputs_per_job(self) -> int:
+        return effective_outputs_per_generation_job(
+            composition_mode=self.composition_mode,
+            requested=self.outputs_per_job,
+        )
+
+    @property
     def effective_planned_job_count(self) -> int:
+        outputs_per_job = self.effective_outputs_per_job
         if not self.batches:
-            return self.planned_job_count
+            requested_images = self.planned_job_count * self.outputs_per_job
+            return (requested_images + outputs_per_job - 1) // outputs_per_job
         return sum(
-            (batch.image_count + self.outputs_per_job - 1) // self.outputs_per_job
-            for batch in self.batches
+            (batch.image_count + outputs_per_job - 1) // outputs_per_job for batch in self.batches
         )
 
 
@@ -315,6 +422,7 @@ class WorkflowOption:
     has_regional_prompting: bool
     capabilities: tuple[WorkflowCapability, ...]
     supports_controlled_duo_v2: bool
+    supports_controlled_trio_v1: bool
     supports_duo_strict_isolation: bool
     supports_duo_high_quality: bool
 
@@ -339,11 +447,16 @@ class NewSetOptions:
         return bool(self.subjects and self.checkpoints and self.workflows)
 
 
-def _workflow_option(row: WorkflowApproval) -> WorkflowOption:
-    capabilities = effective_workflow_capabilities(
-        row.capabilities or (),
-        reviewed_node_classes=row.reviewed_node_classes,
-    )
+def _workflow_option(row: WorkflowApproval) -> WorkflowOption | None:
+    try:
+        capabilities = effective_workflow_capabilities(
+            row.capabilities or (),
+            reviewed_node_classes=row.reviewed_node_classes,
+        )
+    except ValueError:
+        # Old approvals can predate capability-coherence validation. Keep an
+        # incoherent row unavailable without taking down every workflow option.
+        return None
     return WorkflowOption(
         approval_id=row.id,
         name=row.name,
@@ -354,6 +467,7 @@ def _workflow_option(row: WorkflowApproval) -> WorkflowOption:
         has_regional_prompting=(WorkflowCapability.REGIONAL_PROMPTING_V1 in capabilities),
         capabilities=tuple(sorted(capabilities, key=str)),
         supports_controlled_duo_v2=(WorkflowCapability.CONTROLLED_DUO_V2 in capabilities),
+        supports_controlled_trio_v1=(WorkflowCapability.CONTROLLED_TRIO_V1 in capabilities),
         supports_duo_strict_isolation=(WorkflowCapability.DUO_STRICT_ISOLATION in capabilities),
         supports_duo_high_quality=(WorkflowCapability.DUO_HIGH_QUALITY in capabilities),
     )
@@ -523,19 +637,21 @@ async def list_new_set_options(session: AsyncSession) -> NewSetOptions:
             or managed_lora_lifecycles.get(row.id) == ManagedLoraLifecycle.ACTIVE
         )
     )
-    workflows = tuple(
-        _workflow_option(row)
-        for row in (
-            await session.scalars(
-                select(WorkflowApproval)
-                .where(
-                    WorkflowApproval.status == ApprovalStatus.APPROVED,
-                    WorkflowApproval.is_current.is_(True),
-                )
-                .order_by(WorkflowApproval.name, WorkflowApproval.version)
+    workflow_options: list[WorkflowOption] = []
+    for row in (
+        await session.scalars(
+            select(WorkflowApproval)
+            .where(
+                WorkflowApproval.status == ApprovalStatus.APPROVED,
+                WorkflowApproval.is_current.is_(True),
             )
-        ).all()
-    )
+            .order_by(WorkflowApproval.name, WorkflowApproval.version)
+        )
+    ).all():
+        option = _workflow_option(row)
+        if option is not None:
+            workflow_options.append(option)
+    workflows = tuple(workflow_options)
     wildcard_libraries = await list_wildcard_libraries(session)
     wildcards = tuple(
         WildcardOption(
@@ -573,6 +689,11 @@ async def create_and_approve_new_set(
         if command.secondary_subject_approval_id is not None
         else None
     )
+    tertiary_subject = (
+        await _approved_subject(session, command.tertiary_subject_approval_id)
+        if command.tertiary_subject_approval_id is not None
+        else None
+    )
     checkpoint = await _approved_artifact(
         session,
         command.checkpoint_approval_id,
@@ -605,10 +726,20 @@ async def create_and_approve_new_set(
             )
         except ValueError as error:
             raise NewSetInputError(str(error)) from error
+    if command.composition_mode == "trio":
+        try:
+            require_controlled_trio_capabilities(
+                workflow_capabilities,
+                isolation_mode=command.duo_isolation_mode,
+                quality_mode=command.duo_quality_mode,
+            )
+        except ValueError as error:
+            raise NewSetInputError(str(error)) from error
     if command.composition_mode == "single" and workflow_capabilities.intersection(
         {
             WorkflowCapability.REGIONAL_PROMPTING_V1,
             WorkflowCapability.CONTROLLED_DUO_V2,
+            WorkflowCapability.CONTROLLED_TRIO_V1,
         }
     ):
         raise NewSetInputError("single-character composition requires a standard workflow profile")
@@ -622,6 +753,7 @@ async def create_and_approve_new_set(
     except DeliverabilityError as error:
         raise NewSetInputError(str(error)) from error
 
+    effective_outputs_per_job = command.effective_outputs_per_job
     base_generation = GenerationParameters(
         prompt=(command.prompt if command.prompt.strip() else command.batches[0].prompt),
         negative_prompt=command.negative_prompt,
@@ -635,7 +767,7 @@ async def create_and_approve_new_set(
         sampler=command.sampler,
         scheduler=command.scheduler,
         clip_skip=command.clip_skip,
-        outputs_per_job=command.outputs_per_job,
+        outputs_per_job=effective_outputs_per_job,
         hires_scale=command.hires_scale,
         hires_denoise=command.hires_denoise,
         hires_upscale_method=command.hires_upscale_method,
@@ -651,8 +783,13 @@ async def create_and_approve_new_set(
         composition_preset_id=command.composition_preset_id,
         character_a_prompt=command.character_a_prompt,
         character_b_prompt=command.character_b_prompt,
+        character_a_pose_prompt=command.character_a_pose_prompt,
+        character_b_pose_prompt=command.character_b_pose_prompt,
+        character_c_prompt=command.character_c_prompt,
+        character_c_pose_prompt=command.character_c_pose_prompt,
         character_a_negative_prompt=command.character_a_negative_prompt,
         character_b_negative_prompt=command.character_b_negative_prompt,
+        character_c_negative_prompt=command.character_c_negative_prompt,
         interaction_prompt=command.interaction_prompt,
         camera_prompt=command.camera_prompt,
         duo_isolation_mode=command.duo_isolation_mode,
@@ -666,40 +803,72 @@ async def create_and_approve_new_set(
             if batch.seed is not None
             else (-1 if command.seed == -1 else (command.seed + implicit_seed_offset) % (2**63))
         )
+        overrides: dict[str, object] = {
+            "prompt": batch.prompt,
+            "negative_prompt": (
+                command.negative_prompt if batch.negative_prompt is None else batch.negative_prompt
+            ),
+            "detailer_prompt": (
+                command.detailer_prompt if batch.detailer_prompt is None else batch.detailer_prompt
+            ),
+            "detailer_negative_prompt": (
+                command.detailer_negative_prompt
+                if batch.detailer_negative_prompt is None
+                else batch.detailer_negative_prompt
+            ),
+            "seed": batch_seed,
+        }
+        for field_name in (
+            "character_a_prompt",
+            "character_b_prompt",
+            "character_a_pose_prompt",
+            "character_b_pose_prompt",
+            "character_c_prompt",
+            "character_c_pose_prompt",
+            "character_a_negative_prompt",
+            "character_b_negative_prompt",
+            "character_c_negative_prompt",
+            "interaction_prompt",
+            "camera_prompt",
+        ):
+            value = getattr(batch, field_name)
+            if value is not None:
+                overrides[field_name] = value
+        try:
+            batch_generation = GenerationParameters.model_validate(
+                {**base_generation.model_dump(mode="python"), **overrides}
+            )
+        except ValidationError:
+            raise NewSetInputError(
+                f"generation batch {batch.name!r} contains invalid prompt overrides"
+            ) from None
         generation_batches.append(
             GenerationBatchSpecification(
                 name=batch.name,
                 image_count=batch.image_count,
-                generation=base_generation.model_copy(
-                    update={
-                        "prompt": batch.prompt,
-                        "negative_prompt": (
-                            command.negative_prompt
-                            if batch.negative_prompt is None
-                            else batch.negative_prompt
-                        ),
-                        "detailer_prompt": (
-                            command.detailer_prompt
-                            if batch.detailer_prompt is None
-                            else batch.detailer_prompt
-                        ),
-                        "detailer_negative_prompt": (
-                            command.detailer_negative_prompt
-                            if batch.detailer_negative_prompt is None
-                            else batch.detailer_negative_prompt
-                        ),
-                        "seed": batch_seed,
-                    }
-                ),
+                generation=batch_generation,
             )
         )
         implicit_seed_offset += batch.image_count
+    if not generation_batches and effective_outputs_per_job != command.outputs_per_job:
+        # Preserve the exact user-requested image count while transparently
+        # splitting a large Controlled Trio request into signed-envelope-safe
+        # provider jobs. The batch remains unrestricted from the user's point
+        # of view; only the internal fan-out changes.
+        generation_batches.append(
+            GenerationBatchSpecification(
+                name="Default batch",
+                image_count=command.planned_job_count * command.outputs_per_job,
+                generation=base_generation,
+            )
+        )
     selected_generation = (
         generation_batches[0].generation if generation_batches else base_generation
     )
 
     specification = ReleaseSpecification(
         schema_version=2 if generation_batches else 1,
+        worker_request_budget_version=2,
         subjects=[
             SubjectSpecification(
                 name=row.display_name,
@@ -712,7 +881,7 @@ async def create_and_approve_new_set(
                 is_real_person=False,
                 is_aged_up_minor=False,
             )
-            for row in (subject, secondary_subject)
+            for row in (subject, secondary_subject, tertiary_subject)
             if row is not None
         ],
         checkpoint=ArtifactSpecification(

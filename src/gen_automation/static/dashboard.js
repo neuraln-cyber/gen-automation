@@ -37,6 +37,12 @@
     const scope = document.body?.dataset.automationStorageScope?.trim() || "unknown-user";
     return `${key}:${scope}`;
   };
+  const scopedAutomationDraftKey = (key) => {
+    const scopeRoot = document.querySelector("[data-automation-draft-scope]");
+    const draftScope = scopeRoot?.dataset.automationDraftScope?.trim() || "automation";
+    if (draftScope === "automation") return scopedStorageKey(key);
+    return scopedStorageKey(`${key}:${draftScope}`);
+  };
 
   const persistSamePageScroll = () => {
     try {
@@ -87,13 +93,19 @@
   const AUTOMATION_PRESET_FIELDS = Object.freeze([
     "subject_id",
     "subject_2_id",
+    "subject_3_id",
     "composition_mode",
     "character_a_prompt",
     "character_b_prompt",
+    "character_a_pose_prompt",
+    "character_b_pose_prompt",
+    "character_c_prompt",
+    "character_c_pose_prompt",
     "duo_contract_version",
     "composition_preset_id",
     "character_a_negative_prompt",
     "character_b_negative_prompt",
+    "character_c_negative_prompt",
     "duo_isolation_mode",
     "duo_quality_mode",
     "interaction_prompt",
@@ -126,44 +138,105 @@
 
   const namedControl = (form, name) => form.querySelector(`[name="${name}"]`);
 
+  const insertPromptToken = (target, token) => {
+    if (!(target instanceof HTMLInputElement) && !(target instanceof HTMLTextAreaElement)) return;
+    if (!token) return;
+    const start = target.selectionStart ?? target.value.length;
+    const end = target.selectionEnd ?? start;
+    const prefix = start > 0 && !/[\s,]$/.test(target.value.slice(0, start)) ? ", " : "";
+    const suffix = end < target.value.length && !/^[\s,]/.test(target.value.slice(end))
+      ? ", "
+      : "";
+    target.setRangeText(`${prefix}${token}${suffix}`, start, end, "end");
+    target.focus();
+    target.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+
   const CONTROLLED_DUO_PRESETS = Object.freeze({
+    flexible: Object.freeze({
+      label: "Auto / flexible",
+      description: "Neutral identity regions; your pose and interaction text controls the action.",
+      camera: "two-character composition, both characters clearly visible",
+      interaction: "",
+    }),
     close_portrait: Object.freeze({
       label: "Close portrait",
-      description: "Tight shoulder-to-shoulder framing with separate face regions.",
+      description: "Tight framing with separate identity and face regions.",
       camera: "tight two-shot portrait, eye-level camera, both faces fully visible",
-      interaction: "shoulder-to-shoulder, a clear gap between both faces",
+      interaction: "",
     }),
     overhead: Object.freeze({
       label: "Overhead / selfie",
       description: "High camera with controlled foreshortening and two clear silhouettes.",
       camera: "high-angle overhead view, wide-angle foreshortening, both faces visible",
-      interaction: "standing close together and looking up toward the camera",
+      interaction: "",
     }),
     low_angle: Object.freeze({
       label: "Low angle",
-      description: "Ground-up perspective with full, non-overlapping body lanes.",
+      description: "Ground-up framing with separate, full-height identity lanes.",
       camera: "dramatic low-angle view, full figures, strong perspective",
-      interaction: "standing side-by-side with contrasting poses and clear silhouettes",
+      interaction: "",
     }),
     diagonal_depth: Object.freeze({
       label: "Diagonal depth",
-      description: "A leads in the foreground while B remains distinct in the rear region.",
+      description: "A foreground region and B rear region remain independently readable.",
       camera: "diagonal depth composition, character A foreground, character B background",
-      interaction: "moving in the same direction with offset depth and no body overlap",
+      interaction: "",
     }),
     back_to_back: Object.freeze({
-      label: "Back-to-back",
-      description: "Opposing body angles create a strong shared silhouette without trait mixing.",
-      camera: "medium two-shot, opposing three-quarter angles, balanced negative space",
-      interaction: "back-to-back, looking in opposite directions, shoulders lightly touching",
+      label: "Opposed regions",
+      description: "Opposed identity regions create separation without choosing either pose.",
+      camera: "medium two-shot, separate left and right identity regions, balanced negative space",
+      interaction: "",
     }),
     full_body: Object.freeze({
       label: "Full-body duo",
       description: "Head-to-toe framing with generous separation around both figures.",
       camera: "full-body two-shot, head-to-toe framing, eye-level camera",
-      interaction: "standing together in complementary poses with space between limbs",
+      interaction: "",
     }),
   });
+
+  const CONTROLLED_TRIO_PRESETS = Object.freeze({
+    trio_flexible: Object.freeze({
+      label: "Auto / flexible trio",
+      description: "Neutral A/B/C identity regions; freeform pose text controls the action.",
+      camera: "three-character composition, all three characters clearly visible",
+      interaction: "",
+    }),
+    trio_row: Object.freeze({
+      label: "Three-column identity regions",
+      description: "Three readable identity lanes with equal visual weight.",
+      camera: "three-character composition, three readable columns, all faces visible",
+      interaction: "",
+    }),
+    trio_triangle: Object.freeze({
+      label: "Triangle identity regions",
+      description: "Two lower identity regions and one upper region; actions remain freeform.",
+      camera: "three-character composition, triangular visual hierarchy, all faces visible",
+      interaction: "",
+    }),
+    trio_depth: Object.freeze({
+      label: "Layered-depth identity regions",
+      description: "Foreground, middle, and rear identity regions with distinct scale guidance.",
+      camera: "three-character composition with layered depth, all identities readable",
+      interaction: "",
+    }),
+  });
+
+  const CONTROLLED_BATCH_OVERRIDE_FIELDS = Object.freeze([
+    "character_a_prompt",
+    "character_b_prompt",
+    "character_c_prompt",
+    "character_a_pose_prompt",
+    "character_b_pose_prompt",
+    "character_c_pose_prompt",
+    "character_a_negative_prompt",
+    "character_b_negative_prompt",
+    "character_c_negative_prompt",
+    "interaction_prompt",
+    "camera_prompt",
+  ]);
 
   const readStoredAutomationPresets = () => {
     try {
@@ -231,6 +304,17 @@
           optionalPromptsValid = false;
         }
       });
+      CONTROLLED_BATCH_OVERRIDE_FIELDS.forEach((fieldName) => {
+        const value = batch[fieldName];
+        if (value === null || typeof value === "undefined") {
+          optionalPrompts[fieldName] = null;
+        } else if (typeof value === "string" && value.length <= 20_000) {
+          // For controlled overrides, an explicit empty string clears the inherited field.
+          optionalPrompts[fieldName] = value;
+        } else {
+          optionalPromptsValid = false;
+        }
+      });
       if (!optionalPromptsValid) return null;
 
       let seed = null;
@@ -247,6 +331,11 @@
       }
 
       names.add(nameKey);
+      const controlledOverrides = Object.fromEntries(
+        CONTROLLED_BATCH_OVERRIDE_FIELDS.map((fieldName) => (
+          [fieldName, optionalPrompts[fieldName]]
+        )),
+      );
       normalized.push({
         name: normalizedName,
         image_count: batch.image_count,
@@ -254,6 +343,7 @@
         negative_prompt: optionalPrompts.negative_prompt,
         detailer_prompt: optionalPrompts.detailer_prompt,
         detailer_negative_prompt: optionalPrompts.detailer_negative_prompt,
+        ...controlledOverrides,
         seed,
       });
     }
@@ -304,6 +394,7 @@
     });
     const subject = namedControl(form, "subject_id")?.selectedOptions?.item(0);
     const secondarySubject = namedControl(form, "subject_2_id")?.selectedOptions?.item(0);
+    const tertiarySubject = namedControl(form, "subject_3_id")?.selectedOptions?.item(0);
     const checkpoint = namedControl(form, "checkpoint_id")?.selectedOptions?.item(0);
     const workflow = namedControl(form, "workflow_id")?.selectedOptions?.item(0);
     return {
@@ -315,6 +406,8 @@
         subject_slug: subject?.dataset.subjectSlug || "",
         secondary_subject_name: secondarySubject?.dataset.subjectName || "",
         secondary_subject_slug: secondarySubject?.dataset.subjectSlug || "",
+        tertiary_subject_name: tertiarySubject?.dataset.subjectName || "",
+        tertiary_subject_slug: tertiarySubject?.dataset.subjectSlug || "",
         checkpoint_name: checkpoint?.dataset.checkpointName || "",
         checkpoint_sha256: checkpoint?.dataset.checkpointSha256 || "",
         workflow_name: workflow?.dataset.workflowName || "",
@@ -383,6 +476,7 @@
     const matchedSelects = new Set([
       "subject_id",
       "subject_2_id",
+      "subject_3_id",
       "composition_mode",
       "checkpoint_id",
       "workflow_id",
@@ -457,7 +551,32 @@
         secondarySubjectName ? `Subject ${secondarySubjectName}` : "Saved second subject",
       );
     }
-    const compositionMode = fields.composition_mode === "duo" ? "duo" : "single";
+    const tertiarySubjectName = typeof matches.tertiary_subject_name === "string"
+      ? matches.tertiary_subject_name
+      : "";
+    const tertiarySubjectSlug = typeof matches.tertiary_subject_slug === "string"
+      ? matches.tertiary_subject_slug
+      : "";
+    const tertiarySubjectId = typeof fields.subject_3_id === "string"
+      ? fields.subject_3_id
+      : "";
+    if (tertiarySubjectName || tertiarySubjectSlug || tertiarySubjectId) {
+      matchRequiredSelect(
+        "subject_3_id",
+        [
+          (option) => Boolean(tertiarySubjectId && option.value === tertiarySubjectId),
+          (option) => Boolean(
+            tertiarySubjectSlug && option.dataset.subjectSlug === tertiarySubjectSlug
+          ),
+          (option) => Boolean(
+            tertiarySubjectName && option.dataset.subjectName === tertiarySubjectName
+          ),
+        ],
+        tertiarySubjectName ? `Subject ${tertiarySubjectName}` : "Saved third subject",
+      );
+    }
+    const compositionMode = ["duo", "trio"].includes(fields.composition_mode)
+      ? fields.composition_mode : "single";
     const compositionControl = form.querySelector(
       `[name="composition_mode"][value="${compositionMode}"]`,
     );
@@ -576,6 +695,23 @@
     render();
   }
 
+  function initializePromptWildcardPickers() {
+    document.querySelectorAll("[data-prompt-wildcard]").forEach((picker) => {
+      if (!(picker instanceof HTMLSelectElement)
+          || picker.dataset.promptWildcardInitialized === "true") return;
+      const form = picker.closest("form");
+      if (!(form instanceof HTMLFormElement)) return;
+      picker.addEventListener("change", () => {
+        const token = picker.value;
+        const targetName = picker.dataset.promptWildcardTarget || "";
+        const target = targetName ? namedControl(form, targetName) : null;
+        picker.value = "";
+        insertPromptToken(target, token);
+      });
+      picker.dataset.promptWildcardInitialized = "true";
+    });
+  }
+
   function consumePendingImageProfile() {
     const form = document.querySelector("[data-automation-form]");
     if (!form) return false;
@@ -602,7 +738,7 @@
 
   const readStoredAutomationDraft = () => {
     try {
-      const raw = window.localStorage.getItem(scopedStorageKey(AUTOMATION_DRAFT_STORAGE_KEY));
+      const raw = window.localStorage.getItem(scopedAutomationDraftKey(AUTOMATION_DRAFT_STORAGE_KEY));
       if (!raw) return null;
       const draft = JSON.parse(raw);
       if (!draft || draft.schema_version !== 1 || !Array.isArray(draft.batch_plan)) return null;
@@ -618,7 +754,7 @@
     if (!form || !(planData instanceof HTMLTextAreaElement)) return false;
     if (form.dataset.serverError === "true") {
       try {
-        window.sessionStorage.removeItem(scopedStorageKey(AUTOMATION_DRAFT_SUBMISSION_KEY));
+        window.sessionStorage.removeItem(scopedAutomationDraftKey(AUTOMATION_DRAFT_SUBMISSION_KEY));
       } catch (_error) {
         // Storage availability must not replace the server-returned form values.
       }
@@ -969,6 +1105,10 @@
     const submitButtons = Array.from(form.querySelectorAll(".queue-submit"));
     const serverDisabled = submitButtons.some((button) => button.disabled);
     const maximumProviderJobs = 10_000;
+    const signedOutputsPerJobCap = Math.max(
+      1,
+      integerValue(form.dataset.signedOutputsPerJobCap, 8),
+    );
     let lastPrompt = null;
     let slugWasEdited = Boolean(slugInput && slugInput.value.trim());
     let previousDefaultPrompt = defaultPrompt ? defaultPrompt.value : "";
@@ -987,9 +1127,62 @@
     if (defaultPrompt) defaultPrompt.required = false;
 
     const field = (row, name) => row.querySelector(`[data-batch-field="${name}"]`);
+    const activeCompositionMode = () => {
+      const requested = form.querySelector('[name="composition_mode"]:checked')?.value
+        || namedControl(form, "composition_mode")?.value;
+      return ["duo", "trio"].includes(requested) ? requested : "single";
+    };
+    const controlledCompositionIsActive = () => {
+      const mode = activeCompositionMode();
+      const version = namedControl(form, "duo_contract_version")?.value;
+      return (mode === "duo" && version === "2") || (mode === "trio" && version === "3");
+    };
+    const activeControlledOverrideFields = () => {
+      if (!controlledCompositionIsActive()) return new Set();
+      const mode = activeCompositionMode();
+      return new Set(CONTROLLED_BATCH_OVERRIDE_FIELDS.filter((name) => (
+        mode === "trio" || !name.startsWith("character_c_")
+      )));
+    };
+    const emptyControlledBatchOverrides = () => Object.fromEntries(
+      CONTROLLED_BATCH_OVERRIDE_FIELDS.map((name) => [name, null]),
+    );
+    const overrideToggle = (row, name) => row.querySelector(
+      `[data-batch-override-toggle="${name}"]`,
+    );
+    const renderBatchOverrideControls = (row) => {
+      const activeFields = activeControlledOverrideFields();
+      const section = row.querySelector("[data-batch-controlled-overrides]");
+      if (section instanceof HTMLElement) section.hidden = activeFields.size === 0;
+      row.querySelectorAll("[data-batch-trio-only]").forEach((node) => {
+        if (node instanceof HTMLElement) node.hidden = activeCompositionMode() !== "trio";
+      });
+      CONTROLLED_BATCH_OVERRIDE_FIELDS.forEach((name) => {
+        const control = field(row, name);
+        const toggle = overrideToggle(row, name);
+        const active = activeFields.has(name);
+        const enabled = active && toggle instanceof HTMLInputElement && toggle.checked;
+        if (toggle instanceof HTMLInputElement) toggle.disabled = !active;
+        if (control instanceof HTMLTextAreaElement) control.disabled = !enabled;
+        const picker = row.querySelector(`[data-batch-wildcard-target="${name}"]`);
+        if (picker instanceof HTMLSelectElement) picker.disabled = !active;
+      });
+    };
 
     const readRow = (row) => {
       const seedInput = field(row, "seed");
+      const activeFields = activeControlledOverrideFields();
+      const controlledOverrides = Object.fromEntries(
+        CONTROLLED_BATCH_OVERRIDE_FIELDS.map((name) => {
+          const toggle = overrideToggle(row, name);
+          return [
+            name,
+            activeFields.has(name) && toggle instanceof HTMLInputElement && toggle.checked
+              ? field(row, name).value
+              : null,
+          ];
+        }),
+      );
       return {
         name: field(row, "name").value.trim(),
         image_count: integerValue(field(row, "image_count").value, 0),
@@ -998,6 +1191,7 @@
         negative_prompt: field(row, "negative_prompt").value,
         detailer_prompt: optionalText(field(row, "detailer_prompt").value),
         detailer_negative_prompt: optionalText(field(row, "detailer_negative_prompt").value),
+        ...controlledOverrides,
         // Keep the decimal text exact; valid backend seeds extend beyond JS's safe integer range.
         seed: seedInput.value.trim() === "" ? null : seedInput.value.trim(),
       };
@@ -1058,21 +1252,10 @@
           negative_prompt: defaultNegative ? defaultNegative.value : "",
           detailer_prompt: null,
           detailer_negative_prompt: null,
+          ...emptyControlledBatchOverrides(),
           seed: null,
         };
       });
-    };
-
-    const insertToken = (target, token) => {
-      const start = target.selectionStart ?? target.value.length;
-      const end = target.selectionEnd ?? start;
-      const prefix = start > 0 && !/[\s,]$/.test(target.value.slice(0, start)) ? ", " : "";
-      const suffix = end < target.value.length && !/^[\s,]/.test(target.value.slice(end))
-        ? ", "
-        : "";
-      target.setRangeText(`${prefix}${token}${suffix}`, start, end, "end");
-      target.focus();
-      target.dispatchEvent(new Event("input", { bubbles: true }));
     };
 
     const nextUniqueName = (preferred, ignoredRow = null) => {
@@ -1096,6 +1279,7 @@
       negative_prompt: defaultNegative ? defaultNegative.value : "",
       detailer_prompt: null,
       detailer_negative_prompt: null,
+      ...emptyControlledBatchOverrides(),
       seed: null,
     });
 
@@ -1109,8 +1293,16 @@
         ?? (defaultNegative ? defaultNegative.value : "");
       field(row, "detailer_prompt").value = batch.detailer_prompt ?? "";
       field(row, "detailer_negative_prompt").value = batch.detailer_negative_prompt ?? "";
+      CONTROLLED_BATCH_OVERRIDE_FIELDS.forEach((name) => {
+        field(row, name).value = batch[name] ?? "";
+        const toggle = overrideToggle(row, name);
+        if (toggle instanceof HTMLInputElement) {
+          toggle.checked = batch[name] !== null && typeof batch[name] !== "undefined";
+        }
+      });
       field(row, "seed").value = batch.seed ?? "";
       list.insertBefore(fragment, before);
+      renderBatchOverrideControls(row);
       if (!deferUpdate) updateBuilder();
       return row;
     };
@@ -1159,8 +1351,20 @@
     const setBatchValidity = () => {
       const rows = batchRows();
       const names = new Map();
+      const activeFields = activeControlledOverrideFields();
       let hasUnknownWildcard = false;
       [defaultPrompt, defaultNegative, defaultDetailer, defaultDetailerNegative].forEach((control) => {
+        hasUnknownWildcard = applyWildcardValidity(control) || hasUnknownWildcard;
+      });
+      form.querySelectorAll("[data-wildcard-aware]").forEach((control) => {
+        const active = !control.disabled && (
+          !CONTROLLED_BATCH_OVERRIDE_FIELDS.includes(control.name)
+          || activeFields.has(control.name)
+        );
+        if (!active) {
+          control.setCustomValidity("");
+          return;
+        }
         hasUnknownWildcard = applyWildcardValidity(control) || hasUnknownWildcard;
       });
       rows.forEach((row) => {
@@ -1169,10 +1373,23 @@
         const duplicate = key && names.has(key);
         nameInput.setCustomValidity(duplicate ? "Batch labels must be unique." : "");
         if (key && !duplicate) names.set(key, row);
-        ["prompt", "negative_prompt", "detailer_prompt", "detailer_negative_prompt"]
+        const wildcardFields = [
+          "prompt",
+          "negative_prompt",
+          "detailer_prompt",
+          "detailer_negative_prompt",
+          ...Array.from(activeFields).filter((name) => {
+            const toggle = overrideToggle(row, name);
+            return toggle instanceof HTMLInputElement && toggle.checked;
+          }),
+        ];
+        wildcardFields
           .forEach((name) => {
             hasUnknownWildcard = applyWildcardValidity(field(row, name)) || hasUnknownWildcard;
           });
+        CONTROLLED_BATCH_OVERRIDE_FIELDS
+          .filter((name) => !wildcardFields.includes(name))
+          .forEach((name) => field(row, name).setCustomValidity(""));
       });
       const totalImages = rows.reduce(
         (total, row) => total + Math.max(0, integerValue(field(row, "image_count").value)),
@@ -1202,17 +1419,29 @@
     const updateBuilder = () => {
       if (form.dataset.applyingAutomationProfile === "true") return;
       const rows = batchRows();
-      const perJob = Math.max(1, integerValue(outputsPerJob && outputsPerJob.value, 1));
+      const requestedPerJob = Math.max(
+        1,
+        integerValue(outputsPerJob && outputsPerJob.value, 1),
+      );
+      const perJob = Math.min(requestedPerJob, signedOutputsPerJobCap);
       let totalImages = 0;
       let totalJobs = 0;
       rows.forEach((row, index) => {
+        renderBatchOverrideControls(row);
         const imageCount = Math.max(0, integerValue(field(row, "image_count").value));
         const name = field(row, "name").value.trim() || `Batch ${index + 1}`;
         totalImages += imageCount;
         totalJobs += Math.ceil(imageCount / perJob);
         row.querySelector("[data-batch-number]").textContent = `Batch ${index + 1}`;
         row.querySelector("[data-batch-heading]").textContent = name;
-        const wildcardNames = ["prompt", "negative_prompt"].flatMap((promptField) =>
+        const wildcardNames = [
+          "prompt",
+          "negative_prompt",
+          ...Array.from(activeControlledOverrideFields()).filter((name) => {
+            const toggle = overrideToggle(row, name);
+            return toggle instanceof HTMLInputElement && toggle.checked;
+          }),
+        ].flatMap((promptField) =>
           Array.from(
             field(row, promptField).value.matchAll(wildcardPattern),
             (match) => match[1],
@@ -1286,7 +1515,7 @@
           note.textContent = "Every batch needs a prompt structure before this run can start.";
           note.className = "summary-note warning";
         } else if (unknownWildcard) {
-          note.textContent = "Fix the unknown wildcard highlighted in the batch queue.";
+          note.textContent = "Fix the unknown wildcard highlighted in a prompt field.";
           note.className = "summary-note warning";
         } else if (tooManyJobs) {
           note.textContent = `Reduce the queue to ${maximumProviderJobs.toLocaleString()} GPU jobs or fewer.`;
@@ -1298,7 +1527,10 @@
           note.textContent = "Face maximum size must be at least the guide size.";
           note.className = "summary-note warning";
         } else {
-          note.textContent = `${totalImages.toLocaleString()} images will run as ${totalJobs.toLocaleString()} efficient GPU jobs.`;
+          const chunkingNote = requestedPerJob > perJob
+            ? ` Provider jobs are safely split at ${perJob} images each; your batch sizes are unchanged.`
+            : "";
+          note.textContent = `${totalImages.toLocaleString()} images will run as ${totalJobs.toLocaleString()} efficient GPU jobs.${chunkingNote}`;
           note.className = "summary-note ready";
         }
       }
@@ -1333,6 +1565,7 @@
         negative_prompt: defaultNegative ? defaultNegative.value : "",
         detailer_prompt: null,
         detailer_negative_prompt: null,
+        ...emptyControlledBatchOverrides(),
         seed: null,
       }];
     }
@@ -1354,6 +1587,11 @@
       event.detail.replaced = replaceBatchPlan(event.detail.batch_plan);
     });
     form.addEventListener("gen-automation:refresh-batch-plan", updateBuilder);
+    form.addEventListener("gen-automation:profile-changed", updateBuilder);
+    form.addEventListener("input", (event) => {
+      if (event.target instanceof HTMLTextAreaElement
+          && event.target.matches("[data-wildcard-aware]")) updateBuilder();
+    });
 
     if (batchSequenceApply instanceof HTMLButtonElement
         && batchSequenceInput instanceof HTMLTextAreaElement) {
@@ -1415,13 +1653,23 @@
     }
 
     list.addEventListener("change", (event) => {
-      if (!event.target.matches("[data-batch-wildcard]")) return;
-      const token = event.target.value;
-      if (!token) return;
       const row = event.target.closest("[data-batch-row]");
-      const targetName = event.target.dataset.batchWildcardTarget || "prompt";
-      insertToken(field(row, targetName), token);
-      event.target.value = "";
+      if (!row) return;
+      if (event.target.matches("[data-batch-override-toggle]")) {
+        renderBatchOverrideControls(row);
+        updateBuilder();
+        return;
+      }
+      if (event.target.matches("[data-batch-wildcard]")) {
+        const token = event.target.value;
+        if (!token) return;
+        const targetName = event.target.dataset.batchWildcardTarget || "prompt";
+        const toggle = overrideToggle(row, targetName);
+        if (toggle instanceof HTMLInputElement && !toggle.disabled) toggle.checked = true;
+        renderBatchOverrideControls(row);
+        insertPromptToken(field(row, targetName), token);
+        event.target.value = "";
+      }
     });
 
     list.addEventListener("focusin", (event) => {
@@ -1461,7 +1709,7 @@
     form.querySelectorAll("[data-wildcard-token]").forEach((button) => {
       button.addEventListener("click", () => {
         const target = lastPrompt || field(batchRows()[0], "prompt");
-        insertToken(target, button.dataset.wildcardToken);
+        insertPromptToken(target, button.dataset.wildcardToken);
       });
     });
 
@@ -1571,7 +1819,7 @@
         const submissionId = namedControl(form, "submission_id");
         if (submissionId instanceof HTMLInputElement && submissionId.value) {
           window.sessionStorage.setItem(
-            scopedStorageKey(AUTOMATION_DRAFT_SUBMISSION_KEY),
+            scopedAutomationDraftKey(AUTOMATION_DRAFT_SUBMISSION_KEY),
             submissionId.value,
           );
         }
@@ -1619,7 +1867,7 @@
         const seed = namedControl(form, "seed");
         const desiredCount = namedControl(form, "desired_accepted_count");
         const submissionId = namedControl(form, "submission_id");
-        window.localStorage.setItem(scopedStorageKey(AUTOMATION_DRAFT_STORAGE_KEY), JSON.stringify({
+        window.localStorage.setItem(scopedAutomationDraftKey(AUTOMATION_DRAFT_STORAGE_KEY), JSON.stringify({
           schema_version: 1,
           saved_at: new Date().toISOString(),
           title: title instanceof HTMLInputElement ? title.value : "",
@@ -1658,7 +1906,7 @@
         if (timer !== null) window.clearTimeout(timer);
         timer = null;
         try {
-          window.localStorage.removeItem(scopedStorageKey(AUTOMATION_DRAFT_STORAGE_KEY));
+          window.localStorage.removeItem(scopedAutomationDraftKey(AUTOMATION_DRAFT_STORAGE_KEY));
           setStatus("Saved draft cleared; the current form is unchanged.", "success");
         } catch (_error) {
           setStatus("Draft storage is unavailable in this browser.", "warning");
@@ -1673,12 +1921,12 @@
     const submittedDraftId = progress.dataset.submittedDraftId || "";
     if (!submittedDraftId) return;
     try {
-      const submissionKey = scopedStorageKey(AUTOMATION_DRAFT_SUBMISSION_KEY);
+      const submissionKey = scopedAutomationDraftKey(AUTOMATION_DRAFT_SUBMISSION_KEY);
       if (window.sessionStorage.getItem(submissionKey) !== submittedDraftId) return;
       const draft = readStoredAutomationDraft();
       window.sessionStorage.removeItem(submissionKey);
       if (!draft || draft.submission_id !== submittedDraftId) return;
-      window.localStorage.removeItem(scopedStorageKey(AUTOMATION_DRAFT_STORAGE_KEY));
+      window.localStorage.removeItem(scopedAutomationDraftKey(AUTOMATION_DRAFT_STORAGE_KEY));
     } catch (_error) {
       // A private-browser storage failure does not affect the queued run.
     }
@@ -4243,22 +4491,58 @@
   function sanitizedGenerationDetails(value) {
     if (!isRecord(value) || value.available !== true) return { available: false };
 
-    const compositionMode = isRecord(value.composition) && value.composition.mode === "duo"
-      ? "duo"
+    const compositionSource = isRecord(value.composition) ? value.composition : {};
+    const compositionMode = ["duo", "trio"].includes(compositionSource.mode)
+      ? compositionSource.mode
       : "single";
+    const composition = {
+      mode: compositionMode,
+      ...safeFields(compositionSource, [
+        "contract_version",
+        "preset_id",
+        "isolation_mode",
+        "quality_mode",
+      ]),
+    };
     const promptSource = isRecord(value.prompts) ? value.prompts : {};
     const prompts = {};
+    const controlledPromptNames = new Set([
+      "character_a",
+      "character_b",
+      "character_c",
+      "character_a_pose",
+      "character_b_pose",
+      "character_c_pose",
+      "character_a_negative",
+      "character_b_negative",
+      "character_c_negative",
+      "interaction",
+      "camera",
+    ]);
+    const characterCPromptNames = new Set([
+      "character_c",
+      "character_c_pose",
+      "character_c_negative",
+    ]);
     [
       "positive",
       "character_a",
       "character_b",
+      "character_c",
+      "character_a_pose",
+      "character_b_pose",
+      "character_c_pose",
+      "character_a_negative",
+      "character_b_negative",
+      "character_c_negative",
+      "interaction",
+      "camera",
       "negative",
       "detailer_positive",
       "detailer_negative",
     ].forEach((name) => {
-      if ((name === "character_a" || name === "character_b") && compositionMode !== "duo") {
-        return;
-      }
+      if (controlledPromptNames.has(name) && compositionMode === "single") return;
+      if (characterCPromptNames.has(name) && compositionMode !== "trio") return;
       const prompt = safePrompt(promptSource[name]);
       if (prompt !== null) prompts[name] = prompt;
     });
@@ -4315,7 +4599,7 @@
         ? null
         : safeFields(value.batch, ["index", "name", "image_offset", "image_count"]),
       subjects,
-      composition: { mode: compositionMode },
+      composition,
       prompts,
       sampling: safeFields(value.sampling, [
         "seed",
@@ -4466,8 +4750,17 @@
 
   const promptLabels = {
     positive: "Positive prompt",
-    character_a: "Left character prompt",
-    character_b: "Right character prompt",
+    character_a: "Character A identity / appearance",
+    character_b: "Character B identity / appearance",
+    character_c: "Character C identity / appearance",
+    character_a_pose: "Character A pose / action",
+    character_b_pose: "Character B pose / action",
+    character_c_pose: "Character C pose / action",
+    character_a_negative: "Character A negative / exclude",
+    character_b_negative: "Character B negative / exclude",
+    character_c_negative: "Character C negative / exclude",
+    interaction: "Combined pose / interaction",
+    camera: "Camera / framing",
     negative: "Negative prompt",
     detailer_positive: "Detailer prompt",
     detailer_negative: "Detailer negative prompt",
@@ -4514,13 +4807,30 @@
   const forgeStyleImageInfo = (details) => {
     const positive = details.prompts.positive?.resolved || "";
     const negative = details.prompts.negative?.resolved || "";
-    const regionalPrompts = details.composition.mode === "duo"
-      ? [
-        "Composition: two characters (left / right)",
-        `Left character prompt: ${details.prompts.character_a?.resolved || ""}`,
-        `Right character prompt: ${details.prompts.character_b?.resolved || ""}`,
-      ]
-      : [];
+    const controlledPrompts = [];
+    if (details.composition.mode !== "single") {
+      controlledPrompts.push(
+        details.composition.mode === "trio"
+          ? "Composition: three characters (A / B / C)"
+          : "Composition: two characters (A / B)",
+      );
+      [
+        "character_a",
+        "character_b",
+        ...(details.composition.mode === "trio" ? ["character_c"] : []),
+        "character_a_pose",
+        "character_b_pose",
+        ...(details.composition.mode === "trio" ? ["character_c_pose"] : []),
+        "character_a_negative",
+        "character_b_negative",
+        ...(details.composition.mode === "trio" ? ["character_c_negative"] : []),
+        "interaction",
+        "camera",
+      ].forEach((name) => {
+        const resolved = details.prompts[name]?.resolved;
+        if (typeof resolved === "string") controlledPrompts.push(`${promptLabels[name]}: ${resolved}`);
+      });
+    }
     const loraTags = details.loras.map((lora) => (
       `<lora:${displayValue(lora.name)}:${displayValue(lora.weight)}>`
     ));
@@ -4562,7 +4872,7 @@
     if (loras.length > 0) sampling.push(`Lora hashes: "${loras.join(", ")}"`);
     return [
       positiveWithLoras,
-      ...regionalPrompts,
+      ...controlledPrompts,
       `Negative prompt: ${negative}`,
       sampling.join(", "),
     ].join("\n");
@@ -4575,8 +4885,36 @@
     };
     assign("negative_prompt", preferredPromptText(details.prompts.negative));
     assign("composition_mode", details.composition.mode);
+    assign(
+      "duo_contract_version",
+      details.composition.mode === "trio"
+        ? "3"
+        : details.composition.mode === "duo"
+          && String(details.composition.contract_version) === "2" ? "2" : "1",
+    );
+    assign("composition_preset_id", details.composition.preset_id);
+    assign("duo_isolation_mode", details.composition.isolation_mode);
+    assign("duo_quality_mode", details.composition.quality_mode);
     assign("character_a_prompt", preferredPromptText(details.prompts.character_a));
     assign("character_b_prompt", preferredPromptText(details.prompts.character_b));
+    assign("character_c_prompt", preferredPromptText(details.prompts.character_c));
+    assign("character_a_pose_prompt", preferredPromptText(details.prompts.character_a_pose));
+    assign("character_b_pose_prompt", preferredPromptText(details.prompts.character_b_pose));
+    assign("character_c_pose_prompt", preferredPromptText(details.prompts.character_c_pose));
+    assign(
+      "character_a_negative_prompt",
+      preferredPromptText(details.prompts.character_a_negative),
+    );
+    assign(
+      "character_b_negative_prompt",
+      preferredPromptText(details.prompts.character_b_negative),
+    );
+    assign(
+      "character_c_negative_prompt",
+      preferredPromptText(details.prompts.character_c_negative),
+    );
+    assign("interaction_prompt", preferredPromptText(details.prompts.interaction));
+    assign("camera_prompt", preferredPromptText(details.prompts.camera));
     assign("detailer_prompt", preferredPromptText(details.prompts.detailer_positive));
     assign("detailer_negative_prompt", preferredPromptText(details.prompts.detailer_negative));
     ["width", "height", "cfg", "steps", "sampler", "scheduler", "clip_skip"].forEach((name) => {
@@ -4609,6 +4947,7 @@
       matches: {
         subject_name: details.subjects[0]?.name || "",
         secondary_subject_name: details.subjects[1]?.name || "",
+        tertiary_subject_name: details.subjects[2]?.name || "",
         checkpoint_name: details.checkpoint.name || "",
         checkpoint_sha256: details.checkpoint.sha256 || "",
         workflow_name: details.workflow.name || "",
@@ -4683,8 +5022,13 @@
       ["Job image", jobPosition],
       ["Subject", details.subjects.map((item) => item.name).filter(Boolean).join(", ")],
       ["Composition", (
-        details.composition.mode === "duo" ? "Two characters (left / right)" : "Single character"
+        details.composition.mode === "trio"
+          ? "Three characters (A / B / C)"
+          : details.composition.mode === "duo" ? "Two characters (A / B)" : "Single character"
       )],
+      ["Identity-region guide", details.composition.preset_id],
+      ["Isolation", details.composition.isolation_mode],
+      ["Controlled quality", details.composition.quality_mode],
     ]);
 
     const promptsSection = addSection(body, "Prompts used");
@@ -5783,11 +6127,12 @@
     schedule(1500);
   }
 
+
   const initializeControlledDuoBuilders = () => {
     const genericSharedTags = new Set([
       "adult", "adult character", "adult woman", "adult man", "woman", "man",
-      "1girl", "1boy", "2girls", "2boys", "two characters", "detailed face",
-      "high quality", "best quality", "masterpiece",
+      "1girl", "1boy", "2girls", "2boys", "3girls", "3boys", "two characters",
+      "three characters", "detailed face", "high quality", "best quality", "masterpiece",
     ]);
     const normalizedWords = (value) => String(value || "")
       .normalize("NFKD")
@@ -5810,12 +6155,6 @@
       const form = builder.closest("form");
       if (!(form instanceof HTMLFormElement)) return;
       const workflow = form.querySelector("[data-workflow-profile]");
-      const firstSubject = namedControl(form, "subject_id");
-      const secondSubject = namedControl(form, "subject_2_id");
-      const firstPrompt = namedControl(form, "character_a_prompt");
-      const secondPrompt = namedControl(form, "character_b_prompt");
-      const firstNegative = namedControl(form, "character_a_negative_prompt");
-      const secondNegative = namedControl(form, "character_b_negative_prompt");
       const contractVersion = namedControl(form, "duo_contract_version");
       const preset = namedControl(form, "composition_preset_id");
       const interaction = namedControl(form, "interaction_prompt");
@@ -5823,30 +6162,55 @@
       const isolation = namedControl(form, "duo_isolation_mode");
       const quality = namedControl(form, "duo_quality_mode");
       const sharedPrompt = namedControl(form, "prompt");
+      const characterControls = [
+        {
+          key: "a",
+          subject: namedControl(form, "subject_id"),
+          prompt: namedControl(form, "character_a_prompt"),
+          pose: namedControl(form, "character_a_pose_prompt"),
+          negative: namedControl(form, "character_a_negative_prompt"),
+          card: builder.querySelector('[data-character-card="a"]'),
+        },
+        {
+          key: "b",
+          subject: namedControl(form, "subject_2_id"),
+          prompt: namedControl(form, "character_b_prompt"),
+          pose: namedControl(form, "character_b_pose_prompt"),
+          negative: namedControl(form, "character_b_negative_prompt"),
+          card: builder.querySelector('[data-character-card="b"]'),
+        },
+        {
+          key: "c",
+          subject: namedControl(form, "subject_3_id"),
+          prompt: namedControl(form, "character_c_prompt"),
+          pose: namedControl(form, "character_c_pose_prompt"),
+          negative: namedControl(form, "character_c_negative_prompt"),
+          card: builder.querySelector('[data-character-card="c"]'),
+        },
+      ];
       if (!(workflow instanceof HTMLSelectElement)
-          || !(firstSubject instanceof HTMLSelectElement)
-          || !(secondSubject instanceof HTMLSelectElement)
-          || !(firstPrompt instanceof HTMLTextAreaElement)
-          || !(secondPrompt instanceof HTMLTextAreaElement)
-          || !(firstNegative instanceof HTMLTextAreaElement)
-          || !(secondNegative instanceof HTMLTextAreaElement)
           || !(contractVersion instanceof HTMLInputElement)
           || !(preset instanceof HTMLSelectElement)
           || !(interaction instanceof HTMLTextAreaElement)
           || !(camera instanceof HTMLTextAreaElement)
           || !(isolation instanceof HTMLSelectElement)
           || !(quality instanceof HTMLSelectElement)
-          || !(sharedPrompt instanceof HTMLTextAreaElement)) return;
+          || !(sharedPrompt instanceof HTMLTextAreaElement)
+          || characterControls.some(({ subject, prompt, pose, negative }) => (
+            !(subject instanceof HTMLSelectElement)
+            || !(prompt instanceof HTMLTextAreaElement)
+            || !(pose instanceof HTMLTextAreaElement)
+            || !(negative instanceof HTMLTextAreaElement)
+          ))) return;
 
+      const [characterA, characterB, characterC] = characterControls;
       const modeControls = Array.from(form.querySelectorAll('[name="composition_mode"]'))
         .filter((control) => control instanceof HTMLInputElement
           || control instanceof HTMLSelectElement);
       const workbench = builder.querySelector("[data-duo-workbench]");
       const regionalContainer = builder.querySelector("[data-experiment-regional-prompts]");
-      const secondCard = builder.querySelector('[data-character-card="b"]');
-      const duoOnly = Array.from(builder.querySelectorAll("[data-duo-only]"));
       const promptFields = Array.from(builder.querySelectorAll("[data-character-prompt-field]"));
-      const v2Controls = Array.from(builder.querySelectorAll("[data-duo-v2-control]"))
+      const controlledControls = Array.from(builder.querySelectorAll("[data-duo-v2-control]"))
         .filter((control) => control instanceof HTMLInputElement
           || control instanceof HTMLTextAreaElement
           || control instanceof HTMLSelectElement);
@@ -5855,14 +6219,18 @@
       const highOption = builder.querySelector("[data-duo-high-option]");
       const isolationHint = builder.querySelector("[data-duo-isolation-hint]");
       const preview = builder.querySelector("[data-duo-mask-preview]");
+      const regionCanvas = builder.querySelector("[data-controlled-region-canvas]");
+      const maskC = builder.querySelector("[data-duo-mask-c]");
       const presetLabel = builder.querySelector("[data-duo-preset-label]");
       const presetDescription = builder.querySelector("[data-duo-preset-description]");
+      const characterList = builder.querySelector("[data-controlled-character-list]");
+      const populationLabel = builder.querySelector("[data-controlled-population-label]");
+      const preflightLabel = builder.querySelector("[data-controlled-preflight-label]");
       const costNote = builder.querySelector("[data-duo-cost-note]");
       const lint = builder.querySelector("[data-duo-prompt-lint]");
       const capabilityStatus = builder.querySelector("[data-duo-capability-status]");
       const compositionStatus = builder.querySelector("[data-composition-status]");
       const swap = builder.querySelector("[data-swap-characters]");
-      const firstCard = builder.querySelector('[data-character-card="a"]');
       const firstSide = builder.querySelector("[data-character-side-a]");
       const firstPosition = builder.querySelector("[data-character-position-a]");
 
@@ -5871,8 +6239,12 @@
           control instanceof HTMLInputElement && control.checked
         ));
         const select = modeControls.find((control) => control instanceof HTMLSelectElement);
-        return (checked?.value || select?.value) === "duo" ? "duo" : "single";
+        const requested = checked?.value || select?.value;
+        return ["duo", "trio"].includes(requested) ? requested : "single";
       };
+      const activeCharacters = (mode = activeMode()) => (
+        mode === "trio" ? characterControls : mode === "duo" ? characterControls.slice(0, 2) : []
+      );
       const selectedSubjectName = (control) => {
         if (!control.value) return "";
         return control.selectedOptions.item(0)?.dataset.subjectName
@@ -5885,15 +6257,20 @@
         return {
           regional: option?.dataset.regionalPrompting === "true",
           v2: option?.dataset.duoContractV2 === "true",
+          trio: option?.dataset.trioContractV1 === "true",
           strict: option?.dataset.duoStrictIsolation === "true",
-          high: option?.dataset.duoQualityHigh === "true",
         };
       };
-      const supportsMode = (option, mode) => (mode === "duo"
-        ? option?.dataset.duoContractV2 === "true"
-          || option?.dataset.regionalPrompting === "true"
-        : option?.dataset.duoContractV2 !== "true"
-          && option?.dataset.regionalPrompting !== "true");
+      const supportsMode = (option, mode) => {
+        if (mode === "trio") return option?.dataset.trioContractV1 === "true";
+        if (mode === "duo") {
+          return option?.dataset.duoContractV2 === "true"
+            || option?.dataset.regionalPrompting === "true";
+        }
+        return option?.dataset.duoContractV2 !== "true"
+          && option?.dataset.trioContractV1 !== "true"
+          && option?.dataset.regionalPrompting !== "true";
+      };
       const selectWorkflowForMode = (mode) => {
         const current = selectedWorkflow();
         if (supportsMode(current, mode)) return true;
@@ -5904,59 +6281,62 @@
           let value = 0;
           if (option.dataset.upscalerEnabled === current?.dataset.upscalerEnabled) value += 4;
           if (option.dataset.detailerEnabled === current?.dataset.detailerEnabled) value += 4;
+          if (mode === "trio" && option.dataset.trioContractV1 === "true") value += 16;
           if (mode === "duo" && option.dataset.duoContractV2 === "true") value += 8;
           if (mode === "duo" && option.dataset.duoStrictIsolation !== "true") value += 1;
           return value;
         };
         candidates.sort((left, right) => score(right) - score(left));
-        const replacement = candidates[0];
-        if (!replacement) return false;
-        workflow.value = replacement.value;
+        if (!candidates[0]) return false;
+        workflow.value = candidates[0].value;
         workflow.dispatchEvent(new Event("change", { bubbles: true }));
         return true;
       };
-      const setAutomaticPrompt = (control, subjectControl) => {
-        const previous = control.dataset.automaticCharacterPrompt || "";
-        const suggested = selectedSubjectName(subjectControl);
-        if (!control.value.trim() || control.value === previous) control.value = suggested;
-        control.dataset.automaticCharacterPrompt = suggested;
+      const setAutomaticPrompt = ({ prompt, subject }) => {
+        const previous = prompt.dataset.automaticCharacterPrompt || "";
+        const suggested = selectedSubjectName(subject);
+        if (!prompt.value.trim() || prompt.value === previous) prompt.value = suggested;
+        prompt.dataset.automaticCharacterPrompt = suggested;
       };
-      const cacheDuoContract = () => {
-        builder.dataset.duoSubjectId = secondSubject.value;
-        builder.dataset.duoFirstPrompt = firstPrompt.value;
-        builder.dataset.duoSecondPrompt = secondPrompt.value;
-        builder.dataset.duoFirstNegative = firstNegative.value;
-        builder.dataset.duoSecondNegative = secondNegative.value;
-        builder.dataset.duoInteraction = interaction.value;
-        builder.dataset.duoCamera = camera.value;
-        if (preset.value) builder.dataset.duoPreset = preset.value;
+      const cacheMultiContract = () => {
+        characterControls.forEach(({ key, subject, prompt, pose, negative }) => {
+          builder.dataset[`controlledSubject${key}`] = subject.value;
+          builder.dataset[`controlledPrompt${key}`] = prompt.value;
+          builder.dataset[`controlledPose${key}`] = pose.value;
+          builder.dataset[`controlledNegative${key}`] = negative.value;
+        });
+        builder.dataset.controlledInteraction = interaction.value;
+        builder.dataset.controlledCamera = camera.value;
       };
-      const restoreDuoContract = () => {
-        if (!secondSubject.value && builder.dataset.duoSubjectId) {
-          secondSubject.value = builder.dataset.duoSubjectId;
+      const restoreMultiContract = () => {
+        characterControls.forEach((character) => {
+          const { key, subject, prompt, pose, negative } = character;
+          if (!subject.value && builder.dataset[`controlledSubject${key}`]) {
+            subject.value = builder.dataset[`controlledSubject${key}`];
+          }
+          [
+            [prompt, `controlledPrompt${key}`],
+            [pose, `controlledPose${key}`],
+            [negative, `controlledNegative${key}`],
+          ].forEach(([control, dataKey]) => {
+            if (!control.value && builder.dataset[dataKey]) control.value = builder.dataset[dataKey];
+          });
+        });
+        if (!interaction.value && builder.dataset.controlledInteraction) {
+          interaction.value = builder.dataset.controlledInteraction;
         }
-        const restoreText = (control, key) => {
-          if (!control.value && builder.dataset[key]) control.value = builder.dataset[key];
-        };
-        restoreText(firstPrompt, "duoFirstPrompt");
-        restoreText(secondPrompt, "duoSecondPrompt");
-        restoreText(firstNegative, "duoFirstNegative");
-        restoreText(secondNegative, "duoSecondNegative");
-        restoreText(interaction, "duoInteraction");
-        restoreText(camera, "duoCamera");
-        if (!preset.value && builder.dataset.duoPreset) {
-          preset.dataset.savedPreset = builder.dataset.duoPreset;
+        if (!camera.value && builder.dataset.controlledCamera) {
+          camera.value = builder.dataset.controlledCamera;
         }
-        setAutomaticPrompt(firstPrompt, firstSubject);
-        setAutomaticPrompt(secondPrompt, secondSubject);
       };
-      const clearDuoContractForSingle = () => {
-        cacheDuoContract();
-        secondSubject.value = "";
-        firstPrompt.value = "";
-        secondPrompt.value = "";
-        firstNegative.value = "";
-        secondNegative.value = "";
+      const clearMultiContractForSingle = () => {
+        cacheMultiContract();
+        characterControls.forEach(({ key, subject, prompt, pose, negative }) => {
+          if (key !== "a") subject.value = "";
+          prompt.value = "";
+          pose.value = "";
+          negative.value = "";
+        });
         interaction.value = "";
         camera.value = "";
       };
@@ -5966,15 +6346,30 @@
         control.dataset[key] = suggested;
       };
       const renderPreset = ({ suggest = false, enabled = false } = {}) => {
-        const requested = Object.hasOwn(CONTROLLED_DUO_PRESETS, preset.value)
-          ? preset.value : "";
-        if (!enabled && requested) preset.dataset.savedPreset = requested;
+        const mode = activeMode();
+        const definitions = mode === "trio" ? CONTROLLED_TRIO_PRESETS : CONTROLLED_DUO_PRESETS;
+        const defaultValue = mode === "trio" ? "trio_flexible" : "flexible";
+        const savedKey = mode === "trio" ? "savedTrioPreset" : "savedDuoPreset";
+        const requested = Object.hasOwn(definitions, preset.value) ? preset.value : "";
+        if (requested) preset.dataset[savedKey] = requested;
+        Array.from(preset.options).forEach((option) => {
+          const visible = option.dataset.layoutMode === mode;
+          option.hidden = !visible;
+          option.disabled = !enabled || !visible;
+        });
         const value = enabled
-          ? (requested || preset.dataset.savedPreset || "close_portrait")
-          : "close_portrait";
+          ? (requested || preset.dataset[savedKey] || defaultValue)
+          : defaultValue;
         preset.value = enabled ? value : "";
-        const definition = CONTROLLED_DUO_PRESETS[value];
+        const definition = definitions[value] || definitions[defaultValue];
         if (preview instanceof HTMLElement) preview.dataset.preset = value;
+        if (maskC instanceof HTMLElement) maskC.hidden = mode !== "trio";
+        if (regionCanvas instanceof HTMLElement) {
+          regionCanvas.setAttribute(
+            "aria-label",
+            mode === "trio" ? "Three guided identity regions: A, B, and C" : "Two guided identity regions: A and B",
+          );
+        }
         if (presetLabel) presetLabel.textContent = definition.label;
         if (presetDescription) presetDescription.textContent = definition.description;
         if (suggest) {
@@ -5986,16 +6381,21 @@
       };
       const renderLint = () => {
         if (!lint) return;
-        if (activeMode() !== "duo") {
+        const mode = activeMode();
+        const characters = activeCharacters(mode);
+        if (characters.length === 0) {
           lint.textContent = "";
           lint.className = "controlled-duo-lint";
-          firstCard?.classList.remove("has-lint-warning");
-          secondCard?.classList.remove("has-lint-warning");
+          characterControls.forEach(({ card }) => card?.classList.remove("has-lint-warning"));
           return;
         }
         const warnings = [];
-        const aText = normalizedWords(firstPrompt.value);
-        const bText = normalizedWords(secondPrompt.value);
+        const texts = characters.map(({ prompt, pose }) => (
+          normalizedWords(`${prompt.value}\n${pose.value}`)
+        ));
+        const subjects = characters.map(({ subject }) => normalizedWords(
+          selectedSubjectName(subject),
+        ));
         const sharedPromptControls = [
           sharedPrompt,
           ...Array.from(form.querySelectorAll('[data-batch-field="prompt"]'))
@@ -6004,141 +6404,179 @@
         const sharedText = normalizedWords(
           sharedPromptControls.map((control) => control.value).join("\n"),
         );
-        const aSubject = normalizedWords(selectedSubjectName(firstSubject));
-        const bSubject = normalizedWords(selectedSubjectName(secondSubject));
-        if (aText && bText && aText === bText) {
-          warnings.push("A and B prompts are identical");
-        }
-        if (bSubject.length >= 3 && aText.includes(bSubject)) {
-          warnings.push("A mentions B's approved identity");
-        }
-        if (aSubject.length >= 3 && bText.includes(aSubject)) {
-          warnings.push("B mentions A's approved identity");
-        }
-        if (aSubject.length >= 3 && sharedText.includes(aSubject)) {
-          warnings.push("the shared prompt mentions A's approved identity");
-        }
-        if (bSubject.length >= 3 && sharedText.includes(bSubject)) {
-          warnings.push("the shared prompt mentions B's approved identity");
-        }
+        characters.forEach(({ key }, index) => {
+          characters.slice(index + 1).forEach((other, otherOffset) => {
+            const otherIndex = index + otherOffset + 1;
+            if (texts[index] && texts[index] === texts[otherIndex]) {
+              warnings.push(`${key.toUpperCase()} and ${other.key.toUpperCase()} prompts are identical`);
+            }
+          });
+          characters.forEach((other, otherIndex) => {
+            if (otherIndex !== index && subjects[otherIndex].length >= 3
+                && texts[index].includes(subjects[otherIndex])) {
+              warnings.push(`${key.toUpperCase()} mentions ${other.key.toUpperCase()}'s approved identity`);
+            }
+          });
+          if (subjects[index].length >= 3 && sharedText.includes(subjects[index])) {
+            warnings.push(`the shared prompt mentions ${key.toUpperCase()}'s approved identity`);
+          }
+        });
         const populationTokens = Array.from(new Set(
           sharedPromptControls.map((control) => control.value).join("\n").toLowerCase().match(
-            /\b(?:solo|1girl|1boy|2girls|2boys|3girls|3boys|three people|three characters|multiple girls|multiple boys)\b/g,
+            /\b(?:solo|1girl|1boy|2girls|2boys|3girls|3boys|two people|two characters|three people|three characters|multiple girls|multiple boys)\b/g,
           ) || [],
         ));
+        const population = mode === "trio" ? "exact-three" : "exact-two";
         if (populationTokens.length) {
           warnings.push(
-            `shared population tags (${populationTokens.slice(0, 4).join(", ")}) conflict with system-owned exact-two composition`,
+            `shared population tags (${populationTokens.slice(0, 4).join(", ")}) conflict with system-owned ${population} composition`,
           );
         }
-        const aTags = promptTags(firstPrompt.value);
-        const duplicated = Array.from(promptTags(secondPrompt.value))
-          .filter((tag) => aTags.has(tag))
-          .slice(0, 4);
-        if (duplicated.length) warnings.push(`shared character-only tags: ${duplicated.join(", ")}`);
+        characters.forEach(({ key, prompt, pose }, index) => {
+          const tags = promptTags(`${prompt.value}\n${pose.value}`);
+          characters.slice(index + 1).forEach((other) => {
+            const duplicated = Array.from(promptTags(`${other.prompt.value}\n${other.pose.value}`))
+              .filter((tag) => tags.has(tag))
+              .slice(0, 4);
+            if (duplicated.length) {
+              warnings.push(`${key.toUpperCase()}/${other.key.toUpperCase()} share character-only tags: ${duplicated.join(", ")}`);
+            }
+          });
+        });
         const warning = warnings.length > 0;
+        const slots = mode === "trio" ? "A, B, or C" : "A or B";
         lint.textContent = warning
-          ? `Possible prompt bleed — ${warnings.join("; ")}. Keep identity/appearance/pose in A or B, and remove population tags from the shared prompt.`
-          : "Preflight clear: character cards are distinct and the shared prompt leaves exact-two composition to the controlled workflow.";
+          ? `Possible prompt bleed — ${Array.from(new Set(warnings)).join("; ")}. Keep identity, appearance, and individual pose in ${slots}, and remove population tags from the shared prompt.`
+          : `Preflight clear: character cards are distinct and the shared prompt leaves ${population} composition to the controlled workflow.`;
         lint.className = `controlled-duo-lint ${warning ? "warning" : "success"}`;
-        firstCard?.classList.toggle("has-lint-warning", warning);
-        secondCard?.classList.toggle("has-lint-warning", warning);
+        characters.forEach(({ card }) => card?.classList.toggle("has-lint-warning", warning));
+        characterControls.filter((item) => !characters.includes(item))
+          .forEach(({ card }) => card?.classList.remove("has-lint-warning"));
       };
-      const renderCost = (v2Enabled) => {
+      const renderCost = (controlledEnabled) => {
         if (!costNote) return;
-        if (!v2Enabled) {
-          costNote.textContent = "Legacy v1 uses the baseline regional path; v2 isolation and quality controls are locked.";
+        const mode = activeMode();
+        if (!controlledEnabled) {
+          costNote.textContent = "Legacy duo v1 uses the baseline regional path; identity-region guides and per-character overrides are locked.";
+          return;
+        }
+        const draft = quality.value === "draft";
+        if (mode === "trio") {
+          costNote.textContent = `${draft ? "Lowest" : "Baseline"} Controlled Trio GPU work. Balanced identity-region guidance is fixed; exact billed time depends on image size, steps, and worker throughput.`;
           return;
         }
         const strict = isolation.value === "strict";
-        const high = quality.value === "high";
-        const draft = quality.value === "draft";
-        const level = strict && high ? "Highest relative GPU work"
-          : strict ? "Significantly higher GPU work"
-            : high ? "Higher GPU work"
-              : draft ? "Lowest relative GPU work" : "Baseline controlled-duo GPU work";
+        const level = strict ? "Significantly higher GPU work"
+          : draft ? "Lowest relative GPU work" : "Baseline Controlled Duo GPU work";
         const detail = strict
           ? "Strict adds isolated refinement passes."
-          : "Balanced uses the base controlled-duo path.";
+          : "Balanced uses the base Controlled Duo path.";
         costNote.textContent = `${level}. ${detail} Exact billed time depends on image size, steps, and worker throughput.`;
       };
       const render = ({ presetChanged = false } = {}) => {
-        const duo = activeMode() === "duo";
+        const mode = activeMode();
+        const multi = mode !== "single";
+        const trio = mode === "trio";
         const capability = capabilities();
-        const duoCapable = capability.regional || capability.v2;
-        const modeCompatible = supportsMode(selectedWorkflow(), duo ? "duo" : "single");
-        const v2Enabled = duo && capability.v2;
-        if (workbench instanceof HTMLElement) workbench.hidden = !duo;
-        if (regionalContainer instanceof HTMLElement) regionalContainer.hidden = !duo;
-        if (secondCard instanceof HTMLElement) secondCard.hidden = !duo;
-        duoOnly.forEach((node) => { node.hidden = !duo; });
-        promptFields.forEach((node) => { node.hidden = !duo; });
-        if (firstSide) firstSide.textContent = duo ? "Character A" : "Character";
-        if (firstPosition instanceof HTMLElement) firstPosition.hidden = !duo;
-        secondSubject.required = duo;
-        firstPrompt.required = duo;
-        secondPrompt.required = duo;
-        secondSubject.setCustomValidity(
-          duo && firstSubject.value && firstSubject.value === secondSubject.value
-            ? "Choose two different approved characters." : "",
-        );
+        const modeCompatible = supportsMode(selectedWorkflow(), mode);
+        const controlledEnabled = (mode === "duo" && capability.v2)
+          || (trio && capability.trio);
+        const modeCapable = mode === "duo"
+          ? capability.regional || capability.v2
+          : trio ? capability.trio : modeCompatible;
+        form.dataset.compositionMode = mode;
+        contractVersion.value = trio ? "3" : mode === "duo" && capability.v2 ? "2" : "1";
+        form.dataset.duoContractVersion = contractVersion.value;
+        if (workbench instanceof HTMLElement) workbench.hidden = !multi;
+        if (regionalContainer instanceof HTMLElement) regionalContainer.hidden = !multi;
+        characterB.card.hidden = !multi;
+        characterC.card.hidden = !trio;
+        promptFields.forEach((node) => { node.hidden = !multi; });
+        if (firstSide) firstSide.textContent = multi ? "Character A" : "Character";
+        if (firstPosition instanceof HTMLElement) firstPosition.hidden = !multi;
+        characterB.subject.disabled = !multi;
+        characterC.subject.disabled = !trio;
+        characterControls.forEach(({ key, subject, prompt }) => {
+          const subjectActive = key === "a" || (multi && (key !== "c" || trio));
+          const contractActive = multi && (key !== "c" || trio);
+          subject.required = subjectActive;
+          prompt.required = contractActive;
+          prompt.disabled = !contractActive;
+        });
+        const characters = activeCharacters(mode);
+        const selectedIds = characters.map(({ subject }) => subject.value).filter(Boolean);
+        const duplicateSubjects = selectedIds.length !== new Set(selectedIds).size;
+        characters.forEach(({ subject }) => {
+          subject.setCustomValidity(
+            duplicateSubjects ? `Choose ${trio ? "three" : "two"} different approved characters.` : "",
+          );
+        });
+        characterControls.filter((item) => !characters.includes(item))
+          .forEach(({ subject }) => subject.setCustomValidity(""));
         modeControls.forEach((control) => {
           control.setCustomValidity(
             !modeCompatible
-              ? (duo
-                ? "Choose a reviewed workflow that declares a controlled-duo or regional capability."
-                : "Choose a standard single-character workflow without duo capabilities.")
+              ? (trio
+                ? "Choose a reviewed workflow that declares Controlled Trio v1."
+                : mode === "duo"
+                  ? "Choose a reviewed workflow that declares Controlled Duo or regional prompting."
+                  : "Choose a standard single-character workflow without controlled multi-character capabilities.")
               : "",
           );
         });
-        contractVersion.value = v2Enabled ? "2" : "1";
-        v2Controls.forEach((control) => { control.disabled = !v2Enabled; });
+        controlledControls.forEach((control) => {
+          const inactiveCharacterCControl = characterC.card instanceof HTMLElement
+            && characterC.card.contains(control) && !trio;
+          control.disabled = !controlledEnabled || inactiveCharacterCControl;
+        });
         if (balancedOption instanceof HTMLOptionElement) {
-          balancedOption.disabled = v2Enabled && capability.strict;
+          balancedOption.disabled = mode === "duo" && controlledEnabled && capability.strict;
         }
         if (strictOption instanceof HTMLOptionElement) {
-          strictOption.disabled = !v2Enabled || !capability.strict;
+          strictOption.disabled = !controlledEnabled || trio || !capability.strict;
         }
         if (highOption instanceof HTMLOptionElement) highOption.disabled = true;
-        isolation.value = v2Enabled && capability.strict ? "strict" : "balanced";
+        isolation.value = mode === "duo" && controlledEnabled && capability.strict
+          ? "strict" : "balanced";
         if (isolationHint) {
-          isolationHint.textContent = !v2Enabled
-            ? "Isolation unlocks only on a reviewed Controlled Duo v2 workflow."
-            : capability.strict
-              ? "Strict is locked because the selected workflow has fixed isolated-refinement topology."
-              : "Balanced is locked because the selected workflow has fixed base-path topology.";
+          isolationHint.textContent = trio
+            ? "Controlled Trio v1 is reviewed for balanced identity-region guidance only."
+            : !controlledEnabled
+              ? "Isolation unlocks only on a reviewed Controlled Duo v2 workflow."
+              : capability.strict
+                ? "Strict is locked because the selected workflow has fixed isolated-refinement topology."
+                : "Balanced is locked because the selected workflow has fixed base-path topology.";
         }
         if (quality.value === "high") quality.value = "standard";
         renderPreset({
-          enabled: v2Enabled,
-          suggest: v2Enabled && (presetChanged || !camera.value.trim()),
+          enabled: controlledEnabled,
+          suggest: controlledEnabled && (presetChanged || !camera.value.trim()),
         });
-        renderCost(v2Enabled);
+        if (characterList) characterList.textContent = trio ? "A/B/C" : "A/B";
+        if (populationLabel) populationLabel.textContent = trio ? "exact-three" : "exact-two";
+        if (preflightLabel) preflightLabel.textContent = trio ? "Trio preflight" : "Pair preflight";
+        renderCost(controlledEnabled);
         if (capabilityStatus) {
-          capabilityStatus.textContent = !duo ? ""
-            : !duoCapable
-              ? "Blocked: the selected workflow does not declare a controlled-duo or regional capability."
-              : !capability.v2
-                ? "Legacy v1 fallback: fixed regional prompts only. Choose a Controlled Duo v2 workflow for masks, per-character negatives, and isolation modes."
-                : `Controlled Duo v2 ready${capability.strict ? " · strict isolation" : ""}.`;
+          capabilityStatus.textContent = !multi ? ""
+            : !modeCapable
+              ? `Blocked: the selected workflow does not declare a controlled-${trio ? "trio" : "duo"} capability.`
+              : trio
+                ? "Controlled Trio v1 ready · balanced identity-region guidance."
+                : !capability.v2
+                  ? "Legacy duo v1 fallback: fixed regional prompts only. Choose a Controlled Duo v2 workflow for identity-region guides, per-character negatives, and isolation modes."
+                  : `Controlled Duo v2 ready${capability.strict ? " · strict isolation" : ""}.`;
           capabilityStatus.className = `controlled-duo-capability-status ${
-            !duo || capability.v2 ? "success" : "warning"
+            !multi || controlledEnabled ? "success" : "warning"
           }`;
         }
         if (compositionStatus) {
-          const duplicateSubjects = duo && firstSubject.value
-            && firstSubject.value === secondSubject.value;
           compositionStatus.textContent = !modeCompatible
-            ? (duo
-              ? "Select a compatible duo workflow before queueing."
-              : "Select a standard single-character workflow before queueing.")
-            : !duoCapable
-              ? ""
-              : duplicateSubjects
-                ? "A and B must use different approved subjects."
-                : (duo
-                  ? "A and B own separate prompt contracts; the preflight below checks obvious cross-slot conflicts."
-                  : "");
+            ? `Select a compatible ${trio ? "trio" : mode === "duo" ? "duo" : "single-character"} workflow before queueing.`
+            : duplicateSubjects
+              ? `${trio ? "A, B, and C" : "A and B"} must use different approved subjects.`
+              : multi
+                ? `${trio ? "A, B, and C" : "A and B"} own separate identity and pose contracts; the preflight below checks obvious cross-slot conflicts.`
+                : "";
           compositionStatus.className = `composition-status${
             !modeCompatible || duplicateSubjects ? " warning" : ""
           }`;
@@ -6151,61 +6589,67 @@
       const handleModeChange = () => {
         const nextMode = activeMode();
         if (nextMode !== previousMode) {
-          if (nextMode === "duo") restoreDuoContract();
-          else clearDuoContractForSingle();
+          if (previousMode === "single" && nextMode !== "single") restoreMultiContract();
+          if (previousMode !== "single" && nextMode === "single") clearMultiContractForSingle();
+          if (nextMode !== "single") {
+            activeCharacters(nextMode).forEach(setAutomaticPrompt);
+          }
           selectWorkflowForMode(nextMode);
           previousMode = nextMode;
         }
-        render({ presetChanged: nextMode === "duo" });
+        render({ presetChanged: nextMode !== "single" });
       };
       modeControls.forEach((control) => control.addEventListener("change", handleModeChange));
       workflow.addEventListener("change", () => render());
       preset.addEventListener("change", () => render({ presetChanged: true }));
       isolation.addEventListener("change", () => renderCost(contractVersion.value === "2"));
-      quality.addEventListener("change", () => renderCost(contractVersion.value === "2"));
-      [firstPrompt, secondPrompt, sharedPrompt].forEach(
-        (control) => control.addEventListener("input", renderLint),
-      );
+      quality.addEventListener("change", () => renderCost(["2", "3"].includes(contractVersion.value)));
+      [
+        ...characterControls.flatMap(({ prompt, pose }) => [prompt, pose]),
+        interaction,
+        camera,
+        sharedPrompt,
+      ].forEach((control) => control.addEventListener("input", renderLint));
       form.addEventListener("input", (event) => {
         if (event.target instanceof HTMLTextAreaElement
             && event.target.matches('[data-batch-field="prompt"]')) renderLint();
       });
-      firstSubject.addEventListener("change", () => {
-        if (activeMode() === "duo") setAutomaticPrompt(firstPrompt, firstSubject);
-        render();
-      });
-      secondSubject.addEventListener("change", () => {
-        if (activeMode() === "duo") setAutomaticPrompt(secondPrompt, secondSubject);
-        render();
+      characterControls.forEach((character) => {
+        character.subject.addEventListener("change", () => {
+          if (activeCharacters().includes(character)) setAutomaticPrompt(character);
+          render();
+        });
       });
       if (swap instanceof HTMLButtonElement && swap.dataset.duoSwapBound !== "true") {
         swap.dataset.duoSwapBound = "true";
         swap.addEventListener("click", () => {
-          const subjectValue = firstSubject.value;
-          const positiveValue = firstPrompt.value;
-          const negativeValue = firstNegative.value;
-          firstSubject.value = secondSubject.value;
-          firstPrompt.value = secondPrompt.value;
-          firstNegative.value = secondNegative.value;
-          secondSubject.value = subjectValue;
-          secondPrompt.value = positiveValue;
-          secondNegative.value = negativeValue;
-          firstPrompt.dataset.automaticCharacterPrompt = selectedSubjectName(firstSubject);
-          secondPrompt.dataset.automaticCharacterPrompt = selectedSubjectName(secondSubject);
-          [firstSubject, secondSubject].forEach((control) => (
-            control.dispatchEvent(new Event("change", { bubbles: true }))
-          ));
-          [firstPrompt, secondPrompt, firstNegative, secondNegative].forEach((control) => (
-            control.dispatchEvent(new Event("input", { bubbles: true }))
-          ));
+          const values = {
+            subject: characterA.subject.value,
+            prompt: characterA.prompt.value,
+            pose: characterA.pose.value,
+            negative: characterA.negative.value,
+          };
+          characterA.subject.value = characterB.subject.value;
+          characterA.prompt.value = characterB.prompt.value;
+          characterA.pose.value = characterB.pose.value;
+          characterA.negative.value = characterB.negative.value;
+          characterB.subject.value = values.subject;
+          characterB.prompt.value = values.prompt;
+          characterB.pose.value = values.pose;
+          characterB.negative.value = values.negative;
+          characterA.prompt.dataset.automaticCharacterPrompt = selectedSubjectName(characterA.subject);
+          characterB.prompt.dataset.automaticCharacterPrompt = selectedSubjectName(characterB.subject);
+          [characterA, characterB].forEach(({ subject, prompt, pose, negative }) => {
+            subject.dispatchEvent(new Event("change", { bubbles: true }));
+            [prompt, pose, negative].forEach((control) => (
+              control.dispatchEvent(new Event("input", { bubbles: true }))
+            ));
+          });
           render();
         });
       }
       builder.dataset.duoInitialized = "true";
-      if (previousMode === "duo") {
-        setAutomaticPrompt(firstPrompt, firstSubject);
-        setAutomaticPrompt(secondPrompt, secondSubject);
-      }
+      if (previousMode !== "single") activeCharacters(previousMode).forEach(setAutomaticPrompt);
       render();
     });
   };
@@ -6254,7 +6698,7 @@
     };
     const workflowFamily = (option) => (option?.dataset.workflowName || "")
       .toLowerCase()
-      .replace(/\b(base|hires|highres|upscale|upscaler|couple|duo|regional)\b/g, " ")
+      .replace(/\b(base|hires|highres|upscale|upscaler|couple|duo|trio|regional)\b/g, " ")
       .replace(/[^a-z0-9]+/g, " ")
       .trim();
     const pairedWorkflow = (current, desired) => {
@@ -6266,6 +6710,8 @@
         && option.dataset.upscalerEnabled === desired
         && option.dataset.detailerEnabled === current?.dataset.detailerEnabled
         && option.dataset.regionalPrompting === current?.dataset.regionalPrompting
+        && option.dataset.duoContractV2 === current?.dataset.duoContractV2
+        && option.dataset.trioContractV1 === current?.dataset.trioContractV1
         && option.dataset.workflowVersion === current?.dataset.workflowVersion
         && workflowFamily(option) === family
       )) || null;
@@ -6729,18 +7175,18 @@
         if (actions) actions.hidden = false;
         const state = ["off", "starting", "warm", "ending"].includes(payload.state)
           ? payload.state : "off";
-        if (heading) heading.textContent = state === "warm" ? "GPU warm for follow-up tests" : `Warm session: ${state}`;
+        if (heading) heading.textContent = state === "warm" ? "GPU warm for follow-up batches" : `Warm session: ${state}`;
         const seconds = Math.max(0, integerValue(payload.remaining_seconds, 0));
         const cost = typeof payload.hourly_rate_usd === "string" ? payload.hourly_rate_usd : "";
         if (statusNode) {
           if (state === "warm") {
             statusNode.textContent = `${Math.ceil(seconds / 60)} minutes remain${cost ? ` at up to $${cost}/hour` : ""}.`;
           } else if (state === "starting") {
-            statusNode.textContent = "Allocating the single GPU now. Keep editing; queued variants will reuse it when ready.";
+            statusNode.textContent = "Allocating the single GPU now. Keep editing; queued batches will reuse it when ready.";
           } else if (state === "ending") {
             statusNode.textContent = "Releasing the warm worker and returning to scale-to-zero.";
           } else {
-            statusNode.textContent = "Batch mode remains available and scales to zero after the queue.";
+            statusNode.textContent = "Warm batch mode is off. Normal Automation queues still scale from zero safely.";
           }
         }
         buttons.forEach((button) => {
@@ -6767,14 +7213,14 @@
             headers: { Accept: "application/json" },
           });
           if ([404, 501].includes(response.status)) {
-            if (statusNode) statusNode.textContent = "Queue all variants together for one allocation; optional warm follow-up is not enabled yet.";
+            if (statusNode) statusNode.textContent = "Normal Automation queues still work; optional warm follow-up is not enabled yet.";
             return;
           }
           if (!response.ok) throw new Error("warm status unavailable");
           const state = render(await response.json());
           if (state) scheduleStatusRefresh(state);
         } catch (_error) {
-          if (statusNode) statusNode.textContent = "Warm-session status is temporarily unavailable. Normal batch mode still works.";
+          if (statusNode) statusNode.textContent = "Warm-session status is temporarily unavailable. Normal Automation queues still work.";
         }
       };
       refreshStatus();
@@ -6800,7 +7246,7 @@
           const state = render(await response.json());
           if (state) scheduleStatusRefresh(state);
         } catch (_error) {
-          if (statusNode) statusNode.textContent = "Warm session could not be changed. The queued experiment is unaffected.";
+          if (statusNode) statusNode.textContent = "Warm session could not be changed. Queued Automation work is unaffected.";
         } finally {
           buttons.forEach((item) => { item.disabled = false; });
         }
@@ -7321,6 +7767,7 @@
   initializeSamePageScrollPreservation();
   initializeLoraPicker();
   initializeAutomationBuilder();
+  initializePromptWildcardPickers();
   initializeWorkflowRefinement();
   initializeControlledDuoBuilders();
   initializeImageSettingsSummary();

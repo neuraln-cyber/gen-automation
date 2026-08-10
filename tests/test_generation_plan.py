@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 from sqlalchemy import func, select
 
 from gen_automation.config import Settings
@@ -197,7 +197,7 @@ async def test_plan_rejects_a_model_stack_over_the_safe_worker_capacity(
         assert int(await session.scalar(select(func.count()).select_from(GenerationJob)) or 0) == 0
 
 
-async def test_duo_plan_rejects_a_standard_workflow_before_creating_jobs(
+async def test_duo_release_rejects_a_standard_workflow_before_creating_jobs(
     generation_database: Database,
 ) -> None:
     payload = valid_release_payload()
@@ -222,16 +222,10 @@ async def test_duo_plan_rejects_a_standard_workflow_before_creating_jobs(
             "character_b_prompt": "second adult character, on the right",
         }
     )
-    _project, release = await _create_release(generation_database, payload=payload)
+    with pytest.raises(ValidationError, match="requires regional prompting"):
+        await _create_release(generation_database, payload=payload)
 
     async with generation_database.sessions() as session:
-        with pytest.raises(GenerationPlanConflictError, match="approved regional workflow"):
-            await approve_and_expand_generation_plan(
-                session,
-                release_id=release.id,
-                idempotency_key="duo-with-standard-workflow",
-                settings=Settings(),
-            )
         assert int(await session.scalar(select(func.count()).select_from(GenerationJob)) or 0) == 0
 
 

@@ -17,7 +17,7 @@ from sqlalchemy import func, select
 from gen_automation.db.models import Asset, GenerationJob, Project, Release, ReleaseVersion
 from gen_automation.db.session import Database
 from gen_automation.domain.canonical import canonical_sha256
-from gen_automation.domain.controlled_duo import DuoCompositionPreset
+from gen_automation.domain.controlled_duo import DuoCompositionPreset, TrioCompositionPreset
 from gen_automation.domain.deliverability import require_comfy_workflow_deliverability
 from gen_automation.domain.enums import AssetState
 from gen_automation.domain.release_spec import GenerationParameters
@@ -39,6 +39,10 @@ from gen_automation.gpu_worker.models import (
 )
 from gen_automation.gpu_worker.security import verify_authorization
 from gen_automation.services.assets import finalize_raw_master
+from gen_automation.services.controlled_trio import (
+    CONTROLLED_TRIO_MARKER_NODE_CLASS,
+    controlled_trio_bindings,
+)
 from gen_automation.services.salad import SaladJobInputContext
 from gen_automation.services.worker_inputs import (
     CONTROLLED_DUO_MARKER_NODE_CLASS,
@@ -90,6 +94,14 @@ CONTROLLED_DUO_STRICT_WORKFLOW_BODY = (
     / "workflows"
     / "illustrious-sdxl-controlled-duo-strict-v2.json"
 ).read_bytes()
+CONTROLLED_TRIO_BALANCED_WORKFLOW_BODY = (
+    Path(__file__).resolve().parents[1]
+    / "workflows"
+    / "illustrious-sdxl-controlled-trio-balanced-v1.json"
+).read_bytes()
+CONTROLLED_TRIO_BALANCED_WORKFLOW_SHA256 = (
+    "100a3ed840007591f2cfcc0f3277f787f351caeef82610b46952bb826428f71a"
+)
 COUPLE_WORKFLOW_SHA256S = {
     "base": "539bfdf81d9668b6e0c60c77034ac5ff3c4d233e468c1f3dd1fe398415892923",
     "base-detailer": "62f8db236c95a5c88f130c1fc10fa34dbc7455dba45695081aa5bc19d2bde890",
@@ -441,12 +453,69 @@ def _controlled_duo_context(
         "composition_preset_id": preset,
         "character_a_prompt": "short copper bob, green eyes, teal aviator jacket",
         "character_b_prompt": "long indigo braid, amber eyes, ivory tailored coat",
+        "character_a_pose_prompt": "leaning forward with left arm raised",
+        "character_b_pose_prompt": "kneeling and looking toward A",
         "character_a_negative_prompt": "indigo hair, ivory coat",
         "character_b_negative_prompt": "copper hair, teal jacket",
         "interaction_prompt": "back to back, opposing gazes",
         "camera_prompt": "dynamic low camera, diagonal composition",
         "duo_isolation_mode": isolation_mode,
         "duo_quality_mode": quality_mode,
+    }
+    job_context = SaladJobInputContext(
+        **{
+            **context.job_context.__dict__,
+            "parameters": parameters,
+            "parameters_sha256": canonical_sha256(parameters),
+        }
+    )
+    return replace(
+        context,
+        workflow_body=workflow_body,
+        job_context=job_context,
+    )
+
+
+def _controlled_trio_context(
+    context: WorkerInputContext,
+    *,
+    workflow_body: bytes = CONTROLLED_TRIO_BALANCED_WORKFLOW_BODY,
+    preset: str = "trio_flexible",
+    capabilities: list[str] | None = None,
+) -> WorkerInputContext:
+    context.store.put_for_test(
+        context.workflow_key,
+        workflow_body,
+        content_type="application/json",
+    )
+    parameters = dict(context.job_context.parameters)
+    raw_workflow = parameters["workflow"]
+    raw_generation = parameters["generation"]
+    assert isinstance(raw_workflow, dict)
+    assert isinstance(raw_generation, dict)
+    parameters["workflow"] = {
+        **raw_workflow,
+        "sha256": hashlib.sha256(workflow_body).hexdigest(),
+        "capabilities": capabilities if capabilities is not None else ["controlled_trio_v1"],
+    }
+    parameters["generation"] = {
+        **raw_generation,
+        "composition_mode": "trio",
+        "duo_contract_version": 3,
+        "composition_preset_id": preset,
+        "character_a_prompt": "short copper bob, green eyes, teal aviator jacket",
+        "character_b_prompt": "long indigo braid, amber eyes, ivory tailored coat",
+        "character_c_prompt": "silver curls, violet eyes, crimson evening dress",
+        "character_a_pose_prompt": "leaning toward the center with one arm raised",
+        "character_b_pose_prompt": "seated between the other two characters",
+        "character_c_pose_prompt": "kneeling and looking toward Character B",
+        "character_a_negative_prompt": "indigo hair, silver curls",
+        "character_b_negative_prompt": "copper hair, crimson dress",
+        "character_c_negative_prompt": "teal jacket, indigo braid",
+        "interaction_prompt": "the three characters embracing in one coordinated pose",
+        "camera_prompt": "dynamic full-body camera, all three faces visible",
+        "duo_isolation_mode": "balanced",
+        "duo_quality_mode": "standard",
     }
     job_context = SaladJobInputContext(
         **{
@@ -469,6 +538,10 @@ def test_couple_workflow_template_hashes_are_frozen() -> None:
         "hires": hashlib.sha256(COUPLE_HIRES_WORKFLOW_BODY).hexdigest(),
         "hires-detailer": hashlib.sha256(COUPLE_HIRES_DETAILER_WORKFLOW_BODY).hexdigest(),
     } == COUPLE_WORKFLOW_SHA256S
+    assert (
+        hashlib.sha256(CONTROLLED_TRIO_BALANCED_WORKFLOW_BODY).hexdigest()
+        == CONTROLLED_TRIO_BALANCED_WORKFLOW_SHA256
+    )
 
 
 @pytest.mark.asyncio
@@ -661,10 +734,9 @@ async def test_one_provider_job_allows_independent_regional_prompts_per_output(
     assert workflow["output-01-19"]["inputs"]["text"] == "boa hancock, standing on the right"
 
 
-@pytest.mark.asyncio
-async def test_one_provider_job_renders_twenty_five_detailer_branches(
+async def _legacy_twenty_five_output_context(
     worker_input_context: WorkerInputContext,
-) -> None:
+) -> tuple[WorkerInputContext, dict[str, object]]:
     context = _profile_context(
         worker_input_context,
         workflow_body=BASE_DETAILER_WORKFLOW_BODY,
@@ -714,39 +786,63 @@ async def test_one_provider_job_renders_twenty_five_detailer_branches(
             }
         ),
     )
+    return context, parameters
 
+
+@pytest.mark.asyncio
+async def test_legacy_compact_twenty_five_output_job_remains_compatible(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context, parameters = await _legacy_twenty_five_output_context(worker_input_context)
+
+    # Existing frozen jobs remain parseable after the safer new-write boundary
+    # and still run when their exact signed request is compact enough.
+    assert GenerationParameters.model_validate(parameters["generation"]).outputs_per_job == 25
     envelope = GenerateEnvelope.model_validate(await _build(context), strict=True)
-    workflow = envelope.payload.workflow
-
     assert [grant.output_index for grant in envelope.payload.uploads] == list(range(25))
-    assert (
-        sum(
-            isinstance(node, dict) and node.get("class_type") == "SaveImage"
-            for node in workflow.values()
+
+    async with context.database.sessions() as session:
+        asset_count = int(await session.scalar(select(func.count(Asset.id))) or 0)
+    assert asset_count == 25
+
+
+@pytest.mark.asyncio
+async def test_legacy_oversized_exact_envelope_rolls_back_all_upload_intents(
+    worker_input_context: WorkerInputContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context, _ = await _legacy_twenty_five_output_context(worker_input_context)
+    original_presign = context.store.presign_upload
+
+    async def padded_presign(
+        *,
+        key: str,
+        content_type: str,
+        metadata: dict[str, str],
+        expires_in: int,
+        max_bytes: int,
+    ) -> PresignedUpload:
+        grant = await original_presign(
+            key=key,
+            content_type=content_type,
+            metadata=metadata,
+            expires_in=expires_in,
+            max_bytes=max_bytes,
         )
-        == 25
-    )
-    assert (
-        sum(
-            isinstance(node, dict) and node.get("class_type") == "FaceDetailer"
-            for node in workflow.values()
+        return PresignedUpload(
+            url=grant.url,
+            method=grant.method,
+            fields={**grant.fields, "x-amz-security-token": "x" * 9_000},
+            headers=grant.headers,
         )
-        == 25
-    )
-    assert (
-        sum(
-            isinstance(node, dict) and node.get("class_type") == "UltralyticsDetectorProvider"
-            for node in workflow.values()
-        )
-        == 1
-    )
-    latent_nodes = [
-        node
-        for node in workflow.values()
-        if isinstance(node, dict) and node.get("class_type") == "EmptyLatentImage"
-    ]
-    assert len(latent_nodes) == 25
-    assert all(node["inputs"]["batch_size"] == 1 for node in latent_nodes)
+
+    monkeypatch.setattr(context.store, "presign_upload", padded_presign)
+    with pytest.raises(WorkerInputError, match="worker request exceeds"):
+        await _build(context)
+
+    async with context.database.sessions() as session:
+        asset_count = int(await session.scalar(select(func.count(Asset.id))) or 0)
+    assert asset_count == 0
 
 
 @pytest.mark.asyncio
@@ -991,7 +1087,9 @@ async def test_controlled_duo_balanced_renders_disjoint_masked_conditioning(
     assert workflow["19"]["inputs"]["mask"] == ["7", 0]
     assert workflow["20"]["inputs"]["mask"] == ["10", 0]
     assert "short copper bob" in workflow["13"]["inputs"]["text"]
+    assert "leaning forward with left arm raised" in workflow["13"]["inputs"]["text"]
     assert "long indigo braid" in workflow["14"]["inputs"]["text"]
+    assert "kneeling and looking toward A" in workflow["14"]["inputs"]["text"]
     assert "indigo hair" in workflow["15"]["inputs"]["text"]
     assert "copper hair" in workflow["16"]["inputs"]["text"]
     assert "the other character's hair traits" in workflow["15"]["inputs"]["text"]
@@ -1072,6 +1170,57 @@ async def test_controlled_duo_strict_renders_two_sequential_region_refinements(
     )
     assert require_comfy_workflow_deliverability(workflow)
     validate_approved_workflow(workflow, DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
+
+
+@pytest.mark.asyncio
+async def test_controlled_duo_strict_current_budget_fits_eight_output_envelope(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _controlled_duo_context(
+        worker_input_context,
+        workflow_body=CONTROLLED_DUO_STRICT_WORKFLOW_BODY,
+        isolation_mode="strict",
+    )
+    parameters = dict(context.job_context.parameters)
+    generation = dict(parameters["generation"])  # type: ignore[arg-type]
+    output_generations = [
+        {**generation, "outputs_per_job": 1, "seed": 42 + output_index} for output_index in range(8)
+    ]
+    parameters.update(
+        {
+            "schema_version": 2,
+            "worker_request_budget_version": 2,
+            "generation": {**output_generations[0], "outputs_per_job": 8},
+            "output_generations": output_generations,
+            "output_prompt_resolutions": [{"seed": 42 + output_index} for output_index in range(8)],
+        }
+    )
+    parameters_sha256 = canonical_sha256(parameters)
+    context = replace(
+        context,
+        job_context=SaladJobInputContext(
+            **{
+                **context.job_context.__dict__,
+                "expected_output_count": 8,
+                "parameters": parameters,
+                "parameters_sha256": parameters_sha256,
+            }
+        ),
+    )
+    async with context.database.sessions() as session:
+        job = await session.get(GenerationJob, context.job_context.generation_job_id)
+        assert job is not None
+        job.expected_output_count = 8
+        job.parameters = parameters
+        job.parameters_sha256 = parameters_sha256
+        await session.commit()
+
+    request = await _build(context)
+    envelope = GenerateEnvelope.model_validate(request, strict=True)
+    assert len(envelope.payload.uploads) == 8
+    assert len(json.dumps(request, ensure_ascii=False, allow_nan=False).encode("utf-8")) <= (
+        256 * 1024
+    )
 
 
 @pytest.mark.asyncio
@@ -1237,6 +1386,275 @@ async def test_controlled_duo_marker_and_capabilities_fail_closed(
         await _build(extra_output_context)
 
 
+@pytest.mark.asyncio
+async def test_controlled_trio_renders_three_masked_prompt_lanes(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _controlled_trio_context(worker_input_context)
+
+    workflow = GenerateEnvelope.model_validate(
+        await _build(context),
+        strict=True,
+    ).payload.workflow
+
+    assert not any(
+        isinstance(node, dict) and node.get("class_type") == CONTROLLED_TRIO_MARKER_NODE_CLASS
+        for node in workflow.values()
+    )
+    assert workflow["22"]["inputs"]["mask"] == ["7", 0]
+    assert workflow["23"]["inputs"]["mask"] == ["10", 0]
+    assert workflow["24"]["inputs"]["mask"] == ["13", 0]
+    assert workflow["25"]["inputs"]["mask"] == ["7", 0]
+    assert workflow["26"]["inputs"]["mask"] == ["10", 0]
+    assert workflow["27"]["inputs"]["mask"] == ["13", 0]
+    assert "short copper bob" in workflow["16"]["inputs"]["text"]
+    assert "one arm raised" in workflow["16"]["inputs"]["text"]
+    assert "long indigo braid" in workflow["17"]["inputs"]["text"]
+    assert "seated between" in workflow["17"]["inputs"]["text"]
+    assert "silver curls" in workflow["18"]["inputs"]["text"]
+    assert "kneeling" in workflow["18"]["inputs"]["text"]
+    assert "exactly three clearly adult characters" in workflow["14"]["inputs"]["text"]
+    assert "coordinated pose" in workflow["14"]["inputs"]["text"]
+    assert workflow["35"]["inputs"]["positive"] == ["30", 0]
+    assert workflow["35"]["inputs"]["negative"] == ["33", 0]
+    assert (
+        sum(
+            isinstance(node, dict) and node.get("class_type") == "KSampler"
+            for node in workflow.values()
+        )
+        == 1
+    )
+    assert require_comfy_workflow_deliverability(workflow)
+    validate_approved_workflow(workflow, DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
+
+
+@pytest.mark.asyncio
+async def test_controlled_trio_marker_and_capability_fail_closed(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    missing_capability = _controlled_trio_context(
+        worker_input_context,
+        capabilities=[],
+    )
+    with pytest.raises(WorkerInputError, match="workflow capability is invalid"):
+        await _build(missing_capability)
+
+    graph = json.loads(CONTROLLED_TRIO_BALANCED_WORKFLOW_BODY)
+    graph["99"]["inputs"]["character_c_mask_node_id"] = "10"
+    tampered = json.dumps(graph, separators=(",", ":")).encode()
+    tampered_context = _controlled_trio_context(
+        worker_input_context,
+        workflow_body=tampered,
+    )
+    with pytest.raises(WorkerInputError, match="workflow evidence is invalid"):
+        await _build(tampered_context)
+
+    missing_lane_graph = json.loads(CONTROLLED_TRIO_BALANCED_WORKFLOW_BODY)
+    del missing_lane_graph["24"]
+    missing_lane = json.dumps(missing_lane_graph, separators=(",", ":")).encode()
+    missing_lane_context = _controlled_trio_context(
+        worker_input_context,
+        workflow_body=missing_lane,
+    )
+    with pytest.raises(WorkerInputError, match="workflow evidence is invalid"):
+        await _build(missing_lane_context)
+
+    extra_output_graph = json.loads(CONTROLLED_TRIO_BALANCED_WORKFLOW_BODY)
+    extra_output_graph["97"] = {
+        "class_type": "SaveImageWebsocket",
+        "inputs": {"images": ["36", 0]},
+    }
+    extra_output = json.dumps(extra_output_graph, separators=(",", ":")).encode()
+    extra_output_context = _controlled_trio_context(
+        worker_input_context,
+        workflow_body=extra_output,
+    )
+    with pytest.raises(WorkerInputError, match="workflow evidence is invalid"):
+        await _build(extra_output_context)
+
+
+@pytest.mark.asyncio
+async def test_controlled_trio_multi_output_keeps_three_prompt_lanes_independent(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _controlled_trio_context(worker_input_context)
+    parameters = dict(context.job_context.parameters)
+    generation = dict(parameters["generation"])  # type: ignore[arg-type]
+    first = {**generation, "outputs_per_job": 1}
+    second = {
+        **first,
+        "character_a_prompt": "black pixie cut, red coat",
+        "character_b_prompt": "dark green curls, gold dress",
+        "character_c_prompt": "long blue braid, white suit",
+        "character_c_pose_prompt": "standing behind A and B with both arms raised",
+        "interaction_prompt": "all three running in one coordinated formation",
+        "camera_prompt": "overhead action camera",
+        "seed": 43,
+    }
+    parameters.update(
+        {
+            "schema_version": 2,
+            "generation": {**first, "outputs_per_job": 2},
+            "output_generations": [first, second],
+            "output_prompt_resolutions": [{"seed": 42}, {"seed": 43}],
+        }
+    )
+    context = replace(
+        context,
+        job_context=SaladJobInputContext(
+            **{
+                **context.job_context.__dict__,
+                "parameters": parameters,
+                "parameters_sha256": canonical_sha256(parameters),
+            }
+        ),
+    )
+
+    workflow = GenerateEnvelope.model_validate(
+        await _build(context),
+        strict=True,
+    ).payload.workflow
+
+    assert "silver curls" in workflow["output-00-18"]["inputs"]["text"]
+    assert "long blue braid" in workflow["output-01-18"]["inputs"]["text"]
+    assert "kneeling" in workflow["output-00-18"]["inputs"]["text"]
+    assert "both arms raised" in workflow["output-01-18"]["inputs"]["text"]
+    assert "coordinated pose" in workflow["output-00-14"]["inputs"]["text"]
+    assert "coordinated formation" in workflow["output-01-14"]["inputs"]["text"]
+    assert workflow["output-00-35"]["inputs"]["seed"] == 42
+    assert workflow["output-01-35"]["inputs"]["seed"] == 43
+
+
+@pytest.mark.asyncio
+async def test_controlled_trio_envelope_budget_fails_before_upload_intents(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _controlled_trio_context(worker_input_context)
+    async with context.database.sessions() as session:
+        provider = SaladWorkerJobInputProvider(
+            session=session,
+            store=context.store,
+            signing_key_id="worker-key-1",
+            signing_private_key=SecretStr(SIGNING_PRIVATE_KEY),
+            artifact_manifest=context.artifact_manifest,
+            artifact_manifest_sha256=context.artifact_manifest.manifest_sha256,
+            max_envelope_bytes=4096,
+            now=lambda: NOW,
+        )
+        with pytest.raises(WorkerInputError, match="signed worker request budget"):
+            await provider.build_job_input(context.job_context)
+
+    async with context.database.sessions() as session:
+        asset_count = int(await session.scalar(select(func.count(Asset.id))) or 0)
+    assert asset_count == 0
+
+
+@pytest.mark.asyncio
+async def test_controlled_trio_max_internal_fanout_fits_the_signed_envelope(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _controlled_trio_context(worker_input_context)
+    parameters = dict(context.job_context.parameters)
+    generation = dict(parameters["generation"])  # type: ignore[arg-type]
+    output_generations = [
+        {
+            **generation,
+            "outputs_per_job": 1,
+            "seed": 42 + output_index,
+            "character_a_pose_prompt": (
+                f'output {output_index}, reaching toward the center, quoted "pose"'
+            ),
+            "interaction_prompt": (
+                "all three adults in one coordinated pose, "
+                f"variation {output_index}, camera-left to camera-right"
+            ),
+        }
+        for output_index in range(8)
+    ]
+    parameters.update(
+        {
+            "schema_version": 2,
+            "generation": {**output_generations[0], "outputs_per_job": 8},
+            "output_generations": output_generations,
+            "output_prompt_resolutions": [{"seed": 42 + output_index} for output_index in range(8)],
+        }
+    )
+    parameters_sha256 = canonical_sha256(parameters)
+    context = replace(
+        context,
+        job_context=SaladJobInputContext(
+            **{
+                **context.job_context.__dict__,
+                "expected_output_count": 8,
+                "parameters": parameters,
+                "parameters_sha256": parameters_sha256,
+            }
+        ),
+    )
+    async with context.database.sessions() as session:
+        job = await session.get(GenerationJob, context.job_context.generation_job_id)
+        assert job is not None
+        job.expected_output_count = 8
+        job.parameters = parameters
+        job.parameters_sha256 = parameters_sha256
+        await session.commit()
+
+    request = await _build(context)
+    envelope = GenerateEnvelope.model_validate(request, strict=True)
+    assert len(envelope.payload.uploads) == 8
+    assert len(json.dumps(request, ensure_ascii=False, allow_nan=False).encode("utf-8")) <= (
+        256 * 1024
+    )
+
+
+@pytest.mark.parametrize("preset", list(TrioCompositionPreset))
+def test_controlled_trio_identity_regions_are_disjoint_and_bounded(
+    preset: TrioCompositionPreset,
+) -> None:
+    generation = GenerationParameters(
+        composition_mode="trio",
+        duo_contract_version=3,
+        composition_preset_id=preset,
+        prompt="three adults in a coordinated scene",
+        character_a_prompt="short copper hair, teal jacket",
+        character_b_prompt="long indigo hair, ivory coat",
+        character_c_prompt="silver curls, crimson dress",
+        interaction_prompt="coordinated group pose",
+        camera_prompt="all three characters visible",
+        seed=42,
+        width=1024,
+        height=1536,
+        steps=28,
+        sampler="euler",
+        scheduler="normal",
+    )
+
+    bindings = controlled_trio_bindings(generation)
+    assert bindings is not None
+    regions = [bindings[f"character_{label}"] for label in ("a", "b", "c")]
+    assert all(isinstance(region, dict) for region in regions)
+    for region in regions:
+        assert isinstance(region, dict)
+        assert 0 <= region["x"] < generation.width
+        assert 0 <= region["y"] < generation.height
+        assert region["x"] + region["width"] <= generation.width
+        assert region["y"] + region["height"] <= generation.height
+    for left, right in ((0, 1), (0, 2), (1, 2)):
+        left_region = regions[left]
+        right_region = regions[right]
+        assert isinstance(left_region, dict)
+        assert isinstance(right_region, dict)
+        horizontal_overlap = max(left_region["x"], right_region["x"]) < min(
+            left_region["x"] + left_region["width"],
+            right_region["x"] + right_region["width"],
+        )
+        vertical_overlap = max(left_region["y"], right_region["y"]) < min(
+            left_region["y"] + left_region["height"],
+            right_region["y"] + right_region["height"],
+        )
+        assert not (horizontal_overlap and vertical_overlap)
+
+
 @pytest.mark.parametrize("preset", list(DuoCompositionPreset))
 def test_controlled_duo_preset_bindings_are_disjoint_and_bounded(
     preset: DuoCompositionPreset,
@@ -1265,6 +1683,7 @@ def test_controlled_duo_preset_bindings_are_disjoint_and_bounded(
     assert isinstance(character_a, dict)
     assert isinstance(character_b, dict)
     expected_regions = {
+        DuoCompositionPreset.FLEXIBLE: ((24, 48, 472, 1440), (536, 48, 472, 1440)),
         DuoCompositionPreset.CLOSE_PORTRAIT: ((40, 120, 448, 1288), (536, 120, 448, 1288)),
         DuoCompositionPreset.OVERHEAD: ((72, 184, 408, 1104), (552, 104, 400, 1168)),
         DuoCompositionPreset.LOW_ANGLE: ((32, 336, 464, 1152), (536, 168, 464, 1320)),
@@ -1313,6 +1732,7 @@ def test_controlled_duo_default_node_allowlist_is_core_only() -> None:
         "SolidMask",
     }.issubset(DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
     assert CONTROLLED_DUO_MARKER_NODE_CLASS not in DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES
+    assert CONTROLLED_TRIO_MARKER_NODE_CLASS not in DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES
 
 
 def test_generation_parameters_keep_single_mode_backward_compatible_and_guard_duo() -> None:

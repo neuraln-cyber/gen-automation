@@ -98,6 +98,8 @@ def test_lora_manager_template_keeps_rights_and_provider_secrets_server_side() -
     assert 'name="trigger_words"' in source
     assert "Nothing is selected automatically" in source
     assert "data-lora-version-select" in source
+    assert 'pattern="https://(www\\.)?civitai\\.(com|red)/.*"' in source
+    assert "Civitai.com and Civitai.red links are accepted" in source
 
 
 def test_lora_manager_javascript_uploads_directly_and_polls_durable_progress() -> None:
@@ -140,6 +142,10 @@ def test_lora_manager_javascript_uploads_directly_and_polls_durable_progress() -
     assert "navigator.clipboard.writeText" in script
     assert "dialog.showModal()" in script
     assert "returnFocus.focus()" in script
+    assert '["civitai.com", "www.civitai.com", "civitai.red", "www.civitai.red"]' in script
+    assert 'detail === "recent authentication required"' in script
+    assert "Your recent sign-in expired. Sign in again, then retry this change." in script
+    assert "Your session expired. Sign in again, then retry." in script
 
 
 def test_lora_manager_styles_are_scoped_and_collapse_without_horizontal_table() -> None:

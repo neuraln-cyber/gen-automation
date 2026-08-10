@@ -331,8 +331,13 @@ def test_generation_details_accept_twenty_five_output_snapshots() -> None:
     parsed = _GenerationJobParametersV2.model_validate(parameters)
 
     assert len(parsed.output_generations) == 25
+    assert parsed.worker_request_budget_version == 1
     assert parsed.generation.outputs_per_job == 25
     assert parsed.output_generations[-1].seed == 124
+
+    parameters["worker_request_budget_version"] = 2
+    current = _GenerationJobParametersV2.model_validate(parameters)
+    assert current.worker_request_budget_version == 2
 
 
 async def _seed_generation_details(client: TestClient) -> None:

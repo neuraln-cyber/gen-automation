@@ -143,6 +143,7 @@ def _validate_workflow(
         raise ReleaseApprovalError("frozen workflow capabilities do not match the approval")
     supports_legacy_duo = WorkflowCapability.REGIONAL_PROMPTING_V1 in capabilities
     supports_controlled_duo = WorkflowCapability.CONTROLLED_DUO_V2 in capabilities
+    supports_controlled_trio = WorkflowCapability.CONTROLLED_TRIO_V1 in capabilities
     generation = specification.generation
     if (
         generation.composition_mode == "duo"
@@ -153,6 +154,14 @@ def _validate_workflow(
             "two-character composition requires an approved regional workflow"
         )
     if generation.composition_mode == "single" and (supports_legacy_duo or supports_controlled_duo):
+        raise ReleaseApprovalError(
+            "single-character composition requires an approved standard workflow"
+        )
+    if generation.composition_mode == "trio" and not supports_controlled_trio:
+        raise ReleaseApprovalError(
+            "three-character composition requires an approved Controlled Trio workflow"
+        )
+    if generation.composition_mode == "single" and supports_controlled_trio:
         raise ReleaseApprovalError(
             "single-character composition requires an approved standard workflow"
         )

@@ -112,6 +112,19 @@ def model_payload(
             None,
             456,
         ),
+        (
+            "https://civitai.red/models/196908/disgusted-face-illustriousponysd15-or-goofy-ai"
+            "?modelVersionId=2372164",
+            CivitaiSourceKind.MODEL,
+            196908,
+            2372164,
+        ),
+        (
+            "https://civitai.red/models/2836680/biting-own-lips-or-goofy-ai",
+            CivitaiSourceKind.MODEL,
+            2836680,
+            None,
+        ),
     ],
 )
 def test_parse_civitai_url_accepts_only_known_contracts(

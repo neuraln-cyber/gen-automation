@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from gen_automation.domain.deliverability import MAX_ACCEPTED_IMAGES_PER_RELEASE
-from gen_automation.domain.release_spec import ReleaseCreate
+from gen_automation.domain.release_spec import ReleaseCreate, ReleaseSpecification
 from tests.factories import valid_release_payload
 
 
@@ -56,18 +56,33 @@ def test_generation_dimensions_accept_latent_multiples_of_eight() -> None:
         ReleaseCreate.model_validate(payload)
 
 
-def test_generation_job_accepts_twenty_five_outputs_and_rejects_twenty_six() -> None:
+def test_legacy_generation_job_parses_twenty_five_but_new_writes_are_split() -> None:
     payload = valid_release_payload()
     generation = payload["specification"]["generation"]  # type: ignore[index]
     generation["outputs_per_job"] = 25
     payload["specification"]["planned_job_count"] = 1  # type: ignore[index]
 
-    parsed = ReleaseCreate.model_validate(payload)
-    assert parsed.specification.generation.outputs_per_job == 25
+    legacy = ReleaseSpecification.model_validate(payload["specification"])
+    assert legacy.generation.outputs_per_job == 25
+    assert legacy.worker_request_budget_version == 1
+
+    with pytest.raises(ValidationError, match="at most 8 outputs"):
+        ReleaseCreate.model_validate(payload)
 
     generation["outputs_per_job"] = 26
     with pytest.raises(ValidationError, match="less than or equal to 25"):
-        ReleaseCreate.model_validate(payload)
+        ReleaseSpecification.model_validate(payload["specification"])
+
+
+def test_new_release_marks_current_worker_request_budget() -> None:
+    parsed = ReleaseCreate.model_validate(valid_release_payload())
+
+    assert parsed.specification.worker_request_budget_version == 2
+    assert parsed.specification.model_dump(mode="json")["worker_request_budget_version"] == 2
+
+    legacy_payload = valid_release_payload()["specification"]
+    legacy = ReleaseSpecification.model_validate(legacy_payload)
+    assert "worker_request_budget_version" not in legacy.model_dump(mode="json")
 
 
 def test_release_supports_up_to_eight_loras() -> None:
@@ -114,6 +129,9 @@ def _duo_release_payload() -> dict[str, object]:
         }
     )
     subjects.append(second_subject)
+    workflow = specification["workflow"]
+    assert isinstance(workflow, dict)
+    workflow["capabilities"] = ["regional_prompting_v1"]
     generation.update(
         {
             "composition_mode": "duo",
@@ -187,4 +205,39 @@ def test_multi_output_prompt_text_has_an_early_envelope_budget() -> None:
     generation["character_b_prompt"] = "b" * 16_000
 
     with pytest.raises(ValidationError, match="too large for one multi-output"):
+        ReleaseCreate.model_validate(payload)
+
+
+def test_new_release_composition_must_match_subjects_and_workflow() -> None:
+    payload = valid_release_payload()
+    specification = payload["specification"]
+    assert isinstance(specification, dict)
+    subjects = specification["subjects"]
+    workflow = specification["workflow"]
+    assert isinstance(subjects, list)
+    assert isinstance(workflow, dict)
+
+    subjects.append(
+        {
+            **deepcopy(subjects[0]),
+            "name": "Second Approved Adult Character",
+            "canonical_source_url": "https://example.com/second-character",
+        }
+    )
+    with pytest.raises(ValidationError, match="exactly one subject"):
+        ReleaseCreate.model_validate(payload)
+
+    subjects.pop()
+    workflow["capabilities"] = ["controlled_trio_v1"]
+    with pytest.raises(ValidationError, match="non-regional workflow"):
+        ReleaseCreate.model_validate(payload)
+
+
+def test_new_legacy_duo_requires_regional_workflow_capability() -> None:
+    payload = _duo_release_payload()
+    workflow = payload["specification"]["workflow"]  # type: ignore[index]
+    assert isinstance(workflow, dict)
+    workflow["capabilities"] = []
+
+    with pytest.raises(ValidationError, match="requires regional prompting"):
         ReleaseCreate.model_validate(payload)

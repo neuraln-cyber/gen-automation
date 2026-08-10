@@ -1,3 +1,4 @@
+import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -171,10 +172,14 @@ async def create_raw_master_upload_intents(
     expires_in: int = 600,
     max_bytes: int = 100 * 1024 * 1024,
     rotate_incomplete_uploads: bool = False,
+    max_serialized_grant_bytes: int | None = None,
+    commit: bool = True,
     actor: str = "controller",
 ) -> list[UploadIntent]:
     if content_type not in ALLOWED_UPLOAD_CONTENT_TYPES:
         raise AssetConflictError("unsupported upload content type")
+    if max_serialized_grant_bytes is not None and max_serialized_grant_bytes < 1024:
+        raise AssetConflictError("upload grant byte limit is invalid")
 
     row = (
         await session.execute(
@@ -334,19 +339,33 @@ async def create_raw_master_upload_intents(
             upload_fields = {}
             upload_headers = {}
 
-        intents.append(
-            UploadIntent(
-                asset_id=asset.id,
-                upload_attempt_id=UUID(str(asset.asset_metadata["upload_attempt_id"])),
-                output_index=asset.output_index,
-                staging_key=asset.staging_object_key,
-                state=asset.state,
-                upload_url=signed_url,
-                upload_method=upload_method,
-                upload_fields=upload_fields,
-                upload_headers=upload_headers,
-            )
+        intent = UploadIntent(
+            asset_id=asset.id,
+            upload_attempt_id=UUID(str(asset.asset_metadata["upload_attempt_id"])),
+            output_index=asset.output_index,
+            staging_key=asset.staging_object_key,
+            state=asset.state,
+            upload_url=signed_url,
+            upload_method=upload_method,
+            upload_fields=upload_fields,
+            upload_headers=upload_headers,
         )
+        if max_serialized_grant_bytes is not None:
+            serialized_grant = json.dumps(
+                {
+                    "asset_id": str(intent.asset_id),
+                    "upload_attempt_id": str(intent.upload_attempt_id),
+                    "output_index": intent.output_index,
+                    "content_type": content_type,
+                    "url": intent.upload_url,
+                    "fields": intent.upload_fields,
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+            if len(serialized_grant) > max_serialized_grant_bytes:
+                raise AssetConflictError("object store upload grant exceeds the worker budget")
+        intents.append(intent)
 
     if issued_asset_ids:
         now = datetime.now(UTC)
@@ -364,7 +383,10 @@ async def create_raw_master_upload_intents(
                 occurred_at=now,
             )
         )
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     return intents
 
 

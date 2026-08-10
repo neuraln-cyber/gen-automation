@@ -92,10 +92,11 @@ def test_generation_form_has_named_device_local_settings_presets() -> None:
     assert '"character_b_prompt"' in script
     assert "secondary_subject_name" in script
     assert "secondary_subject_slug" in script
-    assert 'compositionMode !== "duo"' in script
-    assert '"Composition: two characters (left / right)"' in script
-    assert "Left character prompt" in script
-    assert "Right character prompt" in script
+    assert '["duo", "trio"].includes(compositionSource.mode)' in script
+    assert '"Composition: two characters (A / B)"' in script
+    assert '"Composition: three characters (A / B / C)"' in script
+    assert "Character A identity / appearance" in script
+    assert "Character B identity / appearance" in script
     preset_fields = script.split("AUTOMATION_PRESET_FIELDS", maxsplit=1)[1].split(
         "]);", maxsplit=1
     )[0]
@@ -103,6 +104,57 @@ def test_generation_form_has_named_device_local_settings_presets() -> None:
     assert '"desired_accepted_count"' not in preset_fields
     assert "scopedStorageKey" in script
     assert "draft.submission_id !== submittedDraftId" in script
+
+
+def test_generation_details_and_reuse_round_trip_the_controlled_trio_contract() -> None:
+    script = (ROOT / "src" / "gen_automation" / "static" / "dashboard.js").read_text(
+        encoding="utf-8"
+    )
+
+    sanitizer = script.split("function sanitizedGenerationDetails", maxsplit=1)[1].split(
+        "const createNode", maxsplit=1
+    )[0]
+    for prompt_name in (
+        "character_c",
+        "character_a_pose",
+        "character_b_pose",
+        "character_c_pose",
+        "character_a_negative",
+        "character_b_negative",
+        "character_c_negative",
+        "interaction",
+        "camera",
+    ):
+        assert f'"{prompt_name}"' in sanitizer
+    for composition_field in (
+        "contract_version",
+        "preset_id",
+        "isolation_mode",
+        "quality_mode",
+    ):
+        assert f'"{composition_field}"' in sanitizer
+
+    reuse = script.split("const automationProfileFromDetails", maxsplit=1)[1].split(
+        "const reuseImageSettingsButton", maxsplit=1
+    )[0]
+    for form_field in (
+        "character_c_prompt",
+        "character_a_pose_prompt",
+        "character_b_pose_prompt",
+        "character_c_pose_prompt",
+        "character_a_negative_prompt",
+        "character_b_negative_prompt",
+        "character_c_negative_prompt",
+        "interaction_prompt",
+        "camera_prompt",
+        "composition_preset_id",
+        "duo_isolation_mode",
+        "duo_quality_mode",
+    ):
+        assert f'"{form_field}"' in reuse
+    assert 'details.composition.mode === "trio"' in reuse
+    assert '"3"' in reuse
+    assert "tertiary_subject_name: details.subjects[2]?.name" in reuse
 
 
 def test_generation_presets_capture_and_restore_complete_ordered_batch_queues() -> None:

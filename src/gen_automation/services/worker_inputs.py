@@ -18,6 +18,7 @@ from gen_automation.domain.controlled_duo import (
     DuoQualityMode,
     WorkflowCapability,
     require_controlled_duo_capabilities,
+    require_controlled_trio_capabilities,
 )
 from gen_automation.domain.deliverability import (
     DeliverabilityError,
@@ -25,6 +26,10 @@ from gen_automation.domain.deliverability import (
 )
 from gen_automation.domain.generation_limits import (
     MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB,
+    MAX_SAFE_OUTPUTS_PER_SIGNED_GENERATION_JOB,
+    MAX_SIGNED_PROMPT_BUDGET_BYTES_PER_GENERATION_JOB,
+    signed_worker_prompt_budget_bytes,
+    utf8_prompt_bytes,
 )
 from gen_automation.domain.release_spec import (
     ArtifactSpecification,
@@ -46,11 +51,19 @@ from gen_automation.gpu_worker.models import (
 )
 from gen_automation.gpu_worker.security import calculate_signature
 from gen_automation.services.assets import create_raw_master_upload_intents
+from gen_automation.services.controlled_trio import (
+    CONTROLLED_TRIO_MARKER_NODE_CLASS,
+    ControlledTrioContractError,
+    controlled_trio_bindings,
+    prepare_controlled_trio_template,
+)
 from gen_automation.services.salad import SaladJobInputContext
 from gen_automation.storage.base import ObjectStore, ObjectStoreError
 
 MAX_WORKFLOW_BYTES = 192 * 1024
 MAX_ENVELOPE_BYTES = 256 * 1024
+MAX_SERIALIZED_UPLOAD_GRANT_BYTES = 12 * 1024
+MAX_SIGNED_ENVELOPE_FIXED_OVERHEAD_BYTES = 16 * 1024
 MAX_JSON_DEPTH = 64
 MAX_JSON_ITEMS = 50_000
 MIN_POST_ACCEPTANCE_UPLOAD_SECONDS = 3600
@@ -61,6 +74,7 @@ MULTI_PROMPT_SHARED_NODE_CLASSES = frozenset(
     {
         "CheckpointLoaderSimple",
         CONTROLLED_DUO_MARKER_NODE_CLASS,
+        CONTROLLED_TRIO_MARKER_NODE_CLASS,
         LORA_CHAIN_NODE_CLASS,
         "CLIPSetLastLayer",
         "UltralyticsDetectorProvider",
@@ -112,6 +126,12 @@ class _ResolvedJobParameters:
         controlled_duo = _controlled_duo_bindings(selected_generation)
         if controlled_duo is not None:
             bindings["controlled_duo"] = controlled_duo
+        try:
+            controlled_trio = controlled_trio_bindings(selected_generation)
+        except ControlledTrioContractError as error:
+            raise WorkerInputError(str(error)) from error
+        if controlled_trio is not None:
+            bindings["controlled_trio"] = controlled_trio
         if runtime.detector_filename is not None:
             bindings["detector"] = {
                 "runtime_filename": runtime.detector_filename,
@@ -163,6 +183,10 @@ _DUO_PRESET_REGION_RATIOS: dict[
     DuoCompositionPreset,
     tuple[tuple[float, float, float, float], tuple[float, float, float, float]],
 ] = {
+    DuoCompositionPreset.FLEXIBLE: (
+        (0.02, 0.03, 0.46, 0.94),
+        (0.52, 0.03, 0.46, 0.94),
+    ),
     DuoCompositionPreset.CLOSE_PORTRAIT: (
         (0.04, 0.08, 0.44, 0.84),
         (0.52, 0.08, 0.44, 0.84),
@@ -239,7 +263,7 @@ def _controlled_duo_bindings(
     if generation.duo_contract_version != 2:
         return None
     preset = generation.composition_preset_id
-    if generation.composition_mode != "duo" or preset is None:
+    if generation.composition_mode != "duo" or not isinstance(preset, DuoCompositionPreset):
         raise WorkerInputError("Controlled Duo generation parameters are invalid")
 
     feather = min(32, max(8, generation.width // 64))
@@ -279,10 +303,12 @@ def _controlled_duo_bindings(
     character_a_local_positive = _join_prompt_parts(
         "left-side subject only, character A only",
         generation.character_a_prompt,
+        generation.character_a_pose_prompt,
     )
     character_b_local_positive = _join_prompt_parts(
         "right-side subject only, character B only",
         generation.character_b_prompt,
+        generation.character_b_pose_prompt,
     )
     character_a_local_negative = _join_prompt_parts(
         generation.character_a_negative_prompt,
@@ -413,6 +439,9 @@ def _resolve_job_parameters(context: SaladJobInputContext) -> _ResolvedJobParame
         raise WorkerInputError("generation parameter schema is unsupported")
     if parameters.get("release_version_id") != str(context.release_version_id):
         raise WorkerInputError("generation parameter identity check failed")
+    worker_request_budget_version = parameters.get("worker_request_budget_version", 1)
+    if worker_request_budget_version not in {1, 2}:
+        raise WorkerInputError("generation parameter schema is unsupported")
 
     try:
         checkpoint = ArtifactSpecification.model_validate(parameters.get("checkpoint"))
@@ -444,6 +473,15 @@ def _resolve_job_parameters(context: SaladJobInputContext) -> _ResolvedJobParame
             )
         except ValueError:
             raise WorkerInputError("Controlled Duo workflow capability is invalid") from None
+    elif generation.duo_contract_version == 3:
+        try:
+            require_controlled_trio_capabilities(
+                frozenset(workflow.capabilities),
+                isolation_mode=generation.duo_isolation_mode,
+                quality_mode=generation.duo_quality_mode,
+            )
+        except ValueError:
+            raise WorkerInputError("Controlled Trio workflow capability is invalid") from None
     if generation.outputs_per_job != context.expected_output_count:
         raise WorkerInputError("generation output count is inconsistent")
     if output_generations:
@@ -457,8 +495,13 @@ def _resolve_job_parameters(context: SaladJobInputContext) -> _ResolvedJobParame
             "prompt",
             "character_a_prompt",
             "character_b_prompt",
+            "character_a_pose_prompt",
+            "character_b_pose_prompt",
+            "character_c_prompt",
+            "character_c_pose_prompt",
             "character_a_negative_prompt",
             "character_b_negative_prompt",
+            "character_c_negative_prompt",
             "interaction_prompt",
             "camera_prompt",
             "negative_prompt",
@@ -480,15 +523,20 @@ def _resolve_job_parameters(context: SaladJobInputContext) -> _ResolvedJobParame
             raise WorkerInputError("generation output parameters are inconsistent")
         if len({item.seed for item in output_generations}) != len(output_generations):
             raise WorkerInputError("generation output seeds are inconsistent")
-        prompt_bytes = sum(
-            len(value.encode("utf-8"))
+        output_prompt_values = tuple(
+            value
             for item in output_generations
             for value in (
                 item.prompt,
                 item.character_a_prompt,
                 item.character_b_prompt,
+                item.character_a_pose_prompt,
+                item.character_b_pose_prompt,
+                item.character_c_prompt,
+                item.character_c_pose_prompt,
                 item.character_a_negative_prompt,
                 item.character_b_negative_prompt,
+                item.character_c_negative_prompt,
                 item.interaction_prompt,
                 item.camera_prompt,
                 item.negative_prompt,
@@ -496,7 +544,18 @@ def _resolve_job_parameters(context: SaladJobInputContext) -> _ResolvedJobParame
                 item.detailer_negative_prompt,
             )
         )
-        if prompt_bytes > MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB:
+        prompt_bytes = utf8_prompt_bytes(output_prompt_values)
+        budgeted_prompt_bytes = (
+            signed_worker_prompt_budget_bytes(output_prompt_values)
+            if worker_request_budget_version >= 2
+            else prompt_bytes
+        )
+        prompt_budget_limit = (
+            MAX_SIGNED_PROMPT_BUDGET_BYTES_PER_GENERATION_JOB
+            if worker_request_budget_version >= 2
+            else MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB
+        )
+        if budgeted_prompt_bytes > prompt_budget_limit:
             raise WorkerInputError("generation prompt text exceeds the worker request budget")
     return _ResolvedJobParameters(
         checkpoint=checkpoint,
@@ -1476,6 +1535,14 @@ async def _load_workflow(
         specification=specification,
         generation=generation,
     )
+    try:
+        template = prepare_controlled_trio_template(
+            template,
+            specification=specification,
+            generation=generation,
+        )
+    except ControlledTrioContractError as error:
+        raise WorkerInputError(str(error)) from error
     rendered = (
         _render_multi_prompt_workflow(template, output_bindings)
         if len(output_bindings) > 1
@@ -1553,6 +1620,22 @@ class SaladWorkerJobInputProvider:
         except DeliverabilityError:
             raise WorkerInputError("rendered workflow geometry is not deliverable") from None
 
+        rendered_workflow_bytes = len(
+            json.dumps(workflow, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        )
+        if rendered_workflow_bytes > self.max_workflow_bytes:
+            raise WorkerInputError("rendered workflow exceeds the configured size limit")
+        reserved_envelope_bytes = (
+            rendered_workflow_bytes
+            + context.expected_output_count * MAX_SERIALIZED_UPLOAD_GRANT_BYTES
+            + MAX_SIGNED_ENVELOPE_FIXED_OVERHEAD_BYTES
+        )
+        if (
+            context.expected_output_count <= MAX_SAFE_OUTPUTS_PER_SIGNED_GENERATION_JOB
+            and reserved_envelope_bytes > self.max_envelope_bytes
+        ):
+            raise WorkerInputError("rendered workflow cannot fit the signed worker request budget")
+
         intents = await create_raw_master_upload_intents(
             self.session,
             self.store,
@@ -1561,9 +1644,12 @@ class SaladWorkerJobInputProvider:
             expires_in=self.upload_grant_ttl_seconds,
             max_bytes=self.max_upload_bytes,
             rotate_incomplete_uploads=True,
+            max_serialized_grant_bytes=MAX_SERIALIZED_UPLOAD_GRANT_BYTES,
+            commit=False,
             actor="salad-worker-input",
         )
         if len(intents) != context.expected_output_count:
+            await self.session.rollback()
             raise WorkerInputError("worker upload grant count is inconsistent")
 
         grants: list[UploadGrant] = []
@@ -1574,17 +1660,29 @@ class SaladWorkerJobInputProvider:
                 or not intent.upload_fields
                 or intent.upload_headers
             ):
+                await self.session.rollback()
                 raise WorkerInputError("object store returned an unsupported upload grant")
-            grants.append(
-                UploadGrant(
-                    asset_id=str(intent.asset_id),
-                    upload_attempt_id=str(intent.upload_attempt_id),
-                    output_index=intent.output_index,
-                    content_type=self.upload_content_type,
-                    url=intent.upload_url,
-                    fields=dict(intent.upload_fields),
-                )
+            grant = UploadGrant(
+                asset_id=str(intent.asset_id),
+                upload_attempt_id=str(intent.upload_attempt_id),
+                output_index=intent.output_index,
+                content_type=self.upload_content_type,
+                url=intent.upload_url,
+                fields=dict(intent.upload_fields),
             )
+            if (
+                len(
+                    json.dumps(
+                        grant.model_dump(mode="json"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ).encode("utf-8")
+                )
+                > MAX_SERIALIZED_UPLOAD_GRANT_BYTES
+            ):
+                await self.session.rollback()
+                raise WorkerInputError("worker upload grant exceeds the request budget")
+            grants.append(grant)
 
         issued_at = int(self.now())
         envelope = GenerateEnvelope(
@@ -1608,5 +1706,7 @@ class SaladWorkerJobInputProvider:
         result = signed.model_dump(mode="json")
         serialized = json.dumps(result, ensure_ascii=False, allow_nan=False).encode()
         if len(serialized) > self.max_envelope_bytes:
+            await self.session.rollback()
             raise WorkerInputError("worker request exceeds the configured size limit")
+        await self.session.commit()
         return result

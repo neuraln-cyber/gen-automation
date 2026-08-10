@@ -2000,6 +2000,25 @@ body.asset-viewer-open { overflow: hidden; }
 .character-card-heading span { color: var(--muted); font-size: .78rem; }
 .character-region-prompt { min-width: 0; }
 .character-region-prompt textarea { min-height: 5.8rem; }
+.character-region-prompt small { color: var(--muted); line-height: 1.4; }
+.prompt-control-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: .45rem .7rem;
+  margin-bottom: .35rem;
+}
+.prompt-control-heading > label:first-child { min-width: 0; }
+.prompt-wildcard-picker {
+  display: block;
+  width: min(100%, 13rem);
+  flex: 0 1 13rem;
+}
+.prompt-wildcard-picker select {
+  min-height: 2.35rem;
+  padding: .42rem .55rem;
+  font-size: .76rem;
+}
 .composition-status { min-height: 1.25rem; color: var(--muted); font-size: .82rem; }
 .composition-status.warning { color: var(--warning, #fcd34d); }
 
@@ -2080,6 +2099,15 @@ body.asset-viewer-open { overflow: hidden; }
   background: rgba(236, 72, 153, .23);
 }
 
+.controlled-duo-mask-c {
+  top: 8%;
+  left: 68%;
+  width: 29%;
+  height: 84%;
+  color: #67e8f9;
+  background: rgba(6, 182, 212, .22);
+}
+
 .controlled-duo-mask-preview[data-preset="overhead"] .controlled-duo-mask-a {
   top: 12%; left: 7%; width: 40%; height: 72%; border-radius: 50%;
 }
@@ -2110,6 +2138,36 @@ body.asset-viewer-open { overflow: hidden; }
 .controlled-duo-mask-preview[data-preset="full_body"] .controlled-duo-mask-b {
   top: 3%; left: 54%; width: 38%; height: 94%; border-radius: 40% 40% 18% 18%;
 }
+.controlled-duo-mask-preview[data-preset="trio_flexible"] .controlled-duo-mask-a,
+.controlled-duo-mask-preview[data-preset="trio_row"] .controlled-duo-mask-a {
+  top: 7%; left: 2%; width: 30%; height: 87%;
+}
+.controlled-duo-mask-preview[data-preset="trio_flexible"] .controlled-duo-mask-b,
+.controlled-duo-mask-preview[data-preset="trio_row"] .controlled-duo-mask-b {
+  top: 7%; left: 35%; width: 30%; height: 87%;
+}
+.controlled-duo-mask-preview[data-preset="trio_flexible"] .controlled-duo-mask-c,
+.controlled-duo-mask-preview[data-preset="trio_row"] .controlled-duo-mask-c {
+  top: 7%; left: 68%; width: 30%; height: 87%;
+}
+.controlled-duo-mask-preview[data-preset="trio_triangle"] .controlled-duo-mask-a {
+  top: 47%; left: 5%; width: 39%; height: 49%; border-radius: 44% 44% 22% 22%;
+}
+.controlled-duo-mask-preview[data-preset="trio_triangle"] .controlled-duo-mask-b {
+  top: 47%; left: 56%; width: 39%; height: 49%; border-radius: 44% 44% 22% 22%;
+}
+.controlled-duo-mask-preview[data-preset="trio_triangle"] .controlled-duo-mask-c {
+  top: 3%; left: 34%; width: 32%; height: 41%; border-radius: 46% 46% 24% 24%;
+}
+.controlled-duo-mask-preview[data-preset="trio_depth"] .controlled-duo-mask-a {
+  top: 33%; left: 2%; width: 34%; height: 64%;
+}
+.controlled-duo-mask-preview[data-preset="trio_depth"] .controlled-duo-mask-b {
+  top: 17%; left: 38%; width: 30%; height: 65%;
+}
+.controlled-duo-mask-preview[data-preset="trio_depth"] .controlled-duo-mask-c {
+  top: 4%; left: 70%; width: 27%; height: 48%;
+}
 
 .controlled-duo-mask-preview figcaption {
   display: flex;
@@ -2133,6 +2191,7 @@ body.asset-viewer-open { overflow: hidden; }
 }
 
 .controlled-duo-direction-grid textarea { min-height: 4.8rem; }
+.controlled-duo-prompt-field { display: grid; align-content: start; min-width: 0; }
 
 .controlled-duo-shared-note,
 .controlled-duo-lora-note,
@@ -2189,7 +2248,18 @@ body.asset-viewer-open { overflow: hidden; }
 
 .character-composition-card[data-character-card="a"] { border-top-color: rgba(196, 181, 253, .7); }
 .character-composition-card[data-character-card="b"] { border-top-color: rgba(249, 168, 212, .7); }
+.character-composition-card[data-character-card="c"] { border-top-color: rgba(103, 232, 249, .72); }
 .character-composition-card.has-lint-warning { border-color: rgba(252, 211, 77, .55); }
+
+.automation-form[data-composition-mode="single"] .character-composition-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+.automation-form[data-composition-mode="duo"] .character-composition-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.automation-form[data-composition-mode="trio"] .character-composition-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
 
 .controlled-duo-workbench :disabled {
   cursor: not-allowed;
@@ -2197,6 +2267,80 @@ body.asset-viewer-open { overflow: hidden; }
 }
 
 .experiment-controlled-duo { margin-top: .75rem; }
+
+.batch-character-overrides {
+  display: none;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: .75rem;
+  padding: .75rem;
+  border: 1px solid rgba(184, 165, 255, .22);
+  border-radius: .72rem;
+  background: rgba(184, 165, 255, .045);
+}
+.automation-form[data-composition-mode="duo"][data-duo-contract-version="2"]
+  .batch-character-overrides,
+.automation-form[data-composition-mode="trio"][data-duo-contract-version="3"]
+  .batch-character-overrides { display: grid; }
+.batch-character-overrides[hidden] { display: none !important; }
+.automation-form[data-composition-mode="trio"] .batch-character-overrides {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.batch-character-overrides-heading {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: start;
+  justify-content: space-between;
+  gap: .75rem;
+}
+.batch-character-overrides-heading p {
+  margin: .2rem 0 0;
+  color: var(--muted);
+  font-size: .76rem;
+  line-height: 1.45;
+}
+.batch-character-overrides-heading a {
+  flex: 0 0 auto;
+  font-size: .76rem;
+}
+.batch-character-override-card,
+.batch-shared-direction-grid {
+  display: grid;
+  min-width: 0;
+  gap: .65rem;
+}
+.batch-character-override-card {
+  align-content: start;
+  padding: .7rem;
+  border: 1px solid rgba(184, 165, 255, .16);
+  border-radius: .65rem;
+  background: rgba(0, 0, 0, .1);
+}
+.batch-character-override-card[hidden] { display: none !important; }
+.batch-character-override-card[data-batch-character-override="c"] {
+  border-color: rgba(103, 232, 249, .2);
+}
+.batch-shared-direction-grid {
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.batch-override-field { display: grid; min-width: 0; gap: .3rem; }
+.batch-override-field textarea { min-height: 4.8rem; }
+.batch-override-field-actions,
+.batch-override-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: .4rem;
+}
+.batch-override-field-actions { justify-content: flex-end; flex-wrap: wrap; }
+.batch-override-toggle {
+  width: auto;
+  color: var(--muted);
+  font-size: .74rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.batch-override-toggle input { width: 1rem; min-height: 1rem; margin: 0; }
+.batch-character-overrides :disabled { cursor: not-allowed; opacity: .58; }
 
 @media (max-width: 680px) {
   .generation-page-actions { align-items: stretch; flex-direction: column; width: 100%; }
@@ -2237,11 +2381,18 @@ body.asset-viewer-open { overflow: hidden; }
   .composition-mode { width: 100%; }
   .composition-mode label { flex: 1; }
   .character-composition-grid { grid-template-columns: minmax(0, 1fr); }
+  .automation-form[data-composition-mode="trio"] .character-composition-grid,
+  .batch-character-overrides,
+  .automation-form[data-composition-mode="trio"] .batch-character-overrides,
+  .batch-shared-direction-grid { grid-template-columns: minmax(0, 1fr); }
   .controlled-duo-layout-grid,
   .controlled-duo-direction-grid,
   .controlled-duo-mode-grid { grid-template-columns: minmax(0, 1fr); }
   .controlled-duo-mask-preview figcaption { align-items: flex-start; flex-direction: column; }
   .controlled-duo-mask-preview figcaption span { text-align: left; }
+  .prompt-control-heading,
+  .batch-character-overrides-heading { align-items: stretch; flex-direction: column; }
+  .prompt-wildcard-picker { width: 100%; flex-basis: auto; }
   .automation-name-advanced { width: 100%; }
   .automation-name-advanced > summary { text-align: center; }
   .settings-preset-bar { align-items: stretch; }
@@ -3316,6 +3467,10 @@ body.asset-viewer-open { overflow: hidden; }
 
 @media (max-width: 900px) {
   .automation-create { padding-bottom: 5.8rem; }
+  .automation-form[data-composition-mode="trio"] .character-composition-grid,
+  .automation-form[data-composition-mode="trio"] .batch-character-overrides {
+    grid-template-columns: minmax(0, 1fr);
+  }
   .automation-create-form #set-details,
   .automation-create-form #generation-setup,
   .automation-create-form #batch-builder,

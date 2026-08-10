@@ -208,6 +208,26 @@
         ],
         "internal_reference": "WORKFLOW-CONTROLLED-DUO-STRICT-V2"
       }
+    },
+    {
+      "name": "Illustrious Controlled Trio balanced",
+      "version": "1",
+      "object_key": "workflows/by-sha256/100a3ed840007591f2cfcc0f3277f787f351caeef82610b46952bb826428f71a.json",
+      "local_path": "../workflows/illustrious-sdxl-controlled-trio-balanced-v1.json",
+      "capabilities": [
+        "controlled_trio_v1"
+      ],
+      "evidence": {
+        "summary": "Reviewed the exact bundled core-only Controlled Trio graph: three disjoint feathered identity regions localize A, B, and C positive and negative conditioning while shared prompts control the combined pose, interaction, and camera through one sampler.",
+        "source_urls": [
+          "https://github.com/Comfy-Org/ComfyUI/blob/700821e1364eaab0e8f21c538a2131719fec57bf/nodes.py",
+          "https://github.com/Comfy-Org/ComfyUI/blob/700821e1364eaab0e8f21c538a2131719fec57bf/comfy_extras/nodes_mask.py"
+        ],
+        "document_sha256s": [
+          "100a3ed840007591f2cfcc0f3277f787f351caeef82610b46952bb826428f71a"
+        ],
+        "internal_reference": "WORKFLOW-CONTROLLED-TRIO-BALANCED-V1"
+      }
     }
   ]
 }

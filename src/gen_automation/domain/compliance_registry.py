@@ -11,7 +11,10 @@ from pydantic import (
     model_validator,
 )
 
-from gen_automation.domain.controlled_duo import WorkflowCapability
+from gen_automation.domain.controlled_duo import (
+    WorkflowCapability,
+    require_coherent_workflow_capabilities,
+)
 from gen_automation.domain.enums import ApprovalStatus, ModelArtifactKind
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -154,7 +157,16 @@ class WorkflowApprovalCreate(StrictComplianceModel):
     ) -> list[WorkflowCapability]:
         if len(values) != len(set(values)):
             raise ValueError("workflow capabilities must be unique")
+        require_coherent_workflow_capabilities(values)
         return sorted(values, key=str)
+
+    @model_validator(mode="after")
+    def validate_capability_topology(self) -> "WorkflowApprovalCreate":
+        require_coherent_workflow_capabilities(
+            self.capabilities,
+            reviewed_node_classes=self.reviewed_node_classes,
+        )
+        return self
 
 
 class ApprovalRevoke(StrictComplianceModel):

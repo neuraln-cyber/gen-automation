@@ -85,8 +85,13 @@ class ResolvedWildcardPrompts:
     prompt: str
     character_a_prompt: str
     character_b_prompt: str
+    character_c_prompt: str
+    character_a_pose_prompt: str
+    character_b_pose_prompt: str
+    character_c_pose_prompt: str
     character_a_negative_prompt: str
     character_b_negative_prompt: str
+    character_c_negative_prompt: str
     interaction_prompt: str
     camera_prompt: str
     negative_prompt: str
@@ -558,6 +563,34 @@ def resolve_wildcard_prompts(
         field_name="character_b_prompt",
         selections=selections,
     )
+    character_c_prompt = _expand_text(
+        selected_generation.character_c_prompt,
+        catalog=catalog.by_name,
+        seed=seed,
+        field_name="character_c_prompt",
+        selections=selections,
+    )
+    character_a_pose_prompt = _expand_text(
+        selected_generation.character_a_pose_prompt,
+        catalog=catalog.by_name,
+        seed=seed,
+        field_name="character_a_pose_prompt",
+        selections=selections,
+    )
+    character_b_pose_prompt = _expand_text(
+        selected_generation.character_b_pose_prompt,
+        catalog=catalog.by_name,
+        seed=seed,
+        field_name="character_b_pose_prompt",
+        selections=selections,
+    )
+    character_c_pose_prompt = _expand_text(
+        selected_generation.character_c_pose_prompt,
+        catalog=catalog.by_name,
+        seed=seed,
+        field_name="character_c_pose_prompt",
+        selections=selections,
+    )
     character_a_negative_prompt = _expand_text(
         selected_generation.character_a_negative_prompt,
         catalog=catalog.by_name,
@@ -570,6 +603,13 @@ def resolve_wildcard_prompts(
         catalog=catalog.by_name,
         seed=seed,
         field_name="character_b_negative_prompt",
+        selections=selections,
+    )
+    character_c_negative_prompt = _expand_text(
+        selected_generation.character_c_negative_prompt,
+        catalog=catalog.by_name,
+        seed=seed,
+        field_name="character_c_negative_prompt",
         selections=selections,
     )
     interaction_prompt = _expand_text(
@@ -608,8 +648,23 @@ def resolve_wildcard_prompts(
         selections=selections,
     )
     references = [reference.model_dump(mode="json") for reference in catalog.references]
+    is_controlled_trio = (
+        selected_generation.composition_mode == "trio"
+        and selected_generation.duo_contract_version == 3
+    )
+    has_duo_pose_prompts = bool(
+        selected_generation.character_a_pose_prompt or selected_generation.character_b_pose_prompt
+    )
     evidence: dict[str, object] = {
-        "schema_version": 3 if selected_generation.duo_contract_version == 2 else 2,
+        "schema_version": (
+            5
+            if is_controlled_trio
+            else (
+                4
+                if has_duo_pose_prompts
+                else (3 if selected_generation.duo_contract_version == 2 else 2)
+            )
+        ),
         "seed": seed,
         "source_prompt": selected_generation.prompt,
         "source_character_a_prompt": selected_generation.character_a_prompt,
@@ -634,7 +689,7 @@ def resolve_wildcard_prompts(
         "wildcard_versions": references,
         "selections": selections,
     }
-    if selected_generation.duo_contract_version == 2:
+    if selected_generation.duo_contract_version in (2, 3):
         evidence.update(
             {
                 "source_character_a_negative_prompt": (
@@ -665,12 +720,56 @@ def resolve_wildcard_prompts(
                 "resolved_camera_prompt_sha256": _text_sha256(camera_prompt),
             }
         )
+    if has_duo_pose_prompts or is_controlled_trio:
+        evidence.update(
+            {
+                "source_character_a_pose_prompt": selected_generation.character_a_pose_prompt,
+                "source_character_b_pose_prompt": selected_generation.character_b_pose_prompt,
+                "source_character_a_pose_prompt_sha256": _text_sha256(
+                    selected_generation.character_a_pose_prompt
+                ),
+                "source_character_b_pose_prompt_sha256": _text_sha256(
+                    selected_generation.character_b_pose_prompt
+                ),
+                "resolved_character_a_pose_prompt_sha256": _text_sha256(character_a_pose_prompt),
+                "resolved_character_b_pose_prompt_sha256": _text_sha256(character_b_pose_prompt),
+            }
+        )
+    if is_controlled_trio:
+        evidence.update(
+            {
+                "source_character_c_prompt": selected_generation.character_c_prompt,
+                "source_character_c_pose_prompt": selected_generation.character_c_pose_prompt,
+                "source_character_c_negative_prompt": (
+                    selected_generation.character_c_negative_prompt
+                ),
+                "source_character_c_prompt_sha256": _text_sha256(
+                    selected_generation.character_c_prompt
+                ),
+                "source_character_c_pose_prompt_sha256": _text_sha256(
+                    selected_generation.character_c_pose_prompt
+                ),
+                "source_character_c_negative_prompt_sha256": _text_sha256(
+                    selected_generation.character_c_negative_prompt
+                ),
+                "resolved_character_c_prompt_sha256": _text_sha256(character_c_prompt),
+                "resolved_character_c_pose_prompt_sha256": _text_sha256(character_c_pose_prompt),
+                "resolved_character_c_negative_prompt_sha256": _text_sha256(
+                    character_c_negative_prompt
+                ),
+            }
+        )
     return ResolvedWildcardPrompts(
         prompt=prompt,
         character_a_prompt=character_a_prompt,
         character_b_prompt=character_b_prompt,
+        character_c_prompt=character_c_prompt,
+        character_a_pose_prompt=character_a_pose_prompt,
+        character_b_pose_prompt=character_b_pose_prompt,
+        character_c_pose_prompt=character_c_pose_prompt,
         character_a_negative_prompt=character_a_negative_prompt,
         character_b_negative_prompt=character_b_negative_prompt,
+        character_c_negative_prompt=character_c_negative_prompt,
         interaction_prompt=interaction_prompt,
         camera_prompt=camera_prompt,
         negative_prompt=negative_prompt,
@@ -688,8 +787,13 @@ def _generation_wildcard_names(specification: ReleaseSpecification) -> set[str]:
             generation.prompt,
             generation.character_a_prompt,
             generation.character_b_prompt,
+            generation.character_c_prompt,
+            generation.character_a_pose_prompt,
+            generation.character_b_pose_prompt,
+            generation.character_c_pose_prompt,
             generation.character_a_negative_prompt,
             generation.character_b_negative_prompt,
+            generation.character_c_negative_prompt,
             generation.interaction_prompt,
             generation.camera_prompt,
             generation.negative_prompt,

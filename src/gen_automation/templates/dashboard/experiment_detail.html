@@ -6,7 +6,7 @@
   {% set initial_gpu_billing_elapsed = initial_gpu_billing.elapsed_seconds if initial_gpu_billing else 0 %}
   {% set initial_gpu_billing_instances = initial_gpu_billing.running_instances if initial_gpu_billing else 0 %}
   {% set initial_gpu_billing_fresh_for = initial_gpu_billing.fresh_for_seconds if initial_gpu_billing else 0 %}
-  <a class="back" href="/dashboard/experiments/new">&larr; New experiment</a>
+  <a class="back" href="/dashboard/experiments/new">&larr; Experiment Lab</a>
   <header class="page-header experiment-page-header">
     <div class="page-header-row">
       <div class="page-header-copy">
@@ -14,7 +14,7 @@
         <h1>{{ experiment.title }}</h1>
         <p class="lede">Results appear as soon as each image is verified. Paired outputs stay aligned by sample number.</p>
       </div>
-      <a class="primary-button" href="/dashboard/experiments/new">Run another comparison</a>
+      <a class="primary-button" href="/dashboard/experiments/new">Queue a warm batch</a>
     </div>
   </header>
 

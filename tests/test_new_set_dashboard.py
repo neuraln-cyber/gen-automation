@@ -151,12 +151,21 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert "Approved Adult Character" in page.text
     assert ">Characters</strong>" in page.text
     assert "Two characters" in page.text
+    assert "Three characters" not in page.text
     assert "Swap complete A / B" in page.text
     assert 'name="composition_mode"' in page.text
     assert 'name="subject_2_id"' in page.text
     assert 'name="character_a_prompt"' in page.text
     assert 'name="character_b_prompt"' in page.text
+    assert 'name="character_a_pose_prompt"' in page.text
+    assert 'name="character_b_pose_prompt"' in page.text
+    assert "Combined pose / interaction" in page.text
+    assert 'data-batch-field="character_a_pose_prompt"' in page.text
+    assert 'data-batch-field="character_b_pose_prompt"' in page.text
+    assert 'data-batch-field="interaction_prompt"' in page.text
+    assert 'data-batch-field="camera_prompt"' in page.text
     assert 'data-regional-prompting="false"' in page.text
+    assert 'data-trio-contract-v1="false"' in page.text
     assert "Illustrious" in page.text
     assert "Portrait Style" in page.text
     assert "production-v1" in page.text

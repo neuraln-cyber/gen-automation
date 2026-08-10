@@ -13,7 +13,7 @@ def test_all_generation_prompt_editors_opt_in_without_serialized_plans() -> None
     experiment = EXPERIMENT.read_text(encoding="utf-8")
     base = BASE.read_text(encoding="utf-8")
 
-    assert new_set.count("data-danbooru-autocomplete") == 12
+    assert new_set.count("data-danbooru-autocomplete") == 22
     assert experiment.count("data-danbooru-autocomplete") == 8
     assert 'data-batch-field="prompt"\n            data-danbooru-autocomplete' in new_set
     assert 'data-batch-field="negative_prompt"\n            data-danbooru-autocomplete' in new_set

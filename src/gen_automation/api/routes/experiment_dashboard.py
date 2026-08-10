@@ -1,29 +1,16 @@
 import hmac
 import json
-import logging
-import secrets
 from pathlib import Path
 from typing import Annotated
-from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
-from pydantic import ValidationError
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from gen_automation.api.browser_experiment_forms import (
-    BrowserExperimentForm,
-    BrowserExperimentFormError,
-    read_experiment_form,
-)
-from gen_automation.api.browser_new_set_forms import (
-    form_key_matches,
-    new_set_csrf_token,
-    new_set_form_key,
-)
+from gen_automation.api.browser_new_set_forms import new_set_csrf_token
+from gen_automation.api.routes.new_set_dashboard import new_set_form_response
 from gen_automation.api.security import (
     RawMasterReader,
     ReleaseReader,
@@ -42,11 +29,6 @@ from gen_automation.domain.enums import (
 from gen_automation.middleware import content_security_policy
 from gen_automation.services.authentication import AuthenticatedPrincipal, CsrfValidationError
 from gen_automation.services.dashboard_previews import dashboard_preview_url
-from gen_automation.services.experiment_support import (
-    ExperimentModelReadiness,
-    classify_experiment_model_readiness,
-    estimate_experiment_session_cost_from_settings,
-)
 from gen_automation.services.experiment_warm_leases import (
     DEFAULT_EXPERIMENT_WARM_LEASE_SECONDS,
     ExperimentWarmLeaseBudgetError,
@@ -59,29 +41,17 @@ from gen_automation.services.experiment_warm_leases import (
     get_current_experiment_warm_lease_status,
 )
 from gen_automation.services.experiments import (
-    ExperimentInputError,
     ExperimentNotFoundError,
-    create_experiment,
     experiment_progress_payload,
     load_experiment_status,
 )
-from gen_automation.services.generation import GenerationPlanConflictError
-from gen_automation.services.managed_artifact_manifest import (
-    ManagedArtifactManifestError,
-    effective_artifact_manifest_from_settings,
-)
-from gen_automation.services.new_sets import (
-    NewSetInputError,
-    NewSetOptions,
-    list_new_set_options,
-)
+from gen_automation.services.new_sets import list_new_set_options
 from gen_automation.services.progressive_assets import (
     AvailableRawMaster,
     ProgressiveAssetIntegrityError,
     ProgressiveAssetNotFoundError,
     list_available_raw_masters,
 )
-from gen_automation.services.releases import ConflictError, NotFoundError
 from gen_automation.storage.base import ObjectStore
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"], include_in_schema=False)
@@ -89,7 +59,6 @@ templates = Jinja2Templates(directory=str(Path(__file__).parents[2] / "templates
 Session = Annotated[AsyncSession, Depends(get_session)]
 _MANAGER_ROLES = frozenset({AdminRole.OWNER, AdminRole.ADMIN})
 _MAX_WARM_REQUEST_BYTES = 4 * 1024
-logger = logging.getLogger(__name__)
 
 
 @router.get(
@@ -112,11 +81,11 @@ async def dashboard_new_experiment(
         )
     options = await list_new_set_options(session)
     try:
-        return await _experiment_form_response(
+        return new_set_form_response(
             request,
-            session=session,
             principal=principal,
             options=options,
+            experiment_mode=True,
         )
     except (CsrfValidationError, HTTPException):
         return _error_response(
@@ -136,7 +105,7 @@ async def dashboard_new_experiment(
 )
 async def submit_dashboard_new_experiment(
     request: Request,
-    session: Session,
+    _session: Session,
     principal: ReleaseReader,
 ) -> Response:
     if principal.role not in _MANAGER_ROLES:
@@ -144,139 +113,13 @@ async def submit_dashboard_new_experiment(
             request,
             principal=principal,
             status_code=status.HTTP_403_FORBIDDEN,
-            heading="Experiment was not created",
-            message="Your account cannot create generation experiments.",
+            heading="Experiment Lab is unavailable",
+            message="Your account cannot create releases.",
         )
-    warm_failed = False
-    try:
-        form = await read_experiment_form(request)
-    except BrowserExperimentFormError as error:
-        options = await list_new_set_options(session)
-        return await _experiment_form_response(
-            request,
-            session=session,
-            principal=principal,
-            options=options,
-            values=error.values,
-            error_message=error.message,
-            status_code=error.status_code,
-        )
-
-    try:
-        manager = await require_release_manager(
-            request,
-            session,
-            csrf_header=form.csrf_token,
-        )
-        settings: Settings = request.app.state.settings
-        if not settings.auth_enabled and not hmac.compare_digest(
-            form.csrf_token,
-            new_set_csrf_token(settings, session_id=manager.session_id),
-        ):
-            raise HTTPException(status_code=403, detail="CSRF validation failed")
-        expected_key = new_set_form_key(
-            settings,
-            session_id=manager.session_id,
-            submission_id=form.submission_id,
-        )
-        if not form_key_matches(form.idempotency_key, expected_key):
-            raise HTTPException(status_code=400, detail="form idempotency validation failed")
-        current_options = await list_new_set_options(session)
-        checkpoints_by_id = {option.approval_id: option for option in current_options.checkpoints}
-        loras_by_id = {option.approval_id: option for option in current_options.loras}
-        for variant in form.command.variants:
-            checkpoint = checkpoints_by_id.get(variant.profile.checkpoint_approval_id)
-            selected_loras = [loras_by_id.get(item.approval_id) for item in variant.profile.loras]
-            if checkpoint is None or any(item is None for item in selected_loras):
-                raise ExperimentInputError(
-                    f"{variant.label}: a selected model is no longer available"
-                )
-            assert all(item is not None for item in selected_loras)
-            required_lora_sha256s = tuple(item.sha256 for item in selected_loras if item)
-            try:
-                effective = await effective_artifact_manifest_from_settings(
-                    session,
-                    settings=settings,
-                    required_lora_sha256s=required_lora_sha256s,
-                )
-            except (ManagedArtifactManifestError, ValueError) as error:
-                raise ExperimentInputError(
-                    f"{variant.label}: the selected models do not fit the safe worker runtime"
-                ) from error
-            manifest_hashes = {artifact.sha256 for artifact in effective.manifest.artifacts}
-            if checkpoint.sha256 not in manifest_hashes or not set(required_lora_sha256s).issubset(
-                manifest_hashes
-            ):
-                raise ExperimentInputError(
-                    f"{variant.label}: onboard the selected model before queueing"
-                )
-        if form.command.keep_warm:
-            try:
-                await ensure_experiment_warm_lease(
-                    session,
-                    actor=str(manager.user_id),
-                    duration_seconds=DEFAULT_EXPERIMENT_WARM_LEASE_SECONDS,
-                )
-            except Exception:
-                await session.rollback()
-                warm_failed = True
-                logger.exception(
-                    "optional experiment warm lease could not be ensured; queueing normally"
-                )
-        await create_experiment(
-            session,
-            command=form.command,
-            idempotency_key=form.idempotency_key,
-            settings=settings,
-            actor=str(manager.user_id),
-        )
-    except HTTPException as error:
-        await session.rollback()
-        return await _submission_error(
-            request,
-            session=session,
-            principal=principal,
-            form=form,
-            status_code=error.status_code,
-            message="The browser session or form could not be verified. Reload and try again.",
-        )
-    except (ExperimentInputError, NewSetInputError) as error:
-        await session.rollback()
-        return await _submission_error(
-            request,
-            session=session,
-            principal=principal,
-            form=form,
-            status_code=status.HTTP_409_CONFLICT,
-            message=str(error).capitalize() + ".",
-        )
-    except (ConflictError, GenerationPlanConflictError, NotFoundError) as error:
-        await session.rollback()
-        return await _submission_error(
-            request,
-            session=session,
-            principal=principal,
-            form=form,
-            status_code=status.HTTP_409_CONFLICT,
-            message=f"The experiment could not be queued: {error}.",
-        )
-    except (IntegrityError, ValidationError):
-        await session.rollback()
-        return await _submission_error(
-            request,
-            session=session,
-            principal=principal,
-            form=form,
-            status_code=status.HTTP_409_CONFLICT,
-            message="An approved input changed while the experiment was queued. Reload and retry.",
-        )
-    location = f"/dashboard/experiments/{form.command.group_slug}"
-    if warm_failed:
-        location += "?warm=unavailable"
     return _secure_response(
         request,
         RedirectResponse(
-            url=location,
+            url="/dashboard/experiments/new",
             status_code=status.HTTP_303_SEE_OTHER,
         ),
     )
@@ -558,159 +401,6 @@ async def dashboard_experiment_generated_assets(
             }
         ),
     )
-
-
-async def _submission_error(
-    request: Request,
-    *,
-    session: AsyncSession,
-    principal: AuthenticatedPrincipal,
-    form: BrowserExperimentForm,
-    status_code: int,
-    message: str,
-) -> Response:
-    options = await list_new_set_options(session)
-    return await _experiment_form_response(
-        request,
-        session=session,
-        principal=principal,
-        options=options,
-        values=form.values,
-        submission_id=form.submission_id,
-        idempotency_key=form.idempotency_key,
-        error_message=message,
-        status_code=status_code,
-    )
-
-
-async def _experiment_form_response(
-    request: Request,
-    *,
-    session: AsyncSession,
-    principal: AuthenticatedPrincipal,
-    options: NewSetOptions,
-    values: dict[str, str] | None = None,
-    submission_id: UUID | None = None,
-    idempotency_key: str | None = None,
-    error_message: str | None = None,
-    status_code: int = status.HTTP_200_OK,
-) -> Response:
-    settings: Settings = request.app.state.settings
-    resolved_submission_id = submission_id or uuid4()
-    resolved_key = idempotency_key or new_set_form_key(
-        settings,
-        session_id=principal.session_id,
-        submission_id=resolved_submission_id,
-    )
-    defaults = _default_values(options)
-    if values:
-        defaults.update(
-            {
-                key: value
-                for key, value in values.items()
-                if key not in {"csrf_token", "submission_id", "idempotency_key"}
-            }
-        )
-    readiness = await _model_readiness(session, settings, options)
-    cost_estimate = estimate_experiment_session_cost_from_settings(
-        settings,
-        idle_ttl_seconds=900,
-        hard_max_duration_seconds=5400,
-    )
-    checkpoint_readiness = {str(item.option.approval_id): item for item in readiness.checkpoints}
-    lora_readiness = {str(item.option.approval_id): item for item in readiness.loras}
-    return _secure_response(
-        request,
-        templates.TemplateResponse(
-            request=request,
-            name="dashboard/experiment_new.html",
-            context={
-                "page_title": "Experiment Lab",
-                "principal": principal,
-                "options": options,
-                "form_values": defaults,
-                "csrf_token": _form_csrf_token(request, principal),
-                "submission_id": resolved_submission_id,
-                "idempotency_key": resolved_key,
-                "error_message": error_message,
-                "model_readiness": readiness,
-                "checkpoint_readiness": checkpoint_readiness,
-                "lora_readiness": lora_readiness,
-                "warm_idle_cost_usd": (
-                    f"{cost_estimate.initial_idle_commitment_microusd / 1_000_000:.2f}"
-                ),
-                "warm_session_max_usd": (f"{cost_estimate.session_max_microusd / 1_000_000:.2f}"),
-                "salad_daily_budget_usd": f"{settings.salad_daily_budget_usd:.2f}",
-                "salad_monthly_budget_usd": f"{settings.salad_monthly_budget_usd:.2f}",
-            },
-            status_code=status_code,
-        ),
-    )
-
-
-async def _model_readiness(
-    session: AsyncSession,
-    settings: Settings,
-    options: NewSetOptions,
-) -> ExperimentModelReadiness:
-    del session
-    # The configured baseline is resident for every worker. Managed LoRAs are
-    # loaded per compatible batch by the controller and are therefore shown as
-    # requiring a worker refresh instead of pretending the full library is warm.
-    return classify_experiment_model_readiness(settings, options)
-
-
-def _default_values(options: NewSetOptions) -> dict[str, str]:
-    preferred_workflow = next(
-        (
-            workflow
-            for workflow in options.workflows
-            if workflow.name.casefold() == "illustrious base detailer"
-        ),
-        options.workflows[0] if options.workflows else None,
-    )
-    values = {
-        "group_slug": f"experiment-{secrets.token_hex(6)}",
-        "experiment_title": "Style comparison",
-        "outputs_per_variant": "2",
-        "paired_seeds": "true",
-        "keep_warm": "true",
-        "base_seed": str(secrets.randbelow(2**63)),
-        "variant_plan": "",
-        "subject_id": str(options.subjects[0].approval_id) if options.subjects else "",
-        "subject_2_id": "",
-        "composition_mode": "single",
-        "character_a_prompt": "",
-        "character_b_prompt": "",
-        "checkpoint_id": str(options.checkpoints[0].approval_id) if options.checkpoints else "",
-        "workflow_id": str(preferred_workflow.approval_id) if preferred_workflow else "",
-        "prompt": "",
-        "negative_prompt": "",
-        "detailer_prompt": "detailed face",
-        "detailer_negative_prompt": "",
-        "seed": str(secrets.randbelow(2**63)),
-        "width": "1144",
-        "height": "1480",
-        "cfg": "6.0",
-        "steps": "30",
-        "sampler": "euler_ancestral",
-        "scheduler": "karras",
-        "clip_skip": "2",
-        "hires_scale": "1.5",
-        "hires_denoise": "0.35",
-        "hires_upscale_method": "bislerp",
-        "detailer_guide_size": "768",
-        "detailer_max_size": "1536",
-        "detailer_denoise": "0.4",
-        "detailer_bbox_threshold": "0.3",
-        "detailer_bbox_dilation": "4",
-        "detailer_bbox_crop_factor": "1.5",
-        "detailer_feather": "4",
-    }
-    for slot in range(1, 9):
-        values[f"lora_{slot}_id"] = ""
-        values[f"lora_{slot}_weight"] = ""
-    return values
 
 
 def _asset_payload(asset: AvailableRawMaster) -> dict[str, object]:

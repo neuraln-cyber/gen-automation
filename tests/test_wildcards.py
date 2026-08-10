@@ -342,6 +342,9 @@ def test_release_freezes_nested_wildcards_and_jobs_store_resolution_evidence(
         }
     )
     subjects.append(second_subject)
+    payload["specification"]["workflow"]["capabilities"] = [  # type: ignore[index]
+        "regional_prompting_v1"
+    ]
     payload["specification"]["generation"]["prompt"] = "portrait, __locations__"  # type: ignore[index]
     payload["specification"]["generation"].update(  # type: ignore[index]
         {
