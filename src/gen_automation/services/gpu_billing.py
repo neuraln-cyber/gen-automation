@@ -8,7 +8,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.db.models import SaladDeployment
-from gen_automation.domain.enums import DesiredDeploymentState, SaladDeploymentState
+from gen_automation.domain.enums import (
+    DesiredDeploymentState,
+    SaladDeploymentPurpose,
+    SaladDeploymentState,
+)
 
 _OBSERVATION_STALE_AFTER = timedelta(seconds=90)
 
@@ -47,8 +51,9 @@ async def load_shared_gpu_billing_snapshot(
     session: AsyncSession,
     *,
     now: datetime | None = None,
+    purpose: SaladDeploymentPurpose = SaladDeploymentPurpose.IMAGE,
 ) -> GpuBillingSnapshot:
-    """Load the one shared worker session, including superseded deployments.
+    """Load one purpose-specific worker session, including superseded deployments.
 
     Rollout marks the replacement current before the old provider group has
     necessarily stopped. An unresolved session therefore wins over
@@ -59,7 +64,9 @@ async def load_shared_gpu_billing_snapshot(
     deployments = list(
         (
             await session.scalars(
-                select(SaladDeployment).order_by(
+                select(SaladDeployment)
+                .where(SaladDeployment.purpose == purpose)
+                .order_by(
                     SaladDeployment.version_no.desc(),
                     SaladDeployment.id.desc(),
                 )

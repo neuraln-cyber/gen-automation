@@ -52,6 +52,7 @@ from gen_automation.domain.enums import (
     ModelArtifactKind,
     ReleasePhase,
     ResourceHealth,
+    SaladDeploymentPurpose,
     SaladDeploymentState,
     ScoringRunState,
 )
@@ -1156,7 +1157,12 @@ async def load_new_set_status(
     status_now = datetime.now(UTC)
     if stage.key in {GenerationProgressStage.QUEUED, GenerationProgressStage.GPU_STARTING}:
         current_deployment = await session.scalar(
-            select(SaladDeployment).where(SaladDeployment.is_current.is_(True)).limit(1)
+            select(SaladDeployment)
+            .where(
+                SaladDeployment.is_current.is_(True),
+                SaladDeployment.purpose == SaladDeploymentPurpose.IMAGE,
+            )
+            .limit(1)
         )
         stage, progress_error = _overlay_provider_preparation(
             stage,

@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+from enum import StrEnum
+from typing import Final, Literal
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from gen_automation.domain.canonical import canonical_sha256
+
+VIDEO_REQUEST_SCHEMA: Final[Literal["video-generation-request/v1"]] = "video-generation-request/v1"
+VIDEO_COMPLIANCE_SCHEMA: Final[Literal["video-compliance/v1"]] = "video-compliance/v1"
+
+
+class VideoContentRating(StrEnum):
+    SFW = "sfw"
+    NSFW = "nsfw"
+    EXPLICIT = "explicit"
+
+
+class VideoGenerationState(StrEnum):
+    QUEUED = "queued"
+    CLAIMED = "claimed"
+    SUBMITTING = "submitting"
+    RUNNING = "running"
+    COLLECTING = "collecting"
+    VERIFYING = "verifying"
+    SUCCEEDED = "succeeded"
+    UNKNOWN = "unknown"
+    RETRY_WAIT = "retry_wait"
+    FAILED = "failed"
+    CANCEL_REQUESTED = "cancel_requested"
+    CANCELLED = "cancelled"
+
+
+class VideoGenerationAttemptState(StrEnum):
+    CREATED = "created"
+    SUBMITTING = "submitting"
+    SUBMITTED = "submitted"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+    CANCEL_REQUESTED = "cancel_requested"
+    CANCELLED = "cancelled"
+
+
+class _StrictFrozenModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+class VideoComplianceAttestations(_StrictFrozenModel):
+    policy_version: Literal["video-compliance/v1"] = VIDEO_COMPLIANCE_SCHEMA
+    source_rights_confirmed: bool
+    lawful_use_confirmed: bool
+    all_depicted_people_are_adults: bool = False
+    consensual_adult_content_confirmed: bool = False
+    no_real_person_sexual_content: bool = False
+
+
+class VideoSourceSnapshot(_StrictFrozenModel):
+    asset_id: UUID
+    storage_backend: str = Field(min_length=1, max_length=50)
+    storage_bucket: str = Field(min_length=1, max_length=255)
+    object_key: str = Field(min_length=1, max_length=1_024)
+    object_version_id: str | None = Field(default=None, max_length=1_024)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    content_type: str = Field(pattern=r"^image/[a-z0-9.+-]+$", max_length=100)
+    image_format: str = Field(min_length=1, max_length=20)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    byte_size: int = Field(gt=0)
+
+
+class VideoGenerationParameters(_StrictFrozenModel):
+    prompt: str = Field(default="", max_length=4_000)
+    negative_prompt: str = Field(default="", max_length=4_000)
+    profile_key: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,99}$",
+    )
+    profile_version: str = Field(min_length=1, max_length=100)
+    profile_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    seed: int = Field(ge=0, le=9_223_372_036_854_775_807)
+    frame_count: Literal[73, 121]
+    fps: Literal[24] = 24
+    width: Literal[480, 832]
+    height: Literal[480, 832]
+    loop_mode: Literal["ping_pong"] = "ping_pong"
+
+    @model_validator(mode="after")
+    def validate_native_dimensions(self) -> VideoGenerationParameters:
+        if (self.width, self.height) not in {(832, 480), (480, 832)}:
+            raise ValueError("video dimensions must be 832x480 or 480x832")
+        return self
+
+
+class VideoGenerationRequest(_StrictFrozenModel):
+    schema_version: Literal["video-generation-request/v1"] = VIDEO_REQUEST_SCHEMA
+    source: VideoSourceSnapshot
+    parameters: VideoGenerationParameters
+    content_rating: VideoContentRating = VideoContentRating.SFW
+    compliance: VideoComplianceAttestations
+
+    @model_validator(mode="after")
+    def validate_attestations(self) -> VideoGenerationRequest:
+        if not self.compliance.source_rights_confirmed:
+            raise ValueError("source-rights attestation is required")
+        if not self.compliance.lawful_use_confirmed:
+            raise ValueError("lawful-use attestation is required")
+        if self.content_rating in {VideoContentRating.NSFW, VideoContentRating.EXPLICIT}:
+            if not self.compliance.all_depicted_people_are_adults:
+                raise ValueError("adult content requires an all-adults attestation")
+            if not self.compliance.consensual_adult_content_confirmed:
+                raise ValueError("adult content requires a consent attestation")
+            if not self.compliance.no_real_person_sexual_content:
+                raise ValueError("adult content requires a no-real-person attestation")
+        return self
+
+    @property
+    def request_sha256(self) -> str:
+        return canonical_sha256(self.model_dump(mode="json"))
+
+
+class VideoCostSummary(_StrictFrozenModel):
+    estimated_cost_microusd: int = Field(default=0, ge=0)
+    reserved_cost_microusd: int = Field(default=0, ge=0)
+    actual_cost_microusd: int = Field(default=0, ge=0)
+    billed_duration_ms: int = Field(default=0, ge=0)

@@ -109,7 +109,7 @@ def test_semantic_feedback_report_uses_jsonb_on_postgresql() -> None:
     assert isinstance(report_type, postgresql.JSONB)
 
 
-def test_lora_catalog_revision_is_the_migration_head() -> None:
+def test_animation_video_revision_is_the_migration_head() -> None:
     configuration = Config("alembic.ini")
     scripts = ScriptDirectory.from_config(configuration)
     independent_targets_revision = scripts.get_revision("20260808_0024")
@@ -121,7 +121,8 @@ def test_lora_catalog_revision_is_the_migration_head() -> None:
     gpu_billing_revision = scripts.get_revision("20260809_0030")
     legacy_retirement_revision = scripts.get_revision("20260809_0031")
     image_only_revision = scripts.get_revision("20260809_0032")
-    revision = scripts.get_revision("20260809_0033")
+    lora_catalog_revision = scripts.get_revision("20260809_0033")
+    revision = scripts.get_revision("20260810_0034")
 
     assert independent_targets_revision is not None
     assert independent_targets_revision.down_revision == "20260808_0023"
@@ -141,9 +142,45 @@ def test_lora_catalog_revision_is_the_migration_head() -> None:
     assert legacy_retirement_revision.down_revision == "20260809_0030"
     assert image_only_revision is not None
     assert image_only_revision.down_revision == "20260809_0031"
+    assert lora_catalog_revision is not None
+    assert lora_catalog_revision.down_revision == "20260809_0032"
     assert revision is not None
-    assert revision.down_revision == "20260809_0032"
-    assert scripts.get_current_head() == "20260809_0033"
+    assert revision.down_revision == "20260809_0033"
+    assert scripts.get_current_head() == "20260810_0034"
+
+
+@pytest.mark.parametrize(
+    ("video_deployments", "video_jobs"),
+    [(1, 0), (0, 1)],
+)
+def test_animation_video_downgrade_refuses_durable_video_data(
+    monkeypatch,
+    video_deployments: int,
+    video_jobs: int,
+) -> None:
+    configuration = Config("alembic.ini")
+    revision = ScriptDirectory.from_config(configuration).get_revision("20260810_0034")
+    assert revision is not None
+
+    class _ScalarResult:
+        def __init__(self, value: int) -> None:
+            self._value = value
+
+        def scalar_one(self) -> int:
+            return self._value
+
+    class _Connection:
+        def execute(self, statement: object) -> _ScalarResult:
+            sql = str(statement)
+            if "salad_deployments" in sql:
+                return _ScalarResult(video_deployments)
+            if "video_generation_jobs" in sql:
+                return _ScalarResult(video_jobs)
+            raise AssertionError(sql)
+
+    monkeypatch.setattr(revision.module.op, "get_bind", _Connection)
+    with pytest.raises(RuntimeError, match="durable video deployment or job data"):
+        revision.module.downgrade()
 
 
 def test_derivative_owner_retry_postgresql_guard_is_narrow_and_bounded(
@@ -393,6 +430,9 @@ def test_foundation_migration_round_trip(
         "semantic_model_promotions",
         "semantic_training_runs",
         "subject_approvals",
+        "video_generation_attempts",
+        "video_generation_jobs",
+        "video_generation_outputs",
         "webhook_receipts",
         "workflow_approvals",
         "wildcard_libraries",
@@ -414,6 +454,7 @@ def test_foundation_migration_round_trip(
         "billing_observed_at",
         "billing_observation_stale",
         "billing_estimated",
+        "purpose",
         "runtime_artifact_manifest_sha256",
     } <= {column["name"] for column in inspect(engine).get_columns("salad_deployments")}
     billing_constraint_names = {
@@ -422,7 +463,13 @@ def test_foundation_migration_round_trip(
     }
     assert "ck_salad_deployments_nonnegative_billing_runtime" in billing_constraint_names
     assert "ck_salad_deployments_billing_active_pair" in billing_constraint_names
+    assert "ck_salad_deployments_salad_deployment_purpose" in billing_constraint_names
     assert "ck_salad_deployments_valid_runtime_artifact_manifest_sha256" in billing_constraint_names
+    salad_index_names = {
+        index["name"] for index in inspect(engine).get_indexes("salad_deployments")
+    }
+    assert "uq_salad_deployments_current_purpose" in salad_index_names
+    assert "uq_salad_deployments_current" not in salad_index_names
     assert {
         "gates_release",
         "x_teaser_revision_id",

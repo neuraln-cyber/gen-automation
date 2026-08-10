@@ -473,7 +473,7 @@ class Settings(BaseSettings):
     worker_signing_private_key: SecretStr | None = None
     worker_signature_ttl_seconds: int = Field(default=7200, ge=5, le=7200)
     salad_attempt_watchdog_seconds: int = Field(default=105 * 60, ge=60, le=6900)
-    worker_upload_grant_ttl_seconds: int = Field(default=10800, ge=3600, le=14400)
+    worker_upload_grant_ttl_seconds: int = Field(default=14400, ge=3600, le=14400)
     salad_worker_allowed_upload_origin: SecretStr | None = None
     salad_worker_model_manifest_json: SecretStr | None = None
     salad_worker_model_manifest_sha256: SecretStr | None = None
@@ -508,6 +508,34 @@ class Settings(BaseSettings):
         default=50 * 1024 * 1024 * 1024,
         ge=10 * 1024 * 1024 * 1024,
         le=250 * 1024 * 1024 * 1024,
+    )
+    # Animation Studio uses a separate immutable worker/container group.  Keeping
+    # its large, cacheable model layer out of the still-image worker preserves
+    # ordinary Automation cold starts and lets both lanes scale to zero
+    # independently.
+    video_generation_enabled: bool = False
+    salad_video_queue_name: str | None = None
+    salad_video_container_group_name: str | None = None
+    salad_video_worker_image: str | None = None
+    salad_video_gpu_class_ids: tuple[UUID, ...] = Field(default=(), max_length=16)
+    salad_video_container_cpu: int = Field(default=4, ge=1, le=16)
+    salad_video_container_memory_mb: int = Field(default=32 * 1024, ge=1024, le=64 * 1024)
+    salad_video_container_storage_bytes: int = Field(
+        default=50 * 1024 * 1024 * 1024,
+        ge=20 * 1024 * 1024 * 1024,
+        le=250 * 1024 * 1024 * 1024,
+    )
+    salad_video_max_hourly_cost_usd: Decimal = Field(
+        default=Decimal("0.35"),
+        gt=0,
+        le=Decimal("100.00"),
+        decimal_places=6,
+    )
+    salad_video_max_queued_jobs: int = Field(default=3, ge=1, le=3)
+    storage_max_video_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        ge=1024 * 1024,
+        le=2 * 1024 * 1024 * 1024,
     )
     salad_max_hourly_cost_usd: Decimal = Field(
         default=Decimal("1.00"),
@@ -944,6 +972,61 @@ class Settings(BaseSettings):
                 errors.append("SaladCloud monthly budget cannot be lower than the daily budget")
             if self.salad_max_hourly_cost_usd > self.salad_daily_budget_usd:
                 errors.append("SaladCloud maximum hourly cost cannot exceed the daily budget")
+            if self.video_generation_enabled:
+                required_video_settings = {
+                    "video queue name": self.salad_video_queue_name,
+                    "video container group name": self.salad_video_container_group_name,
+                    "video worker image": self.salad_video_worker_image,
+                }
+                missing_video = [
+                    label
+                    for label, value in required_video_settings.items()
+                    if value is None or (isinstance(value, str) and not value.strip())
+                ]
+                if missing_video:
+                    errors.append("enabled video generation requires " + ", ".join(missing_video))
+                video_provider_names = {
+                    "video queue name": self.salad_video_queue_name,
+                    "video container group name": self.salad_video_container_group_name,
+                }
+                invalid_video_names = [
+                    label
+                    for label, value in video_provider_names.items()
+                    if value is not None and SALAD_NAME_PATTERN.fullmatch(value) is None
+                ]
+                if invalid_video_names:
+                    errors.append(
+                        "invalid SaladCloud resource name: " + ", ".join(invalid_video_names)
+                    )
+                if self.salad_video_worker_image and (
+                    SALAD_WORKER_IMAGE_PATTERN.fullmatch(self.salad_video_worker_image) is None
+                ):
+                    errors.append("SaladCloud video worker image must be pinned by digest")
+                if not self.salad_video_gpu_class_ids:
+                    errors.append("enabled video generation requires at least one video GPU class")
+                if self.salad_video_max_hourly_cost_usd > self.salad_daily_budget_usd:
+                    errors.append(
+                        "SaladCloud video maximum hourly cost cannot exceed the daily budget"
+                    )
+                minimum_video_grant_ttl = (
+                    self.salad_attempt_watchdog_seconds * 2
+                    + self.background_reconciliation_interval_seconds
+                )
+                if self.worker_upload_grant_ttl_seconds < minimum_video_grant_ttl:
+                    errors.append(
+                        "video generation upload grant TTL must cover two attempt watchdog "
+                        "windows plus reconciliation"
+                    )
+            if (
+                self.salad_video_queue_name is not None
+                and self.salad_video_queue_name == self.salad_queue_name
+            ):
+                errors.append("video and image Salad queues must be different")
+            if (
+                self.salad_video_container_group_name is not None
+                and self.salad_video_container_group_name == self.salad_container_group_name
+            ):
+                errors.append("video and image Salad container groups must be different")
             minimum_provider_timeout = (
                 SALAD_DEPLOYMENT_REQUESTS_PER_CYCLE * self.salad_request_timeout_seconds
             ) + SALAD_OPERATION_TIMEOUT_MARGIN_SECONDS
@@ -961,6 +1044,11 @@ class Settings(BaseSettings):
                 errors.append(
                     "submission timeout must cover a bounded SaladCloud request and local work"
                 )
+
+        if self.video_generation_enabled and (
+            not self.salad_enabled or not self.gpu_allocation_enabled
+        ):
+            errors.append("video generation requires enabled Salad GPU allocation")
 
         if self.background_readiness_failure_threshold > self.background_liveness_failure_threshold:
             errors.append(

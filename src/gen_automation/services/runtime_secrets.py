@@ -13,9 +13,15 @@ from pydantic import SecretStr
 
 from gen_automation.config import Environment, Settings
 from gen_automation.domain.runtime_bindings import (
+    SALAD_IMAGE_WORKER_ALLOWED_RUNTIME_BINDINGS,
+    SALAD_VIDEO_WORKER_REQUIRED_RUNTIME_BINDINGS,
     SALAD_WORKER_ALLOWED_RUNTIME_BINDINGS,
     SALAD_WORKER_REQUIRED_RUNTIME_BINDINGS,
     SALAD_WORKER_RUNTIME_BINDING_REFERENCES,
+    VIDEO_WORKER_ALLOWED_SOURCE_ORIGINS_BINDING,
+    VIDEO_WORKER_ALLOWED_UPLOAD_ORIGIN_BINDING,
+    VIDEO_WORKER_ENVIRONMENT_BINDING,
+    VIDEO_WORKER_VERIFICATION_KEYS_BINDING,
     WORKER_ALLOWED_UPLOAD_ORIGIN_BINDING,
     WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING,
     WORKER_ARTIFACT_BUCKET_BINDING,
@@ -72,7 +78,7 @@ _SETTINGS_BINDINGS = {
 class ConfiguredRuntimeSecretResolver:
     """In-memory resolver backed only by deployment-injected ``SecretStr`` values."""
 
-    __slots__ = ("_closed", "_require_complete", "_values")
+    __slots__ = ("_closed", "_complete_binding_sets", "_require_complete", "_values")
 
     def __init__(
         self,
@@ -85,9 +91,11 @@ class ConfiguredRuntimeSecretResolver:
             raise RuntimeSecretResolutionError("runtime secret configuration is invalid")
         if any(not value.get_secret_value().strip() for value in copied.values()):
             raise RuntimeSecretResolutionError("runtime secret configuration is invalid")
-        if require_complete and not SALAD_WORKER_REQUIRED_RUNTIME_BINDINGS.issubset(copied):
+        complete_binding_sets = _configured_complete_binding_sets(copied)
+        if require_complete and not complete_binding_sets:
             raise RuntimeSecretResolutionError("runtime secret configuration is incomplete")
         self._values = copied
+        self._complete_binding_sets = complete_binding_sets
         self._require_complete = require_complete
         self._closed = False
 
@@ -113,7 +121,7 @@ class ConfiguredRuntimeSecretResolver:
             for name, reference in requested.items()
         ):
             raise RuntimeSecretResolutionError("runtime binding reference is invalid")
-        if self._require_complete and set(requested) != set(self._values):
+        if self._require_complete and frozenset(requested) not in self._complete_binding_sets:
             raise RuntimeSecretResolutionError("runtime binding set is incomplete")
 
         resolved: dict[str, str] = {}
@@ -135,7 +143,14 @@ class ConfiguredRuntimeSecretResolver:
 class AwsAssumeRoleRuntimeSecretResolver:
     """Resolve worker artifact credentials from a fresh, three-hour STS lease."""
 
-    __slots__ = ("_closed", "_require_complete", "_role_arn", "_sts_client", "_values")
+    __slots__ = (
+        "_closed",
+        "_complete_binding_sets",
+        "_require_complete",
+        "_role_arn",
+        "_sts_client",
+        "_values",
+    )
 
     def __init__(
         self,
@@ -156,7 +171,14 @@ class AwsAssumeRoleRuntimeSecretResolver:
         required = SALAD_WORKER_REQUIRED_RUNTIME_BINDINGS | {WORKER_ARTIFACT_SESSION_TOKEN_BINDING}
         if require_complete and not required.issubset(available):
             raise RuntimeSecretResolutionError("runtime secret configuration is incomplete")
+        complete_binding_sets = _configured_complete_binding_sets(
+            copied,
+            artifact_credentials_available=True,
+        )
+        if require_complete and not complete_binding_sets:
+            raise RuntimeSecretResolutionError("runtime secret configuration is incomplete")
         self._values = copied
+        self._complete_binding_sets = complete_binding_sets
         self._role_arn = role_arn
         self._sts_client = sts_client
         self._require_complete = require_complete
@@ -179,7 +201,7 @@ class AwsAssumeRoleRuntimeSecretResolver:
         requested = dict(bindings)
         _validate_requested_bindings(requested)
         available = set(self._values) | _ARTIFACT_CREDENTIAL_BINDINGS
-        if self._require_complete and set(requested) != available:
+        if self._require_complete and frozenset(requested) not in self._complete_binding_sets:
             raise RuntimeSecretResolutionError("runtime binding set is incomplete")
         if not set(requested).issubset(available):
             raise RuntimeSecretResolutionError("runtime binding could not be resolved")
@@ -260,9 +282,26 @@ def configured_runtime_binding_references(settings: Settings) -> dict[str, str]:
 
     if not settings.salad_enabled:
         return {}
-    configured_names = set(_configured_runtime_secret_values(settings))
+    configured_names = set(_configured_runtime_secret_values(settings)) & set(
+        SALAD_IMAGE_WORKER_ALLOWED_RUNTIME_BINDINGS
+    )
     if settings.salad_worker_artifact_role_arn is not None:
         configured_names.update(_ARTIFACT_CREDENTIAL_BINDINGS)
+    return {
+        name: SALAD_WORKER_RUNTIME_BINDING_REFERENCES[name] for name in sorted(configured_names)
+    }
+
+
+def configured_video_runtime_binding_references(settings: Settings) -> dict[str, str]:
+    """Return the minimal public bindings for the isolated video worker."""
+
+    if not settings.video_generation_enabled:
+        return {}
+    configured_names = set(_configured_runtime_secret_values(settings)) & set(
+        SALAD_VIDEO_WORKER_REQUIRED_RUNTIME_BINDINGS
+    )
+    if configured_names != set(SALAD_VIDEO_WORKER_REQUIRED_RUNTIME_BINDINGS):
+        raise RuntimeSecretResolutionError("video runtime secret configuration is incomplete")
     return {
         name: SALAD_WORKER_RUNTIME_BINDING_REFERENCES[name] for name in sorted(configured_names)
     }
@@ -319,19 +358,47 @@ def _configured_runtime_secret_values(settings: Settings) -> dict[str, SecretStr
     }
     public_key = settings.worker_verification_public_key
     if settings.worker_signing_key_id is not None and public_key is not None:
-        values[WORKER_VERIFICATION_KEYS_BINDING] = SecretStr(
-            json.dumps(
-                {settings.worker_signing_key_id: public_key},
-                ensure_ascii=True,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
+        serialized_keys = json.dumps(
+            {settings.worker_signing_key_id: public_key},
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
         )
+        values[WORKER_VERIFICATION_KEYS_BINDING] = SecretStr(serialized_keys)
+        if settings.video_generation_enabled:
+            values[VIDEO_WORKER_VERIFICATION_KEYS_BINDING] = SecretStr(serialized_keys)
+    if settings.video_generation_enabled:
+        values[VIDEO_WORKER_ENVIRONMENT_BINDING] = SecretStr("production")
+        upload_origin = settings.salad_worker_allowed_upload_origin
+        if upload_origin is not None and upload_origin.get_secret_value().strip():
+            raw_origin = upload_origin.get_secret_value()
+            values[VIDEO_WORKER_ALLOWED_UPLOAD_ORIGIN_BINDING] = SecretStr(raw_origin)
+            values[VIDEO_WORKER_ALLOWED_SOURCE_ORIGINS_BINDING] = SecretStr(
+                json.dumps([raw_origin], ensure_ascii=True, separators=(",", ":"))
+            )
     for binding_name, setting_name in _SETTINGS_BINDINGS.items():
         configured = getattr(settings, setting_name)
         if isinstance(configured, SecretStr) and configured.get_secret_value().strip():
             values[binding_name] = configured
     return values
+
+
+def _configured_complete_binding_sets(
+    values: Mapping[str, SecretStr],
+    *,
+    artifact_credentials_available: bool = False,
+) -> frozenset[frozenset[str]]:
+    available = set(values)
+    if artifact_credentials_available:
+        available.update(_ARTIFACT_CREDENTIAL_BINDINGS)
+    complete: set[frozenset[str]] = set()
+    image = available & set(SALAD_IMAGE_WORKER_ALLOWED_RUNTIME_BINDINGS)
+    if SALAD_WORKER_REQUIRED_RUNTIME_BINDINGS.issubset(image):
+        complete.add(frozenset(image))
+    video = available & set(SALAD_VIDEO_WORKER_REQUIRED_RUNTIME_BINDINGS)
+    if video == set(SALAD_VIDEO_WORKER_REQUIRED_RUNTIME_BINDINGS):
+        complete.add(frozenset(video))
+    return frozenset(complete)
 
 
 def _validate_requested_bindings(requested: Mapping[str, str]) -> None:

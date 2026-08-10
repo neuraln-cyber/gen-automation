@@ -444,6 +444,29 @@ def test_csp_allows_dashboard_to_post_to_exact_model_artifact_origin() -> None:
     ]
 
 
+def test_csp_allows_animation_media_from_only_the_exact_asset_origin() -> None:
+    default_media_sources = (
+        content_security_policy(Environment.PRODUCTION)
+        .split("media-src ", maxsplit=1)[1]
+        .split(";", maxsplit=1)[0]
+        .split()
+    )
+    animation_media_sources = (
+        content_security_policy(
+            Environment.PRODUCTION,
+            media_source="https://private-assets.s3.eu-central-1.amazonaws.com",
+        )
+        .split("media-src ", maxsplit=1)[1]
+        .split(";", maxsplit=1)[0]
+        .split()
+    )
+    assert default_media_sources == ["'self'"]
+    assert animation_media_sources == [
+        "'self'",
+        "https://private-assets.s3.eu-central-1.amazonaws.com",
+    ]
+
+
 def test_asset_connection_source_is_restricted_to_the_configured_origin(
     tmp_path: Path,
 ) -> None:

@@ -26,11 +26,14 @@ from gen_automation.db.models import (
     ReleaseVersion,
     SaladDeployment,
 )
+from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import (
+    BudgetState,
     DesiredDeploymentState,
     ExperimentWarmLeaseState,
     GenerationAttemptState,
     GenerationState,
+    SaladDeploymentPurpose,
     SaladDeploymentState,
 )
 from gen_automation.domain.runtime_bindings import (
@@ -100,6 +103,7 @@ from gen_automation.services.quality_runtime import run_quality_cycle
 from gen_automation.services.runtime_secrets import (
     RuntimeSecretResolver,
     configured_runtime_binding_references,
+    configured_video_runtime_binding_references,
 )
 from gen_automation.services.salad import (
     SaladDeploymentConfig,
@@ -135,6 +139,7 @@ from gen_automation.services.semantic_learning import run_semantic_learning_cycl
 from gen_automation.services.semantic_review_reconciliation import (
     reconcile_one_completed_semantic_review,
 )
+from gen_automation.services.video_runtime import VideoRuntime, VideoRuntimeConfig
 from gen_automation.services.worker_inputs import SaladWorkerJobInputProvider
 from gen_automation.storage.base import ObjectStore
 from gen_automation.storage.model_artifacts import ModelArtifactStore
@@ -272,6 +277,90 @@ def salad_deployment_config_from_settings(settings: Settings) -> SaladDeployment
         # controller's bounded prefetch runway. One queued job should be enough
         # to keep the single allowed replica allocated.
         desired_queue_length=1,
+        purpose=SaladDeploymentPurpose.IMAGE,
+    )
+
+
+def salad_video_deployment_config_from_settings(settings: Settings) -> SaladDeploymentConfig:
+    """Build the isolated, scale-to-zero Animation Studio deployment intent."""
+
+    required_names = (
+        settings.salad_organization,
+        settings.salad_project,
+        settings.salad_video_queue_name,
+        settings.salad_video_container_group_name,
+        settings.salad_video_worker_image,
+    )
+    if (
+        not settings.video_generation_enabled
+        or not settings.salad_enabled
+        or not settings.gpu_allocation_enabled
+        or any(value is None for value in required_names)
+        or not settings.salad_video_gpu_class_ids
+    ):
+        raise ValueError("validated Salad video bootstrap settings are incomplete")
+
+    organization, project, queue, container_group, worker_image = required_names
+    assert organization is not None
+    assert project is not None
+    assert queue is not None
+    assert container_group is not None
+    assert worker_image is not None
+
+    runtime_bindings = configured_video_runtime_binding_references(settings)
+    upload_origin = settings.salad_worker_allowed_upload_origin
+    verification_public_key = settings.worker_verification_public_key
+    signing_key_id = settings.worker_signing_key_id
+    if upload_origin is None or verification_public_key is None or signing_key_id is None:
+        raise ValueError("validated Salad video runtime bindings are incomplete")
+    runtime_binding_contract_sha256 = canonical_sha256(
+        {
+            "schema": "video-runtime-bindings/v1",
+            "environment": "production",
+            "verification_keys": {signing_key_id: verification_public_key},
+            "allowed_upload_origin": upload_origin.get_secret_value(),
+            "allowed_source_origins": [upload_origin.get_secret_value()],
+        }
+    )
+    provider_configuration: dict[str, JSONValue] = {
+        "container": {
+            "resources": {
+                "cpu": settings.salad_video_container_cpu,
+                "memory": settings.salad_video_container_memory_mb,
+                "storage_amount": settings.salad_video_container_storage_bytes,
+                "gpu_classes": [
+                    str(gpu_class_id) for gpu_class_id in settings.salad_video_gpu_class_ids
+                ],
+            },
+            # Wan's exact immutable files live in a stable OCI layer. Salad's
+            # private-layer cache moves that transfer out of paid worker time;
+            # no model is fetched by a running replica.
+            "image_caching": True,
+            "priority": settings.salad_container_priority.value,
+        },
+        "replicas": 0,
+        "queue_connection": {},
+        "queue_autoscaler": {"polling_period": 15},
+        "runtime_bindings": [
+            {"name": name, "reference": reference} for name, reference in runtime_bindings.items()
+        ],
+        # Only a one-way fingerprint is durable. Rotating a signing key or
+        # storage origin now creates a fresh immutable VIDEO deployment instead
+        # of silently reusing a group whose ephemeral environment is stale.
+        "runtime_binding_contract_sha256": runtime_binding_contract_sha256,
+    }
+    return SaladDeploymentConfig(
+        organization_name=organization,
+        project_name=project,
+        queue_name=queue,
+        container_group_name=container_group,
+        worker_image_digest=worker_image,
+        max_hourly_cost_microusd=int(settings.salad_video_max_hourly_cost_usd * 1_000_000),
+        provider_configuration=provider_configuration,
+        min_replicas=0,
+        max_replicas=1,
+        desired_queue_length=1,
+        purpose=SaladDeploymentPurpose.VIDEO,
     )
 
 
@@ -713,6 +802,47 @@ class ControllerWorkloads:
         )
         if settings.lora_manager_enabled and self.lora_runtime is None:
             raise RuntimeError("validated LoRA runtime dependencies are unavailable")
+        video_signing_private_key = (
+            settings.worker_signing_private_key.get_secret_value()
+            if settings.worker_signing_private_key is not None
+            else None
+        )
+        self.video_runtime = (
+            VideoRuntime(
+                config=VideoRuntimeConfig(
+                    enabled=settings.video_generation_enabled,
+                    queue_name=settings.salad_video_queue_name or "",
+                    worker_image_digest=settings.salad_video_worker_image or "",
+                    signing_key_id=settings.worker_signing_key_id or "",
+                    signing_private_key=video_signing_private_key or "",
+                    signature_ttl_seconds=settings.worker_signature_ttl_seconds,
+                    grant_ttl_seconds=settings.worker_upload_grant_ttl_seconds,
+                    max_output_bytes=settings.storage_max_video_bytes,
+                    max_queued_jobs=settings.salad_video_max_queued_jobs,
+                    max_hourly_cost_microusd=int(
+                        settings.salad_video_max_hourly_cost_usd * 1_000_000
+                    ),
+                    # Reserve the full bounded provider watchdog window. This
+                    # is a budget commitment, not a charge, and prevents a
+                    # cold allocation from silently overcommitting the cap.
+                    attempt_watchdog_seconds=settings.salad_attempt_watchdog_seconds,
+                    retry_delay_seconds=settings.background_retry_delay_seconds,
+                    reconciliation_interval_seconds=(
+                        settings.background_reconciliation_interval_seconds
+                    ),
+                    unresolved_submission_seconds=min(
+                        settings.salad_attempt_watchdog_seconds,
+                        settings.worker_signature_ttl_seconds,
+                    ),
+                ),
+                sessions=sessions,
+                salad=salad_client,
+                store=object_store,
+                worker_id=f"{instance_id}:video-runtime",
+            )
+            if salad_client is not None and object_store is not None
+            else None
+        )
         self._next_attempt_reconciliation: dict[UUID, float] = {}
         self._generation_stop_settlement_cursor: UUID | None = None
 
@@ -748,13 +878,38 @@ class ControllerWorkloads:
                 daily_limit_usd=self.settings.salad_daily_budget_usd,
                 monthly_limit_usd=self.settings.salad_monthly_budget_usd,
             )
+            budget_guard = await self._lock_budget_guard(session)
             if self.settings.salad_enabled and self.settings.gpu_allocation_enabled:
                 await create_deployment_version(
                     session,
                     salad_deployment_config_from_settings(self.settings),
                     actor=self._worker_id("bootstrap"),
                     now=now,
+                    replace_stopped_replay_reasons=(
+                        frozenset({"gpu_allocation_disabled"})
+                        if budget_guard is not None and budget_guard.state == BudgetState.OPEN
+                        else frozenset()
+                    ),
                 )
+                if self.settings.video_generation_enabled:
+                    await create_deployment_version(
+                        session,
+                        salad_video_deployment_config_from_settings(self.settings),
+                        actor=self._worker_id("video-bootstrap"),
+                        now=now,
+                        replace_stopped_replay_reasons=(
+                            frozenset(
+                                {
+                                    "gpu_allocation_disabled",
+                                    "video_generation_disabled",
+                                }
+                            )
+                            if budget_guard is not None and budget_guard.state == BudgetState.OPEN
+                            else frozenset()
+                        ),
+                    )
+                else:
+                    await self._disable_video_allocations(session, now=now)
             else:
                 await self._disable_gpu_allocations(session, now=now)
             await session.commit()
@@ -781,6 +936,13 @@ class ControllerWorkloads:
         if self.lora_runtime is None:
             return False
         return await self.lora_runtime.lifecycle_once()
+
+    async def video_once(self) -> bool:
+        if self.video_runtime is None:
+            return False
+        if not self.video_runtime.config.enabled:
+            return await self.video_runtime.disable_once()
+        return await self.video_runtime.run_once()
 
     async def deployment_once(self) -> bool:
         if self.salad_client is None:
@@ -893,6 +1055,7 @@ class ControllerWorkloads:
                 select(SaladDeployment.id)
                 .where(
                     SaladDeployment.is_current.is_(True),
+                    SaladDeployment.purpose == SaladDeploymentPurpose.IMAGE,
                     SaladDeployment.state == SaladDeploymentState.ACTIVE,
                     SaladDeployment.desired_state == DesiredDeploymentState.ACTIVE,
                 )
@@ -1836,6 +1999,7 @@ class ControllerWorkloads:
         )
         for deployment in deployments:
             deployment.desired_state = DesiredDeploymentState.STOPPED
+            deployment.administrative_stop_reason = "gpu_allocation_disabled"
             deployment.reconcile_after = now
             deployment.last_error_code = "gpu_allocation_disabled"
             deployment.last_error_detail = (
@@ -1850,6 +2014,53 @@ class ControllerWorkloads:
                     resource_id=deployment.id,
                     correlation_id=f"salad-deployment:{deployment.id}",
                     detail={"previous_desired_state": DesiredDeploymentState.ACTIVE.value},
+                    occurred_at=now,
+                )
+            )
+        await session.flush()
+        return len(deployments)
+
+    async def _disable_video_allocations(
+        self,
+        session: AsyncSession,
+        *,
+        now: datetime,
+    ) -> int:
+        """Durably stop only the video lane when its admission flag is off."""
+
+        if self.settings.video_generation_enabled:
+            return 0
+        deployments = list(
+            (
+                await session.scalars(
+                    select(SaladDeployment)
+                    .where(
+                        SaladDeployment.purpose == SaladDeploymentPurpose.VIDEO,
+                        SaladDeployment.desired_state != DesiredDeploymentState.STOPPED,
+                    )
+                    .order_by(SaladDeployment.version_no)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        for deployment in deployments:
+            previous_desired_state = deployment.desired_state
+            deployment.desired_state = DesiredDeploymentState.STOPPED
+            deployment.administrative_stop_reason = "video_generation_disabled"
+            deployment.reconcile_after = now
+            deployment.last_error_code = "video_generation_disabled"
+            deployment.last_error_detail = (
+                "Animation Studio is disabled; the video provider lane must remain stopped."
+            )
+            deployment.lock_version += 1
+            session.add(
+                AuditEvent(
+                    actor=self._worker_id("video-allocation-guard"),
+                    action="salad_deployment.video_generation_disabled",
+                    resource_type="salad_deployment",
+                    resource_id=deployment.id,
+                    correlation_id=f"salad-deployment:{deployment.id}",
+                    detail={"previous_desired_state": previous_desired_state.value},
                     occurred_at=now,
                 )
             )
@@ -1974,11 +2185,17 @@ class ControllerWorkloads:
                 error_type=type(error).__name__,
             )
 
-    async def _lock_budget_guard(self, session: AsyncSession) -> None:
-        await session.scalar(
-            select(ProviderBudgetGuard.id)
-            .where(ProviderBudgetGuard.provider == "salad")
-            .with_for_update()
+    async def _lock_budget_guard(
+        self,
+        session: AsyncSession,
+    ) -> ProviderBudgetGuard | None:
+        return cast(
+            ProviderBudgetGuard | None,
+            await session.scalar(
+                select(ProviderBudgetGuard)
+                .where(ProviderBudgetGuard.provider == "salad")
+                .with_for_update()
+            ),
         )
 
     def _worker_id(self, loop_name: str) -> str:
@@ -2095,6 +2312,17 @@ def build_controller_runtime(
                 )
             )
     if object_store is not None:
+        if workloads.video_runtime is not None:
+            loops.append(
+                LoopSpec(
+                    name="animation-video",
+                    cycle=workloads.video_once,
+                    idle_interval_seconds=poll,
+                    timeout_seconds=settings.background_collection_timeout_seconds + 15,
+                    # A scale-to-zero video lane can spend its first cycle cold.
+                    requires_initial_success_for_readiness=False,
+                )
+            )
         loops.append(
             LoopSpec(
                 name="master-collection",

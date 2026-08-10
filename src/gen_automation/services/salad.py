@@ -28,6 +28,7 @@ from gen_automation.domain.enums import (
     DesiredDeploymentState,
     GenerationAttemptState,
     GenerationState,
+    SaladDeploymentPurpose,
     SaladDeploymentState,
 )
 from gen_automation.domain.ids import uuid7
@@ -190,6 +191,7 @@ class SaladDeploymentConfig:
     min_replicas: int = 0
     max_replicas: int = 1
     desired_queue_length: int = 1
+    purpose: SaladDeploymentPurpose = SaladDeploymentPurpose.IMAGE
 
     def __post_init__(self) -> None:
         for name, value, max_length in (
@@ -215,7 +217,7 @@ class SaladDeploymentConfig:
         _validate_provider_configuration(self.provider_configuration)
 
     def canonical_value(self) -> dict[str, Any]:
-        return {
+        value = {
             "organization_name": self.organization_name,
             "project_name": self.project_name,
             "queue_name": self.queue_name,
@@ -227,6 +229,9 @@ class SaladDeploymentConfig:
             "max_replicas": self.max_replicas,
             "desired_queue_length": self.desired_queue_length,
         }
+        if self.purpose == SaladDeploymentPurpose.VIDEO:
+            value["purpose"] = self.purpose.value
+        return value
 
     @property
     def config_sha256(self) -> str:
@@ -337,6 +342,7 @@ async def create_deployment_version(
     *,
     actor: str = "controller",
     now: datetime | None = None,
+    replace_stopped_replay_reasons: frozenset[str] = frozenset(),
 ) -> DeploymentVersionResult:
     """Create the next immutable deployment version in the caller's transaction."""
 
@@ -347,9 +353,20 @@ async def create_deployment_version(
     config_value["provider_configuration"] = provider_configuration
     config_hash = canonical_sha256(config_value)
     current = await session.scalar(
-        select(SaladDeployment).where(SaladDeployment.is_current.is_(True)).with_for_update()
+        select(SaladDeployment)
+        .where(
+            SaladDeployment.is_current.is_(True),
+            SaladDeployment.purpose == config.purpose,
+        )
+        .with_for_update()
     )
-    if current is not None and current.config_sha256 == config_hash:
+    replace_stopped_replay = (
+        current is not None
+        and current.config_sha256 == config_hash
+        and current.desired_state == DesiredDeploymentState.STOPPED
+        and current.administrative_stop_reason in replace_stopped_replay_reasons
+    )
+    if current is not None and current.config_sha256 == config_hash and not replace_stopped_replay:
         return DeploymentVersionResult(
             deployment_id=current.id,
             version_no=current.version_no,
@@ -373,7 +390,10 @@ async def create_deployment_version(
                 resource_type="salad_deployment",
                 resource_id=current.id,
                 correlation_id=f"salad-deployment:{current.id}",
-                detail={"replacement_version_no": version_no},
+                detail={
+                    "purpose": config.purpose.value,
+                    "replacement_version_no": version_no,
+                },
                 occurred_at=created_at,
             )
         )
@@ -381,6 +401,7 @@ async def create_deployment_version(
 
     deployment = SaladDeployment(
         id=uuid7(),
+        purpose=config.purpose,
         version_no=version_no,
         config_sha256=config_hash,
         worker_image_digest=config.worker_image_digest,
@@ -408,6 +429,7 @@ async def create_deployment_version(
             correlation_id=f"salad-deployment:{deployment.id}",
             detail={
                 "version_no": version_no,
+                "purpose": config.purpose.value,
                 "config_sha256": config_hash,
                 "max_replicas": config.max_replicas,
             },

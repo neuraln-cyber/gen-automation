@@ -21,6 +21,7 @@ from gen_automation.db.session import Database
 from gen_automation.domain.enums import (
     BudgetState,
     DesiredDeploymentState,
+    SaladDeploymentPurpose,
     SaladDeploymentState,
     SpendEntryType,
 )
@@ -697,6 +698,18 @@ async def test_runtime_binding_requires_resolver_and_complete_resolution() -> No
     resolver = FakeResolver({})
     with pytest.raises(SaladDeploymentValidationError, match="could not be resolved"):
         await _container_group_payload(deployment, resolver)
+
+
+@pytest.mark.asyncio
+async def test_video_runtime_binding_fingerprint_is_not_sent_to_salad() -> None:
+    configuration = provider_configuration()
+    configuration["runtime_binding_contract_sha256"] = "f" * 64
+    deployment = unpersisted_deployment(configuration)
+    deployment.purpose = SaladDeploymentPurpose.VIDEO
+
+    payload = await _container_group_payload(deployment, None)
+
+    assert "runtime_binding_contract_sha256" not in payload
 
 
 @pytest.mark.asyncio
@@ -1485,6 +1498,49 @@ async def test_stopped_desire_only_invokes_stop_and_requires_observed_confirmati
     assert deployment.billing_session_started_at is not None
     assert deployment.billing_session_ended_at is not None
     assert deployment.billing_active_instance_id is None
+
+
+@pytest.mark.asyncio
+async def test_confirmed_video_stop_preserves_administrative_reason_after_transient_error(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(
+        deployment_context,
+        desired_state=DesiredDeploymentState.STOPPED,
+    )
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.groups[group_name] = make_group(
+        group_name,
+        queue_name,
+        status="stopped",
+        start_time=None,
+        finish_time=NOW + timedelta(minutes=1),
+    )
+
+    async with deployment_context.database.sessions() as session:
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+        deployment.purpose = SaladDeploymentPurpose.VIDEO
+        deployment.administrative_stop_reason = "video_generation_disabled"
+        deployment.last_error_code = "stop_container_group_transport_unknown"
+        deployment.last_error_detail = "The earlier provider stop response was ambiguous."
+        await session.commit()
+
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment.id,
+            client=client,
+            now=NOW + timedelta(minutes=1),
+        )
+        await session.commit()
+        await session.refresh(deployment)
+
+    assert result.action == DeploymentAction.STOPPED
+    assert deployment.state == SaladDeploymentState.STOPPED
+    assert deployment.last_error_code is None
+    assert deployment.last_error_detail is None
+    assert deployment.administrative_stop_reason == "video_generation_disabled"
 
 
 @pytest.mark.asyncio

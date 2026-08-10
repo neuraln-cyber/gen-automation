@@ -1,0 +1,328 @@
+name: Publish immutable video worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact green main commit to publish
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: publish-video-worker
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish or reuse the exact video worker
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository }}/video-worker
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      PROFILE_SHA256: a83c946f9a61bac7cf3794fc9aa4debacc2fc676c13957deaed42ecf82c7e2e4
+      WORKFLOW_SHA256: ecba3eef1c14abcd4d0d2ba3cec1f53042767f1a177d833dcfd3fd6b11f09ab3
+      MODEL_REVISION: fb1388adc906ab39ffc26ee40e96b22886b56bc4
+      MAX_COMPRESSED_IMAGE_BYTES: "33000000000"
+      BUILDKIT_IMAGE: moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+      SBOM_GENERATOR_IMAGE: docker/buildkit-syft-scanner:stable-1@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68
+    outputs:
+      image_digest: ${{ steps.verify.outputs.digest }}
+    steps:
+      - name: Check out full main history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require an exact commit already merged to main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [ "$SOURCE_SHA" = "$GITHUB_SHA" ] || {
+            printf '%s\n' \
+              "Publish only the current main commit so provenance matches source." >&2
+            exit 1
+          }
+          git cat-file -e "${SOURCE_SHA}^{commit}"
+          first_parent_commits="$RUNNER_TEMP/video-worker-main-first-parent"
+          git rev-list --first-parent HEAD >"$first_parent_commits"
+          grep -Fxq "$SOURCE_SHA" "$first_parent_commits" || {
+            printf '%s\n' \
+              "The requested source is not a first-parent commit on main." >&2
+            exit 1
+          }
+          ci_runs="$RUNNER_TEMP/video-worker-ci-runs.json"
+          gh api --method GET \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+            -f branch=main \
+            -f event=push \
+            -f head_sha="$SOURCE_SHA" \
+            -f status=completed \
+            -f per_page=100 >"$ci_runs"
+          CI_RUNS="$ci_runs" SOURCE_SHA="$SOURCE_SHA" python3 -c '
+          import json, os
+          with open(os.environ["CI_RUNS"], encoding="utf-8") as handle:
+              runs = json.load(handle).get("workflow_runs", [])
+          matches = [
+              run for run in runs
+              if run.get("head_sha") == os.environ["SOURCE_SHA"]
+              and run.get("head_branch") == "main"
+              and run.get("event") == "push"
+              and run.get("status") == "completed"
+              and run.get("conclusion") == "success"
+          ]
+          if not matches:
+              raise SystemExit("No successful main-push CI run exists for SOURCE_SHA")
+          '
+          git checkout --detach "$SOURCE_SHA"
+          [ "$(git rev-parse HEAD)" = "$SOURCE_SHA" ]
+      - name: Reclaim ephemeral runner space for the one-time model layer
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup \
+            /usr/local/lib/android \
+            /usr/share/dotnet
+          df -h /
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          version: v0.36.1
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Reuse an existing exact immutable image when available
+        id: existing
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_tag="${IMAGE_NAME}:sha-${SOURCE_SHA}"
+          error_file="$RUNNER_TEMP/video-worker-inspect-error"
+          if docker buildx imagetools inspect "$image_tag" >/dev/null 2>"$error_file"; then
+            printf 'exists=true\n' >>"$GITHUB_OUTPUT"
+            existing_manifest="$(
+              docker buildx imagetools inspect \
+                "$image_tag" \
+                --format '{{json .Manifest}}'
+            )"
+            existing_digest="$(
+              MANIFEST_JSON="$existing_manifest" python3 -c \
+                'import json, os; print(json.loads(os.environ["MANIFEST_JSON"])["digest"])'
+            )"
+            [[ "$existing_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            printf 'digest=%s\n' "$existing_digest" >>"$GITHUB_OUTPUT"
+          elif grep -Eqi 'not found|manifest unknown|does not exist' "$error_file"; then
+            printf 'exists=false\n' >>"$GITHUB_OUTPUT"
+          else
+            cat "$error_file" >&2
+            exit 1
+          fi
+      - name: Build and push the checksum-pinned production image
+        id: push
+        if: steps.existing.outputs.exists == 'false'
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: Dockerfile.video-worker
+          target: production
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:sha-${{ env.SOURCE_SHA }}
+          labels: |
+            org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+          provenance: mode=max
+          sbom: generator=${{ env.SBOM_GENERATOR_IMAGE }}
+      - name: Attest the new registry digest
+        if: steps.existing.outputs.exists == 'false'
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+      - name: Verify immutable labels, digest, and compressed size
+        id: verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_tag="${IMAGE_NAME}:sha-${SOURCE_SHA}"
+          manifest_json="$(
+            docker buildx imagetools inspect \
+              "$image_tag" \
+              --format '{{json .Manifest}}'
+          )"
+          image_json="$(
+            docker buildx imagetools inspect \
+              "$image_tag" \
+              --format '{{json .Image}}'
+          )"
+          digest="$(
+            MANIFEST_JSON="$manifest_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["MANIFEST_JSON"])["digest"])'
+          )"
+          revision="$(
+            IMAGE_JSON="$image_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.revision"])'
+          )"
+          profile_sha="$(
+            IMAGE_JSON="$image_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.video-profile-sha256"])'
+          )"
+          workflow_sha="$(
+            IMAGE_JSON="$image_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.video-workflow-sha256"])'
+          )"
+          model_revision="$(
+            IMAGE_JSON="$image_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.model.revision"])'
+          )"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [ "$revision" = "$SOURCE_SHA" ]
+          [ "$profile_sha" = "$PROFILE_SHA256" ]
+          [ "$workflow_sha" = "$WORKFLOW_SHA256" ]
+          [ "$model_revision" = "$MODEL_REVISION" ]
+          if [ "${{ steps.existing.outputs.exists }}" = "false" ]; then
+            [ "$digest" = "${{ steps.push.outputs.digest }}" ]
+          else
+            [ "$digest" = "${{ steps.existing.outputs.digest }}" ]
+          fi
+
+          raw_index="$(docker buildx imagetools inspect "${IMAGE_NAME}@${digest}" --raw)"
+          platform_digest="$(
+            RAW_INDEX="$raw_index" IMAGE_DIGEST="$digest" python3 -c '
+          import json, os
+          data = json.loads(os.environ["RAW_INDEX"])
+          if "layers" in data:
+              print(os.environ["IMAGE_DIGEST"])
+          else:
+              matches = [
+                  item["digest"]
+                  for item in data.get("manifests", [])
+                  if item.get("platform", {}).get("os") == "linux"
+                  and item.get("platform", {}).get("architecture") == "amd64"
+                  and item.get("annotations", {}).get(
+                      "vnd.docker.reference.type"
+                  ) != "attestation-manifest"
+              ]
+              if len(matches) != 1:
+                  raise SystemExit("expected one linux/amd64 image manifest")
+              print(matches[0])
+          '
+          )"
+          [[ "$platform_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          raw_manifest="$(
+            docker buildx imagetools inspect "${IMAGE_NAME}@${platform_digest}" --raw
+          )"
+          compressed_bytes="$(
+            RAW_MANIFEST="$raw_manifest" python3 -c \
+              'import json, os; data=json.loads(os.environ["RAW_MANIFEST"]); layers=data.get("layers"); assert isinstance(layers, list) and layers; print(sum(int(layer["size"]) for layer in layers))'
+          )"
+          [[ "$compressed_bytes" =~ ^[0-9]+$ ]]
+          [ "$compressed_bytes" -le "$MAX_COMPRESSED_IMAGE_BYTES" ] || {
+            printf 'Compressed image is %s bytes; limit is %s.\n' \
+              "$compressed_bytes" "$MAX_COMPRESSED_IMAGE_BYTES" >&2
+            exit 1
+          }
+          printf 'digest=%s\n' "$digest" >>"$GITHUB_OUTPUT"
+          printf 'compressed_bytes=%s\n' "$compressed_bytes" >>"$GITHUB_OUTPUT"
+      - name: Verify GitHub provenance for the exact digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh attestation verify \
+            "oci://${IMAGE_NAME}@${{ steps.verify.outputs.digest }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow \
+              "$GITHUB_REPOSITORY/.github/workflows/publish-video-worker.yml" \
+            --source-ref refs/heads/main \
+            --source-digest "$SOURCE_SHA" \
+            --deny-self-hosted-runners
+      - name: Extract and validate the exact production SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          sbom_tree="$RUNNER_TEMP/video-worker-sbom-tree.json"
+          sbom_file="$RUNNER_TEMP/video-worker-production.spdx.json"
+          docker buildx imagetools inspect \
+            "${IMAGE_NAME}@${{ steps.verify.outputs.digest }}" \
+            --format '{{json .SBOM}}' >"$sbom_tree"
+          SBOM_TREE="$sbom_tree" SBOM_FILE="$sbom_file" python3 -c '
+          import json, os
+          with open(os.environ["SBOM_TREE"], encoding="utf-8") as handle:
+              tree = json.load(handle)
+          if isinstance(tree, dict) and "SPDX" in tree:
+              spdx = tree["SPDX"]
+          else:
+              platform = tree.get("linux/amd64") if isinstance(tree, dict) else None
+              spdx = platform.get("SPDX") if isinstance(platform, dict) else None
+          if not isinstance(spdx, dict) or spdx.get("spdxVersion") != "SPDX-2.3":
+              raise SystemExit("exact production image has no linux/amd64 SPDX 2.3 SBOM")
+          if not isinstance(spdx.get("packages"), list) or not spdx["packages"]:
+              raise SystemExit("exact production image SBOM has no packages")
+          with open(os.environ["SBOM_FILE"], "w", encoding="utf-8") as handle:
+              json.dump(spdx, handle, sort_keys=True, separators=(",", ":"))
+              handle.write("\n")
+          '
+      - name: Scan the exact production video-worker SBOM
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          sbom: ${{ runner.temp }}/video-worker-production.spdx.json
+          fail-build: true
+          severity-cutoff: critical
+          output-format: table
+          grype-version: v0.110.0
+          cache-db: false
+      - name: Require anonymous registry access for Salad
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker logout ghcr.io
+          if ! docker buildx imagetools inspect --raw \
+            "${IMAGE_NAME}@${{ steps.verify.outputs.digest }}" >/dev/null; then
+            printf '%s\n' \
+              "The video-worker GHCR package is not anonymously readable." \
+              "Set this package to public visibility, then rerun publication." >&2
+            exit 1
+          fi
+      - name: Record non-secret publication metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$SOURCE_SHA" >"$RUNNER_TEMP/video-worker-source-revision"
+          printf '%s\n' "${{ steps.verify.outputs.digest }}" >"$RUNNER_TEMP/video-worker-image-digest"
+          printf '%s\n' "${{ steps.verify.outputs.compressed_bytes }}" >"$RUNNER_TEMP/video-worker-compressed-bytes"
+      - name: Upload publication metadata
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: video-worker-publication-${{ env.SOURCE_SHA }}
+          path: |
+            ${{ runner.temp }}/video-worker-source-revision
+            ${{ runner.temp }}/video-worker-image-digest
+            ${{ runner.temp }}/video-worker-compressed-bytes
+            ${{ runner.temp }}/video-worker-production.spdx.json
+          if-no-files-found: error
+          retention-days: 7
