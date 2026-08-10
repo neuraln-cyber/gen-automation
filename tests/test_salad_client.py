@@ -8,6 +8,7 @@ import pytest
 
 from gen_automation.integrations.salad import (
     SALAD_API_BASE_URL,
+    SALAD_QUEUE_JOB_PAGE_SIZE,
     SALAD_REQUESTS_PER_MINUTE,
     JSONObject,
     SaladAPIError,
@@ -343,25 +344,54 @@ async def test_list_container_instances_accepts_minimal_documented_payload() -> 
 
 
 @pytest.mark.asyncio
-async def test_list_jobs_validates_pagination_and_parses_every_documented_status() -> None:
+async def test_list_jobs_uses_provider_compatible_pagination_and_parses_statuses() -> None:
     statuses = tuple(SaladJobStatus)
 
     async def handler(request: httpx2.Request) -> httpx2.Response:
         assert request.url.params["page"] == "2"
-        assert request.url.params["page_size"] == "5"
+        assert request.url.params["page_size"] == str(SALAD_QUEUE_JOB_PAGE_SIZE)
         items = [
             job_payload(status, job_id=UUID(int=index + 1)) for index, status in enumerate(statuses)
         ]
         return httpx2.Response(200, json={"items": items})
 
     async with mocked_salad_client(handler) as client:
-        page = await client.list_jobs("generation-v1", page=2, page_size=5)
-        with pytest.raises(ValueError, match="page_size"):
-            await client.list_jobs("generation-v1", page_size=101)
+        page = await client.list_jobs("generation-v1", page=2)
+        for unsupported_page_size in (26, 50):
+            with pytest.raises(ValueError, match="page_size"):
+                await client.list_jobs(
+                    "generation-v1",
+                    page_size=unsupported_page_size,
+                )
         with pytest.raises(ValueError, match="page"):
             await client.list_jobs("generation-v1", page=0)
 
     assert tuple(job.status for job in page.items) == statuses
+
+
+@pytest.mark.asyncio
+async def test_list_jobs_accepts_an_empty_provider_page() -> None:
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        assert request.url.params["page"] == "1"
+        assert request.url.params["page_size"] == str(SALAD_QUEUE_JOB_PAGE_SIZE)
+        return httpx2.Response(200, json={"items": []})
+
+    async with mocked_salad_client(handler) as client:
+        page = await client.list_jobs("generation-v1")
+
+    assert page.items == ()
+
+
+@pytest.mark.asyncio
+async def test_list_jobs_accepts_a_smaller_live_verified_page_size() -> None:
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        assert request.url.params["page_size"] == "1"
+        return httpx2.Response(200, json={"items": []})
+
+    async with mocked_salad_client(handler) as client:
+        page = await client.list_jobs("generation-v1", page_size=1)
+
+    assert page.items == ()
 
 
 @pytest.mark.asyncio

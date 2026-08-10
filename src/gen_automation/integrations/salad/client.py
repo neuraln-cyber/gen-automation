@@ -40,6 +40,10 @@ from gen_automation.integrations.salad.models import (
 
 SALAD_API_BASE_URL = "https://api.salad.com/api/public"
 SALAD_REQUESTS_PER_MINUTE = 240
+# Salad's live Job Queues endpoint accepts page sizes through 25 but currently
+# rejects 50 and 100 with HTTP 400. Keep the provider-verified maximum in one
+# place so production reconciliation paths share the same efficient default.
+SALAD_QUEUE_JOB_PAGE_SIZE = 25
 SALAD_DEFAULT_TIMEOUT = httpx2.Timeout(
     connect=5.0,
     read=30.0,
@@ -358,12 +362,12 @@ class SaladClient:
         queue_name: str,
         *,
         page: int = 1,
-        page_size: int = 50,
+        page_size: int = SALAD_QUEUE_JOB_PAGE_SIZE,
     ) -> SaladQueueJobPage:
         if page < 1:
             raise ValueError("page must be at least 1")
-        if not 1 <= page_size <= 100:
-            raise ValueError("page_size must be between 1 and 100")
+        if not 1 <= page_size <= SALAD_QUEUE_JOB_PAGE_SIZE:
+            raise ValueError(f"page_size must be between 1 and {SALAD_QUEUE_JOB_PAGE_SIZE}")
         queue_segment = _path_segment(queue_name, "queue name")
         data = await self._request_json(
             "GET",

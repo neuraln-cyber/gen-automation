@@ -43,7 +43,7 @@ from gen_automation.domain.runtime_bindings import (
 from gen_automation.integrations.civitai.client import CivitaiClient
 from gen_automation.integrations.mega import MegaCmdClient
 from gen_automation.integrations.patreon import PatreonPublicationDriver
-from gen_automation.integrations.salad.client import SaladClient
+from gen_automation.integrations.salad.client import SALAD_QUEUE_JOB_PAGE_SIZE, SaladClient
 from gen_automation.integrations.salad.models import JSONValue
 from gen_automation.integrations.semantic_vlm import SemanticVlmClient
 from gen_automation.quality import DEFAULT_QUALITY_CONFIG
@@ -152,6 +152,7 @@ type JitterSource = Callable[[], float]
 
 _MAX_DELAY_JITTER_MULTIPLIER = 1.2
 _STOP_SETTLEMENT_CANDIDATE_LIMIT = 16
+_IMAGE_RECONCILIATION_JOB_SCAN_LIMIT = 200
 _RECONCILABLE_ATTEMPT_STATES = (
     GenerationAttemptState.UNKNOWN,
     GenerationAttemptState.SUBMITTED,
@@ -1403,8 +1404,10 @@ class ControllerWorkloads:
                     session,
                     self.salad_client,  # type: ignore[arg-type]
                     generation_attempt_id=attempt.id,
-                    max_list_pages=2,
-                    list_page_size=100,
+                    max_list_pages=(
+                        _IMAGE_RECONCILIATION_JOB_SCAN_LIMIT // SALAD_QUEUE_JOB_PAGE_SIZE
+                    ),
+                    list_page_size=SALAD_QUEUE_JOB_PAGE_SIZE,
                     attempt_watchdog_seconds=self.settings.salad_attempt_watchdog_seconds,
                 )
                 return True

@@ -33,6 +33,7 @@ from gen_automation.domain.enums import (
 )
 from gen_automation.domain.ids import uuid7
 from gen_automation.gpu_worker.models import GenerateResponse
+from gen_automation.integrations.salad.client import SALAD_QUEUE_JOB_PAGE_SIZE
 from gen_automation.integrations.salad.errors import (
     SaladAPIError,
     SaladProtocolError,
@@ -59,6 +60,7 @@ from gen_automation.services.outbox import (
 
 _PROVIDER = "salad"
 _IMAGE_DIGEST_PATTERN = r".+@sha256:[0-9a-f]{64}"
+_DEFAULT_RECONCILIATION_JOB_SCAN_LIMIT = 500
 _DEFINITIVE_REJECTION_STATUS_CODES = frozenset({400, 401, 403, 404, 422})
 SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE = "salad_attempt_watchdog_cancel_requested"
 SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE = "salad_attempt_watchdog_expired"
@@ -297,7 +299,7 @@ class SaladQueueClient(Protocol):
         queue_name: str,
         *,
         page: int = 1,
-        page_size: int = 50,
+        page_size: int = SALAD_QUEUE_JOB_PAGE_SIZE,
     ) -> SaladQueueJobPage: ...
 
     async def cancel_job(self, queue_name: str, job_id: UUID | str) -> None: ...
@@ -1193,8 +1195,8 @@ async def reconcile_generation_attempt(
     client: SaladQueueClient,
     *,
     generation_attempt_id: UUID,
-    max_list_pages: int = 5,
-    list_page_size: int = 100,
+    max_list_pages: int = (_DEFAULT_RECONCILIATION_JOB_SCAN_LIMIT // SALAD_QUEUE_JOB_PAGE_SIZE),
+    list_page_size: int = SALAD_QUEUE_JOB_PAGE_SIZE,
     attempt_watchdog_seconds: int | None = None,
     now: datetime | None = None,
 ) -> ReconciliationResult:
@@ -1203,8 +1205,10 @@ async def reconcile_generation_attempt(
     reconciled_at = _as_utc(now or datetime.now(UTC))
     if max_list_pages <= 0 or max_list_pages > 100:
         raise SaladServiceValidationError("max_list_pages must be between 1 and 100")
-    if list_page_size <= 0 or list_page_size > 100:
-        raise SaladServiceValidationError("list_page_size must be between 1 and 100")
+    if not 1 <= list_page_size <= SALAD_QUEUE_JOB_PAGE_SIZE:
+        raise SaladServiceValidationError(
+            f"list_page_size must be between 1 and {SALAD_QUEUE_JOB_PAGE_SIZE}"
+        )
     if attempt_watchdog_seconds is not None and attempt_watchdog_seconds <= 0:
         raise SaladServiceValidationError("attempt_watchdog_seconds must be positive")
 

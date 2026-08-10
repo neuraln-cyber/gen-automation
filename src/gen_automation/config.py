@@ -49,8 +49,8 @@ CIVITAI_SECRET_REFERENCE_PATTERN = (
     r"[A-Za-z0-9._/-]{1,400}-[A-Za-z0-9]{6}$"
 )
 SALAD_DEPLOYMENT_REQUESTS_PER_CYCLE = 6
-# Attempt reconcile may scan two list pages and then cancel the matched job.
-SALAD_RECONCILIATION_REQUESTS_PER_CYCLE = 3
+# Attempt reconcile may scan eight list pages and then cancel the matched job.
+SALAD_RECONCILIATION_REQUESTS_PER_CYCLE = 9
 SALAD_OPERATION_TIMEOUT_MARGIN_SECONDS = 5
 SALAD_ATTEMPT_WATCHDOG_SIGNATURE_MARGIN_SECONDS = 300
 BACKGROUND_MAX_DELAY_JITTER_MULTIPLIER = 1.2
@@ -233,7 +233,7 @@ class Settings(BaseSettings):
     background_error_backoff_max_seconds: float = Field(default=60, ge=1, le=300)
     background_submit_timeout_seconds: float = Field(default=180, ge=5, le=600)
     background_deployment_timeout_seconds: float = Field(default=210, ge=5, le=600)
-    background_reconcile_timeout_seconds: float = Field(default=180, ge=5, le=600)
+    background_reconcile_timeout_seconds: float = Field(default=300, ge=5, le=600)
     background_inbox_timeout_seconds: float = Field(default=30, ge=1, le=300)
     background_collection_timeout_seconds: float = Field(default=300, ge=5, le=1800)
     quality_scoring_enabled: bool = False
@@ -1036,7 +1036,7 @@ class Settings(BaseSettings):
                 SALAD_RECONCILIATION_REQUESTS_PER_CYCLE * self.salad_request_timeout_seconds
             ) + SALAD_OPERATION_TIMEOUT_MARGIN_SECONDS
             if self.background_reconcile_timeout_seconds < minimum_reconciliation_timeout:
-                errors.append("reconciliation timeout must cover three bounded SaladCloud requests")
+                errors.append("reconciliation timeout must cover nine bounded SaladCloud requests")
             minimum_submission_timeout = (
                 self.salad_request_timeout_seconds + SALAD_OPERATION_TIMEOUT_MARGIN_SECONDS
             )

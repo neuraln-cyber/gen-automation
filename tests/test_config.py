@@ -23,6 +23,10 @@ def test_semantic_retry_defaults_cover_scale_to_zero_cold_start() -> None:
     assert settings.background_semantic_retry_max_seconds == 120
 
 
+def test_salad_reconciliation_timeout_default_covers_eight_pages_and_cancel() -> None:
+    assert Settings().background_reconcile_timeout_seconds == 300
+
+
 def test_production_configuration_fails_closed() -> None:
     with pytest.raises(ValidationError):
         Settings(environment=Environment.PRODUCTION)
@@ -616,7 +620,7 @@ def test_salad_deployment_timeout_covers_observe_then_immediate_stop_chain() -> 
         "salad_worker_image": f"registry.example/worker@sha256:{'a' * 64}",
         "salad_request_timeout_seconds": 60,
         "background_deployment_timeout_seconds": 360,
-        "background_reconcile_timeout_seconds": 185,
+        "background_reconcile_timeout_seconds": 545,
         "session_secret": "test-session-secret-with-more-than-32-characters",
     }
 
@@ -628,7 +632,7 @@ def test_salad_deployment_timeout_covers_observe_then_immediate_stop_chain() -> 
     assert settings.background_deployment_timeout_seconds == 365
 
 
-def test_salad_attempt_reconcile_timeout_covers_two_list_pages_then_cancel() -> None:
+def test_salad_attempt_reconcile_timeout_covers_eight_list_pages_then_cancel() -> None:
     values = {
         "environment": Environment.TEST,
         "salad_enabled": True,
@@ -640,16 +644,16 @@ def test_salad_attempt_reconcile_timeout_covers_two_list_pages_then_cancel() -> 
         "salad_webhook_secret": "whsec_test",
         "salad_worker_image": f"registry.example/worker@sha256:{'a' * 64}",
         "salad_request_timeout_seconds": 30,
-        "background_reconcile_timeout_seconds": 94,
+        "background_reconcile_timeout_seconds": 274,
         "session_secret": "test-session-secret-with-more-than-32-characters",
     }
 
-    with pytest.raises(ValidationError, match="three bounded SaladCloud requests"):
+    with pytest.raises(ValidationError, match="nine bounded SaladCloud requests"):
         Settings(**values)  # type: ignore[arg-type]
 
-    values["background_reconcile_timeout_seconds"] = 95
+    values["background_reconcile_timeout_seconds"] = 275
     settings = Settings(**values)  # type: ignore[arg-type]
-    assert settings.background_reconcile_timeout_seconds == 95
+    assert settings.background_reconcile_timeout_seconds == 275
 
 
 def test_background_health_thresholds_and_staleness_are_ordered() -> None:

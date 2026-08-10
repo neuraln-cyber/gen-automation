@@ -9,10 +9,12 @@ is failed closed after a bounded observation window.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -47,10 +49,12 @@ from gen_automation.domain.video import (
     VideoGenerationState,
 )
 from gen_automation.integrations.salad import (
+    SALAD_QUEUE_JOB_PAGE_SIZE,
     SaladAPIError,
     SaladClient,
     SaladCloudError,
     SaladJobStatus,
+    SaladProtocolError,
     SaladQueueJob,
 )
 from gen_automation.services.budgets import (
@@ -105,8 +109,41 @@ _SOURCE_CONTENT_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
 _OUTPUT_CONTENT_TYPE = "video/mp4"
 _METADATA_KIND = "animation-video/v1"
 _LINEAGE_RECIPE = "wan2.2-ti2v-5b-comfy-v1"
-_MAX_RECONCILIATION_PAGES = 10
+_RECONCILIATION_BATCH_COUNT = 10
+_RECONCILIATION_PAGES_PER_BATCH = 4
+_RECONCILIATION_LEGACY_PAGE_SIZE = 100
+_RECONCILIATION_NEXT_OFFSET_KEY = "reconciliation_next_offset"
+_RECONCILIATION_PAGE_SIZE_KEY = "reconciliation_page_size"
+_RECONCILIATION_LEGACY_NEXT_PAGE_KEY = "reconciliation_next_page"
+_MAX_RECONCILIATION_BATCH_TIMEOUT_SECONDS = 30.0
 _MAX_WORKER_ENVELOPE_BYTES = 128 * 1024
+
+
+def _reconciliation_start_offset(metadata: Mapping[str, Any]) -> int:
+    raw_offset = metadata.get(_RECONCILIATION_NEXT_OFFSET_KEY)
+    raw_page_size = metadata.get(_RECONCILIATION_PAGE_SIZE_KEY)
+    if (
+        isinstance(raw_offset, int)
+        and not isinstance(raw_offset, bool)
+        and raw_offset >= 0
+        and isinstance(raw_page_size, int)
+        and not isinstance(raw_page_size, bool)
+        and 1 <= raw_page_size <= SALAD_QUEUE_JOB_PAGE_SIZE
+        and raw_offset % raw_page_size == 0
+    ):
+        # Overlap rather than skip when a future compatible page size does not
+        # divide the current provider page size exactly.
+        return (raw_offset // SALAD_QUEUE_JOB_PAGE_SIZE) * SALAD_QUEUE_JOB_PAGE_SIZE
+
+    raw_legacy_page = metadata.get(_RECONCILIATION_LEGACY_NEXT_PAGE_KEY, 1)
+    legacy_page = (
+        raw_legacy_page
+        if isinstance(raw_legacy_page, int)
+        and not isinstance(raw_legacy_page, bool)
+        and raw_legacy_page >= 1
+        else 1
+    )
+    return (legacy_page - 1) * _RECONCILIATION_LEGACY_PAGE_SIZE
 
 
 class VideoRuntimeError(RuntimeError):
@@ -130,6 +167,7 @@ class VideoRuntimeConfig:
     retry_delay_seconds: int = 60
     reconciliation_interval_seconds: int = 30
     unresolved_submission_seconds: int = 900
+    reconciliation_batch_timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         if self.enabled and (not self.queue_name or len(self.queue_name) > 200):
@@ -151,6 +189,11 @@ class VideoRuntimeConfig:
             or self.retry_delay_seconds <= 0
             or self.reconciliation_interval_seconds <= 0
             or self.unresolved_submission_seconds <= 0
+            or not (
+                0
+                < self.reconciliation_batch_timeout_seconds
+                <= _MAX_RECONCILIATION_BATCH_TIMEOUT_SECONDS
+            )
         ):
             raise ValueError("video retry timing is invalid")
         if self.enabled and self.signature_ttl_seconds < (
@@ -453,7 +496,7 @@ class VideoRuntime:
             search_complete = True
         else:
             try:
-                matches, search_complete, next_page = await self._find_provider_jobs(attempt_id)
+                matches, search_complete, next_offset = await self._find_provider_jobs(attempt_id)
             except VideoRuntimeError:
                 await self._fail_attempt(
                     attempt_id,
@@ -474,10 +517,10 @@ class VideoRuntime:
             await self._bind_provider_job(attempt_id, matches[0], now=submitted_at)
             return True
         if not search_complete:
-            if next_page is not None:
+            if next_offset is not None:
                 await self._record_reconciliation_cursor(
                     attempt_id,
-                    next_page=next_page,
+                    next_offset=next_offset,
                     now=submitted_at,
                 )
                 return True
@@ -1152,30 +1195,77 @@ class VideoRuntime:
                 "video_attempt_id": str(attempt.id),
                 "submission_key": attempt.submission_key,
             }
-            raw_next_page = attempt.request_metadata.get("reconciliation_next_page", 1)
-            next_page = raw_next_page if isinstance(raw_next_page, int) else 1
-            next_page = max(1, next_page)
+            start_offset = _reconciliation_start_offset(attempt.request_metadata)
+            next_page = (start_offset // SALAD_QUEUE_JOB_PAGE_SIZE) + 1
         matches: dict[UUID, SaladQueueJob] = {}
-        for page in range(next_page, next_page + _MAX_RECONCILIATION_PAGES):
-            result = await self.salad.list_jobs(
-                deployment.queue_name,
-                page=page,
-                page_size=100,
+        for batch_index in range(_RECONCILIATION_BATCH_COUNT):
+            batch_start_page = next_page + (batch_index * _RECONCILIATION_PAGES_PER_BATCH)
+            pages = tuple(
+                range(batch_start_page, batch_start_page + _RECONCILIATION_PAGES_PER_BATCH)
             )
-            for remote in result.items:
-                if all(remote.metadata.get(key) == value for key, value in expected.items()):
-                    matches[remote.id] = remote
-            if len(result.items) < 100:
+            async with asyncio.timeout(self.config.reconciliation_batch_timeout_seconds):
+                raw_results = await asyncio.gather(
+                    *(
+                        self.salad.list_jobs(
+                            deployment.queue_name,
+                            page=page,
+                            page_size=SALAD_QUEUE_JOB_PAGE_SIZE,
+                        )
+                        for page in pages
+                    ),
+                    return_exceptions=True,
+                )
+            provider_error = next(
+                (result for result in raw_results if isinstance(result, SaladCloudError)),
+                None,
+            )
+            if provider_error is not None:
+                raise provider_error
+            unexpected = next(
+                (result for result in raw_results if isinstance(result, BaseException)),
+                None,
+            )
+            if unexpected is not None:
+                raise RuntimeError("unexpected video provider history scan failure") from unexpected
+            results = cast(list[Any], raw_results)
+            if any(len(result.items) > SALAD_QUEUE_JOB_PAGE_SIZE for result in results):
+                raise SaladProtocolError("Salad queue job page exceeded the requested size")
+
+            first_short_index = next(
+                (
+                    index
+                    for index, result in enumerate(results)
+                    if len(result.items) < SALAD_QUEUE_JOB_PAGE_SIZE
+                ),
+                None,
+            )
+            if first_short_index is not None and any(
+                result.items for result in results[first_short_index + 1 :]
+            ):
+                raise SaladProtocolError("Salad queue job pagination snapshot was inconsistent")
+
+            process_count = len(results) if first_short_index is None else first_short_index + 1
+            for result in results[:process_count]:
+                for remote in result.items:
+                    if all(remote.metadata.get(key) == value for key, value in expected.items()):
+                        matches[remote.id] = remote
+            if first_short_index is not None:
                 return list(matches.values()), True, None
-        return list(matches.values()), False, next_page + _MAX_RECONCILIATION_PAGES
+
+        pages_scanned = _RECONCILIATION_BATCH_COUNT * _RECONCILIATION_PAGES_PER_BATCH
+        next_offset = ((next_page - 1) + pages_scanned) * SALAD_QUEUE_JOB_PAGE_SIZE
+        return list(matches.values()), False, next_offset
 
     async def _record_reconciliation_cursor(
         self,
         attempt_id: UUID,
         *,
-        next_page: int,
+        next_offset: int,
         now: datetime,
     ) -> None:
+        if next_offset < 0 or next_offset % SALAD_QUEUE_JOB_PAGE_SIZE != 0:
+            raise VideoRuntimeError("video reconciliation cursor is invalid")
+        legacy_next_page = (next_offset // _RECONCILIATION_LEGACY_PAGE_SIZE) + 1
         async with self.sessions() as session:
             async with session.begin():
                 row = (
@@ -1199,7 +1289,9 @@ class VideoRuntime:
                     return
                 attempt.request_metadata = {
                     **attempt.request_metadata,
-                    "reconciliation_next_page": next_page,
+                    _RECONCILIATION_NEXT_OFFSET_KEY: next_offset,
+                    _RECONCILIATION_PAGE_SIZE_KEY: SALAD_QUEUE_JOB_PAGE_SIZE,
+                    _RECONCILIATION_LEGACY_NEXT_PAGE_KEY: legacy_next_page,
                 }
                 attempt.last_observed_at = now
                 attempt.updated_at = now
