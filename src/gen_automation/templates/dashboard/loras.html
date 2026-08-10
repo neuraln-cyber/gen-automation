@@ -84,7 +84,7 @@
                     autocomplete="url"
                     required
                     maxlength="2048"
-                    pattern="https://(www\.)?civitai\.com/.*"
+                    pattern="https://(www\.)?civitai\.(com|red)/.*"
                     placeholder="https://civitai.com/models/..."
                     aria-describedby="lora-civitai-help lora-civitai-status"
                   >
@@ -92,7 +92,7 @@
                 </span>
               </label>
               <small id="lora-civitai-help" class="muted">
-                Private or age-gated downloads use the server-side Civitai credential; it is never sent to this browser.
+                Civitai.com and Civitai.red links are accepted. Private or age-gated downloads use the server-side Civitai credential; it is never sent to this browser.
               </small>
               <div class="lora-version-choice" data-lora-version-choice hidden>
                 <label for="lora-civitai-version">

@@ -141,7 +141,11 @@
     }
     if (!response.ok) {
       if (response.status === 401) {
-        throw new Error("Your recent sign-in expired. Sign in again, then retry this change.");
+        const detail = stringValue(payload?.detail);
+        if (detail === "recent authentication required") {
+          throw new Error("Your recent sign-in expired. Sign in again, then retry this change.");
+        }
+        throw new Error("Your session expired. Sign in again, then retry.");
       }
       throw new Error(errorMessage(payload, `Request failed (${response.status}).`));
     }
@@ -214,7 +218,7 @@
       baseModel: stringValue(payload.base_model),
       sourceUrl: safeExternalUrl(
         payload.source_url ?? payload.canonical_source_url,
-        ["civitai.com", "www.civitai.com"],
+        ["civitai.com", "www.civitai.com", "civitai.red", "www.civitai.red"],
       ),
       licenseUrl: safeExternalUrl(payload.license_url),
       files,
