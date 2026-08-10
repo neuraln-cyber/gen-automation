@@ -243,3 +243,33 @@ def test_salad_artifact_reader_is_disabled_and_exact_version_only() -> None:
     assert 'actions   = ["sts:AssumeRole"]' in control_policy
     assert "aws_iam_role.salad_worker_artifact_reader[0].arn" in control_policy
     assert '"${aws_s3_bucket.models.arn}/*"' not in control_policy
+
+
+def test_runtime_can_list_only_managed_lora_model_prefixes() -> None:
+    iam = (INFRA / "iam.tf").read_text(encoding="utf-8")
+    runtime_policy = iam.split(
+        'data "aws_iam_policy_document" "runtime" {',
+        maxsplit=1,
+    )[1].split(
+        'resource "aws_iam_role_policy" "runtime" {',
+        maxsplit=1,
+    )[0]
+    listing_statement = runtime_policy.split(
+        'sid       = "ManagedLoraObjectListing"',
+        maxsplit=1,
+    )[1].split(
+        'sid = "ManagedLoraObjects"',
+        maxsplit=1,
+    )[0]
+
+    assert 'actions   = ["s3:ListBucket"]' in listing_statement
+    assert "resources = [aws_s3_bucket.models.arn]" in listing_statement
+    assert 'test     = "StringLike"' in listing_statement
+    assert 'variable = "s3:prefix"' in listing_statement
+    prefix_values = re.search(r"values\s*=\s*\[(.*?)\]", listing_statement, re.DOTALL)
+    assert prefix_values is not None
+    assert re.findall(r'"([^"]+)"', prefix_values.group(1)) == [
+        "onboarding/loras/*",
+        "worker/managed-loras/sha256/*",
+    ]
+    assert runtime_policy.count('"s3:ListBucket"') == 2

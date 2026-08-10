@@ -234,6 +234,23 @@ data "aws_iam_policy_document" "runtime" {
     resources = [aws_s3_bucket.models.arn]
   }
 
+  # HeadObject needs ListBucket to distinguish a missing object from an
+  # unauthorized one. Keep that visibility inside the managed LoRA namespaces.
+  statement {
+    sid       = "ManagedLoraObjectListing"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.models.arn]
+
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values = [
+        "onboarding/loras/*",
+        "worker/managed-loras/sha256/*",
+      ]
+    }
+  }
+
   statement {
     sid = "ManagedLoraObjects"
     actions = [
