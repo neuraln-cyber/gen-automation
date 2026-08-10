@@ -9,6 +9,7 @@ from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy import select, update
 
 from gen_automation.api.routes import dashboard as dashboard_routes
@@ -24,7 +25,11 @@ from gen_automation.db.models import (
 )
 from gen_automation.db.session import Database
 from gen_automation.domain.enums import AdminRole, ReviewDecisionValue, ReviewTaskState
-from gen_automation.middleware import asset_connection_source, content_security_policy
+from gen_automation.middleware import (
+    asset_connection_source,
+    content_security_policy,
+    model_artifact_connection_source,
+)
 from gen_automation.services.review import create_review_task
 from gen_automation.storage.base import ObjectMetadata, PresignedUpload
 from tests.test_review_api import (
@@ -421,6 +426,24 @@ def test_csp_allows_dashboard_to_fetch_clean_asset_copies() -> None:
     ]
 
 
+def test_csp_allows_dashboard_to_post_to_exact_model_artifact_origin() -> None:
+    connect_sources = (
+        content_security_policy(
+            Environment.PRODUCTION,
+            asset_connect_source="https://private-assets.s3.eu-central-1.amazonaws.com",
+            model_artifact_connect_source=("https://private-models.s3.eu-central-1.amazonaws.com"),
+        )
+        .split("connect-src ", maxsplit=1)[1]
+        .split(";", maxsplit=1)[0]
+        .split()
+    )
+    assert connect_sources == [
+        "'self'",
+        "https://private-assets.s3.eu-central-1.amazonaws.com",
+        "https://private-models.s3.eu-central-1.amazonaws.com",
+    ]
+
+
 def test_asset_connection_source_is_restricted_to_the_configured_origin(
     tmp_path: Path,
 ) -> None:
@@ -439,6 +462,29 @@ def test_asset_connection_source_is_restricted_to_the_configured_origin(
         update={"storage_endpoint_url": "https://objects.example.test:9443/private"}
     )
     assert asset_connection_source(custom_endpoint) == "https://objects.example.test:9443"
+
+
+def test_model_artifact_connection_source_is_restricted_to_configured_origin(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path / "model-csp-origin.sqlite3").model_copy(
+        update={
+            "salad_worker_artifact_bucket": SecretStr("private-models"),
+            "salad_worker_artifact_region": SecretStr("eu-central-1"),
+        }
+    )
+    assert model_artifact_connection_source(settings) == (
+        "https://private-models.s3.eu-central-1.amazonaws.com"
+    )
+
+    custom_endpoint = settings.model_copy(
+        update={
+            "salad_worker_artifact_endpoint_url": SecretStr(
+                "https://models.example.test:9443/private"
+            )
+        }
+    )
+    assert model_artifact_connection_source(custom_endpoint) == ("https://models.example.test:9443")
 
 
 @pytest.mark.parametrize(

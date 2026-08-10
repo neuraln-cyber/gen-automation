@@ -227,6 +227,7 @@ class LoraRuntime:
             resolved = await self.civitai.resolve_lora(
                 claim.job.canonical_source_url,
                 version_id=claim.job.civitai_version_id,
+                allow_commercial_use_override=(claim.job.commercial_use_override_attested),
             )
             if (
                 claim.job.civitai_model_id != resolved.model_id
@@ -254,6 +255,9 @@ class LoraRuntime:
                     "import_job_id": str(claim.job.job_id),
                     "license_url": resolved.canonical_source_url,
                     "license_terms": resolved.license_terms.as_json(),
+                    "commercial_use_override_attested": (
+                        claim.job.commercial_use_override_attested
+                    ),
                 },
                 progress=lambda transferred: self._record_import_progress(
                     claim,
@@ -365,9 +369,14 @@ class LoraRuntime:
             safetensors_verified=True,
             evidence=ApprovalEvidence(
                 summary=(
-                    "Owner-attested commercial/adult-use LoRA; exact Safetensors bytes, "
-                    "size, SHA-256, and private object version verified by the managed "
-                    "onboarding runtime."
+                    (
+                        "Owner-reviewed Civitai commercial-use metadata override and "
+                        "adult-use attestation; "
+                        if claim.job.commercial_use_override_attested
+                        else "Owner-attested commercial/adult-use LoRA; "
+                    )
+                    + "exact Safetensors bytes, size, SHA-256, and private object version "
+                    "verified by the managed onboarding runtime."
                 ),
                 source_urls=source_urls,
                 document_sha256s=[stored.sha256],

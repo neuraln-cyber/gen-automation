@@ -25,6 +25,7 @@ from gen_automation.integrations.civitai.models import (
     CivitaiFileScan,
     CivitaiLicenseTerms,
     CivitaiLoraVersionChoice,
+    CivitaiLoraVersionListing,
     CivitaiModelType,
     CivitaiResolvedLora,
     CivitaiSourceRef,
@@ -124,6 +125,7 @@ class CivitaiClient:
         source: str | CivitaiSourceRef,
         *,
         version_id: int | None = None,
+        allow_commercial_use_override: bool = False,
     ) -> CivitaiResolvedLora:
         reference = parse_civitai_url(source) if isinstance(source, str) else source
         selected_version_id = _selected_version(reference, version_id)
@@ -140,16 +142,28 @@ class CivitaiClient:
         if reference.model_id is not None and model_id != reference.model_id:
             raise CivitaiSourceSelectionError("Civitai version does not belong to the model URL")
         model_data = await self._get_json(f"models/{model_id}")
-        return _resolve_from_payloads(model_data, version_data)
+        resolved = _resolve_from_payloads(model_data, version_data)
+        _require_commercial_image_permission(
+            resolved.license_terms,
+            allow_override=allow_commercial_use_override,
+        )
+        return resolved
 
     async def list_lora_versions(
         self,
         source: str | CivitaiSourceRef,
-    ) -> tuple[CivitaiLoraVersionChoice, ...]:
+        *,
+        allow_commercial_use_override: bool = False,
+    ) -> CivitaiLoraVersionListing:
         reference = parse_civitai_url(source) if isinstance(source, str) else source
         if reference.model_id is None:
             raise CivitaiSourceSelectionError("version choices require a Civitai model URL")
         model_data = await self._get_json(f"models/{reference.model_id}")
+        license_terms = _license_terms(model_data)
+        _require_commercial_image_permission(
+            license_terms,
+            allow_override=allow_commercial_use_override,
+        )
         versions = _object_list(model_data, "modelVersions", "Civitai model", maximum=1_000)
         choices: list[CivitaiLoraVersionChoice] = []
         for raw_version in versions:
@@ -171,7 +185,10 @@ class CivitaiClient:
             raise CivitaiSourceSelectionError(
                 "Civitai model has no downloadable scanned Safetensors LoRA versions"
             )
-        return tuple(choices)
+        return CivitaiLoraVersionListing(
+            versions=tuple(choices),
+            license_terms=license_terms,
+        )
 
     @asynccontextmanager
     async def open_download(
@@ -314,8 +331,6 @@ def _resolve_from_payloads(
     _reject_minor_content(model_data, "Civitai model")
     _reject_minor_content(version_data, "Civitai version")
     license_terms = _license_terms(model_data)
-    if not any(value.casefold() == "image" for value in license_terms.commercial_use):
-        raise CivitaiSourceSelectionError("Civitai model does not permit commercial image use")
     candidate = _select_file(version_data)
     model_name = _text(model_data.get("name"), "Civitai model.name", maximum=300)
     version_name = _text(version_data.get("name"), "Civitai version.name", maximum=300)
@@ -515,6 +530,19 @@ def _license_terms(model_data: dict[str, JSONValue]) -> CivitaiLicenseTerms:
             default=False,
         ),
     )
+
+
+def _require_commercial_image_permission(
+    terms: CivitaiLicenseTerms,
+    *,
+    allow_override: bool,
+) -> None:
+    if not terms.permits_commercial_images and not allow_override:
+        raise CivitaiSourceSelectionError(
+            "Civitai metadata does not explicitly permit commercial image use; "
+            "review the creator's current terms and use the recorded operator override only "
+            "if you have confirmed permission"
+        )
 
 
 def _reject_unavailable(data: dict[str, JSONValue], context: str) -> None:

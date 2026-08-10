@@ -39,23 +39,52 @@ def asset_connection_source(settings: Settings) -> str | None:
     return source if CSP_CONNECT_SOURCE_PATTERN.fullmatch(source) else None
 
 
+def model_artifact_connection_source(settings: Settings) -> str | None:
+    bucket_setting = settings.salad_worker_artifact_bucket
+    region_setting = settings.salad_worker_artifact_region
+    if bucket_setting is None or region_setting is None:
+        return None
+    endpoint_setting = settings.salad_worker_artifact_endpoint_url
+    if endpoint_setting is not None:
+        endpoint = urlsplit(endpoint_setting.get_secret_value())
+        source = f"{endpoint.scheme}://{endpoint.netloc}"
+        return source if CSP_CONNECT_SOURCE_PATTERN.fullmatch(source) else None
+    bucket = bucket_setting.get_secret_value()
+    region = region_setting.get_secret_value()
+    aws_suffix = "amazonaws.com.cn" if region.startswith("cn-") else "amazonaws.com"
+    host = (
+        f"{bucket}.s3.{aws_suffix}"
+        if region == "us-east-1"
+        else f"{bucket}.s3.{region}.{aws_suffix}"
+    )
+    source = f"https://{host}"
+    return source if CSP_CONNECT_SOURCE_PATTERN.fullmatch(source) else None
+
+
 def content_security_policy(
     environment: Environment,
     *,
     allow_same_origin_scripts: bool = False,
     asset_connect_source: str | None = None,
+    model_artifact_connect_source: str | None = None,
 ) -> str:
     image_sources = "'self' https:"
-    connect_sources = "'self'"
+    connect_sources = ["'self'"]
     if environment in {Environment.LOCAL, Environment.TEST}:
         image_sources = f"{image_sources} http:"
-    if asset_connect_source is not None:
-        if CSP_CONNECT_SOURCE_PATTERN.fullmatch(asset_connect_source) is None:
-            raise ValueError("invalid CSP asset connection source")
-        connect_sources = f"{connect_sources} {asset_connect_source}"
+    for label, source in (
+        ("asset", asset_connect_source),
+        ("model artifact", model_artifact_connect_source),
+    ):
+        if source is None:
+            continue
+        if CSP_CONNECT_SOURCE_PATTERN.fullmatch(source) is None:
+            raise ValueError(f"invalid CSP {label} connection source")
+        if source not in connect_sources:
+            connect_sources.append(source)
     script_sources = "'self'" if allow_same_origin_scripts else "'none'"
     return (
-        f"default-src 'self'; base-uri 'none'; connect-src {connect_sources}; "
+        f"default-src 'self'; base-uri 'none'; connect-src {' '.join(connect_sources)}; "
         "font-src 'self'; form-action 'self'; frame-ancestors 'none'; "
         f"img-src {image_sources}; object-src 'none'; "
         f"script-src {script_sources}; style-src 'self' 'unsafe-inline'"
@@ -101,6 +130,15 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
             asset_connect_source=(
                 asset_connection_source(settings)
                 if request.url.path == "/dashboard" or request.url.path.startswith("/dashboard/")
+                else None
+            ),
+            model_artifact_connect_source=(
+                model_artifact_connection_source(settings)
+                if settings.lora_manager_enabled
+                and (
+                    request.url.path == "/dashboard/loras"
+                    or request.url.path.startswith("/dashboard/loras/")
+                )
                 else None
             ),
         )

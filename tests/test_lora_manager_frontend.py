@@ -100,6 +100,11 @@ def test_lora_manager_template_keeps_rights_and_provider_secrets_server_side() -
     assert "data-lora-version-select" in source
     assert 'pattern="https://(www\\.)?civitai\\.(com|red)/.*"' in source
     assert "Civitai.com and Civitai.red links are accepted" in source
+    assert 'name="commercial_use_override_attested"' in source
+    assert "data-lora-provider-commercial-use" in source
+    assert "Leave this off by default" in source
+    assert "The decision is recorded with your account" in source
+    assert "it does not change the license" in source
 
 
 def test_lora_manager_javascript_uploads_directly_and_polls_durable_progress() -> None:
@@ -121,6 +126,10 @@ def test_lora_manager_javascript_uploads_directly_and_polls_durable_progress() -
     assert "pendingManualCompletions.delete(form)" in script
     assert "crypto.randomUUID()" in script
     assert "commercial_image_allowed === true" in script
+    assert "commercial_use_override_applied === true" in script
+    assert "commercial_use_override_attested" in script
+    assert "No commercial-use value reported" in script
+    assert "commercialUseOverrideApplied" in script
     assert "adult_use_requires_attestation === true" in script
     assert "commercial_use_attested" in script
     assert "adult_use_attested" in script
@@ -159,6 +168,8 @@ def test_lora_manager_styles_are_scoped_and_collapse_without_horizontal_table() 
     assert ".lora-manager [hidden] { display: none !important; }" in styles
     assert ".lora-delete-dialog::backdrop" in styles
     assert "min-height: 2.75rem" in styles
+    assert ".lora-license-override {" in styles
+    assert ".lora-license-override input," in styles
 
 
 def test_dashboard_and_both_generation_surfaces_link_to_lora_manager() -> None:

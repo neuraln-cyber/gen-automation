@@ -20,6 +20,7 @@ class StrictLoraApiModel(BaseModel):
 class CivitaiResolveRequest(StrictLoraApiModel):
     url: str = Field(min_length=1, max_length=2_048)
     version_id: int | None = Field(default=None, ge=1)
+    commercial_use_override_attested: bool = False
 
     @field_validator("url")
     @classmethod
@@ -58,6 +59,8 @@ class CivitaiResolveRead(StrictLoraApiModel):
     files: list[CivitaiFileRead] = Field(default_factory=list)
     trained_words: list[str] = Field(default_factory=list)
     commercial_image_allowed: bool
+    provider_commercial_use: list[str] = Field(default_factory=list)
+    commercial_use_override_applied: bool = False
     adult_use_requires_attestation: bool = True
     versions: list[CivitaiVersionRead] = Field(default_factory=list)
 

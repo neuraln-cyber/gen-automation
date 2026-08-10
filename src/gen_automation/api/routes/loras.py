@@ -114,10 +114,18 @@ async def resolve_civitai_lora(
         client = _civitai_client(request)
         selected_version = command.version_id or source.version_id
         if source.model_id is not None and selected_version is None:
-            choices = await client.list_lora_versions(source)
+            listing = await client.list_lora_versions(
+                source,
+                allow_commercial_use_override=(command.commercial_use_override_attested),
+            )
             return CivitaiResolveRead(
                 model_id=source.model_id,
-                commercial_image_allowed=True,
+                commercial_image_allowed=listing.license_terms.permits_commercial_images,
+                provider_commercial_use=list(listing.license_terms.commercial_use),
+                commercial_use_override_applied=(
+                    command.commercial_use_override_attested
+                    and not listing.license_terms.permits_commercial_images
+                ),
                 versions=[
                     CivitaiVersionRead(
                         version_id=item.version_id,
@@ -127,10 +135,14 @@ async def resolve_civitai_lora(
                         declared_size_bytes=item.declared_size_bytes,
                         sha256=item.sha256,
                     )
-                    for item in choices
+                    for item in listing.versions
                 ],
             )
-        resolved = await client.resolve_lora(source, version_id=command.version_id)
+        resolved = await client.resolve_lora(
+            source,
+            version_id=command.version_id,
+            allow_commercial_use_override=command.commercial_use_override_attested,
+        )
     except CivitaiRateLimitError as error:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -166,7 +178,12 @@ async def resolve_civitai_lora(
             )
         ],
         trained_words=list(resolved.trained_words),
-        commercial_image_allowed=True,
+        commercial_image_allowed=resolved.license_terms.permits_commercial_images,
+        provider_commercial_use=list(resolved.license_terms.commercial_use),
+        commercial_use_override_applied=(
+            command.commercial_use_override_attested
+            and not resolved.license_terms.permits_commercial_images
+        ),
     )
 
 

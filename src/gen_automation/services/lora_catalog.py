@@ -37,11 +37,14 @@ from gen_automation.domain.enums import (
 )
 from gen_automation.domain.ids import uuid7
 from gen_automation.domain.lora_catalog import (
+    CIVITAI_COMMERCIAL_USE_OVERRIDE_METADATA_KEY,
+    CIVITAI_COMMERCIAL_USE_OVERRIDE_SCHEMA,
     CivitaiLoraImportCreate,
     LoraDependencySummary,
     ManualLoraImportCreate,
     ManualUploadCompletion,
     VerifiedLoraArtifact,
+    validate_lora_durable_metadata,
 )
 
 _IDEMPOTENCY_KEY_MAX_LENGTH = 200
@@ -105,6 +108,7 @@ class LoraImportJobSnapshot:
     expected_sha256: str | None
     expected_byte_size: int | None
     expected_metadata: dict[str, Any]
+    commercial_use_override_attested: bool
     trigger_words: tuple[str, ...]
     progress_bytes: int
     total_bytes: int | None
@@ -294,11 +298,16 @@ async def create_civitai_import_job(
     created_at = _as_utc(now or datetime.now(UTC))
     attempts_limit = _max_attempts(max_attempts)
     key = _idempotency_key(idempotency_key)
+    idempotency_command = command.model_dump(mode="json")
+    if not command.commercial_use_override_attested:
+        # Preserve the v1 hash produced before this optional flag existed so a
+        # lost-response retry can safely cross the deployment boundary.
+        idempotency_command.pop("commercial_use_override_attested", None)
     request_sha256 = _request_sha256(
         action="create_civitai",
         actor_user_id=actor_user_id,
         command={
-            **command.model_dump(mode="json"),
+            **idempotency_command,
             "max_attempts": attempts_limit,
         },
     )
@@ -311,6 +320,20 @@ async def create_civitai_import_job(
     if replay is not None:
         return await _job_replay_result(session, replay)
     await _require_actor(session, actor_user_id)
+    if CIVITAI_COMMERCIAL_USE_OVERRIDE_METADATA_KEY in command.expected_metadata:
+        raise LoraCatalogInputError("Civitai commercial-use override metadata is server-managed")
+    expected_metadata = dict(command.expected_metadata)
+    if command.commercial_use_override_attested:
+        expected_metadata[CIVITAI_COMMERCIAL_USE_OVERRIDE_METADATA_KEY] = {
+            "schema": CIVITAI_COMMERCIAL_USE_OVERRIDE_SCHEMA,
+            "attested": True,
+            "attested_by_user_id": str(actor_user_id),
+            "attested_at": created_at.isoformat(),
+        }
+    try:
+        validate_lora_durable_metadata(expected_metadata)
+    except ValueError as error:
+        raise LoraCatalogInputError(str(error)) from error
     job = LoraImportJob(
         source_type=LoraImportSource.CIVITAI,
         state=LoraImportJobState.QUEUED,
@@ -330,7 +353,7 @@ async def create_civitai_import_job(
         target_filename=command.target_filename,
         expected_sha256=command.expected_sha256,
         expected_byte_size=command.expected_byte_size,
-        expected_metadata=command.expected_metadata,
+        expected_metadata=expected_metadata,
         trigger_words=command.trigger_words,
         progress_bytes=0,
         total_bytes=command.expected_byte_size,
@@ -368,6 +391,7 @@ async def create_civitai_import_job(
             "civitai_model_id": command.civitai_model_id,
             "civitai_version_id": command.civitai_version_id,
             "civitai_file_id": command.civitai_file_id,
+            "commercial_use_override_attested": (command.commercial_use_override_attested),
         },
         now=created_at,
     )
@@ -1736,6 +1760,7 @@ def _job_snapshot(job: LoraImportJob) -> LoraImportJobSnapshot:
         expected_sha256=job.expected_sha256,
         expected_byte_size=job.expected_byte_size,
         expected_metadata=dict(job.expected_metadata),
+        commercial_use_override_attested=_commercial_use_override_attested(job),
         trigger_words=tuple(job.trigger_words),
         progress_bytes=job.progress_bytes,
         total_bytes=job.total_bytes,
@@ -1755,6 +1780,19 @@ def _job_snapshot(job: LoraImportJob) -> LoraImportJobSnapshot:
         started_at=_optional_utc(job.started_at),
         last_progress_at=_optional_utc(job.last_progress_at),
         completed_at=_optional_utc(job.completed_at),
+    )
+
+
+def _commercial_use_override_attested(job: LoraImportJob) -> bool:
+    marker = job.expected_metadata.get(CIVITAI_COMMERCIAL_USE_OVERRIDE_METADATA_KEY)
+    return bool(
+        job.source_type == LoraImportSource.CIVITAI
+        and isinstance(marker, dict)
+        and marker.get("schema") == CIVITAI_COMMERCIAL_USE_OVERRIDE_SCHEMA
+        and marker.get("attested") is True
+        and marker.get("attested_by_user_id") == str(job.requested_by_user_id)
+        and isinstance(marker.get("attested_at"), str)
+        and bool(marker["attested_at"])
     )
 
 

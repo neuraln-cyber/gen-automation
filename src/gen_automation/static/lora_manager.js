@@ -226,6 +226,10 @@
         ? (payload.trigger_words ?? payload.trained_words).map(stringValue).filter(Boolean).slice(0, 100)
         : [],
       commercialImageAllowed: payload.commercial_image_allowed === true,
+      providerCommercialUse: Array.isArray(payload.provider_commercial_use)
+        ? payload.provider_commercial_use.map(stringValue).filter(Boolean).slice(0, 16)
+        : [],
+      commercialUseOverrideApplied: payload.commercial_use_override_applied === true,
       adultUseRequiresAttestation: payload.adult_use_requires_attestation === true,
     };
   }
@@ -266,6 +270,7 @@
     const nameInput = root.querySelector("[data-lora-resolved-name]");
     const commercialInput = importForm.elements.namedItem("commercial_use_attested");
     const adultInput = importForm.elements.namedItem("adult_use_attested");
+    const overrideInput = resolveForm.elements.namedItem("commercial_use_override_attested");
     let resolved = null;
 
     const clearVersionChoices = () => {
@@ -322,6 +327,8 @@
       const modelId = root.querySelector("[data-lora-resolved-model-id]");
       const versionId = root.querySelector("[data-lora-resolved-version-id]");
       const commercialStatus = root.querySelector("[data-lora-commercial-status]");
+      const commercialCopy = root.querySelector("[data-lora-commercial-attestation-copy]");
+      const providerCommercialUse = root.querySelector("[data-lora-provider-commercial-use]");
       const triggerPreview = root.querySelector("[data-lora-trigger-preview]");
       const triggers = root.querySelector("[data-lora-resolved-triggers]");
       if (heading) heading.textContent = value.name || "Civitai LoRA";
@@ -350,19 +357,37 @@
       }
       if (commercialStatus) {
         commercialStatus.textContent = value.commercialImageAllowed
-          ? "Commercial images allowed"
-          : "Commercial use blocked";
-        commercialStatus.className = `status ${value.commercialImageAllowed ? "ready" : "failed"}`;
+          ? "Civitai marks commercial images allowed"
+          : value.commercialUseOverrideApplied
+            ? "Reviewed-license override"
+            : "Commercial permission unconfirmed";
+        commercialStatus.className = `status ${
+          value.commercialImageAllowed || value.commercialUseOverrideApplied ? "ready" : "failed"
+        }`;
+      }
+      if (commercialCopy) {
+        commercialCopy.textContent = value.commercialUseOverrideApplied
+          ? "I independently confirmed the creator's current terms permit commercial image use and authorize this recorded override."
+          : "I confirm this version permits commercial image use.";
+      }
+      if (providerCommercialUse) {
+        providerCommercialUse.textContent = value.providerCommercialUse.length > 0
+          ? value.providerCommercialUse.join(", ")
+          : "No commercial-use value reported";
       }
       if (commercialInput instanceof HTMLInputElement) {
         commercialInput.checked = false;
-        commercialInput.disabled = !value.commercialImageAllowed;
+        commercialInput.disabled = !(
+          value.commercialImageAllowed || value.commercialUseOverrideApplied
+        );
       }
       if (adultInput instanceof HTMLInputElement) adultInput.checked = false;
       if (triggerPreview) triggerPreview.hidden = value.triggerWords.length === 0;
       if (triggers) triggers.textContent = value.triggerWords.join(", ");
       if (submitButton instanceof HTMLButtonElement) {
-        submitButton.disabled = !value.commercialImageAllowed || value.files.length === 0;
+        submitButton.disabled = !(
+          value.commercialImageAllowed || value.commercialUseOverrideApplied
+        ) || value.files.length === 0;
       }
       importForm.hidden = false;
       syncSelectedFile();
@@ -377,6 +402,14 @@
         clearVersionChoices();
         importForm.hidden = true;
         resolved = null;
+      });
+    }
+    if (overrideInput instanceof HTMLInputElement) {
+      overrideInput.addEventListener("change", () => {
+        clearVersionChoices();
+        importForm.hidden = true;
+        resolved = null;
+        setMessage(resolveStatus, "Check the URL again to apply this license-review choice.", "warning");
       });
     }
 
@@ -396,6 +429,9 @@
       try {
         const requestBody = { url: urlInput.value.trim() };
         if (selectedVersionId) requestBody.version_id = Number(selectedVersionId);
+        requestBody.commercial_use_override_attested = (
+          overrideInput instanceof HTMLInputElement && overrideInput.checked
+        );
         const payload = await requestJson(resolveUrl, {
           method: "POST",
           body: requestBody,
@@ -420,8 +456,10 @@
           resolveStatus,
           value.commercialImageAllowed
             ? "Version found. Review the file and rights confirmation below."
-            : "Version found, but its Civitai permissions do not allow commercial images.",
-          value.commercialImageAllowed ? "success" : "error",
+            : value.commercialUseOverrideApplied
+              ? "Version found using your reviewed-license override. Confirm the exact file and rights below."
+              : "Version found, but commercial permission remains unconfirmed.",
+          value.commercialImageAllowed || value.commercialUseOverrideApplied ? "success" : "error",
         );
       } catch (error) {
         setMessage(resolveStatus, error instanceof Error ? error.message : "Could not check that URL.", "error");
@@ -433,7 +471,11 @@
 
     importForm.addEventListener("submit", async (event) => {
       event.preventDefault();
-      if (!resolved || !importForm.reportValidity() || !resolved.commercialImageAllowed) return;
+      if (
+        !resolved
+        || !importForm.reportValidity()
+        || !(resolved.commercialImageAllowed || resolved.commercialUseOverrideApplied)
+      ) return;
       if (!(fileSelect instanceof HTMLSelectElement) || !(nameInput instanceof HTMLInputElement)) return;
       const selectedFile = resolved.files.find((candidate) => candidate.id === fileSelect.value);
       if (!selectedFile) {
@@ -457,6 +499,7 @@
           civitai_model_id: Number(resolved.modelId),
           civitai_version_id: Number(resolved.versionId),
           civitai_file_id: Number(selectedFile.id),
+          commercial_use_override_attested: resolved.commercialUseOverrideApplied,
           commercial_use_attested: commercialInput instanceof HTMLInputElement && commercialInput.checked,
           adult_use_attested: adultInput instanceof HTMLInputElement && adultInput.checked,
         };
