@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -15,13 +16,20 @@ from gen_automation.domain.controlled_duo import (
     DuoCompositionPreset,
     DuoIsolationMode,
     DuoQualityMode,
+    TrioCompositionPreset,
     WorkflowCapability,
+    require_coherent_workflow_capabilities,
     require_controlled_duo_capabilities,
+    require_controlled_trio_capabilities,
 )
 from gen_automation.domain.deliverability import MAX_ACCEPTED_IMAGES_PER_RELEASE
 from gen_automation.domain.generation_limits import (
     MAX_OUTPUTS_PER_GENERATION_JOB,
     MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB,
+    MAX_SAFE_OUTPUTS_PER_SIGNED_GENERATION_JOB,
+    MAX_SIGNED_PROMPT_BUDGET_BYTES_PER_GENERATION_JOB,
+    signed_worker_prompt_budget_bytes,
+    utf8_prompt_bytes,
 )
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -100,18 +108,24 @@ class WorkflowSpecification(StrictModel):
     ) -> tuple[WorkflowCapability, ...]:
         if len(values) != len(set(values)):
             raise ValueError("workflow capabilities must be unique")
+        require_coherent_workflow_capabilities(values)
         return tuple(sorted(values, key=str))
 
 
 class GenerationParameters(StrictModel):
-    composition_mode: Literal["single", "duo"] = "single"
-    duo_contract_version: Literal[1, 2] = 1
-    composition_preset_id: DuoCompositionPreset | None = None
+    composition_mode: Literal["single", "duo", "trio"] = "single"
+    duo_contract_version: Literal[1, 2, 3] = 1
+    composition_preset_id: DuoCompositionPreset | TrioCompositionPreset | None = None
     prompt: str = Field(min_length=1, max_length=20000)
     character_a_prompt: str = Field(default="", max_length=20000)
     character_b_prompt: str = Field(default="", max_length=20000)
+    character_a_pose_prompt: str = Field(default="", max_length=20000)
+    character_b_pose_prompt: str = Field(default="", max_length=20000)
+    character_c_prompt: str = Field(default="", max_length=20000)
+    character_c_pose_prompt: str = Field(default="", max_length=20000)
     character_a_negative_prompt: str = Field(default="", max_length=20000)
     character_b_negative_prompt: str = Field(default="", max_length=20000)
+    character_c_negative_prompt: str = Field(default="", max_length=20000)
     interaction_prompt: str = Field(default="", max_length=20000)
     camera_prompt: str = Field(default="", max_length=20000)
     duo_isolation_mode: DuoIsolationMode = DuoIsolationMode.BALANCED
@@ -157,6 +171,8 @@ class GenerationParameters(StrictModel):
             if self.duo_contract_version == 1:
                 if (
                     self.composition_preset_id is not None
+                    or self.character_a_pose_prompt
+                    or self.character_b_pose_prompt
                     or self.character_a_negative_prompt
                     or self.character_b_negative_prompt
                     or self.interaction_prompt
@@ -165,29 +181,66 @@ class GenerationParameters(StrictModel):
                     or self.duo_quality_mode != DuoQualityMode.STANDARD
                 ):
                     raise ValueError("Controlled Duo fields require duo contract version 2")
-            elif self.composition_preset_id is None:
+            elif self.duo_contract_version == 2 and self.composition_preset_id is None:
                 raise ValueError("Controlled Duo v2 requires a composition preset")
+            elif self.duo_contract_version != 2:
+                raise ValueError("two-character composition requires duo contract version 1 or 2")
+            elif not isinstance(self.composition_preset_id, DuoCompositionPreset):
+                raise ValueError("two-character composition requires a two-character layout")
+            if (
+                self.character_c_prompt
+                or self.character_c_pose_prompt
+                or self.character_c_negative_prompt
+            ):
+                raise ValueError("two-character composition cannot include Character C fields")
+        elif self.composition_mode == "trio":
+            if self.duo_contract_version != 3:
+                raise ValueError("three-character composition requires Controlled Trio contract v1")
+            if not all(
+                prompt.strip()
+                for prompt in (
+                    self.character_a_prompt,
+                    self.character_b_prompt,
+                    self.character_c_prompt,
+                )
+            ):
+                raise ValueError("three-character composition requires all three character prompts")
+            if not isinstance(self.composition_preset_id, TrioCompositionPreset):
+                raise ValueError("three-character composition requires a three-character layout")
+            if self.duo_isolation_mode != DuoIsolationMode.BALANCED:
+                raise ValueError("Controlled Trio v1 currently supports balanced isolation only")
+            if self.duo_quality_mode == DuoQualityMode.HIGH:
+                raise ValueError("high trio quality is not implemented")
         elif (
             self.duo_contract_version != 1
             or self.composition_preset_id is not None
             or self.character_a_prompt
             or self.character_b_prompt
+            or self.character_a_pose_prompt
+            or self.character_b_pose_prompt
+            or self.character_c_prompt
+            or self.character_c_pose_prompt
             or self.character_a_negative_prompt
             or self.character_b_negative_prompt
+            or self.character_c_negative_prompt
             or self.interaction_prompt
             or self.camera_prompt
             or self.duo_isolation_mode != DuoIsolationMode.BALANCED
             or self.duo_quality_mode != DuoQualityMode.STANDARD
         ):
             raise ValueError("Controlled Duo fields require two-character composition")
-        prompt_bytes = sum(
-            len(value.encode("utf-8"))
-            for value in (
+        prompt_bytes = utf8_prompt_bytes(
+            (
                 self.prompt,
                 self.character_a_prompt,
                 self.character_b_prompt,
+                self.character_a_pose_prompt,
+                self.character_b_pose_prompt,
+                self.character_c_prompt,
+                self.character_c_pose_prompt,
                 self.character_a_negative_prompt,
                 self.character_b_negative_prompt,
+                self.character_c_negative_prompt,
                 self.interaction_prompt,
                 self.camera_prompt,
                 self.negative_prompt,
@@ -232,6 +285,10 @@ class WildcardVersionReference(StrictModel):
 
 class ReleaseSpecification(StrictModel):
     schema_version: int = Field(default=1, ge=1, le=2)
+    worker_request_budget_version: Literal[1, 2] = Field(
+        default=1,
+        exclude_if=lambda value: value == 1,
+    )
     subjects: list[SubjectSpecification] = Field(min_length=1, max_length=20)
     checkpoint: ArtifactSpecification
     loras: list[LoraSpecification] = Field(default_factory=list, max_length=8)
@@ -264,6 +321,17 @@ class ReleaseSpecification(StrictModel):
                     isolation_mode=self.generation.duo_isolation_mode,
                     quality_mode=self.generation.duo_quality_mode,
                 )
+        elif composition_mode == "trio":
+            subject_urls = {str(subject.canonical_source_url) for subject in self.subjects}
+            if len(self.subjects) != 3 or len(subject_urls) != 3:
+                raise ValueError(
+                    "three-character composition requires exactly three distinct subjects"
+                )
+            require_controlled_trio_capabilities(
+                frozenset(self.workflow.capabilities),
+                isolation_mode=self.generation.duo_isolation_mode,
+                quality_mode=self.generation.duo_quality_mode,
+            )
         if any(
             batch.generation.composition_mode != composition_mode
             for batch in self.generation_batches
@@ -278,6 +346,14 @@ class ReleaseSpecification(StrictModel):
             capabilities = frozenset(self.workflow.capabilities)
             for batch in self.generation_batches:
                 require_controlled_duo_capabilities(
+                    capabilities,
+                    isolation_mode=batch.generation.duo_isolation_mode,
+                    quality_mode=batch.generation.duo_quality_mode,
+                )
+        elif self.generation.duo_contract_version == 3:
+            capabilities = frozenset(self.workflow.capabilities)
+            for batch in self.generation_batches:
+                require_controlled_trio_capabilities(
                     capabilities,
                     isolation_mode=batch.generation.duo_isolation_mode,
                     quality_mode=batch.generation.duo_quality_mode,
@@ -324,3 +400,79 @@ class ReleaseCreate(StrictModel):
     title: str = Field(min_length=1, max_length=300)
     desired_accepted_count: int = Field(ge=1, le=MAX_ACCEPTED_IMAGES_PER_RELEASE)
     specification: ReleaseSpecification
+
+    @model_validator(mode="before")
+    @classmethod
+    def mark_current_worker_request_budget(cls, value: object) -> object:
+        """Mark API-created releases without changing legacy specification parsing."""
+
+        if not isinstance(value, Mapping):
+            return value
+        raw_specification = value.get("specification")
+        if not isinstance(raw_specification, Mapping):
+            return value
+        declared = raw_specification.get("worker_request_budget_version")
+        if declared not in {None, 2}:
+            raise ValueError("new releases require the current worker request budget")
+        specification = dict(raw_specification)
+        specification["worker_request_budget_version"] = 2
+        updated = dict(value)
+        updated["specification"] = specification
+        return updated
+
+    @model_validator(mode="after")
+    def require_safe_new_provider_job_fanout(self) -> "ReleaseCreate":
+        if self.specification.worker_request_budget_version != 2:
+            raise ValueError("new releases require the current worker request budget")
+        if any(
+            batch.generation.outputs_per_job > MAX_SAFE_OUTPUTS_PER_SIGNED_GENERATION_JOB
+            for batch in self.specification.ordered_generation_batches
+        ):
+            raise ValueError(
+                "new signed provider jobs support at most "
+                f"{MAX_SAFE_OUTPUTS_PER_SIGNED_GENERATION_JOB} outputs; "
+                "larger batches must be split automatically"
+            )
+        for batch in self.specification.ordered_generation_batches:
+            generation = batch.generation
+            prompt_budget = signed_worker_prompt_budget_bytes(
+                (
+                    generation.prompt,
+                    generation.character_a_prompt,
+                    generation.character_b_prompt,
+                    generation.character_a_pose_prompt,
+                    generation.character_b_pose_prompt,
+                    generation.character_c_prompt,
+                    generation.character_c_pose_prompt,
+                    generation.character_a_negative_prompt,
+                    generation.character_b_negative_prompt,
+                    generation.character_c_negative_prompt,
+                    generation.interaction_prompt,
+                    generation.camera_prompt,
+                    generation.negative_prompt,
+                    generation.detailer_prompt,
+                    generation.detailer_negative_prompt,
+                ),
+                outputs_per_job=generation.outputs_per_job,
+            )
+            if prompt_budget > MAX_SIGNED_PROMPT_BUDGET_BYTES_PER_GENERATION_JOB:
+                raise ValueError("prompt text is too large for one signed provider job")
+
+        capabilities = frozenset(self.specification.workflow.capabilities)
+        generation = self.specification.generation
+        if generation.composition_mode == "single":
+            if len(self.specification.subjects) != 1:
+                raise ValueError("single-character composition requires exactly one subject")
+            unsupported = capabilities.intersection(
+                {
+                    WorkflowCapability.REGIONAL_PROMPTING_V1,
+                    WorkflowCapability.CONTROLLED_DUO_V2,
+                    WorkflowCapability.CONTROLLED_TRIO_V1,
+                }
+            )
+            if unsupported:
+                raise ValueError("single-character composition requires a non-regional workflow")
+        elif generation.duo_contract_version == 1:
+            if WorkflowCapability.REGIONAL_PROMPTING_V1 not in capabilities:
+                raise ValueError("legacy two-character composition requires regional prompting")
+        return self

@@ -4,12 +4,10 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal
 
-import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import select
 
-import gen_automation.api.routes.experiment_dashboard as experiment_dashboard
 from gen_automation.db.models import (
     ExperimentWarmLease,
     GenerationJob,
@@ -28,7 +26,6 @@ from gen_automation.services.experiment_warm_leases import (
     activate_ready_experiment_warm_leases,
     mark_experiment_warm_runtime_refreshed_locked,
 )
-from gen_automation.services.experiments import ExperimentInputError
 from gen_automation.services.new_sets import list_new_set_options
 from tests.factories import seed_release_approvals, valid_release_payload
 
@@ -37,42 +34,6 @@ def _hidden_value(page: str, name: str) -> str:
     match = re.search(rf'<input type="hidden" name="{name}" value="([^"]+)"', page)
     assert match is not None
     return match.group(1)
-
-
-def _variant(*, options: object, label: str, prompt: str, steps: int = 24) -> dict[str, object]:
-    return {
-        "label": label,
-        "subject_id": str(options.subjects[0].approval_id),
-        "subject_2_id": "",
-        "composition_mode": "single",
-        "character_a_prompt": "",
-        "character_b_prompt": "",
-        "checkpoint_id": str(options.checkpoints[0].approval_id),
-        "workflow_id": str(options.workflows[0].approval_id),
-        "prompt": prompt,
-        "negative_prompt": "low quality",
-        "detailer_prompt": "detailed face",
-        "detailer_negative_prompt": "closed eyes",
-        "seed": 777,
-        "width": 1024,
-        "height": 1024,
-        "cfg": 6.0,
-        "steps": steps,
-        "sampler": "euler",
-        "scheduler": "normal",
-        "clip_skip": 2,
-        "hires_scale": 1.0,
-        "hires_denoise": 0.35,
-        "hires_upscale_method": "bislerp",
-        "detailer_guide_size": 768,
-        "detailer_max_size": 1024,
-        "detailer_denoise": 0.4,
-        "detailer_bbox_threshold": 0.3,
-        "detailer_bbox_dilation": 4,
-        "detailer_bbox_crop_factor": 1.5,
-        "detailer_feather": 4,
-        "loras": [],
-    }
 
 
 def _seed_options(client: TestClient) -> object:
@@ -160,73 +121,192 @@ def _seed_warm_deployment(client: TestClient) -> None:
     client.portal.call(seed)
 
 
-def test_experiment_lab_exposes_bounded_warm_aware_builder(client: TestClient) -> None:
+def _automation_form(
+    page: str,
+    options: object,
+    *,
+    slug: str,
+    title: str,
+    batches: list[dict[str, object]],
+    width: int = 1024,
+    steps: int = 30,
+) -> dict[str, str]:
+    form = {
+        "csrf_token": _hidden_value(page, "csrf_token"),
+        "submission_id": _hidden_value(page, "submission_id"),
+        "idempotency_key": _hidden_value(page, "idempotency_key"),
+        "slug": slug,
+        "title": title,
+        "subject_id": str(options.subjects[0].approval_id),
+        "subject_2_id": "",
+        "composition_mode": "single",
+        "duo_contract_version": "1",
+        "composition_preset_id": "",
+        "character_a_prompt": "",
+        "character_b_prompt": "",
+        "character_a_negative_prompt": "",
+        "character_b_negative_prompt": "",
+        "interaction_prompt": "",
+        "camera_prompt": "",
+        "duo_isolation_mode": "balanced",
+        "duo_quality_mode": "standard",
+        "checkpoint_id": str(options.checkpoints[0].approval_id),
+        "workflow_id": str(options.workflows[0].approval_id),
+        "prompt": "shared prompt",
+        "negative_prompt": "low quality",
+        "detailer_prompt": "detailed face",
+        "detailer_negative_prompt": "closed eyes",
+        "batch_plan": json.dumps(batches),
+        "seed": "-1",
+        "width": str(width),
+        "height": "1024",
+        "cfg": "6.0",
+        "steps": str(steps),
+        "sampler": "euler",
+        "scheduler": "normal",
+        "clip_skip": "2",
+        "outputs_per_job": "25",
+        "hires_scale": "1.0",
+        "hires_denoise": "0.35",
+        "hires_upscale_method": "bislerp",
+        "detailer_guide_size": "768",
+        "detailer_max_size": "1024",
+        "detailer_denoise": "0.4",
+        "detailer_bbox_threshold": "0.3",
+        "detailer_bbox_dilation": "4",
+        "detailer_bbox_crop_factor": "1.5",
+        "detailer_feather": "4",
+        "planned_job_count": "1",
+        "desired_accepted_count": str(
+            min(sum(int(batch["image_count"]) for batch in batches), 500)
+        ),
+    }
+    for slot in range(1, 9):
+        form[f"lora_{slot}_id"] = ""
+        form[f"lora_{slot}_weight"] = ""
+    return form
+
+
+def test_experiment_lab_is_the_full_automation_builder_plus_warm_controls(
+    client: TestClient,
+) -> None:
     _seed_options(client)
 
-    page = client.get("/dashboard/experiments/new")
+    automation = client.get("/dashboard/new-set")
+    lab = client.get("/dashboard/experiments/new")
     script = client.get("/static/dashboard.js")
-    stylesheet = client.get("/static/dashboard_ux.css")
 
-    assert page.status_code == 200
-    assert "Compare ideas without repeated cold starts" in page.text
-    assert "data-experiment-form" in page.text
-    assert "data-experiment-plan" in page.text
-    assert "data-experiment-save-variant" in page.text
-    assert "data-experiment-variant-list" in page.text
-    assert 'name="negative_prompt"' in page.text
-    assert 'name="keep_warm" value="true"' in page.text
-    assert "Maximum added idle exposure" in page.text
-    assert "worker restart" in page.text
-    assert 'data-warm-status-url="/dashboard/experiments/warm-session"' in page.text
-    assert "Start 15-minute session" in page.text
-    assert "Experiment Lab" in client.get("/dashboard").text
+    assert automation.status_code == 200
+    assert lab.status_code == 200
+    for contract in (
+        "data-automation-form",
+        'id="batch-builder"',
+        'id="batch-list"',
+        'id="batch-row-template"',
+        "data-automation-presets",
+        "data-lora-picker",
+        'name="outputs_per_job"',
+        'name="desired_accepted_count"',
+    ):
+        assert contract in automation.text
+        assert contract in lab.text
+    assert 'action="/dashboard/new-set?mode=experiment"' in lab.text
+    assert 'data-automation-draft-scope="experiment"' in lab.text
+    assert 'data-automation-draft-scope="automation"' in automation.text
+    assert 'data-warm-status-url="/dashboard/experiments/warm-session"' in lab.text
+    assert "Queue warm batch plan" in lab.text
+    assert "any Automation batch plan" in lab.text
+    assert "data-experiment-form" not in lab.text
+    assert "variant_plan" not in lab.text
+    assert "outputs_per_variant" not in lab.text
+    assert "paired_seeds" not in lab.text
+    assert "comparison" not in lab.text.casefold()
+    assert "queued variants" not in script.text
+    assert "GPU warm for follow-up batches" in script.text
+    assert 'document.querySelector("[data-automation-draft-scope]")' in script.text
+    assert 'if (draftScope === "automation") return scopedStorageKey(key);' in script.text
 
-    assert script.status_code == 200
-    assert "initializeExperimentLab" in script.text
-    assert "profileIsWarmReady" in script.text
-    assert "duration_minutes: 15" in script.text
-    assert "initializeExperimentResults" in script.text
-    assert "Full prompt & settings" in script.text
-    assert stylesheet.status_code == 200
-    assert ".experiment-workbench" in stylesheet.text
-    assert ".experiment-comparison-grid" in stylesheet.text
+    legacy_post = client.post("/dashboard/experiments/new", data={}, follow_redirects=False)
+    assert legacy_post.status_code == 303
+    assert legacy_post.headers["location"] == "/dashboard/experiments/new"
 
 
-def test_experiment_submission_creates_one_release_job_per_variant_with_paired_seeds(
+def test_experiment_lab_queues_large_multi_batch_automation_and_reuses_one_warm_lease(
     client: TestClient,
 ) -> None:
     options = _seed_options(client)
     _configure_worker_manifest(client, options)
     _seed_warm_deployment(client)
-    page = client.get("/dashboard/experiments/new")
-    group_slug = _hidden_value(page.text, "group_slug")
-    variants = [
-        _variant(options=options, label="Baseline", prompt="portrait, style a", steps=24),
-        _variant(options=options, label="More steps", prompt="portrait, style a", steps=30),
+    batches = [
+        {
+            "name": "Large batch",
+            "image_count": 61,
+            "prompt": "large batch prompt",
+            "negative_prompt": "large batch negative",
+            "seed": 100,
+        },
+        *[
+            {
+                "name": f"Batch {index}",
+                "image_count": 5,
+                "prompt": f"batch {index} prompt",
+                "seed": 100 + index,
+            }
+            for index in range(2, 14)
+        ],
     ]
-    form = {
-        "csrf_token": _hidden_value(page.text, "csrf_token"),
-        "submission_id": _hidden_value(page.text, "submission_id"),
-        "idempotency_key": _hidden_value(page.text, "idempotency_key"),
-        "group_slug": group_slug,
-        "experiment_title": "Portrait sampler test",
-        "outputs_per_variant": "2",
-        "paired_seeds": "true",
-        "keep_warm": "true",
-        "base_seed": "456789",
-        "variant_plan": json.dumps(variants),
-    }
+    first_page = client.get("/dashboard/experiments/new")
+    first_form = _automation_form(
+        first_page.text,
+        options,
+        slug="warm-lab-first",
+        title="Warm Lab First",
+        batches=batches,
+    )
 
-    first = client.post("/dashboard/experiments/new", data=form, follow_redirects=False)
-    replay = client.post("/dashboard/experiments/new", data=form, follow_redirects=False)
+    first = client.post(
+        "/dashboard/new-set?mode=experiment",
+        data=first_form,
+        follow_redirects=False,
+    )
+    database = client.app.state.database
+    assert client.portal is not None
+
+    async def lease_snapshot() -> tuple[int, datetime | None, datetime]:
+        async with database.sessions() as session:
+            lease = await session.scalar(select(ExperimentWarmLease))
+            assert lease is not None
+            return lease.lock_version, lease.last_activity_at, lease.expires_at
+
+    before_replay = client.portal.call(lease_snapshot)
+    replay = client.post(
+        "/dashboard/new-set?mode=experiment",
+        data=first_form,
+        follow_redirects=False,
+    )
 
     assert first.status_code == 303
     assert replay.status_code == 303
-    assert first.headers["location"] == f"/dashboard/experiments/{group_slug}"
-    assert replay.headers["location"] == first.headers["location"]
+    assert first.headers["location"] == replay.headers["location"]
+    assert "&mode=experiment" in first.headers["location"]
+    assert client.portal.call(lease_snapshot) == before_replay
 
-    database = client.app.state.database
-    assert client.portal is not None
+    second_page = client.get("/dashboard/experiments/new")
+    second_form = _automation_form(
+        second_page.text,
+        options,
+        slug="warm-lab-second",
+        title="Warm Lab Second",
+        batches=[{"name": "Follow-up", "image_count": 7, "prompt": "different prompt"}],
+        width=1152,
+        steps=40,
+    )
+    second = client.post(
+        "/dashboard/new-set?mode=experiment",
+        data=second_form,
+        follow_redirects=False,
+    )
+    assert second.status_code == 303
 
     async def state() -> tuple[
         list[Release],
@@ -237,7 +317,14 @@ def test_experiment_submission_creates_one_release_job_per_variant_with_paired_s
         async with database.sessions() as session:
             releases = list((await session.scalars(select(Release).order_by(Release.slug))).all())
             jobs = list(
-                (await session.scalars(select(GenerationJob).order_by(GenerationJob.id))).all()
+                (
+                    await session.scalars(
+                        select(GenerationJob).order_by(
+                            GenerationJob.release_version_id,
+                            GenerationJob.logical_key,
+                        )
+                    )
+                ).all()
             )
             versions = list(
                 (await session.scalars(select(ReleaseVersion).order_by(ReleaseVersion.id))).all()
@@ -246,171 +333,52 @@ def test_experiment_submission_creates_one_release_job_per_variant_with_paired_s
             return releases, jobs, versions, leases
 
     releases, jobs, versions, leases = client.portal.call(state)
-    assert len(releases) == 2
-    assert len(jobs) == 2
-    assert all(job.expected_output_count == 2 for job in jobs)
-    assert [release.slug.split("-")[2] for release in releases] == ["01", "02"]
-    assert [release.desired_accepted_count for release in releases] == [2, 2]
-    assert {version.specification["generation"]["seed"] for version in versions} == {456789}
-    assert sorted(version.specification["generation"]["steps"] for version in versions) == [24, 30]
+    assert [release.slug for release in releases] == ["warm-lab-first", "warm-lab-second"]
     assert len(leases) == 1
+    assert len(jobs) == 21
+    first_version = next(version for version in versions if version.release_id == releases[0].id)
+    assert len(first_version.specification["generation_batches"]) == 13
+    assert first_version.specification["generation_batches"][0]["image_count"] == 61
+    first_job_outputs = sorted(
+        job.expected_output_count for job in jobs if job.release_version_id == first_version.id
+    )
+    assert first_job_outputs == [5] * 13 + [8] * 7
+    second_version = next(version for version in versions if version.release_id == releases[1].id)
+    assert second_version.specification["generation"]["width"] == 1152
+    assert second_version.specification["generation"]["steps"] == 40
 
-    results = client.get(first.headers["location"])
-    progress = client.get(f"{first.headers['location']}/progress")
-    assert results.status_code == 200
-    assert "Baseline" in results.text
-    assert "More steps" in results.text
-    assert "data-experiment-results" in results.text
+    status_page = client.get(first.headers["location"])
+    assert status_page.status_code == 200
+    assert "Queue next warm batch" in status_page.text
+    assert "data-experiment-warm-session" in status_page.text
+    assert "data-generation-progress" in status_page.text
+    assert 'data-automation-draft-scope="experiment"' in status_page.text
+    assert "data-experiment-results" not in status_page.text
+
+
+def test_legacy_experiment_comparison_remains_readable(client: TestClient) -> None:
+    options = _seed_options(client)
+    _configure_worker_manifest(client, options)
+    group_slug = "experiment-abcdef123456"
+    for index, label in enumerate(("Baseline", "Alternate"), start=1):
+        page = client.get("/dashboard/new-set")
+        form = _automation_form(
+            page.text,
+            options,
+            slug=f"{group_slug}-{index:02d}-{label.casefold()}",
+            title=f"Legacy comparison - {label}",
+            batches=[{"name": label, "image_count": 2, "prompt": label.casefold()}],
+        )
+        created = client.post("/dashboard/new-set", data=form, follow_redirects=False)
+        assert created.status_code == 303
+
+    legacy = client.get(f"/dashboard/experiments/{group_slug}")
+    progress = client.get(f"/dashboard/experiments/{group_slug}/progress")
+    assert legacy.status_code == 200
+    assert "data-experiment-results" in legacy.text
+    assert "Queue a warm batch" in legacy.text
     assert progress.status_code == 200
-    progress_payload = progress.json()
-    assert progress_payload["schema_version"] == 2
-    assert progress_payload["expected"] == 4
-    assert progress_payload["gpu_billing"]["state"] == "stale"
-    assert progress_payload["gpu_billing"]["estimated"] is True
-    assert progress_payload["poll_after_ms"] == 3000
-    assert len(progress_payload["variants"]) == 2
-    assert all("gpu_billing" not in variant for variant in progress_payload["variants"])
-
-
-def test_failed_experiment_creation_rolls_back_the_uncommitted_warm_lease(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    options = _seed_options(client)
-    _configure_worker_manifest(client, options)
-    _seed_warm_deployment(client)
-    page = client.get("/dashboard/experiments/new")
-
-    async def fail_creation(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        raise ExperimentInputError("forced experiment failure")
-
-    monkeypatch.setattr(experiment_dashboard, "create_experiment", fail_creation)
-    response = client.post(
-        "/dashboard/experiments/new",
-        data={
-            "csrf_token": _hidden_value(page.text, "csrf_token"),
-            "submission_id": _hidden_value(page.text, "submission_id"),
-            "idempotency_key": _hidden_value(page.text, "idempotency_key"),
-            "group_slug": _hidden_value(page.text, "group_slug"),
-            "experiment_title": "Rollback warm setup",
-            "outputs_per_variant": "1",
-            "paired_seeds": "true",
-            "keep_warm": "true",
-            "base_seed": "123",
-            "variant_plan": json.dumps(
-                [
-                    _variant(options=options, label="A", prompt="portrait a"),
-                    _variant(options=options, label="B", prompt="portrait b"),
-                ]
-            ),
-        },
-    )
-
-    assert response.status_code == 409
-    database = client.app.state.database
-    assert client.portal is not None
-
-    async def lease_count() -> int:
-        async with database.sessions() as session:
-            return len(list((await session.scalars(select(ExperimentWarmLease))).all()))
-
-    assert client.portal.call(lease_count) == 0
-
-
-def test_replaying_a_completed_experiment_form_does_not_renew_an_active_warm_lease(
-    client: TestClient,
-) -> None:
-    options = _seed_options(client)
-    _configure_worker_manifest(client, options)
-    _seed_warm_deployment(client)
-    page = client.get("/dashboard/experiments/new")
-    form = {
-        "csrf_token": _hidden_value(page.text, "csrf_token"),
-        "submission_id": _hidden_value(page.text, "submission_id"),
-        "idempotency_key": _hidden_value(page.text, "idempotency_key"),
-        "group_slug": _hidden_value(page.text, "group_slug"),
-        "experiment_title": "Replay warm setup",
-        "outputs_per_variant": "1",
-        "paired_seeds": "true",
-        "keep_warm": "true",
-        "base_seed": "123",
-        "variant_plan": json.dumps(
-            [
-                _variant(options=options, label="A", prompt="portrait a"),
-                _variant(options=options, label="B", prompt="portrait b"),
-            ]
-        ),
-    }
-    created = client.post("/dashboard/experiments/new", data=form, follow_redirects=False)
-    assert created.status_code == 303
-
-    database = client.app.state.database
-    assert client.portal is not None
-
-    async def activate_and_snapshot() -> tuple[datetime | None, datetime]:
-        async with database.sessions() as session:
-            lease = await session.scalar(select(ExperimentWarmLease))
-            deployment = await session.scalar(select(SaladDeployment))
-            assert lease is not None
-            assert deployment is not None
-            mark_experiment_warm_runtime_refreshed_locked(
-                session,
-                lease,
-                provider_version=2,
-                actor="test",
-            )
-            deployment.observed_replicas = 1
-            deployment.ready_replicas = 1
-            await session.commit()
-        async with database.sessions() as session:
-            activated = await activate_ready_experiment_warm_leases(session, actor="test")
-            assert len(activated) == 1
-            await session.commit()
-            lease = await session.scalar(select(ExperimentWarmLease))
-            assert lease is not None
-            return lease.last_activity_at, lease.expires_at
-
-    before = client.portal.call(activate_and_snapshot)
-    replay = client.post("/dashboard/experiments/new", data=form, follow_redirects=False)
-    assert replay.status_code == 303
-
-    async def snapshot() -> tuple[datetime | None, datetime]:
-        async with database.sessions() as session:
-            lease = await session.scalar(select(ExperimentWarmLease))
-            assert lease is not None
-            return lease.last_activity_at, lease.expires_at
-
-    assert client.portal.call(snapshot) == before
-
-
-def test_experiment_form_rejects_an_unbounded_variant_queue(client: TestClient) -> None:
-    options = _seed_options(client)
-    page = client.get("/dashboard/experiments/new")
-    group_slug = _hidden_value(page.text, "group_slug")
-    variant = _variant(options=options, label="Variant", prompt="portrait")
-    variants = []
-    for index in range(13):
-        current = dict(variant)
-        current["label"] = f"Variant {index + 1}"
-        variants.append(current)
-    response = client.post(
-        "/dashboard/experiments/new",
-        data={
-            "csrf_token": _hidden_value(page.text, "csrf_token"),
-            "submission_id": _hidden_value(page.text, "submission_id"),
-            "idempotency_key": _hidden_value(page.text, "idempotency_key"),
-            "group_slug": group_slug,
-            "experiment_title": "Too many",
-            "outputs_per_variant": "2",
-            "paired_seeds": "true",
-            "base_seed": "123",
-            "variant_plan": json.dumps(variants),
-        },
-    )
-
-    assert response.status_code == 422
-    assert "between 2 and 12 variants" in response.text
+    assert len(progress.json()["variants"]) == 2
 
 
 def test_warm_session_routes_are_exact_authenticated_and_idempotent(client: TestClient) -> None:
@@ -492,37 +460,30 @@ def test_warm_session_routes_are_exact_authenticated_and_idempotent(client: Test
     assert final.json()["state"] == "ending"
 
 
-def test_optional_auto_warm_failure_does_not_fail_a_queued_experiment(
+def test_optional_auto_warm_failure_does_not_fail_a_queued_lab_set(
     client: TestClient,
 ) -> None:
     options = _seed_options(client)
     _configure_worker_manifest(client, options)
     page = client.get("/dashboard/experiments/new")
-    group_slug = _hidden_value(page.text, "group_slug")
+    form = _automation_form(
+        page.text,
+        options,
+        slug="warm-fallback",
+        title="Warm fallback",
+        batches=[{"name": "Fallback", "image_count": 9, "prompt": "portrait"}],
+    )
     response = client.post(
-        "/dashboard/experiments/new",
-        data={
-            "csrf_token": _hidden_value(page.text, "csrf_token"),
-            "submission_id": _hidden_value(page.text, "submission_id"),
-            "idempotency_key": _hidden_value(page.text, "idempotency_key"),
-            "group_slug": group_slug,
-            "experiment_title": "Warm fallback",
-            "outputs_per_variant": "1",
-            "paired_seeds": "true",
-            "keep_warm": "true",
-            "base_seed": "123",
-            "variant_plan": json.dumps(
-                [
-                    _variant(options=options, label="A", prompt="portrait a"),
-                    _variant(options=options, label="B", prompt="portrait b"),
-                ]
-            ),
-        },
+        "/dashboard/new-set?mode=experiment",
+        data=form,
         follow_redirects=False,
     )
 
     assert response.status_code == 303
-    assert response.headers["location"] == (f"/dashboard/experiments/{group_slug}?warm=unavailable")
-    results = client.get(response.headers["location"])
-    assert results.status_code == 200
-    assert "comparison was queued successfully" in results.text
+    assert "mode=experiment" in response.headers["location"]
+    assert "warm=unavailable" in response.headers["location"]
+    status_page = client.get(response.headers["location"])
+    assert status_page.status_code == 200
+    assert "This set was queued, but the optional warm hold could not be started" in (
+        status_page.text
+    )

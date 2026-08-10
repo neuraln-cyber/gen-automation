@@ -18,6 +18,9 @@
         </p>
       </div>
       <div class="generation-page-actions">
+        {% if experiment_mode %}
+          <a class="primary-button" href="/dashboard/experiments/new">Queue next warm batch</a>
+        {% endif %}
         <span
           class="status {{ release.stage.key.value }}"
           data-progress-stage-badge
@@ -33,10 +36,46 @@
     </div>
   </section>
 
+  {% if experiment_mode %}
+    {% if warm_unavailable %}
+      <div class="form-error" role="alert">
+        This set was queued, but the optional warm hold could not be started. Generation remains
+        safe and will scale normally; retry Start session before the next batch if you want to
+        keep the GPU between submissions.
+      </div>
+    {% endif %}
+    <section
+      class="experiment-warm-panel"
+      data-experiment-warm-session
+      data-warm-status-url="/dashboard/experiments/warm-session"
+      data-warm-start-url="/dashboard/experiments/warm-session/start"
+      data-warm-extend-url="/dashboard/experiments/warm-session/extend"
+      data-warm-end-url="/dashboard/experiments/warm-session/end"
+      data-csrf-token="{{ warm_session_csrf_token }}"
+    >
+      <div>
+        <span class="experiment-eyebrow">Warm GPU session</span>
+        <strong data-warm-session-heading>Checking the shared worker</strong>
+        <p data-warm-session-status>
+          Queue another Automation batch plan while this run continues; the same compatible
+          worker is reused between submissions.
+        </p>
+      </div>
+      {% if warm_session_csrf_token %}
+        <div class="experiment-warm-actions" hidden data-warm-session-actions>
+          <button class="secondary-button" type="button" data-warm-start>Start 15-minute session</button>
+          <button class="secondary-button" type="button" data-warm-extend>+15 minutes</button>
+          <button class="text-button danger" type="button" data-warm-end>End now</button>
+        </div>
+      {% endif %}
+    </section>
+  {% endif %}
+
   <section
     class="panel panel-accent generation-progress"
     aria-labelledby="generation-progress-heading"
     data-generation-progress
+    data-automation-draft-scope="{{ 'experiment' if experiment_mode else 'automation' }}"
     data-progress-url="/dashboard/releases/{{ release.release_id }}/progress"
     data-progress-stage="{{ release.stage.key.value }}"
     data-stop-generation-requested="{{ 'true' if release.stop_requested else 'false' }}"

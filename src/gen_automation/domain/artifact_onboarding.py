@@ -12,7 +12,10 @@ from pydantic import (
 )
 
 from gen_automation.domain.compliance_registry import ApprovalEvidence
-from gen_automation.domain.controlled_duo import WorkflowCapability
+from gen_automation.domain.controlled_duo import (
+    WorkflowCapability,
+    require_coherent_workflow_capabilities,
+)
 from gen_automation.gpu_worker.artifacts import (
     MAX_ARTIFACT_BYTES,
     MAX_ARTIFACTS,
@@ -142,6 +145,7 @@ class WorkflowOnboardingEntry(StrictOnboardingModel):
     ) -> list[WorkflowCapability]:
         if len(values) != len(set(values)):
             raise ValueError("workflow capabilities must be unique")
+        require_coherent_workflow_capabilities(values)
         return sorted(values, key=str)
 
     @field_validator("name", "version")

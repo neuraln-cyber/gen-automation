@@ -1,0 +1,557 @@
+{
+  "1": {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": {
+      "ckpt_name": {
+        "$gen": "checkpoint.runtime_filename"
+      }
+    }
+  },
+  "2": {
+    "class_type": "GenAutomationLoraChain",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "clip": [
+        "1",
+        1
+      ]
+    }
+  },
+  "3": {
+    "class_type": "CLIPSetLastLayer",
+    "inputs": {
+      "clip": [
+        "2",
+        1
+      ],
+      "stop_at_clip_layer": {
+        "$gen": "generation.clip_stop_at_layer"
+      }
+    }
+  },
+  "4": {
+    "class_type": "SolidMask",
+    "inputs": {
+      "value": 0.0,
+      "width": {
+        "$gen": "generation.width"
+      },
+      "height": {
+        "$gen": "generation.height"
+      }
+    }
+  },
+  "5": {
+    "class_type": "SolidMask",
+    "inputs": {
+      "value": 1.0,
+      "width": {
+        "$gen": "controlled_trio.character_a.width"
+      },
+      "height": {
+        "$gen": "controlled_trio.character_a.height"
+      }
+    }
+  },
+  "6": {
+    "class_type": "FeatherMask",
+    "inputs": {
+      "mask": [
+        "5",
+        0
+      ],
+      "left": {
+        "$gen": "controlled_trio.character_a.feather_left"
+      },
+      "top": {
+        "$gen": "controlled_trio.character_a.feather_top"
+      },
+      "right": {
+        "$gen": "controlled_trio.character_a.feather_right"
+      },
+      "bottom": {
+        "$gen": "controlled_trio.character_a.feather_bottom"
+      }
+    }
+  },
+  "7": {
+    "class_type": "MaskComposite",
+    "inputs": {
+      "destination": [
+        "4",
+        0
+      ],
+      "source": [
+        "6",
+        0
+      ],
+      "x": {
+        "$gen": "controlled_trio.character_a.x"
+      },
+      "y": {
+        "$gen": "controlled_trio.character_a.y"
+      },
+      "operation": "add"
+    }
+  },
+  "8": {
+    "class_type": "SolidMask",
+    "inputs": {
+      "value": 1.0,
+      "width": {
+        "$gen": "controlled_trio.character_b.width"
+      },
+      "height": {
+        "$gen": "controlled_trio.character_b.height"
+      }
+    }
+  },
+  "9": {
+    "class_type": "FeatherMask",
+    "inputs": {
+      "mask": [
+        "8",
+        0
+      ],
+      "left": {
+        "$gen": "controlled_trio.character_b.feather_left"
+      },
+      "top": {
+        "$gen": "controlled_trio.character_b.feather_top"
+      },
+      "right": {
+        "$gen": "controlled_trio.character_b.feather_right"
+      },
+      "bottom": {
+        "$gen": "controlled_trio.character_b.feather_bottom"
+      }
+    }
+  },
+  "10": {
+    "class_type": "MaskComposite",
+    "inputs": {
+      "destination": [
+        "4",
+        0
+      ],
+      "source": [
+        "9",
+        0
+      ],
+      "x": {
+        "$gen": "controlled_trio.character_b.x"
+      },
+      "y": {
+        "$gen": "controlled_trio.character_b.y"
+      },
+      "operation": "add"
+    }
+  },
+  "11": {
+    "class_type": "SolidMask",
+    "inputs": {
+      "value": 1.0,
+      "width": {
+        "$gen": "controlled_trio.character_c.width"
+      },
+      "height": {
+        "$gen": "controlled_trio.character_c.height"
+      }
+    }
+  },
+  "12": {
+    "class_type": "FeatherMask",
+    "inputs": {
+      "mask": [
+        "11",
+        0
+      ],
+      "left": {
+        "$gen": "controlled_trio.character_c.feather_left"
+      },
+      "top": {
+        "$gen": "controlled_trio.character_c.feather_top"
+      },
+      "right": {
+        "$gen": "controlled_trio.character_c.feather_right"
+      },
+      "bottom": {
+        "$gen": "controlled_trio.character_c.feather_bottom"
+      }
+    }
+  },
+  "13": {
+    "class_type": "MaskComposite",
+    "inputs": {
+      "destination": [
+        "4",
+        0
+      ],
+      "source": [
+        "12",
+        0
+      ],
+      "x": {
+        "$gen": "controlled_trio.character_c.x"
+      },
+      "y": {
+        "$gen": "controlled_trio.character_c.y"
+      },
+      "operation": "add"
+    }
+  },
+  "14": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "3",
+        0
+      ],
+      "text": {
+        "$gen": "controlled_trio.shared_positive_prompt"
+      }
+    }
+  },
+  "15": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "3",
+        0
+      ],
+      "text": {
+        "$gen": "controlled_trio.shared_negative_prompt"
+      }
+    }
+  },
+  "16": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "3",
+        0
+      ],
+      "text": {
+        "$gen": "controlled_trio.character_a_local_positive_prompt"
+      }
+    }
+  },
+  "17": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "3",
+        0
+      ],
+      "text": {
+        "$gen": "controlled_trio.character_b_local_positive_prompt"
+      }
+    }
+  },
+  "18": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "3",
+        0
+      ],
+      "text": {
+        "$gen": "controlled_trio.character_c_local_positive_prompt"
+      }
+    }
+  },
+  "19": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "3",
+        0
+      ],
+      "text": {
+        "$gen": "controlled_trio.character_a_local_negative_prompt"
+      }
+    }
+  },
+  "20": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "3",
+        0
+      ],
+      "text": {
+        "$gen": "controlled_trio.character_b_local_negative_prompt"
+      }
+    }
+  },
+  "21": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "3",
+        0
+      ],
+      "text": {
+        "$gen": "controlled_trio.character_c_local_negative_prompt"
+      }
+    }
+  },
+  "22": {
+    "class_type": "ConditioningSetMask",
+    "inputs": {
+      "conditioning": [
+        "16",
+        0
+      ],
+      "mask": [
+        "7",
+        0
+      ],
+      "strength": 1.0,
+      "set_cond_area": "default"
+    }
+  },
+  "23": {
+    "class_type": "ConditioningSetMask",
+    "inputs": {
+      "conditioning": [
+        "17",
+        0
+      ],
+      "mask": [
+        "10",
+        0
+      ],
+      "strength": 1.0,
+      "set_cond_area": "default"
+    }
+  },
+  "24": {
+    "class_type": "ConditioningSetMask",
+    "inputs": {
+      "conditioning": [
+        "18",
+        0
+      ],
+      "mask": [
+        "13",
+        0
+      ],
+      "strength": 1.0,
+      "set_cond_area": "default"
+    }
+  },
+  "25": {
+    "class_type": "ConditioningSetMask",
+    "inputs": {
+      "conditioning": [
+        "19",
+        0
+      ],
+      "mask": [
+        "7",
+        0
+      ],
+      "strength": 1.0,
+      "set_cond_area": "default"
+    }
+  },
+  "26": {
+    "class_type": "ConditioningSetMask",
+    "inputs": {
+      "conditioning": [
+        "20",
+        0
+      ],
+      "mask": [
+        "10",
+        0
+      ],
+      "strength": 1.0,
+      "set_cond_area": "default"
+    }
+  },
+  "27": {
+    "class_type": "ConditioningSetMask",
+    "inputs": {
+      "conditioning": [
+        "21",
+        0
+      ],
+      "mask": [
+        "13",
+        0
+      ],
+      "strength": 1.0,
+      "set_cond_area": "default"
+    }
+  },
+  "28": {
+    "class_type": "ConditioningCombine",
+    "inputs": {
+      "conditioning_1": [
+        "14",
+        0
+      ],
+      "conditioning_2": [
+        "22",
+        0
+      ]
+    }
+  },
+  "29": {
+    "class_type": "ConditioningCombine",
+    "inputs": {
+      "conditioning_1": [
+        "28",
+        0
+      ],
+      "conditioning_2": [
+        "23",
+        0
+      ]
+    }
+  },
+  "30": {
+    "class_type": "ConditioningCombine",
+    "inputs": {
+      "conditioning_1": [
+        "29",
+        0
+      ],
+      "conditioning_2": [
+        "24",
+        0
+      ]
+    }
+  },
+  "31": {
+    "class_type": "ConditioningCombine",
+    "inputs": {
+      "conditioning_1": [
+        "15",
+        0
+      ],
+      "conditioning_2": [
+        "25",
+        0
+      ]
+    }
+  },
+  "32": {
+    "class_type": "ConditioningCombine",
+    "inputs": {
+      "conditioning_1": [
+        "31",
+        0
+      ],
+      "conditioning_2": [
+        "26",
+        0
+      ]
+    }
+  },
+  "33": {
+    "class_type": "ConditioningCombine",
+    "inputs": {
+      "conditioning_1": [
+        "32",
+        0
+      ],
+      "conditioning_2": [
+        "27",
+        0
+      ]
+    }
+  },
+  "34": {
+    "class_type": "EmptyLatentImage",
+    "inputs": {
+      "batch_size": {
+        "$gen": "generation.outputs_per_job"
+      },
+      "height": {
+        "$gen": "generation.height"
+      },
+      "width": {
+        "$gen": "generation.width"
+      }
+    }
+  },
+  "35": {
+    "class_type": "KSampler",
+    "inputs": {
+      "cfg": {
+        "$gen": "generation.cfg"
+      },
+      "denoise": 1.0,
+      "latent_image": [
+        "34",
+        0
+      ],
+      "model": [
+        "2",
+        0
+      ],
+      "negative": [
+        "33",
+        0
+      ],
+      "positive": [
+        "30",
+        0
+      ],
+      "sampler_name": {
+        "$gen": "generation.sampler"
+      },
+      "scheduler": {
+        "$gen": "generation.scheduler"
+      },
+      "seed": {
+        "$gen": "generation.seed"
+      },
+      "steps": {
+        "$gen": "controlled_trio.base_steps"
+      }
+    }
+  },
+  "36": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "35",
+        0
+      ],
+      "vae": [
+        "1",
+        2
+      ]
+    }
+  },
+  "37": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "gen-automation-controlled-trio-balanced-v1",
+      "images": [
+        "36",
+        0
+      ]
+    }
+  },
+  "99": {
+    "class_type": "GenAutomationControlledTrioV1",
+    "inputs": {
+      "contract_version": 1,
+      "isolation_mode": "balanced",
+      "mask_topology": "three_disjoint_regions_v1",
+      "character_a_mask_node_id": "7",
+      "character_b_mask_node_id": "10",
+      "character_c_mask_node_id": "13",
+      "base_sampler_node_id": "35",
+      "final_sampler_node_id": "35"
+    }
+  }
+}

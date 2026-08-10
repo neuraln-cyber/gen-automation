@@ -211,6 +211,45 @@ Balanced approvals declare `controlled_duo_v2`. Strict approvals declare both
 `controlled_duo_v2` and `duo_strict_isolation`. Any marker/capability/topology
 mismatch fails before upload grants or provider submission.
 
+## Controlled Trio v1 profile
+
+`workflows/illustrious-sdxl-controlled-trio-balanced-v1.json` is the bundled
+Balanced, core-node-only three-character template. Its current SHA-256 is
+`100a3ed840007591f2cfcc0f3277f787f351caeef82610b46952bb826428f71a`.
+It uses the existing checkpoint, LoRA-chain, Clip-skip, latent, sampler,
+decode, and save contracts plus core mask and conditioning nodes. No custom
+extension is installed or admitted by this profile.
+
+The release must contain exactly three distinct, approved, clearly-adult
+fictional subjects and the workflow approval must explicitly declare
+`controlled_trio_v1`. The A, B, and C identity/appearance prompts, individual
+pose prompts, and local negative prompts are encoded independently. Shared
+scene/style, combined group interaction, and camera prompts remain full-frame.
+Each character's positive and negative conditioning is confined to one of
+three disjoint feathered identity regions before all lanes feed a single base
+sampler.
+
+The **Auto / flexible**, **three-column**, **triangle**, and **layered-depth**
+presets control only the initial identity-region geometry. They are not a pose
+menu and do not guarantee deterministic limbs, contact, or occlusion. Operators
+remain free to write any individual A/B/C pose and one coordinated two- or
+three-character interaction.
+
+Wildcard expansion happens before binding the frozen graph. Current wildcard
+tokens can be used in each character's identity, pose, and negative prompt as
+well as the shared interaction and camera. Set-level values are defaults; a
+batch override left unset inherits, a supplied value replaces, and a supplied
+empty string explicitly clears the corresponding field. Source and resolved
+prompt hashes are retained as evidence.
+
+Controlled Trio v1 supports Balanced isolation only. Draft lowers the actual
+base sampling step count and Standard uses the requested base count. Strict
+repair and High quality fail closed because no approved trio topology provides
+them. A future opt-in pose-map ControlNet capability would need its own reviewed
+model and pose assets, signed input contract, and canary worker. Its estimated
+roughly 2.5 GB additional cold-start artifact cost is deliberately excluded
+from this core-only profile; no ControlNet extension is installed here.
+
 ## Detector artifact
 
 The detector is not downloaded by ComfyUI, Impact Pack, or Ultralytics. Add one
@@ -244,9 +283,11 @@ Bundling a JSON template does not automatically make it selectable. Upload the
 exact template bytes to private workflow storage and create a current approved
 workflow registry record using the path's SHA-256 above. Register the base,
 base + detailer, hires, hires + detailer, their four couple counterparts, and
-the balanced and strict Controlled Duo v2 profiles as ten separate workflow
-approvals. They then appear in the New Set workflow selector according to their
-declared capabilities.
+the balanced and strict Controlled Duo v2 profiles plus Controlled Trio v1 as
+eleven separate workflow approvals. They then appear in the New Set workflow
+selector according to their declared capabilities. The trio option remains
+hidden or unavailable until its exact template and `controlled_trio_v1`
+capability are approved; bundling the candidate file alone never enables it.
 
 Upstream contracts:
 [ComfyUI custom-node whitelist](https://github.com/Comfy-Org/ComfyUI/blob/700821e1364eaab0e8f21c538a2131719fec57bf/comfy/cli_args.py),

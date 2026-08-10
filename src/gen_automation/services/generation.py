@@ -30,6 +30,9 @@ from gen_automation.domain.enums import (
 )
 from gen_automation.domain.generation_limits import (
     MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB,
+    MAX_SIGNED_PROMPT_BUDGET_BYTES_PER_GENERATION_JOB,
+    signed_worker_prompt_budget_bytes,
+    utf8_prompt_bytes,
 )
 from gen_automation.domain.release_spec import GenerationParameters, ReleaseSpecification
 from gen_automation.gpu_worker.artifacts import ArtifactKind
@@ -221,8 +224,13 @@ def _job_parameters(
                     "prompt": resolved_prompts.prompt,
                     "character_a_prompt": resolved_prompts.character_a_prompt,
                     "character_b_prompt": resolved_prompts.character_b_prompt,
+                    "character_a_pose_prompt": resolved_prompts.character_a_pose_prompt,
+                    "character_b_pose_prompt": resolved_prompts.character_b_pose_prompt,
+                    "character_c_prompt": resolved_prompts.character_c_prompt,
+                    "character_c_pose_prompt": resolved_prompts.character_c_pose_prompt,
                     "character_a_negative_prompt": (resolved_prompts.character_a_negative_prompt),
                     "character_b_negative_prompt": (resolved_prompts.character_b_negative_prompt),
+                    "character_c_negative_prompt": (resolved_prompts.character_c_negative_prompt),
                     "interaction_prompt": resolved_prompts.interaction_prompt,
                     "camera_prompt": resolved_prompts.camera_prompt,
                     "negative_prompt": resolved_prompts.negative_prompt,
@@ -234,15 +242,20 @@ def _job_parameters(
         )
         output_prompt_resolutions.append(resolved_prompts.evidence)
 
-    prompt_bytes = sum(
-        len(str(generation[field]).encode("utf-8"))
+    output_prompt_values = tuple(
+        str(generation[field])
         for generation in output_generations
         for field in (
             "prompt",
             "character_a_prompt",
             "character_b_prompt",
+            "character_a_pose_prompt",
+            "character_b_pose_prompt",
+            "character_c_prompt",
+            "character_c_pose_prompt",
             "character_a_negative_prompt",
             "character_b_negative_prompt",
+            "character_c_negative_prompt",
             "interaction_prompt",
             "camera_prompt",
             "negative_prompt",
@@ -250,7 +263,18 @@ def _job_parameters(
             "detailer_negative_prompt",
         )
     )
-    if prompt_bytes > MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB:
+    prompt_bytes = utf8_prompt_bytes(output_prompt_values)
+    budgeted_prompt_bytes = (
+        signed_worker_prompt_budget_bytes(output_prompt_values)
+        if specification.worker_request_budget_version >= 2
+        else prompt_bytes
+    )
+    prompt_budget_limit = (
+        MAX_SIGNED_PROMPT_BUDGET_BYTES_PER_GENERATION_JOB
+        if specification.worker_request_budget_version >= 2
+        else MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB
+    )
+    if budgeted_prompt_bytes > prompt_budget_limit:
         raise GenerationPlanConflictError(
             "expanded prompt text is too large for one multi-output generation job"
         )
@@ -259,6 +283,7 @@ def _job_parameters(
     generation["outputs_per_job"] = plan.expected_output_count
     parameters: dict[str, object] = {
         "schema_version": 2,
+        "worker_request_budget_version": specification.worker_request_budget_version,
         "release_version_id": str(release_version.id),
         "release_specification_sha256": release_version.specification_sha256,
         "approval_snapshot_sha256": approval_snapshot.sha256,

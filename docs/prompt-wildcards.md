@@ -5,11 +5,26 @@ editing a GPU-worker filesystem. Open `/dashboard/wildcards`, paste one entry
 per line from an existing wildcard text file, and give the library a name such
 as `poses` or `positions/sitting`.
 
-Use the library in either release prompt with double-underscore syntax:
+Use a library in the shared prompt, negative prompt, Character A/B/C identity
+or pose prompt, combined pose/interaction prompt, camera prompt, or their
+per-batch overrides with double-underscore syntax:
 
 ```text
 portrait, __poses__, __positions/sitting__
 ```
+
+For a coordinated multi-character pose library, make each line one complete
+scene instruction rather than one isolated body pose. For example:
+
+```text
+A seated between B and C, B leaning toward A, C kneeling beside A, all three looking at camera
+A and B dancing face to face while C reaches toward both of them, full-body triangular composition
+```
+
+Insert that library in **Combined pose / interaction** (for example
+`__poses/trio__`). Character pose fields can use separate wildcard libraries
+when one character also needs an independent action. A batch can inherit the
+global token, replace it, or explicitly clear it.
 
 Wildcard entries may contain other wildcard tokens. The service rejects a
 release if a referenced library is missing, contains a dependency cycle, or

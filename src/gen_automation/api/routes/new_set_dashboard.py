@@ -1,4 +1,5 @@
 import hmac
+import logging
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID, uuid4
@@ -30,13 +31,24 @@ from gen_automation.config import Settings
 from gen_automation.db.session import get_session
 from gen_automation.domain.deliverability import MAX_ACCEPTED_IMAGES_PER_RELEASE
 from gen_automation.domain.enums import AdminRole
-from gen_automation.domain.generation_limits import MAX_OUTPUTS_PER_GENERATION_JOB
+from gen_automation.domain.generation_limits import (
+    MAX_OUTPUTS_PER_GENERATION_JOB,
+    MAX_SAFE_OUTPUTS_PER_SIGNED_GENERATION_JOB,
+)
 from gen_automation.middleware import content_security_policy
 from gen_automation.services.authentication import (
     AuthenticatedPrincipal,
     CsrfValidationError,
 )
 from gen_automation.services.dashboard_previews import dashboard_preview_url
+from gen_automation.services.experiment_warm_leases import (
+    DEFAULT_EXPERIMENT_WARM_LEASE_SECONDS,
+    ExperimentWarmLeaseBudgetError,
+    ExperimentWarmLeaseConflictError,
+    ExperimentWarmLeaseNotFoundError,
+    ensure_experiment_warm_lease,
+    get_current_experiment_warm_lease_status,
+)
 from gen_automation.services.generation import GenerationPlanConflictError
 from gen_automation.services.generation_control import (
     GenerationControlConflictError,
@@ -66,6 +78,7 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"], include_in_schema=Fa
 templates = Jinja2Templates(directory=str(Path(__file__).parents[2] / "templates"))
 Session = Annotated[AsyncSession, Depends(get_session)]
 _MANAGER_ROLES = frozenset({AdminRole.OWNER, AdminRole.ADMIN})
+logger = logging.getLogger(__name__)
 
 
 @router.get("/new-set", response_class=HTMLResponse, name="dashboard_new_set")
@@ -84,7 +97,7 @@ async def dashboard_new_set(
         )
     options = await list_new_set_options(session)
     try:
-        return _new_set_response(
+        return new_set_form_response(
             request,
             principal=principal,
             options=options,
@@ -118,11 +131,13 @@ async def submit_dashboard_new_set(
             heading="New Set was not created",
             message="Your account cannot create releases.",
         )
+    experiment_mode = _is_experiment_mode(request)
+    warm_failed = False
     try:
         form = await read_new_set_form(request)
     except BrowserNewSetFormError as error:
         options = await list_new_set_options(session)
-        return _new_set_response(
+        return new_set_form_response(
             request,
             principal=principal,
             options=options,
@@ -163,6 +178,31 @@ async def submit_dashboard_new_set(
             settings=settings,
             actor=str(manager.user_id),
         )
+        should_ensure_warm = experiment_mode and not (
+            result.release_replayed and result.generation_plan_replayed
+        )
+        if experiment_mode and not should_ensure_warm:
+            should_ensure_warm = await get_current_experiment_warm_lease_status(session) is None
+        if should_ensure_warm:
+            try:
+                async with session.begin_nested():
+                    await ensure_experiment_warm_lease(
+                        session,
+                        actor=str(manager.user_id),
+                        duration_seconds=DEFAULT_EXPERIMENT_WARM_LEASE_SECONDS,
+                    )
+                await session.commit()
+            except (
+                ExperimentWarmLeaseBudgetError,
+                ExperimentWarmLeaseConflictError,
+                ExperimentWarmLeaseNotFoundError,
+            ) as error:
+                warm_failed = True
+                logger.warning(
+                    "optional Experiment Lab warm lease could not be ensured; "
+                    "queueing normally: %s",
+                    error,
+                )
     except HTTPException as error:
         await session.rollback()
         return await _submission_error(
@@ -230,10 +270,15 @@ async def submit_dashboard_new_set(
             ),
         )
 
+    query = [f"draft={form.submission_id}"]
+    if experiment_mode:
+        query.append("mode=experiment")
+    if warm_failed:
+        query.append("warm=unavailable")
     return _secure_response(
         request,
         RedirectResponse(
-            url=(f"/dashboard/releases/{result.release.id}/status?draft={form.submission_id}"),
+            url=f"/dashboard/releases/{result.release.id}/status?{'&'.join(query)}",
             status_code=status.HTTP_303_SEE_OTHER,
         ),
     )
@@ -265,6 +310,7 @@ async def dashboard_release_status(
         submitted_draft_id = str(UUID(submitted_draft_id))
     except ValueError:
         submitted_draft_id = ""
+    experiment_mode = _is_experiment_mode(request)
     return _secure_response(
         request,
         templates.TemplateResponse(
@@ -275,6 +321,15 @@ async def dashboard_release_status(
                 "principal": principal,
                 "release": release_status,
                 "submitted_draft_id": submitted_draft_id,
+                "experiment_mode": experiment_mode,
+                "warm_unavailable": (
+                    experiment_mode and request.query_params.get("warm") == "unavailable"
+                ),
+                "warm_session_csrf_token": (
+                    _form_csrf_token(request, principal)
+                    if experiment_mode and principal.role in _MANAGER_ROLES
+                    else ""
+                ),
                 "can_manage_generation": principal.role in _MANAGER_ROLES,
                 "stop_generation_csrf_token": (
                     _form_csrf_token(request, principal)
@@ -529,7 +584,7 @@ async def _submission_error(
     message: str,
 ) -> Response:
     options = await list_new_set_options(session)
-    return _new_set_response(
+    return new_set_form_response(
         request,
         principal=principal,
         options=options,
@@ -541,7 +596,7 @@ async def _submission_error(
     )
 
 
-def _new_set_response(
+def new_set_form_response(
     request: Request,
     *,
     principal: AuthenticatedPrincipal,
@@ -551,6 +606,7 @@ def _new_set_response(
     idempotency_key: str | None = None,
     error_message: str | None = None,
     status_code: int = status.HTTP_200_OK,
+    experiment_mode: bool | None = None,
 ) -> Response:
     settings: Settings = request.app.state.settings
     resolved_submission_id = submission_id or uuid4()
@@ -568,13 +624,16 @@ def _new_set_response(
                 if key not in {"csrf_token", "submission_id", "idempotency_key"}
             }
         )
+    resolved_experiment_mode = (
+        _is_experiment_mode(request) if experiment_mode is None else experiment_mode
+    )
     return _secure_response(
         request,
         templates.TemplateResponse(
             request=request,
             name="dashboard/new_set.html",
             context={
-                "page_title": "New Set",
+                "page_title": "Experiment Lab" if resolved_experiment_mode else "New Set",
                 "principal": principal,
                 "options": options,
                 "form_values": form_values,
@@ -583,11 +642,19 @@ def _new_set_response(
                 "idempotency_key": resolved_key,
                 "error_message": error_message,
                 "max_outputs_per_generation_job": MAX_OUTPUTS_PER_GENERATION_JOB,
+                "max_safe_outputs_per_signed_generation_job": (
+                    MAX_SAFE_OUTPUTS_PER_SIGNED_GENERATION_JOB
+                ),
                 "max_accepted_images_per_release": MAX_ACCEPTED_IMAGES_PER_RELEASE,
+                "experiment_mode": resolved_experiment_mode,
             },
             status_code=status_code,
         ),
     )
+
+
+def _is_experiment_mode(request: Request) -> bool:
+    return request.query_params.get("mode") == "experiment"
 
 
 def _default_values(options: NewSetOptions) -> dict[str, str]:
@@ -596,9 +663,23 @@ def _default_values(options: NewSetOptions) -> dict[str, str]:
         "title": "",
         "subject_id": str(options.subjects[0].approval_id) if options.subjects else "",
         "subject_2_id": "",
+        "subject_3_id": "",
         "composition_mode": "single",
+        "duo_contract_version": "1",
+        "composition_preset_id": "",
         "character_a_prompt": "",
         "character_b_prompt": "",
+        "character_a_pose_prompt": "",
+        "character_b_pose_prompt": "",
+        "character_c_prompt": "",
+        "character_c_pose_prompt": "",
+        "character_a_negative_prompt": "",
+        "character_b_negative_prompt": "",
+        "character_c_negative_prompt": "",
+        "interaction_prompt": "",
+        "camera_prompt": "",
+        "duo_isolation_mode": "balanced",
+        "duo_quality_mode": "standard",
         "checkpoint_id": (str(options.checkpoints[0].approval_id) if options.checkpoints else ""),
         "workflow_id": _preferred_workflow_id(options),
         "prompt": "",

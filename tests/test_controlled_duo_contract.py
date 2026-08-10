@@ -1,7 +1,9 @@
 import json
 from copy import deepcopy
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlencode
+from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -11,25 +13,34 @@ from starlette.requests import Request
 from gen_automation.api.browser_experiment_forms import _decode_variant_plan
 from gen_automation.api.browser_new_set_forms import read_new_set_form
 from gen_automation.config import Settings
-from gen_automation.db.models import GenerationJob, ReleaseVersion
+from gen_automation.db.models import GenerationJob, ReleaseVersion, WorkflowApproval
 from gen_automation.db.session import Database
+from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.controlled_duo import (
     LEGACY_REGIONAL_PROMPT_NODE_CLASSES,
+    DuoCompositionPreset,
     WorkflowCapability,
     effective_workflow_capabilities,
 )
+from gen_automation.domain.enums import ApprovalStatus
 from gen_automation.domain.release_spec import GenerationParameters, ReleaseCreate
 from gen_automation.services.generation_details import (
     _prompt_payload,
     _PromptResolutionV3,
+    _PromptResolutionV4,
     _resolution_matches_generation,
 )
 from gen_automation.services.new_sets import (
+    NewSetBatchSubmission,
     NewSetSubmission,
     create_and_approve_new_set,
     list_new_set_options,
 )
-from gen_automation.services.wildcards import FrozenWildcardCatalog, resolve_wildcard_prompts
+from gen_automation.services.wildcards import (
+    FrozenWildcard,
+    FrozenWildcardCatalog,
+    resolve_wildcard_prompts,
+)
 from tests.factories import seed_release_approvals, valid_release_payload
 
 
@@ -60,7 +71,7 @@ def test_controlled_duo_v2_is_explicit_and_v1_remains_compatible() -> None:
 
     controlled = _generation(
         duo_contract_version=2,
-        composition_preset_id="diagonal_depth",
+        composition_preset_id="flexible",
         character_a_negative_prompt="indigo hair, ivory coat",
         character_b_negative_prompt="copper hair, green jacket",
         interaction_prompt="running past each other",
@@ -69,10 +80,71 @@ def test_controlled_duo_v2_is_explicit_and_v1_remains_compatible() -> None:
         duo_quality_mode="standard",
     )
     assert controlled.composition_preset_id is not None
-    assert controlled.composition_preset_id.value == "diagonal_depth"
+    assert controlled.composition_preset_id == DuoCompositionPreset.FLEXIBLE
 
     with pytest.raises(ValidationError, match="require duo contract version 2"):
         _generation(character_a_negative_prompt="indigo hair")
+
+    with pytest.raises(ValidationError, match="require duo contract version 2"):
+        _generation(character_a_pose_prompt="leaning forward")
+
+
+def test_controlled_duo_pose_prompt_evidence_is_versioned_and_complete() -> None:
+    payload = _controlled_release_payload()
+    generation_payload = payload["specification"]["generation"]  # type: ignore[index]
+    assert isinstance(generation_payload, dict)
+    generation_payload.update(
+        {
+            "composition_preset_id": "flexible",
+            "character_a_pose_prompt": "__poses/a__",
+            "character_b_pose_prompt": "kneeling, looking up at A",
+            "interaction_prompt": "__poses/duo__",
+        }
+    )
+    specification = ReleaseCreate.model_validate(payload).specification
+    generation = specification.generation
+    pose_a = FrozenWildcard(
+        library_id=uuid4(),
+        version_id=uuid4(),
+        name="poses/a",
+        version_no=1,
+        entries=("leaning forward, left hand raised",),
+        entries_sha256="a" * 64,
+    )
+    pose_duo = FrozenWildcard(
+        library_id=uuid4(),
+        version_id=uuid4(),
+        name="poses/duo",
+        version_no=1,
+        entries=("A reaches toward B",),
+        entries_sha256="b" * 64,
+    )
+    resolved = resolve_wildcard_prompts(
+        specification,
+        FrozenWildcardCatalog(by_name={"poses/a": pose_a, "poses/duo": pose_duo}),
+        seed=generation.seed,
+    )
+
+    assert resolved.evidence["schema_version"] == 4
+    evidence = _PromptResolutionV4.model_validate(resolved.evidence)
+    resolved_generation = generation.model_copy(
+        update={
+            "character_a_pose_prompt": resolved.character_a_pose_prompt,
+            "character_b_pose_prompt": resolved.character_b_pose_prompt,
+            "interaction_prompt": resolved.interaction_prompt,
+        }
+    )
+    assert _resolution_matches_generation(evidence, resolved_generation)
+    prompts = _prompt_payload(resolved_generation, evidence)
+    assert prompts["character_a_pose"]["resolved"] == (  # type: ignore[index]
+        "leaning forward, left hand raised"
+    )
+    assert prompts["character_b_pose"]["resolved"] == "kneeling, looking up at A"  # type: ignore[index]
+    assert prompts["interaction"]["resolved"] == "A reaches toward B"  # type: ignore[index]
+    assert {selection["field"] for selection in resolved.evidence["selections"]} == {
+        "character_a_pose_prompt",
+        "interaction_prompt",
+    }
 
 
 def test_only_the_legacy_regional_capability_is_inferred_from_nodes() -> None:
@@ -149,6 +221,24 @@ def test_release_requires_explicit_capabilities_for_requested_v2_modes() -> None
     generation["duo_quality_mode"] = "high"
     with pytest.raises(ValidationError, match="high duo quality is not implemented"):
         ReleaseCreate.model_validate(payload)
+
+
+def test_new_strict_duo_prompt_budget_accounts_for_refinement_amplification() -> None:
+    payload = _controlled_release_payload()
+    specification = payload["specification"]
+    assert isinstance(specification, dict)
+    generation = specification["generation"]
+    assert isinstance(generation, dict)
+    generation["outputs_per_job"] = 8
+    generation["character_a_prompt"] = "a" * 5_000
+    specification["planned_job_count"] = 1
+
+    with pytest.raises(ValidationError, match="too large for one signed provider job"):
+        ReleaseCreate.model_validate(payload)
+
+    generation["character_a_prompt"] = "a" * 1_000
+    parsed = ReleaseCreate.model_validate(payload)
+    assert parsed.specification.generation.outputs_per_job == 8
 
 
 def test_every_controlled_duo_batch_is_capability_checked_before_release() -> None:
@@ -228,6 +318,8 @@ async def test_new_set_service_freezes_the_controlled_duo_contract(tmp_path: Pat
                     composition_preset_id="low_angle",
                     character_a_prompt="adult woman, copper bob, green jacket",
                     character_b_prompt="adult woman, indigo braid, ivory coat",
+                    character_a_pose_prompt="standing upright",
+                    character_b_pose_prompt="leaning toward A",
                     character_a_negative_prompt="indigo hair, ivory coat",
                     character_b_negative_prompt="copper hair, green jacket",
                     interaction_prompt="standing shoulder to shoulder",
@@ -237,6 +329,15 @@ async def test_new_set_service_freezes_the_controlled_duo_contract(tmp_path: Pat
                     checkpoint_approval_id=options.checkpoints[0].approval_id,
                     workflow_approval_id=options.workflows[0].approval_id,
                     prompt="shared dramatic scene",
+                    batches=(
+                        NewSetBatchSubmission(
+                            name="Pose override",
+                            image_count=1,
+                            prompt="shared dramatic scene",
+                            character_a_pose_prompt="kneeling with one hand raised",
+                            interaction_prompt="",
+                        ),
+                    ),
                     seed=9,
                     width=1024,
                     height=1024,
@@ -266,16 +367,51 @@ async def test_new_set_service_freezes_the_controlled_duo_contract(tmp_path: Pat
             generation = version.specification["generation"]
             assert generation["duo_contract_version"] == 2
             assert generation["composition_preset_id"] == "low_angle"
+            assert generation["character_a_pose_prompt"] == "kneeling with one hand raised"
+            assert generation["character_b_pose_prompt"] == "leaning toward A"
             assert generation["character_a_negative_prompt"] == "indigo hair, ivory coat"
             assert generation["camera_prompt"] == "low camera, full-body framing"
+            assert generation["interaction_prompt"] == ""
             assert version.specification["workflow"]["capabilities"] == [
                 "controlled_duo_v2",
                 "duo_strict_isolation",
             ]
-            assert job.parameters["prompt_resolution"]["schema_version"] == 3
-            assert job.parameters["output_generations"][0]["interaction_prompt"] == (
-                "standing shoulder to shoulder"
+            assert job.parameters["prompt_resolution"]["schema_version"] == 4
+            assert job.parameters["output_generations"][0]["interaction_prompt"] == ""
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_new_set_options_filter_incoherent_legacy_workflow_rows(tmp_path: Path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'workflow-filter.db').as_posix()}")
+    await database.create_schema()
+    payload = _controlled_release_payload()
+    try:
+        async with database.sessions() as session:
+            owner = await seed_release_approvals(session, payload)
+            evidence = {"review": "legacy-incoherent-test"}
+            session.add(
+                WorkflowApproval(
+                    workflow_sha256="b" * 64,
+                    name="Legacy incoherent workflow",
+                    version="1",
+                    object_key="workflows/legacy-incoherent.json",
+                    reviewed_node_classes=["CheckpointLoaderSimple", "KSampler", "SaveImage"],
+                    capabilities=["controlled_duo_v2", "duo_high_quality"],
+                    evidence=evidence,
+                    evidence_sha256=canonical_sha256(evidence),
+                    status=ApprovalStatus.APPROVED,
+                    is_current=True,
+                    approval_version=1,
+                    approved_by_user_id=owner.id,
+                    approved_at=datetime.now(UTC),
+                )
             )
+            await session.commit()
+
+            options = await list_new_set_options(session)
+            assert [option.name for option in options.workflows] == ["production-v1"]
     finally:
         await database.dispose()
 
@@ -320,6 +456,8 @@ async def test_browser_form_parses_controlled_duo_fields() -> None:
         "composition_preset_id": "overhead",
         "character_a_prompt": "adult woman, copper bob",
         "character_b_prompt": "adult woman, indigo braid",
+        "character_a_pose_prompt": "standing, left arm raised",
+        "character_b_pose_prompt": "kneeling, looking toward A",
         "character_a_negative_prompt": "indigo hair",
         "character_b_negative_prompt": "copper hair",
         "interaction_prompt": "looking up together",
@@ -332,6 +470,23 @@ async def test_browser_form_parses_controlled_duo_fields() -> None:
         "negative_prompt": "third person",
         "detailer_prompt": "expressive faces",
         "detailer_negative_prompt": "closed eyes",
+        "batch_plan": json.dumps(
+            [
+                {
+                    "name": "Pose batch",
+                    "image_count": 1,
+                    "prompt": "shared scene",
+                    "negative_prompt": None,
+                    "character_a_pose_prompt": "__poses/a__",
+                    "character_b_pose_prompt": None,
+                    "interaction_prompt": "__poses/duo__",
+                    "camera_prompt": "",
+                    "detailer_prompt": None,
+                    "detailer_negative_prompt": None,
+                    "seed": None,
+                }
+            ]
+        ),
         "seed": "1",
         "width": "1024",
         "height": "1024",
@@ -361,6 +516,11 @@ async def test_browser_form_parses_controlled_duo_fields() -> None:
     assert parsed.command.composition_preset_id.value == "overhead"
     assert parsed.command.character_b_negative_prompt == "copper hair"
     assert parsed.command.camera_prompt == "overhead wide lens"
+    assert parsed.command.character_a_pose_prompt == "standing, left arm raised"
+    assert parsed.command.batches[0].character_a_pose_prompt == "__poses/a__"
+    assert parsed.command.batches[0].character_b_pose_prompt is None
+    assert parsed.command.batches[0].interaction_prompt == "__poses/duo__"
+    assert parsed.command.batches[0].camera_prompt == ""
 
 
 def test_experiment_variant_parser_accepts_legacy_and_controlled_duo_profiles() -> None:

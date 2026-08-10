@@ -166,12 +166,17 @@ timer is the narrower provider-running estimate described above.
 ### Experiment Lab warm sessions
 
 Experiment Lab keeps the normal scale-to-zero posture and adds an explicit,
-bounded editing lease for interactive prompt/model comparisons:
+bounded editing lease around the complete New Automation workflow:
 
-- the operator can begin warming the current worker while assembling variants;
-- 2-12 complete setting snapshots, with 1-4 outputs each, are queued together;
-- variants sharing a workflow, checkpoint, and LoRA stack are kept adjacent so
-  the same one-replica worker can reuse already loaded models;
+- the operator can begin warming the current worker while assembling an ordinary
+  named batch queue;
+- Experiment Lab uses the exact Automation form, validation, release, job
+  splitting, status, stop, review, and publication path; there are no separate
+  variant or per-variant output caps;
+- one submission may contain the full ordered Automation batch plan, and several
+  independent submissions can reuse the same warm session back to back;
+- compatible workflow, checkpoint, and LoRA stacks reuse the same one-replica
+  worker; a required dynamic manifest change is serialized at an idle boundary;
 - a ready worker remains at autoscaler minimum `1` only while the lease is live;
 - the default idle window is 15 minutes and validated experiment activity resets
   that window without moving the absolute deadline;
@@ -186,12 +191,11 @@ lease reserves its remaining envelope in the durable budget calculation so a
 restart cannot silently drop the cost commitment.
 
 Prompt text, negative prompts, sampler settings, dimensions, workflow profiles,
-and weights for already onboarded LoRAs can change without a container rollout.
-Checkpoints and LoRAs are warm-ready only when their exact SHA-256 is present
-under the expected artifact kind in the configured worker manifest. A genuinely
-new artifact still requires the normal reviewed manifest update and immutable
-worker deployment, because Salad runtime storage is ephemeral and bootstrap
-credentials are intentionally removed after model initialization.
+and LoRA selections can change between submissions. Approved managed LoRAs are
+added to a bounded signed runtime manifest; the controller safely refreshes an
+idle worker when the selected stack is not already resident. The ordinary
+Automation safety bounds still apply, including provider-job chunking, the
+single-replica contract, artifact capacity, and budget kill switches.
 
 The worker image pins ComfyUI and embeds the pinned Salad HTTP Job Queue worker.
 The runtime supervises ComfyUI, the embedded queue forwarder, and the worker HTTP
@@ -298,6 +302,10 @@ Security/resource limits:
 
 The current defaults are recorded in `.env.example`. Tightening them is a
 deployment change; expanding them requires a security and cost review.
+Generation plans use a controller-side fan-out of at most eight outputs per
+signed provider job while preserving the exact user batch total. The rendered
+graph is preflighted against the signed-envelope budget before upload intents
+are created, and each serialized upload grant has its own fail-closed byte limit.
 
 No GPU-worker credential is required during the present local development
 stage. Create the dedicated model-read identity, controller signing key and worker

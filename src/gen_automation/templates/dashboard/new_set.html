@@ -6,19 +6,57 @@
   <header class="page-header new-automation-header">
     <div class="page-header-row">
       <div class="page-header-copy">
-        <p class="page-kicker">Create</p>
-        <h1>New set</h1>
-        <p class="lede">Choose a look, build the queue, then launch.</p>
+        {% if experiment_mode %}
+          <p class="page-kicker">Experiment Lab</p>
+          <h1>Warm batch queue</h1>
+        {% else %}
+          <p class="page-kicker">Create</p>
+          <h1>New set</h1>
+        {% endif %}
+        <p class="lede">
+          {% if experiment_mode %}
+            The complete New Automation workflow, with one warm GPU kept ready between
+            back-to-back batches and separate submissions.
+          {% else %}
+            Choose a look, build the queue, then launch.
+          {% endif %}
+        </p>
       </div>
       <a class="secondary-button" href="/dashboard/wildcards">Manage wildcards</a>
     </div>
-    <nav class="automation-jump-nav" aria-label="New set sections">
+    <nav class="automation-jump-nav" aria-label="{{ 'Experiment Lab' if experiment_mode else 'New set' }} sections">
       <a href="#set-details"><span>1</span> Set details</a>
       <a href="#generation-setup"><span>2</span> Generation</a>
       <a href="#batch-builder"><span>3</span> Batches</a>
       <a href="#final-set-target"><span>4</span> Finish</a>
     </nav>
   </header>
+
+  {% if experiment_mode %}
+    <section
+      class="experiment-warm-panel"
+      data-experiment-warm-session
+      data-warm-status-url="/dashboard/experiments/warm-session"
+      data-warm-start-url="/dashboard/experiments/warm-session/start"
+      data-warm-extend-url="/dashboard/experiments/warm-session/extend"
+      data-warm-end-url="/dashboard/experiments/warm-session/end"
+      data-csrf-token="{{ csrf_token }}"
+    >
+      <div>
+        <span class="experiment-eyebrow">Warm GPU session</span>
+        <strong data-warm-session-heading>One allocation &middot; any Automation batch plan</strong>
+        <p data-warm-session-status>
+          The first submission starts the GPU. Keep submitting freely while the session is
+          warm; each batch is split into safe provider jobs automatically.
+        </p>
+      </div>
+      <div class="experiment-warm-actions" hidden data-warm-session-actions>
+        <button class="secondary-button" type="button" data-warm-start>Start 15-minute session</button>
+        <button class="secondary-button" type="button" data-warm-extend>+15 minutes</button>
+        <button class="text-button danger" type="button" data-warm-end>End now</button>
+      </div>
+    </section>
+  {% endif %}
 
   {% if error_message %}
     <div class="form-error" role="alert">{{ error_message }}</div>
@@ -34,9 +72,11 @@
   <form
     class="set-form automation-form automation-create-form"
     method="post"
-    action="/dashboard/new-set"
+    action="/dashboard/new-set{% if experiment_mode %}?mode=experiment{% endif %}"
     autocomplete="off"
     data-automation-form
+    data-automation-draft-scope="{{ 'experiment' if experiment_mode else 'automation' }}"
+    data-signed-outputs-per-job-cap="{{ max_safe_outputs_per_signed_generation_job }}"
     data-server-error="{{ 'true' if error_message else 'false' }}"
   >
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -125,7 +165,8 @@
             </details>
             <output class="settings-preset-status" data-automation-preset-status aria-live="polite" aria-atomic="true"></output>
           </section>
-          <section class="composition-builder" data-composition-builder data-new-set-composition data-controlled-duo-builder>
+          {% set trio_available = options.workflows | selectattr('supports_controlled_trio_v1') | list | length > 0 %}
+          <section class="composition-builder" data-composition-builder data-new-set-composition data-controlled-duo-builder data-trio-available="{{ 'true' if trio_available else 'false' }}">
             <div class="composition-heading">
               <strong>Characters</strong>
               <div class="composition-mode" role="radiogroup" aria-label="Character composition">
@@ -134,7 +175,7 @@
                     type="radio"
                     name="composition_mode"
                     value="single"
-                    {% if form_values['composition_mode'] != 'duo' %}checked{% endif %}
+                    {% if form_values['composition_mode'] not in ['duo', 'trio'] or (form_values['composition_mode'] == 'trio' and not trio_available) %}checked{% endif %}
                   >
                   <span>Single</span>
                 </label>
@@ -148,6 +189,18 @@
                   >
                   <span>Two characters</span>
                 </label>
+                {% if trio_available %}
+                  <label>
+                    <input
+                      type="radio"
+                      name="composition_mode"
+                      value="trio"
+                      {% if options.subjects|length < 3 %}disabled{% endif %}
+                      {% if form_values['composition_mode'] == 'trio' %}checked{% endif %}
+                    >
+                    <span>Three characters</span>
+                  </label>
+                {% endif %}
               </div>
             </div>
 
@@ -172,17 +225,54 @@
                   </select>
                 </label>
                 <label class="character-region-prompt" data-character-prompt-field hidden>
-                  A &middot; identity, appearance &amp; pose
+                  A &middot; identity &amp; appearance
                   <textarea
                     name="character_a_prompt"
                     rows="3"
                     maxlength="20000"
                     spellcheck="false"
-                    placeholder="adult character A, short copper hair, teal jacket, leaning forward, left shoulder toward camera"
+                    placeholder="adult character A, short copper hair, teal jacket"
                     data-character-prompt="a"
                     data-danbooru-autocomplete
                   >{{ form_values['character_a_prompt'] }}</textarea>
+                  <small>Keep identity, appearance, and outfit here. Direct the body separately below.</small>
                 </label>
+                <div class="character-region-prompt character-pose-prompt" data-character-prompt-field hidden>
+                  <div class="prompt-control-heading">
+                    <label for="character-a-pose-prompt">A &middot; individual pose / action</label>
+                    {% if options.wildcards %}
+                      <label class="prompt-wildcard-picker">
+                        <span class="visually-hidden">Insert a wildcard into Character A's pose</span>
+                        <select
+                          data-prompt-wildcard
+                          data-prompt-wildcard-target="character_a_pose_prompt"
+                          data-duo-v2-control
+                          aria-label="Insert a wildcard into Character A's pose"
+                          disabled
+                        >
+                          <option value="">+ Pose wildcard</option>
+                          {% for wildcard in options.wildcards %}
+                            <option value="__{{ wildcard.name }}__">__{{ wildcard.name }}__ ({{ wildcard.entry_count }})</option>
+                          {% endfor %}
+                        </select>
+                      </label>
+                    {% endif %}
+                  </div>
+                  <textarea
+                    id="character-a-pose-prompt"
+                    name="character_a_pose_prompt"
+                    rows="3"
+                    maxlength="20000"
+                    spellcheck="false"
+                    placeholder="leaning forward, left shoulder toward camera, one hand raised"
+                    data-character-pose-prompt="a"
+                    data-duo-v2-control
+                    data-wildcard-aware
+                    data-danbooru-autocomplete
+                    disabled
+                  >{{ form_values.get('character_a_pose_prompt', '') }}</textarea>
+                  <small>Use a freeform pose, a wildcard, or both. This is not limited by the framing examples.</small>
+                </div>
                 <label class="character-region-prompt" data-character-prompt-field hidden>
                   A &middot; negative / exclude
                   <textarea
@@ -219,17 +309,54 @@
                   </select>
                 </label>
                 <label class="character-region-prompt" data-character-prompt-field>
-                  B &middot; identity, appearance &amp; pose
+                  B &middot; identity &amp; appearance
                   <textarea
                     name="character_b_prompt"
                     rows="3"
                     maxlength="20000"
                     spellcheck="false"
-                    placeholder="adult character B, long indigo braid, ivory coat, standing upright, right hand on hip"
+                    placeholder="adult character B, long indigo braid, ivory coat"
                     data-character-prompt="b"
                     data-danbooru-autocomplete
                   >{{ form_values['character_b_prompt'] }}</textarea>
+                  <small>Keep identity, appearance, and outfit here. Direct the body separately below.</small>
                 </label>
+                <div class="character-region-prompt character-pose-prompt" data-character-prompt-field>
+                  <div class="prompt-control-heading">
+                    <label for="character-b-pose-prompt">B &middot; individual pose / action</label>
+                    {% if options.wildcards %}
+                      <label class="prompt-wildcard-picker">
+                        <span class="visually-hidden">Insert a wildcard into Character B's pose</span>
+                        <select
+                          data-prompt-wildcard
+                          data-prompt-wildcard-target="character_b_pose_prompt"
+                          data-duo-v2-control
+                          aria-label="Insert a wildcard into Character B's pose"
+                          disabled
+                        >
+                          <option value="">+ Pose wildcard</option>
+                          {% for wildcard in options.wildcards %}
+                            <option value="__{{ wildcard.name }}__">__{{ wildcard.name }}__ ({{ wildcard.entry_count }})</option>
+                          {% endfor %}
+                        </select>
+                      </label>
+                    {% endif %}
+                  </div>
+                  <textarea
+                    id="character-b-pose-prompt"
+                    name="character_b_pose_prompt"
+                    rows="3"
+                    maxlength="20000"
+                    spellcheck="false"
+                    placeholder="standing upright, right hand on hip, head turned toward A"
+                    data-character-pose-prompt="b"
+                    data-duo-v2-control
+                    data-wildcard-aware
+                    data-danbooru-autocomplete
+                    disabled
+                  >{{ form_values.get('character_b_pose_prompt', '') }}</textarea>
+                  <small>Use a freeform pose, a wildcard, or both. It can differ completely from A.</small>
+                </div>
                 <label class="character-region-prompt" data-character-prompt-field>
                   B &middot; negative / exclude
                   <textarea
@@ -243,6 +370,91 @@
                     data-danbooru-autocomplete
                     disabled
                   >{{ form_values.get('character_b_negative_prompt', '') }}</textarea>
+                </label>
+              </article>
+
+              <article class="character-composition-card" data-character-card="c" hidden>
+                <div class="character-card-heading">
+                  <strong>Character C</strong>
+                  <span>Region C</span>
+                </div>
+                <label>
+                  <span class="visually-hidden">Third adult fictional subject</span>
+                  <select name="subject_3_id" data-character-subject="c" disabled>
+                    <option value="">Choose third character</option>
+                    {% for subject in options.subjects %}
+                      <option
+                        value="{{ subject.approval_id }}"
+                        data-subject-name="{{ subject.name }}"
+                        data-subject-slug="{{ subject.slug }}"
+                        {% if form_values.get('subject_3_id', '') == subject.approval_id|string %}selected{% endif %}
+                      >{{ subject.name }} &middot; age {{ subject.canonical_age }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <label class="character-region-prompt" data-character-prompt-field>
+                  C &middot; identity &amp; appearance
+                  <textarea
+                    name="character_c_prompt"
+                    rows="3"
+                    maxlength="20000"
+                    spellcheck="false"
+                    placeholder="adult character C, silver curls, black tailored suit"
+                    data-character-prompt="c"
+                    data-danbooru-autocomplete
+                    disabled
+                  >{{ form_values.get('character_c_prompt', '') }}</textarea>
+                  <small>Keep identity, appearance, and outfit here. Direct the body separately below.</small>
+                </label>
+                <div class="character-region-prompt character-pose-prompt" data-character-prompt-field>
+                  <div class="prompt-control-heading">
+                    <label for="character-c-pose-prompt">C &middot; individual pose / action</label>
+                    {% if options.wildcards %}
+                      <label class="prompt-wildcard-picker">
+                        <span class="visually-hidden">Insert a wildcard into Character C's pose</span>
+                        <select
+                          data-prompt-wildcard
+                          data-prompt-wildcard-target="character_c_pose_prompt"
+                          data-duo-v2-control
+                          aria-label="Insert a wildcard into Character C's pose"
+                          disabled
+                        >
+                          <option value="">+ Pose wildcard</option>
+                          {% for wildcard in options.wildcards %}
+                            <option value="__{{ wildcard.name }}__">__{{ wildcard.name }}__ ({{ wildcard.entry_count }})</option>
+                          {% endfor %}
+                        </select>
+                      </label>
+                    {% endif %}
+                  </div>
+                  <textarea
+                    id="character-c-pose-prompt"
+                    name="character_c_pose_prompt"
+                    rows="3"
+                    maxlength="20000"
+                    spellcheck="false"
+                    placeholder="standing behind A and B, one hand resting on B's shoulder"
+                    data-character-pose-prompt="c"
+                    data-duo-v2-control
+                    data-wildcard-aware
+                    data-danbooru-autocomplete
+                    disabled
+                  >{{ form_values.get('character_c_pose_prompt', '') }}</textarea>
+                  <small>Use a freeform pose, a wildcard, or both. It can differ completely from A and B.</small>
+                </div>
+                <label class="character-region-prompt" data-character-prompt-field>
+                  C &middot; negative / exclude
+                  <textarea
+                    name="character_c_negative_prompt"
+                    rows="2"
+                    maxlength="20000"
+                    spellcheck="false"
+                    placeholder="traits reserved for A or B, duplicate person"
+                    data-character-negative-prompt="c"
+                    data-duo-v2-control
+                    data-danbooru-autocomplete
+                    disabled
+                  >{{ form_values.get('character_c_negative_prompt', '') }}</textarea>
                 </label>
               </article>
             </div>
@@ -278,6 +490,7 @@
                     data-detailer-enabled="{{ 'true' if workflow.has_face_detailer else 'false' }}"
                     data-regional-prompting="{{ 'true' if workflow.has_regional_prompting else 'false' }}"
                     data-duo-contract-v2="{{ 'true' if workflow.supports_controlled_duo_v2|default(false) else 'false' }}"
+                    data-trio-contract-v1="{{ 'true' if workflow.supports_controlled_trio_v1|default(false) else 'false' }}"
                     data-duo-strict-isolation="{{ 'true' if workflow.supports_duo_strict_isolation|default(false) else 'false' }}"
                     data-duo-quality-high="{{ 'true' if workflow.supports_duo_high_quality|default(false) else 'false' }}"
                     {% if form_values['workflow_id'] == workflow.approval_id|string %}selected{% endif %}
@@ -683,7 +896,7 @@
               <input type="number" name="planned_job_count" value="{{ form_values['planned_job_count'] }}" min="1" max="10000" data-planned-job-count required>
             </label>
             </div>
-            <p class="muted">Larger jobs reduce pauses between batches.</p>
+            <p class="muted">Larger jobs reduce pauses between batches. Every batch is automatically split into signed-request-safe internal chunks without changing its image count.</p>
           </div>
         </details>
       </div>
@@ -717,7 +930,7 @@
             <button class="text-button" type="button" data-automation-draft-clear>Clear draft</button>
           </div>
           <button class="primary-button queue-submit" type="submit" {% if not options.ready %}disabled{% endif %}>
-            Queue set
+            {{ 'Queue warm batch plan' if experiment_mode else 'Queue set' }}
           </button>
         </section>
       </aside>
@@ -727,7 +940,7 @@
           <span><span data-mobile-summary-jobs>0</span> GPU jobs &middot; final set <span data-mobile-summary-target>0</span></span>
         </div>
         <button class="primary-button queue-submit" type="submit" {% if not options.ready %}disabled{% endif %}>
-          Queue set
+          {{ 'Queue warm batch plan' if experiment_mode else 'Queue set' }}
         </button>
       </div>
     </div>
@@ -826,6 +1039,130 @@
         <details class="batch-overrides">
           <summary>Batch-specific overrides <span>Optional</span></summary>
           <div class="disclosure-body">
+            <section class="batch-character-overrides" data-batch-controlled-overrides>
+              <div class="batch-character-overrides-heading">
+                <div>
+                  <strong>Character and pose direction</strong>
+                  <p>
+                    Leave Override off to inherit the set-level field. Turn it on to replace that
+                    field for this batch. An enabled blank field explicitly clears the inherited
+                    value; switch Override off to inherit again.
+                  </p>
+                </div>
+                <a href="/dashboard/wildcards#create-wildcard">Import pose wildcard</a>
+              </div>
+
+              {% for character in ['a', 'b', 'c'] %}
+                {% set character_label = character | upper %}
+                <article class="batch-character-override-card" data-batch-character-override="{{ character }}" {% if character == 'c' %}data-batch-trio-only{% endif %}>
+                  <strong>Character {{ character_label }}</strong>
+                  <div class="batch-override-field">
+                    <div class="batch-prompt-heading">
+                      <span>Identity &amp; appearance</span>
+                      <label class="batch-override-toggle">
+                        <input type="checkbox" data-batch-override-toggle="character_{{ character }}_prompt">
+                        Override
+                      </label>
+                    </div>
+                    <textarea rows="3" maxlength="20000" spellcheck="false" aria-label="Character {{ character_label }} batch identity and appearance" placeholder="Inherits set-level Character {{ character_label }} identity" data-batch-field="character_{{ character }}_prompt" data-danbooru-autocomplete disabled></textarea>
+                  </div>
+                  <div class="batch-override-field">
+                    <div class="batch-prompt-heading">
+                      <span>Individual pose / action</span>
+                      <span class="batch-override-field-actions">
+                        <label class="batch-override-toggle">
+                          <input type="checkbox" data-batch-override-toggle="character_{{ character }}_pose_prompt">
+                          Override
+                        </label>
+                        {% if options.wildcards %}
+                          <label class="batch-wildcard-picker">
+                            <span class="visually-hidden">Insert wildcard into Character {{ character_label }}'s batch pose</span>
+                            <select
+                              data-batch-wildcard
+                              data-batch-wildcard-target="character_{{ character }}_pose_prompt"
+                              aria-label="Insert wildcard into Character {{ character_label }}'s batch pose"
+                            >
+                              <option value="">+ Pose wildcard</option>
+                              {% for wildcard in options.wildcards %}
+                                <option value="__{{ wildcard.name }}__">__{{ wildcard.name }}__ ({{ wildcard.entry_count }})</option>
+                              {% endfor %}
+                            </select>
+                          </label>
+                        {% endif %}
+                      </span>
+                    </div>
+                    <textarea rows="3" maxlength="20000" spellcheck="false" aria-label="Character {{ character_label }} batch individual pose or action" placeholder="Inherits set-level Character {{ character_label }} pose" data-batch-field="character_{{ character }}_pose_prompt" data-danbooru-autocomplete disabled></textarea>
+                  </div>
+                  <div class="batch-override-field">
+                    <div class="batch-prompt-heading">
+                      <span>Negative / exclude</span>
+                      <label class="batch-override-toggle">
+                        <input type="checkbox" data-batch-override-toggle="character_{{ character }}_negative_prompt">
+                        Override
+                      </label>
+                    </div>
+                    <textarea rows="2" maxlength="20000" spellcheck="false" aria-label="Character {{ character_label }} batch negative prompt" placeholder="Inherits set-level Character {{ character_label }} exclusions" data-batch-field="character_{{ character }}_negative_prompt" data-danbooru-autocomplete disabled></textarea>
+                  </div>
+                </article>
+              {% endfor %}
+
+              <div class="batch-shared-direction-grid">
+                <div class="batch-override-field">
+                  <div class="batch-prompt-heading">
+                    <span>Combined pose / interaction</span>
+                    <span class="batch-override-field-actions">
+                      <label class="batch-override-toggle">
+                        <input type="checkbox" data-batch-override-toggle="interaction_prompt">
+                        Override
+                      </label>
+                      {% if options.wildcards %}
+                        <label class="batch-wildcard-picker">
+                          <span class="visually-hidden">Insert a coordinated pose wildcard into this batch</span>
+                          <select
+                            data-batch-wildcard
+                            data-batch-wildcard-target="interaction_prompt"
+                            aria-label="Insert a coordinated pose wildcard into this batch"
+                          >
+                            <option value="">+ Group-pose wildcard</option>
+                            {% for wildcard in options.wildcards %}
+                              <option value="__{{ wildcard.name }}__">__{{ wildcard.name }}__ ({{ wildcard.entry_count }})</option>
+                            {% endfor %}
+                          </select>
+                        </label>
+                      {% endif %}
+                    </span>
+                  </div>
+                  <textarea rows="3" maxlength="20000" spellcheck="false" aria-label="Batch combined pose or interaction" placeholder="Inherits the set-level combined direction" data-batch-field="interaction_prompt" data-danbooru-autocomplete disabled></textarea>
+                </div>
+                <div class="batch-override-field">
+                  <div class="batch-prompt-heading">
+                    <span>Camera / framing</span>
+                    <span class="batch-override-field-actions">
+                      <label class="batch-override-toggle">
+                        <input type="checkbox" data-batch-override-toggle="camera_prompt">
+                        Override
+                      </label>
+                      {% if options.wildcards %}
+                        <label class="batch-wildcard-picker">
+                          <span class="visually-hidden">Insert wildcard into this batch's camera direction</span>
+                          <select
+                            data-batch-wildcard
+                            data-batch-wildcard-target="camera_prompt"
+                            aria-label="Insert wildcard into this batch's camera direction"
+                          >
+                            <option value="">+ Camera wildcard</option>
+                            {% for wildcard in options.wildcards %}
+                              <option value="__{{ wildcard.name }}__">__{{ wildcard.name }}__ ({{ wildcard.entry_count }})</option>
+                            {% endfor %}
+                          </select>
+                        </label>
+                      {% endif %}
+                    </span>
+                  </div>
+                  <textarea rows="3" maxlength="20000" spellcheck="false" aria-label="Batch camera or framing direction" placeholder="Inherits the set-level camera direction" data-batch-field="camera_prompt" data-danbooru-autocomplete disabled></textarea>
+                </div>
+              </div>
+            </section>
             <div class="form-grid">
               <label>
                 Face-detailer prompt override

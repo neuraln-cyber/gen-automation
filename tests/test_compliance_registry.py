@@ -310,6 +310,27 @@ def test_registry_commands_fail_closed_on_unsafe_inputs() -> None:
     with pytest.raises(ValidationError):
         WorkflowApprovalCreate.model_validate(workflow_payload)
 
+    workflow_payload = _workflow().model_dump(mode="json")
+    workflow_payload["capabilities"] = ["controlled_duo_v2", "controlled_trio_v1"]
+    with pytest.raises(ValidationError, match="cannot declare both"):
+        WorkflowApprovalCreate.model_validate(workflow_payload)
+
+    workflow_payload["capabilities"] = ["controlled_trio_v1", "duo_strict_isolation"]
+    with pytest.raises(ValidationError, match="requires Controlled Duo v2"):
+        WorkflowApprovalCreate.model_validate(workflow_payload)
+
+    workflow_payload["capabilities"] = ["controlled_duo_v2", "duo_high_quality"]
+    with pytest.raises(ValidationError, match="high duo quality is not implemented"):
+        WorkflowApprovalCreate.model_validate(workflow_payload)
+
+    workflow_payload["capabilities"] = ["controlled_duo_v2"]
+    workflow_payload["reviewed_node_classes"] = [
+        "ConditioningCombine",
+        "ConditioningSetAreaPercentage",
+    ]
+    with pytest.raises(ValidationError, match="cannot be mixed"):
+        WorkflowApprovalCreate.model_validate(workflow_payload)
+
     with pytest.raises(ValidationError):
         ApprovalEvidence(
             summary="No evidence reference",

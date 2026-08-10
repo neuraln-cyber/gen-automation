@@ -276,7 +276,7 @@ def test_new_set_submission_accepts_one_twenty_five_image_provider_job() -> None
         }
     )
 
-    assert command.effective_planned_job_count == 1
+    assert command.effective_planned_job_count == 4
 
 
 async def test_generation_batches_split_exact_counts_and_keep_ordered_prompt_metadata(
@@ -347,11 +347,11 @@ async def test_generation_batches_split_exact_counts_and_keep_ordered_prompt_met
     ]
 
 
-async def test_twenty_five_image_batch_expands_to_one_provider_job(
+async def test_eight_image_batch_expands_to_one_provider_job(
     batch_database: Database,
 ) -> None:
     payload = deepcopy(valid_release_payload())
-    payload["desired_accepted_count"] = 25
+    payload["desired_accepted_count"] = 8
     specification = payload["specification"]
     assert isinstance(specification, dict)
     generation = specification["generation"]
@@ -360,7 +360,7 @@ async def test_twenty_five_image_batch_expands_to_one_provider_job(
         {
             "prompt": "portrait, __sfw__",
             "seed": 500,
-            "outputs_per_job": 25,
+            "outputs_per_job": 8,
         }
     )
     specification.update(
@@ -370,7 +370,7 @@ async def test_twenty_five_image_batch_expands_to_one_provider_job(
             "generation_batches": [
                 {
                     "name": "One provider job",
-                    "image_count": 25,
+                    "image_count": 8,
                     "generation": deepcopy(generation),
                 }
             ],
@@ -414,12 +414,12 @@ async def test_twenty_five_image_batch_expands_to_one_provider_job(
     job = jobs[0]
     outputs = job.parameters["output_generations"]
     resolutions = job.parameters["output_prompt_resolutions"]
-    assert job.expected_output_count == 25
-    assert job.parameters["generation"]["outputs_per_job"] == 25
-    assert len(outputs) == 25
-    assert len(resolutions) == 25
-    assert [output["seed"] for output in outputs] == list(range(500, 525))
-    assert [resolution["seed"] for resolution in resolutions] == list(range(500, 525))
+    assert job.expected_output_count == 8
+    assert job.parameters["generation"]["outputs_per_job"] == 8
+    assert len(outputs) == 8
+    assert len(resolutions) == 8
+    assert [output["seed"] for output in outputs] == list(range(500, 508))
+    assert [resolution["seed"] for resolution in resolutions] == list(range(500, 508))
     assert all(output["outputs_per_job"] == 1 for output in outputs)
     assert all("__sfw__" not in output["prompt"] for output in outputs)
 
@@ -428,7 +428,7 @@ async def test_random_seed_sentinel_resolves_unique_nonsequential_seeds_per_imag
     batch_database: Database,
 ) -> None:
     payload = deepcopy(valid_release_payload())
-    payload["desired_accepted_count"] = 25
+    payload["desired_accepted_count"] = 8
     specification = payload["specification"]
     assert isinstance(specification, dict)
     generation = specification["generation"]
@@ -437,7 +437,7 @@ async def test_random_seed_sentinel_resolves_unique_nonsequential_seeds_per_imag
         {
             "prompt": "portrait, __sfw__",
             "seed": -1,
-            "outputs_per_job": 25,
+            "outputs_per_job": 8,
         }
     )
     specification.update(
@@ -447,7 +447,7 @@ async def test_random_seed_sentinel_resolves_unique_nonsequential_seeds_per_imag
             "generation_batches": [
                 {
                     "name": "Randomized provider job",
-                    "image_count": 25,
+                    "image_count": 8,
                     "generation": deepcopy(generation),
                 }
             ],
@@ -496,10 +496,10 @@ async def test_random_seed_sentinel_resolves_unique_nonsequential_seeds_per_imag
     outputs = job.parameters["output_generations"]
     resolutions = job.parameters["output_prompt_resolutions"]
     seeds = [output["seed"] for output in outputs]
-    assert len(seeds) == 25
-    assert len(set(seeds)) == 25
+    assert len(seeds) == 8
+    assert len(set(seeds)) == 8
     assert all(0 <= seed <= (2**63) - 1 for seed in seeds)
-    assert seeds != list(range(seeds[0], seeds[0] + 25))
+    assert seeds != list(range(seeds[0], seeds[0] + 8))
     assert [resolution["seed"] for resolution in resolutions] == seeds
     assert all(output["seed"] != -1 for output in outputs)
 
@@ -631,9 +631,9 @@ async def test_new_set_service_freezes_two_subjects_and_regional_prompts_in_orde
                 steps=30,
                 sampler="euler_ancestral",
                 scheduler="karras",
-                outputs_per_job=4,
+                outputs_per_job=25,
                 planned_job_count=1,
-                desired_accepted_count=4,
+                desired_accepted_count=25,
             ),
             idempotency_key="new-set-regional-duo",
             settings=Settings(),
@@ -643,6 +643,16 @@ async def test_new_set_service_freezes_two_subjects_and_regional_prompts_in_orde
     async with batch_database.sessions() as session:
         version = await session.scalar(
             select(ReleaseVersion).where(ReleaseVersion.release_id == result.release.id)
+        )
+        jobs = list(
+            (
+                await session.scalars(
+                    select(GenerationJob).where(
+                        GenerationJob.release_version_id
+                        == result.generation_plan.release_version_id
+                    )
+                )
+            ).all()
         )
         assert version is not None
 
@@ -654,6 +664,11 @@ async def test_new_set_service_freezes_two_subjects_and_regional_prompts_in_orde
     assert generation["composition_mode"] == "duo"
     assert generation["character_a_prompt"] == "nico robin (one piece), adult woman"
     assert generation["character_b_prompt"] == "boa hancock (one piece), adult woman"
+    assert generation["outputs_per_job"] == 8
+    assert version.specification["schema_version"] == 2
+    assert version.specification["planned_job_count"] == 4
+    assert version.specification["generation_batches"][0]["image_count"] == 25
+    assert sorted(job.expected_output_count for job in jobs) == [1, 8, 8, 8]
 
 
 def test_browser_new_set_accepts_the_optional_batch_plan_json_field(

@@ -4,6 +4,12 @@ Controlled Duo is the two-character generation profile. It replaces the old
 assumption that two overlapping left/right prompt rectangles are sufficient to
 keep identities separate.
 
+Controlled Trio v1 extends the same ownership model to three characters. Duo
+and Trio both separate identity and appearance, individual pose, shared
+interaction, and camera direction so the operator can describe each scene
+freely. The supplied layout examples are optional identity-region guides, not a
+closed list of poses.
+
 The legacy regional workflows remain immutable and executable for historical
 releases. They are labelled **soft isolation** and must not be presented as a
 guarantee that character traits remain local.
@@ -33,8 +39,9 @@ to reduce concept bleeding.
 
 ## Production profiles
 
-The first release uses only exact-pinned ComfyUI core nodes. It does not install
-extensions at runtime and it does not add an unreviewed model artifact.
+The first releases use only exact-pinned ComfyUI core nodes. No custom extension
+is installed for Controlled Duo or Controlled Trio, neither profile installs
+extensions at runtime, and neither adds an unreviewed model artifact.
 
 ### Balanced
 
@@ -85,15 +92,43 @@ The UI and frozen release contract separate prompts by responsibility.
 | --- | --- | --- |
 | Scene and style | setting, medium, palette, lighting, quality | character names, identity triggers, slot-specific hair/clothing |
 | Camera | lens, angle, crop, depth hierarchy | identity attributes |
-| Interaction | shared relationship/action, gaze, contact point | appearance attributes |
-| Character A | A identity, appearance, outfit and action | B identity or attributes |
+| Combined pose / interaction | shared relationship/action, gaze, contact points and coordinated geometry | appearance attributes |
+| Character A identity | A identity, appearance and outfit | B or C identity and attributes |
+| Character A pose | A body direction, gesture, expression and action | B or C identity and attributes |
 | Character A negative | traits that must not appear in A | shared quality negatives |
-| Character B | B identity, appearance, outfit and action | A identity or attributes |
+| Character B identity | B identity, appearance and outfit | A or C identity and attributes |
+| Character B pose | B body direction, gesture, expression and action | A or C identity and attributes |
 | Character B negative | traits that must not appear in B | shared quality negatives |
+| Character C identity | C identity, appearance and outfit | A or B identity and attributes |
+| Character C pose | C body direction, gesture, expression and action | A or B identity and attributes |
+| Character C negative | traits that must not appear in C | shared quality negatives |
 
-Exactly-two population instructions are system-owned. The preflight warns on
-`solo`, `1girl`, conflicting person counts, subject triggers in the shared
-scene, or references to the other slot's exclusive traits.
+Character C fields exist only in Controlled Trio. Exactly-two and exactly-three
+population instructions are system-owned by their respective contracts. The
+preflight warns on `solo`, `1girl`, conflicting person counts, subject triggers
+in the shared scene, or references to another slot's exclusive traits.
+
+### Freeform prompts, wildcards, and batch overrides
+
+The set-level identity and appearance fields are persistent defaults for the
+approved cast. Each character has a separate freeform pose field, while the
+combined pose / interaction field describes coordinated action or contact
+across the complete pair or trio. Camera and framing remain a separate
+freeform field. None of these fields is restricted to the example poses used
+during design.
+
+Current `__wildcard__` tokens may be inserted into the A, B, or C identity,
+pose, and negative fields, the combined interaction, and the camera field. A
+multi-character pose wildcard should make every line one complete coordinated
+pose for the whole cast. The selected wildcard versions are frozen with the
+release and each resolved value is recorded with generation evidence.
+
+Every batch may override the character identity, pose, and negative fields plus
+the shared interaction and camera. An override left off inherits the set-level
+value. An enabled non-empty override replaces it for that batch; an enabled
+blank override explicitly clears it. This allows back-to-back batches to change
+individual or group posing without changing the approved cast or rebuilding
+the set-wide profile.
 
 All currently approved LoRAs remain **shared style LoRAs**. A mask does not
 spatially isolate a conventional `LoraLoader` model patch. Character-specific
@@ -103,33 +138,56 @@ future benchmark, not a production dependency in this release.
 
 ## Composition presets
 
-Presets freeze camera intent and initial disjoint mask geometry. The worker
-converts the same preview percentages into 8-pixel-aligned, bounded rectangles;
-`x`, `y`, `width`, and `height` therefore vary with the preset instead of every
-preset silently using full-height lanes. They are not merely prompt snippets.
+Presets freeze initial disjoint identity-region geometry and may suggest
+editable camera wording. The worker converts the same preview percentages into
+8-pixel-aligned, bounded rectangles; `x`, `y`, `width`, and `height` therefore
+vary with the preset instead of every preset silently using full-height lanes.
+They guide where each identity should remain legible. They do not select a
+pose, restrict freeform pose or interaction text, or guarantee deterministic
+limb and contact geometry.
 
-- **Close portrait:** shoulder-to-shoulder framing, distinct head zones, one
-  intentional contact point.
-- **Overhead:** high camera, diagonal head placement and outer limbs framing
-  the image.
-- **Low angle:** full-body power composition, strong foreground foreshortening
-  and two clean silhouettes.
-- **Diagonal depth:** one character foreground-left and the other
-  background-right, with unequal scale but no mask overlap.
-- **Back to back:** touching shoulders as the central anchor and opposing action
-  diagonals.
-- **Full body:** readable head-to-foot silhouettes with balanced negative space.
+- **Auto / flexible:** neutral disjoint identity regions with the most freedom
+  for operator-authored pose and interaction text.
+- **Close portrait:** compact regions that keep both faces legible.
+- **Overhead:** diagonal upper-image identity regions suited to a high camera.
+- **Low angle:** vertically extended regions suited to full-body depth.
+- **Diagonal depth:** unequal foreground and background identity regions.
+- **Back to back:** opposed regions around a central boundary.
+- **Full body:** full-height regions with balanced negative space.
 
 The principles are drawn from common editorial and character-pair composition:
 asymmetrical hierarchy, opposing body angles, a clear contact point, deliberate
 depth, color separation and gesture lines that direct attention. The presets do
-not reproduce an individual artist's style.
+not reproduce an individual artist's style. The pose and interaction prompts,
+not the preset name, remain the creative instruction.
 
-Pose ControlNet is the next structural layer. Official ComfyUI documentation
-describes pose keypoints as a ControlNet condition for more predictable
-geometry: [ControlNet workflow guide](https://docs.comfy.org/tutorials/controlnet/controlnet).
-It requires a reviewed ControlNet artifact, pose asset provenance and signed
-worker delivery, so it is deliberately not smuggled into this core-only change.
+## Controlled Trio v1
+
+Controlled Trio v1 requires exactly three distinct, currently approved,
+clearly-adult fictional subjects. Its approval must explicitly declare the
+`controlled_trio_v1` capability; a normal, legacy-couple, or Controlled Duo
+workflow cannot be silently substituted.
+
+The bundled Balanced graph gives A, B, and C separate masked positive and
+negative lanes, combines them with the full-frame scene, interaction, camera,
+and shared style, and runs one base sampler. Its **Auto / flexible**,
+**three-column**, **triangle**, and **layered-depth** choices are disjoint
+identity-region layouts only. All three individual poses and the complete
+three-character interaction remain freeform.
+
+This first trio contract is Balanced and core-node-only. Draft and Standard
+change the real base step budget. Strict regional repair and High quality are
+not available until separately reviewed topologies declare those capabilities.
+
+An opt-in pose-map ControlNet profile is a possible next structural layer.
+Official ComfyUI documentation describes pose keypoints as a ControlNet
+condition for more predictable geometry:
+[ControlNet workflow guide](https://docs.comfy.org/tutorials/controlnet/controlnet).
+It would require a reviewed ControlNet artifact, pose-map provenance, explicit
+UI and signed-worker inputs, and a separate canary worker. The current estimate
+is roughly 2.5 GB of additional cold-start artifacts, so this must remain a
+separate costed capability rather than being added to every worker. It is not
+installed or promised by this release.
 
 ## Optional identity references
 
@@ -173,8 +231,8 @@ approved before the workflow is used for a large release.
   lifecycle policy.
 
 High quality is deliberately unavailable in these two v2 workflow approvals.
-The worker fails closed if a workflow claims `duo_high_quality` without a
-separately reviewed high-quality topology.
+The shared approval contract rejects `duo_high_quality`, and the worker still
+fails closed, until a separately reviewed high-quality topology is implemented.
 
 This preserves the existing cost work: the expensive isolation passes are paid
 only for candidates that have already demonstrated useful composition.

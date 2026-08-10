@@ -30,7 +30,7 @@ from gen_automation.services.assets import (
     finalize_raw_master,
     presign_asset_download,
 )
-from gen_automation.storage.base import ObjectNotFoundError, ObjectStoreError
+from gen_automation.storage.base import ObjectNotFoundError, ObjectStoreError, PresignedUpload
 from gen_automation.storage.images import verify_image_bytes
 from gen_automation.storage.memory import MemoryObjectStore
 
@@ -146,6 +146,52 @@ async def test_upload_intents_are_scoped_and_not_reissued(
         for intent in first
     )
     assert all(intent.upload_fields["content-length-range"] == "1,1000000" for intent in first)
+
+
+@pytest.mark.asyncio
+async def test_oversized_upload_grant_rolls_back_before_intents_are_committed(
+    asset_context: AssetContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryObjectStore()
+    original_presign = store.presign_upload
+
+    async def oversized_presign(
+        *,
+        key: str,
+        content_type: str,
+        metadata: dict[str, str],
+        expires_in: int,
+        max_bytes: int,
+    ) -> PresignedUpload:
+        grant = await original_presign(
+            key=key,
+            content_type=content_type,
+            metadata=metadata,
+            expires_in=expires_in,
+            max_bytes=max_bytes,
+        )
+        return PresignedUpload(
+            url=grant.url,
+            method=grant.method,
+            fields={**grant.fields, "x-amz-security-token": "x" * (13 * 1024)},
+            headers=grant.headers,
+        )
+
+    monkeypatch.setattr(store, "presign_upload", oversized_presign)
+    async with asset_context.database.sessions() as session:
+        with pytest.raises(AssetConflictError, match="upload grant exceeds"):
+            await create_raw_master_upload_intents(
+                session,
+                store,
+                generation_job_id=asset_context.job_id,
+                max_bytes=1_000_000,
+                max_serialized_grant_bytes=12 * 1024,
+            )
+
+    async with asset_context.database.sessions() as session:
+        asset_count = int(await session.scalar(select(func.count(Asset.id))) or 0)
+    assert asset_count == 0
 
 
 @pytest.mark.asyncio
