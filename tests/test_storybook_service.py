@@ -503,7 +503,7 @@ async def test_selected_context_rejects_revoked_release_cast_approval(
         approval.status = ApprovalStatus.REVOKED
         approval.is_current = False
         approval.revoked_by_user_id = storybook_fixture.owner_id
-        approval.revoked_at = NOW + timedelta(hours=1)
+        approval.revoked_at = approval.approved_at + timedelta(seconds=1)
         await session.commit()
         with pytest.raises(StorybookSourceAuthorizationError, match="approval evidence"):
             await build_storybook_source_context(
@@ -703,7 +703,7 @@ async def test_finalization_rechecks_idea_only_subject_approval_and_assessor_ide
         approval.status = ApprovalStatus.REVOKED
         approval.is_current = False
         approval.revoked_by_user_id = storybook_fixture.owner_id
-        approval.revoked_at = NOW + timedelta(hours=1)
+        approval.revoked_at = approval.approved_at + timedelta(seconds=1)
         await session.commit()
 
         with pytest.raises(StorybookSourceAuthorizationError, match="currently approved"):
