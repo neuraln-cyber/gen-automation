@@ -31,6 +31,7 @@ PUBLISH_WORKFLOW = ROOT / ".github" / "workflows" / "publish-video-worker-a14b.y
 ANIMATION_STUDIO_DOC = ROOT / "docs" / "animation-studio.md"
 ACCESS_DOC = ROOT / "docs" / "access-and-secrets.md"
 MAIN = ROOT / "src" / "gen_automation" / "video_worker" / "main.py"
+SMOOTHMIX_MIRROR_REVISION = "3521de1624df15f248b28920858db043c71cc76e"
 
 
 def test_a14b_manifest_and_docker_pin_every_private_model_artifact() -> None:
@@ -56,8 +57,24 @@ def test_a14b_manifest_and_docker_pin_every_private_model_artifact() -> None:
     assert dockerfile.count("ADD --checksum=sha256:") == len(A14B_MODEL_ARTIFACTS)
     for artifact in manifest["artifacts"]:
         assert f"ADD --checksum=sha256:{artifact['sha256']} --chmod=0444" in dockerfile
+        assert artifact["source"] in dockerfile
         assert str(artifact["byte_size"]) in dockerfile
         assert Path(artifact["relative_path"]).name in dockerfile
+    smoothmix_sources = [
+        artifact["source"]
+        for artifact in manifest["artifacts"]
+        if artifact["role"] in {"high_noise_diffusion_model", "low_noise_diffusion_model"}
+    ]
+    assert len(smoothmix_sources) == 2
+    assert all(
+        source.startswith(
+            "https://huggingface.co/Animhaven/SmoothMix-Wan2.2-I2V-GGUF/"
+            f"resolve/{SMOOTHMIX_MIRROR_REVISION}/"
+        )
+        for source in smoothmix_sources
+    )
+    assert "civitai.com/api/download/models/2587054" not in dockerfile
+    assert "civitai.com/api/download/models/2587073" not in dockerfile
 
 
 def test_a14b_image_labels_match_all_worker_contracts() -> None:

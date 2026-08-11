@@ -60,8 +60,8 @@ A14B_VIDEO_PROFILE_IDS: Final = frozenset(
 )
 A14B_MODEL_MANIFEST: Final = ModelArtifact(
     path=Path("/opt/video-worker/model-manifest.json"),
-    size_bytes=7_137,
-    sha256="f7d9aa4fc7783ca76b605d1dc520e3ef812257c40c4aef9803e635d28c37bbbb",
+    size_bytes=7_324,
+    sha256="866120efcda36761f68777e5690dafc116b5afc67bbe077a1ca0e338ac389601",
 )
 A14B_MODEL_ARTIFACTS: Final = (
     ModelArtifact(

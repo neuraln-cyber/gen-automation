@@ -58,14 +58,14 @@
     {
       "role": "high_noise_diffusion_model",
       "relative_path": "diffusion_models/smoothMixWan22I2VV20_highQ3KM.gguf",
-      "source": "https://civitai.com/api/download/models/2587054",
+      "source": "https://huggingface.co/Animhaven/SmoothMix-Wan2.2-I2V-GGUF/resolve/3521de1624df15f248b28920858db043c71cc76e/SmoothMix_I2V_v2_High-Q3_K_M.gguf",
       "byte_size": 7176106496,
       "sha256": "f9ead6cc6183a02bfb8827c852a9f2c71289acb10086993c9495b5c242ee096b"
     },
     {
       "role": "low_noise_diffusion_model",
       "relative_path": "diffusion_models/smoothMixWan22I2VV20_lowQ3KM.gguf",
-      "source": "https://civitai.com/api/download/models/2587073",
+      "source": "https://huggingface.co/Animhaven/SmoothMix-Wan2.2-I2V-GGUF/resolve/3521de1624df15f248b28920858db043c71cc76e/SmoothMix_I2V_v2_Low-Q3_K_M.gguf",
       "byte_size": 7176106496,
       "sha256": "8ce49c8a9b272a69cddab5042a4424b6689cc067db17707263f3ef2795564c17"
     },

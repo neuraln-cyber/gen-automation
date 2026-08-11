@@ -156,8 +156,8 @@ ENTRYPOINT ["/opt/video-worker-venv/bin/python", "-m", "gen_automation.video_wor
 
 FROM runtime-foundation AS model-runtime
 
-ADD --checksum=sha256:f9ead6cc6183a02bfb8827c852a9f2c71289acb10086993c9495b5c242ee096b --chmod=0444 https://civitai.com/api/download/models/2587054 /opt/comfyui/models/diffusion_models/smoothMixWan22I2VV20_highQ3KM.gguf
-ADD --checksum=sha256:8ce49c8a9b272a69cddab5042a4424b6689cc067db17707263f3ef2795564c17 --chmod=0444 https://civitai.com/api/download/models/2587073 /opt/comfyui/models/diffusion_models/smoothMixWan22I2VV20_lowQ3KM.gguf
+ADD --checksum=sha256:f9ead6cc6183a02bfb8827c852a9f2c71289acb10086993c9495b5c242ee096b --chmod=0444 https://huggingface.co/Animhaven/SmoothMix-Wan2.2-I2V-GGUF/resolve/3521de1624df15f248b28920858db043c71cc76e/SmoothMix_I2V_v2_High-Q3_K_M.gguf /opt/comfyui/models/diffusion_models/smoothMixWan22I2VV20_highQ3KM.gguf
+ADD --checksum=sha256:8ce49c8a9b272a69cddab5042a4424b6689cc067db17707263f3ef2795564c17 --chmod=0444 https://huggingface.co/Animhaven/SmoothMix-Wan2.2-I2V-GGUF/resolve/3521de1624df15f248b28920858db043c71cc76e/SmoothMix_I2V_v2_Low-Q3_K_M.gguf /opt/comfyui/models/diffusion_models/smoothMixWan22I2VV20_lowQ3KM.gguf
 ADD --checksum=sha256:c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68 --chmod=0444 https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/fb1388adc906ab39ffc26ee40e96b22886b56bc4/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors /opt/comfyui/models/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors
 ADD --checksum=sha256:fd1531e31cdd20af005a9fb66e69afe4ea481a6db9b07cd889ece2e1ca2e67b9 --chmod=0444 https://huggingface.co/Kijai/WanVideo_comfy/resolve/8260d429d19fd7a72304cad059160b95d843913f/Wan2_1_VAE_fp32.safetensors /opt/comfyui/models/vae/Wan2_1_VAE_fp32.safetensors
 ADD --checksum=sha256:887c3bdeb74e83859c920438e16ca31f39ab18ce189abc5f0e36f8348c5bbb19 --chmod=0444 https://huggingface.co/lightx2v/Wan2.2-Distill-Loras/resolve/570044187a5219776ef30a5c60c6f76428a3a10a/wan2.2_i2v_A14b_high_noise_lora_rank64_lightx2v_4step_1022.safetensors /opt/comfyui/models/loras/wan2.2_i2v_A14b_high_noise_lora_rank64_lightx2v_4step_1022.safetensors
@@ -177,7 +177,7 @@ RUN test "$(stat --format=%s /opt/comfyui/models/diffusion_models/smoothMixWan22
 FROM model-runtime AS production
 
 LABEL org.opencontainers.image.model.repository="Civitai:2299142+1307155; HuggingFace pinned auxiliaries" \
-      org.opencontainers.image.model.manifest-sha256="f7d9aa4fc7783ca76b605d1dc520e3ef812257c40c4aef9803e635d28c37bbbb" \
+      org.opencontainers.image.model.manifest-sha256="866120efcda36761f68777e5690dafc116b5afc67bbe077a1ca0e338ac389601" \
       org.opencontainers.image.model.total-bytes="24196862685" \
       org.opencontainers.image.model.public-redistribution-authorized="false"
 
