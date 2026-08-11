@@ -55,6 +55,7 @@ def verify_authorization(
     settings: WorkerSettings,
     *,
     now: Callable[[], float] = time.time,
+    allow_expired_for_replay: bool = False,
 ) -> None:
     public_key = settings.verification_keys.get(envelope.key_id)
     current_time = int(now())
@@ -63,7 +64,10 @@ def verify_authorization(
         or envelope.expires_at <= envelope.issued_at
         or envelope.expires_at - envelope.issued_at > settings.max_signature_ttl_seconds
         or envelope.issued_at > current_time + settings.clock_skew_seconds
-        or envelope.expires_at < current_time - settings.clock_skew_seconds
+        or (
+            not allow_expired_for_replay
+            and envelope.expires_at < current_time - settings.clock_skew_seconds
+        )
     )
     signature_is_valid = verify_message(
         public_key,

@@ -4,6 +4,7 @@ import io
 import json
 import struct
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,10 @@ from PIL import Image
 from gen_automation.domain.signing import derive_public_key, encode_base64url
 from gen_automation.video_worker.app import create_video_worker_app
 from gen_automation.video_worker.comfy import (
+    NAG_CUSTOM_NODE_REVISION,
+    WAN_COMFY_A14B_ADULT_WORKFLOW_SHA256,
+    WAN_COMFY_A14B_WORKFLOW_REGISTRY_SHA256,
+    WAN_COMFY_A14B_WORKFLOW_SHA256,
     WAN_COMFY_HQ_WORKFLOW_SHA256,
     WAN_COMFY_WORKFLOW_REGISTRY_SHA256,
     WAN_COMFY_WORKFLOW_SHA256,
@@ -26,8 +31,10 @@ from gen_automation.video_worker.media import (
     FfprobeMp4Validator,
     ValidatedVideo,
     VideoOutputError,
+    validate_source_image,
 )
 from gen_automation.video_worker.model_integrity import (
+    A14B_VIDEO_PROFILE_IDS,
     ModelArtifact,
     ModelIntegrityError,
     verify_model_artifact,
@@ -40,6 +47,11 @@ from gen_automation.video_worker.models import (
     WorkerSettings,
 )
 from gen_automation.video_worker.profiles import (
+    A14B_ADULT_VIDEO_PROFILE,
+    A14B_ADULT_VIDEO_PROFILE_REGISTRATION,
+    A14B_VIDEO_PROFILE,
+    A14B_VIDEO_PROFILE_REGISTRATION,
+    A14B_VIDEO_PROFILE_REGISTRY_SHA256,
     HQ_VIDEO_PROFILE,
     HQ_VIDEO_PROFILE_REGISTRATION,
     HQ_VIDEO_PROFILE_SHA256,
@@ -47,6 +59,8 @@ from gen_automation.video_worker.profiles import (
     PINNED_VIDEO_PROFILE_SHA256,
     VIDEO_PROFILE_REGISTRY_SHA256,
     VideoRenderSpec,
+    derive_a14b_output_dimensions,
+    derive_a14b_render_dimensions,
 )
 from gen_automation.video_worker.runtime import (
     FfmpegPingPongEncoder,
@@ -62,6 +76,40 @@ TEST_PRIVATE_KEY = encode_base64url(bytes(range(1, 33)))
 TEST_PUBLIC_KEY = derive_public_key(TEST_PRIVATE_KEY)
 SOURCE_ORIGIN = "https://sources.example.test"
 UPLOAD_ORIGIN = "https://uploads.example.test"
+
+_SFW_A14B_CANARY_PROMPT = (
+    "Locked camera and fixed framing. The adult anime woman starts in the exact reference pose "
+    "and moves continuously at natural speed: she shifts her hips and weight from side to side, "
+    "rolls her shoulders, leans her upper body toward the viewer, and then eases back. Her chest "
+    "and abdomen move with clear natural breathing; her extended arm and hand make a small smooth "
+    "gesture; her long hair, loose fabric, and accessories follow with soft delayed secondary "
+    "motion. She maintains eye contact and a lively smile and makes one quick synchronized blink "
+    "near the middle. Smooth coherent full-body motion throughout the shot, stable identity, "
+    "stable face, stable hands, and coherent anatomy. Near the end she settles close to the "
+    "starting pose."
+)
+_ADULT_A14B_CANARY_PROMPT = (
+    "Locked camera and fixed framing. The adult anime woman starts in the exact reference pose "
+    "and performs a continuous sensual body roll at natural speed: her hips rock forward and back "
+    "in a clear rhythm, her pelvis tilts, her back arches, and her torso leans toward the viewer "
+    "and eases back while her shoulders and thighs make natural balancing adjustments. Her "
+    "breasts and soft body tissue bounce and settle naturally with delayed secondary motion; her "
+    "hair, clothing, and accessories sway with inertia. She maintains direct eye contact, parts "
+    "her lips into an aroused smile, and makes one quick synchronized blink near the middle. "
+    "Smooth coherent motion throughout the shot, stable identity, stable face, stable hands, and "
+    "coherent anatomy. Near the end she returns close to the starting pose."
+)
+_A14B_SHARED_NEGATIVE_PROMPT = (
+    "motionless subject, frozen pose, frozen torso, frozen hips, breathing-only motion, "
+    "blinking-only motion, micro-motion only, barely perceptible motion, slow motion, pause, "
+    "asymmetric blink, wink, one eye closes before the other, repeated blinking, eyes stuck "
+    "closed, robotic motion, jerky motion, jitter, stutter, judder, flicker, frame-to-frame "
+    "warping, face morphing, identity drift, facial drift, hand morphing, body deformation, "
+    "malformed anatomy, extra limbs, extra fingers, fused fingers, camera shake, handheld "
+    "camera, moving camera, pan, tilt, roll, zoom, dolly, orbit, reframing, perspective drift, "
+    "background drift, background movement, overexposed, blurry, low quality, jpeg artifacts, "
+    "subtitles, frame corruption"
+)
 
 
 def _image_bytes(width: int = 8, height: int = 6) -> bytes:
@@ -99,6 +147,7 @@ class FakeDownloader:
 class FakeExecutor:
     ready: bool = True
     error: Exception | None = None
+    on_render: Callable[[], None] | None = None
     calls: list[dict[str, object]] = field(default_factory=list)
 
     def is_ready(self) -> bool:
@@ -129,6 +178,8 @@ class FakeExecutor:
         )
         if self.error is not None:
             raise self.error
+        if self.on_render is not None:
+            self.on_render()
         for index in range(render_spec.native_frame_count):
             (native_frames_path / f"frame-{index:06d}.png").write_bytes(b"frame")
 
@@ -265,6 +316,7 @@ def _client(
     uploader: FakeUploader | None = None,
     loop_encoder: FakeLoopEncoder | None = None,
     settings: WorkerSettings | None = None,
+    now: Callable[[], float] | None = None,
 ) -> tuple[TestClient, FakeDownloader, FakeExecutor, FakeValidator, FakeUploader]:
     resolved_downloader = downloader or FakeDownloader(_image_bytes())
     resolved_executor = executor or FakeExecutor()
@@ -278,7 +330,7 @@ def _client(
         validator=resolved_validator,
         uploader=resolved_uploader,
         loop_encoder=resolved_loop_encoder,
-        now=lambda: NOW,
+        now=now or (lambda: NOW),
     )
     return (
         TestClient(app),
@@ -371,6 +423,112 @@ def test_hq_profile_and_workflow_contracts_are_stable_and_camera_locked() -> Non
     assert sampler["sampler_name"] == "uni_pc"
     assert sampler["scheduler"] == "simple"
     assert sampler["denoise"] == 1.0
+
+
+def test_smoothmix_q3_a14b_profiles_pin_plain_i2v_and_optional_adult_loras() -> None:
+    assert (A14B_VIDEO_PROFILE.portrait_width, A14B_VIDEO_PROFILE.portrait_height) == (
+        560,
+        720,
+    )
+    assert A14B_VIDEO_PROFILE.permitted_native_frame_counts == (81,)
+    assert A14B_VIDEO_PROFILE.fps == 16
+    assert A14B_VIDEO_PROFILE.loop_mode == "forward"
+    assert A14B_VIDEO_PROFILE_REGISTRATION.execution_timeout_seconds == 17_100
+    assert A14B_VIDEO_PROFILE_REGISTRATION.estimated_runtime_seconds(81) == 18_000
+    assert A14B_VIDEO_PROFILE_REGISTRATION.max_attempts == 1
+    assert A14B_ADULT_VIDEO_PROFILE_REGISTRATION.max_attempts == 1
+    assert A14B_VIDEO_PROFILE_REGISTRY_SHA256 == (
+        "a0ddd172e300f72fc60c4ae87c4f7d1ff077a0ffa2a9725c7aae2d74ecffa7b9"
+    )
+    assert WAN_COMFY_A14B_WORKFLOW_SHA256 == (
+        "dbe6c644ec0b403d2d52509199ad405a899ce397712e265d5e20b538fd9ff588"
+    )
+    assert WAN_COMFY_A14B_ADULT_WORKFLOW_SHA256 == (
+        "4273bfbc4a3f3dbe309e3cf14e8986272b14a35235a1659fdb1f979a49ebee28"
+    )
+    assert WAN_COMFY_A14B_WORKFLOW_REGISTRY_SHA256 == (
+        "ceee10e914a13dc601a7f64d97237a2736e82c68aefb85c59a5cd9d34cb90d83"
+    )
+    assert NAG_CUSTOM_NODE_REVISION == "c6f27116a8259f5b501d498a09e51c82fa72e35f"
+
+    assert derive_a14b_render_dimensions(480, 814) == (480, 816)
+    assert derive_a14b_render_dimensions(720, 424) == (816, 480)
+    assert derive_a14b_render_dimensions(1152, 1472) == (560, 720)
+    assert derive_a14b_render_dimensions(832, 480) == (832, 480)
+    assert derive_a14b_render_dimensions(1200, 800) == (768, 512)
+    assert derive_a14b_render_dimensions(1024, 1024) == (624, 624)
+    assert derive_a14b_render_dimensions(13, 4) == (1088, 336)
+    assert derive_a14b_output_dimensions(480, 814) == (480, 814)
+    assert derive_a14b_output_dimensions(720, 424) == (720, 424)
+    assert derive_a14b_output_dimensions(1144, 1480) == (1144, 1480)
+    assert derive_a14b_output_dimensions(1024, 1024) == (1024, 1024)
+    assert derive_a14b_output_dimensions(481, 815) == (482, 816)
+    with pytest.raises(ValueError, match="unsupported source output dimensions"):
+        derive_a14b_output_dimensions(2049, 512)
+
+    render_spec = VideoRenderSpec(81, 16, 560, 720, "forward")
+    sfw = build_wan_workflow(
+        source_filename="SOURCE.png",
+        output_prefix="OUTPUT/frame",
+        prompt=_SFW_A14B_CANARY_PROMPT,
+        negative_prompt="",
+        seed=42,
+        render_spec=render_spec,
+        profile=A14B_VIDEO_PROFILE,
+    )
+    adult = build_wan_workflow(
+        source_filename="SOURCE.png",
+        output_prefix="OUTPUT/frame",
+        prompt=_ADULT_A14B_CANARY_PROMPT,
+        negative_prompt="",
+        seed=42,
+        render_spec=render_spec,
+        profile=A14B_ADULT_VIDEO_PROFILE,
+    )
+
+    assert sfw["6"]["inputs"]["text"] == _SFW_A14B_CANARY_PROMPT
+    assert adult["6"]["inputs"]["text"] == _ADULT_A14B_CANARY_PROMPT
+    assert sfw["7"]["inputs"]["text"] == _A14B_SHARED_NEGATIVE_PROMPT
+    assert adult["7"]["inputs"]["text"] == _A14B_SHARED_NEGATIVE_PROMPT
+    assert "motionless subject" in sfw["7"]["inputs"]["text"]
+    assert "blinking-only motion" in sfw["7"]["inputs"]["text"]
+    assert "static, still" not in sfw["7"]["inputs"]["text"]
+    assert sfw["1"] == {
+        "class_type": "UnetLoaderGGUF",
+        "inputs": {"unet_name": "smoothMixWan22I2VV20_highQ3KM.gguf"},
+    }
+    assert sfw["2"] == {
+        "class_type": "UnetLoaderGGUF",
+        "inputs": {"unet_name": "smoothMixWan22I2VV20_lowQ3KM.gguf"},
+    }
+    assert sfw["14"]["class_type"] == "WanImageToVideo"
+    assert "clip_vision_output" not in sfw["14"]["inputs"]
+    assert sfw["14"]["inputs"]["length"] == 81
+    assert sfw["12"]["inputs"] == {"model": ["8", 0], "shift": 8.0}
+    assert sfw["13"]["inputs"] == {"model": ["10", 0], "shift": 8.0}
+    assert sfw["10"]["inputs"]["strength_model"] == 1.0
+    assert "9" not in sfw and "11" not in sfw
+    assert adult["9"]["inputs"]["strength_model"] == 0.9
+    assert adult["11"]["inputs"]["strength_model"] == 0.9
+
+    high = sfw["15"]["inputs"]
+    low = sfw["16"]["inputs"]
+    assert high["add_noise"] == "enable"
+    assert high["noise_seed"] == 42
+    assert (high["steps"], high["cfg"]) == (6, 1.0)
+    assert (high["start_at_step"], high["end_at_step"]) == (0, 3)
+    assert high["return_with_leftover_noise"] == "enable"
+    assert sfw["16"]["class_type"] == "KSamplerWithNAG (Advanced)"
+    assert low["add_noise"] == "disable"
+    assert low["noise_seed"] == 0
+    assert (low["start_at_step"], low["end_at_step"]) == (3, 10_000)
+    assert (low["nag_scale"], low["nag_tau"]) == (30.0, 2.5)
+    assert (low["nag_alpha"], low["nag_sigma_end"]) == (0.25, 1.0)
+    assert low["nag_negative"] == ["14", 1]
+    assert low["return_with_leftover_noise"] == "disable"
+    serialized = json.dumps(sfw, sort_keys=True)
+    for forbidden in ("CLIPVision", "MMAudio", "RIFE", "WanVideoWrapper", "last_image"):
+        assert forbidden not in serialized
 
 
 def test_signed_hq_portrait_job_selects_hq_profile(tmp_path: Path) -> None:
@@ -524,6 +682,113 @@ def test_portrait_dimensions_are_derived_from_signed_source_orientation(tmp_path
     assert (render_spec.width, render_spec.height) == (480, 832)
 
 
+@pytest.mark.parametrize(
+    ("source_dimensions", "expected_dimensions"),
+    [
+        ((480, 814), (480, 816)),
+        ((720, 424), (816, 480)),
+        ((1152, 1472), (560, 720)),
+        ((832, 480), (832, 480)),
+        ((1200, 800), (768, 512)),
+        ((1024, 1024), (624, 624)),
+        ((1300, 400), (1088, 336)),
+    ],
+)
+def test_a14b_dimensions_preserve_source_aspect_without_stretching(
+    source_dimensions: tuple[int, int],
+    expected_dimensions: tuple[int, int],
+    tmp_path: Path,
+) -> None:
+    source = _image_bytes(*source_dimensions)
+    request = _unsigned_request(source)
+    request["version"] = "video-worker.v2"
+    request["payload"].update(
+        {
+            "profile_id": A14B_VIDEO_PROFILE.profile_id,
+            "profile_sha256": A14B_VIDEO_PROFILE_REGISTRATION.job_contract_sha256,
+            "native_frame_count": 81,
+            "fps": 16,
+            "width": derive_a14b_output_dimensions(*source_dimensions)[0],
+            "height": derive_a14b_output_dimensions(*source_dimensions)[1],
+            "loop_mode": "forward",
+        }
+    )
+    settings = _settings(tmp_path, allowed_profile_ids=A14B_VIDEO_PROFILE_IDS)
+    client, _downloader, executor, _validator, _uploader = _client(
+        tmp_path,
+        downloader=FakeDownloader(source),
+        settings=settings,
+    )
+
+    with client:
+        response = client.post("/jobs/generate", json=_sign_request(request))
+
+    assert response.status_code == 200
+    render_spec = executor.calls[0]["render_spec"]
+    assert isinstance(render_spec, VideoRenderSpec)
+    assert (render_spec.width, render_spec.height) == expected_dimensions
+    assert (render_spec.output_content_width, render_spec.output_content_height) == (
+        source_dimensions
+    )
+    assert (response.json()["width"], response.json()["height"]) == (
+        derive_a14b_output_dimensions(*source_dimensions)
+    )
+    assert response.json()["loop_mode"] == "forward"
+    source_ratio = source_dimensions[0] / source_dimensions[1]
+    output_ratio = expected_dimensions[0] / expected_dimensions[1]
+    assert abs(output_ratio - source_ratio) / source_ratio <= 0.02
+
+
+def test_a14b_source_preprocessing_uses_exact_canvas_without_stretch(tmp_path: Path) -> None:
+    source = tmp_path / "source.png"
+    target = tmp_path / "prepared.png"
+    image = Image.new("RGB", (480, 814), color=(10, 20, 30))
+    image.paste((200, 100, 50), (120, 0, 360, 814))
+    image.save(source, format="PNG")
+
+    NativeComfyWanExecutor._prepare_a14b_source(
+        source_path=source,
+        target_path=target,
+        render_spec=VideoRenderSpec(81, 16, 480, 816, "forward"),
+    )
+
+    with Image.open(target) as prepared:
+        assert prepared.size == (480, 816)
+        assert prepared.mode == "RGB"
+        assert prepared.getpixel((216, 360)) != prepared.getpixel((8, 360))
+
+
+def test_source_validation_preserves_raw_legacy_and_exposes_logical_a14b_dimensions(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "oriented.jpg"
+    image = Image.new("RGB", (480, 814), color=(10, 20, 30))
+    exif = Image.Exif()
+    exif[274] = 6
+    image.save(source, format="JPEG", exif=exif)
+    content = source.read_bytes()
+    grant = SourceDownloadGrant.model_validate(
+        {
+            "asset_id": "source-asset-1",
+            "url": f"{SOURCE_ORIGIN}/oriented.jpg",
+            "content_type": "image/jpeg",
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        },
+        strict=True,
+    )
+
+    validated = validate_source_image(
+        source,
+        grant=grant,
+        max_dimension=2048,
+        max_pixels=4_194_304,
+    )
+
+    assert (validated.width, validated.height) == (480, 814)
+    assert (validated.logical_width, validated.logical_height) == (814, 480)
+
+
 def test_successful_retry_is_cached_without_redownload_or_regeneration(tmp_path: Path) -> None:
     client, downloader, executor, _validator, uploader = _client(tmp_path)
     request = _signed_request()
@@ -534,6 +799,66 @@ def test_successful_retry_is_cached_without_redownload_or_regeneration(tmp_path:
 
     assert first.status_code == second.status_code == 200
     assert first.json() == second.json()
+    assert len(downloader.calls) == len(executor.calls) == len(uploader.calls) == 1
+
+
+def test_a14b_completed_attempt_replays_after_admission_expiry_without_regeneration(
+    tmp_path: Path,
+) -> None:
+    source = _image_bytes(480, 814)
+    clock = [NOW]
+    executor = FakeExecutor(on_render=lambda: clock.__setitem__(0, NOW + 17_100))
+    raw = _unsigned_request(source)
+    raw["version"] = "video-worker.v2"
+    raw["payload"].update(
+        {
+            "profile_id": A14B_VIDEO_PROFILE.profile_id,
+            "profile_sha256": A14B_VIDEO_PROFILE_REGISTRATION.job_contract_sha256,
+            "native_frame_count": 81,
+            "fps": 16,
+            "width": 480,
+            "height": 814,
+            "loop_mode": "forward",
+        }
+    )
+    request = _sign_request(raw)
+    client, downloader, _executor, _validator, uploader = _client(
+        tmp_path,
+        downloader=FakeDownloader(source),
+        executor=executor,
+        settings=_settings(tmp_path, allowed_profile_ids=A14B_VIDEO_PROFILE_IDS),
+        now=lambda: clock[0],
+    )
+
+    with client:
+        first = client.post("/jobs/generate", json=request)
+        replay = client.post("/jobs/generate", json=request)
+
+        altered_body = json.loads(json.dumps(request))
+        altered_body["payload"]["prompt"] = "different motion"
+        altered_body = _sign_request(altered_body)
+        rejected_body = client.post("/jobs/generate", json=altered_body)
+
+        altered_signature = json.loads(json.dumps(request))
+        altered_signature["signature"] = ("A" if request["signature"][0] != "A" else "B") + request[
+            "signature"
+        ][1:]
+        rejected_signature = client.post("/jobs/generate", json=altered_signature)
+
+        uncached = json.loads(json.dumps(request))
+        uncached["payload"]["attempt_id"] = "attempt-uncached"
+        uncached = _sign_request(uncached)
+        rejected_uncached = client.post("/jobs/generate", json=uncached)
+
+        clock[0] += 7_201
+        rejected_after_replay_window = client.post("/jobs/generate", json=request)
+
+    assert first.status_code == replay.status_code == 200
+    assert first.json() == replay.json()
+    assert rejected_body.status_code == 401
+    assert rejected_signature.status_code == 401
+    assert rejected_uncached.status_code == 401
+    assert rejected_after_replay_window.status_code == 401
     assert len(downloader.calls) == len(executor.calls) == len(uploader.calls) == 1
 
 
@@ -585,6 +910,75 @@ def test_ping_pong_encoder_excludes_duplicate_endpoints(tmp_path: Path) -> None:
     assert encoded_lines.count("file 'frame-000072.png'") == 1
     assert observed_command[observed_command.index("-frames:v") + 1] == "144"
     assert "+faststart" in observed_command
+
+
+def test_forward_encoder_keeps_each_native_frame_once(tmp_path: Path) -> None:
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    for index in range(81):
+        (frames / f"frame-{index:06d}.png").write_bytes(b"png")
+    output = tmp_path / "output.mp4"
+    observed_manifest: list[str] = []
+    observed_command: list[str] = []
+
+    def runner(command: list[str], _timeout: float) -> subprocess.CompletedProcess[bytes]:
+        observed_command.extend(command)
+        manifest_path = Path(command[command.index("-i") + 1])
+        observed_manifest.extend(manifest_path.read_text(encoding="ascii").splitlines())
+        output.write_bytes(_mp4_stub())
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    spec = VideoRenderSpec(81, 16, 560, 720, "forward")
+    FfmpegPingPongEncoder(runner=runner).encode(
+        native_frames_path=frames,
+        output_path=output,
+        render_spec=spec,
+    )
+
+    file_lines = [line for line in observed_manifest if line.startswith("file ")]
+    assert file_lines[:-1] == [f"file 'frame-{index:06d}.png'" for index in range(81)]
+    assert file_lines[-1] == "file 'frame-000080.png'"
+    assert observed_command[observed_command.index("-r") + 1] == "16"
+    assert observed_command[observed_command.index("-frames:v") + 1] == "81"
+    assert spec.output_frame_count == 81
+    assert spec.output_duration_seconds == 5.0625
+
+
+def test_a14b_forward_encoder_scales_to_source_and_even_pads_only_when_needed(
+    tmp_path: Path,
+) -> None:
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    for index in range(81):
+        (frames / f"frame-{index:06d}.png").write_bytes(b"png")
+    output = tmp_path / "output.mp4"
+    observed_command: list[str] = []
+
+    def runner(command: list[str], _timeout: float) -> subprocess.CompletedProcess[bytes]:
+        observed_command.extend(command)
+        output.write_bytes(_mp4_stub())
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    spec = VideoRenderSpec(
+        81,
+        16,
+        480,
+        816,
+        "forward",
+        output_content_width=481,
+        output_content_height=815,
+    )
+    FfmpegPingPongEncoder(runner=runner).encode(
+        native_frames_path=frames,
+        output_path=output,
+        render_spec=spec,
+    )
+
+    assert observed_command[observed_command.index("-vf") + 1] == (
+        "scale=481:815:force_original_aspect_ratio=increase:flags=lanczos,"
+        "crop=481:815,pad=482:816:0:0:color=black"
+    )
+    assert (spec.output_width, spec.output_height) == (482, 816)
 
 
 def test_model_integrity_checks_exact_size_and_hash(tmp_path: Path) -> None:

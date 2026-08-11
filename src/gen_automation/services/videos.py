@@ -9,7 +9,7 @@ from typing import Final, Literal, cast
 from uuid import UUID
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -36,6 +36,7 @@ from gen_automation.services.assets import (
     AssetStorageUnavailableError,
     presign_asset_download,
 )
+from gen_automation.services.video_runtime import video_runtime_profile_ids_for_worker_image
 from gen_automation.storage.base import ObjectStore
 from gen_automation.video_worker.models import (
     DEFAULT_MAX_IMAGE_DIMENSION,
@@ -43,12 +44,18 @@ from gen_automation.video_worker.models import (
     DEFAULT_MAX_SOURCE_BYTES,
 )
 from gen_automation.video_worker.profiles import (
+    A14B_ADULT_VIDEO_PROFILE,
+    A14B_ADULT_VIDEO_PROFILE_REGISTRATION,
+    A14B_VIDEO_PROFILE,
+    A14B_VIDEO_PROFILE_REGISTRATION,
     HQ_VIDEO_PROFILE_REGISTRATION,
     PINNED_VIDEO_PROFILE,
     PINNED_VIDEO_PROFILE_REGISTRATION,
     PINNED_VIDEO_PROFILE_SHA256,
     VideoProfile,
     VideoProfileRegistration,
+    derive_a14b_output_dimensions,
+    derive_a14b_render_dimensions,
 )
 
 VIDEO_SOURCE_CONTENT_TYPES: Final = frozenset({"image/jpeg", "image/png", "image/webp"})
@@ -58,6 +65,16 @@ MAX_VIDEO_VARIANTS: Final = 3
 MAX_VIDEO_PROMPT_LENGTH: Final = 4_000
 DEFAULT_VIDEO_NEGATIVE_PROMPT: Final = ""
 VIDEO_PROFILE_VERSION: Final = PINNED_VIDEO_PROFILE.adapter_revision
+A14B_TEST_SPEND_CEILING_MICROUSD: Final = 7_000_000
+_A14B_PROFILE_IDS: Final = (
+    A14B_VIDEO_PROFILE.profile_id,
+    A14B_ADULT_VIDEO_PROFILE.profile_id,
+)
+_POSTGRES_A14B_SPEND_LOCK_KEY: Final = int.from_bytes(
+    hashlib.sha256(b"gen-automation:a14b-canary-spend-ceiling:v1").digest()[:8],
+    "big",
+    signed=True,
+)
 _TERMINAL_STATES: Final = frozenset(
     {
         VideoGenerationState.SUCCEEDED,
@@ -70,6 +87,7 @@ _TERMINAL_STATES: Final = frozenset(
 class VideoQualityProfile(StrEnum):
     STANDARD = "standard"
     HQ_NATIVE = "hq_native"
+    SMOOTHMIX_A14B_Q3 = "smoothmix_a14b_q3"
 
 
 _QUALITY_PROFILE_REGISTRATIONS: Final = {
@@ -163,6 +181,7 @@ class VideoJobRead:
     height: int
     frame_count: int
     fps: int
+    loop_mode: str
     estimated_cost_microusd: int
     reserved_cost_microusd: int
     actual_cost_microusd: int
@@ -221,6 +240,7 @@ async def list_video_sources(
     *,
     actor_user_id: UUID,
     limit: int = 100,
+    quality_profile: VideoQualityProfile = VideoQualityProfile.STANDARD,
 ) -> tuple[VideoSourceOption, ...]:
     await _require_actor(session, actor_user_id=actor_user_id, lock=False)
     safe_limit = _bounded_limit(limit)
@@ -247,11 +267,12 @@ async def list_video_sources(
         ).all()
     )
     options: list[VideoSourceOption] = []
+    profile = _registration_for_quality(quality_profile).profile
     for asset, release_title in rows:
         try:
             snapshot = _source_snapshot(asset)
             _validate_source_worker_limits(snapshot)
-            _derive_video_dimensions(snapshot.width, snapshot.height)
+            _derive_video_dimensions(snapshot.width, snapshot.height, profile=profile)
         except VideoStudioConflictError:
             continue
         options.append(
@@ -275,6 +296,7 @@ async def create_video_submission(
     command: CreateVideoSubmission,
     actor_user_id: UUID,
     max_hourly_cost_usd: Decimal,
+    runtime_worker_image_digest: str,
     now: datetime | None = None,
 ) -> VideoSubmissionRead:
     created_at = _as_utc(now or datetime.now(UTC))
@@ -287,7 +309,10 @@ async def create_video_submission(
         raise VideoStudioNotFoundError("source image was not found")
     snapshot = _source_snapshot(asset)
     _validate_source_worker_limits(snapshot)
-    registration = _registration_for_quality(command.quality_profile)
+    registration = _registration_for_quality(
+        command.quality_profile,
+        content_rating=command.content_rating,
+    )
     profile = registration.profile
     width, height = _derive_video_dimensions(
         snapshot.width,
@@ -321,14 +346,18 @@ async def create_video_submission(
         submission_id=command.submission_id,
     )
     if replay:
-        if any(
-            job.cost_metadata.get("submission_request_sha256") != submission_request_sha256
-            for job in replay
-        ):
-            raise VideoStudioConflictError("this form was already submitted with different choices")
-        if len(replay) != command.variant_count:
-            raise VideoStudioConflictError("the saved submission is incomplete")
-        return _submission_read(command.submission_id, replay)
+        return _validated_submission_replay(
+            command=command,
+            submission_request_sha256=submission_request_sha256,
+            replay=replay,
+        )
+
+    if profile.profile_id not in video_runtime_profile_ids_for_worker_image(
+        runtime_worker_image_digest
+    ):
+        raise VideoStudioInputError(
+            "animation profile is unavailable for the configured video worker image"
+        )
 
     fps, frame_count = _video_timing(command.duration_seconds, profile=profile)
     estimate_microusd = _estimated_cost_microusd(
@@ -336,6 +365,27 @@ async def create_video_submission(
         registration=registration,
         frame_count=frame_count,
     )
+    _validate_a14b_budget(command.quality_profile, estimate_microusd)
+    if command.quality_profile == VideoQualityProfile.SMOOTHMIX_A14B_Q3:
+        await _acquire_a14b_spend_lock(session)
+        # A concurrent exact request can finish while this transaction waits
+        # for the global A14B lock. Re-check idempotency before evaluating the
+        # ceiling so a replay never consumes or is rejected by budget twice.
+        replay = await _load_submission_by_id(
+            session,
+            actor_user_id=actor.id,
+            submission_id=command.submission_id,
+        )
+        if replay:
+            return _validated_submission_replay(
+                command=command,
+                submission_request_sha256=submission_request_sha256,
+                replay=replay,
+            )
+        await _validate_a14b_cumulative_budget(
+            session,
+            new_estimate_microusd=estimate_microusd * command.variant_count,
+        )
     jobs: list[VideoGenerationJob] = []
     for variant_index in range(1, command.variant_count + 1):
         seed = (
@@ -360,10 +410,11 @@ async def create_video_submission(
             profile_version=profile.adapter_revision,
             profile_sha256=registration.job_contract_sha256,
             seed=seed,
-            frame_count=frame_count,
-            fps=fps,
+            frame_count=cast("Literal[73, 81, 121]", frame_count),
+            fps=cast("Literal[16, 24]", fps),
             width=width,
             height=height,
+            loop_mode=cast("Literal['forward', 'ping_pong']", profile.loop_mode),
         )
         request = VideoGenerationRequest(
             source=snapshot,
@@ -433,7 +484,11 @@ async def create_video_submission(
                         "experiment_seed_basis": (
                             "operator-override"
                             if command.experiment_seed is not None
-                            else "source-sha256-and-prompt/v1"
+                            else (
+                                "source-sha256-and-prompt/v1"
+                                if command.quality_profile == VideoQualityProfile.HQ_NATIVE
+                                else "submission-request-and-variant/v1"
+                            )
                         ),
                     }
                     if command.quality_profile != VideoQualityProfile.STANDARD
@@ -551,19 +606,23 @@ def planning_estimate_microusd(
     duration_seconds: int,
     variant_count: int,
     quality_profile: VideoQualityProfile = VideoQualityProfile.STANDARD,
+    content_rating: VideoContentRating = VideoContentRating.SFW,
 ) -> int:
     if duration_seconds not in VIDEO_DURATION_SECONDS:
         raise VideoStudioInputError("duration must be 3 or 5 seconds")
     if not MIN_VIDEO_VARIANTS <= variant_count <= MAX_VIDEO_VARIANTS:
         raise VideoStudioInputError("variant count must be between 1 and 3")
-    registration = _registration_for_quality(quality_profile)
+    registration = _registration_for_quality(
+        quality_profile,
+        content_rating=content_rating,
+    )
     _validate_quality_limits(
         quality_profile=quality_profile,
         duration_seconds=duration_seconds,
         variant_count=variant_count,
     )
     _fps, frame_count = _video_timing(duration_seconds, profile=registration.profile)
-    return (
+    estimate_microusd = (
         _estimated_cost_microusd(
             max_hourly_cost_usd=max_hourly_cost_usd,
             registration=registration,
@@ -571,6 +630,8 @@ def planning_estimate_microusd(
         )
         * variant_count
     )
+    _validate_a14b_budget(quality_profile, estimate_microusd)
+    return estimate_microusd
 
 
 def format_microusd(value: int) -> str:
@@ -582,6 +643,11 @@ def _validate_command(command: CreateVideoSubmission) -> None:
         raise VideoStudioInputError(
             f"motion prompt must be at most {MAX_VIDEO_PROMPT_LENGTH} characters"
         )
+    if (
+        command.quality_profile == VideoQualityProfile.SMOOTHMIX_A14B_Q3
+        and not command.prompt.strip()
+    ):
+        raise VideoStudioInputError("SmoothMix A14B motion prompt is required")
     if command.prompt != command.prompt.strip():
         raise VideoStudioInputError("motion prompt must not have outer whitespace")
     if command.duration_seconds not in VIDEO_DURATION_SECONDS:
@@ -692,15 +758,23 @@ def _derive_video_dimensions(
     source_height: int,
     *,
     profile: VideoProfile = PINNED_VIDEO_PROFILE,
-) -> tuple[
-    Literal[480, 832, 1152, 1472],
-    Literal[480, 832, 1152, 1472],
-]:
+) -> tuple[int, int]:
     if source_width <= 0 or source_height <= 0:
         raise VideoStudioConflictError("source image dimensions are invalid")
     aspect_ratio = source_width / source_height
     if not 1 / 3.25 <= aspect_ratio <= 3.25:
         raise VideoStudioConflictError("source image aspect ratio is outside the animation profile")
+    if profile in {A14B_VIDEO_PROFILE, A14B_ADULT_VIDEO_PROFILE}:
+        try:
+            # Validate that a bounded internal inference canvas exists, but
+            # persist only the final MP4 dimensions. The worker derives the
+            # internal canvas deterministically from the frozen source.
+            derive_a14b_render_dimensions(source_width, source_height)
+            return derive_a14b_output_dimensions(source_width, source_height)
+        except ValueError as error:
+            raise VideoStudioConflictError(
+                "source image dimensions are outside the A14B output profile"
+            ) from error
     if source_width >= source_height:
         return cast(
             "tuple[Literal[480, 832, 1152, 1472], Literal[480, 832, 1152, 1472]]",
@@ -734,13 +808,15 @@ def _video_timing(
     duration_seconds: int,
     *,
     profile: VideoProfile,
-) -> tuple[Literal[24], Literal[73, 121]]:
+) -> tuple[int, int]:
     # Wan video latents are most efficient with 4n+1 frames.  The player loops
     # the short base clip, so these are intentionally near 3s/5s rather than a
     # costly long-form render.
+    if profile in {A14B_VIDEO_PROFILE, A14B_ADULT_VIDEO_PROFILE}:
+        return profile.fps, profile.default_native_frame_count
     if duration_seconds == 3:
-        return cast("Literal[24]", profile.fps), 73
-    return cast("Literal[24]", profile.fps), 121
+        return profile.fps, 73
+    return profile.fps, 121
 
 
 def _requested_duration_from_frames(frame_count: int, fps: int) -> int:
@@ -780,7 +856,15 @@ def _estimated_cost_microusd(
 
 def _registration_for_quality(
     quality_profile: VideoQualityProfile,
+    *,
+    content_rating: VideoContentRating = VideoContentRating.SFW,
 ) -> VideoProfileRegistration:
+    if quality_profile == VideoQualityProfile.SMOOTHMIX_A14B_Q3:
+        return (
+            A14B_VIDEO_PROFILE_REGISTRATION
+            if content_rating == VideoContentRating.SFW
+            else A14B_ADULT_VIDEO_PROFILE_REGISTRATION
+        )
     try:
         return _QUALITY_PROFILE_REGISTRATIONS[quality_profile]
     except (KeyError, TypeError):
@@ -797,6 +881,71 @@ def _validate_quality_limits(
         duration_seconds != 3 or variant_count != 1
     ):
         raise VideoStudioInputError("HQ native animation is limited to one 3-second canary")
+    if quality_profile == VideoQualityProfile.SMOOTHMIX_A14B_Q3 and (
+        duration_seconds != 5 or variant_count != 1
+    ):
+        raise VideoStudioInputError("SmoothMix A14B animation requires one 5-second variant")
+
+
+def _validate_a14b_budget(
+    quality_profile: VideoQualityProfile,
+    estimate_microusd: int,
+) -> None:
+    if (
+        quality_profile == VideoQualityProfile.SMOOTHMIX_A14B_Q3
+        and estimate_microusd > A14B_TEST_SPEND_CEILING_MICROUSD
+    ):
+        raise VideoStudioInputError("SmoothMix A14B estimate exceeds the $7 test ceiling")
+
+
+def _validated_submission_replay(
+    *,
+    command: CreateVideoSubmission,
+    submission_request_sha256: str,
+    replay: list[VideoGenerationJob],
+) -> VideoSubmissionRead:
+    if any(
+        job.cost_metadata.get("submission_request_sha256") != submission_request_sha256
+        for job in replay
+    ):
+        raise VideoStudioConflictError("this form was already submitted with different choices")
+    if len(replay) != command.variant_count:
+        raise VideoStudioConflictError("the saved submission is incomplete")
+    return _submission_read(command.submission_id, replay)
+
+
+async def _acquire_a14b_spend_lock(session: AsyncSession) -> None:
+    """Serialize the global A14B cap check and insert on PostgreSQL.
+
+    PostgreSQL holds this advisory lock until the caller commits or rolls back
+    the surrounding submission transaction. SQLite has no advisory locks; its
+    database writer serialization keeps the local/test path compatible.
+    """
+
+    if session.get_bind().dialect.name == "postgresql":
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": _POSTGRES_A14B_SPEND_LOCK_KEY},
+        )
+
+
+async def _validate_a14b_cumulative_budget(
+    session: AsyncSession,
+    *,
+    new_estimate_microusd: int,
+) -> None:
+    prior_estimate_microusd = int(
+        await session.scalar(
+            select(func.coalesce(func.sum(VideoGenerationJob.estimated_cost_microusd), 0)).where(
+                VideoGenerationJob.profile_key.in_(_A14B_PROFILE_IDS)
+            )
+        )
+        or 0
+    )
+    if prior_estimate_microusd + new_estimate_microusd > A14B_TEST_SPEND_CEILING_MICROUSD:
+        raise VideoStudioInputError(
+            "SmoothMix A14B cumulative estimate exceeds the $7 test ceiling"
+        )
 
 
 async def _require_actor(
@@ -882,6 +1031,7 @@ def _job_read(job: VideoGenerationJob) -> VideoJobRead:
         height=job.height,
         frame_count=job.frame_count,
         fps=job.fps,
+        loop_mode=job.loop_mode,
         estimated_cost_microusd=job.estimated_cost_microusd,
         reserved_cost_microusd=job.reserved_cost_microusd,
         actual_cost_microusd=job.actual_cost_microusd,

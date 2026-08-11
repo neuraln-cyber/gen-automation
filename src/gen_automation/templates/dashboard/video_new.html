@@ -5,21 +5,22 @@
     class="video-studio"
     data-video-studio
     data-hourly-rate-usd="{{ hourly_rate_usd }}"
+    data-planning-runtime-seconds="{{ planning_runtime_seconds }}"
   >
     <header class="video-studio-hero">
       <div>
         <p class="page-kicker">Image to video</p>
         <h1>Animation Studio</h1>
         <p class="lede">
-          Turn one private library image into a short, loop-ready motion clip.
-          The fixed economical profile keeps the GPU job small and scales back down after work.
+          Turn one private library image into a higher-resolution, loop-ready motion clip.
+          The final MP4 preserves the source dimensions, with at most one padding pixel per edge.
         </p>
       </div>
       <aside class="video-cost-note" aria-label="Cost plan">
         <span aria-hidden="true">GPU</span>
         <strong>Starts near {{ default_estimate }}</strong>
         <small>
-          Planning estimate for one 3-second variant at the configured
+          Conservative five-hour planning ceiling for one 5-second variant at the configured
           ${{ hourly_rate_usd }}/hour ceiling. Completed jobs show a conservative
           wall-clock usage estimate; provider billing remains authoritative.
         </small>
@@ -83,7 +84,7 @@
               <p class="page-kicker">2 - Motion</p>
               <h2 id="video-motion-heading">Describe the movement</h2>
             </div>
-            <span class="status">Optional prompt</span>
+            <span class="status">Required motion prompt</span>
           </div>
           <label class="video-field">
             <span>Motion prompt</span>
@@ -91,10 +92,11 @@
               name="prompt"
               rows="4"
               maxlength="4000"
-              placeholder="Subtle breathing, hair moving in a light breeze, gentle camera drift..."
+              required
+              placeholder="Locked camera. Clear full-body movement: weight shift, hip and shoulder motion, natural hair and clothing follow-through, one synchronized blink..."
             >{{ values.get("prompt", "") }}</textarea>
             <small>
-              Describe movement and camera behavior. Leave blank when the source already makes the motion obvious.
+              Use natural-language action sentences. Describe the main body motion, secondary hair or clothing motion, expression, and camera behavior. Avoid vague prompts that request only subtle breathing or gentle motion.
             </small>
           </label>
           <div class="video-choice-grid">
@@ -108,25 +110,22 @@
               </select>
             </label>
             <label class="video-field">
-              <span>Base loop length</span>
-              {% set selected_duration = values.get("duration_seconds", "3") %}
+              <span>Clip length</span>
+              {% set selected_duration = values.get("duration_seconds", "5") %}
               <select name="duration_seconds" data-video-duration>
-                <option value="3" {% if selected_duration == "3" %}selected{% endif %}>3s motion -> about 6s seamless loop</option>
-                <option value="5" {% if selected_duration == "5" %}selected{% endif %}>5s motion -> about 10s seamless loop</option>
+                <option value="5" selected>About 5s forward motion</option>
               </select>
             </label>
             <label class="video-field">
               <span>Variants</span>
               {% set selected_variants = values.get("variant_count", "1") %}
               <select name="variant_count" data-video-variants>
-                <option value="1" {% if selected_variants == "1" %}selected{% endif %}>1 variant</option>
-                <option value="2" {% if selected_variants == "2" %}selected{% endif %}>2 variants</option>
-                <option value="3" {% if selected_variants == "3" %}selected{% endif %}>3 variants</option>
+                <option value="1" selected>1 variant</option>
               </select>
             </label>
           </div>
           <p class="video-profile-note">
-            Fixed profile: Wan 2.2 TI2V 5B - source orientation preserved at 832x480 or 480x832 - H.264 MP4 - ping-pong loop without extra diffusion.
+            Fixed profile: SmoothMix Wan 2.2 I2V-A14B Q3 - 81 frames at 16 fps - source-size H.264 MP4 - forward playback loop.
           </p>
         </section>
 

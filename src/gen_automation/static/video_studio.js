@@ -35,7 +35,7 @@
     const updateEstimate = () => {
       if (!duration || !variants || !estimate) return;
       const hourly = Number.parseFloat(studio.dataset.hourlyRateUsd || "0");
-      const seconds = duration.value === "5" ? 600 : 360;
+      const seconds = Number.parseInt(studio.dataset.planningRuntimeSeconds || "0", 10);
       const count = Number.parseInt(variants.value, 10) || 1;
       const dollars = hourly * (seconds / 3600) * count;
       estimate.textContent = `$${dollars.toFixed(3)}`;

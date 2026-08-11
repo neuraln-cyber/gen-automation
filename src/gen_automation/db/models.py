@@ -82,6 +82,22 @@ from gen_automation.domain.video import (
 
 _VIDEO_V1_PROFILE_ID = "wan2.2-ti2v-5b-comfy-v1"
 _VIDEO_HQ_PROFILE_ID = "wan2.2-ti2v-5b-comfy-hq-v1"
+_VIDEO_A14B_PROFILE_ID = "wan2.2-smoothmix-i2v-a14b-q3-v1"
+_VIDEO_A14B_ADULT_PROFILE_ID = "wan2.2-smoothmix-i2v-a14b-q3-adult-v1"
+_VIDEO_A14B_JOB_CONTRACT_SHA256 = "3c31ee0e82b15c582dfccfb5cc83bde80b55dd835f4afd217f3ce342accc6e99"
+_VIDEO_A14B_ADULT_JOB_CONTRACT_SHA256 = (
+    "014fc4502c334bdcd6ec9a8acad08b7599316dd0ddf3788e2101f40588d3e859"
+)
+
+_VIDEO_A14B_OUTPUT_CONTRACT = (
+    "width BETWEEN 2 AND 2048 AND height BETWEEN 2 AND 2048 "
+    "AND width % 2 = 0 AND height % 2 = 0 "
+    "AND CAST(width AS BIGINT) * height <= 4194304 "
+    "AND width = source_width + (source_width % 2) "
+    "AND height = source_height + (source_height % 2) "
+    "AND 13 * CAST(source_width AS BIGINT) >= 4 * source_height "
+    "AND 4 * CAST(source_width AS BIGINT) <= 13 * source_height"
+)
 
 
 def _lower_hex_check(column_name: str) -> str:
@@ -609,30 +625,47 @@ class VideoGenerationJob(UuidPrimaryKeyMixin, TimestampMixin, Base):
         ),
         CheckConstraint("seed >= 0", name="nonnegative_seed"),
         CheckConstraint(
-            "frame_count IN (73, 121)",
+            "frame_count IN (73, 81, 121)",
             name="supported_frame_count",
         ),
         CheckConstraint(
-            "fps = 24",
-            name="fixed_fps",
+            "fps IN (16, 24)",
+            name="supported_fps",
         ),
         CheckConstraint(
             f"(profile_key = '{_VIDEO_V1_PROFILE_ID}' "
             "AND profile_version = 'video-worker-adapter-v1' "
             "AND profile_sha256 = "
             "'a83c946f9a61bac7cf3794fc9aa4debacc2fc676c13957deaed42ecf82c7e2e4' "
-            "AND frame_count IN (73, 121) AND max_attempts = 3 "
+            "AND frame_count IN (73, 121) AND fps = 24 AND loop_mode = 'ping_pong' "
+            "AND max_attempts = 3 "
             "AND ((width = 832 AND height = 480) OR (width = 480 AND height = 832))) "
             f"OR (profile_key = '{_VIDEO_HQ_PROFILE_ID}' "
             "AND profile_version = 'video-worker-adapter-hq-v1' "
             "AND profile_sha256 = "
             "'00fb341e491f295b2db16a32626a6383d83c6cda88978b29479caf245c817387' "
-            "AND frame_count = 73 AND max_attempts = 1 "
+            "AND frame_count = 73 AND fps = 24 AND loop_mode = 'ping_pong' "
+            "AND max_attempts = 1 "
             "AND ((width = 1472 AND height = 1152) "
-            "OR (width = 1152 AND height = 1472)))",
+            "OR (width = 1152 AND height = 1472))) "
+            f"OR (profile_key = '{_VIDEO_A14B_PROFILE_ID}' "
+            "AND profile_version = 'video-worker-adapter-smoothmix-i2v-a14b-q3-v1' "
+            f"AND profile_sha256 = '{_VIDEO_A14B_JOB_CONTRACT_SHA256}' "
+            "AND frame_count = 81 AND fps = 16 AND loop_mode = 'forward' "
+            "AND max_attempts = 1 AND content_rating = 'sfw' "
+            f"AND ({_VIDEO_A14B_OUTPUT_CONTRACT})) "
+            f"OR (profile_key = '{_VIDEO_A14B_ADULT_PROFILE_ID}' "
+            "AND profile_version = 'video-worker-adapter-smoothmix-i2v-a14b-q3-adult-v1' "
+            f"AND profile_sha256 = '{_VIDEO_A14B_ADULT_JOB_CONTRACT_SHA256}' "
+            "AND frame_count = 81 AND fps = 16 AND loop_mode = 'forward' "
+            "AND max_attempts = 1 AND content_rating IN ('nsfw', 'explicit') "
+            f"AND ({_VIDEO_A14B_OUTPUT_CONTRACT}))",
             name="supported_profile_contract",
         ),
-        CheckConstraint("loop_mode = 'ping_pong'", name="ping_pong_loop"),
+        CheckConstraint(
+            "loop_mode IN ('forward', 'ping_pong')",
+            name="supported_loop_mode",
+        ),
         CheckConstraint("max_attempts > 0", name="positive_max_attempts"),
         CheckConstraint(
             "attempt_count >= 0 AND attempt_count <= max_attempts",

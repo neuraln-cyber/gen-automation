@@ -30,18 +30,25 @@ read-only reconciliation phase; the manual Patreon handoff needs no API token.
 | Repository owner/maintainer | Review, merge, branch protection, Actions and package administration for `neuraln-cyber/gen-automation`. | Human GitHub login; local Git/CLI authentication stays in the user's credential manager. | Now. |
 | CI image publisher | No separately created token. The workflow grants the run-scoped `GITHUB_TOKEN` `packages:write`, `contents:read`, `id-token:write`, and `attestations:write`. | GitHub-managed `GITHUB_TOKEN`; never copy it out of Actions. | First successful push to `main`. |
 | Control-plane image pull | Read only the selected control-plane GHCR package. | Host-native GHCR integration or a dedicated pull credential with `read:packages` only. | Control-plane deployment. |
-| Salad worker image pull | Read only the selected GPU-worker package if it remains private. | A registry credential stored in Salad's registry-auth facility, never as a worker environment variable. | GPU canary. |
+| Salad worker image pull | Read only the selected GPU-worker package if it remains private. | A request-scoped registry credential submitted through Salad's registry-auth field, never as a worker environment variable or durable app configuration. | GPU canary. |
 
-Only immutable `@sha256:<digest>` image references are deployable. The current
-Salad provisioning adapter does not yet inject private-registry authentication.
-Therefore one of these must be completed before its canary:
+Only immutable `@sha256:<digest>` image references are deployable. A private
+video deployment stores only the non-secret `ephemeral_basic` pull-mode marker.
+The ordinary controller defers its first container-group creation until an
+operator supplies a registry credential bound to that exact digest. The adapter
+injects it only into that creation POST; it is excluded from durable deployment
+JSON, worker environment, audit detail, and later PATCH requests.
 
-1. configure Salad's provider-managed registry authentication without placing
-   the credential in durable deployment JSON; or
-2. make only the model-free GPU-worker package public and pull it anonymously.
-
-The control-plane package may remain private. Models, LoRAs, images, prompts,
-credentials, and manifests are never baked into either image.
+The control-plane package may remain private. The legacy model-free worker does
+not bake models or LoRAs. The separate experimental model-bearing A14B worker is
+an explicit exception: checksum-pinned model artifacts and its non-secret model
+manifest are baked into a private image, while source images, prompts, and
+credentials are never baked. It requires migration `20260811_0036`, a green
+critical-vulnerability scan of the exact-digest attached SBOM, and
+provider-managed registry authentication. Before any canary,
+prove that anonymous pull fails and authenticated pull of the immutable digest
+succeeds without persisting registry credentials in worker environment or
+durable deployment JSON.
 
 ### Control-plane host, DNS, and TLS
 

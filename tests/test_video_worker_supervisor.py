@@ -113,13 +113,15 @@ async def test_health_is_served_while_model_integrity_hashing_runs(
 ) -> None:
     server: _ProbeServer | None = None
     observed: list[tuple[int, bytes]] = []
+    settings = _settings(tmp_path)
 
     def build_server(application: ASGIApp) -> _ProbeServer:
         nonlocal server
         server = _ProbeServer(application)
         return server
 
-    def fail_after_probe() -> None:
+    def fail_after_probe(*, profile_ids: frozenset[str]) -> None:
+        assert profile_ids == settings.allowed_profile_ids
         assert server is not None
         observed.append(asyncio.run(_asgi_request(server.application, "/health")))
         observed.append(asyncio.run(_asgi_request(server.application, "/ready")))
@@ -129,7 +131,7 @@ async def test_health_is_served_while_model_integrity_hashing_runs(
     monkeypatch.setattr(worker_main, "verify_model_runtime", fail_after_probe)
 
     with pytest.raises(ModelIntegrityError, match="expected test stop"):
-        await worker_main.serve_worker_lifecycle(_settings(tmp_path))
+        await worker_main.serve_worker_lifecycle(settings)
 
     assert observed == [
         (200, b'{"status":"bootstrapping","version":"video-worker.v1"}'),

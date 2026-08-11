@@ -70,7 +70,15 @@ from gen_automation.video_worker.models import (
     SourceDownloadGrant,
     VideoUploadGrant,
 )
-from gen_automation.video_worker.profiles import get_video_profile_registration
+from gen_automation.video_worker.profiles import (
+    A14B_ADULT_VIDEO_PROFILE,
+    A14B_VIDEO_PROFILE,
+    HQ_VIDEO_PROFILE,
+    PINNED_VIDEO_PROFILE,
+    derive_a14b_output_dimensions,
+    derive_a14b_render_dimensions,
+    get_video_profile_registration,
+)
 from gen_automation.video_worker.security import calculate_signature
 
 _ACTIVE_JOB_STATES = frozenset(
@@ -113,6 +121,46 @@ _RECONCILIATION_PAGE_SIZE_KEY = "reconciliation_page_size"
 _RECONCILIATION_LEGACY_NEXT_PAGE_KEY = "reconciliation_next_page"
 _MAX_RECONCILIATION_BATCH_TIMEOUT_SECONDS = 30.0
 _MAX_WORKER_ENVELOPE_BYTES = 128 * 1024
+_A14B_OUTER_WATCHDOG_SECONDS = 18_000
+PRIVATE_A14B_VIDEO_WORKER_IMAGE_REPOSITORY = (
+    "ghcr.io/neuraln-cyber/gen-automation/video-worker-a14b-private"
+)
+LEGACY_VIDEO_RUNTIME_PROFILE_IDS = (
+    PINNED_VIDEO_PROFILE.profile_id,
+    HQ_VIDEO_PROFILE.profile_id,
+)
+A14B_VIDEO_RUNTIME_PROFILE_IDS = (
+    A14B_VIDEO_PROFILE.profile_id,
+    A14B_ADULT_VIDEO_PROFILE.profile_id,
+)
+
+
+def _digest_pinned_image_repository(worker_image_digest: str) -> str | None:
+    repository, separator, digest = worker_image_digest.partition("@sha256:")
+    if (
+        separator != "@sha256:"
+        or not repository
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        return None
+    return repository
+
+
+def is_private_a14b_video_worker_image(worker_image_digest: str) -> bool:
+    return (
+        _digest_pinned_image_repository(worker_image_digest)
+        == PRIVATE_A14B_VIDEO_WORKER_IMAGE_REPOSITORY
+    )
+
+
+def video_runtime_profile_ids_for_worker_image(worker_image_digest: str) -> tuple[str, ...]:
+    repository = _digest_pinned_image_repository(worker_image_digest)
+    if repository is None:
+        return ()
+    if repository == PRIVATE_A14B_VIDEO_WORKER_IMAGE_REPOSITORY:
+        return A14B_VIDEO_RUNTIME_PROFILE_IDS
+    return LEGACY_VIDEO_RUNTIME_PROFILE_IDS
 
 
 def _reconciliation_start_offset(metadata: Mapping[str, Any]) -> int:
@@ -151,6 +199,7 @@ class VideoRuntimeConfig:
     enabled: bool
     queue_name: str = ""
     worker_image_digest: str = ""
+    allowed_profile_ids: tuple[str, ...] = field(init=False)
     signing_key_id: str = ""
     signing_private_key: str = field(default="", repr=False)
     signature_ttl_seconds: int = 7200
@@ -166,9 +215,19 @@ class VideoRuntimeConfig:
     reconciliation_batch_timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
+        allowed_profile_ids = video_runtime_profile_ids_for_worker_image(self.worker_image_digest)
+        object.__setattr__(self, "allowed_profile_ids", allowed_profile_ids)
         if self.enabled and (not self.queue_name or len(self.queue_name) > 200):
             raise ValueError("video queue name is invalid")
-        if self.enabled and "@sha256:" not in self.worker_image_digest:
+        if self.enabled and (
+            not allowed_profile_ids
+            or len(set(self.allowed_profile_ids)) != len(self.allowed_profile_ids)
+            or any(
+                get_video_profile_registration(value) is None for value in self.allowed_profile_ids
+            )
+        ):
+            raise ValueError("video runtime profile allowlist is invalid")
+        if self.enabled and _digest_pinned_image_repository(self.worker_image_digest) is None:
             raise ValueError("video worker image must be digest pinned")
         if self.enabled and (not self.signing_key_id or not self.signing_private_key):
             raise ValueError("video worker signing configuration is incomplete")
@@ -225,6 +284,8 @@ class _ObservationClaim:
     cancel_requested_at: datetime | None
     submitted_at: datetime
     running_started_at: datetime | None
+    attempt_watchdog_seconds: int
+    queue_wait_watchdog_seconds: int
     lease_owner: str
     quarantine_provider_ids: tuple[str, ...]
     quarantine_error_code: str | None
@@ -295,6 +356,43 @@ class VideoRuntime:
                 if deployment.worker_image_digest != self.config.worker_image_digest:
                     return False
 
+                incompatible_count = int(
+                    await session.scalar(
+                        select(func.count(VideoGenerationJob.id)).where(
+                            VideoGenerationJob.state.not_in(
+                                {
+                                    VideoGenerationState.SUCCEEDED,
+                                    VideoGenerationState.FAILED,
+                                    VideoGenerationState.CANCELLED,
+                                }
+                            ),
+                            VideoGenerationJob.profile_key.not_in(self.config.allowed_profile_ids),
+                        )
+                    )
+                    or 0
+                )
+                if incompatible_count:
+                    # A private A14B image does not carry the legacy/HQ model.
+                    # Require the old lane to be fully drained before this
+                    # exact-digest runtime can claim any new provider work.
+                    return False
+                incompatible_attempt_count = int(
+                    await session.scalar(
+                        select(func.count(VideoGenerationAttempt.id))
+                        .join(
+                            VideoGenerationJob,
+                            VideoGenerationJob.id == VideoGenerationAttempt.video_generation_job_id,
+                        )
+                        .where(
+                            VideoGenerationAttempt.state.in_(_ACTIVE_ATTEMPT_STATES),
+                            VideoGenerationJob.profile_key.not_in(self.config.allowed_profile_ids),
+                        )
+                    )
+                    or 0
+                )
+                if incompatible_attempt_count:
+                    return False
+
                 active_count = int(
                     await session.scalar(
                         select(func.count(VideoGenerationJob.id)).where(
@@ -310,6 +408,7 @@ class VideoRuntime:
                     select(VideoGenerationJob)
                     .where(
                         VideoGenerationJob.provider == "salad",
+                        VideoGenerationJob.profile_key.in_(self.config.allowed_profile_ids),
                         (
                             (VideoGenerationJob.state == VideoGenerationState.QUEUED)
                             | (
@@ -606,6 +705,7 @@ class VideoRuntime:
                 if (
                     attempt.state != VideoGenerationAttemptState.CREATED
                     or attempt.provider_external_id is not None
+                    or job.profile_key not in self.config.allowed_profile_ids
                 ):
                     return False
                 attempt.state = VideoGenerationAttemptState.SUBMITTING
@@ -715,7 +815,7 @@ class VideoRuntime:
             if error.status_code == 404:
                 if (
                     observed_at - context.submitted_at
-                ).total_seconds() >= self.config.attempt_watchdog_seconds:
+                ).total_seconds() >= context.attempt_watchdog_seconds:
                     await self._fail_attempt(
                         context.attempt_id,
                         code="video_provider_job_not_found_watchdog",
@@ -737,13 +837,11 @@ class VideoRuntime:
         if remote.status in {SaladJobStatus.PENDING, SaladJobStatus.RUNNING}:
             if remote.status == SaladJobStatus.PENDING:
                 watchdog_started_at = context.submitted_at
-                watchdog_seconds = (
-                    self.config.signature_ttl_seconds - self.config.reconciliation_interval_seconds
-                )
+                watchdog_seconds = context.queue_wait_watchdog_seconds
                 watchdog_code = "video_queue_wait_watchdog_expired"
             else:
                 watchdog_started_at = context.running_started_at or observed_at
-                watchdog_seconds = self.config.attempt_watchdog_seconds
+                watchdog_seconds = context.attempt_watchdog_seconds
                 watchdog_code = "video_attempt_watchdog_expired"
             if (observed_at - watchdog_started_at).total_seconds() >= watchdog_seconds:
                 try:
@@ -818,7 +916,7 @@ class VideoRuntime:
                 if (
                     error.status_code != 404
                     or (now - context.submitted_at).total_seconds()
-                    < self.config.attempt_watchdog_seconds
+                    < context.attempt_watchdog_seconds
                 ):
                     all_terminal = False
             except SaladCloudError:
@@ -1143,7 +1241,10 @@ class VideoRuntime:
                 .where(
                     VideoGenerationAttempt.provider_external_id.is_(None),
                     or_(
-                        VideoGenerationAttempt.state == VideoGenerationAttemptState.CREATED,
+                        and_(
+                            VideoGenerationAttempt.state == VideoGenerationAttemptState.CREATED,
+                            VideoGenerationJob.profile_key.in_(self.config.allowed_profile_ids),
+                        ),
                         and_(
                             VideoGenerationAttempt.state.in_(
                                 {
@@ -1344,7 +1445,11 @@ class VideoRuntime:
             if job.source_object_version_id is None:
                 raise ValueError("video source version is unavailable")
             registration = get_video_profile_registration(job.profile_key)
-            if registration is None or not _profile_matches(job):
+            if (
+                job.profile_key not in self.config.allowed_profile_ids
+                or registration is None
+                or not _profile_matches(job)
+            ):
                 raise ValueError("video profile identity changed")
             requires_bound_contract = (
                 registration.job_contract_sha256 != registration.profile_sha256
@@ -1352,11 +1457,26 @@ class VideoRuntime:
             worker_wire_version = (
                 "video-worker.v2" if requires_bound_contract else "video-worker.v1"
             )
+            is_a14b = registration.profile in {
+                A14B_VIDEO_PROFILE,
+                A14B_ADULT_VIDEO_PROFILE,
+            }
+            attempt_watchdog_seconds = (
+                _A14B_OUTER_WATCHDOG_SECONDS if is_a14b else self.config.attempt_watchdog_seconds
+            )
+            grant_ttl_seconds = (
+                max(
+                    self.config.grant_ttl_seconds,
+                    (attempt_watchdog_seconds * 2) + self.config.reconciliation_interval_seconds,
+                )
+                if is_a14b
+                else self.config.grant_ttl_seconds
+            )
 
         source_url = await self.store.presign_download(
             key=job.source_object_key,
             version_id=job.source_object_version_id,
-            expires_in=self.config.grant_ttl_seconds,
+            expires_in=grant_ttl_seconds,
         )
         upload = await self.store.presign_upload(
             key=output_key,
@@ -1368,7 +1488,7 @@ class VideoRuntime:
                 "output-asset-id": str(output_asset_id),
                 "upload-attempt-id": str(upload_attempt_id),
             },
-            expires_in=self.config.grant_ttl_seconds,
+            expires_in=grant_ttl_seconds,
             max_bytes=self.config.max_output_bytes,
         )
         if upload.method != "POST" or upload.headers:
@@ -1643,6 +1763,14 @@ class VideoRuntime:
                 cancel_requested_at = _cancel_requested_at(attempt)
                 if cancellation_pending and cancel_requested_at is None:
                     cancel_requested_at = _set_cancel_requested_at(attempt, now)
+                registration = get_video_profile_registration(job.profile_key)
+                if registration is None:
+                    return None
+                attempt_watchdog_seconds = (
+                    _A14B_OUTER_WATCHDOG_SECONDS
+                    if registration.profile in {A14B_VIDEO_PROFILE, A14B_ADULT_VIDEO_PROFILE}
+                    else self.config.attempt_watchdog_seconds
+                )
                 return _ObservationClaim(
                     attempt_id=attempt.id,
                     deployment_id=deployment.id,
@@ -1654,6 +1782,12 @@ class VideoRuntime:
                     submitted_at=_as_utc(attempt.submit_started_at or attempt.created_at),
                     running_started_at=(
                         _as_utc(attempt.started_at) if attempt.started_at is not None else None
+                    ),
+                    attempt_watchdog_seconds=attempt_watchdog_seconds,
+                    queue_wait_watchdog_seconds=max(
+                        1,
+                        self.config.signature_ttl_seconds
+                        - self.config.reconciliation_interval_seconds,
                     ),
                     lease_owner=lease_owner,
                     quarantine_provider_ids=quarantine_ids,
@@ -2388,17 +2522,28 @@ def _profile_matches(job: VideoGenerationJob) -> bool:
     if registration is None:
         return False
     profile = registration.profile
+    is_a14b = profile in {A14B_VIDEO_PROFILE, A14B_ADULT_VIDEO_PROFILE}
+    if is_a14b:
+        try:
+            derive_a14b_render_dimensions(job.source_width, job.source_height)
+            dimensions_valid = (job.width, job.height) == derive_a14b_output_dimensions(
+                job.source_width,
+                job.source_height,
+            )
+        except ValueError:
+            dimensions_valid = False
+    else:
+        dimensions_valid = (job.width, job.height) in {
+            (profile.landscape_width, profile.landscape_height),
+            (profile.portrait_width, profile.portrait_height),
+        }
     return (
         job.profile_version == profile.adapter_revision
         and job.profile_sha256 == registration.job_contract_sha256
         and job.max_attempts == registration.max_attempts
         and job.frame_count in profile.permitted_native_frame_counts
         and job.fps == profile.fps
-        and (job.width, job.height)
-        in {
-            (profile.landscape_width, profile.landscape_height),
-            (profile.portrait_width, profile.portrait_height),
-        }
+        and dimensions_valid
         and job.loop_mode == profile.loop_mode
         and len(job.prompt) <= 4000
         and len(job.negative_prompt) <= 4000
@@ -2423,7 +2568,9 @@ def _response_matches(
         if registration.job_contract_sha256 != registration.profile_sha256
         else "video-worker.v1"
     )
-    expected_output_frames = (job.frame_count * 2) - 2
+    expected_output_frames = (
+        job.frame_count if job.loop_mode == "forward" else (job.frame_count * 2) - 2
+    )
     expected_native_duration = job.frame_count / job.fps
     expected_duration = expected_output_frames / job.fps
     return (

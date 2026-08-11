@@ -126,11 +126,20 @@ class SaladClient:
             "api_key=<redacted>)"
         )
 
-    def _redact(self, value: str) -> str:
-        return value.replace(self.__api_key, "[redacted]")
+    def _redact(self, value: str, sensitive_values: Sequence[str] = ()) -> str:
+        redacted = value.replace(self.__api_key, "[redacted]")
+        for sensitive_value in sensitive_values:
+            if sensitive_value:
+                redacted = redacted.replace(sensitive_value, "[redacted]")
+        return redacted
 
-    def _error_details(self, response: httpx2.Response) -> tuple[str, str]:
-        raw_body = self._redact(response.text)
+    def _error_details(
+        self,
+        response: httpx2.Response,
+        *,
+        sensitive_values: Sequence[str] = (),
+    ) -> tuple[str, str]:
+        raw_body = self._redact(response.text, sensitive_values)
         normalized_body = " ".join(html.unescape(_HTML_TAG.sub(" ", raw_body)).split())[
             :_MAX_ERROR_BODY_LENGTH
         ]
@@ -143,14 +152,22 @@ class SaladClient:
             for key in ("title", "detail", "type"):
                 value = payload.get(key)
                 if isinstance(value, (str, int, float)):
-                    text = self._redact(str(value)).strip()
+                    text = self._redact(str(value), sensitive_values).strip()
                     if text and text not in message_parts:
                         message_parts.append(text)
         message = ": ".join(message_parts) or normalized_body or response.reason_phrase
         return message[:_MAX_ERROR_BODY_LENGTH], normalized_body
 
-    def _raise_api_error(self, response: httpx2.Response) -> NoReturn:
-        message, response_body = self._error_details(response)
+    def _raise_api_error(
+        self,
+        response: httpx2.Response,
+        *,
+        sensitive_values: Sequence[str] = (),
+    ) -> NoReturn:
+        message, response_body = self._error_details(
+            response,
+            sensitive_values=sensitive_values,
+        )
         request_id = response.headers.get("x-request-id") or response.headers.get("request-id")
         if response.status_code == 429:
             raise SaladRateLimitError(
@@ -175,6 +192,7 @@ class SaladClient:
         json_body: JSONObject | None = None,
         params: Mapping[str, str | int] | None = None,
         content_type: str | None = None,
+        sensitive_values: Sequence[str] = (),
     ) -> httpx2.Response:
         headers = {
             "Accept": "application/json",
@@ -182,6 +200,8 @@ class SaladClient:
         }
         if content_type is not None:
             headers["Content-Type"] = content_type
+        response: httpx2.Response | None = None
+        request_error: SaladTimeoutError | SaladTransportError | None = None
         try:
             if json_body is None:
                 response = await self._http_client.request(
@@ -200,12 +220,19 @@ class SaladClient:
                     json=json_body,
                     timeout=self._timeout,
                 )
-        except httpx2.TimeoutException as error:
-            raise SaladTimeoutError("SaladCloud request timed out") from error
-        except httpx2.RequestError as error:
-            raise SaladTransportError("SaladCloud request failed") from error
+        except httpx2.TimeoutException:
+            # httpx exceptions retain their Request, including JSON bodies.
+            # Raise only after leaving the handler so neither ``__cause__`` nor
+            # ``__context__`` retains a credential-bearing request.
+            request_error = SaladTimeoutError("SaladCloud request timed out")
+        except httpx2.RequestError:
+            request_error = SaladTransportError("SaladCloud request failed")
+        if request_error is not None:
+            raise request_error
+        if response is None:
+            raise SaladTransportError("SaladCloud request failed")
         if response.status_code != expected_status:
-            self._raise_api_error(response)
+            self._raise_api_error(response, sensitive_values=sensitive_values)
         return response
 
     async def _request_json(
@@ -217,6 +244,7 @@ class SaladClient:
         json_body: JSONObject | None = None,
         params: Mapping[str, str | int] | None = None,
         content_type: str | None = None,
+        sensitive_values: Sequence[str] = (),
     ) -> JSONObject:
         response = await self._request(
             method,
@@ -225,6 +253,7 @@ class SaladClient:
             json_body=json_body,
             params=params,
             content_type=content_type,
+            sensitive_values=sensitive_values,
         )
         try:
             payload: object = response.json()
@@ -391,11 +420,22 @@ class SaladClient:
         self,
         configuration: Mapping[str, JSONValue],
     ) -> SaladContainerGroup:
+        sensitive_values: tuple[str, ...] = ()
+        container = configuration.get("container")
+        if isinstance(container, Mapping):
+            registry_authentication = container.get("registry_authentication")
+            if isinstance(registry_authentication, Mapping):
+                basic = registry_authentication.get("basic")
+                if isinstance(basic, Mapping):
+                    password = basic.get("password")
+                    if isinstance(password, str) and password:
+                        sensitive_values = (password,)
         data = await self._request_json(
             "POST",
             f"{self._project_path}/containers",
             expected_status=201,
             json_body=dict(configuration),
+            sensitive_values=sensitive_values,
         )
         return _parse_model(data, parse_container_group)
 

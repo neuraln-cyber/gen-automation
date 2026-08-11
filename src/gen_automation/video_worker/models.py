@@ -14,7 +14,12 @@ from pydantic import (
 )
 
 from gen_automation.domain.signing import SigningMaterialError, validate_public_key
-from gen_automation.video_worker.profiles import get_video_profile_registration
+from gen_automation.video_worker.profiles import (
+    A14B_ADULT_VIDEO_PROFILE,
+    A14B_VIDEO_PROFILE,
+    get_video_profile_registration,
+    is_a14b_output_dimensions,
+)
 
 MAX_HARD_BODY_BYTES = 512 * 1024
 MAX_HARD_SOURCE_BYTES = 100 * 1024 * 1024
@@ -72,6 +77,12 @@ class WorkerSettings(BaseModel):
     allowed_source_origins: frozenset[str]
     allowed_upload_origin: str
     staging_root: Path
+    allowed_profile_ids: frozenset[str] = frozenset(
+        {
+            "wan2.2-ti2v-5b-comfy-v1",
+            "wan2.2-ti2v-5b-comfy-hq-v1",
+        }
+    )
     max_body_bytes: int = Field(default=128 * 1024, ge=1024, le=MAX_HARD_BODY_BYTES)
     max_source_bytes: int = Field(
         default=DEFAULT_MAX_SOURCE_BYTES,
@@ -121,6 +132,13 @@ class WorkerSettings(BaseModel):
         parse_https_origin(self.allowed_upload_origin, origin_only=True)
         if not self.staging_root.is_absolute():
             raise ValueError("staging root must be absolute")
+        if not self.allowed_profile_ids or len(self.allowed_profile_ids) > 8:
+            raise ValueError("invalid video worker profiles")
+        if any(
+            get_video_profile_registration(profile_id) is None
+            for profile_id in self.allowed_profile_ids
+        ):
+            raise ValueError("invalid video worker profiles")
         return self
 
     @property
@@ -185,6 +203,8 @@ class AnimatePayload(BaseModel):
     profile_id: Literal[
         "wan2.2-ti2v-5b-comfy-v1",
         "wan2.2-ti2v-5b-comfy-hq-v1",
+        "wan2.2-smoothmix-i2v-a14b-q3-v1",
+        "wan2.2-smoothmix-i2v-a14b-q3-adult-v1",
     ]
     profile_sha256: (
         Annotated[
@@ -201,11 +221,11 @@ class AnimatePayload(BaseModel):
         repr=False,
     )
     seed: int = Field(ge=0, le=9_223_372_036_854_775_807)
-    native_frame_count: Literal[73, 121] = 73
-    fps: Literal[24]
-    width: Literal[480, 832, 1152, 1472]
-    height: Literal[480, 832, 1152, 1472]
-    loop_mode: Literal["ping_pong"]
+    native_frame_count: Literal[73, 81, 121] = 73
+    fps: Literal[16, 24]
+    width: Annotated[int, Field(ge=2, le=2048)]
+    height: Annotated[int, Field(ge=2, le=2048)]
+    loop_mode: Literal["forward", "ping_pong"]
 
     @model_validator(mode="after")
     def validate_pinned_profile(self) -> "AnimatePayload":
@@ -218,16 +238,23 @@ class AnimatePayload(BaseModel):
             requires_bound_contract and self.profile_sha256 != registration.job_contract_sha256
         ) or (not requires_bound_contract and self.profile_sha256 is not None):
             raise ValueError("invalid profile")
-        if (self.width, self.height) not in {
-            (
-                profile.landscape_width,
-                profile.landscape_height,
-            ),
-            (
-                profile.portrait_width,
-                profile.portrait_height,
-            ),
-        } or (
+        is_a14b = profile in {A14B_VIDEO_PROFILE, A14B_ADULT_VIDEO_PROFILE}
+        dimensions_valid = (
+            is_a14b_output_dimensions(self.width, self.height)
+            if is_a14b
+            else (self.width, self.height)
+            in {
+                (
+                    profile.landscape_width,
+                    profile.landscape_height,
+                ),
+                (
+                    profile.portrait_width,
+                    profile.portrait_height,
+                ),
+            }
+        )
+        if not dimensions_valid or (
             self.native_frame_count not in profile.permitted_native_frame_counts
             or self.fps != profile.fps
             or self.loop_mode != profile.loop_mode
@@ -275,7 +302,7 @@ class AnimateResponse(BaseModel):
     upload_attempt_id: str
     output_sha256: str
     output_size_bytes: int
-    loop_mode: Literal["ping_pong"] = "ping_pong"
+    loop_mode: Literal["forward", "ping_pong"] = "ping_pong"
     fps: int
     width: int
     height: int

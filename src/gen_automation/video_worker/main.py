@@ -17,6 +17,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from gen_automation.video_worker.app import create_video_worker_app
 from gen_automation.video_worker.comfy import NativeComfyWanExecutor
 from gen_automation.video_worker.model_integrity import (
+    A14B_VIDEO_PROFILE_IDS,
     ModelIntegrityError,
     verify_model_runtime,
 )
@@ -85,6 +86,7 @@ def load_settings() -> WorkerSettings:
             verification_keys=_json_object("VIDEO_WORKER_VERIFICATION_KEYS_JSON"),
             allowed_source_origins=_json_string_set("VIDEO_WORKER_ALLOWED_SOURCE_ORIGINS_JSON"),
             allowed_upload_origin=_required_environment("VIDEO_WORKER_ALLOWED_UPLOAD_ORIGIN"),
+            allowed_profile_ids=_json_string_set("VIDEO_WORKER_PROFILE_IDS_JSON"),
             staging_root=Path(
                 os.environ.get("VIDEO_WORKER_STAGING_ROOT", "/opt/video-worker/runtime")
             ),
@@ -140,13 +142,30 @@ def _comfy_environment(source: dict[str, str]) -> dict[str, str]:
     return result
 
 
-def start_comfy() -> subprocess.Popen[bytes]:
+def start_comfy(*, profile_ids: frozenset[str]) -> subprocess.Popen[bytes]:
     input_directory = _COMFY_RUNTIME_ROOT / "input"
     output_directory = _COMFY_RUNTIME_ROOT / "output"
     temp_directory = _COMFY_RUNTIME_ROOT / "temp"
     user_directory = _COMFY_RUNTIME_ROOT / "user"
     for directory in (input_directory, output_directory, temp_directory, user_directory):
         directory.mkdir(parents=True, exist_ok=True)
+    profile_runtime_flags = (
+        (
+            "--disable-all-custom-nodes",
+            "--whitelist-custom-nodes",
+            "ComfyUI-GGUF",
+            "ComfyUI-NAG",
+            "--lowvram",
+            "--disable-smart-memory",
+            "--cache-none",
+            "--reserve-vram",
+            "3",
+            "--async-offload",
+            "2",
+        )
+        if profile_ids == A14B_VIDEO_PROFILE_IDS
+        else ("--disable-all-custom-nodes",)
+    )
     command = (
         "/opt/video-worker-venv/bin/python",
         (_COMFY_ROOT / "main.py").as_posix(),
@@ -155,7 +174,7 @@ def start_comfy() -> subprocess.Popen[bytes]:
         "--port",
         "8188",
         "--disable-auto-launch",
-        "--disable-all-custom-nodes",
+        *profile_runtime_flags,
         "--disable-api-nodes",
         "--disable-metadata",
         "--models-directory",
@@ -440,8 +459,11 @@ async def serve_worker_lifecycle(settings: WorkerSettings) -> bool:
         await _wait_for_server_start(server, server_task)
         # Hashing 18 GB is deliberately moved off the event loop. The socket
         # above remains healthy while integrity and Comfy startup complete.
-        await asyncio.to_thread(verify_model_runtime)
-        comfy_process = start_comfy()
+        await asyncio.to_thread(
+            verify_model_runtime,
+            profile_ids=settings.allowed_profile_ids,
+        )
+        comfy_process = start_comfy(profile_ids=settings.allowed_profile_ids)
         client = httpx2.Client(
             base_url=_COMFY_BASE_URL,
             follow_redirects=False,
