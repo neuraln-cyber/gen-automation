@@ -14,7 +14,7 @@ from pydantic import (
 )
 
 from gen_automation.domain.signing import SigningMaterialError, validate_public_key
-from gen_automation.video_worker.profiles import PINNED_VIDEO_PROFILE
+from gen_automation.video_worker.profiles import get_video_profile_registration
 
 MAX_HARD_BODY_BYTES = 512 * 1024
 MAX_HARD_SOURCE_BYTES = 100 * 1024 * 1024
@@ -182,7 +182,17 @@ class AnimatePayload(BaseModel):
 
     job_id: BoundedId
     attempt_id: BoundedId
-    profile_id: Literal["wan2.2-ti2v-5b-comfy-v1"]
+    profile_id: Literal[
+        "wan2.2-ti2v-5b-comfy-v1",
+        "wan2.2-ti2v-5b-comfy-hq-v1",
+    ]
+    profile_sha256: (
+        Annotated[
+            str,
+            StringConstraints(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"),
+        ]
+        | None
+    ) = None
     source: SourceDownloadGrant
     upload: VideoUploadGrant
     prompt: Annotated[str, StringConstraints(max_length=4000)] = Field(default="", repr=False)
@@ -193,24 +203,35 @@ class AnimatePayload(BaseModel):
     seed: int = Field(ge=0, le=9_223_372_036_854_775_807)
     native_frame_count: Literal[73, 121] = 73
     fps: Literal[24]
-    width: Literal[480, 832]
-    height: Literal[480, 832]
+    width: Literal[480, 832, 1152, 1472]
+    height: Literal[480, 832, 1152, 1472]
     loop_mode: Literal["ping_pong"]
 
     @model_validator(mode="after")
     def validate_pinned_profile(self) -> "AnimatePayload":
-        if self.profile_id != PINNED_VIDEO_PROFILE.profile_id:
+        registration = get_video_profile_registration(self.profile_id)
+        if registration is None:
+            raise ValueError("invalid profile")
+        profile = registration.profile
+        requires_bound_contract = registration.job_contract_sha256 != registration.profile_sha256
+        if (
+            requires_bound_contract and self.profile_sha256 != registration.job_contract_sha256
+        ) or (not requires_bound_contract and self.profile_sha256 is not None):
             raise ValueError("invalid profile")
         if (self.width, self.height) not in {
             (
-                PINNED_VIDEO_PROFILE.landscape_width,
-                PINNED_VIDEO_PROFILE.landscape_height,
+                profile.landscape_width,
+                profile.landscape_height,
             ),
             (
-                PINNED_VIDEO_PROFILE.portrait_width,
-                PINNED_VIDEO_PROFILE.portrait_height,
+                profile.portrait_width,
+                profile.portrait_height,
             ),
-        }:
+        } or (
+            self.native_frame_count not in profile.permitted_native_frame_counts
+            or self.fps != profile.fps
+            or self.loop_mode != profile.loop_mode
+        ):
             raise ValueError("invalid video dimensions")
         if self.source.asset_id == self.upload.asset_id:
             raise ValueError("source and output assets must be distinct")
@@ -220,7 +241,7 @@ class AnimatePayload(BaseModel):
 class AnimateEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    version: Literal["video-worker.v1"]
+    version: Literal["video-worker.v1", "video-worker.v2"]
     key_id: Annotated[str, StringConstraints(min_length=1, max_length=128)]
     issued_at: int = Field(ge=0)
     expires_at: int = Field(ge=0)
@@ -230,11 +251,21 @@ class AnimateEnvelope(BaseModel):
         StringConstraints(min_length=86, max_length=86, pattern=r"^[A-Za-z0-9_-]{86}$"),
     ] = Field(repr=False)
 
+    @model_validator(mode="after")
+    def validate_wire_version(self) -> "AnimateEnvelope":
+        registration = get_video_profile_registration(self.payload.profile_id)
+        assert registration is not None
+        requires_bound_contract = registration.job_contract_sha256 != registration.profile_sha256
+        expected_version = "video-worker.v2" if requires_bound_contract else "video-worker.v1"
+        if self.version != expected_version:
+            raise ValueError("invalid worker envelope version")
+        return self
+
 
 class AnimateResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    version: Literal["video-worker.v1"] = "video-worker.v1"
+    version: Literal["video-worker.v1", "video-worker.v2"] = "video-worker.v1"
     job_id: str
     attempt_id: str
     status: Literal["succeeded"] = "succeeded"

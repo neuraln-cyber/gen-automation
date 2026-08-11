@@ -11,7 +11,15 @@ from typing import Any
 import httpx2
 from PIL import Image, UnidentifiedImageError
 
-from gen_automation.video_worker.profiles import VideoProfile, VideoRenderSpec
+from gen_automation.video_worker.profiles import (
+    HQ_VIDEO_PROFILE,
+    HQ_VIDEO_WORKFLOW_SHA256,
+    PINNED_VIDEO_PROFILE,
+    PINNED_VIDEO_WORKFLOW_SHA256,
+    VideoProfile,
+    VideoRenderSpec,
+    require_video_profile_registration,
+)
 from gen_automation.video_worker.runtime import VideoExecutionError
 
 _MODEL_NAME = "wan2.2_ti2v_5B_fp16.safetensors"
@@ -21,11 +29,6 @@ _OUTPUT_NODE_ID = "11"
 _PROMPT_ID = re.compile(r"^[0-9a-f-]{36}$")
 _SAFE_FILENAME = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
 _SAFE_SUBFOLDER = re.compile(r"^[A-Za-z0-9._/-]{0,512}$")
-_NEGATIVE_PROMPT = (
-    "overexposed, static, blurry details, subtitles, worst quality, low quality, "
-    "jpeg artifacts, malformed anatomy, extra limbs, fused fingers, duplicate people, "
-    "flicker, frame corruption"
-)
 
 
 def build_wan_workflow(
@@ -36,7 +39,11 @@ def build_wan_workflow(
     negative_prompt: str,
     seed: int,
     render_spec: VideoRenderSpec,
+    profile: VideoProfile = PINNED_VIDEO_PROFILE,
 ) -> dict[str, object]:
+    registration = require_video_profile_registration(profile.profile_id)
+    if registration.profile != profile:
+        raise ValueError("video profile identity mismatch")
     return {
         "1": {
             "class_type": "UNETLoader",
@@ -61,7 +68,12 @@ def build_wan_workflow(
             "inputs": {
                 "clip": ["2", 0],
                 "text": ", ".join(
-                    part for part in (negative_prompt.strip(), _NEGATIVE_PROMPT) if part
+                    part
+                    for part in (
+                        negative_prompt.strip(),
+                        registration.built_in_negative_prompt,
+                    )
+                    if part
                 ),
             },
         },
@@ -106,7 +118,7 @@ def build_wan_workflow(
     }
 
 
-def _workflow_contract_sha256() -> str:
+def _workflow_contract_sha256(profile: VideoProfile = PINNED_VIDEO_PROFILE) -> str:
     representative = build_wan_workflow(
         source_filename="SOURCE.png",
         output_prefix="OUTPUT/frame",
@@ -114,12 +126,13 @@ def _workflow_contract_sha256() -> str:
         negative_prompt="NEGATIVE_PROMPT",
         seed=42,
         render_spec=VideoRenderSpec(
-            native_frame_count=73,
-            fps=24,
-            width=832,
-            height=480,
-            loop_mode="ping_pong",
+            native_frame_count=profile.default_native_frame_count,
+            fps=profile.fps,
+            width=profile.landscape_width,
+            height=profile.landscape_height,
+            loop_mode=profile.loop_mode,
         ),
+        profile=profile,
     )
     encoded = json.dumps(
         representative,
@@ -131,9 +144,34 @@ def _workflow_contract_sha256() -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-WAN_COMFY_WORKFLOW_SHA256 = "ecba3eef1c14abcd4d0d2ba3cec1f53042767f1a177d833dcfd3fd6b11f09ab3"
+WAN_COMFY_WORKFLOW_SHA256 = PINNED_VIDEO_WORKFLOW_SHA256
 if _workflow_contract_sha256() != WAN_COMFY_WORKFLOW_SHA256:
     raise RuntimeError("pinned Wan Comfy workflow changed")
+
+WAN_COMFY_HQ_WORKFLOW_SHA256 = HQ_VIDEO_WORKFLOW_SHA256
+if _workflow_contract_sha256(HQ_VIDEO_PROFILE) != WAN_COMFY_HQ_WORKFLOW_SHA256:
+    raise RuntimeError("pinned HQ Wan Comfy workflow changed")
+
+
+def _workflow_registry_sha256() -> str:
+    encoded = json.dumps(
+        {
+            PINNED_VIDEO_PROFILE.profile_id: WAN_COMFY_WORKFLOW_SHA256,
+            HQ_VIDEO_PROFILE.profile_id: WAN_COMFY_HQ_WORKFLOW_SHA256,
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+WAN_COMFY_WORKFLOW_REGISTRY_SHA256 = (
+    "19e4426429def8dc731b2b8802f714fa85a9e3ec61b5fcc79609c26363783f69"
+)
+if _workflow_registry_sha256() != WAN_COMFY_WORKFLOW_REGISTRY_SHA256:
+    raise RuntimeError("pinned Wan Comfy workflow registry changed")
 
 
 @dataclass(slots=True)
@@ -141,7 +179,9 @@ class NativeComfyWanExecutor:
     client: httpx2.Client = field(repr=False)
     input_directory: Path
     output_directory: Path
-    execution_timeout_seconds: float = 1800.0
+    # A non-None value is a bounded test/operator override. Production resolves
+    # the immutable timeout from the selected profile registration.
+    execution_timeout_seconds: float | None = None
     poll_interval_seconds: float = 1.0
 
     def is_ready(self) -> bool:
@@ -164,6 +204,9 @@ class NativeComfyWanExecutor:
     ) -> None:
         if profile.adapter != "wan-native-comfy":
             raise VideoExecutionError("video generation failed")
+        registration = require_video_profile_registration(profile.profile_id)
+        if registration.profile != profile:
+            raise VideoExecutionError("video generation failed")
         token = uuid.uuid4().hex
         source_filename = f"video-worker-{token}{source_path.suffix.lower()}"
         comfy_source = self.input_directory / source_filename
@@ -181,9 +224,15 @@ class NativeComfyWanExecutor:
                 negative_prompt=negative_prompt,
                 seed=seed,
                 render_spec=render_spec,
+                profile=profile,
             )
             prompt_id = self._submit(workflow)
-            images = self._wait_for_images(prompt_id)
+            timeout_seconds = (
+                self.execution_timeout_seconds
+                if self.execution_timeout_seconds is not None
+                else float(registration.execution_timeout_seconds)
+            )
+            images = self._wait_for_images(prompt_id, timeout_seconds=timeout_seconds)
             if len(images) != render_spec.native_frame_count:
                 raise VideoExecutionError("video generation failed")
             native_frames_path.mkdir(parents=True, exist_ok=True)
@@ -230,8 +279,10 @@ class NativeComfyWanExecutor:
             raise VideoExecutionError("video generation failed")
         return prompt_id
 
-    def _wait_for_images(self, prompt_id: str) -> list[dict[str, object]]:
-        deadline = time.monotonic() + self.execution_timeout_seconds
+    def _wait_for_images(
+        self, prompt_id: str, *, timeout_seconds: float
+    ) -> list[dict[str, object]]:
+        deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
             response = self.client.get(
                 f"/history/{prompt_id}",

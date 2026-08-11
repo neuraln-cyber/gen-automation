@@ -33,11 +33,15 @@ from gen_automation.domain.video import (
     VideoGenerationAttemptState,
     VideoGenerationState,
 )
+from gen_automation.video_worker.profiles import (
+    PINNED_VIDEO_PROFILE,
+    PINNED_VIDEO_PROFILE_SHA256,
+)
 
 NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
 SOURCE_SHA = "a" * 64
-PROFILE_SHA = "b" * 64
-TEST_PROFILE = "wan-i2v-economy"
+PROFILE_SHA = PINNED_VIDEO_PROFILE_SHA256
+TEST_PROFILE = PINNED_VIDEO_PROFILE.profile_id
 REQUEST_SHA = "c" * 64
 OUTPUT_SHA = "d" * 64
 
@@ -160,7 +164,7 @@ def _job(
         prompt="subtle natural movement",
         negative_prompt="camera cut",
         profile_key=TEST_PROFILE,
-        profile_version="1",
+        profile_version=PINNED_VIDEO_PROFILE.adapter_revision,
         profile_sha256=PROFILE_SHA,
         seed=42,
         frame_count=73,
@@ -228,7 +232,7 @@ async def test_video_job_attempt_output_and_lineage_persist_atomically(
             parent_asset_id=context.source_asset_id,
             child_asset_id=output_asset.id,
             relation="animated_from",
-            recipe_version="wan-i2v-economy/1",
+            recipe_version=PINNED_VIDEO_PROFILE.profile_id,
             created_at=NOW,
         )
         session.add(lineage)

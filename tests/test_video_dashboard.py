@@ -1,11 +1,13 @@
 import hashlib
 import re
 from datetime import UTC, datetime
+from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
 from typing import cast
 from uuid import UUID, uuid4
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -29,8 +31,16 @@ from gen_automation.domain.enums import (
     ResourceHealth,
 )
 from gen_automation.domain.video import VideoContentRating, VideoGenerationState
+from gen_automation.services.videos import (
+    CreateVideoSubmission,
+    VideoQualityProfile,
+    VideoStudioInputError,
+    create_video_submission,
+    planning_estimate_microusd,
+)
 from gen_automation.storage.memory import MemoryObjectStore
 from gen_automation.video_worker.models import DEFAULT_MAX_SOURCE_BYTES
+from gen_automation.video_worker.profiles import HQ_VIDEO_PROFILE_REGISTRATION
 
 
 def _hidden_value(page: str, name: str) -> str:
@@ -259,6 +269,62 @@ def test_animation_submit_freezes_source_and_replays_the_same_variant_group(
     assert "Variant 2 of 2" in status_page.text
     assert 'data-video-status-refresh="8"' in status_page.text
     assert "Currently reserved" in status_page.text
+
+
+def test_hidden_hq_canary_uses_native_shape_one_attempt_and_stable_seed(
+    client: TestClient,
+) -> None:
+    _enable_video(client)
+    source_id = _seed_source(client, width=1144, height=1480)
+    database = _application(client).state.database
+    assert client.portal is not None
+
+    async def submit(submission_id: UUID) -> VideoGenerationJob:
+        async with database.sessions() as session:
+            async with session.begin():
+                await create_video_submission(
+                    session,
+                    command=CreateVideoSubmission(
+                        submission_id=submission_id,
+                        source_asset_id=source_id,
+                        prompt="locked camera, one blink and one slow breath",
+                        content_rating=VideoContentRating.SFW,
+                        duration_seconds=3,
+                        variant_count=1,
+                        source_rights_confirmed=True,
+                        lawful_use_confirmed=True,
+                        quality_profile=VideoQualityProfile.HQ_NATIVE,
+                    ),
+                    actor_user_id=UUID(int=0),
+                    max_hourly_cost_usd=Decimal("0.35"),
+                )
+            return (
+                await session.scalars(
+                    select(VideoGenerationJob).order_by(VideoGenerationJob.created_at.desc())
+                )
+            ).first()
+
+    first = client.portal.call(submit, uuid4())
+    second = client.portal.call(submit, uuid4())
+
+    assert first is not None and second is not None
+    assert first.profile_key == HQ_VIDEO_PROFILE_REGISTRATION.profile.profile_id
+    assert first.profile_sha256 == HQ_VIDEO_PROFILE_REGISTRATION.job_contract_sha256
+    assert (first.width, first.height, first.frame_count, first.fps) == (1152, 1472, 73, 24)
+    assert first.max_attempts == 1
+    assert first.estimated_cost_microusd == 297_306
+    assert first.cost_metadata["estimated_runtime_seconds"] == 3058
+    assert first.cost_metadata["native_pixel_count"] == 1152 * 1472
+    assert first.cost_metadata["experiment_seed_basis"] == "source-sha256-and-prompt/v1"
+    assert first.seed == second.seed
+
+    with pytest.raises(VideoStudioInputError, match="one 3-second canary"):
+        planning_estimate_microusd(
+            max_hourly_cost_usd=Decimal("0.35"),
+            duration_seconds=5,
+            variant_count=1,
+            quality_profile=VideoQualityProfile.HQ_NATIVE,
+        )
 
 
 def test_animation_preview_is_private_and_conditionally_revalidated(

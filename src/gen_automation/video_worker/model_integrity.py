@@ -19,8 +19,8 @@ class ModelArtifact:
 
 MODEL_MANIFEST: Final = ModelArtifact(
     path=Path("/opt/video-worker/model-manifest.json"),
-    size_bytes=1384,
-    sha256="15ab9e6ee0dbdb03b81e40d14e1957be107be6312b3f1647883a56915d3b23b5",
+    size_bytes=1472,
+    sha256="83fe998813b2f16662064b4f11e327bb4608efa00b991616cc46df7d996ef65e",
 )
 MODEL_ARTIFACTS: Final = (
     ModelArtifact(

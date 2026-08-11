@@ -29,7 +29,11 @@ from gen_automation.video_worker.models import (
     WorkerSettings,
     validate_grant_url,
 )
-from gen_automation.video_worker.profiles import PINNED_VIDEO_PROFILE, VideoRenderSpec
+from gen_automation.video_worker.profiles import (
+    VideoProfile,
+    VideoRenderSpec,
+    require_video_profile_registration,
+)
 from gen_automation.video_worker.runtime import (
     FfmpegPingPongEncoder,
     HttpxSourceDownloader,
@@ -127,6 +131,7 @@ def _parse_envelope(body: bytes) -> AnimateEnvelope:
 def _render_if_ready(
     executor: VideoExecutor,
     *,
+    profile: VideoProfile,
     source_path: Path,
     native_frames_path: Path,
     render_spec: VideoRenderSpec,
@@ -137,7 +142,7 @@ def _render_if_ready(
     if not executor.is_ready():
         raise WorkerNotReadyError
     executor.render(
-        profile=PINNED_VIDEO_PROFILE,
+        profile=profile,
         render_spec=render_spec,
         source_path=source_path,
         native_frames_path=native_frames_path,
@@ -249,6 +254,7 @@ def create_video_worker_app(
             raise HTTPException(status_code=401, detail="invalid authorization") from None
 
         payload = envelope.payload
+        profile = require_video_profile_registration(payload.profile_id).profile
         render_spec = VideoRenderSpec(
             native_frame_count=payload.native_frame_count,
             fps=payload.fps,
@@ -332,13 +338,13 @@ def create_video_worker_app(
 
                     expected_dimensions = (
                         (
-                            PINNED_VIDEO_PROFILE.landscape_width,
-                            PINNED_VIDEO_PROFILE.landscape_height,
+                            profile.landscape_width,
+                            profile.landscape_height,
                         )
                         if source_image.width >= source_image.height
                         else (
-                            PINNED_VIDEO_PROFILE.portrait_width,
-                            PINNED_VIDEO_PROFILE.portrait_height,
+                            profile.portrait_width,
+                            profile.portrait_height,
                         )
                     )
                     if (render_spec.width, render_spec.height) != expected_dimensions:
@@ -349,6 +355,7 @@ def create_video_worker_app(
                             execution_pool,
                             lambda: _render_if_ready(
                                 executor,
+                                profile=profile,
                                 source_path=source_path,
                                 native_frames_path=native_frames_path,
                                 render_spec=render_spec,
@@ -387,7 +394,7 @@ def create_video_worker_app(
                             execution_pool,
                             lambda: resolved_validator.validate(
                                 path=output_path,
-                                profile=PINNED_VIDEO_PROFILE,
+                                profile=profile,
                                 render_spec=render_spec,
                                 max_bytes=settings.max_output_bytes,
                             ),
@@ -418,9 +425,10 @@ def create_video_worker_app(
                 raise HTTPException(status_code=503, detail="worker not ready") from None
 
             response = AnimateResponse(
+                version=envelope.version,
                 job_id=payload.job_id,
                 attempt_id=payload.attempt_id,
-                profile_id=PINNED_VIDEO_PROFILE.profile_id,
+                profile_id=profile.profile_id,
                 source_asset_id=payload.source.asset_id,
                 output_asset_id=payload.upload.asset_id,
                 upload_attempt_id=payload.upload.upload_attempt_id,
