@@ -162,8 +162,8 @@ ADD --checksum=sha256:c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651
 ADD --checksum=sha256:fd1531e31cdd20af005a9fb66e69afe4ea481a6db9b07cd889ece2e1ca2e67b9 --chmod=0444 https://huggingface.co/Kijai/WanVideo_comfy/resolve/8260d429d19fd7a72304cad059160b95d843913f/Wan2_1_VAE_fp32.safetensors /opt/comfyui/models/vae/Wan2_1_VAE_fp32.safetensors
 ADD --checksum=sha256:887c3bdeb74e83859c920438e16ca31f39ab18ce189abc5f0e36f8348c5bbb19 --chmod=0444 https://huggingface.co/lightx2v/Wan2.2-Distill-Loras/resolve/570044187a5219776ef30a5c60c6f76428a3a10a/wan2.2_i2v_A14b_high_noise_lora_rank64_lightx2v_4step_1022.safetensors /opt/comfyui/models/loras/wan2.2_i2v_A14b_high_noise_lora_rank64_lightx2v_4step_1022.safetensors
 ADD --checksum=sha256:8833bd4fd7c8eabebf0bc8ee5cfaf47f4f310ce116928a02c1adf8941dd4b0f1 --chmod=0444 https://huggingface.co/lightx2v/Wan2.2-Distill-Loras/resolve/570044187a5219776ef30a5c60c6f76428a3a10a/wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step_1022.safetensors /opt/comfyui/models/loras/wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step_1022.safetensors
-ADD --checksum=sha256:34e2144d3cd65360f97d09ccbe03e1c39a096df6c9234af5fe3899d1b63cda39 --chmod=0444 https://civitai.com/api/download/models/2073605 /opt/comfyui/models/loras/NSFW-22-H-e8.safetensors
-ADD --checksum=sha256:d6b783742f4d5fd63a0223ae1d5bf64fc995a6b408480ac2a00528ae0d4146db --chmod=0444 https://civitai.com/api/download/models/2083303 /opt/comfyui/models/loras/NSFW-22-L-e8.safetensors
+ADD --checksum=sha256:34e2144d3cd65360f97d09ccbe03e1c39a096df6c9234af5fe3899d1b63cda39 --chmod=0444 https://huggingface.co/rahul7star/wan2.2Lora/resolve/a49adf1cc929aff7388a840931e9934db4c3cbef/NSFW-22-H-e8.safetensors /opt/comfyui/models/loras/NSFW-22-H-e8.safetensors
+ADD --checksum=sha256:d6b783742f4d5fd63a0223ae1d5bf64fc995a6b408480ac2a00528ae0d4146db --chmod=0444 https://huggingface.co/rahul7star/wan2.2Lora/resolve/a49adf1cc929aff7388a840931e9934db4c3cbef/NSFW-22-L-e8.safetensors /opt/comfyui/models/loras/NSFW-22-L-e8.safetensors
 
 RUN test "$(stat --format=%s /opt/comfyui/models/diffusion_models/smoothMixWan22I2VV20_highQ3KM.gguf)" = 7176106496 \
     && test "$(stat --format=%s /opt/comfyui/models/diffusion_models/smoothMixWan22I2VV20_lowQ3KM.gguf)" = 7176106496 \
@@ -177,7 +177,7 @@ RUN test "$(stat --format=%s /opt/comfyui/models/diffusion_models/smoothMixWan22
 FROM model-runtime AS production
 
 LABEL org.opencontainers.image.model.repository="Civitai:2299142+1307155; HuggingFace pinned auxiliaries" \
-      org.opencontainers.image.model.manifest-sha256="866120efcda36761f68777e5690dafc116b5afc67bbe077a1ca0e338ac389601" \
+      org.opencontainers.image.model.manifest-sha256="0d7232700d072ec3d0f2f38ae09fc092b85dc250c80f4a186fe5c2da9133891c" \
       org.opencontainers.image.model.total-bytes="24196862685" \
       org.opencontainers.image.model.public-redistribution-authorized="false"
 

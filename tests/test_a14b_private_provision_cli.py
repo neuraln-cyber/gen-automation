@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -309,7 +310,14 @@ def test_cli_never_echoes_stdin_or_accidental_argv_credentials(
 
     monkeypatch.setattr(cli, "_execute", fail_with_secret)
     status = cli.a14b_private_provision_main(
-        ["provision", "--deployment-id", str(DEPLOYMENT_ID), "--image", IMAGE],
+        [
+            "provision",
+            "--deployment-id",
+            str(DEPLOYMENT_ID),
+            "--image",
+            IMAGE,
+            "--credential-stdin",
+        ],
         input_stream=io.StringIO(f"{USERNAME}\n{TOKEN}\n"),
     )
     output = capsys.readouterr()
@@ -325,6 +333,7 @@ def test_cli_never_echoes_stdin_or_accidental_argv_credentials(
             str(DEPLOYMENT_ID),
             "--image",
             IMAGE,
+            "--credential-stdin",
             "--token",
             TOKEN,
         ],
@@ -332,6 +341,184 @@ def test_cli_never_echoes_stdin_or_accidental_argv_credentials(
     )
     output = capsys.readouterr()
     assert status == 2
+    assert TOKEN not in output.out + output.err
+
+
+class _ParameterClient:
+    def __init__(self, parameter: dict[str, object]) -> None:
+        self.parameter = parameter
+        self.calls: list[dict[str, object]] = []
+
+    def get_parameter(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(kwargs)
+        return {"Parameter": self.parameter}
+
+
+def _parameter_payload(
+    *,
+    image: str = IMAGE,
+    username: str = cli.A14B_REGISTRY_USERNAME,
+    expires: str = "2026-08-11T14:09:00Z",
+) -> str:
+    return json.dumps(
+        {
+            "schema": cli.A14B_REGISTRY_PARAMETER_SCHEMA,
+            "image": image,
+            "user": username,
+            "pass": TOKEN,
+            "expires": expires,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _parameter(**updates: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "Name": cli.A14B_REGISTRY_PARAMETER_NAME,
+        "ARN": cli.A14B_REGISTRY_PARAMETER_ARN,
+        "Type": "SecureString",
+        "DataType": "text",
+        "Version": 7,
+        "Selector": ":7",
+        "LastModifiedDate": NOW,
+        "Value": _parameter_payload(),
+    }
+    value.update(updates)
+    return value
+
+
+def test_provision_cli_requires_exactly_one_explicit_credential_source() -> None:
+    common = ["provision", "--deployment-id", str(DEPLOYMENT_ID), "--image", IMAGE]
+    with pytest.raises(cli.OperatorInputError):
+        cli._parse_command(common)
+    with pytest.raises(cli.OperatorInputError):
+        cli._parse_command(
+            [
+                *common,
+                "--credential-stdin",
+                "--ssm-parameter-name",
+                cli.A14B_REGISTRY_PARAMETER_NAME,
+                "--ssm-parameter-version",
+                "7",
+            ]
+        )
+    command = cli._parse_command(
+        [
+            *common,
+            "--ssm-parameter-name",
+            cli.A14B_REGISTRY_PARAMETER_NAME,
+            "--ssm-parameter-version",
+            "7",
+        ]
+    )
+    assert command.credential_source == cli._CredentialSource.SSM_PARAMETER
+    assert command.ssm_parameter_version == 7
+    with pytest.raises(cli.OperatorInputError):
+        cli._parse_command(
+            [
+                *common,
+                "--ssm-parameter-name",
+                f"{cli.A14B_REGISTRY_PARAMETER_NAME}-other",
+                "--ssm-parameter-version",
+                "7",
+            ]
+        )
+
+
+def test_ssm_loader_binds_metadata_version_payload_ttl_and_secret() -> None:
+    client = _ParameterClient(_parameter())
+    credentials = cli._load_ssm_credentials(
+        client=client,
+        parameter_name=cli.A14B_REGISTRY_PARAMETER_NAME,
+        parameter_version=7,
+        image=IMAGE,
+        now=NOW,
+    )
+    assert credentials.username == cli.A14B_REGISTRY_USERNAME
+    assert credentials.password.get_secret_value() == TOKEN
+    assert client.calls == [
+        {"Name": f"{cli.A14B_REGISTRY_PARAMETER_NAME}:7", "WithDecryption": True}
+    ]
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    [
+        _parameter(ARN="arn:aws:ssm:eu-central-1:861912887470:parameter/other"),
+        _parameter(Version=8),
+        _parameter(Type="String"),
+        _parameter(LastModifiedDate=datetime(2026, 8, 11, 13, 49, tzinfo=UTC)),
+        _parameter(Value=_parameter_payload(image=OTHER_IMAGE)),
+        _parameter(Value=_parameter_payload(username="different-user")),
+        _parameter(Value=_parameter_payload(expires="2026-08-11T14:11:00Z")),
+        _parameter(Value=_parameter_payload(expires="2026-08-11T13:59:59Z")),
+        _parameter(
+            LastModifiedDate=datetime(2026, 8, 11, 13, 55, tzinfo=UTC),
+            Value=_parameter_payload(expires="2026-08-11T14:09:00Z"),
+        ),
+        _parameter(
+            Value=(
+                '{"expires":"2026-08-11T14:09:00Z","image":"'
+                + IMAGE
+                + '","pass":"first","pass":"second","schema":"'
+                + cli.A14B_REGISTRY_PARAMETER_SCHEMA
+                + '","user":"neuraln-cyber"}'
+            )
+        ),
+    ],
+)
+def test_ssm_loader_rejects_stale_mismatched_or_ambiguous_values(
+    parameter: dict[str, object],
+) -> None:
+    with pytest.raises(cli.OperatorInputError):
+        cli._load_ssm_credentials(
+            client=_ParameterClient(parameter),
+            parameter_name=cli.A14B_REGISTRY_PARAMETER_NAME,
+            parameter_version=7,
+            image=IMAGE,
+            now=NOW,
+        )
+
+
+def test_ssm_cli_does_not_read_stdin_and_redacts_dependency_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class _Unreadable(io.StringIO):
+        def read(self, *_args: object, **_kwargs: object) -> str:
+            raise AssertionError("SSM source must not read stdin")
+
+    async def fail_with_secret(_command: object, credentials: object) -> str:
+        assert isinstance(credentials, cli._Credentials)
+        raise RuntimeError(TOKEN)
+
+    monkeypatch.setattr(cli, "_bounded_ssm_client", lambda: _ParameterClient(_parameter()))
+    monkeypatch.setattr(
+        cli,
+        "_load_ssm_credentials",
+        lambda **_kwargs: cli._Credentials(
+            username=cli.A14B_REGISTRY_USERNAME,
+            password=SecretStr(TOKEN),
+        ),
+    )
+    monkeypatch.setattr(cli, "_execute", fail_with_secret)
+    status = cli.a14b_private_provision_main(
+        [
+            "provision",
+            "--deployment-id",
+            str(DEPLOYMENT_ID),
+            "--image",
+            IMAGE,
+            "--ssm-parameter-name",
+            cli.A14B_REGISTRY_PARAMETER_NAME,
+            "--ssm-parameter-version",
+            "7",
+        ],
+        input_stream=_Unreadable(),
+    )
+    output = capsys.readouterr()
+    assert status == 1
     assert TOKEN not in output.out + output.err
 
 

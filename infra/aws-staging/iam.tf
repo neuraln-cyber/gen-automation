@@ -327,10 +327,29 @@ resource "aws_iam_role_policy" "runtime" {
 
 data "aws_iam_policy_document" "runpod_inference_key_read" {
   statement {
-    sid     = "ReadRunPodInferenceKey"
+    sid     = "ReadExactRuntimeParameters"
     actions = ["ssm:GetParameter"]
     resources = [
       "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${local.name}/runpod/inference-api-key",
+      "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${local.name}/a14b/ghcr-pull-once",
+    ]
+  }
+
+  # AmazonSSMManagedInstanceCore currently grants broad Parameter Store reads.
+  # This explicit boundary leaves the SSM agent's unrelated management APIs
+  # intact while denying runtime reads of every parameter except these two.
+  statement {
+    sid    = "DenyOtherRuntimeParameterReads"
+    effect = "Deny"
+    actions = [
+      "ssm:GetParameter",
+      "ssm:GetParameterHistory",
+      "ssm:GetParameters",
+      "ssm:GetParametersByPath",
+    ]
+    not_resources = [
+      "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${local.name}/runpod/inference-api-key",
+      "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${local.name}/a14b/ghcr-pull-once",
     ]
   }
 }

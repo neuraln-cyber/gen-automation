@@ -100,14 +100,14 @@
     {
       "role": "high_noise_adult_lora",
       "relative_path": "loras/NSFW-22-H-e8.safetensors",
-      "source": "https://civitai.com/api/download/models/2073605",
+      "source": "https://huggingface.co/rahul7star/wan2.2Lora/resolve/a49adf1cc929aff7388a840931e9934db4c3cbef/NSFW-22-H-e8.safetensors",
       "byte_size": 613516752,
       "sha256": "34e2144d3cd65360f97d09ccbe03e1c39a096df6c9234af5fe3899d1b63cda39"
     },
     {
       "role": "low_noise_adult_lora",
       "relative_path": "loras/NSFW-22-L-e8.safetensors",
-      "source": "https://civitai.com/api/download/models/2083303",
+      "source": "https://huggingface.co/rahul7star/wan2.2Lora/resolve/a49adf1cc929aff7388a840931e9934db4c3cbef/NSFW-22-L-e8.safetensors",
       "byte_size": 613516752,
       "sha256": "d6b783742f4d5fd63a0223ae1d5bf64fc995a6b408480ac2a00528ae0d4146db"
     }
