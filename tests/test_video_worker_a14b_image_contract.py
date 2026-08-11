@@ -32,6 +32,7 @@ ANIMATION_STUDIO_DOC = ROOT / "docs" / "animation-studio.md"
 ACCESS_DOC = ROOT / "docs" / "access-and-secrets.md"
 MAIN = ROOT / "src" / "gen_automation" / "video_worker" / "main.py"
 SMOOTHMIX_MIRROR_REVISION = "3521de1624df15f248b28920858db043c71cc76e"
+WAN_GENERAL_MIRROR_REVISION = "a49adf1cc929aff7388a840931e9934db4c3cbef"
 
 
 def test_a14b_manifest_and_docker_pin_every_private_model_artifact() -> None:
@@ -75,6 +76,20 @@ def test_a14b_manifest_and_docker_pin_every_private_model_artifact() -> None:
     )
     assert "civitai.com/api/download/models/2587054" not in dockerfile
     assert "civitai.com/api/download/models/2587073" not in dockerfile
+    adult_lora_sources = [
+        artifact["source"]
+        for artifact in manifest["artifacts"]
+        if artifact["role"] in {"high_noise_adult_lora", "low_noise_adult_lora"}
+    ]
+    assert len(adult_lora_sources) == 2
+    assert all(
+        source.startswith(
+            f"https://huggingface.co/rahul7star/wan2.2Lora/resolve/{WAN_GENERAL_MIRROR_REVISION}/"
+        )
+        for source in adult_lora_sources
+    )
+    assert "civitai.com/api/download/models/2073605" not in dockerfile
+    assert "civitai.com/api/download/models/2083303" not in dockerfile
 
 
 def test_a14b_image_labels_match_all_worker_contracts() -> None:

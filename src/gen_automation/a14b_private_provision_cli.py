@@ -5,16 +5,20 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import hmac
 import json
 import re
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import NoReturn, TextIO
+from typing import Any, NoReturn, Protocol, TextIO, cast
 from uuid import UUID
 
+import boto3
 import httpx2
+from botocore.config import Config
 from pydantic import SecretStr
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -64,6 +68,18 @@ RTX_5090_GPU_CLASS_ID = "851399fb-7329-4195-a042-d6514b28cf33"
 EXPECTED_STORAGE_BYTES = 50 * 1024 * 1024 * 1024
 EXPECTED_MEMORY_MB = 32 * 1024
 EXPECTED_MAX_HOURLY_COST_MICROUSD = 500_000
+A14B_REGISTRY_PARAMETER_NAME = "/gen-automation-staging/a14b/ghcr-pull-once"
+A14B_REGISTRY_PARAMETER_ARN = (
+    "arn:aws:ssm:eu-central-1:861912887470:parameter/gen-automation-staging/a14b/ghcr-pull-once"
+)
+A14B_REGISTRY_PARAMETER_SCHEMA = "gen-automation.a14b-ghcr-pull/v1"
+A14B_REGISTRY_USERNAME = "neuraln-cyber"
+_A14B_REGISTRY_PARAMETER_MAX_CHARACTERS = 2_048
+_A14B_REGISTRY_PARAMETER_MAX_AGE = timedelta(minutes=10)
+_A14B_REGISTRY_PARAMETER_CLOCK_SKEW = timedelta(seconds=30)
+_A14B_REGISTRY_PARAMETER_EXPIRES_PATTERN = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
+)
 _MAX_STDIN_CREDENTIAL_CHARACTERS = 1_128
 
 
@@ -84,6 +100,15 @@ class ProvisionStatus(StrEnum):
     AMBIGUOUS_NOT_FOUND = "ambiguous_not_found"
 
 
+class _CredentialSource(StrEnum):
+    STDIN = "stdin"
+    SSM_PARAMETER = "ssm_parameter"
+
+
+class _SSMClient(Protocol):
+    def get_parameter(self, **kwargs: object) -> dict[str, Any]: ...
+
+
 @dataclass(frozen=True)
 class _Credentials:
     username: str
@@ -98,6 +123,9 @@ class _Command:
     current_image: str | None = None
     minimum_revision: str | None = None
     expected_image_lane_sha256: str | None = None
+    credential_source: _CredentialSource | None = None
+    ssm_parameter_name: str | None = None
+    ssm_parameter_version: int | None = None
 
 
 def _parser() -> _SafeArgumentParser:
@@ -105,7 +133,7 @@ def _parser() -> _SafeArgumentParser:
         prog="python -m gen_automation.a14b_private_provision_cli",
         description=(
             "Validate a staging VIDEO cutover or provision one exact private A14B group. "
-            "Registry credentials are accepted only as two newline-terminated stdin lines."
+            "Registry credentials come from exactly one bounded stdin or SSM source."
         ),
     )
     subcommands = parser.add_subparsers(
@@ -117,6 +145,10 @@ def _parser() -> _SafeArgumentParser:
     provision = subcommands.add_parser("provision")
     provision.add_argument("--deployment-id", required=True)
     provision.add_argument("--image", required=True)
+    credential_source = provision.add_mutually_exclusive_group(required=True)
+    credential_source.add_argument("--credential-stdin", action="store_true")
+    credential_source.add_argument("--ssm-parameter-name")
+    provision.add_argument("--ssm-parameter-version")
 
     safe = subcommands.add_parser("assert-cutover-safe")
     safe.add_argument("--expected-current-image", required=True)
@@ -140,7 +172,32 @@ def _parse_command(arguments: Sequence[str]) -> _Command:
             raise OperatorInputError("deployment ID is invalid") from error
         image = str(namespace.image)
         _require_private_image(image)
-        return _Command(operation="provision", deployment_id=deployment_id, image=image)
+        if namespace.credential_stdin:
+            if namespace.ssm_parameter_version is not None:
+                raise OperatorInputError("stdin credentials cannot select an SSM version")
+            return _Command(
+                operation="provision",
+                deployment_id=deployment_id,
+                image=image,
+                credential_source=_CredentialSource.STDIN,
+            )
+        parameter_name = str(namespace.ssm_parameter_name)
+        if parameter_name != A14B_REGISTRY_PARAMETER_NAME:
+            raise OperatorInputError("SSM credential parameter name is invalid")
+        version_value = namespace.ssm_parameter_version
+        if (
+            not isinstance(version_value, str)
+            or re.fullmatch(r"[1-9][0-9]{0,5}", version_value) is None
+        ):
+            raise OperatorInputError("SSM credential parameter version is invalid")
+        return _Command(
+            operation="provision",
+            deployment_id=deployment_id,
+            image=image,
+            credential_source=_CredentialSource.SSM_PARAMETER,
+            ssm_parameter_name=parameter_name,
+            ssm_parameter_version=int(version_value),
+        )
     if namespace.operation == "assert-cutover-safe":
         current_image = str(namespace.expected_current_image)
         if IMMUTABLE_VIDEO_IMAGE_PATTERN.fullmatch(current_image) is None:
@@ -193,6 +250,10 @@ def _read_credentials(stream: TextIO) -> _Credentials:
     if len(lines) != 2:
         raise OperatorInputError("registry credential input is invalid")
     username, password_value = lines
+    return _validated_credentials(username=username, password_value=password_value)
+
+
+def _validated_credentials(*, username: str, password_value: str) -> _Credentials:
     password = SecretStr(password_value)
     # EphemeralRegistryBasicAuth performs the canonical character/length checks.
     try:
@@ -204,6 +265,133 @@ def _read_credentials(stream: TextIO) -> _Credentials:
     except Exception as error:
         raise OperatorInputError("registry credential input is invalid") from error
     return _Credentials(username=username, password=password)
+
+
+def _bounded_ssm_client() -> _SSMClient:
+    configuration = Config(
+        connect_timeout=5,
+        read_timeout=10,
+        proxies={},
+        retries={"mode": "standard", "total_max_attempts": 2},
+    )
+    session = boto3.Session(region_name="eu-central-1")
+    return cast(
+        _SSMClient,
+        session.client(
+            "ssm",
+            region_name="eu-central-1",
+            endpoint_url="https://ssm.eu-central-1.amazonaws.com",
+            config=configuration,
+        ),
+    )
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise OperatorInputError("SSM credential payload is invalid")
+        value[key] = item
+    return value
+
+
+def _load_ssm_credentials(
+    *,
+    client: _SSMClient,
+    parameter_name: str,
+    parameter_version: int,
+    image: str,
+    now: datetime | None = None,
+) -> _Credentials:
+    if parameter_name != A14B_REGISTRY_PARAMETER_NAME or not 1 <= parameter_version <= 999_999:
+        raise OperatorInputError("SSM credential selector is invalid")
+    selected_at = now or datetime.now(UTC)
+    if selected_at.tzinfo is None:
+        raise OperatorInputError("SSM credential validation clock is invalid")
+    selected_at = selected_at.astimezone(UTC)
+    response = client.get_parameter(
+        Name=f"{parameter_name}:{parameter_version}",
+        WithDecryption=True,
+    )
+    parameter = response.get("Parameter")
+    if not isinstance(parameter, dict):
+        raise OperatorInputError("SSM credential metadata is invalid")
+    selector = parameter.get("Selector")
+    last_modified = parameter.get("LastModifiedDate")
+    if (
+        parameter.get("Name") != parameter_name
+        or parameter.get("ARN") != A14B_REGISTRY_PARAMETER_ARN
+        or parameter.get("Type") != "SecureString"
+        or parameter.get("DataType") != "text"
+        or parameter.get("Version") != parameter_version
+        or selector not in (None, f":{parameter_version}", f"{parameter_name}:{parameter_version}")
+        or not isinstance(last_modified, datetime)
+        or last_modified.tzinfo is None
+    ):
+        raise OperatorInputError("SSM credential metadata is invalid")
+    modified_at = last_modified.astimezone(UTC)
+    if not (
+        selected_at - _A14B_REGISTRY_PARAMETER_MAX_AGE
+        <= modified_at
+        <= selected_at + _A14B_REGISTRY_PARAMETER_CLOCK_SKEW
+    ):
+        raise OperatorInputError("SSM credential parameter is stale")
+    raw_payload = parameter.get("Value")
+    if not isinstance(raw_payload, str) or not raw_payload or "\x00" in raw_payload:
+        raise OperatorInputError("SSM credential payload is invalid")
+    try:
+        payload_size = len(raw_payload.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise OperatorInputError("SSM credential payload is invalid") from error
+    if payload_size > _A14B_REGISTRY_PARAMETER_MAX_CHARACTERS:
+        raise OperatorInputError("SSM credential payload is invalid")
+    try:
+        payload = json.loads(raw_payload, object_pairs_hook=_reject_duplicate_json_keys)
+    except OperatorInputError:
+        raise
+    except (TypeError, ValueError) as error:
+        raise OperatorInputError("SSM credential payload is invalid") from error
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema",
+        "image",
+        "user",
+        "pass",
+        "expires",
+    }:
+        raise OperatorInputError("SSM credential payload is invalid")
+    schema = payload.get("schema")
+    payload_image = payload.get("image")
+    username = payload.get("user")
+    password_value = payload.get("pass")
+    expires = payload.get("expires")
+    if not all(
+        isinstance(value, str)
+        for value in (schema, payload_image, username, password_value, expires)
+    ):
+        raise OperatorInputError("SSM credential payload is invalid")
+    assert isinstance(schema, str)
+    assert isinstance(payload_image, str)
+    assert isinstance(username, str)
+    assert isinstance(password_value, str)
+    assert isinstance(expires, str)
+    if (
+        not hmac.compare_digest(schema, A14B_REGISTRY_PARAMETER_SCHEMA)
+        or not hmac.compare_digest(payload_image, image)
+        or not hmac.compare_digest(username, A14B_REGISTRY_USERNAME)
+        or _A14B_REGISTRY_PARAMETER_EXPIRES_PATTERN.fullmatch(expires) is None
+    ):
+        raise OperatorInputError("SSM credential payload binding is invalid")
+    try:
+        expires_at = datetime.strptime(expires, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except ValueError as error:
+        raise OperatorInputError("SSM credential expiry is invalid") from error
+    if not (
+        selected_at < expires_at <= selected_at + _A14B_REGISTRY_PARAMETER_MAX_AGE
+        and expires_at
+        <= modified_at + _A14B_REGISTRY_PARAMETER_MAX_AGE + _A14B_REGISTRY_PARAMETER_CLOCK_SKEW
+    ):
+        raise OperatorInputError("SSM credential parameter is expired or overlong")
+    return _validated_credentials(username=username, password_value=password_value)
 
 
 def _validate_staging_settings(settings: Settings) -> None:
@@ -634,11 +822,22 @@ def a14b_private_provision_main(
 
     try:
         command = _parse_command(sys.argv[1:] if arguments is None else arguments)
-        credentials = (
-            _read_credentials(input_stream or sys.stdin)
-            if command.operation == "provision"
-            else None
-        )
+        credentials: _Credentials | None = None
+        if command.operation == "provision":
+            assert command.image is not None
+            if command.credential_source == _CredentialSource.STDIN:
+                credentials = _read_credentials(input_stream or sys.stdin)
+            elif command.credential_source == _CredentialSource.SSM_PARAMETER:
+                assert command.ssm_parameter_name is not None
+                assert command.ssm_parameter_version is not None
+                credentials = _load_ssm_credentials(
+                    client=_bounded_ssm_client(),
+                    parameter_name=command.ssm_parameter_name,
+                    parameter_version=command.ssm_parameter_version,
+                    image=command.image,
+                )
+            else:
+                raise OperatorInputError("credential source is invalid")
         result = asyncio.run(_execute(command, credentials))
     except OperatorInputError:
         print("A14B operator input or target validation failed safely.", file=sys.stderr)
