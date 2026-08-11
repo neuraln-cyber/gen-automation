@@ -141,10 +141,7 @@ def test_a14b_model_free_foundation_is_built_and_smoked_in_ci() -> None:
         node_path = f"/opt/comfyui/custom_nodes/{node}"
         assert dockerfile.index(node_path) < dockerfile.index(f"git -C {node_path} init")
         assert f"{variable}={revision}" in dockerfile
-        assert (
-            f'test "$(git -C {node_path} rev-parse HEAD)" = "${{{variable}}}"'
-            in dockerfile
-        )
+        assert f'test "$(git -C {node_path} rev-parse HEAD)" = "${{{variable}}}"' in dockerfile
 
     build_step = ci.split("- name: Build A14B model-free runtime foundation", 1)[1].split(
         "- name:", 1
