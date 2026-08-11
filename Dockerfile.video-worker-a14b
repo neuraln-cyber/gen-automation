@@ -79,7 +79,8 @@ RUN mkdir --parents \
         /opt/comfyui/models/loras \
         /opt/comfyui/models/text_encoders \
         /opt/comfyui/models/vae \
-        /opt/comfyui/custom_nodes
+        /opt/comfyui/custom_nodes/ComfyUI-GGUF \
+        /opt/comfyui/custom_nodes/ComfyUI-NAG
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates ffmpeg git \
