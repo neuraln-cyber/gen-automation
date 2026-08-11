@@ -1,8 +1,8 @@
 # Animation Studio
 
 Animation Studio turns one verified library image into a short image-to-video
-clip. The first release deliberately has one economical profile instead of a
-matrix of models and advanced controls:
+clip. The browser remains pinned to one economical profile instead of exposing
+a matrix of models and advanced controls:
 
 - Wan 2.2 TI2V 5B through pinned, native ComfyUI nodes;
 - 832x480 landscape or 480x832 portrait, selected from the source orientation;
@@ -11,6 +11,16 @@ matrix of models and advanced controls:
 - a deterministic H.264 MP4 ping-pong encode, yielding about 6 or 10 seconds
   of loop-ready playback without a second diffusion pass; and
 - one to three variants per submission, with at most one active Salad worker.
+
+An internal-only `hq_native` canary profile uses the same pinned Wan 2.2 TI2V
+5B weights, built-in Comfy nodes, sampler, and 24 fps timing at exactly 73
+native frames. It renders 1472x1152 landscape or 1152x1472 portrait, permits one
+variant and one provider attempt, plans a conservative 3,058-second render, and
+bounds Comfy execution at 5,400 seconds under the controller's 6,300-second
+watchdog. The worker removes `static` from this profile's built-in negative and
+adds explicit camera-shake, pan, tilt, roll, zoom, reframing, and background-
+drift blockers. The standard v1 descriptor and workflow remain unchanged. This
+selector is intentionally absent from the browser until the canary is accepted.
 
 The status page can cancel the whole variant group. Variants that have not
 reached Salad are cancelled locally; an accepted provider job is cancelled and
@@ -119,10 +129,13 @@ weights.
 
 ## Worker boundary
 
-The controller submits a signed `video-worker.v1` envelope. It contains exact
-presigned source and single-output grants, their expected origins and media
-types, the frozen profile, prompt, seed, shape, and attempt identifiers. The
-worker:
+The controller keeps standard jobs on the original signed `video-worker.v1`
+wire shape so an older standard worker remains compatible during rollout. HQ
+jobs use `video-worker.v2`, which additionally signs the execution-contract
+SHA covering the HQ profile, workflow, built-in negative, timeout, cost plan,
+and one-attempt policy. Both contain exact presigned source and single-output
+grants, their expected origins and media types, the frozen profile, prompt,
+seed, shape, and attempt identifiers. The worker:
 
 1. validates the signature, expiry, replay cache, profile, and grant origins;
 2. downloads and verifies the source bytes and image bounds;
@@ -140,7 +153,7 @@ download token, or runtime network model fetch is present in the video worker.
 The feature remains disabled after an ordinary control-plane deployment. A
 staging enablement requires all of the following:
 
-1. migration `20260810_0034` applied and checked;
+1. migration `20260811_0035` applied and checked;
 2. runtime-contract build, smoke, SBOM, and vulnerability scan green;
 3. an explicitly published production video-worker image whose compressed
    layers are below Salad's 35-GB limit with operational headroom, whose exact
@@ -151,6 +164,11 @@ staging enablement requires all of the following:
 6. a read-only deployment/budget audit; and
 7. one owner-approved, one-variant, 3-second staging canary.
 
+`GEN_AUTOMATION_SALAD_VIDEO_CONTAINER_PRIORITY=batch` may be set for the
+isolated video group. When it is unset, the video lane inherits
+`GEN_AUTOMATION_SALAD_CONTAINER_PRIORITY`; the override never changes the image
+lane deployment intent.
+
 The canary must preserve the image lane, create no more than one video replica,
 produce one verified MP4, settle queue/attempt/outbox work to zero, and return
 the video lane to zero replicas. On any mismatch, disable
@@ -159,10 +177,11 @@ the video group to zero, and retain job/output records for audit. Do not delete
 or mutate the image-generation group as part of video rollback.
 
 Once a `purpose=video` deployment or video job exists, rollback is
-feature-flagged and fix-forward: keep migration `20260810_0034` and a binary
-that understands per-purpose deployments while the cancellation-only loop
-drains work. Do not deploy a pre-purpose binary or downgrade the schema; the
-migration intentionally refuses that downgrade while video state exists.
+feature-flagged and fix-forward: keep migration `20260810_0034`, also keep
+`20260811_0035` once an HQ-profile job exists, and retain a binary that
+understands per-purpose deployments while the cancellation-only loop drains
+work. Do not deploy a pre-purpose binary or downgrade the schema; the migrations
+intentionally refuse those downgrades while their video state exists.
 
 ## References
 

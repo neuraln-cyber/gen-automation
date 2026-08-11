@@ -11,10 +11,16 @@ from gen_automation.domain.video import (
     VideoGenerationRequest,
     VideoSourceSnapshot,
 )
+from gen_automation.video_worker.profiles import (
+    HQ_VIDEO_PROFILE,
+    HQ_VIDEO_PROFILE_REGISTRATION,
+    PINNED_VIDEO_PROFILE,
+    PINNED_VIDEO_PROFILE_SHA256,
+)
 
 SHA = "a" * 64
-PROFILE_SHA = "b" * 64
-TEST_PROFILE = "wan-i2v-economy"
+PROFILE_SHA = PINNED_VIDEO_PROFILE_SHA256
+TEST_PROFILE = PINNED_VIDEO_PROFILE.profile_id
 ASSET_ID = UUID("019fa795-8862-7142-a182-1746d6b0694e")
 
 
@@ -39,7 +45,7 @@ def _parameters(*, frame_count: int = 73, fps: int = 24) -> VideoGenerationParam
         prompt="subtle natural movement",
         negative_prompt="camera cut",
         profile_key=TEST_PROFILE,
-        profile_version="1",
+        profile_version=PINNED_VIDEO_PROFILE.adapter_revision,
         profile_sha256=PROFILE_SHA,
         seed=42,
         frame_count=frame_count,
@@ -120,18 +126,39 @@ def test_video_parameters_enforce_economical_native_profiles() -> None:
     with pytest.raises(ValidationError):
         _parameters(fps=16)
 
-    with pytest.raises(ValidationError, match="832x480 or 480x832"):
+    with pytest.raises(ValidationError, match="selected profile"):
         VideoGenerationParameters(
             prompt="",
             negative_prompt="",
-            profile_key="economy",
-            profile_version="1",
+            profile_key=PINNED_VIDEO_PROFILE.profile_id,
+            profile_version=PINNED_VIDEO_PROFILE.adapter_revision,
             profile_sha256=PROFILE_SHA,
             seed=0,
             frame_count=73,
             fps=24,
             width=832,
             height=832,
+        )
+
+
+def test_hq_video_parameters_require_exact_shape_and_short_timing() -> None:
+    parameters = VideoGenerationParameters(
+        profile_key=HQ_VIDEO_PROFILE.profile_id,
+        profile_version=HQ_VIDEO_PROFILE.adapter_revision,
+        profile_sha256=HQ_VIDEO_PROFILE_REGISTRATION.job_contract_sha256,
+        seed=42,
+        frame_count=73,
+        fps=24,
+        width=1152,
+        height=1472,
+    )
+
+    assert (parameters.width, parameters.height) == (1152, 1472)
+
+    with pytest.raises(ValidationError, match="selected profile"):
+        VideoGenerationParameters(
+            **parameters.model_dump(mode="python", exclude={"frame_count"}),
+            frame_count=121,
         )
 
 

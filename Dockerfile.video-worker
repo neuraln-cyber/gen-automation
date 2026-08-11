@@ -44,6 +44,11 @@ LABEL org.opencontainers.image.title="gen-automation-video-worker" \
       org.opencontainers.image.video-profile="wan2.2-ti2v-5b-comfy-v1" \
       org.opencontainers.image.video-profile-sha256="a83c946f9a61bac7cf3794fc9aa4debacc2fc676c13957deaed42ecf82c7e2e4" \
       org.opencontainers.image.video-workflow-sha256="ecba3eef1c14abcd4d0d2ba3cec1f53042767f1a177d833dcfd3fd6b11f09ab3" \
+      org.opencontainers.image.video-hq-profile-sha256="d690fb7b0fc883075e0a73fc711ae3c021b34044c57b6fb6e74dbf25bbf1b22c" \
+      org.opencontainers.image.video-hq-workflow-sha256="01c5b5350cab319e5cf7ec407971d7fbb269c4eb1e3c91c27c5c3cbb793a5151" \
+      org.opencontainers.image.video-hq-execution-contract-sha256="00fb341e491f295b2db16a32626a6383d83c6cda88978b29479caf245c817387" \
+      org.opencontainers.image.video-profile-registry-sha256="8f536e93c5e097aa70c8036c778c1a454fb8ce8ad5d0fd1dd614b67afd4c80eb" \
+      org.opencontainers.image.video-workflow-registry-sha256="19e4426429def8dc731b2b8802f714fa85a9e3ec61b5fcc79609c26363783f69" \
       org.opencontainers.image.comfyui.revision="700821e1364eaab0e8f21c538a2131719fec57bf" \
       org.opencontainers.image.salad-queue-worker.revision="73d7a3c80a73f26339194e024cb47c8501c67f75" \
       org.opencontainers.image.salad-queue-worker.patch-sha256="a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae"
@@ -58,6 +63,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     VIDEO_WORKER_PROFILE_ID=wan2.2-ti2v-5b-comfy-v1 \
+    VIDEO_WORKER_PROFILE_IDS_JSON='["wan2.2-ti2v-5b-comfy-v1","wan2.2-ti2v-5b-comfy-hq-v1"]' \
     VIDEO_WORKER_MODEL_REVISION=fb1388adc906ab39ffc26ee40e96b22886b56bc4 \
     VIDEO_WORKER_MODEL_MANIFEST=/opt/video-worker/model-manifest.json \
     VIDEO_WORKER_STAGING_ROOT=/opt/video-worker/runtime \
@@ -181,7 +187,7 @@ FROM model-runtime AS production
 
 LABEL org.opencontainers.image.model.repository="Comfy-Org/Wan_2.2_ComfyUI_Repackaged" \
       org.opencontainers.image.model.revision="fb1388adc906ab39ffc26ee40e96b22886b56bc4" \
-      org.opencontainers.image.model.manifest-sha256="15ab9e6ee0dbdb03b81e40d14e1957be107be6312b3f1647883a56915d3b23b5"
+      org.opencontainers.image.model.manifest-sha256="83fe998813b2f16662064b4f11e327bb4608efa00b991616cc46df7d996ef65e"
 
 COPY --from=runtime-contract /opt/video-worker/model-manifest.json ./model-manifest.json
 COPY --from=runtime-contract /opt/video-worker/src ./src

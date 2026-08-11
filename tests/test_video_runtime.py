@@ -67,6 +67,7 @@ from gen_automation.services.video_runtime import (
 from gen_automation.storage.memory import MemoryObjectStore
 from gen_automation.video_worker.models import AnimateEnvelope
 from gen_automation.video_worker.profiles import (
+    HQ_VIDEO_PROFILE_REGISTRATION,
     PINNED_VIDEO_PROFILE,
     PINNED_VIDEO_PROFILE_SHA256,
 )
@@ -84,6 +85,7 @@ class FakeSalad:
     def __init__(self) -> None:
         self.jobs: dict[UUID, SaladQueueJob] = {}
         self.create_calls = 0
+        self.create_inputs: list[JSONValue] = []
         self.cancel_calls = 0
         self.stop_names: list[str] = []
         self.raise_unknown_after_create = False
@@ -115,6 +117,7 @@ class FakeSalad:
     ) -> SaladQueueJob:
         del webhook
         self.create_calls += 1
+        self.create_inputs.append(input)
         self.create_queue_names.append(queue_name)
         envelope = AnimateEnvelope.model_validate(input, strict=True)
         resolved_metadata = cast(dict[str, JSONValue], dict(metadata or {}))
@@ -342,12 +345,20 @@ async def runtime_context(tmp_path: Path) -> AsyncIterator[RuntimeContext]:
 async def _add_job(
     context: RuntimeContext,
     *,
-    max_attempts: int = 3,
+    remaining_attempts: int = 3,
     request_suffix: str = "1",
+    hq: bool = False,
 ) -> UUID:
     async with context.database.sessions() as session:
         source = await session.get(Asset, context.source_id)
         assert source is not None
+        registration = HQ_VIDEO_PROFILE_REGISTRATION if hq else None
+        profile = registration.profile if registration is not None else PINNED_VIDEO_PROFILE
+        profile_sha256 = (
+            registration.job_contract_sha256
+            if registration is not None
+            else PINNED_VIDEO_PROFILE_SHA256
+        )
         job = VideoGenerationJob(
             source_asset_id=source.id,
             created_by_user_id=context.user_id,
@@ -363,21 +374,25 @@ async def _add_job(
             source_byte_size=cast(int, source.byte_size),
             prompt="subtle breathing and hair movement",
             negative_prompt="camera cut",
-            profile_key=PINNED_VIDEO_PROFILE.profile_id,
-            profile_version=PINNED_VIDEO_PROFILE.adapter_revision,
-            profile_sha256=PINNED_VIDEO_PROFILE_SHA256,
+            profile_key=profile.profile_id,
+            profile_version=profile.adapter_revision,
+            profile_sha256=profile_sha256,
             seed=42,
             frame_count=73,
             fps=24,
-            width=480,
-            height=832,
+            width=profile.portrait_width,
+            height=profile.portrait_height,
             loop_mode="ping_pong",
             content_rating=VideoContentRating.SFW,
             source_rights_confirmed=True,
             lawful_use_confirmed=True,
             request_sha256=(request_suffix * 64)[:64],
             state=VideoGenerationState.QUEUED,
-            max_attempts=max_attempts,
+            # The immutable v1 profile always has three total attempts. Tests
+            # that need a shorter remaining retry window start later in that
+            # bounded sequence instead of weakening the persisted profile.
+            attempt_count=(0 if hq else 3 - remaining_attempts),
+            max_attempts=(1 if hq else 3),
             estimated_cost_microusd=20_000,
             cost_metadata={},
             created_at=NOW,
@@ -449,6 +464,10 @@ async def test_video_runtime_success_is_transactional(runtime_context: RuntimeCo
 
     assert await runtime_context.runtime.submit_once(now=NOW) is True
     assert runtime_context.salad.create_calls == 1
+    submitted_input = cast(dict[str, JSONValue], runtime_context.salad.create_inputs[0])
+    submitted_payload = cast(dict[str, JSONValue], submitted_input["payload"])
+    assert submitted_input["version"] == "video-worker.v1"
+    assert "profile_sha256" not in submitted_payload
     assert runtime_context.salad.list_queue_names == []
     assert runtime_context.salad.create_queue_names == ["animation-video-v1-a1b2c3d4"]
     remote = next(iter(runtime_context.salad.jobs.values()))
@@ -501,6 +520,23 @@ async def test_video_runtime_success_is_transactional(runtime_context: RuntimeCo
 
 
 @pytest.mark.asyncio
+async def test_hq_submission_uses_v2_and_binds_execution_contract(
+    runtime_context: RuntimeContext,
+) -> None:
+    await _add_job(runtime_context, hq=True)
+    assert await runtime_context.runtime.claim_once(now=NOW) is True
+    assert await runtime_context.runtime.submit_once(now=NOW) is True
+
+    submitted_input = cast(dict[str, JSONValue], runtime_context.salad.create_inputs[0])
+    submitted_payload = cast(dict[str, JSONValue], submitted_input["payload"])
+    assert submitted_input["version"] == "video-worker.v2"
+    assert submitted_payload["profile_id"] == (HQ_VIDEO_PROFILE_REGISTRATION.profile.profile_id)
+    assert submitted_payload["profile_sha256"] == (
+        HQ_VIDEO_PROFILE_REGISTRATION.job_contract_sha256
+    )
+
+
+@pytest.mark.asyncio
 async def test_unknown_submit_reconciles_without_duplicate(runtime_context: RuntimeContext) -> None:
     job_id = await _add_job(runtime_context)
     await runtime_context.runtime.claim_once(now=NOW)
@@ -542,7 +578,7 @@ async def test_pristine_attempt_posts_without_scanning_saturated_history(
 async def test_known_identity_mismatch_is_cancelled_before_reservation_release(
     runtime_context: RuntimeContext,
 ) -> None:
-    job_id = await _add_job(runtime_context, max_attempts=1)
+    job_id = await _add_job(runtime_context, remaining_attempts=1)
     await runtime_context.runtime.claim_once(now=NOW)
     runtime_context.salad.tamper_create_response = True
     assert await runtime_context.runtime.submit_once(now=NOW) is True
@@ -585,7 +621,7 @@ async def test_known_identity_mismatch_is_cancelled_before_reservation_release(
 async def test_saturated_unknown_history_advances_cursor_and_resolves(
     runtime_context: RuntimeContext,
 ) -> None:
-    job_id = await _add_job(runtime_context, max_attempts=1)
+    job_id = await _add_job(runtime_context, remaining_attempts=1)
     await runtime_context.runtime.claim_once(now=NOW)
     runtime_context.salad.raise_unknown_after_create = True
     await runtime_context.runtime.submit_once(now=NOW)
@@ -628,7 +664,7 @@ async def test_saturated_unknown_history_advances_cursor_and_resolves(
 async def test_legacy_page_cursor_resumes_at_the_same_absolute_offset(
     runtime_context: RuntimeContext,
 ) -> None:
-    job_id = await _add_job(runtime_context, max_attempts=1)
+    job_id = await _add_job(runtime_context, remaining_attempts=1)
     await runtime_context.runtime.claim_once(now=NOW)
     runtime_context.salad.raise_unknown_after_create = True
     await runtime_context.runtime.submit_once(now=NOW)
@@ -668,8 +704,8 @@ async def test_scan_failure_degrades_health_without_advancing_cursor_or_claiming
     failure_mode: str,
     expected_error: type[BaseException],
 ) -> None:
-    first_job_id = await _add_job(runtime_context, max_attempts=1, request_suffix="1")
-    second_job_id = await _add_job(runtime_context, max_attempts=1, request_suffix="2")
+    first_job_id = await _add_job(runtime_context, remaining_attempts=1, request_suffix="1")
+    second_job_id = await _add_job(runtime_context, remaining_attempts=1, request_suffix="2")
     await runtime_context.runtime.claim_once(now=NOW)
     runtime_context.salad.raise_unknown_after_create = True
     await runtime_context.runtime.submit_once(now=NOW)
@@ -760,7 +796,7 @@ async def test_scan_failure_degrades_health_without_advancing_cursor_or_claiming
 async def test_duplicate_provider_matches_are_all_cancelled_before_release(
     runtime_context: RuntimeContext,
 ) -> None:
-    job_id = await _add_job(runtime_context, max_attempts=1)
+    job_id = await _add_job(runtime_context, remaining_attempts=1)
     await runtime_context.runtime.claim_once(now=NOW)
     runtime_context.salad.raise_unknown_after_create = True
     await runtime_context.runtime.submit_once(now=NOW)
@@ -829,7 +865,7 @@ async def test_duplicate_provider_matches_are_all_cancelled_before_release(
 async def test_ambiguous_old_attempt_reconciles_on_frozen_queue_after_rollout(
     runtime_context: RuntimeContext,
 ) -> None:
-    job_id = await _add_job(runtime_context, max_attempts=1)
+    job_id = await _add_job(runtime_context, remaining_attempts=1)
     await runtime_context.runtime.claim_once(now=NOW)
     runtime_context.salad.raise_unknown_after_create = True
     await runtime_context.runtime.submit_once(now=NOW)
@@ -908,7 +944,7 @@ async def test_ambiguous_old_attempt_reconciles_on_frozen_queue_after_rollout(
 async def test_provider_404_ambiguity_is_bounded_by_watchdog(
     runtime_context: RuntimeContext,
 ) -> None:
-    job_id = await _add_job(runtime_context, max_attempts=1)
+    job_id = await _add_job(runtime_context, remaining_attempts=1)
     await runtime_context.runtime.claim_once(now=NOW)
     await runtime_context.runtime.submit_once(now=NOW)
     runtime_context.salad.get_error = SaladAPIError(
@@ -995,7 +1031,7 @@ async def test_cancel_request_survives_ambiguous_post_reconciliation(
 async def test_identity_mismatch_never_publishes_partial_output(
     runtime_context: RuntimeContext,
 ) -> None:
-    job_id = await _add_job(runtime_context, max_attempts=1)
+    job_id = await _add_job(runtime_context, remaining_attempts=1)
     await runtime_context.runtime.claim_once(now=NOW)
     await runtime_context.runtime.submit_once(now=NOW)
     async with runtime_context.database.sessions() as session:
@@ -1038,7 +1074,7 @@ async def test_identity_mismatch_never_publishes_partial_output(
 async def test_remote_failure_retries_without_partial_output(
     runtime_context: RuntimeContext,
 ) -> None:
-    job_id = await _add_job(runtime_context, max_attempts=2)
+    job_id = await _add_job(runtime_context, remaining_attempts=2)
     await runtime_context.runtime.claim_once(now=NOW)
     await runtime_context.runtime.submit_once(now=NOW)
     remote = next(iter(runtime_context.salad.jobs.values()))
@@ -1062,7 +1098,7 @@ async def test_remote_failure_retries_without_partial_output(
 async def test_definitely_unsubmitted_failure_has_zero_provider_usage(
     runtime_context: RuntimeContext,
 ) -> None:
-    job_id = await _add_job(runtime_context, max_attempts=1)
+    job_id = await _add_job(runtime_context, remaining_attempts=1)
     await runtime_context.runtime.claim_once(now=NOW)
     async with runtime_context.database.sessions() as session:
         attempt = await session.scalar(

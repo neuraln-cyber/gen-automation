@@ -16,8 +16,11 @@ from PIL import Image
 from gen_automation.domain.signing import derive_public_key, encode_base64url
 from gen_automation.video_worker.app import create_video_worker_app
 from gen_automation.video_worker.comfy import (
+    WAN_COMFY_HQ_WORKFLOW_SHA256,
+    WAN_COMFY_WORKFLOW_REGISTRY_SHA256,
     WAN_COMFY_WORKFLOW_SHA256,
     NativeComfyWanExecutor,
+    build_wan_workflow,
 )
 from gen_automation.video_worker.media import (
     FfprobeMp4Validator,
@@ -37,8 +40,12 @@ from gen_automation.video_worker.models import (
     WorkerSettings,
 )
 from gen_automation.video_worker.profiles import (
+    HQ_VIDEO_PROFILE,
+    HQ_VIDEO_PROFILE_REGISTRATION,
+    HQ_VIDEO_PROFILE_SHA256,
     PINNED_VIDEO_PROFILE,
     PINNED_VIDEO_PROFILE_SHA256,
+    VIDEO_PROFILE_REGISTRY_SHA256,
     VideoRenderSpec,
 )
 from gen_automation.video_worker.runtime import (
@@ -48,7 +55,7 @@ from gen_automation.video_worker.runtime import (
     SourceDownloadError,
     VideoUploadError,
 )
-from gen_automation.video_worker.security import calculate_signature
+from gen_automation.video_worker.security import calculate_signature, canonical_signing_payload
 
 NOW = 2_000_000_000
 TEST_PRIVATE_KEY = encode_base64url(bytes(range(1, 33)))
@@ -288,6 +295,111 @@ def test_pinned_profile_descriptor_is_stable() -> None:
     assert PINNED_VIDEO_PROFILE.model_revision == "fb1388adc906ab39ffc26ee40e96b22886b56bc4"
     assert PINNED_VIDEO_PROFILE.default_native_frame_count == 73
     assert PINNED_VIDEO_PROFILE.permitted_native_frame_counts == (73, 121)
+
+
+def test_standard_v1_wire_remains_legacy_worker_compatible() -> None:
+    raw = _unsigned_request()
+    envelope = AnimateEnvelope.model_validate(raw, strict=True)
+    serialized = envelope.model_dump(mode="json", exclude_none=True)
+
+    assert envelope.version == "video-worker.v1"
+    assert "profile_sha256" not in raw["payload"]
+    assert "profile_sha256" not in serialized["payload"]
+    assert set(serialized["payload"]) == {
+        "job_id",
+        "attempt_id",
+        "profile_id",
+        "source",
+        "upload",
+        "prompt",
+        "negative_prompt",
+        "seed",
+        "native_frame_count",
+        "fps",
+        "width",
+        "height",
+        "loop_mode",
+    }
+    assert hashlib.sha256(canonical_signing_payload(envelope)).hexdigest() == (
+        "3f27f747f5bde08acefe6c8505f9b020fab4b1af716749c24de49ac7eb24f0fb"
+    )
+    assert calculate_signature(envelope, TEST_PRIVATE_KEY) == (
+        "oH4DWV2oicXvONYHgweiAlBBrtzGH0pUdihxNLedIFIuJlFOjGBwSVdGkY7I0wAi1dpMzzhcUzp4MaZulNmzBw"
+    )
+
+
+def test_hq_profile_and_workflow_contracts_are_stable_and_camera_locked() -> None:
+    assert HQ_VIDEO_PROFILE.descriptor_sha256 == HQ_VIDEO_PROFILE_SHA256
+    assert (HQ_VIDEO_PROFILE.portrait_width, HQ_VIDEO_PROFILE.portrait_height) == (1152, 1472)
+    assert HQ_VIDEO_PROFILE.permitted_native_frame_counts == (73,)
+    assert HQ_VIDEO_PROFILE_REGISTRATION.execution_timeout_seconds == 5400
+    assert HQ_VIDEO_PROFILE_REGISTRATION.max_attempts == 1
+    assert HQ_VIDEO_PROFILE_REGISTRATION.estimated_runtime_seconds(73) == 3058
+    assert HQ_VIDEO_PROFILE_REGISTRATION.workflow_sha256 == WAN_COMFY_HQ_WORKFLOW_SHA256
+    assert HQ_VIDEO_PROFILE_REGISTRATION.job_contract_sha256 == (
+        "00fb341e491f295b2db16a32626a6383d83c6cda88978b29479caf245c817387"
+    )
+    assert VIDEO_PROFILE_REGISTRY_SHA256 == (
+        "8f536e93c5e097aa70c8036c778c1a454fb8ce8ad5d0fd1dd614b67afd4c80eb"
+    )
+    assert WAN_COMFY_HQ_WORKFLOW_SHA256 == (
+        "01c5b5350cab319e5cf7ec407971d7fbb269c4eb1e3c91c27c5c3cbb793a5151"
+    )
+    assert WAN_COMFY_WORKFLOW_REGISTRY_SHA256 == (
+        "19e4426429def8dc731b2b8802f714fa85a9e3ec61b5fcc79609c26363783f69"
+    )
+
+    workflow = build_wan_workflow(
+        source_filename="SOURCE.png",
+        output_prefix="OUTPUT/frame",
+        prompt="one blink and one breath",
+        negative_prompt="",
+        seed=42,
+        render_spec=VideoRenderSpec(73, 24, 1152, 1472, "ping_pong"),
+        profile=HQ_VIDEO_PROFILE,
+    )
+    negative = str(workflow["6"]["inputs"]["text"])
+    sampler = workflow["9"]["inputs"]
+
+    assert "static" not in negative.split(", ")
+    assert "camera shake" in negative
+    assert "background drift" in negative
+    assert workflow["7"]["inputs"]["width"] == 1152
+    assert workflow["7"]["inputs"]["height"] == 1472
+    assert sampler["steps"] == 30
+    assert sampler["cfg"] == 5.0
+    assert sampler["sampler_name"] == "uni_pc"
+    assert sampler["scheduler"] == "simple"
+    assert sampler["denoise"] == 1.0
+
+
+def test_signed_hq_portrait_job_selects_hq_profile(tmp_path: Path) -> None:
+    source = _image_bytes(width=6, height=8)
+    raw = _unsigned_request(source)
+    raw["version"] = "video-worker.v2"
+    raw["payload"].update(
+        {
+            "profile_id": HQ_VIDEO_PROFILE.profile_id,
+            "profile_sha256": HQ_VIDEO_PROFILE_REGISTRATION.job_contract_sha256,
+            "native_frame_count": 73,
+            "width": 1152,
+            "height": 1472,
+        }
+    )
+    client, _downloader, executor, validator, _uploader = _client(
+        tmp_path,
+        downloader=FakeDownloader(source),
+    )
+
+    with client:
+        response = client.post("/jobs/generate", json=_sign_request(raw))
+
+    assert response.status_code == 200
+    assert response.json()["version"] == "video-worker.v2"
+    assert response.json()["profile_id"] == HQ_VIDEO_PROFILE.profile_id
+    assert (response.json()["width"], response.json()["height"]) == (1152, 1472)
+    assert executor.calls[0]["profile"] is HQ_VIDEO_PROFILE
+    assert validator.calls[0][1] is HQ_VIDEO_PROFILE
 
 
 def test_signed_one_image_job_uploads_one_mp4_and_cleans_staging(tmp_path: Path) -> None:

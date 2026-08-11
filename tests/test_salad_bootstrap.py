@@ -149,6 +149,7 @@ def test_video_deployment_is_isolated_cached_and_scale_to_zero() -> None:
     assert config.desired_queue_length == 1
     assert config.provider_configuration["replicas"] == 0
     assert config.provider_configuration["container"]["image_caching"] is True
+    assert config.provider_configuration["container"]["priority"] == "low"
     assert config.provider_configuration["container"]["resources"] == {
         "cpu": 4,
         "memory": 32 * 1024,
@@ -179,6 +180,22 @@ def test_video_deployment_is_isolated_cached_and_scale_to_zero() -> None:
     )
     assert rotated.config_sha256 != config.config_sha256
     assert rotated.provider_configuration["runtime_binding_contract_sha256"] != fingerprint
+
+    batch_settings = _settings(
+        video_generation_enabled=True,
+        salad_worker_allowed_upload_origin="https://private-assets.example.test",
+        salad_video_queue_name="video-generation",
+        salad_video_container_group_name="video-worker",
+        salad_video_worker_image=("registry.example.test/video-worker@sha256:" + "c" * 64),
+        salad_video_gpu_class_ids=(video_gpu_class_id,),
+        salad_video_container_priority="batch",
+    )
+    batch = salad_video_deployment_config_from_settings(batch_settings)
+    assert batch.provider_configuration["container"]["priority"] == "batch"
+    assert (
+        salad_deployment_config_from_settings(batch_settings).config_sha256
+        == salad_deployment_config_from_settings(settings).config_sha256
+    )
 
 
 def test_video_settings_require_grants_to_outlive_bounded_queue_reconciliation() -> None:

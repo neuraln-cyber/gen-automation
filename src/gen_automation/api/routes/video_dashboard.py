@@ -581,7 +581,11 @@ async def _read_video_form(request: Request) -> BrowserVideoForm:
             content_rating=content_rating,
             duration_seconds=duration_seconds,
             variant_count=variant_count,
-            **attestations,
+            source_rights_confirmed=attestations["source_rights_confirmed"],
+            lawful_use_confirmed=attestations["lawful_use_confirmed"],
+            all_depicted_people_are_adults=attestations["all_depicted_people_are_adults"],
+            consensual_adult_content_confirmed=attestations["consensual_adult_content_confirmed"],
+            no_real_person_sexual_content=attestations["no_real_person_sexual_content"],
         )
     except BrowserVideoFormError as error:
         error.values = values

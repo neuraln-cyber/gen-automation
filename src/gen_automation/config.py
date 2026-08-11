@@ -518,6 +518,9 @@ class Settings(BaseSettings):
     salad_video_container_group_name: str | None = None
     salad_video_worker_image: str | None = None
     salad_video_gpu_class_ids: tuple[UUID, ...] = Field(default=(), max_length=16)
+    # Unset inherits the still-image lane priority for backward compatibility.
+    # HQ canaries set this to ``batch`` without changing image-job scheduling.
+    salad_video_container_priority: SaladContainerPriority | None = None
     salad_video_container_cpu: int = Field(default=4, ge=1, le=16)
     salad_video_container_memory_mb: int = Field(default=32 * 1024, ge=1024, le=64 * 1024)
     salad_video_container_storage_bytes: int = Field(

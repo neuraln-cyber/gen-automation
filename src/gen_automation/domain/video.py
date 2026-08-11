@@ -7,6 +7,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from gen_automation.domain.canonical import canonical_sha256
+from gen_automation.video_worker.profiles import get_video_profile_registration
 
 VIDEO_REQUEST_SCHEMA: Final[Literal["video-generation-request/v1"]] = "video-generation-request/v1"
 VIDEO_COMPLIANCE_SCHEMA: Final[Literal["video-compliance/v1"]] = "video-compliance/v1"
@@ -85,14 +86,29 @@ class VideoGenerationParameters(_StrictFrozenModel):
     seed: int = Field(ge=0, le=9_223_372_036_854_775_807)
     frame_count: Literal[73, 121]
     fps: Literal[24] = 24
-    width: Literal[480, 832]
-    height: Literal[480, 832]
+    width: Literal[480, 832, 1152, 1472]
+    height: Literal[480, 832, 1152, 1472]
     loop_mode: Literal["ping_pong"] = "ping_pong"
 
     @model_validator(mode="after")
     def validate_native_dimensions(self) -> VideoGenerationParameters:
-        if (self.width, self.height) not in {(832, 480), (480, 832)}:
-            raise ValueError("video dimensions must be 832x480 or 480x832")
+        registration = get_video_profile_registration(self.profile_key)
+        if registration is None:
+            raise ValueError("video profile is not supported")
+        profile = registration.profile
+        if (
+            self.profile_version != profile.adapter_revision
+            or self.profile_sha256 != registration.job_contract_sha256
+            or self.frame_count not in profile.permitted_native_frame_counts
+            or self.fps != profile.fps
+            or (self.width, self.height)
+            not in {
+                (profile.landscape_width, profile.landscape_height),
+                (profile.portrait_width, profile.portrait_height),
+            }
+            or self.loop_mode != profile.loop_mode
+        ):
+            raise ValueError("video parameters do not match the selected profile")
         return self
 
 

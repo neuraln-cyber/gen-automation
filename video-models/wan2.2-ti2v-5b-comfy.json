@@ -1,6 +1,10 @@
 {
   "schema_version": 1,
   "profile_id": "wan2.2-ti2v-5b-comfy-v1",
+  "profile_ids": [
+    "wan2.2-ti2v-5b-comfy-v1",
+    "wan2.2-ti2v-5b-comfy-hq-v1"
+  ],
   "upstream": {
     "repository": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
     "revision": "fb1388adc906ab39ffc26ee40e96b22886b56bc4",

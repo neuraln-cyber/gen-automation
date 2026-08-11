@@ -30,7 +30,13 @@ jobs:
       SOURCE_SHA: ${{ inputs.source_sha }}
       PROFILE_SHA256: a83c946f9a61bac7cf3794fc9aa4debacc2fc676c13957deaed42ecf82c7e2e4
       WORKFLOW_SHA256: ecba3eef1c14abcd4d0d2ba3cec1f53042767f1a177d833dcfd3fd6b11f09ab3
+      HQ_PROFILE_SHA256: d690fb7b0fc883075e0a73fc711ae3c021b34044c57b6fb6e74dbf25bbf1b22c
+      HQ_WORKFLOW_SHA256: 01c5b5350cab319e5cf7ec407971d7fbb269c4eb1e3c91c27c5c3cbb793a5151
+      HQ_EXECUTION_CONTRACT_SHA256: 00fb341e491f295b2db16a32626a6383d83c6cda88978b29479caf245c817387
+      PROFILE_REGISTRY_SHA256: 8f536e93c5e097aa70c8036c778c1a454fb8ce8ad5d0fd1dd614b67afd4c80eb
+      WORKFLOW_REGISTRY_SHA256: 19e4426429def8dc731b2b8802f714fa85a9e3ec61b5fcc79609c26363783f69
       MODEL_REVISION: fb1388adc906ab39ffc26ee40e96b22886b56bc4
+      MODEL_MANIFEST_SHA256: 83fe998813b2f16662064b4f11e327bb4608efa00b991616cc46df7d996ef65e
       MAX_COMPRESSED_IMAGE_BYTES: "33000000000"
       BUILDKIT_IMAGE: moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
       SBOM_GENERATOR_IMAGE: docker/buildkit-syft-scanner:stable-1@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68
@@ -194,15 +200,45 @@ jobs:
             IMAGE_JSON="$image_json" python3 -c \
               'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.video-workflow-sha256"])'
           )"
+          hq_profile_sha="$(
+            IMAGE_JSON="$image_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.video-hq-profile-sha256"])'
+          )"
+          hq_workflow_sha="$(
+            IMAGE_JSON="$image_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.video-hq-workflow-sha256"])'
+          )"
+          hq_execution_contract_sha="$(
+            IMAGE_JSON="$image_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.video-hq-execution-contract-sha256"])'
+          )"
+          profile_registry_sha="$(
+            IMAGE_JSON="$image_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.video-profile-registry-sha256"])'
+          )"
+          workflow_registry_sha="$(
+            IMAGE_JSON="$image_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.video-workflow-registry-sha256"])'
+          )"
           model_revision="$(
             IMAGE_JSON="$image_json" python3 -c \
               'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.model.revision"])'
+          )"
+          model_manifest_sha="$(
+            IMAGE_JSON="$image_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.model.manifest-sha256"])'
           )"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           [ "$revision" = "$SOURCE_SHA" ]
           [ "$profile_sha" = "$PROFILE_SHA256" ]
           [ "$workflow_sha" = "$WORKFLOW_SHA256" ]
+          [ "$hq_profile_sha" = "$HQ_PROFILE_SHA256" ]
+          [ "$hq_workflow_sha" = "$HQ_WORKFLOW_SHA256" ]
+          [ "$hq_execution_contract_sha" = "$HQ_EXECUTION_CONTRACT_SHA256" ]
+          [ "$profile_registry_sha" = "$PROFILE_REGISTRY_SHA256" ]
+          [ "$workflow_registry_sha" = "$WORKFLOW_REGISTRY_SHA256" ]
           [ "$model_revision" = "$MODEL_REVISION" ]
+          [ "$model_manifest_sha" = "$MODEL_MANIFEST_SHA256" ]
           if [ "${{ steps.existing.outputs.exists }}" = "false" ]; then
             [ "$digest" = "${{ steps.push.outputs.digest }}" ]
           else

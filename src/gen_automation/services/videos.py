@@ -4,7 +4,8 @@ import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
-from typing import Final, Literal
+from enum import StrEnum
+from typing import Final, Literal, cast
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -42,8 +43,12 @@ from gen_automation.video_worker.models import (
     DEFAULT_MAX_SOURCE_BYTES,
 )
 from gen_automation.video_worker.profiles import (
+    HQ_VIDEO_PROFILE_REGISTRATION,
     PINNED_VIDEO_PROFILE,
+    PINNED_VIDEO_PROFILE_REGISTRATION,
     PINNED_VIDEO_PROFILE_SHA256,
+    VideoProfile,
+    VideoProfileRegistration,
 )
 
 VIDEO_SOURCE_CONTENT_TYPES: Final = frozenset({"image/jpeg", "image/png", "image/webp"})
@@ -60,6 +65,17 @@ _TERMINAL_STATES: Final = frozenset(
         VideoGenerationState.CANCELLED,
     }
 )
+
+
+class VideoQualityProfile(StrEnum):
+    STANDARD = "standard"
+    HQ_NATIVE = "hq_native"
+
+
+_QUALITY_PROFILE_REGISTRATIONS: Final = {
+    VideoQualityProfile.STANDARD: PINNED_VIDEO_PROFILE_REGISTRATION,
+    VideoQualityProfile.HQ_NATIVE: HQ_VIDEO_PROFILE_REGISTRATION,
+}
 
 
 class VideoStudioError(Exception):
@@ -115,6 +131,13 @@ class CreateVideoSubmission:
     all_depicted_people_are_adults: bool = False
     consensual_adult_content_confirmed: bool = False
     no_real_person_sexual_content: bool = False
+    # Internal-only canary selector. The browser intentionally omits it, so all
+    # existing callers and forms remain pinned to the standard v1 profile.
+    quality_profile: VideoQualityProfile = VideoQualityProfile.STANDARD
+    # Optional stable seed for comparing this native canary with later manual
+    # fallback tiers. When omitted, HQ derives one from source identity+prompt,
+    # independent of submission ID and quality tier.
+    experiment_seed: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,22 +287,34 @@ async def create_video_submission(
         raise VideoStudioNotFoundError("source image was not found")
     snapshot = _source_snapshot(asset)
     _validate_source_worker_limits(snapshot)
-    width, height = _derive_video_dimensions(snapshot.width, snapshot.height)
-    compliance = _compliance(command)
-    submission_request_sha256 = canonical_sha256(
-        {
-            "schema": "video-studio-submission/v1",
-            "submission_id": str(command.submission_id),
-            "actor_user_id": str(actor.id),
-            "source": snapshot.model_dump(mode="json"),
-            "prompt": command.prompt,
-            "negative_prompt": DEFAULT_VIDEO_NEGATIVE_PROMPT,
-            "content_rating": command.content_rating.value,
-            "duration_seconds": command.duration_seconds,
-            "variant_count": command.variant_count,
-            "compliance": compliance.model_dump(mode="json"),
-        }
+    registration = _registration_for_quality(command.quality_profile)
+    profile = registration.profile
+    width, height = _derive_video_dimensions(
+        snapshot.width,
+        snapshot.height,
+        profile=profile,
     )
+    compliance = _compliance(command)
+    submission_material = {
+        "schema": "video-studio-submission/v1",
+        "submission_id": str(command.submission_id),
+        "actor_user_id": str(actor.id),
+        "source": snapshot.model_dump(mode="json"),
+        "prompt": command.prompt,
+        "negative_prompt": DEFAULT_VIDEO_NEGATIVE_PROMPT,
+        "content_rating": command.content_rating.value,
+        "duration_seconds": command.duration_seconds,
+        "variant_count": command.variant_count,
+        "compliance": compliance.model_dump(mode="json"),
+    }
+    if command.quality_profile != VideoQualityProfile.STANDARD:
+        # Keep the standard v1 replay digest byte-for-byte stable. Experimental
+        # profiles bind their additional choice explicitly.
+        submission_material["quality_profile"] = command.quality_profile.value
+        submission_material["profile_key"] = profile.profile_id
+        if command.experiment_seed is not None:
+            submission_material["experiment_seed"] = command.experiment_seed
+    submission_request_sha256 = canonical_sha256(submission_material)
     replay = await _load_submission_by_id(
         session,
         actor_user_id=actor.id,
@@ -295,16 +330,25 @@ async def create_video_submission(
             raise VideoStudioConflictError("the saved submission is incomplete")
         return _submission_read(command.submission_id, replay)
 
-    fps, frame_count = _video_timing(command.duration_seconds)
+    fps, frame_count = _video_timing(command.duration_seconds, profile=profile)
     estimate_microusd = _estimated_cost_microusd(
         max_hourly_cost_usd=max_hourly_cost_usd,
-        duration_seconds=command.duration_seconds,
+        registration=registration,
+        frame_count=frame_count,
     )
     jobs: list[VideoGenerationJob] = []
     for variant_index in range(1, command.variant_count + 1):
-        seed = _variant_seed(
-            submission_request_sha256=submission_request_sha256,
-            variant_index=variant_index,
+        seed = (
+            command.experiment_seed
+            if command.experiment_seed is not None
+            else (
+                _hq_experiment_seed(source_sha256=snapshot.sha256, prompt=command.prompt)
+                if command.quality_profile == VideoQualityProfile.HQ_NATIVE
+                else _variant_seed(
+                    submission_request_sha256=submission_request_sha256,
+                    variant_index=variant_index,
+                )
+            )
         )
         parameters = VideoGenerationParameters(
             prompt=command.prompt,
@@ -312,9 +356,9 @@ async def create_video_submission(
             # second worker field server-owned and within the same 4,000-byte
             # contract so callers cannot smuggle a larger hidden prompt.
             negative_prompt=DEFAULT_VIDEO_NEGATIVE_PROMPT,
-            profile_key=PINNED_VIDEO_PROFILE.profile_id,
-            profile_version=VIDEO_PROFILE_VERSION,
-            profile_sha256=PINNED_VIDEO_PROFILE_SHA256,
+            profile_key=profile.profile_id,
+            profile_version=profile.adapter_revision,
+            profile_sha256=registration.job_contract_sha256,
             seed=seed,
             frame_count=frame_count,
             fps=fps,
@@ -365,7 +409,7 @@ async def create_video_submission(
             state=VideoGenerationState.QUEUED,
             priority=100,
             attempt_count=0,
-            max_attempts=3,
+            max_attempts=registration.max_attempts,
             lock_version=1,
             estimated_cost_microusd=estimate_microusd,
             reserved_cost_microusd=0,
@@ -379,7 +423,22 @@ async def create_video_submission(
                 "variant_count": command.variant_count,
                 "requested_duration_seconds": command.duration_seconds,
                 "estimate_basis": "configured-hourly-cap-and-planning-window",
-                "estimated_runtime_seconds": _estimated_runtime_seconds(command.duration_seconds),
+                "estimated_runtime_seconds": registration.estimated_runtime_seconds(frame_count),
+                **(
+                    {
+                        "quality_profile": command.quality_profile.value,
+                        "profile_key": profile.profile_id,
+                        "native_pixel_count": width * height,
+                        "experiment_seed": seed,
+                        "experiment_seed_basis": (
+                            "operator-override"
+                            if command.experiment_seed is not None
+                            else "source-sha256-and-prompt/v1"
+                        ),
+                    }
+                    if command.quality_profile != VideoQualityProfile.STANDARD
+                    else {}
+                ),
             },
             output=None,
             created_at=created_at,
@@ -491,15 +550,24 @@ def planning_estimate_microusd(
     max_hourly_cost_usd: Decimal,
     duration_seconds: int,
     variant_count: int,
+    quality_profile: VideoQualityProfile = VideoQualityProfile.STANDARD,
 ) -> int:
     if duration_seconds not in VIDEO_DURATION_SECONDS:
         raise VideoStudioInputError("duration must be 3 or 5 seconds")
     if not MIN_VIDEO_VARIANTS <= variant_count <= MAX_VIDEO_VARIANTS:
         raise VideoStudioInputError("variant count must be between 1 and 3")
+    registration = _registration_for_quality(quality_profile)
+    _validate_quality_limits(
+        quality_profile=quality_profile,
+        duration_seconds=duration_seconds,
+        variant_count=variant_count,
+    )
+    _fps, frame_count = _video_timing(duration_seconds, profile=registration.profile)
     return (
         _estimated_cost_microusd(
             max_hourly_cost_usd=max_hourly_cost_usd,
-            duration_seconds=duration_seconds,
+            registration=registration,
+            frame_count=frame_count,
         )
         * variant_count
     )
@@ -520,6 +588,23 @@ def _validate_command(command: CreateVideoSubmission) -> None:
         raise VideoStudioInputError("duration must be 3 or 5 seconds")
     if not MIN_VIDEO_VARIANTS <= command.variant_count <= MAX_VIDEO_VARIANTS:
         raise VideoStudioInputError("variant count must be between 1 and 3")
+    if not isinstance(command.quality_profile, VideoQualityProfile):
+        raise VideoStudioInputError("animation quality profile is invalid")
+    if command.experiment_seed is not None and (
+        isinstance(command.experiment_seed, bool)
+        or not 0 <= command.experiment_seed <= 9_223_372_036_854_775_807
+    ):
+        raise VideoStudioInputError("animation experiment seed is invalid")
+    if (
+        command.quality_profile == VideoQualityProfile.STANDARD
+        and command.experiment_seed is not None
+    ):
+        raise VideoStudioInputError("animation experiment seed requires an experimental profile")
+    _validate_quality_limits(
+        quality_profile=command.quality_profile,
+        duration_seconds=command.duration_seconds,
+        variant_count=command.variant_count,
+    )
     try:
         _compliance(command)
     except ValidationError as error:
@@ -605,15 +690,26 @@ def _source_snapshot(asset: Asset) -> VideoSourceSnapshot:
 def _derive_video_dimensions(
     source_width: int,
     source_height: int,
-) -> tuple[Literal[832, 480], Literal[480, 832]]:
+    *,
+    profile: VideoProfile = PINNED_VIDEO_PROFILE,
+) -> tuple[
+    Literal[480, 832, 1152, 1472],
+    Literal[480, 832, 1152, 1472],
+]:
     if source_width <= 0 or source_height <= 0:
         raise VideoStudioConflictError("source image dimensions are invalid")
     aspect_ratio = source_width / source_height
     if not 1 / 3.25 <= aspect_ratio <= 3.25:
         raise VideoStudioConflictError("source image aspect ratio is outside the animation profile")
     if source_width >= source_height:
-        return 832, 480
-    return 480, 832
+        return cast(
+            "tuple[Literal[480, 832, 1152, 1472], Literal[480, 832, 1152, 1472]]",
+            (profile.landscape_width, profile.landscape_height),
+        )
+    return cast(
+        "tuple[Literal[480, 832, 1152, 1472], Literal[480, 832, 1152, 1472]]",
+        (profile.portrait_width, profile.portrait_height),
+    )
 
 
 def _validate_source_worker_limits(snapshot: VideoSourceSnapshot) -> None:
@@ -636,13 +732,15 @@ def _validate_source_worker_limits(snapshot: VideoSourceSnapshot) -> None:
 
 def _video_timing(
     duration_seconds: int,
+    *,
+    profile: VideoProfile,
 ) -> tuple[Literal[24], Literal[73, 121]]:
     # Wan video latents are most efficient with 4n+1 frames.  The player loops
     # the short base clip, so these are intentionally near 3s/5s rather than a
     # costly long-form render.
     if duration_seconds == 3:
-        return 24, 73
-    return 24, 121
+        return cast("Literal[24]", profile.fps), 73
+    return cast("Literal[24]", profile.fps), 121
 
 
 def _requested_duration_from_frames(frame_count: int, fps: int) -> int:
@@ -658,26 +756,47 @@ def _variant_seed(*, submission_request_sha256: str, variant_index: int) -> int:
     return int.from_bytes(hashlib.sha256(material).digest()[:8], "big") & ((1 << 63) - 1)
 
 
-def _estimated_runtime_seconds(duration_seconds: int) -> int:
-    # Conservative planning window around the published Wan 2.2 benchmark;
-    # actual billing is reconciled from the Salad attempt instead of this cap.
-    return 360 if duration_seconds == 3 else 600
+def _hq_experiment_seed(*, source_sha256: str, prompt: str) -> int:
+    material = f"hq-native-experiment/v1:{source_sha256}:{prompt}".encode()
+    return int.from_bytes(hashlib.sha256(material).digest()[:8], "big") & ((1 << 63) - 1)
 
 
 def _estimated_cost_microusd(
     *,
     max_hourly_cost_usd: Decimal,
-    duration_seconds: int,
+    registration: VideoProfileRegistration,
+    frame_count: int,
 ) -> int:
     if max_hourly_cost_usd <= 0:
         raise VideoStudioInputError("configured video hourly cost must be positive")
     estimate = (
         max_hourly_cost_usd
-        * Decimal(_estimated_runtime_seconds(duration_seconds))
+        * Decimal(registration.estimated_runtime_seconds(frame_count))
         / Decimal(3600)
         * Decimal(1_000_000)
     )
     return int(estimate.to_integral_value(rounding=ROUND_CEILING))
+
+
+def _registration_for_quality(
+    quality_profile: VideoQualityProfile,
+) -> VideoProfileRegistration:
+    try:
+        return _QUALITY_PROFILE_REGISTRATIONS[quality_profile]
+    except (KeyError, TypeError):
+        raise VideoStudioInputError("animation quality profile is invalid") from None
+
+
+def _validate_quality_limits(
+    *,
+    quality_profile: VideoQualityProfile,
+    duration_seconds: int,
+    variant_count: int,
+) -> None:
+    if quality_profile == VideoQualityProfile.HQ_NATIVE and (
+        duration_seconds != 3 or variant_count != 1
+    ):
+        raise VideoStudioInputError("HQ native animation is limited to one 3-second canary")
 
 
 async def _require_actor(

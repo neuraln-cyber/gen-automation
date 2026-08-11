@@ -1,6 +1,9 @@
+import hashlib
 import json
 import re
 from pathlib import Path
+
+from gen_automation.video_worker.model_integrity import MODEL_MANIFEST as PINNED_MODEL_MANIFEST
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "Dockerfile.video-worker"
@@ -34,6 +37,15 @@ def test_model_layer_uses_exact_revision_checksums_and_sizes() -> None:
     manifest = json.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))
 
     assert manifest["upstream"]["revision"] == MODEL_REVISION
+    assert manifest["profile_id"] == "wan2.2-ti2v-5b-comfy-v1"
+    assert manifest["profile_ids"] == [
+        "wan2.2-ti2v-5b-comfy-v1",
+        "wan2.2-ti2v-5b-comfy-hq-v1",
+    ]
+    manifest_bytes = MODEL_MANIFEST.read_bytes()
+    assert len(manifest_bytes) == PINNED_MODEL_MANIFEST.size_bytes == 1472
+    assert hashlib.sha256(manifest_bytes).hexdigest() == PINNED_MODEL_MANIFEST.sha256
+    assert PINNED_MODEL_MANIFEST.sha256 in dockerfile
     assert manifest["distribution"]["runtime_model_download"] is False
     assert manifest["total_bytes"] == sum(size for size, _digest in ARTIFACTS.values())
     for filename, (size, digest) in ARTIFACTS.items():
@@ -84,6 +96,13 @@ def test_video_image_is_non_root_and_contains_pinned_ffprobe_contract() -> None:
     assert "gen_automation.gpu_worker" not in dockerfile
     assert 'org.opencontainers.image.video-profile-sha256="a83c946f9a61' in dockerfile
     assert 'org.opencontainers.image.video-workflow-sha256="ecba3eef1c14' in dockerfile
+    assert 'org.opencontainers.image.video-hq-profile-sha256="d690fb7b0fc8' in dockerfile
+    assert 'org.opencontainers.image.video-hq-workflow-sha256="01c5b5350cab' in dockerfile
+    assert 'org.opencontainers.image.video-hq-execution-contract-sha256="00fb341e491f' in dockerfile
+    assert 'org.opencontainers.image.video-profile-registry-sha256="8f536e93c5e0' in dockerfile
+    assert 'org.opencontainers.image.video-workflow-registry-sha256="19e4426429de' in dockerfile
+    assert "VIDEO_WORKER_PROFILE_ID=wan2.2-ti2v-5b-comfy-v1" in dockerfile
+    assert "VIDEO_WORKER_PROFILE_IDS_JSON=" in dockerfile
 
 
 def test_pinned_salad_sidecar_is_built_patched_and_copied() -> None:

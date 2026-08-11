@@ -337,7 +337,9 @@ def salad_video_deployment_config_from_settings(settings: Settings) -> SaladDepl
             # private-layer cache moves that transfer out of paid worker time;
             # no model is fetched by a running replica.
             "image_caching": True,
-            "priority": settings.salad_container_priority.value,
+            "priority": (
+                settings.salad_video_container_priority or settings.salad_container_priority
+            ).value,
         },
         "replicas": 0,
         "queue_connection": {},

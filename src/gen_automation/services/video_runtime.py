@@ -70,10 +70,7 @@ from gen_automation.video_worker.models import (
     SourceDownloadGrant,
     VideoUploadGrant,
 )
-from gen_automation.video_worker.profiles import (
-    PINNED_VIDEO_PROFILE,
-    PINNED_VIDEO_PROFILE_SHA256,
-)
+from gen_automation.video_worker.profiles import get_video_profile_registration
 from gen_automation.video_worker.security import calculate_signature
 
 _ACTIVE_JOB_STATES = frozenset(
@@ -108,7 +105,6 @@ _REMOTE_ATTEMPT_STATES = frozenset(
 _SOURCE_CONTENT_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
 _OUTPUT_CONTENT_TYPE = "video/mp4"
 _METADATA_KIND = "animation-video/v1"
-_LINEAGE_RECIPE = "wan2.2-ti2v-5b-comfy-v1"
 _RECONCILIATION_BATCH_COUNT = 10
 _RECONCILIATION_PAGES_PER_BATCH = 4
 _RECONCILIATION_LEGACY_PAGE_SIZE = 100
@@ -1347,6 +1343,15 @@ class VideoRuntime:
                 raise ValueError("video source identity changed")
             if job.source_object_version_id is None:
                 raise ValueError("video source version is unavailable")
+            registration = get_video_profile_registration(job.profile_key)
+            if registration is None or not _profile_matches(job):
+                raise ValueError("video profile identity changed")
+            requires_bound_contract = (
+                registration.job_contract_sha256 != registration.profile_sha256
+            )
+            worker_wire_version = (
+                "video-worker.v2" if requires_bound_contract else "video-worker.v1"
+            )
 
         source_url = await self.store.presign_download(
             key=job.source_object_key,
@@ -1373,6 +1378,7 @@ class VideoRuntime:
             job_id=str(job.id),
             attempt_id=str(attempt.id),
             profile_id=cast(Any, job.profile_key),
+            profile_sha256=(job.profile_sha256 if requires_bound_contract else None),
             source=SourceDownloadGrant(
                 asset_id=str(job.source_asset_id),
                 url=source_url,
@@ -1397,7 +1403,7 @@ class VideoRuntime:
             loop_mode=cast(Any, job.loop_mode),
         )
         unsigned = AnimateEnvelope(
-            version="video-worker.v1",
+            version=cast(Any, worker_wire_version),
             key_id=self.config.signing_key_id,
             issued_at=issued_at,
             expires_at=issued_at + self.config.signature_ttl_seconds,
@@ -1405,12 +1411,16 @@ class VideoRuntime:
             signature="A" * 86,
         )
         envelope = AnimateEnvelope(
-            **unsigned.model_dump(mode="python", exclude={"signature"}),
+            **unsigned.model_dump(
+                mode="python",
+                exclude={"signature"},
+                exclude_none=True,
+            ),
             signature=calculate_signature(unsigned, self.config.signing_private_key),
         )
         serialized_size = len(
             json.dumps(
-                envelope.model_dump(mode="json"),
+                envelope.model_dump(mode="json", exclude_none=True),
                 ensure_ascii=False,
                 allow_nan=False,
                 separators=(",", ":"),
@@ -1422,7 +1432,7 @@ class VideoRuntime:
         return _PreparedSubmission(
             attempt_id=attempt.id,
             queue_name=deployment.queue_name,
-            input=envelope.model_dump(mode="json"),
+            input=envelope.model_dump(mode="json", exclude_none=True),
             metadata={
                 "kind": _METADATA_KIND,
                 "video_job_id": str(job.id),
@@ -1838,7 +1848,7 @@ class VideoRuntime:
                     parent_asset_id=job.source_asset_id,
                     child_asset_id=asset.id,
                     relation="animated_from",
-                    recipe_version=_LINEAGE_RECIPE,
+                    recipe_version=job.profile_key,
                     created_at=now,
                 )
                 asset.state = AssetState.AVAILABLE
@@ -2374,10 +2384,22 @@ def _source_matches(job: VideoGenerationJob, source: Asset, store: ObjectStore) 
 
 
 def _profile_matches(job: VideoGenerationJob) -> bool:
+    registration = get_video_profile_registration(job.profile_key)
+    if registration is None:
+        return False
+    profile = registration.profile
     return (
-        job.profile_key == PINNED_VIDEO_PROFILE.profile_id
-        and job.profile_version == PINNED_VIDEO_PROFILE.adapter_revision
-        and job.profile_sha256 == PINNED_VIDEO_PROFILE_SHA256
+        job.profile_version == profile.adapter_revision
+        and job.profile_sha256 == registration.job_contract_sha256
+        and job.max_attempts == registration.max_attempts
+        and job.frame_count in profile.permitted_native_frame_counts
+        and job.fps == profile.fps
+        and (job.width, job.height)
+        in {
+            (profile.landscape_width, profile.landscape_height),
+            (profile.portrait_width, profile.portrait_height),
+        }
+        and job.loop_mode == profile.loop_mode
         and len(job.prompt) <= 4000
         and len(job.negative_prompt) <= 4000
     )
@@ -2393,12 +2415,20 @@ def _response_matches(
     upload_attempt_id: UUID,
     max_output_bytes: int,
 ) -> bool:
+    registration = get_video_profile_registration(job.profile_key)
+    if registration is None:
+        return False
+    expected_wire_version = (
+        "video-worker.v2"
+        if registration.job_contract_sha256 != registration.profile_sha256
+        else "video-worker.v1"
+    )
     expected_output_frames = (job.frame_count * 2) - 2
     expected_native_duration = job.frame_count / job.fps
     expected_duration = expected_output_frames / job.fps
     return (
         attempt.provider_external_id == str(remote.id)
-        and response.version == "video-worker.v1"
+        and response.version == expected_wire_version
         and response.status == "succeeded"
         and response.job_id == str(job.id)
         and response.attempt_id == str(attempt.id)
@@ -2451,13 +2481,20 @@ def _remote_input_matches(
         )
     except (ValidationError, ValueError, VideoRuntimeError):
         return False
+    registration = get_video_profile_registration(job.profile_key)
+    if registration is None:
+        return False
+    requires_bound_contract = registration.job_contract_sha256 != registration.profile_sha256
+    expected_version = "video-worker.v2" if requires_bound_contract else "video-worker.v1"
+    expected_profile_sha256 = job.profile_sha256 if requires_bound_contract else None
     return (
-        envelope.version == "video-worker.v1"
+        envelope.version == expected_version
         and (not verify_signature or envelope.key_id == signing_key_id)
         and (not verify_signature or hmac.compare_digest(envelope.signature, expected_signature))
         and payload.job_id == str(job.id)
         and payload.attempt_id == str(attempt.id)
         and payload.profile_id == job.profile_key
+        and payload.profile_sha256 == expected_profile_sha256
         and payload.source.asset_id == str(job.source_asset_id)
         and payload.source.content_type == job.source_content_type
         and payload.source.size_bytes == job.source_byte_size

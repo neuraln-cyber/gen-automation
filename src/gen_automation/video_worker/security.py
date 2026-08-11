@@ -28,7 +28,9 @@ def canonical_signing_payload(envelope: AnimateEnvelope) -> bytes:
         "expires_at": envelope.expires_at,
         "issued_at": envelope.issued_at,
         "key_id": envelope.key_id,
-        "payload": envelope.payload.model_dump(mode="json"),
+        # Keep standard video-worker.v1 byte-compatible with the original
+        # singleton worker while v2 binds the HQ execution contract.
+        "payload": envelope.payload.model_dump(mode="json", exclude_none=True),
         "version": envelope.version,
     }
     _reject_non_finite(unsigned)
