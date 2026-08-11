@@ -350,7 +350,7 @@ async def test_ensure_is_idempotent_and_explicit_extension_respects_hard_cap(
 
 
 @pytest.mark.asyncio
-async def test_dispatchable_generation_holds_worker_without_an_experiment_lease(
+async def test_dispatchable_generation_does_not_prestart_worker_before_runtime_refresh(
     warm_context: WarmContext,
 ) -> None:
     async with warm_context.database.sessions() as session:
@@ -366,7 +366,7 @@ async def test_dispatchable_generation_holds_worker_without_an_experiment_lease(
                 salad_deployment_id=warm_context.deployment_id,
                 now=NOW,
             )
-            == 1
+            == 0
         )
 
         job.state = GenerationState.SUCCEEDED
@@ -433,7 +433,7 @@ async def test_dispatchable_image_job_never_retains_the_video_lane(
 
 
 @pytest.mark.asyncio
-async def test_retry_wait_holds_worker_only_when_due(
+async def test_retry_wait_never_prestarts_worker_before_runtime_refresh(
     warm_context: WarmContext,
 ) -> None:
     async with warm_context.database.sessions() as session:
@@ -461,7 +461,7 @@ async def test_retry_wait_holds_worker_only_when_due(
                 salad_deployment_id=warm_context.deployment_id,
                 now=NOW,
             )
-            == 1
+            == 0
         )
 
         job.retry_at = NOW - timedelta(seconds=1)
@@ -472,7 +472,7 @@ async def test_retry_wait_holds_worker_only_when_due(
                 salad_deployment_id=warm_context.deployment_id,
                 now=NOW,
             )
-            == 1
+            == 0
         )
 
 

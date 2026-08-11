@@ -11,7 +11,7 @@ from typing import Any, Protocol, cast
 from uuid import UUID
 
 from pydantic import SecretStr
-from sqlalchemy import exists, or_, select
+from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.db.models import (
@@ -29,7 +29,6 @@ from gen_automation.domain.enums import (
     GenerationAttemptState,
     GenerationState,
     ReleasePhase,
-    ResourceHealth,
     SaladDeploymentPurpose,
     SaladDeploymentState,
     SpendEntryType,
@@ -801,7 +800,6 @@ async def effective_worker_min_replicas(
     )
     if experiment_minimum == 1:
         return 1
-    observed_at = _as_utc(now)
     stop_marker = exists(
         select(AuditEvent.id).where(
             AuditEvent.resource_type == "release",
@@ -809,34 +807,13 @@ async def effective_worker_min_replicas(
             AuditEvent.action == _GENERATION_STOP_REQUESTED_ACTION,
         )
     )
-    dispatchable_job_id = await session.scalar(
-        select(GenerationJob.id)
-        .join(ReleaseVersion, ReleaseVersion.id == GenerationJob.release_version_id)
-        .join(Release, Release.id == ReleaseVersion.release_id)
-        .where(
-            GenerationJob.provider == _PROVIDER,
-            GenerationJob.attempt_count < GenerationJob.max_attempts,
-            or_(
-                GenerationJob.state == GenerationState.QUEUED,
-                (
-                    (GenerationJob.state == GenerationState.RETRY_WAIT)
-                    & or_(
-                        GenerationJob.retry_at.is_(None),
-                        GenerationJob.retry_at <= observed_at,
-                    )
-                ),
-            ),
-            Release.phase.in_(_GENERATION_ACTIVE_RELEASE_PHASES),
-            Release.health == ResourceHealth.HEALTHY,
-            Release.current_version_no == ReleaseVersion.version_no,
-            ~stop_marker,
-        )
-        .order_by(GenerationJob.created_at, GenerationJob.id)
-        .limit(1)
-    )
-    if dispatchable_job_id is not None:
-        return 1
-
+    # A local queued/retryable job has not crossed the provider boundary yet.
+    # Raising the minimum here can start a scaled-to-zero group before the
+    # runtime refresh replaces its short-lived artifact credentials. Keep the
+    # group at zero until either a warm lease records the refreshed provider
+    # version above or submission records durable provider work below. Salad's
+    # queue autoscaler then supplies the same demand signal without booting a
+    # stale container.
     active_attempt_id = await session.scalar(
         select(GenerationAttempt.id)
         .join(GenerationJob, GenerationJob.id == GenerationAttempt.job_id)
