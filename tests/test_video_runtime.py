@@ -60,6 +60,9 @@ from gen_automation.integrations.salad import (
 )
 from gen_automation.services.budgets import reserve_attempt_budget
 from gen_automation.services.video_runtime import (
+    A14B_VIDEO_RUNTIME_PROFILE_IDS,
+    LEGACY_VIDEO_RUNTIME_PROFILE_IDS,
+    PRIVATE_A14B_VIDEO_WORKER_IMAGE_REPOSITORY,
     VideoRuntime,
     VideoRuntimeConfig,
     request_video_cancellation,
@@ -67,6 +70,7 @@ from gen_automation.services.video_runtime import (
 from gen_automation.storage.memory import MemoryObjectStore
 from gen_automation.video_worker.models import AnimateEnvelope
 from gen_automation.video_worker.profiles import (
+    A14B_VIDEO_PROFILE_REGISTRATION,
     HQ_VIDEO_PROFILE_REGISTRATION,
     PINNED_VIDEO_PROFILE,
     PINNED_VIDEO_PROFILE_SHA256,
@@ -74,11 +78,93 @@ from gen_automation.video_worker.profiles import (
 
 NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
 WORKER_IMAGE = "registry.example.test/video@sha256:" + ("e" * 64)
+A14B_WORKER_IMAGE = PRIVATE_A14B_VIDEO_WORKER_IMAGE_REPOSITORY + "@sha256:" + ("a" * 64)
 
 
 def test_claim_lock_order_is_budget_then_deployment() -> None:
     source = inspect.getsource(VideoRuntime.claim_once)
     assert source.index("await self._lock_budget") < source.index("select(SaladDeployment)")
+
+
+@pytest.mark.asyncio
+async def test_worker_image_exact_repository_derives_one_nonoverlapping_profile_lane(
+    runtime_context: RuntimeContext,
+) -> None:
+    legacy = runtime_context.runtime.config
+    a14b = replace(legacy, worker_image_digest=A14B_WORKER_IMAGE)
+    suffix_collision = replace(
+        legacy,
+        worker_image_digest=(
+            "ghcr.io/untrusted/fork/video-worker-a14b-private@sha256:" + ("b" * 64)
+        ),
+    )
+
+    assert legacy.allowed_profile_ids == LEGACY_VIDEO_RUNTIME_PROFILE_IDS
+    assert a14b.allowed_profile_ids == A14B_VIDEO_RUNTIME_PROFILE_IDS
+    assert suffix_collision.allowed_profile_ids == LEGACY_VIDEO_RUNTIME_PROFILE_IDS
+    assert set(legacy.allowed_profile_ids).isdisjoint(a14b.allowed_profile_ids)
+
+
+@pytest.mark.asyncio
+async def test_legacy_image_does_not_claim_a14b_candidate_before_environment_cutover(
+    runtime_context: RuntimeContext,
+) -> None:
+    a14b_job_id = await _add_job(runtime_context, a14b=True)
+
+    assert runtime_context.runtime.config.allowed_profile_ids == LEGACY_VIDEO_RUNTIME_PROFILE_IDS
+    assert await runtime_context.runtime.claim_once(now=NOW) is False
+    async with runtime_context.database.sessions() as session:
+        job = await session.get(VideoGenerationJob, a14b_job_id)
+        attempt_count = await session.scalar(select(func.count(VideoGenerationAttempt.id)))
+        assert job is not None and job.state == VideoGenerationState.QUEUED
+        assert attempt_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a14b_image_runtime_refuses_to_cross_a_nondrained_legacy_or_hq_lane(
+    runtime_context: RuntimeContext,
+) -> None:
+    legacy_job_id = await _add_job(runtime_context)
+    hq_job_id = await _add_job(runtime_context, hq=True, request_suffix="2")
+    runtime = await _runtime_for_worker_image(
+        runtime_context,
+        worker_image_digest=A14B_WORKER_IMAGE,
+        worker_id="controller-test:a14b-drain-guard",
+    )
+
+    assert await runtime.claim_once(now=NOW) is False
+    async with runtime_context.database.sessions() as session:
+        legacy_job = await session.get(VideoGenerationJob, legacy_job_id)
+        hq_job = await session.get(VideoGenerationJob, hq_job_id)
+        attempt_count = await session.scalar(select(func.count(VideoGenerationAttempt.id)))
+        assert legacy_job is not None and legacy_job.state == VideoGenerationState.QUEUED
+        assert hq_job is not None and hq_job.state == VideoGenerationState.QUEUED
+        assert attempt_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a14b_image_runtime_never_submits_a_prepared_legacy_attempt(
+    runtime_context: RuntimeContext,
+) -> None:
+    legacy_job_id = await _add_job(runtime_context)
+    assert await runtime_context.runtime.claim_once(now=NOW) is True
+    runtime = await _runtime_for_worker_image(
+        runtime_context,
+        worker_image_digest=A14B_WORKER_IMAGE,
+        worker_id="controller-test:a14b-submit-guard",
+    )
+
+    assert await runtime.submit_once(now=NOW) is False
+    assert runtime_context.salad.create_calls == 0
+    async with runtime_context.database.sessions() as session:
+        legacy_job = await session.get(VideoGenerationJob, legacy_job_id)
+        attempt = await session.scalar(
+            select(VideoGenerationAttempt).where(
+                VideoGenerationAttempt.video_generation_job_id == legacy_job_id
+            )
+        )
+        assert legacy_job is not None and legacy_job.state == VideoGenerationState.CLAIMED
+        assert attempt is not None and attempt.state == VideoGenerationAttemptState.CREATED
 
 
 class FakeSalad:
@@ -342,17 +428,46 @@ async def runtime_context(tmp_path: Path) -> AsyncIterator[RuntimeContext]:
         await database.dispose()
 
 
+async def _runtime_for_worker_image(
+    context: RuntimeContext,
+    *,
+    worker_image_digest: str,
+    worker_id: str,
+) -> VideoRuntime:
+    async with context.database.sessions() as session:
+        deployment = await session.get(SaladDeployment, context.deployment_id)
+        assert deployment is not None
+        deployment.worker_image_digest = worker_image_digest
+        await session.commit()
+    return VideoRuntime(
+        config=replace(
+            context.runtime.config,
+            worker_image_digest=worker_image_digest,
+        ),
+        sessions=context.database.sessions,
+        salad=cast(Any, context.salad),
+        store=context.store,
+        worker_id=worker_id,
+    )
+
+
 async def _add_job(
     context: RuntimeContext,
     *,
     remaining_attempts: int = 3,
     request_suffix: str = "1",
     hq: bool = False,
+    a14b: bool = False,
 ) -> UUID:
     async with context.database.sessions() as session:
         source = await session.get(Asset, context.source_id)
         assert source is not None
-        registration = HQ_VIDEO_PROFILE_REGISTRATION if hq else None
+        assert not (hq and a14b)
+        registration = (
+            A14B_VIDEO_PROFILE_REGISTRATION
+            if a14b
+            else (HQ_VIDEO_PROFILE_REGISTRATION if hq else None)
+        )
         profile = registration.profile if registration is not None else PINNED_VIDEO_PROFILE
         profile_sha256 = (
             registration.job_contract_sha256
@@ -372,17 +487,20 @@ async def _add_job(
             source_width=cast(int, source.width),
             source_height=cast(int, source.height),
             source_byte_size=cast(int, source.byte_size),
-            prompt="subtle breathing and hair movement",
+            prompt=(
+                "Locked camera. The subject shifts their weight and rolls both shoulders while "
+                "their hair follows."
+            ),
             negative_prompt="camera cut",
             profile_key=profile.profile_id,
             profile_version=profile.adapter_revision,
             profile_sha256=profile_sha256,
             seed=42,
-            frame_count=73,
-            fps=24,
-            width=profile.portrait_width,
-            height=profile.portrait_height,
-            loop_mode="ping_pong",
+            frame_count=(81 if a14b else 73),
+            fps=(16 if a14b else 24),
+            width=(cast(int, source.width) if a14b else profile.portrait_width),
+            height=(cast(int, source.height) if a14b else profile.portrait_height),
+            loop_mode=("forward" if a14b else "ping_pong"),
             content_rating=VideoContentRating.SFW,
             source_rights_confirmed=True,
             lawful_use_confirmed=True,
@@ -391,9 +509,9 @@ async def _add_job(
             # The immutable v1 profile always has three total attempts. Tests
             # that need a shorter remaining retry window start later in that
             # bounded sequence instead of weakening the persisted profile.
-            attempt_count=(0 if hq else 3 - remaining_attempts),
-            max_attempts=(1 if hq else 3),
-            estimated_cost_microusd=20_000,
+            attempt_count=(0 if hq or a14b else 3 - remaining_attempts),
+            max_attempts=(1 if hq or a14b else 3),
+            estimated_cost_microusd=(1_750_000 if a14b else 20_000),
             cost_metadata={},
             created_at=NOW,
             updated_at=NOW,
@@ -517,6 +635,80 @@ async def test_video_runtime_success_is_transactional(runtime_context: RuntimeCo
         assert asset is not None and asset.state == AssetState.AVAILABLE
         assert asset.object_key == output_key
         assert lineage_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a14b_forward_success_preserves_source_output_dimensions(
+    runtime_context: RuntimeContext,
+) -> None:
+    job_id = await _add_job(runtime_context, a14b=True)
+    runtime = await _runtime_for_worker_image(
+        runtime_context,
+        worker_image_digest=A14B_WORKER_IMAGE,
+        worker_id="controller-test:a14b-forward",
+    )
+    assert await runtime.claim_once(now=NOW) is True
+    async with runtime_context.database.sessions() as session:
+        attempt = await session.scalar(
+            select(VideoGenerationAttempt).where(
+                VideoGenerationAttempt.video_generation_job_id == job_id
+            )
+        )
+        assert attempt is not None
+        output_asset_id = UUID(str(attempt.request_metadata["output_asset_id"]))
+        upload_attempt_id = UUID(str(attempt.request_metadata["upload_attempt_id"]))
+        output_key = str(attempt.request_metadata["output_object_key"])
+
+    assert await runtime.submit_once(now=NOW) is True
+    submitted = cast(dict[str, JSONValue], runtime_context.salad.create_inputs[0])
+    payload = cast(dict[str, JSONValue], submitted["payload"])
+    assert submitted["version"] == "video-worker.v2"
+    assert (payload["width"], payload["height"]) == (768, 1024)
+    assert payload["loop_mode"] == "forward"
+
+    body = b"verified-a14b-mp4"
+    digest = hashlib.sha256(body).hexdigest()
+    runtime_context.store.put_for_test(
+        output_key,
+        body,
+        content_type="video/mp4",
+        metadata={
+            "schema": "animation-video/v1",
+            "video-job-id": str(job_id),
+            "video-attempt-id": str(attempt.id),
+            "output-asset-id": str(output_asset_id),
+            "upload-attempt-id": str(upload_attempt_id),
+        },
+    )
+    remote = next(iter(runtime_context.salad.jobs.values()))
+    runtime_context.salad.jobs[remote.id] = _remote_job(
+        remote_id=remote.id,
+        status=SaladJobStatus.SUCCEEDED,
+        input=remote.input,
+        metadata=remote.metadata,
+        output=_success_output(
+            job_id=job_id,
+            attempt_id=attempt.id,
+            source_id=runtime_context.source_id,
+            output_asset_id=output_asset_id,
+            upload_attempt_id=upload_attempt_id,
+            digest=digest,
+            size=len(body),
+            a14b=True,
+        ),
+    )
+
+    assert await runtime.observe_once(now=NOW + timedelta(seconds=31)) is True
+    async with runtime_context.database.sessions() as session:
+        job = await session.get(VideoGenerationJob, job_id)
+        output = await session.scalar(
+            select(VideoGenerationOutput).where(
+                VideoGenerationOutput.video_generation_job_id == job_id
+            )
+        )
+        assert job is not None and job.state == VideoGenerationState.SUCCEEDED
+        assert output is not None
+        assert (output.width, output.height, output.frame_count) == (768, 1024, 81)
 
 
 @pytest.mark.asyncio
@@ -966,6 +1158,48 @@ async def test_provider_404_ambiguity_is_bounded_by_watchdog(
         assert job is not None and job.state == VideoGenerationState.FAILED
         assert job.last_error_code == "video_provider_job_not_found_watchdog"
         assert job.reserved_cost_microusd == 0
+
+
+@pytest.mark.asyncio
+async def test_a14b_uses_short_queue_signature_long_grants_and_five_hour_outer_watchdog(
+    runtime_context: RuntimeContext,
+) -> None:
+    job_id = await _add_job(runtime_context, a14b=True)
+    runtime = await _runtime_for_worker_image(
+        runtime_context,
+        worker_image_digest=A14B_WORKER_IMAGE,
+        worker_id="controller-test:a14b-watchdog",
+    )
+    await runtime.claim_once(now=NOW)
+    await runtime.submit_once(now=NOW)
+
+    remote = next(iter(runtime_context.salad.jobs.values()))
+    envelope = cast(dict[str, Any], remote.input)
+    assert int(envelope["expires_at"]) - int(envelope["issued_at"]) == 720
+    payload = cast(dict[str, Any], envelope["payload"])
+    source = cast(dict[str, Any], payload["source"])
+    upload = cast(dict[str, Any], payload["upload"])
+    assert "expires=36030" in str(source["url"])
+    assert "expires=36030" in str(upload["url"])
+
+    runtime_context.salad.jobs[remote.id] = _remote_job(
+        remote_id=remote.id,
+        status=SaladJobStatus.RUNNING,
+        input=remote.input,
+        metadata=remote.metadata,
+    )
+    assert await runtime.observe_once(now=NOW + timedelta(seconds=31)) is True
+    assert await runtime.observe_once(now=NOW + timedelta(seconds=631)) is True
+    async with runtime_context.database.sessions() as session:
+        job = await session.get(VideoGenerationJob, job_id)
+        assert job is not None and job.state == VideoGenerationState.RUNNING
+
+    assert await runtime.observe_once(now=NOW + timedelta(seconds=18_032)) is True
+    async with runtime_context.database.sessions() as session:
+        job = await session.get(VideoGenerationJob, job_id)
+        assert job is not None and job.state == VideoGenerationState.CANCEL_REQUESTED
+        assert job.last_error_code == "video_attempt_watchdog_expired"
+        assert job.reserved_cost_microusd > 0
 
 
 @pytest.mark.asyncio
@@ -1935,7 +2169,29 @@ def _success_output(
     upload_attempt_id: UUID,
     digest: str,
     size: int,
+    a14b: bool = False,
 ) -> dict[str, object]:
+    if a14b:
+        return {
+            "version": "video-worker.v2",
+            "job_id": str(job_id),
+            "attempt_id": str(attempt_id),
+            "status": "succeeded",
+            "profile_id": A14B_VIDEO_PROFILE_REGISTRATION.profile.profile_id,
+            "source_asset_id": str(source_id),
+            "output_asset_id": str(output_asset_id),
+            "upload_attempt_id": str(upload_attempt_id),
+            "output_sha256": digest,
+            "output_size_bytes": size,
+            "loop_mode": "forward",
+            "fps": 16,
+            "width": 768,
+            "height": 1_024,
+            "native_frame_count": 81,
+            "native_duration_seconds": 81 / 16,
+            "output_frame_count": 81,
+            "output_duration_seconds": 81 / 16,
+        }
     return {
         "version": "video-worker.v1",
         "job_id": str(job_id),

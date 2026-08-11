@@ -32,6 +32,8 @@ from gen_automation.video_worker.models import (
 from gen_automation.video_worker.profiles import (
     VideoProfile,
     VideoRenderSpec,
+    derive_a14b_output_dimensions,
+    derive_a14b_render_dimensions,
     require_video_profile_registration,
 )
 from gen_automation.video_worker.runtime import (
@@ -170,6 +172,7 @@ def create_video_worker_app(
     execution_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-gpu")
     readiness_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-ready")
     replay_cache: OrderedDict[str, tuple[int, str, AnimateResponse]] = OrderedDict()
+    active_attempt: tuple[str, str] | None = None
 
     resolved_downloader = downloader
     resolved_uploader = uploader
@@ -240,6 +243,7 @@ def create_video_worker_app(
 
     @app.post("/jobs/generate", response_model=AnimateResponse)
     async def animate(request: Request) -> AnimateResponse:
+        nonlocal active_attempt
         content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
             raise HTTPException(status_code=415, detail="application/json required")
@@ -249,19 +253,20 @@ def create_video_worker_app(
         except WorkerRequestError:
             raise HTTPException(status_code=400, detail="invalid request") from None
         try:
-            verify_authorization(envelope, settings, now=now)
+            verify_authorization(
+                envelope,
+                settings,
+                now=now,
+                allow_expired_for_replay=True,
+            )
         except AuthorizationError:
             raise HTTPException(status_code=401, detail="invalid authorization") from None
 
         payload = envelope.payload
-        profile = require_video_profile_registration(payload.profile_id).profile
-        render_spec = VideoRenderSpec(
-            native_frame_count=payload.native_frame_count,
-            fps=payload.fps,
-            width=payload.width,
-            height=payload.height,
-            loop_mode=payload.loop_mode,
-        )
+        if payload.profile_id not in settings.allowed_profile_ids:
+            raise HTTPException(status_code=400, detail="invalid request")
+        registration = require_video_profile_registration(payload.profile_id)
+        profile = registration.profile
         try:
             if payload.source.size_bytes > settings.max_source_bytes:
                 raise ValueError
@@ -270,7 +275,27 @@ def create_video_worker_app(
         except ValueError:
             raise HTTPException(status_code=400, detail="invalid request") from None
 
+        try:
+            verify_authorization(envelope, settings, now=now)
+            request_is_fresh = True
+        except AuthorizationError:
+            request_is_fresh = False
+        if not request_is_fresh:
+            current_time = int(now())
+            cached = replay_cache.get(payload.attempt_id)
+            if cached is not None and cached[0] >= current_time:
+                _expires_at, cached_signature, cached_response = cached
+                if cached_signature == envelope.signature:
+                    replay_cache.move_to_end(payload.attempt_id)
+                    return cached_response
+                raise HTTPException(status_code=401, detail="invalid authorization")
+            if active_attempt != (payload.attempt_id, envelope.signature):
+                raise HTTPException(status_code=401, detail="invalid authorization")
+
         async with execution_lock:
+            # Any prior active marker is now either complete or failed because
+            # this request owns the single execution lock.
+            active_attempt = None
             current_time = int(now())
             for attempt_id in [
                 key
@@ -282,12 +307,21 @@ def create_video_worker_app(
             if cached is not None:
                 _expires_at, cached_signature, cached_response = cached
                 if cached_signature != envelope.signature:
+                    if not request_is_fresh:
+                        raise HTTPException(
+                            status_code=401,
+                            detail="invalid authorization",
+                        )
                     raise HTTPException(
                         status_code=409,
                         detail="request conflicts with completed attempt",
                     )
                 replay_cache.move_to_end(payload.attempt_id)
                 return cached_response
+            if not request_is_fresh:
+                raise HTTPException(status_code=401, detail="invalid authorization")
+
+            active_attempt = (payload.attempt_id, envelope.signature)
 
             try:
                 with tempfile.TemporaryDirectory(
@@ -336,19 +370,50 @@ def create_video_worker_app(
                             detail="source image invalid",
                         ) from None
 
-                    expected_dimensions = (
-                        (
-                            profile.landscape_width,
-                            profile.landscape_height,
+                    if profile.adapter == "wan-native-comfy-gguf":
+                        try:
+                            render_dimensions = derive_a14b_render_dimensions(
+                                source_image.logical_width,
+                                source_image.logical_height,
+                            )
+                            output_dimensions = derive_a14b_output_dimensions(
+                                source_image.logical_width,
+                                source_image.logical_height,
+                            )
+                        except ValueError:
+                            raise HTTPException(status_code=400, detail="invalid request") from None
+                        if (payload.width, payload.height) != output_dimensions:
+                            raise HTTPException(status_code=400, detail="invalid request")
+                        render_spec = VideoRenderSpec(
+                            native_frame_count=payload.native_frame_count,
+                            fps=payload.fps,
+                            width=render_dimensions[0],
+                            height=render_dimensions[1],
+                            loop_mode=payload.loop_mode,
+                            output_content_width=source_image.logical_width,
+                            output_content_height=source_image.logical_height,
                         )
-                        if source_image.width >= source_image.height
-                        else (
-                            profile.portrait_width,
-                            profile.portrait_height,
+                    else:
+                        expected_dimensions = (
+                            (
+                                profile.landscape_width,
+                                profile.landscape_height,
+                            )
+                            if source_image.width >= source_image.height
+                            else (
+                                profile.portrait_width,
+                                profile.portrait_height,
+                            )
                         )
-                    )
-                    if (render_spec.width, render_spec.height) != expected_dimensions:
-                        raise HTTPException(status_code=400, detail="invalid request")
+                        if (payload.width, payload.height) != expected_dimensions:
+                            raise HTTPException(status_code=400, detail="invalid request")
+                        render_spec = VideoRenderSpec(
+                            native_frame_count=payload.native_frame_count,
+                            fps=payload.fps,
+                            width=payload.width,
+                            height=payload.height,
+                            loop_mode=payload.loop_mode,
+                        )
 
                     try:
                         await loop.run_in_executor(
@@ -434,9 +499,10 @@ def create_video_worker_app(
                 upload_attempt_id=payload.upload.upload_attempt_id,
                 output_sha256=validated.sha256,
                 output_size_bytes=validated.size_bytes,
+                loop_mode=render_spec.loop_mode,
                 fps=render_spec.fps,
-                width=render_spec.width,
-                height=render_spec.height,
+                width=render_spec.output_width,
+                height=render_spec.output_height,
                 native_frame_count=render_spec.native_frame_count,
                 native_duration_seconds=round(render_spec.native_duration_seconds, 6),
                 output_frame_count=render_spec.output_frame_count,
@@ -445,10 +511,15 @@ def create_video_worker_app(
             while len(replay_cache) >= settings.max_replay_entries:
                 replay_cache.popitem(last=False)
             replay_cache[payload.attempt_id] = (
-                envelope.expires_at + settings.clock_skew_seconds,
+                (
+                    int(now()) + registration.completed_replay_ttl_seconds
+                    if registration.completed_replay_ttl_seconds is not None
+                    else envelope.expires_at + settings.clock_skew_seconds
+                ),
                 envelope.signature,
                 response,
             )
+            active_attempt = None
             return response
 
     return app

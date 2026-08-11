@@ -139,7 +139,11 @@ from gen_automation.services.semantic_learning import run_semantic_learning_cycl
 from gen_automation.services.semantic_review_reconciliation import (
     reconcile_one_completed_semantic_review,
 )
-from gen_automation.services.video_runtime import VideoRuntime, VideoRuntimeConfig
+from gen_automation.services.video_runtime import (
+    PRIVATE_A14B_VIDEO_WORKER_IMAGE_REPOSITORY,
+    VideoRuntime,
+    VideoRuntimeConfig,
+)
 from gen_automation.services.worker_inputs import SaladWorkerJobInputProvider
 from gen_automation.storage.base import ObjectStore
 from gen_automation.storage.model_artifacts import ModelArtifactStore
@@ -153,6 +157,7 @@ type JitterSource = Callable[[], float]
 _MAX_DELAY_JITTER_MULTIPLIER = 1.2
 _STOP_SETTLEMENT_CANDIDATE_LIMIT = 16
 _IMAGE_RECONCILIATION_JOB_SCAN_LIMIT = 200
+_PRIVATE_A14B_MIN_STORAGE_BYTES = 53_687_091_200
 _RECONCILABLE_ATTEMPT_STATES = (
     GenerationAttemptState.UNKNOWN,
     GenerationAttemptState.SUBMITTED,
@@ -308,6 +313,20 @@ def salad_video_deployment_config_from_settings(settings: Settings) -> SaladDepl
     assert container_group is not None
     assert worker_image is not None
 
+    image_repository = worker_image.rsplit("@sha256:", 1)[0]
+    is_private_a14b_image = image_repository == PRIVATE_A14B_VIDEO_WORKER_IMAGE_REPOSITORY
+    container_priority = (
+        settings.salad_video_container_priority or settings.salad_container_priority
+    )
+    if is_private_a14b_image:
+        if container_priority.value != "high":
+            raise ValueError("private A14B video worker requires high Salad priority")
+        if settings.salad_video_container_storage_bytes < _PRIVATE_A14B_MIN_STORAGE_BYTES:
+            raise ValueError(
+                "private A14B video worker requires at least "
+                f"{_PRIVATE_A14B_MIN_STORAGE_BYTES} bytes of storage"
+            )
+
     runtime_bindings = configured_video_runtime_binding_references(settings)
     upload_origin = settings.salad_worker_allowed_upload_origin
     verification_public_key = settings.worker_verification_public_key
@@ -337,9 +356,7 @@ def salad_video_deployment_config_from_settings(settings: Settings) -> SaladDepl
             # private-layer cache moves that transfer out of paid worker time;
             # no model is fetched by a running replica.
             "image_caching": True,
-            "priority": (
-                settings.salad_video_container_priority or settings.salad_container_priority
-            ).value,
+            "priority": container_priority.value,
         },
         "replicas": 0,
         "queue_connection": {},
@@ -352,6 +369,11 @@ def salad_video_deployment_config_from_settings(settings: Settings) -> SaladDepl
         # of silently reusing a group whose ephemeral environment is stale.
         "runtime_binding_contract_sha256": runtime_binding_contract_sha256,
     }
+    if is_private_a14b_image:
+        # This non-secret marker makes the ordinary controller stop before the
+        # private-image POST. An operator supplies the bound credential only to
+        # the one provisioning call that creates this exact immutable group.
+        provider_configuration["image_pull_mode"] = "ephemeral_basic"
     return SaladDeploymentConfig(
         organization_name=organization,
         project_name=project,

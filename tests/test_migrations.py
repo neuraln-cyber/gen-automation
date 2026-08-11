@@ -123,7 +123,8 @@ def test_animation_video_revision_is_the_migration_head() -> None:
     image_only_revision = scripts.get_revision("20260809_0032")
     lora_catalog_revision = scripts.get_revision("20260809_0033")
     animation_revision = scripts.get_revision("20260810_0034")
-    revision = scripts.get_revision("20260811_0035")
+    hq_revision = scripts.get_revision("20260811_0035")
+    revision = scripts.get_revision("20260811_0036")
 
     assert independent_targets_revision is not None
     assert independent_targets_revision.down_revision == "20260808_0023"
@@ -147,9 +148,11 @@ def test_animation_video_revision_is_the_migration_head() -> None:
     assert lora_catalog_revision.down_revision == "20260809_0032"
     assert animation_revision is not None
     assert animation_revision.down_revision == "20260809_0033"
+    assert hq_revision is not None
+    assert hq_revision.down_revision == "20260810_0034"
     assert revision is not None
-    assert revision.down_revision == "20260810_0034"
-    assert scripts.get_current_head() == "20260811_0035"
+    assert revision.down_revision == "20260811_0035"
+    assert scripts.get_current_head() == "20260811_0036"
 
 
 def test_hq_video_profile_migration_replaces_dimension_constraint(monkeypatch) -> None:
@@ -237,6 +240,84 @@ def test_hq_video_profile_migration_downgrade_is_guarded(monkeypatch, hq_rows: i
         assert operations[1][0:2] == (
             "create",
             "ck_video_generation_jobs_supported_dimensions",
+        )
+
+
+def test_a14b_video_profile_migration_binds_forward_source_size_contract(monkeypatch) -> None:
+    configuration = Config("alembic.ini")
+    revision = ScriptDirectory.from_config(configuration).get_revision("20260811_0036")
+    assert revision is not None
+    operations: list[tuple[str, str, str]] = []
+
+    class _Batch:
+        def __enter__(self) -> "_Batch":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def drop_constraint(self, name: str, *, type_: str) -> None:
+            operations.append(("drop", name, type_))
+
+        def create_check_constraint(self, name: str, expression: str) -> None:
+            operations.append(("create", name, expression))
+
+    monkeypatch.setattr(revision.module.op, "f", lambda name: name)
+    monkeypatch.setattr(revision.module.op, "batch_alter_table", lambda _table: _Batch())
+    revision.module.upgrade()
+
+    created = {name: expression for action, name, expression in operations if action == "create"}
+    profile_contract = created["ck_video_generation_jobs_supported_profile_contract"]
+    assert "wan2.2-smoothmix-i2v-a14b-q3-v1" in profile_contract
+    assert "wan2.2-smoothmix-i2v-a14b-q3-adult-v1" in profile_contract
+    assert "frame_count = 81 AND fps = 16 AND loop_mode = 'forward'" in profile_contract
+    assert "width = source_width + (source_width % 2)" in profile_contract
+    assert "height = source_height + (source_height % 2)" in profile_contract
+    assert "content_rating = 'sfw'" in profile_contract
+    assert "content_rating IN ('nsfw', 'explicit')" in profile_contract
+    assert created["ck_video_generation_jobs_supported_fps"] == "fps IN (16, 24)"
+
+
+@pytest.mark.parametrize("a14b_rows", [0, 1])
+def test_a14b_video_profile_migration_downgrade_is_guarded(
+    monkeypatch,
+    a14b_rows: int,
+) -> None:
+    configuration = Config("alembic.ini")
+    revision = ScriptDirectory.from_config(configuration).get_revision("20260811_0036")
+    assert revision is not None
+    operations: list[tuple[str, str, str]] = []
+
+    class _Connection:
+        def scalar(self, _statement: object) -> int:
+            return a14b_rows
+
+    class _Batch:
+        def __enter__(self) -> "_Batch":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def drop_constraint(self, name: str, *, type_: str) -> None:
+            operations.append(("drop", name, type_))
+
+        def create_check_constraint(self, name: str, expression: str) -> None:
+            operations.append(("create", name, expression))
+
+    monkeypatch.setattr(revision.module.op, "get_bind", _Connection)
+    monkeypatch.setattr(revision.module.op, "f", lambda name: name)
+    monkeypatch.setattr(revision.module.op, "batch_alter_table", lambda _table: _Batch())
+
+    if a14b_rows:
+        with pytest.raises(RuntimeError, match="SmoothMix A14B video jobs"):
+            revision.module.downgrade()
+        assert operations == []
+    else:
+        revision.module.downgrade()
+        assert any(
+            operation[0:2] == ("create", "ck_video_generation_jobs_supported_profile_contract")
+            for operation in operations
         )
 
 

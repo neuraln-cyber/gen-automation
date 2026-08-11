@@ -9,9 +9,13 @@ from pathlib import Path
 from typing import Any
 
 import httpx2
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from gen_automation.video_worker.profiles import (
+    A14B_ADULT_VIDEO_PROFILE,
+    A14B_ADULT_VIDEO_WORKFLOW_SHA256,
+    A14B_VIDEO_PROFILE,
+    A14B_VIDEO_WORKFLOW_SHA256,
     HQ_VIDEO_PROFILE,
     HQ_VIDEO_WORKFLOW_SHA256,
     PINNED_VIDEO_PROFILE,
@@ -26,6 +30,17 @@ _MODEL_NAME = "wan2.2_ti2v_5B_fp16.safetensors"
 _TEXT_ENCODER_NAME = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
 _VAE_NAME = "wan2.2_vae.safetensors"
 _OUTPUT_NODE_ID = "11"
+_A14B_HIGH_MODEL_NAME = "smoothMixWan22I2VV20_highQ3KM.gguf"
+_A14B_LOW_MODEL_NAME = "smoothMixWan22I2VV20_lowQ3KM.gguf"
+_A14B_VAE_NAME = "Wan2_1_VAE_fp32.safetensors"
+_A14B_HIGH_LIGHTX_LORA_NAME = (
+    "wan2.2_i2v_A14b_high_noise_lora_rank64_lightx2v_4step_1022.safetensors"
+)
+_A14B_LOW_LIGHTX_LORA_NAME = "wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step_1022.safetensors"
+_A14B_HIGH_ADULT_LORA_NAME = "NSFW-22-H-e8.safetensors"
+_A14B_LOW_ADULT_LORA_NAME = "NSFW-22-L-e8.safetensors"
+_A14B_OUTPUT_NODE_ID = "18"
+NAG_CUSTOM_NODE_REVISION = "c6f27116a8259f5b501d498a09e51c82fa72e35f"
 _PROMPT_ID = re.compile(r"^[0-9a-f-]{36}$")
 _SAFE_FILENAME = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
 _SAFE_SUBFOLDER = re.compile(r"^[A-Za-z0-9._/-]{0,512}$")
@@ -44,6 +59,16 @@ def build_wan_workflow(
     registration = require_video_profile_registration(profile.profile_id)
     if registration.profile != profile:
         raise ValueError("video profile identity mismatch")
+    if profile in {A14B_VIDEO_PROFILE, A14B_ADULT_VIDEO_PROFILE}:
+        return _build_a14b_q4_workflow(
+            source_filename=source_filename,
+            output_prefix=output_prefix,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            render_spec=render_spec,
+            profile=profile,
+        )
     return {
         "1": {
             "class_type": "UNETLoader",
@@ -118,6 +143,170 @@ def build_wan_workflow(
     }
 
 
+def _build_a14b_q4_workflow(
+    *,
+    source_filename: str,
+    output_prefix: str,
+    prompt: str,
+    negative_prompt: str,
+    seed: int,
+    render_spec: VideoRenderSpec,
+    profile: VideoProfile,
+) -> dict[str, object]:
+    registration = require_video_profile_registration(profile.profile_id)
+    is_adult = profile is A14B_ADULT_VIDEO_PROFILE
+    high_model: list[object] = ["8", 0]
+    low_model: list[object] = ["10", 0]
+    workflow: dict[str, object] = {
+        "1": {
+            "class_type": "UnetLoaderGGUF",
+            "inputs": {"unet_name": _A14B_HIGH_MODEL_NAME},
+        },
+        "2": {
+            "class_type": "UnetLoaderGGUF",
+            "inputs": {"unet_name": _A14B_LOW_MODEL_NAME},
+        },
+        "3": {
+            "class_type": "CLIPLoader",
+            "inputs": {
+                "clip_name": _TEXT_ENCODER_NAME,
+                "type": "wan",
+                "device": "default",
+            },
+        },
+        "4": {"class_type": "VAELoader", "inputs": {"vae_name": _A14B_VAE_NAME}},
+        "5": {"class_type": "LoadImage", "inputs": {"image": source_filename}},
+        "6": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {"clip": ["3", 0], "text": prompt},
+        },
+        "7": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+                "clip": ["3", 0],
+                "text": ", ".join(
+                    part
+                    for part in (
+                        negative_prompt.strip(),
+                        registration.built_in_negative_prompt,
+                    )
+                    if part
+                ),
+            },
+        },
+        "8": {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {
+                "model": ["1", 0],
+                "lora_name": _A14B_HIGH_LIGHTX_LORA_NAME,
+                "strength_model": 1.0,
+            },
+        },
+        "10": {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {
+                "model": ["2", 0],
+                "lora_name": _A14B_LOW_LIGHTX_LORA_NAME,
+                "strength_model": 1.0,
+            },
+        },
+    }
+    if is_adult:
+        workflow["9"] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {
+                "model": ["8", 0],
+                "lora_name": _A14B_HIGH_ADULT_LORA_NAME,
+                "strength_model": 0.9,
+            },
+        }
+        workflow["11"] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {
+                "model": ["10", 0],
+                "lora_name": _A14B_LOW_ADULT_LORA_NAME,
+                "strength_model": 0.9,
+            },
+        }
+        high_model = ["9", 0]
+        low_model = ["11", 0]
+    workflow.update(
+        {
+            "12": {
+                "class_type": "ModelSamplingSD3",
+                "inputs": {"model": high_model, "shift": 8.0},
+            },
+            "13": {
+                "class_type": "ModelSamplingSD3",
+                "inputs": {"model": low_model, "shift": 8.0},
+            },
+            "14": {
+                "class_type": "WanImageToVideo",
+                "inputs": {
+                    "positive": ["6", 0],
+                    "negative": ["7", 0],
+                    "vae": ["4", 0],
+                    "start_image": ["5", 0],
+                    "width": render_spec.width,
+                    "height": render_spec.height,
+                    "length": render_spec.native_frame_count,
+                    "batch_size": 1,
+                },
+            },
+            "15": {
+                "class_type": "KSamplerAdvanced",
+                "inputs": {
+                    "model": ["12", 0],
+                    "positive": ["14", 0],
+                    "negative": ["14", 1],
+                    "latent_image": ["14", 2],
+                    "add_noise": "enable",
+                    "noise_seed": seed,
+                    "steps": 6,
+                    "cfg": 1.0,
+                    "sampler_name": "euler",
+                    "scheduler": "simple",
+                    "start_at_step": 0,
+                    "end_at_step": 3,
+                    "return_with_leftover_noise": "enable",
+                },
+            },
+            "16": {
+                "class_type": "KSamplerWithNAG (Advanced)",
+                "inputs": {
+                    "model": ["13", 0],
+                    "positive": ["14", 0],
+                    "negative": ["14", 1],
+                    "nag_negative": ["14", 1],
+                    "latent_image": ["15", 0],
+                    "add_noise": "disable",
+                    "noise_seed": 0,
+                    "steps": 6,
+                    "cfg": 1.0,
+                    "nag_scale": 30.0,
+                    "nag_tau": 2.5,
+                    "nag_alpha": 0.25,
+                    "nag_sigma_end": 1.0,
+                    "sampler_name": "euler",
+                    "scheduler": "simple",
+                    "start_at_step": 3,
+                    "end_at_step": 10_000,
+                    "return_with_leftover_noise": "disable",
+                },
+            },
+            "17": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["16", 0], "vae": ["4", 0]},
+            },
+            _A14B_OUTPUT_NODE_ID: {
+                "class_type": "SaveImage",
+                "inputs": {"images": ["17", 0], "filename_prefix": output_prefix},
+            },
+        }
+    )
+    return workflow
+
+
 def _workflow_contract_sha256(profile: VideoProfile = PINNED_VIDEO_PROFILE) -> str:
     representative = build_wan_workflow(
         source_filename="SOURCE.png",
@@ -152,6 +341,14 @@ WAN_COMFY_HQ_WORKFLOW_SHA256 = HQ_VIDEO_WORKFLOW_SHA256
 if _workflow_contract_sha256(HQ_VIDEO_PROFILE) != WAN_COMFY_HQ_WORKFLOW_SHA256:
     raise RuntimeError("pinned HQ Wan Comfy workflow changed")
 
+WAN_COMFY_A14B_WORKFLOW_SHA256 = A14B_VIDEO_WORKFLOW_SHA256
+if _workflow_contract_sha256(A14B_VIDEO_PROFILE) != WAN_COMFY_A14B_WORKFLOW_SHA256:
+    raise RuntimeError("pinned A14B Wan Comfy workflow changed")
+
+WAN_COMFY_A14B_ADULT_WORKFLOW_SHA256 = A14B_ADULT_VIDEO_WORKFLOW_SHA256
+if _workflow_contract_sha256(A14B_ADULT_VIDEO_PROFILE) != WAN_COMFY_A14B_ADULT_WORKFLOW_SHA256:
+    raise RuntimeError("pinned adult A14B Wan Comfy workflow changed")
+
 
 def _workflow_registry_sha256() -> str:
     encoded = json.dumps(
@@ -172,6 +369,27 @@ WAN_COMFY_WORKFLOW_REGISTRY_SHA256 = (
 )
 if _workflow_registry_sha256() != WAN_COMFY_WORKFLOW_REGISTRY_SHA256:
     raise RuntimeError("pinned Wan Comfy workflow registry changed")
+
+
+def _a14b_workflow_registry_sha256() -> str:
+    encoded = json.dumps(
+        {
+            A14B_VIDEO_PROFILE.profile_id: WAN_COMFY_A14B_WORKFLOW_SHA256,
+            A14B_ADULT_VIDEO_PROFILE.profile_id: WAN_COMFY_A14B_ADULT_WORKFLOW_SHA256,
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+WAN_COMFY_A14B_WORKFLOW_REGISTRY_SHA256 = (
+    "ceee10e914a13dc601a7f64d97237a2736e82c68aefb85c59a5cd9d34cb90d83"
+)
+if _a14b_workflow_registry_sha256() != WAN_COMFY_A14B_WORKFLOW_REGISTRY_SHA256:
+    raise RuntimeError("pinned A14B Wan Comfy workflow registry changed")
 
 
 @dataclass(slots=True)
@@ -202,13 +420,18 @@ class NativeComfyWanExecutor:
         negative_prompt: str,
         seed: int,
     ) -> None:
-        if profile.adapter != "wan-native-comfy":
+        if profile.adapter not in {"wan-native-comfy", "wan-native-comfy-gguf"}:
             raise VideoExecutionError("video generation failed")
         registration = require_video_profile_registration(profile.profile_id)
         if registration.profile != profile:
             raise VideoExecutionError("video generation failed")
         token = uuid.uuid4().hex
-        source_filename = f"video-worker-{token}{source_path.suffix.lower()}"
+        is_a14b = profile in {A14B_VIDEO_PROFILE, A14B_ADULT_VIDEO_PROFILE}
+        source_filename = (
+            f"video-worker-{token}.png"
+            if is_a14b
+            else f"video-worker-{token}{source_path.suffix.lower()}"
+        )
         comfy_source = self.input_directory / source_filename
         output_subfolder = f"video-worker/{token}"
         output_prefix = f"{output_subfolder}/frame"
@@ -216,7 +439,14 @@ class NativeComfyWanExecutor:
         try:
             self.input_directory.mkdir(parents=True, exist_ok=True)
             self.output_directory.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source_path, comfy_source)
+            if is_a14b:
+                self._prepare_a14b_source(
+                    source_path=source_path,
+                    target_path=comfy_source,
+                    render_spec=render_spec,
+                )
+            else:
+                shutil.copyfile(source_path, comfy_source)
             workflow = build_wan_workflow(
                 source_filename=source_filename,
                 output_prefix=output_prefix,
@@ -232,7 +462,16 @@ class NativeComfyWanExecutor:
                 if self.execution_timeout_seconds is not None
                 else float(registration.execution_timeout_seconds)
             )
-            images = self._wait_for_images(prompt_id, timeout_seconds=timeout_seconds)
+            output_node_id = (
+                _A14B_OUTPUT_NODE_ID
+                if profile in {A14B_VIDEO_PROFILE, A14B_ADULT_VIDEO_PROFILE}
+                else _OUTPUT_NODE_ID
+            )
+            images = self._wait_for_images(
+                prompt_id,
+                output_node_id=output_node_id,
+                timeout_seconds=timeout_seconds,
+            )
             if len(images) != render_spec.native_frame_count:
                 raise VideoExecutionError("video generation failed")
             native_frames_path.mkdir(parents=True, exist_ok=True)
@@ -261,6 +500,27 @@ class NativeComfyWanExecutor:
             except OSError:
                 pass
 
+    @staticmethod
+    def _prepare_a14b_source(
+        *,
+        source_path: Path,
+        target_path: Path,
+        render_spec: VideoRenderSpec,
+    ) -> None:
+        # The dimensions are derived from source aspect before this call. A
+        # centered crop removes only the rounding remainder and never stretches
+        # the subject to the model canvas.
+        with Image.open(source_path) as raw_image:
+            transposed = ImageOps.exif_transpose(raw_image)
+            converted = transposed.convert("RGB")
+            fitted = ImageOps.fit(
+                converted,
+                (render_spec.width, render_spec.height),
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            )
+            fitted.save(target_path, format="PNG", optimize=False)
+
     def _submit(self, workflow: dict[str, object]) -> str:
         response = self.client.post(
             "/prompt",
@@ -280,7 +540,11 @@ class NativeComfyWanExecutor:
         return prompt_id
 
     def _wait_for_images(
-        self, prompt_id: str, *, timeout_seconds: float
+        self,
+        prompt_id: str,
+        *,
+        output_node_id: str,
+        timeout_seconds: float,
     ) -> list[dict[str, object]]:
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
@@ -300,7 +564,7 @@ class NativeComfyWanExecutor:
                 status = record.get("status", {})
                 if status.get("status_str") == "error" or status.get("completed") is False:
                     raise VideoExecutionError("video generation failed")
-                raw_images = record["outputs"][_OUTPUT_NODE_ID]["images"]
+                raw_images = record["outputs"][output_node_id]["images"]
                 if not isinstance(raw_images, list):
                     raise ValueError
                 images = [item for item in raw_images if isinstance(item, dict)]

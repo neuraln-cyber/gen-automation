@@ -12,6 +12,10 @@ from gen_automation.domain.video import (
     VideoSourceSnapshot,
 )
 from gen_automation.video_worker.profiles import (
+    A14B_ADULT_VIDEO_PROFILE,
+    A14B_ADULT_VIDEO_PROFILE_REGISTRATION,
+    A14B_VIDEO_PROFILE,
+    A14B_VIDEO_PROFILE_REGISTRATION,
     HQ_VIDEO_PROFILE,
     HQ_VIDEO_PROFILE_REGISTRATION,
     PINNED_VIDEO_PROFILE,
@@ -24,7 +28,7 @@ TEST_PROFILE = PINNED_VIDEO_PROFILE.profile_id
 ASSET_ID = UUID("019fa795-8862-7142-a182-1746d6b0694e")
 
 
-def _source() -> VideoSourceSnapshot:
+def _source(*, width: int = 768, height: int = 1_024) -> VideoSourceSnapshot:
     return VideoSourceSnapshot(
         asset_id=ASSET_ID,
         storage_backend="s3",
@@ -34,8 +38,8 @@ def _source() -> VideoSourceSnapshot:
         sha256=SHA,
         content_type="image/webp",
         image_format="WEBP",
-        width=768,
-        height=1_024,
+        width=width,
+        height=height,
         byte_size=120_000,
     )
 
@@ -159,6 +163,70 @@ def test_hq_video_parameters_require_exact_shape_and_short_timing() -> None:
         VideoGenerationParameters(
             **parameters.model_dump(mode="python", exclude={"frame_count"}),
             frame_count=121,
+        )
+
+
+def test_a14b_request_preserves_source_size_and_routes_content_rating() -> None:
+    source = _source(width=701, height=1_101)
+    base_parameters = VideoGenerationParameters(
+        profile_key=A14B_VIDEO_PROFILE.profile_id,
+        profile_version=A14B_VIDEO_PROFILE.adapter_revision,
+        profile_sha256=A14B_VIDEO_PROFILE_REGISTRATION.job_contract_sha256,
+        seed=42,
+        frame_count=81,
+        fps=16,
+        width=702,
+        height=1_102,
+        loop_mode="forward",
+    )
+    request = VideoGenerationRequest(
+        source=source,
+        parameters=base_parameters,
+        content_rating=VideoContentRating.SFW,
+        compliance=_compliance(adult=False),
+    )
+
+    assert (request.parameters.width, request.parameters.height) == (702, 1_102)
+    assert request.parameters.loop_mode == "forward"
+
+    with pytest.raises(ValidationError, match="requires SFW content"):
+        VideoGenerationRequest(
+            source=source,
+            parameters=base_parameters,
+            content_rating=VideoContentRating.EXPLICIT,
+            compliance=_compliance(adult=True),
+        )
+
+    adult_parameters = VideoGenerationParameters(
+        **base_parameters.model_dump(
+            mode="python",
+            exclude={"profile_key", "profile_version", "profile_sha256"},
+        ),
+        profile_key=A14B_ADULT_VIDEO_PROFILE.profile_id,
+        profile_version=A14B_ADULT_VIDEO_PROFILE.adapter_revision,
+        profile_sha256=A14B_ADULT_VIDEO_PROFILE_REGISTRATION.job_contract_sha256,
+    )
+    adult_request = VideoGenerationRequest(
+        source=source,
+        parameters=adult_parameters,
+        content_rating=VideoContentRating.EXPLICIT,
+        compliance=_compliance(adult=True),
+    )
+    assert adult_request.parameters.profile_key == A14B_ADULT_VIDEO_PROFILE.profile_id
+
+    with pytest.raises(ValidationError, match="preserve the source image"):
+        VideoGenerationRequest(
+            source=source,
+            parameters=VideoGenerationParameters(
+                **base_parameters.model_dump(
+                    mode="python",
+                    exclude={"width", "height"},
+                ),
+                width=700,
+                height=1_100,
+            ),
+            content_rating=VideoContentRating.SFW,
+            compliance=_compliance(adult=False),
         )
 
 

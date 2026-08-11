@@ -22,6 +22,29 @@ adds explicit camera-shake, pan, tilt, roll, zoom, reframing, and background-
 drift blockers. The standard v1 descriptor and workflow remain unchanged. This
 selector is intentionally absent from the browser until the canary is accepted.
 
+An additional experimental, private A14B lane provides the prompt-only
+`wan2.2-smoothmix-i2v-a14b-q3-v1` and
+`wan2.2-smoothmix-i2v-a14b-q3-adult-v1` profiles. Both accept only one source
+image, produce 81 native frames at 16 fps in forward mode, and preserve the
+source's logical dimensions in the delivered H.264 MP4 (padding an odd edge by
+at most one pixel). Their internal Wan canvas is derived independently on a
+bounded multiple-of-16 aspect grid. The worker execution bound is 17,100
+seconds inside the controller's 18,000-second watchdog, with one attempt and an
+operator no-progress abort after 30 minutes. The owner-only browser currently
+selects the A14B profile, but the lane remains experimental and is not a
+production-quality claim until an exact RTX 5090 runtime-fit report is reviewed.
+
+Unlike the legacy 5B image, the A14B image bakes its checksum-pinned SmoothMix
+Q3 experts, text encoder, VAE, LightX adapters, and (for the adult profile) WAN
+General adapters. It is an experimental **private** GHCR package. Publication
+requires a pre-provisioned private package, an exact successful `main` CI
+commit, an exact-digest SPDX SBOM with a green critical-vulnerability scan, and
+compressed layers no larger than 33 GB. The
+candidate remains labelled runtime-fit-unverified. Deployment additionally
+requires provider-managed registry authentication, an authenticated pull proof
+for the exact digest, and a failed anonymous-pull proof; credentials never enter
+the worker image, environment, or durable deployment JSON.
+
 The status page can cancel the whole variant group. Variants that have not
 reached Salad are cancelled locally; an accepted provider job is cancelled and
 reconciled through the controller before its reservation is released.
@@ -55,7 +78,8 @@ replacement or true scale-to-zero. Its image cache applies to OCI layers, not
 files downloaded by application code. The video worker therefore never fetches
 model weights at runtime.
 
-The production image bakes three immutable files into a stable model layer:
+The legacy 5B production image bakes three immutable files into a stable model
+layer:
 
 | File | Bytes | SHA-256 |
 | --- | ---: | --- |
@@ -70,7 +94,8 @@ committing the layer, and worker startup independently verifies the manifest,
 sizes, and hashes before readiness can succeed. Application source is copied in
 a later layer, so normal code changes reuse the large model layer.
 
-The Salad group uses `image_caching=true`. The dedicated GHCR package must be
+The legacy 5B Salad group uses `image_caching=true`. Its dedicated GHCR package
+must be
 publicly readable by digest because the MVP deliberately does not distribute a
 long-lived registry credential to Salad. Publication fails unless the exact
 digest can be inspected without registry credentials. The publication runner
@@ -81,7 +106,8 @@ a new origin-registry download when the layer is cached. A newly selected node
 may still need to receive the cached layer; this design removes paid runtime
 model downloads, not all cold-start transfer time.
 
-CI builds the `runtime-contract` Docker target, which contains the exact
+For the legacy 5B lane, CI builds the `runtime-contract` Docker target, which
+contains the exact
 ComfyUI/runtime/queue adapter but deliberately excludes the 18.145-GB model
 layer. CI generates and scans that runtime-contract SBOM. A production
 publication is explicit and must run from `main` for an exact successful
@@ -139,9 +165,11 @@ seed, shape, and attempt identifiers. The worker:
 
 1. validates the signature, expiry, replay cache, profile, and grant origins;
 2. downloads and verifies the source bytes and image bounds;
-3. runs a loopback-only pinned ComfyUI process with all custom nodes disabled;
+3. runs a loopback-only pinned ComfyUI process; legacy images disable all custom
+   nodes, while the A14B image permits only its pinned GGUF and NAG nodes;
 4. validates every native output frame;
-5. creates the ping-pong H.264/yuv420p/faststart MP4 locally;
+5. creates the legacy ping-pong or A14B forward-only
+   H.264/yuv420p/faststart MP4 locally;
 6. verifies the final media metadata, hash, and size; and
 7. uploads only to the signed output grant.
 
@@ -150,8 +178,8 @@ download token, or runtime network model fetch is present in the video worker.
 
 ## Rollout
 
-The feature remains disabled after an ordinary control-plane deployment. A
-staging enablement requires all of the following:
+The feature remains disabled after an ordinary control-plane deployment. The
+legacy 5B staging lane requires all of the following:
 
 1. migration `20260811_0035` applied and checked;
 2. runtime-contract build, smoke, SBOM, and vulnerability scan green;
@@ -164,10 +192,37 @@ staging enablement requires all of the following:
 6. a read-only deployment/budget audit; and
 7. one owner-approved, one-variant, 3-second staging canary.
 
-`GEN_AUTOMATION_SALAD_VIDEO_CONTAINER_PRIORITY=batch` may be set for the
-isolated video group. When it is unset, the video lane inherits
-`GEN_AUTOMATION_SALAD_CONTAINER_PRIORITY`; the override never changes the image
-lane deployment intent.
+The experimental A14B canary has a separate, fail-closed checklist:
+
+1. migration `20260811_0036` is applied and its exact base/adult profile,
+   workflow, and job-contract hashes match the worker image labels;
+2. the immutable private candidate digest has an attached SPDX SBOM with a
+   green critical-vulnerability scan, and its actual compressed OCI layers are
+   no larger than 33 GB;
+3. provider-managed registry authentication is configured, anonymous pull of
+   the digest fails, and authenticated pull of that exact digest succeeds with
+   no credential in durable deployment JSON or the worker environment;
+4. the exact GPU class is an RTX 5090 with at least 32 GiB VRAM, the deployment
+   storage allocation is at least 50 GiB, and the isolated video priority is
+   `high`;
+5. all legacy/HQ video work, attempts, reservations, and warm leases are drained
+   before the immutable deployment switch, while the image-generation lane is
+   left unchanged;
+6. a read-only deployment/budget audit enforces one attempt, the five-hour
+   outer ceiling, the 30-minute no-progress abort, the USD 7 test ceiling, and
+   guaranteed teardown to zero replicas; and
+7. the first source has absent/identity EXIF orientation, and the result is one
+   verified 81-frame, 16-fps, approximately five-second forward MP4 at the
+   source's even or deterministically padded output dimensions.
+
+The private candidate remains runtime-fit-unverified for that first canary.
+Only the exact candidate digest may be promoted after its RTX 5090 fit report,
+output contract, billing bound, and zero-replica teardown all pass.
+
+`GEN_AUTOMATION_SALAD_VIDEO_CONTAINER_PRIORITY=batch` may be used for the
+legacy isolated video group. The A14B canary requires `high`. When the override
+is unset, the video lane inherits `GEN_AUTOMATION_SALAD_CONTAINER_PRIORITY`;
+neither setting changes the image-lane deployment intent.
 
 The canary must preserve the image lane, create no more than one video replica,
 produce one verified MP4, settle queue/attempt/outbox work to zero, and return
@@ -180,8 +235,10 @@ Once a `purpose=video` deployment or video job exists, rollback is
 feature-flagged and fix-forward: keep migration `20260810_0034`, also keep
 `20260811_0035` once an HQ-profile job exists, and retain a binary that
 understands per-purpose deployments while the cancellation-only loop drains
-work. Do not deploy a pre-purpose binary or downgrade the schema; the migrations
-intentionally refuse those downgrades while their video state exists.
+work. Keep migration `20260811_0036` and an A14B-aware binary once any A14B job
+exists. Do not deploy a pre-purpose or pre-A14B binary or downgrade the schema;
+the migrations intentionally refuse those downgrades while their video state
+exists.
 
 ## References
 

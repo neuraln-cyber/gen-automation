@@ -34,6 +34,8 @@ from gen_automation.domain.video import (
     VideoGenerationState,
 )
 from gen_automation.video_worker.profiles import (
+    A14B_ADULT_VIDEO_PROFILE_REGISTRATION,
+    A14B_VIDEO_PROFILE_REGISTRATION,
     PINNED_VIDEO_PROFILE,
     PINNED_VIDEO_PROFILE_SHA256,
 )
@@ -290,6 +292,49 @@ async def test_database_rejects_missing_explicit_content_attestations(
         job.all_depicted_people_are_adults = False
         session.add(job)
 
+        with pytest.raises(IntegrityError):
+            await session.flush()
+        await session.rollback()
+
+
+async def test_database_enforces_a14b_rating_timing_and_source_output_dimensions(
+    video_persistence_context: VideoPersistenceContext,
+) -> None:
+    context = video_persistence_context
+    async with context.database.sessions() as session:
+        job = _job(context, request_sha256="e" * 64)
+        registration = A14B_ADULT_VIDEO_PROFILE_REGISTRATION
+        job.profile_key = registration.profile.profile_id
+        job.profile_version = registration.profile.adapter_revision
+        job.profile_sha256 = registration.job_contract_sha256
+        job.source_width = 701
+        job.source_height = 1_101
+        job.width = 702
+        job.height = 1_102
+        job.frame_count = 81
+        job.fps = 16
+        job.loop_mode = "forward"
+        job.max_attempts = 1
+        session.add(job)
+        await session.flush()
+        await session.rollback()
+
+    async with context.database.sessions() as session:
+        job = _job(context, request_sha256="f" * 64)
+        registration = A14B_VIDEO_PROFILE_REGISTRATION
+        job.profile_key = registration.profile.profile_id
+        job.profile_version = registration.profile.adapter_revision
+        job.profile_sha256 = registration.job_contract_sha256
+        job.source_width = 701
+        job.source_height = 1_101
+        job.width = 700
+        job.height = 1_100
+        job.frame_count = 81
+        job.fps = 16
+        job.loop_mode = "forward"
+        job.max_attempts = 1
+        job.content_rating = VideoContentRating.SFW
+        session.add(job)
         with pytest.raises(IntegrityError):
             await session.flush()
         await session.rollback()

@@ -61,8 +61,12 @@
             <div>
               <p class="page-kicker">Variant {{ job.variant_index }} of {{ job.variant_count }}</p>
               <h2>
-                {{ job.requested_duration_seconds }}s motion ->
-                about {{ job.requested_duration_seconds * 2 }}s seamless loop
+                {% if job.loop_mode == "forward" %}
+                  About {{ job.requested_duration_seconds }}s forward motion
+                {% else %}
+                  {{ job.requested_duration_seconds }}s motion ->
+                  about {{ job.requested_duration_seconds * 2 }}s seamless loop
+                {% endif %}
               </h2>
             </div>
             <span class="status {{ job.state.value }}">{{ job.state.value | replace("_", " ") }}</span>
@@ -93,7 +97,7 @@
           <dl class="video-job-facts">
             <div>
               <dt>Output</dt>
-              <dd>{{ job.width }}x{{ job.height }} - {{ job.fps }} fps</dd>
+              <dd>{{ job.width }}x{{ job.height }} - {{ job.fps }} fps - {{ job.loop_mode | replace("_", " ") }}</dd>
             </div>
             <div>
               <dt>Rating</dt>

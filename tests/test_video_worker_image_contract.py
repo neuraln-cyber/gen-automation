@@ -117,7 +117,8 @@ def test_pinned_salad_sidecar_is_built_patched_and_copied() -> None:
 
 def test_production_starts_real_comfy_adapter_and_bootstrap_server() -> None:
     main = MAIN_PATH.read_text(encoding="utf-8")
-    assert "await asyncio.to_thread(verify_model_runtime)" in main
+    assert "verify_model_runtime,\n            profile_ids=settings.allowed_profile_ids" in main
+    assert "start_comfy(profile_ids=settings.allowed_profile_ids)" in main
     assert "executor = NativeComfyWanExecutor(" in main
     assert "UnconfiguredWanComfyExecutor" not in main
     assert "await _wait_for_server_start(server, server_task)" in main

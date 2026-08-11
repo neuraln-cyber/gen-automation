@@ -7,7 +7,15 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from gen_automation.domain.canonical import canonical_sha256
-from gen_automation.video_worker.profiles import get_video_profile_registration
+from gen_automation.video_worker.profiles import (
+    A14B_ADULT_VIDEO_PROFILE,
+    A14B_MAX_OUTPUT_EDGE,
+    A14B_MAX_OUTPUT_PIXELS,
+    A14B_VIDEO_PROFILE,
+    derive_a14b_output_dimensions,
+    derive_a14b_render_dimensions,
+    get_video_profile_registration,
+)
 
 VIDEO_REQUEST_SCHEMA: Final[Literal["video-generation-request/v1"]] = "video-generation-request/v1"
 VIDEO_COMPLIANCE_SCHEMA: Final[Literal["video-compliance/v1"]] = "video-compliance/v1"
@@ -84,11 +92,11 @@ class VideoGenerationParameters(_StrictFrozenModel):
     profile_version: str = Field(min_length=1, max_length=100)
     profile_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     seed: int = Field(ge=0, le=9_223_372_036_854_775_807)
-    frame_count: Literal[73, 121]
-    fps: Literal[24] = 24
-    width: Literal[480, 832, 1152, 1472]
-    height: Literal[480, 832, 1152, 1472]
-    loop_mode: Literal["ping_pong"] = "ping_pong"
+    frame_count: Literal[73, 81, 121]
+    fps: Literal[16, 24] = 24
+    width: int = Field(ge=2, le=A14B_MAX_OUTPUT_EDGE, multiple_of=2)
+    height: int = Field(ge=2, le=A14B_MAX_OUTPUT_EDGE, multiple_of=2)
+    loop_mode: Literal["forward", "ping_pong"] = "ping_pong"
 
     @model_validator(mode="after")
     def validate_native_dimensions(self) -> VideoGenerationParameters:
@@ -96,16 +104,22 @@ class VideoGenerationParameters(_StrictFrozenModel):
         if registration is None:
             raise ValueError("video profile is not supported")
         profile = registration.profile
+        is_a14b = profile in {A14B_VIDEO_PROFILE, A14B_ADULT_VIDEO_PROFILE}
+        dimensions_valid = (
+            self.width * self.height <= A14B_MAX_OUTPUT_PIXELS
+            if is_a14b
+            else (self.width, self.height)
+            in {
+                (profile.landscape_width, profile.landscape_height),
+                (profile.portrait_width, profile.portrait_height),
+            }
+        )
         if (
             self.profile_version != profile.adapter_revision
             or self.profile_sha256 != registration.job_contract_sha256
             or self.frame_count not in profile.permitted_native_frame_counts
             or self.fps != profile.fps
-            or (self.width, self.height)
-            not in {
-                (profile.landscape_width, profile.landscape_height),
-                (profile.portrait_width, profile.portrait_height),
-            }
+            or not dimensions_valid
             or self.loop_mode != profile.loop_mode
         ):
             raise ValueError("video parameters do not match the selected profile")
@@ -132,6 +146,36 @@ class VideoGenerationRequest(_StrictFrozenModel):
                 raise ValueError("adult content requires a consent attestation")
             if not self.compliance.no_real_person_sexual_content:
                 raise ValueError("adult content requires a no-real-person attestation")
+        if self.parameters.profile_key == A14B_VIDEO_PROFILE.profile_id:
+            if self.content_rating != VideoContentRating.SFW:
+                raise ValueError("SFW A14B profile requires SFW content")
+            try:
+                derive_a14b_render_dimensions(self.source.width, self.source.height)
+                output_dimensions = derive_a14b_output_dimensions(
+                    self.source.width,
+                    self.source.height,
+                )
+            except ValueError:
+                raise ValueError(
+                    "source dimensions are not supported by the A14B profile"
+                ) from None
+            if (self.parameters.width, self.parameters.height) != output_dimensions:
+                raise ValueError("A14B output dimensions must preserve the source image")
+        elif self.parameters.profile_key == A14B_ADULT_VIDEO_PROFILE.profile_id:
+            if self.content_rating == VideoContentRating.SFW:
+                raise ValueError("adult A14B profile requires adult content")
+            try:
+                derive_a14b_render_dimensions(self.source.width, self.source.height)
+                output_dimensions = derive_a14b_output_dimensions(
+                    self.source.width,
+                    self.source.height,
+                )
+            except ValueError:
+                raise ValueError(
+                    "source dimensions are not supported by the A14B profile"
+                ) from None
+            if (self.parameters.width, self.parameters.height) != output_dimensions:
+                raise ValueError("A14B output dimensions must preserve the source image")
         return self
 
     @property

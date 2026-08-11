@@ -8,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import func, select
 
-from gen_automation.config import Environment, Settings
+from gen_automation.config import Environment, SaladContainerPriority, Settings
 from gen_automation.controller.runtime import (
     ControllerWorkloads,
     salad_deployment_config_from_settings,
@@ -23,9 +23,18 @@ from gen_automation.domain.enums import (
 )
 from gen_automation.domain.signing import encode_base64url
 from gen_automation.integrations.salad.client import SaladClient
+from gen_automation.services.video_runtime import (
+    A14B_VIDEO_RUNTIME_PROFILE_IDS,
+    LEGACY_VIDEO_RUNTIME_PROFILE_IDS,
+)
+from gen_automation.storage.base import ObjectStore
+from gen_automation.storage.memory import MemoryObjectStore
 
 GPU_CLASS_ID = UUID("3c90c3cc-0d44-4b50-8888-8dd25736052a")
 WORKER_IMAGE = "registry.example.test/worker@sha256:" + "b" * 64
+PRIVATE_A14B_WORKER_IMAGE = (
+    "ghcr.io/neuraln-cyber/gen-automation/video-worker-a14b-private@sha256:" + "d" * 64
+)
 WORKER_SIGNING_PRIVATE_KEY = encode_base64url(bytes(range(1, 33)))
 
 
@@ -52,13 +61,18 @@ def _settings(**updates: object) -> Settings:
     return Settings(**values)  # type: ignore[arg-type]
 
 
-def _workloads(database: Database, settings: Settings) -> ControllerWorkloads:
+def _workloads(
+    database: Database,
+    settings: Settings,
+    *,
+    object_store: ObjectStore | None = None,
+) -> ControllerWorkloads:
     return ControllerWorkloads(
         settings=settings,
         sessions=database.sessions,
         instance_id="controller-bootstrap-test",
         salad_client=cast(SaladClient, object()),
-        object_store=None,
+        object_store=object_store,
     )
 
 
@@ -165,6 +179,57 @@ def test_video_deployment_is_isolated_cached_and_scale_to_zero() -> None:
     }
     fingerprint = config.provider_configuration["runtime_binding_contract_sha256"]
     assert isinstance(fingerprint, str) and len(fingerprint) == 64
+    assert "image_pull_mode" not in config.provider_configuration
+
+    with pytest.raises(ValueError, match="requires high Salad priority"):
+        salad_video_deployment_config_from_settings(
+            settings.model_copy(
+                update={
+                    "salad_video_worker_image": PRIVATE_A14B_WORKER_IMAGE,
+                    "salad_video_container_storage_bytes": 20 * 1024 * 1024 * 1024,
+                }
+            )
+        )
+    with pytest.raises(ValueError, match="requires at least 53687091200 bytes"):
+        salad_video_deployment_config_from_settings(
+            settings.model_copy(
+                update={
+                    "salad_video_worker_image": PRIVATE_A14B_WORKER_IMAGE,
+                    "salad_video_container_priority": SaladContainerPriority.HIGH,
+                    "salad_video_container_storage_bytes": 20 * 1024 * 1024 * 1024,
+                }
+            )
+        )
+
+    private_a14b = salad_video_deployment_config_from_settings(
+        settings.model_copy(
+            update={
+                "salad_video_worker_image": PRIVATE_A14B_WORKER_IMAGE,
+                "salad_video_container_priority": SaladContainerPriority.HIGH,
+                "salad_video_container_storage_bytes": 53_687_091_200,
+            }
+        )
+    )
+    assert private_a14b.provider_configuration["image_pull_mode"] == "ephemeral_basic"
+    assert private_a14b.provider_configuration["container"]["priority"] == "high"
+    assert (
+        private_a14b.provider_configuration["container"]["resources"]["storage_amount"]
+        == 53_687_091_200
+    )
+    assert "registry_authentication" not in str(private_a14b.provider_configuration)
+
+    suffix_collision = salad_video_deployment_config_from_settings(
+        settings.model_copy(
+            update={
+                "salad_video_worker_image": (
+                    "ghcr.io/untrusted/fork/video-worker-a14b-private@sha256:" + "e" * 64
+                ),
+                "salad_video_container_storage_bytes": 20 * 1024 * 1024 * 1024,
+            }
+        )
+    )
+    assert suffix_collision.provider_configuration["container"]["priority"] == "low"
+    assert "image_pull_mode" not in suffix_collision.provider_configuration
 
     rotated = salad_video_deployment_config_from_settings(
         _settings(
@@ -196,6 +261,48 @@ def test_video_deployment_is_isolated_cached_and_scale_to_zero() -> None:
         salad_deployment_config_from_settings(batch_settings).config_sha256
         == salad_deployment_config_from_settings(settings).config_sha256
     )
+
+
+@pytest.mark.asyncio
+async def test_controller_video_runtime_allowlist_is_derived_from_exact_worker_image(
+    tmp_path: Path,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'allowlist.db').as_posix()}")
+    video_gpu_class_id = UUID("f2e8a738-2fb5-4e42-8c1a-944509496506")
+    common = {
+        "video_generation_enabled": True,
+        "salad_worker_allowed_upload_origin": "https://private-assets.example.test",
+        "salad_video_queue_name": "video-generation",
+        "salad_video_container_group_name": "video-worker",
+        "salad_video_gpu_class_ids": (video_gpu_class_id,),
+    }
+    store = MemoryObjectStore(bucket="private-assets")
+    try:
+        legacy = _workloads(
+            database,
+            _settings(
+                **common,
+                salad_video_worker_image=("registry.example.test/video-worker@sha256:" + "c" * 64),
+            ),
+            object_store=store,
+        )
+        a14b = _workloads(
+            database,
+            _settings(
+                **common,
+                salad_video_worker_image=PRIVATE_A14B_WORKER_IMAGE,
+                salad_video_container_priority=SaladContainerPriority.HIGH,
+                salad_video_container_storage_bytes=53_687_091_200,
+            ),
+            object_store=store,
+        )
+
+        assert legacy.video_runtime is not None
+        assert a14b.video_runtime is not None
+        assert legacy.video_runtime.config.allowed_profile_ids == LEGACY_VIDEO_RUNTIME_PROFILE_IDS
+        assert a14b.video_runtime.config.allowed_profile_ids == A14B_VIDEO_RUNTIME_PROFILE_IDS
+    finally:
+        await database.dispose()
 
 
 def test_video_settings_require_grants_to_outlive_bounded_queue_reconciliation() -> None:

@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "profile_ids": [
+    "wan2.2-smoothmix-i2v-a14b-q3-v1",
+    "wan2.2-smoothmix-i2v-a14b-q3-adult-v1"
+  ],
+  "contracts": {
+    "base": {
+      "profile_sha256": "0c23b27caeda9d444f266db3a5e4c7ff36aa8705027df09c5485e7a6154178ef",
+      "workflow_sha256": "dbe6c644ec0b403d2d52509199ad405a899ce397712e265d5e20b538fd9ff588",
+      "execution_contract_sha256": "3c31ee0e82b15c582dfccfb5cc83bde80b55dd835f4afd217f3ce342accc6e99"
+    },
+    "adult": {
+      "profile_sha256": "064fd6e46d63e037d552f9d720e7815ee67d31186c4b9b920c6c5d5cc6a25781",
+      "workflow_sha256": "4273bfbc4a3f3dbe309e3cf14e8986272b14a35235a1659fdb1f979a49ebee28",
+      "execution_contract_sha256": "014fc4502c334bdcd6ec9a8acad08b7599316dd0ddf3788e2101f40588d3e859"
+    },
+    "profile_registry_sha256": "a0ddd172e300f72fc60c4ae87c4f7d1ff077a0ffa2a9725c7aae2d74ecffa7b9",
+    "workflow_registry_sha256": "ceee10e914a13dc601a7f64d97237a2736e82c68aefb85c59a5cd9d34cb90d83",
+    "wire_dimensions": "final source dimensions, each odd edge padded by one pixel",
+    "inference_dimensions": "derived aspect-preserving multiple-of-16 canvas, 360000..403200 pixels",
+    "output_resampling": "ffmpeg Lanczos aspect-fill with centered crop, then odd-edge pad; no AI upscaler or frame interpolation"
+  },
+  "workflow_source": {
+    "site": "Civitai",
+    "creator": "DigitalPastel",
+    "model_id": 1847730,
+    "model_version_id": 2875350,
+    "name": "Smooth Workflow v5.0 AIO",
+    "archive_sha256": "80e990bf85cb327b4e7a1255cc49769666e97da88c88470e4eb18e18217e5403",
+    "adaptation": "plain I2V branch with Q3_K_M SmoothMix v2 experts and matched Wan2.2 I2V LightX LoRAs; no T2V, F2LF, MMAudio, interpolation, upscale, captioning, or driving input",
+    "quality_equivalence_claimed": false
+  },
+  "runtime": {
+    "comfyui_repository": "Comfy-Org/ComfyUI",
+    "comfyui_revision": "3086026401180c9216bcb6ace442a4e3587d2c66",
+    "custom_nodes": [
+      {
+        "repository": "city96/ComfyUI-GGUF",
+        "revision": "6ea2651e7df66d7585f6ffee804b20e92fb38b8a",
+        "license": "Apache-2.0",
+        "allowed_node": "UnetLoaderGGUF"
+      },
+      {
+        "repository": "scottmudge/ComfyUI-NAG",
+        "revision": "c6f27116a8259f5b501d498a09e51c82fa72e35f",
+        "license": "MIT",
+        "allowed_node": "KSamplerWithNAG (Advanced)"
+      }
+    ],
+    "locked_custom_node_dependencies": {
+      "gguf": "0.19.0",
+      "protobuf": "7.35.1",
+      "sentencepiece": "0.2.0"
+    }
+  },
+  "artifacts": [
+    {
+      "role": "high_noise_diffusion_model",
+      "relative_path": "diffusion_models/smoothMixWan22I2VV20_highQ3KM.gguf",
+      "source": "https://civitai.com/api/download/models/2587054",
+      "byte_size": 7176106496,
+      "sha256": "f9ead6cc6183a02bfb8827c852a9f2c71289acb10086993c9495b5c242ee096b"
+    },
+    {
+      "role": "low_noise_diffusion_model",
+      "relative_path": "diffusion_models/smoothMixWan22I2VV20_lowQ3KM.gguf",
+      "source": "https://civitai.com/api/download/models/2587073",
+      "byte_size": 7176106496,
+      "sha256": "8ce49c8a9b272a69cddab5042a4424b6689cc067db17707263f3ef2795564c17"
+    },
+    {
+      "role": "text_encoder",
+      "relative_path": "text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "source": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/fb1388adc906ab39ffc26ee40e96b22886b56bc4/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "byte_size": 6735906897,
+      "sha256": "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68"
+    },
+    {
+      "role": "vae",
+      "relative_path": "vae/Wan2_1_VAE_fp32.safetensors",
+      "source": "https://huggingface.co/Kijai/WanVideo_comfy/resolve/8260d429d19fd7a72304cad059160b95d843913f/Wan2_1_VAE_fp32.safetensors",
+      "byte_size": 507591244,
+      "sha256": "fd1531e31cdd20af005a9fb66e69afe4ea481a6db9b07cd889ece2e1ca2e67b9"
+    },
+    {
+      "role": "high_noise_lightx_lora",
+      "relative_path": "loras/wan2.2_i2v_A14b_high_noise_lora_rank64_lightx2v_4step_1022.safetensors",
+      "source": "https://huggingface.co/lightx2v/Wan2.2-Distill-Loras/resolve/570044187a5219776ef30a5c60c6f76428a3a10a/wan2.2_i2v_A14b_high_noise_lora_rank64_lightx2v_4step_1022.safetensors",
+      "byte_size": 634645944,
+      "sha256": "887c3bdeb74e83859c920438e16ca31f39ab18ce189abc5f0e36f8348c5bbb19"
+    },
+    {
+      "role": "low_noise_lightx_lora",
+      "relative_path": "loras/wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step_1022.safetensors",
+      "source": "https://huggingface.co/lightx2v/Wan2.2-Distill-Loras/resolve/570044187a5219776ef30a5c60c6f76428a3a10a/wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step_1022.safetensors",
+      "byte_size": 739472104,
+      "sha256": "8833bd4fd7c8eabebf0bc8ee5cfaf47f4f310ce116928a02c1adf8941dd4b0f1"
+    },
+    {
+      "role": "high_noise_adult_lora",
+      "relative_path": "loras/NSFW-22-H-e8.safetensors",
+      "source": "https://civitai.com/api/download/models/2073605",
+      "byte_size": 613516752,
+      "sha256": "34e2144d3cd65360f97d09ccbe03e1c39a096df6c9234af5fe3899d1b63cda39"
+    },
+    {
+      "role": "low_noise_adult_lora",
+      "relative_path": "loras/NSFW-22-L-e8.safetensors",
+      "source": "https://civitai.com/api/download/models/2083303",
+      "byte_size": 613516752,
+      "sha256": "d6b783742f4d5fd63a0223ae1d5bf64fc995a6b408480ac2a00528ae0d4146db"
+    }
+  ],
+  "total_bytes": 24196862685,
+  "predeploy_validation": {
+    "runtime_fit_report_sha256": null,
+    "required": true,
+    "must_prove": [
+      "selected RTX 5090 class exposes at least 32 GiB VRAM",
+      "high and low experts load and offload sequentially without CUDA OOM",
+      "81 native frames render at an allowed aspect-preserving size",
+      "forward-only 16 fps H.264 encode validates",
+      "compressed OCI image is at most 33000000000 bytes",
+      "provider-managed private GHCR pull authentication is configured without durable credentials in image or environment",
+      "the selected provider lane proves an anonymous pull fails and an authenticated exact-digest pull succeeds"
+    ]
+  },
+  "test_lane": {
+    "container_priority": "high",
+    "gpu_class": "RTX 5090 32 GiB",
+    "maximum_warm_seconds": 18000,
+    "abort_after_no_progress_seconds": 1800,
+    "abort_on_repeated_cuda_oom": true,
+    "absolute_spend_ceiling_microusd": 7000000,
+    "explicit_teardown_required": true
+  },
+  "distribution": {
+    "strategy": "immutable_private_oci_layer",
+    "visibility": "private",
+    "experimental": true,
+    "runtime_model_download": false,
+    "gated_source_token_required_at_build": false,
+    "public_redistribution_authorized": false,
+    "minimum_storage_bytes": 53687091200,
+    "maximum_compressed_image_bytes": 33000000000,
+    "runtime_fit_verified": false,
+    "required_predeploy_gate": "private exact-digest pull proof, sequential high/low expert load-offload, 81-frame render, encode, and CUDA OOM smoke on the selected 32 GiB GPU class",
+    "provider_registry_auth": "provider-managed secret only; never bake credentials or pass durable registry JSON/tokens in container environment"
+  }
+}

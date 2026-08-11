@@ -199,17 +199,39 @@ class FfmpegPingPongEncoder:
                 status = frame_path.lstat()
                 if not stat.S_ISREG(status.st_mode) or status.st_size < 1:
                     raise LoopEncodingError("video encoding failed")
-            concat_path = native_frames_path / "ping-pong.ffconcat"
+            if render_spec.loop_mode == "ping_pong":
+                concat_path = native_frames_path / "ping-pong.ffconcat"
+                encoded_frames = frame_paths + frame_paths[-2:0:-1]
+            elif render_spec.loop_mode == "forward":
+                concat_path = native_frames_path / "forward.ffconcat"
+                encoded_frames = frame_paths
+            else:
+                raise LoopEncodingError("video encoding failed")
             lines = ["ffconcat version 1.0"]
-            forward_and_reverse = frame_paths + frame_paths[-2:0:-1]
             frame_duration = 1 / render_spec.fps
-            for frame_path in forward_and_reverse:
+            for frame_path in encoded_frames:
                 lines.append(f"file '{frame_path.name}'")
                 lines.append(f"duration {frame_duration:.12f}")
             # The concat demuxer needs a final repeated file for the preceding
             # duration to be honored; -frames:v excludes that sentinel frame.
-            lines.append(f"file '{forward_and_reverse[-1].name}'")
+            lines.append(f"file '{encoded_frames[-1].name}'")
             concat_path.write_text("\n".join(lines) + "\n", encoding="ascii")
+            video_filters: list[str] = []
+            if render_spec.output_content_width is not None:
+                assert render_spec.output_content_height is not None
+                video_filters.extend(
+                    [
+                        "-vf",
+                        (
+                            f"scale={render_spec.output_content_width}:"
+                            f"{render_spec.output_content_height}:"
+                            "force_original_aspect_ratio=increase:flags=lanczos,"
+                            f"crop={render_spec.output_content_width}:"
+                            f"{render_spec.output_content_height},"
+                            f"pad={render_spec.output_width}:{render_spec.output_height}:0:0:color=black"
+                        ),
+                    ]
+                )
             result = self.runner(
                 [
                     self.ffmpeg_path,
@@ -223,6 +245,7 @@ class FfmpegPingPongEncoder:
                     "1",
                     "-i",
                     str(concat_path),
+                    *video_filters,
                     "-an",
                     "-c:v",
                     "libx264",
@@ -248,6 +271,12 @@ class FfmpegPingPongEncoder:
         finally:
             try:
                 os.unlink(native_frames_path / "ping-pong.ffconcat")
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            try:
+                os.unlink(native_frames_path / "forward.ffconcat")
             except FileNotFoundError:
                 pass
             except OSError:

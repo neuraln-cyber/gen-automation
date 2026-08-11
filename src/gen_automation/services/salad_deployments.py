@@ -10,6 +10,7 @@ from enum import StrEnum
 from typing import Any, Protocol, cast
 from uuid import UUID
 
+from pydantic import SecretStr
 from sqlalchemy import exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -91,6 +92,9 @@ _MAX_PROVIDER_NAME_LENGTH = 63
 _MICROSECONDS_PER_HOUR = 3_600_000_000
 _RUNTIME_BINDINGS_KEY = "runtime_bindings"
 _RUNTIME_BINDING_CONTRACT_SHA256_KEY = "runtime_binding_contract_sha256"
+_IMAGE_PULL_MODE_KEY = "image_pull_mode"
+_IMAGE_PULL_MODE_PUBLIC = "public"
+_IMAGE_PULL_MODE_EPHEMERAL_BASIC = "ephemeral_basic"
 _WORKER_QUEUE_PATH = "/jobs/generate"
 _WORKER_PORT = 8000
 _WORKER_RESTART_POLICY = "on_failure"
@@ -184,6 +188,46 @@ class SaladDeploymentValidationError(SaladDeploymentError):
 
 class SaladDeploymentNotFoundError(SaladDeploymentError):
     """The requested deployment does not exist."""
+
+
+class SaladRegistryAuthenticationRequiredError(SaladDeploymentError):
+    """A private image is waiting for one request-scoped registry credential."""
+
+
+@dataclass(frozen=True, repr=False)
+class EphemeralRegistryBasicAuth:
+    """Basic auth bound to one immutable image and retained only for one POST."""
+
+    image_digest: str
+    username: str
+    password: SecretStr
+
+    def __post_init__(self) -> None:
+        if _IMAGE_DIGEST_PATTERN.fullmatch(self.image_digest) is None:
+            raise SaladDeploymentValidationError(
+                "registry authentication image must use an immutable sha256 digest"
+            )
+        if (
+            not self.username
+            or len(self.username) > 100
+            or any(ord(character) < 33 or ord(character) > 126 for character in self.username)
+        ):
+            raise SaladDeploymentValidationError("registry authentication username is invalid")
+        if not isinstance(self.password, SecretStr):
+            raise SaladDeploymentValidationError("registry authentication password is invalid")
+        password = self.password.get_secret_value()
+        if (
+            not password
+            or len(password) > 1_024
+            or any(ord(character) < 33 or ord(character) > 126 for character in password)
+        ):
+            raise SaladDeploymentValidationError("registry authentication password is invalid")
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(image_digest={self.image_digest!r}, "
+            f"username={self.username!r}, password=<redacted>)"
+        )
 
 
 class DeploymentAction(StrEnum):
@@ -290,6 +334,7 @@ async def provision_deployment_step(
     deployment_id: UUID,
     client: SaladDeploymentClient,
     secret_resolver: RuntimeSecretResolver | None = None,
+    registry_basic_auth: EphemeralRegistryBasicAuth | None = None,
     now: datetime | None = None,
     billing_observation_clock: Callable[[], datetime] | None = None,
 ) -> DeploymentResult:
@@ -432,7 +477,14 @@ async def provision_deployment_step(
             )
 
         try:
-            payload = await _container_group_payload(deployment, secret_resolver)
+            payload = await _container_group_payload(
+                deployment,
+                secret_resolver,
+                for_create=True,
+                registry_basic_auth=registry_basic_auth,
+            )
+        except SaladRegistryAuthenticationRequiredError:
+            return await _defer_registry_authentication(session, deployment, observed_at)
         except SaladDeploymentValidationError:
             return await _mark_failed(
                 session,
@@ -578,7 +630,7 @@ async def _reconcile_locked(
         salad_deployment_id=deployment.id,
         now=observed_at,
     )
-    await _refresh_billing_observation(
+    billing_observation = await _refresh_billing_observation(
         session,
         deployment,
         client,
@@ -604,6 +656,9 @@ async def _reconcile_locked(
             current_replicas=current_replicas,
             group=group,
             observed_at=observed_at,
+            running_instances=(
+                billing_observation.running_instances if billing_observation is not None else None
+            ),
         )
     except BudgetError:
         deployment.desired_state = DesiredDeploymentState.STOPPED
@@ -1084,6 +1139,11 @@ async def _request_stop(
                 current_replicas=current_replicas,
                 group=group,
                 observed_at=observed_at,
+                running_instances=(
+                    billing_observation.running_instances
+                    if billing_observation is not None
+                    else None
+                ),
             )
         except BudgetError:
             deployment.last_error_code = "final_runtime_metering_failed"
@@ -1278,6 +1338,26 @@ async def _defer_rollout_overlap(
     )
 
 
+async def _defer_registry_authentication(
+    session: AsyncSession,
+    deployment: SaladDeployment,
+    observed_at: datetime,
+) -> DeploymentResult:
+    deployment.state = SaladDeploymentState.PROVISIONING
+    deployment.last_error_code = "registry_authentication_required"
+    deployment.last_error_detail = (
+        "Private image provisioning requires one request-scoped registry credential."
+    )
+    deployment.reconcile_after = observed_at + _RECONCILE_DELAY
+    _touch(deployment)
+    await session.flush()
+    return _result(
+        deployment,
+        DeploymentAction.DEFERRED,
+        error_code=deployment.last_error_code,
+    )
+
+
 def _matches_worker_contract(
     value: object,
     expected: JSONValue,
@@ -1324,6 +1404,8 @@ async def _container_group_payload(
     resolver: RuntimeSecretResolver | None,
     *,
     environment_overrides: Mapping[str, str] | None = None,
+    for_create: bool = False,
+    registry_basic_auth: EphemeralRegistryBasicAuth | None = None,
 ) -> JSONObject:
     configuration = deepcopy(deployment.provider_configuration)
     if not isinstance(configuration, dict) or not all(
@@ -1336,6 +1418,17 @@ async def _container_group_payload(
         _RUNTIME_BINDING_CONTRACT_SHA256_KEY,
         None,
     )
+    image_pull_mode = configuration.pop(_IMAGE_PULL_MODE_KEY, _IMAGE_PULL_MODE_PUBLIC)
+    if image_pull_mode not in {
+        _IMAGE_PULL_MODE_PUBLIC,
+        _IMAGE_PULL_MODE_EPHEMERAL_BASIC,
+    }:
+        raise SaladDeploymentValidationError("image pull mode is invalid")
+    if (
+        image_pull_mode == _IMAGE_PULL_MODE_EPHEMERAL_BASIC
+        and deployment.purpose != SaladDeploymentPurpose.VIDEO
+    ):
+        raise SaladDeploymentValidationError("private image pull mode is restricted to video")
     if deployment.purpose == SaladDeploymentPurpose.VIDEO and (
         not isinstance(binding_contract_sha256, str)
         or re.fullmatch(r"[0-9a-f]{64}", binding_contract_sha256) is None
@@ -1466,6 +1559,23 @@ async def _container_group_payload(
     container["image"] = deployment.worker_image_digest
     if environment:
         container["environment_variables"] = environment
+    if for_create and image_pull_mode == _IMAGE_PULL_MODE_EPHEMERAL_BASIC:
+        if registry_basic_auth is None:
+            raise SaladRegistryAuthenticationRequiredError
+        if registry_basic_auth.image_digest != deployment.worker_image_digest:
+            raise SaladDeploymentValidationError(
+                "registry authentication does not match the immutable image"
+            )
+        container["registry_authentication"] = {
+            "basic": {
+                "username": registry_basic_auth.username,
+                "password": registry_basic_auth.password.get_secret_value(),
+            }
+        }
+    elif registry_basic_auth is not None:
+        raise SaladDeploymentValidationError(
+            "registry authentication is not allowed for this provider operation"
+        )
     queue_connection["queue_name"] = deployment.queue_name
     configuration["name"] = deployment.container_group_name
     configuration["display_name"] = deployment.container_group_name
@@ -1866,9 +1976,11 @@ async def _meter_runtime_interval(
     current_replicas: int,
     group: SaladContainerGroup,
     observed_at: datetime,
+    running_instances: int | None,
 ) -> int:
     previous_replicas = deployment.observed_replicas or 0
-    replicas = max(previous_replicas, current_replicas)
+    instance_floor = group.replicas if running_instances is None else running_instances
+    replicas = max(previous_replicas, current_replicas, instance_floor)
     if replicas <= 0:
         return 0
 
@@ -1880,11 +1992,19 @@ async def _meter_runtime_interval(
             interval_start = max(interval_start, _stored_as_utc(deployment.created_at))
     else:
         return 0
-    if interval_start >= observed_at:
+    interval_end = observed_at
+    if _is_authoritatively_stopped(group) and running_instances == 0:
+        finish_time = group.current_state.finish_time
+        if finish_time is None:
+            # A definitive zero-instance STOPPED observation disproves an
+            # ongoing synthetic interval even when Salad omits its end time.
+            return 0
+        interval_end = min(interval_end, _stored_as_utc(finish_time))
+    if interval_start >= interval_end:
         return 0
 
     newly_metered = 0
-    for segment_start, segment_end in _daily_segments(interval_start, observed_at):
+    for segment_start, segment_end in _daily_segments(interval_start, interval_end):
         duration_microseconds = _timedelta_microseconds(segment_end - segment_start)
         amount = (
             deployment.max_hourly_cost_microusd * replicas * duration_microseconds
@@ -1936,7 +2056,22 @@ def _observed_replicas(group: SaladContainerGroup) -> int:
     lifecycle_count = (
         state.allocating_count + state.creating_count + state.running_count + state.stopping_count
     )
+    if _is_authoritatively_stopped(group):
+        # Salad can retain the configured replica target after every actual
+        # instance has stopped. The target is not billable observation data.
+        return 0
     return max(group.replicas, lifecycle_count)
+
+
+def _is_authoritatively_stopped(group: SaladContainerGroup) -> bool:
+    state = group.current_state
+    return bool(
+        state.status.strip().lower() == "stopped"
+        and state.allocating_count == 0
+        and state.creating_count == 0
+        and state.running_count == 0
+        and state.stopping_count == 0
+    )
 
 
 def _safe_provider_status(queue: SaladQueue, group: SaladContainerGroup) -> str:

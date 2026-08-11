@@ -46,6 +46,8 @@ class ValidatedVideo:
 class ValidatedSourceImage:
     width: int
     height: int
+    logical_width: int
+    logical_height: int
 
 
 def validate_source_image(
@@ -60,19 +62,29 @@ def validate_source_image(
         if not stat.S_ISREG(status.st_mode) or status.st_size != grant.size_bytes:
             raise SourceImageError("source image invalid")
         with Image.open(path) as image:
+            raw_width = image.width
+            raw_height = image.height
             if (
                 image.format != _IMAGE_FORMATS[grant.content_type]
                 or image.width < 1
                 or image.height < 1
-                or image.width > max_dimension
-                or image.height > max_dimension
-                or image.width * image.height > max_pixels
                 or getattr(image, "n_frames", 1) != 1
             ):
                 raise SourceImageError("source image invalid")
-            width = image.width
-            height = image.height
             image.verify()
+        with Image.open(path) as image:
+            orientation = image.getexif().get(274, 1)
+            logical_width, logical_height = (
+                (image.height, image.width)
+                if orientation in {5, 6, 7, 8}
+                else (image.width, image.height)
+            )
+        if (
+            logical_width > max_dimension
+            or logical_height > max_dimension
+            or logical_width * logical_height > max_pixels
+        ):
+            raise SourceImageError("source image invalid")
     except SourceImageError:
         raise
     except (
@@ -83,7 +95,12 @@ def validate_source_image(
         ValueError,
     ):
         raise SourceImageError("source image invalid") from None
-    return ValidatedSourceImage(width=width, height=height)
+    return ValidatedSourceImage(
+        width=raw_width,
+        height=raw_height,
+        logical_width=logical_width,
+        logical_height=logical_height,
+    )
 
 
 type ProbeRunner = Callable[[list[str], float], subprocess.CompletedProcess[str]]
@@ -169,8 +186,8 @@ class FfprobeMp4Validator:
             if (
                 width % 2
                 or height % 2
-                or width != render_spec.width
-                or height != render_spec.height
+                or width != render_spec.output_width
+                or height != render_spec.output_height
             ):
                 raise ValueError
             frame_rate = _frame_rate(video.get("avg_frame_rate") or video["r_frame_rate"])

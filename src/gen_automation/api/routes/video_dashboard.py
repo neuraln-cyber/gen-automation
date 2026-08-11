@@ -38,9 +38,13 @@ from gen_automation.services.dashboard_previews import (
     DashboardPreviewStorageError,
     load_or_create_dashboard_preview,
 )
-from gen_automation.services.video_runtime import request_video_cancellation
+from gen_automation.services.video_runtime import (
+    is_private_a14b_video_worker_image,
+    request_video_cancellation,
+)
 from gen_automation.services.videos import (
     CreateVideoSubmission,
+    VideoQualityProfile,
     VideoStudioConflictError,
     VideoStudioError,
     VideoStudioInputError,
@@ -115,13 +119,14 @@ async def dashboard_video_new(
     session: Session,
     principal: ReleaseReader,
 ) -> Response:
-    unavailable = _availability_response(request, principal)
+    unavailable = _availability_response(request, principal, require_a14b_runtime=True)
     if unavailable is not None:
         return unavailable
     try:
         sources = await list_video_sources(
             session,
             actor_user_id=principal.user_id,
+            quality_profile=VideoQualityProfile.SMOOTHMIX_A14B_Q3,
         )
         csrf_token = _form_csrf_token(request, principal)
     except CsrfValidationError:
@@ -159,7 +164,7 @@ async def submit_dashboard_video(
     session: Session,
     principal: ReleaseReader,
 ) -> Response:
-    unavailable = _availability_response(request, principal)
+    unavailable = _availability_response(request, principal, require_a14b_runtime=True)
     if unavailable is not None:
         return unavailable
     try:
@@ -209,6 +214,7 @@ async def submit_dashboard_video(
             command=form.command,
             actor_user_id=manager.user_id,
             max_hourly_cost_usd=settings.salad_video_max_hourly_cost_usd,
+            runtime_worker_image_digest=settings.salad_video_worker_image or "",
         )
         await session.commit()
     except HTTPException as error:
@@ -565,6 +571,8 @@ async def _read_video_form(request: Request) -> BrowserVideoForm:
             raise _bad_request("The form expired or was changed. Reload and try again.")
         source_asset_id = _uuid(values["source_asset_id"], label="Source image")
         prompt = values["prompt"].strip()
+        if not prompt:
+            raise _unprocessable("Motion prompt is required for SmoothMix A14B animation.")
         if len(prompt) > 4_000:
             raise _unprocessable("Motion prompt must be at most 4,000 characters.")
         try:
@@ -586,6 +594,7 @@ async def _read_video_form(request: Request) -> BrowserVideoForm:
             all_depicted_people_are_adults=attestations["all_depicted_people_are_adults"],
             consensual_adult_content_confirmed=attestations["consensual_adult_content_confirmed"],
             no_real_person_sexual_content=attestations["no_real_person_sexual_content"],
+            quality_profile=VideoQualityProfile.SMOOTHMIX_A14B_Q3,
         )
     except BrowserVideoFormError as error:
         error.values = values
@@ -677,6 +686,7 @@ async def _submission_error(
         sources = await list_video_sources(
             session,
             actor_user_id=principal.user_id,
+            quality_profile=VideoQualityProfile.SMOOTHMIX_A14B_Q3,
         )
         csrf_token = _form_csrf_token(request, principal)
     except (CsrfValidationError, VideoStudioError):
@@ -724,8 +734,9 @@ def _video_form_response(
     )
     estimate = planning_estimate_microusd(
         max_hourly_cost_usd=settings.salad_video_max_hourly_cost_usd,
-        duration_seconds=3,
+        duration_seconds=5,
         variant_count=1,
+        quality_profile=VideoQualityProfile.SMOOTHMIX_A14B_Q3,
     )
     return _secure_response(
         request,
@@ -742,6 +753,7 @@ def _video_form_response(
                 "values": submitted,
                 "error_message": error_message,
                 "hourly_rate_usd": str(settings.salad_video_max_hourly_cost_usd),
+                "planning_runtime_seconds": 18_000,
                 "default_estimate": format_microusd(estimate),
             },
             status_code=status_code,
@@ -752,6 +764,8 @@ def _video_form_response(
 def _availability_response(
     request: Request,
     principal: AuthenticatedPrincipal,
+    *,
+    require_a14b_runtime: bool = False,
 ) -> Response | None:
     if principal.role not in _MANAGER_ROLES:
         return _error_response(
@@ -769,6 +783,16 @@ def _availability_response(
             status_code=status.HTTP_404_NOT_FOUND,
             heading="Animation Studio is not enabled",
             message="The private video worker is not enabled in this environment yet.",
+        )
+    if require_a14b_runtime and not is_private_a14b_video_worker_image(
+        settings.salad_video_worker_image or ""
+    ):
+        return _error_response(
+            request,
+            principal=principal,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            heading="Animation Studio A14B runtime is not ready",
+            message="The configured video worker image cannot run this animation profile.",
         )
     return None
 

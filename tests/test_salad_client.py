@@ -21,6 +21,7 @@ from gen_automation.integrations.salad import (
 )
 
 API_KEY = "salad-test-token"
+GHCR_PAT = "ghp_request_scoped_registry_secret"
 JOB_ID = UUID("50150edd-e182-47b5-a754-2d2a04d6ee31")
 GPU_ID = UUID("3c90c3cc-0d44-4b50-8888-8dd25736052a")
 LIVE_GPU_ID = UUID("a5db5c50-cbcb-4596-ae80-6a0c8090d80f")
@@ -433,6 +434,54 @@ async def test_html_api_error_is_readable_truncated_and_redacted() -> None:
     assert "<html>" not in error.response_body
     assert API_KEY not in error.response_body
     assert len(error.response_body) == 1_000
+
+
+@pytest.mark.asyncio
+async def test_private_registry_password_is_redacted_from_provider_errors() -> None:
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        body: object = json.loads(request.content)
+        assert isinstance(body, dict)
+        assert body["container"]["registry_authentication"]["basic"]["password"] == GHCR_PAT
+        return httpx2.Response(
+            400,
+            json={"title": "Bad Request", "detail": f"credential rejected: {GHCR_PAT}"},
+        )
+
+    configuration: JSONObject = {
+        "name": "worker-v1",
+        "replicas": 0,
+        "container": {
+            "registry_authentication": {"basic": {"username": "reader", "password": GHCR_PAT}}
+        },
+    }
+    async with mocked_salad_client(handler) as client:
+        with pytest.raises(SaladAPIError) as captured:
+            await client.create_container_group(configuration)
+
+    assert GHCR_PAT not in str(captured.value)
+    assert GHCR_PAT not in captured.value.response_body
+    assert "[redacted]" in captured.value.response_body
+
+
+@pytest.mark.asyncio
+async def test_private_registry_transport_error_does_not_retain_request_cause() -> None:
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ReadTimeout("slow response", request=request)
+
+    configuration: JSONObject = {
+        "name": "worker-v1",
+        "replicas": 0,
+        "container": {
+            "registry_authentication": {"basic": {"username": "reader", "password": GHCR_PAT}}
+        },
+    }
+    async with mocked_salad_client(handler) as client:
+        with pytest.raises(SaladTimeoutError) as captured:
+            await client.create_container_group(configuration)
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert GHCR_PAT not in repr(captured.value)
 
 
 @pytest.mark.asyncio
