@@ -28,11 +28,14 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "Dockerfile.video-worker-a14b"
 MANIFEST = ROOT / "video-models" / "wan2.2-smoothmix-i2v-a14b-q3-private.json"
 PUBLISH_WORKFLOW = ROOT / ".github" / "workflows" / "publish-video-worker-a14b.yml"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 ANIMATION_STUDIO_DOC = ROOT / "docs" / "animation-studio.md"
 ACCESS_DOC = ROOT / "docs" / "access-and-secrets.md"
 MAIN = ROOT / "src" / "gen_automation" / "video_worker" / "main.py"
 SMOOTHMIX_MIRROR_REVISION = "3521de1624df15f248b28920858db043c71cc76e"
 WAN_GENERAL_MIRROR_REVISION = "a49adf1cc929aff7388a840931e9934db4c3cbef"
+COMFYUI_GGUF_REVISION = "6ea2651e7df66d7585f6ffee804b20e92fb38b8a"
+COMFYUI_NAG_REVISION = "c6f27116a8259f5b501d498a09e51c82fa72e35f"
 
 
 def test_a14b_manifest_and_docker_pin_every_private_model_artifact() -> None:
@@ -125,6 +128,38 @@ def test_a14b_image_labels_match_all_worker_contracts() -> None:
     assert "--whitelist-custom-nodes" in main
     assert '"ComfyUI-GGUF"' in main
     assert '"ComfyUI-NAG"' in main
+
+
+def test_a14b_model_free_foundation_is_built_and_smoked_in_ci() -> None:
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    ci = CI_WORKFLOW.read_text(encoding="utf-8")
+
+    for node, variable, revision in (
+        ("ComfyUI-GGUF", "COMFYUI_GGUF_COMMIT", COMFYUI_GGUF_REVISION),
+        ("ComfyUI-NAG", "COMFYUI_NAG_COMMIT", COMFYUI_NAG_REVISION),
+    ):
+        node_path = f"/opt/comfyui/custom_nodes/{node}"
+        assert dockerfile.index(node_path) < dockerfile.index(f"git -C {node_path} init")
+        assert f"{variable}={revision}" in dockerfile
+        assert f'test "$(git -C {node_path} rev-parse HEAD)" = "${{{variable}}}"' in dockerfile
+
+    build_step = ci.split("- name: Build A14B model-free runtime foundation", 1)[1].split(
+        "- name:", 1
+    )[0]
+    assert "--file Dockerfile.video-worker-a14b" in build_step
+    assert "--target runtime-foundation" in build_step
+    assert "--tag gen-automation-video-worker-a14b-foundation:test" in build_step
+    assert "--target production" not in build_step
+
+    smoke_step = ci.split("- name: Smoke-test A14B custom node revisions", 1)[1].split(
+        "- name:", 1
+    )[0]
+    assert "docker run --rm" in smoke_step
+    assert "gen-automation-video-worker-a14b-foundation:test" in smoke_step
+    assert COMFYUI_GGUF_REVISION in smoke_step
+    assert COMFYUI_NAG_REVISION in smoke_step
+    assert "UnetLoaderGGUF" in smoke_step
+    assert "KSamplerWithNAG (Advanced)" in smoke_step
 
 
 def test_a14b_publish_workflow_bootstraps_only_a_private_or_exactly_absent_package() -> None:

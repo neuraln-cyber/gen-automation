@@ -7,4 +7,4 @@ gguf==0.19.0 \
 protobuf==7.35.1 \
     --hash=sha256:74758715c53d7158fb76caf4f0cfdacc5329a4b1bb994f865d6cf302d413a1c4
 sentencepiece==0.2.0 \
-    --hash=sha256:a52c19171daaf2e697dc6cbe67684e0fa341b1248966f6aebb541de654d15843
+    --hash=sha256:f295105c6bdbb05bd5e1b0cafbd78ff95036f5d3641e7949455a3f4e5e7c3109

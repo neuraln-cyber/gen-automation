@@ -171,6 +171,25 @@ jobs:
           --entrypoint /opt/video-worker-venv/bin/python
           gen-automation-video-worker-contract:test
           -c 'from gen_automation.video_worker.comfy import WAN_COMFY_WORKFLOW_SHA256; from gen_automation.video_worker.main import load_settings; print(WAN_COMFY_WORKFLOW_SHA256)'
+      - name: Build A14B model-free runtime foundation
+        run: >-
+          docker build
+          --file Dockerfile.video-worker-a14b
+          --target runtime-foundation
+          --tag gen-automation-video-worker-a14b-foundation:test
+          .
+      - name: Smoke-test A14B custom node revisions
+        run: |
+          docker run --rm \
+            --entrypoint /bin/bash \
+            gen-automation-video-worker-a14b-foundation:test \
+            -c '
+          set -euo pipefail
+          test "$COMFYUI_GGUF_COMMIT" = "6ea2651e7df66d7585f6ffee804b20e92fb38b8a"
+          test "$COMFYUI_NAG_COMMIT" = "c6f27116a8259f5b501d498a09e51c82fa72e35f"
+          grep -R -Fq "UnetLoaderGGUF" /opt/comfyui/custom_nodes/ComfyUI-GGUF
+          grep -R -Fq "KSamplerWithNAG (Advanced)" /opt/comfyui/custom_nodes/ComfyUI-NAG
+          '
       - name: Build semantic gateway image
         run: >-
           docker build
