@@ -59,6 +59,9 @@ install -o root -g root -m 0755 \
   "$source_dir/update-control-plane.sh" \
   /usr/local/sbin/gen-automation-update-control-plane
 install -o root -g root -m 0755 \
+  "$source_dir/cutover-video-worker-a14b.sh" \
+  /usr/local/sbin/gen-automation-cutover-video-worker-a14b
+install -o root -g root -m 0755 \
   "$source_dir/activate-semantic-gateway.sh" \
   /usr/local/sbin/gen-automation-activate-semantic-gateway
 install -o root -g root -m 0755 \

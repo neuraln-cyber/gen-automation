@@ -28,7 +28,7 @@ jobs:
       IMAGE_NAME: ghcr.io/${{ github.repository }}/video-worker-a14b-private
       PACKAGE_NAME: gen-automation%2Fvideo-worker-a14b-private
       SOURCE_SHA: ${{ inputs.source_sha }}
-      MODEL_MANIFEST_SHA256: f7d9aa4fc7783ca76b605d1dc520e3ef812257c40c4aef9803e635d28c37bbbb
+      MODEL_MANIFEST_SHA256: 866120efcda36761f68777e5690dafc116b5afc67bbe077a1ca0e338ac389601
       PROFILE_REGISTRY_SHA256: a0ddd172e300f72fc60c4ae87c4f7d1ff077a0ffa2a9725c7aae2d74ecffa7b9
       WORKFLOW_REGISTRY_SHA256: ceee10e914a13dc601a7f64d97237a2736e82c68aefb85c59a5cd9d34cb90d83
       MAX_COMPRESSED_IMAGE_BYTES: "33000000000"

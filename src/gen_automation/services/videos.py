@@ -300,6 +300,11 @@ async def create_video_submission(
     now: datetime | None = None,
 ) -> VideoSubmissionRead:
     created_at = _as_utc(now or datetime.now(UTC))
+    if command.quality_profile == VideoQualityProfile.SMOOTHMIX_A14B_Q3:
+        # This transaction-scoped gate is the first lock for every A14B
+        # submission. The private-group operator holds the same gate through
+        # its final drain check and provider POST, closing the admission race.
+        await acquire_a14b_submission_lock(session)
     actor = await _require_actor(session, actor_user_id=actor_user_id, lock=True)
     _validate_command(command)
     asset = await session.scalar(
@@ -367,10 +372,9 @@ async def create_video_submission(
     )
     _validate_a14b_budget(command.quality_profile, estimate_microusd)
     if command.quality_profile == VideoQualityProfile.SMOOTHMIX_A14B_Q3:
-        await _acquire_a14b_spend_lock(session)
-        # A concurrent exact request can finish while this transaction waits
-        # for the global A14B lock. Re-check idempotency before evaluating the
-        # ceiling so a replay never consumes or is rejected by budget twice.
+        # The initial replay check runs after the global gate is acquired, so a
+        # concurrent exact request cannot finish between that check and this
+        # cumulative ceiling calculation.
         replay = await _load_submission_by_id(
             session,
             actor_user_id=actor.id,
@@ -914,12 +918,15 @@ def _validated_submission_replay(
     return _submission_read(command.submission_id, replay)
 
 
-async def _acquire_a14b_spend_lock(session: AsyncSession) -> None:
-    """Serialize the global A14B cap check and insert on PostgreSQL.
+async def acquire_a14b_submission_lock(session: AsyncSession) -> bool:
+    """Serialize A14B admission, its global cap, and private-group cutover.
 
     PostgreSQL holds this advisory lock until the caller commits or rolls back
-    the surrounding submission transaction. SQLite has no advisory locks; its
-    database writer serialization keeps the local/test path compatible.
+    the surrounding transaction. The private-group operator takes this before
+    the provider budget/deployment locks; the controller never takes it. The
+    return value is ``True`` only when the database provides the cross-process,
+    transaction-scoped advisory lock, so operator paths fail closed on SQLite
+    and other unsupported databases.
     """
 
     if session.get_bind().dialect.name == "postgresql":
@@ -927,6 +934,8 @@ async def _acquire_a14b_spend_lock(session: AsyncSession) -> None:
             text("SELECT pg_advisory_xact_lock(:lock_key)"),
             {"lock_key": _POSTGRES_A14B_SPEND_LOCK_KEY},
         )
+        return True
+    return False
 
 
 async def _validate_a14b_cumulative_budget(
