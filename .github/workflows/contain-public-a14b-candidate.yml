@@ -1,4 +1,4 @@
-name: Contain accidentally public A14B candidate
+name: Bootstrap private owner-scoped A14B package
 
 on:
   push:
@@ -14,52 +14,118 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  contain:
+  bootstrap:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
       EXPECTED_BASE_SHA: 48f74ec9e6cd46f74804747ae37da80f2a4f08a3
-      EXPECTED_PACKAGE_ID: "14370553"
-      EXPECTED_VERSION_ID: "1123214799"
-      EXPECTED_DIGEST: sha256:9bfd7675fa9c213de42b51ceab91e0478daab87049ce0b132267c709eb19da2e
-      EXPECTED_TAG: candidate-sha-48f74ec9e6cd46f74804747ae37da80f2a4f08a3
-      PACKAGE_API_NAME: gen-automation%2Fvideo-worker-a14b-private
-      REGISTRY_REPOSITORY: neuraln-cyber/gen-automation/video-worker-a14b-private
+      IMAGE_NAME: ghcr.io/neuraln-cyber/video-worker-a14b-private
+      PACKAGE_API_NAME: video-worker-a14b-private
+      REGISTRY_REPOSITORY: neuraln-cyber/video-worker-a14b-private
+      BOOTSTRAP_TAG: private-bootstrap-48f74ec9e6cd46f74804747ae37da80f2a4f08a3
+      BUILDKIT_IMAGE: moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
     steps:
-      - name: Check out the exact containment commit
+      - name: Check out the exact bootstrap commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Delete the exact candidate-only exposed package
+      - name: Require the contained legacy package and an absent new package
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REPOSITORY" = "neuraln-cyber/gen-automation" ] || {
-            printf 'Containment repository identity mismatch.\n' >&2
-            exit 1
-          }
-          [ "$GITHUB_REF" = "refs/heads/emergency/a14b-ghcr-containment-v2" ] || {
-            printf 'Containment ref identity mismatch.\n' >&2
-            exit 1
-          }
-          git merge-base --is-ancestor "$EXPECTED_BASE_SHA" HEAD || {
-            printf 'Containment base ancestry mismatch.\n' >&2
-            exit 1
-          }
-          changed_paths="$(git diff --name-only "$EXPECTED_BASE_SHA" HEAD)"
-          [ "$changed_paths" = ".github/workflows/contain-public-a14b-candidate.yml" ] || {
-            printf 'Containment branch scope mismatch.\n' >&2
-            exit 1
-          }
-          printf 'Containment source boundary verified.\n'
+          [ "$GITHUB_REPOSITORY" = "neuraln-cyber/gen-automation" ]
+          [ "$GITHUB_REF" = "refs/heads/emergency/a14b-ghcr-containment-v2" ]
+          git merge-base --is-ancestor "$EXPECTED_BASE_SHA" HEAD
+          [ "$(git diff --name-only "$EXPECTED_BASE_SHA" HEAD)" = ".github/workflows/contain-public-a14b-candidate.yml" ]
 
+          old_status="$(
+            curl --silent --show-error \
+              --output "$RUNNER_TEMP/a14b-old-package.json" \
+              --write-out '%{http_code}' \
+              --header 'Accept: application/vnd.github+json' \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              'https://api.github.com/users/neuraln-cyber/packages/container/gen-automation%2Fvideo-worker-a14b-private'
+          )"
+          [ "$old_status" = "404" ] || {
+            printf 'The exposed legacy package is not authoritatively absent.\n' >&2
+            exit 1
+          }
+
+          new_status="$(
+            curl --silent --show-error \
+              --output "$RUNNER_TEMP/a14b-new-package-preflight.json" \
+              --write-out '%{http_code}' \
+              --header 'Accept: application/vnd.github+json' \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/users/neuraln-cyber/packages/container/${PACKAGE_API_NAME}"
+          )"
+          [ "$new_status" = "404" ] || {
+            printf 'The owner-scoped bootstrap package already exists.\n' >&2
+            exit 1
+          }
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          version: v0.36.1
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push a harmless scratch bootstrap
+        id: bootstrap
+        shell: bash
+        run: |
+          set -euo pipefail
+          bootstrap_dir="$(mktemp -d)"
+          printf 'private A14B package bootstrap; contains no model or application bytes\n' \
+            >"$bootstrap_dir/marker.txt"
+          cat >"$bootstrap_dir/Dockerfile" <<'EOF'
+          FROM scratch
+          COPY marker.txt /a14b-private-bootstrap.txt
+          LABEL org.opencontainers.image.title="A14B private package bootstrap"
+          LABEL org.opencontainers.image.description="Harmless marker only; no model or application bytes"
+          EOF
+          docker buildx build \
+            --file "$bootstrap_dir/Dockerfile" \
+            --platform linux/amd64 \
+            --provenance=false \
+            --sbom=false \
+            --push \
+            --tag "${IMAGE_NAME}:${BOOTSTRAP_TAG}" \
+            "$bootstrap_dir"
+          tag_manifest="$(
+            docker buildx imagetools inspect \
+              "${IMAGE_NAME}:${BOOTSTRAP_TAG}" \
+              --format '{{json .Manifest}}'
+          )"
+          digest="$(
+            MANIFEST_JSON="$tag_manifest" python3 -c \
+              'import json, os; print(json.loads(os.environ["MANIFEST_JSON"])["digest"])'
+          )"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'digest=%s\n' "$digest" >>"$GITHUB_OUTPUT"
+
+      - name: Require private metadata and anonymous pull denial
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOOTSTRAP_DIGEST: ${{ steps.bootstrap.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
           package_path="/users/neuraln-cyber/packages/container/${PACKAGE_API_NAME}"
-          package_json="$RUNNER_TEMP/a14b-public-package.json"
-          version_json="$RUNNER_TEMP/a14b-public-version.json"
+          package_json="$RUNNER_TEMP/a14b-private-bootstrap-package.json"
           package_status="$(
             curl --silent --show-error \
               --output "$package_json" \
@@ -69,198 +135,53 @@ jobs:
               --header 'X-GitHub-Api-Version: 2022-11-28' \
               "https://api.github.com${package_path}"
           )"
-          [ "$package_status" = "200" ] || {
-            printf 'Exact package metadata was unavailable: HTTP %s.\n' "$package_status" >&2
-            exit 1
-          }
-          version_status="$(
-            curl --silent --show-error \
-              --output "$version_json" \
-              --write-out '%{http_code}' \
-              --header 'Accept: application/vnd.github+json' \
-              --header "Authorization: Bearer ${GH_TOKEN}" \
-              --header 'X-GitHub-Api-Version: 2022-11-28' \
-              "https://api.github.com${package_path}/versions/${EXPECTED_VERSION_ID}"
-          )"
-          [ "$version_status" = "200" ] || {
-            printf 'Exact package version metadata was unavailable: HTTP %s.\n' "$version_status" >&2
-            exit 1
-          }
-
-          PACKAGE_JSON="$package_json" VERSION_JSON="$version_json" python3 - <<'PY'
+          [ "$package_status" = "200" ]
+          PACKAGE_JSON="$package_json" python3 - <<'PY'
           import json
           import os
 
           with open(os.environ["PACKAGE_JSON"], encoding="utf-8") as handle:
               package = json.load(handle)
-          with open(os.environ["VERSION_JSON"], encoding="utf-8") as handle:
-              version = json.load(handle)
-
-          if str(package.get("id")) != os.environ["EXPECTED_PACKAGE_ID"]:
-              raise SystemExit("unexpected package identity")
-          if package.get("name") != "gen-automation/video-worker-a14b-private":
-              raise SystemExit("unexpected package name")
-          if package.get("package_type") != "container" or package.get("visibility") != "public":
-              raise SystemExit("package is not the exact exposed public container")
-          if str(version.get("id")) != os.environ["EXPECTED_VERSION_ID"]:
-              raise SystemExit("unexpected package version identity")
-          if version.get("name") != os.environ["EXPECTED_DIGEST"]:
-              raise SystemExit("unexpected package version digest")
-          tags = version.get("metadata", {}).get("container", {}).get("tags")
-          if tags != [os.environ["EXPECTED_TAG"]]:
-              raise SystemExit("unexpected package version tags")
+          if package.get("name") != "video-worker-a14b-private":
+              raise SystemExit("unexpected bootstrap package name")
+          if package.get("package_type") != "container":
+              raise SystemExit("unexpected bootstrap package type")
+          if package.get("visibility") != "private":
+              raise SystemExit("owner-scoped bootstrap package is not private")
           PY
 
-          token_json="$RUNNER_TEMP/a14b-anonymous-token.json"
-          before_headers="$RUNNER_TEMP/a14b-public-candidate.headers"
-          before_manifest="$RUNNER_TEMP/a14b-public-candidate-index.json"
-          curl --fail --silent --show-error --get \
-            --data-urlencode 'service=ghcr.io' \
-            --data-urlencode "scope=repository:${REGISTRY_REPOSITORY}:pull" \
-            'https://ghcr.io/token' >"$token_json"
-          anonymous_token="$(jq -er '.token | select(type == "string" and length > 0)' "$token_json")" || {
-            printf 'Anonymous registry token response was invalid.\n' >&2
-            exit 1
-          }
-          before_status="$(
-            curl --silent --show-error \
-              --output "$before_manifest" \
-              --dump-header "$before_headers" \
-              --write-out '%{http_code}' \
-              --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
-              --header "Authorization: Bearer ${anonymous_token}" \
-              "https://ghcr.io/v2/${REGISTRY_REPOSITORY}/manifests/${EXPECTED_DIGEST}"
+          authenticated_manifest="$(
+            docker buildx imagetools inspect \
+              "${IMAGE_NAME}:${BOOTSTRAP_TAG}" \
+              --format '{{json .Manifest}}'
           )"
-          [ "$before_status" = "200" ] || {
-            printf 'Exact public digest was not anonymously readable: HTTP %s.\n' "$before_status" >&2
-            exit 1
-          }
-          tr -d '\r' <"$before_headers" \
-            | grep -Fxi "docker-content-digest: ${EXPECTED_DIGEST}" >/dev/null || {
-              printf 'Anonymous digest response identity mismatch.\n' >&2
-              exit 1
-            }
-          printf 'Exact anonymous digest exposure verified.\n'
-
-          versions_page_one="$RUNNER_TEMP/a14b-package-versions-page-1.json"
-          versions_page_two="$RUNNER_TEMP/a14b-package-versions-page-2.json"
-          page_one_status="$(
-            curl --silent --show-error \
-              --output "$versions_page_one" \
-              --write-out '%{http_code}' \
-              --header 'Accept: application/vnd.github+json' \
-              --header "Authorization: Bearer ${GH_TOKEN}" \
-              --header 'X-GitHub-Api-Version: 2022-11-28' \
-              "https://api.github.com${package_path}/versions?per_page=100&page=1"
+          authenticated_digest="$(
+            MANIFEST_JSON="$authenticated_manifest" python3 -c \
+              'import json, os; print(json.loads(os.environ["MANIFEST_JSON"])["digest"])'
           )"
-          page_two_status="$(
-            curl --silent --show-error \
-              --output "$versions_page_two" \
+          [ "$authenticated_digest" = "$BOOTSTRAP_DIGEST" ]
+
+          token_json="$RUNNER_TEMP/a14b-private-bootstrap-anonymous-token.json"
+          token_status="$(
+            curl --silent --show-error --get \
+              --output "$token_json" \
               --write-out '%{http_code}' \
-              --header 'Accept: application/vnd.github+json' \
-              --header "Authorization: Bearer ${GH_TOKEN}" \
-              --header 'X-GitHub-Api-Version: 2022-11-28' \
-              "https://api.github.com${package_path}/versions?per_page=100&page=2"
+              --data-urlencode 'service=ghcr.io' \
+              --data-urlencode "scope=repository:${REGISTRY_REPOSITORY}:pull" \
+              'https://ghcr.io/token'
           )"
-          if [ "$page_one_status" != "200" ] || [ "$page_two_status" != "200" ]; then
-            printf 'Package-version inventory failed closed.\n' >&2
-            exit 1
-          fi
-
-          CANDIDATE_INDEX="$before_manifest" \
-          VERSIONS_PAGE_ONE="$versions_page_one" \
-          VERSIONS_PAGE_TWO="$versions_page_two" python3 - <<'PY'
-          import hashlib
-          import json
-          import os
-
-          def load(name: str):
-              with open(os.environ[name], encoding="utf-8") as handle:
-                  return json.load(handle)
-
-          index = load("CANDIDATE_INDEX")
-          page_one = load("VERSIONS_PAGE_ONE")
-          page_two = load("VERSIONS_PAGE_TWO")
-          if not isinstance(page_one, list) or not page_one or page_two != []:
-              raise SystemExit("package-version inventory is not exhaustive")
-          children = index.get("manifests")
-          if not isinstance(children, list) or not children:
-              raise SystemExit("candidate digest is not an OCI image index")
-          child_digests = {item.get("digest") for item in children}
-          if None in child_digests or not all(
-              isinstance(item, str) and item.startswith("sha256:") for item in child_digests
-          ):
-              raise SystemExit("candidate index child identity is invalid")
-          allowed_digests = child_digests | {os.environ["EXPECTED_DIGEST"]}
-          inventory_digests = {item.get("name") for item in page_one}
-          if None in inventory_digests or not inventory_digests <= allowed_digests:
-              raise SystemExit("package contains a version outside the exact candidate index")
-          expected_versions = [
-              item for item in page_one
-              if str(item.get("id")) == os.environ["EXPECTED_VERSION_ID"]
-          ]
-          if len(expected_versions) != 1:
-              raise SystemExit("exact tagged candidate is absent from inventory")
-          expected_tags = expected_versions[0].get("metadata", {}).get("container", {}).get("tags")
-          if expected_versions[0].get("name") != os.environ["EXPECTED_DIGEST"]:
-              raise SystemExit("tagged candidate digest changed")
-          if expected_tags != [os.environ["EXPECTED_TAG"]]:
-              raise SystemExit("tagged candidate tags changed")
-          for item in page_one:
-              tags = item.get("metadata", {}).get("container", {}).get("tags")
-              if str(item.get("id")) != os.environ["EXPECTED_VERSION_ID"] and tags not in ([], None):
-                  raise SystemExit("unexpected additional tagged package version")
-          canonical = "\n".join(sorted(inventory_digests)).encode()
-          print(f"Exact candidate-only package inventory verified: versions={len(page_one)}")
-          print(f"Inventory digest-set SHA256: {hashlib.sha256(canonical).hexdigest()}")
-          PY
-
-          delete_status="$(
-            curl --silent --show-error \
-              --request DELETE \
-              --output "$RUNNER_TEMP/a14b-package-delete-response.json" \
-              --write-out '%{http_code}' \
-              --header 'Accept: application/vnd.github+json' \
-              --header "Authorization: Bearer ${GH_TOKEN}" \
-              --header 'X-GitHub-Api-Version: 2022-11-28' \
-              "https://api.github.com${package_path}"
-          )"
-          [ "$delete_status" = "204" ] || {
-            printf 'Exact candidate-only package deletion failed: HTTP %s.\n' "$delete_status" >&2
-            exit 1
-          }
-
-          package_status=000
-          after_status=000
-          for _ in $(seq 1 12); do
-            package_status="$(
+          if [ "$token_status" = "200" ]; then
+            anonymous_token="$(jq -er '.token | select(type == "string" and length > 0)' "$token_json")"
+            manifest_status="$(
               curl --silent --show-error \
-                --output "$RUNNER_TEMP/a14b-package-after-delete.json" \
+                --output "$RUNNER_TEMP/a14b-private-bootstrap-anonymous-manifest.json" \
                 --write-out '%{http_code}' \
-                --header 'Accept: application/vnd.github+json' \
-                --header "Authorization: Bearer ${GH_TOKEN}" \
-                --header 'X-GitHub-Api-Version: 2022-11-28' \
-                "https://api.github.com${package_path}"
-            )"
-            after_status="$(
-              curl --silent --show-error \
-                --output "$RUNNER_TEMP/a14b-manifest-after-delete.json" \
-                --write-out '%{http_code}' \
-                --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+                --header 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json' \
                 --header "Authorization: Bearer ${anonymous_token}" \
-                "https://ghcr.io/v2/${REGISTRY_REPOSITORY}/manifests/${EXPECTED_DIGEST}"
+                "https://ghcr.io/v2/${REGISTRY_REPOSITORY}/manifests/${BOOTSTRAP_DIGEST}"
             )"
-            if [ "$package_status" = "404" ] && [[ "$after_status" =~ ^(401|403|404)$ ]]; then
-              break
-            fi
-            sleep 5
-          done
-          [ "$package_status" = "404" ] || {
-            printf 'Deleted package metadata remained visible: HTTP %s.\n' "$package_status" >&2
-            exit 1
-          }
-          [[ "$after_status" =~ ^(401|403|404)$ ]] || {
-            printf 'Deleted digest remained anonymously accessible: HTTP %s.\n' "$after_status" >&2
-            exit 1
-          }
-          printf 'Exact candidate-only package deleted; anonymous digest access is gone.\n'
+            [[ "$manifest_status" =~ ^(401|403|404)$ ]]
+          else
+            [[ "$token_status" =~ ^(401|403)$ ]]
+          fi
+          printf 'Owner-scoped A14B package is private and denies anonymous pulls.\n'
