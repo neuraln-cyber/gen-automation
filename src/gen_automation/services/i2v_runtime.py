@@ -34,6 +34,7 @@ from gen_automation.integrations.salad.models import (
 )
 from gen_automation.services.i2v import (
     acknowledge_i2v_cancellation,
+    adopt_validated_i2v_provider_attempt,
     claim_next_i2v_job,
     complete_i2v_job,
     fail_i2v_attempt,
@@ -63,6 +64,8 @@ _ACTIVE_JOB_STATES = (
 )
 _ACTIVE_ATTEMPT_STATES = (I2VAttemptState.CREATED, I2VAttemptState.RUNNING)
 _DEFINITELY_REJECTED_STATUS_CODES = frozenset({400, 401, 403, 404, 422})
+I2V_SINGLETON_WORKER_ID = "controller:i2v:singleton"
+_RESTART_RECONCILIATION_WAITING = "restart_reconciliation_waiting"
 
 
 class I2VRuntimeError(Exception):
@@ -179,7 +182,10 @@ class I2VRuntime:
         for active in await self._active_attempts():
             action = await self._advance_attempt(*active, now=timestamp)
             if action is not None:
-                return I2VRuntimeCycle(action=action, changed=True)
+                return I2VRuntimeCycle(
+                    action=action,
+                    changed=action != _RESTART_RECONCILIATION_WAITING,
+                )
 
         if await self._sync_deployment(
             observation,
@@ -288,6 +294,8 @@ class I2VRuntime:
                     submission_key=submission_key,
                 )
                 if remote is None:
+                    if job.lease_owner != self.worker_id or attempt.worker_id != self.worker_id:
+                        return _RESTART_RECONCILIATION_WAITING
                     return await self._record_provider_absence(job, attempt, now=now)
         else:
             state = attempt.request_metadata.get("submission_state")
@@ -298,6 +306,10 @@ class I2VRuntime:
                     submission_key=submission_key,
                 )
                 if remote is None:
+                    if _lease_expired(job, now=now):
+                        return None
+                    if job.lease_owner != self.worker_id or attempt.worker_id != self.worker_id:
+                        return _RESTART_RECONCILIATION_WAITING
                     if job.state == I2VJobState.CANCEL_REQUESTED:
                         async with self.sessions() as session:
                             await acknowledge_i2v_cancellation(
@@ -310,20 +322,40 @@ class I2VRuntime:
                         return "unsubmitted_cancellation_acknowledged"
                     return await self._submit_existing(job, attempt, now=now)
             elif state == "prepared":
-                if job.state == I2VJobState.CANCEL_REQUESTED:
-                    async with self.sessions() as session:
-                        await acknowledge_i2v_cancellation(
-                            session,
-                            job_id=job.job_id,
-                            attempt_id=attempt.attempt_id,
-                            worker_id=self.worker_id,
-                            now=now,
-                        )
-                    return "unsubmitted_cancellation_acknowledged"
-                return await self._submit_existing(job, attempt, now=now)
+                # A controller may have died after Salad accepted the POST but
+                # before its provider ID was persisted. Search the deterministic
+                # submission identity before any retry, including on the stable
+                # singleton after a process restart.
+                remote = await find_i2v_submission(
+                    self.salad_client,
+                    queue_name=self.config.salad.queue_name,
+                    submission_key=submission_key,
+                )
+                if remote is None:
+                    if job.lease_owner != self.worker_id or attempt.worker_id != self.worker_id:
+                        if _lease_expired(job, now=now):
+                            return None
+                        return _RESTART_RECONCILIATION_WAITING
+                    if _lease_expired(job, now=now):
+                        return None
+                    if job.state == I2VJobState.CANCEL_REQUESTED:
+                        async with self.sessions() as session:
+                            await acknowledge_i2v_cancellation(
+                                session,
+                                job_id=job.job_id,
+                                attempt_id=attempt.attempt_id,
+                                worker_id=self.worker_id,
+                                now=now,
+                            )
+                        return "unsubmitted_cancellation_acknowledged"
+                    return await self._submit_existing(job, attempt, now=now)
             else:
                 # Legacy/malformed fresh-lane rows fail closed: first persist the
                 # stable submission identity, then submit on a later cycle.
+                if job.lease_owner != self.worker_id or attempt.worker_id != self.worker_id:
+                    if _lease_expired(job, now=now):
+                        return None
+                    return _RESTART_RECONCILIATION_WAITING
                 await self._record_attempt_metadata(
                     job,
                     attempt,
@@ -340,6 +372,39 @@ class I2VRuntime:
         if remote is None:
             return None
         _validate_remote_identity(remote.metadata, job, attempt, submission_key)
+        if attempt.provider_job_id is not None and attempt.provider_job_id != str(remote.id):
+            raise I2VRuntimeError("Salad I2V job ID does not match the durable provider job")
+        adopted = False
+        owner_changed = job.lease_owner != self.worker_id or attempt.worker_id != self.worker_id
+        provider_id_changed = attempt.provider_job_id != str(remote.id)
+        if owner_changed or provider_id_changed:
+            previous_worker_id = job.lease_owner
+            if previous_worker_id is None or attempt.worker_id != previous_worker_id:
+                raise I2VRuntimeError(
+                    "provider-backed I2V attempt is not eligible for restart adoption"
+                )
+            if owner_changed and (
+                self.worker_id != I2V_SINGLETON_WORKER_ID
+                or previous_worker_id == I2V_SINGLETON_WORKER_ID
+            ):
+                # Only the configured singleton may migrate a legacy per-process
+                # owner. A retired controller therefore cannot steal it back.
+                return _RESTART_RECONCILIATION_WAITING
+            async with self.sessions() as session:
+                claim = await adopt_validated_i2v_provider_attempt(
+                    session,
+                    job_id=job.job_id,
+                    attempt_id=attempt.attempt_id,
+                    attempt_no=attempt.attempt_no,
+                    provider_job_id=str(remote.id),
+                    previous_provider_job_id=attempt.provider_job_id,
+                    previous_worker_id=previous_worker_id,
+                    worker_id=self.worker_id,
+                    lease_duration=timedelta(seconds=self.config.salad.worker_lease_seconds),
+                    now=now,
+                )
+            job, attempt = claim.job, claim.attempt
+            adopted = owner_changed
         if job.lease_expires_at is None or job.lease_expires_at <= now:
             # Provider evidence wins over a stale controller lease. Refresh first,
             # then apply the provider transition next cycle. There is no execution
@@ -359,14 +424,21 @@ class I2VRuntime:
             )
             return "provider_backed_lease_refreshed"
         if job.state == I2VJobState.CANCEL_REQUESTED:
-            if remote.status in {SaladJobStatus.CANCELLED, SaladJobStatus.FAILED}:
+            if remote.status in {
+                SaladJobStatus.CANCELLED,
+                SaladJobStatus.FAILED,
+                SaladJobStatus.SUCCEEDED,
+            }:
                 async with self.sessions() as session:
                     await acknowledge_i2v_cancellation(
                         session,
                         job_id=job.job_id,
                         attempt_id=attempt.attempt_id,
                         worker_id=self.worker_id,
-                        response_metadata={"provider_status": remote.status.value},
+                        response_metadata={
+                            "provider_status": remote.status.value,
+                            "provider_job_id": str(remote.id),
+                        },
                         now=now,
                     )
                 return "cancellation_acknowledged"
@@ -386,12 +458,14 @@ class I2VRuntime:
                     now=now,
                 )
                 return "provider_cancellation_requested"
-            return await self._observe_nonterminal(job, attempt, remote, now=now)
+            action = await self._observe_nonterminal(job, attempt, remote, now=now)
+            return action or ("provider_attempt_adopted" if adopted else None)
 
         if remote.status == SaladJobStatus.PENDING:
             # Pending includes provider capacity, image pulling and container
             # startup. None of these starts the inference clock or a watchdog.
-            return await self._observe_nonterminal(job, attempt, remote, now=now)
+            action = await self._observe_nonterminal(job, attempt, remote, now=now)
+            return action or ("provider_attempt_adopted" if adopted else None)
         if remote.status == SaladJobStatus.RUNNING:
             if attempt.state == I2VAttemptState.CREATED:
                 async with self.sessions() as session:
@@ -411,7 +485,8 @@ class I2VRuntime:
                         now=now,
                     )
                 return "inference_started"
-            return await self._observe_nonterminal(job, attempt, remote, now=now)
+            action = await self._observe_nonterminal(job, attempt, remote, now=now)
+            return action or ("provider_attempt_adopted" if adopted else None)
         if remote.status == SaladJobStatus.SUCCEEDED:
             _validate_worker_result_identity(remote.output, job=job, attempt=attempt)
             output = parse_i2v_worker_output(remote.output)
@@ -455,7 +530,7 @@ class I2VRuntime:
                     now=now,
                 )
             return "provider_terminal_failure"
-        return None
+        return "provider_attempt_adopted" if adopted else None
 
     async def _claim_and_submit(self, *, now: datetime) -> str | None:
         # Recover first, as required. Active provider attempts were reconciled by
@@ -803,6 +878,10 @@ def _submission_key(job: I2VJobSnapshot, attempt: I2VAttemptSnapshot) -> str:
     if stored is not None and stored != calculated:
         raise I2VRuntimeError("stored I2V submission identity is invalid")
     return calculated
+
+
+def _lease_expired(job: I2VJobSnapshot, *, now: datetime) -> bool:
+    return job.lease_expires_at is None or job.lease_expires_at <= now
 
 
 def _validate_remote_identity(

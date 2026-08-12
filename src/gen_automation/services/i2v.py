@@ -473,6 +473,67 @@ async def renew_i2v_job_lease(
     return _job_snapshot(job)
 
 
+async def adopt_validated_i2v_provider_attempt(
+    session: AsyncSession,
+    *,
+    job_id: UUID,
+    attempt_id: UUID,
+    attempt_no: int,
+    provider_job_id: str,
+    previous_provider_job_id: str | None,
+    previous_worker_id: str,
+    worker_id: str,
+    lease_duration: timedelta,
+    now: datetime | None = None,
+) -> I2VClaim:
+    """Transfer an exact provider-backed attempt after its remote identity was verified."""
+
+    normalized_provider_job_id = _nonempty_text(provider_job_id, "provider job id")
+    normalized_previous_provider_job_id = (
+        _nonempty_text(previous_provider_job_id, "previous provider job id")
+        if previous_provider_job_id is not None
+        else None
+    )
+    if normalized_previous_provider_job_id not in {None, normalized_provider_job_id}:
+        raise I2VConflictError("the provider-backed I2V attempt changed concurrently")
+    normalized_previous_worker = _nonempty_text(previous_worker_id, "previous worker id")
+    normalized_worker = _nonempty_text(worker_id, "worker id")
+    if attempt_no <= 0:
+        raise I2VInputError("attempt number must be positive")
+    if lease_duration <= timedelta(0):
+        raise I2VInputError("lease duration must be positive")
+    timestamp = _now(now)
+    job = await session.scalar(select(I2VJob).where(I2VJob.id == job_id).with_for_update())
+    attempt = await session.scalar(
+        select(I2VAttempt)
+        .where(
+            I2VAttempt.id == attempt_id,
+            I2VAttempt.job_id == job_id,
+            I2VAttempt.attempt_no == attempt_no,
+        )
+        .with_for_update()
+    )
+    if (
+        job is None
+        or attempt is None
+        or job.state not in {I2VJobState.CLAIMED, I2VJobState.RUNNING, I2VJobState.CANCEL_REQUESTED}
+        or attempt.state not in {I2VAttemptState.CREATED, I2VAttemptState.RUNNING}
+        or job.attempt_count != attempt_no
+        or job.lease_owner != normalized_previous_worker
+        or attempt.worker_id != normalized_previous_worker
+        or attempt.provider_job_id != normalized_previous_provider_job_id
+    ):
+        raise I2VConflictError("the provider-backed I2V attempt changed concurrently")
+    job.lease_owner = normalized_worker
+    job.lease_expires_at = timestamp + lease_duration
+    job.updated_at = timestamp
+    attempt.worker_id = normalized_worker
+    attempt.provider_job_id = normalized_provider_job_id
+    attempt.updated_at = timestamp
+    await _commit(session, "the provider-backed I2V attempt changed concurrently")
+    return I2VClaim(job=_job_snapshot(job), attempt=_attempt_snapshot(attempt))
+
+
 async def fail_i2v_attempt(
     session: AsyncSession,
     *,

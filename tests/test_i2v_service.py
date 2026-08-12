@@ -23,6 +23,7 @@ from gen_automation.domain.i2v import (
 from gen_automation.services.i2v import (
     I2VConflictError,
     acknowledge_i2v_cancellation,
+    adopt_validated_i2v_provider_attempt,
     claim_next_i2v_job,
     complete_i2v_job,
     create_i2v_job,
@@ -293,6 +294,104 @@ async def test_worker_claim_attempt_output_and_recent_result(
         states={I2VJobState.SUCCEEDED},
     )
     assert completed[0].completed_at == _NOW + timedelta(minutes=1)
+
+
+async def test_provider_backed_attempt_can_be_atomically_adopted_after_restart(
+    i2v_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, owner_id = i2v_session
+    source = await register_i2v_input(
+        session,
+        actor_user_id=owner_id,
+        registration=_input_registration(object_key="i2v/restart-source.png"),
+        now=_NOW,
+    )
+    job = await create_i2v_job(
+        session,
+        actor_user_id=owner_id,
+        draft=I2VJobDraft(input_id=source.input_id),
+        now=_NOW,
+    )
+    claim = await claim_next_i2v_job(
+        session,
+        worker_id="controller-before-restart:i2v",
+        lease_duration=timedelta(days=1),
+        now=_NOW,
+    )
+    assert claim is not None
+    running = await start_i2v_attempt(
+        session,
+        job_id=job.job_id,
+        attempt_id=claim.attempt.attempt_id,
+        worker_id="controller-before-restart:i2v",
+        provider_job_id="salad-job-exact",
+        now=_NOW + timedelta(seconds=1),
+    )
+
+    with pytest.raises(I2VConflictError, match="changed concurrently"):
+        await adopt_validated_i2v_provider_attempt(
+            session,
+            job_id=job.job_id,
+            attempt_id=running.attempt.attempt_id,
+            attempt_no=running.attempt.attempt_no,
+            provider_job_id="salad-job-other",
+            previous_provider_job_id="salad-job-exact",
+            previous_worker_id="controller-before-restart:i2v",
+            worker_id="controller-after-restart:i2v",
+            lease_duration=timedelta(days=1),
+            now=_NOW + timedelta(seconds=2),
+        )
+
+    adopted = await adopt_validated_i2v_provider_attempt(
+        session,
+        job_id=job.job_id,
+        attempt_id=running.attempt.attempt_id,
+        attempt_no=running.attempt.attempt_no,
+        provider_job_id="salad-job-exact",
+        previous_provider_job_id="salad-job-exact",
+        previous_worker_id="controller-before-restart:i2v",
+        worker_id="controller-after-restart:i2v",
+        lease_duration=timedelta(days=1),
+        now=_NOW + timedelta(seconds=3),
+    )
+    assert adopted.job.lease_owner == "controller-after-restart:i2v"
+    assert adopted.job.lease_expires_at == _NOW + timedelta(days=1, seconds=3)
+    assert adopted.attempt.worker_id == "controller-after-restart:i2v"
+    assert adopted.attempt.provider_job_id == "salad-job-exact"
+    assert adopted.attempt.attempt_no == adopted.job.attempt_count == 1
+
+    with pytest.raises(I2VConflictError, match="another worker"):
+        await fail_i2v_attempt(
+            session,
+            job_id=job.job_id,
+            attempt_id=adopted.attempt.attempt_id,
+            worker_id="controller-before-restart:i2v",
+            error_code="stale_controller",
+            error_detail="the retired runtime must not retain ownership",
+            now=_NOW + timedelta(seconds=4),
+        )
+    await fail_i2v_attempt(
+        session,
+        job_id=job.job_id,
+        attempt_id=adopted.attempt.attempt_id,
+        worker_id="controller-after-restart:i2v",
+        error_code="provider_failed",
+        error_detail="terminal rows must not be adoptable",
+        now=_NOW + timedelta(seconds=5),
+    )
+    with pytest.raises(I2VConflictError, match="changed concurrently"):
+        await adopt_validated_i2v_provider_attempt(
+            session,
+            job_id=job.job_id,
+            attempt_id=adopted.attempt.attempt_id,
+            attempt_no=adopted.attempt.attempt_no,
+            provider_job_id="salad-job-exact",
+            previous_provider_job_id="salad-job-exact",
+            previous_worker_id="controller-after-restart:i2v",
+            worker_id="controller-third:i2v",
+            lease_duration=timedelta(days=1),
+            now=_NOW + timedelta(seconds=6),
+        )
 
 
 async def test_fail_retry_has_no_attempt_ceiling_and_running_cancel_is_acknowledged(

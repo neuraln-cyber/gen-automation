@@ -18,7 +18,7 @@ from gen_automation.domain.i2v import (
     I2VJobSnapshot,
     I2VJobState,
 )
-from gen_automation.integrations.salad.errors import SaladTransportError
+from gen_automation.integrations.salad.errors import SaladAPIError, SaladTransportError
 from gen_automation.integrations.salad.models import (
     JSONValue,
     SaladContainerGroup,
@@ -33,11 +33,17 @@ from gen_automation.integrations.salad.models import (
     SaladQueueJob,
     SaladQueueJobPage,
 )
-from gen_automation.services.i2v import create_i2v_job, register_i2v_input
+from gen_automation.services.i2v import (
+    create_i2v_job,
+    register_i2v_input,
+    request_i2v_job_cancellation,
+)
 from gen_automation.services.i2v_runtime import (
+    I2V_SINGLETON_WORKER_ID,
     I2VJobInputBuilder,
     I2VRuntime,
     I2VRuntimeConfig,
+    I2VRuntimeError,
 )
 from gen_automation.services.i2v_salad import (
     I2V_SALAD_GPU_CLASS_NAME,
@@ -190,7 +196,15 @@ class FakeRuntimeSalad:
         return remote
 
     async def get_job(self, _queue_name: str, job_id: UUID | str) -> SaladQueueJob:
-        return self.jobs[UUID(str(job_id))]
+        try:
+            return self.jobs[UUID(str(job_id))]
+        except KeyError as error:
+            raise SaladAPIError(
+                status_code=404,
+                message="job not found",
+                response_body="{}",
+                request_id=None,
+            ) from error
 
     async def list_jobs(
         self,
@@ -253,6 +267,7 @@ def _runtime(
     *,
     warm_idle_seconds: int | None = 1800,
     prefetch: int = 3,
+    worker_id: str = I2V_SINGLETON_WORKER_ID,
 ) -> I2VRuntime:
     return I2VRuntime(
         config=I2VRuntimeConfig(
@@ -268,7 +283,7 @@ def _runtime(
         ),
         sessions=database.sessions,
         salad_client=client,
-        worker_id="i2v-runtime-test",
+        worker_id=worker_id,
         input_builder=SignedGrantBuilder(),
     )
 
@@ -373,6 +388,31 @@ async def test_ambiguous_post_is_recovered_before_any_resubmit(
     assert attempt is not None and attempt.provider_job_id == str(next(iter(client.jobs)))
 
 
+async def test_current_owner_retries_only_after_unknown_submission_scan_is_empty(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, input_id = runtime_database
+    job_id = await _queue_job(database, owner_id=owner_id, input_id=input_id)
+    client = FakeRuntimeSalad()
+    runtime = _runtime(database, client)
+    await runtime.run_cycle(now=_NOW)
+    await runtime.run_cycle(now=_NOW + timedelta(seconds=1))
+    _job, attempt = await _durable_job(database, job_id)
+    assert attempt is not None
+    async with database.sessions() as session:
+        durable_attempt = await session.get(I2VAttempt, attempt.id)
+        assert durable_attempt is not None
+        durable_attempt.request_metadata = {
+            **durable_attempt.request_metadata,
+            "submission_state": "unknown",
+        }
+        await session.commit()
+
+    retried = await runtime.run_cycle(now=_NOW + timedelta(seconds=2))
+    assert retried.action == "provider_job_submitted"
+    assert client.submission_calls == 1
+
+
 async def test_reallocation_updates_machine_without_replacing_attempt(
     runtime_database: tuple[Database, UUID, UUID],
 ) -> None:
@@ -424,6 +464,295 @@ async def test_provider_evidence_refreshes_expired_lease_without_deadline(
     assert durable.state == I2VJobState.CLAIMED
     assert _utc(durable.lease_expires_at) == far_future + timedelta(days=1)
     assert same_attempt is not None and same_attempt.id == attempt.id
+
+
+async def test_restart_adopts_exact_provider_attempt_before_applying_transition(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, input_id = runtime_database
+    job_id = await _queue_job(database, owner_id=owner_id, input_id=input_id)
+    client = FakeRuntimeSalad()
+    before_restart = _runtime(
+        database,
+        client,
+        worker_id="controller-before-restart:i2v",
+    )
+    await before_restart.run_cycle(now=_NOW)
+    await before_restart.run_cycle(now=_NOW + timedelta(seconds=1))
+    submitted = await before_restart.run_cycle(now=_NOW + timedelta(seconds=2))
+    assert submitted.action == "provider_job_submitted"
+    before_job, before_attempt = await _durable_job(database, job_id)
+    assert before_attempt is not None and before_attempt.provider_job_id is not None
+
+    after_restart = _runtime(
+        database,
+        client,
+        worker_id=I2V_SINGLETON_WORKER_ID,
+    )
+    client.set_all_job_status(SaladJobStatus.RUNNING)
+    transitioned = await after_restart.run_cycle(now=_NOW + timedelta(seconds=3))
+    assert transitioned.action == "inference_started"
+    adopted_job, adopted_attempt = await _durable_job(database, job_id)
+    assert adopted_job.state == I2VJobState.RUNNING
+    assert adopted_job.lease_owner == I2V_SINGLETON_WORKER_ID
+    assert _utc(adopted_job.lease_expires_at) == _NOW + timedelta(days=1, seconds=3)
+    assert adopted_job.attempt_count == before_job.attempt_count == 1
+    assert adopted_attempt is not None
+    assert adopted_attempt.id == before_attempt.id
+    assert adopted_attempt.worker_id == I2V_SINGLETON_WORKER_ID
+    assert adopted_attempt.provider_job_id == before_attempt.provider_job_id
+    assert client.submission_calls == 1
+
+    # A briefly overlapping retired controller may observe the same exact
+    # provider job, but one-way migration prevents it from stealing ownership
+    # back from the stable singleton.
+    retired = await before_restart.run_cycle(now=_NOW + timedelta(milliseconds=3500))
+    assert retired.action == "restart_reconciliation_waiting"
+    assert retired.changed is False
+    still_adopted_job, still_adopted_attempt = await _durable_job(database, job_id)
+    assert still_adopted_job.lease_owner == I2V_SINGLETON_WORKER_ID
+    assert still_adopted_attempt is not None
+    assert still_adopted_attempt.worker_id == I2V_SINGLETON_WORKER_ID
+    assert client.submission_calls == 1
+
+    client.set_all_job_status(SaladJobStatus.SUCCEEDED)
+    completed = await after_restart.run_cycle(now=_NOW + timedelta(seconds=4))
+    assert completed.action == "output_completed"
+    completed_job, completed_attempt = await _durable_job(database, job_id)
+    assert completed_job.state == I2VJobState.SUCCEEDED
+    assert completed_attempt is not None
+    assert completed_attempt.state == I2VAttemptState.SUCCEEDED
+    assert completed_attempt.worker_id == I2V_SINGLETON_WORKER_ID
+    assert client.submission_calls == 1
+
+
+async def test_restart_rejects_unvalidated_provider_identity_without_adoption(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, input_id = runtime_database
+    job_id = await _queue_job(database, owner_id=owner_id, input_id=input_id)
+    client = FakeRuntimeSalad()
+    before_restart = _runtime(
+        database,
+        client,
+        worker_id="controller-before-restart:i2v",
+    )
+    await before_restart.run_cycle(now=_NOW)
+    await before_restart.run_cycle(now=_NOW + timedelta(seconds=1))
+    await before_restart.run_cycle(now=_NOW + timedelta(seconds=2))
+    before_job, before_attempt = await _durable_job(database, job_id)
+    assert before_attempt is not None and before_attempt.provider_job_id is not None
+    remote_id = UUID(before_attempt.provider_job_id)
+    remote = client.jobs[remote_id]
+    client.jobs[remote_id] = SaladQueueJob(
+        id=remote.id,
+        input=remote.input,
+        status=remote.status,
+        events=remote.events,
+        create_time=remote.create_time,
+        update_time=remote.update_time,
+        metadata={**remote.metadata, "i2v_attempt_id": str(uuid4())},
+        webhook=remote.webhook,
+        output=remote.output,
+    )
+
+    after_restart = _runtime(
+        database,
+        client,
+        worker_id=I2V_SINGLETON_WORKER_ID,
+    )
+    with pytest.raises(I2VRuntimeError, match="identity does not match"):
+        await after_restart.run_cycle(now=_NOW + timedelta(seconds=3))
+    unchanged_job, unchanged_attempt = await _durable_job(database, job_id)
+    assert unchanged_job.state == before_job.state == I2VJobState.CLAIMED
+    assert unchanged_job.lease_owner == "controller-before-restart:i2v"
+    assert unchanged_job.attempt_count == 1
+    assert unchanged_attempt is not None
+    assert unchanged_attempt.id == before_attempt.id
+    assert unchanged_attempt.worker_id == "controller-before-restart:i2v"
+    assert unchanged_attempt.provider_job_id == before_attempt.provider_job_id
+    assert client.submission_calls == 1
+
+
+async def test_restart_does_not_adopt_or_requeue_an_absent_provider_job(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, input_id = runtime_database
+    job_id = await _queue_job(database, owner_id=owner_id, input_id=input_id)
+    client = FakeRuntimeSalad()
+    before_restart = _runtime(
+        database,
+        client,
+        worker_id="controller-before-restart:i2v",
+    )
+    await before_restart.run_cycle(now=_NOW)
+    await before_restart.run_cycle(now=_NOW + timedelta(seconds=1))
+    await before_restart.run_cycle(now=_NOW + timedelta(seconds=2))
+    before_job, before_attempt = await _durable_job(database, job_id)
+    assert before_attempt is not None and before_attempt.provider_job_id is not None
+    client.jobs.clear()
+
+    after_restart = _runtime(
+        database,
+        client,
+        worker_id=I2V_SINGLETON_WORKER_ID,
+    )
+    waiting = await after_restart.run_cycle(now=_NOW + timedelta(days=30))
+    assert waiting.action == "restart_reconciliation_waiting"
+    assert waiting.changed is False
+    unchanged_job, unchanged_attempt = await _durable_job(database, job_id)
+    assert unchanged_job.state == before_job.state == I2VJobState.CLAIMED
+    assert unchanged_job.lease_owner == "controller-before-restart:i2v"
+    assert unchanged_job.queue_position is None
+    assert unchanged_job.attempt_count == 1
+    assert unchanged_attempt is not None
+    assert unchanged_attempt.id == before_attempt.id
+    assert unchanged_attempt.worker_id == "controller-before-restart:i2v"
+    assert unchanged_attempt.provider_job_id == before_attempt.provider_job_id
+    assert client.submission_calls == 1
+
+
+async def test_restart_adopts_and_binds_exact_discovered_provider_job_without_resubmit(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, input_id = runtime_database
+    job_id = await _queue_job(database, owner_id=owner_id, input_id=input_id)
+    client = FakeRuntimeSalad()
+    legacy = _runtime(database, client, worker_id="controller-legacy:i2v")
+    await legacy.run_cycle(now=_NOW)
+    await legacy.run_cycle(now=_NOW + timedelta(seconds=1))
+    await legacy.run_cycle(now=_NOW + timedelta(seconds=2))
+    before_job, before_attempt = await _durable_job(database, job_id)
+    assert before_attempt is not None and before_attempt.provider_job_id is not None
+    exact_provider_job_id = before_attempt.provider_job_id
+
+    # Model the crash window where Salad accepted the deterministic submission
+    # but its ID was not durably bound to the attempt.
+    async with database.sessions() as session:
+        attempt = await session.get(I2VAttempt, before_attempt.id)
+        assert attempt is not None
+        attempt.provider_job_id = None
+        attempt.request_metadata = {
+            **attempt.request_metadata,
+            "submission_state": "unknown",
+        }
+        await session.commit()
+
+    singleton = _runtime(database, client, worker_id=I2V_SINGLETON_WORKER_ID)
+    adopted = await singleton.run_cycle(now=_NOW + timedelta(seconds=3))
+    assert adopted.action == "provider_attempt_adopted"
+    durable_job, durable_attempt = await _durable_job(database, job_id)
+    assert durable_job.lease_owner == I2V_SINGLETON_WORKER_ID
+    assert durable_job.attempt_count == before_job.attempt_count == 1
+    assert durable_attempt is not None and durable_attempt.id == before_attempt.id
+    assert durable_attempt.worker_id == I2V_SINGLETON_WORKER_ID
+    assert durable_attempt.provider_job_id == exact_provider_job_id
+    assert client.submission_calls == 1
+
+
+async def test_restart_with_unbound_absent_provider_waits_then_recovers_without_post(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, input_id = runtime_database
+    job_id = await _queue_job(database, owner_id=owner_id, input_id=input_id)
+    client = FakeRuntimeSalad()
+    legacy = _runtime(database, client, worker_id="controller-legacy:i2v")
+    await legacy.run_cycle(now=_NOW)
+    assert (await legacy.run_cycle(now=_NOW + timedelta(seconds=1))).action == "job_claimed"
+    claimed_job, claimed_attempt = await _durable_job(database, job_id)
+    assert claimed_attempt is not None and claimed_attempt.provider_job_id is None
+    assert claimed_attempt.request_metadata["submission_state"] == "prepared"
+
+    singleton = _runtime(database, client, worker_id=I2V_SINGLETON_WORKER_ID)
+    waiting = await singleton.run_cycle(now=_NOW + timedelta(seconds=2))
+    assert waiting.action == "restart_reconciliation_waiting"
+    assert waiting.changed is False
+    unchanged_job, unchanged_attempt = await _durable_job(database, job_id)
+    assert unchanged_job.lease_owner == claimed_job.lease_owner
+    assert unchanged_attempt is not None and unchanged_attempt.id == claimed_attempt.id
+    assert client.submission_calls == 0
+
+    far_future = _NOW + timedelta(days=2)
+    actions: list[str] = []
+    for _ in range(3):
+        cycle = await singleton.run_cycle(now=far_future)
+        actions.append(cycle.action)
+        if cycle.action == "expired_claims_recovered":
+            break
+    assert "expired_claims_recovered" in actions
+    recovered_job, recovered_attempt = await _durable_job(database, job_id)
+    assert recovered_job.state == I2VJobState.QUEUED
+    assert recovered_job.attempt_count == 1
+    assert recovered_attempt is not None and recovered_attempt.state == I2VAttemptState.FAILED
+    assert client.submission_calls == 0
+
+
+async def test_restart_rejects_different_remote_id_for_durably_bound_provider_job(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, input_id = runtime_database
+    job_id = await _queue_job(database, owner_id=owner_id, input_id=input_id)
+    client = FakeRuntimeSalad()
+    runtime = _runtime(database, client)
+    await runtime.run_cycle(now=_NOW)
+    await runtime.run_cycle(now=_NOW + timedelta(seconds=1))
+    await runtime.run_cycle(now=_NOW + timedelta(seconds=2))
+    before_job, before_attempt = await _durable_job(database, job_id)
+    assert before_attempt is not None and before_attempt.provider_job_id is not None
+    original = client.jobs.pop(UUID(before_attempt.provider_job_id))
+    replacement = SaladQueueJob(
+        id=uuid4(),
+        input=original.input,
+        status=original.status,
+        events=original.events,
+        create_time=original.create_time,
+        update_time=original.update_time,
+        metadata=original.metadata,
+        webhook=original.webhook,
+        output=original.output,
+    )
+    client.jobs[replacement.id] = replacement
+
+    with pytest.raises(I2VRuntimeError, match="durable provider job"):
+        await runtime.run_cycle(now=_NOW + timedelta(seconds=3))
+    unchanged_job, unchanged_attempt = await _durable_job(database, job_id)
+    assert unchanged_job.lease_owner == before_job.lease_owner
+    assert unchanged_attempt is not None
+    assert unchanged_attempt.provider_job_id == before_attempt.provider_job_id
+    assert client.submission_calls == 1
+
+
+async def test_cancel_requested_provider_success_settles_as_cancelled(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, input_id = runtime_database
+    job_id = await _queue_job(database, owner_id=owner_id, input_id=input_id)
+    client = FakeRuntimeSalad()
+    runtime = _runtime(database, client)
+    await runtime.run_cycle(now=_NOW)
+    await runtime.run_cycle(now=_NOW + timedelta(seconds=1))
+    await runtime.run_cycle(now=_NOW + timedelta(seconds=2))
+    client.set_all_job_status(SaladJobStatus.RUNNING)
+    await runtime.run_cycle(now=_NOW + timedelta(seconds=3))
+    async with database.sessions() as session:
+        requested = await request_i2v_job_cancellation(
+            session,
+            actor_user_id=owner_id,
+            job_id=job_id,
+            now=_NOW + timedelta(seconds=4),
+        )
+    assert requested.state == I2VJobState.CANCEL_REQUESTED
+
+    client.set_all_job_status(SaladJobStatus.SUCCEEDED)
+    settled = await runtime.run_cycle(now=_NOW + timedelta(seconds=5))
+    assert settled.action == "cancellation_acknowledged"
+    durable_job, durable_attempt = await _durable_job(database, job_id)
+    assert durable_job.state == I2VJobState.CANCELLED
+    assert durable_attempt is not None
+    assert durable_attempt.state == I2VAttemptState.CANCELLED
+    assert durable_attempt.response_metadata["provider_status"] == "succeeded"
+    assert durable_attempt.response_metadata["provider_job_id"] == str(next(iter(client.jobs)))
+    assert "cancel_job" not in client.provider_mutations
 
 
 async def test_warm_idle_can_stop_or_remain_manual_unbounded(
