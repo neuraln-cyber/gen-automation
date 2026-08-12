@@ -10,7 +10,10 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "infra" / "aws-staging" / "deploy" / "cutover-video-worker-a14b.sh"
 INSTALLER = ROOT / "infra" / "aws-staging" / "deploy" / "install.sh"
-IMAGE = "ghcr.io/neuraln-cyber/gen-automation/video-worker-a14b-private@sha256:" + "a" * 64
+IMAGE = (
+    "ghcr.io/neuraln-cyber/gen-automation-a14b-registry/"
+    "video-worker-a14b-private@sha256:" + "a" * 64
+)
 REVISION = "d585214403c2b8090dc468b5045db1cf7b06b3ac"
 
 
@@ -83,7 +86,7 @@ def test_cutover_script_has_valid_bash_and_offline_argument_validation() -> None
             str(SCRIPT),
             "--validate-only",
             "--image",
-            IMAGE.replace("video-worker-a14b-private", "video-worker"),
+            "ghcr.io/neuraln-cyber/gen-automation/video-worker@sha256:" + "a" * 64,
             "--expected-control-plane-revision",
             REVISION,
         ],

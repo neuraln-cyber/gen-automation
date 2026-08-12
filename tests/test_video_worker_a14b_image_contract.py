@@ -162,44 +162,15 @@ def test_a14b_model_free_foundation_is_built_and_smoked_in_ci() -> None:
     assert "KSamplerWithNAG (Advanced)" in smoke_step
 
 
-def test_a14b_publish_workflow_bootstraps_only_a_private_or_exactly_absent_package() -> None:
+def test_public_repository_cannot_publish_the_model_bearing_a14b_image() -> None:
     workflow = PUBLISH_WORKFLOW.read_text(encoding="utf-8")
     assert "workflow_dispatch:" in workflow
-    assert "ref: ${{ inputs.source_sha }}" in workflow
-    assert 'git rev-parse HEAD)" = "$SOURCE_SHA"' in workflow
-    assert "publish-video-worker-a14b-private" in workflow
-    assert 'gh api "/repos/${GITHUB_REPOSITORY}"' in workflow
-    # The source repository is public. GHCR still defaults a first-published
-    # container package to private, and the workflow verifies that postcondition.
-    assert "jq -r .private" not in workflow
-    assert 'package_scope="orgs"' in workflow
-    assert 'package_scope="users"' in workflow
-    assert "private-or-absent package" in workflow
-    assert "scripts/require_private_ghcr_package.py" in workflow
-    assert "--phase pre-push" in workflow
-    assert "--phase post-push" in workflow
-    assert "Require the model-bearing package to be private after push" in workflow
-    assert workflow.index("Build and push the immutable unverified candidate") < workflow.index(
-        "Require the model-bearing package to be private after push"
-    )
-    assert "candidate-sha-${{ env.SOURCE_SHA }}" in workflow
-    assert "candidate workflow accepts only an unverified image" in workflow
-    assert "runtime_fit_report_sha256" in workflow
-    assert "license_confirmation_sha256" not in workflow
-    assert "operator_license_confirmation" not in workflow
-    assert 'MAX_COMPRESSED_IMAGE_BYTES: "33000000000"' in workflow
-    assert "70000000000" in workflow
-    assert "moby/buildkit:v0.32.2@sha256:" in workflow
-    assert "docker/buildkit-syft-scanner:stable-1@sha256:" in workflow
-    assert "${IMAGE_NAME}@${{ steps.verify.outputs.digest }}" in workflow
-    assert "a14b-candidate.spdx.json" in workflow
-    assert "anchore/scan-action@e1165082" in workflow
-    assert "grype-version: v0.110.0" in workflow
-    assert "severity-cutoff: critical" in workflow
-    assert "candidate_digest: ${{ steps.verify.outputs.digest }}" in workflow
-    assert 'imagetools inspect "${IMAGE_NAME}@${digest}"' in workflow
-    assert "actions/upload-artifact@043fb46d" in workflow
-    assert "Dockerfile.video-worker-a14b" in workflow
+    assert "A14B model publication is restricted to the private packaging repository" in workflow
+    assert "packages: write" not in workflow
+    assert "docker/login-action" not in workflow
+    assert "docker/build-push-action" not in workflow
+    assert "Dockerfile.video-worker-a14b" not in workflow
+    assert "ghcr.io" not in workflow
     assert "schedule:" not in workflow
 
 

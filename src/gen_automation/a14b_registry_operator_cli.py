@@ -38,10 +38,13 @@ AWS_PROFILE = "gen-automation-staging"
 AWS_REGION = "eu-central-1"
 GITHUB_API_URL = "https://api.github.com/user"
 GHCR_MANIFEST_PREFIX = (
-    "https://ghcr.io/v2/neuraln-cyber/gen-automation/video-worker-a14b-private/manifests/"
+    "https://ghcr.io/v2/neuraln-cyber/gen-automation-a14b-registry/"
+    "video-worker-a14b-private/manifests/"
 )
 GHCR_TOKEN_ENDPOINT = "https://ghcr.io/token"  # noqa: S105 - public endpoint
-GHCR_REPOSITORY_SCOPE = "repository:neuraln-cyber/gen-automation/video-worker-a14b-private:pull"
+GHCR_REPOSITORY_SCOPE = (
+    "repository:neuraln-cyber/gen-automation-a14b-registry/video-worker-a14b-private:pull"
+)
 _AWS_OPERATOR_ARN_PATTERN = re.compile(
     r"arn:aws:sts::861912887470:assumed-role/"
     r"AWSReservedSSO_GenAutomationStagingDeployer_[A-Fa-f0-9]{16}/"

@@ -48,7 +48,8 @@ from gen_automation.video_worker.profiles import (
 )
 
 A14B_WORKER_IMAGE = (
-    "ghcr.io/neuraln-cyber/gen-automation/video-worker-a14b-private@sha256:" + "a" * 64
+    "ghcr.io/neuraln-cyber/gen-automation-a14b-registry/"
+    "video-worker-a14b-private@sha256:" + "a" * 64
 )
 LEGACY_WORKER_IMAGE = "registry.example.test/video-worker@sha256:" + "b" * 64
 

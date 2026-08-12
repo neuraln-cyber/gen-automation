@@ -19,7 +19,7 @@ Run the helper with only the immutable image and deployment identifiers:
 
 ```powershell
 .\scripts\provision-a14b-private-staging.ps1 `
-  -Image 'ghcr.io/neuraln-cyber/gen-automation/video-worker-a14b-private@sha256:<64-hex>' `
+  -Image 'ghcr.io/neuraln-cyber/gen-automation-a14b-registry/video-worker-a14b-private@sha256:<64-hex>' `
   -DeploymentId '<cutover deployment UUID>'
 ```
 

@@ -41,6 +41,16 @@ GROUP_ID = UUID("f959d7cd-05d5-45fb-9a2a-2fca464c889d")
 QUEUE_ID = UUID("aa834e62-4bc7-43c9-875a-20c62da68a37")
 IMAGE = f"{cli.PRIVATE_IMAGE_REPOSITORY}@sha256:{'a' * 64}"
 OTHER_IMAGE = f"{cli.PRIVATE_IMAGE_REPOSITORY}@sha256:{'b' * 64}"
+
+
+def test_immutable_video_image_allowlist_excludes_abandoned_public_a14b_path() -> None:
+    legacy = "ghcr.io/neuraln-cyber/gen-automation/video-worker@sha256:" + "c" * 64
+    abandoned = "ghcr.io/neuraln-cyber/gen-automation/video-worker-a14b-private@sha256:" + "d" * 64
+    assert cli.IMMUTABLE_VIDEO_IMAGE_PATTERN.fullmatch(legacy) is not None
+    assert cli.IMMUTABLE_VIDEO_IMAGE_PATTERN.fullmatch(IMAGE) is not None
+    assert cli.IMMUTABLE_VIDEO_IMAGE_PATTERN.fullmatch(abandoned) is None
+
+
 USERNAME = "request-scoped-reader"
 TOKEN = "ghp_request_scoped_secret_that_must_never_be_rendered"  # noqa: S105
 NOW = datetime(2026, 8, 11, 14, 0, tzinfo=UTC)
