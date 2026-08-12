@@ -53,6 +53,7 @@ from gen_automation.services.i2v_salad import (
     i2v_submission_metadata,
     observe_i2v_provider,
     parse_i2v_worker_output,
+    validate_i2v_group_contract,
 )
 
 _ACTIVE_JOB_STATES = (
@@ -144,6 +145,8 @@ class I2VRuntime:
             return I2VRuntimeCycle(action="queue_created", changed=True)
         if infrastructure.mutation == I2VInfrastructureMutation.GROUP_CREATED:
             return I2VRuntimeCycle(action="group_created", changed=True)
+        if infrastructure.mutation == I2VInfrastructureMutation.GROUP_CONTRACT_REPAIRED:
+            return I2VRuntimeCycle(action="group_contract_repaired", changed=True)
         if infrastructure.group is None:
             raise I2VSaladConflictError("I2V infrastructure reconciliation omitted its group")
 
@@ -198,10 +201,15 @@ class I2VRuntime:
                     raise I2VRuntimeConfigurationError("I2V runtime environment is empty")
                 updated = await self.salad_client.update_container_group(
                     self.config.salad.container_group_name,
-                    {"container": {"environment_variables": cast(JSONValue, environment)}},
+                    {
+                        "container": {
+                            "environment_variables": cast(JSONValue, environment),
+                            "priority": self.config.salad.priority,
+                        },
+                        "queue_autoscaler": (self.config.salad.queue_autoscaler_configuration()),
+                    },
                 )
-                if updated.name != self.config.salad.container_group_name:
-                    raise I2VSaladConflictError("I2V runtime refresh changed group identity")
+                validate_i2v_group_contract(updated, self.config.salad)
                 self._runtime_prepared = True
                 return I2VRuntimeCycle(action="runtime_credentials_refreshed", changed=True)
             await self.salad_client.start_container_group(self.config.salad.container_group_name)
