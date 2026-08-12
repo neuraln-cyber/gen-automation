@@ -426,6 +426,22 @@ def test_csp_allows_dashboard_to_fetch_clean_asset_copies() -> None:
     ]
 
 
+def test_csp_allows_signed_asset_origin_for_recent_video_playback() -> None:
+    media_sources = (
+        content_security_policy(
+            Environment.PRODUCTION,
+            asset_connect_source="https://private-assets.s3.eu-central-1.amazonaws.com",
+        )
+        .split("media-src ", maxsplit=1)[1]
+        .split(";", maxsplit=1)[0]
+        .split()
+    )
+    assert media_sources == [
+        "'self'",
+        "https://private-assets.s3.eu-central-1.amazonaws.com",
+    ]
+
+
 def test_csp_allows_dashboard_to_post_to_exact_model_artifact_origin() -> None:
     connect_sources = (
         content_security_policy(
@@ -441,29 +457,6 @@ def test_csp_allows_dashboard_to_post_to_exact_model_artifact_origin() -> None:
         "'self'",
         "https://private-assets.s3.eu-central-1.amazonaws.com",
         "https://private-models.s3.eu-central-1.amazonaws.com",
-    ]
-
-
-def test_csp_allows_animation_media_from_only_the_exact_asset_origin() -> None:
-    default_media_sources = (
-        content_security_policy(Environment.PRODUCTION)
-        .split("media-src ", maxsplit=1)[1]
-        .split(";", maxsplit=1)[0]
-        .split()
-    )
-    animation_media_sources = (
-        content_security_policy(
-            Environment.PRODUCTION,
-            media_source="https://private-assets.s3.eu-central-1.amazonaws.com",
-        )
-        .split("media-src ", maxsplit=1)[1]
-        .split(";", maxsplit=1)[0]
-        .split()
-    )
-    assert default_media_sources == ["'self'"]
-    assert animation_media_sources == [
-        "'self'",
-        "https://private-assets.s3.eu-central-1.amazonaws.com",
     ]
 
 

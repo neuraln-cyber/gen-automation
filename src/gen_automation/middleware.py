@@ -17,12 +17,6 @@ DASHBOARD_PREVIEW_PATH_PATTERN = re.compile(
     r"previews/dashboard-preview-v[0-9]+/[0-9a-f]{16}\.jpg$",
     re.IGNORECASE,
 )
-ANIMATION_PREVIEW_PATH_PATTERN = re.compile(
-    r"^/dashboard/animations/assets/"
-    r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/"
-    r"preview/[0-9a-f]{16}\.jpg$",
-    re.IGNORECASE,
-)
 
 
 def asset_connection_source(settings: Settings) -> str | None:
@@ -73,10 +67,10 @@ def content_security_policy(
     allow_same_origin_scripts: bool = False,
     asset_connect_source: str | None = None,
     model_artifact_connect_source: str | None = None,
-    media_source: str | None = None,
 ) -> str:
     image_sources = "'self' https:"
     connect_sources = ["'self'"]
+    media_sources = ["'self'"]
     if environment in {Environment.LOCAL, Environment.TEST}:
         image_sources = f"{image_sources} http:"
     for label, source in (
@@ -89,12 +83,9 @@ def content_security_policy(
             raise ValueError(f"invalid CSP {label} connection source")
         if source not in connect_sources:
             connect_sources.append(source)
+        if label == "asset" and source not in media_sources:
+            media_sources.append(source)
     script_sources = "'self'" if allow_same_origin_scripts else "'none'"
-    media_sources = ["'self'"]
-    if media_source is not None:
-        if CSP_CONNECT_SOURCE_PATTERN.fullmatch(media_source) is None:
-            raise ValueError("invalid CSP media source")
-        media_sources.append(media_source)
     return (
         f"default-src 'self'; base-uri 'none'; connect-src {' '.join(connect_sources)}; "
         "font-src 'self'; form-action 'self'; frame-ancestors 'none'; "
@@ -154,12 +145,6 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                 )
                 else None
             ),
-            media_source=(
-                asset_connection_source(settings)
-                if request.url.path == "/dashboard/animations"
-                or request.url.path.startswith("/dashboard/animations/")
-                else None
-            ),
         )
         response.headers["Permissions-Policy"] = (
             "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
@@ -185,10 +170,7 @@ def _is_private_revalidated_preview_response(request: Request, response: Respons
     content_type = response.headers.get("content-type", "").partition(";")[0].lower()
     return (
         request.method in {"GET", "HEAD"}
-        and (
-            DASHBOARD_PREVIEW_PATH_PATTERN.fullmatch(request.url.path) is not None
-            or ANIMATION_PREVIEW_PATH_PATTERN.fullmatch(request.url.path) is not None
-        )
+        and DASHBOARD_PREVIEW_PATH_PATTERN.fullmatch(request.url.path) is not None
         and response.status_code in {200, 304}
         and (response.status_code == 304 or content_type == "image/jpeg")
         and "private" in {part.strip() for part in cache_control.split(",")}

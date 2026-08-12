@@ -159,6 +159,42 @@ class S3ObjectStore:
         except (BotoCoreError, ClientError) as error:
             raise ObjectStoreError("S3 download signing failed") from error
 
+    async def presign_put(
+        self,
+        *,
+        key: str,
+        content_type: str,
+        metadata: dict[str, str],
+        expires_in: int,
+    ) -> PresignedUpload:
+        headers = {
+            "Content-Type": content_type,
+            "Cache-Control": PRIVATE_NO_STORE_CACHE_CONTROL,
+            "x-amz-server-side-encryption": "AES256",
+        }
+        headers.update({f"x-amz-meta-{name}": value for name, value in metadata.items()})
+        parameters: dict[str, Any] = {
+            "Bucket": self.bucket,
+            "Key": key,
+            "ContentType": content_type,
+            "CacheControl": PRIVATE_NO_STORE_CACHE_CONTROL,
+            "ServerSideEncryption": "AES256",
+            "Metadata": metadata,
+        }
+        try:
+            url = cast(
+                str,
+                self.client.generate_presigned_url(
+                    "put_object",
+                    Params=parameters,
+                    ExpiresIn=expires_in,
+                    HttpMethod="PUT",
+                ),
+            )
+        except (BotoCoreError, ClientError) as error:
+            raise ObjectStoreError("S3 PUT signing failed") from error
+        return PresignedUpload(url=url, method="PUT", fields={}, headers=headers)
+
     async def head(
         self,
         key: str,

@@ -74,30 +74,6 @@ from gen_automation.domain.enums import (
     SemanticVerdict,
     SpendEntryType,
 )
-from gen_automation.domain.video import (
-    VideoContentRating,
-    VideoGenerationAttemptState,
-    VideoGenerationState,
-)
-
-_VIDEO_V1_PROFILE_ID = "wan2.2-ti2v-5b-comfy-v1"
-_VIDEO_HQ_PROFILE_ID = "wan2.2-ti2v-5b-comfy-hq-v1"
-_VIDEO_A14B_PROFILE_ID = "wan2.2-smoothmix-i2v-a14b-q3-v1"
-_VIDEO_A14B_ADULT_PROFILE_ID = "wan2.2-smoothmix-i2v-a14b-q3-adult-v1"
-_VIDEO_A14B_JOB_CONTRACT_SHA256 = "3c31ee0e82b15c582dfccfb5cc83bde80b55dd835f4afd217f3ce342accc6e99"
-_VIDEO_A14B_ADULT_JOB_CONTRACT_SHA256 = (
-    "014fc4502c334bdcd6ec9a8acad08b7599316dd0ddf3788e2101f40588d3e859"
-)
-
-_VIDEO_A14B_OUTPUT_CONTRACT = (
-    "width BETWEEN 2 AND 2048 AND height BETWEEN 2 AND 2048 "
-    "AND width % 2 = 0 AND height % 2 = 0 "
-    "AND CAST(width AS BIGINT) * height <= 4194304 "
-    "AND width = source_width + (source_width % 2) "
-    "AND height = source_height + (source_height % 2) "
-    "AND 13 * CAST(source_width AS BIGINT) >= 4 * source_height "
-    "AND 4 * CAST(source_width AS BIGINT) <= 13 * source_height"
-)
 
 
 def _lower_hex_check(column_name: str) -> str:
@@ -599,398 +575,6 @@ class AssetLineage(UuidPrimaryKeyMixin, Base):
     relation: Mapped[str] = mapped_column(String(50), nullable=False)
     recipe_version: Mapped[str] = mapped_column(String(100), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-
-class VideoGenerationJob(UuidPrimaryKeyMixin, TimestampMixin, Base):
-    __tablename__ = "video_generation_jobs"
-    __table_args__ = (
-        UniqueConstraint(
-            "id",
-            "source_asset_id",
-            name="uq_video_generation_jobs_id_source_asset_id",
-        ),
-        CheckConstraint("source_width > 0", name="positive_source_width"),
-        CheckConstraint("source_height > 0", name="positive_source_height"),
-        CheckConstraint("source_byte_size > 0", name="positive_source_byte_size"),
-        CheckConstraint(
-            "source_content_type LIKE 'image/%'",
-            name="source_is_image",
-        ),
-        CheckConstraint(_lower_hex_check("source_sha256"), name="valid_source_sha256"),
-        CheckConstraint(_lower_hex_check("profile_sha256"), name="valid_profile_sha256"),
-        CheckConstraint(_lower_hex_check("request_sha256"), name="valid_request_sha256"),
-        CheckConstraint(
-            "length(prompt) <= 4000 AND length(negative_prompt) <= 4000",
-            name="bounded_prompts",
-        ),
-        CheckConstraint("seed >= 0", name="nonnegative_seed"),
-        CheckConstraint(
-            "frame_count IN (73, 81, 121)",
-            name="supported_frame_count",
-        ),
-        CheckConstraint(
-            "fps IN (16, 24)",
-            name="supported_fps",
-        ),
-        CheckConstraint(
-            f"(profile_key = '{_VIDEO_V1_PROFILE_ID}' "
-            "AND profile_version = 'video-worker-adapter-v1' "
-            "AND profile_sha256 = "
-            "'a83c946f9a61bac7cf3794fc9aa4debacc2fc676c13957deaed42ecf82c7e2e4' "
-            "AND frame_count IN (73, 121) AND fps = 24 AND loop_mode = 'ping_pong' "
-            "AND max_attempts = 3 "
-            "AND ((width = 832 AND height = 480) OR (width = 480 AND height = 832))) "
-            f"OR (profile_key = '{_VIDEO_HQ_PROFILE_ID}' "
-            "AND profile_version = 'video-worker-adapter-hq-v1' "
-            "AND profile_sha256 = "
-            "'00fb341e491f295b2db16a32626a6383d83c6cda88978b29479caf245c817387' "
-            "AND frame_count = 73 AND fps = 24 AND loop_mode = 'ping_pong' "
-            "AND max_attempts = 1 "
-            "AND ((width = 1472 AND height = 1152) "
-            "OR (width = 1152 AND height = 1472))) "
-            f"OR (profile_key = '{_VIDEO_A14B_PROFILE_ID}' "
-            "AND profile_version = 'video-worker-adapter-smoothmix-i2v-a14b-q3-v1' "
-            f"AND profile_sha256 = '{_VIDEO_A14B_JOB_CONTRACT_SHA256}' "
-            "AND frame_count = 81 AND fps = 16 AND loop_mode = 'forward' "
-            "AND max_attempts = 1 AND content_rating = 'sfw' "
-            f"AND ({_VIDEO_A14B_OUTPUT_CONTRACT})) "
-            f"OR (profile_key = '{_VIDEO_A14B_ADULT_PROFILE_ID}' "
-            "AND profile_version = 'video-worker-adapter-smoothmix-i2v-a14b-q3-adult-v1' "
-            f"AND profile_sha256 = '{_VIDEO_A14B_ADULT_JOB_CONTRACT_SHA256}' "
-            "AND frame_count = 81 AND fps = 16 AND loop_mode = 'forward' "
-            "AND max_attempts = 1 AND content_rating IN ('nsfw', 'explicit') "
-            f"AND ({_VIDEO_A14B_OUTPUT_CONTRACT}))",
-            name="supported_profile_contract",
-        ),
-        CheckConstraint(
-            "loop_mode IN ('forward', 'ping_pong')",
-            name="supported_loop_mode",
-        ),
-        CheckConstraint("max_attempts > 0", name="positive_max_attempts"),
-        CheckConstraint(
-            "attempt_count >= 0 AND attempt_count <= max_attempts",
-            name="valid_attempt_count",
-        ),
-        CheckConstraint("lock_version > 0", name="positive_lock_version"),
-        CheckConstraint(
-            "(lease_owner IS NULL AND lease_expires_at IS NULL) OR "
-            "(lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)",
-            name="lease_pair",
-        ),
-        CheckConstraint(
-            "source_rights_confirmed = true AND lawful_use_confirmed = true",
-            name="base_attestations_required",
-        ),
-        CheckConstraint(
-            "content_rating = 'sfw' OR ("
-            "all_depicted_people_are_adults = true "
-            "AND consensual_adult_content_confirmed = true "
-            "AND no_real_person_sexual_content = true)",
-            name="adult_attestations_required",
-        ),
-        CheckConstraint(
-            "attestation_policy_version = 'video-compliance/v1'",
-            name="known_attestation_policy",
-        ),
-        CheckConstraint(
-            "estimated_cost_microusd >= 0 "
-            "AND reserved_cost_microusd >= 0 "
-            "AND actual_cost_microusd >= 0 "
-            "AND billed_duration_ms >= 0",
-            name="nonnegative_cost_summary",
-        ),
-        CheckConstraint(
-            "(state IN ('succeeded', 'failed', 'cancelled') AND completed_at IS NOT NULL) "
-            "OR (state NOT IN ('succeeded', 'failed', 'cancelled') "
-            "AND completed_at IS NULL)",
-            name="terminal_state_metadata",
-        ),
-        Index(
-            "ix_video_generation_jobs_schedule",
-            "state",
-            "retry_at",
-            "priority",
-            "created_at",
-        ),
-    )
-
-    source_asset_id: Mapped[UUID] = mapped_column(
-        ForeignKey("assets.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    created_by_user_id: Mapped[UUID] = mapped_column(
-        ForeignKey("admin_users.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    source_storage_backend: Mapped[str] = mapped_column(String(50), nullable=False)
-    source_storage_bucket: Mapped[str] = mapped_column(String(255), nullable=False)
-    source_object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
-    source_object_version_id: Mapped[str | None] = mapped_column(String(1024))
-    source_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    source_content_type: Mapped[str] = mapped_column(String(100), nullable=False)
-    source_image_format: Mapped[str] = mapped_column(String(20), nullable=False)
-    source_width: Mapped[int] = mapped_column(Integer, nullable=False)
-    source_height: Mapped[int] = mapped_column(Integer, nullable=False)
-    source_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    negative_prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    profile_key: Mapped[str] = mapped_column(String(100), nullable=False)
-    profile_version: Mapped[str] = mapped_column(String(100), nullable=False)
-    profile_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    seed: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    frame_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    fps: Mapped[int] = mapped_column(Integer, nullable=False)
-    width: Mapped[int] = mapped_column(Integer, nullable=False)
-    height: Mapped[int] = mapped_column(Integer, nullable=False)
-    loop_mode: Mapped[str] = mapped_column(
-        String(9),
-        nullable=False,
-        default="ping_pong",
-    )
-    content_rating: Mapped[VideoContentRating] = mapped_column(
-        Enum(
-            VideoContentRating,
-            name="video_content_rating",
-            native_enum=False,
-            create_constraint=True,
-            values_callable=lambda members: [member.value for member in members],
-            length=8,
-        ),
-        nullable=False,
-        default=VideoContentRating.SFW,
-    )
-    attestation_policy_version: Mapped[str] = mapped_column(
-        String(50),
-        nullable=False,
-        default="video-compliance/v1",
-    )
-    source_rights_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    lawful_use_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    all_depicted_people_are_adults: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        default=False,
-    )
-    consensual_adult_content_confirmed: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        default=False,
-    )
-    no_real_person_sexual_content: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        default=False,
-    )
-    request_sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    provider: Mapped[str] = mapped_column(String(50), nullable=False, default="salad")
-    state: Mapped[VideoGenerationState] = mapped_column(
-        Enum(
-            VideoGenerationState,
-            name="video_generation_state",
-            native_enum=False,
-            create_constraint=True,
-            values_callable=lambda members: [member.value for member in members],
-            length=16,
-        ),
-        nullable=False,
-        default=VideoGenerationState.QUEUED,
-    )
-    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
-    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
-    lock_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    lease_owner: Mapped[str | None] = mapped_column(String(200))
-    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    last_error_code: Mapped[str | None] = mapped_column(String(100))
-    last_error_detail: Mapped[str | None] = mapped_column(Text)
-    estimated_cost_microusd: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
-    reserved_cost_microusd: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
-    actual_cost_microusd: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
-    billed_duration_ms: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
-    cost_metadata: Mapped[dict[str, Any]] = mapped_column(
-        JSON_TYPE,
-        nullable=False,
-        default=dict,
-    )
-
-    attempts: Mapped[list["VideoGenerationAttempt"]] = relationship(
-        back_populates="job",
-        order_by="VideoGenerationAttempt.attempt_no",
-    )
-    output: Mapped["VideoGenerationOutput | None"] = relationship(
-        back_populates="job",
-        uselist=False,
-    )
-
-
-class VideoGenerationAttempt(UuidPrimaryKeyMixin, TimestampMixin, Base):
-    __tablename__ = "video_generation_attempts"
-    __table_args__ = (
-        UniqueConstraint("video_generation_job_id", "attempt_no"),
-        UniqueConstraint(
-            "id",
-            "video_generation_job_id",
-            name="uq_video_generation_attempts_id_job_id",
-        ),
-        UniqueConstraint(
-            "provider",
-            "provider_external_id",
-            name="uq_video_generation_attempts_provider_external_id",
-        ),
-        UniqueConstraint(
-            "provider",
-            "submission_key",
-            name="uq_video_generation_attempts_submission_key",
-        ),
-        CheckConstraint("attempt_no > 0", name="positive_attempt_no"),
-        CheckConstraint(_lower_hex_check("request_sha256"), name="valid_request_sha256"),
-        CheckConstraint(
-            "reserved_cost_microusd >= 0 AND actual_cost_microusd >= 0 AND billed_duration_ms >= 0",
-            name="nonnegative_cost_summary",
-        ),
-        CheckConstraint(
-            "state NOT IN "
-            "('submitted', 'running', 'succeeded', 'cancel_requested', 'cancelled') "
-            "OR provider_external_id IS NOT NULL",
-            name="remote_state_has_provider_id",
-        ),
-        CheckConstraint(
-            "state NOT IN ('succeeded', 'failed', 'cancelled') OR completed_at IS NOT NULL",
-            name="terminal_attempt_is_completed",
-        ),
-        Index(
-            "ix_video_generation_attempts_observe",
-            "state",
-            "last_observed_at",
-        ),
-    )
-
-    video_generation_job_id: Mapped[UUID] = mapped_column(
-        ForeignKey("video_generation_jobs.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    salad_deployment_id: Mapped[UUID] = mapped_column(
-        ForeignKey("salad_deployments.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
-    provider: Mapped[str] = mapped_column(String(50), nullable=False, default="salad")
-    provider_external_id: Mapped[str | None] = mapped_column(String(200))
-    submission_key: Mapped[str] = mapped_column(String(64), nullable=False)
-    request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    state: Mapped[VideoGenerationAttemptState] = mapped_column(
-        Enum(
-            VideoGenerationAttemptState,
-            name="video_generation_attempt_state",
-            native_enum=False,
-            create_constraint=True,
-            values_callable=lambda members: [member.value for member in members],
-            length=16,
-        ),
-        nullable=False,
-        default=VideoGenerationAttemptState.CREATED,
-    )
-    worker_image_digest: Mapped[str] = mapped_column(String(255), nullable=False)
-    request_metadata: Mapped[dict[str, Any]] = mapped_column(
-        JSON_TYPE,
-        nullable=False,
-        default=dict,
-    )
-    response_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON_TYPE)
-    submit_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    last_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    provider_state: Mapped[str | None] = mapped_column(String(50))
-    reserved_cost_microusd: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
-    actual_cost_microusd: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
-    billed_duration_ms: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
-    error_code: Mapped[str | None] = mapped_column(String(100))
-    error_detail: Mapped[str | None] = mapped_column(Text)
-
-    job: Mapped[VideoGenerationJob] = relationship(back_populates="attempts")
-    output: Mapped["VideoGenerationOutput | None"] = relationship(
-        back_populates="successful_attempt",
-        uselist=False,
-        viewonly=True,
-    )
-
-
-class VideoGenerationOutput(UuidPrimaryKeyMixin, Base):
-    __tablename__ = "video_generation_outputs"
-    __table_args__ = (
-        ForeignKeyConstraint(
-            ["successful_attempt_id", "video_generation_job_id"],
-            [
-                "video_generation_attempts.id",
-                "video_generation_attempts.video_generation_job_id",
-            ],
-            ondelete="RESTRICT",
-            name="fk_video_generation_outputs_successful_attempt_job",
-        ),
-        ForeignKeyConstraint(
-            ["video_generation_job_id", "source_asset_id"],
-            ["video_generation_jobs.id", "video_generation_jobs.source_asset_id"],
-            ondelete="RESTRICT",
-            name="fk_video_generation_outputs_job_source_asset",
-        ),
-        CheckConstraint(_lower_hex_check("sha256"), name="valid_sha256"),
-        CheckConstraint("content_type LIKE 'video/%'", name="output_is_video"),
-        CheckConstraint("width > 0", name="positive_width"),
-        CheckConstraint("height > 0", name="positive_height"),
-        CheckConstraint("byte_size > 0", name="positive_byte_size"),
-        CheckConstraint("frame_count > 0", name="positive_frame_count"),
-        CheckConstraint("fps > 0", name="positive_fps"),
-        CheckConstraint("duration_ms > 0", name="positive_duration"),
-    )
-
-    video_generation_job_id: Mapped[UUID] = mapped_column(
-        nullable=False,
-        unique=True,
-    )
-    successful_attempt_id: Mapped[UUID] = mapped_column(nullable=False, unique=True)
-    source_asset_id: Mapped[UUID] = mapped_column(
-        ForeignKey("assets.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    asset_id: Mapped[UUID] = mapped_column(
-        ForeignKey("assets.id", ondelete="RESTRICT"),
-        nullable=False,
-        unique=True,
-    )
-    asset_lineage_id: Mapped[UUID] = mapped_column(
-        ForeignKey("asset_lineage.id", ondelete="RESTRICT"),
-        nullable=False,
-        unique=True,
-    )
-    storage_backend: Mapped[str] = mapped_column(String(50), nullable=False)
-    storage_bucket: Mapped[str] = mapped_column(String(255), nullable=False)
-    object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
-    object_version_id: Mapped[str | None] = mapped_column(String(1024))
-    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    content_type: Mapped[str] = mapped_column(String(100), nullable=False)
-    video_format: Mapped[str] = mapped_column(String(20), nullable=False)
-    width: Mapped[int] = mapped_column(Integer, nullable=False)
-    height: Mapped[int] = mapped_column(Integer, nullable=False)
-    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    frame_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    fps: Mapped[int] = mapped_column(Integer, nullable=False)
-    duration_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-    job: Mapped[VideoGenerationJob] = relationship(back_populates="output")
-    successful_attempt: Mapped[VideoGenerationAttempt] = relationship(
-        back_populates="output",
-        viewonly=True,
-    )
 
 
 class WebhookReceipt(UuidPrimaryKeyMixin, Base):
@@ -5146,6 +4730,322 @@ class WorkflowApproval(UuidPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("admin_users.id", ondelete="RESTRICT"),
     )
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class I2VInput(UuidPrimaryKeyMixin, Base):
+    """One immutable, verified source image for the isolated I2V queue."""
+
+    __tablename__ = "i2v_inputs"
+    __table_args__ = (
+        CheckConstraint("source IN ('upload', 'generation')", name="known_source"),
+        CheckConstraint(
+            "source <> 'generation' OR asset_id IS NOT NULL",
+            name="generation_has_asset",
+        ),
+        CheckConstraint("content_type LIKE 'image/%'", name="image_content"),
+        CheckConstraint(
+            "width > 0 AND height > 0 AND byte_size > 0",
+            name="positive_dimensions_and_size",
+        ),
+        CheckConstraint(_lower_hex_check("sha256"), name="valid_sha256"),
+        UniqueConstraint(
+            "storage_backend",
+            "storage_bucket",
+            "object_key",
+            "object_version_id",
+            name="uq_i2v_inputs_frozen_object",
+        ),
+        Index(
+            "uq_i2v_inputs_unversioned_object",
+            "storage_backend",
+            "storage_bucket",
+            "object_key",
+            unique=True,
+            postgresql_where=text("object_version_id IS NULL"),
+            sqlite_where=text("object_version_id IS NULL"),
+        ),
+        Index("ix_i2v_inputs_recent", "created_at", "id"),
+    )
+
+    created_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    source: Mapped[str] = mapped_column(String(10), nullable=False)
+    asset_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("assets.id", ondelete="RESTRICT"), index=True
+    )
+    display_name: Mapped[str] = mapped_column(String(500), nullable=False)
+    storage_backend: Mapped[str] = mapped_column(String(50), nullable=False)
+    storage_bucket: Mapped[str] = mapped_column(String(255), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    object_version_id: Mapped[str | None] = mapped_column(String(1024))
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    width: Mapped[int] = mapped_column(Integer, nullable=False)
+    height: Mapped[int] = mapped_column(Integer, nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    input_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON_TYPE, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+
+class I2VPreset(UuidPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "i2v_presets"
+    __table_args__ = (
+        CheckConstraint("lock_version > 0", name="positive_lock_version"),
+        UniqueConstraint("created_by_user_id", "name"),
+    )
+
+    created_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(500), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    positive_prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    negative_prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    settings: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, nullable=False, default=dict)
+    lock_version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1)
+
+
+class I2VWorkerDeployment(UuidPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "i2v_worker_deployments"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('stopped', 'provisioning', 'starting', 'ready', "
+            "'busy', 'draining', 'failed')",
+            name="known_state",
+        ),
+        UniqueConstraint("provider", "provider_group_id"),
+        Index("ix_i2v_worker_deployments_state", "state", "updated_at"),
+    )
+
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    provider_group_id: Mapped[str | None] = mapped_column(String(255))
+    provider_instance_id: Mapped[str | None] = mapped_column(String(255))
+    state: Mapped[str] = mapped_column(String(20), nullable=False)
+    gpu_class: Mapped[str] = mapped_column(String(100), nullable=False)
+    worker_image_digest: Mapped[str] = mapped_column(String(255), nullable=False)
+    current_job_id: Mapped[UUID | None] = mapped_column()
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deployment_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON_TYPE, nullable=False, default=dict
+    )
+
+
+class I2VJob(UuidPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "i2v_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('queued', 'claimed', 'running', 'cancel_requested', "
+            "'succeeded', 'failed', 'cancelled')",
+            name="known_state",
+        ),
+        CheckConstraint(
+            "(state = 'queued' AND queue_position IS NOT NULL AND queue_position > 0) "
+            "OR (state <> 'queued' AND queue_position IS NULL)",
+            name="queue_position_matches_state",
+        ),
+        CheckConstraint("attempt_count >= 0", name="nonnegative_attempt_count"),
+        CheckConstraint(
+            "(lease_owner IS NULL AND lease_expires_at IS NULL) OR "
+            "(lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)",
+            name="lease_pair",
+        ),
+        CheckConstraint(
+            "(state IN ('succeeded', 'failed', 'cancelled') AND completed_at IS NOT NULL) "
+            "OR (state NOT IN ('succeeded', 'failed', 'cancelled') AND completed_at IS NULL)",
+            name="terminal_completion",
+        ),
+        CheckConstraint(_lower_hex_check("request_sha256"), name="valid_request_sha256"),
+        Index(
+            "uq_i2v_jobs_queue_position",
+            "queue_position",
+            unique=True,
+            postgresql_where=text("queue_position IS NOT NULL"),
+            sqlite_where=text("queue_position IS NOT NULL"),
+        ),
+        Index("ix_i2v_jobs_queue", "state", "queue_position", "created_at", "id"),
+        Index("ix_i2v_jobs_recent", "created_by_user_id", "created_at", "id"),
+    )
+
+    created_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    input_id: Mapped[UUID] = mapped_column(
+        ForeignKey("i2v_inputs.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    preset_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("i2v_presets.id", ondelete="SET NULL"), index=True
+    )
+    positive_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    negative_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, nullable=False)
+    preset_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, nullable=False)
+    settings_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, nullable=False)
+    request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(20), nullable=False)
+    queue_position: Mapped[int | None] = mapped_column(BigInteger)
+    attempt_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    lease_owner: Mapped[str | None] = mapped_column(String(255))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(String(100))
+    last_error_detail: Mapped[str | None] = mapped_column(Text)
+
+
+class I2VAttempt(UuidPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "i2v_attempts"
+    __table_args__ = (
+        CheckConstraint("attempt_no > 0", name="positive_attempt_no"),
+        CheckConstraint(
+            "state IN ('created', 'running', 'succeeded', 'failed', 'cancelled')",
+            name="known_state",
+        ),
+        CheckConstraint(
+            "state NOT IN ('succeeded', 'failed', 'cancelled') OR completed_at IS NOT NULL",
+            name="terminal_completion",
+        ),
+        UniqueConstraint("job_id", "attempt_no"),
+        UniqueConstraint("id", "job_id", name="uq_i2v_attempts_id_job_id"),
+        UniqueConstraint(
+            "worker_deployment_id", "provider_job_id", name="uq_i2v_attempts_provider_job"
+        ),
+        Index("ix_i2v_attempts_state", "state", "updated_at"),
+    )
+
+    job_id: Mapped[UUID] = mapped_column(
+        ForeignKey("i2v_jobs.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    worker_deployment_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("i2v_worker_deployments.id", ondelete="RESTRICT"), index=True
+    )
+    attempt_no: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    state: Mapped[str] = mapped_column(String(20), nullable=False)
+    worker_id: Mapped[str | None] = mapped_column(String(255))
+    worker_image_digest: Mapped[str | None] = mapped_column(String(255))
+    provider_job_id: Mapped[str | None] = mapped_column(String(255))
+    request_metadata: Mapped[dict[str, Any]] = mapped_column(
+        JSON_TYPE, nullable=False, default=dict
+    )
+    response_metadata: Mapped[dict[str, Any]] = mapped_column(
+        JSON_TYPE, nullable=False, default=dict
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(100))
+    error_detail: Mapped[str | None] = mapped_column(Text)
+
+
+class I2VOutput(UuidPrimaryKeyMixin, Base):
+    __tablename__ = "i2v_outputs"
+    __table_args__ = (
+        CheckConstraint(_lower_hex_check("sha256"), name="valid_sha256"),
+        CheckConstraint("content_type LIKE 'video/%'", name="video_content"),
+        CheckConstraint(
+            "width > 0 AND height > 0 AND frame_count > 0 AND fps > 0 "
+            "AND duration_ms > 0 AND byte_size > 0",
+            name="positive_media_values",
+        ),
+        ForeignKeyConstraint(
+            ["attempt_id", "job_id"],
+            ["i2v_attempts.id", "i2v_attempts.job_id"],
+            name="fk_i2v_outputs_attempt_job",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("attempt_id"),
+        UniqueConstraint(
+            "storage_backend",
+            "storage_bucket",
+            "object_key",
+            "object_version_id",
+            name="uq_i2v_outputs_object",
+        ),
+        Index(
+            "uq_i2v_outputs_unversioned_object",
+            "storage_backend",
+            "storage_bucket",
+            "object_key",
+            unique=True,
+            postgresql_where=text("object_version_id IS NULL"),
+            sqlite_where=text("object_version_id IS NULL"),
+        ),
+        Index("ix_i2v_outputs_recent", "created_at", "id"),
+    )
+
+    job_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    storage_backend: Mapped[str] = mapped_column(String(50), nullable=False)
+    storage_bucket: Mapped[str] = mapped_column(String(255), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    object_version_id: Mapped[str | None] = mapped_column(String(1024))
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    width: Mapped[int] = mapped_column(Integer, nullable=False)
+    height: Mapped[int] = mapped_column(Integer, nullable=False)
+    frame_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    fps: Mapped[float] = mapped_column(nullable=False)
+    duration_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    output_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON_TYPE, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+
+event.listen(
+    I2VJob.__table__,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE TRIGGER i2v_jobs_immutable_request BEFORE UPDATE ON i2v_jobs "
+        "BEGIN SELECT CASE WHEN OLD.id IS NOT NEW.id "
+        "OR OLD.created_by_user_id IS NOT NEW.created_by_user_id "
+        "OR OLD.input_id IS NOT NEW.input_id "
+        "OR OLD.positive_prompt IS NOT NEW.positive_prompt "
+        "OR OLD.negative_prompt IS NOT NEW.negative_prompt "
+        "OR OLD.input_snapshot IS NOT NEW.input_snapshot "
+        "OR OLD.preset_snapshot IS NOT NEW.preset_snapshot "
+        "OR OLD.settings_snapshot IS NOT NEW.settings_snapshot "
+        "OR OLD.request_sha256 IS NOT NEW.request_sha256 "
+        "OR OLD.created_at IS NOT NEW.created_at "
+        "THEN RAISE(ABORT, 'i2v job request snapshots are immutable') END; END"
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    I2VJob.__table__,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE FUNCTION guard_i2v_job_request() RETURNS trigger AS $$ BEGIN "
+        "IF OLD.id IS DISTINCT FROM NEW.id "
+        "OR OLD.created_by_user_id IS DISTINCT FROM NEW.created_by_user_id "
+        "OR OLD.input_id IS DISTINCT FROM NEW.input_id "
+        "OR OLD.positive_prompt IS DISTINCT FROM NEW.positive_prompt "
+        "OR OLD.negative_prompt IS DISTINCT FROM NEW.negative_prompt "
+        "OR OLD.input_snapshot IS DISTINCT FROM NEW.input_snapshot "
+        "OR OLD.preset_snapshot IS DISTINCT FROM NEW.preset_snapshot "
+        "OR OLD.settings_snapshot IS DISTINCT FROM NEW.settings_snapshot "
+        "OR OLD.request_sha256 IS DISTINCT FROM NEW.request_sha256 "
+        "OR OLD.created_at IS DISTINCT FROM NEW.created_at THEN "
+        "RAISE EXCEPTION 'i2v job request snapshots are immutable'; END IF; "
+        "RETURN NEW; END; $$ LANGUAGE plpgsql"
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    I2VJob.__table__,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE TRIGGER i2v_jobs_immutable_request BEFORE UPDATE ON i2v_jobs "
+        "FOR EACH ROW EXECUTE FUNCTION guard_i2v_job_request()"
+    ).execute_if(dialect="postgresql"),
+)
 
 
 def _ddl(statement: str) -> Any:

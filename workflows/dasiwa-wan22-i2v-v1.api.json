@@ -1,0 +1,228 @@
+{
+  "1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": {
+        "$i2v": "input.image"
+      }
+    }
+  },
+  "2": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "DasiwaWAN22I2V14BLightspeed_snatchkissHighV11.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "3": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "DasiwaWAN22I2V14BLightspeed_snatchkissLowV11.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "4": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "device": "default",
+      "type": "wan"
+    }
+  },
+  "5": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "Wan/wan_2.1_vae.safetensors"
+    }
+  },
+  "6": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "4",
+        0
+      ],
+      "text": {
+        "$i2v": "prompt.positive"
+      }
+    }
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "4",
+        0
+      ],
+      "text": {
+        "$i2v": "prompt.negative"
+      }
+    }
+  },
+  "8": {
+    "class_type": "ModelSamplingSD3",
+    "inputs": {
+      "model": [
+        "2",
+        0
+      ],
+      "shift": {
+        "$i2v": "sampling.high_shift"
+      }
+    }
+  },
+  "9": {
+    "class_type": "ModelSamplingSD3",
+    "inputs": {
+      "model": [
+        "3",
+        0
+      ],
+      "shift": {
+        "$i2v": "sampling.low_shift"
+      }
+    }
+  },
+  "10": {
+    "class_type": "WanImageToVideo",
+    "inputs": {
+      "batch_size": 1,
+      "height": {
+        "$i2v": "generation.height"
+      },
+      "length": {
+        "$i2v": "generation.frame_count"
+      },
+      "negative": [
+        "7",
+        0
+      ],
+      "positive": [
+        "6",
+        0
+      ],
+      "start_image": [
+        "1",
+        0
+      ],
+      "vae": [
+        "5",
+        0
+      ],
+      "width": {
+        "$i2v": "generation.width"
+      }
+    }
+  },
+  "11": {
+    "class_type": "KSamplerAdvanced",
+    "inputs": {
+      "add_noise": "enable",
+      "cfg": {
+        "$i2v": "sampling.cfg"
+      },
+      "end_at_step": {
+        "$i2v": "sampling.high_end_step"
+      },
+      "latent_image": [
+        "10",
+        2
+      ],
+      "model": [
+        "8",
+        0
+      ],
+      "negative": [
+        "10",
+        1
+      ],
+      "noise_seed": {
+        "$i2v": "generation.seed"
+      },
+      "positive": [
+        "10",
+        0
+      ],
+      "return_with_leftover_noise": "enable",
+      "sampler_name": {
+        "$i2v": "sampling.sampler"
+      },
+      "scheduler": {
+        "$i2v": "sampling.scheduler"
+      },
+      "start_at_step": 0,
+      "steps": {
+        "$i2v": "sampling.steps"
+      }
+    }
+  },
+  "12": {
+    "class_type": "KSamplerAdvanced",
+    "inputs": {
+      "add_noise": "disable",
+      "cfg": {
+        "$i2v": "sampling.cfg"
+      },
+      "end_at_step": {
+        "$i2v": "sampling.steps"
+      },
+      "latent_image": [
+        "11",
+        0
+      ],
+      "model": [
+        "9",
+        0
+      ],
+      "negative": [
+        "10",
+        1
+      ],
+      "noise_seed": {
+        "$i2v": "generation.seed"
+      },
+      "positive": [
+        "10",
+        0
+      ],
+      "return_with_leftover_noise": "disable",
+      "sampler_name": {
+        "$i2v": "sampling.sampler"
+      },
+      "scheduler": {
+        "$i2v": "sampling.scheduler"
+      },
+      "start_at_step": {
+        "$i2v": "sampling.high_end_step"
+      },
+      "steps": {
+        "$i2v": "sampling.steps"
+      }
+    }
+  },
+  "13": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "12",
+        0
+      ],
+      "vae": [
+        "5",
+        0
+      ]
+    }
+  },
+  "14": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": {
+        "$i2v": "output.frame_prefix"
+      },
+      "images": [
+        "13",
+        0
+      ]
+    }
+  }
+}

@@ -1,0 +1,352 @@
+{
+  "schema_version": 1,
+  "workflow_id": "dasiwa-wan22-i2v-v1",
+  "template": "workflows/dasiwa-wan22-i2v-v1.api.json",
+  "placeholder_key": "$i2v",
+  "bindings": [
+    {
+      "default": null,
+      "description": "Filename returned by ComfyUI's image upload endpoint.",
+      "path": "input.image",
+      "required": true,
+      "targets": [
+        {
+          "document": "workflow",
+          "input": "image",
+          "node_id": "1"
+        }
+      ],
+      "type": "string"
+    },
+    {
+      "default": "",
+      "path": "prompt.positive",
+      "required": true,
+      "targets": [
+        {
+          "document": "workflow",
+          "input": "text",
+          "node_id": "6"
+        }
+      ],
+      "type": "string"
+    },
+    {
+      "default": "",
+      "description": "Encoded and retained for presets. At CFG 1 it has no effect unless a separately reviewed NAG graph is selected.",
+      "path": "prompt.negative",
+      "required": false,
+      "targets": [
+        {
+          "document": "workflow",
+          "input": "text",
+          "node_id": "7"
+        }
+      ],
+      "type": "string"
+    },
+    {
+      "default": 1,
+      "path": "generation.seed",
+      "required": true,
+      "rules": {
+        "minimum": 0
+      },
+      "targets": [
+        {
+          "document": "workflow",
+          "input": "noise_seed",
+          "node_id": "11"
+        },
+        {
+          "document": "workflow",
+          "input": "noise_seed",
+          "node_id": "12"
+        }
+      ],
+      "type": "integer"
+    },
+    {
+      "default": 576,
+      "path": "generation.width",
+      "required": true,
+      "rules": {
+        "divisible_by": 32,
+        "minimum": 32,
+        "recommended_total_pixels": {
+          "maximum": 830000,
+          "minimum": 520000
+        }
+      },
+      "targets": [
+        {
+          "document": "workflow",
+          "input": "width",
+          "node_id": "10"
+        }
+      ],
+      "type": "integer"
+    },
+    {
+      "default": 1024,
+      "path": "generation.height",
+      "required": true,
+      "rules": {
+        "divisible_by": 32,
+        "minimum": 32,
+        "recommended_total_pixels": {
+          "maximum": 830000,
+          "minimum": 520000
+        }
+      },
+      "targets": [
+        {
+          "document": "workflow",
+          "input": "height",
+          "node_id": "10"
+        }
+      ],
+      "type": "integer"
+    },
+    {
+      "default": 81,
+      "description": "Five-second WAN baseline. Longer values are allowed; values congruent to 1 modulo 8 preserve WAN's latent temporal packing.",
+      "path": "generation.frame_count",
+      "required": true,
+      "rules": {
+        "minimum": 9,
+        "recommended_modulo": {
+          "divisor": 8,
+          "remainder": 1
+        }
+      },
+      "targets": [
+        {
+          "document": "workflow",
+          "input": "length",
+          "node_id": "10"
+        },
+        {
+          "document": "postprocess",
+          "json_pointer": "/ffmpeg/arguments/8"
+        }
+      ],
+      "type": "integer"
+    },
+    {
+      "default": 16,
+      "description": "The generation graph is frame based; FPS is applied only by external FFmpeg encoding.",
+      "path": "generation.fps",
+      "required": true,
+      "rules": {
+        "minimum_exclusive": 0
+      },
+      "targets": [
+        {
+          "document": "postprocess",
+          "json_pointer": "/ffmpeg/arguments/2"
+        }
+      ],
+      "type": "number"
+    },
+    {
+      "default": 4,
+      "path": "sampling.steps",
+      "required": true,
+      "rules": {
+        "minimum": 2,
+        "recommended_maximum": 8
+      },
+      "targets": [
+        {
+          "document": "workflow",
+          "input": "steps",
+          "node_id": "11"
+        },
+        {
+          "document": "workflow",
+          "input": "steps",
+          "node_id": "12"
+        },
+        {
+          "document": "workflow",
+          "input": "end_at_step",
+          "node_id": "12"
+        }
+      ],
+      "type": "integer"
+    },
+    {
+      "default": 2,
+      "description": "Exclusive end of the High stage and inclusive start of the Low stage.",
+      "path": "sampling.high_end_step",
+      "required": true,
+      "rules": {
+        "less_than": "sampling.steps",
+        "minimum": 1
+      },
+      "targets": [
+        {
+          "document": "workflow",
+          "input": "end_at_step",
+          "node_id": "11"
+        },
+        {
+          "document": "workflow",
+          "input": "start_at_step",
+          "node_id": "12"
+        }
+      ],
+      "type": "integer"
+    },
+    {
+      "default": 1.0,
+      "path": "sampling.cfg",
+      "required": true,
+      "rules": {
+        "minimum_exclusive": 0
+      },
+      "targets": [
+        {
+          "document": "workflow",
+          "input": "cfg",
+          "node_id": "11"
+        },
+        {
+          "document": "workflow",
+          "input": "cfg",
+          "node_id": "12"
+        }
+      ],
+      "type": "number"
+    },
+    {
+      "recommended_values": [
+        "euler"
+      ],
+      "default": "euler",
+      "path": "sampling.sampler",
+      "required": true,
+      "targets": [
+        {
+          "document": "workflow",
+          "input": "sampler_name",
+          "node_id": "11"
+        },
+        {
+          "document": "workflow",
+          "input": "sampler_name",
+          "node_id": "12"
+        }
+      ],
+      "type": "string"
+    },
+    {
+      "recommended_values": [
+        "linear_quadratic",
+        "simple"
+      ],
+      "default": "linear_quadratic",
+      "path": "sampling.scheduler",
+      "required": true,
+      "targets": [
+        {
+          "document": "workflow",
+          "input": "scheduler",
+          "node_id": "11"
+        },
+        {
+          "document": "workflow",
+          "input": "scheduler",
+          "node_id": "12"
+        }
+      ],
+      "type": "string"
+    },
+    {
+      "default": 5.0,
+      "path": "sampling.high_shift",
+      "required": true,
+      "rules": {
+        "recommended_maximum": 8,
+        "recommended_minimum": 3
+      },
+      "targets": [
+        {
+          "document": "workflow",
+          "input": "shift",
+          "node_id": "8"
+        }
+      ],
+      "type": "number"
+    },
+    {
+      "default": 5.0,
+      "path": "sampling.low_shift",
+      "required": true,
+      "rules": {
+        "recommended_maximum": 8,
+        "recommended_minimum": 3
+      },
+      "targets": [
+        {
+          "document": "workflow",
+          "input": "shift",
+          "node_id": "9"
+        }
+      ],
+      "type": "number"
+    },
+    {
+      "default": "i2v/dasiwa-wan22-i2v-v1",
+      "path": "output.frame_prefix",
+      "required": true,
+      "targets": [
+        {
+          "document": "workflow",
+          "input": "filename_prefix",
+          "node_id": "14"
+        }
+      ],
+      "type": "string"
+    }
+  ],
+  "postprocess": {
+    "ffmpeg": {
+      "arguments": [
+        "-y",
+        "-framerate",
+        {
+          "$i2v": "generation.fps"
+        },
+        "-start_number",
+        "0",
+        "-i",
+        "frame-%06d.png",
+        "-frames:v",
+        {
+          "$i2v": "generation.frame_count"
+        },
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-an",
+        "output.mp4"
+      ],
+      "binary": "ffmpeg",
+      "frame_input": {
+        "materialization": "Copy the ordered images returned by SaveImage node 14 to frame-%06d.png starting at zero.",
+        "node_id": "14"
+      },
+      "output_contract": {
+        "codec": "h264",
+        "container": "mp4",
+        "pixel_format": "yuv420p",
+        "streaming_layout": "faststart"
+      }
+    }
+  }
+}

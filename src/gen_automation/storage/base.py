@@ -86,6 +86,15 @@ class ObjectStore(Protocol):
         max_bytes: int,
     ) -> PresignedUpload: ...
 
+    async def presign_put(
+        self,
+        *,
+        key: str,
+        content_type: str,
+        metadata: dict[str, str],
+        expires_in: int,
+    ) -> PresignedUpload: ...
+
     async def presign_download(
         self,
         *,

@@ -1,0 +1,154 @@
+# syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+FROM golang:1.26.2-alpine@sha256:f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739500e08c86393a21b1 AS salad-queue-worker-builder
+
+ENV SALAD_QUEUE_WORKER_COMMIT=73d7a3c80a73f26339194e024cb47c8501c67f75 \
+    SALAD_QUEUE_WORKER_PATCH_SHA256=a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae
+
+RUN apk add --no-cache git \
+    && mkdir --parents /src \
+    && git -C /src init \
+    && git -C /src remote add origin \
+        https://github.com/SaladTechnologies/salad-cloud-job-queue-worker.git \
+    && git -C /src fetch --depth 1 origin "${SALAD_QUEUE_WORKER_COMMIT}" \
+    && git -C /src checkout --detach FETCH_HEAD \
+    && test "$(git -C /src rev-parse HEAD)" = "${SALAD_QUEUE_WORKER_COMMIT}"
+
+WORKDIR /src
+
+COPY patches/salad-queue-worker/strict-http-status.patch /tmp/strict-http-status.patch
+
+RUN printf '%s  %s\n' \
+        "${SALAD_QUEUE_WORKER_PATCH_SHA256}" \
+        /tmp/strict-http-status.patch \
+        | sha256sum -c - \
+    && git apply --unidiff-zero --check /tmp/strict-http-status.patch \
+    && git apply --unidiff-zero /tmp/strict-http-status.patch \
+    && git diff --check \
+    && go mod download \
+    && go mod verify \
+    && go test -mod=readonly ./cmd/salad-http-job-queue-worker \
+    && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+        -mod=readonly \
+        -trimpath \
+        -buildvcs=false \
+        -ldflags="-s -w -X github.com/saladtechnologies/salad-cloud-job-queue-worker/pkg/workers.Version=git-${SALAD_QUEUE_WORKER_COMMIT}" \
+        -o /out/salad-http-job-queue-worker \
+        ./cmd/salad-http-job-queue-worker
+
+FROM pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime@sha256:7b324d212a4450795b49edba9949b7cdc72429148a64e974334bfe5774d51385
+
+LABEL org.opencontainers.image.title="gen-automation-dasiwa-i2v-worker" \
+      org.opencontainers.image.description="Model-free DaSiWa WAN 2.2 image-to-video worker" \
+      org.opencontainers.image.source="https://github.com/neuraln-cyber/gen-automation" \
+      org.opencontainers.image.comfyui.revision="c2bcbecd82ec5ae66594340b395c24ef0217b238" \
+      org.opencontainers.image.salad-queue-worker.revision="73d7a3c80a73f26339194e024cb47c8501c67f75" \
+      org.opencontainers.image.salad-queue-worker.patch-sha256="a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    COMFYUI_COMMIT=c2bcbecd82ec5ae66594340b395c24ef0217b238 \
+    VIRTUAL_ENV=/opt/i2v-venv \
+    PATH=/opt/i2v-venv/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/opt/conda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONNOUSERSITE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/opt/i2v/src \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HOME=/home/i2v-worker
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ADD --checksum=sha256:012096056b97abf1f68c46b7146bd2cbd68c1be762340b4f5dad4fbbe99177bc \
+    --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/openssl-3.6.3-h35e630c_1.conda \
+    /tmp/openssl-3.6.3-h35e630c_1.conda
+
+RUN /opt/conda/bin/conda install \
+        --yes \
+        --offline \
+        --no-deps \
+        /tmp/openssl-3.6.3-h35e630c_1.conda \
+    && test "$(/opt/conda/bin/openssl version | awk '{print $2}')" = "3.6.3" \
+    && /opt/conda/bin/conda clean --all --yes \
+    && rm -f /tmp/openssl-3.6.3-h35e630c_1.conda
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+        git \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+    && mkdir --parents /opt/comfyui \
+    && git -C /opt/comfyui init \
+    && git -C /opt/comfyui remote add origin https://github.com/Comfy-Org/ComfyUI.git \
+    && git -C /opt/comfyui fetch --depth 1 origin "${COMFYUI_COMMIT}" \
+    && git -C /opt/comfyui checkout --detach FETCH_HEAD \
+    && test "$(git -C /opt/comfyui rev-parse HEAD)" = "${COMFYUI_COMMIT}" \
+    && rm -rf /opt/comfyui/.git \
+    && apt-get purge --yes --auto-remove git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/i2v
+
+COPY requirements-i2v-worker.lock ./requirements-i2v-worker.lock
+
+RUN /opt/conda/bin/python -c "import sys; assert sys.version_info[:2] == (3, 11)" \
+    && /opt/conda/bin/python -m venv \
+        --copies \
+        --without-pip \
+        --system-site-packages \
+        /opt/i2v-venv \
+    && /opt/i2v-venv/bin/python -m pip install \
+        --only-binary=:all: \
+        --require-hashes \
+        --no-deps \
+        -r requirements-i2v-worker.lock \
+    && /opt/i2v-venv/bin/python -c "import torch, torchaudio, torchvision; assert torch.__version__.split('+')[0] == '2.9.1'; assert torchvision.__version__.split('+')[0] == '0.24.1'; assert torchaudio.__version__.split('+')[0] == '2.9.1'; assert all('/opt/i2v-venv/' not in module.__file__ for module in (torch, torchaudio, torchvision))" \
+    && grep -Fq 'class UNETLoader:' /opt/comfyui/nodes.py \
+    && grep -Fq 'class KSamplerAdvanced:' /opt/comfyui/nodes.py \
+    && grep -Fq 'class ModelSamplingSD3' /opt/comfyui/comfy_extras/nodes_model_advanced.py \
+    && grep -Fq 'class WanImageToVideo' /opt/comfyui/comfy_extras/nodes_wan.py
+
+COPY src/gen_automation/__init__.py ./src/gen_automation/__init__.py
+COPY src/gen_automation/i2v_worker ./src/gen_automation/i2v_worker
+COPY workflows/dasiwa-wan22-i2v-v1.api.json ./workflows/dasiwa-wan22-i2v-v1.api.json
+COPY --from=salad-queue-worker-builder --chmod=0555 \
+    /out/salad-http-job-queue-worker \
+    /usr/local/bin/salad-http-job-queue-worker
+
+RUN groupadd --system --gid 10002 i2v-worker \
+    && useradd \
+        --system \
+        --create-home \
+        --uid 10002 \
+        --gid i2v-worker \
+        --home-dir /home/i2v-worker \
+        --shell /usr/sbin/nologin \
+        i2v-worker \
+    && mkdir --parents \
+        /opt/comfyui/models/diffusion_models \
+        /opt/comfyui/models/text_encoders \
+        /opt/comfyui/models/vae/Wan \
+        /opt/comfyui/models/loras \
+        /opt/i2v/runtime/input \
+        /opt/i2v/runtime/output \
+        /opt/i2v/runtime/temp \
+        /opt/i2v/runtime/user \
+        /opt/i2v/runtime/jobs \
+    && chown --recursive 10002:10002 \
+        /opt/comfyui/models \
+        /opt/i2v/runtime \
+        /home/i2v-worker \
+    && chmod --recursive go-rwx /opt/comfyui/models /opt/i2v/runtime
+
+USER 10002:10002
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=20s --timeout=3s --start-period=60m --retries=3 \
+    CMD ["/opt/i2v-venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
+
+ENTRYPOINT ["/opt/i2v-venv/bin/python", "-m", "gen_automation.i2v_worker.main"]

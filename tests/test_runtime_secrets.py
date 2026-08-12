@@ -15,7 +15,6 @@ from gen_automation.controller.runtime import (
     RuntimeStatus,
 )
 from gen_automation.domain.runtime_bindings import (
-    SALAD_VIDEO_WORKER_REQUIRED_RUNTIME_BINDINGS,
     WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING,
     WORKER_ARTIFACT_SESSION_TOKEN_BINDING,
 )
@@ -26,7 +25,6 @@ from gen_automation.services.runtime_secrets import (
     RuntimeSecretResolutionError,
     build_runtime_secret_resolver,
     configured_runtime_binding_references,
-    configured_video_runtime_binding_references,
 )
 
 SESSION_SECRET = encode_base64url(bytes(range(32)))
@@ -231,35 +229,9 @@ async def test_configured_resolver_resolves_only_the_complete_allowlisted_set(
     assert second[WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING] == f"{RUNTIME_ACCESS_KEY}-2"
     assert len(sts_client.calls) == 2
     assert all(call["RoleArn"] == RUNTIME_ROLE_ARN for call in sts_client.calls)
-    assert all(call["DurationSeconds"] == 10_800 for call in sts_client.calls)
+    assert all(call["DurationSeconds"] == 43_200 for call in sts_client.calls)
     assert RUNTIME_ACCESS_KEY not in repr(resolver)
     assert RUNTIME_SECRET_KEY not in repr(resolver)
-
-
-@pytest.mark.asyncio
-async def test_video_resolver_exposes_only_public_video_worker_bindings() -> None:
-    values = _protected_gpu_values()
-    values.update(
-        {
-            "video_generation_enabled": True,
-            "salad_video_queue_name": "video-queue",
-            "salad_video_container_group_name": "video-workers",
-            "salad_video_worker_image": ("registry.example.test/video-worker@sha256:" + ("b" * 64)),
-            "salad_video_gpu_class_ids": ("f2e8a738-2fb5-4e42-8c1a-944509496506",),
-        }
-    )
-    settings = Settings(**values)  # type: ignore[arg-type]
-    sts_client = FakeStsClient()
-    resolver = build_runtime_secret_resolver(settings, sts_client=sts_client)
-    assert isinstance(resolver, AwsAssumeRoleRuntimeSecretResolver)
-
-    bindings = configured_video_runtime_binding_references(settings)
-    resolved = await resolver.resolve_many(bindings)
-
-    assert set(resolved) == set(SALAD_VIDEO_WORKER_REQUIRED_RUNTIME_BINDINGS)
-    assert set(resolved) == set(bindings)
-    assert not any("ARTIFACT" in name for name in resolved)
-    assert sts_client.calls == []
 
 
 @pytest.mark.asyncio

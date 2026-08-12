@@ -53,6 +53,19 @@ def test_control_plane_images_are_digest_attested_without_a_mutable_tag() -> Non
     assert ":latest" not in workflow.casefold()
 
 
+def test_model_free_i2v_worker_is_published_and_exported_by_exact_digest() -> None:
+    workflow = _workflow()
+    metadata_job = workflow.split("  record-staging-source:\n", maxsplit=1)[1]
+
+    assert "component: i2v-worker" in workflow
+    assert "image_suffix: i2v-worker" in workflow
+    assert "dockerfile: Dockerfile.i2v-worker" in workflow
+    assert "Verify the exact immutable I2V worker image" in metadata_job
+    assert 'image_tag="${I2V_IMAGE_NAME}:sha-${SOURCE_SHA}"' in metadata_job
+    assert '[ "$revision" = "$SOURCE_SHA" ]' in metadata_job
+    assert "staging-i2v-worker-image-digest" in metadata_job
+
+
 def test_worker_publication_is_keyed_only_by_the_exact_worker_inputs() -> None:
     workflow = _workflow()
     generic_matrix = workflow.split("  publish-worker:\n", maxsplit=1)[0]

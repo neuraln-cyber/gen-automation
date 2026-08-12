@@ -215,6 +215,8 @@ class SaladDeploymentConfig:
             raise SaladServiceValidationError("desired_queue_length must be positive")
         if self.max_hourly_cost_microusd <= 0:
             raise SaladServiceValidationError("max_hourly_cost_microusd must be positive")
+        if self.purpose != SaladDeploymentPurpose.IMAGE:
+            raise SaladServiceValidationError("only image deployments are supported")
 
         _validate_provider_configuration(self.provider_configuration)
 
@@ -231,8 +233,6 @@ class SaladDeploymentConfig:
             "max_replicas": self.max_replicas,
             "desired_queue_length": self.desired_queue_length,
         }
-        if self.purpose == SaladDeploymentPurpose.VIDEO:
-            value["purpose"] = self.purpose.value
         return value
 
     @property

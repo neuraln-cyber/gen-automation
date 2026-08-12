@@ -1,3 +1,0 @@
-# Python media inspection for the pinned video-worker runtime.  MP4 container
-# conformance is independently checked with the image's pinned ffprobe binary.
-av==18.0.0

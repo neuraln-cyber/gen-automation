@@ -159,7 +159,7 @@ resource "aws_iam_role" "salad_worker_artifact_reader" {
 
   name                 = "${local.name}-salad-artifact-reader"
   assume_role_policy   = data.aws_iam_policy_document.salad_worker_artifact_reader_assume[0].json
-  max_session_duration = 10800
+  max_session_duration = 43200
 
   tags = {
     Name = "${local.name}-salad-artifact-reader"
@@ -235,7 +235,7 @@ data "aws_iam_policy_document" "runtime" {
   }
 
   # HeadObject needs ListBucket to distinguish a missing object from an
-  # unauthorized one. Keep that visibility inside the managed LoRA namespaces.
+  # unauthorized one. Keep that visibility inside managed model namespaces.
   statement {
     sid       = "ManagedLoraObjectListing"
     actions   = ["s3:ListBucket"]
@@ -247,6 +247,7 @@ data "aws_iam_policy_document" "runtime" {
       values = [
         "onboarding/loras/*",
         "worker/managed-loras/sha256/*",
+        "worker/i2v/sha256/*",
       ]
     }
   }
@@ -263,6 +264,20 @@ data "aws_iam_policy_document" "runtime" {
     resources = [
       "${aws_s3_bucket.models.arn}/onboarding/loras/*",
       "${aws_s3_bucket.models.arn}/worker/managed-loras/sha256/*",
+    ]
+  }
+
+  statement {
+    sid = "ManagedI2vModelObjects"
+    actions = [
+      "s3:AbortMultipartUpload",
+      "s3:DeleteObjectVersion",
+      "s3:GetObject",
+      "s3:GetObjectVersion",
+      "s3:PutObject",
+    ]
+    resources = [
+      "${aws_s3_bucket.models.arn}/worker/i2v/sha256/*",
     ]
   }
 
@@ -331,13 +346,12 @@ data "aws_iam_policy_document" "runpod_inference_key_read" {
     actions = ["ssm:GetParameter"]
     resources = [
       "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${local.name}/runpod/inference-api-key",
-      "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${local.name}/a14b/ghcr-pull-once",
     ]
   }
 
   # AmazonSSMManagedInstanceCore currently grants broad Parameter Store reads.
   # This explicit boundary leaves the SSM agent's unrelated management APIs
-  # intact while denying runtime reads of every parameter except these two.
+  # intact while denying runtime reads of every other parameter.
   statement {
     sid    = "DenyOtherRuntimeParameterReads"
     effect = "Deny"
@@ -349,7 +363,6 @@ data "aws_iam_policy_document" "runpod_inference_key_read" {
     ]
     not_resources = [
       "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${local.name}/runpod/inference-api-key",
-      "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${local.name}/a14b/ghcr-pull-once",
     ]
   }
 }

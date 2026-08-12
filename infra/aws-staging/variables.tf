@@ -237,7 +237,10 @@ variable "salad_worker_artifact_object_versions" {
   validation {
     condition = alltrue([
       for object_key, version_id in var.salad_worker_artifact_object_versions :
-      can(regex("^worker/(checkpoints|loras|detectors)/[A-Za-z0-9][A-Za-z0-9._/-]*$", object_key))
+      can(regex(
+        "^worker/((checkpoints|loras|detectors)/[A-Za-z0-9][A-Za-z0-9._/-]*|i2v/sha256/[0-9a-f]{64})$",
+        object_key,
+      ))
       && !strcontains(object_key, "..")
       && !strcontains(object_key, "//")
       && !endswith(object_key, "/")
