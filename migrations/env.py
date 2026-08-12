@@ -1,4 +1,5 @@
 from asyncio import run
+from collections.abc import Mapping
 from logging.config import fileConfig
 
 from alembic import context
@@ -16,6 +17,23 @@ if config.config_file_name is not None:
 settings = Settings()
 config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
 target_metadata = Base.metadata
+_RETIRED_TABLES = frozenset(
+    {
+        "video_generation_attempts",
+        "video_generation_jobs",
+        "video_generation_outputs",
+    }
+)
+
+
+def _include_name(
+    name: str | None,
+    type_: str,
+    _parent_names: Mapping[str, str | None],
+) -> bool:
+    """Preserve retired video records without treating them as active ORM schema."""
+
+    return type_ != "table" or name not in _RETIRED_TABLES
 
 
 def run_migrations_offline() -> None:
@@ -26,6 +44,7 @@ def run_migrations_offline() -> None:
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
         compare_server_default=True,
+        include_name=_include_name,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -37,6 +56,7 @@ def run_migrations(connection: Connection) -> None:
         target_metadata=target_metadata,
         compare_type=True,
         compare_server_default=True,
+        include_name=_include_name,
         render_as_batch=connection.dialect.name == "sqlite",
     )
     with context.begin_transaction():

@@ -1336,13 +1336,6 @@
             href="/dashboard/experiments/new"
             {% if request.url.path.startswith("/dashboard/experiments") %}aria-current="page"{% endif %}
           >Experiment Lab</a>
-          {% if request.app is defined and request.app.state.settings.video_generation_enabled and principal.role.value in ["owner", "admin"] %}
-            <a
-              class="nav-link"
-              href="/dashboard/animations"
-              {% if request.url.path.startswith("/dashboard/animations") %}aria-current="page"{% endif %}
-            >Animation</a>
-          {% endif %}
           {% if principal.role.value in ["owner", "admin"] %}
             <a
               class="nav-link"

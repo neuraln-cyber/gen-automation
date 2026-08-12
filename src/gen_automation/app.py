@@ -27,7 +27,6 @@ from gen_automation.api.routes.experiment_dashboard import (
 from gen_automation.api.routes.lora_dashboard import router as lora_dashboard_router
 from gen_automation.api.routes.new_set_dashboard import router as new_set_dashboard_router
 from gen_automation.api.routes.salad_webhooks import router as salad_webhook_router
-from gen_automation.api.routes.video_dashboard import router as video_dashboard_router
 from gen_automation.api.routes.wildcard_dashboard import (
     router as wildcard_dashboard_router,
 )
@@ -397,7 +396,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(delivery_dashboard_router)
     application.include_router(new_set_dashboard_router)
     application.include_router(experiment_dashboard_router)
-    application.include_router(video_dashboard_router)
     application.include_router(lora_dashboard_router)
     application.include_router(wildcard_dashboard_router)
     application.include_router(salad_webhook_router)

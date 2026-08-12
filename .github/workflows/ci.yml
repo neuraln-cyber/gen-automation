@@ -158,38 +158,6 @@ jobs:
           --entrypoint /opt/worker-venv/bin/python
           gen-automation-gpu-worker:test
           -c 'import gen_automation.gpu_worker.main'
-      - name: Build video worker runtime contract
-        run: >-
-          docker build
-          --file Dockerfile.video-worker
-          --target runtime-contract
-          --tag gen-automation-video-worker-contract:test
-          .
-      - name: Smoke-test video worker Python runtime contract
-        run: >-
-          docker run --rm
-          --entrypoint /opt/video-worker-venv/bin/python
-          gen-automation-video-worker-contract:test
-          -c 'from gen_automation.video_worker.comfy import WAN_COMFY_WORKFLOW_SHA256; from gen_automation.video_worker.main import load_settings; print(WAN_COMFY_WORKFLOW_SHA256)'
-      - name: Build A14B model-free runtime foundation
-        run: >-
-          docker build
-          --file Dockerfile.video-worker-a14b
-          --target runtime-foundation
-          --tag gen-automation-video-worker-a14b-foundation:test
-          .
-      - name: Smoke-test A14B custom node revisions
-        run: |
-          docker run --rm \
-            --entrypoint /bin/bash \
-            gen-automation-video-worker-a14b-foundation:test \
-            -c '
-          set -euo pipefail
-          test "$COMFYUI_GGUF_COMMIT" = "6ea2651e7df66d7585f6ffee804b20e92fb38b8a"
-          test "$COMFYUI_NAG_COMMIT" = "c6f27116a8259f5b501d498a09e51c82fa72e35f"
-          grep -R -Fq "UnetLoaderGGUF" /opt/comfyui/custom_nodes/ComfyUI-GGUF
-          grep -R -Fq "KSamplerWithNAG (Advanced)" /opt/comfyui/custom_nodes/ComfyUI-NAG
-          '
       - name: Build semantic gateway image
         run: >-
           docker build
@@ -262,17 +230,6 @@ jobs:
           dependency-snapshot: false
           upload-artifact: false
           upload-release-assets: false
-      - name: Generate video worker runtime-contract SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          image: gen-automation-video-worker-contract:test
-          format: spdx-json
-          output-file: video-worker-contract.spdx.json
-          syft-version: v1.42.3
-          github-token: ""
-          dependency-snapshot: false
-          upload-artifact: false
-          upload-release-assets: false
       - name: Generate MEGA-enabled control-plane image SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
@@ -319,16 +276,6 @@ jobs:
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
           sbom: semantic-gateway.spdx.json
-          fail-build: true
-          severity-cutoff: critical
-          output-format: table
-          grype-version: v0.110.0
-          cache-db: false
-          only-fixed: true
-      - name: Scan video worker runtime-contract SBOM
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
-        with:
-          sbom: video-worker-contract.spdx.json
           fail-build: true
           severity-cutoff: critical
           output-format: table

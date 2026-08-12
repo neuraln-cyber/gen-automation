@@ -593,7 +593,6 @@ def test_salad_accepts_a_complete_fail_closed_test_configuration() -> None:
     assert settings.salad_max_replicas == 1
     assert settings.salad_max_queued_jobs == 3
     assert settings.salad_container_priority == SaladContainerPriority.LOW
-    assert settings.salad_video_container_priority is None
 
 
 @pytest.mark.parametrize("priority", tuple(SaladContainerPriority))
@@ -606,14 +605,6 @@ def test_salad_accepts_each_provider_container_priority(
 def test_salad_rejects_unknown_container_priority() -> None:
     with pytest.raises(ValidationError, match="salad_container_priority"):
         Settings(salad_container_priority="urgent")  # type: ignore[arg-type]
-
-
-@pytest.mark.parametrize("priority", tuple(SaladContainerPriority))
-def test_salad_accepts_video_specific_container_priority(
-    priority: SaladContainerPriority,
-) -> None:
-    settings = Settings(salad_video_container_priority=priority.value)
-    assert settings.salad_video_container_priority == priority
 
 
 def test_salad_deployment_timeout_covers_observe_then_immediate_stop_chain() -> None:

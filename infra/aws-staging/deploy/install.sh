@@ -59,14 +59,13 @@ install -o root -g root -m 0755 \
   "$source_dir/update-control-plane.sh" \
   /usr/local/sbin/gen-automation-update-control-plane
 install -o root -g root -m 0755 \
-  "$source_dir/cutover-video-worker-a14b.sh" \
-  /usr/local/sbin/gen-automation-cutover-video-worker-a14b
-install -o root -g root -m 0755 \
   "$source_dir/activate-semantic-gateway.sh" \
   /usr/local/sbin/gen-automation-activate-semantic-gateway
 install -o root -g root -m 0755 \
   "$source_dir/promote-semantic-anatomy.sh" \
   /usr/local/sbin/gen-automation-promote-semantic-anatomy
+# Remove the privileged helper from the retired image-to-video implementation.
+rm -f -- /usr/local/sbin/gen-automation-cutover-video-worker-a14b
 install -o root -g root -m 0644 \
   "$source_dir/gen-automation-staging.service" \
   /etc/systemd/system/gen-automation-staging.service

@@ -28,6 +28,7 @@ from gen_automation.domain.enums import (
     DesiredDeploymentState,
     GenerationAttemptState,
     GenerationState,
+    SaladDeploymentPurpose,
     SaladDeploymentState,
 )
 from gen_automation.integrations.salad.client import SALAD_QUEUE_JOB_PAGE_SIZE
@@ -383,6 +384,7 @@ def test_deployment_config_hash_is_canonical_and_enforces_one_replica() -> None:
         ({"min_replicas": -1}, "replica range"),
         ({"desired_queue_length": 0}, "desired_queue_length"),
         ({"max_hourly_cost_microusd": 0}, "max_hourly_cost"),
+        ({"purpose": SaladDeploymentPurpose.VIDEO}, "only image deployments"),
         ({"provider_configuration": {"replicas": True}}, "must not request"),
         (
             {"provider_configuration": {"autoscaling": {"max_replicas": 2}}},

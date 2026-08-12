@@ -9,7 +9,6 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
-from pydantic import SecretStr
 from sqlalchemy import event, func, select
 
 from gen_automation.db.models import (
@@ -50,7 +49,6 @@ from gen_automation.services.budgets import BudgetError, ensure_budget_guard, re
 from gen_automation.services.runtime_secrets import RuntimeSecretResolver
 from gen_automation.services.salad_deployments import (
     DeploymentAction,
-    EphemeralRegistryBasicAuth,
     SaladDeploymentNotFoundError,
     SaladDeploymentValidationError,
     _as_utc,
@@ -73,8 +71,6 @@ QUEUE_ID = UUID("7dcd6922-50e9-4d56-89b5-91cde26f0211")
 GROUP_ID = UUID("ab3a4591-efc3-46c0-b06a-3d820c0ec100")
 INSTANCE_ID = "instance-creator-1"
 LIVE_VALUE = "resolved-value-that-must-not-be-persisted"
-GHCR_USERNAME = "private-image-reader"
-GHCR_PAT = "ghp_request_scoped_registry_secret"
 STARTUP_PROBE: dict[str, JSONValue] = {
     "http": {
         "headers": [],
@@ -703,198 +699,6 @@ async def test_runtime_binding_requires_resolver_and_complete_resolution() -> No
     resolver = FakeResolver({})
     with pytest.raises(SaladDeploymentValidationError, match="could not be resolved"):
         await _container_group_payload(deployment, resolver)
-
-
-@pytest.mark.asyncio
-async def test_video_runtime_binding_fingerprint_is_not_sent_to_salad() -> None:
-    configuration = provider_configuration()
-    configuration["runtime_binding_contract_sha256"] = "f" * 64
-    deployment = unpersisted_deployment(configuration)
-    deployment.purpose = SaladDeploymentPurpose.VIDEO
-
-    payload = await _container_group_payload(deployment, None)
-
-    assert "runtime_binding_contract_sha256" not in payload
-
-
-def private_video_deployment(configuration: dict[str, object] | None = None) -> SaladDeployment:
-    resolved_configuration = configuration or provider_configuration()
-    resolved_configuration["runtime_binding_contract_sha256"] = "f" * 64
-    resolved_configuration["image_pull_mode"] = "ephemeral_basic"
-    deployment = unpersisted_deployment(resolved_configuration)
-    deployment.purpose = SaladDeploymentPurpose.VIDEO
-    return deployment
-
-
-def ephemeral_registry_auth(
-    *,
-    image_digest: str = IMAGE_DIGEST,
-) -> EphemeralRegistryBasicAuth:
-    return EphemeralRegistryBasicAuth(
-        image_digest=image_digest,
-        username=GHCR_USERNAME,
-        password=SecretStr(GHCR_PAT),
-    )
-
-
-@pytest.mark.asyncio
-async def test_private_registry_auth_is_exact_digest_bound_and_create_only() -> None:
-    deployment = private_video_deployment()
-    auth = ephemeral_registry_auth()
-
-    payload = await _container_group_payload(
-        deployment,
-        None,
-        for_create=True,
-        registry_basic_auth=auth,
-    )
-    container = payload["container"]
-    assert isinstance(container, dict)
-    assert container["registry_authentication"] == {
-        "basic": {"username": GHCR_USERNAME, "password": GHCR_PAT}
-    }
-    assert "image_pull_mode" not in payload
-    assert GHCR_PAT not in repr(auth)
-    assert GHCR_PAT not in repr(deployment.provider_configuration)
-
-    patch_payload = await _container_group_payload(deployment, None)
-    patch_container = patch_payload["container"]
-    assert isinstance(patch_container, dict)
-    assert "registry_authentication" not in patch_container
-
-    with pytest.raises(SaladDeploymentValidationError, match="does not match"):
-        await _container_group_payload(
-            deployment,
-            None,
-            for_create=True,
-            registry_basic_auth=ephemeral_registry_auth(
-                image_digest="registry.example.test/other@sha256:" + "d" * 64
-            ),
-        )
-
-    public_deployment = unpersisted_deployment()
-    with pytest.raises(SaladDeploymentValidationError, match="not allowed"):
-        await _container_group_payload(
-            public_deployment,
-            None,
-            for_create=True,
-            registry_basic_auth=auth,
-        )
-
-
-@pytest.mark.asyncio
-async def test_private_group_waits_for_ephemeral_auth_then_posts_without_durable_leakage(
-    deployment_context: DeploymentContext,
-) -> None:
-    client = FakeClient()
-    auth = ephemeral_registry_auth()
-    async with deployment_context.database.sessions() as session:
-        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
-        assert deployment is not None
-        deployment.purpose = SaladDeploymentPurpose.VIDEO
-        deployment.provider_configuration = provider_configuration()
-        deployment.provider_configuration["runtime_binding_contract_sha256"] = "f" * 64
-        deployment.provider_configuration["image_pull_mode"] = "ephemeral_basic"
-        await session.commit()
-
-        queue_result = await provision_deployment_step(
-            session,
-            deployment_id=deployment.id,
-            client=client,
-            now=NOW,
-        )
-        await session.commit()
-        waiting_result = await provision_deployment_step(
-            session,
-            deployment_id=deployment.id,
-            client=client,
-            now=NOW + timedelta(seconds=1),
-        )
-        await session.commit()
-
-        assert queue_result.action == DeploymentAction.QUEUE_CREATED
-        assert waiting_result.action == DeploymentAction.DEFERRED
-        assert waiting_result.error_code == "registry_authentication_required"
-        assert client.created_group_payloads == []
-
-        created_result = await provision_deployment_step(
-            session,
-            deployment_id=deployment.id,
-            client=client,
-            registry_basic_auth=auth,
-            now=NOW + timedelta(seconds=31),
-        )
-        await session.commit()
-        await session.refresh(deployment)
-        audit_details = list((await session.scalars(select(AuditEvent.detail))).all())
-
-    assert created_result.action == DeploymentAction.GROUP_CREATED
-    assert len(client.created_group_payloads) == 1
-    sent_container = client.created_group_payloads[0]["container"]
-    assert isinstance(sent_container, dict)
-    assert sent_container["registry_authentication"] == {
-        "basic": {"username": GHCR_USERNAME, "password": GHCR_PAT}
-    }
-    assert "registry_authentication" not in deployment.provider_configuration["container"]
-    assert GHCR_PAT not in repr(deployment.provider_configuration)
-    assert all(GHCR_PAT not in repr(detail) for detail in audit_details)
-    assert (
-        _group_configuration_drift(
-            deployment,
-            client.groups[deployment.container_group_name],
-        )
-        is None
-    )
-
-
-@pytest.mark.asyncio
-async def test_ambiguous_private_group_post_is_not_repeated_with_registry_auth(
-    deployment_context: DeploymentContext,
-) -> None:
-    client = FakeClient()
-    auth = ephemeral_registry_auth()
-    async with deployment_context.database.sessions() as session:
-        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
-        assert deployment is not None
-        deployment.purpose = SaladDeploymentPurpose.VIDEO
-        deployment.provider_configuration = provider_configuration()
-        deployment.provider_configuration["runtime_binding_contract_sha256"] = "f" * 64
-        deployment.provider_configuration["image_pull_mode"] = "ephemeral_basic"
-        await session.commit()
-
-        await provision_deployment_step(
-            session,
-            deployment_id=deployment.id,
-            client=client,
-            now=NOW,
-        )
-        await session.commit()
-        client.create_group_error = SaladTransportError("uncertain")
-        first = await provision_deployment_step(
-            session,
-            deployment_id=deployment.id,
-            client=client,
-            registry_basic_auth=auth,
-            now=NOW + timedelta(seconds=1),
-        )
-        await session.commit()
-        second = await provision_deployment_step(
-            session,
-            deployment_id=deployment.id,
-            client=client,
-            registry_basic_auth=auth,
-            now=NOW + timedelta(seconds=31),
-        )
-        await session.commit()
-        await session.refresh(deployment)
-        audit_details = list((await session.scalars(select(AuditEvent.detail))).all())
-
-    assert first.state == SaladDeploymentState.UNKNOWN
-    assert second.action == DeploymentAction.DEFERRED
-    assert second.error_code == "group_create_outcome_unknown"
-    assert len(client.created_group_payloads) == 1
-    assert GHCR_PAT not in repr(deployment.provider_configuration)
-    assert all(GHCR_PAT not in repr(detail) for detail in audit_details)
 
 
 @pytest.mark.asyncio
@@ -1686,7 +1490,46 @@ async def test_stopped_desire_only_invokes_stop_and_requires_observed_confirmati
 
 
 @pytest.mark.asyncio
-async def test_confirmed_video_stop_preserves_administrative_reason_after_transient_error(
+async def test_retired_video_deployment_is_never_restarted(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(
+        deployment_context,
+        desired_state=DesiredDeploymentState.ACTIVE,
+    )
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.groups[group_name] = make_group(
+        group_name,
+        queue_name,
+        status="stopped",
+        start_time=None,
+        finish_time=NOW,
+    )
+
+    async with deployment_context.database.sessions() as session:
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+        deployment.purpose = SaladDeploymentPurpose.VIDEO
+        await session.commit()
+
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment.id,
+            client=client,
+            now=NOW,
+        )
+        await session.commit()
+        await session.refresh(deployment)
+
+    assert result.action == DeploymentAction.STOPPED
+    assert deployment.desired_state == DesiredDeploymentState.STOPPED
+    assert deployment.administrative_stop_reason == "video_generation_retired"
+    assert all(call[0] != "start_group" for call in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_confirmed_stop_preserves_administrative_reason_after_transient_error(
     deployment_context: DeploymentContext,
 ) -> None:
     await make_fully_provisioned(
@@ -1706,8 +1549,7 @@ async def test_confirmed_video_stop_preserves_administrative_reason_after_transi
     async with deployment_context.database.sessions() as session:
         deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
         assert deployment is not None
-        deployment.purpose = SaladDeploymentPurpose.VIDEO
-        deployment.administrative_stop_reason = "video_generation_disabled"
+        deployment.administrative_stop_reason = "gpu_allocation_disabled"
         deployment.last_error_code = "stop_container_group_transport_unknown"
         deployment.last_error_detail = "The earlier provider stop response was ambiguous."
         await session.commit()
@@ -1725,7 +1567,7 @@ async def test_confirmed_video_stop_preserves_administrative_reason_after_transi
     assert deployment.state == SaladDeploymentState.STOPPED
     assert deployment.last_error_code is None
     assert deployment.last_error_detail is None
-    assert deployment.administrative_stop_reason == "video_generation_disabled"
+    assert deployment.administrative_stop_reason == "gpu_allocation_disabled"
 
 
 @pytest.mark.asyncio

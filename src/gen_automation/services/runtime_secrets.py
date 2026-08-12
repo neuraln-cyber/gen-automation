@@ -14,14 +14,9 @@ from pydantic import SecretStr
 from gen_automation.config import Environment, Settings
 from gen_automation.domain.runtime_bindings import (
     SALAD_IMAGE_WORKER_ALLOWED_RUNTIME_BINDINGS,
-    SALAD_VIDEO_WORKER_REQUIRED_RUNTIME_BINDINGS,
     SALAD_WORKER_ALLOWED_RUNTIME_BINDINGS,
     SALAD_WORKER_REQUIRED_RUNTIME_BINDINGS,
     SALAD_WORKER_RUNTIME_BINDING_REFERENCES,
-    VIDEO_WORKER_ALLOWED_SOURCE_ORIGINS_BINDING,
-    VIDEO_WORKER_ALLOWED_UPLOAD_ORIGIN_BINDING,
-    VIDEO_WORKER_ENVIRONMENT_BINDING,
-    VIDEO_WORKER_VERIFICATION_KEYS_BINDING,
     WORKER_ALLOWED_UPLOAD_ORIGIN_BINDING,
     WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING,
     WORKER_ARTIFACT_BUCKET_BINDING,
@@ -292,21 +287,6 @@ def configured_runtime_binding_references(settings: Settings) -> dict[str, str]:
     }
 
 
-def configured_video_runtime_binding_references(settings: Settings) -> dict[str, str]:
-    """Return the minimal public bindings for the isolated video worker."""
-
-    if not settings.video_generation_enabled:
-        return {}
-    configured_names = set(_configured_runtime_secret_values(settings)) & set(
-        SALAD_VIDEO_WORKER_REQUIRED_RUNTIME_BINDINGS
-    )
-    if configured_names != set(SALAD_VIDEO_WORKER_REQUIRED_RUNTIME_BINDINGS):
-        raise RuntimeSecretResolutionError("video runtime secret configuration is incomplete")
-    return {
-        name: SALAD_WORKER_RUNTIME_BINDING_REFERENCES[name] for name in sorted(configured_names)
-    }
-
-
 def build_runtime_secret_resolver(
     settings: Settings,
     *,
@@ -365,17 +345,6 @@ def _configured_runtime_secret_values(settings: Settings) -> dict[str, SecretStr
             sort_keys=True,
         )
         values[WORKER_VERIFICATION_KEYS_BINDING] = SecretStr(serialized_keys)
-        if settings.video_generation_enabled:
-            values[VIDEO_WORKER_VERIFICATION_KEYS_BINDING] = SecretStr(serialized_keys)
-    if settings.video_generation_enabled:
-        values[VIDEO_WORKER_ENVIRONMENT_BINDING] = SecretStr("production")
-        upload_origin = settings.salad_worker_allowed_upload_origin
-        if upload_origin is not None and upload_origin.get_secret_value().strip():
-            raw_origin = upload_origin.get_secret_value()
-            values[VIDEO_WORKER_ALLOWED_UPLOAD_ORIGIN_BINDING] = SecretStr(raw_origin)
-            values[VIDEO_WORKER_ALLOWED_SOURCE_ORIGINS_BINDING] = SecretStr(
-                json.dumps([raw_origin], ensure_ascii=True, separators=(",", ":"))
-            )
     for binding_name, setting_name in _SETTINGS_BINDINGS.items():
         configured = getattr(settings, setting_name)
         if isinstance(configured, SecretStr) and configured.get_secret_value().strip():
@@ -395,9 +364,6 @@ def _configured_complete_binding_sets(
     image = available & set(SALAD_IMAGE_WORKER_ALLOWED_RUNTIME_BINDINGS)
     if SALAD_WORKER_REQUIRED_RUNTIME_BINDINGS.issubset(image):
         complete.add(frozenset(image))
-    video = available & set(SALAD_VIDEO_WORKER_REQUIRED_RUNTIME_BINDINGS)
-    if video == set(SALAD_VIDEO_WORKER_REQUIRED_RUNTIME_BINDINGS):
-        complete.add(frozenset(video))
     return frozenset(complete)
 
 

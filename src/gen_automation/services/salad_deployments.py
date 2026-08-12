@@ -10,7 +10,6 @@ from enum import StrEnum
 from typing import Any, Protocol, cast
 from uuid import UUID
 
-from pydantic import SecretStr
 from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -90,10 +89,6 @@ _RECONCILE_DELAY = timedelta(seconds=30)
 _MAX_PROVIDER_NAME_LENGTH = 63
 _MICROSECONDS_PER_HOUR = 3_600_000_000
 _RUNTIME_BINDINGS_KEY = "runtime_bindings"
-_RUNTIME_BINDING_CONTRACT_SHA256_KEY = "runtime_binding_contract_sha256"
-_IMAGE_PULL_MODE_KEY = "image_pull_mode"
-_IMAGE_PULL_MODE_PUBLIC = "public"
-_IMAGE_PULL_MODE_EPHEMERAL_BASIC = "ephemeral_basic"
 _WORKER_QUEUE_PATH = "/jobs/generate"
 _WORKER_PORT = 8000
 _WORKER_RESTART_POLICY = "on_failure"
@@ -187,46 +182,6 @@ class SaladDeploymentValidationError(SaladDeploymentError):
 
 class SaladDeploymentNotFoundError(SaladDeploymentError):
     """The requested deployment does not exist."""
-
-
-class SaladRegistryAuthenticationRequiredError(SaladDeploymentError):
-    """A private image is waiting for one request-scoped registry credential."""
-
-
-@dataclass(frozen=True, repr=False)
-class EphemeralRegistryBasicAuth:
-    """Basic auth bound to one immutable image and retained only for one POST."""
-
-    image_digest: str
-    username: str
-    password: SecretStr
-
-    def __post_init__(self) -> None:
-        if _IMAGE_DIGEST_PATTERN.fullmatch(self.image_digest) is None:
-            raise SaladDeploymentValidationError(
-                "registry authentication image must use an immutable sha256 digest"
-            )
-        if (
-            not self.username
-            or len(self.username) > 100
-            or any(ord(character) < 33 or ord(character) > 126 for character in self.username)
-        ):
-            raise SaladDeploymentValidationError("registry authentication username is invalid")
-        if not isinstance(self.password, SecretStr):
-            raise SaladDeploymentValidationError("registry authentication password is invalid")
-        password = self.password.get_secret_value()
-        if (
-            not password
-            or len(password) > 1_024
-            or any(ord(character) < 33 or ord(character) > 126 for character in password)
-        ):
-            raise SaladDeploymentValidationError("registry authentication password is invalid")
-
-    def __repr__(self) -> str:
-        return (
-            f"{type(self).__name__}(image_digest={self.image_digest!r}, "
-            f"username={self.username!r}, password=<redacted>)"
-        )
 
 
 class DeploymentAction(StrEnum):
@@ -333,7 +288,6 @@ async def provision_deployment_step(
     deployment_id: UUID,
     client: SaladDeploymentClient,
     secret_resolver: RuntimeSecretResolver | None = None,
-    registry_basic_auth: EphemeralRegistryBasicAuth | None = None,
     now: datetime | None = None,
     billing_observation_clock: Callable[[], datetime] | None = None,
 ) -> DeploymentResult:
@@ -354,6 +308,7 @@ async def provision_deployment_step(
     budget_guard_available = await _lock_budget_guard(session)
     deployment = await _load_deployment_locked(session, deployment_id)
     _validate_local_deployment(deployment)
+    _retire_legacy_video_deployment(session, deployment, observed_at)
     was_unknown = deployment.state == SaladDeploymentState.UNKNOWN
     _assign_deterministic_names(deployment)
 
@@ -479,11 +434,7 @@ async def provision_deployment_step(
             payload = await _container_group_payload(
                 deployment,
                 secret_resolver,
-                for_create=True,
-                registry_basic_auth=registry_basic_auth,
             )
-        except SaladRegistryAuthenticationRequiredError:
-            return await _defer_registry_authentication(session, deployment, observed_at)
         except SaladDeploymentValidationError:
             return await _mark_failed(
                 session,
@@ -566,6 +517,7 @@ async def reconcile_deployment(
     budget_guard_available = await _lock_budget_guard(session)
     deployment = await _load_deployment_locked(session, deployment_id)
     _validate_local_deployment(deployment)
+    _retire_legacy_video_deployment(session, deployment, observed_at)
     _assign_deterministic_names(deployment)
     if deployment.provider_queue_id is None or deployment.provider_container_group_id is None:
         return await _defer_unknown(
@@ -788,9 +740,8 @@ async def effective_worker_min_replicas(
         select(SaladDeployment.purpose).where(SaladDeployment.id == salad_deployment_id)
     )
     if purpose is None or purpose == SaladDeploymentPurpose.VIDEO:
-        # The video lane is driven exclusively by its own Salad queue
-        # autoscaler. Image jobs and Experiment warm leases must never retain
-        # the much larger video worker at one replica.
+        # Retired video deployment rows remain readable for migration history,
+        # but image jobs and Experiment warm leases must never reactivate them.
         return 0
 
     experiment_minimum = await effective_experiment_min_replicas(
@@ -1315,26 +1266,6 @@ async def _defer_rollout_overlap(
     )
 
 
-async def _defer_registry_authentication(
-    session: AsyncSession,
-    deployment: SaladDeployment,
-    observed_at: datetime,
-) -> DeploymentResult:
-    deployment.state = SaladDeploymentState.PROVISIONING
-    deployment.last_error_code = "registry_authentication_required"
-    deployment.last_error_detail = (
-        "Private image provisioning requires one request-scoped registry credential."
-    )
-    deployment.reconcile_after = observed_at + _RECONCILE_DELAY
-    _touch(deployment)
-    await session.flush()
-    return _result(
-        deployment,
-        DeploymentAction.DEFERRED,
-        error_code=deployment.last_error_code,
-    )
-
-
 def _matches_worker_contract(
     value: object,
     expected: JSONValue,
@@ -1381,8 +1312,6 @@ async def _container_group_payload(
     resolver: RuntimeSecretResolver | None,
     *,
     environment_overrides: Mapping[str, str] | None = None,
-    for_create: bool = False,
-    registry_basic_auth: EphemeralRegistryBasicAuth | None = None,
 ) -> JSONObject:
     configuration = deepcopy(deployment.provider_configuration)
     if not isinstance(configuration, dict) or not all(
@@ -1391,28 +1320,10 @@ async def _container_group_payload(
         raise SaladDeploymentValidationError("provider configuration must be an object")
     bindings_value = configuration.pop(_RUNTIME_BINDINGS_KEY, [])
     bindings = _parse_runtime_bindings(bindings_value)
-    binding_contract_sha256 = configuration.pop(
-        _RUNTIME_BINDING_CONTRACT_SHA256_KEY,
-        None,
-    )
-    image_pull_mode = configuration.pop(_IMAGE_PULL_MODE_KEY, _IMAGE_PULL_MODE_PUBLIC)
-    if image_pull_mode not in {
-        _IMAGE_PULL_MODE_PUBLIC,
-        _IMAGE_PULL_MODE_EPHEMERAL_BASIC,
-    }:
-        raise SaladDeploymentValidationError("image pull mode is invalid")
-    if (
-        image_pull_mode == _IMAGE_PULL_MODE_EPHEMERAL_BASIC
-        and deployment.purpose != SaladDeploymentPurpose.VIDEO
-    ):
-        raise SaladDeploymentValidationError("private image pull mode is restricted to video")
-    if deployment.purpose == SaladDeploymentPurpose.VIDEO and (
-        not isinstance(binding_contract_sha256, str)
-        or re.fullmatch(r"[0-9a-f]{64}", binding_contract_sha256) is None
-    ):
-        raise SaladDeploymentValidationError("video runtime binding contract is invalid")
-    if deployment.purpose != SaladDeploymentPurpose.VIDEO and binding_contract_sha256 is not None:
-        raise SaladDeploymentValidationError("runtime binding contract is not allowed")
+    if configuration.pop("runtime_binding_contract_sha256", None) is not None:
+        raise SaladDeploymentValidationError("retired runtime binding contract is not supported")
+    if configuration.pop("image_pull_mode", "public") != "public":
+        raise SaladDeploymentValidationError("private image pull mode is not supported")
 
     if _contains_sensitive_configuration(configuration):
         raise SaladDeploymentValidationError(
@@ -1536,23 +1447,6 @@ async def _container_group_payload(
     container["image"] = deployment.worker_image_digest
     if environment:
         container["environment_variables"] = environment
-    if for_create and image_pull_mode == _IMAGE_PULL_MODE_EPHEMERAL_BASIC:
-        if registry_basic_auth is None:
-            raise SaladRegistryAuthenticationRequiredError
-        if registry_basic_auth.image_digest != deployment.worker_image_digest:
-            raise SaladDeploymentValidationError(
-                "registry authentication does not match the immutable image"
-            )
-        container["registry_authentication"] = {
-            "basic": {
-                "username": registry_basic_auth.username,
-                "password": registry_basic_auth.password.get_secret_value(),
-            }
-        }
-    elif registry_basic_auth is not None:
-        raise SaladDeploymentValidationError(
-            "registry authentication is not allowed for this provider operation"
-        )
     queue_connection["queue_name"] = deployment.queue_name
     configuration["name"] = deployment.container_group_name
     configuration["display_name"] = deployment.container_group_name
@@ -2618,6 +2512,31 @@ def _has_provider_resources(deployment: SaladDeployment) -> bool:
 
 def _stop_is_desired(deployment: SaladDeployment) -> bool:
     return deployment.desired_state == DesiredDeploymentState.STOPPED
+
+
+def _retire_legacy_video_deployment(
+    session: AsyncSession,
+    deployment: SaladDeployment,
+    observed_at: datetime,
+) -> None:
+    """Force historical video lanes toward STOPPED without reviving their runtime."""
+
+    if deployment.purpose != SaladDeploymentPurpose.VIDEO:
+        return
+    previous_desired_state = deployment.desired_state
+    deployment.desired_state = DesiredDeploymentState.STOPPED
+    deployment.administrative_stop_reason = "video_generation_retired"
+    deployment.reconcile_after = observed_at
+    if previous_desired_state == DesiredDeploymentState.STOPPED:
+        return
+    _touch(deployment)
+    _audit(
+        session,
+        deployment,
+        action="salad_deployment.video_generation_retired",
+        detail={"previous_desired_state": previous_desired_state.value},
+        occurred_at=observed_at,
+    )
 
 
 def _touch(deployment: SaladDeployment) -> None:

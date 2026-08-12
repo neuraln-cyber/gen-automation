@@ -382,7 +382,7 @@ async def test_dispatchable_generation_does_not_prestart_worker_before_runtime_r
 
 
 @pytest.mark.asyncio
-async def test_dispatchable_image_job_never_retains_the_video_lane(
+async def test_dispatchable_image_job_never_retains_a_retired_lane(
     warm_context: WarmContext,
 ) -> None:
     async with warm_context.database.sessions() as session:
@@ -392,7 +392,7 @@ async def test_dispatchable_image_job_never_retains_the_video_lane(
             suffix=101,
             state=GenerationState.QUEUED,
         )
-        video_deployment = SaladDeployment(
+        retired_deployment = SaladDeployment(
             purpose=SaladDeploymentPurpose.VIDEO,
             version_no=2,
             config_sha256="d" * 64,
@@ -400,13 +400,13 @@ async def test_dispatchable_image_job_never_retains_the_video_lane(
                 "container": {},
                 "queue_autoscaler": {"polling_period": 15},
             },
-            worker_image_digest="registry.example.test/video-worker@sha256:" + "e" * 64,
+            worker_image_digest="registry.example.test/retired-worker@sha256:" + "e" * 64,
             organization_name="organization",
             project_name="project",
-            queue_name="video-generation",
-            provider_queue_id="video-queue-id",
-            container_group_name="video-worker",
-            provider_container_group_id="video-group-id",
+            queue_name="retired-generation",
+            provider_queue_id="retired-queue-id",
+            container_group_name="retired-worker",
+            provider_container_group_id="retired-group-id",
             state=SaladDeploymentState.ACTIVE,
             desired_state=DesiredDeploymentState.ACTIVE,
             is_current=True,
@@ -419,13 +419,13 @@ async def test_dispatchable_image_job_never_retains_the_video_lane(
             created_at=NOW,
             updated_at=NOW,
         )
-        session.add(video_deployment)
+        session.add(retired_deployment)
         await session.flush()
 
         assert (
             await effective_worker_min_replicas(
                 session,
-                salad_deployment_id=video_deployment.id,
+                salad_deployment_id=retired_deployment.id,
                 now=NOW,
             )
             == 0
