@@ -8,7 +8,7 @@ from starlette.types import ASGIApp
 
 from gen_automation.domain.signing import derive_public_key, encode_base64url
 from gen_automation.video_worker import main as worker_main
-from gen_automation.video_worker.model_integrity import ModelIntegrityError
+from gen_automation.video_worker.model_integrity import A14B_VIDEO_PROFILE_IDS, ModelIntegrityError
 from gen_automation.video_worker.models import (
     DEFAULT_MAX_IMAGE_DIMENSION,
     DEFAULT_MAX_IMAGE_PIXELS,
@@ -105,6 +105,30 @@ def _settings(staging_root: Path) -> WorkerSettings:
         allowed_upload_origin="https://uploads.example.test",
         staging_root=staging_root,
     )
+
+
+def test_start_comfy_uses_supported_base_directory_for_pinned_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    comfy_root = tmp_path / "comfyui"
+    runtime_root = tmp_path / "runtime"
+    observed_command: tuple[str, ...] | None = None
+
+    def popen(command: tuple[str, ...], **_kwargs: object) -> subprocess.Popen[bytes]:
+        nonlocal observed_command
+        observed_command = command
+        return cast("subprocess.Popen[bytes]", cast(Any, _RunningProcess()))
+
+    monkeypatch.setattr(worker_main, "_COMFY_ROOT", comfy_root)
+    monkeypatch.setattr(worker_main, "_COMFY_RUNTIME_ROOT", runtime_root)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+
+    worker_main.start_comfy(profile_ids=A14B_VIDEO_PROFILE_IDS)
+
+    assert observed_command is not None
+    assert observed_command[observed_command.index("--base-directory") + 1] == comfy_root.as_posix()
+    assert "--models-directory" not in observed_command
 
 
 async def test_health_is_served_while_model_integrity_hashing_runs(
