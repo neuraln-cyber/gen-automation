@@ -154,7 +154,8 @@ def _comfy_command(settings: I2VWorkerSettings) -> tuple[str, ...]:
         f"sqlite:///{(runtime / 'user/comfyui.db').as_posix()}",
         "--preview-method",
         "none",
-        "--highvram",
+        "--reserve-vram",
+        "4",
         "--log-stdout",
     )
 
