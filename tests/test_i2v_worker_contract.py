@@ -193,6 +193,8 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
     assert "--system-site-packages" in dockerfile
     assert "--require-hashes" in dockerfile
     assert "--no-deps" in dockerfile
+    assert "sys.version_info[:2] == (3, 11)" in dockerfile
+    assert "--python-version 3.11" in LOCK.read_text(encoding="utf-8")
     for package in ("torch==2.9.1", "torchvision==0.24.1", "torchaudio==2.9.1"):
         assert package in LOCK.read_text(encoding="utf-8")
     assert "'/opt/i2v-venv/' not in module.__file__" in dockerfile

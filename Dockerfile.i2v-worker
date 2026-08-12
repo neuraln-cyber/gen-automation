@@ -81,7 +81,7 @@ WORKDIR /opt/i2v
 
 COPY requirements-i2v-worker.lock ./requirements-i2v-worker.lock
 
-RUN /opt/conda/bin/python -c "import sys; assert sys.version_info[:2] == (3, 12)" \
+RUN /opt/conda/bin/python -c "import sys; assert sys.version_info[:2] == (3, 11)" \
     && /opt/conda/bin/python -m venv \
         --copies \
         --without-pip \
