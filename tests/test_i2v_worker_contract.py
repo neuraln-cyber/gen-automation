@@ -194,6 +194,9 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
     assert "--require-hashes" in dockerfile
     assert "--no-deps" in dockerfile
     assert "sys.version_info[:2] == (3, 11)" in dockerfile
+    assert "openssl-3.6.3-h35e630c_1.conda" in dockerfile
+    assert "012096056b97abf1f68c46b7146bd2cbd68c1be762340b4f5dad4fbbe99177bc" in dockerfile
+    assert "openssl version | awk" in dockerfile
     lock = LOCK.read_text(encoding="utf-8")
     assert "--python-version 3.11" in lock
     assert "numpy==2.4.6" in lock
