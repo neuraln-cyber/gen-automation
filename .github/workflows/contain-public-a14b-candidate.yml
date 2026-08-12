@@ -1,0 +1,117 @@
+name: Contain accidentally public A14B candidate
+
+on:
+  push:
+    branches:
+      - emergency/a14b-ghcr-containment
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: contain-public-a14b-candidate
+  cancel-in-progress: false
+
+jobs:
+  contain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      EXPECTED_PARENT_SHA: 48f74ec9e6cd46f74804747ae37da80f2a4f08a3
+      EXPECTED_PACKAGE_ID: "14370553"
+      EXPECTED_VERSION_ID: "1123214799"
+      EXPECTED_DIGEST: sha256:9bfd7675fa9c213de42b51ceab91e0478daab87049ce0b132267c709eb19da2e
+      EXPECTED_TAG: candidate-sha-48f74ec9e6cd46f74804747ae37da80f2a4f08a3
+      PACKAGE_API_NAME: gen-automation%2Fvideo-worker-a14b-private
+      REGISTRY_REPOSITORY: neuraln-cyber/gen-automation/video-worker-a14b-private
+    steps:
+      - name: Check out the exact containment commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Delete only the exact exposed model-bearing version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REPOSITORY" = "neuraln-cyber/gen-automation" ]
+          [ "$GITHUB_REF" = "refs/heads/emergency/a14b-ghcr-containment" ]
+          [ "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT_SHA" ]
+          [ "$(git diff --name-only HEAD^ HEAD)" = ".github/workflows/contain-public-a14b-candidate.yml" ]
+
+          package_path="/users/neuraln-cyber/packages/container/${PACKAGE_API_NAME}"
+          package_json="$RUNNER_TEMP/a14b-public-package.json"
+          version_json="$RUNNER_TEMP/a14b-public-version.json"
+          gh api "$package_path" >"$package_json"
+          gh api "${package_path}/versions/${EXPECTED_VERSION_ID}" >"$version_json"
+
+          PACKAGE_JSON="$package_json" VERSION_JSON="$version_json" python3 - <<'PY'
+          import json
+          import os
+
+          with open(os.environ["PACKAGE_JSON"], encoding="utf-8") as handle:
+              package = json.load(handle)
+          with open(os.environ["VERSION_JSON"], encoding="utf-8") as handle:
+              version = json.load(handle)
+
+          if str(package.get("id")) != os.environ["EXPECTED_PACKAGE_ID"]:
+              raise SystemExit("unexpected package identity")
+          if package.get("name") != "gen-automation/video-worker-a14b-private":
+              raise SystemExit("unexpected package name")
+          if package.get("package_type") != "container" or package.get("visibility") != "public":
+              raise SystemExit("package is not the exact exposed public container")
+          if str(version.get("id")) != os.environ["EXPECTED_VERSION_ID"]:
+              raise SystemExit("unexpected package version identity")
+          if version.get("name") != os.environ["EXPECTED_DIGEST"]:
+              raise SystemExit("unexpected package version digest")
+          tags = version.get("metadata", {}).get("container", {}).get("tags")
+          if tags != [os.environ["EXPECTED_TAG"]]:
+              raise SystemExit("unexpected package version tags")
+          PY
+
+          token_json="$RUNNER_TEMP/a14b-anonymous-token.json"
+          before_headers="$RUNNER_TEMP/a14b-before-delete.headers"
+          curl --fail --silent --show-error --get \
+            --data-urlencode 'service=ghcr.io' \
+            --data-urlencode "scope=repository:${REGISTRY_REPOSITORY}:pull" \
+            'https://ghcr.io/token' >"$token_json"
+          anonymous_token="$(jq -er '.token | select(type == "string" and length > 0)' "$token_json")"
+          before_status="$(
+            curl --silent --show-error \
+              --output /dev/null \
+              --dump-header "$before_headers" \
+              --write-out '%{http_code}' \
+              --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+              --header "Authorization: Bearer ${anonymous_token}" \
+              "https://ghcr.io/v2/${REGISTRY_REPOSITORY}/manifests/${EXPECTED_DIGEST}"
+          )"
+          [ "$before_status" = "200" ]
+          grep -Eqi "^docker-content-digest: ${EXPECTED_DIGEST}\r?$" "$before_headers"
+
+          gh api --method DELETE "${package_path}/versions/${EXPECTED_VERSION_ID}"
+
+          package_status="$(
+            curl --silent --show-error \
+              --output "$RUNNER_TEMP/a14b-package-after-delete.json" \
+              --write-out '%{http_code}' \
+              --header 'Accept: application/vnd.github+json' \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com${package_path}"
+          )"
+          [ "$package_status" = "404" ]
+
+          after_status="$(
+            curl --silent --show-error \
+              --output "$RUNNER_TEMP/a14b-manifest-after-delete.json" \
+              --write-out '%{http_code}' \
+              --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+              --header "Authorization: Bearer ${anonymous_token}" \
+              "https://ghcr.io/v2/${REGISTRY_REPOSITORY}/manifests/${EXPECTED_DIGEST}"
+          )"
+          [ "$after_status" = "404" ]
+          printf 'Exact public A14B package version deleted; anonymous digest access is gone.\n'
