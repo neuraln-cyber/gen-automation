@@ -536,7 +536,16 @@ def _group() -> SaladContainerGroup:
                 "image": _IMAGE,
                 "resources": {"gpu_classes": [str(_GPU_ID)]},
             },
+            "priority": "high",
             "queue_connection": {"queue_name": "i2v-dasiwa-v1"},
+            "queue_autoscaler": {
+                "min_replicas": 1,
+                "max_replicas": 1,
+                "desired_queue_length": 1,
+                "polling_period": 15,
+                "max_upscale_per_minute": 1,
+                "max_downscale_per_minute": 1,
+            },
         },
     )
 

@@ -23,6 +23,7 @@ from gen_automation.services.i2v_salad import (
     I2VInfrastructureMutation,
     I2VSaladConfig,
     I2VSaladConfigurationError,
+    I2VSaladConflictError,
     ensure_i2v_infrastructure_step,
     find_i2v_submission,
     observe_i2v_provider,
@@ -102,7 +103,16 @@ def _group(*, status: str = "running", replicas: int = 1) -> SaladContainerGroup
                 "image": _IMAGE,
                 "resources": {"gpu_classes": [str(_GPU_ID)]},
             },
+            "priority": "high",
             "queue_connection": {"queue_name": "i2v-dasiwa-v1"},
+            "queue_autoscaler": {
+                "min_replicas": 1,
+                "max_replicas": 1,
+                "desired_queue_length": 1,
+                "polling_period": 15,
+                "max_upscale_per_minute": 1,
+                "max_downscale_per_minute": 1,
+            },
         },
     )
 
@@ -148,6 +158,10 @@ class FakeSalad:
         self.instances: tuple[SaladContainerGroupInstance, ...] = ()
         self.jobs: tuple[SaladQueueJob, ...] = ()
         self.mutations: list[str] = []
+        self.created_configuration: dict[str, object] | None = None
+        self.updated_patches: list[dict[str, object]] = []
+        self.omit_autoscaler_on_create = False
+        self.omit_autoscaler_on_update = False
 
     async def list_gpu_classes(self) -> tuple[SaladGpuClass, ...]:
         return self.gpus
@@ -173,8 +187,30 @@ class FakeSalad:
     async def create_container_group(self, configuration: object) -> SaladContainerGroup:
         assert isinstance(configuration, dict)
         assert configuration["container"]["resources"]["gpu_classes"] == [str(_GPU_ID)]
+        self.created_configuration = configuration
         self.mutations.append("create_group")
         self.group = _group(status="stopped", replicas=0)
+        if self.omit_autoscaler_on_create:
+            self.group.raw.pop("queue_autoscaler")
+        return self.group
+
+    async def update_container_group(
+        self,
+        _name: str,
+        patch: object,
+    ) -> SaladContainerGroup:
+        assert self.group is not None
+        assert isinstance(patch, dict)
+        self.updated_patches.append(patch)
+        self.mutations.append("update_group")
+        container = patch.get("container")
+        if isinstance(container, dict) and "priority" in container:
+            self.group.raw["priority"] = container["priority"]
+        autoscaler = patch.get("queue_autoscaler")
+        if isinstance(autoscaler, dict):
+            self.group.raw["queue_autoscaler"] = dict(autoscaler)
+        if self.omit_autoscaler_on_update:
+            self.group.raw.pop("queue_autoscaler", None)
         return self.group
 
     async def list_container_group_instances(self, _name: str) -> SaladContainerGroupInstancePage:
@@ -201,6 +237,8 @@ def test_i2v_salad_config_has_no_small_limits_but_requires_exact_pinning() -> No
     assert config.prefetch == 50_000
     assert config.worker_lease_seconds == 10**9
     assert config.max_replicas == 500
+    assert config.queue_autoscaler_configuration()["max_upscale_per_minute"] == 100
+    assert config.queue_autoscaler_configuration()["max_downscale_per_minute"] == 100
     assert config.container_configuration()["container"]["resources"]["gpu_classes"] == [
         str(_GPU_ID)
     ]
@@ -221,6 +259,18 @@ async def test_infrastructure_reconcile_performs_only_one_mutation_and_recovers_
     second = await ensure_i2v_infrastructure_step(client, _config())
     assert second.mutation == I2VInfrastructureMutation.GROUP_CREATED
     assert client.mutations == ["create_queue", "create_group"]
+    assert client.created_configuration is not None
+    assert client.created_configuration["autostart_policy"] is False
+    container = client.created_configuration["container"]
+    assert isinstance(container, dict) and container["priority"] == "high"
+    assert client.created_configuration["queue_autoscaler"] == {
+        "min_replicas": 1,
+        "max_replicas": 1,
+        "desired_queue_length": 1,
+        "polling_period": 15,
+        "max_upscale_per_minute": 1,
+        "max_downscale_per_minute": 1,
+    }
 
     client.group = None
     client.groups = (_group(),)
@@ -228,6 +278,48 @@ async def test_infrastructure_reconcile_performs_only_one_mutation_and_recovers_
     assert recovered.mutation == I2VInfrastructureMutation.NONE
     assert recovered.group is client.groups[0]
     assert client.mutations == ["create_queue", "create_group"]
+
+
+async def test_reconcile_repairs_priority_and_autoscaler_before_use() -> None:
+    client = FakeSalad()
+    assert client.group is not None
+    client.group.raw["priority"] = "low"
+    client.group.raw["queue_autoscaler"] = {
+        "min_replicas": 0,
+        "max_replicas": 9,
+        "desired_queue_length": 7,
+        "polling_period": 30,
+    }
+
+    repaired = await ensure_i2v_infrastructure_step(client, _config())
+
+    assert repaired.mutation == I2VInfrastructureMutation.GROUP_CONTRACT_REPAIRED
+    assert client.updated_patches == [
+        {
+            "container": {"priority": "high"},
+            "queue_autoscaler": {
+                "min_replicas": 1,
+                "max_replicas": 1,
+                "desired_queue_length": 1,
+                "polling_period": 15,
+                "max_upscale_per_minute": 1,
+                "max_downscale_per_minute": 1,
+            },
+        }
+    ]
+
+
+async def test_create_and_update_readback_omit_autoscaler_fail_closed() -> None:
+    client = FakeSalad()
+    client.group = None
+    client.omit_autoscaler_on_create = True
+    with pytest.raises(I2VSaladConflictError, match="priority or queue autoscaler"):
+        await ensure_i2v_infrastructure_step(client, _config())
+
+    client.omit_autoscaler_on_update = True
+    with pytest.raises(I2VSaladConflictError, match="priority or queue autoscaler"):
+        await ensure_i2v_infrastructure_step(client, _config())
+    assert client.mutations == ["create_group", "update_group"]
 
 
 async def test_exact_gpu_name_has_no_fallback() -> None:

@@ -51,6 +51,7 @@ class I2VInfrastructureMutation(StrEnum):
     NONE = "none"
     QUEUE_CREATED = "queue_created"
     GROUP_CREATED = "group_created"
+    GROUP_CONTRACT_REPAIRED = "group_contract_repaired"
 
 
 @dataclass(frozen=True)
@@ -133,6 +134,9 @@ class I2VSaladConfig:
         configuration: JSONObject = {
             "name": self.container_group_name,
             "display_name": "Image to video - RTX 5090",
+            # Salad's current create contract requires this field. Keep the
+            # group stopped until fresh runtime credentials are patched in.
+            "autostart_policy": False,
             "container": {
                 "image": self.worker_image,
                 "resources": {
@@ -159,12 +163,7 @@ class I2VSaladConfig:
             # A started group stays warm until this controller explicitly applies
             # the configured idle policy.  This avoids provider-side scale-down
             # racing a sequence of queued generations.
-            "queue_autoscaler": {
-                "min_replicas": 1,
-                "max_replicas": self.max_replicas,
-                "desired_queue_length": 1,
-                "polling_period": 15,
-            },
+            "queue_autoscaler": self.queue_autoscaler_configuration(),
         }
         if self.runtime_bindings:
             configuration["runtime_bindings"] = [
@@ -176,6 +175,19 @@ class I2VSaladConfig:
             assert isinstance(container, dict)
             container["environment_variables"] = dict(sorted(self.environment_variables.items()))
         return configuration
+
+    def queue_autoscaler_configuration(self) -> JSONObject:
+        scale_rate = min(self.max_replicas, 100)
+        return {
+            "min_replicas": 1,
+            "max_replicas": self.max_replicas,
+            "desired_queue_length": 1,
+            "polling_period": 15,
+            # Use Salad's maximum permitted rate unless the replica cap is
+            # lower. The live one-replica deployment therefore reads back 1.
+            "max_upscale_per_minute": scale_rate,
+            "max_downscale_per_minute": scale_rate,
+        }
 
 
 class I2VSaladClient(Protocol):
@@ -325,12 +337,26 @@ async def ensure_i2v_infrastructure_step(
             group = matches[0]
         else:
             group = await client.create_container_group(config.container_configuration())
+            validate_i2v_group_contract(group, config)
             return I2VInfrastructureStep(
                 mutation=I2VInfrastructureMutation.GROUP_CREATED,
                 queue=queue,
                 group=group,
             )
-    _validate_group_identity(group, config)
+    _validate_group_base_identity(group, config)
+    repair_patch = _group_contract_repair_patch(group, config)
+    if repair_patch:
+        group = await client.update_container_group(
+            config.container_group_name,
+            repair_patch,
+        )
+        validate_i2v_group_contract(group, config)
+        return I2VInfrastructureStep(
+            mutation=I2VInfrastructureMutation.GROUP_CONTRACT_REPAIRED,
+            queue=queue,
+            group=group,
+        )
+    validate_i2v_group_contract(group, config)
     return I2VInfrastructureStep(
         mutation=I2VInfrastructureMutation.NONE,
         queue=queue,
@@ -345,7 +371,7 @@ async def observe_i2v_provider(
     active_job_count: int,
 ) -> I2VProviderObservation:
     group = await client.get_container_group(config.container_group_name)
-    _validate_group_identity(group, config)
+    validate_i2v_group_contract(group, config)
     page = await client.list_container_group_instances(config.container_group_name)
     raw_instances = getattr(page, "instances", None)
     if not isinstance(raw_instances, tuple):
@@ -451,7 +477,7 @@ async def _require_exact_gpu(client: I2VSaladClient, config: I2VSaladConfig) -> 
         )
 
 
-def _validate_group_identity(group: SaladContainerGroup, config: I2VSaladConfig) -> None:
+def _validate_group_base_identity(group: SaladContainerGroup, config: I2VSaladConfig) -> None:
     if group.name != config.container_group_name:
         raise I2VSaladConflictError("Salad returned a different I2V container group")
     container = group.raw.get("container")
@@ -470,6 +496,45 @@ def _validate_group_identity(group: SaladContainerGroup, config: I2VSaladConfig)
         or queue_connection.get("queue_name") != config.queue_name
     ):
         raise I2VSaladConflictError("I2V group is connected to the wrong queue")
+
+
+def validate_i2v_group_contract(
+    group: SaladContainerGroup,
+    config: I2VSaladConfig,
+) -> None:
+    """Fail closed unless Salad read-back matches the scheduling contract."""
+
+    _validate_group_base_identity(group, config)
+    if _group_contract_repair_patch(group, config):
+        raise I2VSaladConflictError(
+            "I2V group omitted or drifted its priority or queue autoscaler contract"
+        )
+
+
+def _group_contract_repair_patch(
+    group: SaladContainerGroup,
+    config: I2VSaladConfig,
+) -> JSONObject:
+    patch: JSONObject = {}
+    # Salad accepts priority inside ``container`` on writes and exposes the
+    # effective priority at group level on reads.
+    if group.raw.get("priority") != config.priority:
+        patch["container"] = {"priority": config.priority}
+    autoscaler = group.raw.get("queue_autoscaler")
+    desired_autoscaler = config.queue_autoscaler_configuration()
+    if not _matches_exact_autoscaler(autoscaler, desired_autoscaler):
+        patch["queue_autoscaler"] = desired_autoscaler
+    return patch
+
+
+def _matches_exact_autoscaler(observed: JSONValue, expected: JSONObject) -> bool:
+    if not isinstance(observed, dict):
+        return False
+    if any(observed.get(key) != value for key, value in expected.items()):
+        return False
+    # Salad may expose optional rate-limit properties as null even when they
+    # were omitted. A non-null extension changes scaling behavior and is drift.
+    return all(key in expected or value is None for key, value in observed.items())
 
 
 def _instance_preference(instance: SaladContainerGroupInstance) -> tuple[int, int, object, str]:
