@@ -38,10 +38,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REPOSITORY" = "neuraln-cyber/gen-automation" ]
-          [ "$GITHUB_REF" = "refs/heads/emergency/a14b-ghcr-containment" ]
-          git merge-base --is-ancestor "$EXPECTED_BASE_SHA" HEAD
-          [ "$(git diff --name-only "$EXPECTED_BASE_SHA" HEAD)" = ".github/workflows/contain-public-a14b-candidate.yml" ]
+          [ "$GITHUB_REPOSITORY" = "neuraln-cyber/gen-automation" ] || {
+            printf 'Containment repository identity mismatch.\n' >&2
+            exit 1
+          }
+          [ "$GITHUB_REF" = "refs/heads/emergency/a14b-ghcr-containment" ] || {
+            printf 'Containment ref identity mismatch.\n' >&2
+            exit 1
+          }
+          git merge-base --is-ancestor "$EXPECTED_BASE_SHA" HEAD || {
+            printf 'Containment base ancestry mismatch.\n' >&2
+            exit 1
+          }
+          changed_paths="$(git diff --name-only "$EXPECTED_BASE_SHA" HEAD)"
+          [ "$changed_paths" = ".github/workflows/contain-public-a14b-candidate.yml" ] || {
+            printf 'Containment branch scope mismatch.\n' >&2
+            exit 1
+          }
+          printf 'Containment source boundary verified.\n'
 
           package_path="/users/neuraln-cyber/packages/container/${PACKAGE_API_NAME}"
           package_json="$RUNNER_TEMP/a14b-public-package.json"
