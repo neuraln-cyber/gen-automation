@@ -15,7 +15,7 @@ $ErrorActionPreference = "Stop"
 
 $awsProfile = "gen-automation-staging"
 $awsRegion = "eu-central-1"
-$imagePattern = "^ghcr[.]io/neuraln-cyber/gen-automation/video-worker-a14b-private@sha256:[0-9a-f]{64}$"
+$imagePattern = "^ghcr[.]io/neuraln-cyber/gen-automation-a14b-registry/video-worker-a14b-private@sha256:[0-9a-f]{64}$"
 $deploymentIdPattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 $instanceIdPattern = "^i-[0-9a-f]{8,17}$"
 

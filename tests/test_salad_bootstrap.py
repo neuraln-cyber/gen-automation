@@ -33,7 +33,8 @@ from gen_automation.storage.memory import MemoryObjectStore
 GPU_CLASS_ID = UUID("3c90c3cc-0d44-4b50-8888-8dd25736052a")
 WORKER_IMAGE = "registry.example.test/worker@sha256:" + "b" * 64
 PRIVATE_A14B_WORKER_IMAGE = (
-    "ghcr.io/neuraln-cyber/gen-automation/video-worker-a14b-private@sha256:" + "d" * 64
+    "ghcr.io/neuraln-cyber/gen-automation-a14b-registry/"
+    "video-worker-a14b-private@sha256:" + "d" * 64
 )
 WORKER_SIGNING_PRIVATE_KEY = encode_base64url(bytes(range(1, 33)))
 

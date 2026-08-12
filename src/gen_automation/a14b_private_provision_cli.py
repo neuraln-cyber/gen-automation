@@ -58,11 +58,14 @@ from gen_automation.services.videos import acquire_a14b_submission_lock
 
 MINIMUM_CONTROL_PLANE_REVISION = "d585214403c2b8090dc468b5045db1cf7b06b3ac"
 REQUIRED_MIGRATION_HEAD = "20260811_0036"
-PRIVATE_IMAGE_REPOSITORY = "ghcr.io/neuraln-cyber/gen-automation/video-worker-a14b-private"
+PRIVATE_IMAGE_REPOSITORY = (
+    "ghcr.io/neuraln-cyber/gen-automation-a14b-registry/video-worker-a14b-private"
+)
 PRIVATE_IMAGE_PATTERN = re.compile(rf"{re.escape(PRIVATE_IMAGE_REPOSITORY)}@sha256:[0-9a-f]{{64}}")
 IMMUTABLE_VIDEO_IMAGE_PATTERN = re.compile(
-    r"ghcr[.]io/neuraln-cyber/gen-automation/"
-    r"(?:video-worker|video-worker-a14b-private)@sha256:[0-9a-f]{64}"
+    r"(?:ghcr[.]io/neuraln-cyber/gen-automation/video-worker|"
+    r"ghcr[.]io/neuraln-cyber/gen-automation-a14b-registry/"
+    r"video-worker-a14b-private)@sha256:[0-9a-f]{64}"
 )
 RTX_5090_GPU_CLASS_ID = "851399fb-7329-4195-a042-d6514b28cf33"
 EXPECTED_STORAGE_BYTES = 50 * 1024 * 1024 * 1024

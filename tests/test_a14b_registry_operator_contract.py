@@ -180,7 +180,10 @@ def test_wrapper_scrubs_tofu_environment_and_restores_case_insensitive_proxy(
         }
     )
     script_literal = str(SCRIPT).replace("'", "''")
-    image = "ghcr.io/neuraln-cyber/gen-automation/video-worker-a14b-private@sha256:" + "a" * 64
+    image = (
+        "ghcr.io/neuraln-cyber/gen-automation-a14b-registry/"
+        "video-worker-a14b-private@sha256:" + "a" * 64
+    )
     command = (
         f"try {{ & '{script_literal}' -Image '{image}' "
         "-DeploymentId 'd32be515-170f-416a-a356-3c70ef30db52' } catch {} ; "

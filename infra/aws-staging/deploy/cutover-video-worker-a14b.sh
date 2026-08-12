@@ -12,7 +12,7 @@ lock_file="/run/lock/gen-automation-control-plane-update.lock"
 video_image_key="GEN_AUTOMATION_SALAD_VIDEO_WORKER_IMAGE"
 image_lane_key="GEN_AUTOMATION_SALAD_WORKER_IMAGE"
 minimum_control_plane_revision="d585214403c2b8090dc468b5045db1cf7b06b3ac"
-private_repository="ghcr.io/neuraln-cyber/gen-automation/video-worker-a14b-private"
+private_repository="ghcr.io/neuraln-cyber/gen-automation-a14b-registry/video-worker-a14b-private"
 
 new_image=""
 expected_revision=""
@@ -258,7 +258,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-[[ "$new_image" =~ ^ghcr[.]io/neuraln-cyber/gen-automation/video-worker-a14b-private@sha256:[0-9a-f]{64}$ ]] ||
+[[ "$new_image" =~ ^ghcr[.]io/neuraln-cyber/gen-automation-a14b-registry/video-worker-a14b-private@sha256:[0-9a-f]{64}$ ]] ||
   fail "image must be an immutable digest from $private_repository"
 [[ "$expected_revision" =~ ^[0-9a-f]{40}$ ]] ||
   fail "expected control-plane revision must be exactly 40 lowercase hexadecimal characters"
@@ -290,7 +290,7 @@ wait_for_control_plane "$(env_value "$video_image_key" "$controller_env")" ||
 
 old_video_image="$(env_value "$video_image_key" "$controller_env")"
 old_image_lane="$(env_value "$image_lane_key" "$controller_env")"
-[[ "$old_video_image" =~ ^ghcr[.]io/neuraln-cyber/gen-automation/(video-worker|video-worker-a14b-private)@sha256:[0-9a-f]{64}$ ]] ||
+[[ "$old_video_image" =~ ^ghcr[.]io/neuraln-cyber/(gen-automation/video-worker|gen-automation-a14b-registry/video-worker-a14b-private)@sha256:[0-9a-f]{64}$ ]] ||
   fail "currently configured VIDEO image is not an approved immutable reference"
 [[ "$old_image_lane" =~ ^ghcr[.]io/neuraln-cyber/gen-automation/gpu-worker@sha256:[0-9a-f]{64}$ ]] ||
   fail "IMAGE lane immutable binding is invalid"

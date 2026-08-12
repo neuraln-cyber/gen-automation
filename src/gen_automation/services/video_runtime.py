@@ -123,7 +123,7 @@ _MAX_RECONCILIATION_BATCH_TIMEOUT_SECONDS = 30.0
 _MAX_WORKER_ENVELOPE_BYTES = 128 * 1024
 _A14B_OUTER_WATCHDOG_SECONDS = 18_000
 PRIVATE_A14B_VIDEO_WORKER_IMAGE_REPOSITORY = (
-    "ghcr.io/neuraln-cyber/gen-automation/video-worker-a14b-private"
+    "ghcr.io/neuraln-cyber/gen-automation-a14b-registry/video-worker-a14b-private"
 )
 LEGACY_VIDEO_RUNTIME_PROFILE_IDS = (
     PINNED_VIDEO_PROFILE.profile_id,

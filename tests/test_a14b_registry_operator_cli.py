@@ -23,6 +23,15 @@ IMAGE = f"{operator.PRIVATE_IMAGE_REPOSITORY}@{DIGEST}"
 DEPLOYMENT_ID = UUID("d32be515-170f-416a-a356-3c70ef30db52")
 INSTANCE_ID = "i-0123456789abcdef0"
 COMMAND_ID = "11111111-2222-3333-4444-555555555555"
+
+
+def test_registry_transport_is_bound_to_the_private_packaging_namespace() -> None:
+    repository = "neuraln-cyber/gen-automation-a14b-registry/video-worker-a14b-private"
+    assert operator.PRIVATE_IMAGE_REPOSITORY == f"ghcr.io/{repository}"
+    assert operator.GHCR_MANIFEST_PREFIX == f"https://ghcr.io/v2/{repository}/manifests/"
+    assert operator.GHCR_REPOSITORY_SCOPE == f"repository:{repository}:pull"
+
+
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
 OPERATOR_ARN = (
     "arn:aws:sts::861912887470:assumed-role/"
