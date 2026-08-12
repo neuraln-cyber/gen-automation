@@ -5,8 +5,10 @@ import os
 import signal
 import stat
 import subprocess
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
+from typing import cast
 
 from gen_automation.i2v_worker.artifacts import ModelBootstrapError, S3ModelBootstrapper
 from gen_automation.i2v_worker.comfy import ComfyClient
@@ -15,6 +17,11 @@ from gen_automation.i2v_worker.settings import I2VWorkerSettings
 
 class WorkerStartupError(Exception):
     pass
+
+
+def _kill_process_group(pid: int, sig: int) -> None:
+    killpg = cast(Callable[[int, int], None], os.__dict__["killpg"])
+    killpg(pid, sig)
 
 
 class WorkerSupervisor:
@@ -220,14 +227,14 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
         return
     try:
         if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)  # type: ignore[attr-defined]
+            _kill_process_group(process.pid, signal.SIGTERM)
         else:
             process.terminate()
         process.wait(timeout=20)
     except (OSError, subprocess.TimeoutExpired):
         with suppress(OSError):
             if os.name == "posix":
-                os.killpg(  # type: ignore[attr-defined]
+                _kill_process_group(
                     process.pid,
                     getattr(signal, "SIGKILL", signal.SIGTERM),
                 )
