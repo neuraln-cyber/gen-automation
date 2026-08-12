@@ -205,7 +205,7 @@ def test_i2v_salad_config_has_no_small_limits_but_requires_exact_pinning() -> No
         str(_GPU_ID)
     ]
     with pytest.raises(I2VSaladConfigurationError, match="exact"):
-        _config(gpu_class_name="RTX 4090")
+        _config(gpu_class_name="RTX 5090 Laptop (24 GB)")
     with pytest.raises(I2VSaladConfigurationError, match="immutable"):
         _config(worker_image="ghcr.io/example/i2v:latest")
 

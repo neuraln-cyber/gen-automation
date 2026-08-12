@@ -604,7 +604,7 @@ def test_i2v_defaults_to_one_exact_5090_without_small_queue_or_runtime_caps() ->
         i2v_salad_storage_bytes=2 * 1024 * 1024 * 1024 * 1024,
     )
 
-    assert settings.i2v_salad_gpu_class_name == "NVIDIA GeForce RTX 5090"
+    assert settings.i2v_salad_gpu_class_name == "RTX 5090 (32 GB)"
     assert settings.i2v_salad_prefetch == 10_000
     assert settings.i2v_worker_lease_seconds == 30 * 24 * 60 * 60
     assert settings.i2v_salad_max_replicas == 32

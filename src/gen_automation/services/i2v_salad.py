@@ -28,7 +28,7 @@ from gen_automation.integrations.salad.models import (
     SaladQueueJobPage,
 )
 
-I2V_SALAD_GPU_CLASS_NAME = "NVIDIA GeForce RTX 5090"
+I2V_SALAD_GPU_CLASS_NAME = "RTX 5090 (32 GB)"
 I2V_SALAD_SUBMISSION_SCHEMA = "i2v-salad-submission/v1"
 I2V_SALAD_JOB_SCHEMA = "i2v-salad-job/v1"
 I2V_WORKER_OUTPUT_SCHEMA = "i2v-salad-result/v1"

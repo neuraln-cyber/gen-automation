@@ -535,7 +535,7 @@ class Settings(BaseSettings):
     i2v_salad_container_group_name: str = "i2v-worker-v1"
     i2v_worker_image: str | None = None
     i2v_salad_gpu_class_id: UUID | None = None
-    i2v_salad_gpu_class_name: str = "NVIDIA GeForce RTX 5090"
+    i2v_salad_gpu_class_name: str = "RTX 5090 (32 GB)"
     i2v_salad_prefetch: int = Field(default=3, gt=0)
     i2v_worker_lease_seconds: int = Field(default=24 * 60 * 60, gt=0)
     i2v_warm_idle_seconds: int | None = Field(default=5 * 60 * 60, gt=0)
@@ -931,8 +931,8 @@ class Settings(BaseSettings):
                 errors.append("I2V requires the background runtime")
             if self.i2v_salad_gpu_class_id is None:
                 errors.append("I2V requires the exact Salad RTX 5090 GPU class ID")
-            if self.i2v_salad_gpu_class_name != "NVIDIA GeForce RTX 5090":
-                errors.append("I2V GPU class must be NVIDIA GeForce RTX 5090")
+            if self.i2v_salad_gpu_class_name != "RTX 5090 (32 GB)":
+                errors.append("I2V GPU class must be RTX 5090 (32 GB)")
             for label, value in (
                 ("queue name", self.i2v_salad_queue_name),
                 ("container group name", self.i2v_salad_container_group_name),

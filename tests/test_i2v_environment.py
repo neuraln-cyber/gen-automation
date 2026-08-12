@@ -67,7 +67,7 @@ def _settings() -> Settings:
         i2v_enabled=True,
         i2v_worker_image="ghcr.io/example/i2v@sha256:" + "a" * 64,
         i2v_salad_gpu_class_id=UUID("11111111-1111-4111-8111-111111111111"),
-        i2v_salad_gpu_class_name="NVIDIA GeForce RTX 5090",
+        i2v_salad_gpu_class_name="RTX 5090 (32 GB)",
         i2v_salad_queue_name="i2v-jobs-v1",
         i2v_salad_container_group_name="i2v-worker-v1",
         i2v_salad_prefetch=3,
@@ -182,7 +182,7 @@ def test_runtime_config_keeps_five_hour_warm_session_and_exact_5090() -> None:
     config = i2v_runtime_config_from_settings(_settings())
 
     assert config.salad.warm_idle_seconds == 18_000
-    assert config.salad.gpu_class_name == "NVIDIA GeForce RTX 5090"
+    assert config.salad.gpu_class_name == "RTX 5090 (32 GB)"
     assert config.salad.storage_bytes == 268_435_456_000
     assert config.salad.max_replicas == 1
 
