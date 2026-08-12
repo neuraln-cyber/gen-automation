@@ -117,7 +117,10 @@ jobs:
             --data-urlencode 'service=ghcr.io' \
             --data-urlencode "scope=repository:${REGISTRY_REPOSITORY}:pull" \
             'https://ghcr.io/token' >"$token_json"
-          anonymous_token="$(jq -er '.token | select(type == "string" and length > 0)' "$token_json")"
+          anonymous_token="$(jq -er '.token | select(type == "string" and length > 0)' "$token_json")" || {
+            printf 'Anonymous registry token response was invalid.\n' >&2
+            exit 1
+          }
           before_status="$(
             curl --silent --show-error \
               --output /dev/null \
@@ -127,8 +130,16 @@ jobs:
               --header "Authorization: Bearer ${anonymous_token}" \
               "https://ghcr.io/v2/${REGISTRY_REPOSITORY}/manifests/${EXPECTED_DIGEST}"
           )"
-          [ "$before_status" = "200" ]
-          grep -Eqi "^docker-content-digest: ${EXPECTED_DIGEST}\r?$" "$before_headers"
+          [ "$before_status" = "200" ] || {
+            printf 'Exact public digest was not anonymously readable: HTTP %s.\n' "$before_status" >&2
+            exit 1
+          }
+          tr -d '\r' <"$before_headers" \
+            | grep -Fxi "docker-content-digest: ${EXPECTED_DIGEST}" >/dev/null || {
+              printf 'Anonymous digest response identity mismatch.\n' >&2
+              exit 1
+            }
+          printf 'Exact anonymous digest exposure verified.\n'
 
           delete_status="$(
             curl --silent --show-error \
