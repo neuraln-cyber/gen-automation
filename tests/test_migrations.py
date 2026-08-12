@@ -109,7 +109,7 @@ def test_semantic_feedback_report_uses_jsonb_on_postgresql() -> None:
     assert isinstance(report_type, postgresql.JSONB)
 
 
-def test_animation_video_revision_is_the_migration_head() -> None:
+def test_fresh_i2v_revision_is_the_migration_head() -> None:
     configuration = Config("alembic.ini")
     scripts = ScriptDirectory.from_config(configuration)
     independent_targets_revision = scripts.get_revision("20260808_0024")
@@ -124,7 +124,8 @@ def test_animation_video_revision_is_the_migration_head() -> None:
     lora_catalog_revision = scripts.get_revision("20260809_0033")
     animation_revision = scripts.get_revision("20260810_0034")
     hq_revision = scripts.get_revision("20260811_0035")
-    revision = scripts.get_revision("20260811_0036")
+    retired_video_revision = scripts.get_revision("20260811_0036")
+    revision = scripts.get_revision("20260812_0037")
 
     assert independent_targets_revision is not None
     assert independent_targets_revision.down_revision == "20260808_0023"
@@ -150,9 +151,11 @@ def test_animation_video_revision_is_the_migration_head() -> None:
     assert animation_revision.down_revision == "20260809_0033"
     assert hq_revision is not None
     assert hq_revision.down_revision == "20260810_0034"
+    assert retired_video_revision is not None
+    assert retired_video_revision.down_revision == "20260811_0035"
     assert revision is not None
-    assert revision.down_revision == "20260811_0035"
-    assert scripts.get_current_head() == "20260811_0036"
+    assert revision.down_revision == "20260811_0036"
+    assert scripts.get_current_head() == "20260812_0037"
 
 
 def test_hq_video_profile_migration_replaces_dimension_constraint(monkeypatch) -> None:
@@ -566,6 +569,12 @@ def test_foundation_migration_round_trip(
         "generation_attempts",
         "generation_jobs",
         "idempotency_records",
+        "i2v_attempts",
+        "i2v_inputs",
+        "i2v_jobs",
+        "i2v_outputs",
+        "i2v_presets",
+        "i2v_worker_deployments",
         "login_throttles",
         "lora_import_jobs",
         "managed_lora_artifacts",

@@ -1,0 +1,191 @@
+{% extends "dashboard/base.html" %}
+
+{% block page_styles %}
+  <link rel="stylesheet" href="/static/i2v.css">
+{% endblock %}
+
+{% block content %}
+  <section
+    class="i2v-studio"
+    data-i2v-studio
+    data-api-base="/api/v1/i2v"
+    data-csrf-token="{{ csrf_token }}"
+    data-can-manage="{{ 'true' if can_manage else 'false' }}"
+    data-max-image-bytes="{{ max_image_bytes }}"
+  >
+    <header class="i2v-hero">
+      <div class="i2v-hero-copy">
+        <p class="page-kicker">DaSiWa Wan 2.2 · queued generation</p>
+        <h1>Image to video</h1>
+        <p class="lede">
+          Pick a generation or upload an image, describe the motion, and keep the
+          RTX 5090 fed with an ordered queue. Presets preserve every advanced setting.
+        </p>
+      </div>
+      <aside class="i2v-worker" data-worker-card aria-live="polite">
+        <div class="i2v-worker-heading">
+          <span class="i2v-worker-dot unknown" data-worker-dot aria-hidden="true"></span>
+          <div>
+            <small>RTX 5090 worker</small>
+            <strong data-worker-state>Checking provider state…</strong>
+          </div>
+        </div>
+        <p data-worker-message>Worker state has not been loaded yet.</p>
+        <dl class="i2v-worker-facts" data-worker-facts hidden>
+          <div><dt>Machine</dt><dd data-worker-machine>—</dd></div>
+          <div><dt>Heartbeat</dt><dd data-worker-heartbeat>—</dd></div>
+          <div><dt>Current job</dt><dd data-worker-job>—</dd></div>
+        </dl>
+      </aside>
+    </header>
+
+    <output class="i2v-banner" data-global-status aria-live="polite" hidden></output>
+
+    <div class="i2v-workspace">
+      <section class="panel i2v-source-panel" aria-labelledby="i2v-source-heading">
+        <div class="i2v-panel-heading">
+          <div>
+            <p class="i2v-step">1 · Source</p>
+            <h2 id="i2v-source-heading">Choose the first frame</h2>
+          </div>
+          <button class="i2v-icon-button" type="button" data-refresh-library title="Refresh library" aria-label="Refresh generated image library">↻</button>
+        </div>
+
+        <div class="i2v-tabs" role="tablist" aria-label="Image source">
+          <button class="i2v-tab active" type="button" role="tab" aria-selected="true" aria-controls="i2v-library" data-source-tab="library">Library</button>
+          <button class="i2v-tab" type="button" role="tab" aria-selected="false" aria-controls="i2v-upload" data-source-tab="upload">Upload</button>
+        </div>
+
+        <div id="i2v-library" class="i2v-source-view" role="tabpanel" data-source-view="library">
+          <div class="i2v-library" data-source-library aria-live="polite">
+            <p class="muted">Loading recent generations…</p>
+          </div>
+          <button class="secondary-button i2v-wide-button" type="button" data-load-more-sources>Show more</button>
+        </div>
+
+        <div id="i2v-upload" class="i2v-source-view" role="tabpanel" data-source-view="upload" hidden>
+          <label class="i2v-dropzone" data-upload-dropzone for="i2v-file">
+            <span class="i2v-dropzone-icon" aria-hidden="true">↑</span>
+            <strong>Drop an image here</strong>
+            <span>or browse for JPEG, PNG, or WebP</span>
+            <input id="i2v-file" type="file" accept="image/jpeg,image/png,image/webp" data-upload-file>
+          </label>
+          <div class="i2v-upload-progress" data-upload-progress hidden>
+            <div><span data-upload-status>Preparing upload…</span><strong data-upload-percent>0%</strong></div>
+            <progress max="100" value="0" data-upload-meter></progress>
+          </div>
+        </div>
+
+        <article class="i2v-selected-source" data-selected-source hidden>
+          <img alt="Selected source image" data-selected-image>
+          <div><small>Selected source</small><strong data-selected-name></strong><span data-selected-size></span></div>
+          <button class="i2v-icon-button" type="button" data-clear-source aria-label="Clear selected source">×</button>
+        </article>
+      </section>
+
+      <form class="panel i2v-compose" data-generation-form>
+        <div class="i2v-panel-heading">
+          <div>
+            <p class="i2v-step">2 · Direction</p>
+            <h2>Describe the motion</h2>
+          </div>
+          <span class="i2v-draft-state" data-draft-state>Draft saved locally</span>
+        </div>
+
+        <div class="i2v-preset-bar">
+          <label for="i2v-preset">Preset
+            <select id="i2v-preset" data-preset-select>
+              <option value="">Custom settings</option>
+            </select>
+          </label>
+          <button class="secondary-button" type="button" data-preset-save>Save as…</button>
+          <button class="i2v-icon-button" type="button" data-preset-update title="Update selected preset" aria-label="Update selected preset" disabled>✓</button>
+          <button class="i2v-icon-button danger" type="button" data-preset-delete title="Delete selected preset" aria-label="Delete selected preset" disabled>×</button>
+        </div>
+
+        <label class="i2v-prompt" for="i2v-positive">
+          <span>Positive prompt <small>What moves, how it moves, and what stays stable</small></span>
+          <textarea id="i2v-positive" name="positive_prompt" rows="7" maxlength="100000" required data-positive-prompt placeholder="The subject makes one smooth hip sway… Camera remains locked, face and background remain stable."></textarea>
+        </label>
+        <label class="i2v-prompt" for="i2v-negative">
+          <span>Negative prompt <small>Artifacts and motion to avoid</small></span>
+          <textarea id="i2v-negative" name="negative_prompt" rows="4" maxlength="100000" data-negative-prompt placeholder="camera shake, background drift, identity change, anatomy deformation, flicker, frozen hold"></textarea>
+        </label>
+
+        <details class="i2v-advanced" data-advanced-settings>
+          <summary><span><strong>Advanced settings</strong><small>DaSiWa WAN 2.2 baseline · all values are saved with the job</small></span><span aria-hidden="true">⌄</span></summary>
+          <div class="i2v-settings-grid">
+            <label>Frames <input type="number" name="frame_count" value="81" min="9" step="8" required></label>
+            <label>Frame rate <span><input type="number" name="fps" value="16" min="1" step="1" required> fps</span></label>
+            <label>Duration <output data-duration>5.06 seconds</output></label>
+            <label>Width <input type="number" name="width" value="576" min="32" step="32" required></label>
+            <label>Height <input type="number" name="height" value="1024" min="32" step="32" required></label>
+            <label>Seed <input type="number" name="seed" value="-1" step="1" aria-describedby="seed-help"><small id="seed-help">−1 chooses a fresh seed</small></label>
+            <label>Total steps <input type="number" name="steps" value="4" min="1" step="1" required></label>
+            <label>High-stage end step <input type="number" name="high_end_step" value="2" min="1" step="1" required></label>
+            <label>CFG <input type="number" name="cfg" value="1" min="0.01" step="0.05" required></label>
+            <label>High shift <input type="number" name="high_shift" value="5" step="0.1" required></label>
+            <label>Low shift <input type="number" name="low_shift" value="5" step="0.1" required></label>
+            <label>Sampler
+              <select name="sampler"><option value="euler" selected>Euler</option></select>
+            </label>
+            <label>Scheduler
+              <select name="scheduler"><option value="linear_quadratic" selected>Linear quadratic</option></select>
+            </label>
+            <label>Interpolation <select name="interpolation" disabled><option value="none" selected>Off for baseline</option></select></label>
+            <label>Upscale <select name="upscale" disabled><option value="none" selected>Off for baseline</option></select></label>
+          </div>
+          <div class="i2v-toggle-row">
+            <label><input type="checkbox" name="loop" disabled> Close the loop (later profile)</label>
+            <label><input type="checkbox" name="color_transfer" disabled> Match source colors (later profile)</label>
+            <label><input type="checkbox" name="tiled_vae" disabled> Tiled VAE (not used by baseline)</label>
+          </div>
+
+          <section class="i2v-loras" aria-labelledby="i2v-lora-heading">
+            <div class="i2v-subheading"><div><h3 id="i2v-lora-heading">Paired motion LoRAs</h3><p>The verified pair is mirrored privately, but remains off until its graph passes the baseline canary.</p></div><button class="secondary-button" type="button" data-add-lora disabled>Add pair after baseline</button></div>
+            <div class="i2v-lora-list" data-lora-list></div>
+          </section>
+        </details>
+
+        <footer class="i2v-submit-bar">
+          <label>Copies <input type="number" name="batch_count" value="1" min="1" step="1" required></label>
+          <div><span data-submit-summary>Select a source to continue</span><button class="primary-button" type="submit" data-enqueue disabled>Queue generation</button></div>
+        </footer>
+      </form>
+
+      <aside class="panel i2v-queue-panel" aria-labelledby="i2v-queue-heading">
+        <div class="i2v-panel-heading">
+          <div><p class="i2v-step">3 · Queue</p><h2 id="i2v-queue-heading">Worker queue</h2></div>
+          <button class="i2v-icon-button" type="button" data-refresh-queue aria-label="Refresh queue">↻</button>
+        </div>
+        <p class="muted i2v-queue-help">Use the arrows to change the order. Running work is never represented as queued.</p>
+        <ol class="i2v-queue" data-job-queue>
+          <li class="i2v-empty">Loading queue…</li>
+        </ol>
+      </aside>
+    </div>
+
+    <section class="i2v-recent" aria-labelledby="i2v-recent-heading">
+      <div class="section-heading">
+        <div><p class="page-kicker">Outputs</p><h2 id="i2v-recent-heading">Recent videos</h2><p class="muted">Finished outputs remain easy to preview, download, or reuse.</p></div>
+        <button class="secondary-button" type="button" data-refresh-outputs>Refresh</button>
+      </div>
+      <div class="i2v-video-grid" data-video-grid>
+        <p class="muted">Loading recent videos…</p>
+      </div>
+    </section>
+
+    <dialog class="i2v-dialog" data-preset-dialog>
+      <form method="dialog" data-preset-dialog-form>
+        <div><p class="page-kicker">Save reusable setup</p><h2>Name this preset</h2></div>
+        <label>Preset name <input name="name" maxlength="200" required autocomplete="off"></label>
+        <label>Description <textarea name="description" maxlength="2000" rows="3"></textarea></label>
+        <footer><button class="secondary-button" value="cancel">Cancel</button><button class="primary-button" value="save" data-preset-dialog-submit>Save preset</button></footer>
+      </form>
+    </dialog>
+  </section>
+{% endblock %}
+
+{% block page_scripts %}
+  <script src="/static/i2v.js" defer></script>
+{% endblock %}

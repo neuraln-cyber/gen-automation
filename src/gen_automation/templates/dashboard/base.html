@@ -1308,6 +1308,7 @@
       }
     </style>
     <link rel="stylesheet" href="/static/dashboard_ux.css">
+    {% block page_styles %}{% endblock %}
   </head>
   <body data-automation-storage-scope="{{ principal.user_id }}">
     <a class="skip-link" href="#main-content">Skip to main content</a>
@@ -1336,6 +1337,11 @@
             href="/dashboard/experiments/new"
             {% if request.url.path.startswith("/dashboard/experiments") %}aria-current="page"{% endif %}
           >Experiment Lab</a>
+          <a
+            class="nav-link"
+            href="/dashboard/animations"
+            {% if request.url.path.startswith("/dashboard/animations") %}aria-current="page"{% endif %}
+          >Animate</a>
           {% if principal.role.value in ["owner", "admin"] %}
             <a
               class="nav-link"

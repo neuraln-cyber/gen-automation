@@ -1,3 +1,5 @@
+import hashlib
+import json
 import re
 from decimal import Decimal
 from enum import StrEnum
@@ -525,6 +527,37 @@ class Settings(BaseSettings):
         gt=0,
         decimal_places=2,
     )
+    # Fresh image-to-video runtime. These settings are intentionally separate from
+    # the retired VIDEO lane so the new DaSiWa worker can be deployed and reasoned
+    # about as one self-contained system.
+    i2v_enabled: bool = False
+    i2v_salad_queue_name: str = "i2v-jobs-v1"
+    i2v_salad_container_group_name: str = "i2v-worker-v1"
+    i2v_worker_image: str | None = None
+    i2v_salad_gpu_class_id: UUID | None = None
+    i2v_salad_gpu_class_name: str = "NVIDIA GeForce RTX 5090"
+    i2v_salad_prefetch: int = Field(default=3, gt=0)
+    i2v_worker_lease_seconds: int = Field(default=24 * 60 * 60, gt=0)
+    i2v_warm_idle_seconds: int | None = Field(default=5 * 60 * 60, gt=0)
+    i2v_salad_cpu: int = Field(default=8, gt=0)
+    i2v_salad_memory_mb: int = Field(default=32 * 1024, gt=0)
+    i2v_salad_storage_bytes: int = Field(default=250 * 1024 * 1024 * 1024, gt=0)
+    i2v_salad_priority: SaladContainerPriority = SaladContainerPriority.HIGH
+    i2v_salad_max_replicas: int = Field(default=1, gt=0)
+    i2v_model_manifest_json: SecretStr | None = None
+    i2v_model_manifest_sha256: SecretStr | None = None
+    # Seven days is the maximum duration supported by SigV4 S3 presigned URLs.
+    # It is a transport constraint, not an inference timeout or queue ceiling.
+    i2v_object_grant_ttl_seconds: int = Field(
+        default=7 * 24 * 60 * 60,
+        ge=60 * 60,
+        le=7 * 24 * 60 * 60,
+    )
+    i2v_output_prefix: str = Field(
+        default="i2v/outputs",
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,510}[A-Za-z0-9]$",
+        max_length=512,
+    )
     storage_enabled: bool = False
     storage_endpoint_url: AnyHttpUrl | None = None
     storage_region: str = "us-east-1"
@@ -889,6 +922,51 @@ class Settings(BaseSettings):
                     "staging and production GPU allocation requires a Salad worker "
                     "artifact reader role ARN"
                 )
+        if self.i2v_enabled:
+            if not self.salad_enabled:
+                errors.append("I2V requires the SaladCloud integration")
+            if not self.storage_enabled:
+                errors.append("I2V requires private object storage")
+            if not self.background_runtime_enabled:
+                errors.append("I2V requires the background runtime")
+            if self.i2v_salad_gpu_class_id is None:
+                errors.append("I2V requires the exact Salad RTX 5090 GPU class ID")
+            if self.i2v_salad_gpu_class_name != "NVIDIA GeForce RTX 5090":
+                errors.append("I2V GPU class must be NVIDIA GeForce RTX 5090")
+            for label, value in (
+                ("queue name", self.i2v_salad_queue_name),
+                ("container group name", self.i2v_salad_container_group_name),
+            ):
+                if SALAD_NAME_PATTERN.fullmatch(value) is None:
+                    errors.append(f"invalid I2V SaladCloud {label}")
+            if self.i2v_worker_image is None:
+                errors.append("I2V requires an immutable worker image")
+            elif SALAD_WORKER_IMAGE_PATTERN.fullmatch(self.i2v_worker_image) is None:
+                errors.append("I2V worker image must be pinned by digest")
+
+            manifest_json = _secret_value(self.i2v_model_manifest_json)
+            manifest_sha256 = _secret_value(self.i2v_model_manifest_sha256)
+            if manifest_json is None or manifest_sha256 is None:
+                errors.append("I2V requires the exact private model manifest and digest")
+            else:
+                try:
+                    decoded_manifest = json.loads(manifest_json)
+                except (TypeError, ValueError):
+                    errors.append("I2V private model manifest is invalid JSON")
+                else:
+                    if not isinstance(decoded_manifest, dict):
+                        errors.append("I2V private model manifest must be a JSON object")
+                if SHA256_PATTERN.fullmatch(manifest_sha256) is None:
+                    errors.append("I2V private model manifest digest is invalid")
+                elif hashlib.sha256(manifest_json.encode("utf-8")).hexdigest() != manifest_sha256:
+                    errors.append("I2V private model manifest digest does not match")
+
+            artifact_bucket = _secret_value(self.salad_worker_artifact_bucket)
+            artifact_region = _secret_value(self.salad_worker_artifact_region)
+            if not artifact_bucket or not artifact_region:
+                errors.append("I2V requires the private worker model store")
+            if protected_environment and self.salad_worker_artifact_role_arn is None:
+                errors.append("protected I2V requires the worker model reader role ARN")
         self._validate_worker_runtime_values(errors)
         if self.salad_enabled:
             if protected_environment and not self.background_runtime_enabled:

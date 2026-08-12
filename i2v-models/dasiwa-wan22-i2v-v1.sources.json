@@ -1,0 +1,59 @@
+{
+  "schema": "gen-automation/i2v-model-sources/v1",
+  "sources": [
+    {
+      "expected_bytes": 14528782272,
+      "name": "snatchkiss-high-v11",
+      "optional": false,
+      "role": "diffusion_model_high",
+      "sha256": "fa4202ea621725c57b0cbb84543bd6a5548de1d85c0c5a9f18db0bcf91202a54",
+      "target_filename": "DasiwaWAN22I2V14BLightspeed_snatchkissHighV11.safetensors",
+      "url": "https://civitai.com/api/download/models/2953474"
+    },
+    {
+      "expected_bytes": 14528782272,
+      "name": "snatchkiss-low-v11",
+      "optional": false,
+      "role": "diffusion_model_low",
+      "sha256": "6e746571355bb589b966a72ed7a8717a09af0aeaf699391138e9788bace224d1",
+      "target_filename": "DasiwaWAN22I2V14BLightspeed_snatchkissLowV11.safetensors",
+      "url": "https://civitai.com/api/download/models/2953485"
+    },
+    {
+      "expected_bytes": 6735906897,
+      "name": "umt5-xxl-fp8-scaled",
+      "optional": false,
+      "role": "text_encoder",
+      "sha256": "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68",
+      "target_filename": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+    },
+    {
+      "expected_bytes": 253815318,
+      "name": "wan-2.1-vae",
+      "optional": false,
+      "role": "vae",
+      "sha256": "2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b",
+      "target_filename": "wan_2.1_vae.safetensors",
+      "url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors"
+    },
+    {
+      "expected_bytes": 613516752,
+      "name": "wan-general-nsfw-high-v008a",
+      "optional": true,
+      "role": "lora_high",
+      "sha256": "34e2144d3cd65360f97d09ccbe03e1c39a096df6c9234af5fe3899d1b63cda39",
+      "target_filename": "NSFW-22-H-e8.safetensors",
+      "url": "https://civitai.com/api/download/models/2073605"
+    },
+    {
+      "expected_bytes": 613516752,
+      "name": "wan-general-nsfw-low-v008a",
+      "optional": true,
+      "role": "lora_low",
+      "sha256": "d6b783742f4d5fd63a0223ae1d5bf64fc995a6b408480ac2a00528ae0d4146db",
+      "target_filename": "NSFW-22-L-e8.safetensors",
+      "url": "https://civitai.com/api/download/models/2083303"
+    }
+  ]
+}

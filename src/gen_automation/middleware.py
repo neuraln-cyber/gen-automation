@@ -70,6 +70,7 @@ def content_security_policy(
 ) -> str:
     image_sources = "'self' https:"
     connect_sources = ["'self'"]
+    media_sources = ["'self'"]
     if environment in {Environment.LOCAL, Environment.TEST}:
         image_sources = f"{image_sources} http:"
     for label, source in (
@@ -82,12 +83,14 @@ def content_security_policy(
             raise ValueError(f"invalid CSP {label} connection source")
         if source not in connect_sources:
             connect_sources.append(source)
+        if label == "asset" and source not in media_sources:
+            media_sources.append(source)
     script_sources = "'self'" if allow_same_origin_scripts else "'none'"
     return (
         f"default-src 'self'; base-uri 'none'; connect-src {' '.join(connect_sources)}; "
         "font-src 'self'; form-action 'self'; frame-ancestors 'none'; "
         f"img-src {image_sources}; object-src 'none'; "
-        "media-src 'self'; "
+        f"media-src {' '.join(media_sources)}; "
         f"script-src {script_sources}; style-src 'self' 'unsafe-inline'"
     )
 

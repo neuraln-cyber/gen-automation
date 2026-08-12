@@ -4732,6 +4732,322 @@ class WorkflowApproval(UuidPrimaryKeyMixin, TimestampMixin, Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class I2VInput(UuidPrimaryKeyMixin, Base):
+    """One immutable, verified source image for the isolated I2V queue."""
+
+    __tablename__ = "i2v_inputs"
+    __table_args__ = (
+        CheckConstraint("source IN ('upload', 'generation')", name="known_source"),
+        CheckConstraint(
+            "source <> 'generation' OR asset_id IS NOT NULL",
+            name="generation_has_asset",
+        ),
+        CheckConstraint("content_type LIKE 'image/%'", name="image_content"),
+        CheckConstraint(
+            "width > 0 AND height > 0 AND byte_size > 0",
+            name="positive_dimensions_and_size",
+        ),
+        CheckConstraint(_lower_hex_check("sha256"), name="valid_sha256"),
+        UniqueConstraint(
+            "storage_backend",
+            "storage_bucket",
+            "object_key",
+            "object_version_id",
+            name="uq_i2v_inputs_frozen_object",
+        ),
+        Index(
+            "uq_i2v_inputs_unversioned_object",
+            "storage_backend",
+            "storage_bucket",
+            "object_key",
+            unique=True,
+            postgresql_where=text("object_version_id IS NULL"),
+            sqlite_where=text("object_version_id IS NULL"),
+        ),
+        Index("ix_i2v_inputs_recent", "created_at", "id"),
+    )
+
+    created_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    source: Mapped[str] = mapped_column(String(10), nullable=False)
+    asset_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("assets.id", ondelete="RESTRICT"), index=True
+    )
+    display_name: Mapped[str] = mapped_column(String(500), nullable=False)
+    storage_backend: Mapped[str] = mapped_column(String(50), nullable=False)
+    storage_bucket: Mapped[str] = mapped_column(String(255), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    object_version_id: Mapped[str | None] = mapped_column(String(1024))
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    width: Mapped[int] = mapped_column(Integer, nullable=False)
+    height: Mapped[int] = mapped_column(Integer, nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    input_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON_TYPE, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+
+class I2VPreset(UuidPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "i2v_presets"
+    __table_args__ = (
+        CheckConstraint("lock_version > 0", name="positive_lock_version"),
+        UniqueConstraint("created_by_user_id", "name"),
+    )
+
+    created_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(500), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    positive_prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    negative_prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    settings: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, nullable=False, default=dict)
+    lock_version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1)
+
+
+class I2VWorkerDeployment(UuidPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "i2v_worker_deployments"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('stopped', 'provisioning', 'starting', 'ready', "
+            "'busy', 'draining', 'failed')",
+            name="known_state",
+        ),
+        UniqueConstraint("provider", "provider_group_id"),
+        Index("ix_i2v_worker_deployments_state", "state", "updated_at"),
+    )
+
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    provider_group_id: Mapped[str | None] = mapped_column(String(255))
+    provider_instance_id: Mapped[str | None] = mapped_column(String(255))
+    state: Mapped[str] = mapped_column(String(20), nullable=False)
+    gpu_class: Mapped[str] = mapped_column(String(100), nullable=False)
+    worker_image_digest: Mapped[str] = mapped_column(String(255), nullable=False)
+    current_job_id: Mapped[UUID | None] = mapped_column()
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deployment_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON_TYPE, nullable=False, default=dict
+    )
+
+
+class I2VJob(UuidPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "i2v_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('queued', 'claimed', 'running', 'cancel_requested', "
+            "'succeeded', 'failed', 'cancelled')",
+            name="known_state",
+        ),
+        CheckConstraint(
+            "(state = 'queued' AND queue_position IS NOT NULL AND queue_position > 0) "
+            "OR (state <> 'queued' AND queue_position IS NULL)",
+            name="queue_position_matches_state",
+        ),
+        CheckConstraint("attempt_count >= 0", name="nonnegative_attempt_count"),
+        CheckConstraint(
+            "(lease_owner IS NULL AND lease_expires_at IS NULL) OR "
+            "(lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)",
+            name="lease_pair",
+        ),
+        CheckConstraint(
+            "(state IN ('succeeded', 'failed', 'cancelled') AND completed_at IS NOT NULL) "
+            "OR (state NOT IN ('succeeded', 'failed', 'cancelled') AND completed_at IS NULL)",
+            name="terminal_completion",
+        ),
+        CheckConstraint(_lower_hex_check("request_sha256"), name="valid_request_sha256"),
+        Index(
+            "uq_i2v_jobs_queue_position",
+            "queue_position",
+            unique=True,
+            postgresql_where=text("queue_position IS NOT NULL"),
+            sqlite_where=text("queue_position IS NOT NULL"),
+        ),
+        Index("ix_i2v_jobs_queue", "state", "queue_position", "created_at", "id"),
+        Index("ix_i2v_jobs_recent", "created_by_user_id", "created_at", "id"),
+    )
+
+    created_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    input_id: Mapped[UUID] = mapped_column(
+        ForeignKey("i2v_inputs.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    preset_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("i2v_presets.id", ondelete="SET NULL"), index=True
+    )
+    positive_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    negative_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, nullable=False)
+    preset_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, nullable=False)
+    settings_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, nullable=False)
+    request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(20), nullable=False)
+    queue_position: Mapped[int | None] = mapped_column(BigInteger)
+    attempt_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    lease_owner: Mapped[str | None] = mapped_column(String(255))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(String(100))
+    last_error_detail: Mapped[str | None] = mapped_column(Text)
+
+
+class I2VAttempt(UuidPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "i2v_attempts"
+    __table_args__ = (
+        CheckConstraint("attempt_no > 0", name="positive_attempt_no"),
+        CheckConstraint(
+            "state IN ('created', 'running', 'succeeded', 'failed', 'cancelled')",
+            name="known_state",
+        ),
+        CheckConstraint(
+            "state NOT IN ('succeeded', 'failed', 'cancelled') OR completed_at IS NOT NULL",
+            name="terminal_completion",
+        ),
+        UniqueConstraint("job_id", "attempt_no"),
+        UniqueConstraint("id", "job_id", name="uq_i2v_attempts_id_job_id"),
+        UniqueConstraint(
+            "worker_deployment_id", "provider_job_id", name="uq_i2v_attempts_provider_job"
+        ),
+        Index("ix_i2v_attempts_state", "state", "updated_at"),
+    )
+
+    job_id: Mapped[UUID] = mapped_column(
+        ForeignKey("i2v_jobs.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    worker_deployment_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("i2v_worker_deployments.id", ondelete="RESTRICT"), index=True
+    )
+    attempt_no: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    state: Mapped[str] = mapped_column(String(20), nullable=False)
+    worker_id: Mapped[str | None] = mapped_column(String(255))
+    worker_image_digest: Mapped[str | None] = mapped_column(String(255))
+    provider_job_id: Mapped[str | None] = mapped_column(String(255))
+    request_metadata: Mapped[dict[str, Any]] = mapped_column(
+        JSON_TYPE, nullable=False, default=dict
+    )
+    response_metadata: Mapped[dict[str, Any]] = mapped_column(
+        JSON_TYPE, nullable=False, default=dict
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(100))
+    error_detail: Mapped[str | None] = mapped_column(Text)
+
+
+class I2VOutput(UuidPrimaryKeyMixin, Base):
+    __tablename__ = "i2v_outputs"
+    __table_args__ = (
+        CheckConstraint(_lower_hex_check("sha256"), name="valid_sha256"),
+        CheckConstraint("content_type LIKE 'video/%'", name="video_content"),
+        CheckConstraint(
+            "width > 0 AND height > 0 AND frame_count > 0 AND fps > 0 "
+            "AND duration_ms > 0 AND byte_size > 0",
+            name="positive_media_values",
+        ),
+        ForeignKeyConstraint(
+            ["attempt_id", "job_id"],
+            ["i2v_attempts.id", "i2v_attempts.job_id"],
+            name="fk_i2v_outputs_attempt_job",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("attempt_id"),
+        UniqueConstraint(
+            "storage_backend",
+            "storage_bucket",
+            "object_key",
+            "object_version_id",
+            name="uq_i2v_outputs_object",
+        ),
+        Index(
+            "uq_i2v_outputs_unversioned_object",
+            "storage_backend",
+            "storage_bucket",
+            "object_key",
+            unique=True,
+            postgresql_where=text("object_version_id IS NULL"),
+            sqlite_where=text("object_version_id IS NULL"),
+        ),
+        Index("ix_i2v_outputs_recent", "created_at", "id"),
+    )
+
+    job_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    storage_backend: Mapped[str] = mapped_column(String(50), nullable=False)
+    storage_bucket: Mapped[str] = mapped_column(String(255), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    object_version_id: Mapped[str | None] = mapped_column(String(1024))
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    width: Mapped[int] = mapped_column(Integer, nullable=False)
+    height: Mapped[int] = mapped_column(Integer, nullable=False)
+    frame_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    fps: Mapped[float] = mapped_column(nullable=False)
+    duration_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    output_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON_TYPE, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+
+event.listen(
+    I2VJob.__table__,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE TRIGGER i2v_jobs_immutable_request BEFORE UPDATE ON i2v_jobs "
+        "BEGIN SELECT CASE WHEN OLD.id IS NOT NEW.id "
+        "OR OLD.created_by_user_id IS NOT NEW.created_by_user_id "
+        "OR OLD.input_id IS NOT NEW.input_id "
+        "OR OLD.positive_prompt IS NOT NEW.positive_prompt "
+        "OR OLD.negative_prompt IS NOT NEW.negative_prompt "
+        "OR OLD.input_snapshot IS NOT NEW.input_snapshot "
+        "OR OLD.preset_snapshot IS NOT NEW.preset_snapshot "
+        "OR OLD.settings_snapshot IS NOT NEW.settings_snapshot "
+        "OR OLD.request_sha256 IS NOT NEW.request_sha256 "
+        "OR OLD.created_at IS NOT NEW.created_at "
+        "THEN RAISE(ABORT, 'i2v job request snapshots are immutable') END; END"
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    I2VJob.__table__,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE FUNCTION guard_i2v_job_request() RETURNS trigger AS $$ BEGIN "
+        "IF OLD.id IS DISTINCT FROM NEW.id "
+        "OR OLD.created_by_user_id IS DISTINCT FROM NEW.created_by_user_id "
+        "OR OLD.input_id IS DISTINCT FROM NEW.input_id "
+        "OR OLD.positive_prompt IS DISTINCT FROM NEW.positive_prompt "
+        "OR OLD.negative_prompt IS DISTINCT FROM NEW.negative_prompt "
+        "OR OLD.input_snapshot IS DISTINCT FROM NEW.input_snapshot "
+        "OR OLD.preset_snapshot IS DISTINCT FROM NEW.preset_snapshot "
+        "OR OLD.settings_snapshot IS DISTINCT FROM NEW.settings_snapshot "
+        "OR OLD.request_sha256 IS DISTINCT FROM NEW.request_sha256 "
+        "OR OLD.created_at IS DISTINCT FROM NEW.created_at THEN "
+        "RAISE EXCEPTION 'i2v job request snapshots are immutable'; END IF; "
+        "RETURN NEW; END; $$ LANGUAGE plpgsql"
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    I2VJob.__table__,
+    "after_create",
+    DDL(  # type: ignore[no-untyped-call]
+        "CREATE TRIGGER i2v_jobs_immutable_request BEFORE UPDATE ON i2v_jobs "
+        "FOR EACH ROW EXECUTE FUNCTION guard_i2v_job_request()"
+    ).execute_if(dialect="postgresql"),
+)
+
+
 def _ddl(statement: str) -> Any:
     return DDL(statement)  # type: ignore[no-untyped-call]
 

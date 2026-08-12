@@ -29,7 +29,7 @@ output "model_bucket_name" {
 }
 
 output "salad_worker_artifact_role_arn" {
-  description = "Optional three-hour STS reader role for exact model-artifact versions."
+  description = "Optional twelve-hour STS reader role for exact model-artifact versions."
   value       = try(aws_iam_role.salad_worker_artifact_reader[0].arn, null)
 }
 

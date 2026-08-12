@@ -233,7 +233,7 @@ def test_salad_artifact_reader_is_disabled_and_exact_version_only() -> None:
     )
     assert "salad_worker_artifact_object_versions = {" in tfvars
     assert "length(var.salad_worker_artifact_object_versions) > 0" in source
-    assert "max_session_duration = 10800" in source
+    assert "max_session_duration = 43200" in source
     assert "identifiers = [aws_iam_role.control_plane.arn]" in source
     assert 'actions   = ["s3:GetObjectVersion"]' in reader_policy
     assert 'variable = "s3:VersionId"' in reader_policy
@@ -271,5 +271,6 @@ def test_runtime_can_list_only_managed_lora_model_prefixes() -> None:
     assert re.findall(r'"([^"]+)"', prefix_values.group(1)) == [
         "onboarding/loras/*",
         "worker/managed-loras/sha256/*",
+        "worker/i2v/sha256/*",
     ]
     assert runtime_policy.count('"s3:ListBucket"') == 2

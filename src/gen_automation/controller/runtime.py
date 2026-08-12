@@ -72,6 +72,12 @@ from gen_automation.services.generation_control import (
     GENERATION_STOPPED_ACTION,
     settle_stopped_generation_once,
 )
+from gen_automation.services.i2v_environment import (
+    I2VRuntimeEnvironment,
+    i2v_runtime_config_from_settings,
+)
+from gen_automation.services.i2v_media import I2VSignedGrantBuilder
+from gen_automation.services.i2v_runtime import I2VRuntime
 from gen_automation.services.lora_runtime import LoraRuntime
 from gen_automation.services.managed_artifact_manifest import (
     EffectiveArtifactManifest,
@@ -702,6 +708,30 @@ class ControllerWorkloads:
         self.mega_client = mega_client
         self.semantic_vlm_client = semantic_vlm_client
         self.patreon_driver = patreon_driver
+        self.i2v_runtime = (
+            I2VRuntime(
+                config=i2v_runtime_config_from_settings(settings),
+                sessions=sessions,
+                salad_client=salad_client,
+                worker_id=f"{instance_id}:i2v",
+                input_builder=I2VSignedGrantBuilder(
+                    store=object_store,
+                    expires_in=settings.i2v_object_grant_ttl_seconds,
+                    output_prefix=settings.i2v_output_prefix,
+                ),
+                environment_provider=I2VRuntimeEnvironment(
+                    settings=settings,
+                    resolver=secret_resolver,
+                ),
+            )
+            if settings.i2v_enabled
+            and salad_client is not None
+            and object_store is not None
+            and secret_resolver is not None
+            else None
+        )
+        if settings.i2v_enabled and self.i2v_runtime is None:
+            raise RuntimeError("validated I2V runtime dependencies are unavailable")
         self.lora_runtime = (
             LoraRuntime(
                 settings=settings,
@@ -781,6 +811,11 @@ class ControllerWorkloads:
             )
             await session.commit()
         return False
+
+    async def i2v_once(self) -> bool:
+        if self.i2v_runtime is None:
+            return False
+        return await self.i2v_runtime.cycle_once()
 
     async def lora_import_once(self) -> bool:
         if self.lora_runtime is None:
@@ -2091,6 +2126,18 @@ def build_controller_runtime(
                 ),
             )
         )
+        if settings.i2v_enabled:
+            loops.append(
+                LoopSpec(
+                    name="image-to-video",
+                    cycle=workloads.i2v_once,
+                    idle_interval_seconds=poll,
+                    # This bounds one reconciliation/API cycle only. Pending model
+                    # download and inference remain provider-backed with no watchdog.
+                    timeout_seconds=120,
+                    requires_initial_success_for_readiness=False,
+                )
+            )
         if settings.gpu_allocation_enabled:
             loops.extend(
                 (

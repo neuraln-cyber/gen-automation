@@ -1,0 +1,49 @@
+# DaSiWa WAN 2.2 I2V worker runtime.
+#
+# ComfyUI dependencies below mirror the upstream requirements file at commit
+# c2bcbecd82ec5ae66594340b395c24ef0217b238. Torch, torchvision, and torchaudio
+# are supplied by the immutable CUDA base image. They remain exact requirements
+# so pip can prove the base is compatible; the system-site venv, no-deps install,
+# and Docker build assertions reject any replacement inside the worker venv.
+torch==2.9.1
+torchvision==0.24.1
+torchaudio==2.9.1
+comfyui-frontend-package==1.48.7
+comfyui-workflow-templates==0.11.39
+comfyui-embedded-docs==0.5.9
+torchsde
+numpy>=1.25.0
+einops
+transformers>=4.50.3
+tokenizers>=0.13.3
+sentencepiece
+safetensors>=0.4.2
+aiohttp>=3.11.8
+yarl>=1.18.0
+pyyaml
+pillow
+scipy
+tqdm
+psutil
+alembic
+sqlalchemy>=2.0.0
+filelock
+av>=16.0.0
+comfy-kitchen==0.2.30
+comfy-aimdo==0.4.13
+requests
+simpleeval>=1.0.0
+blake3
+kornia>=0.7.1
+spandrel
+pydantic~=2.0
+pydantic-settings~=2.0
+pyopengl>=3.1.8
+comfy-angle
+
+# HTTP worker, queue integration, and artifact bootstrap dependencies.
+boto3>=1.39,<2
+fastapi>=0.140,<1
+httpx2>=2.7,<3
+structlog>=25.4,<26
+uvicorn[standard]>=0.40,<1

@@ -85,6 +85,27 @@ class MemoryObjectStore:
         version = f"&version={quote(version_id)}" if version_id else ""
         return f"memory://{self.bucket}/{quote(key)}?expires={expires_in}{name}{version}"
 
+    async def presign_put(
+        self,
+        *,
+        key: str,
+        content_type: str,
+        metadata: dict[str, str],
+        expires_in: int,
+    ) -> PresignedUpload:
+        headers = {
+            "Content-Type": content_type,
+            "Cache-Control": "private, no-store, max-age=0",
+            "x-amz-server-side-encryption": "AES256",
+        }
+        headers.update({f"x-amz-meta-{name}": value for name, value in metadata.items()})
+        return PresignedUpload(
+            url=f"memory://{self.bucket}/{quote(key)}?expires={expires_in}",
+            method="PUT",
+            fields={},
+            headers=headers,
+        )
+
     async def head(
         self,
         key: str,

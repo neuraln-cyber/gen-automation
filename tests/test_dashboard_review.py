@@ -426,6 +426,22 @@ def test_csp_allows_dashboard_to_fetch_clean_asset_copies() -> None:
     ]
 
 
+def test_csp_allows_signed_asset_origin_for_recent_video_playback() -> None:
+    media_sources = (
+        content_security_policy(
+            Environment.PRODUCTION,
+            asset_connect_source="https://private-assets.s3.eu-central-1.amazonaws.com",
+        )
+        .split("media-src ", maxsplit=1)[1]
+        .split(";", maxsplit=1)[0]
+        .split()
+    )
+    assert media_sources == [
+        "'self'",
+        "https://private-assets.s3.eu-central-1.amazonaws.com",
+    ]
+
+
 def test_csp_allows_dashboard_to_post_to_exact_model_artifact_origin() -> None:
     connect_sources = (
         content_security_policy(

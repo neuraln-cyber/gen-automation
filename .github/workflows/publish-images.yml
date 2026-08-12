@@ -23,7 +23,7 @@ jobs:
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -40,6 +40,9 @@ jobs:
           - component: patreon-browser
             image_suffix: patreon-browser
             dockerfile: Dockerfile.patreon-browser
+          - component: i2v-worker
+            image_suffix: i2v-worker
+            dockerfile: Dockerfile.i2v-worker
     env:
       IMAGE_NAME: ghcr.io/${{ github.repository }}/${{ matrix.image_suffix }}
       SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -269,22 +272,65 @@ jobs:
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     env:
       SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
       WORKER_SOURCE_REVISION: ${{ needs.publish-worker.outputs.source_revision }}
       WORKER_IMAGE_DIGEST: ${{ needs.publish-worker.outputs.image_digest }}
+      I2V_IMAGE_NAME: ghcr.io/${{ github.repository }}/i2v-worker
     steps:
+      - name: Set up Docker Buildx for immutable metadata verification
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify the exact immutable I2V worker image
+        id: verify_i2v
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_tag="${I2V_IMAGE_NAME}:sha-${SOURCE_SHA}"
+          manifest_json="$(
+            docker buildx imagetools inspect \
+              "$image_tag" \
+              --format '{{json .Manifest}}'
+          )"
+          image_json="$(
+            docker buildx imagetools inspect \
+              "$image_tag" \
+              --format '{{json .Image}}'
+          )"
+          digest="$(
+            MANIFEST_JSON="$manifest_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["MANIFEST_JSON"])["digest"])'
+          )"
+          revision="$(
+            IMAGE_JSON="$image_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.revision"])'
+          )"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [ "$revision" = "$SOURCE_SHA" ] || {
+            printf '%s\n' "Published I2V worker source label does not match the CI-tested revision." >&2
+            exit 1
+          }
+          printf 'digest=%s\n' "$digest" >>"$GITHUB_OUTPUT"
       - name: Write non-secret deployment metadata
         shell: bash
+        env:
+          I2V_IMAGE_DIGEST: ${{ steps.verify_i2v.outputs.digest }}
         run: |
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$WORKER_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
           [[ "$WORKER_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$I2V_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           printf '%s\n' "$SOURCE_SHA" >"$RUNNER_TEMP/staging-source-revision"
           printf '%s\n' "$WORKER_SOURCE_REVISION" >"$RUNNER_TEMP/staging-worker-source-revision"
           printf '%s\n' "$WORKER_IMAGE_DIGEST" >"$RUNNER_TEMP/staging-worker-image-digest"
+          printf '%s\n' "$I2V_IMAGE_DIGEST" >"$RUNNER_TEMP/staging-i2v-worker-image-digest"
       - name: Upload deployment metadata for the follow-on workflow
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -293,5 +339,6 @@ jobs:
             ${{ runner.temp }}/staging-source-revision
             ${{ runner.temp }}/staging-worker-source-revision
             ${{ runner.temp }}/staging-worker-image-digest
+            ${{ runner.temp }}/staging-i2v-worker-image-digest
           if-no-files-found: error
           retention-days: 1

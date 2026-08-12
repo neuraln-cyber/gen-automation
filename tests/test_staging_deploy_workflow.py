@@ -96,15 +96,18 @@ def test_staging_rollout_follows_only_successful_immutable_publication() -> None
     assert workflow.count("if: steps.main_gate.outputs.deploy == 'true'") == 4
     assert "control-plane-mega@sha256:[0-9a-f]{64}" in workflow
     assert "gpu-worker@sha256:[0-9a-f]{64}" in workflow
+    assert "i2v-worker@sha256:[0-9a-f]{64}" in workflow
     assert "WORKER_IMAGE_REPOSITORY: ghcr.io/neuraln-cyber/gen-automation/gpu-worker" in workflow
     assert "staging-worker-source-revision" in workflow
     assert "staging-worker-image-digest" in workflow
+    assert "staging-i2v-worker-image-digest" in workflow
     assert 'worker_image_ref="${WORKER_IMAGE_REPOSITORY}@${PUBLISHED_WORKER_IMAGE_DIGEST}"' in (
         workflow
     )
     assert '[ "$worker_image_digest" = "$PUBLISHED_WORKER_IMAGE_DIGEST" ]' in workflow
     assert '[ "$worker_image_revision" = "$WORKER_SOURCE_REVISION" ]' in workflow
     assert "WORKER_IMAGE_REF=%s@%s" in workflow
+    assert "I2V_WORKER_IMAGE_REF=%s@%s" in workflow
     assert "org.opencontainers.image.revision" in workflow
 
 
@@ -591,6 +594,9 @@ def test_routine_rollout_refreshes_the_host_deployment_bundle_safely() -> None:
         ),
         "SSM_WORKER_IMAGE_REF": (
             "ghcr.io/neuraln-cyber/gen-automation/gpu-worker@sha256:" + "b" * 64
+        ),
+        "SSM_I2V_WORKER_IMAGE_REF": (
+            "ghcr.io/neuraln-cyber/gen-automation/i2v-worker@sha256:" + "d" * 64
         ),
         "SSM_SOURCE_REVISION": "c" * 40,
         "SSM_BOOTSTRAP_HELPER_SHA256": helper_sha256,

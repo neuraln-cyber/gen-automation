@@ -32,6 +32,7 @@ civitai_api_secret_arn = null
 # immutable S3 object versions present in the signed worker manifest.
 salad_worker_artifact_object_versions = {
   # "worker/checkpoints/example-sha256.safetensors" = "opaque-s3-version-id"
+  # "worker/i2v/sha256/<exact-64-hex-sha256>" = "opaque-s3-version-id"
 }
 
 # Exchange GitHub's main-branch OIDC token for a short-lived, exact-instance

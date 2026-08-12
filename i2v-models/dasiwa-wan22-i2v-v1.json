@@ -1,0 +1,228 @@
+{
+  "schema_version": 1,
+  "id": "dasiwa-wan22-i2v-v1",
+  "display_name": "DaSiWa WAN 2.2 I2V 14B SnatchKiss v11 FP8",
+  "base_model": "Wan Video 2.2 I2V-A14B",
+  "recorded_at": "2026-08-12",
+  "workflow": {
+    "api_template": "workflows/dasiwa-wan22-i2v-v1.api.json",
+    "workflow_template_sha256": "3be64bc05bddf152961940d0433dc135e66c05e03c55166dc31040ff39af6d23",
+    "bindings": "workflows/dasiwa-wan22-i2v-v1.bindings.json",
+    "bindings_sha256": "83b893929bc89eff3f2de7bbb7aed3892fee42f91d3d18a52d7b5c95b0c630cd",
+    "output_stage": "external_ffmpeg",
+    "required_custom_nodes": []
+  },
+  "baseline": {
+    "cfg": 1.0,
+    "default_height": 1024,
+    "default_width": 576,
+    "fps": 16,
+    "frame_count": 81,
+    "high_end_step": 2,
+    "high_shift": 5.0,
+    "low_shift": 5.0,
+    "sampler": "euler",
+    "scheduler": "linear_quadratic",
+    "steps": 4
+  },
+  "required_artifact_bytes": 36047286759,
+  "required_artifacts": [
+    {
+      "bytes": 14528782272,
+      "civitai": {
+        "file_id": 2837908,
+        "model_id": 1981116,
+        "version_id": 2953474
+      },
+      "download_url": "https://civitai.com/api/download/models/2953474",
+      "filename": "DasiwaWAN22I2V14BLightspeed_snatchkissHighV11.safetensors",
+      "format": "safetensors",
+      "install_path": "models/diffusion_models/DasiwaWAN22I2V14BLightspeed_snatchkissHighV11.safetensors",
+      "precision": "fp8",
+      "role": "diffusion_model_high",
+      "sha256": "fa4202ea621725c57b0cbb84543bd6a5548de1d85c0c5a9f18db0bcf91202a54",
+      "variant": "SnatchKiss High v11 primary pruned FP8"
+    },
+    {
+      "bytes": 14528782272,
+      "civitai": {
+        "file_id": 2837910,
+        "model_id": 1981116,
+        "version_id": 2953485
+      },
+      "download_url": "https://civitai.com/api/download/models/2953485",
+      "filename": "DasiwaWAN22I2V14BLightspeed_snatchkissLowV11.safetensors",
+      "format": "safetensors",
+      "install_path": "models/diffusion_models/DasiwaWAN22I2V14BLightspeed_snatchkissLowV11.safetensors",
+      "precision": "fp8",
+      "role": "diffusion_model_low",
+      "sha256": "6e746571355bb589b966a72ed7a8717a09af0aeaf699391138e9788bace224d1",
+      "variant": "SnatchKiss Low v11 primary pruned FP8"
+    },
+    {
+      "bytes": 6735906897,
+      "download_url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "filename": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "format": "safetensors",
+      "hugging_face": {
+        "repository": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+        "repository_path": "split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+      },
+      "install_path": "models/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "precision": "fp8_e4m3fn_scaled",
+      "role": "text_encoder",
+      "sha256": "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68"
+    },
+    {
+      "bytes": 253815318,
+      "download_url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors",
+      "filename": "wan_2.1_vae.safetensors",
+      "format": "safetensors",
+      "hugging_face": {
+        "repository": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+        "repository_path": "split_files/vae/wan_2.1_vae.safetensors"
+      },
+      "install_path": "models/vae/Wan/wan_2.1_vae.safetensors",
+      "role": "vae",
+      "sha256": "2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b"
+    }
+  ],
+  "optional_paired_loras": [
+    {
+      "enabled_by_default": false,
+      "graph_injection": "deferred",
+      "id": "wan-general-nsfw-v0.08a",
+      "notes": "The author labels this pair experimental, unfinished, underbaked, and seed-sensitive. The base canary must pass before a separately reviewed graph injects it.",
+      "recommended_initial_strength": 0.3,
+      "trigger_words": [
+        "nsfwsks"
+      ],
+      "high": {
+        "bytes": 613516752,
+        "civitai": {
+          "file_id": 1969798,
+          "model_id": 1307155,
+          "version_id": 2073605
+        },
+        "download_url": "https://civitai.com/api/download/models/2073605",
+        "filename": "NSFW-22-H-e8.safetensors",
+        "install_path": "models/loras/NSFW-22-H-e8.safetensors",
+        "sha256": "34e2144d3cd65360f97d09ccbe03e1c39a096df6c9234af5fe3899d1b63cda39"
+      },
+      "low": {
+        "bytes": 613516752,
+        "civitai": {
+          "file_id": 1979213,
+          "model_id": 1307155,
+          "version_id": 2083303
+        },
+        "download_url": "https://civitai.com/api/download/models/2083303",
+        "filename": "NSFW-22-L-e8.safetensors",
+        "install_path": "models/loras/NSFW-22-L-e8.safetensors",
+        "sha256": "d6b783742f4d5fd63a0223ae1d5bf64fc995a6b408480ac2a00528ae0d4146db"
+      }
+    }
+  ],
+  "runtime": {
+    "architecture": "linux-x86_64-nvidia-blackwell",
+    "author_installer": {
+      "commit": "b15469d45524f51440c282da7f5213ac80b9b9b2",
+      "repository": "https://github.com/darksidewalker/dasiwa-comfyui-installer"
+    },
+    "comfyui": {
+      "commit": "c2bcbecd82ec5ae66594340b395c24ef0217b238",
+      "release": "v0.32.0",
+      "repository": "https://github.com/Comfy-Org/ComfyUI"
+    },
+    "comfyui_frontend": {
+      "commit": "ab42ebc2d9c94b65832ee72dbde3c25fccbf374b",
+      "release": "v1.51.2",
+      "required_by_headless_worker": false,
+      "repository": "https://github.com/Comfy-Org/ComfyUI_frontend"
+    },
+    "cuda_wheel_index": "https://download.pytorch.org/whl/cu128",
+    "ffmpeg": {
+      "codec": "libx264",
+      "required": true,
+      "runs_outside_comfyui": true
+    },
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "python": "3.12",
+    "torch": "2.9.1+cu128",
+    "torchaudio": "2.9.1+cu128",
+    "torchvision": "0.24.1+cu128"
+  },
+  "reference_workflows": [
+    {
+      "civitai_file_id": 3084725,
+      "civitai_version_id": 2712329,
+      "filename": "DasiwaWan22WorkflowsI2VSVI2_fastfidelityCAioV89.json",
+      "name": "FastFidelity C-AiO v8.9",
+      "repository_commit": "603b067be2d47e0532fda398f41ad6a2719d075e",
+      "repository_raw_url": "https://raw.githubusercontent.com/darksidewalker/dasiwa-comfyui-workflows/603b067be2d47e0532fda398f41ad6a2719d075e/C-AiO/DaSiWa%20WAN%202.2%20i2v%20FastFidelity%20C-AiO-89.json",
+      "sha256": "9c0646ce576bb08761425a9653cfbd9bd0132580f8e6e88029327d370583c3e09",
+      "source_url": "https://civitai.com/api/download/models/2712329",
+      "used_as_design_source": true
+    },
+    {
+      "civitai_file_id": 2295720,
+      "civitai_version_id": 2405252,
+      "filename": "DasiwaWan22WorkflowsI2VSVI2_backendTestV10.zip",
+      "name": "Backend Test v1.0",
+      "sha256": "1145a6c6c2e4bfdbc657bf0fc1b4310d4e10a715af9c481af548008c836967ba",
+      "source_url": "https://civitai.com/api/download/models/2405252",
+      "used_as_design_source": false
+    },
+    {
+      "civitai_file_id": 3084714,
+      "civitai_version_id": 2580650,
+      "filename": "DasiwaWan22WorkflowsI2VSVI2_fastfidelityCSVIV42.json",
+      "name": "FastFidelity C-SVI v4.2",
+      "sha256": "8cd330768e4981b6a3367c4f845c12c476f3fc5a78ec372af525aa76015b5756",
+      "source_url": "https://civitai.com/api/download/models/2580650",
+      "used_as_design_source": false
+    }
+  ],
+  "reference_custom_node_pins": [
+    {
+      "commit": "85b38df1619d1fa6e67dc17d27f82b179f89a21f",
+      "required_by_minimal_graph": false,
+      "repository": "https://github.com/darksidewalker/ComfyUI-DaSiWa-Nodes"
+    },
+    {
+      "commit": "6b76ee6f2c5a007710b5a16f97c94330d6ecc871",
+      "required_by_minimal_graph": false,
+      "repository": "https://github.com/rgthree/rgthree-comfy"
+    },
+    {
+      "commit": "4815da41473c99400da6ca4127f0e324dbfd865a",
+      "required_by_minimal_graph": false,
+      "repository": "https://github.com/Artificial-Sweetener/comfyui-WhiteRabbit"
+    },
+    {
+      "commit": "6ab7e8130e449ed2c0037589bcf84146ceb7fc9c",
+      "required_by_minimal_graph": false,
+      "repository": "https://github.com/kijai/ComfyUI-KJNodes"
+    },
+    {
+      "commit": "6ea2651e7df66d7585f6ffee804b20e92fb38b8a",
+      "required_by_minimal_graph": false,
+      "repository": "https://github.com/city96/ComfyUI-GGUF"
+    },
+    {
+      "commit": "4ee72c065db22c9d96c2427954dc69e7b908444b",
+      "required_by_minimal_graph": false,
+      "repository": "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
+    },
+    {
+      "commit": "ac4d99839020b983e956a8ab67ec38aec1b6e65a",
+      "required_by_minimal_graph": false,
+      "repository": "https://github.com/Lightricks/ComfyUI-LTXVideo"
+    },
+    {
+      "commit": "a3c809c8b593a74c2ddcd6c1f83ad85ebebe3c64",
+      "required_by_minimal_graph": false,
+      "repository": "https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI"
+    }
+  ]
+}
