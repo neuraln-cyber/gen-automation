@@ -797,6 +797,7 @@ class ControllerWorkloads:
                 )
             else:
                 await self._disable_gpu_allocations(session, now=now)
+            await self._retire_legacy_video_allocations(session, now=now)
             await session.commit()
 
     async def budget_once(self) -> bool:
@@ -865,6 +866,10 @@ class ControllerWorkloads:
             async with self.sessions() as session:
                 await self._lock_budget_guard(session)
                 disabled_count = await self._disable_gpu_allocations(session, now=now)
+                retired_video_count = await self._retire_legacy_video_allocations(
+                    session,
+                    now=now,
+                )
                 deployment = await session.scalar(
                     select(SaladDeployment)
                     .where(due, or_(*predicates))
@@ -876,7 +881,7 @@ class ControllerWorkloads:
                     .with_for_update(skip_locked=True)
                 )
                 if deployment is None:
-                    if disabled_count:
+                    if disabled_count or retired_video_count:
                         await session.commit()
                         return True
                     await session.rollback()
@@ -929,6 +934,51 @@ class ControllerWorkloads:
                     error_code="controller_provider_operation_failed",
                 )
             raise
+
+    async def _retire_legacy_video_allocations(
+        self,
+        session: AsyncSession,
+        *,
+        now: datetime,
+    ) -> int:
+        """Keep every deployment from the removed video subsystem stopped."""
+
+        deployments = list(
+            (
+                await session.scalars(
+                    select(SaladDeployment)
+                    .where(
+                        SaladDeployment.purpose == SaladDeploymentPurpose.VIDEO,
+                        SaladDeployment.desired_state != DesiredDeploymentState.STOPPED,
+                    )
+                    .order_by(SaladDeployment.version_no)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        for deployment in deployments:
+            previous_desired_state = deployment.desired_state
+            deployment.desired_state = DesiredDeploymentState.STOPPED
+            deployment.administrative_stop_reason = "legacy_video_retired"
+            deployment.reconcile_after = now
+            deployment.last_error_code = "legacy_video_retired"
+            deployment.last_error_detail = (
+                "The retired video subsystem may not allocate provider capacity."
+            )
+            deployment.lock_version += 1
+            session.add(
+                AuditEvent(
+                    actor=self._worker_id("legacy-video-retirement"),
+                    action="salad_deployment.legacy_video_retired",
+                    resource_type="salad_deployment",
+                    resource_id=deployment.id,
+                    correlation_id=f"salad-deployment:{deployment.id}",
+                    detail={"previous_desired_state": previous_desired_state.value},
+                    occurred_at=now,
+                )
+            )
+        await session.flush()
+        return len(deployments)
 
     async def dispatch_once(self) -> bool:
         if self.salad_client is None or not self.settings.gpu_allocation_enabled:

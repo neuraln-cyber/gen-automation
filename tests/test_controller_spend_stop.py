@@ -35,6 +35,7 @@ from gen_automation.domain.enums import (
     GenerationAttemptState,
     GenerationState,
     OutboxStatus,
+    SaladDeploymentPurpose,
     SaladDeploymentState,
 )
 from gen_automation.domain.signing import encode_base64url
@@ -324,6 +325,62 @@ async def test_disabled_allocation_durably_stops_unknown_resource_with_missing_i
             assert "salad_deployment.stop_container_group_recovered" in actions
         assert client.stop_names == [group_name]
         assert client.create_calls == 0
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_retired_video_deployment_is_stopped_even_when_gpu_allocation_is_enabled(
+    tmp_path: Path,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'retired-video.db').as_posix()}")
+    await database.create_schema()
+    try:
+        async with database.sessions() as session:
+            deployment = SaladDeployment(
+                version_no=1,
+                config_sha256=CONFIG_SHA256,
+                provider_configuration=_provider_configuration(),
+                worker_image_digest=IMAGE_DIGEST,
+                organization_name="organization",
+                project_name="project",
+                queue_name="retired-video",
+                provider_queue_id=str(QUEUE_ID),
+                container_group_name="retired-video-worker",
+                provider_container_group_id=str(GROUP_ID),
+                purpose=SaladDeploymentPurpose.VIDEO,
+                state=SaladDeploymentState.ACTIVE,
+                desired_state=DesiredDeploymentState.ACTIVE,
+                is_current=True,
+                max_hourly_cost_microusd=3_600_000,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            session.add(deployment)
+            await session.commit()
+            deployment_id = deployment.id
+
+        workloads = ControllerWorkloads(
+            settings=Settings().model_copy(update={"gpu_allocation_enabled": True}),
+            sessions=database.sessions,
+            instance_id="controller-retired-video-test",
+            salad_client=None,
+            object_store=None,
+        )
+        async with database.sessions() as session:
+            changed = await workloads._retire_legacy_video_allocations(session, now=NOW)
+            await session.commit()
+
+        assert changed == 1
+        async with database.sessions() as session:
+            deployment = await session.get(SaladDeployment, deployment_id)
+            action = await session.scalar(
+                select(AuditEvent.action).where(AuditEvent.resource_id == deployment_id)
+            )
+            assert deployment is not None
+            assert deployment.desired_state == DesiredDeploymentState.STOPPED
+            assert deployment.last_error_code == "legacy_video_retired"
+            assert action == "salad_deployment.legacy_video_retired"
     finally:
         await database.dispose()
 
