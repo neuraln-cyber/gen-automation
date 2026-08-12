@@ -165,7 +165,8 @@ def test_comfy_command_uses_supported_base_directory_and_no_custom_nodes(tmp_pat
     assert command[command.index("--base-directory") + 1] == (tmp_path / "comfy").as_posix()
     assert "--models-directory" not in command
     assert "--disable-all-custom-nodes" in command
-    assert "--highvram" in command
+    assert "--highvram" not in command
+    assert command[command.index("--reserve-vram") + 1] == "4"
 
 
 def test_image_is_model_free_pinned_and_non_root() -> None:
