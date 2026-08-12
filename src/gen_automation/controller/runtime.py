@@ -77,7 +77,7 @@ from gen_automation.services.i2v_environment import (
     i2v_runtime_config_from_settings,
 )
 from gen_automation.services.i2v_media import I2VSignedGrantBuilder
-from gen_automation.services.i2v_runtime import I2VRuntime
+from gen_automation.services.i2v_runtime import I2V_SINGLETON_WORKER_ID, I2VRuntime
 from gen_automation.services.lora_runtime import LoraRuntime
 from gen_automation.services.managed_artifact_manifest import (
     EffectiveArtifactManifest,
@@ -713,7 +713,7 @@ class ControllerWorkloads:
                 config=i2v_runtime_config_from_settings(settings),
                 sessions=sessions,
                 salad_client=salad_client,
-                worker_id=f"{instance_id}:i2v",
+                worker_id=I2V_SINGLETON_WORKER_ID,
                 input_builder=I2VSignedGrantBuilder(
                     store=object_store,
                     expires_in=settings.i2v_object_grant_ttl_seconds,

@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,12 +11,47 @@ from gen_automation.config import Environment, Settings
 from gen_automation.controller.runtime import (
     ControllerRuntime,
     ControllerRuntimeSnapshot,
+    ControllerWorkloads,
     LoopSpec,
     RuntimeStatus,
     build_controller_runtime,
 )
 from gen_automation.db.session import Database
+from gen_automation.services.i2v_runtime import I2V_SINGLETON_WORKER_ID
 from gen_automation.storage.memory import MemoryObjectStore
+
+
+def test_controller_workloads_use_stable_singleton_i2v_worker_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[str] = []
+
+    class _Runtime:
+        def __init__(self, **kwargs: object) -> None:
+            captured.append(str(kwargs["worker_id"]))
+
+    monkeypatch.setattr("gen_automation.controller.runtime.I2VRuntime", _Runtime)
+    monkeypatch.setattr(
+        "gen_automation.controller.runtime.i2v_runtime_config_from_settings",
+        lambda _settings: object(),
+    )
+    settings = SimpleNamespace(
+        i2v_enabled=True,
+        i2v_object_grant_ttl_seconds=3600,
+        i2v_output_prefix="i2v/outputs",
+        lora_manager_enabled=False,
+    )
+    dependencies = {
+        "settings": settings,
+        "sessions": object(),
+        "salad_client": object(),
+        "object_store": MemoryObjectStore(),
+        "secret_resolver": object(),
+    }
+    ControllerWorkloads(instance_id="controller-old", **dependencies)  # type: ignore[arg-type]
+    ControllerWorkloads(instance_id="controller-new", **dependencies)  # type: ignore[arg-type]
+
+    assert captured == [I2V_SINGLETON_WORKER_ID, I2V_SINGLETON_WORKER_ID]
 
 
 @pytest.mark.asyncio
