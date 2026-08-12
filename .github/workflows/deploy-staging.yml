@@ -98,6 +98,9 @@ jobs:
           worker_image_digest="$(
             tr -d '\r\n' <"$metadata_dir/staging-worker-image-digest"
           )"
+          i2v_worker_source_revision="$(
+            tr -d '\r\n' <"$metadata_dir/staging-i2v-worker-source-revision"
+          )"
           i2v_worker_image_digest="$(
             tr -d '\r\n' <"$metadata_dir/staging-i2v-worker-image-digest"
           )"
@@ -113,6 +116,10 @@ jobs:
             printf '%s\n' "Publication metadata does not contain a valid worker digest." >&2
             exit 1
           }
+          [[ "$i2v_worker_source_revision" =~ ^[0-9a-f]{40}$ ]] || {
+            printf '%s\n' "Publication metadata does not contain a full I2V worker Git SHA." >&2
+            exit 1
+          }
           [[ "$i2v_worker_image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
             printf '%s\n' "Publication metadata does not contain a valid I2V worker digest." >&2
             exit 1
@@ -121,6 +128,8 @@ jobs:
           printf 'WORKER_SOURCE_REVISION=%s\n' "$worker_source_revision" >>"$GITHUB_ENV"
           printf 'PUBLISHED_WORKER_IMAGE_DIGEST=%s\n' \
             "$worker_image_digest" >>"$GITHUB_ENV"
+          printf 'I2V_WORKER_SOURCE_REVISION=%s\n' \
+            "$i2v_worker_source_revision" >>"$GITHUB_ENV"
           printf 'PUBLISHED_I2V_WORKER_IMAGE_DIGEST=%s\n' \
             "$i2v_worker_image_digest" >>"$GITHUB_ENV"
           printf '%s\n' "available=true" >>"$GITHUB_OUTPUT"
@@ -245,8 +254,8 @@ jobs:
             printf '%s\n' "Published I2V worker digest does not match deployment metadata." >&2
             exit 1
           }
-          [ "$i2v_worker_image_revision" = "$SOURCE_REVISION" ] || {
-            printf '%s\n' "Published I2V worker revision label does not match its workflow source." >&2
+          [ "$i2v_worker_image_revision" = "$I2V_WORKER_SOURCE_REVISION" ] || {
+            printf '%s\n' "Published I2V worker revision label does not match its resolved input source." >&2
             exit 1
           }
           printf 'IMAGE_REF=%s@%s\n' "$IMAGE_REPOSITORY" "$image_digest" >>"$GITHUB_ENV"

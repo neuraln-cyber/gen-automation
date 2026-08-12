@@ -100,12 +100,18 @@ def test_staging_rollout_follows_only_successful_immutable_publication() -> None
     assert "WORKER_IMAGE_REPOSITORY: ghcr.io/neuraln-cyber/gen-automation/gpu-worker" in workflow
     assert "staging-worker-source-revision" in workflow
     assert "staging-worker-image-digest" in workflow
+    assert "staging-i2v-worker-source-revision" in workflow
     assert "staging-i2v-worker-image-digest" in workflow
+    assert "tr -d '\\r\\n' <\"$metadata_dir/staging-i2v-worker-source-revision\"" in workflow
+    assert '[[ "$i2v_worker_source_revision" =~ ^[0-9a-f]{40}$ ]]' in workflow
+    assert "I2V_WORKER_SOURCE_REVISION=%s" in workflow
     assert 'worker_image_ref="${WORKER_IMAGE_REPOSITORY}@${PUBLISHED_WORKER_IMAGE_DIGEST}"' in (
         workflow
     )
     assert '[ "$worker_image_digest" = "$PUBLISHED_WORKER_IMAGE_DIGEST" ]' in workflow
     assert '[ "$worker_image_revision" = "$WORKER_SOURCE_REVISION" ]' in workflow
+    assert '[ "$i2v_worker_image_revision" = "$I2V_WORKER_SOURCE_REVISION" ]' in workflow
+    assert '[ "$i2v_worker_image_revision" = "$SOURCE_REVISION" ]' not in workflow
     assert "WORKER_IMAGE_REF=%s@%s" in workflow
     assert "I2V_WORKER_IMAGE_REF=%s@%s" in workflow
     assert "org.opencontainers.image.revision" in workflow
@@ -263,15 +269,21 @@ def test_publication_exports_its_exact_ci_source_for_nested_workflow_run() -> No
     )
 
     assert "record-staging-source:" in publication
-    assert "needs: [publish, publish-worker]" in publication
+    assert "needs: [publish, publish-worker, publish-i2v-worker]" in publication
     assert "SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}" in publication
     assert "printf '%s\\n' \"$SOURCE_SHA\"" in publication
     assert "WORKER_SOURCE_REVISION: ${{ needs.publish-worker.outputs.source_revision }}" in (
         publication
     )
     assert "WORKER_IMAGE_DIGEST: ${{ needs.publish-worker.outputs.image_digest }}" in publication
+    assert "I2V_SOURCE_REVISION: ${{ needs.publish-i2v-worker.outputs.source_revision }}" in (
+        publication
+    )
+    assert "I2V_IMAGE_DIGEST: ${{ needs.publish-i2v-worker.outputs.image_digest }}" in publication
     assert "staging-worker-source-revision" in publication
     assert "staging-worker-image-digest" in publication
+    assert "staging-i2v-worker-source-revision" in publication
+    assert "staging-i2v-worker-image-digest" in publication
     assert "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" in publication
     assert "name: staging-deploy-source" in publication
     assert "retention-days: 1" in publication
