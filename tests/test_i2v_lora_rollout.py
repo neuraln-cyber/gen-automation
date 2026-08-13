@@ -38,7 +38,11 @@ from gen_automation.services.i2v_lora_rollout import (
     PreparedReviewedManifest,
     ReviewedManifestCoordinates,
 )
-from gen_automation.services.i2v_salad import I2V_SALAD_GPU_CLASS_NAME, I2VSaladConfig
+from gen_automation.services.i2v_salad import (
+    I2V_SALAD_GPU_CLASS_NAME,
+    I2VSaladConfig,
+    I2VSaladError,
+)
 
 _NOW = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
 _GPU_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -1479,6 +1483,240 @@ async def test_dry_run_accepts_legacy_missing_default_fields_without_mutation(
     assert client.update_patches == []
     assert "autostart_policy" not in client.group.raw
     assert "readiness_probe" not in client.group.raw
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_stage"),
+    (
+        ("group-name", "provider-source-group-name"),
+        ("container", "provider-source-container"),
+        ("image", "provider-source-image"),
+        ("gpu-resources", "provider-source-gpu-resources"),
+        ("priority", "provider-source-priority"),
+        ("readiness-probe", "provider-source-readiness-probe"),
+        ("compute", "provider-source-compute"),
+        ("autostart", "provider-source-autostart"),
+        ("restart-policy", "provider-source-restart-policy"),
+        ("startup-probe", "provider-source-startup-probe"),
+        ("liveness-probe", "provider-source-liveness-probe"),
+        ("queue-connection", "provider-source-queue-connection"),
+        ("autoscaler", "provider-source-autoscaler"),
+        ("group-identity", "provider-source-group-identity"),
+        ("runtime-bindings", "provider-source-runtime-bindings"),
+        ("lifecycle", "provider-source-lifecycle"),
+    ),
+)
+async def test_dry_run_records_only_the_fixed_provider_source_failure_category(
+    failure: str,
+    expected_stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    monkeypatch.setattr(rollout, "verify_reviewed_artifact_access", _no_artifact_check)
+    group = _group(capable=False)
+    raw = deepcopy(group.raw)
+    container = cast(JSONObject, raw["container"])
+    resources = cast(JSONObject, container["resources"])
+    if failure == "group-name":
+        group = replace(group, name="unreviewed-worker")
+    elif failure == "container":
+        raw["container"] = None
+    elif failure == "image":
+        container["image"] = _TARGET_IMAGE
+    elif failure == "gpu-resources":
+        resources["gpu_classes"] = [str(uuid4())]
+    elif failure == "priority":
+        raw["priority"] = "low"
+    elif failure == "readiness-probe":
+        raw["readiness_probe"] = rollout._readiness_probe("/wrong-ready")
+    elif failure == "compute":
+        resources["memory"] = 1
+    elif failure == "autostart":
+        raw["autostart_policy"] = True
+    elif failure == "restart-policy":
+        raw["restart_policy"] = "always"
+    elif failure == "startup-probe":
+        raw["startup_probe"] = None
+    elif failure == "liveness-probe":
+        raw["liveness_probe"] = None
+    elif failure == "queue-connection":
+        cast(JSONObject, raw["queue_connection"])["queue_name"] = "wrong-queue"
+    elif failure == "autoscaler":
+        cast(JSONObject, raw["queue_autoscaler"])["polling_period"] = 16
+    elif failure == "group-identity":
+        group = replace(group, id=uuid4())
+    elif failure == "runtime-bindings":
+        raw["runtime_bindings"] = [{"name": "unreviewed", "reference": "unreviewed"}]
+    elif failure == "lifecycle":
+        raw["replicas"] = 0
+        group = replace(
+            group,
+            replicas=0,
+            current_state=replace(group.current_state, status="stopped", running_count=0),
+        )
+    else:
+        raise AssertionError(f"unknown failure {failure}")
+    group = replace(group, raw=raw)
+    client = _FakeSalad(group=group)
+
+    with pytest.raises(I2VLoraRolloutError):
+        await _dry_run(
+            database=database,
+            client=client,
+            artifact=_ArtifactClient(),
+            tmp_path=tmp_path,
+        )
+
+    assert json.loads((tmp_path / "rollout-diagnostic.json").read_text()) == {
+        "schema": "gen-automation/i2v-lora-diagnostic/v1",
+        "operation": "dry-run",
+        "stage": expected_stage,
+        "outcome": "preparing",
+    }
+    assert client.update_patches == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_stage"),
+    (
+        ("readiness-after-null-autoscaler-extension", "provider-source-readiness-probe"),
+        ("null-autoscaler-extension", "provider-source-autoscaler"),
+        ("queue-path", "provider-source-queue-connection"),
+    ),
+)
+async def test_dry_run_provider_source_categories_follow_validator_precedence(
+    failure: str,
+    expected_stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    monkeypatch.setattr(rollout, "verify_reviewed_artifact_access", _no_artifact_check)
+    group = _group(capable=False)
+    raw = deepcopy(group.raw)
+    autoscaler = cast(JSONObject, raw["queue_autoscaler"])
+    if failure in {
+        "readiness-after-null-autoscaler-extension",
+        "null-autoscaler-extension",
+    }:
+        autoscaler["optional_provider_default"] = None
+    if failure == "readiness-after-null-autoscaler-extension":
+        raw["readiness_probe"] = rollout._readiness_probe("/wrong-ready")
+    elif failure == "queue-path":
+        cast(JSONObject, raw["queue_connection"])["path"] = "/wrong-worker"
+    group = replace(group, raw=raw)
+    client = _FakeSalad(group=group)
+
+    with pytest.raises(I2VLoraRolloutError):
+        await _dry_run(
+            database=database,
+            client=client,
+            artifact=_ArtifactClient(),
+            tmp_path=tmp_path,
+        )
+
+    assert json.loads((tmp_path / "rollout-diagnostic.json").read_text()) == {
+        "schema": "gen-automation/i2v-lora-diagnostic/v1",
+        "operation": "dry-run",
+        "stage": expected_stage,
+        "outcome": "preparing",
+    }
+
+
+async def test_dry_run_unknown_base_contract_failure_uses_redacted_fallback_category(
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    monkeypatch.setattr(rollout, "verify_reviewed_artifact_access", _no_artifact_check)
+
+    def reject_with_unknown_provider_message(_group: object, _config: object) -> None:
+        raise I2VSaladError("secret provider value")
+
+    monkeypatch.setattr(
+        rollout,
+        "validate_i2v_group_contract",
+        reject_with_unknown_provider_message,
+    )
+
+    with pytest.raises(I2VLoraRolloutError, match="base contract is not rollout-safe"):
+        await _dry_run(
+            database=database,
+            client=_FakeSalad(),
+            artifact=_ArtifactClient(),
+            tmp_path=tmp_path,
+        )
+
+    diagnostic = json.loads((tmp_path / "rollout-diagnostic.json").read_text())
+    assert diagnostic == {
+        "schema": "gen-automation/i2v-lora-diagnostic/v1",
+        "operation": "dry-run",
+        "stage": "provider-source-base-contract",
+        "outcome": "preparing",
+    }
+    assert "secret provider value" not in json.dumps(diagnostic)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_stage"),
+    (
+        ("zero-work", "provider-source-zero-work"),
+        ("group-readback", "provider-source-group-readback"),
+        ("gpu-class", "provider-source-gpu-class"),
+        ("instance-readback", "provider-source-instance-readback"),
+    ),
+)
+async def test_dry_run_provider_read_failures_keep_only_the_fixed_operation_category(
+    failure: str,
+    expected_stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    monkeypatch.setattr(rollout, "verify_reviewed_artifact_access", _no_artifact_check)
+
+    class FailingReadSalad(_FakeSalad):
+        async def get_queue(self, name: str) -> SaladQueue:
+            if failure == "zero-work":
+                raise RuntimeError("secret provider queue value")
+            return await super().get_queue(name)
+
+        async def get_container_group(self, name: str) -> SaladContainerGroup:
+            if failure == "group-readback":
+                raise RuntimeError("secret provider group value")
+            return await super().get_container_group(name)
+
+        async def list_gpu_classes(self) -> tuple[SaladGpuClass, ...]:
+            if failure == "gpu-class":
+                raise RuntimeError("secret provider GPU value")
+            return await super().list_gpu_classes()
+
+        async def list_container_group_instances(
+            self, name: str
+        ) -> SaladContainerGroupInstancePage:
+            if failure == "instance-readback":
+                raise RuntimeError("secret provider instance value")
+            return await super().list_container_group_instances(name)
+
+    with pytest.raises(RuntimeError, match="secret provider"):
+        await _dry_run(
+            database=database,
+            client=FailingReadSalad(),
+            artifact=_ArtifactClient(),
+            tmp_path=tmp_path,
+        )
+
+    assert json.loads((tmp_path / "rollout-diagnostic.json").read_text()) == {
+        "schema": "gen-automation/i2v-lora-diagnostic/v1",
+        "operation": "dry-run",
+        "stage": expected_stage,
+        "outcome": "preparing",
+    }
 
 
 @pytest.mark.parametrize("value", (None, True, 0, "false"))
