@@ -358,6 +358,13 @@ rollback_after_failure() {
   [ -f "$provider_marker" ] && provider_rollback_needed=1 || provider_rollback_needed=0
   printf '%s\n' "Rollout failed; keeping the site in queue-frozen maintenance while restoring." >&2
   maintenance_id="$(restart_into "$maintenance_env" "$expected_revision")" || rollback_failed=1
+  if [ "$provider_rollback_needed" -eq 1 ] && [ ! -f "$provider_state" ]; then
+    # A failed recycle writes the mutation marker before STOP. Its service-level
+    # recovery removes that marker only after the exact group is safely started.
+    # Without a promotion rollback state, an extant marker is therefore
+    # ambiguous and must leave the serving controller queue-frozen.
+    rollback_failed=1
+  fi
   if [ "$provider_rollback_needed" -eq 1 ] && [ -f "$provider_state" ] &&
     [ "$rollback_failed" -eq 0 ]; then
     run_one_off "$original_env" "$maintenance_id" 1900s rollback \
@@ -415,7 +422,7 @@ trap cleanup EXIT
 [ "$(id -u)" -eq 0 ] || fail "run as root through AWS Systems Manager"
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --status|--dry-run|--promote|--rollback)
+    --status|--dry-run|--promote|--recycle-promote|--rollback)
       [ -z "$operation" ] || fail "choose exactly one operation"
       operation="${1#--}"
       shift
@@ -430,7 +437,10 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-case "$operation" in status|dry-run|promote|rollback) ;; *) fail "choose one operation" ;; esac
+case "$operation" in
+  status|dry-run|promote|recycle-promote|rollback) ;;
+  *) fail "choose one operation" ;;
+esac
 [[ "$expected_revision" =~ ^[0-9a-f]{40}$ ]] || fail "exact control-plane revision is required"
 if [ "$operation" != "rollback" ]; then
   [[ "$expected_worker_image" =~ ^ghcr[.]io/neuraln-cyber/gen-automation/i2v-worker@sha256:[0-9a-f]{64}$ ]] ||
@@ -531,21 +541,25 @@ fi
 resume_env="$original_env"
 # Prove the operation is rollout-ready before the serving controller is put
 # into maintenance. Promotion repeats the same guards immediately before PATCH.
-run_one_off "$original_env" "$initial_container" 900s dry-run \
-  --expected-worker-image "$expected_worker_image" \
-  --expected-worker-source-revision "$expected_worker_source_revision" \
-  --expected-private-manifest-bucket "$manifest_bucket" \
-  --expected-private-manifest-key "$manifest_key" \
-  --expected-private-manifest-version "$manifest_version" \
-  --expected-private-manifest-source-sha256 "$manifest_source_sha256" \
-  --prepared-host-env-output /run/i2v-lora-rollout/target.patch >/dev/null
+if [ "$operation" = "promote" ]; then
+  run_one_off "$original_env" "$initial_container" 900s dry-run \
+    --expected-worker-image "$expected_worker_image" \
+    --expected-worker-source-revision "$expected_worker_source_revision" \
+    --expected-private-manifest-bucket "$manifest_bucket" \
+    --expected-private-manifest-key "$manifest_key" \
+    --expected-private-manifest-version "$manifest_version" \
+    --expected-private-manifest-source-sha256 "$manifest_source_sha256" \
+    --prepared-host-env-output /run/i2v-lora-rollout/target.patch >/dev/null
+fi
 rollback_armed=1
 maintenance_id="$(restart_into "$maintenance_env" "$expected_revision")"
 assert_container_flags "$maintenance_id" false false false false
 
 # The one-off receives the exact pre-maintenance profile for safe baseline or
-# capable-to-capable rollback, while the serving controller stays frozen.
-if ! run_one_off "$original_env" "$maintenance_id" 10000s promote \
+# capable-to-capable rollback, while the serving controller stays frozen. The
+# recycle-promote variant prepares its complete target before STOP and performs
+# STOP -> PATCH while stopped -> START -> Ready inside this single invocation.
+if ! run_one_off "$original_env" "$maintenance_id" 10000s "$operation" \
   --expected-worker-image "$expected_worker_image" \
   --expected-worker-source-revision "$expected_worker_source_revision" \
   --expected-private-manifest-bucket "$manifest_bucket" \

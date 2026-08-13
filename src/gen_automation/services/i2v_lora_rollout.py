@@ -651,6 +651,243 @@ async def rollback_reviewed_worker(
     )
 
 
+async def recycle_promote_reviewed_worker(
+    *,
+    settings: Settings,
+    sessions: async_sessionmaker[AsyncSession],
+    salad_client: I2VSaladClient,
+    resolver: RuntimeSecretResolver,
+    manifest_client: VersionedManifestClient,
+    artifact_client_factory: ArtifactClientFactory,
+    coordinates: ReviewedManifestCoordinates,
+    worker_image: str,
+    worker_source_revision: str,
+    prepared_host_env_output: Path,
+    rollback_state_output: Path,
+    provider_mutation_marker_output: Path,
+    timeout_seconds: float = 6_900,
+) -> I2VLoraRolloutResult:
+    """Atomically replace an exact idle degraded worker with the reviewed target."""
+
+    if _path_exists(provider_mutation_marker_output):
+        raise I2VLoraRolloutError("provider mutation marker already exists")
+
+    # Finish every remote target-preparation step before stopping the only warm
+    # replica. A preparation failure therefore leaves the provider untouched.
+    manifest = await fetch_reviewed_manifest(manifest_client, coordinates)
+    target = reviewed_target_settings(
+        settings,
+        worker_image=worker_image,
+        worker_source_revision=worker_source_revision,
+        manifest=manifest,
+    )
+    target_environment = await resolve_reviewed_worker_environment(target, resolver)
+    artifact_client = artifact_client_factory(target_environment)
+    try:
+        await verify_reviewed_artifact_access(artifact_client, manifest)
+    finally:
+        artifact_client.close()
+    write_private_host_patch(prepared_host_env_output, reviewed_host_patch(target))
+
+    group_name = target.i2v_salad_container_group_name
+    prior_config = i2v_runtime_config_from_settings(
+        settings.model_copy(update={"i2v_enabled": True})
+    ).salad
+    gpu_classes = await salad_client.list_gpu_classes()
+    if not any(
+        item.id == prior_config.gpu_class_id and item.name == I2V_SALAD_GPU_CLASS_NAME
+        for item in gpu_classes
+    ):
+        raise I2VLoraRolloutError("provider GPU class is not the exact reviewed RTX 5090")
+    prior_environment = dict(
+        await I2VRuntimeEnvironment(settings=settings, resolver=resolver).resolve()
+    )
+    prior = await salad_client.get_container_group(group_name)
+    prior_instances = await salad_client.list_container_group_instances(group_name)
+    _validate_exact_recycle_source(
+        prior,
+        prior_instances,
+        config=prior_config,
+        expected_environment=prior_environment,
+    )
+    target_probe = i2v_runtime_config_from_settings(target).salad.readiness_probe_path
+    state = _rollback_state(
+        prior,
+        promoted_image=worker_image,
+        promoted_environment=target_environment,
+        promoted_readiness_probe=_readiness_probe(target_probe),
+    )
+    # Persist recovery material before the marker and before any provider call.
+    write_private_json(rollback_state_output, asdict(state))
+    patch = _promotion_patch(
+        prior,
+        worker_image=worker_image,
+        environment=target_environment,
+        readiness_probe_path=target_probe,
+    )
+    counts: tuple[int, int, int]
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    try:
+        # Guard the STOP request itself. The marker precedes the await because a
+        # transport failure can be ambiguous after the provider accepted it.
+        async with sessions() as session, session.begin():
+            counts = await assert_zero_active_rollout_work(
+                session,
+                salad_client,
+                queue_name=target.i2v_salad_queue_name,
+            )
+            current = await salad_client.get_container_group(group_name)
+            current_instances = await salad_client.list_container_group_instances(group_name)
+            _assert_group_unchanged_before_patch(current, prior)
+            _validate_exact_recycle_source(
+                current,
+                current_instances,
+                config=prior_config,
+                expected_environment=prior_environment,
+            )
+            queue = await salad_client.get_queue(target.i2v_salad_queue_name)
+            if queue.current_queue_length:
+                raise I2VLoraRolloutError("provider queue changed immediately before recycle")
+            _write_provider_mutation_marker(provider_mutation_marker_output)
+            await salad_client.stop_container_group(group_name)
+
+        stopped = await _wait_for_exact_recycle_stopped(
+            salad_client,
+            group_name=group_name,
+            group_id=state.group_id,
+            expected_version=state.prior_version,
+            config=prior_config,
+            expected_environment=prior_environment,
+            timeout_seconds=_remaining_timeout(deadline),
+        )
+
+        # Recheck every work plane while stopped, then PATCH the already-prepared
+        # target as the sole operation inside this transaction boundary.
+        async with sessions() as session, session.begin():
+            counts = await assert_zero_active_rollout_work(
+                session,
+                salad_client,
+                queue_name=target.i2v_salad_queue_name,
+            )
+            current = await salad_client.get_container_group(group_name)
+            _validate_exact_recycle_static_readback(
+                current,
+                group_id=state.group_id,
+                expected_version=stopped.version,
+                config=prior_config,
+                expected_environment=prior_environment,
+            )
+            current_instances = await salad_client.list_container_group_instances(group_name)
+            if (
+                not _is_exact_stopped_group(current)
+                or getattr(current_instances, "instances", None) != ()
+            ):
+                raise I2VLoraRolloutError("provider source changed before target patch")
+            queue = await salad_client.get_queue(target.i2v_salad_queue_name)
+            if queue.current_queue_length:
+                raise I2VLoraRolloutError("provider queue changed immediately before target patch")
+            updated = await salad_client.update_container_group(group_name, patch)
+            if str(updated.id) != state.group_id or updated.version != state.promoted_version:
+                raise I2VLoraRolloutError("provider did not create the expected worker version")
+
+        promoted_stopped = await _wait_for_saved_profile_stopped(
+            salad_client,
+            group_name=group_name,
+            state=state,
+            worker_image=state.promoted_image,
+            environment_keys=state.promoted_environment_keys,
+            environment_identity_sha256=state.promoted_environment_identity_sha256,
+            readiness_probe=state.promoted_readiness_probe,
+            expected_version=state.promoted_version,
+            timeout_seconds=_remaining_timeout(deadline),
+        )
+
+        # START is separately guarded so the command cannot expose a newly
+        # queued job to the target while the controller remains in maintenance.
+        async with sessions() as session, session.begin():
+            counts = await assert_zero_active_rollout_work(
+                session,
+                salad_client,
+                queue_name=target.i2v_salad_queue_name,
+            )
+            current = await salad_client.get_container_group(group_name)
+            _assert_saved_group_readback(
+                current,
+                state=state,
+                worker_image=state.promoted_image,
+                environment_keys=state.promoted_environment_keys,
+                environment_identity_sha256=state.promoted_environment_identity_sha256,
+                readiness_probe=state.promoted_readiness_probe,
+            )
+            current_instances = await salad_client.list_container_group_instances(group_name)
+            if (
+                current.version != promoted_stopped.version
+                or not _is_exact_stopped_group(current)
+                or getattr(current_instances, "instances", None) != ()
+            ):
+                raise I2VLoraRolloutError("provider target changed before restart")
+            queue = await salad_client.get_queue(target.i2v_salad_queue_name)
+            if queue.current_queue_length:
+                raise I2VLoraRolloutError(
+                    "provider queue changed immediately before target restart"
+                )
+            await salad_client.start_container_group(group_name)
+
+        ready_group = await _wait_for_ready_group(
+            salad_client,
+            group_name=group_name,
+            group_id=state.group_id,
+            worker_image=state.promoted_image,
+            environment=target_environment,
+            readiness_probe=state.promoted_readiness_probe,
+            prior_contract=state.prior_contract,
+            minimum_version=state.promoted_version,
+            timeout_seconds=_remaining_timeout(deadline),
+        )
+    except BaseException:
+        if not _path_exists(provider_mutation_marker_output):
+            raise
+        try:
+            # Never restart either profile if work appeared while the group was
+            # stopped. In that case the durable marker intentionally remains.
+            async with sessions() as session, session.begin():
+                await assert_zero_active_rollout_work(
+                    session,
+                    salad_client,
+                    queue_name=target.i2v_salad_queue_name,
+                )
+            resolved_prior_environment = dict(
+                await I2VRuntimeEnvironment(settings=settings, resolver=resolver).resolve()
+            )
+            restored_prior_environment = _reconstructed_prior_environment(
+                state,
+                resolved_prior_environment,
+            )
+            await _restore_provider(
+                salad_client,
+                state=state,
+                environment=restored_prior_environment,
+                provider_mutation_marker_output=provider_mutation_marker_output,
+                exact_degraded_prior_config=prior_config,
+                timeout_seconds=min(timeout_seconds, 1_800),
+            )
+            _durable_unlink(provider_mutation_marker_output)
+        except BaseException:
+            raise I2VLoraRolloutError(
+                "provider recycle-promotion failed and automatic rollback needs operator attention"
+            ) from None
+        raise
+    return I2VLoraRolloutResult(
+        operation="recycle-promote",
+        provider_image=_group_image(ready_group),
+        provider_ready=True,
+        durable_active_jobs=counts[0],
+        durable_active_attempts=counts[1],
+        provider_active_jobs=counts[2],
+    )
+
+
 async def profile_preflight(
     *,
     settings: Settings,
@@ -828,6 +1065,8 @@ def _validate_prior_group_contract(
 def _validate_prior_group_static_contract(
     group: SaladContainerGroup,
     config: I2VSaladConfig,
+    *,
+    require_running: bool = True,
 ) -> None:
     try:
         validate_i2v_group_contract(group, config)
@@ -854,11 +1093,10 @@ def _validate_prior_group_static_contract(
     ):
         if group.raw.get(key) != desired.get(key):
             raise I2VLoraRolloutError("provider group scheduling contract drifted")
-    if (
-        str(group.id) != REVIEWED_PROVIDER_GROUP_ID
-        or group.replicas != config.max_replicas
-        or config.max_replicas != 1
-        or group.status.lower() != "running"
+    if str(group.id) != REVIEWED_PROVIDER_GROUP_ID or config.max_replicas != 1:
+        raise I2VLoraRolloutError("provider group is not the exact warm replica contract")
+    if require_running and (
+        group.replicas != config.max_replicas or group.status.lower() != "running"
     ):
         raise I2VLoraRolloutError("provider group is not the exact warm replica contract")
     expected_runtime_bindings = desired.get("runtime_bindings")
@@ -873,6 +1111,7 @@ async def _restore_provider(
     state: ProviderRollbackState,
     environment: Mapping[str, str],
     provider_mutation_marker_output: Path | None = None,
+    exact_degraded_prior_config: I2VSaladConfig | None = None,
     timeout_seconds: float,
 ) -> SaladContainerGroup:
     loop = asyncio.get_running_loop()
@@ -919,15 +1158,21 @@ async def _restore_provider(
                 expected_version=updated.version,
                 deadline=deadline,
             )
-            return await _wait_for_ready_group(
+            return await _wait_for_restored_prior(
                 client,
-                group_name=state.group_name,
-                group_id=state.group_id,
-                worker_image=state.prior_image,
+                state=state,
                 environment=environment,
-                readiness_probe=state.prior_readiness_probe,
-                prior_contract=state.prior_contract,
-                minimum_version=updated.version,
+                expected_version=updated.version,
+                exact_degraded_prior_config=exact_degraded_prior_config,
+                timeout_seconds=_remaining_timeout(deadline),
+            )
+        if exact_degraded_prior_config is not None:
+            return await _wait_for_restored_prior(
+                client,
+                state=state,
+                environment=environment,
+                expected_version=current.version,
+                exact_degraded_prior_config=exact_degraded_prior_config,
                 timeout_seconds=_remaining_timeout(deadline),
             )
         return await _wait_for_saved_prior_ready(
@@ -970,17 +1215,47 @@ async def _restore_provider(
         expected_version=updated.version,
         deadline=deadline,
     )
-    return await _wait_for_ready_group(
+    return await _wait_for_restored_prior(
+        client,
+        state=state,
+        environment=environment,
+        expected_version=updated.version,
+        exact_degraded_prior_config=exact_degraded_prior_config,
+        timeout_seconds=_remaining_timeout(deadline),
+    )
+
+
+async def _wait_for_restored_prior(
+    client: I2VSaladClient,
+    *,
+    state: ProviderRollbackState,
+    environment: Mapping[str, str],
+    expected_version: int,
+    exact_degraded_prior_config: I2VSaladConfig | None,
+    timeout_seconds: float,
+) -> SaladContainerGroup:
+    if exact_degraded_prior_config is None:
+        return await _wait_for_ready_group(
+            client,
+            group_name=state.group_name,
+            group_id=state.group_id,
+            worker_image=state.prior_image,
+            environment=environment,
+            readiness_probe=state.prior_readiness_probe,
+            prior_contract=state.prior_contract,
+            minimum_version=expected_version,
+            timeout_seconds=timeout_seconds,
+        )
+    restored, _provider_ready = await _wait_for_exact_recycle_started(
         client,
         group_name=state.group_name,
         group_id=state.group_id,
-        worker_image=state.prior_image,
-        environment=environment,
-        readiness_probe=state.prior_readiness_probe,
-        prior_contract=state.prior_contract,
-        minimum_version=updated.version,
-        timeout_seconds=_remaining_timeout(deadline),
+        expected_version=expected_version,
+        config=exact_degraded_prior_config,
+        expected_environment=environment,
+        timeout_seconds=timeout_seconds,
     )
+    return restored
 
 
 async def _wait_for_saved_prior_ready(
@@ -1135,6 +1410,257 @@ def _is_exact_stopped_group(group: SaladContainerGroup) -> bool:
         and group.current_state.creating_count == 0
         and group.current_state.stopping_count == 0
     )
+
+
+def _validate_exact_recycle_source(
+    group: SaladContainerGroup,
+    instances: object,
+    *,
+    config: I2VSaladConfig,
+    expected_environment: Mapping[str, str],
+) -> None:
+    _validate_prior_group_static_contract(group, config)
+    expected_probe = _readiness_probe(config.readiness_probe_path)
+    if _group_image(group) != config.worker_image:
+        raise I2VLoraRolloutError("provider worker image differs from the pinned recycle source")
+    if group.raw.get("readiness_probe") != expected_probe:
+        raise I2VLoraRolloutError("provider readiness probe differs from the pinned recycle source")
+    observed_environment = _environment_variables(_group_container(group))
+    _validate_exact_environment_readback(observed_environment, expected_environment)
+    _validate_exact_recycle_source_lifecycle(group, instances)
+
+
+def _validate_exact_recycle_source_lifecycle(
+    group: SaladContainerGroup,
+    page: object,
+) -> None:
+    instances = getattr(page, "instances", None)
+    if (
+        not isinstance(instances, tuple)
+        or group.pending_change
+        or group.replicas != 1
+        or group.status.lower() != "running"
+        or group.current_state.stopping_count != 0
+        or any(
+            not isinstance(instance, SaladContainerGroupInstance)
+            or instance.version != group.version
+            or instance.state == SaladContainerGroupInstanceState.STOPPING
+            for instance in instances
+        )
+    ):
+        raise I2VLoraRolloutError("provider lifecycle is not an exact idle recycle source")
+    counts = (
+        group.current_state.allocating_count,
+        group.current_state.creating_count,
+        group.current_state.running_count,
+        group.current_state.stopping_count,
+    )
+    if not instances:
+        if counts == (1, 0, 0, 0):
+            return
+        raise I2VLoraRolloutError("provider lifecycle is not an exact idle recycle source")
+    if len(instances) != 1:
+        raise I2VLoraRolloutError("provider lifecycle is not an exact idle recycle source")
+    instance = instances[0]
+    expected_counts = {
+        SaladContainerGroupInstanceState.ALLOCATING: (1, 0, 0, 0),
+        SaladContainerGroupInstanceState.DOWNLOADING: (0, 1, 0, 0),
+        SaladContainerGroupInstanceState.CREATING: (0, 1, 0, 0),
+        SaladContainerGroupInstanceState.RUNNING: (0, 0, 1, 0),
+    }[instance.state]
+    if counts != expected_counts:
+        raise I2VLoraRolloutError("provider lifecycle is not an exact idle recycle source")
+    if instance.state == SaladContainerGroupInstanceState.RUNNING:
+        if instance.started is not True:
+            raise I2VLoraRolloutError("provider running recycle source was never started")
+    elif instance.ready is not False or instance.started is not False:
+        raise I2VLoraRolloutError("provider pre-running recycle source flags are ambiguous")
+
+
+def _validate_exact_recycle_static_readback(
+    group: SaladContainerGroup,
+    *,
+    group_id: str,
+    expected_version: int,
+    config: I2VSaladConfig,
+    expected_environment: Mapping[str, str],
+) -> None:
+    if (
+        str(group.id) != group_id
+        or group.version != expected_version
+        or group.pending_change
+        or _group_image(group) != config.worker_image
+        or group.raw.get("readiness_probe") != _readiness_probe(config.readiness_probe_path)
+    ):
+        raise I2VLoraRolloutError("provider recycle contract changed outside the operation")
+    _validate_prior_group_static_contract(group, config, require_running=False)
+    _validate_exact_environment_readback(
+        _environment_variables(_group_container(group)),
+        expected_environment,
+    )
+
+
+async def _wait_for_exact_recycle_stopped(
+    client: I2VSaladClient,
+    *,
+    group_name: str,
+    group_id: str,
+    expected_version: int,
+    config: I2VSaladConfig,
+    expected_environment: Mapping[str, str],
+    timeout_seconds: float,
+) -> SaladContainerGroup:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while loop.time() < deadline:
+        group = await client.get_container_group(group_name)
+        if not group.pending_change:
+            _validate_exact_recycle_static_readback(
+                group,
+                group_id=group_id,
+                expected_version=expected_version,
+                config=config,
+                expected_environment=expected_environment,
+            )
+            instances = await client.list_container_group_instances(group_name)
+            if _is_exact_stopped_group(group) and getattr(instances, "instances", None) == ():
+                return group
+        await asyncio.sleep(5)
+    raise I2VLoraRolloutError("provider group did not reach exact stopped state within the bound")
+
+
+async def _wait_for_saved_profile_stopped(
+    client: I2VSaladClient,
+    *,
+    group_name: str,
+    state: ProviderRollbackState,
+    worker_image: str,
+    environment_keys: tuple[str, ...],
+    environment_identity_sha256: str,
+    readiness_probe: JSONObject | None,
+    expected_version: int,
+    timeout_seconds: float,
+) -> SaladContainerGroup:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while loop.time() < deadline:
+        group = await client.get_container_group(group_name)
+        if str(group.id) != state.group_id or group.version > expected_version:
+            raise I2VLoraRolloutError("provider target identity changed while stopped")
+        if group.version == expected_version and not group.pending_change:
+            _assert_saved_group_readback(
+                group,
+                state=state,
+                worker_image=worker_image,
+                environment_keys=environment_keys,
+                environment_identity_sha256=environment_identity_sha256,
+                readiness_probe=readiness_probe,
+            )
+            instances = await client.list_container_group_instances(group_name)
+            if not _is_exact_stopped_group(group) or getattr(instances, "instances", None) != ():
+                raise I2VLoraRolloutError("provider target did not remain exactly stopped")
+            return group
+        await asyncio.sleep(5)
+    raise I2VLoraRolloutError("provider target patch did not settle while stopped")
+
+
+async def _wait_for_exact_recycle_started(
+    client: I2VSaladClient,
+    *,
+    group_name: str,
+    group_id: str,
+    expected_version: int,
+    config: I2VSaladConfig,
+    expected_environment: Mapping[str, str],
+    timeout_seconds: float,
+) -> tuple[SaladContainerGroup, bool]:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while loop.time() < deadline:
+        group = await client.get_container_group(group_name)
+        if not group.pending_change:
+            _validate_exact_recycle_static_readback(
+                group,
+                group_id=group_id,
+                expected_version=expected_version,
+                config=config,
+                expected_environment=expected_environment,
+            )
+            instances = await client.list_container_group_instances(group_name)
+            try:
+                ready = _has_exact_ready_instance(group, instances)
+            except I2VLoraRolloutError:
+                raise
+            if ready:
+                return group, True
+            _validate_exact_recycle_source_lifecycle(group, instances)
+            return group, False
+        await asyncio.sleep(5)
+    raise I2VLoraRolloutError("provider group did not reach a safe started state within the bound")
+
+
+async def _recover_recycle_start(
+    client: I2VSaladClient,
+    *,
+    group_name: str,
+    group_id: str,
+    expected_version: int,
+    config: I2VSaladConfig,
+    expected_environment: Mapping[str, str],
+    timeout_seconds: float,
+) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    group = await client.get_container_group(group_name)
+    if group.pending_change:
+        group = await _wait_for_recycle_pending_clear(
+            client,
+            group_name=group_name,
+            group_id=group_id,
+            expected_version=expected_version,
+            timeout_seconds=_remaining_timeout(deadline),
+        )
+    _validate_exact_recycle_static_readback(
+        group,
+        group_id=group_id,
+        expected_version=expected_version,
+        config=config,
+        expected_environment=expected_environment,
+    )
+    if _is_exact_stopped_group(group):
+        instances = await client.list_container_group_instances(group_name)
+        if getattr(instances, "instances", None) != ():
+            raise I2VLoraRolloutError("stopped provider recycle retained an instance")
+        await client.start_container_group(group_name)
+    await _wait_for_exact_recycle_started(
+        client,
+        group_name=group_name,
+        group_id=group_id,
+        expected_version=expected_version,
+        config=config,
+        expected_environment=expected_environment,
+        timeout_seconds=_remaining_timeout(deadline),
+    )
+
+
+async def _wait_for_recycle_pending_clear(
+    client: I2VSaladClient,
+    *,
+    group_name: str,
+    group_id: str,
+    expected_version: int,
+    timeout_seconds: float,
+) -> SaladContainerGroup:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while loop.time() < deadline:
+        group = await client.get_container_group(group_name)
+        if str(group.id) != group_id or group.version != expected_version:
+            raise I2VLoraRolloutError("provider recycle identity changed during recovery")
+        if not group.pending_change:
+            return group
+        await asyncio.sleep(5)
+    raise I2VLoraRolloutError("provider recycle pending change did not settle within the bound")
 
 
 def _assert_exact_group_readback(
@@ -1429,6 +1955,10 @@ def _write_provider_mutation_marker(path: Path | None) -> None:
 def _durable_unlink(path: Path) -> None:
     path.unlink(missing_ok=True)
     _fsync_directory(path.parent)
+
+
+def _path_exists(path: Path) -> bool:
+    return path.exists()
 
 
 def _atomic_private_write(path: Path, content: str) -> None:
