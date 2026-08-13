@@ -1011,7 +1011,8 @@ async def recycle_promote_reviewed_worker(
                 group=current,
                 instances=current_instances,
             )
-            await salad_client.stop_container_group(group_name)
+            if not _is_exact_stopped_group(current):
+                await salad_client.stop_container_group(group_name)
 
         stage = "stopped-readback"
         _write_rollout_diagnostic(diagnostic_output, stage=stage, outcome="mutating")
@@ -1947,7 +1948,12 @@ def _is_exact_stopped_group(group: SaladContainerGroup) -> bool:
 
     return (
         not group.pending_change
-        and group.replicas == 0
+        # Salad's explicit STOP endpoint preserves the configured replica
+        # target on readback, while warm-idle autoscaling may expose zero.
+        # Operational stopped identity is the lifecycle status and four zero
+        # counters; saved/static contract checks still pin the configured
+        # replica count separately.
+        and group.replicas in (0, 1)
         and group.status.lower() == "stopped"
         and group.current_state.running_count == 0
         and group.current_state.allocating_count == 0
@@ -1963,7 +1969,12 @@ def _validate_exact_recycle_source(
     config: I2VSaladConfig,
     expected_environment: Mapping[str, str],
 ) -> None:
-    _validate_prior_group_static_contract(group, config)
+    stopped_source = _is_exact_stopped_group(group) and getattr(instances, "instances", None) == ()
+    _validate_prior_group_static_contract(
+        group,
+        config,
+        require_running=not stopped_source,
+    )
     if _group_image(group) != config.worker_image:
         raise I2VLoraRolloutError("provider worker image differs from the pinned recycle source")
     observed_environment = _environment_variables(_group_container(group))
@@ -1976,6 +1987,8 @@ def _validate_exact_recycle_source_lifecycle(
     page: object,
 ) -> None:
     instances = getattr(page, "instances", None)
+    if _is_exact_stopped_group(group) and instances == ():
+        return
     if (
         not isinstance(instances, tuple)
         or group.pending_change

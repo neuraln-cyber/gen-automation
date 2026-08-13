@@ -414,6 +414,7 @@ class _FakeSalad:
                 raw["readiness_probe"] = deepcopy(readiness_probe)
         next_version = self.group.version + 1
         replicas = self.group.replicas
+        remains_stopped = self.group.current_state.status == "stopped"
         self.group = SaladContainerGroup(
             id=self.group.id,
             name=self.group.name,
@@ -423,10 +424,10 @@ class _FakeSalad:
             version=next_version,
             current_state=replace(
                 self.group.current_state,
-                status="running" if replicas else "stopped",
+                status="stopped" if remains_stopped else ("running" if replicas else "stopped"),
                 allocating_count=0,
                 creating_count=0,
-                running_count=replicas,
+                running_count=0 if remains_stopped else replicas,
                 stopping_count=0,
             ),
             create_time=self.group.create_time,
@@ -434,7 +435,9 @@ class _FakeSalad:
             raw=raw,
         )
         self.instances = (
-            _instance_page(version=next_version) if replicas else _empty_instance_page()
+            _empty_instance_page()
+            if remains_stopped or not replicas
+            else _instance_page(version=next_version)
         )
         if self.raise_after_first_update and len(self.update_patches) == 1:
             raise RuntimeError("ambiguous provider response with secret details")
@@ -796,6 +799,43 @@ async def test_recycle_promote_accepts_exact_idle_running_not_ready_source(
     assert result.provider_image == _TARGET_IMAGE
     assert result.provider_ready is True
     assert client.stop_calls == 1
+    assert client.start_calls == 1
+    assert len(client.update_patches) == 1
+
+
+@pytest.mark.asyncio
+async def test_recycle_promote_patches_an_exact_explicitly_stopped_source_before_start(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    source = _group(capable=False)
+    source = replace(
+        source,
+        current_state=replace(
+            source.current_state,
+            status="stopped",
+            allocating_count=0,
+            creating_count=0,
+            running_count=0,
+            stopping_count=0,
+        ),
+    )
+    client = _FakeSalad(group=source)
+    client.instances = _empty_instance_page()
+
+    result = await _recycle_promote(
+        database=database,
+        client=client,
+        artifact=_ArtifactClient(),
+        tmp_path=tmp_path,
+    )
+
+    assert result.operation == "recycle-promote"
+    assert result.provider_image == _TARGET_IMAGE
+    assert result.provider_ready is True
+    assert client.stop_calls == 0
     assert client.start_calls == 1
     assert len(client.update_patches) == 1
 
