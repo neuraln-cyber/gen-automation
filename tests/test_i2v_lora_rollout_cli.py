@@ -61,6 +61,10 @@ def _manifest_arguments(tmp_path: Path) -> list[str]:
     ]
 
 
+def _diagnostic_arguments(tmp_path: Path) -> list[str]:
+    return ["--diagnostic-output", str(tmp_path / "rollout-diagnostic.json")]
+
+
 class _FakeDatabase:
     instances: ClassVar[list[_FakeDatabase]] = []
 
@@ -156,11 +160,13 @@ async def test_mutating_operations_require_exact_service_stop_proof_before_clien
             ]
         )
     elif operation in {"promote", "recycle-promote"}:
+        diagnostic = _diagnostic_arguments(tmp_path) if operation == "recycle-promote" else []
         arguments = cli._parser().parse_args(
             [
                 operation,
                 *_worker_identity_arguments(),
                 *_manifest_arguments(tmp_path),
+                *diagnostic,
                 "--rollback-state-output",
                 str(tmp_path / "rollback.json"),
                 "--provider-mutation-marker-output",
@@ -234,6 +240,7 @@ async def test_recycle_promote_dispatches_one_atomic_service_with_s3_client(
             "recycle-promote",
             *_worker_identity_arguments(),
             *_manifest_arguments(tmp_path),
+            *_diagnostic_arguments(tmp_path),
             "--rollback-state-output",
             str(tmp_path / "rollback.json"),
             "--provider-mutation-marker-output",
@@ -247,6 +254,7 @@ async def test_recycle_promote_dispatches_one_atomic_service_with_s3_client(
     assert captured["provider_mutation_marker_output"] == marker
     assert captured["rollback_state_output"] == tmp_path / "rollback.json"
     assert captured["prepared_host_env_output"] == tmp_path / "prepared.env"
+    assert captured["diagnostic_output"] == tmp_path / "rollout-diagnostic.json"
     assert captured["worker_image"] == WORKER_IMAGE
     assert captured["resolver"] is resolver
     assert len(boto_calls) == 1
@@ -305,7 +313,12 @@ async def test_dry_run_dispatches_exact_manifest_and_closes_s3(
 
     monkeypatch.setattr(cli, "dry_run_reviewed_worker_rollout", dry_run)
     arguments = cli._parser().parse_args(
-        ["dry-run", *_worker_identity_arguments(), *_manifest_arguments(tmp_path)]
+        [
+            "dry-run",
+            *_worker_identity_arguments(),
+            *_manifest_arguments(tmp_path),
+            *_diagnostic_arguments(tmp_path),
+        ]
     )
 
     result = await cli._run(arguments, settings=_settings())
@@ -321,6 +334,7 @@ async def test_dry_run_dispatches_exact_manifest_and_closes_s3(
     assert captured["worker_image"] == WORKER_IMAGE
     assert captured["worker_source_revision"] == SOURCE_REVISION
     assert captured["prepared_host_env_output"] == tmp_path / "prepared.env"
+    assert captured["diagnostic_output"] == tmp_path / "rollout-diagnostic.json"
     assert callable(captured["artifact_client_factory"])
     assert len(boto_calls) == 1
     assert boto_calls[0][0] == "s3"
@@ -355,6 +369,7 @@ def test_mutating_parsers_require_a_provider_mutation_marker(tmp_path: Path) -> 
             "recycle-promote",
             *_worker_identity_arguments(),
             *_manifest_arguments(tmp_path),
+            *_diagnostic_arguments(tmp_path),
             "--rollback-state-output",
             str(tmp_path / "rollback.json"),
             "--provider-mutation-marker-output",

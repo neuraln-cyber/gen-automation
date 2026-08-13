@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from collections.abc import AsyncIterator, Mapping
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
-from pydantic import SecretStr
+from pydantic import AnyHttpUrl, SecretStr
 
-from gen_automation.config import Settings
+from gen_automation.config import SaladContainerPriority, Settings
 from gen_automation.db.session import Database
+from gen_automation.i2v_worker.settings import I2VWorkerSettings
 from gen_automation.integrations.salad.models import (
     JSONObject,
     SaladContainerGroup,
@@ -28,6 +32,7 @@ from gen_automation.integrations.salad.models import (
     SaladQueueJobPage,
 )
 from gen_automation.services import i2v_lora_rollout as rollout
+from gen_automation.services.i2v_environment import I2VRuntimeEnvironment, i2v_worker_identity
 from gen_automation.services.i2v_lora_rollout import (
     I2VLoraRolloutError,
     PreparedReviewedManifest,
@@ -327,6 +332,12 @@ _COORDINATES = ReviewedManifestCoordinates(
 )
 
 
+def _reviewed_manifest_source_bytes() -> bytes:
+    fixture = Path("tests/fixtures/i2v-reviewed-private-manifest.json")
+    source = fixture.read_text(encoding="utf-8").replace("\r\n", "\n")
+    return source.replace("\n", "\r\n").encode("utf-8")
+
+
 class _FakeSalad:
     def __init__(self, *, group: SaladContainerGroup | None = None) -> None:
         self.group = group or _group(capable=False)
@@ -444,6 +455,26 @@ class _FakeSalad:
         self.instances = _empty_instance_page()
 
 
+class _DeferredPatchResponseSalad(_FakeSalad):
+    def __init__(self, *, group: SaladContainerGroup | None = None) -> None:
+        super().__init__(group=group)
+        self.deferred_readback: SaladContainerGroup | None = None
+
+    async def get_container_group(self, name: str) -> SaladContainerGroup:
+        if self.deferred_readback is not None:
+            self.get_group_calls += 1
+            deferred = self.deferred_readback
+            self.deferred_readback = None
+            return deferred
+        return await super().get_container_group(name)
+
+    async def update_container_group(self, name: str, patch: JSONObject) -> SaladContainerGroup:
+        prior = self.group
+        await super().update_container_group(name, patch)
+        self.deferred_readback = replace(prior, pending_change=True)
+        return self.deferred_readback
+
+
 class _RuntimeEnvironment:
     calls = 0
 
@@ -458,10 +489,14 @@ class _RuntimeEnvironment:
 def _patch_promotion_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     _RuntimeEnvironment.calls = 0
 
-    async def fetch(_client: object, _coordinates: object) -> PreparedReviewedManifest:
+    async def fetch(
+        _client: object, _coordinates: object, **_kwargs: object
+    ) -> PreparedReviewedManifest:
         return _MANIFEST
 
-    async def target_environment(_settings: Settings, _resolver: object) -> Mapping[str, str]:
+    async def target_environment(
+        _settings: Settings, _resolver: object, **_kwargs: object
+    ) -> Mapping[str, str]:
         return _TARGET_ENVIRONMENT
 
     def runtime_config(settings: Settings) -> SimpleNamespace:
@@ -531,6 +566,7 @@ async def _dry_run(
         worker_image=_TARGET_IMAGE,
         worker_source_revision=_TARGET_REVISION,
         prepared_host_env_output=tmp_path / "target.env",
+        diagnostic_output=tmp_path / "rollout-diagnostic.json",
     )
 
 
@@ -555,8 +591,13 @@ async def _recycle_promote(
         prepared_host_env_output=tmp_path / "target.env",
         rollback_state_output=tmp_path / "rollback.json",
         provider_mutation_marker_output=tmp_path / "recycle-mutation.json",
+        diagnostic_output=tmp_path / "rollout-diagnostic.json",
         timeout_seconds=0.1,
     )
+
+
+async def _no_sleep(_seconds: float) -> None:
+    return None
 
 
 def test_exact_ready_instance_requires_one_current_running_ready_replica() -> None:
@@ -616,6 +657,44 @@ async def test_recycle_promote_prepares_target_then_stops_patches_starts_and_wai
     assert client.group.version == 2
     assert (tmp_path / "target.env").exists()
     assert (tmp_path / "recycle-mutation.json").exists()
+    assert json.loads((tmp_path / "rollout-diagnostic.json").read_text()) == {
+        "operation": "recycle-promote",
+        "outcome": "ready",
+        "provider": {
+            "allocating_count": 0,
+            "creating_count": 0,
+            "pending_change": False,
+            "replicas": 1,
+            "running_count": 1,
+            "status": "running",
+            "stopping_count": 0,
+            "version": 2,
+        },
+        "schema": "gen-automation/i2v-lora-diagnostic/v1",
+        "stage": "complete",
+    }
+
+
+@pytest.mark.asyncio
+async def test_recycle_promote_accepts_deferred_exact_next_version_acknowledgement(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    monkeypatch.setattr(rollout.asyncio, "sleep", _no_sleep)
+    client = _DeferredPatchResponseSalad()
+
+    result = await _recycle_promote(
+        database=database,
+        client=client,
+        artifact=_ArtifactClient(),
+        tmp_path=tmp_path,
+    )
+
+    assert result.provider_ready
+    assert client.group.version == 2
+    assert client.start_calls == 1
 
 
 @pytest.mark.asyncio
@@ -642,6 +721,10 @@ async def test_recycle_promote_finishes_all_target_artifact_work_before_stop(
     assert client.start_calls == 0
     assert client.update_patches == []
     assert not (tmp_path / "recycle-mutation.json").exists()
+    diagnostic = json.loads((tmp_path / "rollout-diagnostic.json").read_text())
+    assert diagnostic["stage"] == "artifact-head-access"
+    assert diagnostic["outcome"] == "preparing"
+    assert "secret" not in json.dumps(diagnostic).lower()
 
 
 @pytest.mark.asyncio
@@ -751,6 +834,40 @@ async def test_recycle_promote_ambiguous_stop_restores_prior_and_clears_marker(
 
 
 @pytest.mark.asyncio
+async def test_recycle_promote_recovery_accepts_only_an_exact_degraded_prior_restart(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+
+    class DegradedRecoverySalad(_FakeSalad):
+        async def stop_container_group(self, name: str) -> None:
+            await super().stop_container_group(name)
+            raise RuntimeError("ambiguous stop")
+
+        async def start_container_group(self, name: str) -> None:
+            await super().start_container_group(name)
+            self.group = _allocating_group(version=self.group.version)
+            self.instances = _empty_instance_page()
+
+    client = DegradedRecoverySalad()
+
+    with pytest.raises(RuntimeError, match="ambiguous stop"):
+        await _recycle_promote(
+            database=database,
+            client=client,
+            artifact=_ArtifactClient(),
+            tmp_path=tmp_path,
+        )
+
+    assert rollout._group_image(client.group) == _PRIOR_IMAGE
+    assert client.group.current_state.allocating_count == 1
+    assert client.instances.instances == ()
+    assert not (tmp_path / "recycle-mutation.json").exists()
+
+
+@pytest.mark.asyncio
 async def test_recycle_promote_fails_closed_if_stop_changes_group_version(
     database: Database,
     monkeypatch: pytest.MonkeyPatch,
@@ -845,6 +962,38 @@ async def test_recycle_promote_rechecks_provider_queue_immediately_before_each_m
 
     assert client.stop_calls == 1
     assert len(client.update_patches) == expected_updates
+    assert client.start_calls == 0
+    assert (tmp_path / "recycle-mutation.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_recycle_promote_rereads_target_after_final_queue_guard_before_start(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+
+    class StartRaceSalad(_FakeSalad):
+        queue_reads = 0
+
+        async def get_queue(self, name: str) -> SaladQueue:
+            self.queue_reads += 1
+            queue = await super().get_queue(name)
+            if self.queue_reads == 6:
+                self.group = replace(self.group, name="raced-worker")
+            return queue
+
+    client = StartRaceSalad()
+
+    with pytest.raises(I2VLoraRolloutError, match="operator attention"):
+        await _recycle_promote(
+            database=database,
+            client=client,
+            artifact=_ArtifactClient(),
+            tmp_path=tmp_path,
+        )
+
     assert client.start_calls == 0
     assert (tmp_path / "recycle-mutation.json").exists()
 
@@ -1107,6 +1256,89 @@ async def test_reviewed_artifact_preflight_heads_exactly_all_fourteen_objects() 
         }
         for item in _MANIFEST.objects
     ]
+
+
+async def test_exact_reviewed_manifest_derives_the_worker_readiness_identities(
+    tmp_path: Path,
+) -> None:
+    source_bytes = _reviewed_manifest_source_bytes()
+    assert len(source_bytes) == rollout.REVIEWED_MANIFEST_BYTES
+
+    class ManifestClient:
+        def get_object(self, **kwargs: object) -> Mapping[str, object]:
+            assert kwargs == {
+                "Bucket": rollout.REVIEWED_MANIFEST_BUCKET,
+                "Key": rollout.REVIEWED_MANIFEST_KEY,
+                "VersionId": rollout.REVIEWED_MANIFEST_VERSION,
+            }
+            return {
+                "Body": BytesIO(source_bytes),
+                "ContentLength": len(source_bytes),
+                "VersionId": rollout.REVIEWED_MANIFEST_VERSION,
+            }
+
+    manifest = await rollout.fetch_reviewed_manifest(ManifestClient(), _COORDINATES)
+    assert manifest.canonical_sha256 == rollout.REVIEWED_CANONICAL_MANIFEST_SHA256
+    base = _settings(capable=False).model_copy(
+        update={
+            "i2v_salad_priority": SaladContainerPriority.HIGH,
+            "salad_enabled": True,
+            "salad_api_key": SecretStr("test-api-key"),
+            "salad_organization": "organization",
+            "salad_project": "project",
+            "salad_queue_name": "jobs-v1",
+            "salad_container_group_name": "worker-v1",
+            "salad_webhook_secret": SecretStr("test-webhook-secret"),
+            "salad_worker_image": _PRIOR_IMAGE,
+            "salad_worker_artifact_role_arn": "arn:aws:iam::111111111111:role/test-reader",
+            "storage_enabled": True,
+            "storage_bucket": "test-private-bucket",
+            "background_runtime_enabled": True,
+            "public_base_url": AnyHttpUrl("https://example.invalid"),
+        }
+    )
+    target = rollout.reviewed_target_settings(
+        base,
+        worker_image=_TARGET_IMAGE,
+        worker_source_revision=_TARGET_REVISION,
+        manifest=manifest,
+    )
+
+    class Resolver:
+        async def resolve_many(self, bindings: Mapping[str, str]) -> Mapping[str, str]:
+            credentials = {
+                "GEN_WORKER_ARTIFACT_ACCESS_KEY_ID": "test-access",
+                "GEN_WORKER_ARTIFACT_BUCKET": rollout.REVIEWED_MANIFEST_BUCKET,
+                "GEN_WORKER_ARTIFACT_REGION": "eu-central-1",
+                "GEN_WORKER_ARTIFACT_SECRET_ACCESS_KEY": "test-secret",
+                "GEN_WORKER_ARTIFACT_SESSION_TOKEN": "test-session",
+                "GEN_WORKER_ENVIRONMENT": "production",
+            }
+            return {name: credentials[name] for name in bindings}
+
+        async def aclose(self) -> None:
+            return None
+
+    environment = await I2VRuntimeEnvironment(
+        settings=target,
+        resolver=Resolver(),
+    ).resolve()
+    rollout._validate_worker_environment_identity(environment, settings=target)
+    assert i2v_worker_identity(target) == (
+        rollout.REVIEWED_MODEL_OBJECTS_SHA256,
+        rollout.REVIEWED_ARTIFACT_IDENTITY_SHA256,
+    )
+    worker = I2VWorkerSettings(
+        comfy_root=tmp_path / "comfyui",
+        model_objects_json=SecretStr(environment["GEN_I2V_WORKER_MODEL_OBJECTS_JSON"]),
+        lora_worker_enabled=True,
+        runtime_root=tmp_path / "runtime",
+        source_revision=_TARGET_REVISION,
+        private_manifest_source_sha256=rollout.REVIEWED_SOURCE_SHA256,
+    )
+    assert len(worker.model_objects) == 14
+    assert worker.model_objects_sha256 == rollout.REVIEWED_MODEL_OBJECTS_SHA256
+    assert worker.artifact_identity_sha256 == rollout.REVIEWED_ARTIFACT_IDENTITY_SHA256
 
 
 async def test_artifact_preflight_failure_occurs_before_any_provider_update(
@@ -1505,7 +1737,7 @@ async def test_pre_running_promotion_accepts_safe_lifecycle_progress_before_patc
     assert len(client.update_patches) == 1
 
 
-async def _no_artifact_check(_client: object, _manifest: object) -> None:
+async def _no_artifact_check(_client: object, _manifest: object, **_kwargs: object) -> None:
     return None
 
 
@@ -1607,6 +1839,56 @@ async def test_failed_promotion_automatically_rolls_back_with_tombstones_and_rot
     assert wait_calls == 2
 
 
+async def test_promotion_accepts_deferred_exact_next_version_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    monkeypatch.setattr(rollout.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(rollout, "verify_reviewed_artifact_access", _no_artifact_check)
+    client = _DeferredPatchResponseSalad()
+
+    result = await _promote(
+        database=database,
+        client=client,
+        artifact=_ArtifactClient(),
+        tmp_path=tmp_path,
+    )
+
+    assert result.provider_ready
+    assert client.group.version == 2
+
+
+@pytest.mark.parametrize(
+    ("version_offset", "pending_change", "name"),
+    (
+        (0, False, "i2v-worker-v1"),
+        (-1, True, "i2v-worker-v1"),
+        (2, True, "i2v-worker-v1"),
+        (1, False, "other-worker"),
+    ),
+)
+def test_patch_acknowledgement_rejects_ambiguous_identity_or_version(
+    version_offset: int,
+    pending_change: bool,
+    name: str,
+) -> None:
+    response = replace(
+        _group(capable=False, version=10 + version_offset),
+        name=name,
+        pending_change=pending_change,
+    )
+
+    with pytest.raises(I2VLoraRolloutError, match="patch response"):
+        rollout._validate_accepted_patch_response(
+            response,
+            group_id=str(_GROUP_ID),
+            group_name="i2v-worker-v1",
+            prior_version=10,
+        )
+
+
 async def test_ambiguous_promotion_response_rolls_back_when_provider_applied_the_patch(
     monkeypatch: pytest.MonkeyPatch,
     database: Database,
@@ -1654,6 +1936,22 @@ async def test_rollback_refuses_to_clobber_a_later_provider_contract_drift() -> 
     assert client.update_patches == []
 
 
+async def test_rollback_refuses_same_id_with_wrong_saved_group_name_before_patch() -> None:
+    prior = _group(capable=False, version=1)
+    state = _rollback_state(prior)
+    client = _FakeSalad(group=replace(_group(capable=True, version=3), name="other-worker"))
+
+    with pytest.raises(I2VLoraRolloutError, match="identity changed"):
+        await rollout._restore_provider(
+            cast(Any, client),
+            state=state,
+            environment=_ROTATED_PRIOR_ENVIRONMENT,
+            timeout_seconds=0.1,
+        )
+
+    assert client.update_patches == []
+
+
 async def test_rollback_accepts_a_later_exact_promoted_contract() -> None:
     prior = _group(capable=False, version=1)
     state = _rollback_state(prior)
@@ -1669,6 +1967,27 @@ async def test_rollback_accepts_a_later_exact_promoted_contract() -> None:
 
     assert restored.raw["container"]["image"] == _PRIOR_IMAGE
     assert len(client.update_patches) == 1
+
+
+async def test_rollback_accepts_deferred_promoted_profile_patch_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(rollout.asyncio, "sleep", _no_sleep)
+    prior = _group(capable=False, version=1)
+    state = _rollback_state(prior)
+    client = _DeferredPatchResponseSalad(group=_group(capable=True, version=3))
+    client.instances = _instance_page(version=3)
+
+    restored = await rollout._restore_provider(
+        cast(Any, client),
+        state=state,
+        environment=_ROTATED_PRIOR_ENVIRONMENT,
+        timeout_seconds=1,
+    )
+
+    assert restored.raw["container"]["image"] == _PRIOR_IMAGE
+    assert restored.version == 4
+    assert client.start_calls == 0
 
 
 async def test_exact_restored_prior_waits_for_readiness_without_another_patch(
@@ -1737,6 +2056,103 @@ async def test_rollback_recovers_an_exact_warm_idle_promoted_group() -> None:
     assert restored.raw["container"]["image"] == _PRIOR_IMAGE
     assert client.start_calls == 1
     assert len(client.update_patches) == 1
+
+
+async def test_rollback_accepts_deferred_stopped_prior_credential_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(rollout.asyncio, "sleep", _no_sleep)
+    prior = _group(capable=False, version=1)
+    state = _rollback_state(prior)
+    client = _DeferredPatchResponseSalad(group=_group(capable=False, version=3, replicas=0))
+    client.instances = _empty_instance_page()
+
+    restored = await rollout._restore_provider(
+        cast(Any, client),
+        state=state,
+        environment=_ROTATED_PRIOR_ENVIRONMENT,
+        timeout_seconds=1,
+    )
+
+    assert restored.version == 4
+    assert client.start_calls == 1
+
+
+async def test_deferred_patch_must_converge_before_a_stopped_group_is_started() -> None:
+    client = _FakeSalad(group=replace(_group(capable=False, version=3), pending_change=True))
+    client.instances = _empty_instance_page()
+    state = _rollback_state(_group(capable=False, version=1))
+
+    with pytest.raises(I2VLoraRolloutError, match="exact saved version"):
+        await rollout._start_exact_group_if_stopped(
+            cast(Any, client),
+            state=state,
+            environment=_ROTATED_PRIOR_ENVIRONMENT,
+            expected_version=4,
+            deadline=asyncio.get_running_loop().time() + 0.01,
+        )
+
+    assert client.start_calls == 0
+
+
+@pytest.mark.parametrize("retained_instance", (False, True))
+async def test_rollback_refuses_to_start_wrong_or_nonempty_exact_next_version(
+    retained_instance: bool,
+) -> None:
+    state = _rollback_state(_group(capable=False, version=1))
+    group = _group(
+        capable=False if retained_instance else True,
+        version=4,
+        replicas=0,
+        environment=_ROTATED_PRIOR_ENVIRONMENT if retained_instance else _TARGET_ENVIRONMENT,
+    )
+    client = _FakeSalad(group=group)
+    client.instances = _instance_page(version=4) if retained_instance else _empty_instance_page()
+
+    with pytest.raises(I2VLoraRolloutError):
+        await rollout._start_exact_group_if_stopped(
+            cast(Any, client),
+            state=state,
+            environment=_ROTATED_PRIOR_ENVIRONMENT,
+            expected_version=4,
+            deadline=asyncio.get_running_loop().time() + 1,
+        )
+
+    assert client.start_calls == 0
+
+
+async def test_rollback_rereads_stopped_prior_immediately_before_start() -> None:
+    state = _rollback_state(_group(capable=False, version=1))
+    client = _FakeSalad(
+        group=_group(
+            capable=False,
+            version=4,
+            replicas=0,
+            environment=_ROTATED_PRIOR_ENVIRONMENT,
+        )
+    )
+    client.instances = _empty_instance_page()
+    reads = 0
+
+    async def instances(_name: str) -> SaladContainerGroupInstancePage:
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            client.group = replace(client.group, name="raced-worker")
+        return _empty_instance_page()
+
+    client.list_container_group_instances = instances  # type: ignore[method-assign]
+
+    with pytest.raises(I2VLoraRolloutError, match="identity changed"):
+        await rollout._start_exact_group_if_stopped(
+            cast(Any, client),
+            state=state,
+            environment=_ROTATED_PRIOR_ENVIRONMENT,
+            expected_version=4,
+            deadline=asyncio.get_running_loop().time() + 1,
+        )
+
+    assert client.start_calls == 0
 
 
 async def test_provider_job_pagination_has_a_hard_one_hundred_page_bound() -> None:

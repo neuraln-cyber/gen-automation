@@ -1,0 +1,131 @@
+{
+  "objects": [
+    {
+      "bytes": 253815318,
+      "key": "worker/i2v/sha256/2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b",
+      "name": "wan-2.1-vae",
+      "role": "vae",
+      "sha256": "2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b",
+      "target_filename": "wan_2.1_vae.safetensors",
+      "version_id": "YO8wfaZEuLZ3bWfBz532LXX7I1y.gxII"
+    },
+    {
+      "bytes": 6735906897,
+      "key": "worker/i2v/sha256/c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68",
+      "name": "umt5-xxl-fp8-scaled",
+      "role": "text_encoder",
+      "sha256": "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68",
+      "target_filename": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "version_id": "A2Cou_V6ltF7nAXqwZAnlW1dwUTq_DdX"
+    },
+    {
+      "bytes": 14528782272,
+      "key": "worker/i2v/sha256/fa4202ea621725c57b0cbb84543bd6a5548de1d85c0c5a9f18db0bcf91202a54",
+      "name": "snatchkiss-high-v11",
+      "role": "diffusion_model_high",
+      "sha256": "fa4202ea621725c57b0cbb84543bd6a5548de1d85c0c5a9f18db0bcf91202a54",
+      "target_filename": "DasiwaWAN22I2V14BLightspeed_snatchkissHighV11.safetensors",
+      "version_id": "xiXTYTGu81UlYMDdecTffMj1Op7Gs4Xg"
+    },
+    {
+      "bytes": 14528782272,
+      "key": "worker/i2v/sha256/6e746571355bb589b966a72ed7a8717a09af0aeaf699391138e9788bace224d1",
+      "name": "snatchkiss-low-v11",
+      "role": "diffusion_model_low",
+      "sha256": "6e746571355bb589b966a72ed7a8717a09af0aeaf699391138e9788bace224d1",
+      "target_filename": "DasiwaWAN22I2V14BLightspeed_snatchkissLowV11.safetensors",
+      "version_id": "Z8FKbKoicL4Xdt43OGrd8MVVYPe.Mp3w"
+    },
+    {
+      "bytes": 306807280,
+      "key": "worker/i2v/sha256/eac4f4341008abb00434d08fed1d4fda4a144bc94cd26b4819f629f930a75181",
+      "name": "smoothmix-xxx-animations-high",
+      "role": "lora_smoothmix_animations_high",
+      "sha256": "eac4f4341008abb00434d08fed1d4fda4a144bc94cd26b4819f629f930a75181",
+      "target_filename": "SmoothXXXAnimation_High.safetensors",
+      "version_id": "hzWNfJwm0URbIWcllszcCvlbm6ZERTRf"
+    },
+    {
+      "bytes": 306807280,
+      "key": "worker/i2v/sha256/ad50dfc46c765a6ccc36d40e8a5f77ac2db041f68266593add12ac5f5eac2d76",
+      "name": "smoothmix-xxx-animations-low",
+      "role": "lora_smoothmix_animations_low",
+      "sha256": "ad50dfc46c765a6ccc36d40e8a5f77ac2db041f68266593add12ac5f5eac2d76",
+      "target_filename": "SmoothXXXAnimation_Low.safetensors",
+      "version_id": "Ig41HSpFwWz4d2RN3PsYHr7Y.Sv5DFW5"
+    },
+    {
+      "bytes": 306807976,
+      "key": "worker/i2v/sha256/d9931756c202bd8d4946c0d163c1269231a6352b51bb4235f6a19894c9ad8c68",
+      "name": "dr34ml4y-i2v-14b-high-v2",
+      "role": "lora_dr34ml4y_high",
+      "sha256": "d9931756c202bd8d4946c0d163c1269231a6352b51bb4235f6a19894c9ad8c68",
+      "target_filename": "DR34ML4Y_I2V_14B_HIGH_V2.safetensors",
+      "version_id": "bQrMPtN6rm20aLZhOtPRMLgbQBIMRZUq"
+    },
+    {
+      "bytes": 306807976,
+      "key": "worker/i2v/sha256/066ee4bfafb685c85f08174c8283cd11bc6d36f4845347f20d633ab44581601f",
+      "name": "dr34ml4y-i2v-14b-low-v2",
+      "role": "lora_dr34ml4y_low",
+      "sha256": "066ee4bfafb685c85f08174c8283cd11bc6d36f4845347f20d633ab44581601f",
+      "target_filename": "DR34ML4Y_I2V_14B_LOW_V2.safetensors",
+      "version_id": "yKzJhX8Qg0KqxWPbXWmVxMfDyXQzOLJ9"
+    },
+    {
+      "bytes": 306807976,
+      "key": "worker/i2v/sha256/851c928737235b4a4a2c5993c893c79ee46a3131aa9b16eb56de1dcc576c3ad9",
+      "name": "m4crom4sti4-natural-breasts-high-k3nk",
+      "role": "lora_m4crom4sti4_high",
+      "sha256": "851c928737235b4a4a2c5993c893c79ee46a3131aa9b16eb56de1dcc576c3ad9",
+      "target_filename": "wan22-m4crom4sti4-i2v-20epoc-high-k3nk.safetensors",
+      "version_id": "VrB8Q47BLLGi5nzzpyAX5k_mBE40LH07"
+    },
+    {
+      "bytes": 306807976,
+      "key": "worker/i2v/sha256/c8a940ad5ab59a15c7f39624f694482a020f0dd047cec56f498b58418d3d937c",
+      "name": "m4crom4sti4-natural-breasts-low-k3nk",
+      "role": "lora_m4crom4sti4_low",
+      "sha256": "c8a940ad5ab59a15c7f39624f694482a020f0dd047cec56f498b58418d3d937c",
+      "target_filename": "wan22-m4crom4sti4-i2v-20epoc-low-k3nk.safetensors",
+      "version_id": "v_b_4fdm_tx4cVu2vnELlGIildf5ZC.J"
+    },
+    {
+      "bytes": 306847504,
+      "key": "worker/i2v/sha256/3ba8320137ba7d99885624dc512d8e0ea02f24364eabbe31e803fec785339ecb",
+      "name": "bouncing-boobs-wan22-low",
+      "role": "lora_bouncing_boobs_low",
+      "sha256": "3ba8320137ba7d99885624dc512d8e0ea02f24364eabbe31e803fec785339ecb",
+      "target_filename": "BounceLowWan2_2.safetensors",
+      "version_id": "OMN0ZCEBXuHQSs4RZE95TPOYwDOpdyGZ"
+    },
+    {
+      "bytes": 306847512,
+      "key": "worker/i2v/sha256/a4f4398031e9f39571310355f23e2d104c21143f517cf053e06d21f1c48d3d52",
+      "name": "bouncing-boobs-wan22-high",
+      "role": "lora_bouncing_boobs_high",
+      "sha256": "a4f4398031e9f39571310355f23e2d104c21143f517cf053e06d21f1c48d3d52",
+      "target_filename": "BounceHighWan2_2.safetensors",
+      "version_id": "GIwb8Gv.YFxVf6_s0wwTLEx1sn3OFIw2"
+    },
+    {
+      "bytes": 613516752,
+      "key": "worker/i2v/sha256/34e2144d3cd65360f97d09ccbe03e1c39a096df6c9234af5fe3899d1b63cda39",
+      "name": "wan-general-nsfw-high-v008a",
+      "role": "lora_wan_general_nsfw_high",
+      "sha256": "34e2144d3cd65360f97d09ccbe03e1c39a096df6c9234af5fe3899d1b63cda39",
+      "target_filename": "NSFW-22-H-e8.safetensors",
+      "version_id": "bsLvkEmPu19tQ9hUkD7dX9RptHO6UYKL"
+    },
+    {
+      "bytes": 613516752,
+      "key": "worker/i2v/sha256/d6b783742f4d5fd63a0223ae1d5bf64fc995a6b408480ac2a00528ae0d4146db",
+      "name": "wan-general-nsfw-low-v008a",
+      "role": "lora_wan_general_nsfw_low",
+      "sha256": "d6b783742f4d5fd63a0223ae1d5bf64fc995a6b408480ac2a00528ae0d4146db",
+      "target_filename": "NSFW-22-L-e8.safetensors",
+      "version_id": "GHSoFIONrSN.7J1fR5ai4cuoknu.5tUL"
+    }
+  ],
+  "schema": "gen-automation/i2v-private-model-mirror/v1"
+}

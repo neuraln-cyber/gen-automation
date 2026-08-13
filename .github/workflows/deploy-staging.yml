@@ -1087,7 +1087,7 @@ jobs:
       EXPECTED_ARTIFACT_IDENTITY_SHA256: 68f6c28831ac2a8e1801ba420c9816a29e09c8cc4738aae85611955553a3d301
       EXPECTED_PRIVATE_MANIFEST_SHA256: f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1e2de19876e
       EXPECTED_MODEL_MANIFEST_SHA256: ebdeca736ee3e9ea4e4b7118c9e4b54dfcfd1bbde5a761f424aa85b1670b806f
-      EXPECTED_WORKER_MODEL_OBJECTS_SHA256: be5802ffc52ee6bfa6c64a135dfdef37e4e0274e4098c9eb87e4edaafc4719a6
+      EXPECTED_WORKER_MODEL_OBJECTS_SHA256: 4ff59362992c7284e2e24fcb7d3ce2c61b6d662f074123777bc621971f33a8fc
     steps:
       - name: Check out the exact workflow revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1111,7 +1111,7 @@ jobs:
           fi
           [ "$EXPECTED_PRIVATE_MANIFEST_SHA256" = "f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1e2de19876e" ]
           [ "$EXPECTED_MODEL_MANIFEST_SHA256" = "ebdeca736ee3e9ea4e4b7118c9e4b54dfcfd1bbde5a761f424aa85b1670b806f" ]
-          [ "$EXPECTED_WORKER_MODEL_OBJECTS_SHA256" = "be5802ffc52ee6bfa6c64a135dfdef37e4e0274e4098c9eb87e4edaafc4719a6" ]
+          [ "$EXPECTED_WORKER_MODEL_OBJECTS_SHA256" = "4ff59362992c7284e2e24fcb7d3ce2c61b6d662f074123777bc621971f33a8fc" ]
           [ "$EXPECTED_ARTIFACT_IDENTITY_SHA256" = "68f6c28831ac2a8e1801ba420c9816a29e09c8cc4738aae85611955553a3d301" ]
           bash -n infra/aws-staging/deploy/configure-i2v-lora-profile.sh
           printf 'PROFILE_SCRIPT_SHA256=%s\n' "$(sha256sum infra/aws-staging/deploy/configure-i2v-lora-profile.sh | cut -d' ' -f1)" >>"$GITHUB_ENV"
