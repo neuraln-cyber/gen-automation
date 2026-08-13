@@ -841,6 +841,67 @@ async def test_recycle_promote_patches_an_exact_explicitly_stopped_source_before
 
 
 @pytest.mark.asyncio
+async def test_recycle_promote_accepts_only_the_legacy_omitted_false_capability_key(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    source = _group(capable=False)
+    raw = deepcopy(source.raw)
+    environment = cast(
+        dict[str, str],
+        cast(JSONObject, raw["container"])["environment_variables"],
+    )
+    environment.pop("GEN_I2V_WORKER_LORA_WORKER_ENABLED")
+    client = _FakeSalad(group=replace(source, raw=raw))
+
+    result = await _recycle_promote(
+        database=database,
+        client=client,
+        artifact=_ArtifactClient(),
+        tmp_path=tmp_path,
+    )
+
+    state = rollout.read_provider_rollback_state(tmp_path / "rollback.json")
+    assert result.provider_ready
+    assert "GEN_I2V_WORKER_LORA_WORKER_ENABLED" not in state.prior_environment_keys
+    assert cast(JSONObject, client.update_patches[0]["container"])
+
+
+def test_legacy_recycle_environment_rejects_missing_or_non_false_other_values() -> None:
+    expected = {
+        "GEN_I2V_WORKER_LORA_WORKER_ENABLED": "false",
+        "GEN_I2V_WORKER_SOURCE_REVISION": "a" * 40,
+        "AWS_ACCESS_KEY_ID": "access",
+        "AWS_SECRET_ACCESS_KEY": "secret",
+        "AWS_SESSION_TOKEN": "token",
+    }
+    legacy_observed = {
+        key: value for key, value in expected.items() if key != "GEN_I2V_WORKER_LORA_WORKER_ENABLED"
+    }
+    rollout._validate_exact_legacy_recycle_environment_readback(
+        legacy_observed,
+        expected,
+    )
+
+    with pytest.raises(I2VLoraRolloutError, match="environment keys changed"):
+        rollout._validate_exact_legacy_recycle_environment_readback(
+            {
+                key: value
+                for key, value in legacy_observed.items()
+                if key != "GEN_I2V_WORKER_SOURCE_REVISION"
+            },
+            expected,
+        )
+    with pytest.raises(I2VLoraRolloutError, match="environment identity changed"):
+        rollout._validate_exact_legacy_recycle_environment_readback(
+            {**expected, "GEN_I2V_WORKER_LORA_WORKER_ENABLED": "true"},
+            expected,
+        )
+
+
+@pytest.mark.asyncio
 async def test_recycle_promote_refuses_all_provider_mutation_when_any_queue_plane_is_nonzero(
     database: Database,
     monkeypatch: pytest.MonkeyPatch,
