@@ -15,6 +15,10 @@
   const advanced = root.querySelector("[data-advanced-settings]");
   const sourceLibrary = root.querySelector("[data-source-library]");
   const selectedCard = root.querySelector("[data-selected-source]");
+  const assetIdForm = root.querySelector("[data-asset-id-form]");
+  const assetIdInput = root.querySelector("[data-asset-id-input]");
+  const assetIdButton = root.querySelector("[data-select-asset-id]");
+  const assetIdStatus = root.querySelector("[data-asset-id-status]");
   const enqueueButton = root.querySelector("[data-enqueue]");
   const globalStatus = root.querySelector("[data-global-status]");
   const presetSelect = root.querySelector("[data-preset-select]");
@@ -24,6 +28,7 @@
   const presetDialog = root.querySelector("[data-preset-dialog]");
   const draftState = root.querySelector("[data-draft-state]");
   const state = { selected: null, presets: [], jobs: [], sourceLimit: 100 };
+  const assetIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
   const maxLoopDurationSeconds = 25;
   const maxLoopCycles = 20;
   const workerSettingDefaults = {
@@ -173,6 +178,59 @@
     root.querySelectorAll("[data-source-view]").forEach((view) => {
       view.hidden = view.dataset.sourceView !== name;
     });
+  }
+
+  function setAssetIdStatus(message, error = false) {
+    assetIdStatus.textContent = message;
+    assetIdStatus.classList.toggle("error", error);
+  }
+
+  async function selectAssetById(event) {
+    event.preventDefault();
+    const assetId = assetIdInput.value.trim();
+    assetIdInput.value = assetId;
+    assetIdInput.setCustomValidity("");
+    if (!assetIdPattern.test(assetId)) {
+      const message = "Enter a complete asset UUID, including its four hyphens.";
+      assetIdInput.setCustomValidity(message);
+      setAssetIdStatus(message, true);
+      assetIdInput.reportValidity();
+      return;
+    }
+
+    assetIdForm.setAttribute("aria-busy", "true");
+    assetIdInput.disabled = true;
+    assetIdButton.disabled = true;
+    assetIdButton.textContent = "Selecting…";
+    setAssetIdStatus("Registering the generated image…");
+    try {
+      const input = await api("/inputs/from-asset", {
+        method: "POST",
+        body: JSON.stringify({ asset_id: assetId }),
+      });
+      const registeredAssetId = input.asset_id || assetId;
+      form.elements.match_source_aspect.checked = true;
+      setSelected({
+        kind: "input",
+        inputId: input.input_id,
+        assetId: registeredAssetId,
+        name: input.display_name,
+        preview: `${apiBase}/source-images/${registeredAssetId}/preview/${input.sha256.slice(0, 16)}.jpg`,
+        sourceWidth: input.width,
+        sourceHeight: input.height,
+        detail: `${input.width} × ${input.height} · ${friendlyBytes(input.byte_size)}`,
+      });
+      setAssetIdStatus(`Selected ${input.width} × ${input.height} source image.`);
+      announce("Generated image selected. Add motion direction and queue the generation.");
+    } catch (error) {
+      setAssetIdStatus(error.message, true);
+      announce(error.message, true);
+    } finally {
+      assetIdForm.setAttribute("aria-busy", "false");
+      assetIdInput.disabled = !canManage;
+      assetIdButton.disabled = !canManage;
+      assetIdButton.textContent = "Use image";
+    }
   }
 
   function uploadDirect(grant, file, onProgress) {
@@ -568,6 +626,11 @@
   root.querySelectorAll("[data-source-tab]").forEach((button) => button.addEventListener("click", () => activateSourceTab(button.dataset.sourceTab)));
   q("[data-refresh-library]").addEventListener("click", () => loadSources().catch((error) => announce(error.message, true)));
   q("[data-load-more-sources]").addEventListener("click", () => { state.sourceLimit = 200; loadSources().catch((error) => announce(error.message, true)); });
+  assetIdForm.addEventListener("submit", selectAssetById);
+  assetIdInput.addEventListener("input", () => {
+    assetIdInput.setCustomValidity("");
+    setAssetIdStatus("Paste an exact generated-image asset UUID.");
+  });
   q("[data-clear-source]").addEventListener("click", () => setSelected(null));
   q("[data-upload-file]").addEventListener("change", (event) => uploadImage(event.target.files[0]));
   const dropzone = q("[data-upload-dropzone]");
@@ -616,6 +679,8 @@
   });
 
   if (!canManage) {
+    assetIdInput.disabled = true;
+    assetIdButton.disabled = true;
     form.querySelectorAll("input, textarea, select, button").forEach((element) => { element.disabled = true; });
     announce("Your account can view image-to-video activity but cannot change the queue.");
   }

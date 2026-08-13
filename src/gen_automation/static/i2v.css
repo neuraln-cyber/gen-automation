@@ -24,7 +24,7 @@
 .i2v-icon-button.danger { color: var(--danger); }
 .i2v-wide-button { width: 100%; margin-top: .75rem; }
 
-.i2v-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: .25rem; margin: 1rem 0 .75rem; padding: .25rem; border-radius: .8rem; background: rgba(255, 255, 255, .04); }
+.i2v-tabs { display: grid; grid-template-columns: repeat(3, 1fr); gap: .25rem; margin: 1rem 0 .75rem; padding: .25rem; border-radius: .8rem; background: rgba(255, 255, 255, .04); }
 .i2v-tab { min-height: 2.55rem; border: 0; border-radius: .6rem; background: transparent; color: var(--muted); font-weight: 800; }
 .i2v-tab.active { background: var(--surface-raised); box-shadow: var(--shadow-sm); color: var(--text); }
 .i2v-library { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .55rem; max-height: 30rem; overflow: auto; padding: .1rem; }
@@ -32,6 +32,13 @@
 .i2v-source-card:hover, .i2v-source-card.selected { border-color: var(--i2v-cyan); box-shadow: 0 0 0 2px rgba(114, 215, 255, .13); }
 .i2v-source-card img { display: block; width: 100%; aspect-ratio: 4 / 5; object-fit: cover; }
 .i2v-source-card span { position: absolute; inset: auto .35rem .35rem; overflow: hidden; padding: .3rem .42rem; border-radius: .45rem; background: rgba(7, 8, 14, .82); font-size: .68rem; font-weight: 730; text-overflow: ellipsis; white-space: nowrap; backdrop-filter: blur(8px); }
+.i2v-asset-id-picker { display: grid; gap: .7rem; padding: .85rem; border: 1px solid var(--border); border-radius: var(--radius); background: rgba(255, 255, 255, .018); }
+.i2v-asset-id-picker label { display: grid; gap: .3rem; color: var(--muted-strong); font-size: .77rem; font-weight: 730; }
+.i2v-asset-id-picker label small { color: var(--muted); font-weight: 500; line-height: 1.4; }
+.i2v-asset-id-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .45rem; }
+.i2v-asset-id-row input { min-width: 0; min-height: 2.7rem; padding: .55rem .65rem; border: 1px solid var(--border); border-radius: .65rem; background: rgba(7, 8, 14, .66); color: var(--text); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .72rem; }
+.i2v-asset-id-picker p { margin: 0; font-size: .72rem; }
+.i2v-asset-id-picker p.error { color: var(--danger); }
 .i2v-dropzone { display: grid; min-height: 15rem; place-items: center; align-content: center; gap: .3rem; padding: 1rem; border: 1px dashed var(--border-strong); border-radius: var(--radius); background: rgba(255, 255, 255, .018); color: var(--muted-strong); text-align: center; cursor: pointer; }
 .i2v-dropzone:hover, .i2v-dropzone.dragging { border-color: var(--i2v-cyan); background: var(--i2v-cyan-soft); }
 .i2v-dropzone input { position: absolute; width: 1px; height: 1px; opacity: 0; }
@@ -117,6 +124,7 @@
   .i2v-queue-panel { grid-column: auto; }
 }
 @media (max-width: 540px) {
+  .i2v-asset-id-row { grid-template-columns: 1fr; }
   .i2v-preset-bar { grid-template-columns: minmax(0, 1fr) auto auto; }
   .i2v-preset-bar .secondary-button { grid-column: 1 / -1; grid-row: 2; }
   .i2v-settings-grid { grid-template-columns: 1fr; }
