@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _SAFE_OBJECT_KEY = re.compile(r"^[^\x00-\x1f\\]{1,1024}$")
+_MAX_LOOP_DURATION_SECONDS = 25
 
 
 class _StrictModel(BaseModel):
@@ -99,6 +100,7 @@ class GenerationSettings(_StrictModel):
     fps: int = Field(default=16, gt=0)
     width: int = Field(default=576, ge=32)
     height: int = Field(default=1024, ge=32)
+    match_source_aspect: bool = False
     seed: int = -1
     steps: int = Field(default=4, ge=2)
     high_end_step: int = Field(default=2, ge=1)
@@ -108,8 +110,11 @@ class GenerationSettings(_StrictModel):
     sampler: Literal["euler"] = "euler"
     scheduler: Literal["linear_quadratic"] = "linear_quadratic"
     interpolation: Literal["none"] = "none"
-    upscale: Literal["none"] = "none"
-    loop: Literal[False] = False
+    upscale: Literal["none", "source"] = "none"
+    loop: bool = False
+    # The field ceiling is a secondary resource guard; the cross-field
+    # validator below enforces the actual 25-second delivery contract.
+    loop_count: int = Field(default=2, ge=1, le=20)
     color_transfer: Literal[False] = False
     tiled_vae: Literal[False] = False
     loras: list[dict[str, Any]] = Field(default_factory=list, max_length=0)
@@ -122,6 +127,10 @@ class GenerationSettings(_StrictModel):
             raise ValueError("dimensions must be divisible by 32")
         if self.high_end_step >= self.steps:
             raise ValueError("high stage must end before total steps")
+        if self.loop:
+            output_frames = ((2 * self.frame_count) - 2) * self.loop_count
+            if output_frames > self.fps * _MAX_LOOP_DURATION_SECONDS:
+                raise ValueError("looped output duration must not exceed 25 seconds")
         return self
 
 

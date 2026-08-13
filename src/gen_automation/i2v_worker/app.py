@@ -16,6 +16,8 @@ from gen_automation.i2v_worker.media import (
     MediaError,
     download_input,
     encode_video,
+    prepare_input_image,
+    resolve_generation_settings,
     upload_video,
 )
 from gen_automation.i2v_worker.models import I2VJob, I2VResult, OutputResult
@@ -131,6 +133,8 @@ async def _run_job(
     }[job.input_snapshot.content_type]
     input_name = f"source-{job.attempt_id}{input_suffix}"
     input_path = settings.runtime_root / "input" / input_name
+    prepared_name = f"prepared-{job.attempt_id}.png"
+    prepared_path = settings.runtime_root / "input" / prepared_name
     allow_http = settings.environment == "test"
     try:
         job_root.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -142,12 +146,24 @@ async def _run_job(
             attempts=settings.network_attempts,
             allow_http=allow_http,
         )
+        generation_settings = resolve_generation_settings(
+            job.settings_snapshot,
+            source_width=job.input_snapshot.width,
+            source_height=job.input_snapshot.height,
+        )
+        await asyncio.to_thread(
+            prepare_input_image,
+            input_path,
+            prepared_path,
+            width=generation_settings.width,
+            height=generation_settings.height,
+        )
         rendered, seed, _prefix = render_workflow(
             workflow,
-            input_filename=input_name,
+            input_filename=prepared_name,
             positive_prompt=job.positive_prompt,
             negative_prompt=job.negative_prompt,
-            settings=job.settings_snapshot,
+            settings=generation_settings,
             job_id=job.job_id,
             attempt_id=job.attempt_id,
         )
@@ -158,8 +174,10 @@ async def _run_job(
         video, metadata = await asyncio.to_thread(
             encode_video,
             frames,
-            job.settings_snapshot,
+            generation_settings,
             job_root,
+            source_width=job.input_snapshot.width,
+            source_height=job.input_snapshot.height,
         )
         version_id, byte_size, sha256 = await upload_video(
             video,
@@ -190,11 +208,19 @@ async def _run_job(
                     "codec": metadata["codec"],
                     "pixel_format": metadata["pixel_format"],
                     "faststart": metadata["faststart"],
+                    "native_width": metadata["native_width"],
+                    "native_height": metadata["native_height"],
+                    "upscale": metadata["upscale"],
+                    "loop_mode": metadata["loop_mode"],
+                    "loop_count": metadata["loop_count"],
+                    "source_fit": metadata["source_fit"],
+                    "match_source_aspect": metadata["match_source_aspect"],
                 },
             ),
         )
     finally:
         input_path.unlink(missing_ok=True)
+        prepared_path.unlink(missing_ok=True)
         shutil.rmtree(job_root, ignore_errors=True)
         output_attempt = (
             settings.runtime_root / "output/i2v" / str(job.job_id) / str(job.attempt_id)

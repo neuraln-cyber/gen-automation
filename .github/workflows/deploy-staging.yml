@@ -57,6 +57,10 @@ jobs:
       IMAGE_REPOSITORY: ghcr.io/neuraln-cyber/gen-automation/control-plane-mega
       WORKER_IMAGE_REPOSITORY: ghcr.io/neuraln-cyber/gen-automation/gpu-worker
       I2V_WORKER_IMAGE_REPOSITORY: ghcr.io/neuraln-cyber/gen-automation/i2v-worker
+      COORDINATED_I2V_ROLLOUT_SOURCE_REVISION: >-
+        ${{ vars.STAGING_COORDINATED_I2V_ROLLOUT_SOURCE_REVISION }}
+      COORDINATED_I2V_WORKER_IMAGE_REF: >-
+        ${{ vars.STAGING_COORDINATED_I2V_WORKER_IMAGE_REF }}
       PUBLISH_RUN_ID: ${{ github.event.workflow_run.id }}
     steps:
       # This is a second-level workflow_run event (CI -> publish -> deploy), so
@@ -305,6 +309,26 @@ jobs:
           [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
           [[ "$WORKER_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
 
+          # Ordinary releases carry no coordinated I2V metadata and preserve
+          # the existing host pin. An operator-authorized rollout must bind an
+          # exact published image to this exact control-plane source revision.
+          coordinated_i2v_revision="${COORDINATED_I2V_ROLLOUT_SOURCE_REVISION:-}"
+          coordinated_i2v_image="${COORDINATED_I2V_WORKER_IMAGE_REF:-}"
+          if [ -n "$coordinated_i2v_revision" ] || [ -n "$coordinated_i2v_image" ]; then
+            [[ "$coordinated_i2v_revision" =~ ^[0-9a-f]{40}$ ]] || {
+              printf '%s\n' "Coordinated I2V rollout source revision is invalid." >&2
+              exit 1
+            }
+            [ "$coordinated_i2v_revision" = "$SOURCE_REVISION" ] || {
+              printf '%s\n' "Coordinated I2V rollout targets a different source revision." >&2
+              exit 1
+            }
+            [ "$coordinated_i2v_image" = "$I2V_WORKER_IMAGE_REF" ] || {
+              printf '%s\n' "Coordinated I2V rollout image differs from the published image." >&2
+              exit 1
+            }
+          fi
+
           latest_main="$(
             gh api \
               --header 'Accept: application/vnd.github+json' \
@@ -350,7 +374,7 @@ jobs:
           parameters_file="$RUNNER_TEMP/ssm-parameters.json"
           SSM_IMAGE_REF="$IMAGE_REF" \
           SSM_WORKER_IMAGE_REF="$WORKER_IMAGE_REF" \
-          SSM_I2V_WORKER_IMAGE_REF="$I2V_WORKER_IMAGE_REF" \
+          SSM_COORDINATED_I2V_WORKER_IMAGE_REF="$coordinated_i2v_image" \
           SSM_SOURCE_REVISION="$SOURCE_REVISION" \
           SSM_BOOTSTRAP_HELPER_SHA256="$bootstrap_helper_sha256" \
           SSM_BOOTSTRAP_COMPOSE_SHA256="$bootstrap_compose_sha256" \
@@ -361,11 +385,23 @@ jobs:
             python3 -c '
           import json
           import os
+          import re
           import shlex
 
           image = os.environ["SSM_IMAGE_REF"]
           worker_image = os.environ["SSM_WORKER_IMAGE_REF"]
-          i2v_worker_image = os.environ["SSM_I2V_WORKER_IMAGE_REF"]
+          # Routine control-plane releases must preserve the live I2V pin. A
+          # coordinated provider rollout may opt in by supplying this exact,
+          # immutable reference to the command generator explicitly.
+          i2v_worker_image = os.environ.get(
+              "SSM_COORDINATED_I2V_WORKER_IMAGE_REF",
+              "",
+          ).strip()
+          if i2v_worker_image and not re.fullmatch(
+              r"ghcr\.io/neuraln-cyber/gen-automation/i2v-worker@sha256:[0-9a-f]{64}",
+              i2v_worker_image,
+          ):
+              raise SystemExit("coordinated I2V worker image reference is invalid")
           revision = os.environ["SSM_SOURCE_REVISION"]
           bootstrap_helper_sha256 = os.environ["SSM_BOOTSTRAP_HELPER_SHA256"]
           bootstrap_compose_sha256 = os.environ["SSM_BOOTSTRAP_COMPOSE_SHA256"]
@@ -379,6 +415,8 @@ jobs:
           runtime_env_backup = f"{runtime_env}.{revision}.rollback"
           worker_image_key = "GEN_AUTOMATION_SALAD_WORKER_IMAGE"
           i2v_worker_image_key = "GEN_AUTOMATION_I2V_WORKER_IMAGE"
+          i2v_enabled_key = "GEN_AUTOMATION_I2V_ENABLED"
+          i2v_hires_profile_key = "GEN_AUTOMATION_I2V_HIRES_PROFILE_ENABLED"
           update_runtime_images = """
           import os
           import pathlib
@@ -421,14 +459,23 @@ jobs:
               "sudo /usr/bin/install -o root -g root -m 0600"
               f" {shlex.quote(runtime_env)} {shlex.quote(runtime_env_backup)}"
           )
+          runtime_image_updates = [worker_image_key, worker_image]
+          if i2v_worker_image:
+              runtime_image_updates.extend(
+                  [
+                      i2v_worker_image_key,
+                      i2v_worker_image,
+                      i2v_enabled_key,
+                      "true",
+                      i2v_hires_profile_key,
+                      "true",
+                  ]
+              )
           update_worker_references = (
               "sudo /usr/bin/python3 -c"
               f" {shlex.quote(update_runtime_images)}"
               f" {shlex.quote(runtime_env)}"
-              f" {shlex.quote(worker_image_key)}"
-              f" {shlex.quote(worker_image)}"
-              f" {shlex.quote(i2v_worker_image_key)}"
-              f" {shlex.quote(i2v_worker_image)}"
+              + "".join(f" {shlex.quote(value)}" for value in runtime_image_updates)
           )
           remove_runtime_backup = f"sudo /usr/bin/rm -f -- {shlex.quote(runtime_env_backup)}"
           refresh_host_bootstrap = (

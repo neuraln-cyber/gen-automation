@@ -360,9 +360,16 @@ async def jobs(
 @router.post("/jobs", response_model=JobBatchRead, status_code=status.HTTP_201_CREATED)
 async def enqueue_jobs(
     payload: JobCreate,
+    request: Request,
     session: Session,
     principal: ReleaseManager,
 ) -> JobBatchRead:
+    settings: Settings = request.app.state.settings
+    if not settings.i2v_hires_profile_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="image-to-video submissions are paused for the coordinated worker rollout",
+        )
     created: list[I2VJobSnapshot] = []
     draft = I2VJobDraft(
         input_id=payload.input_id,

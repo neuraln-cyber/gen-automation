@@ -16,6 +16,7 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
         database_url=f"sqlite+aiosqlite:///{database_path.as_posix()}",
         auto_create_schema=True,
         auth_development_bypass_enabled=True,
+        i2v_hires_profile_enabled=True,
         session_secret="test-session-secret-with-more-than-32-characters",  # noqa: S106
     )
     with TestClient(create_app(settings)) as test_client:

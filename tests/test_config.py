@@ -28,6 +28,10 @@ def test_salad_reconciliation_timeout_default_covers_eight_pages_and_cancel() ->
     assert Settings().background_reconcile_timeout_seconds == 300
 
 
+def test_hires_i2v_profile_defaults_closed_until_matching_worker_rollout() -> None:
+    assert Settings().i2v_hires_profile_enabled is False
+
+
 def test_production_configuration_fails_closed() -> None:
     with pytest.raises(ValidationError):
         Settings(environment=Environment.PRODUCTION)

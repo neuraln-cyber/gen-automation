@@ -72,7 +72,7 @@ def _settings() -> Settings:
         i2v_salad_container_group_name="i2v-worker-v1",
         i2v_salad_prefetch=3,
         i2v_worker_lease_seconds=86_400,
-        i2v_warm_idle_seconds=18_000,
+        i2v_warm_idle_seconds=36_000,
         i2v_salad_cpu=8,
         i2v_salad_memory_mb=32_768,
         i2v_salad_storage_bytes=268_435_456_000,
@@ -178,10 +178,10 @@ async def test_runtime_environment_contains_only_required_bootstrap_values() -> 
     assert "CIVITAI" not in " ".join(environment)
 
 
-def test_runtime_config_keeps_five_hour_warm_session_and_exact_5090() -> None:
+def test_runtime_config_keeps_ten_hour_warm_session_and_exact_5090() -> None:
     config = i2v_runtime_config_from_settings(_settings())
 
-    assert config.salad.warm_idle_seconds == 18_000
+    assert config.salad.warm_idle_seconds == 36_000
     assert config.salad.gpu_class_name == "RTX 5090 (32 GB)"
     assert config.salad.storage_bytes == 268_435_456_000
     assert config.salad.max_replicas == 1

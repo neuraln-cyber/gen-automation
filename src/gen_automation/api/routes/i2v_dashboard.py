@@ -40,6 +40,7 @@ async def dashboard_i2v(request: Request, principal: ReleaseReader) -> Response:
             "csrf_token": csrf_token,
             "can_manage": principal.role in {AdminRole.OWNER, AdminRole.ADMIN},
             "max_image_bytes": settings.storage_max_image_bytes,
+            "hires_profile_enabled": settings.i2v_hires_profile_enabled,
         },
     )
     response.headers["Cache-Control"] = "private, no-store"

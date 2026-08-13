@@ -531,6 +531,9 @@ class Settings(BaseSettings):
     # the retired VIDEO lane so the new DaSiWa worker can be deployed and reasoned
     # about as one self-contained system.
     i2v_enabled: bool = False
+    # Keep wire-incompatible dashboard controls closed until the matching
+    # immutable worker image is running and ready.
+    i2v_hires_profile_enabled: bool = False
     i2v_salad_queue_name: str = "i2v-jobs-v1"
     i2v_salad_container_group_name: str = "i2v-worker-v1"
     i2v_worker_image: str | None = None
@@ -538,7 +541,7 @@ class Settings(BaseSettings):
     i2v_salad_gpu_class_name: str = "RTX 5090 (32 GB)"
     i2v_salad_prefetch: int = Field(default=3, gt=0)
     i2v_worker_lease_seconds: int = Field(default=24 * 60 * 60, gt=0)
-    i2v_warm_idle_seconds: int | None = Field(default=5 * 60 * 60, gt=0)
+    i2v_warm_idle_seconds: int | None = Field(default=10 * 60 * 60, gt=0)
     i2v_salad_cpu: int = Field(default=8, gt=0)
     i2v_salad_memory_mb: int = Field(default=32 * 1024, gt=0)
     i2v_salad_storage_bytes: int = Field(default=250 * 1024 * 1024 * 1024, gt=0)

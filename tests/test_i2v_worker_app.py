@@ -134,9 +134,20 @@ def test_generation_returns_exact_wire_result_and_cleans_runtime(
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(b"x")
 
-    def encode(_frames: Any, generation: Any, job_root: Path) -> tuple[Path, dict[str, Any]]:
+    def prepare(source: Path, destination: Path, **_kwargs: Any) -> None:
+        destination.write_bytes(source.read_bytes())
+
+    def encode(
+        _frames: Any,
+        generation: Any,
+        job_root: Path,
+        *,
+        source_width: int,
+        source_height: int,
+    ) -> tuple[Path, dict[str, Any]]:
         output = job_root / "output.mp4"
         output.write_bytes(b"video")
+        assert (source_width, source_height) == (576, 1024)
         return output, {
             "width": generation.width,
             "height": generation.height,
@@ -146,12 +157,20 @@ def test_generation_returns_exact_wire_result_and_cleans_runtime(
             "codec": "h264",
             "pixel_format": "yuv420p",
             "faststart": True,
+            "native_width": generation.width,
+            "native_height": generation.height,
+            "upscale": generation.upscale,
+            "loop_mode": "none",
+            "loop_count": 1,
+            "source_fit": "contain_edge_pad",
+            "match_source_aspect": generation.match_source_aspect,
         }
 
     async def upload(*_args: Any, **_kwargs: Any) -> tuple[str, int, str]:
         return "output-v1", 5, SHA
 
     monkeypatch.setattr("gen_automation.i2v_worker.app.download_input", download)
+    monkeypatch.setattr("gen_automation.i2v_worker.app.prepare_input_image", prepare)
     monkeypatch.setattr("gen_automation.i2v_worker.app.encode_video", encode)
     monkeypatch.setattr("gen_automation.i2v_worker.app.upload_video", upload)
     app = create_i2v_worker_app(settings, supervisor=supervisor)  # type: ignore[arg-type]
