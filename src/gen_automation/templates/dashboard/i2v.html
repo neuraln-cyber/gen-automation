@@ -153,7 +153,7 @@
             <label>Seed <input type="number" name="seed" value="-1" step="1" aria-describedby="seed-help"><small id="seed-help">−1 chooses a fresh seed</small></label>
             <label>Total steps <input type="number" name="steps" value="4" min="1" step="1" required></label>
             <label>High-stage end step <input type="number" name="high_end_step" value="2" min="1" step="1" required></label>
-            <label>CFG <input type="number" name="cfg" value="1" min="0.01" step="0.05" required></label>
+            <label>CFG <input type="number" name="cfg" value="1.0" min="0.01" step="0.01" required></label>
             <label>High shift <input type="number" name="high_shift" value="5" step="0.1" required></label>
             <label>Low shift <input type="number" name="low_shift" value="5" step="0.1" required></label>
             <label>Sampler
@@ -210,9 +210,9 @@
     <dialog class="i2v-dialog" data-preset-dialog>
       <form method="dialog" data-preset-dialog-form>
         <div><p class="page-kicker">Save reusable setup</p><h2>Name this preset</h2></div>
-        <label>Preset name <input name="name" maxlength="200" required autocomplete="off"></label>
+        <label>Preset name <input name="name" maxlength="200" required autocomplete="off" data-preset-name disabled></label>
         <label>Description <textarea name="description" maxlength="2000" rows="3"></textarea></label>
-        <footer><button class="secondary-button" value="cancel">Cancel</button><button class="primary-button" value="save" data-preset-dialog-submit>Save preset</button></footer>
+        <footer><button class="secondary-button" type="submit" value="cancel" formnovalidate>Cancel</button><button class="primary-button" type="submit" value="save" data-preset-dialog-submit>Save preset</button></footer>
       </form>
     </dialog>
   </section>
