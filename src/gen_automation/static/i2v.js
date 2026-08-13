@@ -26,6 +26,8 @@
   const videoGrid = root.querySelector("[data-video-grid]");
   const loraList = root.querySelector("[data-lora-list]");
   const presetDialog = root.querySelector("[data-preset-dialog]");
+  const presetDialogForm = root.querySelector("[data-preset-dialog-form]");
+  const presetName = root.querySelector("[data-preset-name]");
   const draftState = root.querySelector("[data-draft-state]");
   const state = { selected: null, presets: [], jobs: [], sourceLimit: 100 };
   const assetIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -652,7 +654,15 @@
     const preset = state.presets.find((item) => item.preset_id === presetSelect.value);
     if (preset) applyPreset(preset); updatePresetButtons();
   });
-  q("[data-preset-save]").addEventListener("click", () => presetDialog.showModal());
+  q("[data-preset-save]").addEventListener("click", () => {
+    presetName.disabled = false;
+    presetDialog.showModal();
+    presetName.focus();
+  });
+  presetDialog.addEventListener("close", () => {
+    presetDialogForm.reset();
+    presetName.disabled = true;
+  });
   q("[data-preset-update]").addEventListener("click", async () => {
     const preset = state.presets.find((item) => item.preset_id === presetSelect.value); if (!preset) return;
     try {
@@ -670,11 +680,11 @@
     try { await api(`/presets/${preset.preset_id}`, { method: "DELETE" }); presetSelect.value = ""; await loadPresets(); announce("Preset deleted."); }
     catch (error) { announce(error.message, true); }
   });
-  q("[data-preset-dialog-form]").addEventListener("submit", async (event) => {
+  presetDialogForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     if (event.submitter?.value === "cancel") { presetDialog.close(); return; }
     const data = new FormData(event.currentTarget);
-    try { await createPreset(String(data.get("name") || ""), String(data.get("description") || "")); presetDialog.close(); event.currentTarget.reset(); }
+    try { await createPreset(String(data.get("name") || ""), String(data.get("description") || "")); presetDialog.close(); }
     catch (error) { announce(error.message, true); }
   });
 

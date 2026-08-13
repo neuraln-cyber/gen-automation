@@ -1,6 +1,17 @@
+from html.parser import HTMLParser
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+
+
+class _InputCollector(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.inputs: list[dict[str, str | None]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "input":
+            self.inputs.append(dict(attrs))
 
 
 def test_i2v_dashboard_exposes_focused_generation_controls(client: TestClient) -> None:
@@ -63,6 +74,31 @@ def test_i2v_dashboard_dynamically_enforces_loop_duration() -> None:
     assert "loopField.max = String(Math.max(1, allowedCycles))" in script
     assert "loopField.value = String(allowedCycles)" in script
     assert "One ping-pong cycle exceeds the 25-second limit." in script
+
+
+def test_i2v_dashboard_default_submit_controls_are_constraint_valid(
+    client: TestClient,
+) -> None:
+    response = client.get("/dashboard/animations")
+    collector = _InputCollector()
+    collector.feed(response.text)
+
+    cfg = next(item for item in collector.inputs if item.get("name") == "cfg")
+    cfg_steps = (float(cfg["value"]) - float(cfg["min"])) / float(cfg["step"])
+    assert cfg["value"] == "1.0"
+    assert cfg_steps.is_integer()
+
+    preset_name = next(item for item in collector.inputs if "data-preset-name" in item)
+    assert "required" in preset_name
+    assert "disabled" in preset_name
+    assert 'value="cancel" formnovalidate' in response.text
+
+    script = (Path(__file__).parents[1] / "src/gen_automation/static/i2v.js").read_text(
+        encoding="utf-8"
+    )
+    assert "presetName.disabled = false" in script
+    assert "presetName.disabled = true" in script
+    assert 'presetDialog.addEventListener("close"' in script
 
 
 def test_i2v_dashboard_can_register_an_older_generation_by_exact_asset_id() -> None:
