@@ -290,6 +290,60 @@ raise SystemExit(0 if all(value.get(key) == 0 for key in keys) else 1)
 '
 }
 
+print_rollout_diagnostic() {
+  local path="$1"
+  [ -f "$path" ] || return 0
+  /usr/bin/python3 - "$path" <<'PY' >&2
+import json
+import pathlib
+import sys
+
+allowed_stages = {
+    "manifest-fetch", "manifest-integrity", "target-settings",
+    "target-runtime-resolution", "target-identity", "artifact-head-access",
+    "artifact-readback", "host-patch-write", "provider-source-preflight",
+    "rollback-state-persist", "stop-guard", "provider-stop", "stopped-readback",
+    "target-patch-guard", "target-patch", "target-patch-convergence",
+    "target-start-guard", "target-start", "target-readiness",
+    "recovery-zero-work", "recovery-environment", "recovery-provider",
+    "recovery-complete", "complete",
+}
+allowed_outcomes = {
+    "preparing", "mutating", "recovering", "recovered", "recovery-failed", "ready"
+}
+try:
+    value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    raise SystemExit("I2V LoRA diagnostic is unavailable")
+if (
+    not isinstance(value, dict)
+    or value.get("schema") != "gen-automation/i2v-lora-diagnostic/v1"
+    or value.get("operation") not in {"dry-run", "recycle-promote"}
+    or value.get("stage") not in allowed_stages
+    or value.get("outcome") not in allowed_outcomes
+    or ("recovery_stage" in value and value["recovery_stage"] not in allowed_stages)
+):
+    raise SystemExit("I2V LoRA diagnostic is unavailable")
+summary = {
+    "operation": value["operation"],
+    "stage": value["stage"],
+    "outcome": value["outcome"],
+}
+if "recovery_stage" in value:
+    summary["recovery_stage"] = value["recovery_stage"]
+provider = value.get("provider")
+allowed_provider = {
+    "version", "pending_change", "replicas", "status", "allocating_count",
+    "creating_count", "running_count", "stopping_count", "instance_count",
+    "instance_states", "instance_versions", "instance_ready_count",
+    "instance_started_count",
+}
+if isinstance(provider, dict) and set(provider) <= allowed_provider:
+    summary["provider"] = provider
+print("I2V LoRA diagnostic: " + json.dumps(summary, separators=(",", ":"), sort_keys=True))
+PY
+}
+
 assert_container_flags() {
   local container_id="$1"
   local enabled="$2"
@@ -486,20 +540,26 @@ current_env="$work_dir/current.env"
 maintenance_env="$work_dir/maintenance.env"
 provider_state="$work_dir/provider-rollback.json"
 provider_marker="$work_dir/provider-mutation-attempted.json"
+diagnostic_output="$work_dir/rollout-diagnostic.json"
 render_profile "$controller_env" "$original_env" normalize
 chown 10001:10001 "$original_env"
 render_profile "$original_env" "$maintenance_env" maintenance
 chown 10001:10001 "$maintenance_env"
 
 if [ "$operation" = "dry-run" ]; then
-  run_one_off "$original_env" "$initial_container" 900s dry-run \
+  if ! run_one_off "$original_env" "$initial_container" 900s dry-run \
     --expected-worker-image "$expected_worker_image" \
     --expected-worker-source-revision "$expected_worker_source_revision" \
     --expected-private-manifest-bucket "$manifest_bucket" \
     --expected-private-manifest-key "$manifest_key" \
     --expected-private-manifest-version "$manifest_version" \
     --expected-private-manifest-source-sha256 "$manifest_source_sha256" \
-    --prepared-host-env-output /run/i2v-lora-rollout/target.patch
+    --prepared-host-env-output /run/i2v-lora-rollout/target.patch \
+    --diagnostic-output /run/i2v-lora-rollout/rollout-diagnostic.json; then
+    print_rollout_diagnostic "$diagnostic_output"
+    false
+  fi
+  print_rollout_diagnostic "$diagnostic_output"
   exit 0
 fi
 
@@ -549,7 +609,8 @@ if [ "$operation" = "promote" ]; then
     --expected-private-manifest-key "$manifest_key" \
     --expected-private-manifest-version "$manifest_version" \
     --expected-private-manifest-source-sha256 "$manifest_source_sha256" \
-    --prepared-host-env-output /run/i2v-lora-rollout/target.patch >/dev/null
+    --prepared-host-env-output /run/i2v-lora-rollout/target.patch \
+    --diagnostic-output /run/i2v-lora-rollout/rollout-diagnostic.json >/dev/null
 fi
 rollback_armed=1
 maintenance_id="$(restart_into "$maintenance_env" "$expected_revision")"
@@ -559,6 +620,10 @@ assert_container_flags "$maintenance_id" false false false false
 # capable-to-capable rollback, while the serving controller stays frozen. The
 # recycle-promote variant prepares its complete target before STOP and performs
 # STOP -> PATCH while stopped -> START -> Ready inside this single invocation.
+diagnostic_arguments=()
+if [ "$operation" = "recycle-promote" ]; then
+  diagnostic_arguments=(--diagnostic-output /run/i2v-lora-rollout/rollout-diagnostic.json)
+fi
 if ! run_one_off "$original_env" "$maintenance_id" 10000s "$operation" \
   --expected-worker-image "$expected_worker_image" \
   --expected-worker-source-revision "$expected_worker_source_revision" \
@@ -569,7 +634,11 @@ if ! run_one_off "$original_env" "$maintenance_id" 10000s "$operation" \
   --prepared-host-env-output /run/i2v-lora-rollout/target.patch \
   --rollback-state-output /run/i2v-lora-rollout/provider-rollback.json \
   --provider-mutation-marker-output \
-    /run/i2v-lora-rollout/provider-mutation-attempted.json; then
+    /run/i2v-lora-rollout/provider-mutation-attempted.json \
+  "${diagnostic_arguments[@]}"; then
+  if [ "$operation" = "recycle-promote" ]; then
+    print_rollout_diagnostic "$diagnostic_output"
+  fi
   [ -f "$provider_marker" ] && provider_rollback_needed=1
   false
 fi

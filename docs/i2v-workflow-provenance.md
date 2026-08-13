@@ -216,7 +216,7 @@ another:
 | --- | --- |
 | Immutable S3 source bytes | `f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1e2de19876e` |
 | Canonical compact private-manifest JSON stored on the host | `ebdeca736ee3e9ea4e4b7118c9e4b54dfcfd1bbde5a761f424aa85b1670b806f` |
-| Derived 14-role worker model-object JSON | `be5802ffc52ee6bfa6c64a135dfdef37e4e0274e4098c9eb87e4edaafc4719a6` |
+| Derived 14-role worker model-object JSON | `4ff59362992c7284e2e24fcb7d3ce2c61b6d662f074123777bc621971f33a8fc` |
 | Artifact identity over role, bytes, content SHA, and S3 version | `68f6c28831ac2a8e1801ba420c9816a29e09c8cc4738aae85611955553a3d301` |
 
 `promote` and `rollback` first acquire the control-plane deployment lock, close

@@ -59,7 +59,7 @@ def i2v_lora_rollout_main(arguments: Sequence[str] | None = None) -> int:
         return 1
     print(
         json.dumps(
-            asdict(result),
+            {key: value for key, value in asdict(result).items() if value is not None},
             ensure_ascii=True,
             allow_nan=False,
             separators=(",", ":"),
@@ -150,7 +150,10 @@ async def _run(arguments: argparse.Namespace, *, settings: Settings) -> I2VLoraR
             "prepared_host_env_output": arguments.prepared_host_env_output,
         }
         if arguments.operation == "dry-run":
-            return await dry_run_reviewed_worker_rollout(**common)
+            return await dry_run_reviewed_worker_rollout(
+                **common,
+                diagnostic_output=arguments.diagnostic_output,
+            )
         if arguments.operation == "promote":
             return await promote_reviewed_worker(
                 **common,
@@ -162,6 +165,7 @@ async def _run(arguments: argparse.Namespace, *, settings: Settings) -> I2VLoraR
                 **common,
                 rollback_state_output=arguments.rollback_state_output,
                 provider_mutation_marker_output=arguments.provider_mutation_marker_output,
+                diagnostic_output=arguments.diagnostic_output,
             )
         raise I2VLoraRolloutError("unknown rollout operation")
     finally:
@@ -249,6 +253,8 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--expected-private-manifest-version", required=True)
         command.add_argument("--expected-private-manifest-source-sha256", required=True)
         command.add_argument("--prepared-host-env-output", required=True, type=Path)
+        if name in {"dry-run", "recycle-promote"}:
+            command.add_argument("--diagnostic-output", required=True, type=Path)
         if name in {"promote", "recycle-promote"}:
             command.add_argument("--rollback-state-output", required=True, type=Path)
             command.add_argument(

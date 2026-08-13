@@ -799,6 +799,19 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
     ) < rollback.index('restart_into "$original_env"')
     assert "backups remain under $work_dir" in rollback
     assert "provider-mutation-attempted.json" in rollout
+    assert "rollout-diagnostic.json" in rollout
+    assert "gen-automation/i2v-lora-diagnostic/v1" in rollout
+    assert 'print("I2V LoRA diagnostic: "' in rollout
+    dry_run = rollout.split('if [ "$operation" = "dry-run" ]; then', maxsplit=1)[1].split(
+        "\nfi\n", maxsplit=1
+    )[0]
+    assert "--diagnostic-output /run/i2v-lora-rollout/rollout-diagnostic.json" in dry_run
+    actual_failure = promotion.split(
+        'if ! run_one_off "$original_env" "$maintenance_id" 10000s "$operation"',
+        maxsplit=1,
+    )[1].split("\nfi\n", maxsplit=1)[0]
+    assert 'if [ "$operation" = "recycle-promote" ]; then' in actual_failure
+    assert actual_failure.count('print_rollout_diagnostic "$diagnostic_output"') == 1
     assert "merge_saved_i2v_profile" in rollout
     assert 'status_json="$(run_one_off "$controller_env" "$initial_container" 900s status)"' in (
         rollout
@@ -1065,13 +1078,13 @@ def test_i2v_lora_profile_operation_is_single_flag_atomic_and_provider_read_only
     assert workflow_timeout <= 360 * 60
     assert "f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1e2de19876e" in (workflow)
     assert "ebdeca736ee3e9ea4e4b7118c9e4b54dfcfd1bbde5a761f424aa85b1670b806f" in (workflow)
-    assert "be5802ffc52ee6bfa6c64a135dfdef37e4e0274e4098c9eb87e4edaafc4719a6" in workflow
+    assert "4ff59362992c7284e2e24fcb7d3ce2c61b6d662f074123777bc621971f33a8fc" in workflow
     assert "68f6c28831ac2a8e1801ba420c9816a29e09c8cc4738aae85611955553a3d301" in workflow
     assert "i2v_artifact_identity_sha256:" not in workflow
     for identity in (
         "f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1e2de19876e",
         "ebdeca736ee3e9ea4e4b7118c9e4b54dfcfd1bbde5a761f424aa85b1670b806f",
-        "be5802ffc52ee6bfa6c64a135dfdef37e4e0274e4098c9eb87e4edaafc4719a6",
+        "4ff59362992c7284e2e24fcb7d3ce2c61b6d662f074123777bc621971f33a8fc",
         "68f6c28831ac2a8e1801ba420c9816a29e09c8cc4738aae85611955553a3d301",
     ):
         assert identity in configurator
@@ -1168,7 +1181,7 @@ def test_i2v_lora_profile_workflow_transfers_only_checksum_pinned_helper() -> No
             "ebdeca736ee3e9ea4e4b7118c9e4b54dfcfd1bbde5a761f424aa85b1670b806f"
         ),
         "SSM_WORKER_MODEL_OBJECTS_SHA256": (
-            "be5802ffc52ee6bfa6c64a135dfdef37e4e0274e4098c9eb87e4edaafc4719a6"
+            "4ff59362992c7284e2e24fcb7d3ce2c61b6d662f074123777bc621971f33a8fc"
         ),
         "SSM_ARTIFACT_IDENTITY_SHA256": (
             "68f6c28831ac2a8e1801ba420c9816a29e09c8cc4738aae85611955553a3d301"

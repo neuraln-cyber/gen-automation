@@ -56,7 +56,7 @@ REVIEWED_SOURCE_SHA256 = "f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1
 REVIEWED_CANONICAL_MANIFEST_SHA256 = (
     "ebdeca736ee3e9ea4e4b7118c9e4b54dfcfd1bbde5a761f424aa85b1670b806f"
 )
-REVIEWED_MODEL_OBJECTS_SHA256 = "be5802ffc52ee6bfa6c64a135dfdef37e4e0274e4098c9eb87e4edaafc4719a6"
+REVIEWED_MODEL_OBJECTS_SHA256 = "4ff59362992c7284e2e24fcb7d3ce2c61b6d662f074123777bc621971f33a8fc"
 REVIEWED_ARTIFACT_IDENTITY_SHA256 = (
     "68f6c28831ac2a8e1801ba420c9816a29e09c8cc4738aae85611955553a3d301"
 )
@@ -84,6 +84,37 @@ _HOST_PATCH_KEYS = (
     "GEN_AUTOMATION_I2V_MODEL_MANIFEST_SHA256",
     "GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED",
     "GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED",
+)
+_ROLLOUT_DIAGNOSTIC_STAGES = frozenset(
+    {
+        "manifest-fetch",
+        "manifest-integrity",
+        "target-settings",
+        "target-runtime-resolution",
+        "target-identity",
+        "artifact-head-access",
+        "artifact-readback",
+        "host-patch-write",
+        "provider-source-preflight",
+        "rollback-state-persist",
+        "stop-guard",
+        "provider-stop",
+        "stopped-readback",
+        "target-patch-guard",
+        "target-patch",
+        "target-patch-convergence",
+        "target-start-guard",
+        "target-start",
+        "target-readiness",
+        "recovery-zero-work",
+        "recovery-environment",
+        "recovery-provider",
+        "recovery-complete",
+        "complete",
+    }
+)
+_ROLLOUT_DIAGNOSTIC_OUTCOMES = frozenset(
+    {"preparing", "mutating", "recovering", "recovered", "recovery-failed", "ready"}
 )
 
 
@@ -183,6 +214,7 @@ class I2VLoraRolloutResult:
     durable_active_jobs: int
     durable_active_attempts: int
     provider_active_jobs: int
+    provider_diagnostic: JSONObject | None = None
 
 
 async def rollout_status(
@@ -222,12 +254,15 @@ async def rollout_status(
         durable_active_jobs=active_jobs,
         durable_active_attempts=active_attempts,
         provider_active_jobs=len(provider_jobs),
+        provider_diagnostic=_provider_lifecycle_diagnostic(group, instances),
     )
 
 
 async def fetch_reviewed_manifest(
     client: VersionedManifestClient,
     coordinates: ReviewedManifestCoordinates,
+    *,
+    diagnostic_stage: Callable[[str], None] | None = None,
 ) -> PreparedReviewedManifest:
     """Fetch exactly one immutable S3 version and verify all reviewed identities."""
 
@@ -248,6 +283,8 @@ async def fetch_reviewed_manifest(
         return payload, response
 
     payload, response = await asyncio.to_thread(read)
+    if diagnostic_stage is not None:
+        diagnostic_stage("manifest-integrity")
     if response.get("VersionId") != coordinates.version_id:
         raise I2VLoraRolloutError("private manifest response version changed")
     if response.get("ContentLength") not in {None, REVIEWED_MANIFEST_BYTES}:
@@ -275,6 +312,8 @@ async def fetch_reviewed_manifest(
 async def verify_reviewed_artifact_access(
     client: VersionedArtifactClient,
     manifest: PreparedReviewedManifest,
+    *,
+    diagnostic_stage: Callable[[str], None] | None = None,
 ) -> None:
     """Prove the exact worker role can read every immutable model object."""
 
@@ -294,6 +333,8 @@ async def verify_reviewed_artifact_access(
             ):
                 raise I2VLoraRolloutError("reviewed model object identity is invalid")
             try:
+                if diagnostic_stage is not None:
+                    diagnostic_stage("artifact-head-access")
                 response = client.head_object(
                     Bucket=REVIEWED_MANIFEST_BUCKET,
                     Key=key,
@@ -303,6 +344,8 @@ async def verify_reviewed_artifact_access(
                 raise I2VLoraRolloutError(
                     "the worker artifact role cannot read every reviewed object"
                 ) from None
+            if diagnostic_stage is not None:
+                diagnostic_stage("artifact-readback")
             if (
                 response.get("VersionId") != version_id
                 or response.get("ContentLength") != byte_size
@@ -342,8 +385,14 @@ def reviewed_target_settings(
 async def resolve_reviewed_worker_environment(
     settings: Settings,
     resolver: RuntimeSecretResolver,
+    *,
+    diagnostic_stage: Callable[[str], None] | None = None,
 ) -> Mapping[str, str]:
+    if diagnostic_stage is not None:
+        diagnostic_stage("target-runtime-resolution")
     environment = dict(await I2VRuntimeEnvironment(settings=settings, resolver=resolver).resolve())
+    if diagnostic_stage is not None:
+        diagnostic_stage("target-identity")
     _validate_worker_environment_identity(environment, settings=settings)
     return environment
 
@@ -376,6 +425,99 @@ def write_private_json(path: Path, value: object) -> None:
         path,
         json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n",
     )
+
+
+def _provider_lifecycle_diagnostic(
+    group: SaladContainerGroup,
+    page: object | None = None,
+) -> JSONObject:
+    diagnostic: JSONObject = {
+        "version": group.version,
+        "pending_change": group.pending_change,
+        "replicas": group.replicas,
+        "status": group.status.lower(),
+        "allocating_count": group.current_state.allocating_count,
+        "creating_count": group.current_state.creating_count,
+        "running_count": group.current_state.running_count,
+        "stopping_count": group.current_state.stopping_count,
+    }
+    if page is None:
+        return diagnostic
+    instances = getattr(page, "instances", None)
+    if not isinstance(instances, tuple) or any(
+        not isinstance(instance, SaladContainerGroupInstance) for instance in instances
+    ):
+        raise I2VLoraRolloutError("provider instance lifecycle readback is invalid")
+    typed_instances = cast(tuple[SaladContainerGroupInstance, ...], instances)
+    diagnostic["instance_count"] = len(typed_instances)
+    diagnostic["instance_states"] = cast(
+        list[JSONValue], [instance.state.value for instance in typed_instances]
+    )
+    diagnostic["instance_versions"] = cast(
+        list[JSONValue], sorted({instance.version for instance in typed_instances})
+    )
+    diagnostic["instance_ready_count"] = sum(instance.ready is True for instance in typed_instances)
+    diagnostic["instance_started_count"] = sum(
+        instance.started is True for instance in typed_instances
+    )
+    return diagnostic
+
+
+def _write_rollout_diagnostic(
+    path: Path | None,
+    *,
+    operation: str = "recycle-promote",
+    stage: str,
+    outcome: str,
+    recovery_stage: str | None = None,
+    group: SaladContainerGroup | None = None,
+    instances: object | None = None,
+) -> None:
+    if path is None:
+        return
+    if (
+        operation not in {"dry-run", "recycle-promote"}
+        or stage not in _ROLLOUT_DIAGNOSTIC_STAGES
+        or outcome not in _ROLLOUT_DIAGNOSTIC_OUTCOMES
+        or (recovery_stage is not None and recovery_stage not in _ROLLOUT_DIAGNOSTIC_STAGES)
+    ):
+        raise I2VLoraRolloutError("rollout diagnostic state is invalid")
+    diagnostic: JSONObject = {
+        "schema": "gen-automation/i2v-lora-diagnostic/v1",
+        "operation": operation,
+        "stage": stage,
+        "outcome": outcome,
+    }
+    if recovery_stage is not None:
+        diagnostic["recovery_stage"] = recovery_stage
+    if group is not None:
+        diagnostic["provider"] = _provider_lifecycle_diagnostic(group, instances)
+    write_private_json(path, diagnostic)
+
+
+def _best_effort_rollout_diagnostic(
+    path: Path | None,
+    *,
+    operation: str = "recycle-promote",
+    stage: str,
+    outcome: str,
+    recovery_stage: str | None = None,
+    group: SaladContainerGroup | None = None,
+    instances: object | None = None,
+) -> None:
+    try:
+        _write_rollout_diagnostic(
+            path,
+            operation=operation,
+            stage=stage,
+            outcome=outcome,
+            recovery_stage=recovery_stage,
+            group=group,
+            instances=instances,
+        )
+    except (OSError, I2VLoraRolloutError):
+        # Diagnostics must never replace the original failure or prevent recovery.
+        pass
 
 
 def write_private_host_patch(path: Path, values: Mapping[str, str]) -> None:
@@ -435,21 +577,46 @@ async def dry_run_reviewed_worker_rollout(
     worker_image: str,
     worker_source_revision: str,
     prepared_host_env_output: Path,
+    diagnostic_output: Path | None = None,
 ) -> I2VLoraRolloutResult:
-    manifest = await fetch_reviewed_manifest(manifest_client, coordinates)
+    def record_stage(stage: str) -> None:
+        _write_rollout_diagnostic(
+            diagnostic_output,
+            operation="dry-run",
+            stage=stage,
+            outcome="preparing",
+        )
+
+    record_stage("manifest-fetch")
+    manifest = await fetch_reviewed_manifest(
+        manifest_client,
+        coordinates,
+        diagnostic_stage=record_stage,
+    )
+    record_stage("target-settings")
     target = reviewed_target_settings(
         settings,
         worker_image=worker_image,
         worker_source_revision=worker_source_revision,
         manifest=manifest,
     )
-    environment = await resolve_reviewed_worker_environment(target, resolver)
+    environment = await resolve_reviewed_worker_environment(
+        target,
+        resolver,
+        diagnostic_stage=record_stage,
+    )
     artifact_client = artifact_client_factory(environment)
     try:
-        await verify_reviewed_artifact_access(artifact_client, manifest)
+        await verify_reviewed_artifact_access(
+            artifact_client,
+            manifest,
+            diagnostic_stage=record_stage,
+        )
     finally:
         artifact_client.close()
+    record_stage("host-patch-write")
     write_private_host_patch(prepared_host_env_output, reviewed_host_patch(target))
+    record_stage("provider-source-preflight")
     async with sessions() as session, session.begin():
         counts = await assert_zero_active_rollout_work(
             session,
@@ -470,6 +637,14 @@ async def dry_run_reviewed_worker_rollout(
         target.i2v_salad_container_group_name
     )
     provider_ready = _validate_safe_prior_rollout_baseline(group, instances, prior_config)
+    _write_rollout_diagnostic(
+        diagnostic_output,
+        operation="dry-run",
+        stage="complete",
+        outcome="ready",
+        group=group,
+        instances=instances,
+    )
     return I2VLoraRolloutResult(
         operation="dry-run",
         provider_image=_group_image(group),
@@ -567,8 +742,12 @@ async def promote_reviewed_worker(
             {"schema": "gen-automation/i2v-lora-provider-mutation/v1"},
         )
         updated = await salad_client.update_container_group(group_name, patch)
-        if str(updated.id) != state.group_id or updated.version != state.promoted_version:
-            raise I2VLoraRolloutError("provider did not create the expected worker version")
+        _validate_accepted_patch_response(
+            updated,
+            group_id=state.group_id,
+            group_name=state.group_name,
+            prior_version=state.prior_version,
+        )
         ready_group = await _wait_for_ready_group(
             salad_client,
             group_name=group_name,
@@ -577,7 +756,7 @@ async def promote_reviewed_worker(
             environment=target_environment,
             readiness_probe=_readiness_probe(target_probe),
             prior_contract=state.prior_contract,
-            minimum_version=updated.version,
+            minimum_version=state.promoted_version,
             timeout_seconds=timeout_seconds,
         )
     except BaseException:
@@ -665,6 +844,7 @@ async def recycle_promote_reviewed_worker(
     prepared_host_env_output: Path,
     rollback_state_output: Path,
     provider_mutation_marker_output: Path,
+    diagnostic_output: Path | None = None,
     timeout_seconds: float = 6_900,
 ) -> I2VLoraRolloutResult:
     """Atomically replace an exact idle degraded worker with the reviewed target."""
@@ -673,22 +853,47 @@ async def recycle_promote_reviewed_worker(
         raise I2VLoraRolloutError("provider mutation marker already exists")
 
     # Finish every remote target-preparation step before stopping the only warm
-    # replica. A preparation failure therefore leaves the provider untouched.
-    manifest = await fetch_reviewed_manifest(manifest_client, coordinates)
+    # replica. The diagnostic contains only fixed stage labels and redacted
+    # lifecycle counts; it is safe for the operator wrapper to report.
+    stage = "manifest-fetch"
+
+    def record_preparation_stage(value: str) -> None:
+        nonlocal stage
+        stage = value
+        _write_rollout_diagnostic(diagnostic_output, stage=stage, outcome="preparing")
+
+    record_preparation_stage(stage)
+    manifest = await fetch_reviewed_manifest(
+        manifest_client,
+        coordinates,
+        diagnostic_stage=record_preparation_stage,
+    )
+    record_preparation_stage("target-settings")
     target = reviewed_target_settings(
         settings,
         worker_image=worker_image,
         worker_source_revision=worker_source_revision,
         manifest=manifest,
     )
-    target_environment = await resolve_reviewed_worker_environment(target, resolver)
+    target_environment = await resolve_reviewed_worker_environment(
+        target,
+        resolver,
+        diagnostic_stage=record_preparation_stage,
+    )
     artifact_client = artifact_client_factory(target_environment)
     try:
-        await verify_reviewed_artifact_access(artifact_client, manifest)
+        await verify_reviewed_artifact_access(
+            artifact_client,
+            manifest,
+            diagnostic_stage=record_preparation_stage,
+        )
     finally:
         artifact_client.close()
+    record_preparation_stage("host-patch-write")
     write_private_host_patch(prepared_host_env_output, reviewed_host_patch(target))
 
+    stage = "provider-source-preflight"
+    _write_rollout_diagnostic(diagnostic_output, stage=stage, outcome="preparing")
     group_name = target.i2v_salad_container_group_name
     prior_config = i2v_runtime_config_from_settings(
         settings.model_copy(update={"i2v_enabled": True})
@@ -710,6 +915,13 @@ async def recycle_promote_reviewed_worker(
         config=prior_config,
         expected_environment=prior_environment,
     )
+    _write_rollout_diagnostic(
+        diagnostic_output,
+        stage=stage,
+        outcome="preparing",
+        group=prior,
+        instances=prior_instances,
+    )
     target_probe = i2v_runtime_config_from_settings(target).salad.readiness_probe_path
     state = _rollback_state(
         prior,
@@ -718,6 +930,14 @@ async def recycle_promote_reviewed_worker(
         promoted_readiness_probe=_readiness_probe(target_probe),
     )
     # Persist recovery material before the marker and before any provider call.
+    stage = "rollback-state-persist"
+    _write_rollout_diagnostic(
+        diagnostic_output,
+        stage=stage,
+        outcome="preparing",
+        group=prior,
+        instances=prior_instances,
+    )
     write_private_json(rollback_state_output, asdict(state))
     patch = _promotion_patch(
         prior,
@@ -731,6 +951,8 @@ async def recycle_promote_reviewed_worker(
     try:
         # Guard the STOP request itself. The marker precedes the await because a
         # transport failure can be ambiguous after the provider accepted it.
+        stage = "stop-guard"
+        _write_rollout_diagnostic(diagnostic_output, stage=stage, outcome="mutating")
         async with sessions() as session, session.begin():
             counts = await assert_zero_active_rollout_work(
                 session,
@@ -750,8 +972,18 @@ async def recycle_promote_reviewed_worker(
             if queue.current_queue_length:
                 raise I2VLoraRolloutError("provider queue changed immediately before recycle")
             _write_provider_mutation_marker(provider_mutation_marker_output)
+            stage = "provider-stop"
+            _write_rollout_diagnostic(
+                diagnostic_output,
+                stage=stage,
+                outcome="mutating",
+                group=current,
+                instances=current_instances,
+            )
             await salad_client.stop_container_group(group_name)
 
+        stage = "stopped-readback"
+        _write_rollout_diagnostic(diagnostic_output, stage=stage, outcome="mutating")
         stopped = await _wait_for_exact_recycle_stopped(
             salad_client,
             group_name=group_name,
@@ -764,6 +996,13 @@ async def recycle_promote_reviewed_worker(
 
         # Recheck every work plane while stopped, then PATCH the already-prepared
         # target as the sole operation inside this transaction boundary.
+        stage = "target-patch-guard"
+        _write_rollout_diagnostic(
+            diagnostic_output,
+            stage=stage,
+            outcome="mutating",
+            group=stopped,
+        )
         async with sessions() as session, session.begin():
             counts = await assert_zero_active_rollout_work(
                 session,
@@ -787,10 +1026,29 @@ async def recycle_promote_reviewed_worker(
             queue = await salad_client.get_queue(target.i2v_salad_queue_name)
             if queue.current_queue_length:
                 raise I2VLoraRolloutError("provider queue changed immediately before target patch")
+            stage = "target-patch"
+            _write_rollout_diagnostic(
+                diagnostic_output,
+                stage=stage,
+                outcome="mutating",
+                group=current,
+                instances=current_instances,
+            )
             updated = await salad_client.update_container_group(group_name, patch)
-            if str(updated.id) != state.group_id or updated.version != state.promoted_version:
-                raise I2VLoraRolloutError("provider did not create the expected worker version")
+            _validate_accepted_patch_response(
+                updated,
+                group_id=state.group_id,
+                group_name=state.group_name,
+                prior_version=state.prior_version,
+            )
 
+        stage = "target-patch-convergence"
+        _write_rollout_diagnostic(
+            diagnostic_output,
+            stage=stage,
+            outcome="mutating",
+            group=updated,
+        )
         promoted_stopped = await _wait_for_saved_profile_stopped(
             salad_client,
             group_name=group_name,
@@ -805,6 +1063,13 @@ async def recycle_promote_reviewed_worker(
 
         # START is separately guarded so the command cannot expose a newly
         # queued job to the target while the controller remains in maintenance.
+        stage = "target-start-guard"
+        _write_rollout_diagnostic(
+            diagnostic_output,
+            stage=stage,
+            outcome="mutating",
+            group=promoted_stopped,
+        )
         async with sessions() as session, session.begin():
             counts = await assert_zero_active_rollout_work(
                 session,
@@ -832,8 +1097,32 @@ async def recycle_promote_reviewed_worker(
                 raise I2VLoraRolloutError(
                     "provider queue changed immediately before target restart"
                 )
+            stage = "target-start"
+            _write_rollout_diagnostic(
+                diagnostic_output,
+                stage=stage,
+                outcome="mutating",
+                group=current,
+                instances=current_instances,
+            )
+            final_instances = await salad_client.list_container_group_instances(group_name)
+            if getattr(final_instances, "instances", None) != ():
+                raise I2VLoraRolloutError("provider target changed immediately before restart")
+            final = await salad_client.get_container_group(group_name)
+            _assert_saved_group_readback(
+                final,
+                state=state,
+                worker_image=state.promoted_image,
+                environment_keys=state.promoted_environment_keys,
+                environment_identity_sha256=state.promoted_environment_identity_sha256,
+                readiness_probe=state.promoted_readiness_probe,
+            )
+            if final.version != state.promoted_version or not _is_exact_stopped_group(final):
+                raise I2VLoraRolloutError("provider target changed immediately before restart")
             await salad_client.start_container_group(group_name)
 
+        stage = "target-readiness"
+        _write_rollout_diagnostic(diagnostic_output, stage=stage, outcome="mutating")
         ready_group = await _wait_for_ready_group(
             salad_client,
             group_name=group_name,
@@ -846,17 +1135,32 @@ async def recycle_promote_reviewed_worker(
             timeout_seconds=_remaining_timeout(deadline),
         )
     except BaseException:
+        failed_stage = stage
         if not _path_exists(provider_mutation_marker_output):
             raise
         try:
             # Never restart either profile if work appeared while the group was
             # stopped. In that case the durable marker intentionally remains.
+            stage = "recovery-zero-work"
+            _best_effort_rollout_diagnostic(
+                diagnostic_output,
+                stage=failed_stage,
+                outcome="recovering",
+                recovery_stage=stage,
+            )
             async with sessions() as session, session.begin():
                 await assert_zero_active_rollout_work(
                     session,
                     salad_client,
                     queue_name=target.i2v_salad_queue_name,
                 )
+            stage = "recovery-environment"
+            _best_effort_rollout_diagnostic(
+                diagnostic_output,
+                stage=failed_stage,
+                outcome="recovering",
+                recovery_stage=stage,
+            )
             resolved_prior_environment = dict(
                 await I2VRuntimeEnvironment(settings=settings, resolver=resolver).resolve()
             )
@@ -864,7 +1168,14 @@ async def recycle_promote_reviewed_worker(
                 state,
                 resolved_prior_environment,
             )
-            await _restore_provider(
+            stage = "recovery-provider"
+            _best_effort_rollout_diagnostic(
+                diagnostic_output,
+                stage=failed_stage,
+                outcome="recovering",
+                recovery_stage=stage,
+            )
+            restored = await _restore_provider(
                 salad_client,
                 state=state,
                 environment=restored_prior_environment,
@@ -872,12 +1183,31 @@ async def recycle_promote_reviewed_worker(
                 exact_degraded_prior_config=prior_config,
                 timeout_seconds=min(timeout_seconds, 1_800),
             )
+            _best_effort_rollout_diagnostic(
+                diagnostic_output,
+                stage=failed_stage,
+                outcome="recovered",
+                recovery_stage="recovery-complete",
+                group=restored,
+            )
             _durable_unlink(provider_mutation_marker_output)
         except BaseException:
+            _best_effort_rollout_diagnostic(
+                diagnostic_output,
+                stage=failed_stage,
+                outcome="recovery-failed",
+                recovery_stage=stage,
+            )
             raise I2VLoraRolloutError(
                 "provider recycle-promotion failed and automatic rollback needs operator attention"
             ) from None
         raise
+    _write_rollout_diagnostic(
+        diagnostic_output,
+        stage="complete",
+        outcome="ready",
+        group=ready_group,
+    )
     return I2VLoraRolloutResult(
         operation="recycle-promote",
         provider_image=_group_image(ready_group),
@@ -994,6 +1324,43 @@ async def _provider_active_jobs(
 async def _lock_i2v_queue(session: AsyncSession) -> None:
     if session.get_bind().dialect.name == "postgresql":
         await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _QUEUE_LOCK_KEY})
+
+
+def _validate_accepted_patch_response(
+    group: SaladContainerGroup,
+    *,
+    group_id: str,
+    group_name: str,
+    prior_version: int,
+) -> int:
+    """Accept Salad's exact synchronous or documented deferred PATCH acknowledgement."""
+
+    expected_version = prior_version + 1
+    if str(group.id) != group_id or group.name != group_name:
+        raise I2VLoraRolloutError("provider patch response identity changed")
+    if group.version == expected_version:
+        return expected_version
+    if group.version == prior_version and group.pending_change:
+        return expected_version
+    raise I2VLoraRolloutError("provider patch response did not acknowledge the exact next version")
+
+
+def _validate_expected_patch_progress(
+    group: SaladContainerGroup,
+    *,
+    group_id: str,
+    group_name: str,
+    expected_version: int,
+) -> bool:
+    """Return true only once an exact one-version PATCH has settled."""
+
+    if str(group.id) != group_id or group.name != group_name:
+        raise I2VLoraRolloutError("provider group identity changed during patch convergence")
+    if group.version == expected_version:
+        return not group.pending_change
+    if group.version == expected_version - 1 and group.pending_change:
+        return False
+    raise I2VLoraRolloutError("provider patch version changed outside the exact operation")
 
 
 def _rollback_state(
@@ -1117,7 +1484,7 @@ async def _restore_provider(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds
     current = await client.get_container_group(state.group_name)
-    if str(current.id) != state.group_id:
+    if str(current.id) != state.group_id or current.name != state.group_name:
         raise I2VLoraRolloutError("provider group identity changed; rollback refused")
     current = await _wait_for_pending_change_clear(
         client,
@@ -1148,21 +1515,24 @@ async def _restore_provider(
                 state.group_name,
                 {"container": {"environment_variables": dict(environment)}},
             )
-            if str(updated.id) != state.group_id or updated.version != current.version + 1:
-                raise I2VLoraRolloutError(
-                    "provider did not create the expected credential-refresh version"
-                )
+            refreshed_version = _validate_accepted_patch_response(
+                updated,
+                group_id=state.group_id,
+                group_name=state.group_name,
+                prior_version=current.version,
+            )
             await _start_exact_group_if_stopped(
                 client,
                 state=state,
-                expected_version=updated.version,
+                environment=environment,
+                expected_version=refreshed_version,
                 deadline=deadline,
             )
             return await _wait_for_restored_prior(
                 client,
                 state=state,
                 environment=environment,
-                expected_version=updated.version,
+                expected_version=refreshed_version,
                 exact_degraded_prior_config=exact_degraded_prior_config,
                 timeout_seconds=_remaining_timeout(deadline),
             )
@@ -1207,19 +1577,24 @@ async def _restore_provider(
     }
     _write_provider_mutation_marker(provider_mutation_marker_output)
     updated = await client.update_container_group(state.group_name, patch)
-    if str(updated.id) != state.group_id or updated.version != current.version + 1:
-        raise I2VLoraRolloutError("provider did not create the expected rollback version")
+    restored_version = _validate_accepted_patch_response(
+        updated,
+        group_id=state.group_id,
+        group_name=state.group_name,
+        prior_version=current.version,
+    )
     await _start_exact_group_if_stopped(
         client,
         state=state,
-        expected_version=updated.version,
+        environment=environment,
+        expected_version=restored_version,
         deadline=deadline,
     )
     return await _wait_for_restored_prior(
         client,
         state=state,
         environment=environment,
-        expected_version=updated.version,
+        expected_version=restored_version,
         exact_degraded_prior_config=exact_degraded_prior_config,
         timeout_seconds=_remaining_timeout(deadline),
     )
@@ -1288,19 +1663,47 @@ async def _start_exact_group_if_stopped(
     client: I2VSaladClient,
     *,
     state: ProviderRollbackState,
+    environment: Mapping[str, str],
     expected_version: int,
     deadline: float,
 ) -> None:
-    settled = await _wait_for_pending_change_clear(
+    settled = await _wait_for_exact_patch_version(
         client,
         group_name=state.group_name,
         group_id=state.group_id,
-        minimum_version=expected_version,
+        expected_version=expected_version,
         timeout_seconds=_remaining_timeout(deadline),
     )
-    if settled.version != expected_version:
-        raise I2VLoraRolloutError("provider version changed before rollback restart")
+    _assert_saved_group_readback(
+        settled,
+        state=state,
+        worker_image=state.prior_image,
+        environment_keys=state.prior_environment_keys,
+        environment_identity_sha256=_environment_identity_sha256(environment),
+        readiness_probe=state.prior_readiness_probe,
+    )
     if _is_exact_stopped_group(settled):
+        instances = await client.list_container_group_instances(state.group_name)
+        if getattr(instances, "instances", None) != ():
+            raise I2VLoraRolloutError("restored prior stopped provider retained an instance")
+        final = await client.get_container_group(state.group_name)
+        if not _validate_expected_patch_progress(
+            final,
+            group_id=state.group_id,
+            group_name=state.group_name,
+            expected_version=expected_version,
+        ):
+            raise I2VLoraRolloutError("restored prior provider changed before restart")
+        _assert_saved_group_readback(
+            final,
+            state=state,
+            worker_image=state.prior_image,
+            environment_keys=state.prior_environment_keys,
+            environment_identity_sha256=_environment_identity_sha256(environment),
+            readiness_probe=state.prior_readiness_probe,
+        )
+        if not _is_exact_stopped_group(final):
+            raise I2VLoraRolloutError("restored prior provider changed before restart")
         await client.start_container_group(state.group_name)
 
 
@@ -1320,11 +1723,12 @@ async def _wait_for_ready_group(
     deadline = loop.time() + timeout_seconds
     while loop.time() < deadline:
         group = await client.get_container_group(group_name)
-        if str(group.id) != group_id:
-            raise I2VLoraRolloutError("provider group identity changed during rollout")
-        if group.version > minimum_version:
-            raise I2VLoraRolloutError("provider group version changed outside the rollout")
-        if group.version == minimum_version and not group.pending_change:
+        if _validate_expected_patch_progress(
+            group,
+            group_id=group_id,
+            group_name=group_name,
+            expected_version=minimum_version,
+        ):
             _assert_exact_group_readback(
                 group,
                 group_id=group_id,
@@ -1340,6 +1744,29 @@ async def _wait_for_ready_group(
     raise I2VLoraRolloutError("provider worker did not reach exact readiness within the bound")
 
 
+async def _wait_for_exact_patch_version(
+    client: I2VSaladClient,
+    *,
+    group_name: str,
+    group_id: str,
+    expected_version: int,
+    timeout_seconds: float,
+) -> SaladContainerGroup:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while loop.time() < deadline:
+        group = await client.get_container_group(group_name)
+        if _validate_expected_patch_progress(
+            group,
+            group_id=group_id,
+            group_name=group_name,
+            expected_version=expected_version,
+        ):
+            return group
+        await asyncio.sleep(5)
+    raise I2VLoraRolloutError("provider patch did not reach its exact saved version")
+
+
 async def _wait_for_pending_change_clear(
     client: I2VSaladClient,
     *,
@@ -1352,7 +1779,7 @@ async def _wait_for_pending_change_clear(
     deadline = loop.time() + timeout_seconds
     while loop.time() < deadline:
         group = await client.get_container_group(group_name)
-        if str(group.id) != group_id:
+        if str(group.id) != group_id or group.name != group_name:
             raise I2VLoraRolloutError("provider group identity changed during rollback")
         if group.version < minimum_version:
             raise I2VLoraRolloutError(
@@ -1373,7 +1800,11 @@ def _assert_saved_group_readback(
     environment_identity_sha256: str,
     readiness_probe: JSONObject | None,
 ) -> None:
-    if str(group.id) != state.group_id or _group_image(group) != worker_image:
+    if (
+        str(group.id) != state.group_id
+        or group.name != state.group_name
+        or _group_image(group) != worker_image
+    ):
         raise I2VLoraRolloutError("provider saved image or identity changed")
     environment = _environment_variables(_group_container(group))
     if (
@@ -1545,9 +1976,12 @@ async def _wait_for_saved_profile_stopped(
     deadline = loop.time() + timeout_seconds
     while loop.time() < deadline:
         group = await client.get_container_group(group_name)
-        if str(group.id) != state.group_id or group.version > expected_version:
-            raise I2VLoraRolloutError("provider target identity changed while stopped")
-        if group.version == expected_version and not group.pending_change:
+        if _validate_expected_patch_progress(
+            group,
+            group_id=state.group_id,
+            group_name=state.group_name,
+            expected_version=expected_version,
+        ):
             _assert_saved_group_readback(
                 group,
                 state=state,
@@ -1631,6 +2065,16 @@ async def _recover_recycle_start(
         instances = await client.list_container_group_instances(group_name)
         if getattr(instances, "instances", None) != ():
             raise I2VLoraRolloutError("stopped provider recycle retained an instance")
+        final = await client.get_container_group(group_name)
+        _validate_exact_recycle_static_readback(
+            final,
+            group_id=group_id,
+            expected_version=expected_version,
+            config=config,
+            expected_environment=expected_environment,
+        )
+        if not _is_exact_stopped_group(final):
+            raise I2VLoraRolloutError("provider recycle changed before recovery restart")
         await client.start_container_group(group_name)
     await _wait_for_exact_recycle_started(
         client,
@@ -1655,7 +2099,11 @@ async def _wait_for_recycle_pending_clear(
     deadline = loop.time() + timeout_seconds
     while loop.time() < deadline:
         group = await client.get_container_group(group_name)
-        if str(group.id) != group_id or group.version != expected_version:
+        if (
+            str(group.id) != group_id
+            or group.name != group_name
+            or group.version != expected_version
+        ):
             raise I2VLoraRolloutError("provider recycle identity changed during recovery")
         if not group.pending_change:
             return group
