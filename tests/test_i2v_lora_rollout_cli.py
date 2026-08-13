@@ -131,7 +131,7 @@ def _assert_runtime_closed(resolver: _FakeResolver) -> None:
     assert _FakeHttpClient.instances[0].closed is True
 
 
-@pytest.mark.parametrize("operation", ("promote", "rollback"))
+@pytest.mark.parametrize("operation", ("promote", "rollback", "recycle-promote"))
 @pytest.mark.asyncio
 async def test_mutating_operations_require_exact_service_stop_proof_before_clients(
     operation: str,
@@ -155,10 +155,10 @@ async def test_mutating_operations_require_exact_service_stop_proof_before_clien
                 str(tmp_path / "provider-mutation.json"),
             ]
         )
-    else:
+    elif operation in {"promote", "recycle-promote"}:
         arguments = cli._parser().parse_args(
             [
-                "promote",
+                operation,
                 *_worker_identity_arguments(),
                 *_manifest_arguments(tmp_path),
                 "--rollback-state-output",
@@ -167,7 +167,6 @@ async def test_mutating_operations_require_exact_service_stop_proof_before_clien
                 str(tmp_path / "provider-mutation.json"),
             ]
         )
-
     with pytest.raises(I2VLoraRolloutError, match="service-stop proof"):
         await cli._run(arguments, settings=_settings())
 
@@ -211,6 +210,48 @@ async def test_status_is_read_only_and_does_not_construct_an_s3_client(
     assert captured["settings"] is not None
     assert captured["sessions"] is _FakeDatabase.instances[0].sessions
     assert boto_calls == []
+    _assert_runtime_closed(resolver)
+
+
+@pytest.mark.asyncio
+async def test_recycle_promote_dispatches_one_atomic_service_with_s3_client(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("GEN_AUTOMATION_I2V_ROLLOUT_MAINTENANCE_CONFIRMED", "true")
+    resolver, boto_calls = _install_runtime_fakes(monkeypatch)
+    captured: dict[str, object] = {}
+    expected = I2VLoraRolloutResult("recycle-promote", WORKER_IMAGE, True, 0, 0, 0)
+
+    async def recycle_promote(**kwargs: object) -> I2VLoraRolloutResult:
+        captured.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(cli, "recycle_promote_reviewed_worker", recycle_promote)
+    marker = tmp_path / "provider-mutation.json"
+    arguments = cli._parser().parse_args(
+        [
+            "recycle-promote",
+            *_worker_identity_arguments(),
+            *_manifest_arguments(tmp_path),
+            "--rollback-state-output",
+            str(tmp_path / "rollback.json"),
+            "--provider-mutation-marker-output",
+            str(marker),
+        ]
+    )
+
+    result = await cli._run(arguments, settings=_settings())
+
+    assert result == expected
+    assert captured["provider_mutation_marker_output"] == marker
+    assert captured["rollback_state_output"] == tmp_path / "rollback.json"
+    assert captured["prepared_host_env_output"] == tmp_path / "prepared.env"
+    assert captured["worker_image"] == WORKER_IMAGE
+    assert captured["resolver"] is resolver
+    assert len(boto_calls) == 1
+    assert boto_calls[0][0] == "s3"
+    assert cast(_FakeManifestClient, captured["manifest_client"]).closed is True
     _assert_runtime_closed(resolver)
 
 
@@ -309,9 +350,21 @@ def test_mutating_parsers_require_a_provider_mutation_marker(tmp_path: Path) -> 
             str(tmp_path / "provider-mutation.json"),
         ]
     )
+    recycled = cli._parser().parse_args(
+        [
+            "recycle-promote",
+            *_worker_identity_arguments(),
+            *_manifest_arguments(tmp_path),
+            "--rollback-state-output",
+            str(tmp_path / "rollback.json"),
+            "--provider-mutation-marker-output",
+            str(tmp_path / "provider-mutation.json"),
+        ]
+    )
 
     assert promoted.provider_mutation_marker_output == tmp_path / "provider-mutation.json"
     assert rolled_back.provider_mutation_marker_output == tmp_path / "provider-mutation.json"
+    assert recycled.provider_mutation_marker_output == tmp_path / "provider-mutation.json"
 
 
 @pytest.mark.parametrize(

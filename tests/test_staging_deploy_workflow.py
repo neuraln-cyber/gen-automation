@@ -663,8 +663,8 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
 
     assert "- i2v-lora-worker" in workflow
     assert "inputs.component == 'i2v-lora-worker'" in worker_job
-    assert 'case "$OPERATION" in status|dry-run|promote|rollback)' in worker_job
-    assert 'case "$operation" in status|dry-run|promote|rollback)' in rollout
+    assert 'case "$OPERATION" in status|dry-run|promote|recycle-promote|rollback)' in worker_job
+    assert "status|dry-run|promote|recycle-promote|rollback" in rollout
     assert "timeout-minutes: 350" in worker_job
     assert "role-duration-seconds: 20400" in worker_job
     assert '"executionTimeout": ["19000"]' in worker_job
@@ -674,7 +674,7 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
     assert '[ "$remaining" -gt 0 ] || return 1' in rollout
     assert 'sleep "$((remaining < 5 ? remaining : 5))"' in rollout
     assert 'timeout --signal=TERM --kill-after=60s "$timeout_seconds"' in rollout
-    for bound in ("900s dry-run", "1900s rollback", "10000s promote"):
+    for bound in ("900s dry-run", "1900s rollback", '10000s "$operation"'):
         assert bound in rollout
     # Worst-case automatic recovery fits inside the RunShellScript execution
     # budget. The separate SSM delivery allowance plus execution then fits
@@ -758,12 +758,26 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
     assert promotion.index('run_one_off "$original_env" "$initial_container" 900s dry-run') < (
         promotion.index('restart_into "$maintenance_env"')
     )
+    atomic_provider_operation = 'run_one_off "$original_env" "$maintenance_id" 10000s "$operation"'
     assert promotion.index('restart_into "$maintenance_env"') < promotion.index(
-        'run_one_off "$original_env" "$maintenance_id" 10000s promote'
+        atomic_provider_operation
     )
-    assert promotion.index(
-        'run_one_off "$original_env" "$maintenance_id" 10000s promote'
-    ) < promotion.index('run_one_off "$target_env" "$maintenance_id" 900s profile-preflight')
+    assert promotion.count(atomic_provider_operation) == 1
+    assert "900s recycle" not in promotion
+    assert "10000s promote" not in promotion
+    atomic_index = promotion.index(atomic_provider_operation)
+    rollback_armed_index = promotion.index("provider_rollback_needed=1", atomic_index)
+    target_restart_index = promotion.index(
+        'target_container="$(restart_into "$target_env"', atomic_index
+    )
+    rollback_disarmed_index = promotion.index("provider_rollback_needed=0", target_restart_index)
+    assert atomic_index < rollback_armed_index < target_restart_index < rollback_disarmed_index
+    assert promotion.index('rm -rf --one-file-system -- "$work_dir"', target_restart_index) > (
+        rollback_disarmed_index
+    )
+    assert promotion.index(atomic_provider_operation) < promotion.index(
+        'run_one_off "$target_env" "$maintenance_id" 900s profile-preflight'
+    )
     assert promotion.index(
         'run_one_off "$target_env" "$maintenance_id" 900s profile-preflight'
     ) < promotion.index('mv -- "$active_temporary" "$active_state"')
@@ -840,7 +854,7 @@ def test_i2v_lora_worker_workflow_transfers_only_checksum_pinned_helper() -> Non
         "SSM_SCRIPT_PAYLOAD": payload,
     }
     commands: dict[str, str] = {}
-    for operation in ("status", "dry-run", "promote", "rollback"):
+    for operation in ("status", "dry-run", "promote", "recycle-promote", "rollback"):
         environment = {**common, "SSM_OPERATION": operation}
         if operation == "rollback":
             environment.update({"SSM_WORKER_IMAGE": "", "SSM_WORKER_SOURCE_REVISION": ""})
@@ -868,7 +882,7 @@ def test_i2v_lora_worker_workflow_transfers_only_checksum_pinned_helper() -> Non
         assert command.count('/usr/bin/bash -n "$payload_root/rollout-i2v-lora-worker.sh"') == 1
         assert f"--{operation}" in command
         assert "--expected-control-plane-revision" in command
-    for operation in ("status", "dry-run", "promote"):
+    for operation in ("status", "dry-run", "promote", "recycle-promote"):
         assert "--expected-worker-image" in commands[operation]
         assert "--expected-worker-source-revision" in commands[operation]
         assert common["SSM_WORKER_IMAGE"] in commands[operation]
@@ -1104,6 +1118,18 @@ def test_i2v_lora_profile_operation_is_single_flag_atomic_and_provider_read_only
         configurator
     )
     assert '"$rollback_reference_container_id" "$rollback_deadline"' in configurator
+    restart_recovery = configurator.split(
+        "restart_control_plane_requiring_replacement() {\n", maxsplit=1
+    )[1].split("\n}\n\nprofile_value_from_file", maxsplit=1)[0]
+    assert 'local previous_container_id="$1"' in restart_recovery
+    assert 'if [ -z "$previous_container_id" ]' not in restart_recovery
+    restore = configurator.split("restore_previous_configuration() {\n", maxsplit=1)[1].split(
+        "\n}\n\ncleanup()", maxsplit=1
+    )[0]
+    assert 'try_control_plane_container_id "$command_timeout" || true' in restore
+    assert "restart_control_plane_requiring_replacement" in restore
+    assert '"$rollback_reference_container_id" "$rollback_deadline"' in restore
+    assert "Empty means the restored service may satisfy recovery with any exact" in restore
     assert "a prior running control-plane container is required" not in configurator
     assert "Could not capture the container that rollback must replace." not in configurator
     assert "GEN_AUTOMATION_I2V_PROFILE_TIMEOUT_SUPERVISED" in configurator

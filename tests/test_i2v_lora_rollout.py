@@ -337,6 +337,8 @@ class _FakeSalad:
         self.get_group_calls = 0
         self.update_patches: list[JSONObject] = []
         self.start_calls = 0
+        self.stop_calls = 0
+        self.allow_stop = False
         self.raise_after_first_update = False
 
     async def list_gpu_classes(self) -> tuple[SaladGpuClass, ...]:
@@ -366,7 +368,8 @@ class _FakeSalad:
         raw = deepcopy(self.group.raw)
         patch_container = cast(JSONObject, patch["container"])
         container = cast(JSONObject, raw["container"])
-        container["image"] = patch_container["image"]
+        if "image" in patch_container:
+            container["image"] = patch_container["image"]
         current_environment = cast(dict[str, str], dict(container["environment_variables"]))
         for key, value in cast(JSONObject, patch_container["environment_variables"]).items():
             if value is None:
@@ -375,7 +378,8 @@ class _FakeSalad:
                 assert isinstance(value, str)
                 current_environment[key] = value
         container["environment_variables"] = current_environment
-        raw["readiness_probe"] = deepcopy(patch.get("readiness_probe"))
+        if "readiness_probe" in patch:
+            raw["readiness_probe"] = deepcopy(patch["readiness_probe"])
         next_version = self.group.version + 1
         replicas = self.group.replicas
         self.group = SaladContainerGroup(
@@ -419,7 +423,25 @@ class _FakeSalad:
         self.instances = _instance_page(version=self.group.version)
 
     async def stop_container_group(self, _name: str) -> None:
-        raise AssertionError("rollout must not call a provider stop endpoint")
+        if not self.allow_stop:
+            raise AssertionError("only an explicit recycle may stop the provider group")
+        self.stop_calls += 1
+        raw = deepcopy(self.group.raw)
+        raw["replicas"] = 0
+        self.group = replace(
+            self.group,
+            replicas=0,
+            current_state=replace(
+                self.group.current_state,
+                status="stopped",
+                allocating_count=0,
+                creating_count=0,
+                running_count=0,
+                stopping_count=0,
+            ),
+            raw=raw,
+        )
+        self.instances = _empty_instance_page()
 
 
 class _RuntimeEnvironment:
@@ -512,6 +534,31 @@ async def _dry_run(
     )
 
 
+async def _recycle_promote(
+    *,
+    database: Database,
+    client: _FakeSalad,
+    artifact: _ArtifactClient,
+    tmp_path: Path,
+) -> rollout.I2VLoraRolloutResult:
+    client.allow_stop = True
+    return await rollout.recycle_promote_reviewed_worker(
+        settings=_settings(capable=False),
+        sessions=database.sessions,
+        salad_client=cast(Any, client),
+        resolver=cast(Any, object()),
+        manifest_client=cast(Any, object()),
+        artifact_client_factory=lambda _environment: artifact,
+        coordinates=_COORDINATES,
+        worker_image=_TARGET_IMAGE,
+        worker_source_revision=_TARGET_REVISION,
+        prepared_host_env_output=tmp_path / "target.env",
+        rollback_state_output=tmp_path / "rollback.json",
+        provider_mutation_marker_output=tmp_path / "recycle-mutation.json",
+        timeout_seconds=0.1,
+    )
+
+
 def test_exact_ready_instance_requires_one_current_running_ready_replica() -> None:
     exact = _group(capable=True, version=8)
     assert rollout._has_exact_ready_instance(exact, _instance_page(version=8))
@@ -533,6 +580,273 @@ def test_safe_prior_rollout_baseline_accepts_only_exact_empty_allocating_state()
         _empty_instance_page(),
         _config(capable=False),
     )
+
+
+@pytest.mark.asyncio
+async def test_recycle_promote_prepares_target_then_stops_patches_starts_and_waits_ready(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    client = _FakeSalad()
+    artifact = _ArtifactClient()
+
+    result = await _recycle_promote(
+        database=database,
+        client=client,
+        artifact=artifact,
+        tmp_path=tmp_path,
+    )
+
+    assert result.operation == "recycle-promote"
+    assert result.provider_image == _TARGET_IMAGE
+    assert result.provider_ready is True
+    assert result.durable_active_jobs == 0
+    assert result.durable_active_attempts == 0
+    assert result.provider_active_jobs == 0
+    assert client.stop_calls == 1
+    assert client.start_calls == 1
+    assert len(client.update_patches) == 1
+    assert cast(JSONObject, client.update_patches[0]["container"])["image"] == _TARGET_IMAGE
+    assert len(artifact.calls) == 14
+    state = rollout.read_provider_rollback_state(tmp_path / "rollback.json")
+    assert state.prior_version == 1
+    assert state.promoted_version == 2
+    assert client.group.version == 2
+    assert (tmp_path / "target.env").exists()
+    assert (tmp_path / "recycle-mutation.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_recycle_promote_finishes_all_target_artifact_work_before_stop(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    client = _FakeSalad()
+    artifact = _ArtifactClient(fail_at=14)
+
+    with pytest.raises(I2VLoraRolloutError, match="cannot read every reviewed object"):
+        await _recycle_promote(
+            database=database,
+            client=client,
+            artifact=artifact,
+            tmp_path=tmp_path,
+        )
+
+    assert len(artifact.calls) == 14
+    assert client.get_group_calls == 0
+    assert client.stop_calls == 0
+    assert client.start_calls == 0
+    assert client.update_patches == []
+    assert not (tmp_path / "recycle-mutation.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_recycle_promote_accepts_exact_idle_running_not_ready_source(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    client = _FakeSalad()
+    current = client.instances.instances[0]
+    client.instances = SaladContainerGroupInstancePage(
+        instances=(replace(current, ready=False, started=True),)
+    )
+
+    result = await _recycle_promote(
+        database=database,
+        client=client,
+        artifact=_ArtifactClient(),
+        tmp_path=tmp_path,
+    )
+
+    assert result.operation == "recycle-promote"
+    assert result.provider_image == _TARGET_IMAGE
+    assert result.provider_ready is True
+    assert client.stop_calls == 1
+    assert client.start_calls == 1
+    assert len(client.update_patches) == 1
+
+
+@pytest.mark.asyncio
+async def test_recycle_promote_refuses_all_provider_mutation_when_any_queue_plane_is_nonzero(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    client = _FakeSalad()
+    client.queue = _queue(length=1)
+
+    with pytest.raises(I2VLoraRolloutError, match="zero active"):
+        await _recycle_promote(
+            database=database,
+            client=client,
+            artifact=_ArtifactClient(),
+            tmp_path=tmp_path,
+        )
+
+    assert client.stop_calls == 0
+    assert client.start_calls == 0
+    assert client.update_patches == []
+    assert not (tmp_path / "recycle-mutation.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_recycle_promote_refuses_pending_provider_lifecycle_before_stop(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    client = _FakeSalad(group=_group(capable=False, pending_change=True))
+
+    with pytest.raises(I2VLoraRolloutError):
+        await _recycle_promote(
+            database=database,
+            client=client,
+            artifact=_ArtifactClient(),
+            tmp_path=tmp_path,
+        )
+
+    assert client.stop_calls == 0
+    assert client.start_calls == 0
+    assert not (tmp_path / "recycle-mutation.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_recycle_promote_ambiguous_stop_restores_prior_and_clears_marker(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+
+    class AmbiguousStopSalad(_FakeSalad):
+        async def stop_container_group(self, name: str) -> None:
+            await super().stop_container_group(name)
+            raise RuntimeError("ambiguous provider transport with secret detail")
+
+    client = AmbiguousStopSalad()
+    marker = tmp_path / "recycle-mutation.json"
+
+    with pytest.raises(RuntimeError, match="ambiguous provider transport"):
+        await _recycle_promote(
+            database=database,
+            client=client,
+            artifact=_ArtifactClient(),
+            tmp_path=tmp_path,
+        )
+
+    assert client.stop_calls == 1
+    assert client.start_calls == 1
+    assert client.group.replicas == 1
+    assert rollout._group_image(client.group) == _PRIOR_IMAGE
+    assert len(client.update_patches) == 1
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_recycle_promote_fails_closed_if_stop_changes_group_version(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+
+    class VersionChangingStopSalad(_FakeSalad):
+        async def stop_container_group(self, name: str) -> None:
+            await super().stop_container_group(name)
+            self.group = replace(self.group, version=self.group.version + 1)
+
+    client = VersionChangingStopSalad()
+
+    with pytest.raises(I2VLoraRolloutError, match="contract changed outside"):
+        await _recycle_promote(
+            database=database,
+            client=client,
+            artifact=_ArtifactClient(),
+            tmp_path=tmp_path,
+        )
+
+    assert client.stop_calls == 1
+    assert client.start_calls == 1
+    assert len(client.update_patches) == 1
+    assert "image" not in cast(JSONObject, client.update_patches[0]["container"])
+    assert rollout._group_image(client.group) == _PRIOR_IMAGE
+    assert client.group.version == 3
+    assert not (tmp_path / "recycle-mutation.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_recycle_promote_ambiguous_target_patch_restores_prior_profile(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    client = _FakeSalad()
+    client.raise_after_first_update = True
+
+    with pytest.raises(RuntimeError, match="ambiguous provider response"):
+        await _recycle_promote(
+            database=database,
+            client=client,
+            artifact=_ArtifactClient(),
+            tmp_path=tmp_path,
+        )
+
+    assert client.stop_calls == 1
+    assert client.start_calls == 1
+    assert len(client.update_patches) == 2
+    assert cast(JSONObject, client.update_patches[0]["container"])["image"] == _TARGET_IMAGE
+    assert cast(JSONObject, client.update_patches[1]["container"])["image"] == _PRIOR_IMAGE
+    assert rollout._group_image(client.group) == _PRIOR_IMAGE
+    assert client.group.replicas == 1
+    assert not (tmp_path / "recycle-mutation.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("queue_race_call", "expected_updates"),
+    ((4, 0), (6, 1)),
+)
+@pytest.mark.asyncio
+async def test_recycle_promote_rechecks_provider_queue_immediately_before_each_mutation(
+    queue_race_call: int,
+    expected_updates: int,
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+
+    class QueueRaceSalad(_FakeSalad):
+        queue_reads = 0
+
+        async def get_queue(self, name: str) -> SaladQueue:
+            self.queue_reads += 1
+            if self.queue_reads >= queue_race_call:
+                return _queue(length=1)
+            return await super().get_queue(name)
+
+    client = QueueRaceSalad()
+
+    with pytest.raises(I2VLoraRolloutError, match="operator attention"):
+        await _recycle_promote(
+            database=database,
+            client=client,
+            artifact=_ArtifactClient(),
+            tmp_path=tmp_path,
+        )
+
+    assert client.stop_calls == 1
+    assert len(client.update_patches) == expected_updates
+    assert client.start_calls == 0
+    assert (tmp_path / "recycle-mutation.json").exists()
 
 
 @pytest.mark.parametrize(

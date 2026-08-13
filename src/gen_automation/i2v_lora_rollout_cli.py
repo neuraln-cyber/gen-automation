@@ -35,6 +35,7 @@ from gen_automation.services.i2v_lora_rollout import (
     profile_preflight,
     promote_reviewed_worker,
     read_provider_rollback_state,
+    recycle_promote_reviewed_worker,
     rollback_reviewed_worker,
     rollout_status,
 )
@@ -70,7 +71,7 @@ def i2v_lora_rollout_main(arguments: Sequence[str] | None = None) -> int:
 
 async def _run(arguments: argparse.Namespace, *, settings: Settings) -> I2VLoraRolloutResult:
     _require_control_plane_integrations(settings)
-    if arguments.operation in {"promote", "rollback"}:
+    if arguments.operation in {"promote", "rollback", "recycle-promote"}:
         _require_phase_one_maintenance(settings)
     database = Database(settings.database_url)
     http_client = httpx2.AsyncClient(follow_redirects=False, trust_env=False)
@@ -91,7 +92,7 @@ async def _run(arguments: argparse.Namespace, *, settings: Settings) -> I2VLoraR
     )
     manifest_client: Any | None = None
     try:
-        if arguments.operation in {"dry-run", "promote"}:
+        if arguments.operation in {"dry-run", "promote", "recycle-promote"}:
             manifest_client = boto3.client(
                 "s3",
                 region_name=settings.salad_worker_artifact_region.get_secret_value()
@@ -152,6 +153,12 @@ async def _run(arguments: argparse.Namespace, *, settings: Settings) -> I2VLoraR
             return await dry_run_reviewed_worker_rollout(**common)
         if arguments.operation == "promote":
             return await promote_reviewed_worker(
+                **common,
+                rollback_state_output=arguments.rollback_state_output,
+                provider_mutation_marker_output=arguments.provider_mutation_marker_output,
+            )
+        if arguments.operation == "recycle-promote":
+            return await recycle_promote_reviewed_worker(
                 **common,
                 rollback_state_output=arguments.rollback_state_output,
                 provider_mutation_marker_output=arguments.provider_mutation_marker_output,
@@ -234,7 +241,7 @@ def _parser() -> argparse.ArgumentParser:
         metavar="true|false",
     )
 
-    for name in ("dry-run", "promote"):
+    for name in ("dry-run", "promote", "recycle-promote"):
         command = subparsers.add_parser(name)
         _add_worker_identity_arguments(command)
         command.add_argument("--expected-private-manifest-bucket", required=True)
@@ -242,7 +249,7 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--expected-private-manifest-version", required=True)
         command.add_argument("--expected-private-manifest-source-sha256", required=True)
         command.add_argument("--prepared-host-env-output", required=True, type=Path)
-        if name == "promote":
+        if name in {"promote", "recycle-promote"}:
             command.add_argument("--rollback-state-output", required=True, type=Path)
             command.add_argument(
                 "--provider-mutation-marker-output",
