@@ -28,6 +28,7 @@ from gen_automation.integrations.salad.models import (
     JSONValue,
     SaladContainerGroup,
     SaladContainerGroupInstance,
+    SaladContainerGroupInstanceState,
     SaladJobStatus,
 )
 from gen_automation.services.i2v_environment import (
@@ -1350,7 +1351,7 @@ def _validate_safe_prior_rollout_baseline(
     page: object,
     config: I2VSaladConfig,
 ) -> bool:
-    """Accept only an exact ready or exact empty-allocating reviewed prior worker."""
+    """Accept only an exact ready or reviewed pre-running prior worker."""
 
     _validate_prior_group_static_contract(group, config)
     if _has_exact_ready_instance(group, page):
@@ -1365,6 +1366,30 @@ def _validate_safe_prior_rollout_baseline(
         and group.current_state.creating_count == 0
         and group.current_state.stopping_count == 0
         and instances == ()
+    ):
+        return False
+    if not isinstance(instances, tuple) or len(instances) != 1:
+        raise I2VLoraRolloutError("provider group is not an exact safe baseline before rollout")
+    instance = instances[0]
+    if not isinstance(instance, SaladContainerGroupInstance):
+        raise I2VLoraRolloutError("provider instance readback is invalid")
+    expected_counts = {
+        SaladContainerGroupInstanceState.ALLOCATING: (1, 0),
+        SaladContainerGroupInstanceState.DOWNLOADING: (0, 1),
+        SaladContainerGroupInstanceState.CREATING: (0, 1),
+    }.get(instance.state)
+    if (
+        expected_counts is not None
+        and not group.pending_change
+        and group.replicas == 1
+        and group.status.lower() == "running"
+        and group.current_state.allocating_count == expected_counts[0]
+        and group.current_state.creating_count == expected_counts[1]
+        and group.current_state.running_count == 0
+        and group.current_state.stopping_count == 0
+        and instance.version == group.version
+        and instance.ready is False
+        and instance.started is False
     ):
         return False
     raise I2VLoraRolloutError("provider group is not an exact safe baseline before rollout")

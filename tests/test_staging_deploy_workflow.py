@@ -804,6 +804,28 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
         assert queue_mutation not in rollout
 
 
+def test_i2v_lora_worker_status_is_read_only_and_legacy_profile_compatible() -> None:
+    rollout = _i2v_worker_rollout()
+    status = rollout.split('if [ "$operation" = "status" ]; then\n', maxsplit=1)[1].split(
+        "\nfi\n", maxsplit=1
+    )[0]
+
+    assert "/usr/bin/docker exec" in status
+    assert "gen_automation.i2v_lora_rollout_cli status" in status
+    assert "profile-preflight" not in status
+    assert "configured_public" not in status
+    assert "GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED" not in status
+    assert "render_profile" not in status
+    assert "restart_into" not in status
+    assert "systemctl" not in status
+    assert "install " not in status
+    assert "run_one_off" not in status
+    assert "mktemp" not in status
+    assert rollout.index('if [ "$operation" = "status" ]; then') < rollout.index(
+        'work_dir="$(mktemp -d'
+    )
+
+
 def test_i2v_lora_worker_workflow_transfers_only_checksum_pinned_helper() -> None:
     rollout = (DEPLOY / "rollout-i2v-lora-worker.sh").read_bytes()
     checksum = hashlib.sha256(rollout).hexdigest()

@@ -462,17 +462,9 @@ if [ "$operation" = "rollback" ]; then
 fi
 
 if [ "$operation" = "status" ]; then
-  configured_public="$(grep '^GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED=' "$controller_env" || true)"
-  [ "$(printf '%s\n' "$configured_public" | sed '/^$/d' | wc -l)" -eq 1 ] ||
-    fail "host public LoRA flag must be defined exactly once"
-  configured_public="${configured_public#*=}"
-  case "$configured_public" in true|false) ;; *) fail "host public LoRA flag is invalid" ;; esac
   timeout --signal=TERM --kill-after=10s 900s \
     /usr/bin/docker exec "$initial_container" python3.12 -m \
-    gen_automation.i2v_lora_rollout_cli profile-preflight \
-      --expected-worker-image "$expected_worker_image" \
-      --expected-worker-source-revision "$expected_worker_source_revision" \
-      --expected-public-profile "$configured_public"
+    gen_automation.i2v_lora_rollout_cli status
   exit 0
 fi
 
