@@ -184,6 +184,28 @@ def _empty_instance_page() -> SaladContainerGroupInstancePage:
     return SaladContainerGroupInstancePage(instances=())
 
 
+def _pre_running_instance_page(
+    state: SaladContainerGroupInstanceState,
+    *,
+    version: int = 1,
+    ready: bool | None = False,
+    started: bool | None = False,
+) -> SaladContainerGroupInstancePage:
+    return SaladContainerGroupInstancePage(
+        instances=(
+            SaladContainerGroupInstance(
+                id="instance-1",
+                machine_id="machine-1",
+                state=state,
+                update_time=_NOW,
+                version=version,
+                ready=ready,
+                started=started,
+            ),
+        )
+    )
+
+
 def _allocating_group(*, version: int = 1) -> SaladContainerGroup:
     group = _group(capable=False, version=version)
     return replace(
@@ -192,6 +214,32 @@ def _allocating_group(*, version: int = 1) -> SaladContainerGroup:
             group.current_state,
             allocating_count=1,
             creating_count=0,
+            running_count=0,
+            stopping_count=0,
+        ),
+    )
+
+
+def _pre_running_group(
+    state: SaladContainerGroupInstanceState,
+    *,
+    version: int = 1,
+) -> SaladContainerGroup:
+    group = _group(capable=False, version=version)
+    allocating_count = int(state == SaladContainerGroupInstanceState.ALLOCATING)
+    creating_count = int(
+        state
+        in {
+            SaladContainerGroupInstanceState.DOWNLOADING,
+            SaladContainerGroupInstanceState.CREATING,
+        }
+    )
+    return replace(
+        group,
+        current_state=replace(
+            group.current_state,
+            allocating_count=allocating_count,
+            creating_count=creating_count,
             running_count=0,
             stopping_count=0,
         ),
@@ -488,6 +536,30 @@ def test_safe_prior_rollout_baseline_accepts_only_exact_empty_allocating_state()
 
 
 @pytest.mark.parametrize(
+    "state",
+    (
+        SaladContainerGroupInstanceState.ALLOCATING,
+        SaladContainerGroupInstanceState.DOWNLOADING,
+        SaladContainerGroupInstanceState.CREATING,
+    ),
+)
+def test_safe_prior_rollout_baseline_accepts_exact_pre_running_singleton(
+    state: SaladContainerGroupInstanceState,
+) -> None:
+    group = _pre_running_group(state, version=8)
+
+    assert not rollout._validate_safe_prior_rollout_baseline(
+        group,
+        _pre_running_instance_page(state, version=8),
+        _config(capable=False),
+    )
+    assert not rollout._has_exact_ready_instance(
+        group,
+        _pre_running_instance_page(state, version=8),
+    )
+
+
+@pytest.mark.parametrize(
     ("mutation", "instances"),
     (
         ("pending", _empty_instance_page()),
@@ -537,6 +609,133 @@ def test_safe_prior_rollout_baseline_rejects_every_allocating_state_drift(
     with pytest.raises(I2VLoraRolloutError, match="exact safe baseline"):
         rollout._validate_safe_prior_rollout_baseline(
             group,
+            instances,
+            _config(capable=False),
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "state"),
+    (
+        ("pending", SaladContainerGroupInstanceState.DOWNLOADING),
+        ("replicas", SaladContainerGroupInstanceState.DOWNLOADING),
+        ("status", SaladContainerGroupInstanceState.DOWNLOADING),
+        ("allocating", SaladContainerGroupInstanceState.DOWNLOADING),
+        ("creating", SaladContainerGroupInstanceState.DOWNLOADING),
+        ("running", SaladContainerGroupInstanceState.DOWNLOADING),
+        ("stopping", SaladContainerGroupInstanceState.DOWNLOADING),
+        ("empty", SaladContainerGroupInstanceState.DOWNLOADING),
+        ("two", SaladContainerGroupInstanceState.DOWNLOADING),
+        ("stale-version", SaladContainerGroupInstanceState.DOWNLOADING),
+        ("ready-none", SaladContainerGroupInstanceState.DOWNLOADING),
+        ("ready-true", SaladContainerGroupInstanceState.DOWNLOADING),
+        ("started-none", SaladContainerGroupInstanceState.DOWNLOADING),
+        ("started-true", SaladContainerGroupInstanceState.DOWNLOADING),
+        ("running-instance", SaladContainerGroupInstanceState.DOWNLOADING),
+        ("stopping-instance", SaladContainerGroupInstanceState.DOWNLOADING),
+        ("allocating-count-mismatch", SaladContainerGroupInstanceState.ALLOCATING),
+        ("downloading-count-mismatch", SaladContainerGroupInstanceState.DOWNLOADING),
+        ("creating-count-mismatch", SaladContainerGroupInstanceState.CREATING),
+    ),
+)
+def test_safe_prior_rollout_baseline_rejects_every_pre_running_singleton_drift(
+    mutation: str,
+    state: SaladContainerGroupInstanceState,
+) -> None:
+    group = _pre_running_group(state, version=8)
+    page = _pre_running_instance_page(state, version=8)
+    if mutation == "pending":
+        group = replace(group, pending_change=True)
+    elif mutation == "replicas":
+        raw = deepcopy(group.raw)
+        raw["replicas"] = 2
+        group = replace(group, replicas=2, raw=raw)
+    elif mutation == "status":
+        group = replace(
+            group,
+            current_state=replace(group.current_state, status="stopped"),
+        )
+    elif mutation == "allocating":
+        group = replace(
+            group,
+            current_state=replace(group.current_state, allocating_count=1),
+        )
+    elif mutation == "creating":
+        group = replace(
+            group,
+            current_state=replace(group.current_state, creating_count=0),
+        )
+    elif mutation == "running":
+        group = replace(
+            group,
+            current_state=replace(group.current_state, running_count=1),
+        )
+    elif mutation == "stopping":
+        group = replace(
+            group,
+            current_state=replace(group.current_state, stopping_count=1),
+        )
+    elif mutation == "empty":
+        page = _empty_instance_page()
+    elif mutation == "two":
+        instance = page.instances[0]
+        page = SaladContainerGroupInstancePage(instances=(instance, replace(instance, id="two")))
+    elif mutation == "stale-version":
+        page = _pre_running_instance_page(state, version=7)
+    elif mutation == "ready-none":
+        page = _pre_running_instance_page(state, version=8, ready=None)
+    elif mutation == "ready-true":
+        page = _pre_running_instance_page(state, version=8, ready=True)
+    elif mutation == "started-none":
+        page = _pre_running_instance_page(state, version=8, started=None)
+    elif mutation == "started-true":
+        page = _pre_running_instance_page(state, version=8, started=True)
+    elif mutation == "running-instance":
+        page = _pre_running_instance_page(SaladContainerGroupInstanceState.RUNNING, version=8)
+    elif mutation == "stopping-instance":
+        page = _pre_running_instance_page(SaladContainerGroupInstanceState.STOPPING, version=8)
+    elif mutation == "allocating-count-mismatch":
+        group = replace(
+            group,
+            current_state=replace(
+                group.current_state,
+                allocating_count=0,
+                creating_count=1,
+            ),
+        )
+    elif mutation in {"downloading-count-mismatch", "creating-count-mismatch"}:
+        group = replace(
+            group,
+            current_state=replace(
+                group.current_state,
+                allocating_count=1,
+                creating_count=0,
+            ),
+        )
+    else:
+        raise AssertionError(f"unknown mutation {mutation}")
+
+    with pytest.raises(I2VLoraRolloutError):
+        rollout._validate_safe_prior_rollout_baseline(
+            group,
+            page,
+            _config(capable=False),
+        )
+
+
+@pytest.mark.parametrize(
+    "instances",
+    (
+        SimpleNamespace(instances=[]),
+        SimpleNamespace(instances=(object(),)),
+    ),
+)
+def test_safe_prior_rollout_baseline_rejects_invalid_pre_running_instance_readback(
+    instances: object,
+) -> None:
+    with pytest.raises(I2VLoraRolloutError, match="instance readback is invalid"):
+        rollout._validate_safe_prior_rollout_baseline(
+            _pre_running_group(SaladContainerGroupInstanceState.DOWNLOADING),
             instances,
             _config(capable=False),
         )
@@ -637,6 +836,36 @@ async def test_dry_run_accepts_exact_empty_allocating_prior_as_not_ready(
     assert client.update_patches == []
 
 
+@pytest.mark.parametrize(
+    "state",
+    (
+        SaladContainerGroupInstanceState.ALLOCATING,
+        SaladContainerGroupInstanceState.DOWNLOADING,
+        SaladContainerGroupInstanceState.CREATING,
+    ),
+)
+async def test_dry_run_accepts_exact_pre_running_singleton_as_not_ready(
+    state: SaladContainerGroupInstanceState,
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    monkeypatch.setattr(rollout, "verify_reviewed_artifact_access", _no_artifact_check)
+    client = _FakeSalad(group=_pre_running_group(state))
+    client.instances = _pre_running_instance_page(state)
+
+    result = await _dry_run(
+        database=database,
+        client=client,
+        artifact=_ArtifactClient(),
+        tmp_path=tmp_path,
+    )
+
+    assert not result.provider_ready
+    assert client.update_patches == []
+
+
 async def test_promotion_is_one_patch_only_and_rechecks_zero_work_before_mutation(
     monkeypatch: pytest.MonkeyPatch,
     database: Database,
@@ -682,6 +911,37 @@ async def test_promotion_accepts_exact_empty_allocating_prior_at_both_guards(
     assert result.provider_ready
     assert len(client.update_patches) == 1
     assert client.update_patches[0]["container"]["image"] == _TARGET_IMAGE
+
+
+@pytest.mark.parametrize(
+    "state",
+    (
+        SaladContainerGroupInstanceState.ALLOCATING,
+        SaladContainerGroupInstanceState.DOWNLOADING,
+        SaladContainerGroupInstanceState.CREATING,
+    ),
+)
+async def test_promotion_accepts_exact_pre_running_singleton_at_both_guards(
+    state: SaladContainerGroupInstanceState,
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    monkeypatch.setattr(rollout, "verify_reviewed_artifact_access", _no_artifact_check)
+    client = _FakeSalad(group=_pre_running_group(state))
+    client.instances = _pre_running_instance_page(state)
+
+    result = await _promote(
+        database=database,
+        client=client,
+        artifact=_ArtifactClient(),
+        tmp_path=tmp_path,
+    )
+
+    assert result.provider_ready
+    assert client.list_jobs_calls == 2
+    assert len(client.update_patches) == 1
 
 
 @pytest.mark.parametrize("race", ("pending", "version"))
@@ -744,6 +1004,191 @@ async def test_allocating_promotion_rejects_queue_race_immediately_before_patch(
         )
 
     assert client.update_patches == []
+
+
+@pytest.mark.parametrize(
+    "race",
+    (
+        "empty",
+        "two",
+        "stale-version",
+        "ready",
+        "started",
+        "running",
+        "stopping",
+    ),
+)
+async def test_pre_running_promotion_rejects_instance_race_immediately_before_patch(
+    race: str,
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    monkeypatch.setattr(rollout, "verify_reviewed_artifact_access", _no_artifact_check)
+    state = SaladContainerGroupInstanceState.DOWNLOADING
+    client = _FakeSalad(group=_pre_running_group(state, version=8))
+    initial = _pre_running_instance_page(state, version=8)
+    if race == "empty":
+        raced = _empty_instance_page()
+    elif race == "two":
+        instance = initial.instances[0]
+        raced = SaladContainerGroupInstancePage(
+            instances=(instance, replace(instance, id="instance-2"))
+        )
+    elif race == "stale-version":
+        raced = _pre_running_instance_page(state, version=7)
+    elif race == "ready":
+        raced = _pre_running_instance_page(state, version=8, ready=True)
+    elif race == "started":
+        raced = _pre_running_instance_page(state, version=8, started=True)
+    elif race == "running":
+        raced = _pre_running_instance_page(SaladContainerGroupInstanceState.RUNNING, version=8)
+    elif race == "stopping":
+        raced = _pre_running_instance_page(SaladContainerGroupInstanceState.STOPPING, version=8)
+    else:
+        raise AssertionError(f"unknown race {race}")
+    pages = iter((initial, raced))
+
+    async def list_instances(_name: str) -> SaladContainerGroupInstancePage:
+        return next(pages)
+
+    monkeypatch.setattr(client, "list_container_group_instances", list_instances)
+
+    with pytest.raises(I2VLoraRolloutError):
+        await _promote(
+            database=database,
+            client=client,
+            artifact=_ArtifactClient(),
+            tmp_path=tmp_path,
+        )
+
+    assert client.update_patches == []
+
+
+@pytest.mark.parametrize(
+    "race",
+    (
+        "pending",
+        "version",
+        "replicas",
+        "status",
+        "allocating",
+        "creating",
+        "running",
+        "stopping",
+    ),
+)
+async def test_pre_running_promotion_rejects_group_race_immediately_before_patch(
+    race: str,
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    monkeypatch.setattr(rollout, "verify_reviewed_artifact_access", _no_artifact_check)
+    state = SaladContainerGroupInstanceState.DOWNLOADING
+    initial = _pre_running_group(state, version=8)
+    raced = initial
+    if race == "pending":
+        raced = replace(raced, pending_change=True)
+    elif race == "version":
+        raced = replace(raced, version=9)
+    elif race == "replicas":
+        raced = replace(raced, replicas=2)
+    elif race == "status":
+        raced = replace(
+            raced,
+            current_state=replace(raced.current_state, status="stopped"),
+        )
+    elif race == "allocating":
+        raced = replace(
+            raced,
+            current_state=replace(raced.current_state, allocating_count=1),
+        )
+    elif race == "creating":
+        raced = replace(
+            raced,
+            current_state=replace(raced.current_state, creating_count=0),
+        )
+    elif race == "running":
+        raced = replace(
+            raced,
+            current_state=replace(raced.current_state, running_count=1),
+        )
+    elif race == "stopping":
+        raced = replace(
+            raced,
+            current_state=replace(raced.current_state, stopping_count=1),
+        )
+    else:
+        raise AssertionError(f"unknown race {race}")
+    client = _FakeSalad(group=initial)
+    client.instances = _pre_running_instance_page(state, version=8)
+    reads = 0
+
+    async def get_group(_name: str) -> SaladContainerGroup:
+        nonlocal reads
+        reads += 1
+        return initial if reads == 1 else raced
+
+    monkeypatch.setattr(client, "get_container_group", get_group)
+
+    with pytest.raises(I2VLoraRolloutError):
+        await _promote(
+            database=database,
+            client=client,
+            artifact=_ArtifactClient(),
+            tmp_path=tmp_path,
+        )
+
+    assert client.update_patches == []
+
+
+async def test_pre_running_promotion_accepts_safe_lifecycle_progress_before_patch(
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    monkeypatch.setattr(rollout, "verify_reviewed_artifact_access", _no_artifact_check)
+    initial_state = SaladContainerGroupInstanceState.ALLOCATING
+    current_state = SaladContainerGroupInstanceState.DOWNLOADING
+    initial_group = _pre_running_group(initial_state, version=8)
+    current_group = _pre_running_group(current_state, version=8)
+    client = _FakeSalad(group=initial_group)
+    groups = iter((initial_group, current_group))
+    pages = iter(
+        (
+            _pre_running_instance_page(initial_state, version=8),
+            _pre_running_instance_page(current_state, version=8),
+        )
+    )
+    group_reads = 0
+    instance_reads = 0
+
+    async def get_group(_name: str) -> SaladContainerGroup:
+        nonlocal group_reads
+        group_reads += 1
+        return next(groups) if group_reads <= 2 else client.group
+
+    async def list_instances(_name: str) -> SaladContainerGroupInstancePage:
+        nonlocal instance_reads
+        instance_reads += 1
+        return next(pages) if instance_reads <= 2 else client.instances
+
+    monkeypatch.setattr(client, "get_container_group", get_group)
+    monkeypatch.setattr(client, "list_container_group_instances", list_instances)
+
+    result = await _promote(
+        database=database,
+        client=client,
+        artifact=_ArtifactClient(),
+        tmp_path=tmp_path,
+    )
+
+    assert result.provider_ready
+    assert len(client.update_patches) == 1
 
 
 async def _no_artifact_check(_client: object, _manifest: object) -> None:
@@ -1056,6 +1501,46 @@ async def test_profile_preflight_accepts_only_the_exact_current_ready_group(
     assert result.operation == "profile-preflight"
     assert result.provider_ready
     assert result.provider_active_jobs == 0
+
+
+@pytest.mark.parametrize(
+    "state",
+    (
+        SaladContainerGroupInstanceState.ALLOCATING,
+        SaladContainerGroupInstanceState.DOWNLOADING,
+        SaladContainerGroupInstanceState.CREATING,
+    ),
+)
+async def test_profile_preflight_still_rejects_pre_running_singletons(
+    state: SaladContainerGroupInstanceState,
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+) -> None:
+    _patch_profile_dependencies(monkeypatch)
+    capable = _group(capable=True, version=9)
+    pre_running = replace(
+        capable,
+        current_state=replace(
+            capable.current_state,
+            allocating_count=int(state == SaladContainerGroupInstanceState.ALLOCATING),
+            creating_count=int(
+                state
+                in {
+                    SaladContainerGroupInstanceState.DOWNLOADING,
+                    SaladContainerGroupInstanceState.CREATING,
+                }
+            ),
+            running_count=0,
+            stopping_count=0,
+        ),
+    )
+    client = _FakeSalad(group=pre_running)
+    client.instances = _pre_running_instance_page(state, version=9)
+
+    with pytest.raises(I2VLoraRolloutError, match="exact warm replica"):
+        await _profile_preflight(database=database, client=client)
+
+    assert client.update_patches == []
 
 
 def _with_group_mutation(
