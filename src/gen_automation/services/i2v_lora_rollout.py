@@ -75,6 +75,7 @@ _MAX_PROVIDER_JOB_PAGES = 100
 _WORKER_CREDENTIAL_KEYS = frozenset(
     {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"}
 )
+_LEGACY_RECYCLE_FALSE_ENVIRONMENT_KEYS = frozenset({"GEN_I2V_WORKER_LORA_WORKER_ENABLED"})
 _HOST_PATCH_KEYS = (
     "GEN_AUTOMATION_I2V_ENABLED",
     "GEN_AUTOMATION_I2V_HIRES_PROFILE_ENABLED",
@@ -1978,7 +1979,10 @@ def _validate_exact_recycle_source(
     if _group_image(group) != config.worker_image:
         raise I2VLoraRolloutError("provider worker image differs from the pinned recycle source")
     observed_environment = _environment_variables(_group_container(group))
-    _validate_exact_environment_readback(observed_environment, expected_environment)
+    _validate_exact_legacy_recycle_environment_readback(
+        observed_environment,
+        expected_environment,
+    )
     _validate_exact_recycle_source_lifecycle(group, instances)
 
 
@@ -2047,7 +2051,7 @@ def _validate_exact_recycle_static_readback(
     ):
         raise I2VLoraRolloutError("provider recycle contract changed outside the operation")
     _validate_prior_group_static_contract(group, config, require_running=False)
-    _validate_exact_environment_readback(
+    _validate_exact_legacy_recycle_environment_readback(
         _environment_variables(_group_container(group)),
         expected_environment,
     )
@@ -2333,6 +2337,17 @@ def _validate_exact_environment_readback(
             raise I2VLoraRolloutError("provider worker environment identity changed")
     if any(not observed.get(key) for key in _WORKER_CREDENTIAL_KEYS):
         raise I2VLoraRolloutError("provider worker artifact credentials are incomplete")
+
+
+def _validate_exact_legacy_recycle_environment_readback(
+    observed: Mapping[str, str],
+    expected: Mapping[str, str],
+) -> None:
+    normalized_expected = dict(expected)
+    for key in _LEGACY_RECYCLE_FALSE_ENVIRONMENT_KEYS:
+        if key not in observed and normalized_expected.get(key) == "false":
+            normalized_expected.pop(key)
+    _validate_exact_environment_readback(observed, normalized_expected)
 
 
 def _redacted_provider_contract(group: SaladContainerGroup) -> JSONObject:
