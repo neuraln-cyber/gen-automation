@@ -97,6 +97,27 @@ _ROLLOUT_DIAGNOSTIC_STAGES = frozenset(
         "artifact-readback",
         "host-patch-write",
         "provider-source-preflight",
+        "provider-source-zero-work",
+        "provider-source-group-readback",
+        "provider-source-gpu-class",
+        "provider-source-instance-readback",
+        "provider-source-group-name",
+        "provider-source-container",
+        "provider-source-image",
+        "provider-source-gpu-resources",
+        "provider-source-priority",
+        "provider-source-readiness-probe",
+        "provider-source-base-contract",
+        "provider-source-compute",
+        "provider-source-autostart",
+        "provider-source-restart-policy",
+        "provider-source-startup-probe",
+        "provider-source-liveness-probe",
+        "provider-source-queue-connection",
+        "provider-source-autoscaler",
+        "provider-source-group-identity",
+        "provider-source-runtime-bindings",
+        "provider-source-lifecycle",
         "rollback-state-persist",
         "stop-guard",
         "provider-stop",
@@ -618,26 +639,35 @@ async def dry_run_reviewed_worker_rollout(
     record_stage("host-patch-write")
     write_private_host_patch(prepared_host_env_output, reviewed_host_patch(target))
     record_stage("provider-source-preflight")
+    record_stage("provider-source-zero-work")
     async with sessions() as session, session.begin():
         counts = await assert_zero_active_rollout_work(
             session,
             salad_client,
             queue_name=target.i2v_salad_queue_name,
         )
+        record_stage("provider-source-group-readback")
         group = await salad_client.get_container_group(target.i2v_salad_container_group_name)
     prior_config = i2v_runtime_config_from_settings(
         settings.model_copy(update={"i2v_enabled": True})
     ).salad
+    record_stage("provider-source-gpu-class")
     gpu_classes = await salad_client.list_gpu_classes()
     if not any(
         item.id == prior_config.gpu_class_id and item.name == I2V_SALAD_GPU_CLASS_NAME
         for item in gpu_classes
     ):
         raise I2VLoraRolloutError("provider GPU class is not the exact reviewed RTX 5090")
+    record_stage("provider-source-instance-readback")
     instances = await salad_client.list_container_group_instances(
         target.i2v_salad_container_group_name
     )
-    provider_ready = _validate_safe_prior_rollout_baseline(group, instances, prior_config)
+    provider_ready = _validate_safe_prior_rollout_baseline(
+        group,
+        instances,
+        prior_config,
+        diagnostic_stage=record_stage,
+    )
     _write_rollout_diagnostic(
         diagnostic_output,
         operation="dry-run",
@@ -1430,19 +1460,80 @@ def _validate_prior_group_contract(
         raise I2VLoraRolloutError("provider group is not the exact warm replica contract")
 
 
+def _record_provider_source_stage(
+    diagnostic_stage: Callable[[str], None] | None,
+    stage: str,
+) -> None:
+    if diagnostic_stage is not None:
+        diagnostic_stage(stage)
+
+
+def _provider_source_base_contract_failure_stage(
+    group: SaladContainerGroup,
+    config: I2VSaladConfig,
+) -> str:
+    """Classify a base-contract failure without exposing provider values or messages."""
+
+    if group.name != config.container_group_name:
+        return "provider-source-group-name"
+    container = group.raw.get("container")
+    if not isinstance(container, dict):
+        return "provider-source-container"
+    if container.get("image") != config.worker_image:
+        return "provider-source-image"
+    resources = container.get("resources")
+    if not isinstance(resources, dict) or resources.get("gpu_classes") != [
+        str(config.gpu_class_id)
+    ]:
+        return "provider-source-gpu-resources"
+    queue_connection = group.raw.get("queue_connection")
+    if (
+        not isinstance(queue_connection, dict)
+        or queue_connection.get("queue_name") != config.queue_name
+    ):
+        return "provider-source-queue-connection"
+    if group.raw.get("priority") != config.priority:
+        return "provider-source-priority"
+    observed_autoscaler = group.raw.get("queue_autoscaler")
+    expected_autoscaler = config.queue_autoscaler_configuration()
+    if (
+        not isinstance(observed_autoscaler, dict)
+        or any(observed_autoscaler.get(key) != value for key, value in expected_autoscaler.items())
+        or any(
+            key not in expected_autoscaler and value is not None
+            for key, value in observed_autoscaler.items()
+        )
+    ):
+        return "provider-source-autoscaler"
+    observed_readiness = group.raw.get("readiness_probe")
+    expected_readiness = _readiness_probe(config.readiness_probe_path)
+    if (observed_readiness is not None and observed_readiness != expected_readiness) or (
+        observed_readiness is None and config.readiness_probe_path != "/ready"
+    ):
+        return "provider-source-readiness-probe"
+    return "provider-source-base-contract"
+
+
 def _validate_prior_group_static_contract(
     group: SaladContainerGroup,
     config: I2VSaladConfig,
     *,
     require_running: bool = True,
+    diagnostic_stage: Callable[[str], None] | None = None,
 ) -> None:
+    _record_provider_source_stage(diagnostic_stage, "provider-source-base-contract")
     try:
         validate_i2v_group_contract(group, config)
     except I2VSaladError:
+        _record_provider_source_stage(
+            diagnostic_stage,
+            _provider_source_base_contract_failure_stage(group, config),
+        )
         raise I2VLoraRolloutError("provider group base contract is not rollout-safe") from None
     desired = config.container_configuration()
     desired_container = desired.get("container")
     observed_container = group.raw.get("container")
+    _record_provider_source_stage(diagnostic_stage, "provider-source-container")
     if not isinstance(desired_container, dict) or not isinstance(observed_container, dict):
         raise I2VLoraRolloutError("provider group container contract is invalid")
     desired_resources = desired_container.get("resources")
@@ -1454,6 +1545,7 @@ def _validate_prior_group_static_contract(
         observed_resources = {
             key: value for key, value in observed_resources.items() if key != "shm_size"
         }
+    _record_provider_source_stage(diagnostic_stage, "provider-source-compute")
     if observed_resources != desired_resources or observed_container.get(
         "image_caching"
     ) != desired_container.get("image_caching"):
@@ -1462,27 +1554,33 @@ def _validate_prior_group_static_contract(
     # Salad's legacy create default was false, so preserve that exact omitted
     # representation for rollback while rejecting every explicit value except
     # the literal boolean false.
+    _record_provider_source_stage(diagnostic_stage, "provider-source-autostart")
     if desired.get("autostart_policy") is not False:
         raise I2VLoraRolloutError("reviewed provider autostart contract is invalid")
     if "autostart_policy" in group.raw and group.raw["autostart_policy"] is not False:
         raise I2VLoraRolloutError("provider group scheduling contract drifted")
-    for key in (
-        "restart_policy",
-        "startup_probe",
-        "liveness_probe",
-        "queue_connection",
-        "queue_autoscaler",
-    ):
+    scheduling_contract_stages = {
+        "restart_policy": "provider-source-restart-policy",
+        "startup_probe": "provider-source-startup-probe",
+        "liveness_probe": "provider-source-liveness-probe",
+        "queue_connection": "provider-source-queue-connection",
+        "queue_autoscaler": "provider-source-autoscaler",
+    }
+    for key, stage in scheduling_contract_stages.items():
+        _record_provider_source_stage(diagnostic_stage, stage)
         if group.raw.get(key) != desired.get(key):
             raise I2VLoraRolloutError("provider group scheduling contract drifted")
+    _record_provider_source_stage(diagnostic_stage, "provider-source-group-identity")
     if str(group.id) != REVIEWED_PROVIDER_GROUP_ID or config.max_replicas != 1:
         raise I2VLoraRolloutError("provider group is not the exact warm replica contract")
+    _record_provider_source_stage(diagnostic_stage, "provider-source-lifecycle")
     if require_running and (
         group.replicas != config.max_replicas or group.status.lower() != "running"
     ):
         raise I2VLoraRolloutError("provider group is not the exact warm replica contract")
     expected_runtime_bindings = desired.get("runtime_bindings")
     observed_runtime_bindings = group.raw.get("runtime_bindings")
+    _record_provider_source_stage(diagnostic_stage, "provider-source-runtime-bindings")
     if observed_runtime_bindings not in (expected_runtime_bindings, None):
         raise I2VLoraRolloutError("provider runtime bindings drifted")
 
@@ -2335,10 +2433,17 @@ def _validate_safe_prior_rollout_baseline(
     group: SaladContainerGroup,
     page: object,
     config: I2VSaladConfig,
+    *,
+    diagnostic_stage: Callable[[str], None] | None = None,
 ) -> bool:
     """Accept only an exact ready or reviewed pre-running prior worker."""
 
-    _validate_prior_group_static_contract(group, config)
+    _validate_prior_group_static_contract(
+        group,
+        config,
+        diagnostic_stage=diagnostic_stage,
+    )
+    _record_provider_source_stage(diagnostic_stage, "provider-source-lifecycle")
     if _has_exact_ready_instance(group, page):
         return True
     instances = getattr(page, "instances", None)
