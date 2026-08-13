@@ -1,12 +1,20 @@
+import hashlib
 from datetime import UTC, datetime
 from io import BytesIO
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from gen_automation.db.models import AdminUser
-from gen_automation.domain.enums import AdminRole
+from gen_automation.db.models import (
+    AdminUser,
+    Asset,
+    GenerationJob,
+    Project,
+    Release,
+    ReleaseVersion,
+)
+from gen_automation.domain.enums import AdminRole, AssetKind, AssetState
 from gen_automation.storage.memory import MemoryObjectStore
 
 
@@ -82,6 +90,75 @@ def _complete_uploaded_input(client: TestClient, store: MemoryObjectStore) -> di
     return completed
 
 
+async def _seed_generated_asset(client: TestClient, store: MemoryObjectStore) -> UUID:
+    asset_id = uuid4()
+    now = datetime.now(UTC)
+    source = BytesIO()
+    Image.new("RGB", (1144, 1480), (65, 90, 125)).save(source, format="PNG")
+    source_bytes = source.getvalue()
+    source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    source_key = f"raw/{asset_id}.png"
+    store.put_for_test(source_key, source_bytes, content_type="image/png")
+
+    async with client.app.state.database.sessions() as session:
+        project = Project(slug=f"i2v-source-{asset_id.hex}", name="Older I2V Source")
+        session.add(project)
+        await session.flush()
+        release = Release(
+            project_id=project.id,
+            slug=f"i2v-source-{asset_id.hex}",
+            title="Older I2V Source",
+            current_version_no=1,
+            desired_accepted_count=1,
+        )
+        session.add(release)
+        await session.flush()
+        version = ReleaseVersion(
+            release_id=release.id,
+            version_no=1,
+            specification={"schema_version": 1},
+            specification_sha256=hashlib.sha256(asset_id.bytes).hexdigest(),
+            created_by="test",
+            created_at=now,
+        )
+        session.add(version)
+        await session.flush()
+        job = GenerationJob(
+            release_version_id=version.id,
+            logical_key=hashlib.sha256(b"logical" + asset_id.bytes).hexdigest(),
+            parameters={"ordinal": 0},
+            parameters_sha256=hashlib.sha256(b"parameters" + asset_id.bytes).hexdigest(),
+            provider="salad",
+            expected_output_count=1,
+        )
+        session.add(job)
+        await session.flush()
+        session.add(
+            Asset(
+                id=asset_id,
+                release_id=release.id,
+                generation_job_id=job.id,
+                output_index=0,
+                kind=AssetKind.RAW_MASTER,
+                state=AssetState.AVAILABLE,
+                storage_backend=store.backend,
+                storage_bucket=store.bucket,
+                object_key=source_key,
+                object_version_id=store.objects[source_key].version_id,
+                sha256=source_sha256,
+                content_type="image/png",
+                image_format="PNG",
+                width=1144,
+                height=1480,
+                byte_size=len(source_bytes),
+                asset_metadata={},
+                available_at=now,
+            )
+        )
+        await session.commit()
+    return asset_id
+
+
 def test_i2v_upload_presets_and_queue_are_one_focused_flow(client: TestClient) -> None:
     _seed_development_owner(client)
     store = MemoryObjectStore(bucket="i2v-tests")
@@ -155,6 +232,31 @@ def test_i2v_upload_presets_and_queue_are_one_focused_flow(client: TestClient) -
     )
     assert retry_response.status_code == 200
     assert retry_response.json()["state"] == "queued"
+
+
+def test_i2v_generated_asset_registration_returns_source_dimensions(
+    client: TestClient,
+) -> None:
+    _seed_development_owner(client)
+    store = MemoryObjectStore(bucket="i2v-asset-id-tests")
+    client.app.state.object_store = store
+    assert client.portal is not None
+    asset_id = client.portal.call(_seed_generated_asset, client, store)
+
+    response = client.post(
+        "/api/v1/i2v/inputs/from-asset",
+        json={"asset_id": str(asset_id)},
+        headers={"X-CSRF-Token": "development"},
+    )
+
+    assert response.status_code == 201, response.text
+    registered = response.json()
+    assert registered["source"] == "generation"
+    assert registered["asset_id"] == str(asset_id)
+    assert registered["width"] == 1144
+    assert registered["height"] == 1480
+    assert registered["display_name"] == f"Generated image {str(asset_id)[:8]}"
+    assert registered["object_key"] in store.objects
 
 
 def test_i2v_worker_endpoint_never_invents_progress(client: TestClient) -> None:

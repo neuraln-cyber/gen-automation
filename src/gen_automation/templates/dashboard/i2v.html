@@ -54,6 +54,7 @@
 
         <div class="i2v-tabs" role="tablist" aria-label="Image source">
           <button class="i2v-tab active" type="button" role="tab" aria-selected="true" aria-controls="i2v-library" data-source-tab="library">Library</button>
+          <button class="i2v-tab" type="button" role="tab" aria-selected="false" aria-controls="i2v-asset-id" data-source-tab="asset-id">Asset ID</button>
           <button class="i2v-tab" type="button" role="tab" aria-selected="false" aria-controls="i2v-upload" data-source-tab="upload">Upload</button>
         </div>
 
@@ -62,6 +63,34 @@
             <p class="muted">Loading recent generations…</p>
           </div>
           <button class="secondary-button i2v-wide-button" type="button" data-load-more-sources>Show more</button>
+        </div>
+
+        <div id="i2v-asset-id" class="i2v-source-view" role="tabpanel" data-source-view="asset-id" hidden>
+          <form class="i2v-asset-id-picker" data-asset-id-form>
+            <label for="i2v-asset-uuid">
+              Generated image asset UUID
+              <small id="i2v-asset-id-help">Use the full asset ID from any generation, even if it is older than this library.</small>
+            </label>
+            <div class="i2v-asset-id-row">
+              <input
+                id="i2v-asset-uuid"
+                name="asset_id"
+                type="text"
+                inputmode="text"
+                autocomplete="off"
+                spellcheck="false"
+                required
+                minlength="36"
+                maxlength="36"
+                pattern="[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+                aria-describedby="i2v-asset-id-help i2v-asset-id-status"
+                placeholder="12345678-1234-1234-1234-123456789abc"
+                data-asset-id-input
+              >
+              <button class="secondary-button" type="submit" data-select-asset-id>Use image</button>
+            </div>
+            <p id="i2v-asset-id-status" class="muted" role="status" aria-live="polite" data-asset-id-status>Paste an exact generated-image asset UUID.</p>
+          </form>
         </div>
 
         <div id="i2v-upload" class="i2v-source-view" role="tabpanel" data-source-view="upload" hidden>
