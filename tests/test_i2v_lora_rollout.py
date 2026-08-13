@@ -184,6 +184,20 @@ def _empty_instance_page() -> SaladContainerGroupInstancePage:
     return SaladContainerGroupInstancePage(instances=())
 
 
+def _allocating_group(*, version: int = 1) -> SaladContainerGroup:
+    group = _group(capable=False, version=version)
+    return replace(
+        group,
+        current_state=replace(
+            group.current_state,
+            allocating_count=1,
+            creating_count=0,
+            running_count=0,
+            stopping_count=0,
+        ),
+    )
+
+
 def _queue(*, length: int = 0) -> SaladQueue:
     return SaladQueue(
         id=_QUEUE_ID,
@@ -326,7 +340,10 @@ class _FakeSalad:
             current_state=replace(
                 self.group.current_state,
                 status="running" if replicas else "stopped",
+                allocating_count=0,
+                creating_count=0,
                 running_count=replicas,
+                stopping_count=0,
             ),
             create_time=self.group.create_time,
             update_time=_NOW,
@@ -426,6 +443,27 @@ async def _promote(
     )
 
 
+async def _dry_run(
+    *,
+    database: Database,
+    client: _FakeSalad,
+    artifact: _ArtifactClient,
+    tmp_path: Path,
+) -> rollout.I2VLoraRolloutResult:
+    return await rollout.dry_run_reviewed_worker_rollout(
+        settings=_settings(capable=False),
+        sessions=database.sessions,
+        salad_client=cast(Any, client),
+        resolver=cast(Any, object()),
+        manifest_client=cast(Any, object()),
+        artifact_client_factory=lambda _environment: artifact,
+        coordinates=_COORDINATES,
+        worker_image=_TARGET_IMAGE,
+        worker_source_revision=_TARGET_REVISION,
+        prepared_host_env_output=tmp_path / "target.env",
+    )
+
+
 def test_exact_ready_instance_requires_one_current_running_ready_replica() -> None:
     exact = _group(capable=True, version=8)
     assert rollout._has_exact_ready_instance(exact, _instance_page(version=8))
@@ -437,6 +475,71 @@ def test_exact_ready_instance_requires_one_current_running_ready_replica() -> No
     assert not rollout._has_exact_ready_instance(
         _group(capable=True, version=8, pending_change=True), _instance_page(version=8)
     )
+
+
+def test_safe_prior_rollout_baseline_accepts_only_exact_empty_allocating_state() -> None:
+    group = _allocating_group(version=8)
+
+    assert not rollout._validate_safe_prior_rollout_baseline(
+        group,
+        _empty_instance_page(),
+        _config(capable=False),
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "instances"),
+    (
+        ("pending", _empty_instance_page()),
+        ("allocating-zero", _empty_instance_page()),
+        ("allocating-two", _empty_instance_page()),
+        ("running", _empty_instance_page()),
+        ("creating", _empty_instance_page()),
+        ("stopping", _empty_instance_page()),
+        ("instance", _instance_page(version=8)),
+    ),
+)
+def test_safe_prior_rollout_baseline_rejects_every_allocating_state_drift(
+    mutation: str,
+    instances: SaladContainerGroupInstancePage,
+) -> None:
+    group = _allocating_group(version=8)
+    if mutation == "pending":
+        group = replace(group, pending_change=True)
+    elif mutation == "allocating-zero":
+        group = replace(
+            group,
+            current_state=replace(group.current_state, allocating_count=0),
+        )
+    elif mutation == "allocating-two":
+        group = replace(
+            group,
+            current_state=replace(group.current_state, allocating_count=2),
+        )
+    elif mutation == "running":
+        group = replace(
+            group,
+            current_state=replace(group.current_state, running_count=1),
+        )
+    elif mutation == "creating":
+        group = replace(
+            group,
+            current_state=replace(group.current_state, creating_count=1),
+        )
+    elif mutation == "stopping":
+        group = replace(
+            group,
+            current_state=replace(group.current_state, stopping_count=1),
+        )
+    elif mutation != "instance":
+        raise AssertionError(f"unknown mutation {mutation}")
+
+    with pytest.raises(I2VLoraRolloutError, match="exact safe baseline"):
+        rollout._validate_safe_prior_rollout_baseline(
+            group,
+            instances,
+            _config(capable=False),
+        )
 
 
 @pytest.mark.parametrize(
@@ -511,6 +614,29 @@ async def test_artifact_preflight_failure_occurs_before_any_provider_update(
     assert client.update_patches == []
 
 
+async def test_dry_run_accepts_exact_empty_allocating_prior_as_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    monkeypatch.setattr(rollout, "verify_reviewed_artifact_access", _no_artifact_check)
+    client = _FakeSalad(group=_allocating_group())
+    client.instances = _empty_instance_page()
+
+    result = await _dry_run(
+        database=database,
+        client=client,
+        artifact=_ArtifactClient(),
+        tmp_path=tmp_path,
+    )
+
+    assert result.operation == "dry-run"
+    assert result.provider_image == _PRIOR_IMAGE
+    assert not result.provider_ready
+    assert client.update_patches == []
+
+
 async def test_promotion_is_one_patch_only_and_rechecks_zero_work_before_mutation(
     monkeypatch: pytest.MonkeyPatch,
     database: Database,
@@ -534,6 +660,90 @@ async def test_promotion_is_one_patch_only_and_rechecks_zero_work_before_mutatio
     assert len(client.update_patches) == 1
     assert client.update_patches[0]["container"]["image"] == _TARGET_IMAGE
     assert _RuntimeEnvironment.calls == 0
+
+
+async def test_promotion_accepts_exact_empty_allocating_prior_at_both_guards(
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    monkeypatch.setattr(rollout, "verify_reviewed_artifact_access", _no_artifact_check)
+    client = _FakeSalad(group=_allocating_group())
+    client.instances = _empty_instance_page()
+
+    result = await _promote(
+        database=database,
+        client=client,
+        artifact=_ArtifactClient(),
+        tmp_path=tmp_path,
+    )
+
+    assert result.provider_ready
+    assert len(client.update_patches) == 1
+    assert client.update_patches[0]["container"]["image"] == _TARGET_IMAGE
+
+
+@pytest.mark.parametrize("race", ("pending", "version"))
+async def test_allocating_promotion_rejects_group_race_immediately_before_patch(
+    race: str,
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    monkeypatch.setattr(rollout, "verify_reviewed_artifact_access", _no_artifact_check)
+    client = _FakeSalad(group=_allocating_group())
+    client.instances = _empty_instance_page()
+    reads = 0
+
+    async def get_group(_name: str) -> SaladContainerGroup:
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return client.group
+        if race == "pending":
+            return replace(client.group, pending_change=True)
+        return replace(client.group, version=client.group.version + 1)
+
+    monkeypatch.setattr(client, "get_container_group", get_group)
+
+    with pytest.raises(I2VLoraRolloutError, match="group changed before rollout"):
+        await _promote(
+            database=database,
+            client=client,
+            artifact=_ArtifactClient(),
+            tmp_path=tmp_path,
+        )
+
+    assert client.update_patches == []
+
+
+async def test_allocating_promotion_rejects_queue_race_immediately_before_patch(
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    monkeypatch.setattr(rollout, "verify_reviewed_artifact_access", _no_artifact_check)
+    client = _FakeSalad(group=_allocating_group())
+    client.instances = _empty_instance_page()
+    queue_lengths = iter((0, 0, 1))
+
+    async def get_queue(_name: str) -> SaladQueue:
+        return _queue(length=next(queue_lengths))
+
+    monkeypatch.setattr(client, "get_queue", get_queue)
+
+    with pytest.raises(I2VLoraRolloutError, match="queue changed immediately"):
+        await _promote(
+            database=database,
+            client=client,
+            artifact=_ArtifactClient(),
+            tmp_path=tmp_path,
+        )
+
+    assert client.update_patches == []
 
 
 async def _no_artifact_check(_client: object, _manifest: object) -> None:
@@ -854,6 +1064,16 @@ def _with_group_mutation(
 ) -> tuple[SaladContainerGroup, SaladContainerGroupInstancePage]:
     if mutation == "pending":
         return replace(group, pending_change=True), _instance_page(version=group.version)
+    if mutation == "allocating":
+        allocating = replace(
+            group,
+            current_state=replace(
+                group.current_state,
+                allocating_count=1,
+                running_count=0,
+            ),
+        )
+        return allocating, _empty_instance_page()
     if mutation == "stale-instance":
         return group, _instance_page(version=group.version - 1)
     if mutation == "zero-replica":
@@ -901,6 +1121,7 @@ def _with_group_mutation(
     "mutation",
     (
         "pending",
+        "allocating",
         "stale-instance",
         "zero-replica",
         "wrong-group",

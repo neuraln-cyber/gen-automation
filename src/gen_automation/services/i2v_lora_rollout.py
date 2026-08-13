@@ -456,12 +456,9 @@ async def dry_run_reviewed_worker_rollout(
             queue_name=target.i2v_salad_queue_name,
         )
         group = await salad_client.get_container_group(target.i2v_salad_container_group_name)
-    if group.pending_change:
-        raise I2VLoraRolloutError("provider group already has a pending change")
     prior_config = i2v_runtime_config_from_settings(
         settings.model_copy(update={"i2v_enabled": True})
     ).salad
-    _validate_prior_group_contract(group, prior_config)
     gpu_classes = await salad_client.list_gpu_classes()
     if not any(
         item.id == prior_config.gpu_class_id and item.name == I2V_SALAD_GPU_CLASS_NAME
@@ -471,12 +468,11 @@ async def dry_run_reviewed_worker_rollout(
     instances = await salad_client.list_container_group_instances(
         target.i2v_salad_container_group_name
     )
-    if not _has_exact_ready_instance(group, instances):
-        raise I2VLoraRolloutError("provider group is not stable and ready before rollout")
+    provider_ready = _validate_safe_prior_rollout_baseline(group, instances, prior_config)
     return I2VLoraRolloutResult(
         operation="dry-run",
         provider_image=_group_image(group),
-        provider_ready=True,
+        provider_ready=provider_ready,
         durable_active_jobs=counts[0],
         durable_active_attempts=counts[1],
         provider_active_jobs=counts[2],
@@ -521,12 +517,9 @@ async def promote_reviewed_worker(
         )
     group_name = target.i2v_salad_container_group_name
     prior = await salad_client.get_container_group(group_name)
-    if prior.pending_change:
-        raise I2VLoraRolloutError("provider group already has a pending change")
     prior_config = i2v_runtime_config_from_settings(
         settings.model_copy(update={"i2v_enabled": True})
     ).salad
-    _validate_prior_group_contract(prior, prior_config)
     gpu_classes = await salad_client.list_gpu_classes()
     if not any(
         item.id == prior_config.gpu_class_id and item.name == I2V_SALAD_GPU_CLASS_NAME
@@ -534,8 +527,7 @@ async def promote_reviewed_worker(
     ):
         raise I2VLoraRolloutError("provider GPU class is not the exact reviewed RTX 5090")
     prior_instances = await salad_client.list_container_group_instances(group_name)
-    if not _has_exact_ready_instance(prior, prior_instances):
-        raise I2VLoraRolloutError("provider group is not stable and ready before rollout")
+    _validate_safe_prior_rollout_baseline(prior, prior_instances, prior_config)
     target_probe = i2v_runtime_config_from_settings(target).salad.readiness_probe_path
     state = _rollback_state(
         prior,
@@ -562,8 +554,7 @@ async def promote_reviewed_worker(
         current = await salad_client.get_container_group(group_name)
         _assert_group_unchanged_before_patch(current, prior)
         current_instances = await salad_client.list_container_group_instances(group_name)
-        if not _has_exact_ready_instance(current, current_instances):
-            raise I2VLoraRolloutError("provider group stopped being ready before rollout")
+        _validate_safe_prior_rollout_baseline(current, current_instances, prior_config)
         queue = await salad_client.get_queue(target.i2v_salad_queue_name)
         if queue.current_queue_length:
             raise I2VLoraRolloutError("provider queue changed immediately before rollout")
@@ -822,6 +813,21 @@ def _validate_prior_group_contract(
     group: SaladContainerGroup,
     config: I2VSaladConfig,
 ) -> None:
+    _validate_prior_group_static_contract(group, config)
+    if (
+        group.pending_change
+        or group.current_state.running_count != 1
+        or group.current_state.allocating_count
+        or group.current_state.creating_count
+        or group.current_state.stopping_count
+    ):
+        raise I2VLoraRolloutError("provider group is not the exact warm replica contract")
+
+
+def _validate_prior_group_static_contract(
+    group: SaladContainerGroup,
+    config: I2VSaladConfig,
+) -> None:
     try:
         validate_i2v_group_contract(group, config)
     except I2VSaladError:
@@ -852,10 +858,6 @@ def _validate_prior_group_contract(
         or group.replicas != config.max_replicas
         or config.max_replicas != 1
         or group.status.lower() != "running"
-        or group.current_state.running_count != 1
-        or group.current_state.allocating_count
-        or group.current_state.creating_count
-        or group.current_state.stopping_count
     ):
         raise I2VLoraRolloutError("provider group is not the exact warm replica contract")
     expected_runtime_bindings = desired.get("runtime_bindings")
@@ -1341,6 +1343,31 @@ def _has_exact_ready_instance(group: SaladContainerGroup, page: object) -> bool:
         and instance.started is True
         for instance in instances
     )
+
+
+def _validate_safe_prior_rollout_baseline(
+    group: SaladContainerGroup,
+    page: object,
+    config: I2VSaladConfig,
+) -> bool:
+    """Accept only an exact ready or exact empty-allocating reviewed prior worker."""
+
+    _validate_prior_group_static_contract(group, config)
+    if _has_exact_ready_instance(group, page):
+        return True
+    instances = getattr(page, "instances", None)
+    if (
+        not group.pending_change
+        and group.replicas == 1
+        and group.status.lower() == "running"
+        and group.current_state.allocating_count == 1
+        and group.current_state.running_count == 0
+        and group.current_state.creating_count == 0
+        and group.current_state.stopping_count == 0
+        and instances == ()
+    ):
+        return False
+    raise I2VLoraRolloutError("provider group is not an exact safe baseline before rollout")
 
 
 def _assert_group_unchanged_before_patch(
