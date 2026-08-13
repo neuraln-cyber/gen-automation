@@ -802,6 +802,30 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
     assert "rollout-diagnostic.json" in rollout
     assert "gen-automation/i2v-lora-diagnostic/v1" in rollout
     assert 'print("I2V LoRA diagnostic: "' in rollout
+    for stage in (
+        "provider-source-zero-work",
+        "provider-source-group-readback",
+        "provider-source-gpu-class",
+        "provider-source-instance-readback",
+        "provider-source-group-name",
+        "provider-source-container",
+        "provider-source-image",
+        "provider-source-gpu-resources",
+        "provider-source-priority",
+        "provider-source-readiness-probe",
+        "provider-source-base-contract",
+        "provider-source-compute",
+        "provider-source-autostart",
+        "provider-source-restart-policy",
+        "provider-source-startup-probe",
+        "provider-source-liveness-probe",
+        "provider-source-queue-connection",
+        "provider-source-autoscaler",
+        "provider-source-group-identity",
+        "provider-source-runtime-bindings",
+        "provider-source-lifecycle",
+    ):
+        assert f'"{stage}"' in rollout
     dry_run = rollout.split('if [ "$operation" = "dry-run" ]; then', maxsplit=1)[1].split(
         "\nfi\n", maxsplit=1
     )[0]
