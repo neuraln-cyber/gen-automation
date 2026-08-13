@@ -169,6 +169,19 @@ def _group(
     )
 
 
+def _without_autostart_policy(group: SaladContainerGroup) -> SaladContainerGroup:
+    raw = deepcopy(group.raw)
+    raw.pop("autostart_policy", None)
+    return replace(group, raw=raw)
+
+
+def _without_legacy_default_fields(group: SaladContainerGroup) -> SaladContainerGroup:
+    group = _without_autostart_policy(group)
+    raw = deepcopy(group.raw)
+    raw.pop("readiness_probe", None)
+    return replace(group, raw=raw)
+
+
 def _instance_page(*, version: int = 1) -> SaladContainerGroupInstancePage:
     return SaladContainerGroupInstancePage(
         instances=(
@@ -390,7 +403,11 @@ class _FakeSalad:
                 current_environment[key] = value
         container["environment_variables"] = current_environment
         if "readiness_probe" in patch:
-            raw["readiness_probe"] = deepcopy(patch["readiness_probe"])
+            readiness_probe = patch["readiness_probe"]
+            if readiness_probe is None:
+                raw.pop("readiness_probe", None)
+            else:
+                raw["readiness_probe"] = deepcopy(readiness_probe)
         next_version = self.group.version + 1
         replicas = self.group.replicas
         self.group = SaladContainerGroup(
@@ -673,6 +690,30 @@ async def test_recycle_promote_prepares_target_then_stops_patches_starts_and_wai
         "schema": "gen-automation/i2v-lora-diagnostic/v1",
         "stage": "complete",
     }
+
+
+@pytest.mark.asyncio
+async def test_recycle_promote_accepts_and_preserves_legacy_missing_default_fields(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    client = _FakeSalad(group=_without_legacy_default_fields(_group(capable=False)))
+
+    result = await _recycle_promote(
+        database=database,
+        client=client,
+        artifact=_ArtifactClient(),
+        tmp_path=tmp_path,
+    )
+
+    state = rollout.read_provider_rollback_state(tmp_path / "rollback.json")
+    assert result.provider_ready
+    assert "autostart_policy" not in state.prior_contract
+    assert state.prior_readiness_probe is None
+    assert "readiness_probe" not in state.prior_contract
+    assert "autostart_policy" not in client.group.raw
 
 
 @pytest.mark.asyncio
@@ -1412,6 +1453,92 @@ async def test_dry_run_accepts_exact_pre_running_singleton_as_not_ready(
     assert client.update_patches == []
 
 
+async def test_dry_run_accepts_legacy_missing_default_fields_without_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    monkeypatch.setattr(rollout, "verify_reviewed_artifact_access", _no_artifact_check)
+    source = _without_legacy_default_fields(
+        _pre_running_group(SaladContainerGroupInstanceState.DOWNLOADING)
+    )
+    client = _FakeSalad(group=source)
+    client.instances = _pre_running_instance_page(SaladContainerGroupInstanceState.DOWNLOADING)
+
+    result = await _dry_run(
+        database=database,
+        client=client,
+        artifact=_ArtifactClient(),
+        tmp_path=tmp_path,
+    )
+
+    assert not result.provider_ready
+    assert client.update_patches == []
+    assert "autostart_policy" not in client.group.raw
+    assert "readiness_probe" not in client.group.raw
+
+
+@pytest.mark.parametrize("value", (None, True, 0, "false"))
+def test_prior_contract_rejects_every_explicit_non_false_autostart_policy(
+    value: object,
+) -> None:
+    group = _group(capable=False)
+    group.raw["autostart_policy"] = cast(Any, value)
+
+    with pytest.raises(I2VLoraRolloutError, match="scheduling contract drifted"):
+        rollout._validate_safe_prior_rollout_baseline(
+            group,
+            _instance_page(),
+            _config(capable=False),
+        )
+
+
+def test_prior_contract_rejects_a_non_false_reviewed_autostart_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = I2VSaladConfig.container_configuration
+
+    def _unexpected_autostart(self: I2VSaladConfig) -> JSONObject:
+        desired = original(self)
+        desired["autostart_policy"] = True
+        return desired
+
+    monkeypatch.setattr(I2VSaladConfig, "container_configuration", _unexpected_autostart)
+
+    with pytest.raises(
+        I2VLoraRolloutError, match="reviewed provider autostart contract is invalid"
+    ):
+        rollout._validate_safe_prior_rollout_baseline(
+            _without_autostart_policy(_group(capable=False)),
+            _instance_page(),
+            _config(capable=False),
+        )
+
+
+def test_prior_contract_accepts_legacy_missing_baseline_readiness_probe() -> None:
+    group = _without_autostart_policy(_group(capable=False))
+    group.raw.pop("readiness_probe")
+
+    rollout._validate_safe_prior_rollout_baseline(
+        group,
+        _instance_page(),
+        _config(capable=False),
+    )
+
+
+def test_prior_contract_rejects_explicit_wrong_baseline_readiness_probe() -> None:
+    group = _without_autostart_policy(_group(capable=False))
+    group.raw["readiness_probe"] = rollout._readiness_probe("/wrong-ready")
+
+    with pytest.raises(I2VLoraRolloutError, match="base contract is not rollout-safe"):
+        rollout._validate_safe_prior_rollout_baseline(
+            group,
+            _instance_page(),
+            _config(capable=False),
+        )
+
+
 async def test_promotion_is_one_patch_only_and_rechecks_zero_work_before_mutation(
     monkeypatch: pytest.MonkeyPatch,
     database: Database,
@@ -1969,6 +2096,27 @@ async def test_rollback_accepts_a_later_exact_promoted_contract() -> None:
     assert len(client.update_patches) == 1
 
 
+async def test_rollback_preserves_legacy_missing_default_fields() -> None:
+    prior = _without_legacy_default_fields(_group(capable=False, version=1))
+    state = _rollback_state(prior)
+    promoted = _without_autostart_policy(_group(capable=True, version=3))
+    client = _FakeSalad(group=promoted)
+    client.instances = _instance_page(version=3)
+
+    restored = await rollout._restore_provider(
+        cast(Any, client),
+        state=state,
+        environment=_ROTATED_PRIOR_ENVIRONMENT,
+        timeout_seconds=0.1,
+    )
+
+    assert "autostart_policy" not in state.prior_contract
+    assert state.prior_readiness_probe is None
+    assert "autostart_policy" not in restored.raw
+    assert "readiness_probe" not in restored.raw
+    assert restored.raw["container"]["image"] == _PRIOR_IMAGE
+
+
 async def test_rollback_accepts_deferred_promoted_profile_patch_acknowledgement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2231,6 +2379,35 @@ async def test_profile_preflight_accepts_only_the_exact_current_ready_group(
     assert result.operation == "profile-preflight"
     assert result.provider_ready
     assert result.provider_active_jobs == 0
+
+
+async def test_profile_preflight_accepts_legacy_missing_autostart_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+) -> None:
+    _patch_profile_dependencies(monkeypatch)
+    group = _without_autostart_policy(_group(capable=True, version=9))
+    client = _FakeSalad(group=group)
+    client.instances = _instance_page(version=9)
+
+    result = await _profile_preflight(database=database, client=client)
+
+    assert result.provider_ready
+    assert "autostart_policy" not in client.group.raw
+
+
+async def test_profile_preflight_rejects_missing_capability_readiness_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+) -> None:
+    _patch_profile_dependencies(monkeypatch)
+    group = _without_autostart_policy(_group(capable=True, version=9))
+    group.raw.pop("readiness_probe")
+    client = _FakeSalad(group=group)
+    client.instances = _instance_page(version=9)
+
+    with pytest.raises(I2VLoraRolloutError, match="base contract is not rollout-safe"):
+        await _profile_preflight(database=database, client=client)
 
 
 @pytest.mark.parametrize(

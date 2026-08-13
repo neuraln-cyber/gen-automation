@@ -1449,11 +1449,17 @@ def _validate_prior_group_static_contract(
         observed_container.get(key) != desired_container.get(key) for key in exact_container_fields
     ):
         raise I2VLoraRolloutError("provider group compute contract drifted")
+    # The pinned container group predates Salad's required autostart field.
+    # Salad's legacy create default was false, so preserve that exact omitted
+    # representation for rollback while rejecting every explicit value except
+    # the literal boolean false.
+    if desired.get("autostart_policy") is not False:
+        raise I2VLoraRolloutError("reviewed provider autostart contract is invalid")
+    if "autostart_policy" in group.raw and group.raw["autostart_policy"] is not False:
+        raise I2VLoraRolloutError("provider group scheduling contract drifted")
     for key in (
-        "autostart_policy",
         "restart_policy",
         "startup_probe",
-        "readiness_probe",
         "liveness_probe",
         "queue_connection",
         "queue_autoscaler",
@@ -1851,11 +1857,8 @@ def _validate_exact_recycle_source(
     expected_environment: Mapping[str, str],
 ) -> None:
     _validate_prior_group_static_contract(group, config)
-    expected_probe = _readiness_probe(config.readiness_probe_path)
     if _group_image(group) != config.worker_image:
         raise I2VLoraRolloutError("provider worker image differs from the pinned recycle source")
-    if group.raw.get("readiness_probe") != expected_probe:
-        raise I2VLoraRolloutError("provider readiness probe differs from the pinned recycle source")
     observed_environment = _environment_variables(_group_container(group))
     _validate_exact_environment_readback(observed_environment, expected_environment)
     _validate_exact_recycle_source_lifecycle(group, instances)
@@ -1921,7 +1924,6 @@ def _validate_exact_recycle_static_readback(
         or group.version != expected_version
         or group.pending_change
         or _group_image(group) != config.worker_image
-        or group.raw.get("readiness_probe") != _readiness_probe(config.readiness_probe_path)
     ):
         raise I2VLoraRolloutError("provider recycle contract changed outside the operation")
     _validate_prior_group_static_contract(group, config, require_running=False)
