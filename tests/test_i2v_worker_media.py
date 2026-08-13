@@ -69,7 +69,7 @@ def test_source_sized_ping_pong_delivery_is_deterministic(
     assert metadata["loop_mode"] == "ping_pong"
     assert metadata["loop_count"] == 2
     assert metadata["source_fit"] == "contain_edge_pad"
-    materialized = tuple((tmp_path / "job/frames").glob("*.png"))
+    materialized = tuple(sorted((tmp_path / "job/frames").glob("*.png")))
     assert [item.read_bytes()[0] for item in materialized] == [
         0,
         1,
