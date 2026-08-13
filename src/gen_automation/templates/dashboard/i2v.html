@@ -11,6 +11,7 @@
     data-api-base="/api/v1/i2v"
     data-csrf-token="{{ csrf_token }}"
     data-can-manage="{{ 'true' if can_manage else 'false' }}"
+    data-hires-profile-enabled="{{ 'true' if hires_profile_enabled else 'false' }}"
     data-max-image-bytes="{{ max_image_bytes }}"
   >
     <header class="i2v-hero">
@@ -39,7 +40,7 @@
       </aside>
     </header>
 
-    <output class="i2v-banner" data-global-status aria-live="polite" hidden></output>
+    <output class="i2v-banner" data-global-status aria-live="polite"{% if hires_profile_enabled %} hidden{% endif %}>{% if not hires_profile_enabled %}Higher-resolution submissions are paused while the matching RTX 5090 worker is rolled out.{% endif %}</output>
 
     <div class="i2v-workspace">
       <section class="panel i2v-source-panel" aria-labelledby="i2v-source-heading">
@@ -117,9 +118,9 @@
           <div class="i2v-settings-grid">
             <label>Frames <input type="number" name="frame_count" value="81" min="9" step="8" required></label>
             <label>Frame rate <span><input type="number" name="fps" value="16" min="1" step="1" required> fps</span></label>
-            <label>Duration <output data-duration>5.06 seconds</output></label>
-            <label>Width <input type="number" name="width" value="576" min="32" step="32" required></label>
-            <label>Height <input type="number" name="height" value="1024" min="32" step="32" required></label>
+            <label>Encoded duration <output data-duration>5.06 seconds</output></label>
+            <label>Native width <input type="number" name="width" value="768" min="32" step="32" required disabled></label>
+            <label>Native height <input type="number" name="height" value="992" min="32" step="32" required disabled></label>
             <label>Seed <input type="number" name="seed" value="-1" step="1" aria-describedby="seed-help"><small id="seed-help">−1 chooses a fresh seed</small></label>
             <label>Total steps <input type="number" name="steps" value="4" min="1" step="1" required></label>
             <label>High-stage end step <input type="number" name="high_end_step" value="2" min="1" step="1" required></label>
@@ -133,16 +134,18 @@
               <select name="scheduler"><option value="linear_quadratic" selected>Linear quadratic</option></select>
             </label>
             <label>Interpolation <select name="interpolation" disabled><option value="none" selected>Off for baseline</option></select></label>
-            <label>Upscale <select name="upscale" disabled><option value="none" selected>Off for baseline</option></select></label>
+            <label>Delivery size <select name="upscale"><option value="source" selected>Match source image</option><option value="none">Native generation size</option></select><small>High-quality Lanczos output scaling</small></label>
+            <label>Ping-pong cycles <input type="number" name="loop_count" value="2" min="1" max="2" step="1" required disabled><small>Looped delivery is capped at 25 seconds</small></label>
           </div>
           <div class="i2v-toggle-row">
-            <label><input type="checkbox" name="loop" disabled> Close the loop (later profile)</label>
+            <label><input type="checkbox" name="match_source_aspect" checked> Match source aspect without cropping</label>
+            <label><input type="checkbox" name="loop"> Smooth loop by playing forward then backward</label>
             <label><input type="checkbox" name="color_transfer" disabled> Match source colors (later profile)</label>
             <label><input type="checkbox" name="tiled_vae" disabled> Tiled VAE (not used by baseline)</label>
           </div>
 
           <section class="i2v-loras" aria-labelledby="i2v-lora-heading">
-            <div class="i2v-subheading"><div><h3 id="i2v-lora-heading">Paired motion LoRAs</h3><p>The verified pair is mirrored privately, but remains off until its graph passes the baseline canary.</p></div><button class="secondary-button" type="button" data-add-lora disabled>Add pair after baseline</button></div>
+            <div class="i2v-subheading"><div><h3 id="i2v-lora-heading">Paired motion LoRAs</h3><p>The reviewed experimental pair remains unavailable until its separate graph and artifact canary pass.</p></div><button class="secondary-button" type="button" data-add-lora disabled>Add pair after baseline</button></div>
             <div class="i2v-lora-list" data-lora-list></div>
           </section>
         </details>

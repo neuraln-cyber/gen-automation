@@ -32,7 +32,9 @@ frames as `frame-%06d.png` and invokes external FFmpeg outside ComfyUI. The enco
 contract is MP4/H.264, `yuv420p`, `+faststart`, no audio, and exactly the bound
 frame count and FPS. The graph intentionally contains no video-combine,
 interpolation, upscaling, caching, tiled-VAE, NAG, SageAttention, watermark, or
-perfect-loop node.
+perfect-loop node. The worker can optionally scale decoded frames to the source
+image's even dimensions and materialize a deterministic ping-pong output; both
+are external delivery transforms and do not change the inference graph.
 
 ## Author sources
 
@@ -101,6 +103,23 @@ five-second 24 FPS output use 121 frames; 81 frames at 24 FPS truncates the
 learned interval. The binding contract has recommendations, not arbitrary short
 duration or resolution ceilings. Callers may expose advanced overrides while
 keeping the baseline preset intact.
+
+The dashboard's high-resolution profile automatically chooses the closest
+source-aspect canvas that is divisible by 32, no larger than 1024 pixels on
+either side, and inside the reviewed 0.52-0.83 megapixel range. A 16:9 source
+therefore resolves to 1024 x 576; a 1144 x 1480 portrait resolves to 768 x 992
+(761,856 native pixels and less than 0.16% aspect error). The verified source is
+contained and edge-padded to that canvas before ComfyUI sees it, so WAN's core
+resize cannot crop source pixels. Lanczos delivery scaling then restores the
+exact even source dimensions. For the portrait example this improves native
+sampling density by roughly 29% over the baseline while avoiding the memory and
+latency risk of asking WAN to sample 1.69 megapixels directly. Optional ping-pong
+cycles order the decoded frames forward and backward without repeating the
+endpoints, so cycle boundaries remain adjacent-frame transitions. This is smooth
+delivery looping, not generative first/last-frame conditioning. Looped delivery
+is limited to 25 seconds after frame/FPS/cycle expansion. The standard 81-frame,
+16 FPS profile therefore permits two 160-frame ping-pong cycles (320 frames,
+20 seconds); looping remains off for the baseline canary.
 
 At CFG 1, ordinary negative conditioning has no practical effect. The dashboard
 may save and submit a negative prompt, but must describe it honestly. Activating

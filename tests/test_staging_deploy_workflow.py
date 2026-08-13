@@ -396,6 +396,89 @@ def test_ssm_command_contains_only_public_immutable_coordinates() -> None:
         assert prohibited not in command_block.upper()
 
 
+def test_routine_rollout_preserves_i2v_pin_without_explicit_coordination() -> None:
+    workflow = _workflow()
+    rollout = workflow.split(
+        "      - name: Roll out through AWS Systems Manager\n",
+        maxsplit=1,
+    )[1].split("\n  semantic-anatomy:", maxsplit=1)[0]
+    program = _rollout_command_program()
+    environment = {
+        "SSM_IMAGE_REF": (
+            "ghcr.io/neuraln-cyber/gen-automation/control-plane-mega@sha256:" + "a" * 64
+        ),
+        "SSM_WORKER_IMAGE_REF": (
+            "ghcr.io/neuraln-cyber/gen-automation/gpu-worker@sha256:" + "b" * 64
+        ),
+        "SSM_COORDINATED_I2V_WORKER_IMAGE_REF": "",
+        "SSM_SOURCE_REVISION": "c" * 40,
+        "SSM_BOOTSTRAP_HELPER_SHA256": "d" * 64,
+        "SSM_BOOTSTRAP_COMPOSE_SHA256": "e" * 64,
+        "SSM_CONTROL_PLANE_UPDATER_SHA256": "f" * 64,
+        "SSM_BOOTSTRAP_HELPER_GZIP_BASE64": "AA==",
+        "SSM_BOOTSTRAP_COMPOSE_GZIP_BASE64": "AA==",
+        "SSM_CONTROL_PLANE_UPDATER_GZIP_BASE64": "AA==",
+    }
+
+    assert 'SSM_I2V_WORKER_IMAGE_REF="$I2V_WORKER_IMAGE_REF"' not in rollout
+    assert (
+        "COORDINATED_I2V_ROLLOUT_SOURCE_REVISION: >-\n"
+        "        ${{ vars.STAGING_COORDINATED_I2V_ROLLOUT_SOURCE_REVISION }}"
+    ) in workflow
+    assert (
+        "COORDINATED_I2V_WORKER_IMAGE_REF: >-\n"
+        "        ${{ vars.STAGING_COORDINATED_I2V_WORKER_IMAGE_REF }}"
+    ) in workflow
+    assert 'SSM_COORDINATED_I2V_WORKER_IMAGE_REF="$coordinated_i2v_image"' in rollout
+    assert '[ "$coordinated_i2v_revision" = "$SOURCE_REVISION" ]' in rollout
+    assert '[ "$coordinated_i2v_image" = "$I2V_WORKER_IMAGE_REF" ]' in rollout
+    assert 'os.environ.get(\n    "SSM_COORDINATED_I2V_WORKER_IMAGE_REF"' in program
+
+    routine = subprocess.run(  # noqa: S603 - executes the repository-owned fixture.
+        [sys.executable, "-c", program],
+        check=True,
+        capture_output=True,
+        env={**os.environ, **environment},
+        text=True,
+    )
+    routine_command = json.loads(routine.stdout)["commands"][0]
+    assert "GEN_AUTOMATION_SALAD_WORKER_IMAGE" in routine_command
+    assert "GEN_AUTOMATION_I2V_WORKER_IMAGE" not in routine_command
+    assert "GEN_AUTOMATION_I2V_HIRES_PROFILE_ENABLED" not in routine_command
+
+    coordinated_image = "ghcr.io/neuraln-cyber/gen-automation/i2v-worker@sha256:" + "1" * 64
+    coordinated = subprocess.run(  # noqa: S603 - executes the repository-owned fixture.
+        [sys.executable, "-c", program],
+        check=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            **environment,
+            "SSM_COORDINATED_I2V_WORKER_IMAGE_REF": coordinated_image,
+        },
+        text=True,
+    )
+    coordinated_command = json.loads(coordinated.stdout)["commands"][0]
+    assert "GEN_AUTOMATION_I2V_WORKER_IMAGE" in coordinated_command
+    assert coordinated_image in coordinated_command
+    assert "GEN_AUTOMATION_I2V_ENABLED" in coordinated_command
+    assert "GEN_AUTOMATION_I2V_HIRES_PROFILE_ENABLED" in coordinated_command
+
+    invalid = subprocess.run(  # noqa: S603 - executes the repository-owned fixture.
+        [sys.executable, "-c", program],
+        check=False,
+        capture_output=True,
+        env={
+            **os.environ,
+            **environment,
+            "SSM_COORDINATED_I2V_WORKER_IMAGE_REF": "mutable:latest",
+        },
+        text=True,
+    )
+    assert invalid.returncode != 0
+    assert "coordinated I2V worker image reference is invalid" in invalid.stderr
+
+
 def test_post_migration_updater_failure_restores_files_but_never_restarts_old_code() -> None:
     updater = _updater()
 
@@ -606,9 +689,6 @@ def test_routine_rollout_refreshes_the_host_deployment_bundle_safely() -> None:
         ),
         "SSM_WORKER_IMAGE_REF": (
             "ghcr.io/neuraln-cyber/gen-automation/gpu-worker@sha256:" + "b" * 64
-        ),
-        "SSM_I2V_WORKER_IMAGE_REF": (
-            "ghcr.io/neuraln-cyber/gen-automation/i2v-worker@sha256:" + "d" * 64
         ),
         "SSM_SOURCE_REVISION": "c" * 40,
         "SSM_BOOTSTRAP_HELPER_SHA256": helper_sha256,

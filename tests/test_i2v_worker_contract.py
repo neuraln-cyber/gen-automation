@@ -110,12 +110,37 @@ def test_job_contract_is_strict_and_uses_wire_schema_alias() -> None:
 
 def test_baseline_accepts_wan_shape_but_experimental_features_fail_closed() -> None:
     assert GenerationSettings().frame_count == 81
+    delivery = GenerationSettings(
+        width=768,
+        height=992,
+        match_source_aspect=True,
+        upscale="source",
+        loop=True,
+        loop_count=2,
+    )
+    assert (delivery.width, delivery.height) == (768, 992)
+    assert delivery.upscale == "source"
+    assert delivery.match_source_aspect is True
+    assert delivery.loop is True
+    assert delivery.loop_count == 2
+    assert GenerationSettings().loop is False
+    assert GenerationSettings().loop_count == 2
     with pytest.raises(ValidationError):
         GenerationSettings(frame_count=80)
     with pytest.raises(ValidationError):
         GenerationSettings(loras=[{"filename": "unreviewed.safetensors"}])
     with pytest.raises(ValidationError):
         GenerationSettings(tiled_vae=True)
+    with pytest.raises(ValidationError):
+        GenerationSettings(loop_count=0)
+    with pytest.raises(ValidationError):
+        GenerationSettings(loop_count=21)
+    with pytest.raises(ValidationError, match="looped output duration must not exceed 25 seconds"):
+        GenerationSettings(loop=True, loop_count=3)
+    with pytest.raises(ValidationError, match="looped output duration must not exceed 25 seconds"):
+        GenerationSettings(frame_count=209, fps=16, loop=True, loop_count=1)
+    long_non_loop = GenerationSettings(frame_count=409, fps=16, loop=False, loop_count=20)
+    assert long_non_loop.loop is False
 
 
 def test_model_objects_are_exact_versioned_and_confined_to_comfy_models() -> None:

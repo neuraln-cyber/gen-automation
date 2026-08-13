@@ -7,6 +7,7 @@
   const apiBase = root.dataset.apiBase || "/api/v1/i2v";
   const csrfToken = root.dataset.csrfToken || "";
   const canManage = root.dataset.canManage === "true";
+  const hiresProfileEnabled = root.dataset.hiresProfileEnabled === "true";
   const maxImageBytes = Number(root.dataset.maxImageBytes || 0);
   const scope = document.body.dataset.automationStorageScope || "operator";
   const draftKey = `i2v-draft-v1:${scope}`;
@@ -23,6 +24,30 @@
   const presetDialog = root.querySelector("[data-preset-dialog]");
   const draftState = root.querySelector("[data-draft-state]");
   const state = { selected: null, presets: [], jobs: [], sourceLimit: 100 };
+  const maxLoopDurationSeconds = 25;
+  const maxLoopCycles = 20;
+  const workerSettingDefaults = {
+    frame_count: 81,
+    fps: 16,
+    width: 576,
+    height: 1024,
+    match_source_aspect: false,
+    seed: -1,
+    steps: 4,
+    high_end_step: 2,
+    cfg: 1,
+    high_shift: 5,
+    low_shift: 5,
+    sampler: "euler",
+    scheduler: "linear_quadratic",
+    interpolation: "none",
+    upscale: "none",
+    loop: false,
+    loop_count: 2,
+    color_transfer: false,
+    tiled_vae: false,
+    loras: [],
+  };
   let saveTimer = null;
 
   const q = (selector) => root.querySelector(selector);
@@ -92,14 +117,17 @@
     sourceLibrary.querySelectorAll(".i2v-source-card").forEach((card) => {
       card.classList.toggle("selected", selected?.assetId === card.dataset.assetId);
     });
+    syncAspectControls();
     updateSubmitState();
     scheduleDraftSave();
   }
 
   function updateSubmitState() {
     const copies = Math.max(1, Number(form.elements.batch_count.value) || 1);
-    enqueueButton.disabled = !canManage || !state.selected || !form.elements.positive_prompt.value.trim();
-    q("[data-submit-summary]").textContent = state.selected
+    enqueueButton.disabled = !hiresProfileEnabled || !canManage || !state.selected || !form.elements.positive_prompt.value.trim();
+    q("[data-submit-summary]").textContent = !hiresProfileEnabled
+      ? "Waiting for the matching high-resolution worker rollout"
+      : state.selected
       ? `${copies} ${copies === 1 ? "generation" : "generations"} will be added to the queue`
       : "Select a source to continue";
   }
@@ -126,6 +154,8 @@
         assetId: item.asset_id,
         name: item.display_name,
         preview: item.preview_url,
+        sourceWidth: item.width,
+        sourceHeight: item.height,
         detail: `${item.width} × ${item.height} · ${friendlyBytes(item.byte_size)}`,
       }));
       sourceLibrary.append(button);
@@ -203,6 +233,7 @@
       uploadStatus.textContent = "Verified and ready";
       setSelected({
         kind: "input", inputId: input.input_id, name: input.display_name, preview: "",
+        sourceWidth: input.width, sourceHeight: input.height,
         detail: `${input.width} × ${input.height} · ${friendlyBytes(input.byte_size)}`,
       });
       announce("Image verified. Add motion direction and queue the generation.");
@@ -214,7 +245,7 @@
 
   function collectSettings() {
     const settings = {};
-    const numbers = new Set(["frame_count", "fps", "width", "height", "seed", "steps", "high_end_step", "cfg", "high_shift", "low_shift"]);
+    const numbers = new Set(["frame_count", "fps", "width", "height", "seed", "steps", "high_end_step", "cfg", "high_shift", "low_shift", "loop_count"]);
     advanced.querySelectorAll("input[name], select[name]").forEach((field) => {
       if (field.type === "checkbox") settings[field.name] = field.checked;
       else if (numbers.has(field.name)) settings[field.name] = Number(field.value);
@@ -229,7 +260,8 @@
   }
 
   function applySettings(settings = {}) {
-    Object.entries(settings).forEach(([name, value]) => {
+    const resolved = { ...workerSettingDefaults, ...settings };
+    Object.entries(resolved).forEach(([name, value]) => {
       if (name === "loras") return;
       const field = advanced.querySelector(`[name="${CSS.escape(name)}"]`);
       if (!field) return;
@@ -237,8 +269,40 @@
       else field.value = String(value);
     });
     loraList.replaceChildren();
-    (Array.isArray(settings.loras) ? settings.loras : []).forEach(addLoraRow);
+    (Array.isArray(resolved.loras) ? resolved.loras : []).forEach(addLoraRow);
+    syncAspectControls();
     updateDuration();
+  }
+
+  function sourceNativeDimensions(sourceWidth, sourceHeight) {
+    if (!(sourceWidth > 0 && sourceHeight > 0)) return null;
+    const sourceRatio = sourceWidth / sourceHeight;
+    let best = null;
+    for (let width = 32; width <= 1024; width += 32) {
+      for (let height = 32; height <= 1024; height += 32) {
+        const pixels = width * height;
+        if (pixels < 520000 || pixels > 830000) continue;
+        const error = Math.abs(Math.log((width / height) / sourceRatio));
+        if (!best || error < best.error || (error === best.error && pixels > best.pixels)) {
+          best = { width, height, pixels, error };
+        }
+      }
+    }
+    return best;
+  }
+
+  function syncAspectControls() {
+    const automatic = form.elements.match_source_aspect.checked;
+    form.elements.width.disabled = automatic;
+    form.elements.height.disabled = automatic;
+    if (!automatic) return;
+    const dimensions = sourceNativeDimensions(
+      state.selected?.sourceWidth,
+      state.selected?.sourceHeight,
+    );
+    if (!dimensions) return;
+    form.elements.width.value = String(dimensions.width);
+    form.elements.height.value = String(dimensions.height);
   }
 
   function addLoraRow(value = {}) {
@@ -266,7 +330,28 @@
   function updateDuration() {
     const frames = Number(form.elements.frame_count.value) || 0;
     const fps = Number(form.elements.fps.value) || 0;
-    q("[data-duration]").textContent = `${(frames / Math.max(1, fps)).toFixed(2)} seconds`;
+    const loopEnabled = form.elements.loop.checked;
+    const loopField = form.elements.loop_count;
+    const cycleFrames = Math.max(1, (frames * 2) - 2);
+    const allowedCycles = Math.min(
+      maxLoopCycles,
+      Math.floor((maxLoopDurationSeconds * fps) / cycleFrames),
+    );
+    loopField.disabled = !loopEnabled;
+    loopField.max = String(Math.max(1, allowedCycles));
+    if (allowedCycles > 0) {
+      loopField.setCustomValidity("");
+      if (Number(loopField.value) > allowedCycles) loopField.value = String(allowedCycles);
+    } else if (loopEnabled) {
+      loopField.setCustomValidity("One ping-pong cycle exceeds the 25-second limit.");
+    } else {
+      loopField.setCustomValidity("");
+    }
+    const loopCount = Math.max(1, Number(loopField.value) || 1);
+    const outputFrames = form.elements.loop.checked
+      ? cycleFrames * loopCount
+      : frames;
+    q("[data-duration]").textContent = `${(outputFrames / Math.max(1, fps)).toFixed(2)} seconds`;
   }
 
   function draftPayload() {
@@ -490,7 +575,11 @@
   ["dragleave", "drop"].forEach((name) => dropzone.addEventListener(name, (event) => { event.preventDefault(); dropzone.classList.remove("dragging"); }));
   dropzone.addEventListener("drop", (event) => uploadImage(event.dataTransfer.files[0]));
   form.addEventListener("submit", enqueue);
-  form.addEventListener("input", (event) => { if (["frame_count", "fps"].includes(event.target.name)) updateDuration(); scheduleDraftSave(); });
+  form.addEventListener("input", (event) => {
+    if (event.target.name === "match_source_aspect") syncAspectControls();
+    if (["frame_count", "fps", "loop", "loop_count"].includes(event.target.name)) updateDuration();
+    scheduleDraftSave();
+  });
   form.addEventListener("change", scheduleDraftSave);
   q("[data-add-lora]").addEventListener("click", () => addLoraRow());
   q("[data-refresh-queue]").addEventListener("click", () => loadQueue().catch((error) => announce(error.message, true)));

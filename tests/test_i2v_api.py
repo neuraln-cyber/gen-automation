@@ -166,6 +166,33 @@ def test_i2v_worker_endpoint_never_invents_progress(client: TestClient) -> None:
     assert "not configured" in payload["message"]
 
 
+def test_i2v_queue_is_paused_until_matching_hires_worker_is_enabled(
+    client: TestClient,
+) -> None:
+    _seed_development_owner(client)
+    store = MemoryObjectStore(bucket="i2v-tests")
+    client.app.state.object_store = store
+    completed = _complete_uploaded_input(client, store)
+    client.app.state.settings = client.app.state.settings.model_copy(
+        update={"i2v_hires_profile_enabled": False}
+    )
+
+    response = client.post(
+        "/api/v1/i2v/jobs",
+        json={
+            "input_id": completed["input_id"],
+            "positive_prompt": "one controlled motion",
+            "settings": {"width": 768, "height": 992},
+            "batch_count": 1,
+        },
+        headers={"X-CSRF-Token": "development"},
+    )
+
+    assert response.status_code == 409
+    assert "coordinated worker rollout" in response.json()["detail"]
+    assert client.get("/api/v1/i2v/jobs").json() == []
+
+
 def test_i2v_upload_completion_is_bound_to_issuing_operator_metadata(
     client: TestClient,
 ) -> None:
