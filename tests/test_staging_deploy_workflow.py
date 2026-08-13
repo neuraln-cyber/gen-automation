@@ -865,6 +865,7 @@ def test_i2v_lora_worker_profile_renderer_freezes_and_restores_exact_flags(
     source = tmp_path / "source.env"
     maintenance = tmp_path / "maintenance.env"
     target = tmp_path / "target.env"
+    normalized = tmp_path / "normalized.env"
     patch = tmp_path / "target.patch"
     source.write_text(
         "\n".join(
@@ -929,6 +930,55 @@ def test_i2v_lora_worker_profile_renderer_freezes_and_restores_exact_flags(
     for key, value in target_values.items():
         assert f"{key}={value}" in target_text
     assert "UNRELATED_SETTING=preserved" in target_text
+
+    legacy = tmp_path / "legacy.env"
+    legacy.write_text(
+        "\n".join(
+            (
+                "GEN_AUTOMATION_ENVIRONMENT=staging",
+                "GEN_AUTOMATION_I2V_ENABLED=true",
+                "GEN_AUTOMATION_I2V_HIRES_PROFILE_ENABLED=true",
+                "GEN_AUTOMATION_I2V_WORKER_IMAGE=prior-image",
+                'GEN_AUTOMATION_I2V_MODEL_MANIFEST_JSON={"objects":[]}',
+                "GEN_AUTOMATION_I2V_MODEL_MANIFEST_SHA256=" + "3" * 64,
+                "UNRELATED_SETTING=preserved",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(  # noqa: S603 - executes an extracted repository-owned renderer.
+        [sys.executable, "-c", render_program, str(legacy), str(normalized), "normalize", ""],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    normalized_text = normalized.read_text(encoding="utf-8")
+    for line in (
+        "GEN_AUTOMATION_I2V_WORKER_SOURCE_REVISION=",
+        "GEN_AUTOMATION_I2V_PRIVATE_MANIFEST_SOURCE_SHA256=",
+        "GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED=false",
+        "GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED=false",
+    ):
+        assert normalized_text.count(line + "\n") == 1
+    assert "GEN_AUTOMATION_I2V_WORKER_IMAGE=prior-image" in normalized_text
+    assert "UNRELATED_SETTING=preserved" in normalized_text
+
+    duplicate = tmp_path / "duplicate.env"
+    duplicate.write_text(
+        legacy.read_text(encoding="utf-8")
+        + "GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED=false\n"
+        + "GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED=false\n",
+        encoding="utf-8",
+    )
+    rejected = subprocess.run(  # noqa: S603 - executes a repository-owned renderer.
+        [sys.executable, "-c", render_program, str(duplicate), str(normalized), "normalize", ""],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode != 0
+    assert "each rollout key exactly once" in rejected.stderr
 
 
 def test_i2v_lora_profile_operation_is_single_flag_atomic_and_provider_read_only() -> None:

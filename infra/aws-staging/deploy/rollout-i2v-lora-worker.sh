@@ -143,7 +143,21 @@ destination = pathlib.Path(sys.argv[2])
 mode = sys.argv[3]
 lines = source.read_text(encoding="utf-8").splitlines()
 
-if mode == "maintenance":
+bootstrap_defaults = {
+    # These coordinates were introduced after the original four-role I2V
+    # deployment.  A first reviewed-LoRA rollout may therefore encounter a
+    # healthy legacy host that has no lines for them yet.  Materialize only
+    # their fail-closed baseline values in the private operation copy; never
+    # alter the live host until the guarded restart step.
+    "GEN_AUTOMATION_I2V_WORKER_SOURCE_REVISION": "",
+    "GEN_AUTOMATION_I2V_PRIVATE_MANIFEST_SOURCE_SHA256": "",
+    "GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED": "false",
+    "GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED": "false",
+}
+
+if mode == "normalize":
+    updates = {}
+elif mode == "maintenance":
     updates = {
         "GEN_AUTOMATION_I2V_ENABLED": "false",
         "GEN_AUTOMATION_I2V_HIRES_PROFILE_ENABLED": "false",
@@ -177,16 +191,23 @@ elif mode == "target":
 else:
     raise SystemExit("unknown profile rendering mode")
 
-seen = {key: 0 for key in updates}
+managed = set(updates) | set(bootstrap_defaults)
+seen = {key: 0 for key in managed}
 rendered = []
 for line in lines:
     key = line.split("=", 1)[0]
-    if key in updates:
+    if key in managed:
         seen[key] += 1
+    if key in updates:
         rendered.append(f"{key}={updates[key]}")
     else:
         rendered.append(line)
-if any(count != 1 for count in seen.values()):
+if any(count > 1 for count in seen.values()):
+    raise SystemExit("control-plane environment does not contain each rollout key exactly once")
+for key, default in bootstrap_defaults.items():
+    if seen[key] == 0:
+        rendered.append(f"{key}={updates.get(key, default)}")
+if any(seen[key] != 1 for key in set(updates) - set(bootstrap_defaults)):
     raise SystemExit("control-plane environment does not contain each rollout key exactly once")
 
 destination.parent.mkdir(parents=True, exist_ok=True)
@@ -463,7 +484,8 @@ current_env="$work_dir/current.env"
 maintenance_env="$work_dir/maintenance.env"
 provider_state="$work_dir/provider-rollback.json"
 provider_marker="$work_dir/provider-mutation-attempted.json"
-install -o 10001 -g 10001 -m 0600 "$controller_env" "$original_env"
+render_profile "$controller_env" "$original_env" normalize
+chown 10001:10001 "$original_env"
 render_profile "$original_env" "$maintenance_env" maintenance
 chown 10001:10001 "$maintenance_env"
 
@@ -486,7 +508,8 @@ if [ "$operation" = "rollback" ]; then
   status_json="$(run_one_off "$controller_env" "$initial_container" 900s status)"
   printf '%s' "$status_json" | assert_zero_status ||
     fail "rollback requires zero active I2V work"
-  install -o 10001 -g 10001 -m 0600 "$controller_env" "$current_env"
+  render_profile "$controller_env" "$current_env" normalize
+  chown 10001:10001 "$current_env"
   resume_env="$current_env"
   merge_saved_i2v_profile "$current_env" "$active_state/original.env" "$original_env"
   chown 10001:10001 "$original_env"
