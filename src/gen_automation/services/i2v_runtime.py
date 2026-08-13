@@ -21,6 +21,10 @@ from gen_automation.domain.i2v import (
     I2VWorkerDeploymentRegistration,
     I2VWorkerDeploymentState,
 )
+from gen_automation.domain.i2v_loras import (
+    I2VLoraSettingsKind,
+    classify_i2v_lora_settings,
+)
 from gen_automation.integrations.salad.errors import (
     SaladAPIError,
     SaladRateLimitError,
@@ -66,6 +70,7 @@ _ACTIVE_ATTEMPT_STATES = (I2VAttemptState.CREATED, I2VAttemptState.RUNNING)
 _DEFINITELY_REJECTED_STATUS_CODES = frozenset({400, 401, 403, 404, 422})
 I2V_SINGLETON_WORKER_ID = "controller:i2v:singleton"
 _RESTART_RECONCILIATION_WAITING = "restart_reconciliation_waiting"
+_REVIEWED_LORA_PAUSED = "reviewed_lora_paused"
 
 
 class I2VRuntimeError(Exception):
@@ -104,6 +109,7 @@ class I2VRuntimeEnvironmentProvider(Protocol):
 class I2VRuntimeConfig:
     salad: I2VSaladConfig
     output_prefix: str = "i2v/outputs"
+    reviewed_loras_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -166,11 +172,17 @@ class I2VRuntime:
                 )
                 or 0
             )
-            queued_count = int(
-                await session.scalar(
-                    select(func.count(I2VJob.id)).where(I2VJob.state == I2VJobState.QUEUED)
+            queued_settings = (
+                await session.scalars(
+                    select(I2VJob.settings_snapshot).where(I2VJob.state == I2VJobState.QUEUED)
                 )
-                or 0
+            ).all()
+            queued_count = sum(
+                _dispatch_eligible(
+                    settings,
+                    reviewed_loras_enabled=self.config.reviewed_loras_enabled,
+                )
+                for settings in queued_settings
             )
         observation = await observe_i2v_provider(
             self.salad_client,
@@ -184,7 +196,7 @@ class I2VRuntime:
             if action is not None:
                 return I2VRuntimeCycle(
                     action=action,
-                    changed=action != _RESTART_RECONCILIATION_WAITING,
+                    changed=action not in {_RESTART_RECONCILIATION_WAITING, _REVIEWED_LORA_PAUSED},
                 )
 
         if await self._sync_deployment(
@@ -320,6 +332,8 @@ class I2VRuntime:
                                 now=now,
                             )
                         return "unsubmitted_cancellation_acknowledged"
+                    if self._reviewed_lora_job_is_paused(job):
+                        return _REVIEWED_LORA_PAUSED
                     return await self._submit_existing(job, attempt, now=now)
             elif state == "prepared":
                 # A controller may have died after Salad accepted the POST but
@@ -348,14 +362,18 @@ class I2VRuntime:
                                 now=now,
                             )
                         return "unsubmitted_cancellation_acknowledged"
+                    if self._reviewed_lora_job_is_paused(job):
+                        return _REVIEWED_LORA_PAUSED
                     return await self._submit_existing(job, attempt, now=now)
             else:
                 # Legacy/malformed fresh-lane rows fail closed: first persist the
                 # stable submission identity, then submit on a later cycle.
+                if _lease_expired(job, now=now):
+                    return None
                 if job.lease_owner != self.worker_id or attempt.worker_id != self.worker_id:
-                    if _lease_expired(job, now=now):
-                        return None
                     return _RESTART_RECONCILIATION_WAITING
+                if self._reviewed_lora_job_is_paused(job):
+                    return _REVIEWED_LORA_PAUSED
                 await self._record_attempt_metadata(
                     job,
                     attempt,
@@ -544,6 +562,8 @@ class I2VRuntime:
                 session,
                 worker_id=self.worker_id,
                 lease_duration=timedelta(seconds=self.config.salad.worker_lease_seconds),
+                worker_image_digest=self.config.salad.worker_image,
+                reviewed_loras_enabled=self.config.reviewed_loras_enabled,
                 now=now,
             )
         if claim is None:
@@ -571,6 +591,8 @@ class I2VRuntime:
         *,
         now: datetime,
     ) -> str:
+        if self._reviewed_lora_job_is_paused(job):
+            return _REVIEWED_LORA_PAUSED
         if self.input_builder is None:
             raise I2VRuntimeConfigurationError(
                 "production I2V submission requires a fresh signed-grant builder"
@@ -644,6 +666,12 @@ class I2VRuntime:
             now=now,
         )
         return "provider_job_submitted"
+
+    def _reviewed_lora_job_is_paused(self, job: I2VJobSnapshot) -> bool:
+        return not _dispatch_eligible(
+            job.settings_snapshot,
+            reviewed_loras_enabled=self.config.reviewed_loras_enabled,
+        )
 
     async def _mark_submission_unknown(
         self,
@@ -1007,6 +1035,17 @@ def _worker_input_snapshot(value: Mapping[str, object]) -> dict[str, object]:
     ):
         raise I2VRuntimeConfigurationError("durable I2V input snapshot is invalid")
     return normalized
+
+
+def _dispatch_eligible(
+    value: Mapping[str, object],
+    *,
+    reviewed_loras_enabled: bool,
+) -> bool:
+    kind = classify_i2v_lora_settings(value)
+    return kind == I2VLoraSettingsKind.BASELINE or (
+        kind == I2VLoraSettingsKind.REVIEWED and reviewed_loras_enabled
+    )
 
 
 def _job_snapshot(job: I2VJob) -> I2VJobSnapshot:

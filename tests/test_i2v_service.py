@@ -1,9 +1,11 @@
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.db.models import AdminUser
@@ -22,6 +24,7 @@ from gen_automation.domain.i2v import (
 )
 from gen_automation.services.i2v import (
     I2VConflictError,
+    I2VInputError,
     acknowledge_i2v_cancellation,
     adopt_validated_i2v_provider_attempt,
     claim_next_i2v_job,
@@ -203,6 +206,203 @@ async def test_presets_and_jobs_freeze_snapshots_and_support_fifo_reordering(
     after_delete = await list_i2v_jobs(session, actor_user_id=owner_id)
     assert all(item.preset_id is None for item in after_delete)
     assert all(item.preset_snapshot == frozen_preset for item in after_delete)
+
+
+async def test_claim_skips_paused_reviewed_and_invalid_jobs_without_mutating_them(
+    i2v_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, owner_id = i2v_session
+    source = await register_i2v_input(
+        session,
+        actor_user_id=owner_id,
+        registration=_input_registration(object_key="i2v/dispatch-source.png"),
+        now=_NOW,
+    )
+    reviewed = await create_i2v_job(
+        session,
+        actor_user_id=owner_id,
+        draft=I2VJobDraft(
+            input_id=source.input_id,
+            settings={"loras": [{"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.3}]},
+        ),
+        now=_NOW,
+    )
+    baseline = await create_i2v_job(
+        session,
+        actor_user_id=owner_id,
+        draft=I2VJobDraft(input_id=source.input_id),
+        now=_NOW + timedelta(seconds=1),
+    )
+
+    claim = await claim_next_i2v_job(
+        session,
+        worker_id="baseline-worker",
+        lease_duration=timedelta(hours=1),
+        reviewed_loras_enabled=False,
+        now=_NOW + timedelta(seconds=2),
+    )
+
+    assert claim is not None and claim.job.job_id == baseline.job_id
+    paused = (await list_i2v_jobs(session, states={I2VJobState.QUEUED}))[0]
+    assert paused.job_id == reviewed.job_id
+    assert paused.queue_position == 1
+    assert paused.attempt_count == 0
+
+    invalid_id = uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO i2v_jobs ("
+            "id,created_by_user_id,input_id,preset_id,positive_prompt,negative_prompt,"
+            "input_snapshot,preset_snapshot,settings_snapshot,request_sha256,state,"
+            "queue_position,attempt_count,lease_owner,lease_expires_at,"
+            "cancel_requested_at,completed_at,last_error_code,last_error_detail,"
+            "created_at,updated_at"
+            ") VALUES ("
+            ":id,:owner_id,:input_id,NULL,:positive_prompt,:negative_prompt,"
+            ":input_snapshot,:preset_snapshot,:settings_snapshot,:request_sha256,"
+            "'queued',2,0,NULL,NULL,NULL,NULL,NULL,NULL,:created_at,:updated_at"
+            ")"
+        ),
+        {
+            "id": invalid_id.hex,
+            "owner_id": owner_id.hex,
+            "input_id": source.input_id.hex,
+            "positive_prompt": "historical request",
+            "negative_prompt": "",
+            "input_snapshot": json.dumps(source.model_dump(mode="json")),
+            "preset_snapshot": "{}",
+            "settings_snapshot": json.dumps(
+                {
+                    "loras": [
+                        {
+                            "high": "arbitrary-high.safetensors",
+                            "low": "arbitrary-low.safetensors",
+                            "strength": 1.0,
+                        }
+                    ]
+                }
+            ),
+            "request_sha256": "f" * 64,
+            "created_at": (_NOW + timedelta(seconds=3)).isoformat(),
+            "updated_at": (_NOW + timedelta(seconds=3)).isoformat(),
+        },
+    )
+    await session.commit()
+
+    capable_claim = await claim_next_i2v_job(
+        session,
+        worker_id="capable-worker",
+        lease_duration=timedelta(hours=1),
+        reviewed_loras_enabled=True,
+        now=_NOW + timedelta(seconds=4),
+    )
+    assert capable_claim is not None and capable_claim.job.job_id == reviewed.job_id
+    assert (
+        await claim_next_i2v_job(
+            session,
+            worker_id="capable-worker",
+            lease_duration=timedelta(hours=1),
+            reviewed_loras_enabled=True,
+            now=_NOW + timedelta(seconds=5),
+        )
+        is None
+    )
+    invalid_after = (await list_i2v_jobs(session, states={I2VJobState.QUEUED}))[0]
+    assert invalid_after.job_id == invalid_id
+    assert invalid_after.attempt_count == 0
+
+
+async def test_service_rejects_mutually_exclusive_dream_terms_before_queue_insert(
+    i2v_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, owner_id = i2v_session
+    source = await register_i2v_input(
+        session,
+        actor_user_id=owner_id,
+        registration=_input_registration(object_key="i2v/dream-source.png"),
+        now=_NOW,
+    )
+    with pytest.raises(I2VInputError, match="mutually exclusive"):
+        await create_i2v_job(
+            session,
+            actor_user_id=owner_id,
+            draft=I2VJobDraft(
+                input_id=source.input_id,
+                positive_prompt="m15510n4ry then bl0wj0b",
+                settings={
+                    "loras": [
+                        {
+                            "catalog_id": "dr34ml4y-aio-nsfw-wan22-v2",
+                            "strength": 0.7,
+                        }
+                    ]
+                },
+            ),
+            now=_NOW,
+        )
+    assert await list_i2v_jobs(session, actor_user_id=owner_id) == ()
+
+
+async def test_service_rejects_historical_conflicting_dream_prompt_before_retry(
+    i2v_session: tuple[AsyncSession, UUID],
+) -> None:
+    session, owner_id = i2v_session
+    source = await register_i2v_input(
+        session,
+        actor_user_id=owner_id,
+        registration=_input_registration(object_key="i2v/historical-dream-source.png"),
+        now=_NOW,
+    )
+    job_id = uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO i2v_jobs ("
+            "id,created_by_user_id,input_id,preset_id,positive_prompt,negative_prompt,"
+            "input_snapshot,preset_snapshot,settings_snapshot,request_sha256,state,"
+            "queue_position,attempt_count,lease_owner,lease_expires_at,"
+            "cancel_requested_at,completed_at,last_error_code,last_error_detail,"
+            "created_at,updated_at"
+            ") VALUES ("
+            ":id,:owner_id,:input_id,NULL,:positive_prompt,'',:input_snapshot,'{}',"
+            ":settings_snapshot,:request_sha256,'cancelled',NULL,0,NULL,NULL,"
+            ":cancelled_at,:completed_at,NULL,NULL,:created_at,:updated_at"
+            ")"
+        ),
+        {
+            "id": job_id.hex,
+            "owner_id": owner_id.hex,
+            "input_id": source.input_id.hex,
+            "positive_prompt": "m15510n4ry then bl0wj0b",
+            "input_snapshot": json.dumps(source.model_dump(mode="json")),
+            "settings_snapshot": json.dumps(
+                {
+                    "loras": [
+                        {
+                            "catalog_id": "dr34ml4y-aio-nsfw-wan22-v2",
+                            "strength": 0.7,
+                        }
+                    ]
+                }
+            ),
+            "request_sha256": "e" * 64,
+            "cancelled_at": _NOW.isoformat(),
+            "completed_at": _NOW.isoformat(),
+            "created_at": _NOW.isoformat(),
+            "updated_at": _NOW.isoformat(),
+        },
+    )
+    await session.commit()
+
+    with pytest.raises(I2VInputError, match="mutually exclusive"):
+        await retry_i2v_job(
+            session,
+            actor_user_id=owner_id,
+            job_id=job_id,
+            now=_NOW + timedelta(seconds=1),
+        )
+    frozen = (await list_i2v_jobs(session, actor_user_id=owner_id))[0]
+    assert frozen.state == I2VJobState.CANCELLED
+    assert frozen.queue_position is None
 
 
 async def test_worker_claim_attempt_output_and_recent_result(

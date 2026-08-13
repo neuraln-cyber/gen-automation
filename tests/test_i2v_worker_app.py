@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from gen_automation.i2v_worker.app import create_i2v_worker_app
+from gen_automation.i2v_worker.lora_catalog import LORA_ARTIFACTS_BY_ROLE
 from gen_automation.i2v_worker.settings import I2VWorkerSettings
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,7 +18,7 @@ WORKFLOW = ROOT / "workflows/dasiwa-wan22-i2v-v1.api.json"
 SHA = "a" * 64
 
 
-def _settings(tmp_path: Path) -> I2VWorkerSettings:
+def _settings(tmp_path: Path, *, lora_worker_enabled: bool = True) -> I2VWorkerSettings:
     models = []
     for role, install_path in (
         ("diffusion_model_high", "models/diffusion_models/high.safetensors"),
@@ -36,6 +37,19 @@ def _settings(tmp_path: Path) -> I2VWorkerSettings:
                 "install_path": install_path,
             }
         )
+    if lora_worker_enabled:
+        for role, artifact in LORA_ARTIFACTS_BY_ROLE.items():
+            models.append(
+                {
+                    "role": role,
+                    "bucket": "models",
+                    "key": f"worker/i2v/sha256/{artifact.sha256}",
+                    "version_id": "v1",
+                    "byte_size": artifact.byte_size,
+                    "sha256": artifact.sha256,
+                    "install_path": artifact.install_path,
+                }
+            )
     return I2VWorkerSettings(
         model_objects_json=SecretStr(json.dumps(models)),
         environment="test",
@@ -43,6 +57,9 @@ def _settings(tmp_path: Path) -> I2VWorkerSettings:
         runtime_root=tmp_path / "runtime",
         workflow_template=WORKFLOW,
         queue_worker_enabled=False,
+        lora_worker_enabled=lora_worker_enabled,
+        source_revision="b" * 40,
+        private_manifest_source_sha256="c" * 64,
     )
 
 
@@ -122,6 +139,41 @@ def test_health_is_early_but_readiness_waits_for_models_and_comfy(tmp_path: Path
     assert supervisor.started and supervisor.stopped
 
 
+def test_ready_reports_nonsecret_exact_worker_capability_identity(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    app = create_i2v_worker_app(
+        settings,
+        supervisor=_Supervisor(),  # type: ignore[arg-type]
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/ready")
+
+    assert response.status_code == 200
+    capability = response.json()["capability"]
+    assert capability == {
+        "schema": "gen-automation/i2v-worker-capability/v1",
+        "lora_worker_enabled": True,
+        "private_manifest_source_sha256": "c" * 64,
+        "model_objects_sha256": settings.model_objects_sha256,
+        "artifact_identity_sha256": settings.artifact_identity_sha256,
+        "model_roles": [item.role for item in settings.model_objects],
+        "source_revision": "b" * 40,
+    }
+    assert "model_objects_json" not in response.text.casefold()
+    assert "storage_bucket" not in response.text.casefold()
+
+    with TestClient(app) as client:
+        exact = client.get(
+            f"/ready/capability/{'c' * 64}/{settings.artifact_identity_sha256}/{'b' * 40}"
+        )
+        wrong = client.get(
+            f"/ready/capability/{'d' * 64}/{settings.artifact_identity_sha256}/{'b' * 40}"
+        )
+    assert exact.status_code == 200
+    assert wrong.status_code == 404
+
+
 def test_generation_returns_exact_wire_result_and_cleans_runtime(
     tmp_path: Path,
     monkeypatch: Any,
@@ -183,6 +235,8 @@ def test_generation_returns_exact_wire_result_and_cleans_runtime(
     assert result["schema"] == "i2v-salad-result/v1"
     assert result["output"]["frame_count"] == 81
     assert result["output"]["metadata"]["codec"] == "h264"
+    assert result["output"]["metadata"]["loras"] == []
+    assert result["output"]["metadata"]["effective_positive_prompt"] == ("subtle natural motion")
     assert list((settings.runtime_root / "jobs").glob("*")) == []
 
 
@@ -199,3 +253,35 @@ def test_worker_rejects_unbounded_or_invalid_request_bodies(tmp_path: Path) -> N
         )
         assert wrong_type.status_code == 415
         assert client.post("/jobs/i2v", json={}).status_code == 400
+
+
+def test_baseline_worker_rejects_reviewed_lora_job_before_execution(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, lora_worker_enabled=False)
+    supervisor = _Supervisor()
+    app = create_i2v_worker_app(settings, supervisor=supervisor)  # type: ignore[arg-type]
+    job = _job()
+    job["settings_snapshot"] = {
+        "loras": [{"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.3}]
+    }
+
+    with TestClient(app) as client:
+        response = client.post("/jobs/i2v", json=job)
+
+    assert response.status_code == 409
+
+
+def test_worker_rejects_mutually_exclusive_dream_terms_before_execution(tmp_path: Path) -> None:
+    app = create_i2v_worker_app(
+        _settings(tmp_path),
+        supervisor=_Supervisor(),  # type: ignore[arg-type]
+    )
+    job = _job()
+    job["positive_prompt"] = "m15510n4ry then bl0wj0b"
+    job["settings_snapshot"] = {
+        "loras": [{"catalog_id": "dr34ml4y-aio-nsfw-wan22-v2", "strength": 0.7}]
+    }
+
+    with TestClient(app) as client:
+        response = client.post("/jobs/i2v", json=job)
+
+    assert response.status_code == 400

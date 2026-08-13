@@ -114,7 +114,7 @@ def test_github_deploy_role_has_only_exact_instance_run_command_access() -> None
     assert "s3:" not in policy
     assert "iam:PassRole" not in policy
     assert "sts:AssumeRole" not in policy
-    assert "max_session_duration = 3600" in iam
+    assert "max_session_duration = 43200" in iam
 
 
 def test_github_deploy_outputs_examples_and_runbook_are_explicit() -> None:

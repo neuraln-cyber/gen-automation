@@ -108,6 +108,7 @@ RUN /opt/conda/bin/python -c "import sys; assert sys.version_info[:2] == (3, 11)
         -r requirements-i2v-worker.lock \
     && /opt/i2v-venv/bin/python -c "import torch, torchaudio, torchvision; assert torch.__version__.split('+')[0] == '2.9.1'; assert torchvision.__version__.split('+')[0] == '0.24.1'; assert torchaudio.__version__.split('+')[0] == '2.9.1'; assert all('/opt/i2v-venv/' not in module.__file__ for module in (torch, torchaudio, torchvision))" \
     && grep -Fq 'class UNETLoader:' /opt/comfyui/nodes.py \
+    && grep -Fq 'class LoraLoaderModelOnly' /opt/comfyui/nodes.py \
     && grep -Fq 'class KSamplerAdvanced:' /opt/comfyui/nodes.py \
     && grep -Fq 'class ModelSamplingSD3' /opt/comfyui/comfy_extras/nodes_model_advanced.py \
     && grep -Fq 'class WanImageToVideo' /opt/comfyui/comfy_extras/nodes_wan.py

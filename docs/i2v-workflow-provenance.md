@@ -23,7 +23,8 @@ The checked-in contract consists of:
 
 The graph uses only these ComfyUI core classes: `LoadImage`, `UNETLoader`,
 `CLIPLoader`, `VAELoader`, `CLIPTextEncode`, `ModelSamplingSD3`,
-`WanImageToVideo`, `KSamplerAdvanced`, `VAEDecode`, and `SaveImage`. It has no
+`WanImageToVideo`, `KSamplerAdvanced`, `VAEDecode`, and `SaveImage`. A selected
+reviewed LoRA additionally uses core `LoraLoaderModelOnly`; there is still no
 custom-node requirement. The worker expands every `{"$i2v": "..."}` binding
 before submitting the prompt to ComfyUI.
 
@@ -56,7 +57,8 @@ commit `603b067be2d47e0532fda398f41ad6a2719d075e`.
 The author also supplies a basic backend test: Civitai version `2405252`, file
 `2295720`, SHA-256
 `1145a6c6c2e4bfdbc657bf0fc1b4310d4e10a715af9c481af548008c836967ba`.
-Run that health check before the full canary when validating a new worker image.
+Run that health check before exact artifact/bootstrap/readiness verification when
+validating a new worker image. The rollout itself does not submit a generation.
 
 ## Required model artifacts
 
@@ -119,30 +121,147 @@ endpoints, so cycle boundaries remain adjacent-frame transitions. This is smooth
 delivery looping, not generative first/last-frame conditioning. Looped delivery
 is limited to 25 seconds after frame/FPS/cycle expansion. The standard 81-frame,
 16 FPS profile therefore permits two 160-frame ping-pong cycles (320 frames,
-20 seconds); looping remains off for the baseline canary.
+20 seconds); looping remains off for the baseline validation preset.
 
 At CFG 1, ordinary negative conditioning has no practical effect. The dashboard
 may save and submit a negative prompt, but must describe it honestly. Activating
 negative guidance requires a separately reviewed graph with core `NAGuidance`;
 it is not silently enabled in v1.
 
-## Optional paired LoRA
+## Reviewed paired LoRAs
 
-The WAN General NSFW v0.08a pair is recorded in the model manifest but disabled
-and absent from the executable graph:
+All reviewed LoRAs are disabled by default and absent from the checked-in base
+graph. A closed-catalog selection inserts each high artifact on the high model
+branch and its low artifact on the low model branch, in both cases before
+`ModelSamplingSD3`. Filenames never cross the public submission contract.
+The manifest's `graph_injection` field records this exact core-node topology for
+every reviewed pair.
 
-| Role | Civitai version/file | Bytes | SHA-256 |
+| Catalog / role | Civitai version/file | Bytes | SHA-256 |
 | --- | --- | ---: | --- |
-| `NSFW-22-H-e8.safetensors` | `2073605` / `1969798` | 613,516,752 | `34e2144d3cd65360f97d09ccbe03e1c39a096df6c9234af5fe3899d1b63cda39` |
-| `NSFW-22-L-e8.safetensors` | `2083303` / `1979213` | 613,516,752 | `d6b783742f4d5fd63a0223ae1d5bf64fc995a6b408480ac2a00528ae0d4146db` |
+| WAN General high `NSFW-22-H-e8.safetensors` | `2073605` / `1969798` | 613,516,752 | `34e2144d3cd65360f97d09ccbe03e1c39a096df6c9234af5fe3899d1b63cda39` |
+| WAN General low `NSFW-22-L-e8.safetensors` | `2083303` / `1979213` | 613,516,752 | `d6b783742f4d5fd63a0223ae1d5bf64fc995a6b408480ac2a00528ae0d4146db` |
+| Bouncing Boobs high `BounceHighWan2_2.safetensors` | `2191217` / `2084187` | 306,847,512 | `a4f4398031e9f39571310355f23e2d104c21143f517cf053e06d21f1c48d3d52` |
+| Bouncing Boobs low `BounceLowWan2_2.safetensors` | `2191270` / `2084219` | 306,847,504 | `3ba8320137ba7d99885624dc512d8e0ea02f24364eabbe31e803fec785339ecb` |
+| M4CROM4STI4 high `wan22-m4crom4sti4-i2v-20epoc-high-k3nk.safetensors` | `2265575` / `2157676` | 306,807,976 | `851c928737235b4a4a2c5993c893c79ee46a3131aa9b16eb56de1dcc576c3ad9` |
+| M4CROM4STI4 low `wan22-m4crom4sti4-i2v-20epoc-low-k3nk.safetensors` | `2266727` / `2158834` | 306,807,976 | `c8a940ad5ab59a15c7f39624f694482a020f0dd047cec56f498b58418d3d937c` |
+| DR34ML4Y v2 high `DR34ML4Y_I2V_14B_HIGH_V2.safetensors` | `2553151` / `2441563` | 306,807,976 | `d9931756c202bd8d4946c0d163c1269231a6352b51bb4235f6a19894c9ad8c68` |
+| DR34ML4Y v2 low `DR34ML4Y_I2V_14B_LOW_V2.safetensors` | `2553271` / `2441662` | 306,807,976 | `066ee4bfafb685c85f08174c8283cd11bc6d36f4845347f20d633ab44581601f` |
+| SmoothMix animation high `SmoothXXXAnimation_High.safetensors` | `2376136` / `2266910` | 306,807,280 | `eac4f4341008abb00434d08fed1d4fda4a144bc94cd26b4819f629f930a75181` |
+| SmoothMix animation low `SmoothXXXAnimation_Low.safetensors` | `2376143` / `2266915` | 306,807,280 | `ad50dfc46c765a6ccc36d40e8a5f77ac2db041f68266593add12ac5f5eac2d76` |
 
-The author labels the 2.2 pair experimental, unfinished, slightly underbaked,
-and seed-sensitive. Although the description calls `nsfwsks` a trigger, the two
-2.2 API versions declare no trained words. A future workflow revision may inject
-the matched High and Low LoRAs after the bare-model canary passes, beginning at
-strength 0.3. The manifest therefore records `graph_injection` as `deferred`.
-V1 does not invent inactive LoRA node values. Extra speed-up LoRAs
-must not be added because Lightspeed already contains its low-step distillation.
+WAN General's author labels the pair experimental, unfinished, slightly
+underbaked, and seed-sensitive; its reviewed starting strength is 0.3 and its
+trigger is `nsfwsks`. Bouncing Boobs is a WAN 2.2 I2V-A14B high/low pair with
+trained phrase `her breasts are bouncing`; the author reference workflow uses
+1.0 standalone, with 0.5-0.6 suggested when stacking. M4CROM4STI4 is a WAN 2.2
+I2V-A14B high/low pair with trigger `m4crom4sti4`. Its author publishes no
+numeric strength and the model can strongly bias breast size and anatomy, so
+0.5 is the conservative implementation default, followed by isolated A/B at
+0.7 and 1.0. The worker appends each selected
+trigger exactly once and records the effective prompt, catalog IDs, strengths,
+artifact filenames, and SHA-256 values in result provenance. Extra speed-up
+LoRAs must not be added because Lightspeed already contains its low-step
+distillation.
+
+DR34ML4Y v2 supplies five alternative concept words: `m15510n4ry`, `bl0wj0b`,
+`c0wg1rl`, `d0gg1e`, and `d0ubl3_bj`. They are not a combined trigger. The
+operator chooses the concept appropriate to the prompt, and the worker appends
+none automatically. The author publishes no numeric WAN v2 strength for this
+stronger pair, so the implementation starts isolated A/B at 0.7 (0.5 when
+stacking); this is not an author recommendation. SmoothMix's official paired
+animation versions declare no
+trained words; the author showcases strength 1.0. A request may select at most
+three unique catalog entries at once. This keeps the five-entry catalog
+extensible while bounding stacked model patches and avoiding highly confounded
+experiments on the 32 GB worker.
+
+The following source-model usage flags were recorded from the official Civitai
+API on 2026-08-13. They are provenance presented to the operator, not runtime
+prompt or character restrictions:
+
+| Catalog | Credit required | Commercial-use values | Derivatives | Different license |
+| --- | --- | --- | --- | --- |
+| WAN General NSFW v0.08a | No | `RentCivit` | Allowed | Allowed |
+| Bouncing Boobs WAN 2.2 | Yes | `Image`, `RentCivit` | Not allowed | Not allowed |
+| M4CROM4STI4 K3NK | Yes | none declared | Not allowed | Allowed |
+| DR34ML4Y I2V 14B v2 | No | `RentCivit` | Not allowed | Not allowed |
+| SmoothMix XXX Animations | Yes | `RentCivit`, `Image` | Not allowed | Allowed |
+
+### Two-phase LoRA rollout
+
+LoRA worker capability and public submission are deliberately separate. Routine
+control-plane deployments preserve the I2V image, manifest, source revision,
+high-resolution flag, worker capability flag, and public profile flag. Only the
+explicit `i2v-lora-worker` phase-one operation may align those values with a new
+provider image; it forces `GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED=false` before
+the replacement worker downloads and verifies the exact reviewed artifacts.
+The normal dashboard remains available in a serving maintenance profile during
+that long provider bootstrap; only new I2V enqueue, retry, and reorder actions
+are frozen, while cancellation remains available.
+
+The reviewed phase-one manifest is an immutable, version-addressed private
+object, never an unversioned latest value:
+
+- bucket `gen-automation-staging-861912887470-eu-central-1-models`
+- key `worker/i2v/manifests/sha256/f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1e2de19876e.json`
+- version `u4bSnCPzDJ4zctrA2Nr66ji0Zh2qPpXX`
+- byte length `6153` and source-object SHA-256
+  `f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1e2de19876e`
+
+Four hashes have distinct meanings and must never be substituted for one
+another:
+
+| Identity | Exact SHA-256 |
+| --- | --- |
+| Immutable S3 source bytes | `f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1e2de19876e` |
+| Canonical compact private-manifest JSON stored on the host | `ebdeca736ee3e9ea4e4b7118c9e4b54dfcfd1bbde5a761f424aa85b1670b806f` |
+| Derived 14-role worker model-object JSON | `be5802ffc52ee6bfa6c64a135dfdef37e4e0274e4098c9eb87e4edaafc4719a6` |
+| Artifact identity over role, bytes, content SHA, and S3 version | `68f6c28831ac2a8e1801ba420c9816a29e09c8cc4738aae85611955553a3d301` |
+
+`promote` and `rollback` first acquire the control-plane deployment lock, close
+the public profile, freeze I2V reconciliation and claiming, and restart the
+controller in that maintenance state. Before any provider mutation the bounded
+operation requires zero active durable I2V jobs or attempts and a direct Salad
+read showing no pending or running provider work. It does not submit, cancel,
+retry, or reorder jobs. The promote path fetches the exact S3 `VersionId`,
+recomputes all four identities, resolves fresh short-lived artifact credentials,
+and atomically replaces the provider image, full environment, and exact
+capability readiness probe. It then directly reads back the provider contract
+and waits for an exact Ready instance before aligning the host and reopening
+baseline I2V. The worker wait is bounded at 10,000 seconds, and the enclosing
+SSM, OIDC, and workflow limits include explicit headroom for a full automatic
+provider and host rollback.
+
+Provider rollback restores the previous image and readiness probe, issues fresh
+credentials for the restored worker profile, and null-tombstones environment
+keys that did not exist in the previous merge-patched contract. The host
+maintenance snapshot is restored if any guard, provider patch, readiness check,
+host alignment, or controller health check fails. Durable queued jobs remain
+unchanged throughout.
+
+Once bootstrap and ComfyUI are ready, worker `GET /ready` reports a non-secret
+`gen-automation/i2v-worker-capability/v1` identity containing the capability
+flag, ordered artifact roles, SHA-256 of the exact worker model-object manifest,
+and immutable source revision. The endpoint does not expose buckets, keys,
+versions, grants, or credentials. A coordinated rollout must compare this
+identity with the intended manifest and revision before opening the public gate.
+The identity distinguishes the promoted raw private-manifest SHA-256 from the
+derived worker-object JSON SHA-256 and includes a digest over each artifact's
+role, byte size, SHA-256, and immutable object version. Salad's readiness probe
+can bind all three identities in
+`/ready/capability/{raw_manifest_sha256}/{artifact_identity_sha256}/{source_revision}`;
+an exact 200 therefore proves full bootstrap without exposing a Container Gateway.
+
+After the provider reports the exact expected image digest, the worker is ready,
+bootstrap readback confirms every reviewed artifact, and there are no
+incompatible active jobs, an operator may use `i2v-lora-profile enable` to set
+only `GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED=true` and restart the control
+plane. This publication step must not change the worker image or model manifest.
+`i2v-lora-profile disable` is the immediate rollback; it hides the
+catalog and rejects new, preset-derived, and retried LoRA work while leaving
+cancel available. The first LoRA generation remains an operator-authored queue
+submission; rollout automation never submits one.
 
 ## RTX 5090 runtime lock
 

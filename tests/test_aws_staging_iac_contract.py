@@ -3,6 +3,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 INFRA = ROOT / "infra" / "aws-staging"
+I2V_REVIEWED_MANIFEST_KEY = (
+    "worker/i2v/manifests/sha256/"
+    "f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1e2de19876e.json"
+)
+I2V_REVIEWED_MANIFEST_VERSION = "u4bSnCPzDJ4zctrA2Nr66ji0Zh2qPpXX"
 
 
 def _terraform_source() -> str:
@@ -238,11 +243,51 @@ def test_salad_artifact_reader_is_disabled_and_exact_version_only() -> None:
     assert 'actions   = ["s3:GetObjectVersion"]' in reader_policy
     assert 'variable = "s3:VersionId"' in reader_policy
     assert "statement.value" in reader_policy
+    assert "i2v/manifests/sha256/" in variables
+    assert "ReadPinnedI2vManifest" in control_policy
+    assert 'actions   = ["s3:GetObjectVersion"]' in control_policy
+    assert 'variable = "s3:VersionId"' in control_policy
     assert re.search(r'"s3:(?:GetObject|ListBucket|PutObject|DeleteObject)"', reader_policy) is None
     assert 'sid       = "AssumeSaladArtifactReader"' in control_policy
     assert 'actions   = ["sts:AssumeRole"]' in control_policy
     assert "aws_iam_role.salad_worker_artifact_reader[0].arn" in control_policy
     assert '"${aws_s3_bucket.models.arn}/*"' not in control_policy
+
+
+def test_reviewed_i2v_source_manifest_is_exactly_inventoried_for_host_read() -> None:
+    iam = (INFRA / "iam.tf").read_text(encoding="utf-8")
+    variables = (INFRA / "variables.tf").read_text(encoding="utf-8")
+    tfvars = (INFRA / "terraform.tfvars.example").read_text(encoding="utf-8")
+    runtime_policy = iam.split(
+        'data "aws_iam_policy_document" "runtime" {',
+        maxsplit=1,
+    )[1].split(
+        'resource "aws_iam_role_policy" "runtime" {',
+        maxsplit=1,
+    )[0]
+    manifest_statement = runtime_policy.split(
+        'sid       = "ReadPinnedI2vManifest',
+        maxsplit=1,
+    )[1].split(
+        'sid = "RdsManagedMasterSecretRead"',
+        maxsplit=1,
+    )[0]
+
+    assert f'"{I2V_REVIEWED_MANIFEST_KEY}" = "{I2V_REVIEWED_MANIFEST_VERSION}"' in tfvars
+    assert r"i2v/manifests/sha256/[0-9a-f]{64}\\.json" in variables
+    assert 'if startswith(object_key, "worker/i2v/manifests/sha256/")' in runtime_policy
+    assert 'actions   = ["s3:GetObjectVersion"]' in manifest_statement
+    assert 'resources = ["${aws_s3_bucket.models.arn}/${statement.key}"]' in (manifest_statement)
+    assert 'variable = "s3:VersionId"' in manifest_statement
+    assert "values   = [statement.value]" in manifest_statement
+    assert '"${aws_s3_bucket.models.arn}/worker/i2v/manifests/sha256/*"' not in (manifest_statement)
+    for broader_action in (
+        '"s3:GetObject"',
+        '"s3:PutObject"',
+        '"s3:DeleteObject"',
+        '"s3:ListBucket"',
+    ):
+        assert broader_action not in manifest_statement
 
 
 def test_runtime_can_list_only_managed_lora_model_prefixes() -> None:
@@ -271,6 +316,7 @@ def test_runtime_can_list_only_managed_lora_model_prefixes() -> None:
     assert re.findall(r'"([^"]+)"', prefix_values.group(1)) == [
         "onboarding/loras/*",
         "worker/managed-loras/sha256/*",
+        "worker/i2v/manifests/sha256/*",
         "worker/i2v/sha256/*",
     ]
     assert runtime_policy.count('"s3:ListBucket"') == 2

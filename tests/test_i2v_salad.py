@@ -113,6 +113,19 @@ def _group(*, status: str = "running", replicas: int = 1) -> SaladContainerGroup
                 "max_upscale_per_minute": 1,
                 "max_downscale_per_minute": 1,
             },
+            "readiness_probe": {
+                "http": {
+                    "headers": [],
+                    "path": "/ready",
+                    "port": 8000,
+                    "scheme": "http",
+                },
+                "initial_delay_seconds": 0,
+                "period_seconds": 5,
+                "timeout_seconds": 3,
+                "success_threshold": 1,
+                "failure_threshold": 3,
+            },
         },
     )
 
@@ -209,6 +222,9 @@ class FakeSalad:
         autoscaler = patch.get("queue_autoscaler")
         if isinstance(autoscaler, dict):
             self.group.raw["queue_autoscaler"] = dict(autoscaler)
+        readiness_probe = patch.get("readiness_probe")
+        if isinstance(readiness_probe, dict):
+            self.group.raw["readiness_probe"] = dict(readiness_probe)
         if self.omit_autoscaler_on_update:
             self.group.raw.pop("queue_autoscaler", None)
         return self.group
@@ -305,6 +321,45 @@ async def test_reconcile_repairs_priority_and_autoscaler_before_use() -> None:
                 "max_upscale_per_minute": 1,
                 "max_downscale_per_minute": 1,
             },
+        }
+    ]
+
+
+async def test_reconcile_restores_baseline_readiness_probe_after_capability_rollback() -> None:
+    client = FakeSalad()
+    assert client.group is not None
+    client.group.raw["readiness_probe"] = {
+        "http": {
+            "path": "/ready/capability/" + "a" * 64 + "/" + "b" * 64 + "/" + "c" * 40,
+            "port": 8000,
+            "scheme": "http",
+            "headers": [],
+        },
+        "initial_delay_seconds": 0,
+        "period_seconds": 5,
+        "timeout_seconds": 3,
+        "success_threshold": 1,
+        "failure_threshold": 3,
+    }
+
+    repaired = await ensure_i2v_infrastructure_step(client, _config())
+
+    assert repaired.mutation == I2VInfrastructureMutation.GROUP_CONTRACT_REPAIRED
+    assert client.updated_patches == [
+        {
+            "readiness_probe": {
+                "http": {
+                    "path": "/ready",
+                    "port": 8000,
+                    "scheme": "http",
+                    "headers": [],
+                },
+                "initial_delay_seconds": 0,
+                "period_seconds": 5,
+                "timeout_seconds": 3,
+                "success_threshold": 1,
+                "failure_threshold": 3,
+            }
         }
     ]
 

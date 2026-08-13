@@ -36,6 +36,14 @@ from gen_automation.domain.i2v import (
     I2VWorkerDeploymentSnapshot,
     I2VWorkerDeploymentState,
 )
+from gen_automation.domain.i2v_loras import (
+    I2VLoraPromptError,
+    I2VLoraSelectionError,
+    I2VLoraSettingsKind,
+    classify_i2v_lora_settings,
+    normalize_i2v_settings,
+    validate_i2v_lora_prompt,
+)
 from gen_automation.domain.ids import uuid7
 
 
@@ -129,7 +137,7 @@ async def create_i2v_preset(
         description=draft.description,
         positive_prompt=draft.positive_prompt,
         negative_prompt=draft.negative_prompt,
-        settings=dict(draft.settings),
+        settings=_normalized_settings(draft.settings),
         lock_version=1,
         created_at=timestamp,
         updated_at=timestamp,
@@ -155,7 +163,7 @@ async def update_i2v_preset(
     preset.description = draft.description
     preset.positive_prompt = draft.positive_prompt
     preset.negative_prompt = draft.negative_prompt
-    preset.settings = dict(draft.settings)
+    preset.settings = _normalized_settings(draft.settings)
     preset.lock_version += 1
     preset.updated_at = _now(now)
     await _commit(session, "the preset update conflicts with existing state")
@@ -217,6 +225,11 @@ async def create_i2v_job(
     settings = dict(preset.settings) if preset is not None else {}
     if draft.settings is not None:
         settings.update(draft.settings)
+    settings = _normalized_settings(settings)
+    try:
+        validate_i2v_lora_prompt(positive_prompt, settings)
+    except I2VLoraPromptError as error:
+        raise I2VInputError(str(error)) from None
     input_snapshot = _input_snapshot(input_record).model_dump(mode="json")
     preset_snapshot = _preset_snapshot(preset).model_dump(mode="json") if preset is not None else {}
     request = {
@@ -360,6 +373,11 @@ async def retry_i2v_job(
     job = await _owned_job(session, actor_user_id, job_id, lock=True)
     if job.state not in {I2VJobState.FAILED, I2VJobState.CANCELLED}:
         raise I2VConflictError("only failed or cancelled I2V jobs can be retried")
+    settings = _normalized_settings(dict(job.settings_snapshot))
+    try:
+        validate_i2v_lora_prompt(job.positive_prompt, settings)
+    except I2VLoraPromptError as error:
+        raise I2VInputError(str(error)) from None
     queue_position = await _next_queue_position(session)
     job.state = I2VJobState.QUEUED
     job.queue_position = queue_position
@@ -381,6 +399,7 @@ async def claim_next_i2v_job(
     lease_duration: timedelta,
     worker_deployment_id: UUID | None = None,
     worker_image_digest: str | None = None,
+    reviewed_loras_enabled: bool = False,
     now: datetime | None = None,
 ) -> I2VClaim | None:
     normalized_worker = _nonempty_text(worker_id, "worker id")
@@ -388,12 +407,24 @@ async def claim_next_i2v_job(
         raise I2VInputError("lease duration must be positive")
     timestamp = _now(now)
     await _lock_queue(session)
-    job = await session.scalar(
-        select(I2VJob)
-        .where(I2VJob.state == I2VJobState.QUEUED)
-        .order_by(I2VJob.queue_position, I2VJob.created_at, I2VJob.id)
-        .limit(1)
-        .with_for_update(skip_locked=True)
+    queued_jobs = (
+        await session.scalars(
+            select(I2VJob)
+            .where(I2VJob.state == I2VJobState.QUEUED)
+            .order_by(I2VJob.queue_position, I2VJob.created_at, I2VJob.id)
+            .with_for_update(skip_locked=True)
+        )
+    ).all()
+    job = next(
+        (
+            queued
+            for queued in queued_jobs
+            if _dispatch_eligible(
+                queued.settings_snapshot,
+                reviewed_loras_enabled=reviewed_loras_enabled,
+            )
+        ),
+        None,
     )
     if job is None:
         return None
@@ -422,7 +453,16 @@ async def claim_next_i2v_job(
         updated_at=timestamp,
     )
     session.add(attempt)
-    await _compact_queue(session, timestamp)
+    # A rollback-paused LoRA row must retain its durable queue state. Gaps are
+    # valid queue positions and are compacted by the next explicit queue edit.
+    if all(
+        _dispatch_eligible(
+            queued.settings_snapshot,
+            reviewed_loras_enabled=reviewed_loras_enabled,
+        )
+        for queued in queued_jobs
+    ):
+        await _compact_queue(session, timestamp)
     await _commit(session, "the next I2V job was claimed concurrently")
     return I2VClaim(job=_job_snapshot(job), attempt=_attempt_snapshot(attempt))
 
@@ -1065,6 +1105,24 @@ def _canonical_sha256(value: dict[str, Any]) -> str:
         return canonical_sha256(value)
     except (TypeError, ValueError) as error:
         raise I2VInputError("I2V settings must be finite JSON data") from error
+
+
+def _normalized_settings(value: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return normalize_i2v_settings(value)
+    except I2VLoraSelectionError as error:
+        raise I2VInputError(str(error)) from error
+
+
+def _dispatch_eligible(
+    value: dict[str, Any],
+    *,
+    reviewed_loras_enabled: bool,
+) -> bool:
+    kind = classify_i2v_lora_settings(value)
+    return kind == I2VLoraSettingsKind.BASELINE or (
+        kind == I2VLoraSettingsKind.REVIEWED and reviewed_loras_enabled
+    )
 
 
 def _nonempty_text(value: str, label: str) -> str:

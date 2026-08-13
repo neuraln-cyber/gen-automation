@@ -52,6 +52,16 @@ def test_staging_salad_prefetch_runway_is_pinned_to_three_jobs() -> None:
     assert "prefetch must be exactly 3" in validator
 
 
+def test_i2v_lora_capability_and_public_gates_are_each_declared_once() -> None:
+    controller = _text("control-plane.env.example")
+    local_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+
+    for source in (controller, local_example):
+        assert source.count("GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED=false") == 1
+        assert source.count("GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED=false") == 1
+        assert source.count("GEN_AUTOMATION_I2V_PRIVATE_MANIFEST_SOURCE_SHA256=") == 1
+
+
 def test_staging_salad_container_priority_is_pinned_high() -> None:
     controller = _text("control-plane.env.example")
     validator = _text("validate-deployment.sh")

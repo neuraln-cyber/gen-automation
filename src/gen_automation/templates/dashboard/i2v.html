@@ -12,6 +12,7 @@
     data-csrf-token="{{ csrf_token }}"
     data-can-manage="{{ 'true' if can_manage else 'false' }}"
     data-hires-profile-enabled="{{ 'true' if hires_profile_enabled else 'false' }}"
+    data-lora-profile-enabled="{{ 'true' if lora_profile_enabled else 'false' }}"
     data-max-image-bytes="{{ max_image_bytes }}"
   >
     <header class="i2v-hero">
@@ -174,8 +175,19 @@
           </div>
 
           <section class="i2v-loras" aria-labelledby="i2v-lora-heading">
-            <div class="i2v-subheading"><div><h3 id="i2v-lora-heading">Paired motion LoRAs</h3><p>The reviewed experimental pair remains unavailable until its separate graph and artifact canary pass.</p></div><button class="secondary-button" type="button" data-add-lora disabled>Add pair after baseline</button></div>
-            <div class="i2v-lora-list" data-lora-list></div>
+            <div class="i2v-subheading">
+              <div>
+                <h3 id="i2v-lora-heading">Reviewed motion LoRAs</h3>
+                <p data-lora-status>Checking the matching worker catalog...</p>
+              </div>
+              <button class="secondary-button" type="button" data-clear-loras disabled>Clear all</button>
+            </div>
+            <div class="i2v-lora-list" data-lora-list aria-live="polite"></div>
+            <p class="i2v-lora-effective" data-lora-effective hidden>
+              <strong>Effective prompt guidance</strong>
+              <span data-lora-effective-text></span>
+              <small>Your written prompt stays unchanged. Where an automatic trigger exists, the worker appends it once in catalog order.</small>
+            </p>
           </section>
         </details>
 

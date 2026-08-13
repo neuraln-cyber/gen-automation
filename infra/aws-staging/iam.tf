@@ -85,9 +85,12 @@ data "aws_iam_policy_document" "github_actions_deploy_assume" {
 resource "aws_iam_role" "github_actions_deploy" {
   count = var.github_actions_deploy_enabled ? 1 : 0
 
-  name                 = "${local.name}-github-deploy"
-  assume_role_policy   = data.aws_iam_policy_document.github_actions_deploy_assume[0].json
-  max_session_duration = 3600
+  name               = "${local.name}-github-deploy"
+  assume_role_policy = data.aws_iam_policy_document.github_actions_deploy_assume[0].json
+  # A cold 5090 I2V image/model bootstrap can exceed one hour. The manual,
+  # main-branch-bound rollout workflow needs enough lifetime to observe SSM's
+  # bounded automatic rollback rather than abandoning an in-flight mutation.
+  max_session_duration = 43200
 
   tags = {
     Name = "${local.name}-github-deploy"
@@ -247,6 +250,7 @@ data "aws_iam_policy_document" "runtime" {
       values = [
         "onboarding/loras/*",
         "worker/managed-loras/sha256/*",
+        "worker/i2v/manifests/sha256/*",
         "worker/i2v/sha256/*",
       ]
     }
@@ -279,6 +283,26 @@ data "aws_iam_policy_document" "runtime" {
     resources = [
       "${aws_s3_bucket.models.arn}/worker/i2v/sha256/*",
     ]
+  }
+
+  dynamic "statement" {
+    for_each = {
+      for object_key, version_id in var.salad_worker_artifact_object_versions :
+      object_key => version_id
+      if startswith(object_key, "worker/i2v/manifests/sha256/")
+    }
+
+    content {
+      sid       = "ReadPinnedI2vManifest${substr(sha256(statement.key), 0, 12)}"
+      actions   = ["s3:GetObjectVersion"]
+      resources = ["${aws_s3_bucket.models.arn}/${statement.key}"]
+
+      condition {
+        test     = "StringEquals"
+        variable = "s3:VersionId"
+        values   = [statement.value]
+      }
+    }
   }
 
   statement {

@@ -161,6 +161,9 @@ async def _seed_generated_asset(client: TestClient, store: MemoryObjectStore) ->
 
 def test_i2v_upload_presets_and_queue_are_one_focused_flow(client: TestClient) -> None:
     _seed_development_owner(client)
+    client.app.state.settings = client.app.state.settings.model_copy(
+        update={"i2v_lora_profile_enabled": True}
+    )
     store = MemoryObjectStore(bucket="i2v-tests")
     client.app.state.object_store = store
     completed = _complete_uploaded_input(client, store)
@@ -191,8 +194,7 @@ def test_i2v_upload_presets_and_queue_are_one_focused_flow(client: TestClient) -
                 "fps": 16,
                 "loras": [
                     {
-                        "high": "motion-high.safetensors",
-                        "low": "motion-low.safetensors",
+                        "catalog_id": "wan-general-nsfw-v0.08a",
                         "strength": 0.3,
                     }
                 ],
@@ -232,6 +234,268 @@ def test_i2v_upload_presets_and_queue_are_one_focused_flow(client: TestClient) -
     )
     assert retry_response.status_code == 200
     assert retry_response.json()["state"] == "queued"
+
+
+def test_i2v_reviewed_lora_catalog_is_closed_and_profile_gated(client: TestClient) -> None:
+    disabled = client.get("/api/v1/i2v/loras")
+
+    assert disabled.status_code == 200
+    payload = disabled.json()
+    assert payload["profile_enabled"] is False
+    assert payload["maximum_selections"] == 3
+    assert len(payload["loras"]) == 5
+    assert all(item["available"] is False for item in payload["loras"])
+    assert ".safetensors" not in disabled.text
+
+    client.app.state.settings = client.app.state.settings.model_copy(
+        update={"i2v_lora_profile_enabled": True}
+    )
+    enabled = client.get("/api/v1/i2v/loras").json()
+    by_id = {item["catalog_id"]: item for item in enabled["loras"]}
+    assert all(item["available"] is True for item in enabled["loras"])
+    assert by_id["wan-general-nsfw-v0.08a"]["automatic_trigger_words"] == ["nsfwsks"]
+    assert by_id["dr34ml4y-aio-nsfw-wan22-v2"]["automatic_trigger_words"] == []
+    assert len(by_id["dr34ml4y-aio-nsfw-wan22-v2"]["trigger_words"]) == 5
+    assert by_id["smoothmix-xxx-animations-wan22"]["trigger_words"] == []
+    assert by_id["bouncing-boobs-wan22"]["recommended_initial_strength"] == 1.0
+    assert by_id["m4crom4sti4-natural-breasts-k3nk"]["recommended_initial_strength"] == 0.5
+    assert by_id["dr34ml4y-aio-nsfw-wan22-v2"]["recommended_initial_strength"] == 0.7
+    assert by_id["smoothmix-xxx-animations-wan22"]["recommended_initial_strength"] == 1.0
+    assert by_id["m4crom4sti4-natural-breasts-k3nk"]["commercial_use"] == []
+    assert by_id["bouncing-boobs-wan22"]["creator_name"] == "ai_build_art"
+    assert by_id["bouncing-boobs-wan22"]["canonical_source_url"] == (
+        "https://civitai.com/models/1343431"
+    )
+    assert by_id["bouncing-boobs-wan22"]["canonical_version_urls"] == [
+        "https://civitai.com/models/1343431?modelVersionId=2191217",
+        "https://civitai.com/models/1343431?modelVersionId=2191270",
+    ]
+
+
+def test_i2v_lora_gate_rejects_direct_and_preset_derived_selections(
+    client: TestClient,
+) -> None:
+    _seed_development_owner(client)
+    store = MemoryObjectStore(bucket="i2v-lora-gate-tests")
+    client.app.state.object_store = store
+    completed = _complete_uploaded_input(client, store)
+    headers = {"X-CSRF-Token": "development"}
+
+    rejected = client.post(
+        "/api/v1/i2v/jobs",
+        json={
+            "input_id": completed["input_id"],
+            "positive_prompt": "controlled motion",
+            "settings": {"loras": [{"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.3}]},
+        },
+        headers=headers,
+    )
+    assert rejected.status_code == 409
+
+    arbitrary = client.post(
+        "/api/v1/i2v/presets",
+        json={
+            "name": "unsafe filenames",
+            "settings": {
+                "loras": [
+                    {"high": "arbitrary-high.safetensors", "low": "arbitrary-low.safetensors"}
+                ]
+            },
+        },
+        headers=headers,
+    )
+    assert arbitrary.status_code == 422
+
+    client.app.state.settings = client.app.state.settings.model_copy(
+        update={"i2v_lora_profile_enabled": True}
+    )
+    preset = client.post(
+        "/api/v1/i2v/presets",
+        json={
+            "name": "LoRA rollout preset",
+            "positive_prompt": "controlled motion",
+            "settings": {"loras": [{"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.3}]},
+        },
+        headers=headers,
+    ).json()
+    lora_job = client.post(
+        "/api/v1/i2v/jobs",
+        json={"input_id": completed["input_id"], "preset_id": preset["preset_id"]},
+        headers=headers,
+    ).json()["jobs"][0]
+    assert lora_job["settings_snapshot"]["loras"] == [
+        {"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.3}
+    ]
+    updated_preset = client.put(
+        f"/api/v1/i2v/presets/{preset['preset_id']}",
+        json={
+            "name": preset["name"],
+            "positive_prompt": preset["positive_prompt"],
+            "expected_lock_version": preset["lock_version"],
+            "settings": {"loras": [{"catalog_id": "bouncing-boobs-wan22", "strength": 0.6}]},
+        },
+        headers=headers,
+    ).json()
+    assert updated_preset["settings"]["loras"] == [
+        {"catalog_id": "bouncing-boobs-wan22", "strength": 0.6}
+    ]
+    frozen_job = next(
+        item
+        for item in client.get("/api/v1/i2v/jobs").json()
+        if item["job_id"] == lora_job["job_id"]
+    )
+    assert frozen_job["settings_snapshot"]["loras"] == [
+        {"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.3}
+    ]
+    client.post(f"/api/v1/i2v/jobs/{lora_job['job_id']}:cancel", headers=headers)
+    client.app.state.settings = client.app.state.settings.model_copy(
+        update={"i2v_lora_profile_enabled": False}
+    )
+
+    retry = client.post(f"/api/v1/i2v/jobs/{lora_job['job_id']}:retry", headers=headers)
+    assert retry.status_code == 409
+
+    stale = client.post(
+        "/api/v1/i2v/jobs",
+        json={"input_id": completed["input_id"], "preset_id": preset["preset_id"]},
+        headers=headers,
+    )
+    assert stale.status_code == 409
+    baseline_override = client.post(
+        "/api/v1/i2v/jobs",
+        json={
+            "input_id": completed["input_id"],
+            "preset_id": preset["preset_id"],
+            "settings": {"loras": []},
+        },
+        headers=headers,
+    )
+    assert baseline_override.status_code == 201
+    assert baseline_override.json()["jobs"][0]["settings_snapshot"]["loras"] == []
+
+
+def test_i2v_dream_lora_rejects_mutually_exclusive_terms_before_queue_write(
+    client: TestClient,
+) -> None:
+    _seed_development_owner(client)
+    store = MemoryObjectStore(bucket="i2v-dream-prompt-tests")
+    client.app.state.object_store = store
+    completed = _complete_uploaded_input(client, store)
+    headers = {"X-CSRF-Token": "development"}
+    client.app.state.settings = client.app.state.settings.model_copy(
+        update={"i2v_lora_profile_enabled": True}
+    )
+    dream_settings = {"loras": [{"catalog_id": "dr34ml4y-aio-nsfw-wan22-v2", "strength": 0.7}]}
+
+    direct = client.post(
+        "/api/v1/i2v/jobs",
+        json={
+            "input_id": completed["input_id"],
+            "positive_prompt": "m15510n4ry then bl0wj0b",
+            "settings": dream_settings,
+        },
+        headers=headers,
+    )
+    assert direct.status_code == 422
+    assert "mutually exclusive" in direct.json()["detail"]
+    assert client.get("/api/v1/i2v/jobs").json() == []
+
+    preset_rejected = client.post(
+        "/api/v1/i2v/presets",
+        json={
+            "name": "conflicting Dream preset",
+            "positive_prompt": "c0wg1rl and d0gg1e",
+            "settings": dream_settings,
+        },
+        headers=headers,
+    )
+    assert preset_rejected.status_code == 422
+
+    preset = client.post(
+        "/api/v1/i2v/presets",
+        json={
+            "name": "historical Dream preset",
+            "positive_prompt": "m15510n4ry",
+            "settings": dream_settings,
+        },
+        headers=headers,
+    ).json()
+
+    async def make_historical_prompt_invalid() -> None:
+        from gen_automation.db.models import I2VPreset
+
+        async with client.app.state.database.sessions() as session:
+            record = await session.get(I2VPreset, UUID(preset["preset_id"]))
+            assert record is not None
+            record.positive_prompt = "m15510n4ry and bl0wj0b"
+            await session.commit()
+
+    assert client.portal is not None
+    client.portal.call(make_historical_prompt_invalid)
+    derived = client.post(
+        "/api/v1/i2v/jobs",
+        json={"input_id": completed["input_id"], "preset_id": preset["preset_id"]},
+        headers=headers,
+    )
+    assert derived.status_code == 422
+    assert client.get("/api/v1/i2v/jobs").json() == []
+
+
+def test_i2v_enqueue_rejects_legacy_preset_lora_shape_with_public_gate_enabled(
+    client: TestClient,
+) -> None:
+    _seed_development_owner(client)
+    store = MemoryObjectStore(bucket="i2v-legacy-preset-tests")
+    client.app.state.object_store = store
+    completed = _complete_uploaded_input(client, store)
+    headers = {"X-CSRF-Token": "development"}
+    client.app.state.settings = client.app.state.settings.model_copy(
+        update={"i2v_lora_profile_enabled": True}
+    )
+    preset = client.post(
+        "/api/v1/i2v/presets",
+        json={"name": "temporary baseline", "positive_prompt": "controlled motion"},
+        headers=headers,
+    ).json()
+
+    async def install_legacy_shape() -> None:
+        from gen_automation.db.models import I2VPreset
+
+        async with client.app.state.database.sessions() as session:
+            record = await session.get(I2VPreset, UUID(preset["preset_id"]))
+            assert record is not None
+            record.settings = {
+                "loras": [
+                    {
+                        "high": "arbitrary-high.safetensors",
+                        "low": "arbitrary-low.safetensors",
+                        "strength": 1.0,
+                    }
+                ]
+            }
+            await session.commit()
+
+    assert client.portal is not None
+    client.portal.call(install_legacy_shape)
+    rejected = client.post(
+        "/api/v1/i2v/jobs",
+        json={"input_id": completed["input_id"], "preset_id": preset["preset_id"]},
+        headers=headers,
+    )
+    assert rejected.status_code == 422
+    assert "contain only catalog_id and strength" in rejected.json()["detail"]
+    assert client.get("/api/v1/i2v/jobs").json() == []
+
+    baseline = client.post(
+        "/api/v1/i2v/jobs",
+        json={
+            "input_id": completed["input_id"],
+            "preset_id": preset["preset_id"],
+            "settings": {"loras": []},
+        },
+        headers=headers,
+    )
+    assert baseline.status_code == 201
 
 
 def test_i2v_generated_asset_registration_returns_source_dimensions(
@@ -293,6 +557,55 @@ def test_i2v_queue_is_paused_until_matching_hires_worker_is_enabled(
     assert response.status_code == 409
     assert "coordinated worker rollout" in response.json()["detail"]
     assert client.get("/api/v1/i2v/jobs").json() == []
+
+
+def test_i2v_rollout_freeze_blocks_reorder_and_retry_but_allows_cancel(
+    client: TestClient,
+) -> None:
+    _seed_development_owner(client)
+    store = MemoryObjectStore(bucket="i2v-rollout-freeze-tests")
+    client.app.state.object_store = store
+    completed = _complete_uploaded_input(client, store)
+    headers = {"X-CSRF-Token": "development"}
+    created = client.post(
+        "/api/v1/i2v/jobs",
+        json={
+            "input_id": completed["input_id"],
+            "positive_prompt": "one controlled motion",
+            "batch_count": 3,
+        },
+        headers=headers,
+    ).json()["jobs"]
+    client.app.state.settings = client.app.state.settings.model_copy(
+        update={"i2v_hires_profile_enabled": False}
+    )
+
+    cancelled = client.post(
+        f"/api/v1/i2v/jobs/{created[2]['job_id']}:cancel",
+        headers=headers,
+    )
+    assert cancelled.status_code == 200
+    assert cancelled.json()["state"] == "cancelled"
+    frozen_snapshot = client.get("/api/v1/i2v/jobs").json()
+
+    reorder = client.patch(
+        "/api/v1/i2v/queue",
+        json={
+            "job_id": created[1]["job_id"],
+            "before_job_id": created[0]["job_id"],
+        },
+        headers=headers,
+    )
+    retry = client.post(
+        f"/api/v1/i2v/jobs/{created[2]['job_id']}:retry",
+        headers=headers,
+    )
+
+    assert reorder.status_code == 409
+    assert retry.status_code == 409
+    assert "queue writes are paused" in reorder.json()["detail"]
+    assert "queue writes are paused" in retry.json()["detail"]
+    assert client.get("/api/v1/i2v/jobs").json() == frozen_snapshot
 
 
 def test_i2v_upload_completion_is_bound_to_issuing_operator_metadata(

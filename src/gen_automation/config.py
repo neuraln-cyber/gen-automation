@@ -28,6 +28,7 @@ from gen_automation.domain.signing import (
     derive_public_key,
     validate_private_key,
 )
+from gen_automation.i2v_worker.manifest_contract import validated_i2v_manifest_objects
 
 LOCAL_SESSION_SECRET = "local-development-only"  # noqa: S105
 SALAD_API_BASE_URL = "https://api.salad.com/api/public"
@@ -534,9 +535,28 @@ class Settings(BaseSettings):
     # Keep wire-incompatible dashboard controls closed until the matching
     # immutable worker image is running and ready.
     i2v_hires_profile_enabled: bool = False
+    # Enable only after the immutable worker image contains every exact reviewed
+    # paired LoRA artifact and exact bootstrap/readiness verification has passed.
+    i2v_lora_worker_enabled: bool = False
+    # Public submission gate. This remains closed while the capable worker's
+    # exact artifacts and readiness identity are verified, and can be rolled
+    # back without changing its manifest.
+    i2v_lora_profile_enabled: bool = False
     i2v_salad_queue_name: str = "i2v-jobs-v1"
     i2v_salad_container_group_name: str = "i2v-worker-v1"
     i2v_worker_image: str | None = None
+    i2v_worker_source_revision: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{40}$",
+    )
+    # Digest of the immutable source object from which the reviewed private
+    # manifest was prepared. This is deliberately distinct from
+    # ``i2v_model_manifest_sha256``, which protects the exact compact JSON bytes
+    # stored in the control-plane environment.
+    i2v_private_manifest_source_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     i2v_salad_gpu_class_id: UUID | None = None
     i2v_salad_gpu_class_name: str = "RTX 5090 (32 GB)"
     i2v_salad_prefetch: int = Field(default=3, gt=0)
@@ -925,6 +945,18 @@ class Settings(BaseSettings):
                     "staging and production GPU allocation requires a Salad worker "
                     "artifact reader role ARN"
                 )
+        if self.i2v_lora_profile_enabled and not self.i2v_enabled:
+            errors.append("I2V LoRA profile requires I2V")
+        if self.i2v_lora_worker_enabled and not self.i2v_enabled:
+            errors.append("I2V LoRA worker capability requires I2V")
+        if self.i2v_lora_worker_enabled and self.i2v_worker_source_revision is None:
+            errors.append("I2V LoRA worker capability requires an immutable source revision")
+        if self.i2v_lora_worker_enabled and self.i2v_private_manifest_source_sha256 is None:
+            errors.append("I2V LoRA worker capability requires an immutable source manifest digest")
+        if self.i2v_lora_profile_enabled and not self.i2v_hires_profile_enabled:
+            errors.append("I2V LoRA profile requires the matching high-resolution profile")
+        if self.i2v_lora_profile_enabled and not self.i2v_lora_worker_enabled:
+            errors.append("I2V LoRA profile requires a LoRA-capable worker")
         if self.i2v_enabled:
             if not self.salad_enabled:
                 errors.append("I2V requires the SaladCloud integration")
@@ -959,6 +991,16 @@ class Settings(BaseSettings):
                 else:
                     if not isinstance(decoded_manifest, dict):
                         errors.append("I2V private model manifest must be a JSON object")
+                    else:
+                        try:
+                            validated_i2v_manifest_objects(
+                                decoded_manifest,
+                                reviewed_loras_enabled=self.i2v_lora_worker_enabled,
+                            )
+                        except ValueError:
+                            errors.append(
+                                "I2V private model manifest does not match the worker capability"
+                            )
                 if SHA256_PATTERN.fullmatch(manifest_sha256) is None:
                     errors.append("I2V private model manifest digest is invalid")
                 elif hashlib.sha256(manifest_json.encode("utf-8")).hexdigest() != manifest_sha256:

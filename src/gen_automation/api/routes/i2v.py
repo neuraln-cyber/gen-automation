@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.api.security import ReleaseManager, ReleaseReader
 from gen_automation.config import Settings
+from gen_automation.db.models import I2VJob, I2VPreset
 from gen_automation.db.session import get_session
 from gen_automation.domain.enums import AdminRole
 from gen_automation.domain.i2v import (
@@ -23,6 +26,19 @@ from gen_automation.domain.i2v import (
     I2VPresetDraft,
     I2VPresetSnapshot,
     I2VWorkerDeploymentSnapshot,
+)
+from gen_automation.domain.i2v_loras import (
+    I2VLoraPromptError,
+    I2VLoraSelectionError,
+    normalize_i2v_settings,
+    selected_i2v_loras,
+    validate_i2v_lora_prompt,
+)
+from gen_automation.i2v_worker.lora_catalog import (
+    LORA_CATALOG,
+    MAX_REVIEWED_LORA_SELECTIONS,
+    MAX_REVIEWED_LORA_STRENGTH,
+    MIN_REVIEWED_LORA_STRENGTH,
 )
 from gen_automation.services.dashboard_previews import (
     DASHBOARD_PREVIEW_CACHE_CONTROL,
@@ -138,6 +154,106 @@ class WorkerRead(BaseModel):
     status_available: bool
     message: str
     deployment: I2VWorkerDeploymentSnapshot | None
+
+
+class ReviewedLoraRead(BaseModel):
+    catalog_id: str
+    display_name: str
+    creator_name: str
+    canonical_source_url: str = Field(
+        pattern=r"^https://civitai[.]com/models/[0-9]+$",
+    )
+    canonical_version_urls: tuple[str, str]
+    trigger_words: tuple[str, ...]
+    automatic_trigger_words: tuple[str, ...]
+    recommended_initial_strength: float
+    strength_guidance: str
+    usage_notes: str
+    minimum_strength: float
+    maximum_strength: float
+    strength_step: float
+    available: bool
+    prompt_behavior: str
+    credit_required: bool
+    commercial_use: tuple[str, ...]
+    derivatives_allowed: bool
+    different_license_allowed: bool
+    usage_recorded_at: str
+
+    @field_validator("canonical_version_urls")
+    @classmethod
+    def validate_canonical_version_urls(
+        cls,
+        value: tuple[str, str],
+    ) -> tuple[str, str]:
+        pattern = re.compile(r"^https://civitai[.]com/models/[0-9]+[?]modelVersionId=[0-9]+$")
+        if any(pattern.fullmatch(item) is None for item in value):
+            raise ValueError("canonical version URLs must be exact Civitai versions")
+        return value
+
+
+class ReviewedLoraCatalogRead(BaseModel):
+    profile_enabled: bool
+    maximum_selections: int
+    message: str
+    loras: tuple[ReviewedLoraRead, ...]
+
+
+@router.get("/loras", response_model=ReviewedLoraCatalogRead)
+async def reviewed_loras(
+    request: Request,
+    _principal: ReleaseReader,
+) -> ReviewedLoraCatalogRead:
+    enabled = bool(request.app.state.settings.i2v_lora_profile_enabled)
+    loras = tuple(
+        ReviewedLoraRead(
+            catalog_id=entry.catalog_id,
+            display_name=entry.display_name,
+            creator_name=entry.creator_name,
+            canonical_source_url=entry.canonical_source_url,
+            canonical_version_urls=(
+                entry.high.canonical_version_url,
+                entry.low.canonical_version_url,
+            ),
+            trigger_words=entry.trigger_words,
+            automatic_trigger_words=entry.automatic_trigger_words,
+            recommended_initial_strength=entry.recommended_initial_strength,
+            strength_guidance=entry.strength_guidance,
+            usage_notes=entry.usage_notes,
+            minimum_strength=MIN_REVIEWED_LORA_STRENGTH,
+            maximum_strength=MAX_REVIEWED_LORA_STRENGTH,
+            strength_step=0.01,
+            available=enabled,
+            prompt_behavior=(
+                "Trigger text is appended once to the effective positive prompt"
+                if entry.automatic_trigger_words
+                else (
+                    "Include the one concept keyword that matches the requested action"
+                    if entry.trigger_words
+                    else "No trained trigger; describe the pose and action in the positive prompt"
+                )
+            ),
+            credit_required=entry.source_usage.credit_required,
+            commercial_use=entry.source_usage.commercial_use,
+            derivatives_allowed=entry.source_usage.derivatives_allowed,
+            different_license_allowed=entry.source_usage.different_license_allowed,
+            usage_recorded_at=entry.source_usage.recorded_at,
+        )
+        for entry in LORA_CATALOG.values()
+    )
+    return ReviewedLoraCatalogRead(
+        profile_enabled=enabled,
+        maximum_selections=MAX_REVIEWED_LORA_SELECTIONS,
+        message=(
+            "Reviewed LoRAs are installed and available on the matching worker."
+            if enabled
+            else (
+                "LoRAs remain unavailable until exact worker artifact and readiness "
+                "verification passes."
+            )
+        ),
+        loras=loras,
+    )
 
 
 @router.get("/source-images", response_model=tuple[I2VLibraryImage, ...])
@@ -295,15 +411,23 @@ async def presets(session: Session, principal: ReleaseReader) -> tuple[I2VPreset
 @router.post("/presets", response_model=I2VPresetSnapshot, status_code=status.HTTP_201_CREATED)
 async def create_preset(
     payload: PresetCreate,
+    request: Request,
     session: Session,
     principal: ReleaseManager,
 ) -> I2VPresetSnapshot:
     try:
+        normalized_settings = _settings_for_profile(
+            payload.settings,
+            enabled=request.app.state.settings.i2v_lora_profile_enabled,
+        )
+        _validate_lora_prompt(payload.positive_prompt, normalized_settings)
         return await create_i2v_preset(
             session,
             actor_user_id=principal.user_id,
-            draft=_preset_draft(payload),
+            draft=_preset_draft(payload, settings=normalized_settings),
         )
+    except HTTPException:
+        raise
     except (I2VInputError, I2VConflictError) as error:
         raise _core_http_error(error) from error
 
@@ -312,17 +436,25 @@ async def create_preset(
 async def update_preset(
     preset_id: UUID,
     payload: PresetUpdate,
+    request: Request,
     session: Session,
     principal: ReleaseManager,
 ) -> I2VPresetSnapshot:
     try:
+        normalized_settings = _settings_for_profile(
+            payload.settings,
+            enabled=request.app.state.settings.i2v_lora_profile_enabled,
+        )
+        _validate_lora_prompt(payload.positive_prompt, normalized_settings)
         return await update_i2v_preset(
             session,
             actor_user_id=principal.user_id,
             preset_id=preset_id,
-            draft=_preset_draft(payload),
+            draft=_preset_draft(payload, settings=normalized_settings),
             expected_lock_version=payload.expected_lock_version,
         )
+    except HTTPException:
+        raise
     except (I2VInputError, I2VNotFoundError, I2VConflictError) as error:
         raise _core_http_error(error) from error
 
@@ -365,18 +497,57 @@ async def enqueue_jobs(
     principal: ReleaseManager,
 ) -> JobBatchRead:
     settings: Settings = request.app.state.settings
-    if not settings.i2v_hires_profile_enabled:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="image-to-video submissions are paused for the coordinated worker rollout",
+    _require_i2v_queue_writes_enabled(settings)
+    normalized_settings = (
+        _settings_for_profile(
+            payload.settings,
+            enabled=settings.i2v_lora_profile_enabled,
         )
+        if payload.settings is not None
+        else None
+    )
+    if (
+        not settings.i2v_lora_profile_enabled
+        and not _settings_override_disables_loras(normalized_settings)
+        and payload.preset_id is not None
+    ):
+        preset_settings = await session.scalar(
+            select(I2VPreset.settings).where(
+                I2VPreset.id == payload.preset_id,
+                I2VPreset.created_by_user_id == principal.user_id,
+            )
+        )
+        if preset_settings is not None and _settings_have_loras(preset_settings):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="reviewed I2V LoRAs are paused until the matching worker rollout passes",
+            )
+    effective_prompt = payload.positive_prompt
+    effective_settings = dict(normalized_settings or {})
+    if payload.preset_id is not None:
+        preset = await session.scalar(
+            select(I2VPreset).where(
+                I2VPreset.id == payload.preset_id,
+                I2VPreset.created_by_user_id == principal.user_id,
+            )
+        )
+        if preset is not None:
+            if effective_prompt is None:
+                effective_prompt = preset.positive_prompt
+            merged_settings = dict(preset.settings)
+            merged_settings.update(effective_settings)
+            effective_settings = _settings_for_profile(
+                merged_settings,
+                enabled=settings.i2v_lora_profile_enabled,
+            )
+    _validate_lora_prompt(effective_prompt or "", effective_settings)
     created: list[I2VJobSnapshot] = []
     draft = I2VJobDraft(
         input_id=payload.input_id,
         preset_id=payload.preset_id,
         positive_prompt=payload.positive_prompt,
         negative_prompt=payload.negative_prompt,
-        settings=payload.settings,
+        settings=normalized_settings,
     )
     try:
         for _ in range(payload.batch_count):
@@ -395,9 +566,11 @@ async def enqueue_jobs(
 @router.patch("/queue", response_model=tuple[I2VJobSnapshot, ...])
 async def move_queue_job(
     payload: QueueMove,
+    request: Request,
     session: Session,
     principal: ReleaseManager,
 ) -> tuple[I2VJobSnapshot, ...]:
+    _require_i2v_queue_writes_enabled(request.app.state.settings)
     if payload.before_job_id is not None and payload.after_job_id is not None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -434,16 +607,43 @@ async def cancel_job(
 @router.post("/jobs/{job_id}:retry", response_model=I2VJobSnapshot)
 async def retry_job(
     job_id: UUID,
+    request: Request,
     session: Session,
     principal: ReleaseManager,
 ) -> I2VJobSnapshot:
+    _require_i2v_queue_writes_enabled(request.app.state.settings)
+    frozen_job = (
+        await session.execute(
+            select(I2VJob.settings_snapshot, I2VJob.positive_prompt).where(
+                I2VJob.id == job_id,
+                I2VJob.created_by_user_id == principal.user_id,
+            )
+        )
+    ).one_or_none()
+    if frozen_job is not None:
+        job_settings, positive_prompt = frozen_job
+        try:
+            normalized_job_settings = normalize_i2v_settings(job_settings)
+            validate_i2v_lora_prompt(positive_prompt, normalized_job_settings)
+        except I2VLoraSelectionError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"the frozen I2V job has invalid LoRA settings: {error}",
+            ) from error
+        if not request.app.state.settings.i2v_lora_profile_enabled and _settings_have_loras(
+            normalized_job_settings
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="reviewed I2V LoRAs are paused until the matching worker rollout passes",
+            )
     try:
         return await retry_i2v_job(
             session,
             actor_user_id=principal.user_id,
             job_id=job_id,
         )
-    except (I2VNotFoundError, I2VConflictError) as error:
+    except (I2VInputError, I2VNotFoundError, I2VConflictError) as error:
         raise _core_http_error(error) from error
 
 
@@ -526,14 +726,63 @@ async def worker_status(
     )
 
 
-def _preset_draft(payload: PresetCreate | PresetUpdate) -> I2VPresetDraft:
+def _preset_draft(
+    payload: PresetCreate | PresetUpdate,
+    *,
+    settings: dict[str, Any],
+) -> I2VPresetDraft:
     return I2VPresetDraft(
         name=payload.name,
         description=payload.description,
         positive_prompt=payload.positive_prompt,
         negative_prompt=payload.negative_prompt,
-        settings=payload.settings,
+        settings=settings,
     )
+
+
+def _settings_for_profile(value: dict[str, Any], *, enabled: bool) -> dict[str, Any]:
+    try:
+        normalized = normalize_i2v_settings(value)
+    except I2VLoraSelectionError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(error),
+        ) from error
+    if selected_i2v_loras(normalized) and not enabled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="reviewed I2V LoRAs are paused until the matching worker rollout passes",
+        )
+    return normalized
+
+
+def _require_i2v_queue_writes_enabled(settings: Settings) -> None:
+    if settings.i2v_hires_profile_enabled:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="image-to-video queue writes are paused for the coordinated worker rollout",
+    )
+
+
+def _settings_override_disables_loras(value: dict[str, Any] | None) -> bool:
+    return value is not None and "loras" in value and not value["loras"]
+
+
+def _settings_have_loras(value: dict[str, Any]) -> bool:
+    """Fail closed for legacy or malformed frozen LoRA settings."""
+
+    return "loras" in value and value["loras"] != []
+
+
+def _validate_lora_prompt(positive_prompt: str, settings: dict[str, Any]) -> None:
+    try:
+        validate_i2v_lora_prompt(positive_prompt, settings)
+    except I2VLoraPromptError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(error),
+        ) from error
 
 
 def _require_manager_reader(role: AdminRole) -> None:
