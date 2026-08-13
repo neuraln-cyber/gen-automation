@@ -2770,7 +2770,7 @@ async def test_pending_clear_resets_tracking_and_repairs_autoscaler(
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_uses_status_to_start_stopped_active_group(
+async def test_reconciliation_leaves_stopped_active_group_idle_without_demand(
     deployment_context: DeploymentContext,
 ) -> None:
     await make_fully_provisioned(deployment_context)
@@ -2786,6 +2786,64 @@ async def test_reconciliation_uses_status_to_start_stopped_active_group(
     )
     group.raw["autostart_policy"] = False
     client.groups[group_name] = group
+
+    async with deployment_context.database.sessions() as session:
+        assert (
+            await deployment_service.effective_worker_min_replicas(
+                session,
+                salad_deployment_id=deployment_context.deployment_id,
+                now=NOW + timedelta(minutes=1),
+            )
+            == 0
+        )
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=NOW + timedelta(minutes=1),
+        )
+        await session.commit()
+
+    assert result.action == DeploymentAction.RECONCILED
+    assert result.state == SaladDeploymentState.ACTIVE
+    assert result.error_code is None
+    assert client.start_names == []
+    assert client.updated_group_patches == []
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_uses_status_to_start_stopped_active_group_with_demand(
+    deployment_context: DeploymentContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await make_fully_provisioned(deployment_context)
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.queues[queue_name] = make_queue(queue_name)
+    group = make_group(
+        group_name,
+        queue_name,
+        status="stopped",
+        start_time=None,
+        finish_time=NOW,
+        autoscaler={
+            "min_replicas": 1,
+            "max_replicas": 1,
+            "desired_queue_length": 1,
+            "polling_period": 30,
+        },
+    )
+    group.raw["autostart_policy"] = False
+    client.groups[group_name] = group
+
+    async def demand_one_worker(*_args: object, **_kwargs: object) -> int:
+        return 1
+
+    monkeypatch.setattr(
+        deployment_service,
+        "effective_worker_min_replicas",
+        demand_one_worker,
+    )
 
     async with deployment_context.database.sessions() as session:
         result = await reconcile_deployment(

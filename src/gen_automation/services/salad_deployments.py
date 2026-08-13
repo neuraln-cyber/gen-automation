@@ -696,7 +696,13 @@ async def _reconcile_locked(
             return repair_result
 
     if not group.pending_change:
-        unhealthy_status = group.status.strip().lower() in {"failed", "stopped"}
+        provider_status = group.status.strip().lower()
+        # A manually or provider-stopped group is a valid idle state while the
+        # durable demand calculation remains zero. Starting it here would fight
+        # the operator stop and allocate an otherwise unneeded GPU.
+        unhealthy_status = provider_status == "failed" or (
+            provider_status == "stopped" and effective_min_replicas == 1
+        )
         if drift_code is not None or unhealthy_status:
             deployment.state = SaladDeploymentState.DEGRADED
             deployment.last_error_code = drift_code or "provider_group_unhealthy"
@@ -801,7 +807,8 @@ async def _request_active_contract_repair(
 
     A missing autoscaler can be restored directly. A stopped group whose
     configuration otherwise matches can be started through its dedicated
-    action. All other drift remains degraded and blocks dispatch.
+    action only when durable demand requires one worker. All other drift
+    remains degraded and blocks dispatch.
     """
 
     if drift_code == "provider_autoscaler_drift":
@@ -854,7 +861,11 @@ async def _request_active_contract_repair(
             error_code=deployment.last_error_code,
         )
 
-    if drift_code is None and group.status.strip().lower() == "stopped":
+    if (
+        drift_code is None
+        and effective_min_replicas == 1
+        and group.status.strip().lower() == "stopped"
+    ):
         try:
             await client.start_container_group(deployment.container_group_name)
         except (SaladAPIError, SaladProtocolError, SaladTransportError) as error:
