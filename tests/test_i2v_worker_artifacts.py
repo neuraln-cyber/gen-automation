@@ -59,12 +59,18 @@ def _settings(tmp_path: Path, model: ModelObject) -> I2VWorkerSettings:
             }
         )
         values.append(value.model_dump(mode="json"))
-    return I2VWorkerSettings(
+    # These tests isolate the ranged downloader. Startup completeness and exact
+    # reviewed LoRA identity are covered by the worker-contract suite.
+    return I2VWorkerSettings.model_construct(
         model_objects_json=SecretStr(json.dumps(values)),
         environment="test",
+        aws_region="eu-central-1",
+        s3_endpoint_url=None,
         comfy_root=tmp_path / "comfy",
         runtime_root=tmp_path / "runtime",
         artifact_chunk_bytes=1024 * 1024,
+        network_attempts=5,
+        network_timeout_seconds=120,
     )
 
 
@@ -93,6 +99,38 @@ async def test_model_download_is_version_pinned_resumable_and_hash_verified(tmp_
     assert materialized[0].read_bytes() == content
     assert client.ranges[0] == f"bytes=8-{len(content) - 1}"
     assert not partial.exists()
+
+
+@pytest.mark.asyncio
+async def test_full_size_corrupt_partial_is_removed_before_retry(tmp_path: Path) -> None:
+    content = b"correct"
+    model = ModelObject(
+        role="diffusion_model_high",
+        bucket="models",
+        key="worker/i2v/sha256/" + hashlib.sha256(content).hexdigest(),
+        version_id="version-1",
+        byte_size=len(content),
+        sha256=hashlib.sha256(content).hexdigest(),
+        install_path="models/diffusion_models/model.safetensors",
+    )
+    settings = _settings(tmp_path, model)
+    installed_model = settings.model_objects[0]
+    target = settings.comfy_root / installed_model.install_path
+    target.parent.mkdir(parents=True)
+    partial = target.with_name(f".{target.name}.partial")
+    partial.write_bytes(b"wrong!!")
+    client = _S3(content, model.version_id)
+
+    with pytest.raises(ModelBootstrapError):
+        await S3ModelBootstrapper(settings, client=client).bootstrap()
+
+    assert not partial.exists()
+    assert client.ranges == []
+
+    materialized = await S3ModelBootstrapper(settings, client=client).bootstrap()
+
+    assert materialized[0].read_bytes() == content
+    assert client.ranges[0] == f"bytes=0-{len(content) - 1}"
 
 
 @pytest.mark.asyncio

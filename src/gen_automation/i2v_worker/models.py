@@ -7,6 +7,15 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
+from gen_automation.i2v_worker.lora_catalog import (
+    LORA_ARTIFACTS_BY_ROLE,
+    LORA_CATALOG,
+    MAX_REVIEWED_LORA_SELECTIONS,
+    MAX_REVIEWED_LORA_STRENGTH,
+    MIN_REVIEWED_LORA_STRENGTH,
+    LoraCatalogId,
+)
+
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _SAFE_OBJECT_KEY = re.compile(r"^[^\x00-\x1f\\]{1,1024}$")
 _MAX_LOOP_DURATION_SECONDS = 25
@@ -22,8 +31,16 @@ class ModelObject(_StrictModel):
         "diffusion_model_low",
         "text_encoder",
         "vae",
-        "lora_high",
-        "lora_low",
+        "lora_wan_general_nsfw_high",
+        "lora_wan_general_nsfw_low",
+        "lora_bouncing_boobs_high",
+        "lora_bouncing_boobs_low",
+        "lora_m4crom4sti4_high",
+        "lora_m4crom4sti4_low",
+        "lora_dr34ml4y_high",
+        "lora_dr34ml4y_low",
+        "lora_smoothmix_animations_high",
+        "lora_smoothmix_animations_low",
     ]
     bucket: str = Field(min_length=2, max_length=255)
     key: str = Field(min_length=1, max_length=1024)
@@ -39,8 +56,16 @@ class ModelObject(_StrictModel):
             "diffusion_model_low": "models/diffusion_models/",
             "text_encoder": "models/text_encoders/",
             "vae": "models/vae/",
-            "lora_high": "models/loras/",
-            "lora_low": "models/loras/",
+            "lora_wan_general_nsfw_high": "models/loras/",
+            "lora_wan_general_nsfw_low": "models/loras/",
+            "lora_bouncing_boobs_high": "models/loras/",
+            "lora_bouncing_boobs_low": "models/loras/",
+            "lora_m4crom4sti4_high": "models/loras/",
+            "lora_m4crom4sti4_low": "models/loras/",
+            "lora_dr34ml4y_high": "models/loras/",
+            "lora_dr34ml4y_low": "models/loras/",
+            "lora_smoothmix_animations_high": "models/loras/",
+            "lora_smoothmix_animations_low": "models/loras/",
         }[self.role]
         if (
             _SAFE_OBJECT_KEY.fullmatch(self.key) is None
@@ -53,6 +78,13 @@ class ModelObject(_StrictModel):
             or not self.install_path.endswith(".safetensors")
         ):
             raise ValueError("model object path is invalid")
+        reviewed = LORA_ARTIFACTS_BY_ROLE.get(self.role)
+        if reviewed is not None and (
+            self.install_path != reviewed.install_path
+            or self.byte_size != reviewed.byte_size
+            or self.sha256 != reviewed.sha256
+        ):
+            raise ValueError("reviewed LoRA artifact identity is invalid")
         return self
 
 
@@ -95,6 +127,14 @@ class UploadGrant(_StrictModel):
         return self
 
 
+class LoraSelection(_StrictModel):
+    catalog_id: LoraCatalogId
+    strength: float = Field(
+        ge=MIN_REVIEWED_LORA_STRENGTH,
+        le=MAX_REVIEWED_LORA_STRENGTH,
+    )
+
+
 class GenerationSettings(_StrictModel):
     frame_count: int = Field(default=81, ge=9)
     fps: int = Field(default=16, gt=0)
@@ -117,7 +157,10 @@ class GenerationSettings(_StrictModel):
     loop_count: int = Field(default=2, ge=1, le=20)
     color_transfer: Literal[False] = False
     tiled_vae: Literal[False] = False
-    loras: list[dict[str, Any]] = Field(default_factory=list, max_length=0)
+    loras: list[LoraSelection] = Field(
+        default_factory=list,
+        max_length=MAX_REVIEWED_LORA_SELECTIONS,
+    )
 
     @model_validator(mode="after")
     def validate_wan_shape(self) -> GenerationSettings:
@@ -131,6 +174,10 @@ class GenerationSettings(_StrictModel):
             output_frames = ((2 * self.frame_count) - 2) * self.loop_count
             if output_frames > self.fps * _MAX_LOOP_DURATION_SECONDS:
                 raise ValueError("looped output duration must not exceed 25 seconds")
+        if len({selection.catalog_id for selection in self.loras}) != len(self.loras):
+            raise ValueError("reviewed LoRA selections must be unique")
+        catalog_order = {catalog_id: index for index, catalog_id in enumerate(LORA_CATALOG)}
+        self.loras.sort(key=lambda selection: catalog_order[selection.catalog_id])
         return self
 
 

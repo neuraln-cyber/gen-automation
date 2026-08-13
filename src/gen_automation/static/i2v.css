@@ -57,7 +57,7 @@
 .i2v-draft-state { align-self: center; color: var(--muted); font-size: .72rem; }
 .i2v-preset-bar { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: .45rem; align-items: end; }
 .i2v-preset-bar label, .i2v-prompt, .i2v-settings-grid label, .i2v-dialog label { display: grid; gap: .38rem; color: var(--muted-strong); font-size: .77rem; font-weight: 730; }
-.i2v-preset-bar select, .i2v-prompt textarea, .i2v-settings-grid input, .i2v-settings-grid select, .i2v-submit-bar input, .i2v-dialog input, .i2v-dialog textarea, .i2v-lora-row input { width: 100%; border: 1px solid var(--border); border-radius: .65rem; background: rgba(7, 8, 14, .66); color: var(--text); }
+.i2v-preset-bar select, .i2v-prompt textarea, .i2v-settings-grid input, .i2v-settings-grid select, .i2v-submit-bar input, .i2v-dialog input, .i2v-dialog textarea, .i2v-lora-strength input { width: 100%; border: 1px solid var(--border); border-radius: .65rem; background: rgba(7, 8, 14, .66); color: var(--text); }
 .i2v-preset-bar select, .i2v-settings-grid input, .i2v-settings-grid select, .i2v-submit-bar input, .i2v-dialog input { min-height: 2.7rem; padding: .55rem .65rem; }
 .i2v-prompt > span { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .4rem; }
 .i2v-prompt small, .i2v-settings-grid small { color: var(--muted); font-weight: 500; }
@@ -77,8 +77,19 @@
 .i2v-loras { margin: 0 .9rem .9rem; padding-top: .85rem; border-top: 1px solid var(--border); }
 .i2v-subheading p { margin: .2rem 0 0; color: var(--muted); font-size: .72rem; }
 .i2v-lora-list { display: grid; gap: .55rem; margin-top: .7rem; }
-.i2v-lora-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 5rem auto; gap: .45rem; align-items: center; }
-.i2v-lora-row input { min-height: 2.5rem; padding: .5rem .6rem; }
+.i2v-lora-card { display: grid; grid-template-columns: minmax(0, 1fr) 7rem; gap: .55rem .8rem; align-items: center; padding: .7rem; border: 1px solid var(--border); border-radius: .75rem; background: rgba(7, 8, 14, .35); }
+.i2v-lora-card.selected { border-color: rgba(114, 215, 255, .42); background: var(--i2v-cyan-soft); }
+.i2v-lora-toggle { display: flex; min-width: 0; align-items: flex-start; gap: .55rem; color: var(--text); cursor: pointer; }
+.i2v-lora-toggle input { margin-top: .18rem; accent-color: var(--i2v-cyan); }
+.i2v-lora-toggle span { display: grid; min-width: 0; }
+.i2v-lora-toggle strong { font-size: .8rem; }
+.i2v-lora-toggle small, .i2v-lora-guidance, .i2v-lora-effective small { color: var(--muted); font-size: .68rem; font-weight: 500; line-height: 1.4; }
+.i2v-lora-strength { display: grid; gap: .25rem; color: var(--muted-strong); font-size: .7rem; font-weight: 730; }
+.i2v-lora-strength input { min-height: 2.5rem; padding: .5rem .6rem; }
+.i2v-lora-guidance { grid-column: 1 / -1; margin: 0; }
+.i2v-lora-effective { display: grid; gap: .18rem; margin: .65rem 0 0; padding: .65rem; border-radius: .65rem; background: rgba(114, 215, 255, .08); }
+.i2v-lora-effective strong { color: var(--i2v-cyan); font-size: .7rem; letter-spacing: .04em; text-transform: uppercase; }
+.i2v-lora-effective span { color: var(--text); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .7rem; overflow-wrap: anywhere; }
 .i2v-submit-bar { display: flex; align-items: end; justify-content: space-between; gap: 1rem; padding-top: .25rem; }
 .i2v-submit-bar > label { display: grid; width: 5rem; gap: .25rem; color: var(--muted); font-size: .72rem; }
 .i2v-submit-bar > div { display: flex; align-items: center; justify-content: flex-end; gap: .75rem; }
@@ -128,8 +139,7 @@
   .i2v-preset-bar { grid-template-columns: minmax(0, 1fr) auto auto; }
   .i2v-preset-bar .secondary-button { grid-column: 1 / -1; grid-row: 2; }
   .i2v-settings-grid { grid-template-columns: 1fr; }
-  .i2v-lora-row { grid-template-columns: 1fr auto; }
-  .i2v-lora-row input:nth-child(1), .i2v-lora-row input:nth-child(2) { grid-column: 1 / -1; }
+  .i2v-lora-card { grid-template-columns: minmax(0, 1fr) 6.5rem; }
   .i2v-submit-bar, .i2v-submit-bar > div { align-items: stretch; flex-direction: column; }
   .i2v-submit-bar > label { width: 100%; }
   .i2v-submit-bar span { text-align: left; }

@@ -128,6 +128,7 @@ class S3ModelBootstrapper:
                     output.flush()
                     os.fsync(output.fileno())
             if partial_path.stat().st_size != model.byte_size or digest.hexdigest() != model.sha256:
+                partial_path.unlink()
                 raise ModelBootstrapError("model bootstrap failed")
             os.chmod(partial_path, 0o444)
             os.replace(partial_path, target)

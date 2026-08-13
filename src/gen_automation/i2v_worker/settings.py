@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Literal
@@ -7,6 +8,7 @@ from typing import Literal
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from gen_automation.i2v_worker.lora_catalog import REQUIRED_LORA_ROLES
 from gen_automation.i2v_worker.models import ModelObject
 
 
@@ -38,6 +40,12 @@ class I2VWorkerSettings(BaseSettings):
     comfy_poll_seconds: float = Field(default=1, gt=0)
     queue_worker_enabled: bool = True
     queue_worker_path: Path = Path("/usr/local/bin/salad-http-job-queue-worker")
+    lora_worker_enabled: bool = False
+    source_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+    private_manifest_source_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
     @model_validator(mode="after")
     def validate_configuration(self) -> I2VWorkerSettings:
@@ -48,7 +56,13 @@ class I2VWorkerSettings(BaseSettings):
         objects = self.model_objects
         roles = {item.role for item in objects}
         required = {"diffusion_model_high", "diffusion_model_low", "text_encoder", "vae"}
-        if not required.issubset(roles) or len(roles) != len(objects):
+        if self.lora_worker_enabled:
+            if self.source_revision is None or self.private_manifest_source_sha256 is None:
+                raise ValueError(
+                    "LoRA worker capability requires immutable manifest and source identity"
+                )
+            required.update(REQUIRED_LORA_ROLES)
+        if roles != required or len(roles) != len(objects):
             raise ValueError("model manifest roles are incomplete or duplicated")
         return self
 
@@ -61,3 +75,28 @@ class I2VWorkerSettings(BaseSettings):
             return tuple(ModelObject.model_validate(item) for item in raw)
         except (TypeError, ValueError):
             raise ValueError("model object manifest is invalid") from None
+
+    @property
+    def model_objects_sha256(self) -> str:
+        return hashlib.sha256(
+            self.model_objects_json.get_secret_value().encode("utf-8")
+        ).hexdigest()
+
+    @property
+    def artifact_identity_sha256(self) -> str:
+        identity = [
+            {
+                "role": item.role,
+                "byte_size": item.byte_size,
+                "sha256": item.sha256,
+                "version_id": item.version_id,
+            }
+            for item in self.model_objects
+        ]
+        encoded = json.dumps(
+            identity,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

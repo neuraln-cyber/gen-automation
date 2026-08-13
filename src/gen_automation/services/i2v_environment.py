@@ -15,18 +15,16 @@ from gen_automation.domain.runtime_bindings import (
     WORKER_ARTIFACT_SECRET_ACCESS_KEY_BINDING,
     WORKER_ARTIFACT_SESSION_TOKEN_BINDING,
 )
+from gen_automation.i2v_worker.lora_catalog import LORA_ARTIFACTS_BY_ROLE, REQUIRED_LORA_ROLES
+from gen_automation.i2v_worker.manifest_contract import (
+    required_i2v_model_roles,
+    validated_i2v_manifest_objects,
+)
 from gen_automation.services.i2v_runtime import I2VRuntimeConfig
 from gen_automation.services.i2v_salad import I2VSaladConfig
 from gen_automation.services.runtime_secrets import (
     RuntimeSecretResolver,
     configured_runtime_binding_references,
-)
-
-_REQUIRED_ROLES = (
-    "diffusion_model_high",
-    "diffusion_model_low",
-    "text_encoder",
-    "vae",
 )
 
 
@@ -51,12 +49,21 @@ class I2VRuntimeEnvironment:
             raise I2VEnvironmentError("I2V model credentials are unavailable")
         environment = {
             "GEN_I2V_WORKER_ENVIRONMENT": "production",
+            "GEN_I2V_WORKER_LORA_WORKER_ENABLED": (
+                "true" if self.settings.i2v_lora_worker_enabled else "false"
+            ),
             "GEN_I2V_WORKER_AWS_REGION": _artifact_region(self.settings),
             "GEN_I2V_WORKER_MODEL_OBJECTS_JSON": _worker_model_objects(self.settings),
             "AWS_ACCESS_KEY_ID": resolved[WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING],
             "AWS_SECRET_ACCESS_KEY": resolved[WORKER_ARTIFACT_SECRET_ACCESS_KEY_BINDING],
             "AWS_SESSION_TOKEN": resolved[WORKER_ARTIFACT_SESSION_TOKEN_BINDING],
         }
+        source_manifest_sha256 = self.settings.i2v_private_manifest_source_sha256
+        if source_manifest_sha256 is not None:
+            environment["GEN_I2V_WORKER_PRIVATE_MANIFEST_SOURCE_SHA256"] = source_manifest_sha256
+        source_revision = self.settings.i2v_worker_source_revision
+        if source_revision is not None:
+            environment["GEN_I2V_WORKER_SOURCE_REVISION"] = source_revision
         endpoint = resolved.get(WORKER_ARTIFACT_ENDPOINT_URL_BINDING)
         if endpoint is not None:
             environment["GEN_I2V_WORKER_S3_ENDPOINT_URL"] = endpoint
@@ -70,6 +77,17 @@ def i2v_runtime_config_from_settings(settings: Settings) -> I2VRuntimeConfig:
         or settings.i2v_salad_gpu_class_id is None
     ):
         raise I2VEnvironmentError("validated I2V settings are incomplete")
+    readiness_probe_path = "/ready"
+    if settings.i2v_lora_worker_enabled:
+        source_manifest_sha256 = settings.i2v_private_manifest_source_sha256
+        source_revision = settings.i2v_worker_source_revision
+        if source_manifest_sha256 is None or source_revision is None:
+            raise I2VEnvironmentError("validated I2V capability identity is incomplete")
+        readiness_probe_path = (
+            "/ready/capability/"
+            f"{source_manifest_sha256}/{_worker_artifact_identity_sha256(settings)}/"
+            f"{source_revision}"
+        )
     return I2VRuntimeConfig(
         salad=I2VSaladConfig(
             queue_name=settings.i2v_salad_queue_name,
@@ -85,8 +103,40 @@ def i2v_runtime_config_from_settings(settings: Settings) -> I2VRuntimeConfig:
             storage_bytes=settings.i2v_salad_storage_bytes,
             priority=settings.i2v_salad_priority.value,
             max_replicas=settings.i2v_salad_max_replicas,
+            readiness_probe_path=readiness_probe_path,
         ),
         output_prefix=settings.i2v_output_prefix,
+        reviewed_loras_enabled=settings.i2v_lora_worker_enabled,
+    )
+
+
+def _worker_artifact_identity_sha256(settings: Settings) -> str:
+    objects = json.loads(_worker_model_objects(settings))
+    identity = [
+        {
+            "role": item["role"],
+            "byte_size": item["byte_size"],
+            "sha256": item["sha256"],
+            "version_id": item["version_id"],
+        }
+        for item in objects
+    ]
+    encoded = json.dumps(
+        identity,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def i2v_worker_identity(settings: Settings) -> tuple[str, str]:
+    """Return derived model-object and artifact identities without secret values."""
+
+    model_objects = _worker_model_objects(settings)
+    return (
+        hashlib.sha256(model_objects.encode("utf-8")).hexdigest(),
+        _worker_artifact_identity_sha256(settings),
     )
 
 
@@ -108,32 +158,36 @@ def _worker_model_objects(settings: Settings) -> str:
         raise I2VEnvironmentError("I2V private model manifest digest changed")
     try:
         document = json.loads(raw)
-        objects = document["objects"]
+        by_role = validated_i2v_manifest_objects(
+            document,
+            reviewed_loras_enabled=settings.i2v_lora_worker_enabled,
+        )
     except (KeyError, TypeError, ValueError):
         raise I2VEnvironmentError("I2V private model manifest is invalid") from None
-    if not isinstance(objects, list):
-        raise I2VEnvironmentError("I2V private model manifest is invalid")
-    by_role: dict[str, dict[str, Any]] = {}
-    for value in objects:
-        if not isinstance(value, dict) or not isinstance(value.get("role"), str):
-            raise I2VEnvironmentError("I2V private model manifest is invalid")
-        role = value["role"]
-        if role in by_role:
-            raise I2VEnvironmentError("I2V private model manifest duplicates a role")
-        by_role[role] = value
-    if any(role not in by_role for role in _REQUIRED_ROLES):
-        raise I2VEnvironmentError("I2V private model manifest is incomplete")
-    install_directories = {
+    required_roles = required_i2v_model_roles(
+        reviewed_loras_enabled=settings.i2v_lora_worker_enabled
+    )
+    # Raw private manifests may retain obsolete roles during a coordinated
+    # migration. Only selected required roles cross the worker boundary.
+    install_directories: dict[str, str] = {
         "diffusion_model_high": "models/diffusion_models",
         "diffusion_model_low": "models/diffusion_models",
         "text_encoder": "models/text_encoders",
         "vae": "models/vae/Wan",
+        **{role: "models/loras" for role in REQUIRED_LORA_ROLES},
     }
     bucket = bucket_value.get_secret_value()
     result: list[dict[str, object]] = []
-    for role in _REQUIRED_ROLES:
+    for role in required_roles:
         value = by_role[role]
         try:
+            expected_lora = LORA_ARTIFACTS_BY_ROLE.get(role)
+            if expected_lora is not None and (
+                _text(value, "target_filename") != expected_lora.filename
+                or _positive_int(value, "bytes") != expected_lora.byte_size
+                or _text(value, "sha256") != expected_lora.sha256
+            ):
+                raise ValueError
             result.append(
                 {
                     "role": role,

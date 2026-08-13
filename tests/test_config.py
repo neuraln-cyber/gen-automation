@@ -1,4 +1,5 @@
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from gen_automation.config import Environment, SaladContainerPriority, Settings,
 from gen_automation.domain.deliverability import PATREON_MAX_ARCHIVE_BYTES
 from gen_automation.domain.enums import SemanticEnforcementMode
 from gen_automation.domain.signing import derive_public_key, encode_base64url
+from gen_automation.i2v_worker.lora_catalog import LORA_ARTIFACTS_BY_ROLE
 
 WORKER_SIGNING_PRIVATE_KEY = encode_base64url(bytes(range(1, 33)))
 WORKER_VERIFICATION_PUBLIC_KEY = derive_public_key(WORKER_SIGNING_PRIVATE_KEY)
@@ -30,6 +32,22 @@ def test_salad_reconciliation_timeout_default_covers_eight_pages_and_cancel() ->
 
 def test_hires_i2v_profile_defaults_closed_until_matching_worker_rollout() -> None:
     assert Settings().i2v_hires_profile_enabled is False
+    assert Settings().i2v_lora_worker_enabled is False
+    assert Settings().i2v_lora_profile_enabled is False
+
+    with pytest.raises(ValidationError, match="I2V LoRA profile requires I2V"):
+        Settings(i2v_lora_profile_enabled=True)
+    with pytest.raises(
+        ValidationError,
+        match="I2V LoRA profile requires the matching high-resolution profile",
+    ):
+        Settings(i2v_enabled=True, i2v_lora_profile_enabled=True)
+    with pytest.raises(ValidationError, match="I2V LoRA profile requires a LoRA-capable worker"):
+        Settings(
+            i2v_enabled=True,
+            i2v_hires_profile_enabled=True,
+            i2v_lora_profile_enabled=True,
+        )
 
 
 def test_production_configuration_fails_closed() -> None:
@@ -616,8 +634,22 @@ def test_i2v_defaults_to_one_exact_5090_without_small_queue_or_runtime_caps() ->
 
 
 def test_i2v_accepts_complete_digest_pinned_configuration() -> None:
-    manifest = '{"objects":[]}'
-    settings = Settings(
+    manifest = json.dumps(
+        {
+            "schema": "gen-automation/i2v-private-model-mirror/v1",
+            "objects": [
+                {"role": role}
+                for role in (
+                    "diffusion_model_high",
+                    "diffusion_model_low",
+                    "text_encoder",
+                    "vae",
+                )
+            ],
+        },
+        sort_keys=True,
+    )
+    values = dict(
         environment=Environment.TEST,
         background_runtime_enabled=True,
         storage_enabled=True,
@@ -638,10 +670,67 @@ def test_i2v_accepts_complete_digest_pinned_configuration() -> None:
         i2v_model_manifest_json=manifest,
         i2v_model_manifest_sha256=hashlib.sha256(manifest.encode()).hexdigest(),
     )
+    settings = Settings(**values)
 
     assert settings.i2v_enabled
     assert settings.i2v_salad_priority == SaladContainerPriority.HIGH
     assert settings.i2v_object_grant_ttl_seconds == 7 * 24 * 60 * 60
+
+    with pytest.raises(
+        ValidationError,
+        match="worker capability requires an immutable source revision",
+    ):
+        Settings(**values, i2v_lora_worker_enabled=True)
+
+    capable_manifest = json.dumps(
+        {
+            "schema": "gen-automation/i2v-private-model-mirror/v1",
+            "objects": [
+                *json.loads(manifest)["objects"],
+                *[
+                    {
+                        "role": role,
+                        "target_filename": artifact.filename,
+                        "bytes": artifact.byte_size,
+                        "sha256": artifact.sha256,
+                    }
+                    for role, artifact in LORA_ARTIFACTS_BY_ROLE.items()
+                ],
+            ],
+        },
+        sort_keys=True,
+    )
+    capable = Settings(
+        **{
+            **values,
+            "i2v_lora_worker_enabled": True,
+            "i2v_worker_source_revision": "c" * 40,
+            "i2v_private_manifest_source_sha256": "d" * 64,
+            "i2v_model_manifest_json": capable_manifest,
+            "i2v_model_manifest_sha256": hashlib.sha256(capable_manifest.encode()).hexdigest(),
+        }
+    )
+    assert capable.i2v_lora_worker_enabled is True
+
+    legacy_manifest = json.dumps(
+        {
+            "schema": "gen-automation/i2v-private-model-mirror/v1",
+            "objects": [
+                *json.loads(manifest)["objects"],
+                {"role": "lora_high"},
+                {"role": "lora_low"},
+            ],
+        },
+        sort_keys=True,
+    )
+    legacy = Settings(
+        **{
+            **values,
+            "i2v_model_manifest_json": legacy_manifest,
+            "i2v_model_manifest_sha256": hashlib.sha256(legacy_manifest.encode()).hexdigest(),
+        }
+    )
+    assert legacy.i2v_lora_worker_enabled is False
 
 
 @pytest.mark.parametrize("priority", tuple(SaladContainerPriority))

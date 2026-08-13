@@ -21,8 +21,10 @@ from gen_automation.domain.runtime_bindings import (
     WORKER_ARTIFACT_SECRET_ACCESS_KEY_BINDING,
     WORKER_ARTIFACT_SESSION_TOKEN_BINDING,
 )
+from gen_automation.i2v_worker.lora_catalog import LORA_ARTIFACTS_BY_ROLE
 from gen_automation.services.i2v_environment import (
     I2VRuntimeEnvironment,
+    _worker_artifact_identity_sha256,
     _worker_model_objects,
     i2v_runtime_config_from_settings,
 )
@@ -39,8 +41,6 @@ def _manifest() -> str:
         "diffusion_model_low",
         "text_encoder",
         "vae",
-        "lora_high",
-        "lora_low",
     )
     for index, role in enumerate(roles, start=1):
         sha256 = f"{index:064x}"
@@ -55,17 +55,38 @@ def _manifest() -> str:
                 "version_id": f"version-{index}",
             }
         )
+    for role, artifact in LORA_ARTIFACTS_BY_ROLE.items():
+        objects.append(
+            {
+                "bytes": artifact.byte_size,
+                "key": f"worker/i2v/sha256/{artifact.sha256}",
+                "name": role,
+                "role": role,
+                "sha256": artifact.sha256,
+                "target_filename": artifact.filename,
+                "version_id": f"version-{role}",
+            }
+        )
     return json.dumps(
         {"schema": "gen-automation/i2v-private-model-mirror/v1", "objects": objects},
         sort_keys=True,
     )
 
 
-def _settings() -> Settings:
-    manifest = _manifest()
+def _settings(
+    *,
+    lora_profile_enabled: bool = True,
+    lora_worker_enabled: bool = True,
+    manifest: str | None = None,
+) -> Settings:
+    manifest = manifest or _manifest()
     return Settings.model_construct(
         i2v_enabled=True,
+        i2v_lora_profile_enabled=lora_profile_enabled,
+        i2v_lora_worker_enabled=lora_worker_enabled,
         i2v_worker_image="ghcr.io/example/i2v@sha256:" + "a" * 64,
+        i2v_worker_source_revision="b" * 40,
+        i2v_private_manifest_source_sha256="c" * 64,
         i2v_salad_gpu_class_id=UUID("11111111-1111-4111-8111-111111111111"),
         i2v_salad_gpu_class_name="RTX 5090 (32 GB)",
         i2v_salad_queue_name="i2v-jobs-v1",
@@ -153,17 +174,40 @@ def _attempt(job: I2VJobSnapshot) -> I2VAttemptSnapshot:
     )
 
 
-def test_runtime_model_manifest_installs_only_the_four_baseline_objects() -> None:
+def test_runtime_model_manifest_installs_baseline_and_all_reviewed_lora_objects() -> None:
     objects = json.loads(_worker_model_objects(_settings()))
 
-    assert [item["role"] for item in objects] == [
+    assert [item["role"] for item in objects[:4]] == [
         "diffusion_model_high",
         "diffusion_model_low",
         "text_encoder",
         "vae",
     ]
+    assert [item["role"] for item in objects[4:]] == list(LORA_ARTIFACTS_BY_ROLE)
     assert all(item["bucket"] == "private-models" for item in objects)
     assert all(item["install_path"].endswith(".safetensors") for item in objects)
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"objects": []},
+        {"schema": "wrong", "objects": []},
+        {
+            "schema": "gen-automation/i2v-private-model-mirror/v1",
+            "objects": [],
+            "unexpected": True,
+        },
+    ],
+)
+def test_private_manifest_rejects_missing_wrong_or_extra_schema(
+    document: dict[str, object],
+) -> None:
+    raw = json.dumps(document, sort_keys=True)
+    settings = _settings(lora_worker_enabled=False, manifest=raw)
+
+    with pytest.raises(Exception, match="manifest is invalid"):
+        _worker_model_objects(settings)
 
 
 @pytest.mark.asyncio
@@ -173,9 +217,75 @@ async def test_runtime_environment_contains_only_required_bootstrap_values() -> 
     environment = await provider.resolve()
 
     assert environment["GEN_I2V_WORKER_ENVIRONMENT"] == "production"
+    assert environment["GEN_I2V_WORKER_LORA_WORKER_ENABLED"] == "true"
+    assert environment["GEN_I2V_WORKER_SOURCE_REVISION"] == "b" * 40
+    assert environment["GEN_I2V_WORKER_PRIVATE_MANIFEST_SOURCE_SHA256"] == "c" * 64
     assert environment["AWS_SESSION_TOKEN"].startswith("temporary-")
-    assert len(json.loads(environment["GEN_I2V_WORKER_MODEL_OBJECTS_JSON"])) == 4
+    assert len(json.loads(environment["GEN_I2V_WORKER_MODEL_OBJECTS_JSON"])) == 14
     assert "CIVITAI" not in " ".join(environment)
+
+
+@pytest.mark.asyncio
+async def test_routine_deploy_keeps_legacy_four_role_worker_environment_healthy() -> None:
+    full = json.loads(_manifest())
+    legacy_manifest = json.dumps(
+        {**full, "objects": full["objects"][:4]},
+        sort_keys=True,
+    )
+    settings = _settings(
+        lora_profile_enabled=False,
+        lora_worker_enabled=False,
+        manifest=legacy_manifest,
+    )
+    provider = I2VRuntimeEnvironment(settings=settings, resolver=_Resolver())  # type: ignore[arg-type]
+
+    environment = await provider.resolve()
+
+    objects = json.loads(environment["GEN_I2V_WORKER_MODEL_OBJECTS_JSON"])
+    assert environment["GEN_I2V_WORKER_LORA_WORKER_ENABLED"] == "false"
+    assert [item["role"] for item in objects] == [
+        "diffusion_model_high",
+        "diffusion_model_low",
+        "text_encoder",
+        "vae",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_routine_deploy_ignores_live_legacy_lora_roles_when_worker_is_off() -> None:
+    full = json.loads(_manifest())
+    legacy_objects = list(full["objects"][:4])
+    for index, role in enumerate(("lora_high", "lora_low"), start=20):
+        digest = f"{index:064x}"
+        legacy_objects.append(
+            {
+                "bytes": index,
+                "key": f"worker/i2v/sha256/{digest}",
+                "name": role,
+                "role": role,
+                "sha256": digest,
+                "target_filename": f"legacy-{role}.safetensors",
+                "version_id": f"legacy-version-{index}",
+            }
+        )
+    live_manifest = json.dumps(
+        {**full, "objects": legacy_objects},
+        sort_keys=True,
+    )
+    settings = _settings(
+        lora_profile_enabled=False,
+        lora_worker_enabled=False,
+        manifest=live_manifest,
+    )
+
+    objects = json.loads(_worker_model_objects(settings))
+
+    assert [item["role"] for item in objects] == [
+        "diffusion_model_high",
+        "diffusion_model_low",
+        "text_encoder",
+        "vae",
+    ]
 
 
 def test_runtime_config_keeps_ten_hour_warm_session_and_exact_5090() -> None:
@@ -185,6 +295,18 @@ def test_runtime_config_keeps_ten_hour_warm_session_and_exact_5090() -> None:
     assert config.salad.gpu_class_name == "RTX 5090 (32 GB)"
     assert config.salad.storage_bytes == 268_435_456_000
     assert config.salad.max_replicas == 1
+    assert config.salad.readiness_probe_path == (
+        f"/ready/capability/{'c' * 64}/{_worker_artifact_identity_sha256(_settings())}/{'b' * 40}"
+    )
+    assert config.reviewed_loras_enabled is True
+
+
+def test_public_lora_gate_does_not_control_worker_capability() -> None:
+    config = i2v_runtime_config_from_settings(
+        _settings(lora_profile_enabled=False, lora_worker_enabled=True)
+    )
+
+    assert config.reviewed_loras_enabled is True
 
 
 @pytest.mark.asyncio

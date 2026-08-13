@@ -90,10 +90,21 @@
   "optional_paired_loras": [
     {
       "enabled_by_default": false,
-      "graph_injection": "deferred",
+      "creator_name": "CubeyAI",
+      "canonical_source_url": "https://civitai.com/models/1307155",
+      "graph_injection": "core LoraLoaderModelOnly on each stage before ModelSamplingSD3",
       "id": "wan-general-nsfw-v0.08a",
       "notes": "The author labels this pair experimental, unfinished, underbaked, and seed-sensitive. The base canary must pass before a separately reviewed graph injects it.",
       "recommended_initial_strength": 0.3,
+      "source_usage": {
+        "allow_commercial_use": [
+          "RentCivit"
+        ],
+        "allow_derivatives": true,
+        "allow_different_license": true,
+        "credit_required": false,
+        "recorded_at": "2026-08-13"
+      },
       "trigger_words": [
         "nsfwsks"
       ],
@@ -107,6 +118,7 @@
         "download_url": "https://civitai.com/api/download/models/2073605",
         "filename": "NSFW-22-H-e8.safetensors",
         "install_path": "models/loras/NSFW-22-H-e8.safetensors",
+        "role": "lora_wan_general_nsfw_high",
         "sha256": "34e2144d3cd65360f97d09ccbe03e1c39a096df6c9234af5fe3899d1b63cda39"
       },
       "low": {
@@ -119,7 +131,200 @@
         "download_url": "https://civitai.com/api/download/models/2083303",
         "filename": "NSFW-22-L-e8.safetensors",
         "install_path": "models/loras/NSFW-22-L-e8.safetensors",
+        "role": "lora_wan_general_nsfw_low",
         "sha256": "d6b783742f4d5fd63a0223ae1d5bf64fc995a6b408480ac2a00528ae0d4146db"
+      }
+    },
+    {
+      "enabled_by_default": false,
+      "creator_name": "ai_build_art",
+      "canonical_source_url": "https://civitai.com/models/1343431",
+      "graph_injection": "core LoraLoaderModelOnly on each stage before ModelSamplingSD3",
+      "id": "bouncing-boobs-wan22",
+      "notes": "The linked WAN 2.2 I2V-A14B version is the high-stage half; version 2191270 is the matching low-stage half. The author reference workflow uses 1.0 standalone; use 0.5-0.6 when stacking.",
+      "recommended_initial_strength": 1.0,
+      "source_usage": {
+        "allow_commercial_use": [
+          "Image",
+          "RentCivit"
+        ],
+        "allow_derivatives": false,
+        "allow_different_license": false,
+        "credit_required": true,
+        "recorded_at": "2026-08-13"
+      },
+      "trigger_words": [
+        "her breasts are bouncing"
+      ],
+      "high": {
+        "bytes": 306847512,
+        "civitai": {
+          "file_id": 2084187,
+          "model_id": 1343431,
+          "version_id": 2191217
+        },
+        "download_url": "https://civitai.com/api/download/models/2191217",
+        "filename": "BounceHighWan2_2.safetensors",
+        "install_path": "models/loras/BounceHighWan2_2.safetensors",
+        "role": "lora_bouncing_boobs_high",
+        "sha256": "a4f4398031e9f39571310355f23e2d104c21143f517cf053e06d21f1c48d3d52"
+      },
+      "low": {
+        "bytes": 306847504,
+        "civitai": {
+          "file_id": 2084219,
+          "model_id": 1343431,
+          "version_id": 2191270
+        },
+        "download_url": "https://civitai.com/api/download/models/2191270",
+        "filename": "BounceLowWan2_2.safetensors",
+        "install_path": "models/loras/BounceLowWan2_2.safetensors",
+        "role": "lora_bouncing_boobs_low",
+        "sha256": "3ba8320137ba7d99885624dc512d8e0ea02f24364eabbe31e803fec785339ecb"
+      }
+    },
+    {
+      "enabled_by_default": false,
+      "creator_name": "K3NK",
+      "canonical_source_url": "https://civitai.com/models/1852647",
+      "graph_injection": "core LoraLoaderModelOnly on each stage before ModelSamplingSD3",
+      "id": "m4crom4sti4-natural-breasts-k3nk",
+      "notes": "The linked version is the high-noise WAN 2.2 I2V-A14B half; version 2266727 is the matching low-noise I2V half. The author publishes no numeric strength. Its strong breast-size/anatomy bias may alter anatomy, face, hands, or pubic detail, so 0.5 is the conservative implementation default; A/B 0.7 then 1.0.",
+      "recommended_initial_strength": 0.5,
+      "source_usage": {
+        "allow_commercial_use": [],
+        "allow_derivatives": false,
+        "allow_different_license": true,
+        "credit_required": true,
+        "recorded_at": "2026-08-13"
+      },
+      "trigger_words": [
+        "m4crom4sti4"
+      ],
+      "high": {
+        "bytes": 306807976,
+        "civitai": {
+          "file_id": 2157676,
+          "model_id": 1852647,
+          "version_id": 2265575
+        },
+        "download_url": "https://civitai.com/api/download/models/2265575",
+        "filename": "wan22-m4crom4sti4-i2v-20epoc-high-k3nk.safetensors",
+        "install_path": "models/loras/wan22-m4crom4sti4-i2v-20epoc-high-k3nk.safetensors",
+        "role": "lora_m4crom4sti4_high",
+        "sha256": "851c928737235b4a4a2c5993c893c79ee46a3131aa9b16eb56de1dcc576c3ad9"
+      },
+      "low": {
+        "bytes": 306807976,
+        "civitai": {
+          "file_id": 2158834,
+          "model_id": 1852647,
+          "version_id": 2266727
+        },
+        "download_url": "https://civitai.com/api/download/models/2266727",
+        "filename": "wan22-m4crom4sti4-i2v-20epoc-low-k3nk.safetensors",
+        "install_path": "models/loras/wan22-m4crom4sti4-i2v-20epoc-low-k3nk.safetensors",
+        "role": "lora_m4crom4sti4_low",
+        "sha256": "c8a940ad5ab59a15c7f39624f694482a020f0dd047cec56f498b58418d3d937c"
+      }
+    },
+    {
+      "automatic_trigger_words": [],
+      "creator_name": "c0ur4ge",
+      "canonical_source_url": "https://civitai.com/models/1811313",
+      "enabled_by_default": false,
+      "graph_injection": "core LoraLoaderModelOnly on each stage before ModelSamplingSD3",
+      "id": "dr34ml4y-aio-nsfw-wan22-v2",
+      "notes": "The five trained words are mutually alternative scene concepts. The worker does not auto-append them; the operator selects the concept that matches the requested motion. The author publishes no numeric WAN v2 strength; 0.7 is a conservative standalone implementation A/B default, reduced to 0.5 when stacking.",
+      "recommended_initial_strength": 0.7,
+      "source_usage": {
+        "allow_commercial_use": [
+          "RentCivit"
+        ],
+        "allow_derivatives": false,
+        "allow_different_license": false,
+        "credit_required": false,
+        "recorded_at": "2026-08-13"
+      },
+      "trigger_words": [
+        "m15510n4ry",
+        "bl0wj0b",
+        "c0wg1rl",
+        "d0gg1e",
+        "d0ubl3_bj"
+      ],
+      "high": {
+        "bytes": 306807976,
+        "civitai": {
+          "file_id": 2441563,
+          "model_id": 1811313,
+          "version_id": 2553151
+        },
+        "download_url": "https://civitai.com/api/download/models/2553151",
+        "filename": "DR34ML4Y_I2V_14B_HIGH_V2.safetensors",
+        "install_path": "models/loras/DR34ML4Y_I2V_14B_HIGH_V2.safetensors",
+        "role": "lora_dr34ml4y_high",
+        "sha256": "d9931756c202bd8d4946c0d163c1269231a6352b51bb4235f6a19894c9ad8c68"
+      },
+      "low": {
+        "bytes": 306807976,
+        "civitai": {
+          "file_id": 2441662,
+          "model_id": 1811313,
+          "version_id": 2553271
+        },
+        "download_url": "https://civitai.com/api/download/models/2553271",
+        "filename": "DR34ML4Y_I2V_14B_LOW_V2.safetensors",
+        "install_path": "models/loras/DR34ML4Y_I2V_14B_LOW_V2.safetensors",
+        "role": "lora_dr34ml4y_low",
+        "sha256": "066ee4bfafb685c85f08174c8283cd11bc6d36f4845347f20d633ab44581601f"
+      }
+    },
+    {
+      "automatic_trigger_words": [],
+      "creator_name": "DigitalPastel",
+      "canonical_source_url": "https://civitai.com/models/2040641",
+      "enabled_by_default": false,
+      "graph_injection": "core LoraLoaderModelOnly on each stage before ModelSamplingSD3",
+      "id": "smoothmix-xxx-animations-wan22",
+      "notes": "The official versions declare no trained words. The author showcases the matched animation pair at 1.0 and recommends combining it with a scene-specific LoRA for complex poses.",
+      "recommended_initial_strength": 1.0,
+      "source_usage": {
+        "allow_commercial_use": [
+          "RentCivit",
+          "Image"
+        ],
+        "allow_derivatives": false,
+        "allow_different_license": true,
+        "credit_required": true,
+        "recorded_at": "2026-08-13"
+      },
+      "trigger_words": [],
+      "high": {
+        "bytes": 306807280,
+        "civitai": {
+          "file_id": 2266910,
+          "model_id": 2040641,
+          "version_id": 2376136
+        },
+        "download_url": "https://civitai.com/api/download/models/2376136",
+        "filename": "SmoothXXXAnimation_High.safetensors",
+        "install_path": "models/loras/SmoothXXXAnimation_High.safetensors",
+        "role": "lora_smoothmix_animations_high",
+        "sha256": "eac4f4341008abb00434d08fed1d4fda4a144bc94cd26b4819f629f930a75181"
+      },
+      "low": {
+        "bytes": 306807280,
+        "civitai": {
+          "file_id": 2266915,
+          "model_id": 2040641,
+          "version_id": 2376143
+        },
+        "download_url": "https://civitai.com/api/download/models/2376143",
+        "filename": "SmoothXXXAnimation_Low.safetensors",
+        "install_path": "models/loras/SmoothXXXAnimation_Low.safetensors",
+        "role": "lora_smoothmix_animations_low",
+        "sha256": "ad50dfc46c765a6ccc36d40e8a5f77ac2db041f68266593add12ac5f5eac2d76"
       }
     }
   ],

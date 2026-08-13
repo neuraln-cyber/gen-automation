@@ -26,7 +26,9 @@ def test_i2v_dashboard_exposes_focused_generation_controls(client: TestClient) -
     assert 'role="status" aria-live="polite" data-asset-id-status' in response.text
     assert "Positive prompt" in response.text
     assert "Negative prompt" in response.text
-    assert "Paired motion LoRAs" in response.text
+    assert "Reviewed motion LoRAs" in response.text
+    assert 'data-lora-profile-enabled="false"' in response.text
+    assert "data-lora-effective" in response.text
     assert "Worker state has not been loaded yet" in response.text
     assert "Recent videos" in response.text
     assert 'name="width" value="768"' in response.text
@@ -99,6 +101,46 @@ def test_i2v_dashboard_default_submit_controls_are_constraint_valid(
     assert "presetName.disabled = false" in script
     assert "presetName.disabled = true" in script
     assert 'presetDialog.addEventListener("close"' in script
+
+
+def test_i2v_dashboard_uses_only_the_backend_reviewed_lora_catalog() -> None:
+    root = Path(__file__).parents[1]
+    template = (root / "src/gen_automation/templates/dashboard/i2v.html").read_text(
+        encoding="utf-8"
+    )
+    script = (root / "src/gen_automation/static/i2v.js").read_text(encoding="utf-8")
+
+    assert 'api("/loras")' in script
+    assert "entry.catalog_id" in script
+    assert "entry.recommended_initial_strength" in script
+    assert "entry.trigger_words" in script
+    assert "entry.creator_name" in script
+    assert "entry.canonical_source_url" in script
+    assert "entry.canonical_version_urls" in script
+    assert "catalog_id: catalogId" in script
+    assert "lora_high" not in script
+    assert "lora_low" not in script
+    assert ".safetensors" not in template
+    assert "Your written prompt stays unchanged" in template
+    assert "Where an automatic trigger exists" in template
+    assert "selectedManualPromptConflicts" in script
+    assert "choose exactly one" in script
+    assert "catalogâ" not in template
+
+
+def test_i2v_dashboard_fails_closed_without_silently_dropping_saved_loras() -> None:
+    script = (Path(__file__).parents[1] / "src/gen_automation/static/i2v.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "loraCatalogLoaded: false" in script
+    assert "loraCatalogError: false" in script
+    assert "if (loraWriteBlocked()) throw new Error(loraBlockMessage())" in script
+    assert "settings.loras = [...state.loraSelections]" in script
+    assert "state.loraCatalogError = true" in script
+    assert "No settings will be silently removed" in script
+    assert "Saved reviewed LoRA settings cannot be reused on the current profile" in script
+    assert "Clear them before queueing or saving" in script
 
 
 def test_i2v_dashboard_can_register_an_older_generation_by_exact_asset_id() -> None:

@@ -22,6 +22,7 @@ from gen_automation.integrations.salad import (
 
 API_KEY = "salad-test-token"
 GHCR_PAT = "ghp_request_scoped_registry_secret"
+WORKER_SESSION_VALUE = "temporary-worker-session-value"
 JOB_ID = UUID("50150edd-e182-47b5-a754-2d2a04d6ee31")
 GPU_ID = UUID("3c90c3cc-0d44-4b50-8888-8dd25736052a")
 LIVE_GPU_ID = UUID("a5db5c50-cbcb-4596-ae80-6a0c8090d80f")
@@ -460,6 +461,37 @@ async def test_private_registry_password_is_redacted_from_provider_errors() -> N
 
     assert GHCR_PAT not in str(captured.value)
     assert GHCR_PAT not in captured.value.response_body
+    assert "[redacted]" in captured.value.response_body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["create", "update"])
+async def test_container_environment_is_redacted_from_provider_errors(operation: str) -> None:
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        body: object = json.loads(request.content)
+        assert isinstance(body, dict)
+        assert body["container"]["environment_variables"]["AWS_SESSION_TOKEN"] == (
+            WORKER_SESSION_VALUE
+        )
+        return httpx2.Response(
+            400,
+            json={"title": "Bad Request", "detail": f"rejected: {WORKER_SESSION_VALUE}"},
+        )
+
+    configuration: JSONObject = {
+        "name": "worker-v1",
+        "replicas": 0,
+        "container": {"environment_variables": {"AWS_SESSION_TOKEN": WORKER_SESSION_VALUE}},
+    }
+    async with mocked_salad_client(handler) as client:
+        with pytest.raises(SaladAPIError) as captured:
+            if operation == "create":
+                await client.create_container_group(configuration)
+            else:
+                await client.update_container_group("worker-v1", configuration)
+
+    assert WORKER_SESSION_VALUE not in str(captured.value)
+    assert WORKER_SESSION_VALUE not in captured.value.response_body
     assert "[redacted]" in captured.value.response_body
 
 

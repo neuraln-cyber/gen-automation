@@ -71,6 +71,7 @@ class I2VSaladConfig:
     max_replicas: int = 1
     worker_port: int = 8000
     worker_path: str = "/jobs/i2v"
+    readiness_probe_path: str = "/ready"
     runtime_bindings: Mapping[str, str] = field(default_factory=dict)
     environment_variables: Mapping[str, str] = field(default_factory=dict)
 
@@ -112,10 +113,16 @@ class I2VSaladConfig:
             raise I2VSaladConfigurationError("I2V warm idle seconds must be nonnegative or null")
         if self.priority not in {"low", "medium", "high", "batch"}:
             raise I2VSaladConfigurationError("I2V Salad priority is invalid")
-        if not self.worker_path.startswith("/") or any(
-            character.isspace() for character in self.worker_path
+        for label, path in (
+            ("worker", self.worker_path),
+            ("readiness probe", self.readiness_probe_path),
         ):
-            raise I2VSaladConfigurationError("I2V worker path is invalid")
+            if (
+                not path.startswith("/")
+                or len(path) > 512
+                or any(character.isspace() for character in path)
+            ):
+                raise I2VSaladConfigurationError(f"I2V {label} path is invalid")
         for collection_name, collection in (
             ("runtime binding", self.runtime_bindings),
             ("environment variable", self.environment_variables),
@@ -151,7 +158,12 @@ class I2VSaladConfig:
             "replicas": 0,
             "restart_policy": "on_failure",
             "startup_probe": _http_probe(path="/health", period=5, timeout=5, failure_threshold=20),
-            "readiness_probe": _http_probe(path="/ready", period=5, timeout=3, failure_threshold=3),
+            "readiness_probe": _http_probe(
+                path=self.readiness_probe_path,
+                period=5,
+                timeout=3,
+                failure_threshold=3,
+            ),
             "liveness_probe": _http_probe(
                 path="/health", period=30, timeout=5, failure_threshold=3
             ),
@@ -524,6 +536,17 @@ def _group_contract_repair_patch(
     desired_autoscaler = config.queue_autoscaler_configuration()
     if not _matches_exact_autoscaler(autoscaler, desired_autoscaler):
         patch["queue_autoscaler"] = desired_autoscaler
+    readiness_probe = group.raw.get("readiness_probe")
+    desired_readiness_probe = _http_probe(
+        path=config.readiness_probe_path,
+        period=5,
+        timeout=3,
+        failure_threshold=3,
+    )
+    if readiness_probe is not None and readiness_probe != desired_readiness_probe:
+        patch["readiness_probe"] = desired_readiness_probe
+    elif readiness_probe is None and config.readiness_probe_path != "/ready":
+        patch["readiness_probe"] = desired_readiness_probe
     return patch
 
 

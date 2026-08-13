@@ -268,6 +268,7 @@ def _runtime(
     warm_idle_seconds: int | None = 1800,
     prefetch: int = 3,
     worker_id: str = I2V_SINGLETON_WORKER_ID,
+    reviewed_loras_enabled: bool = False,
 ) -> I2VRuntime:
     return I2VRuntime(
         config=I2VRuntimeConfig(
@@ -279,7 +280,8 @@ def _runtime(
                 prefetch=prefetch,
                 worker_lease_seconds=86_400,
                 warm_idle_seconds=warm_idle_seconds,
-            )
+            ),
+            reviewed_loras_enabled=reviewed_loras_enabled,
         ),
         sessions=database.sessions,
         salad_client=client,
@@ -294,6 +296,7 @@ async def _queue_job(
     owner_id: UUID,
     input_id: UUID,
     index: int = 0,
+    settings: dict[str, object] | None = None,
 ) -> UUID:
     async with database.sessions() as session:
         job = await create_i2v_job(
@@ -302,7 +305,7 @@ async def _queue_job(
             draft=I2VJobDraft(
                 input_id=input_id,
                 positive_prompt=f"smooth motion {index}",
-                settings={"seed": index},
+                settings=settings or {"seed": index},
             ),
             now=_NOW + timedelta(seconds=index),
         )
@@ -322,6 +325,38 @@ async def _durable_job(database: Database, job_id: UUID) -> tuple[I2VJob, I2VAtt
         if attempt is not None:
             session.expunge(attempt)
         return job, attempt
+
+
+async def test_worker_capability_gates_reviewed_dispatch_without_provider_post(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, input_id = runtime_database
+    lora_settings = {"loras": [{"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.3}]}
+    job_id = await _queue_job(
+        database,
+        owner_id=owner_id,
+        input_id=input_id,
+        settings=lora_settings,
+    )
+    client = FakeRuntimeSalad()
+    paused = _runtime(database, client, reviewed_loras_enabled=False)
+
+    assert (await paused.run_cycle(now=_NOW)).action == "deployment_observed"
+    assert (await paused.run_cycle(now=_NOW + timedelta(seconds=1))).action == "idle"
+    job, attempt = await _durable_job(database, job_id)
+    assert job.state == I2VJobState.QUEUED
+    assert job.attempt_count == 0 and attempt is None
+    assert client.submission_calls == 0
+
+    capable = _runtime(database, client, reviewed_loras_enabled=True)
+    assert (
+        await capable.run_cycle(now=_NOW + timedelta(seconds=2))
+    ).action == "deployment_observed"
+    assert (await capable.run_cycle(now=_NOW + timedelta(seconds=3))).action == "job_claimed"
+    assert (
+        await capable.run_cycle(now=_NOW + timedelta(seconds=4))
+    ).action == "provider_job_submitted"
+    assert client.submission_calls == 1
 
 
 async def test_pending_pull_never_starts_inference_and_success_completes(
@@ -683,6 +718,39 @@ async def test_restart_with_unbound_absent_provider_waits_then_recovers_without_
     recovered_job, recovered_attempt = await _durable_job(database, job_id)
     assert recovered_job.state == I2VJobState.QUEUED
     assert recovered_job.attempt_count == 1
+    assert recovered_attempt is not None and recovered_attempt.state == I2VAttemptState.FAILED
+    assert client.submission_calls == 0
+
+
+async def test_expired_blank_metadata_reviewed_claim_recovers_without_post(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, input_id = runtime_database
+    job_id = await _queue_job(
+        database,
+        owner_id=owner_id,
+        input_id=input_id,
+        settings={"loras": [{"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.3}]},
+    )
+    client = FakeRuntimeSalad()
+    capable = _runtime(database, client, reviewed_loras_enabled=True)
+    await capable.run_cycle(now=_NOW)
+    assert (await capable.run_cycle(now=_NOW + timedelta(seconds=1))).action == "job_claimed"
+    _job, attempt = await _durable_job(database, job_id)
+    assert attempt is not None
+    async with database.sessions() as session:
+        row = await session.get(I2VAttempt, attempt.id)
+        assert row is not None
+        row.request_metadata = {}
+        await session.commit()
+
+    paused = _runtime(database, client, reviewed_loras_enabled=False)
+    far_future = _NOW + timedelta(days=2)
+    actions = [(await paused.run_cycle(now=far_future)).action]
+    actions.append((await paused.run_cycle(now=far_future)).action)
+    assert "expired_claims_recovered" in actions
+    recovered, recovered_attempt = await _durable_job(database, job_id)
+    assert recovered.state == I2VJobState.QUEUED
     assert recovered_attempt is not None and recovered_attempt.state == I2VAttemptState.FAILED
     assert client.submission_calls == 0
 

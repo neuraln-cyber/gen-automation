@@ -334,14 +334,24 @@ def test_manifest_pins_exact_required_artifacts_and_no_extra_model_stack() -> No
     }
 
 
-def test_optional_lora_is_matched_recorded_and_absent_from_base_graph() -> None:
+def test_reviewed_paired_loras_are_exact_and_absent_from_disabled_base_graph() -> None:
     manifest = _load(MANIFEST_PATH)
     workflow = _load(WORKFLOW_PATH)
-    assert len(manifest["optional_paired_loras"]) == 1
-    pair = manifest["optional_paired_loras"][0]
+    assert len(manifest["optional_paired_loras"]) == 5
+    pairs = {entry["id"]: entry for entry in manifest["optional_paired_loras"]}
+    assert set(pairs) == {
+        "wan-general-nsfw-v0.08a",
+        "bouncing-boobs-wan22",
+        "m4crom4sti4-natural-breasts-k3nk",
+        "dr34ml4y-aio-nsfw-wan22-v2",
+        "smoothmix-xxx-animations-wan22",
+    }
+    pair = pairs["wan-general-nsfw-v0.08a"]
     assert pair["id"] == "wan-general-nsfw-v0.08a"
     assert pair["enabled_by_default"] is False
-    assert pair["graph_injection"] == "deferred"
+    assert pair["graph_injection"] == (
+        "core LoraLoaderModelOnly on each stage before ModelSamplingSD3"
+    )
     assert pair["recommended_initial_strength"] == 0.3
     assert pair["trigger_words"] == ["nsfwsks"]
     assert pair["high"]["civitai"]["version_id"] == 2073605
@@ -353,6 +363,41 @@ def test_optional_lora_is_matched_recorded_and_absent_from_base_graph() -> None:
     assert pair["low"]["sha256"] == (
         "d6b783742f4d5fd63a0223ae1d5bf64fc995a6b408480ac2a00528ae0d4146db"
     )
+    bounce = pairs["bouncing-boobs-wan22"]
+    assert bounce["trigger_words"] == ["her breasts are bouncing"]
+    assert bounce["high"]["civitai"]["version_id"] == 2191217
+    assert bounce["low"]["civitai"]["version_id"] == 2191270
+    assert bounce["high"]["sha256"] == (
+        "a4f4398031e9f39571310355f23e2d104c21143f517cf053e06d21f1c48d3d52"
+    )
+    assert bounce["low"]["sha256"] == (
+        "3ba8320137ba7d99885624dc512d8e0ea02f24364eabbe31e803fec785339ecb"
+    )
+    physics = pairs["m4crom4sti4-natural-breasts-k3nk"]
+    assert physics["trigger_words"] == ["m4crom4sti4"]
+    assert physics["high"]["civitai"]["version_id"] == 2265575
+    assert physics["low"]["civitai"]["version_id"] == 2266727
+    assert physics["high"]["sha256"] == (
+        "851c928737235b4a4a2c5993c893c79ee46a3131aa9b16eb56de1dcc576c3ad9"
+    )
+    assert physics["low"]["sha256"] == (
+        "c8a940ad5ab59a15c7f39624f694482a020f0dd047cec56f498b58418d3d937c"
+    )
+    dream = pairs["dr34ml4y-aio-nsfw-wan22-v2"]
+    assert dream["automatic_trigger_words"] == []
+    assert dream["trigger_words"] == [
+        "m15510n4ry",
+        "bl0wj0b",
+        "c0wg1rl",
+        "d0gg1e",
+        "d0ubl3_bj",
+    ]
+    assert dream["high"]["civitai"]["version_id"] == 2553151
+    assert dream["low"]["civitai"]["version_id"] == 2553271
+    smooth = pairs["smoothmix-xxx-animations-wan22"]
+    assert smooth["automatic_trigger_words"] == smooth["trigger_words"] == []
+    assert smooth["high"]["civitai"]["version_id"] == 2376136
+    assert smooth["low"]["civitai"]["version_id"] == 2376143
     assert all("Lora" not in node["class_type"] for node in workflow.values())
 
 

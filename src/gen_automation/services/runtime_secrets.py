@@ -136,7 +136,7 @@ class ConfiguredRuntimeSecretResolver:
 
 
 class AwsAssumeRoleRuntimeSecretResolver:
-    """Resolve worker artifact credentials from a fresh, three-hour STS lease."""
+    """Resolve worker artifact credentials from a fresh, twelve-hour STS lease."""
 
     __slots__ = (
         "_closed",

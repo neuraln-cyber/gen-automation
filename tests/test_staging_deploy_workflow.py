@@ -28,6 +28,14 @@ def _lora_configurator() -> str:
     return (DEPLOY / "configure-lora-manager.sh").read_text(encoding="utf-8")
 
 
+def _i2v_profile_configurator() -> str:
+    return (DEPLOY / "configure-i2v-lora-profile.sh").read_text(encoding="utf-8")
+
+
+def _i2v_worker_rollout() -> str:
+    return (DEPLOY / "rollout-i2v-lora-worker.sh").read_text(encoding="utf-8")
+
+
 def _migration_validator() -> str:
     return (DEPLOY / "validate-migration-environment.sh").read_text(encoding="utf-8")
 
@@ -58,6 +66,46 @@ def _lora_command_program() -> str:
         .split("  lora-manager:\n", maxsplit=1)[1]
         .split(
             "      - name: Run the pinned LoRA-manager operation through Systems Manager\n",
+            maxsplit=1,
+        )[1]
+    )
+    embedded = textwrap.dedent(
+        operation.split("python3 -c '", maxsplit=1)[1].split(
+            '\' >"$parameters_file"',
+            maxsplit=1,
+        )[0]
+    )
+    command = shlex.split(f"python3 -c '{embedded}'", posix=True)
+    assert command[:2] == ["python3", "-c"]
+    return command[2]
+
+
+def _i2v_profile_command_program() -> str:
+    operation = (
+        _workflow()
+        .split("  i2v-lora-profile:\n", maxsplit=1)[1]
+        .split(
+            "      - name: Run the pinned I2V LoRA profile operation through Systems Manager\n",
+            maxsplit=1,
+        )[1]
+    )
+    embedded = textwrap.dedent(
+        operation.split("python3 -c '", maxsplit=1)[1].split(
+            '\' >"$parameters_file"',
+            maxsplit=1,
+        )[0]
+    )
+    command = shlex.split(f"python3 -c '{embedded}'", posix=True)
+    assert command[:2] == ["python3", "-c"]
+    return command[2]
+
+
+def _i2v_worker_command_program() -> str:
+    operation = (
+        _workflow()
+        .split("  i2v-lora-worker:\n", maxsplit=1)[1]
+        .split(
+            "      - name: Run the checksum-pinned worker operation through Systems Manager\n",
             maxsplit=1,
         )[1]
     )
@@ -396,7 +444,7 @@ def test_ssm_command_contains_only_public_immutable_coordinates() -> None:
         assert prohibited not in command_block.upper()
 
 
-def test_routine_rollout_preserves_i2v_pin_without_explicit_coordination() -> None:
+def test_routine_rollout_always_preserves_i2v_pin_and_profile_state() -> None:
     workflow = _workflow()
     rollout = workflow.split(
         "      - name: Roll out through AWS Systems Manager\n",
@@ -410,7 +458,6 @@ def test_routine_rollout_preserves_i2v_pin_without_explicit_coordination() -> No
         "SSM_WORKER_IMAGE_REF": (
             "ghcr.io/neuraln-cyber/gen-automation/gpu-worker@sha256:" + "b" * 64
         ),
-        "SSM_COORDINATED_I2V_WORKER_IMAGE_REF": "",
         "SSM_SOURCE_REVISION": "c" * 40,
         "SSM_BOOTSTRAP_HELPER_SHA256": "d" * 64,
         "SSM_BOOTSTRAP_COMPOSE_SHA256": "e" * 64,
@@ -421,18 +468,7 @@ def test_routine_rollout_preserves_i2v_pin_without_explicit_coordination() -> No
     }
 
     assert 'SSM_I2V_WORKER_IMAGE_REF="$I2V_WORKER_IMAGE_REF"' not in rollout
-    assert (
-        "COORDINATED_I2V_ROLLOUT_SOURCE_REVISION: >-\n"
-        "        ${{ vars.STAGING_COORDINATED_I2V_ROLLOUT_SOURCE_REVISION }}"
-    ) in workflow
-    assert (
-        "COORDINATED_I2V_WORKER_IMAGE_REF: >-\n"
-        "        ${{ vars.STAGING_COORDINATED_I2V_WORKER_IMAGE_REF }}"
-    ) in workflow
-    assert 'SSM_COORDINATED_I2V_WORKER_IMAGE_REF="$coordinated_i2v_image"' in rollout
-    assert '[ "$coordinated_i2v_revision" = "$SOURCE_REVISION" ]' in rollout
-    assert '[ "$coordinated_i2v_image" = "$I2V_WORKER_IMAGE_REF" ]' in rollout
-    assert 'os.environ.get(\n    "SSM_COORDINATED_I2V_WORKER_IMAGE_REF"' in program
+    assert "COORDINATED_I2V" not in workflow
 
     routine = subprocess.run(  # noqa: S603 - executes the repository-owned fixture.
         [sys.executable, "-c", program],
@@ -445,38 +481,11 @@ def test_routine_rollout_preserves_i2v_pin_without_explicit_coordination() -> No
     assert "GEN_AUTOMATION_SALAD_WORKER_IMAGE" in routine_command
     assert "GEN_AUTOMATION_I2V_WORKER_IMAGE" not in routine_command
     assert "GEN_AUTOMATION_I2V_HIRES_PROFILE_ENABLED" not in routine_command
-
-    coordinated_image = "ghcr.io/neuraln-cyber/gen-automation/i2v-worker@sha256:" + "1" * 64
-    coordinated = subprocess.run(  # noqa: S603 - executes the repository-owned fixture.
-        [sys.executable, "-c", program],
-        check=True,
-        capture_output=True,
-        env={
-            **os.environ,
-            **environment,
-            "SSM_COORDINATED_I2V_WORKER_IMAGE_REF": coordinated_image,
-        },
-        text=True,
-    )
-    coordinated_command = json.loads(coordinated.stdout)["commands"][0]
-    assert "GEN_AUTOMATION_I2V_WORKER_IMAGE" in coordinated_command
-    assert coordinated_image in coordinated_command
-    assert "GEN_AUTOMATION_I2V_ENABLED" in coordinated_command
-    assert "GEN_AUTOMATION_I2V_HIRES_PROFILE_ENABLED" in coordinated_command
-
-    invalid = subprocess.run(  # noqa: S603 - executes the repository-owned fixture.
-        [sys.executable, "-c", program],
-        check=False,
-        capture_output=True,
-        env={
-            **os.environ,
-            **environment,
-            "SSM_COORDINATED_I2V_WORKER_IMAGE_REF": "mutable:latest",
-        },
-        text=True,
-    )
-    assert invalid.returncode != 0
-    assert "coordinated I2V worker image reference is invalid" in invalid.stderr
+    assert "GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED" not in routine_command
+    assert "GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED" not in routine_command
+    assert "GEN_AUTOMATION_I2V_MODEL_MANIFEST_JSON" not in routine_command
+    assert "GEN_AUTOMATION_I2V_MODEL_MANIFEST_SHA256" not in routine_command
+    assert "GEN_AUTOMATION_I2V_WORKER_SOURCE_REVISION" not in routine_command
 
 
 def test_post_migration_updater_failure_restores_files_but_never_restarts_old_code() -> None:
@@ -643,6 +652,473 @@ def test_lora_configurator_is_atomic_idempotent_and_requires_manifest_trust_anch
     assert disabled_without_credential.read_text(encoding="utf-8") == (
         "GEN_AUTOMATION_LORA_MANAGER_ENABLED=false\nGEN_AUTOMATION_CIVITAI_API_SECRET_REFERENCE=\n"
     )
+
+
+def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> None:
+    workflow = _workflow()
+    rollout = _i2v_worker_rollout()
+    worker_job = workflow.split("  i2v-lora-worker:\n", maxsplit=1)[1].split(
+        "\n  i2v-lora-profile:\n", maxsplit=1
+    )[0]
+
+    assert "- i2v-lora-worker" in workflow
+    assert "inputs.component == 'i2v-lora-worker'" in worker_job
+    assert 'case "$OPERATION" in status|dry-run|promote|rollback)' in worker_job
+    assert 'case "$operation" in status|dry-run|promote|rollback)' in rollout
+    assert "timeout-minutes: 350" in worker_job
+    assert "role-duration-seconds: 20400" in worker_job
+    assert '"executionTimeout": ["19000"]' in worker_job
+    assert "--timeout-seconds 180" in worker_job
+    assert "for _ in $(seq 1 3900)" in worker_job
+    assert 'deadline="$(( $(cut -d. -f1 /proc/uptime) + 600 ))"' in rollout
+    assert '[ "$remaining" -gt 0 ] || return 1' in rollout
+    assert 'sleep "$((remaining < 5 ? remaining : 5))"' in rollout
+    assert 'timeout --signal=TERM --kill-after=60s "$timeout_seconds"' in rollout
+    for bound in ("900s dry-run", "1900s rollback", "10000s promote"):
+        assert bound in rollout
+    # Worst-case automatic recovery fits inside the RunShellScript execution
+    # budget. The separate SSM delivery allowance plus execution then fits
+    # inside polling, which fits inside OIDC, which fits inside the job timeout.
+    worst_run_one_off_dry_run = 900 + 60
+    worst_restart = 600
+    worst_run_one_off_promote = 10_000 + 60
+    worst_run_one_off_preflight = 900 + 60
+    # The outer watchdog is 1900s, while the shared provider rollback deadline
+    # is 1800s plus the one-off process's 60s termination grace.
+    worst_run_one_off_rollback = 1_800 + 60
+    worst_full_sequence = (
+        worst_run_one_off_dry_run
+        + worst_restart
+        + worst_run_one_off_promote
+        + worst_run_one_off_preflight
+        + worst_restart
+        # Failure cleanup returns to maintenance before touching the provider.
+        + worst_restart
+        + worst_run_one_off_rollback
+        + worst_restart
+    )
+    execution_timeout = 19_000
+    delivery_timeout = 180
+    polling_timeout = 3_900 * 5
+    oidc_timeout = 20_400
+    workflow_timeout = 350 * 60
+    github_hosted_job_maximum = 360 * 60
+    assert worst_full_sequence < execution_timeout
+    assert execution_timeout + delivery_timeout < polling_timeout < oidc_timeout < workflow_timeout
+    assert workflow_timeout <= github_hosted_job_maximum
+    assert 'systemctl restart --no-block "$service_name"' in rollout
+    assert "while true" not in worker_job
+
+    assert "Bind the immutable worker digest to its intrinsic source revision" in worker_job
+    assert "if: inputs.operation != 'rollback'" in worker_job
+    assert worker_job.count("docker buildx imagetools inspect") == 2
+    assert "--format '{{json .Manifest}}'" in worker_job
+    assert "--format '{{json .Image}}'" in worker_job
+    assert 'Labels"]["org.opencontainers.image.revision"]' in worker_job
+    assert '[ "${EXPECTED_WORKER_IMAGE#*@}" = "$actual_digest" ]' in worker_job
+    assert '[ "$actual_revision" = "$EXPECTED_WORKER_SOURCE_REVISION" ]' in worker_job
+
+    assert "bash -n infra/aws-staging/deploy/rollout-i2v-lora-worker.sh" in worker_job
+    assert "I2V_ROLLOUT_SCRIPT_SHA256" in worker_job
+    assert worker_job.count("/usr/bin/sha256sum --check --status") == 1
+    assert worker_job.count('/usr/bin/bash -n \\"$payload_root/rollout-i2v-lora-worker.sh\\"') == 1
+    assert "SSM command exceeds the reviewed size bound" in worker_job
+
+    assert 'manifest_bucket="gen-automation-staging-861912887470-eu-central-1-models"' in rollout
+    assert (
+        'manifest_key="worker/i2v/manifests/sha256/'
+        'f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1e2de19876e.json"' in rollout
+    )
+    assert 'manifest_version="u4bSnCPzDJ4zctrA2Nr66ji0Zh2qPpXX"' in rollout
+    assert (
+        'manifest_source_sha256="'
+        'f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1e2de19876e"' in rollout
+    )
+    assert "i2v-worker@sha256:[0-9a-f]{64}" in rollout
+
+    for flag in (
+        "GEN_AUTOMATION_I2V_ENABLED",
+        "GEN_AUTOMATION_I2V_HIRES_PROFILE_ENABLED",
+        "GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED",
+        "GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED",
+    ):
+        assert f'"{flag}": "false"' in rollout
+    assert 'assert_container_flags "$maintenance_id" false false false false' in rollout
+    assert 'assert_container_flags "$target_container" true true true false' in rollout
+    assert "http://127.0.0.1:8000/api/v1/health/ready" in rollout
+    assert "systemctl stop" not in rollout
+    assert "docker stop" not in rollout
+    assert "compose stop" not in rollout
+    assert "compose down" not in rollout
+
+    promotion = rollout.split(
+        '[ ! -e "$active_state" ] || fail "a prior reviewed-worker rollback bundle already exists"',
+        maxsplit=1,
+    )[1]
+    assert promotion.index('run_one_off "$original_env" "$initial_container" 900s dry-run') < (
+        promotion.index('restart_into "$maintenance_env"')
+    )
+    assert promotion.index('restart_into "$maintenance_env"') < promotion.index(
+        'run_one_off "$original_env" "$maintenance_id" 10000s promote'
+    )
+    assert promotion.index(
+        'run_one_off "$original_env" "$maintenance_id" 10000s promote'
+    ) < promotion.index('run_one_off "$target_env" "$maintenance_id" 900s profile-preflight')
+    assert promotion.index(
+        'run_one_off "$target_env" "$maintenance_id" 900s profile-preflight'
+    ) < promotion.index('mv -- "$active_temporary" "$active_state"')
+    assert promotion.index('mv -- "$active_temporary" "$active_state"') < promotion.index(
+        'restart_into "$target_env"'
+    )
+    assert promotion.index('restart_into "$target_env"') < promotion.index(
+        'assert_container_flags "$target_container" true true true false'
+    )
+
+    rollback = rollout.split("rollback_after_failure() {\n", maxsplit=1)[1].split(
+        "\n}\n\ncleanup()", maxsplit=1
+    )[0]
+    assert rollback.index('restart_into "$maintenance_env"') < rollback.index(
+        'run_one_off "$original_env" "$maintenance_id" 1900s rollback'
+    )
+    assert rollback.index(
+        'run_one_off "$original_env" "$maintenance_id" 1900s rollback'
+    ) < rollback.index('restart_into "$original_env"')
+    assert "backups remain under $work_dir" in rollback
+    assert "provider-mutation-attempted.json" in rollout
+    assert "merge_saved_i2v_profile" in rollout
+    assert 'status_json="$(run_one_off "$controller_env" "$initial_container" 900s status)"' in (
+        rollout
+    )
+    explicit_rollback = rollout.split('if [ "$operation" = "rollback" ]; then', maxsplit=2)[2]
+    assert explicit_rollback.index('resume_env="$original_env"') < explicit_rollback.index(
+        'restart_into "$original_env"'
+    )
+
+    for queue_mutation in (
+        "create_job",
+        "cancel_job",
+        "retry_job",
+        "reorder_job",
+        "/api/v1/i2v/jobs",
+    ):
+        assert queue_mutation not in rollout
+
+
+def test_i2v_lora_worker_workflow_transfers_only_checksum_pinned_helper() -> None:
+    rollout = (DEPLOY / "rollout-i2v-lora-worker.sh").read_bytes()
+    checksum = hashlib.sha256(rollout).hexdigest()
+    payload = base64.b64encode(gzip.compress(rollout, compresslevel=9, mtime=0)).decode("ascii")
+    program = _i2v_worker_command_program()
+    compile(program, "staging-i2v-lora-worker-ssm-command", "exec")
+    common = {
+        "SSM_SOURCE_REVISION": "a" * 40,
+        "SSM_WORKER_IMAGE": ("ghcr.io/neuraln-cyber/gen-automation/i2v-worker@sha256:" + "b" * 64),
+        "SSM_WORKER_SOURCE_REVISION": "c" * 40,
+        "SSM_SCRIPT_SHA256": checksum,
+        "SSM_SCRIPT_PAYLOAD": payload,
+    }
+    commands: dict[str, str] = {}
+    for operation in ("status", "dry-run", "promote", "rollback"):
+        environment = {**common, "SSM_OPERATION": operation}
+        if operation == "rollback":
+            environment.update({"SSM_WORKER_IMAGE": "", "SSM_WORKER_SOURCE_REVISION": ""})
+        result = subprocess.run(  # noqa: S603 - repository-owned command generator.
+            [sys.executable, "-c", program],
+            check=True,
+            capture_output=True,
+            env={**os.environ, **environment},
+            text=True,
+        )
+        parameters = json.loads(result.stdout)
+        command = parameters["commands"][0]
+        assert parameters == {
+            "commands": [command],
+            "executionTimeout": ["19000"],
+        }
+        commands[operation] = command
+
+    for operation, command in commands.items():
+        assert len(command.encode("utf-8")) <= 24_000
+        assert payload in command
+        assert checksum in command
+        assert command.count("/usr/bin/gzip --decompress") == 1
+        assert command.count("/usr/bin/sha256sum --check --status") == 1
+        assert command.count('/usr/bin/bash -n "$payload_root/rollout-i2v-lora-worker.sh"') == 1
+        assert f"--{operation}" in command
+        assert "--expected-control-plane-revision" in command
+    for operation in ("status", "dry-run", "promote"):
+        assert "--expected-worker-image" in commands[operation]
+        assert "--expected-worker-source-revision" in commands[operation]
+        assert common["SSM_WORKER_IMAGE"] in commands[operation]
+    assert "--expected-worker-image" not in commands["rollback"]
+    assert "--expected-worker-source-revision" not in commands["rollback"]
+    for prohibited in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "SALAD_API_KEY"):
+        assert prohibited not in "\n".join(commands.values())
+
+
+def test_i2v_lora_worker_profile_renderer_freezes_and_restores_exact_flags(
+    tmp_path: Path,
+) -> None:
+    rollout = _i2v_worker_rollout()
+    render_program = rollout.split("<<'PY'\n", maxsplit=1)[1].split("\nPY\n", maxsplit=1)[0]
+    compile(render_program, "rollout-i2v-lora-worker-profile-renderer", "exec")
+    source = tmp_path / "source.env"
+    maintenance = tmp_path / "maintenance.env"
+    target = tmp_path / "target.env"
+    patch = tmp_path / "target.patch"
+    source.write_text(
+        "\n".join(
+            (
+                "GEN_AUTOMATION_ENVIRONMENT=staging",
+                "GEN_AUTOMATION_I2V_ENABLED=true",
+                "GEN_AUTOMATION_I2V_HIRES_PROFILE_ENABLED=true",
+                "GEN_AUTOMATION_I2V_WORKER_IMAGE=prior-image",
+                "GEN_AUTOMATION_I2V_WORKER_SOURCE_REVISION=" + "1" * 40,
+                "GEN_AUTOMATION_I2V_PRIVATE_MANIFEST_SOURCE_SHA256=" + "2" * 64,
+                'GEN_AUTOMATION_I2V_MODEL_MANIFEST_JSON={"objects":[]}',
+                "GEN_AUTOMATION_I2V_MODEL_MANIFEST_SHA256=" + "3" * 64,
+                "GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED=true",
+                "GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED=true",
+                "UNRELATED_SETTING=preserved",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(  # noqa: S603 - executes an extracted repository-owned renderer.
+        [sys.executable, "-c", render_program, str(source), str(maintenance), "maintenance", ""],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    maintenance_text = maintenance.read_text(encoding="utf-8")
+    for flag in (
+        "GEN_AUTOMATION_I2V_ENABLED",
+        "GEN_AUTOMATION_I2V_HIRES_PROFILE_ENABLED",
+        "GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED",
+        "GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED",
+    ):
+        assert f"{flag}=false" in maintenance_text
+    assert "UNRELATED_SETTING=preserved" in maintenance_text
+    assert "GEN_AUTOMATION_I2V_WORKER_IMAGE=prior-image" in maintenance_text
+
+    target_values = {
+        "GEN_AUTOMATION_I2V_ENABLED": "true",
+        "GEN_AUTOMATION_I2V_HIRES_PROFILE_ENABLED": "true",
+        "GEN_AUTOMATION_I2V_WORKER_IMAGE": (
+            "ghcr.io/neuraln-cyber/gen-automation/i2v-worker@sha256:" + "4" * 64
+        ),
+        "GEN_AUTOMATION_I2V_WORKER_SOURCE_REVISION": "5" * 40,
+        "GEN_AUTOMATION_I2V_PRIVATE_MANIFEST_SOURCE_SHA256": "6" * 64,
+        "GEN_AUTOMATION_I2V_MODEL_MANIFEST_JSON": '{"objects":[]}',
+        "GEN_AUTOMATION_I2V_MODEL_MANIFEST_SHA256": "7" * 64,
+        "GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED": "true",
+        "GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED": "false",
+    }
+    patch.write_text(
+        "".join(f"{key}={value}\n" for key, value in target_values.items()),
+        encoding="utf-8",
+    )
+    subprocess.run(  # noqa: S603 - executes an extracted repository-owned renderer.
+        [sys.executable, "-c", render_program, str(source), str(target), "target", str(patch)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    target_text = target.read_text(encoding="utf-8")
+    for key, value in target_values.items():
+        assert f"{key}={value}" in target_text
+    assert "UNRELATED_SETTING=preserved" in target_text
+
+
+def test_i2v_lora_profile_operation_is_single_flag_atomic_and_provider_read_only() -> None:
+    workflow = _workflow()
+    configurator = _i2v_profile_configurator()
+    environment_program = configurator.split("<<'PY'\n", maxsplit=1)[1].split("\nPY\n", maxsplit=1)[
+        0
+    ]
+    compile(environment_program, "configure-i2v-lora-profile-environment", "exec")
+
+    assert "- i2v-lora-profile" in workflow
+    profile_job = workflow.split("  i2v-lora-profile:\n", maxsplit=1)[1]
+    assert "timeout-minutes: 120" in profile_job
+    assert "role-duration-seconds: 6600" in profile_job
+    assert '"executionTimeout": ["5400"]' in profile_job
+    assert "--timeout-seconds 120" in profile_job
+    assert "for _ in $(seq 1 1140)" in profile_job
+    # A latest-possible enable failure includes the lock, bounded service and
+    # Docker reads, initial readiness, both local environment programs, both
+    # provider preflights (including TERM grace), the changed-profile restart,
+    # and the complete automatic rollback deadline.
+    worst_failure_recovery = (
+        120
+        + 20
+        + 10
+        + 10
+        + 10
+        + 60
+        + 30
+        + (600 + 15)
+        + 10
+        + 30
+        + 10
+        + 240
+        + 10
+        + 10
+        + (600 + 15)
+        + 330
+    )
+    execution_timeout = 5_400
+    delivery_timeout = 120
+    polling_timeout = 1_140 * 5
+    oidc_timeout = 6_600
+    workflow_timeout = 120 * 60
+    assert worst_failure_recovery == 2_130 < 2_160
+    assert 2_160 + 360 == 2_520 < execution_timeout
+    assert execution_timeout + delivery_timeout < polling_timeout < oidc_timeout < workflow_timeout
+    assert workflow_timeout <= 360 * 60
+    assert "f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1e2de19876e" in (workflow)
+    assert "ebdeca736ee3e9ea4e4b7118c9e4b54dfcfd1bbde5a761f424aa85b1670b806f" in (workflow)
+    assert "be5802ffc52ee6bfa6c64a135dfdef37e4e0274e4098c9eb87e4edaafc4719a6" in workflow
+    assert "68f6c28831ac2a8e1801ba420c9816a29e09c8cc4738aae85611955553a3d301" in workflow
+    assert "i2v_artifact_identity_sha256:" not in workflow
+    for identity in (
+        "f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1e2de19876e",
+        "ebdeca736ee3e9ea4e4b7118c9e4b54dfcfd1bbde5a761f424aa85b1670b806f",
+        "be5802ffc52ee6bfa6c64a135dfdef37e4e0274e4098c9eb87e4edaafc4719a6",
+        "68f6c28831ac2a8e1801ba420c9816a29e09c8cc4738aae85611955553a3d301",
+    ):
+        assert identity in configurator
+    assert "profile-preflight" in configurator
+    assert "--expected-public-profile" in configurator
+    assert "verify_provider_and_queue false" in configurator
+    assert configurator.index("verify_provider_and_queue false") < configurator.index(
+        'environment_backup="$(mktemp'
+    )
+    assert "GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED" in environment_program
+    for protected_key in (
+        "GEN_AUTOMATION_I2V_WORKER_IMAGE",
+        "GEN_AUTOMATION_I2V_WORKER_SOURCE_REVISION",
+        "GEN_AUTOMATION_I2V_MODEL_MANIFEST_JSON",
+        "GEN_AUTOMATION_I2V_MODEL_MANIFEST_SHA256",
+        "GEN_AUTOMATION_I2V_PRIVATE_MANIFEST_SOURCE_SHA256",
+        "GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED",
+    ):
+        assert f'set_profile("{protected_key}' not in environment_program
+    assert "os.replace(temporary, path)" in environment_program
+    assert "os.fsync" in environment_program
+    assert "restore_previous_configuration" in configurator
+    assert "Preserved the root-only rollback backup at $environment_backup" in configurator
+    assert "rollback_restored=0" in configurator
+    assert "wait_for_control_plane" in configurator
+    assert "wait_for_control_plane_replacement" in configurator
+    assert "restart_control_plane_requiring_replacement" in configurator
+    assert 'systemctl restart --no-block "$service_name"' in configurator
+    assert 'systemctl reset-failed "$service_name"' in configurator
+    assert "control_plane_ready_deadline_seconds=60" in configurator
+    assert "control_plane_restart_deadline_seconds=240" in configurator
+    assert "rollback_deadline_seconds=330" in configurator
+    assert "provider_preflight_timeout_seconds=600" in configurator
+    assert "provider_preflight_kill_grace_seconds=15" in configurator
+    assert "operation_timeout_seconds=2160" in configurator
+    assert "operation_cleanup_grace_seconds=360" in configurator
+    assert "monotonic_seconds" in configurator
+    assert "</proc/uptime" in configurator
+    assert "deadline_remaining" in configurator
+    assert "bounded_timeout_before" in configurator
+    assert "for _ in $(seq 1 90)" not in configurator
+    assert '--connect-timeout "$probe_timeout" --max-time "$probe_timeout"' in configurator
+    assert 'wait_for_control_plane_replacement "$previous_container_id" "$deadline"' in (
+        configurator
+    )
+    assert '"$rollback_reference_container_id" "$rollback_deadline"' in configurator
+    assert "a prior running control-plane container is required" not in configurator
+    assert "Could not capture the container that rollback must replace." not in configurator
+    assert "GEN_AUTOMATION_I2V_PROFILE_TIMEOUT_SUPERVISED" in configurator
+    assert "trap 'exit 143' TERM" in configurator
+    assert '[ "$replacement_container_id" != "$previous_container_id" ]' in configurator
+    assert 'original_control_plane_container_id="$(control_plane_container_id)"' in configurator
+    assert 'restart_from_control_plane_container_id="$(control_plane_container_id)"' in configurator
+    assert 'verify_profile_readback "$expected_profile"' in configurator
+    assert '"$original_profile" "$restored_container_id" "$rollback_deadline"' in configurator
+    assert configurator.index('verify_profile_readback "$expected_profile"') < configurator.rindex(
+        "rollback_armed=0"
+    )
+    assert "running public profile flag differs from the expected value" in configurator
+    assert "Restored control-plane revision differs from the original revision." in configurator
+    assert "create_job" not in configurator
+    assert "cancel_job" not in configurator
+    assert "update_container_group" not in configurator
+    assert "start_container_group" not in configurator
+    assert "stop_container_group" not in configurator
+
+
+def test_i2v_lora_profile_workflow_transfers_only_checksum_pinned_helper() -> None:
+    configurator = (DEPLOY / "configure-i2v-lora-profile.sh").read_bytes()
+    checksum = hashlib.sha256(configurator).hexdigest()
+    payload = base64.b64encode(gzip.compress(configurator, compresslevel=9, mtime=0)).decode(
+        "ascii"
+    )
+    program = _i2v_profile_command_program()
+    compile(program, "staging-i2v-lora-profile-ssm-command", "exec")
+    common = {
+        "SSM_SOURCE_REVISION": "a" * 40,
+        "SSM_WORKER_IMAGE": ("ghcr.io/neuraln-cyber/gen-automation/i2v-worker@sha256:" + "b" * 64),
+        "SSM_WORKER_SOURCE_REVISION": "c" * 40,
+        "SSM_MANIFEST_SHA256": "f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1e2de19876e",
+        "SSM_MODEL_MANIFEST_SHA256": (
+            "ebdeca736ee3e9ea4e4b7118c9e4b54dfcfd1bbde5a761f424aa85b1670b806f"
+        ),
+        "SSM_WORKER_MODEL_OBJECTS_SHA256": (
+            "be5802ffc52ee6bfa6c64a135dfdef37e4e0274e4098c9eb87e4edaafc4719a6"
+        ),
+        "SSM_ARTIFACT_IDENTITY_SHA256": (
+            "68f6c28831ac2a8e1801ba420c9816a29e09c8cc4738aae85611955553a3d301"
+        ),
+        "SSM_SCRIPT_SHA256": checksum,
+        "SSM_SCRIPT_PAYLOAD": payload,
+    }
+    commands: dict[str, str] = {}
+    for operation in ("status", "enable", "disable"):
+        environment = dict(common)
+        environment["SSM_OPERATION"] = operation
+        if operation == "disable":
+            environment.update(
+                {
+                    "SSM_WORKER_IMAGE": "",
+                    "SSM_WORKER_SOURCE_REVISION": "",
+                }
+            )
+        result = subprocess.run(  # noqa: S603 - repository-owned command generator.
+            [sys.executable, "-c", program],
+            check=True,
+            capture_output=True,
+            env={**os.environ, **environment},
+            text=True,
+        )
+        parameters = json.loads(result.stdout)
+        command = parameters["commands"][0]
+        assert parameters == {
+            "commands": [command],
+            "executionTimeout": ["5400"],
+        }
+        commands[operation] = command
+
+    for command in commands.values():
+        assert len(command.encode("utf-8")) <= 24_000
+        assert payload in command
+        assert checksum in command
+        assert command.count("/usr/bin/gzip --decompress") == 1
+        assert command.count("/usr/bin/sha256sum --check --status") == 1
+        assert '/usr/bin/bash -n "$payload_root/configure-i2v-lora-profile.sh"' in command
+    assert "--expected-worker-image" in commands["status"]
+    assert "--expected-artifact-identity-sha256" in commands["enable"]
+    assert "--expected-model-manifest-sha256" in commands["enable"]
+    assert "--expected-worker-model-objects-sha256" in commands["enable"]
+    assert "--expected-worker-image" not in commands["disable"]
+    assert "--disable" in commands["disable"]
+    for prohibited in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "SALAD_API_KEY"):
+        assert prohibited not in "\n".join(commands.values())
 
 
 def test_routine_rollout_refreshes_the_host_deployment_bundle_safely() -> None:

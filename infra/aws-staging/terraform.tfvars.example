@@ -28,9 +28,11 @@ x_oauth_auth_mode  = "oauth2"
 # secret value never enters OpenTofu state or the browser.
 civitai_api_secret_arn = null
 
-# Empty is disabled by default. After artifact onboarding, map only the exact
-# immutable S3 object versions present in the signed worker manifest.
+# Map only exact immutable S3 object versions. The reviewed I2V source manifest
+# is pinned because the host-side rollout verifier reads that exact VersionId;
+# add model objects only after their separate artifact review.
 salad_worker_artifact_object_versions = {
+  "worker/i2v/manifests/sha256/f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1e2de19876e.json" = "u4bSnCPzDJ4zctrA2Nr66ji0Zh2qPpXX"
   # "worker/checkpoints/example-sha256.safetensors" = "opaque-s3-version-id"
   # "worker/i2v/sha256/<exact-64-hex-sha256>" = "opaque-s3-version-id"
 }

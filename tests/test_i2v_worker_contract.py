@@ -10,10 +10,16 @@ from uuid import uuid4
 import pytest
 from pydantic import SecretStr, ValidationError
 
+from gen_automation.i2v_worker.lora_catalog import LORA_ARTIFACTS_BY_ROLE, LORA_CATALOG
 from gen_automation.i2v_worker.models import GenerationSettings, I2VJob, ModelObject
 from gen_automation.i2v_worker.settings import I2VWorkerSettings
 from gen_automation.i2v_worker.supervisor import _comfy_command
-from gen_automation.i2v_worker.workflow import load_workflow_template, render_workflow
+from gen_automation.i2v_worker.workflow import (
+    WorkflowError,
+    load_workflow_template,
+    lora_provenance,
+    render_workflow,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "Dockerfile.i2v-worker"
@@ -24,7 +30,7 @@ SHA = "a" * 64
 
 
 def _objects() -> list[dict[str, object]]:
-    return [
+    baseline = [
         {
             "role": role,
             "bucket": "private-models",
@@ -44,11 +50,26 @@ def _objects() -> list[dict[str, object]]:
             start=1,
         )
     ]
+    loras = [
+        {
+            "role": role,
+            "bucket": "private-models",
+            "key": f"worker/i2v/sha256/{artifact.sha256}",
+            "version_id": f"version-{role}",
+            "byte_size": artifact.byte_size,
+            "sha256": artifact.sha256,
+            "install_path": artifact.install_path,
+        }
+        for role, artifact in LORA_ARTIFACTS_BY_ROLE.items()
+    ]
+    return baseline + loras
 
 
-def _settings(tmp_path: Path) -> I2VWorkerSettings:
+def _settings(tmp_path: Path, *, lora_worker_enabled: bool = True) -> I2VWorkerSettings:
     return I2VWorkerSettings(
-        model_objects_json=SecretStr(json.dumps(_objects())),
+        model_objects_json=SecretStr(
+            json.dumps(_objects() if lora_worker_enabled else _objects()[:4])
+        ),
         environment="test",
         comfy_root=tmp_path / "comfy",
         runtime_root=tmp_path / "runtime",
@@ -56,6 +77,9 @@ def _settings(tmp_path: Path) -> I2VWorkerSettings:
         comfy_python=tmp_path / "venv/python",
         comfy_main=tmp_path / "comfy/main.py",
         queue_worker_enabled=False,
+        lora_worker_enabled=lora_worker_enabled,
+        source_revision="b" * 40 if lora_worker_enabled else None,
+        private_manifest_source_sha256="c" * 64 if lora_worker_enabled else None,
     )
 
 
@@ -108,7 +132,7 @@ def test_job_contract_is_strict_and_uses_wire_schema_alias() -> None:
         I2VJob.model_validate_json(json.dumps(invalid), strict=True)
 
 
-def test_baseline_accepts_wan_shape_but_experimental_features_fail_closed() -> None:
+def test_baseline_accepts_wan_shape_and_only_reviewed_loras() -> None:
     assert GenerationSettings().frame_count == 81
     delivery = GenerationSettings(
         width=768,
@@ -127,8 +151,21 @@ def test_baseline_accepts_wan_shape_but_experimental_features_fail_closed() -> N
     assert GenerationSettings().loop_count == 2
     with pytest.raises(ValidationError):
         GenerationSettings(frame_count=80)
+    reviewed = GenerationSettings(
+        loras=[{"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.3}]
+    )
+    assert reviewed.loras[0].catalog_id == "wan-general-nsfw-v0.08a"
     with pytest.raises(ValidationError):
-        GenerationSettings(loras=[{"filename": "unreviewed.safetensors"}])
+        GenerationSettings(loras=[{"catalog_id": "unreviewed", "strength": 0.3}])
+    with pytest.raises(ValidationError):
+        GenerationSettings(loras=[{"catalog_id": "wan-general-nsfw-v0.08a", "strength": 2.01}])
+    with pytest.raises(ValidationError):
+        GenerationSettings(
+            loras=[
+                {"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.3},
+                {"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.4},
+            ]
+        )
     with pytest.raises(ValidationError):
         GenerationSettings(tiled_vae=True)
     with pytest.raises(ValidationError):
@@ -151,13 +188,24 @@ def test_model_objects_are_exact_versioned_and_confined_to_comfy_models() -> Non
         ModelObject.model_validate(invalid)
 
 
-def test_settings_require_every_baseline_role_once(tmp_path: Path) -> None:
-    assert len(_settings(tmp_path).model_objects) == 4
+def test_settings_require_every_baseline_and_reviewed_lora_role_once(tmp_path: Path) -> None:
+    assert len(_settings(tmp_path).model_objects) == 14
+    assert len(_settings(tmp_path, lora_worker_enabled=False).model_objects) == 4
     with pytest.raises(ValidationError):
         I2VWorkerSettings(
-            model_objects_json=SecretStr(json.dumps(_objects()[:3])),
+            model_objects_json=SecretStr(json.dumps(_objects()[:-1])),
             comfy_root=tmp_path / "comfy",
             runtime_root=tmp_path / "runtime",
+            lora_worker_enabled=True,
+            source_revision="b" * 40,
+            private_manifest_source_sha256="c" * 64,
+        )
+    with pytest.raises(ValidationError, match="immutable manifest and source identity"):
+        I2VWorkerSettings(
+            model_objects_json=SecretStr(json.dumps(_objects())),
+            comfy_root=tmp_path / "comfy",
+            runtime_root=tmp_path / "runtime",
+            lora_worker_enabled=True,
         )
 
 
@@ -182,6 +230,99 @@ def test_workflow_renders_all_runtime_values_without_mutating_template() -> None
     assert rendered["14"]["inputs"]["filename_prefix"] == prefix
     assert "$i2v" not in json.dumps(rendered)
     assert json.dumps(template, sort_keys=True) == original
+
+
+def test_reviewed_loras_chain_each_stage_before_sampling_and_inject_triggers_once() -> None:
+    template = load_workflow_template(WORKFLOW)
+    rendered, _seed, _prefix = render_workflow(
+        template,
+        input_filename="source.png",
+        positive_prompt="NSFWSKS, slow movement, nsfwsks",
+        negative_prompt="jitter",
+        settings=GenerationSettings(
+            seed=42,
+            loras=[
+                {"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.3},
+                {"catalog_id": "bouncing-boobs-wan22", "strength": 1.0},
+            ],
+        ),
+        job_id=uuid4(),
+        attempt_id=uuid4(),
+    )
+
+    assert rendered["6"]["inputs"]["text"].casefold().count("nsfwsks") == 1
+    assert rendered["6"]["inputs"]["text"].endswith("her breasts are bouncing")
+    for branch, loader_node, first_model, last_sampling in (
+        ("high", "lora-high", "2", "8"),
+        ("low", "lora-low", "3", "9"),
+    ):
+        first = rendered[f"{loader_node}-1"]
+        second = rendered[f"{loader_node}-2"]
+        assert first["class_type"] == second["class_type"] == "LoraLoaderModelOnly"
+        assert first["inputs"]["model"] == [first_model, 0]
+        assert second["inputs"]["model"] == [f"{loader_node}-1", 0]
+        assert rendered[last_sampling]["inputs"]["model"] == [f"{loader_node}-2", 0]
+        entries = tuple(LORA_CATALOG.values())
+        expected = entries[0].high if branch == "high" else entries[0].low
+        assert first["inputs"]["lora_name"] == expected.filename
+        assert first["inputs"]["strength_model"] == 0.3
+    provenance = lora_provenance(
+        GenerationSettings(loras=[{"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.3}])
+    )[0]
+    assert provenance["high"] == {
+        "role": "lora_wan_general_nsfw_high",
+        "filename": "NSFW-22-H-e8.safetensors",
+        "byte_size": 613_516_752,
+        "sha256": "34e2144d3cd65360f97d09ccbe03e1c39a096df6c9234af5fe3899d1b63cda39",
+        "civitai_model_id": 1_307_155,
+        "civitai_version_id": 2_073_605,
+        "civitai_file_id": 1_969_798,
+        "canonical_version_url": ("https://civitai.com/models/1307155?modelVersionId=2073605"),
+    }
+    assert provenance["creator_name"] == "CubeyAI"
+    assert provenance["canonical_source_url"] == "https://civitai.com/models/1307155"
+
+
+def test_manual_and_triggerless_loras_do_not_mutate_the_author_prompt() -> None:
+    template = load_workflow_template(WORKFLOW)
+    prompt = "controlled natural motion"
+    rendered, _seed, _prefix = render_workflow(
+        template,
+        input_filename="source.png",
+        positive_prompt=prompt,
+        negative_prompt="jitter",
+        settings=GenerationSettings(
+            loras=[
+                {"catalog_id": "dr34ml4y-aio-nsfw-wan22-v2", "strength": 0.7},
+                {"catalog_id": "smoothmix-xxx-animations-wan22", "strength": 1.0},
+            ]
+        ),
+        job_id=uuid4(),
+        attempt_id=uuid4(),
+    )
+
+    assert rendered["6"]["inputs"]["text"] == prompt
+
+
+def test_dream_lora_rejects_multiple_mutually_exclusive_concept_terms() -> None:
+    template = load_workflow_template(WORKFLOW)
+    settings = GenerationSettings(
+        loras=[{"catalog_id": "dr34ml4y-aio-nsfw-wan22-v2", "strength": 0.7}]
+    )
+
+    with pytest.raises(
+        WorkflowError,
+        match="mutually exclusive concept terms",
+    ):
+        render_workflow(
+            template,
+            input_filename="source.png",
+            positive_prompt="M15510N4RY motion followed by bl0wj0b motion",
+            negative_prompt="jitter",
+            settings=settings,
+            job_id=uuid4(),
+            attempt_id=uuid4(),
+        )
 
 
 def test_comfy_command_uses_supported_base_directory_and_no_custom_nodes(tmp_path: Path) -> None:

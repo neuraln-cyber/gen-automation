@@ -14,6 +14,8 @@ on:
         options:
           - semantic-anatomy
           - lora-manager
+          - i2v-lora-worker
+          - i2v-lora-profile
       operation:
         description: Status, dry-run, promote, pause, enable, or disable
         required: true
@@ -23,6 +25,7 @@ on:
           - status
           - dry-run
           - promote
+          - rollback
           - pause
           - enable
           - disable
@@ -31,7 +34,16 @@ on:
         required: true
         type: string
         default: "400"
-
+      i2v_worker_image:
+        description: Exact ghcr.io/.../i2v-worker@sha256 digest for an I2V LoRA operation
+        required: false
+        type: string
+        default: ""
+      i2v_worker_source_revision:
+        description: Exact 40-hex source revision embedded in the I2V worker
+        required: false
+        type: string
+        default: ""
 permissions:
   actions: read
   contents: read
@@ -57,10 +69,6 @@ jobs:
       IMAGE_REPOSITORY: ghcr.io/neuraln-cyber/gen-automation/control-plane-mega
       WORKER_IMAGE_REPOSITORY: ghcr.io/neuraln-cyber/gen-automation/gpu-worker
       I2V_WORKER_IMAGE_REPOSITORY: ghcr.io/neuraln-cyber/gen-automation/i2v-worker
-      COORDINATED_I2V_ROLLOUT_SOURCE_REVISION: >-
-        ${{ vars.STAGING_COORDINATED_I2V_ROLLOUT_SOURCE_REVISION }}
-      COORDINATED_I2V_WORKER_IMAGE_REF: >-
-        ${{ vars.STAGING_COORDINATED_I2V_WORKER_IMAGE_REF }}
       PUBLISH_RUN_ID: ${{ github.event.workflow_run.id }}
     steps:
       # This is a second-level workflow_run event (CI -> publish -> deploy), so
@@ -309,26 +317,6 @@ jobs:
           [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
           [[ "$WORKER_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
 
-          # Ordinary releases carry no coordinated I2V metadata and preserve
-          # the existing host pin. An operator-authorized rollout must bind an
-          # exact published image to this exact control-plane source revision.
-          coordinated_i2v_revision="${COORDINATED_I2V_ROLLOUT_SOURCE_REVISION:-}"
-          coordinated_i2v_image="${COORDINATED_I2V_WORKER_IMAGE_REF:-}"
-          if [ -n "$coordinated_i2v_revision" ] || [ -n "$coordinated_i2v_image" ]; then
-            [[ "$coordinated_i2v_revision" =~ ^[0-9a-f]{40}$ ]] || {
-              printf '%s\n' "Coordinated I2V rollout source revision is invalid." >&2
-              exit 1
-            }
-            [ "$coordinated_i2v_revision" = "$SOURCE_REVISION" ] || {
-              printf '%s\n' "Coordinated I2V rollout targets a different source revision." >&2
-              exit 1
-            }
-            [ "$coordinated_i2v_image" = "$I2V_WORKER_IMAGE_REF" ] || {
-              printf '%s\n' "Coordinated I2V rollout image differs from the published image." >&2
-              exit 1
-            }
-          fi
-
           latest_main="$(
             gh api \
               --header 'Accept: application/vnd.github+json' \
@@ -374,7 +362,6 @@ jobs:
           parameters_file="$RUNNER_TEMP/ssm-parameters.json"
           SSM_IMAGE_REF="$IMAGE_REF" \
           SSM_WORKER_IMAGE_REF="$WORKER_IMAGE_REF" \
-          SSM_COORDINATED_I2V_WORKER_IMAGE_REF="$coordinated_i2v_image" \
           SSM_SOURCE_REVISION="$SOURCE_REVISION" \
           SSM_BOOTSTRAP_HELPER_SHA256="$bootstrap_helper_sha256" \
           SSM_BOOTSTRAP_COMPOSE_SHA256="$bootstrap_compose_sha256" \
@@ -385,23 +372,10 @@ jobs:
             python3 -c '
           import json
           import os
-          import re
           import shlex
 
           image = os.environ["SSM_IMAGE_REF"]
           worker_image = os.environ["SSM_WORKER_IMAGE_REF"]
-          # Routine control-plane releases must preserve the live I2V pin. A
-          # coordinated provider rollout may opt in by supplying this exact,
-          # immutable reference to the command generator explicitly.
-          i2v_worker_image = os.environ.get(
-              "SSM_COORDINATED_I2V_WORKER_IMAGE_REF",
-              "",
-          ).strip()
-          if i2v_worker_image and not re.fullmatch(
-              r"ghcr\.io/neuraln-cyber/gen-automation/i2v-worker@sha256:[0-9a-f]{64}",
-              i2v_worker_image,
-          ):
-              raise SystemExit("coordinated I2V worker image reference is invalid")
           revision = os.environ["SSM_SOURCE_REVISION"]
           bootstrap_helper_sha256 = os.environ["SSM_BOOTSTRAP_HELPER_SHA256"]
           bootstrap_compose_sha256 = os.environ["SSM_BOOTSTRAP_COMPOSE_SHA256"]
@@ -414,9 +388,6 @@ jobs:
           runtime_env = "/etc/gen-automation/control-plane.env"
           runtime_env_backup = f"{runtime_env}.{revision}.rollback"
           worker_image_key = "GEN_AUTOMATION_SALAD_WORKER_IMAGE"
-          i2v_worker_image_key = "GEN_AUTOMATION_I2V_WORKER_IMAGE"
-          i2v_enabled_key = "GEN_AUTOMATION_I2V_ENABLED"
-          i2v_hires_profile_key = "GEN_AUTOMATION_I2V_HIRES_PROFILE_ENABLED"
           update_runtime_images = """
           import os
           import pathlib
@@ -460,17 +431,6 @@ jobs:
               f" {shlex.quote(runtime_env)} {shlex.quote(runtime_env_backup)}"
           )
           runtime_image_updates = [worker_image_key, worker_image]
-          if i2v_worker_image:
-              runtime_image_updates.extend(
-                  [
-                      i2v_worker_image_key,
-                      i2v_worker_image,
-                      i2v_enabled_key,
-                      "true",
-                      i2v_hires_profile_key,
-                      "true",
-                  ]
-              )
           update_worker_references = (
               "sudo /usr/bin/python3 -c"
               f" {shlex.quote(update_runtime_images)}"
@@ -924,5 +884,380 @@ jobs:
             --output json
           [ "$final_status" = "Success" ] || {
             printf '%s\n' "LoRA manager operation finished with status: ${final_status:-unknown}" >&2
+            exit 1
+          }
+
+  i2v-lora-worker:
+    name: ${{ inputs.operation }} staging I2V LoRA worker
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      inputs.component == 'i2v-lora-worker'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      AWS_REGION: eu-central-1
+      AWS_STAGING_INSTANCE_ID: ${{ vars.AWS_STAGING_INSTANCE_ID }}
+      OPERATION: ${{ inputs.operation }}
+      SOURCE_REVISION: ${{ github.sha }}
+      EXPECTED_WORKER_IMAGE: ${{ inputs.i2v_worker_image }}
+      EXPECTED_WORKER_SOURCE_REVISION: ${{ inputs.i2v_worker_source_revision }}
+    steps:
+      - name: Check out the exact workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate the bounded I2V LoRA worker operation
+        shell: bash
+        env:
+          AWS_STAGING_DEPLOY_ROLE_ARN: ${{ vars.AWS_STAGING_DEPLOY_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          case "$OPERATION" in status|dry-run|promote|rollback) ;; *) exit 1 ;; esac
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$AWS_STAGING_INSTANCE_ID" =~ ^i-[0-9a-f]{8,17}$ ]]
+          [[ "$AWS_STAGING_DEPLOY_ROLE_ARN" =~ ^arn:aws:iam::861912887470:role/[A-Za-z0-9+=,.@_/-]+$ ]]
+          if [ "$OPERATION" = "rollback" ]; then
+            [ -z "$EXPECTED_WORKER_IMAGE" ]
+            [ -z "$EXPECTED_WORKER_SOURCE_REVISION" ]
+          else
+            [[ "$EXPECTED_WORKER_IMAGE" =~ ^ghcr\.io/neuraln-cyber/gen-automation/i2v-worker@sha256:[0-9a-f]{64}$ ]]
+            [[ "$EXPECTED_WORKER_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          fi
+          bash -n infra/aws-staging/deploy/rollout-i2v-lora-worker.sh
+          printf 'I2V_ROLLOUT_SCRIPT_SHA256=%s\n' \
+            "$(sha256sum infra/aws-staging/deploy/rollout-i2v-lora-worker.sh | cut -d' ' -f1)" \
+            >>"$GITHUB_ENV"
+
+      - name: Bind the immutable worker digest to its intrinsic source revision
+        if: inputs.operation != 'rollback'
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$GHCR_TOKEN" |
+            docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin >/dev/null
+          manifest_json="$(
+            docker buildx imagetools inspect \
+              "$EXPECTED_WORKER_IMAGE" \
+              --format '{{json .Manifest}}'
+          )"
+          image_json="$(
+            docker buildx imagetools inspect \
+              "$EXPECTED_WORKER_IMAGE" \
+              --format '{{json .Image}}'
+          )"
+          actual_digest="$(
+            MANIFEST_JSON="$manifest_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["MANIFEST_JSON"])["digest"])'
+          )"
+          actual_revision="$(
+            IMAGE_JSON="$image_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.revision"])'
+          )"
+          [ "${EXPECTED_WORKER_IMAGE#*@}" = "$actual_digest" ] || {
+            printf '%s\n' "I2V worker registry digest differs from the requested digest." >&2
+            exit 1
+          }
+          [ "$actual_revision" = "$EXPECTED_WORKER_SOURCE_REVISION" ] || {
+            printf '%s\n' "I2V worker revision label differs from the requested source." >&2
+            exit 1
+          }
+
+      - name: Exchange GitHub OIDC identity for the staging deploy role
+        uses: aws-actions/configure-aws-credentials@acca2b1b2070338fb9fd1ca27ecee81d687e58e5 # v6.1.2
+        with:
+          role-to-assume: ${{ vars.AWS_STAGING_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+          allowed-account-ids: "861912887470"
+          role-duration-seconds: 20400
+          role-session-name: gen-automation-i2v-worker-${{ github.run_id }}
+
+      - name: Run the checksum-pinned worker operation through Systems Manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          script_payload="$(gzip --best --no-name --stdout infra/aws-staging/deploy/rollout-i2v-lora-worker.sh | base64 --wrap=0)"
+          [[ "$I2V_ROLLOUT_SCRIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$script_payload" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
+          parameters_file="$RUNNER_TEMP/i2v-lora-worker-parameters.json"
+          SSM_OPERATION="$OPERATION" \
+          SSM_SOURCE_REVISION="$SOURCE_REVISION" \
+          SSM_WORKER_IMAGE="$EXPECTED_WORKER_IMAGE" \
+          SSM_WORKER_SOURCE_REVISION="$EXPECTED_WORKER_SOURCE_REVISION" \
+          SSM_SCRIPT_SHA256="$I2V_ROLLOUT_SCRIPT_SHA256" \
+          SSM_SCRIPT_PAYLOAD="$script_payload" \
+            python3 -c '
+          import json
+          import os
+          import shlex
+
+          operation = os.environ["SSM_OPERATION"]
+          revision = os.environ["SSM_SOURCE_REVISION"]
+          worker_image = os.environ["SSM_WORKER_IMAGE"]
+          worker_revision = os.environ["SSM_WORKER_SOURCE_REVISION"]
+          checksum = os.environ["SSM_SCRIPT_SHA256"]
+          payload = os.environ["SSM_SCRIPT_PAYLOAD"]
+          arguments = "--" + operation + " --expected-control-plane-revision " + shlex.quote(revision)
+          if operation != "rollback":
+              arguments += (
+                  " --expected-worker-image " + shlex.quote(worker_image)
+                  + " --expected-worker-source-revision " + shlex.quote(worker_revision)
+              )
+          command = (
+              "set -Eeuo pipefail; "
+              "payload_root=$(/usr/bin/mktemp --directory /tmp/gen-automation-i2v-worker.XXXXXX); "
+              "trap '\''/usr/bin/rm -rf -- \"$payload_root\"'\'' EXIT; "
+              "/usr/bin/printf '\''%s'\'' " + shlex.quote(payload)
+              + " | /usr/bin/base64 --decode | /usr/bin/gzip --decompress"
+              " >\"$payload_root/rollout-i2v-lora-worker.sh\"; "
+              "/usr/bin/printf '\''%s  %s\\n'\'' " + shlex.quote(checksum)
+              + " \"$payload_root/rollout-i2v-lora-worker.sh\""
+              " | /usr/bin/sha256sum --check --status; "
+              "/usr/bin/bash -n \"$payload_root/rollout-i2v-lora-worker.sh\"; "
+              "sudo /usr/bin/bash \"$payload_root/rollout-i2v-lora-worker.sh\" "
+              + arguments
+          )
+          if len(command.encode("utf-8")) > 24_000:
+              raise SystemExit("SSM command exceeds the reviewed size bound")
+          print(
+              json.dumps(
+                  {
+                      "commands": [command],
+                      "executionTimeout": ["19000"],
+                  }
+              )
+          )
+          ' >"$parameters_file"
+
+          command_id="$(
+            aws ssm send-command \
+              --region "$AWS_REGION" \
+              --instance-ids "$AWS_STAGING_INSTANCE_ID" \
+              --document-name AWS-RunShellScript \
+              --comment "${OPERATION} staging I2V LoRA worker at ${SOURCE_REVISION}" \
+              --timeout-seconds 180 \
+              --parameters "file://${parameters_file}" \
+              --query 'Command.CommandId' \
+              --output text
+          )"
+          final_status=""
+          for _ in $(seq 1 3900); do
+            final_status="$(
+              aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$command_id" \
+                --instance-id "$AWS_STAGING_INSTANCE_ID" \
+                --query 'Status' \
+                --output text 2>/dev/null || true
+            )"
+            case "$final_status" in
+              Success|Cancelled|TimedOut|Failed|Cancelling) break ;;
+            esac
+            sleep 5
+          done
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$command_id" \
+            --instance-id "$AWS_STAGING_INSTANCE_ID" \
+            --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
+            --output json
+          [ "$final_status" = "Success" ] || {
+            printf '%s\n' "I2V LoRA worker operation finished with status: ${final_status:-unknown}" >&2
+            exit 1
+          }
+
+  i2v-lora-profile:
+    name: ${{ inputs.operation }} staging I2V LoRA public profile
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      inputs.component == 'i2v-lora-profile'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      AWS_REGION: eu-central-1
+      AWS_STAGING_INSTANCE_ID: ${{ vars.AWS_STAGING_INSTANCE_ID }}
+      OPERATION: ${{ inputs.operation }}
+      SOURCE_REVISION: ${{ github.sha }}
+      EXPECTED_WORKER_IMAGE: ${{ inputs.i2v_worker_image }}
+      EXPECTED_WORKER_SOURCE_REVISION: ${{ inputs.i2v_worker_source_revision }}
+      EXPECTED_ARTIFACT_IDENTITY_SHA256: 68f6c28831ac2a8e1801ba420c9816a29e09c8cc4738aae85611955553a3d301
+      EXPECTED_PRIVATE_MANIFEST_SHA256: f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1e2de19876e
+      EXPECTED_MODEL_MANIFEST_SHA256: ebdeca736ee3e9ea4e4b7118c9e4b54dfcfd1bbde5a761f424aa85b1670b806f
+      EXPECTED_WORKER_MODEL_OBJECTS_SHA256: be5802ffc52ee6bfa6c64a135dfdef37e4e0274e4098c9eb87e4edaafc4719a6
+    steps:
+      - name: Check out the exact workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate bounded I2V LoRA profile coordinates
+        shell: bash
+        env:
+          AWS_STAGING_DEPLOY_ROLE_ARN: ${{ vars.AWS_STAGING_DEPLOY_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          case "$OPERATION" in status|enable|disable) ;; *) exit 1 ;; esac
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$AWS_STAGING_INSTANCE_ID" =~ ^i-[0-9a-f]{8,17}$ ]]
+          [[ "$AWS_STAGING_DEPLOY_ROLE_ARN" =~ ^arn:aws:iam::861912887470:role/[A-Za-z0-9+=,.@_/-]+$ ]]
+          if [ "$OPERATION" = "disable" ]; then
+            [ -z "$EXPECTED_WORKER_IMAGE" ]
+            [ -z "$EXPECTED_WORKER_SOURCE_REVISION" ]
+          else
+            [[ "$EXPECTED_WORKER_IMAGE" =~ ^ghcr\.io/neuraln-cyber/gen-automation/i2v-worker@sha256:[0-9a-f]{64}$ ]]
+            [[ "$EXPECTED_WORKER_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          fi
+          [ "$EXPECTED_PRIVATE_MANIFEST_SHA256" = "f0cd579606c8bc7fbf77ee8353b5c542395576d08f21e9acea37a1e2de19876e" ]
+          [ "$EXPECTED_MODEL_MANIFEST_SHA256" = "ebdeca736ee3e9ea4e4b7118c9e4b54dfcfd1bbde5a761f424aa85b1670b806f" ]
+          [ "$EXPECTED_WORKER_MODEL_OBJECTS_SHA256" = "be5802ffc52ee6bfa6c64a135dfdef37e4e0274e4098c9eb87e4edaafc4719a6" ]
+          [ "$EXPECTED_ARTIFACT_IDENTITY_SHA256" = "68f6c28831ac2a8e1801ba420c9816a29e09c8cc4738aae85611955553a3d301" ]
+          bash -n infra/aws-staging/deploy/configure-i2v-lora-profile.sh
+          printf 'PROFILE_SCRIPT_SHA256=%s\n' "$(sha256sum infra/aws-staging/deploy/configure-i2v-lora-profile.sh | cut -d' ' -f1)" >>"$GITHUB_ENV"
+
+      - name: Re-verify the worker image source binding before public exposure
+        if: inputs.operation != 'disable'
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$GHCR_TOKEN" |
+            docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin >/dev/null
+          manifest_json="$(
+            docker buildx imagetools inspect \
+              "$EXPECTED_WORKER_IMAGE" \
+              --format '{{json .Manifest}}'
+          )"
+          image_json="$(
+            docker buildx imagetools inspect \
+              "$EXPECTED_WORKER_IMAGE" \
+              --format '{{json .Image}}'
+          )"
+          actual_digest="$(
+            MANIFEST_JSON="$manifest_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["MANIFEST_JSON"])["digest"])'
+          )"
+          actual_revision="$(
+            IMAGE_JSON="$image_json" python3 -c \
+              'import json, os; print(json.loads(os.environ["IMAGE_JSON"])["config"]["Labels"]["org.opencontainers.image.revision"])'
+          )"
+          [ "${EXPECTED_WORKER_IMAGE#*@}" = "$actual_digest" ]
+          [ "$actual_revision" = "$EXPECTED_WORKER_SOURCE_REVISION" ]
+
+      - name: Exchange GitHub OIDC identity for the staging deploy role
+        uses: aws-actions/configure-aws-credentials@acca2b1b2070338fb9fd1ca27ecee81d687e58e5 # v6.1.2
+        with:
+          role-to-assume: ${{ vars.AWS_STAGING_DEPLOY_ROLE_ARN }}
+          aws-region: eu-central-1
+          allowed-account-ids: "861912887470"
+          role-duration-seconds: 6600
+          role-session-name: gen-automation-i2v-profile-${{ github.run_id }}
+
+      - name: Run the pinned I2V LoRA profile operation through Systems Manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          script_payload="$(gzip --best --no-name --stdout infra/aws-staging/deploy/configure-i2v-lora-profile.sh | base64 --wrap=0)"
+          [[ "$PROFILE_SCRIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$script_payload" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
+          parameters_file="$RUNNER_TEMP/i2v-lora-profile-parameters.json"
+          SSM_OPERATION="$OPERATION" \
+          SSM_SOURCE_REVISION="$SOURCE_REVISION" \
+          SSM_WORKER_IMAGE="$EXPECTED_WORKER_IMAGE" \
+          SSM_WORKER_SOURCE_REVISION="$EXPECTED_WORKER_SOURCE_REVISION" \
+          SSM_MANIFEST_SHA256="$EXPECTED_PRIVATE_MANIFEST_SHA256" \
+          SSM_MODEL_MANIFEST_SHA256="$EXPECTED_MODEL_MANIFEST_SHA256" \
+          SSM_WORKER_MODEL_OBJECTS_SHA256="$EXPECTED_WORKER_MODEL_OBJECTS_SHA256" \
+          SSM_ARTIFACT_IDENTITY_SHA256="$EXPECTED_ARTIFACT_IDENTITY_SHA256" \
+          SSM_SCRIPT_SHA256="$PROFILE_SCRIPT_SHA256" \
+          SSM_SCRIPT_PAYLOAD="$script_payload" \
+            python3 -c '
+          import json
+          import os
+          import shlex
+
+          operation = os.environ["SSM_OPERATION"]
+          revision = os.environ["SSM_SOURCE_REVISION"]
+          worker_image = os.environ["SSM_WORKER_IMAGE"]
+          worker_revision = os.environ["SSM_WORKER_SOURCE_REVISION"]
+          manifest_sha256 = os.environ["SSM_MANIFEST_SHA256"]
+          model_manifest_sha256 = os.environ["SSM_MODEL_MANIFEST_SHA256"]
+          worker_model_objects_sha256 = os.environ["SSM_WORKER_MODEL_OBJECTS_SHA256"]
+          artifact_identity = os.environ["SSM_ARTIFACT_IDENTITY_SHA256"]
+          checksum = os.environ["SSM_SCRIPT_SHA256"]
+          payload = os.environ["SSM_SCRIPT_PAYLOAD"]
+          arguments = f"--{operation}"
+          if operation in {"status", "enable"}:
+              arguments += (
+                  " --expected-control-plane-revision " + shlex.quote(revision)
+                  + " --expected-worker-image " + shlex.quote(worker_image)
+                  + " --expected-worker-source-revision " + shlex.quote(worker_revision)
+                  + " --expected-private-manifest-sha256 " + shlex.quote(manifest_sha256)
+                  + " --expected-model-manifest-sha256 " + shlex.quote(model_manifest_sha256)
+                  + " --expected-worker-model-objects-sha256 " + shlex.quote(worker_model_objects_sha256)
+                  + " --expected-artifact-identity-sha256 " + shlex.quote(artifact_identity)
+              )
+          command = (
+              "set -Eeuo pipefail; "
+              "payload_root=$(/usr/bin/mktemp --directory /tmp/gen-automation-i2v-profile.XXXXXX); "
+              "trap '\''/usr/bin/rm -rf -- \"$payload_root\"'\'' EXIT; "
+              "/usr/bin/printf '\''%s'\'' " + shlex.quote(payload)
+              + " | /usr/bin/base64 --decode | /usr/bin/gzip --decompress"
+              " >\"$payload_root/configure-i2v-lora-profile.sh\"; "
+              "/usr/bin/printf '\''%s  %s\\n'\'' " + shlex.quote(checksum)
+              + " \"$payload_root/configure-i2v-lora-profile.sh\""
+              " | /usr/bin/sha256sum --check --status; "
+              "/usr/bin/bash -n \"$payload_root/configure-i2v-lora-profile.sh\"; "
+              "sudo /usr/bin/bash \"$payload_root/configure-i2v-lora-profile.sh\" "
+              + arguments
+          )
+          if len(command.encode("utf-8")) > 24_000:
+              raise SystemExit("SSM command exceeds the reviewed size bound")
+          print(
+              json.dumps(
+                  {
+                      "commands": [command],
+                      "executionTimeout": ["5400"],
+                  }
+              )
+          )
+          ' >"$parameters_file"
+
+          command_id="$(
+            aws ssm send-command \
+              --region "$AWS_REGION" \
+              --instance-ids "$AWS_STAGING_INSTANCE_ID" \
+              --document-name AWS-RunShellScript \
+              --comment "${OPERATION} staging I2V LoRA profile at ${SOURCE_REVISION}" \
+              --timeout-seconds 120 \
+              --parameters "file://${parameters_file}" \
+              --query 'Command.CommandId' \
+              --output text
+          )"
+          final_status=""
+          for _ in $(seq 1 1140); do
+            final_status="$(
+              aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$command_id" \
+                --instance-id "$AWS_STAGING_INSTANCE_ID" \
+                --query 'Status' \
+                --output text 2>/dev/null || true
+            )"
+            case "$final_status" in
+              Success|Cancelled|TimedOut|Failed|Cancelling) break ;;
+            esac
+            sleep 5
+          done
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$command_id" \
+            --instance-id "$AWS_STAGING_INSTANCE_ID" \
+            --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
+            --output json
+          [ "$final_status" = "Success" ] || {
+            printf '%s\n' "I2V LoRA profile operation finished with status: ${final_status:-unknown}" >&2
             exit 1
           }

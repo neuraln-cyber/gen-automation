@@ -41,7 +41,7 @@
       "expected_bytes": 613516752,
       "name": "wan-general-nsfw-high-v008a",
       "optional": true,
-      "role": "lora_high",
+      "role": "lora_wan_general_nsfw_high",
       "sha256": "34e2144d3cd65360f97d09ccbe03e1c39a096df6c9234af5fe3899d1b63cda39",
       "target_filename": "NSFW-22-H-e8.safetensors",
       "url": "https://civitai.com/api/download/models/2073605"
@@ -50,10 +50,82 @@
       "expected_bytes": 613516752,
       "name": "wan-general-nsfw-low-v008a",
       "optional": true,
-      "role": "lora_low",
+      "role": "lora_wan_general_nsfw_low",
       "sha256": "d6b783742f4d5fd63a0223ae1d5bf64fc995a6b408480ac2a00528ae0d4146db",
       "target_filename": "NSFW-22-L-e8.safetensors",
       "url": "https://civitai.com/api/download/models/2083303"
+    },
+    {
+      "expected_bytes": 306847512,
+      "name": "bouncing-boobs-wan22-high",
+      "optional": true,
+      "role": "lora_bouncing_boobs_high",
+      "sha256": "a4f4398031e9f39571310355f23e2d104c21143f517cf053e06d21f1c48d3d52",
+      "target_filename": "BounceHighWan2_2.safetensors",
+      "url": "https://civitai.com/api/download/models/2191217"
+    },
+    {
+      "expected_bytes": 306847504,
+      "name": "bouncing-boobs-wan22-low",
+      "optional": true,
+      "role": "lora_bouncing_boobs_low",
+      "sha256": "3ba8320137ba7d99885624dc512d8e0ea02f24364eabbe31e803fec785339ecb",
+      "target_filename": "BounceLowWan2_2.safetensors",
+      "url": "https://civitai.com/api/download/models/2191270"
+    },
+    {
+      "expected_bytes": 306807976,
+      "name": "m4crom4sti4-natural-breasts-high-k3nk",
+      "optional": true,
+      "role": "lora_m4crom4sti4_high",
+      "sha256": "851c928737235b4a4a2c5993c893c79ee46a3131aa9b16eb56de1dcc576c3ad9",
+      "target_filename": "wan22-m4crom4sti4-i2v-20epoc-high-k3nk.safetensors",
+      "url": "https://civitai.com/api/download/models/2265575"
+    },
+    {
+      "expected_bytes": 306807976,
+      "name": "m4crom4sti4-natural-breasts-low-k3nk",
+      "optional": true,
+      "role": "lora_m4crom4sti4_low",
+      "sha256": "c8a940ad5ab59a15c7f39624f694482a020f0dd047cec56f498b58418d3d937c",
+      "target_filename": "wan22-m4crom4sti4-i2v-20epoc-low-k3nk.safetensors",
+      "url": "https://civitai.com/api/download/models/2266727"
+    },
+    {
+      "expected_bytes": 306807976,
+      "name": "dr34ml4y-i2v-14b-high-v2",
+      "optional": true,
+      "role": "lora_dr34ml4y_high",
+      "sha256": "d9931756c202bd8d4946c0d163c1269231a6352b51bb4235f6a19894c9ad8c68",
+      "target_filename": "DR34ML4Y_I2V_14B_HIGH_V2.safetensors",
+      "url": "https://civitai.com/api/download/models/2553151"
+    },
+    {
+      "expected_bytes": 306807976,
+      "name": "dr34ml4y-i2v-14b-low-v2",
+      "optional": true,
+      "role": "lora_dr34ml4y_low",
+      "sha256": "066ee4bfafb685c85f08174c8283cd11bc6d36f4845347f20d633ab44581601f",
+      "target_filename": "DR34ML4Y_I2V_14B_LOW_V2.safetensors",
+      "url": "https://civitai.com/api/download/models/2553271"
+    },
+    {
+      "expected_bytes": 306807280,
+      "name": "smoothmix-xxx-animations-high",
+      "optional": true,
+      "role": "lora_smoothmix_animations_high",
+      "sha256": "eac4f4341008abb00434d08fed1d4fda4a144bc94cd26b4819f629f930a75181",
+      "target_filename": "SmoothXXXAnimation_High.safetensors",
+      "url": "https://civitai.com/api/download/models/2376136"
+    },
+    {
+      "expected_bytes": 306807280,
+      "name": "smoothmix-xxx-animations-low",
+      "optional": true,
+      "role": "lora_smoothmix_animations_low",
+      "sha256": "ad50dfc46c765a6ccc36d40e8a5f77ac2db041f68266593add12ac5f5eac2d76",
+      "target_filename": "SmoothXXXAnimation_Low.safetensors",
+      "url": "https://civitai.com/api/download/models/2376143"
     }
   ]
 }

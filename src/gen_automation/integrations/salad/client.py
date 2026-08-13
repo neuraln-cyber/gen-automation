@@ -82,6 +82,30 @@ def _retry_after_seconds(value: str | None) -> float | None:
         return max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
 
 
+def _container_group_sensitive_values(
+    configuration: Mapping[str, JSONValue],
+) -> tuple[str, ...]:
+    """Return credential-bearing values that a provider error may echo."""
+
+    container = configuration.get("container")
+    if not isinstance(container, Mapping):
+        return ()
+    values: list[str] = []
+    registry_authentication = container.get("registry_authentication")
+    if isinstance(registry_authentication, Mapping):
+        basic = registry_authentication.get("basic")
+        if isinstance(basic, Mapping):
+            password = basic.get("password")
+            if isinstance(password, str) and password:
+                values.append(password)
+    environment_variables = container.get("environment_variables")
+    if isinstance(environment_variables, Mapping):
+        values.extend(
+            value for value in environment_variables.values() if isinstance(value, str) and value
+        )
+    return tuple(dict.fromkeys(values))
+
+
 class SaladClient:
     """Typed async adapter for the SaladCloud public REST API.
 
@@ -420,16 +444,7 @@ class SaladClient:
         self,
         configuration: Mapping[str, JSONValue],
     ) -> SaladContainerGroup:
-        sensitive_values: tuple[str, ...] = ()
-        container = configuration.get("container")
-        if isinstance(container, Mapping):
-            registry_authentication = container.get("registry_authentication")
-            if isinstance(registry_authentication, Mapping):
-                basic = registry_authentication.get("basic")
-                if isinstance(basic, Mapping):
-                    password = basic.get("password")
-                    if isinstance(password, str) and password:
-                        sensitive_values = (password,)
+        sensitive_values = _container_group_sensitive_values(configuration)
         data = await self._request_json(
             "POST",
             f"{self._project_path}/containers",
@@ -499,6 +514,7 @@ class SaladClient:
             expected_status=200,
             json_body=dict(patch),
             content_type="application/merge-patch+json",
+            sensitive_values=_container_group_sensitive_values(patch),
         )
         return _parse_model(data, parse_container_group)
 

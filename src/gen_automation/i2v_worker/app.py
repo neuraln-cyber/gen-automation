@@ -25,7 +25,9 @@ from gen_automation.i2v_worker.settings import I2VWorkerSettings
 from gen_automation.i2v_worker.supervisor import WorkerSupervisor
 from gen_automation.i2v_worker.workflow import (
     WorkflowError,
+    effective_positive_prompt,
     load_workflow_template,
+    lora_provenance,
     render_workflow,
 )
 
@@ -81,13 +83,51 @@ def create_i2v_worker_app(
             content={"status": "failed" if resolved_supervisor.failed else "ok"},
         )
 
-    @app.get("/ready")
-    async def ready() -> JSONResponse:
+    async def _readiness() -> tuple[bool, dict[str, object]]:
         comfy = resolved_supervisor.comfy_client
         is_ready = bool(resolved_supervisor.ready and comfy is not None and await comfy.ready())
+        content: dict[str, object] = {
+            "status": "ready" if is_ready else "not_ready",
+        }
+        if is_ready:
+            content["capability"] = {
+                "schema": "gen-automation/i2v-worker-capability/v1",
+                "lora_worker_enabled": settings.lora_worker_enabled,
+                "private_manifest_source_sha256": (settings.private_manifest_source_sha256),
+                "model_objects_sha256": settings.model_objects_sha256,
+                "artifact_identity_sha256": settings.artifact_identity_sha256,
+                "model_roles": [item.role for item in settings.model_objects],
+                "source_revision": settings.source_revision,
+            }
+        return is_ready, content
+
+    @app.get("/ready")
+    async def ready() -> JSONResponse:
+        is_ready, content = await _readiness()
         return JSONResponse(
             status_code=200 if is_ready else 503,
-            content={"status": "ready" if is_ready else "not_ready"},
+            content=content,
+        )
+
+    @app.get("/ready/capability/{manifest_sha256}/{artifact_identity_sha256}/{source_revision}")
+    async def exact_capability(
+        manifest_sha256: str,
+        artifact_identity_sha256: str,
+        source_revision: str,
+    ) -> JSONResponse:
+        if (
+            not settings.lora_worker_enabled
+            or settings.private_manifest_source_sha256 is None
+            or settings.source_revision is None
+            or manifest_sha256 != settings.private_manifest_source_sha256
+            or artifact_identity_sha256 != settings.artifact_identity_sha256
+            or source_revision != settings.source_revision
+        ):
+            raise HTTPException(status_code=404, detail="worker capability not found")
+        is_ready, content = await _readiness()
+        return JSONResponse(
+            status_code=200 if is_ready else 503,
+            content=content,
         )
 
     @app.post("/jobs/i2v", response_model=I2VResult)
@@ -102,6 +142,15 @@ def create_i2v_worker_app(
             job = I2VJob.model_validate_json(body, strict=True)
         except (ValidationError, ValueError, json.JSONDecodeError):
             raise HTTPException(status_code=400, detail="invalid request") from None
+        if job.settings_snapshot.loras and not settings.lora_worker_enabled:
+            raise HTTPException(
+                status_code=409,
+                detail="reviewed LoRAs are not enabled for this worker profile",
+            )
+        try:
+            effective_positive_prompt(job.positive_prompt, job.settings_snapshot)
+        except WorkflowError:
+            raise HTTPException(status_code=400, detail="invalid reviewed LoRA prompt") from None
 
         async with execution_lock:
             try:
@@ -167,6 +216,10 @@ async def _run_job(
             job_id=job.job_id,
             attempt_id=job.attempt_id,
         )
+        resolved_positive_prompt = effective_positive_prompt(
+            job.positive_prompt,
+            generation_settings,
+        )
         comfy = supervisor.comfy_client
         if comfy is None:
             raise MediaError("worker lost ComfyUI")
@@ -215,6 +268,8 @@ async def _run_job(
                     "loop_count": metadata["loop_count"],
                     "source_fit": metadata["source_fit"],
                     "match_source_aspect": metadata["match_source_aspect"],
+                    "loras": lora_provenance(generation_settings),
+                    "effective_positive_prompt": resolved_positive_prompt,
                 },
             ),
         )
