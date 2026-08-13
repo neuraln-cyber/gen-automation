@@ -1463,6 +1463,8 @@ async def test_dry_run_accepts_legacy_missing_default_fields_without_mutation(
     source = _without_legacy_default_fields(
         _pre_running_group(SaladContainerGroupInstanceState.DOWNLOADING)
     )
+    container = cast(JSONObject, source.raw["container"])
+    cast(JSONObject, container["resources"])["shm_size"] = 64
     client = _FakeSalad(group=source)
     client.instances = _pre_running_instance_page(SaladContainerGroupInstanceState.DOWNLOADING)
 
@@ -1511,6 +1513,42 @@ def test_prior_contract_rejects_a_non_false_reviewed_autostart_policy(
     ):
         rollout._validate_safe_prior_rollout_baseline(
             _without_autostart_policy(_group(capable=False)),
+            _instance_page(),
+            _config(capable=False),
+        )
+
+
+def test_prior_contract_accepts_only_salads_injected_default_shm_size() -> None:
+    group = _without_legacy_default_fields(_group(capable=False))
+    container = cast(JSONObject, group.raw["container"])
+    resources = cast(JSONObject, container["resources"])
+    resources["shm_size"] = 64
+
+    rollout._validate_safe_prior_rollout_baseline(
+        group,
+        _instance_page(),
+        _config(capable=False),
+    )
+
+    resources["shm_size"] = 128
+    with pytest.raises(I2VLoraRolloutError, match="compute contract drifted"):
+        rollout._validate_safe_prior_rollout_baseline(
+            group,
+            _instance_page(),
+            _config(capable=False),
+        )
+
+
+def test_prior_contract_rejects_extra_compute_resource_fields() -> None:
+    group = _without_legacy_default_fields(_group(capable=False))
+    container = cast(JSONObject, group.raw["container"])
+    resources = cast(JSONObject, container["resources"])
+    resources["shm_size"] = 64
+    resources["unreviewed"] = None
+
+    with pytest.raises(I2VLoraRolloutError, match="compute contract drifted"):
+        rollout._validate_safe_prior_rollout_baseline(
+            group,
             _instance_page(),
             _config(capable=False),
         )

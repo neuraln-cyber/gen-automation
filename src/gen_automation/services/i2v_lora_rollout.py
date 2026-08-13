@@ -61,6 +61,7 @@ REVIEWED_ARTIFACT_IDENTITY_SHA256 = (
     "68f6c28831ac2a8e1801ba420c9816a29e09c8cc4738aae85611955553a3d301"
 )
 REVIEWED_PROVIDER_GROUP_ID = "411e67d9-1584-4c60-8a6e-301319a64ea3"
+_SALAD_DEFAULT_SHM_SIZE = 64
 
 _QUEUE_LOCK_KEY = 749220037
 _ACTIVE_JOB_STATES = (
@@ -1444,10 +1445,18 @@ def _validate_prior_group_static_contract(
     observed_container = group.raw.get("container")
     if not isinstance(desired_container, dict) or not isinstance(observed_container, dict):
         raise I2VLoraRolloutError("provider group container contract is invalid")
-    exact_container_fields = ("resources", "image_caching")
-    if any(
-        observed_container.get(key) != desired_container.get(key) for key in exact_container_fields
+    desired_resources = desired_container.get("resources")
+    observed_resources = observed_container.get("resources")
+    if (
+        isinstance(observed_resources, dict)
+        and observed_resources.get("shm_size") == _SALAD_DEFAULT_SHM_SIZE
     ):
+        observed_resources = {
+            key: value for key, value in observed_resources.items() if key != "shm_size"
+        }
+    if observed_resources != desired_resources or observed_container.get(
+        "image_caching"
+    ) != desired_container.get("image_caching"):
         raise I2VLoraRolloutError("provider group compute contract drifted")
     # The pinned container group predates Salad's required autostart field.
     # Salad's legacy create default was false, so preserve that exact omitted
