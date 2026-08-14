@@ -821,6 +821,11 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
     assert 'diagnostic.get("outcome")' not in recovery
     assert '"outcome": "recovery-failed"' in recovery
     assert '"recovery_stage": "recovery-provider"' in recovery
+    assert '"stage": "inflight-recovery-environment"' in recovery
+    assert '"stage": "inflight-recovery-guard"' in recovery
+    assert "and (original_failure or pre_mutation_recovery_retry)" in recovery
+    assert "--diagnostic-output /run/i2v-lora-rollout/inflight-recovery-diagnostic.json" in recovery
+    assert "--diagnostic-output /run/i2v-lora-rollout/rollout-diagnostic.json" not in recovery
     assert "if len(candidates) != 1" in recovery
     assert "10000s recover-inflight" in recovery
     assert recovery.index("assert_zero_status") < recovery.index("10000s recover-inflight")
