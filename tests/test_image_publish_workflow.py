@@ -11,6 +11,7 @@ I2V_INPUTS = (
     ".gitattributes",
     "Dockerfile.i2v-worker",
     "requirements-i2v-worker.lock",
+    "patches/comfyui-nag/chroma-stream-blocks.patch",
     "patches/salad-queue-worker/strict-http-status.patch",
     "src/gen_automation/__init__.py",
     "src/gen_automation/i2v_worker",
