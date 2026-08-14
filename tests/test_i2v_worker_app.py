@@ -237,7 +237,78 @@ def test_generation_returns_exact_wire_result_and_cleans_runtime(
     assert result["output"]["metadata"]["codec"] == "h264"
     assert result["output"]["metadata"]["loras"] == []
     assert result["output"]["metadata"]["effective_positive_prompt"] == ("subtle natural motion")
+    assert result["output"]["metadata"]["effective_negative_prompt"] == "jitter"
+    assert result["output"]["metadata"]["face_fidelity"] == "off"
     assert list((settings.runtime_root / "jobs").glob("*")) == []
+
+
+def test_generation_records_effective_face_fidelity_contract(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    settings = _settings(tmp_path)
+    supervisor = _Supervisor()
+    captured: dict[str, Any] = {}
+
+    async def download(*_args: Any, **_kwargs: Any) -> None:
+        destination = _args[2]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"x")
+
+    def prepare(source: Path, destination: Path, **_kwargs: Any) -> None:
+        destination.write_bytes(source.read_bytes())
+
+    async def execute(workflow: dict[str, Any], _output: Path) -> tuple[Path, ...]:
+        captured["workflow"] = workflow
+        return (Path("frame.png"),)
+
+    def encode(
+        _frames: Any,
+        generation: Any,
+        job_root: Path,
+        **_kwargs: Any,
+    ) -> tuple[Path, dict[str, Any]]:
+        output = job_root / "output.mp4"
+        output.write_bytes(b"video")
+        return output, {
+            "width": generation.width,
+            "height": generation.height,
+            "frame_count": generation.frame_count,
+            "fps": float(generation.fps),
+            "duration_ms": 5063,
+            "codec": "h264",
+            "pixel_format": "yuv420p",
+            "faststart": True,
+            "native_width": generation.width,
+            "native_height": generation.height,
+            "upscale": generation.upscale,
+            "loop_mode": "none",
+            "loop_count": 1,
+            "source_fit": "contain_edge_pad",
+            "match_source_aspect": generation.match_source_aspect,
+        }
+
+    async def upload(*_args: Any, **_kwargs: Any) -> tuple[str, int, str]:
+        return "output-v1", 5, SHA
+
+    supervisor.comfy_client.execute = execute  # type: ignore[method-assign]
+    monkeypatch.setattr("gen_automation.i2v_worker.app.download_input", download)
+    monkeypatch.setattr("gen_automation.i2v_worker.app.prepare_input_image", prepare)
+    monkeypatch.setattr("gen_automation.i2v_worker.app.encode_video", encode)
+    monkeypatch.setattr("gen_automation.i2v_worker.app.upload_video", upload)
+    app = create_i2v_worker_app(settings, supervisor=supervisor)  # type: ignore[arg-type]
+    job = _job()
+    job["settings_snapshot"] = {"face_fidelity": "stable_expression"}
+
+    with TestClient(app) as client:
+        response = client.post("/jobs/i2v", json=job)
+
+    assert response.status_code == 200, response.text
+    metadata = response.json()["output"]["metadata"]
+    assert metadata["face_fidelity"] == "stable_expression"
+    assert "one subtle natural blink" in metadata["effective_positive_prompt"]
+    assert "expression change" in metadata["effective_negative_prompt"]
+    assert captured["workflow"]["11"]["class_type"] == "KSamplerWithNAG (Advanced)"
 
 
 def test_worker_rejects_unbounded_or_invalid_request_bodies(tmp_path: Path) -> None:

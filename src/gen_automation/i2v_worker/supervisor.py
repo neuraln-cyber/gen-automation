@@ -138,6 +138,8 @@ def _comfy_command(settings: I2VWorkerSettings) -> tuple[str, ...]:
         "8188",
         "--disable-auto-launch",
         "--disable-all-custom-nodes",
+        "--whitelist-custom-nodes",
+        "ComfyUI-NAG",
         "--disable-api-nodes",
         "--disable-metadata",
         "--base-directory",

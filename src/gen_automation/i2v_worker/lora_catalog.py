@@ -279,10 +279,13 @@ _SMOOTHMIX_ANIMATIONS = ReviewedPairedLora(
     trigger_words=(),
     automatic_trigger_words=(),
     recommended_initial_strength=1.0,
-    strength_guidance="Author showcase value for the paired animation LoRA",
+    strength_guidance=(
+        "Author showcase value is 1.0; use about 0.3 when face stability is the priority"
+    ),
     usage_notes=(
         "Generic motion enhancer; the author recommends combining it with a scene-specific "
-        "LoRA for complex or niche poses."
+        "LoRA for complex or niche poses. Higher strength can animate everything, including "
+        "the face."
     ),
     source_usage=SourceUsage(
         recorded_at="2026-08-13",

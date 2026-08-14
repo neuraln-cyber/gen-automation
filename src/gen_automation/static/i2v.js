@@ -70,6 +70,7 @@
     loop_count: 2,
     color_transfer: false,
     tiled_vae: false,
+    face_fidelity: "stable_expression",
     loras: [],
   };
   let saveTimer = null;

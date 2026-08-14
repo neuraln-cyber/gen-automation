@@ -8,6 +8,8 @@ from typing import Any
 import httpx2
 
 _PROMPT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_REQUIRED_NAG_NODE = "KSamplerWithNAG (Advanced)"
+_REQUIRED_NAG_NODE_PATH = "/object_info/KSamplerWithNAG%20%28Advanced%29"
 
 
 class ComfyError(Exception):
@@ -41,7 +43,13 @@ class ComfyClient:
     async def ready(self) -> bool:
         try:
             response = await self.client.get("/system_stats")
-            return response.status_code == 200
+            if response.status_code != 200:
+                return False
+            node_response = await self.client.get(_REQUIRED_NAG_NODE_PATH)
+            if node_response.status_code != 200:
+                return False
+            node_info = node_response.json()
+            return isinstance(node_info, dict) and set(node_info) == {_REQUIRED_NAG_NODE}
         except Exception:
             return False
 

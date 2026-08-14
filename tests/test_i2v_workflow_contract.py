@@ -418,7 +418,15 @@ def test_runtime_and_reference_sources_are_immutable() -> None:
         "release": "v0.32.0",
         "repository": "https://github.com/Comfy-Org/ComfyUI",
     }
-    assert manifest["workflow"]["required_custom_nodes"] == []
+    assert manifest["workflow"]["required_custom_nodes"] == [
+        {
+            "class_types": ["KSamplerWithNAG (Advanced)"],
+            "commit": "ef8a641be08983cf5f06669f70719b6eecce3c7f",
+            "enabled_for": "face_fidelity=stable_expression",
+            "license": "MIT",
+            "repository": "https://github.com/ChenDarYen/ComfyUI-NAG",
+        }
+    ]
 
     reference_workflows = {
         item["civitai_version_id"]: item for item in manifest["reference_workflows"]

@@ -157,6 +157,7 @@ class GenerationSettings(_StrictModel):
     loop_count: int = Field(default=2, ge=1, le=20)
     color_transfer: Literal[False] = False
     tiled_vae: Literal[False] = False
+    face_fidelity: Literal["off", "stable_expression"] = "off"
     loras: list[LoraSelection] = Field(
         default_factory=list,
         max_length=MAX_REVIEWED_LORA_SELECTIONS,

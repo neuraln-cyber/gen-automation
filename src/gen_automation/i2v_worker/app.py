@@ -25,6 +25,7 @@ from gen_automation.i2v_worker.settings import I2VWorkerSettings
 from gen_automation.i2v_worker.supervisor import WorkerSupervisor
 from gen_automation.i2v_worker.workflow import (
     WorkflowError,
+    effective_negative_prompt,
     effective_positive_prompt,
     load_workflow_template,
     lora_provenance,
@@ -220,6 +221,10 @@ async def _run_job(
             job.positive_prompt,
             generation_settings,
         )
+        resolved_negative_prompt = effective_negative_prompt(
+            job.negative_prompt,
+            generation_settings,
+        )
         comfy = supervisor.comfy_client
         if comfy is None:
             raise MediaError("worker lost ComfyUI")
@@ -270,6 +275,8 @@ async def _run_job(
                     "match_source_aspect": metadata["match_source_aspect"],
                     "loras": lora_provenance(generation_settings),
                     "effective_positive_prompt": resolved_positive_prompt,
+                    "effective_negative_prompt": resolved_negative_prompt,
+                    "face_fidelity": generation_settings.face_fidelity,
                 },
             ),
         )

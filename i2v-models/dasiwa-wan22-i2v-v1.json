@@ -10,7 +10,17 @@
     "bindings": "workflows/dasiwa-wan22-i2v-v1.bindings.json",
     "bindings_sha256": "83b893929bc89eff3f2de7bbb7aed3892fee42f91d3d18a52d7b5c95b0c630cd",
     "output_stage": "external_ffmpeg",
-    "required_custom_nodes": []
+    "required_custom_nodes": [
+      {
+        "class_types": [
+          "KSamplerWithNAG (Advanced)"
+        ],
+        "commit": "ef8a641be08983cf5f06669f70719b6eecce3c7f",
+        "enabled_for": "face_fidelity=stable_expression",
+        "license": "MIT",
+        "repository": "https://github.com/ChenDarYen/ComfyUI-NAG"
+      }
+    ]
   },
   "baseline": {
     "cfg": 1.0,

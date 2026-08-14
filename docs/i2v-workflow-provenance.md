@@ -24,15 +24,18 @@ The checked-in contract consists of:
 The graph uses only these ComfyUI core classes: `LoadImage`, `UNETLoader`,
 `CLIPLoader`, `VAELoader`, `CLIPTextEncode`, `ModelSamplingSD3`,
 `WanImageToVideo`, `KSamplerAdvanced`, `VAEDecode`, and `SaveImage`. A selected
-reviewed LoRA additionally uses core `LoraLoaderModelOnly`; there is still no
-custom-node requirement. The worker expands every `{"$i2v": "..."}` binding
-before submitting the prompt to ComfyUI.
+reviewed LoRA additionally uses core `LoraLoaderModelOnly`. The optional
+`face_fidelity=stable_expression` path replaces only the two sampler classes
+with `KSamplerWithNAG (Advanced)` from ComfyUI-NAG commit
+`ef8a641be08983cf5f06669f70719b6eecce3c7f`; the worker starts ComfyUI with all
+custom nodes disabled except that exact allowlisted directory. The worker expands every
+`{"$i2v": "..."}` binding before submitting the prompt to ComfyUI.
 
 `SaveImage` emits the ordered decoded frames. The worker materializes those
 frames as `frame-%06d.png` and invokes external FFmpeg outside ComfyUI. The encoding
 contract is MP4/H.264, `yuv420p`, `+faststart`, no audio, and exactly the bound
 frame count and FPS. The graph intentionally contains no video-combine,
-interpolation, upscaling, caching, tiled-VAE, NAG, SageAttention, watermark, or
+interpolation, upscaling, caching, tiled-VAE, SageAttention, watermark, or
 perfect-loop node. The worker can optionally scale decoded frames to the source
 image's even dimensions and materialize a deterministic ping-pong output; both
 are external delivery transforms and do not change the inference graph.
@@ -47,6 +50,8 @@ are external delivery transforms and do not change the inference graph.
 - [Experimental WAN General NSFW LoRA](https://civitai.com/models/1307155)
 - [Official Comfy-Org WAN 2.2 dependency package](https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged)
 - [Author's current ComfyUI installer](https://github.com/darksidewalker/dasiwa-comfyui-installer)
+- [Normalized Attention Guidance paper](https://arxiv.org/abs/2505.21179)
+- [Pinned ComfyUI-NAG implementation](https://github.com/ChenDarYen/ComfyUI-NAG/tree/ef8a641be08983cf5f06669f70719b6eecce3c7f)
 
 The source C-AiO artifact is Civitai version `2712329`, file `3084725`, named
 `DasiwaWan22WorkflowsI2VSVI2_fastfidelityCAioV89.json`, with SHA-256
@@ -123,10 +128,25 @@ is limited to 25 seconds after frame/FPS/cycle expansion. The standard 81-frame,
 16 FPS profile therefore permits two 160-frame ping-pong cycles (320 frames,
 20 seconds); looping remains off for the baseline validation preset.
 
-At CFG 1, ordinary negative conditioning has no practical effect. The dashboard
-may save and submit a negative prompt, but must describe it honestly. Activating
-negative guidance requires a separately reviewed graph with core `NAGuidance`;
-it is not silently enabled in v1.
+At CFG 1, ordinary negative conditioning has no practical effect. The default
+worker setting remains `face_fidelity=off`, which renders the original graph
+without NAG and preserves exact compatibility with frozen v4 jobs. The dashboard
+offers `stable_expression` for new jobs. That mode retains the same model pair,
+latent topology, steps, seed, LoRAs, and delivery path, but selects the pinned
+NAG sampler with reviewed values `scale=11`, `tau=2.37`, `alpha=0.25`, and
+`sigma_end=0`. It appends a fixed effective positive anchor that preserves the
+source expression and head angle while allowing one subtle blink, and a fixed
+effective negative anchor covering expression, mouth, gaze, and head drift.
+Authored prompts remain unchanged; both effective prompts and the selected mode
+are recorded in output provenance.
+
+The rollback anchor immediately before this feature is control-plane merge
+`74ae801c0d61e445209dda5508807587529ce20c`, I2V worker source
+`7dd463a4daafc55e7abf088ff1faa85b045200cf`, worker image digest
+`sha256:da8d423e188193421d5299c71dd6719fc89ac3bdc04119a7437ed7d5300b47e7`,
+and provider contract version 4. Disabling the per-job setting returns to the
+original inference path without a provider rollback. The guarded worker rollout
+can restore that exact source/digest if image-level rollback is required.
 
 ## Reviewed paired LoRAs
 
