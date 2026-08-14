@@ -26,6 +26,7 @@ from gen_automation.i2v_worker.workflow import (
 ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "Dockerfile.i2v-worker"
 LOCK = ROOT / "requirements-i2v-worker.lock"
+NAG_PATCH = ROOT / "patches/comfyui-nag/chroma-stream-blocks.patch"
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 WORKFLOW = ROOT / "workflows/dasiwa-wan22-i2v-v1.api.json"
 SHA = "a" * 64
@@ -414,6 +415,14 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
     assert (
         'LABEL org.opencontainers.image.comfyui-nag.revision="${COMFYUI_NAG_COMMIT}"' in dockerfile
     )
+    nag_patch = NAG_PATCH.read_text(encoding="utf-8")
+    assert hashlib.sha256(NAG_PATCH.read_bytes()).hexdigest() in dockerfile
+    assert nag_patch.count("+from comfy.ldm.flux.layers import") == 2
+    assert nag_patch.count("-from comfy.ldm.chroma.layers import") == 2
+    assert "spec_from_file_location('comfyui_nag'" in dockerfile
+    assert "sys.argv=['comfyui-build-check','--cpu']" in dockerfile
+    assert "comfy.options.enable_args_parsing()" in dockerfile
+    assert "'KSamplerWithNAG (Advanced)' in m.NODE_CLASS_MAPPINGS" in dockerfile
     heavyweight_runtime_end = dockerfile.index(
         "grep -Fq 'class WanImageToVideo' /opt/comfyui/comfy_extras/nodes_wan.py"
     )

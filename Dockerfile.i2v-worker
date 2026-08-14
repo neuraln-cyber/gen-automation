@@ -117,8 +117,15 @@ RUN /opt/conda/bin/python -c "import sys; assert sys.version_info[:2] == (3, 11)
 # runtime layers. Publication can then reuse those proven blobs, and Salad only
 # needs to pull this small extension layer plus the application delta.
 ARG COMFYUI_NAG_COMMIT=ef8a641be08983cf5f06669f70719b6eecce3c7f
+ARG COMFYUI_NAG_PATCH_SHA256=63d93ed85b7ae819328a27b928f39944690988d964cc336da8a82b63c06917e8
 
-RUN apt-get update \
+COPY patches/comfyui-nag/chroma-stream-blocks.patch /tmp/chroma-stream-blocks.patch
+
+RUN printf '%s  %s\n' \
+        "${COMFYUI_NAG_PATCH_SHA256}" \
+        /tmp/chroma-stream-blocks.patch \
+        | sha256sum -c - \
+    && apt-get update \
     && apt-get install --yes --no-install-recommends git \
     && mkdir --parents /opt/comfyui/custom_nodes/ComfyUI-NAG \
     && git -C /opt/comfyui/custom_nodes/ComfyUI-NAG init \
@@ -129,8 +136,19 @@ RUN apt-get update \
     && git -C /opt/comfyui/custom_nodes/ComfyUI-NAG checkout --detach FETCH_HEAD \
     && test "$(git -C /opt/comfyui/custom_nodes/ComfyUI-NAG rev-parse HEAD)" = \
         "${COMFYUI_NAG_COMMIT}" \
+    && git -C /opt/comfyui/custom_nodes/ComfyUI-NAG apply \
+        --check /tmp/chroma-stream-blocks.patch \
+    && git -C /opt/comfyui/custom_nodes/ComfyUI-NAG apply \
+        /tmp/chroma-stream-blocks.patch \
+    && git -C /opt/comfyui/custom_nodes/ComfyUI-NAG diff --check \
+    && grep -Fq 'from comfy.ldm.flux.layers import' \
+        /opt/comfyui/custom_nodes/ComfyUI-NAG/chroma/layers.py \
+    && grep -Fq 'from comfy.ldm.flux.layers import' \
+        /opt/comfyui/custom_nodes/ComfyUI-NAG/chroma/model.py \
     && grep -Fq '"KSamplerWithNAG (Advanced)"' \
         /opt/comfyui/custom_nodes/ComfyUI-NAG/node.py \
+    && /opt/i2v-venv/bin/python -c \
+        "import importlib.util,sys; sys.argv=['comfyui-build-check','--cpu']; p='/opt/comfyui/custom_nodes/ComfyUI-NAG'; sys.path.insert(0,'/opt/comfyui'); import comfy.options; comfy.options.enable_args_parsing(); s=importlib.util.spec_from_file_location('comfyui_nag',f'{p}/__init__.py',submodule_search_locations=[p]); assert s is not None and s.loader is not None; m=importlib.util.module_from_spec(s); sys.modules['comfyui_nag']=m; s.loader.exec_module(m); assert 'KSamplerWithNAG (Advanced)' in m.NODE_CLASS_MAPPINGS" \
     && rm -rf /opt/comfyui/custom_nodes/ComfyUI-NAG/.git \
     && apt-get purge --yes --auto-remove git \
     && rm -rf /var/lib/apt/lists/*

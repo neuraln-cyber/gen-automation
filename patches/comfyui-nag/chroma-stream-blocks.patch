@@ -1,0 +1,23 @@
+diff --git a/chroma/layers.py b/chroma/layers.py
+--- a/chroma/layers.py
++++ b/chroma/layers.py
+@@ -2,7 +2,7 @@ import torch
+ from torch import Tensor
+ 
+ from comfy.ldm.flux.math import attention
+-from comfy.ldm.chroma.layers import DoubleStreamBlock, SingleStreamBlock
++from comfy.ldm.flux.layers import DoubleStreamBlock, SingleStreamBlock
+ 
+ from ..utils import nag
+ 
+diff --git a/chroma/model.py b/chroma/model.py
+--- a/chroma/model.py
++++ b/chroma/model.py
+@@ -7,6 +7,6 @@ import comfy.ldm.common_dit
+ 
+ from comfy.ldm.flux.layers import timestep_embedding
+-from comfy.ldm.chroma.layers import (
++from comfy.ldm.flux.layers import (
+     DoubleStreamBlock,
+     SingleStreamBlock,
+ )
