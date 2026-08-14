@@ -148,7 +148,7 @@ RUN printf '%s  %s\n' \
     && grep -Fq '"KSamplerWithNAG (Advanced)"' \
         /opt/comfyui/custom_nodes/ComfyUI-NAG/node.py \
     && /opt/i2v-venv/bin/python -c \
-        "import importlib.util,sys; sys.argv=['comfyui-build-check','--cpu']; p='/opt/comfyui/custom_nodes/ComfyUI-NAG'; sys.path.insert(0,'/opt/comfyui'); s=importlib.util.spec_from_file_location('comfyui_nag',f'{p}/__init__.py',submodule_search_locations=[p]); assert s is not None and s.loader is not None; m=importlib.util.module_from_spec(s); sys.modules['comfyui_nag']=m; s.loader.exec_module(m); assert 'KSamplerWithNAG (Advanced)' in m.NODE_CLASS_MAPPINGS" \
+        "import importlib.util,sys; sys.argv=['comfyui-build-check','--cpu']; p='/opt/comfyui/custom_nodes/ComfyUI-NAG'; sys.path.insert(0,'/opt/comfyui'); import comfy.options; comfy.options.enable_args_parsing(); s=importlib.util.spec_from_file_location('comfyui_nag',f'{p}/__init__.py',submodule_search_locations=[p]); assert s is not None and s.loader is not None; m=importlib.util.module_from_spec(s); sys.modules['comfyui_nag']=m; s.loader.exec_module(m); assert 'KSamplerWithNAG (Advanced)' in m.NODE_CLASS_MAPPINGS" \
     && rm -rf /opt/comfyui/custom_nodes/ComfyUI-NAG/.git \
     && apt-get purge --yes --auto-remove git \
     && rm -rf /var/lib/apt/lists/*

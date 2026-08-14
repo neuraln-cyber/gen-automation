@@ -421,6 +421,7 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
     assert nag_patch.count("-from comfy.ldm.chroma.layers import") == 2
     assert "spec_from_file_location('comfyui_nag'" in dockerfile
     assert "sys.argv=['comfyui-build-check','--cpu']" in dockerfile
+    assert "comfy.options.enable_args_parsing()" in dockerfile
     assert "'KSamplerWithNAG (Advanced)' in m.NODE_CLASS_MAPPINGS" in dockerfile
     heavyweight_runtime_end = dockerfile.index(
         "grep -Fq 'class WanImageToVideo' /opt/comfyui/comfy_extras/nodes_wan.py"
