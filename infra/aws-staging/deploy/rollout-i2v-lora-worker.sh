@@ -324,7 +324,12 @@ allowed_stages = {
     "target-patch-guard", "target-patch", "target-patch-convergence",
     "target-start-guard", "target-start", "target-readiness",
     "recovery-zero-work", "recovery-environment", "recovery-provider",
-    "recovery-complete", "complete",
+    "recovery-complete", "inflight-recovery-guard",
+    "inflight-recovery-environment", "inflight-recovery-patch",
+    "inflight-recovery-convergence", "inflight-recovery-start-guard",
+    "inflight-recovery-start", "inflight-recovery-readiness",
+    "inflight-target-exact", "inflight-target-environment",
+    "inflight-target-readiness", "complete",
 }
 allowed_outcomes = {
     "preparing", "mutating", "recovering", "recovered", "recovery-failed", "ready"
@@ -336,7 +341,7 @@ except (OSError, ValueError):
 if (
     not isinstance(value, dict)
     or value.get("schema") != "gen-automation/i2v-lora-diagnostic/v1"
-    or value.get("operation") not in {"dry-run", "recycle-promote"}
+    or value.get("operation") not in {"dry-run", "recycle-promote", "recover-inflight"}
     or value.get("stage") not in allowed_stages
     or value.get("outcome") not in allowed_outcomes
     or ("recovery_stage" in value and value["recovery_stage"] not in allowed_stages)
@@ -506,7 +511,7 @@ trap cleanup EXIT
 [ "$(id -u)" -eq 0 ] || fail "run as root through AWS Systems Manager"
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --status|--dry-run|--promote|--recycle-promote|--finalize|--rollback)
+    --status|--dry-run|--promote|--recycle-promote|--recover-inflight|--finalize|--rollback)
       [ -z "$operation" ] || fail "choose exactly one operation"
       operation="${1#--}"
       shift
@@ -522,7 +527,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$operation" in
-  status|dry-run|promote|recycle-promote|finalize|rollback) ;;
+  status|dry-run|promote|recycle-promote|recover-inflight|finalize|rollback) ;;
   *) fail "choose one operation" ;;
 esac
 [[ "$expected_revision" =~ ^[0-9a-f]{40}$ ]] || fail "exact control-plane revision is required"
@@ -562,6 +567,141 @@ if [ "$operation" = "status" ]; then
   timeout --signal=TERM --kill-after=10s 900s \
     /usr/bin/docker exec "$initial_container" python3.12 -m \
     gen_automation.i2v_lora_rollout_cli status
+  exit 0
+fi
+
+if [ "$operation" = "recover-inflight" ]; then
+  [ ! -e "$active_state" ] || fail "in-flight recovery refuses an active rollback bundle"
+  status_json="$(timeout --signal=TERM --kill-after=10s 900s \
+    /usr/bin/docker exec "$initial_container" python3.12 -m \
+    gen_automation.i2v_lora_rollout_cli status)"
+  printf '%s' "$status_json" | assert_zero_status ||
+    fail "in-flight recovery requires zero active I2V work"
+  provider_version="$(printf '%s' "$status_json" | \
+    RECOVERY_EXPECTED_IMAGE="$expected_worker_image" /usr/bin/python3 -c '
+import json
+import os
+import sys
+
+data = json.load(sys.stdin)
+diagnostic = data.get("provider_diagnostic")
+expected_image = os.environ["RECOVERY_EXPECTED_IMAGE"]
+if (
+    data.get("provider_image") != expected_image
+    or data.get("provider_ready") is not False
+    or not isinstance(diagnostic, dict)
+    or diagnostic.get("pending_change") is not False
+    or diagnostic.get("replicas") not in (0, 1)
+    or diagnostic.get("status") != "stopped"
+    or diagnostic.get("allocating_count") != 0
+    or diagnostic.get("creating_count") != 0
+    or diagnostic.get("running_count") != 0
+    or diagnostic.get("stopping_count") != 0
+    or diagnostic.get("instance_count") != 0
+    or diagnostic.get("instance_states") != []
+    or diagnostic.get("instance_versions") != []
+    or not isinstance(diagnostic.get("version"), int)
+):
+    raise SystemExit("provider is not the exact stopped in-flight target")
+print(diagnostic["version"], end="")
+')" ||
+    fail "provider is not the exact stopped in-flight target"
+  work_dir="$(/usr/bin/python3 - "$state_root" "$expected_worker_image" "$provider_version" <<'PY'
+import json
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+expected_image = sys.argv[2]
+expected_version = int(sys.argv[3])
+required = {
+    "original.env",
+    "maintenance.env",
+    "target.patch",
+    "provider-rollback.json",
+    "provider-mutation-attempted.json",
+    "rollout-diagnostic.json",
+}
+candidates = []
+for path in sorted(root.glob(".operation.*")):
+    try:
+        directory_stat = path.lstat()
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or path.is_symlink()
+            or directory_stat.st_uid != 10001
+            or directory_stat.st_gid != 10001
+            or stat.S_IMODE(directory_stat.st_mode) != 0o700
+        ):
+            continue
+        for name in required:
+            item = path / name
+            item_stat = item.lstat()
+            if (
+                not stat.S_ISREG(item_stat.st_mode)
+                or item.is_symlink()
+                or item_stat.st_uid != 10001
+                or item_stat.st_gid != 10001
+                or stat.S_IMODE(item_stat.st_mode) != 0o600
+            ):
+                raise ValueError
+        state = json.loads((path / "provider-rollback.json").read_text(encoding="utf-8"))
+        diagnostic = json.loads((path / "rollout-diagnostic.json").read_text(encoding="utf-8"))
+        if (
+            state.get("schema") == "gen-automation/i2v-lora-rollback/v2"
+            and state.get("promoted_image") == expected_image
+            and state.get("promoted_version") == expected_version
+            and diagnostic
+            == {
+                "schema": "gen-automation/i2v-lora-diagnostic/v1",
+                "operation": "recycle-promote",
+                "stage": "target-patch-convergence",
+                "outcome": "recovery-failed",
+                "recovery_stage": "recovery-provider",
+            }
+        ):
+            candidates.append(path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        continue
+if len(candidates) != 1:
+    raise SystemExit("expected exactly one matching in-flight recovery bundle")
+print(candidates[0], end="")
+PY
+)" || fail "expected exactly one matching in-flight recovery bundle"
+  case "$work_dir" in "$state_root"/.operation.*) ;; *) fail "invalid recovery bundle path" ;; esac
+  original_env="$work_dir/original.env"
+  maintenance_env="$work_dir/maintenance.env"
+  provider_state="$work_dir/provider-rollback.json"
+  provider_marker="$work_dir/provider-mutation-attempted.json"
+  # Keep the original recycle failure diagnostic immutable so an interrupted
+  # recovery can select the same exact bundle again. Recovery writes its own
+  # fixed-schema diagnostic beside it.
+  diagnostic_output="$work_dir/inflight-recovery-diagnostic.json"
+  resume_env="$original_env"
+  if ! run_one_off "$original_env" "$initial_container" 10000s recover-inflight \
+    --expected-worker-image "$expected_worker_image" \
+    --expected-worker-source-revision "$expected_worker_source_revision" \
+    --rollback-state-input /run/i2v-lora-rollout/provider-rollback.json \
+    --provider-mutation-marker-output \
+      /run/i2v-lora-rollout/provider-mutation-attempted.json \
+    --diagnostic-output /run/i2v-lora-rollout/rollout-diagnostic.json; then
+    print_rollout_diagnostic "$diagnostic_output"
+    false
+  fi
+  print_rollout_diagnostic "$diagnostic_output"
+  rollback_armed=1
+  restart_into "$original_env" "$expected_revision" >/dev/null
+  rollback_armed=0
+  recovered_state="$state_root/recovered-inflight-$(date -u +%Y%m%dT%H%M%SZ)"
+  [ ! -e "$recovered_state" ] || fail "in-flight recovery archive already exists"
+  mv -- "$work_dir" "$recovered_state"
+  chown -R root:root "$recovered_state"
+  /usr/bin/find "$recovered_state" -type d -exec chmod 0700 {} +
+  /usr/bin/find "$recovered_state" -type f -exec chmod 0600 {} +
+  work_dir=""
+  printf '%s\n' "Incomplete I2V promotion recovered to the exact saved prior worker."
   exit 0
 fi
 

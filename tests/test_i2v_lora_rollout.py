@@ -624,6 +624,141 @@ async def _no_sleep(_seconds: float) -> None:
     return None
 
 
+async def _partial_stopped_target(
+    client: _FakeSalad,
+    state: rollout.ProviderRollbackState,
+    *,
+    environment_drift: bool = True,
+) -> None:
+    client.allow_stop = True
+    await client.stop_container_group(state.group_name)
+    await client.update_container_group(
+        state.group_name,
+        rollout._promotion_patch(
+            client.group,
+            worker_image=_TARGET_IMAGE,
+            environment=_TARGET_ENVIRONMENT,
+            readiness_probe_path=_config(capable=True).readiness_probe_path,
+        ),
+    )
+    if environment_drift:
+        raw = deepcopy(client.group.raw)
+        container = cast(JSONObject, raw["container"])
+        environment = cast(dict[str, str], dict(container["environment_variables"]))
+        environment["GEN_I2V_WORKER_SOURCE_REVISION"] = "d" * 40
+        container["environment_variables"] = environment
+        client.group = replace(client.group, raw=raw)
+
+
+@pytest.mark.asyncio
+async def test_recover_inflight_restores_exact_prior_from_partial_stopped_target(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(rollout, "I2VRuntimeEnvironment", _RuntimeEnvironment)
+    monkeypatch.setattr(rollout.asyncio, "sleep", _no_sleep)
+    prior = _group(capable=False)
+    state = _rollback_state(prior)
+    client = _FakeSalad(group=prior)
+    await _partial_stopped_target(client, state)
+    marker = tmp_path / "provider-mutation.json"
+    rollout._write_provider_mutation_marker(marker)
+    diagnostic = tmp_path / "diagnostic.json"
+
+    result = await rollout.recover_inflight_reviewed_worker(
+        settings=_settings(capable=False),
+        sessions=database.sessions,
+        salad_client=cast(Any, client),
+        resolver=cast(Any, object()),
+        state=state,
+        expected_promoted_image=_TARGET_IMAGE,
+        provider_mutation_marker_output=marker,
+        diagnostic_output=diagnostic,
+        timeout_seconds=0.1,
+    )
+
+    assert result.operation == "recover-inflight"
+    assert result.provider_image == state.prior_image
+    assert result.provider_ready is True
+    assert client.group.version == state.promoted_version + 1
+    assert client.start_calls == 1
+    assert not marker.exists()
+    assert json.loads(diagnostic.read_text(encoding="utf-8"))["recovery_stage"] == (
+        "inflight-target-environment"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_inflight_refuses_static_drift_without_provider_mutation(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(rollout, "I2VRuntimeEnvironment", _RuntimeEnvironment)
+    prior = _group(capable=False)
+    state = _rollback_state(prior)
+    client = _FakeSalad(group=prior)
+    await _partial_stopped_target(client, state, environment_drift=False)
+    raw = deepcopy(client.group.raw)
+    raw["restart_policy"] = "never"
+    client.group = replace(client.group, raw=raw)
+    updates_before = len(client.update_patches)
+    marker = tmp_path / "provider-mutation.json"
+    rollout._write_provider_mutation_marker(marker)
+
+    with pytest.raises(I2VLoraRolloutError, match="static contract changed"):
+        await rollout.recover_inflight_reviewed_worker(
+            settings=_settings(capable=False),
+            sessions=database.sessions,
+            salad_client=cast(Any, client),
+            resolver=cast(Any, object()),
+            state=state,
+            expected_promoted_image=_TARGET_IMAGE,
+            provider_mutation_marker_output=marker,
+            diagnostic_output=tmp_path / "diagnostic.json",
+            timeout_seconds=0.1,
+        )
+
+    assert len(client.update_patches) == updates_before
+    assert client.start_calls == 0
+    assert marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_recover_inflight_accepts_deferred_exact_prior_patch(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(rollout, "I2VRuntimeEnvironment", _RuntimeEnvironment)
+    monkeypatch.setattr(rollout.asyncio, "sleep", _no_sleep)
+    prior = _group(capable=False)
+    state = _rollback_state(prior)
+    client = _DeferredPatchResponseSalad(group=prior)
+    await _partial_stopped_target(client, state)
+    client.deferred_readback = None
+    marker = tmp_path / "provider-mutation.json"
+    rollout._write_provider_mutation_marker(marker)
+
+    result = await rollout.recover_inflight_reviewed_worker(
+        settings=_settings(capable=False),
+        sessions=database.sessions,
+        salad_client=cast(Any, client),
+        resolver=cast(Any, object()),
+        state=state,
+        expected_promoted_image=_TARGET_IMAGE,
+        provider_mutation_marker_output=marker,
+        diagnostic_output=tmp_path / "diagnostic.json",
+        timeout_seconds=0.1,
+    )
+
+    assert result.provider_ready
+    assert client.group.version == state.promoted_version + 1
+    assert client.start_calls == 1
+    assert not marker.exists()
+
+
 def test_exact_ready_instance_requires_one_current_running_ready_replica() -> None:
     exact = _group(capable=True, version=8)
     assert rollout._has_exact_ready_instance(exact, _instance_page(version=8))

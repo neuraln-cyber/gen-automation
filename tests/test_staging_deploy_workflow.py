@@ -664,11 +664,15 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
     assert "- i2v-lora-worker" in workflow
     assert "inputs.component == 'i2v-lora-worker'" in worker_job
     assert (
-        'case "$OPERATION" in status|dry-run|promote|recycle-promote|finalize|rollback)'
-        in worker_job
+        'case "$OPERATION" in '
+        "status|dry-run|promote|recycle-promote|recover-inflight|finalize|rollback)" in worker_job
     )
-    assert "status|dry-run|promote|recycle-promote|finalize|rollback" in rollout
-    assert "--status|--dry-run|--promote|--recycle-promote|--finalize|--rollback" in rollout
+    assert "status|dry-run|promote|recycle-promote|recover-inflight|finalize|rollback" in rollout
+    assert (
+        "--status|--dry-run|--promote|--recycle-promote|--recover-inflight|--finalize|--rollback"
+        in rollout
+    )
+    assert "- recover-inflight" in workflow
     assert "- finalize" in workflow
     assert "timeout-minutes: 350" in worker_job
     assert "role-duration-seconds: 20400" in worker_job
@@ -807,6 +811,22 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
     assert "rollout-diagnostic.json" in rollout
     assert "gen-automation/i2v-lora-diagnostic/v1" in rollout
     assert 'print("I2V LoRA diagnostic: "' in rollout
+    recovery = rollout.split('if [ "$operation" = "recover-inflight" ]; then', maxsplit=1)[1].split(
+        '\nwork_dir="$(mktemp', maxsplit=1
+    )[0]
+    assert 'data.get("provider_image") != expected_image' in recovery
+    assert 'diagnostic.get("status") != "stopped"' in recovery
+    assert 'state.get("promoted_image") == expected_image' in recovery
+    assert 'state.get("promoted_version") == expected_version' in recovery
+    assert 'diagnostic.get("outcome")' not in recovery
+    assert '"outcome": "recovery-failed"' in recovery
+    assert '"recovery_stage": "recovery-provider"' in recovery
+    assert "if len(candidates) != 1" in recovery
+    assert "10000s recover-inflight" in recovery
+    assert recovery.index("assert_zero_status") < recovery.index("10000s recover-inflight")
+    assert recovery.index("10000s recover-inflight") < recovery.index(
+        'restart_into "$original_env"'
+    )
     for stage in (
         "provider-source-zero-work",
         "provider-source-group-readback",
@@ -912,6 +932,7 @@ def test_i2v_lora_worker_workflow_transfers_only_checksum_pinned_helper() -> Non
         "dry-run",
         "promote",
         "recycle-promote",
+        "recover-inflight",
         "finalize",
         "rollback",
     ):
@@ -942,7 +963,14 @@ def test_i2v_lora_worker_workflow_transfers_only_checksum_pinned_helper() -> Non
         assert command.count('/usr/bin/bash -n "$payload_root/rollout-i2v-lora-worker.sh"') == 1
         assert f"--{operation}" in command
         assert "--expected-control-plane-revision" in command
-    for operation in ("status", "dry-run", "promote", "recycle-promote", "finalize"):
+    for operation in (
+        "status",
+        "dry-run",
+        "promote",
+        "recycle-promote",
+        "recover-inflight",
+        "finalize",
+    ):
         assert "--expected-worker-image" in commands[operation]
         assert "--expected-worker-source-revision" in commands[operation]
         assert common["SSM_WORKER_IMAGE"] in commands[operation]
