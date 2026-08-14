@@ -32,6 +32,25 @@ _EXPECTED_NODE_CLASSES = {
     "14": "SaveImage",
 }
 
+_FACE_FIDELITY_POSITIVE = (
+    "Facial identity and the source facial expression remain consistent throughout. "
+    "The head keeps the exact source angle without turning, tilting, nodding, or "
+    "translating. The eyes may perform one subtle natural blink; otherwise the gaze, "
+    "eyebrows, cheeks, lips, mouth, and jaw remain stable."
+)
+_FACE_FIDELITY_NEGATIVE = (
+    "face morphing, identity drift, expression change, smile change, frown, eyebrow "
+    "movement, mouth movement, lip movement, talking, speaking, lip-sync, chewing, "
+    "jaw movement, head turn, head rotation, head tilt, nodding, head movement, gaze "
+    "shift, eye direction change, repeated blinking, exaggerated blink"
+)
+_FACE_FIDELITY_NAG = {
+    "nag_scale": 11.0,
+    "nag_tau": 2.37,
+    "nag_alpha": 0.25,
+    "nag_sigma_end": 0.0,
+}
+
 
 class WorkflowError(Exception):
     pass
@@ -66,7 +85,7 @@ def render_workflow(
     values: dict[str, object] = {
         "input.image": input_filename,
         "prompt.positive": effective_positive_prompt(positive_prompt, settings),
-        "prompt.negative": negative_prompt,
+        "prompt.negative": effective_negative_prompt(negative_prompt, settings),
         "generation.seed": seed,
         "generation.width": settings.width,
         "generation.height": settings.height,
@@ -84,6 +103,8 @@ def render_workflow(
     if _contains_placeholder(rendered):
         raise WorkflowError("workflow template contains an unresolved binding")
     rendered = _inject_reviewed_loras(rendered, settings)
+    if settings.face_fidelity == "stable_expression":
+        rendered = _enable_face_fidelity(rendered)
     return rendered, seed, frame_prefix
 
 
@@ -93,23 +114,33 @@ def effective_positive_prompt(
 ) -> str:
     """Append each selected catalog trigger exactly once, case-insensitively."""
 
-    if not settings.loras:
-        return positive_prompt
-    try:
-        validate_reviewed_lora_prompt(
-            positive_prompt,
-            tuple(selection.catalog_id for selection in settings.loras),
-        )
-    except ReviewedLoraPromptError:
-        raise WorkflowError(
-            "reviewed LoRA prompt contains mutually exclusive concept terms"
-        ) from None
     result = positive_prompt
-    for selection in settings.loras:
-        entry = reviewed_lora(selection.catalog_id)
-        for trigger in entry.automatic_trigger_words:
-            result = _append_trigger_once(result, trigger)
+    if settings.loras:
+        try:
+            validate_reviewed_lora_prompt(
+                positive_prompt,
+                tuple(selection.catalog_id for selection in settings.loras),
+            )
+        except ReviewedLoraPromptError:
+            raise WorkflowError(
+                "reviewed LoRA prompt contains mutually exclusive concept terms"
+            ) from None
+        for selection in settings.loras:
+            entry = reviewed_lora(selection.catalog_id)
+            for trigger in entry.automatic_trigger_words:
+                result = _append_trigger_once(result, trigger)
+    if settings.face_fidelity == "stable_expression":
+        result = _append_sentence_once(result, _FACE_FIDELITY_POSITIVE)
     return result
+
+
+def effective_negative_prompt(
+    negative_prompt: str,
+    settings: GenerationSettings,
+) -> str:
+    if settings.face_fidelity == "off":
+        return negative_prompt
+    return _append_sentence_once(negative_prompt, _FACE_FIDELITY_NEGATIVE)
 
 
 def lora_provenance(settings: GenerationSettings) -> list[dict[str, object]]:
@@ -187,6 +218,27 @@ def _inject_reviewed_loras(
     workflow["8"]["inputs"]["model"] = high_model
     workflow["9"]["inputs"]["model"] = low_model
     return workflow
+
+
+def _enable_face_fidelity(workflow: dict[str, Any]) -> dict[str, Any]:
+    for node_id in ("11", "12"):
+        node = workflow[node_id]
+        if node.get("class_type") != "KSamplerAdvanced":
+            raise WorkflowError("face-fidelity sampler topology is invalid")
+        node["class_type"] = "KSamplerWithNAG (Advanced)"
+        node["inputs"].update(_FACE_FIDELITY_NAG)
+        node["inputs"]["nag_negative"] = ["10", 1]
+    return workflow
+
+
+def _append_sentence_once(value: str, sentence: str) -> str:
+    if sentence.casefold() in value.casefold():
+        return value
+    stripped = value.rstrip()
+    if not stripped:
+        return sentence
+    separator = " " if stripped.endswith((".", "!", "?")) else ". "
+    return f"{stripped}{separator}{sentence}"
 
 
 def _append_trigger_once(prompt: str, trigger: str) -> str:

@@ -155,6 +155,13 @@
             <label>Total steps <input type="number" name="steps" value="4" min="1" step="1" required></label>
             <label>High-stage end step <input type="number" name="high_end_step" value="2" min="1" step="1" required></label>
             <label>CFG <input type="number" name="cfg" value="1.0" min="0.01" step="0.01" required></label>
+            <label>Face fidelity
+              <select name="face_fidelity">
+                <option value="stable_expression" selected>Stable expression + one natural blink</option>
+                <option value="off">Off (original v4 behavior)</option>
+              </select>
+              <small>Uses effective negative guidance at CFG 1. Keeps the source expression and head angle while allowing one subtle blink.</small>
+            </label>
             <label>High shift <input type="number" name="high_shift" value="5" step="0.1" required></label>
             <label>Low shift <input type="number" name="low_shift" value="5" step="0.1" required></label>
             <label>Sampler

@@ -16,6 +16,8 @@ from gen_automation.i2v_worker.settings import I2VWorkerSettings
 from gen_automation.i2v_worker.supervisor import _comfy_command
 from gen_automation.i2v_worker.workflow import (
     WorkflowError,
+    effective_negative_prompt,
+    effective_positive_prompt,
     load_workflow_template,
     lora_provenance,
     render_workflow,
@@ -134,6 +136,12 @@ def test_job_contract_is_strict_and_uses_wire_schema_alias() -> None:
 
 def test_baseline_accepts_wan_shape_and_only_reviewed_loras() -> None:
     assert GenerationSettings().frame_count == 81
+    assert GenerationSettings().face_fidelity == "off"
+    assert GenerationSettings(face_fidelity="stable_expression").face_fidelity == (
+        "stable_expression"
+    )
+    with pytest.raises(ValidationError):
+        GenerationSettings(face_fidelity="unreviewed")
     delivery = GenerationSettings(
         width=768,
         height=992,
@@ -232,6 +240,52 @@ def test_workflow_renders_all_runtime_values_without_mutating_template() -> None
     assert json.dumps(template, sort_keys=True) == original
 
 
+def test_face_fidelity_uses_pinned_nag_and_effective_expression_anchors() -> None:
+    template = load_workflow_template(WORKFLOW)
+    settings = GenerationSettings(seed=42, face_fidelity="stable_expression")
+
+    rendered, _seed, _prefix = render_workflow(
+        template,
+        input_filename="source.png",
+        positive_prompt="one gentle torso sway",
+        negative_prompt="camera shake",
+        settings=settings,
+        job_id=uuid4(),
+        attempt_id=uuid4(),
+    )
+
+    assert rendered["6"]["inputs"]["text"] == effective_positive_prompt(
+        "one gentle torso sway", settings
+    )
+    assert "one subtle natural blink" in rendered["6"]["inputs"]["text"]
+    assert "exact source angle" in rendered["6"]["inputs"]["text"]
+    assert rendered["7"]["inputs"]["text"] == effective_negative_prompt("camera shake", settings)
+    assert "expression change" in rendered["7"]["inputs"]["text"]
+    assert "repeated blinking" in rendered["7"]["inputs"]["text"]
+    for node_id in ("11", "12"):
+        sampler = rendered[node_id]
+        assert sampler["class_type"] == "KSamplerWithNAG (Advanced)"
+        assert sampler["inputs"]["nag_negative"] == ["10", 1]
+        assert sampler["inputs"]["nag_scale"] == 11.0
+        assert sampler["inputs"]["nag_tau"] == 2.37
+        assert sampler["inputs"]["nag_alpha"] == 0.25
+        assert sampler["inputs"]["nag_sigma_end"] == 0.0
+    assert template["11"]["class_type"] == "KSamplerAdvanced"
+    assert template["12"]["class_type"] == "KSamplerAdvanced"
+
+
+def test_face_fidelity_anchors_are_idempotent_and_off_is_byte_compatible() -> None:
+    enabled = GenerationSettings(face_fidelity="stable_expression")
+    positive = effective_positive_prompt("subtle body movement", enabled)
+    negative = effective_negative_prompt("jitter", enabled)
+    assert effective_positive_prompt(positive, enabled) == positive
+    assert effective_negative_prompt(negative, enabled) == negative
+
+    disabled = GenerationSettings(face_fidelity="off")
+    assert effective_positive_prompt("subtle body movement", disabled) == ("subtle body movement")
+    assert effective_negative_prompt("jitter", disabled) == "jitter"
+
+
 def test_reviewed_loras_chain_each_stage_before_sampling_and_inject_triggers_once() -> None:
     template = load_workflow_template(WORKFLOW)
     rendered, _seed, _prefix = render_workflow(
@@ -325,12 +379,13 @@ def test_dream_lora_rejects_multiple_mutually_exclusive_concept_terms() -> None:
         )
 
 
-def test_comfy_command_uses_supported_base_directory_and_no_custom_nodes(tmp_path: Path) -> None:
+def test_comfy_command_uses_supported_base_directory_and_only_pinned_nag(tmp_path: Path) -> None:
     command = _comfy_command(_settings(tmp_path))
 
     assert command[command.index("--base-directory") + 1] == (tmp_path / "comfy").as_posix()
     assert "--models-directory" not in command
     assert "--disable-all-custom-nodes" in command
+    assert command[command.index("--whitelist-custom-nodes") + 1] == "ComfyUI-NAG"
     assert "--highvram" not in command
     assert command[command.index("--reserve-vram") + 1] == "4"
 
@@ -353,6 +408,9 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
     ]
     assert all("@sha256:" in line for line in from_lines)
     assert "c2bcbecd82ec5ae66594340b395c24ef0217b238" in dockerfile
+    assert "ef8a641be08983cf5f06669f70719b6eecce3c7f" in dockerfile
+    assert "https://github.com/ChenDarYen/ComfyUI-NAG.git" in dockerfile
+    assert 'org.opencontainers.image.comfyui-nag.revision="ef8a641' in dockerfile
     assert "USER 10002:10002" in dockerfile
     assert "COPY i2v-models" not in dockerfile
     assert not re.search(r"(?:civitai|huggingface)\.com/.+safetensors", dockerfile)

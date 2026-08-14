@@ -42,11 +42,13 @@ LABEL org.opencontainers.image.title="gen-automation-dasiwa-i2v-worker" \
       org.opencontainers.image.description="Model-free DaSiWa WAN 2.2 image-to-video worker" \
       org.opencontainers.image.source="https://github.com/neuraln-cyber/gen-automation" \
       org.opencontainers.image.comfyui.revision="c2bcbecd82ec5ae66594340b395c24ef0217b238" \
+      org.opencontainers.image.comfyui-nag.revision="ef8a641be08983cf5f06669f70719b6eecce3c7f" \
       org.opencontainers.image.salad-queue-worker.revision="73d7a3c80a73f26339194e024cb47c8501c67f75" \
       org.opencontainers.image.salad-queue-worker.patch-sha256="a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     COMFYUI_COMMIT=c2bcbecd82ec5ae66594340b395c24ef0217b238 \
+    COMFYUI_NAG_COMMIT=ef8a641be08983cf5f06669f70719b6eecce3c7f \
     VIRTUAL_ENV=/opt/i2v-venv \
     PATH=/opt/i2v-venv/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/opt/conda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -87,7 +89,19 @@ RUN apt-get update \
     && git -C /opt/comfyui fetch --depth 1 origin "${COMFYUI_COMMIT}" \
     && git -C /opt/comfyui checkout --detach FETCH_HEAD \
     && test "$(git -C /opt/comfyui rev-parse HEAD)" = "${COMFYUI_COMMIT}" \
+    && mkdir --parents /opt/comfyui/custom_nodes/ComfyUI-NAG \
+    && git -C /opt/comfyui/custom_nodes/ComfyUI-NAG init \
+    && git -C /opt/comfyui/custom_nodes/ComfyUI-NAG remote add origin \
+        https://github.com/ChenDarYen/ComfyUI-NAG.git \
+    && git -C /opt/comfyui/custom_nodes/ComfyUI-NAG fetch --depth 1 origin \
+        "${COMFYUI_NAG_COMMIT}" \
+    && git -C /opt/comfyui/custom_nodes/ComfyUI-NAG checkout --detach FETCH_HEAD \
+    && test "$(git -C /opt/comfyui/custom_nodes/ComfyUI-NAG rev-parse HEAD)" = \
+        "${COMFYUI_NAG_COMMIT}" \
+    && grep -Fq '"KSamplerWithNAG (Advanced)"' \
+        /opt/comfyui/custom_nodes/ComfyUI-NAG/node.py \
     && rm -rf /opt/comfyui/.git \
+        /opt/comfyui/custom_nodes/ComfyUI-NAG/.git \
     && apt-get purge --yes --auto-remove git \
     && rm -rf /var/lib/apt/lists/*
 

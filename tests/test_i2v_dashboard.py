@@ -37,6 +37,10 @@ def test_i2v_dashboard_exposes_focused_generation_controls(client: TestClient) -
     assert 'name="loop_count" value="2" min="1" max="2"' in response.text
     assert "Looped delivery is capped at 25 seconds" in response.text
     assert 'name="match_source_aspect" checked' in response.text
+    assert 'name="face_fidelity"' in response.text
+    assert '<option value="stable_expression" selected>' in response.text
+    assert "Stable expression + one natural blink" in response.text
+    assert "effective negative guidance at CFG 1" in response.text
     assert 'name="loop"> Smooth loop by playing forward then backward' in response.text
     assert 'data-hires-profile-enabled="true"' in response.text
     assert "/static/i2v.js" in response.text
@@ -114,6 +118,7 @@ def test_i2v_dashboard_default_submit_controls_are_constraint_valid(
     assert "presetName.disabled = false" in script
     assert "presetName.disabled = true" in script
     assert 'presetDialog.addEventListener("close"' in script
+    assert 'face_fidelity: "stable_expression"' in script
 
 
 def test_i2v_dashboard_uses_only_the_backend_reviewed_lora_catalog() -> None:
