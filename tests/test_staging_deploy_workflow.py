@@ -663,8 +663,12 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
 
     assert "- i2v-lora-worker" in workflow
     assert "inputs.component == 'i2v-lora-worker'" in worker_job
-    assert 'case "$OPERATION" in status|dry-run|promote|recycle-promote|rollback)' in worker_job
-    assert "status|dry-run|promote|recycle-promote|rollback" in rollout
+    assert (
+        'case "$OPERATION" in status|dry-run|promote|recycle-promote|finalize|rollback)'
+        in worker_job
+    )
+    assert "status|dry-run|promote|recycle-promote|finalize|rollback" in rollout
+    assert "- finalize" in workflow
     assert "timeout-minutes: 350" in worker_job
     assert "role-duration-seconds: 20400" in worker_job
     assert '"executionTimeout": ["19000"]' in worker_job
@@ -830,6 +834,17 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
         "\nfi\n", maxsplit=1
     )[0]
     assert "--diagnostic-output /run/i2v-lora-rollout/rollout-diagnostic.json" in dry_run
+    finalize = rollout.split('if [ "$operation" = "finalize" ]; then', maxsplit=1)[1].split(
+        "\nfi\n", maxsplit=1
+    )[0]
+    assert 'run_one_off "$controller_env" "$initial_container" 900s status' in finalize
+    assert finalize.count("assert_zero_status") == 3
+    assert 'run_one_off "$active_state/target.env"' in finalize
+    assert 'profile_preflight "$initial_container" "$public_profile"' in finalize
+    assert 'mv -- "$active_state" "$finalized_state"' in finalize
+    assert "restart_into" not in finalize
+    assert "provider-mutation-attempted" not in finalize
+    assert "1900s rollback" not in finalize
     actual_failure = promotion.split(
         'if ! run_one_off "$original_env" "$maintenance_id" 10000s "$operation"',
         maxsplit=1,
@@ -891,7 +906,14 @@ def test_i2v_lora_worker_workflow_transfers_only_checksum_pinned_helper() -> Non
         "SSM_SCRIPT_PAYLOAD": payload,
     }
     commands: dict[str, str] = {}
-    for operation in ("status", "dry-run", "promote", "recycle-promote", "rollback"):
+    for operation in (
+        "status",
+        "dry-run",
+        "promote",
+        "recycle-promote",
+        "finalize",
+        "rollback",
+    ):
         environment = {**common, "SSM_OPERATION": operation}
         if operation == "rollback":
             environment.update({"SSM_WORKER_IMAGE": "", "SSM_WORKER_SOURCE_REVISION": ""})

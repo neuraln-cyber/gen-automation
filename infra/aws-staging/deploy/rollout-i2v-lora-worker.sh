@@ -53,6 +53,13 @@ require_private_root_file() {
   case "$(stat -c '%a' "$path")" in 400|600) ;; *) fail "$path must be private" ;; esac
 }
 
+require_private_root_directory() {
+  local path="$1"
+  [ -d "$path" ] && [ ! -L "$path" ] || fail "missing $path"
+  [ "$(stat -c '%U:%G' "$path")" = "root:root" ] || fail "$path must be root-owned"
+  [ "$(stat -c '%a' "$path")" = "700" ] || fail "$path must be private"
+}
+
 control_plane_container_id() {
   local value
   value="$(timeout 15s /usr/bin/docker compose --env-file "$deploy_env" \
@@ -386,6 +393,18 @@ raise SystemExit(0 if actual == expected else 1)
 '
 }
 
+container_public_profile() {
+  local container_id="$1"
+  local value
+  value="$(timeout --signal=TERM --kill-after=10s 60s /usr/bin/docker exec \
+    "$container_id" python3.12 -c '
+from gen_automation.config import Settings
+print("true" if Settings().i2v_lora_profile_enabled else "false")
+')"
+  case "$value" in true|false) ;; *) fail "public I2V profile could not be read" ;; esac
+  printf '%s' "$value"
+}
+
 run_one_off() {
   local profile_env="$1"
   local container_id="$2"
@@ -503,7 +522,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$operation" in
-  status|dry-run|promote|recycle-promote|rollback) ;;
+  status|dry-run|promote|recycle-promote|finalize|rollback) ;;
   *) fail "choose one operation" ;;
 esac
 [[ "$expected_revision" =~ ^[0-9a-f]{40}$ ]] || fail "exact control-plane revision is required"
@@ -528,12 +547,15 @@ initial_container="$(control_plane_container_id)"
 curl --fail --silent --show-error --max-time 5 \
   http://127.0.0.1:8000/api/v1/health/ready >/dev/null
 
-if [ "$operation" = "rollback" ]; then
-  [ -z "$expected_worker_image$expected_worker_source_revision" ] ||
-    fail "rollback accepts no new worker coordinates"
-  [ -d "$active_state" ] || fail "no preserved reviewed-worker rollback bundle exists"
-  require_private_root_file "$active_state/original.env"
-  require_private_root_file "$active_state/provider-rollback.json"
+if [ "$operation" = "rollback" ] || [ "$operation" = "finalize" ]; then
+  if [ "$operation" = "rollback" ]; then
+    [ -z "$expected_worker_image$expected_worker_source_revision" ] ||
+      fail "rollback accepts no new worker coordinates"
+  fi
+  require_private_root_directory "$active_state"
+  for name in original.env maintenance.env target.env provider-rollback.json; do
+    require_private_root_file "$active_state/$name"
+  done
 fi
 
 if [ "$operation" = "status" ]; then
@@ -571,6 +593,32 @@ if [ "$operation" = "dry-run" ]; then
     false
   fi
   print_rollout_diagnostic "$diagnostic_output"
+  exit 0
+fi
+
+if [ "$operation" = "finalize" ]; then
+  # Retire only the rollback bundle whose saved target and current serving
+  # profile both prove the exact requested healthy worker. This does not
+  # restart the controller or mutate the provider; the next promotion can then
+  # preserve today's worker as its fresh rollback target.
+  status_json="$(run_one_off "$controller_env" "$initial_container" 900s status)"
+  printf '%s' "$status_json" | assert_zero_status ||
+    fail "finalize requires zero active I2V work"
+  saved_preflight="$(run_one_off "$active_state/target.env" "$initial_container" 900s \
+    profile-preflight \
+    --expected-worker-image "$expected_worker_image" \
+    --expected-worker-source-revision "$expected_worker_source_revision" \
+    --expected-public-profile false)"
+  printf '%s' "$saved_preflight" | assert_zero_status ||
+    fail "saved rollout target has active I2V work"
+  public_profile="$(container_public_profile "$initial_container")"
+  current_preflight="$(profile_preflight "$initial_container" "$public_profile")"
+  printf '%s' "$current_preflight" | assert_zero_status ||
+    fail "current rollout target has active I2V work"
+  finalized_state="$state_root/finalized-$(date -u +%Y%m%dT%H%M%SZ)"
+  [ ! -e "$finalized_state" ] || fail "finalized rollback archive already exists"
+  mv -- "$active_state" "$finalized_state"
+  printf '%s\n' "Current reviewed I2V worker finalized; prior rollback bundle archived."
   exit 0
 fi
 

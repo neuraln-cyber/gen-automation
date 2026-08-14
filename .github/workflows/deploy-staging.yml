@@ -17,7 +17,7 @@ on:
           - i2v-lora-worker
           - i2v-lora-profile
       operation:
-        description: Status, dry-run, promote, recycle-promote, pause, enable, or disable
+        description: Status, dry-run, promote, recycle-promote, finalize, pause, enable, or disable
         required: true
         type: choice
         default: dry-run
@@ -26,6 +26,7 @@ on:
           - dry-run
           - promote
           - recycle-promote
+          - finalize
           - rollback
           - pause
           - enable
@@ -913,7 +914,7 @@ jobs:
           AWS_STAGING_DEPLOY_ROLE_ARN: ${{ vars.AWS_STAGING_DEPLOY_ROLE_ARN }}
         run: |
           set -euo pipefail
-          case "$OPERATION" in status|dry-run|promote|recycle-promote|rollback) ;; *) exit 1 ;; esac
+          case "$OPERATION" in status|dry-run|promote|recycle-promote|finalize|rollback) ;; *) exit 1 ;; esac
           [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
           [[ "$AWS_STAGING_INSTANCE_ID" =~ ^i-[0-9a-f]{8,17}$ ]]
           [[ "$AWS_STAGING_DEPLOY_ROLE_ARN" =~ ^arn:aws:iam::861912887470:role/[A-Za-z0-9+=,.@_/-]+$ ]]
