@@ -649,18 +649,38 @@ for path in sorted(root.glob(".operation.*")):
                 raise ValueError
         state = json.loads((path / "provider-rollback.json").read_text(encoding="utf-8"))
         diagnostic = json.loads((path / "rollout-diagnostic.json").read_text(encoding="utf-8"))
+        original_failure = diagnostic == {
+            "schema": "gen-automation/i2v-lora-diagnostic/v1",
+            "operation": "recycle-promote",
+            "stage": "target-patch-convergence",
+            "outcome": "recovery-failed",
+            "recovery_stage": "recovery-provider",
+        }
+        # The first deployed recover-inflight wrapper accidentally directed its
+        # diagnostic output at rollout-diagnostic.json.  It could overwrite the
+        # immutable recycle failure only before provider recovery was attempted:
+        # environment resolution or the stopped-target guard.  Accept exactly
+        # those two private, fixed-schema retry anchors while the independent
+        # live guard above still proves the same stopped promoted version/image.
+        pre_mutation_recovery_retry = diagnostic in (
+            {
+                "schema": "gen-automation/i2v-lora-diagnostic/v1",
+                "operation": "recover-inflight",
+                "stage": "inflight-recovery-environment",
+                "outcome": "recovering",
+            },
+            {
+                "schema": "gen-automation/i2v-lora-diagnostic/v1",
+                "operation": "recover-inflight",
+                "stage": "inflight-recovery-guard",
+                "outcome": "recovering",
+            },
+        )
         if (
             state.get("schema") == "gen-automation/i2v-lora-rollback/v2"
             and state.get("promoted_image") == expected_image
             and state.get("promoted_version") == expected_version
-            and diagnostic
-            == {
-                "schema": "gen-automation/i2v-lora-diagnostic/v1",
-                "operation": "recycle-promote",
-                "stage": "target-patch-convergence",
-                "outcome": "recovery-failed",
-                "recovery_stage": "recovery-provider",
-            }
+            and (original_failure or pre_mutation_recovery_retry)
         ):
             candidates.append(path)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
@@ -686,7 +706,7 @@ PY
     --rollback-state-input /run/i2v-lora-rollout/provider-rollback.json \
     --provider-mutation-marker-output \
       /run/i2v-lora-rollout/provider-mutation-attempted.json \
-    --diagnostic-output /run/i2v-lora-rollout/rollout-diagnostic.json; then
+    --diagnostic-output /run/i2v-lora-rollout/inflight-recovery-diagnostic.json; then
     print_rollout_diagnostic "$diagnostic_output"
     false
   fi
