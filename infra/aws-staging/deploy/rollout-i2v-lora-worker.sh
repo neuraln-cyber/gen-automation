@@ -506,7 +506,7 @@ trap cleanup EXIT
 [ "$(id -u)" -eq 0 ] || fail "run as root through AWS Systems Manager"
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --status|--dry-run|--promote|--recycle-promote|--rollback)
+    --status|--dry-run|--promote|--recycle-promote|--finalize|--rollback)
       [ -z "$operation" ] || fail "choose exactly one operation"
       operation="${1#--}"
       shift
