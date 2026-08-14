@@ -668,6 +668,7 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
         in worker_job
     )
     assert "status|dry-run|promote|recycle-promote|finalize|rollback" in rollout
+    assert "--status|--dry-run|--promote|--recycle-promote|--finalize|--rollback" in rollout
     assert "- finalize" in workflow
     assert "timeout-minutes: 350" in worker_job
     assert "role-duration-seconds: 20400" in worker_job
@@ -941,7 +942,7 @@ def test_i2v_lora_worker_workflow_transfers_only_checksum_pinned_helper() -> Non
         assert command.count('/usr/bin/bash -n "$payload_root/rollout-i2v-lora-worker.sh"') == 1
         assert f"--{operation}" in command
         assert "--expected-control-plane-revision" in command
-    for operation in ("status", "dry-run", "promote", "recycle-promote"):
+    for operation in ("status", "dry-run", "promote", "recycle-promote", "finalize"):
         assert "--expected-worker-image" in commands[operation]
         assert "--expected-worker-source-revision" in commands[operation]
         assert common["SSM_WORKER_IMAGE"] in commands[operation]
