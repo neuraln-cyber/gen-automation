@@ -410,7 +410,16 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
     assert "c2bcbecd82ec5ae66594340b395c24ef0217b238" in dockerfile
     assert "ef8a641be08983cf5f06669f70719b6eecce3c7f" in dockerfile
     assert "https://github.com/ChenDarYen/ComfyUI-NAG.git" in dockerfile
-    assert 'org.opencontainers.image.comfyui-nag.revision="ef8a641' in dockerfile
+    assert "ARG COMFYUI_NAG_COMMIT=ef8a641be08983cf5f06669f70719b6eecce3c7f" in dockerfile
+    assert (
+        'LABEL org.opencontainers.image.comfyui-nag.revision="${COMFYUI_NAG_COMMIT}"' in dockerfile
+    )
+    heavyweight_runtime_end = dockerfile.index(
+        "grep -Fq 'class WanImageToVideo' /opt/comfyui/comfy_extras/nodes_wan.py"
+    )
+    nag_install = dockerfile.index("ARG COMFYUI_NAG_COMMIT=")
+    assert nag_install > heavyweight_runtime_end
+    assert "COMFYUI_NAG" not in dockerfile[:heavyweight_runtime_end]
     assert "USER 10002:10002" in dockerfile
     assert "COPY i2v-models" not in dockerfile
     assert not re.search(r"(?:civitai|huggingface)\.com/.+safetensors", dockerfile)
