@@ -133,6 +133,16 @@ _ROLLOUT_DIAGNOSTIC_STAGES = frozenset(
         "recovery-environment",
         "recovery-provider",
         "recovery-complete",
+        "inflight-recovery-guard",
+        "inflight-recovery-environment",
+        "inflight-recovery-patch",
+        "inflight-recovery-convergence",
+        "inflight-recovery-start-guard",
+        "inflight-recovery-start",
+        "inflight-recovery-readiness",
+        "inflight-target-exact",
+        "inflight-target-environment",
+        "inflight-target-readiness",
         "complete",
     }
 )
@@ -499,7 +509,7 @@ def _write_rollout_diagnostic(
     if path is None:
         return
     if (
-        operation not in {"dry-run", "recycle-promote"}
+        operation not in {"dry-run", "recycle-promote", "recover-inflight"}
         or stage not in _ROLLOUT_DIAGNOSTIC_STAGES
         or outcome not in _ROLLOUT_DIAGNOSTIC_OUTCOMES
         or (recovery_stage is not None and recovery_stage not in _ROLLOUT_DIAGNOSTIC_STAGES)
@@ -855,6 +865,211 @@ async def rollback_reviewed_worker(
     return I2VLoraRolloutResult(
         operation="rollback",
         provider_image=_group_image(group),
+        provider_ready=True,
+        durable_active_jobs=counts[0],
+        durable_active_attempts=counts[1],
+        provider_active_jobs=counts[2],
+    )
+
+
+async def recover_inflight_reviewed_worker(
+    *,
+    settings: Settings,
+    sessions: async_sessionmaker[AsyncSession],
+    salad_client: I2VSaladClient,
+    resolver: RuntimeSecretResolver,
+    state: ProviderRollbackState,
+    expected_promoted_image: str,
+    provider_mutation_marker_output: Path,
+    diagnostic_output: Path | None = None,
+    timeout_seconds: float = 6_900,
+) -> I2VLoraRolloutResult:
+    """Restore the saved prior from one exact stopped, incomplete promotion.
+
+    This is intentionally narrower than normal rollback.  It exists for the
+    fail-closed state where the reviewed target PATCH reached its exact next
+    version while stopped, but provider readback normalization prevented the
+    transaction from proving the complete promoted contract.  Only the three
+    fields that the rollout itself attempted to change (image, environment and
+    readiness probe) may differ; every other saved provider field remains exact.
+    """
+
+    if state.promoted_image != expected_promoted_image:
+        raise I2VLoraRolloutError("in-flight recovery target image is not the saved promotion")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    _write_rollout_diagnostic(
+        diagnostic_output,
+        operation="recover-inflight",
+        stage="inflight-recovery-environment",
+        outcome="recovering",
+    )
+    resolved_environment = dict(
+        await I2VRuntimeEnvironment(settings=settings, resolver=resolver).resolve()
+    )
+    prior_environment = _reconstructed_prior_environment(state, resolved_environment)
+
+    _write_rollout_diagnostic(
+        diagnostic_output,
+        operation="recover-inflight",
+        stage="inflight-recovery-guard",
+        outcome="recovering",
+    )
+    async with sessions() as session, session.begin():
+        counts = await assert_zero_active_rollout_work(
+            session,
+            salad_client,
+            queue_name=settings.i2v_salad_queue_name,
+        )
+        current = await salad_client.get_container_group(state.group_name)
+        instances = await salad_client.list_container_group_instances(state.group_name)
+        source_stage = _validate_recoverable_inflight_target(
+            current,
+            instances,
+            state=state,
+            expected_promoted_image=expected_promoted_image,
+        )
+        queue = await salad_client.get_queue(settings.i2v_salad_queue_name)
+        if queue.current_queue_length:
+            raise I2VLoraRolloutError("provider queue changed before in-flight recovery")
+        current_environment = _environment_variables(_group_container(current))
+        patch_environment: JSONObject = {
+            key: None for key in current_environment if key not in prior_environment
+        }
+        patch_environment.update(prior_environment)
+        patch: JSONObject = {
+            "container": {
+                "image": state.prior_image,
+                "environment_variables": patch_environment,
+            },
+            "readiness_probe": deepcopy(state.prior_readiness_probe),
+        }
+        _write_provider_mutation_marker(provider_mutation_marker_output)
+        _write_rollout_diagnostic(
+            diagnostic_output,
+            operation="recover-inflight",
+            stage="inflight-recovery-patch",
+            outcome="recovering",
+            recovery_stage=source_stage,
+            group=current,
+            instances=instances,
+        )
+        updated = await salad_client.update_container_group(state.group_name, patch)
+        restored_version = _validate_accepted_patch_response(
+            updated,
+            group_id=state.group_id,
+            group_name=state.group_name,
+            prior_version=state.promoted_version,
+        )
+
+    _write_rollout_diagnostic(
+        diagnostic_output,
+        operation="recover-inflight",
+        stage="inflight-recovery-convergence",
+        outcome="recovering",
+        recovery_stage=source_stage,
+        group=updated,
+    )
+    restored_stopped = await _wait_for_saved_profile_stopped(
+        salad_client,
+        group_name=state.group_name,
+        state=state,
+        worker_image=state.prior_image,
+        environment_keys=state.prior_environment_keys,
+        environment_identity_sha256=_environment_identity_sha256(prior_environment),
+        readiness_probe=state.prior_readiness_probe,
+        expected_version=restored_version,
+        timeout_seconds=_remaining_timeout(deadline),
+    )
+
+    _write_rollout_diagnostic(
+        diagnostic_output,
+        operation="recover-inflight",
+        stage="inflight-recovery-start-guard",
+        outcome="recovering",
+        recovery_stage=source_stage,
+        group=restored_stopped,
+    )
+    async with sessions() as session, session.begin():
+        counts = await assert_zero_active_rollout_work(
+            session,
+            salad_client,
+            queue_name=settings.i2v_salad_queue_name,
+        )
+        current = await salad_client.get_container_group(state.group_name)
+        _assert_saved_group_readback(
+            current,
+            state=state,
+            worker_image=state.prior_image,
+            environment_keys=state.prior_environment_keys,
+            environment_identity_sha256=_environment_identity_sha256(prior_environment),
+            readiness_probe=state.prior_readiness_probe,
+        )
+        current_instances = await salad_client.list_container_group_instances(state.group_name)
+        if (
+            current.version != restored_version
+            or not _is_exact_stopped_group(current)
+            or getattr(current_instances, "instances", None) != ()
+        ):
+            raise I2VLoraRolloutError("restored provider changed before in-flight restart")
+        queue = await salad_client.get_queue(settings.i2v_salad_queue_name)
+        if queue.current_queue_length:
+            raise I2VLoraRolloutError("provider queue changed before in-flight restart")
+        _write_rollout_diagnostic(
+            diagnostic_output,
+            operation="recover-inflight",
+            stage="inflight-recovery-start",
+            outcome="recovering",
+            recovery_stage=source_stage,
+            group=current,
+            instances=current_instances,
+        )
+        final_instances = await salad_client.list_container_group_instances(state.group_name)
+        if getattr(final_instances, "instances", None) != ():
+            raise I2VLoraRolloutError("restored provider retained an instance before restart")
+        final = await salad_client.get_container_group(state.group_name)
+        _assert_saved_group_readback(
+            final,
+            state=state,
+            worker_image=state.prior_image,
+            environment_keys=state.prior_environment_keys,
+            environment_identity_sha256=_environment_identity_sha256(prior_environment),
+            readiness_probe=state.prior_readiness_probe,
+        )
+        if final.version != restored_version or not _is_exact_stopped_group(final):
+            raise I2VLoraRolloutError("restored provider changed immediately before restart")
+        await salad_client.start_container_group(state.group_name)
+
+    _write_rollout_diagnostic(
+        diagnostic_output,
+        operation="recover-inflight",
+        stage="inflight-recovery-readiness",
+        outcome="recovering",
+        recovery_stage=source_stage,
+    )
+    ready_group = await _wait_for_ready_group(
+        salad_client,
+        group_name=state.group_name,
+        group_id=state.group_id,
+        worker_image=state.prior_image,
+        environment=prior_environment,
+        readiness_probe=state.prior_readiness_probe,
+        prior_contract=state.prior_contract,
+        minimum_version=restored_version,
+        timeout_seconds=_remaining_timeout(deadline),
+    )
+    _durable_unlink(provider_mutation_marker_output)
+    _write_rollout_diagnostic(
+        diagnostic_output,
+        operation="recover-inflight",
+        stage="complete",
+        outcome="ready",
+        recovery_stage=source_stage,
+        group=ready_group,
+    )
+    return I2VLoraRolloutResult(
+        operation="recover-inflight",
+        provider_image=_group_image(ready_group),
         provider_ready=True,
         durable_active_jobs=counts[0],
         durable_active_attempts=counts[1],
@@ -1942,6 +2157,52 @@ def _assert_saved_group_readback(
         observed_contract["replicas"] = expected_contract.get("replicas", 1)
     if observed_contract != expected_contract:
         raise I2VLoraRolloutError("provider saved container contract drifted")
+
+
+def _validate_recoverable_inflight_target(
+    group: SaladContainerGroup,
+    instances: object,
+    *,
+    state: ProviderRollbackState,
+    expected_promoted_image: str,
+) -> str:
+    """Validate the sole partial-target state that operator recovery may overwrite."""
+
+    if (
+        str(group.id) != state.group_id
+        or group.name != state.group_name
+        or group.version != state.promoted_version
+        or _group_image(group) != expected_promoted_image
+        or state.promoted_image != expected_promoted_image
+    ):
+        raise I2VLoraRolloutError("in-flight provider image, identity, or version changed")
+    if not _is_exact_stopped_group(group) or getattr(instances, "instances", None) != ():
+        raise I2VLoraRolloutError("in-flight provider is not exactly stopped and empty")
+
+    observed_contract = _redacted_provider_contract(group)
+    expected_contract = deepcopy(state.prior_contract)
+    observed_contract["replicas"] = expected_contract.get("replicas", 1)
+    observed_container = cast(JSONObject, observed_contract["container"])
+    expected_container = cast(JSONObject, expected_contract["container"])
+    for container in (observed_container, expected_container):
+        container.pop("image", None)
+        container.pop("environment_variable_keys", None)
+    observed_contract.pop("readiness_probe", None)
+    expected_contract.pop("readiness_probe", None)
+    if observed_contract != expected_contract:
+        raise I2VLoraRolloutError("in-flight provider static contract changed")
+
+    environment = _environment_variables(_group_container(group))
+    environment_exact = (
+        tuple(sorted(environment)) == state.promoted_environment_keys
+        and _environment_identity_sha256(environment) == state.promoted_environment_identity_sha256
+    )
+    readiness_exact = group.raw.get("readiness_probe") == state.promoted_readiness_probe
+    if not environment_exact:
+        return "inflight-target-environment"
+    if not readiness_exact:
+        return "inflight-target-readiness"
+    return "inflight-target-exact"
 
 
 def _is_exact_stopped_group(group: SaladContainerGroup) -> bool:

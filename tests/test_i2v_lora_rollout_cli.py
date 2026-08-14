@@ -135,7 +135,9 @@ def _assert_runtime_closed(resolver: _FakeResolver) -> None:
     assert _FakeHttpClient.instances[0].closed is True
 
 
-@pytest.mark.parametrize("operation", ("promote", "rollback", "recycle-promote"))
+@pytest.mark.parametrize(
+    "operation", ("promote", "rollback", "recycle-promote", "recover-inflight")
+)
 @pytest.mark.asyncio
 async def test_mutating_operations_require_exact_service_stop_proof_before_clients(
     operation: str,
@@ -171,6 +173,18 @@ async def test_mutating_operations_require_exact_service_stop_proof_before_clien
                 str(tmp_path / "rollback.json"),
                 "--provider-mutation-marker-output",
                 str(tmp_path / "provider-mutation.json"),
+            ]
+        )
+    else:
+        arguments = cli._parser().parse_args(
+            [
+                "recover-inflight",
+                *_worker_identity_arguments(),
+                "--rollback-state-input",
+                str(tmp_path / "rollback.json"),
+                "--provider-mutation-marker-output",
+                str(tmp_path / "provider-mutation.json"),
+                *_diagnostic_arguments(tmp_path),
             ]
         )
     with pytest.raises(I2VLoraRolloutError, match="service-stop proof"):
@@ -260,6 +274,49 @@ async def test_recycle_promote_dispatches_one_atomic_service_with_s3_client(
     assert len(boto_calls) == 1
     assert boto_calls[0][0] == "s3"
     assert cast(_FakeManifestClient, captured["manifest_client"]).closed is True
+    _assert_runtime_closed(resolver)
+
+
+@pytest.mark.asyncio
+async def test_recover_inflight_dispatches_without_an_s3_client(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("GEN_AUTOMATION_I2V_ROLLOUT_MAINTENANCE_CONFIRMED", "true")
+    resolver, boto_calls = _install_runtime_fakes(monkeypatch)
+    captured: dict[str, object] = {}
+    expected = I2VLoraRolloutResult("recover-inflight", WORKER_IMAGE, True, 0, 0, 0)
+    state = object()
+
+    async def recover(**kwargs: object) -> I2VLoraRolloutResult:
+        captured.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(cli, "recover_inflight_reviewed_worker", recover)
+    monkeypatch.setattr(cli, "read_provider_rollback_state", lambda _path: state)
+    marker = tmp_path / "provider-mutation.json"
+    result = await cli._run(
+        cli._parser().parse_args(
+            [
+                "recover-inflight",
+                *_worker_identity_arguments(),
+                "--rollback-state-input",
+                str(tmp_path / "rollback.json"),
+                "--provider-mutation-marker-output",
+                str(marker),
+                *_diagnostic_arguments(tmp_path),
+            ]
+        ),
+        settings=_settings(),
+    )
+
+    assert result == expected
+    assert captured["state"] is state
+    assert captured["expected_promoted_image"] == WORKER_IMAGE
+    assert captured["provider_mutation_marker_output"] == marker
+    assert captured["diagnostic_output"] == tmp_path / "rollout-diagnostic.json"
+    assert captured["resolver"] is resolver
+    assert boto_calls == []
     _assert_runtime_closed(resolver)
 
 

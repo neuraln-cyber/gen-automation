@@ -35,6 +35,7 @@ from gen_automation.services.i2v_lora_rollout import (
     profile_preflight,
     promote_reviewed_worker,
     read_provider_rollback_state,
+    recover_inflight_reviewed_worker,
     recycle_promote_reviewed_worker,
     rollback_reviewed_worker,
     rollout_status,
@@ -71,7 +72,12 @@ def i2v_lora_rollout_main(arguments: Sequence[str] | None = None) -> int:
 
 async def _run(arguments: argparse.Namespace, *, settings: Settings) -> I2VLoraRolloutResult:
     _require_control_plane_integrations(settings)
-    if arguments.operation in {"promote", "rollback", "recycle-promote"}:
+    if arguments.operation in {
+        "promote",
+        "rollback",
+        "recycle-promote",
+        "recover-inflight",
+    }:
         _require_phase_one_maintenance(settings)
     database = Database(settings.database_url)
     http_client = httpx2.AsyncClient(follow_redirects=False, trust_env=False)
@@ -130,6 +136,17 @@ async def _run(arguments: argparse.Namespace, *, settings: Settings) -> I2VLoraR
                 resolver=resolver,
                 state=read_provider_rollback_state(arguments.rollback_state_input),
                 provider_mutation_marker_output=arguments.provider_mutation_marker_output,
+            )
+        if arguments.operation == "recover-inflight":
+            return await recover_inflight_reviewed_worker(
+                settings=settings,
+                sessions=database.sessions,
+                salad_client=salad_client,
+                resolver=resolver,
+                state=read_provider_rollback_state(arguments.rollback_state_input),
+                expected_promoted_image=arguments.expected_worker_image,
+                provider_mutation_marker_output=arguments.provider_mutation_marker_output,
+                diagnostic_output=arguments.diagnostic_output,
             )
         coordinates = ReviewedManifestCoordinates(
             bucket=arguments.expected_private_manifest_bucket,
@@ -270,6 +287,15 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         type=Path,
     )
+    recover = subparsers.add_parser("recover-inflight")
+    _add_worker_identity_arguments(recover)
+    recover.add_argument("--rollback-state-input", required=True, type=Path)
+    recover.add_argument(
+        "--provider-mutation-marker-output",
+        required=True,
+        type=Path,
+    )
+    recover.add_argument("--diagnostic-output", required=True, type=Path)
     return parser
 
 
