@@ -186,6 +186,19 @@ def _without_legacy_default_fields(group: SaladContainerGroup) -> SaladContainer
     return replace(group, raw=raw)
 
 
+def _with_image_metadata(
+    group: SaladContainerGroup,
+    *,
+    image_hash: str = "sha256:" + "1" * 64,
+    image_size: int = 5_389_225_028,
+) -> SaladContainerGroup:
+    raw = deepcopy(group.raw)
+    container = cast(JSONObject, raw["container"])
+    container["hash"] = image_hash
+    container["size"] = image_size
+    return replace(group, raw=raw)
+
+
 def _instance_page(*, version: int = 1) -> SaladContainerGroupInstancePage:
     return SaladContainerGroupInstancePage(
         instances=(
@@ -479,6 +492,23 @@ class _FakeSalad:
         self.instances = _empty_instance_page()
 
 
+class _ImageMetadataSalad(_FakeSalad):
+    """Model Salad's image-derived hash/size readback on each image PATCH."""
+
+    async def update_container_group(self, name: str, patch: JSONObject) -> SaladContainerGroup:
+        group = await super().update_container_group(name, patch)
+        raw = deepcopy(group.raw)
+        container = cast(JSONObject, raw["container"])
+        if container["image"] == _TARGET_IMAGE:
+            container["hash"] = "sha256:" + "2" * 64
+            container["size"] = 5_389_918_925
+        else:
+            container["hash"] = "sha256:" + "1" * 64
+            container["size"] = 5_389_225_028
+        self.group = replace(group, raw=raw)
+        return self.group
+
+
 class _DeferredPatchResponseSalad(_FakeSalad):
     def __init__(self, *, group: SaladContainerGroup | None = None) -> None:
         super().__init__(group=group)
@@ -690,6 +720,62 @@ async def test_recover_inflight_restores_exact_prior_from_partial_stopped_target
 
 
 @pytest.mark.asyncio
+async def test_recover_inflight_accepts_image_derived_hash_and_size_then_restores_prior(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(rollout, "I2VRuntimeEnvironment", _RuntimeEnvironment)
+    monkeypatch.setattr(rollout.asyncio, "sleep", _no_sleep)
+    prior = _with_image_metadata(_group(capable=False))
+    state = _rollback_state(prior)
+    client = _ImageMetadataSalad(group=prior)
+    await _partial_stopped_target(client, state)
+    promoted_container = cast(JSONObject, client.group.raw["container"])
+    assert promoted_container["hash"] == "sha256:" + "2" * 64
+    assert promoted_container["size"] == 5_389_918_925
+    marker = tmp_path / "provider-mutation.json"
+    rollout._write_provider_mutation_marker(marker)
+
+    result = await rollout.recover_inflight_reviewed_worker(
+        settings=_settings(capable=False),
+        sessions=database.sessions,
+        salad_client=cast(Any, client),
+        resolver=cast(Any, object()),
+        state=state,
+        expected_promoted_image=_TARGET_IMAGE,
+        provider_mutation_marker_output=marker,
+        diagnostic_output=tmp_path / "diagnostic.json",
+        timeout_seconds=0.1,
+    )
+
+    restored_container = cast(JSONObject, client.group.raw["container"])
+    assert result.provider_ready
+    assert restored_container["hash"] == "sha256:" + "1" * 64
+    assert restored_container["size"] == 5_389_225_028
+
+
+def test_saved_prior_readback_rejects_changed_image_metadata() -> None:
+    prior = _with_image_metadata(_group(capable=False))
+    state = _rollback_state(prior)
+    changed = _with_image_metadata(
+        prior,
+        image_hash="sha256:" + "9" * 64,
+        image_size=5_389_918_925,
+    )
+
+    with pytest.raises(I2VLoraRolloutError, match="container contract drifted"):
+        rollout._assert_saved_group_readback(
+            changed,
+            state=state,
+            worker_image=state.prior_image,
+            environment_keys=state.prior_environment_keys,
+            environment_identity_sha256=state.prior_environment_identity_sha256,
+            readiness_probe=state.prior_readiness_probe,
+        )
+
+
+@pytest.mark.asyncio
 async def test_recover_inflight_refuses_static_drift_without_provider_mutation(
     database: Database,
     monkeypatch: pytest.MonkeyPatch,
@@ -832,6 +918,29 @@ async def test_recycle_promote_prepares_target_then_stops_patches_starts_and_wai
         "schema": "gen-automation/i2v-lora-diagnostic/v1",
         "stage": "complete",
     }
+
+
+@pytest.mark.asyncio
+async def test_recycle_promote_accepts_salads_image_derived_hash_and_size(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    prior = _with_image_metadata(_group(capable=False))
+    client = _ImageMetadataSalad(group=prior)
+
+    result = await _recycle_promote(
+        database=database,
+        client=client,
+        artifact=_ArtifactClient(),
+        tmp_path=tmp_path,
+    )
+
+    container = cast(JSONObject, client.group.raw["container"])
+    assert result.provider_ready
+    assert container["hash"] == "sha256:" + "2" * 64
+    assert container["size"] == 5_389_918_925
 
 
 @pytest.mark.asyncio

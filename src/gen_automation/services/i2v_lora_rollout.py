@@ -2155,6 +2155,15 @@ def _assert_saved_group_readback(
     observed_contract = _redacted_provider_contract(group)
     if _is_exact_stopped_group(group):
         observed_contract["replicas"] = expected_contract.get("replicas", 1)
+    if worker_image == state.promoted_image:
+        # Salad derives these two readback fields from the immutable container
+        # image. They must change when the image digest changes and are not
+        # request configuration. The pinned image itself remains exact above;
+        # rollback to the saved prior image still compares its saved hash/size.
+        observed_container = cast(JSONObject, observed_contract["container"])
+        for container in (observed_container, expected_container):
+            container.pop("hash", None)
+            container.pop("size", None)
     if observed_contract != expected_contract:
         raise I2VLoraRolloutError("provider saved container contract drifted")
 
@@ -2187,6 +2196,11 @@ def _validate_recoverable_inflight_target(
     for container in (observed_container, expected_container):
         container.pop("image", None)
         container.pop("environment_variable_keys", None)
+        # The stopped target uses the exact promoted image, so Salad's image
+        # hash and compressed-size metadata necessarily differ from the saved
+        # prior image. No other provider contract field is relaxed here.
+        container.pop("hash", None)
+        container.pop("size", None)
     observed_contract.pop("readiness_probe", None)
     expected_contract.pop("readiness_probe", None)
     if observed_contract != expected_contract:
@@ -2518,12 +2532,18 @@ def _assert_exact_group_readback(
     observed_contract = _redacted_provider_contract(group)
     expected_contract = deepcopy(prior_contract)
     expected_container = cast(JSONObject, expected_contract["container"])
+    prior_image = expected_container.get("image")
     expected_container["image"] = worker_image
     expected_container["environment_variable_keys"] = cast(list[JSONValue], sorted(environment))
     if readiness_probe is None:
         expected_contract.pop("readiness_probe", None)
     else:
         expected_contract["readiness_probe"] = readiness_probe
+    if worker_image != prior_image:
+        observed_container = cast(JSONObject, observed_contract["container"])
+        for container in (observed_container, expected_container):
+            container.pop("hash", None)
+            container.pop("size", None)
     if observed_contract != expected_contract:
         raise I2VLoraRolloutError("provider container contract drifted during rollout")
 
