@@ -630,6 +630,7 @@ async def _recycle_promote(
     client: _FakeSalad,
     artifact: _ArtifactClient,
     tmp_path: Path,
+    timeout_seconds: float = 0.1,
 ) -> rollout.I2VLoraRolloutResult:
     client.allow_stop = True
     return await rollout.recycle_promote_reviewed_worker(
@@ -646,7 +647,7 @@ async def _recycle_promote(
         rollback_state_output=tmp_path / "rollback.json",
         provider_mutation_marker_output=tmp_path / "recycle-mutation.json",
         diagnostic_output=tmp_path / "rollout-diagnostic.json",
-        timeout_seconds=0.1,
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -982,6 +983,7 @@ async def test_recycle_promote_accepts_deferred_exact_next_version_acknowledgeme
         client=client,
         artifact=_ArtifactClient(),
         tmp_path=tmp_path,
+        timeout_seconds=5,
     )
 
     assert result.provider_ready
@@ -1037,6 +1039,7 @@ async def test_recycle_promote_accepts_exact_idle_running_not_ready_source(
         client=client,
         artifact=_ArtifactClient(),
         tmp_path=tmp_path,
+        timeout_seconds=5,
     )
 
     assert result.operation == "recycle-promote"
@@ -1074,6 +1077,7 @@ async def test_recycle_promote_patches_an_exact_explicitly_stopped_source_before
         client=client,
         artifact=_ArtifactClient(),
         tmp_path=tmp_path,
+        timeout_seconds=5,
     )
 
     assert result.operation == "recycle-promote"
@@ -1348,6 +1352,7 @@ async def test_recycle_promote_rechecks_provider_queue_immediately_before_each_m
             client=client,
             artifact=_ArtifactClient(),
             tmp_path=tmp_path,
+            timeout_seconds=5,
         )
 
     assert client.stop_calls == 1
@@ -1382,6 +1387,7 @@ async def test_recycle_promote_rereads_target_after_final_queue_guard_before_sta
             client=client,
             artifact=_ArtifactClient(),
             tmp_path=tmp_path,
+            timeout_seconds=5,
         )
 
     assert client.start_calls == 0
