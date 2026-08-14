@@ -78,6 +78,19 @@ def test_i2v_dashboard_dynamically_enforces_loop_duration() -> None:
     assert "One ping-pong cycle exceeds the 25-second limit." in script
 
 
+def test_i2v_dashboard_bounds_initial_media_requests_below_ingress_burst() -> None:
+    script = (Path(__file__).parents[1] / "src/gen_automation/static/i2v.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "const sourcePageSize = 24" in script
+    assert "sourceLimit: sourcePageSize" in script
+    assert "state.sourceLimit + sourcePageSize" in script
+    assert "loadSources({ append: true })" in script
+    assert 'video.preload = "none"' in script
+    assert 'video.preload = "metadata"' not in script
+
+
 def test_i2v_dashboard_default_submit_controls_are_constraint_valid(
     client: TestClient,
 ) -> None:

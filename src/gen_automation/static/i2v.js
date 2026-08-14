@@ -34,11 +34,12 @@
   const presetDialogForm = root.querySelector("[data-preset-dialog-form]");
   const presetName = root.querySelector("[data-preset-name]");
   const draftState = root.querySelector("[data-draft-state]");
+  const sourcePageSize = 24;
   const state = {
     selected: null,
     presets: [],
     jobs: [],
-    sourceLimit: 100,
+    sourceLimit: sourcePageSize,
     loraCatalog: [],
     loraSelections: new Map(),
     loraProfileEnabled: initialLoraProfileEnabled,
@@ -161,14 +162,22 @@
     updatePresetButtons();
   }
 
-  async function loadSources() {
+  async function loadSources({ append = false } = {}) {
     const items = await api(`/source-images?limit=${state.sourceLimit}`);
-    sourceLibrary.replaceChildren();
+    if (!append) sourceLibrary.replaceChildren();
     if (!items.length) {
-      sourceLibrary.append(text("p", "No completed generation images are available yet.", "muted"));
+      if (!append) {
+        sourceLibrary.append(text("p", "No completed generation images are available yet.", "muted"));
+      }
       return;
     }
+    const existingAssetIds = new Set(
+      [...sourceLibrary.querySelectorAll("[data-asset-id]")]
+        .map((card) => card.dataset.assetId)
+        .filter(Boolean),
+    );
     items.forEach((item) => {
+      if (existingAssetIds.has(item.asset_id)) return;
       const button = document.createElement("button");
       button.type = "button";
       button.className = "i2v-source-card";
@@ -858,7 +867,7 @@
       const output = item.output;
       const card = document.createElement("article"); card.className = "i2v-video-card";
       const video = document.createElement("video");
-      video.src = item.playback_url; video.controls = true; video.preload = "metadata"; video.playsInline = true;
+      video.src = item.playback_url; video.controls = true; video.preload = "none"; video.playsInline = true;
       const body = document.createElement("div"); body.className = "i2v-video-body";
       const heading = document.createElement("div");
       heading.append(text("strong", `Video ${String(output.output_id).slice(0, 8)}`), statusChip("succeeded"));
@@ -878,8 +887,14 @@
   }
 
   root.querySelectorAll("[data-source-tab]").forEach((button) => button.addEventListener("click", () => activateSourceTab(button.dataset.sourceTab)));
-  q("[data-refresh-library]").addEventListener("click", () => loadSources().catch((error) => announce(error.message, true)));
-  q("[data-load-more-sources]").addEventListener("click", () => { state.sourceLimit = 200; loadSources().catch((error) => announce(error.message, true)); });
+  q("[data-refresh-library]").addEventListener("click", () => {
+    state.sourceLimit = sourcePageSize;
+    loadSources().catch((error) => announce(error.message, true));
+  });
+  q("[data-load-more-sources]").addEventListener("click", () => {
+    state.sourceLimit = Math.min(200, state.sourceLimit + sourcePageSize);
+    loadSources({ append: true }).catch((error) => announce(error.message, true));
+  });
   assetIdForm.addEventListener("submit", selectAssetById);
   assetIdInput.addEventListener("input", () => {
     assetIdInput.setCustomValidity("");
