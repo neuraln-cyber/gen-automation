@@ -13,7 +13,7 @@ diff --git a/chroma/layers.py b/chroma/layers.py
 diff --git a/chroma/model.py b/chroma/model.py
 --- a/chroma/model.py
 +++ b/chroma/model.py
-@@ -7,7 +7,7 @@ import comfy.ldm.common_dit
+@@ -7,6 +7,6 @@ import comfy.ldm.common_dit
  
  from comfy.ldm.flux.layers import timestep_embedding
 -from comfy.ldm.chroma.layers import (

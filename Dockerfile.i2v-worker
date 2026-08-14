@@ -117,7 +117,7 @@ RUN /opt/conda/bin/python -c "import sys; assert sys.version_info[:2] == (3, 11)
 # runtime layers. Publication can then reuse those proven blobs, and Salad only
 # needs to pull this small extension layer plus the application delta.
 ARG COMFYUI_NAG_COMMIT=ef8a641be08983cf5f06669f70719b6eecce3c7f
-ARG COMFYUI_NAG_PATCH_SHA256=2eb542ee103e0bb0b2897483d2d1601ae54a16f916ece474a2737d8c9022d664
+ARG COMFYUI_NAG_PATCH_SHA256=63d93ed85b7ae819328a27b928f39944690988d964cc336da8a82b63c06917e8
 
 COPY patches/comfyui-nag/chroma-stream-blocks.patch /tmp/chroma-stream-blocks.patch
 
