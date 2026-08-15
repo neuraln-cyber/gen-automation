@@ -5,7 +5,7 @@ import json
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import SecretStr, ValidationError
@@ -276,16 +276,24 @@ def test_face_fidelity_uses_pinned_nag_and_effective_expression_anchors() -> Non
     assert rendered["7"]["inputs"]["text"] == effective_negative_prompt("camera shake", settings)
     assert "expression change" in rendered["7"]["inputs"]["text"]
     assert "repeated blinking" in rendered["7"]["inputs"]["text"]
+    assert rendered["10"]["class_type"] == "WanFirstLastFrameToVideo"
+    assert rendered["10"]["inputs"]["start_image"] == ["1", 0]
+    assert rendered["10"]["inputs"]["end_image"] == ["1", 0]
     for node_id in ("11", "12"):
         sampler = rendered[node_id]
         assert sampler["class_type"] == "KSamplerWithNAG (Advanced)"
+        assert sampler["inputs"]["positive"] == ["10", 0]
+        assert sampler["inputs"]["negative"] == ["10", 1]
         assert sampler["inputs"]["nag_negative"] == ["10", 1]
         assert sampler["inputs"]["nag_scale"] == 11.0
         assert sampler["inputs"]["nag_tau"] == 2.37
         assert sampler["inputs"]["nag_alpha"] == 0.25
         assert sampler["inputs"]["nag_sigma_end"] == 0.0
+    assert rendered["11"]["inputs"]["latent_image"] == ["10", 2]
     assert template["11"]["class_type"] == "KSamplerAdvanced"
     assert template["12"]["class_type"] == "KSamplerAdvanced"
+    assert template["10"]["class_type"] == "WanImageToVideo"
+    assert "end_image" not in template["10"]["inputs"]
 
 
 def test_face_fidelity_anchors_are_idempotent_and_off_is_byte_compatible() -> None:
@@ -298,6 +306,40 @@ def test_face_fidelity_anchors_are_idempotent_and_off_is_byte_compatible() -> No
     disabled = GenerationSettings(face_fidelity="off")
     assert effective_positive_prompt("subtle body movement", disabled) == ("subtle body movement")
     assert effective_negative_prompt("jitter", disabled) == "jitter"
+
+    template = load_workflow_template(WORKFLOW)
+    rendered, _seed, _prefix = render_workflow(
+        template,
+        input_filename="source.png",
+        positive_prompt="subtle body movement",
+        negative_prompt="jitter",
+        settings=GenerationSettings(seed=42, face_fidelity="off"),
+        job_id=UUID("00000000-0000-0000-0000-000000000001"),
+        attempt_id=UUID("00000000-0000-0000-0000-000000000002"),
+    )
+    assert "end_image" not in rendered["10"]["inputs"]
+    assert rendered["11"]["class_type"] == "KSamplerAdvanced"
+    assert rendered["12"]["class_type"] == "KSamplerAdvanced"
+    canonical = json.dumps(rendered, sort_keys=True, separators=(",", ":")).encode()
+    assert hashlib.sha256(canonical).hexdigest() == (
+        "c0c9d3f9dd99519e2f52772a35affb2dbc72535142e07b934a918b2f657023dc"
+    )
+
+
+def test_face_fidelity_rejects_unreviewed_conditioning_topology() -> None:
+    template = load_workflow_template(WORKFLOW)
+    template["10"]["inputs"]["start_image"] = ["unreviewed", 0]
+
+    with pytest.raises(WorkflowError, match="conditioning topology"):
+        render_workflow(
+            template,
+            input_filename="source.png",
+            positive_prompt="subtle body movement",
+            negative_prompt="jitter",
+            settings=GenerationSettings(face_fidelity="stable_expression"),
+            job_id=uuid4(),
+            attempt_id=uuid4(),
+        )
 
 
 def test_reviewed_loras_chain_each_stage_before_sampling_and_inject_triggers_once() -> None:

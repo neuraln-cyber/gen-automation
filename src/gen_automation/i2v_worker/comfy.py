@@ -8,8 +8,16 @@ from typing import Any
 import httpx2
 
 _PROMPT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
-_REQUIRED_NAG_NODE = "KSamplerWithNAG (Advanced)"
-_REQUIRED_NAG_NODE_PATH = "/object_info/KSamplerWithNAG%20%28Advanced%29"
+_REQUIRED_NODES = (
+    (
+        "KSamplerWithNAG (Advanced)",
+        "/object_info/KSamplerWithNAG%20%28Advanced%29",
+    ),
+    (
+        "WanFirstLastFrameToVideo",
+        "/object_info/WanFirstLastFrameToVideo",
+    ),
+)
 
 
 class ComfyError(Exception):
@@ -45,11 +53,14 @@ class ComfyClient:
             response = await self.client.get("/system_stats")
             if response.status_code != 200:
                 return False
-            node_response = await self.client.get(_REQUIRED_NAG_NODE_PATH)
-            if node_response.status_code != 200:
-                return False
-            node_info = node_response.json()
-            return isinstance(node_info, dict) and set(node_info) == {_REQUIRED_NAG_NODE}
+            for node_name, node_path in _REQUIRED_NODES:
+                node_response = await self.client.get(node_path)
+                if node_response.status_code != 200:
+                    return False
+                node_info = node_response.json()
+                if not isinstance(node_info, dict) or set(node_info) != {node_name}:
+                    return False
+            return True
         except Exception:
             return False
 
