@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import func, select
 
-from gen_automation.db.models import AdminUser, I2VAttempt, I2VJob
+from gen_automation.db.models import AdminUser, I2VAttempt, I2VJob, I2VWorkerDeployment
 from gen_automation.db.session import Database
 from gen_automation.domain.enums import AdminRole
 from gen_automation.domain.i2v import (
@@ -134,6 +134,7 @@ class FakeRuntimeSalad:
         self.instances = (_instance("instance-1", "machine-1"),)
         self.jobs: dict[UUID, SaladQueueJob] = {}
         self.provider_mutations: list[str] = []
+        self.stopped_group_names: list[str] = []
         self.submission_calls = 0
         self.raise_ambiguous_once = False
         self.last_input: JSONValue = None
@@ -162,8 +163,9 @@ class FakeRuntimeSalad:
     async def start_container_group(self, _name: str) -> None:
         self.provider_mutations.append("start_group")
 
-    async def stop_container_group(self, _name: str) -> None:
+    async def stop_container_group(self, name: str) -> None:
         self.provider_mutations.append("stop_group")
+        self.stopped_group_names.append(name)
 
     async def create_job(
         self,
@@ -833,12 +835,207 @@ async def test_warm_idle_can_stop_or_remain_manual_unbounded(
     stopped = await runtime.run_cycle(now=_NOW + timedelta(seconds=1801))
     assert stopped.action == "group_stop_requested"
     assert client.provider_mutations == ["stop_group"]
+    assert client.stopped_group_names == ["i2v-dasiwa-5090-v1"]
 
     client.provider_mutations.clear()
     manual = _runtime(database, client, warm_idle_seconds=None)
     idle = await manual.run_cycle(now=_NOW + timedelta(days=365))
     assert idle.action in {"idle", "deployment_observed"}
     assert client.provider_mutations == []
+
+
+@pytest.mark.parametrize(
+    ("instance_id", "machine_id", "version"),
+    (
+        ("instance-2", "machine-1", 1),
+        ("instance-1", "machine-2", 1),
+        ("instance-1", "machine-1", 2),
+    ),
+)
+async def test_new_ready_worker_identity_earns_a_fresh_warm_idle_window(
+    runtime_database: tuple[Database, UUID, UUID],
+    instance_id: str,
+    machine_id: str,
+    version: int,
+) -> None:
+    database, _owner_id, _input_id = runtime_database
+    client = FakeRuntimeSalad()
+    runtime = _runtime(database, client, warm_idle_seconds=1800)
+    assert (await runtime.run_cycle(now=_NOW)).action == "deployment_observed"
+
+    replacement_ready_at = _NOW + timedelta(seconds=1801)
+    client.instances = (_instance(instance_id, machine_id, version=version),)
+    observed = await runtime.run_cycle(now=replacement_ready_at)
+    assert observed.action == "deployment_observed"
+    assert client.provider_mutations == []
+    async with database.sessions() as session:
+        deployment = await session.scalar(select(I2VWorkerDeployment))
+        assert deployment is not None
+        assert deployment.deployment_metadata["idle_since"] == replacement_ready_at.isoformat()
+
+    before_deadline = await runtime.run_cycle(now=replacement_ready_at + timedelta(seconds=1799))
+    assert before_deadline.action == "idle"
+    assert client.provider_mutations == []
+    at_deadline = await runtime.run_cycle(now=replacement_ready_at + timedelta(seconds=1800))
+    assert at_deadline.action == "group_stop_requested"
+    assert client.provider_mutations == ["stop_group"]
+    assert client.stopped_group_names == ["i2v-dasiwa-5090-v1"]
+
+
+async def test_nonready_to_ready_transition_earns_a_fresh_warm_idle_window(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, _owner_id, _input_id = runtime_database
+    client = FakeRuntimeSalad()
+    runtime = _runtime(database, client, warm_idle_seconds=1800)
+    assert (await runtime.run_cycle(now=_NOW)).action == "deployment_observed"
+
+    client.instances = (
+        _instance(
+            "instance-1",
+            "machine-1",
+            state=SaladContainerGroupInstanceState.DOWNLOADING,
+            ready=False,
+            started=False,
+        ),
+    )
+    provisioning_at = _NOW + timedelta(seconds=1801)
+    assert (await runtime.run_cycle(now=provisioning_at)).action == "deployment_observed"
+    async with database.sessions() as session:
+        deployment = await session.scalar(select(I2VWorkerDeployment))
+        assert deployment is not None
+        assert deployment.deployment_metadata["idle_since"] is None
+
+    ready_at = provisioning_at + timedelta(hours=2)
+    client.instances = (_instance("instance-1", "machine-1"),)
+    assert (await runtime.run_cycle(now=ready_at)).action == "deployment_observed"
+    assert client.provider_mutations == []
+    async with database.sessions() as session:
+        deployment = await session.scalar(select(I2VWorkerDeployment))
+        assert deployment is not None
+        assert deployment.deployment_metadata["idle_since"] == ready_at.isoformat()
+
+    assert (await runtime.run_cycle(now=ready_at + timedelta(seconds=1799))).action == "idle"
+    assert client.provider_mutations == []
+    assert (
+        await runtime.run_cycle(now=ready_at + timedelta(seconds=1800))
+    ).action == "group_stop_requested"
+    assert client.provider_mutations == ["stop_group"]
+    assert client.stopped_group_names == ["i2v-dasiwa-5090-v1"]
+
+
+async def test_promoted_worker_image_earns_a_fresh_warm_idle_window(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, _owner_id, _input_id = runtime_database
+    client = FakeRuntimeSalad()
+    runtime = _runtime(database, client, warm_idle_seconds=1800)
+    assert (await runtime.run_cycle(now=_NOW)).action == "deployment_observed"
+    async with database.sessions() as session:
+        deployment = await session.scalar(select(I2VWorkerDeployment).with_for_update())
+        assert deployment is not None
+        deployment.worker_image_digest = "ghcr.io/example/i2v@sha256:" + "f" * 64
+        await session.commit()
+
+    promoted_ready_at = _NOW + timedelta(seconds=1801)
+    assert (await runtime.run_cycle(now=promoted_ready_at)).action == "deployment_observed"
+    assert client.provider_mutations == []
+    async with database.sessions() as session:
+        deployment = await session.scalar(select(I2VWorkerDeployment))
+        assert deployment is not None
+        assert deployment.worker_image_digest == _IMAGE
+        assert deployment.deployment_metadata["idle_since"] == promoted_ready_at.isoformat()
+
+    assert (await runtime.run_cycle(now=promoted_ready_at + timedelta(seconds=1))).action == "idle"
+    assert client.provider_mutations == []
+
+
+async def test_same_ready_worker_preserves_warm_idle_epoch_across_runtime_restart(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, _owner_id, _input_id = runtime_database
+    client = FakeRuntimeSalad()
+    assert (await _runtime(database, client).run_cycle(now=_NOW)).action == "deployment_observed"
+
+    restarted = _runtime(database, client, warm_idle_seconds=1800)
+    assert (await restarted.run_cycle(now=_NOW + timedelta(seconds=1799))).action == "idle"
+    assert client.provider_mutations == []
+    assert (
+        await restarted.run_cycle(now=_NOW + timedelta(seconds=1800))
+    ).action == "group_stop_requested"
+    assert client.provider_mutations == ["stop_group"]
+    assert client.stopped_group_names == ["i2v-dasiwa-5090-v1"]
+
+
+@pytest.mark.parametrize(
+    "invalid_idle_since",
+    (
+        "not-a-timestamp",
+        "0001-01-01T00:00:00+14:00",
+        _NOW.replace(tzinfo=None).isoformat(),
+        (_NOW + timedelta(days=1)).isoformat(),
+    ),
+)
+async def test_invalid_idle_timestamp_cannot_end_or_extend_a_ready_epoch(
+    runtime_database: tuple[Database, UUID, UUID],
+    invalid_idle_since: str,
+) -> None:
+    database, _owner_id, _input_id = runtime_database
+    client = FakeRuntimeSalad()
+    runtime = _runtime(database, client, warm_idle_seconds=1800)
+    assert (await runtime.run_cycle(now=_NOW)).action == "deployment_observed"
+    async with database.sessions() as session:
+        deployment = await session.scalar(select(I2VWorkerDeployment).with_for_update())
+        assert deployment is not None
+        metadata = dict(deployment.deployment_metadata)
+        metadata["idle_since"] = invalid_idle_since
+        deployment.deployment_metadata = metadata
+        await session.commit()
+
+    reset_at = _NOW + timedelta(seconds=1)
+    assert (await runtime.run_cycle(now=reset_at)).action == "deployment_observed"
+    assert client.provider_mutations == []
+    async with database.sessions() as session:
+        deployment = await session.scalar(select(I2VWorkerDeployment))
+        assert deployment is not None
+        assert deployment.deployment_metadata["idle_since"] == reset_at.isoformat()
+
+
+async def test_queued_and_active_work_clear_a_stale_warm_idle_epoch(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, input_id = runtime_database
+    client = FakeRuntimeSalad()
+    runtime = _runtime(database, client, warm_idle_seconds=1800)
+    assert (await runtime.run_cycle(now=_NOW)).action == "deployment_observed"
+    await _queue_job(database, owner_id=owner_id, input_id=input_id)
+
+    queued_at = _NOW + timedelta(seconds=1801)
+    assert (await runtime.run_cycle(now=queued_at)).action == "deployment_observed"
+    async with database.sessions() as session:
+        deployment = await session.scalar(select(I2VWorkerDeployment))
+        assert deployment is not None
+        assert deployment.deployment_metadata["idle_since"] is None
+    assert (await runtime.run_cycle(now=queued_at + timedelta(seconds=1))).action == "job_claimed"
+    assert (
+        await runtime.run_cycle(now=queued_at + timedelta(seconds=2))
+    ).action == "provider_job_submitted"
+
+    async with database.sessions() as session:
+        deployment = await session.scalar(select(I2VWorkerDeployment).with_for_update())
+        assert deployment is not None
+        metadata = dict(deployment.deployment_metadata)
+        metadata["idle_since"] = _NOW.isoformat()
+        deployment.deployment_metadata = metadata
+        await session.commit()
+    active_observed = await runtime.run_cycle(now=queued_at + timedelta(seconds=3))
+    assert active_observed.action == "deployment_observed"
+    assert client.provider_mutations == ["create_job"]
+    assert client.stopped_group_names == []
+    async with database.sessions() as session:
+        deployment = await session.scalar(select(I2VWorkerDeployment))
+        assert deployment is not None
+        assert deployment.deployment_metadata["idle_since"] is None
 
 
 async def test_prefetch_three_leaves_rest_editable_in_postgresql_fifo(
@@ -947,15 +1144,23 @@ def _group() -> SaladContainerGroup:
     )
 
 
-def _instance(instance_id: str, machine_id: str) -> SaladContainerGroupInstance:
+def _instance(
+    instance_id: str,
+    machine_id: str,
+    *,
+    state: SaladContainerGroupInstanceState = SaladContainerGroupInstanceState.RUNNING,
+    ready: bool | None = True,
+    started: bool | None = True,
+    version: int = 1,
+) -> SaladContainerGroupInstance:
     return SaladContainerGroupInstance(
         id=instance_id,
         machine_id=machine_id,
-        state=SaladContainerGroupInstanceState.RUNNING,
+        state=state,
         update_time=_NOW,
-        version=1,
-        ready=True,
-        started=True,
+        version=version,
+        ready=ready,
+        started=started,
     )
 
 

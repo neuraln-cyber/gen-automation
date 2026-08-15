@@ -276,6 +276,7 @@ class I2VProviderObservation:
     replicas: int
     instance_id: str | None
     machine_id: str | None
+    instance_version: int | None
     instance_state: str | None
     ready: bool | None
     instances: tuple[JSONObject, ...]
@@ -417,6 +418,7 @@ async def observe_i2v_provider(
         replicas=group.replicas,
         instance_id=primary.id if primary is not None else None,
         machine_id=primary.machine_id if primary is not None else None,
+        instance_version=primary.version if primary is not None else None,
         instance_state=primary.state.value if primary is not None else None,
         ready=primary.ready if primary is not None else None,
         instances=summaries,
