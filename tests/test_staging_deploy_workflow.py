@@ -683,14 +683,14 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
     assert '[ "$remaining" -gt 0 ] || return 1' in rollout
     assert 'sleep "$((remaining < 5 ? remaining : 5))"' in rollout
     assert 'timeout --signal=TERM --kill-after=60s "$timeout_seconds"' in rollout
-    for bound in ("900s dry-run", "1900s rollback", '10000s "$operation"'):
+    for bound in ("900s dry-run", "1900s rollback", '12000s "$operation"'):
         assert bound in rollout
     # Worst-case automatic recovery fits inside the RunShellScript execution
     # budget. The separate SSM delivery allowance plus execution then fits
     # inside polling, which fits inside OIDC, which fits inside the job timeout.
     worst_run_one_off_dry_run = 900 + 60
     worst_restart = 600
-    worst_run_one_off_promote = 10_000 + 60
+    worst_run_one_off_promote = 12_000 + 60
     worst_run_one_off_preflight = 900 + 60
     # The outer watchdog is 1900s, while the shared provider rollback deadline
     # is 1800s plus the one-off process's 60s termination grace.
@@ -767,7 +767,7 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
     assert promotion.index('run_one_off "$original_env" "$initial_container" 900s dry-run') < (
         promotion.index('restart_into "$maintenance_env"')
     )
-    atomic_provider_operation = 'run_one_off "$original_env" "$maintenance_id" 10000s "$operation"'
+    atomic_provider_operation = 'run_one_off "$original_env" "$maintenance_id" 12000s "$operation"'
     assert promotion.index('restart_into "$maintenance_env"') < promotion.index(
         atomic_provider_operation
     )
@@ -872,7 +872,7 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
     assert "provider-mutation-attempted" not in finalize
     assert "1900s rollback" not in finalize
     actual_failure = promotion.split(
-        'if ! run_one_off "$original_env" "$maintenance_id" 10000s "$operation"',
+        'if ! run_one_off "$original_env" "$maintenance_id" 12000s "$operation"',
         maxsplit=1,
     )[1].split("\nfi\n", maxsplit=1)[0]
     assert 'if [ "$operation" = "recycle-promote" ]; then' in actual_failure
@@ -882,6 +882,10 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
         rollout
     )
     explicit_rollback = rollout.split('if [ "$operation" = "rollback" ]; then', maxsplit=2)[2]
+    assert 'fail "rollback requires zero active I2V work"' in explicit_rollback
+    assert explicit_rollback.index("assert_zero_status") < explicit_rollback.index(
+        'restart_into "$maintenance_env"'
+    )
     assert explicit_rollback.index('resume_env="$original_env"') < explicit_rollback.index(
         'restart_into "$original_env"'
     )

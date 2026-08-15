@@ -1092,7 +1092,7 @@ async def recycle_promote_reviewed_worker(
     rollback_state_output: Path,
     provider_mutation_marker_output: Path,
     diagnostic_output: Path | None = None,
-    timeout_seconds: float = 6_900,
+    timeout_seconds: float = 9_000,
 ) -> I2VLoraRolloutResult:
     """Atomically replace an exact idle degraded worker with the reviewed target."""
 

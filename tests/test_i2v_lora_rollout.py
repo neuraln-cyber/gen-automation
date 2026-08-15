@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import AsyncIterator, Mapping
 from copy import deepcopy
@@ -844,6 +845,14 @@ async def test_recover_inflight_accepts_deferred_exact_prior_patch(
     assert client.group.version == state.promoted_version + 1
     assert client.start_calls == 1
     assert not marker.exists()
+
+
+def test_recycle_promote_cold_bootstrap_budget_is_bounded_to_150_minutes() -> None:
+    timeout = inspect.signature(rollout.recycle_promote_reviewed_worker).parameters[
+        "timeout_seconds"
+    ]
+
+    assert timeout.default == 9_000
 
 
 def test_exact_ready_instance_requires_one_current_running_ready_replica() -> None:
