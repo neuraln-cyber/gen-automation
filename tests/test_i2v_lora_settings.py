@@ -10,6 +10,7 @@ from gen_automation.domain.i2v_loras import (
     normalize_i2v_settings,
     validate_i2v_lora_prompt,
 )
+from gen_automation.i2v_worker.lora_catalog import LORA_CATALOG
 
 
 def test_reviewed_lora_selections_are_frozen_in_catalog_order() -> None:
@@ -60,14 +61,17 @@ def test_reviewed_lora_selection_rejects_open_or_invalid_values(
 
 
 def test_reviewed_lora_selection_limits_simultaneous_stack_not_catalog_size() -> None:
-    with pytest.raises(I2VLoraSelectionError, match="at most three"):
+    all_reviewed = [{"catalog_id": catalog_id, "strength": 0.25} for catalog_id in LORA_CATALOG]
+
+    normalized = normalize_i2v_settings({"loras": list(reversed(all_reviewed))})
+
+    assert normalized["loras"] == all_reviewed
+    with pytest.raises(I2VLoraSelectionError, match="at most 5"):
         normalize_i2v_settings(
             {
                 "loras": [
-                    {"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.3},
-                    {"catalog_id": "bouncing-boobs-wan22", "strength": 1},
-                    {"catalog_id": "m4crom4sti4-natural-breasts-k3nk", "strength": 1},
-                    {"catalog_id": "smoothmix-xxx-animations-wan22", "strength": 1},
+                    *all_reviewed,
+                    {"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.25},
                 ]
             }
         )

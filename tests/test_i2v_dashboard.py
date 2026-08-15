@@ -136,6 +136,8 @@ def test_i2v_dashboard_uses_only_the_backend_reviewed_lora_catalog() -> None:
     assert "entry.canonical_source_url" in script
     assert "entry.canonical_version_urls" in script
     assert "catalog_id: catalogId" in script
+    assert "state.maximumLoraSelections = Number(catalog.maximum_selections)" in script
+    assert "Choose at most ${state.maximumLoraSelections} reviewed LoRAs." in script
     assert "lora_high" not in script
     assert "lora_low" not in script
     assert ".safetensors" not in template

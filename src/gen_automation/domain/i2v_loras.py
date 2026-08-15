@@ -45,7 +45,9 @@ def normalize_i2v_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(raw_loras, list):
         raise I2VLoraSelectionError("I2V LoRAs must be a list")
     if len(raw_loras) > MAX_REVIEWED_LORA_SELECTIONS:
-        raise I2VLoraSelectionError("at most three reviewed I2V LoRAs may be selected")
+        raise I2VLoraSelectionError(
+            f"at most {MAX_REVIEWED_LORA_SELECTIONS} reviewed I2V LoRAs may be selected"
+        )
 
     by_catalog_id: dict[str, dict[str, float | str]] = {}
     for raw_selection in raw_loras:

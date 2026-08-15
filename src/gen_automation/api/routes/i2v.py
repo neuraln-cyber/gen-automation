@@ -245,7 +245,10 @@ async def reviewed_loras(
         profile_enabled=enabled,
         maximum_selections=MAX_REVIEWED_LORA_SELECTIONS,
         message=(
-            "Reviewed LoRAs are installed and available on the matching worker."
+            (
+                "Reviewed LoRAs are installed and available on the matching worker. "
+                f"Select up to {MAX_REVIEWED_LORA_SELECTIONS}."
+            )
             if enabled
             else (
                 "LoRAs remain unavailable until exact worker artifact and readiness "
