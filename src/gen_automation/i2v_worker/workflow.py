@@ -221,6 +221,19 @@ def _inject_reviewed_loras(
 
 
 def _enable_face_fidelity(workflow: dict[str, Any]) -> dict[str, Any]:
+    conditioning = workflow["10"]
+    if conditioning.get("class_type") != "WanImageToVideo" or conditioning.get("inputs", {}).get(
+        "start_image"
+    ) != ["1", 0]:
+        raise WorkflowError("face-fidelity conditioning topology is invalid")
+    # The pinned native first/last-frame node preserves the same three outputs
+    # as WanImageToVideo. Reusing the exact source image gives the denoiser a
+    # structural expression/head-pose anchor at both endpoints, reducing the
+    # drift that text-only negative guidance cannot prevent. Intermediate-frame
+    # behavior still requires visual validation on the exact model and LoRAs.
+    conditioning["class_type"] = "WanFirstLastFrameToVideo"
+    conditioning["inputs"]["end_image"] = ["1", 0]
+
     for node_id in ("11", "12"):
         node = workflow[node_id]
         if node.get("class_type") != "KSamplerAdvanced":
