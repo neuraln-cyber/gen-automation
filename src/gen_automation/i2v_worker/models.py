@@ -172,6 +172,8 @@ class GenerationSettings(_StrictModel):
         if self.high_end_step >= self.steps:
             raise ValueError("high stage must end before total steps")
         if self.loop:
+            if self.face_fidelity == "stable_expression":
+                raise ValueError("stable expression does not support looped delivery")
             output_frames = ((2 * self.frame_count) - 2) * self.loop_count
             if output_frames > self.fps * _MAX_LOOP_DURATION_SECONDS:
                 raise ValueError("looped output duration must not exceed 25 seconds")

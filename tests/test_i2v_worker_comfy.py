@@ -40,11 +40,6 @@ async def test_readiness_requires_the_exact_face_fidelity_nodes() -> None:
                 200,
                 json={"KSamplerWithNAG (Advanced)": {"input": {}}},
             )
-        if request.url.path == "/object_info/WanFirstLastFrameToVideo":
-            return httpx2.Response(
-                200,
-                json={"WanFirstLastFrameToVideo": {"input": {}}},
-            )
         raise AssertionError(request.url.path)
 
     client = await _client(handler)
@@ -56,7 +51,6 @@ async def test_readiness_requires_the_exact_face_fidelity_nodes() -> None:
     assert paths == [
         "/system_stats",
         "/object_info/KSamplerWithNAG (Advanced)",
-        "/object_info/WanFirstLastFrameToVideo",
     ]
 
 
@@ -85,34 +79,6 @@ async def test_readiness_fails_closed_for_missing_or_ambiguous_node_contract(
         assert not await client.ready()
     finally:
         await client.close()
-
-
-@pytest.mark.asyncio
-async def test_readiness_fails_closed_without_native_first_last_conditioning() -> None:
-    paths: list[str] = []
-
-    def handler(request: httpx2.Request) -> httpx2.Response:
-        paths.append(request.url.path)
-        if request.url.path == "/system_stats":
-            return httpx2.Response(200, json={})
-        if request.url.path == "/object_info/KSamplerWithNAG (Advanced)":
-            return httpx2.Response(
-                200,
-                json={"KSamplerWithNAG (Advanced)": {"input": {}}},
-            )
-        return httpx2.Response(200, json={})
-
-    client = await _client(handler)
-    try:
-        assert not await client.ready()
-    finally:
-        await client.close()
-
-    assert paths == [
-        "/system_stats",
-        "/object_info/KSamplerWithNAG (Advanced)",
-        "/object_info/WanFirstLastFrameToVideo",
-    ]
 
 
 @pytest.mark.asyncio

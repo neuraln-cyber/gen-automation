@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
 import stat
@@ -12,7 +13,14 @@ from typing import cast
 
 from gen_automation.i2v_worker.artifacts import ModelBootstrapError, S3ModelBootstrapper
 from gen_automation.i2v_worker.comfy import ComfyClient
+from gen_automation.i2v_worker.face_stabilizer import (
+    FaceDetector,
+    FaceStabilizationError,
+    preflight_face_stabilizer,
+)
 from gen_automation.i2v_worker.settings import I2VWorkerSettings
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class WorkerStartupError(Exception):
@@ -30,6 +38,7 @@ class WorkerSupervisor:
         self.comfy: subprocess.Popen[bytes] | None = None
         self.queue_worker: subprocess.Popen[bytes] | None = None
         self.comfy_client: ComfyClient | None = None
+        self.face_detector: FaceDetector | None = None
         self.ready = False
         self.failed = False
         self._task: asyncio.Task[None] | None = None
@@ -52,11 +61,16 @@ class WorkerSupervisor:
                 await asyncio.to_thread(_stop_process, process)
         if self.comfy_client is not None:
             await self.comfy_client.close()
+        self.face_detector = None
 
     async def _run(self) -> None:
         try:
             _ensure_directories(self.settings)
             await asyncio.to_thread(_verify_gpu_runtime)
+            self.face_detector = await asyncio.to_thread(
+                preflight_face_stabilizer,
+                device="cpu",
+            )
             await S3ModelBootstrapper(self.settings).bootstrap()
             self.comfy = _start_process(
                 _comfy_command(self.settings),
@@ -88,9 +102,18 @@ class WorkerSupervisor:
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
             raise
+        except FaceStabilizationError as error:
+            _LOGGER.error(
+                "face stabilizer startup failed: reason_code=%s",
+                error.reason.name.lower(),
+            )
+            self.ready = False
+            self.failed = True
+            self.face_detector = None
         except (ModelBootstrapError, WorkerStartupError, OSError):
             self.ready = False
             self.failed = True
+            self.face_detector = None
 
 
 def _ensure_directories(settings: I2VWorkerSettings) -> None:

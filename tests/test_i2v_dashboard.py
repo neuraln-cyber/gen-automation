@@ -41,6 +41,7 @@ def test_i2v_dashboard_exposes_focused_generation_controls(client: TestClient) -
     assert '<option value="stable_expression" selected>' in response.text
     assert "Stable expression + one natural blink" in response.text
     assert "effective negative guidance at CFG 1" in response.text
+    assert "requires one clear, near-frontal face on a simple light background" in response.text
     assert 'name="loop"> Smooth loop by playing forward then backward' in response.text
     assert 'data-hires-profile-enabled="true"' in response.text
     assert "/static/i2v.js" in response.text
@@ -80,6 +81,10 @@ def test_i2v_dashboard_dynamically_enforces_loop_duration() -> None:
     assert "loopField.max = String(Math.max(1, allowedCycles))" in script
     assert "loopField.value = String(allowedCycles)" in script
     assert "One ping-pong cycle exceeds the 25-second limit." in script
+    assert 'form.elements.face_fidelity.value === "stable_expression"' in script
+    assert "if (stableExpression) loopToggle.checked = false" in script
+    assert "loopToggle.disabled = stableExpression" in script
+    assert '"loop_count", "face_fidelity"' in script
 
 
 def test_i2v_dashboard_bounds_initial_media_requests_below_ingress_burst() -> None:

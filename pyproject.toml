@@ -38,6 +38,8 @@ gen-automation-x-runtime-check = "gen_automation.x_runtime_check_cli:x_runtime_c
 dev = [
   "aiosqlite>=0.21,<1",
   "mypy>=1.16,<2",
+  "numpy>=2.4,<2.5",
+  "opencv-python-headless==4.14.0.94",
   "pip-tools>=7.5,<8",
   "pytest>=8.4,<10",
   "pytest-asyncio>=1.0,<2",
