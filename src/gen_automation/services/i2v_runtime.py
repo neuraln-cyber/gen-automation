@@ -821,15 +821,33 @@ class I2VRuntime:
             )
             existing_metadata = dict(existing.deployment_metadata) if existing else {}
             idle_since = existing_metadata.get("idle_since")
-            if queued_count > 0 or active_count > 0:
+            same_ready_epoch = (
+                existing is not None
+                and existing.state == I2VWorkerDeploymentState.READY
+                and existing.provider_instance_id == observation.instance_id
+                and existing.gpu_class == self.config.salad.gpu_class_name
+                and existing.worker_image_digest == self.config.salad.worker_image
+                and existing_metadata.get("machine_id") == observation.machine_id
+                and existing_metadata.get("instance_version") == observation.instance_version
+                and existing_metadata.get("ready") is True
+                and existing_metadata.get("queued_job_count") == 0
+                and existing_metadata.get("active_job_count") == 0
+                and _is_valid_idle_since(idle_since, now=now)
+            )
+            if (
+                queued_count > 0
+                or active_count > 0
+                or observation.state != I2VWorkerDeploymentState.READY
+            ):
                 idle_since = None
-            elif not isinstance(idle_since, str):
+            elif not same_ready_epoch:
                 idle_since = now.isoformat()
             metadata: dict[str, JSONValue] = {
                 "provider_status": observation.provider_status,
                 "replicas": observation.replicas,
                 "instance_state": observation.instance_state,
                 "machine_id": observation.machine_id,
+                "instance_version": observation.instance_version,
                 "ready": observation.ready,
                 "instances": list(observation.instances),
                 "queued_job_count": queued_count,
@@ -1103,6 +1121,18 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _is_valid_idle_since(value: object, *, now: datetime) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return False
+        return parsed.astimezone(UTC) <= now
+    except (OverflowError, ValueError):
+        return False
 
 
 def _optional_utc(value: datetime | None) -> datetime | None:
