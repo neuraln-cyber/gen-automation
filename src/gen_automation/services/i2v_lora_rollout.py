@@ -2750,6 +2750,7 @@ def _validate_safe_prior_rollout_baseline(
     _validate_prior_group_static_contract(
         group,
         config,
+        require_running=False,
         diagnostic_stage=diagnostic_stage,
     )
     _record_provider_source_stage(diagnostic_stage, "provider-source-lifecycle")
@@ -2759,7 +2760,7 @@ def _validate_safe_prior_rollout_baseline(
     if (
         not group.pending_change
         and group.replicas == 1
-        and group.status.lower() == "running"
+        and group.status.lower() in {"running", "deploying"}
         and group.current_state.allocating_count == 1
         and group.current_state.running_count == 0
         and group.current_state.creating_count == 0
@@ -2781,7 +2782,7 @@ def _validate_safe_prior_rollout_baseline(
         expected_counts is not None
         and not group.pending_change
         and group.replicas == 1
-        and group.status.lower() == "running"
+        and group.status.lower() in {"running", "deploying"}
         and group.current_state.allocating_count == expected_counts[0]
         and group.current_state.creating_count == expected_counts[1]
         and group.current_state.running_count == 0

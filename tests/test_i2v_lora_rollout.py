@@ -1428,6 +1428,34 @@ def test_safe_prior_rollout_baseline_accepts_exact_pre_running_singleton(
 
 
 @pytest.mark.parametrize(
+    "state",
+    (
+        SaladContainerGroupInstanceState.ALLOCATING,
+        SaladContainerGroupInstanceState.DOWNLOADING,
+        SaladContainerGroupInstanceState.CREATING,
+    ),
+)
+def test_safe_prior_rollout_baseline_accepts_exact_deploying_singleton(
+    state: SaladContainerGroupInstanceState,
+) -> None:
+    group = _pre_running_group(state, version=8)
+    group = replace(
+        group,
+        current_state=replace(group.current_state, status="deploying"),
+    )
+
+    assert not rollout._validate_safe_prior_rollout_baseline(
+        group,
+        _pre_running_instance_page(state, version=8),
+        _config(capable=False),
+    )
+    assert not rollout._has_exact_ready_instance(
+        group,
+        _pre_running_instance_page(state, version=8),
+    )
+
+
+@pytest.mark.parametrize(
     ("mutation", "instances"),
     (
         ("pending", _empty_instance_page()),
@@ -2239,6 +2267,34 @@ async def test_promotion_accepts_exact_pre_running_singleton_at_both_guards(
     _patch_promotion_dependencies(monkeypatch)
     monkeypatch.setattr(rollout, "verify_reviewed_artifact_access", _no_artifact_check)
     client = _FakeSalad(group=_pre_running_group(state))
+    client.instances = _pre_running_instance_page(state)
+
+    result = await _promote(
+        database=database,
+        client=client,
+        artifact=_ArtifactClient(),
+        tmp_path=tmp_path,
+    )
+
+    assert result.provider_ready
+    assert client.list_jobs_calls == 2
+    assert len(client.update_patches) == 1
+
+
+async def test_promotion_accepts_exact_deploying_singleton_at_both_guards(
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    monkeypatch.setattr(rollout, "verify_reviewed_artifact_access", _no_artifact_check)
+    state = SaladContainerGroupInstanceState.DOWNLOADING
+    group = _pre_running_group(state)
+    group = replace(
+        group,
+        current_state=replace(group.current_state, status="deploying"),
+    )
+    client = _FakeSalad(group=group)
     client.instances = _pre_running_instance_page(state)
 
     result = await _promote(
