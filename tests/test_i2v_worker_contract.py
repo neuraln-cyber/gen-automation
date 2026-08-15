@@ -164,6 +164,17 @@ def test_baseline_accepts_wan_shape_and_only_reviewed_loras() -> None:
         loras=[{"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.3}]
     )
     assert reviewed.loras[0].catalog_id == "wan-general-nsfw-v0.08a"
+    all_reviewed = GenerationSettings(
+        loras=[{"catalog_id": catalog_id, "strength": 0.25} for catalog_id in LORA_CATALOG]
+    )
+    assert [selection.catalog_id for selection in all_reviewed.loras] == list(LORA_CATALOG)
+    with pytest.raises(ValidationError):
+        GenerationSettings(
+            loras=[
+                *({"catalog_id": catalog_id, "strength": 0.25} for catalog_id in LORA_CATALOG),
+                {"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.25},
+            ]
+        )
     with pytest.raises(ValidationError):
         GenerationSettings(loras=[{"catalog_id": "unreviewed", "strength": 0.3}])
     with pytest.raises(ValidationError):
@@ -336,6 +347,49 @@ def test_reviewed_loras_chain_each_stage_before_sampling_and_inject_triggers_onc
     }
     assert provenance["creator_name"] == "CubeyAI"
     assert provenance["canonical_source_url"] == "https://civitai.com/models/1307155"
+
+
+@pytest.mark.parametrize("selection_count", [4, 5])
+def test_four_and_five_reviewed_loras_chain_both_model_stages(
+    selection_count: int,
+) -> None:
+    template = load_workflow_template(WORKFLOW)
+    catalog_ids = list(LORA_CATALOG)[:selection_count]
+    settings = GenerationSettings(
+        loras=[{"catalog_id": catalog_id, "strength": 0.25} for catalog_id in catalog_ids]
+    )
+
+    rendered, _seed, _prefix = render_workflow(
+        template,
+        input_filename="source.png",
+        positive_prompt="controlled conservative motion",
+        negative_prompt="jitter",
+        settings=settings,
+        job_id=uuid4(),
+        attempt_id=uuid4(),
+    )
+
+    for branch, base_model, sampling_node in (
+        ("high", "2", "8"),
+        ("low", "3", "9"),
+    ):
+        previous_model: list[object] = [base_model, 0]
+        for index, catalog_id in enumerate(catalog_ids, start=1):
+            node_id = f"lora-{branch}-{index}"
+            node = rendered[node_id]
+            entry = LORA_CATALOG[catalog_id]
+            artifact = entry.high if branch == "high" else entry.low
+            assert node["class_type"] == "LoraLoaderModelOnly"
+            assert node["inputs"] == {
+                "model": previous_model,
+                "lora_name": artifact.filename,
+                "strength_model": 0.25,
+            }
+            previous_model = [node_id, 0]
+        assert rendered[sampling_node]["inputs"]["model"] == previous_model
+        assert f"lora-{branch}-{selection_count + 1}" not in rendered
+
+    assert len(lora_provenance(settings)) == selection_count
 
 
 def test_manual_and_triggerless_loras_do_not_mutate_the_author_prompt() -> None:
