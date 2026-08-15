@@ -242,7 +242,7 @@ def test_i2v_reviewed_lora_catalog_is_closed_and_profile_gated(client: TestClien
     assert disabled.status_code == 200
     payload = disabled.json()
     assert payload["profile_enabled"] is False
-    assert payload["maximum_selections"] == 5
+    assert payload["maximum_selections"] == 3
     assert len(payload["loras"]) == 5
     assert all(item["available"] is False for item in payload["loras"])
     assert ".safetensors" not in disabled.text
@@ -251,8 +251,8 @@ def test_i2v_reviewed_lora_catalog_is_closed_and_profile_gated(client: TestClien
         update={"i2v_lora_profile_enabled": True}
     )
     enabled = client.get("/api/v1/i2v/loras").json()
-    assert enabled["maximum_selections"] == 5
-    assert "Select up to 5" in enabled["message"]
+    assert enabled["maximum_selections"] == 3
+    assert "Select up to 3" in enabled["message"]
     by_id = {item["catalog_id"]: item for item in enabled["loras"]}
     assert all(item["available"] is True for item in enabled["loras"])
     assert by_id["wan-general-nsfw-v0.08a"]["automatic_trigger_words"] == ["nsfwsks"]

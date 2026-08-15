@@ -62,19 +62,13 @@ def test_reviewed_lora_selection_rejects_open_or_invalid_values(
 
 def test_reviewed_lora_selection_limits_simultaneous_stack_not_catalog_size() -> None:
     all_reviewed = [{"catalog_id": catalog_id, "strength": 0.25} for catalog_id in LORA_CATALOG]
+    allowed = all_reviewed[:3]
 
-    normalized = normalize_i2v_settings({"loras": list(reversed(all_reviewed))})
+    normalized = normalize_i2v_settings({"loras": list(reversed(allowed))})
 
-    assert normalized["loras"] == all_reviewed
-    with pytest.raises(I2VLoraSelectionError, match="at most 5"):
-        normalize_i2v_settings(
-            {
-                "loras": [
-                    *all_reviewed,
-                    {"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.25},
-                ]
-            }
-        )
+    assert normalized["loras"] == allowed
+    with pytest.raises(I2VLoraSelectionError, match="at most 3"):
+        normalize_i2v_settings({"loras": all_reviewed[:4]})
 
 
 def test_frozen_queue_classifier_never_dispatches_legacy_arbitrary_files() -> None:

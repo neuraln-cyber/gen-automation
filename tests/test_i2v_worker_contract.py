@@ -164,15 +164,17 @@ def test_baseline_accepts_wan_shape_and_only_reviewed_loras() -> None:
         loras=[{"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.3}]
     )
     assert reviewed.loras[0].catalog_id == "wan-general-nsfw-v0.08a"
-    all_reviewed = GenerationSettings(
-        loras=[{"catalog_id": catalog_id, "strength": 0.25} for catalog_id in LORA_CATALOG]
+    three_reviewed = GenerationSettings(
+        loras=[
+            {"catalog_id": catalog_id, "strength": 0.25} for catalog_id in list(LORA_CATALOG)[:3]
+        ]
     )
-    assert [selection.catalog_id for selection in all_reviewed.loras] == list(LORA_CATALOG)
+    assert [selection.catalog_id for selection in three_reviewed.loras] == list(LORA_CATALOG)[:3]
     with pytest.raises(ValidationError):
         GenerationSettings(
             loras=[
-                *({"catalog_id": catalog_id, "strength": 0.25} for catalog_id in LORA_CATALOG),
-                {"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.25},
+                {"catalog_id": catalog_id, "strength": 0.25}
+                for catalog_id in list(LORA_CATALOG)[:4]
             ]
         )
     with pytest.raises(ValidationError):
@@ -349,12 +351,9 @@ def test_reviewed_loras_chain_each_stage_before_sampling_and_inject_triggers_onc
     assert provenance["canonical_source_url"] == "https://civitai.com/models/1307155"
 
 
-@pytest.mark.parametrize("selection_count", [4, 5])
-def test_four_and_five_reviewed_loras_chain_both_model_stages(
-    selection_count: int,
-) -> None:
+def test_three_reviewed_loras_chain_both_model_stages() -> None:
     template = load_workflow_template(WORKFLOW)
-    catalog_ids = list(LORA_CATALOG)[:selection_count]
+    catalog_ids = list(LORA_CATALOG)[:3]
     settings = GenerationSettings(
         loras=[{"catalog_id": catalog_id, "strength": 0.25} for catalog_id in catalog_ids]
     )
@@ -387,9 +386,20 @@ def test_four_and_five_reviewed_loras_chain_both_model_stages(
             }
             previous_model = [node_id, 0]
         assert rendered[sampling_node]["inputs"]["model"] == previous_model
-        assert f"lora-{branch}-{selection_count + 1}" not in rendered
+        assert f"lora-{branch}-4" not in rendered
 
-    assert len(lora_provenance(settings)) == selection_count
+    assert len(lora_provenance(settings)) == 3
+
+
+@pytest.mark.parametrize("selection_count", [4, 5])
+def test_four_and_five_reviewed_loras_are_rejected_before_rendering(
+    selection_count: int,
+) -> None:
+    catalog_ids = list(LORA_CATALOG)[:selection_count]
+    with pytest.raises(ValidationError):
+        GenerationSettings(
+            loras=[{"catalog_id": catalog_id, "strength": 0.25} for catalog_id in catalog_ids]
+        )
 
 
 def test_manual_and_triggerless_loras_do_not_mutate_the_author_prompt() -> None:
