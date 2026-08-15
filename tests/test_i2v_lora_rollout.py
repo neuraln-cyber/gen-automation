@@ -1060,6 +1060,38 @@ async def test_recycle_promote_accepts_exact_idle_running_not_ready_source(
 
 
 @pytest.mark.asyncio
+async def test_recycle_promote_accepts_exact_deploying_downloading_source(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_promotion_dependencies(monkeypatch)
+    state = SaladContainerGroupInstanceState.DOWNLOADING
+    source = _pre_running_group(state)
+    source = replace(
+        source,
+        current_state=replace(source.current_state, status="deploying"),
+    )
+    client = _FakeSalad(group=source)
+    client.instances = _pre_running_instance_page(state)
+
+    result = await _recycle_promote(
+        database=database,
+        client=client,
+        artifact=_ArtifactClient(),
+        tmp_path=tmp_path,
+        timeout_seconds=5,
+    )
+
+    assert result.operation == "recycle-promote"
+    assert result.provider_image == _TARGET_IMAGE
+    assert result.provider_ready is True
+    assert client.stop_calls == 1
+    assert client.start_calls == 1
+    assert len(client.update_patches) == 1
+
+
+@pytest.mark.asyncio
 async def test_recycle_promote_patches_an_exact_explicitly_stopped_source_before_start(
     database: Database,
     monkeypatch: pytest.MonkeyPatch,
