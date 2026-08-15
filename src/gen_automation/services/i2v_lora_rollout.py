@@ -2245,11 +2245,10 @@ def _validate_exact_recycle_source(
     config: I2VSaladConfig,
     expected_environment: Mapping[str, str],
 ) -> None:
-    stopped_source = _is_exact_stopped_group(group) and getattr(instances, "instances", None) == ()
     _validate_prior_group_static_contract(
         group,
         config,
-        require_running=not stopped_source,
+        require_running=False,
     )
     if _group_image(group) != config.worker_image:
         raise I2VLoraRolloutError("provider worker image differs from the pinned recycle source")
@@ -2272,7 +2271,6 @@ def _validate_exact_recycle_source_lifecycle(
         not isinstance(instances, tuple)
         or group.pending_change
         or group.replicas != 1
-        or group.status.lower() != "running"
         or group.current_state.stopping_count != 0
         or any(
             not isinstance(instance, SaladContainerGroupInstance)
@@ -2289,7 +2287,7 @@ def _validate_exact_recycle_source_lifecycle(
         group.current_state.stopping_count,
     )
     if not instances:
-        if counts == (1, 0, 0, 0):
+        if group.status.lower() == "running" and counts == (1, 0, 0, 0):
             return
         raise I2VLoraRolloutError("provider lifecycle is not an exact idle recycle source")
     if len(instances) != 1:
@@ -2304,9 +2302,13 @@ def _validate_exact_recycle_source_lifecycle(
     if counts != expected_counts:
         raise I2VLoraRolloutError("provider lifecycle is not an exact idle recycle source")
     if instance.state == SaladContainerGroupInstanceState.RUNNING:
-        if instance.started is not True:
+        if group.status.lower() != "running" or instance.started is not True:
             raise I2VLoraRolloutError("provider running recycle source was never started")
-    elif instance.ready is not False or instance.started is not False:
+    elif (
+        group.status.lower() not in {"running", "deploying"}
+        or instance.ready is not False
+        or instance.started is not False
+    ):
         raise I2VLoraRolloutError("provider pre-running recycle source flags are ambiguous")
 
 
