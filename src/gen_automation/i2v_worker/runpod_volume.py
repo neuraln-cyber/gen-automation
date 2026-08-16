@@ -230,9 +230,14 @@ class RunPodVolumeBootstrapper:
     def _install(self, root: Path, model: ModelObject) -> Path:
         cache = root / f"{model.sha256}.safetensors"
         comfy = self.settings.comfy_root.resolve()
-        target = (comfy / model.install_path).resolve(strict=False)
-        if not target.is_relative_to(comfy):
+        unresolved_target = comfy / model.install_path
+        try:
+            target_parent = unresolved_target.parent.resolve(strict=False)
+        except OSError:
+            raise ModelBootstrapError("model bootstrap failed") from None
+        if not target_parent.is_relative_to(comfy):
             raise ModelBootstrapError("model bootstrap failed")
+        target = target_parent / unresolved_target.name
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
         if target.exists() or target.is_symlink():
             try:

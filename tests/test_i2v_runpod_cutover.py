@@ -22,7 +22,7 @@ def test_cutover_shell_and_embedded_python_are_syntactically_valid() -> None:
         pytest.skip("bash is unavailable")
     subprocess.run([bash, "-n", str(SCRIPT)], check=True)  # noqa: S603
     programs = re.findall(r"<<'PY'\n(.*?)\nPY", _script(), flags=re.DOTALL)
-    assert len(programs) == 5
+    assert len(programs) == 6
     for index, program in enumerate(programs):
         compile(program, f"cutover-i2v-runpod-{index}", "exec")
 
