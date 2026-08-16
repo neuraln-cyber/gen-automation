@@ -52,7 +52,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONNOUSERSITE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/opt/i2v/src \
+    PYTHONPATH=/opt/i2v/src:/opt/i2v/vendor \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     HOME=/home/i2v-worker
@@ -155,6 +155,61 @@ RUN printf '%s  %s\n' \
 
 LABEL org.opencontainers.image.comfyui-nag.revision="${COMFYUI_NAG_COMMIT}"
 ENV COMFYUI_NAG_COMMIT="${COMFYUI_NAG_COMMIT}"
+
+# Source-face stabilization is an immutable, CPU-only post-process. Keep it
+# after the existing runtime/NAG layers so a face-control revision does not
+# invalidate the multi-gigabyte CUDA and ComfyUI blobs.
+ARG ANIME_FACE_DETECTOR_REVISION=7db835de7a3a052eb4d68d241ae9f2cf28a0b509
+ARG ANIME_FACE_DETECTOR_WHEEL_SHA256=9a6a8c1384b7a57fab8ce9988f814271ff88bac52a9dd871490a28b61dff7692
+ARG ANIME_FACE_YOLO_SHA256=23bbc708146bcbc1c910f00fe152adbc70d7658d875a0121eaf4ee61d978b2c4
+ARG ANIME_FACE_HRNET_SHA256=e71271376406a743c01528a0460637fcc06e72aeeea583f85007cc72dc8b7a4a
+ARG OPENCV_HEADLESS_SHA256=211e581f5a4670acbbe08fff36a35e9946039d2eea28b80394632d036d1be527
+
+ADD --checksum=sha256:9a6a8c1384b7a57fab8ce9988f814271ff88bac52a9dd871490a28b61dff7692 \
+    --chmod=0444 \
+    https://files.pythonhosted.org/packages/ff/42/a164a2431cff2acc0cace7448d7c61702ecab49a8ed44c7fdd3b704de3f3/anime_face_detector-0.1.0-py3-none-any.whl \
+    /tmp/anime-face-detector.whl
+ADD --checksum=sha256:23bbc708146bcbc1c910f00fe152adbc70d7658d875a0121eaf4ee61d978b2c4 \
+    --chmod=0444 \
+    https://huggingface.co/hysts/anime-face-detector-yolov3/resolve/afdd4226a79ae8bb81f334dbcffd34f8cc000c38/model.safetensors \
+    /opt/i2v/face-models/yolov3.safetensors
+ADD --checksum=sha256:e71271376406a743c01528a0460637fcc06e72aeeea583f85007cc72dc8b7a4a \
+    --chmod=0444 \
+    https://huggingface.co/hysts/anime-face-detector-hrnetv2/resolve/9b3435248b26aeb82e2a8578fe9d86d5d57158af/model.safetensors \
+    /opt/i2v/face-models/hrnetv2.safetensors
+ADD --checksum=sha256:d041f98f4392370b9df7078023b9ebdaa18da812accbb866e1bcda962108fe0f \
+    --chmod=0444 \
+    https://raw.githubusercontent.com/hysts/anime-face-detector/7db835de7a3a052eb4d68d241ae9f2cf28a0b509/assets/input.jpg \
+    /tmp/anime-face-detector-input.jpg
+
+COPY requirements-i2v-face.lock ./requirements-i2v-face.lock
+COPY THIRD_PARTY_LICENSES.md /opt/i2v/licenses/THIRD_PARTY_LICENSES.md
+
+RUN /opt/i2v-venv/bin/python -m pip install \
+        --require-hashes \
+        --no-deps \
+        -r requirements-i2v-face.lock \
+    && mkdir --parents /opt/i2v/vendor \
+    && /opt/i2v-venv/bin/python -m zipfile \
+        -e /tmp/anime-face-detector.whl /opt/i2v/vendor \
+    && /opt/i2v-venv/bin/python -m compileall \
+        -q /opt/i2v/vendor/anime_face_detector \
+    && /opt/i2v-venv/bin/python -c \
+        "from pathlib import Path; import cv2; import numpy as np; assert cv2.__version__=='4.14.0'; from PIL import Image; source=Image.open('/tmp/anime-face-detector-input.jpg'); source.crop((0,0,512,512)).save('/tmp/anime-face-detector-smoke.png'); from anime_face_detector.detector import LandmarkDetector; detector=LandmarkDetector('/opt/i2v/face-models/hrnetv2.safetensors',face_detector_name='yolov3',face_detector_checkpoint_path='/opt/i2v/face-models/yolov3.safetensors',device='cpu',flip_test=False); result=detector(Path('/tmp/anime-face-detector-smoke.png')); assert len(result)==1; assert float(result[0]['bbox'][4])>=0.95; assert result[0]['keypoints'].shape==(28,3); confidence=np.asarray(result[0]['keypoints'])[:,2]; assert float(confidence.min())>=0.60; assert float(confidence.mean())>=0.85" \
+    && rm -f \
+        /tmp/anime-face-detector-input.jpg \
+        /tmp/anime-face-detector-smoke.png \
+        /tmp/anime-face-detector.whl
+
+LABEL org.opencontainers.image.face-stabilizer="static-source-head-single-blink-v2" \
+      org.opencontainers.image.anime-face-detector.revision="${ANIME_FACE_DETECTOR_REVISION}" \
+      org.opencontainers.image.anime-face-detector.wheel-sha256="${ANIME_FACE_DETECTOR_WHEEL_SHA256}" \
+      org.opencontainers.image.anime-face-detector.yolo-sha256="${ANIME_FACE_YOLO_SHA256}" \
+      org.opencontainers.image.anime-face-detector.hrnet-sha256="${ANIME_FACE_HRNET_SHA256}" \
+      org.opencontainers.image.opencv-headless.sha256="${OPENCV_HEADLESS_SHA256}"
+ENV GEN_I2V_FACE_DETECTOR_YOLO_PATH=/opt/i2v/face-models/yolov3.safetensors \
+    GEN_I2V_FACE_LANDMARK_HRNET_PATH=/opt/i2v/face-models/hrnetv2.safetensors \
+    HF_HUB_OFFLINE=1
 
 COPY src/gen_automation/__init__.py ./src/gen_automation/__init__.py
 COPY src/gen_automation/i2v_worker ./src/gen_automation/i2v_worker

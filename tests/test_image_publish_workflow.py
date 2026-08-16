@@ -10,6 +10,8 @@ I2V_INPUTS = (
     ".dockerignore",
     ".gitattributes",
     "Dockerfile.i2v-worker",
+    "THIRD_PARTY_LICENSES.md",
+    "requirements-i2v-face.lock",
     "requirements-i2v-worker.lock",
     "patches/comfyui-nag/chroma-stream-blocks.patch",
     "patches/salad-queue-worker/strict-http-status.patch",

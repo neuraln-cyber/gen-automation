@@ -652,7 +652,11 @@
   function updateDuration() {
     const frames = Number(form.elements.frame_count.value) || 0;
     const fps = Number(form.elements.fps.value) || 0;
-    const loopEnabled = form.elements.loop.checked;
+    const loopToggle = form.elements.loop;
+    const stableExpression = form.elements.face_fidelity.value === "stable_expression";
+    if (stableExpression) loopToggle.checked = false;
+    loopToggle.disabled = stableExpression;
+    const loopEnabled = loopToggle.checked;
     const loopField = form.elements.loop_count;
     const cycleFrames = Math.max(1, (frames * 2) - 2);
     const allowedCycles = Math.min(
@@ -910,7 +914,7 @@
   form.addEventListener("submit", enqueue);
   form.addEventListener("input", (event) => {
     if (event.target.name === "match_source_aspect") syncAspectControls();
-    if (["frame_count", "fps", "loop", "loop_count"].includes(event.target.name)) updateDuration();
+    if (["frame_count", "fps", "loop", "loop_count", "face_fidelity"].includes(event.target.name)) updateDuration();
     if (event.target.name === "positive_prompt") syncLoraPromptPreview();
     scheduleDraftSave();
   });

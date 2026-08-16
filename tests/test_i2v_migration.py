@@ -28,7 +28,15 @@ def _configuration(database_path: Path, monkeypatch: pytest.MonkeyPatch) -> Conf
         "GEN_AUTOMATION_DATABASE_URL",
         f"sqlite+aiosqlite:///{database_path.as_posix()}",
     )
-    return Config("alembic.ini")
+    configuration = Config("alembic.ini")
+    # Materialize the parsed options before clearing the filename so the
+    # migration keeps its script location without env.py re-running fileConfig.
+    _ = configuration.file_config
+    # Alembic's env.py applies fileConfig when this is set, which removes
+    # pytest's live log-capture handler and pollutes every later test. The
+    # script location and all parsed options remain available without it.
+    configuration.config_file_name = None
+    return configuration
 
 
 def test_fresh_i2v_revision_isolated_and_uses_jsonb_on_postgresql() -> None:

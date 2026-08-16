@@ -1,0 +1,6 @@
+# Exact, platform-specific face-stabilizer extension for the CPython 3.11
+# manylinux_2_28 x86_64 I2V image. Dependencies are already supplied by the
+# immutable worker runtime; Docker installs this wheel with --no-deps.
+--only-binary :all:
+
+opencv-python-headless @ https://files.pythonhosted.org/packages/ae/ce/7f538891722a4f06921419d55bac6f41729258d54442861edb2de0dbdf5e/opencv_python_headless-4.14.0.94-cp37-abi3-manylinux_2_28_x86_64.whl#sha256=211e581f5a4670acbbe08fff36a35e9946039d2eea28b80394632d036d1be527

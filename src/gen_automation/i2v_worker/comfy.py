@@ -13,10 +13,6 @@ _REQUIRED_NODES = (
         "KSamplerWithNAG (Advanced)",
         "/object_info/KSamplerWithNAG%20%28Advanced%29",
     ),
-    (
-        "WanFirstLastFrameToVideo",
-        "/object_info/WanFirstLastFrameToVideo",
-    ),
 )
 
 

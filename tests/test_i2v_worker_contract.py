@@ -26,6 +26,8 @@ from gen_automation.i2v_worker.workflow import (
 ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "Dockerfile.i2v-worker"
 LOCK = ROOT / "requirements-i2v-worker.lock"
+FACE_LOCK = ROOT / "requirements-i2v-face.lock"
+FACE_NOTICES = ROOT / "THIRD_PARTY_LICENSES.md"
 NAG_PATCH = ROOT / "patches/comfyui-nag/chroma-stream-blocks.patch"
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 WORKFLOW = ROOT / "workflows/dasiwa-wan22-i2v-v1.api.json"
@@ -198,6 +200,8 @@ def test_baseline_accepts_wan_shape_and_only_reviewed_loras() -> None:
         GenerationSettings(loop=True, loop_count=3)
     with pytest.raises(ValidationError, match="looped output duration must not exceed 25 seconds"):
         GenerationSettings(frame_count=209, fps=16, loop=True, loop_count=1)
+    with pytest.raises(ValidationError, match="stable expression does not support looped delivery"):
+        GenerationSettings(loop=True, face_fidelity="stable_expression")
     long_non_loop = GenerationSettings(frame_count=409, fps=16, loop=False, loop_count=20)
     assert long_non_loop.loop is False
 
@@ -276,9 +280,9 @@ def test_face_fidelity_uses_pinned_nag_and_effective_expression_anchors() -> Non
     assert rendered["7"]["inputs"]["text"] == effective_negative_prompt("camera shake", settings)
     assert "expression change" in rendered["7"]["inputs"]["text"]
     assert "repeated blinking" in rendered["7"]["inputs"]["text"]
-    assert rendered["10"]["class_type"] == "WanFirstLastFrameToVideo"
+    assert rendered["10"]["class_type"] == "WanImageToVideo"
     assert rendered["10"]["inputs"]["start_image"] == ["1", 0]
-    assert rendered["10"]["inputs"]["end_image"] == ["1", 0]
+    assert "end_image" not in rendered["10"]["inputs"]
     for node_id in ("11", "12"):
         sampler = rendered[node_id]
         assert sampler["class_type"] == "KSamplerWithNAG (Advanced)"
@@ -537,7 +541,47 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
     assert "COMFYUI_NAG" not in dockerfile[:heavyweight_runtime_end]
     assert "USER 10002:10002" in dockerfile
     assert "COPY i2v-models" not in dockerfile
-    assert not re.search(r"(?:civitai|huggingface)\.com/.+safetensors", dockerfile)
+    detector_urls = {
+        (
+            "https://huggingface.co/hysts/anime-face-detector-yolov3/resolve/"
+            "afdd4226a79ae8bb81f334dbcffd34f8cc000c38/model.safetensors"
+        ),
+        (
+            "https://huggingface.co/hysts/anime-face-detector-hrnetv2/resolve/"
+            "9b3435248b26aeb82e2a8578fe9d86d5d57158af/model.safetensors"
+        ),
+    }
+    generation_model_urls = dockerfile
+    for detector_url in detector_urls:
+        assert detector_url in generation_model_urls
+        generation_model_urls = generation_model_urls.replace(detector_url, "")
+    assert not re.search(r"(?:civitai|huggingface)\.com/.+safetensors", generation_model_urls)
+    for identity in (
+        "7db835de7a3a052eb4d68d241ae9f2cf28a0b509",
+        "9a6a8c1384b7a57fab8ce9988f814271ff88bac52a9dd871490a28b61dff7692",
+        "23bbc708146bcbc1c910f00fe152adbc70d7658d875a0121eaf4ee61d978b2c4",
+        "e71271376406a743c01528a0460637fcc06e72aeeea583f85007cc72dc8b7a4a",
+        "211e581f5a4670acbbe08fff36a35e9946039d2eea28b80394632d036d1be527",
+    ):
+        assert identity in dockerfile
+    assert "from anime_face_detector.detector import LandmarkDetector" in dockerfile
+    assert "device='cpu'" in dockerfile
+    assert "assert len(result)==1" in dockerfile
+    assert "assert float(confidence.min())>=0.60" in dockerfile
+    assert "assert float(confidence.mean())>=0.85" in dockerfile
+    assert "static-source-head-single-blink-v2" in dockerfile
+    assert "COPY THIRD_PARTY_LICENSES.md /opt/i2v/licenses/THIRD_PARTY_LICENSES.md" in dockerfile
+    face_lock = FACE_LOCK.read_text(encoding="utf-8")
+    assert "opencv-python-headless" in face_lock
+    assert "211e581f5a4670acbbe08fff36a35e9946039d2eea28b80394632d036d1be527" in face_lock
+    notices = FACE_NOTICES.read_text(encoding="utf-8")
+    for identity in (
+        "7db835de7a3a052eb4d68d241ae9f2cf28a0b509",
+        "23bbc708146bcbc1c910f00fe152adbc70d7658d875a0121eaf4ee61d978b2c4",
+        "e71271376406a743c01528a0460637fcc06e72aeeea583f85007cc72dc8b7a4a",
+        "211e581f5a4670acbbe08fff36a35e9946039d2eea28b80394632d036d1be527",
+    ):
+        assert identity in notices
     assert "--start-period=60m" in dockerfile
     assert "--system-site-packages" in dockerfile
     assert "--require-hashes" in dockerfile
