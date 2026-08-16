@@ -290,7 +290,7 @@ def preflight_face_stabilizer(
                 expected_sha256=_HRNET_SHA256,
                 expected_byte_size=_HRNET_BYTE_SIZE,
             )
-            from anime_face_detector import LandmarkDetector
+            from anime_face_detector.detector import LandmarkDetector
 
             detector = cast(
                 FaceDetector,
