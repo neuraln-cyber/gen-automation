@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 from pathlib import Path
 from typing import Any
 
@@ -123,14 +122,16 @@ async def test_supervisor_loads_one_cpu_face_detector_before_bootstrap(
 async def test_face_detector_load_failure_fails_before_model_or_comfy_start(
     tmp_path: Path,
     monkeypatch: Any,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     import gen_automation.i2v_worker.supervisor as module
 
     calls = {"bootstrap": 0, "start": 0}
-    caplog.set_level("ERROR", logger="gen_automation.i2v_worker.supervisor")
-    supervisor_logger = logging.getLogger("gen_automation.i2v_worker.supervisor")
-    supervisor_logger.addHandler(caplog.handler)
+    log_calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def record_error(message: str, *args: object) -> None:
+        log_calls.append((message, args))
+
+    monkeypatch.setattr(module._LOGGER, "error", record_error)
 
     class UnexpectedBootstrapper(_Bootstrapper):
         async def bootstrap(self) -> None:
@@ -149,16 +150,13 @@ async def test_face_detector_load_failure_fails_before_model_or_comfy_start(
     monkeypatch.setattr(module, "S3ModelBootstrapper", UnexpectedBootstrapper)
     monkeypatch.setattr(module, "_start_process", start_process)
 
-    try:
-        supervisor = WorkerSupervisor(_settings(tmp_path))
-        await supervisor.start()
-        await _wait_for(lambda: supervisor.failed)
-        await supervisor.stop()
-    finally:
-        supervisor_logger.removeHandler(caplog.handler)
+    supervisor = WorkerSupervisor(_settings(tmp_path))
+    await supervisor.start()
+    await _wait_for(lambda: supervisor.failed)
+    await supervisor.stop()
 
     assert supervisor.ready is False
     assert supervisor.face_detector is None
     assert calls == {"bootstrap": 0, "start": 0}
-    assert "reason_code=internal" in caplog.text
-    assert "sensitive detector path" not in caplog.text
+    assert log_calls == [("face stabilizer startup failed: reason_code=%s", ("internal",))]
+    assert "sensitive detector path" not in repr(log_calls)

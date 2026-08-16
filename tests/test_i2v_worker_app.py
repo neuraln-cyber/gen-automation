@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import json
-import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
@@ -450,8 +448,8 @@ def test_readiness_fails_closed_without_loaded_face_stabilizer(tmp_path: Path) -
 def test_stable_expression_post_render_guard_fails_without_encode_or_upload(
     tmp_path: Path,
     monkeypatch: Any,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    import gen_automation.i2v_worker.app as app_module
     from gen_automation.i2v_worker.face_stabilizer import (
         FaceStabilizationError,
         FaceStabilizationReason,
@@ -460,9 +458,12 @@ def test_stable_expression_post_render_guard_fails_without_encode_or_upload(
     settings = _settings(tmp_path)
     supervisor = _Supervisor()
     calls = {"execute": 0, "encode": 0, "upload": 0}
-    caplog.set_level("WARNING", logger="gen_automation.i2v_worker.app")
-    app_logger = logging.getLogger("gen_automation.i2v_worker.app")
-    app_logger.addHandler(caplog.handler)
+    log_calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def record_warning(message: str, *args: object) -> None:
+        log_calls.append((message, args))
+
+    monkeypatch.setattr(app_module._LOGGER, "warning", record_warning)
 
     async def download(*_args: Any, **_kwargs: Any) -> None:
         destination = _args[2]
@@ -510,32 +511,37 @@ def test_stable_expression_post_render_guard_fails_without_encode_or_upload(
     job = _job()
     job["settings_snapshot"] = {"face_fidelity": "stable_expression"}
 
-    try:
-        with TestClient(app) as client:
-            response = client.post("/jobs/i2v", json=job)
-    finally:
-        app_logger.removeHandler(caplog.handler)
+    with TestClient(app) as client:
+        response = client.post("/jobs/i2v", json=job)
 
     assert response.status_code == 422
     assert response.json() == {"detail": "stable-expression face contract failed"}
     assert calls == {"execute": 1, "encode": 0, "upload": 0}
     assert list((settings.runtime_root / "jobs").glob("*")) == []
-    assert "reason_code=pose_guard status=422" in caplog.text
-    assert "sensitive pose details" not in caplog.text
+    assert log_calls == [
+        (
+            "stable-expression processing failed: reason_code=%s status=%d job_id=%s attempt_id=%s",
+            ("pose_guard", 422, UUID(job["job_id"]), UUID(job["attempt_id"])),
+        )
+    ]
+    assert "sensitive pose details" not in repr(log_calls)
 
 
 def test_stable_expression_internal_failure_is_generic_500_and_safely_logged(
     tmp_path: Path,
     monkeypatch: Any,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    import gen_automation.i2v_worker.app as app_module
     from gen_automation.i2v_worker.face_stabilizer import FaceStabilizationError
 
     settings = _settings(tmp_path)
     supervisor = _Supervisor()
-    caplog.set_level("WARNING", logger="gen_automation.i2v_worker.app")
-    app_logger = logging.getLogger("gen_automation.i2v_worker.app")
-    app_logger.addHandler(caplog.handler)
+    log_calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def record_warning(message: str, *args: object) -> None:
+        log_calls.append((message, args))
+
+    monkeypatch.setattr(app_module._LOGGER, "warning", record_warning)
 
     async def download(*_args: Any, **_kwargs: Any) -> None:
         destination = _args[2]
@@ -564,17 +570,19 @@ def test_stable_expression_internal_failure_is_generic_500_and_safely_logged(
     job = _job()
     job["settings_snapshot"] = {"face_fidelity": "stable_expression"}
 
-    try:
-        with TestClient(app) as client:
-            response = client.post("/jobs/i2v", json=job)
-    finally:
-        app_logger.removeHandler(caplog.handler)
+    with TestClient(app) as client:
+        response = client.post("/jobs/i2v", json=job)
 
     assert response.status_code == 500
     assert response.json() == {"detail": "generation failed"}
-    assert "reason_code=internal status=500" in caplog.text
+    assert log_calls == [
+        (
+            "stable-expression processing failed: reason_code=%s status=%d job_id=%s attempt_id=%s",
+            ("internal", 500, UUID(job["job_id"]), UUID(job["attempt_id"])),
+        )
+    ]
     assert "C:/sensitive/frame-000042.png" not in response.text
-    assert "C:/sensitive/frame-000042.png" not in caplog.text
+    assert "C:/sensitive/frame-000042.png" not in repr(log_calls)
     assert list((settings.runtime_root / "jobs").glob("*")) == []
 
 
