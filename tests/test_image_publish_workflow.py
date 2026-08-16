@@ -14,7 +14,6 @@ I2V_INPUTS = (
     "requirements-i2v-face.lock",
     "requirements-i2v-worker.lock",
     "patches/comfyui-nag/chroma-stream-blocks.patch",
-    "patches/salad-queue-worker/strict-http-status.patch",
     "src/gen_automation/__init__.py",
     "src/gen_automation/i2v_worker",
     "workflows/dasiwa-wan22-i2v-v1.api.json",

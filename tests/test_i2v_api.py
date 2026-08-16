@@ -192,6 +192,7 @@ def test_i2v_upload_presets_and_queue_are_one_focused_flow(client: TestClient) -
             "settings": {
                 "duration_seconds": 5,
                 "fps": 16,
+                "runpod_authorization": "written_permission",
                 "loras": [
                     {
                         "catalog_id": "wan-general-nsfw-v0.08a",
@@ -210,6 +211,7 @@ def test_i2v_upload_presets_and_queue_are_one_focused_flow(client: TestClient) -
         item["positive_prompt"] == "operator-authored adult motion direction" for item in jobs
     )
     assert jobs[0]["settings_snapshot"]["loras"][0]["strength"] == 0.3
+    assert jobs[0]["settings_snapshot"]["runpod_authorization"] == "written_permission"
 
     move_response = client.patch(
         "/api/v1/i2v/queue",

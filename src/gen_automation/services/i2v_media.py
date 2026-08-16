@@ -29,7 +29,8 @@ from gen_automation.domain.i2v import (
     I2VOutputSnapshot,
 )
 from gen_automation.domain.ids import uuid7
-from gen_automation.integrations.salad.models import JSONValue
+from gen_automation.i2v_worker.models import ModelObject
+from gen_automation.integrations.runpod.models import JSONValue
 from gen_automation.services.i2v import register_i2v_input
 from gen_automation.storage.base import (
     ObjectAlreadyExistsError,
@@ -191,6 +192,69 @@ class I2VSignedGrantBuilder:
             raise
         except ObjectStoreError as error:
             raise I2VMediaStorageError("private I2V output could not be verified") from error
+
+
+@dataclass(frozen=True, slots=True)
+class I2VRunPodGrantBuilder:
+    """Issue input/output plus immutable model grants for one RunPod job."""
+
+    store: ObjectStore
+    expires_in: int
+    model_objects: tuple[ModelObject, ...]
+    output_prefix: str = "i2v/outputs"
+
+    async def build(
+        self,
+        *,
+        job: I2VJobSnapshot,
+        attempt: I2VAttemptSnapshot,
+    ) -> dict[str, JSONValue]:
+        base = I2VSignedGrantBuilder(
+            store=self.store,
+            expires_in=self.expires_in,
+            output_prefix=self.output_prefix,
+        )
+        additions = await base.build(job=job, attempt=attempt)
+        expires_at = datetime.now(UTC) + timedelta(seconds=self.expires_in)
+        grants: list[JSONValue] = []
+        try:
+            for model in self.model_objects:
+                if model.bucket != self.store.bucket:
+                    raise I2VMediaConflictError(
+                        "I2V model object is outside the configured private store"
+                    )
+                url = await self.store.presign_download(
+                    key=model.key,
+                    version_id=model.version_id,
+                    expires_in=self.expires_in,
+                )
+                grants.append(
+                    {
+                        "role": model.role,
+                        "method": "GET",
+                        "url": url,
+                        "expires_at": expires_at.isoformat(),
+                        "byte_size": model.byte_size,
+                        "sha256": model.sha256,
+                    }
+                )
+        except ObjectStoreError as error:
+            raise I2VMediaStorageError("private I2V model grants could not be issued") from error
+        additions["model_grants"] = grants
+        return additions
+
+    async def verify_output(
+        self,
+        *,
+        job: I2VJobSnapshot,
+        attempt: I2VAttemptSnapshot,
+        output: I2VOutputRegistration,
+    ) -> None:
+        await I2VSignedGrantBuilder(
+            store=self.store,
+            expires_in=self.expires_in,
+            output_prefix=self.output_prefix,
+        ).verify_output(job=job, attempt=attempt, output=output)
 
 
 _UPLOAD_CONTENT_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})

@@ -26,11 +26,12 @@ class I2VWorkerSettings(BaseSettings):
     s3_endpoint_url: str | None = None
     comfy_root: Path = Path("/opt/comfyui")
     runtime_root: Path = Path("/opt/i2v/runtime")
+    volume_root: Path = Path("/runpod-volume")
     workflow_template: Path = Path("/opt/i2v/workflows/dasiwa-wan22-i2v-v1.api.json")
     comfy_python: Path = Path("/opt/i2v-venv/bin/python")
     comfy_main: Path = Path("/opt/comfyui/main.py")
     comfy_base_url: str = "http://127.0.0.1:8188"
-    host: str = "0.0.0.0"  # noqa: S104 - container ingress is required for Salad.
+    host: str = "127.0.0.1"
     port: int = Field(default=8000, gt=0, le=65535)
     log_level: str = "info"
     max_body_bytes: int = Field(default=1024 * 1024, gt=0)
@@ -38,8 +39,9 @@ class I2VWorkerSettings(BaseSettings):
     network_attempts: int = Field(default=5, gt=0)
     artifact_chunk_bytes: int = Field(default=64 * 1024 * 1024, ge=1024 * 1024)
     comfy_poll_seconds: float = Field(default=1, gt=0)
-    queue_worker_enabled: bool = True
-    queue_worker_path: Path = Path("/usr/local/bin/salad-http-job-queue-worker")
+    models_prepared: bool = False
+    minimum_gpu_vram_bytes: int = Field(default=31 * 1024 * 1024 * 1024, gt=0)
+    allowed_gpu_names_csv: str = "NVIDIA A40,NVIDIA RTX A6000,NVIDIA L40S,NVIDIA GeForce RTX 5090"
     lora_worker_enabled: bool = False
     source_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     private_manifest_source_sha256: str | None = Field(
@@ -51,8 +53,14 @@ class I2VWorkerSettings(BaseSettings):
     def validate_configuration(self) -> I2VWorkerSettings:
         if self.comfy_base_url != "http://127.0.0.1:8188":
             raise ValueError("ComfyUI must be loopback only")
-        if not self.runtime_root.is_absolute() or not self.comfy_root.is_absolute():
+        if (
+            not _is_container_absolute(self.runtime_root)
+            or not _is_container_absolute(self.comfy_root)
+            or not _is_container_absolute(self.volume_root)
+        ):
             raise ValueError("runtime paths must be absolute")
+        if not self.allowed_gpu_names:
+            raise ValueError("at least one RunPod GPU name is required")
         objects = self.model_objects
         roles = {item.role for item in objects}
         required = {"diffusion_model_high", "diffusion_model_low", "text_encoder", "vae"}
@@ -100,3 +108,15 @@ class I2VWorkerSettings(BaseSettings):
             sort_keys=True,
         )
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @property
+    def allowed_gpu_names(self) -> frozenset[str]:
+        return frozenset(
+            name.strip() for name in self.allowed_gpu_names_csv.split(",") if name.strip()
+        )
+
+
+def _is_container_absolute(path: Path) -> bool:
+    """Recognize Linux container roots while unit tests run on Windows."""
+
+    return path.is_absolute() or path.as_posix().startswith("/")

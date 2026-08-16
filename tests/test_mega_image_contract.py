@@ -22,6 +22,9 @@ def test_mega_image_has_a_reproducible_default_package() -> None:
     )
     assert re.findall(r"^USER\s+(.+)$", dockerfile, flags=re.MULTILINE) == ["10001:10001"]
     assert ":latest" not in dockerfile.casefold()
+    assert (
+        "COPY scripts/runpod_i2v_seed_volume.py ./scripts/runpod_i2v_seed_volume.py"
+    ) in dockerfile
     for command in ("mega-cmd", "mega-whoami", "mega-https"):
         assert f"command -v {command}" in dockerfile
 

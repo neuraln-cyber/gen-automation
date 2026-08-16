@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from pydantic import SecretStr
@@ -16,19 +16,13 @@ from gen_automation.domain.i2v import (
     I2VJobState,
     I2VOutputRegistration,
 )
-from gen_automation.domain.runtime_bindings import (
-    WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING,
-    WORKER_ARTIFACT_SECRET_ACCESS_KEY_BINDING,
-    WORKER_ARTIFACT_SESSION_TOKEN_BINDING,
-)
 from gen_automation.i2v_worker.lora_catalog import LORA_ARTIFACTS_BY_ROLE
 from gen_automation.services.i2v_environment import (
-    I2VRuntimeEnvironment,
-    _worker_artifact_identity_sha256,
     _worker_model_objects,
     i2v_runtime_config_from_settings,
+    i2v_worker_model_objects,
 )
-from gen_automation.services.i2v_media import I2VSignedGrantBuilder
+from gen_automation.services.i2v_media import I2VRunPodGrantBuilder
 from gen_automation.storage.memory import MemoryObjectStore
 
 _NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
@@ -82,38 +76,24 @@ def _settings(
     manifest = manifest or _manifest()
     return Settings.model_construct(
         i2v_enabled=True,
+        i2v_runpod_enabled=True,
         i2v_lora_profile_enabled=lora_profile_enabled,
         i2v_lora_worker_enabled=lora_worker_enabled,
         i2v_worker_image="ghcr.io/example/i2v@sha256:" + "a" * 64,
         i2v_worker_source_revision="b" * 40,
         i2v_private_manifest_source_sha256="c" * 64,
-        i2v_salad_gpu_class_id=UUID("11111111-1111-4111-8111-111111111111"),
-        i2v_salad_gpu_class_name="RTX 5090 (32 GB)",
-        i2v_salad_queue_name="i2v-jobs-v1",
-        i2v_salad_container_group_name="i2v-worker-v1",
-        i2v_salad_prefetch=3,
+        i2v_runpod_endpoint_id="endpoint123",
+        i2v_runpod_api_key=SecretStr("runpod-test-key-1234567890"),
+        i2v_runpod_claim_url="https://staging.example/api/v1/i2v/runpod/claim",
+        i2v_runpod_execution_timeout_seconds=21_600,
+        i2v_runpod_job_ttl_seconds=604_800,
         i2v_worker_lease_seconds=86_400,
-        i2v_warm_idle_seconds=36_000,
-        i2v_salad_cpu=8,
-        i2v_salad_memory_mb=32_768,
-        i2v_salad_storage_bytes=268_435_456_000,
-        i2v_salad_priority=type("Priority", (), {"value": "high"})(),
-        i2v_salad_max_replicas=1,
         i2v_output_prefix="i2v/outputs",
         i2v_model_manifest_json=SecretStr(manifest),
         i2v_model_manifest_sha256=SecretStr(hashlib.sha256(manifest.encode()).hexdigest()),
         salad_worker_artifact_bucket=SecretStr("private-models"),
         salad_worker_artifact_region=SecretStr("eu-central-1"),
     )
-
-
-class _Resolver:
-    async def resolve_many(self, _bindings: object) -> dict[str, str]:
-        return {
-            WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING: "temporary-access",
-            WORKER_ARTIFACT_SECRET_ACCESS_KEY_BINDING: "temporary-secret",
-            WORKER_ARTIFACT_SESSION_TOKEN_BINDING: "temporary-session",
-        }
 
 
 def _job(*, input_version: str = "input-v1") -> I2VJobSnapshot:
@@ -127,7 +107,7 @@ def _job(*, input_version: str = "input-v1") -> I2VJobSnapshot:
         negative_prompt="jitter",
         input_snapshot={
             "storage_backend": "memory",
-            "storage_bucket": "private-i2v",
+            "storage_bucket": "private-models",
             "object_key": "i2v/input.png",
             "object_version_id": input_version,
             "sha256": hashlib.sha256(b"input").hexdigest(),
@@ -210,23 +190,7 @@ def test_private_manifest_rejects_missing_wrong_or_extra_schema(
         _worker_model_objects(settings)
 
 
-@pytest.mark.asyncio
-async def test_runtime_environment_contains_only_required_bootstrap_values() -> None:
-    provider = I2VRuntimeEnvironment(settings=_settings(), resolver=_Resolver())  # type: ignore[arg-type]
-
-    environment = await provider.resolve()
-
-    assert environment["GEN_I2V_WORKER_ENVIRONMENT"] == "production"
-    assert environment["GEN_I2V_WORKER_LORA_WORKER_ENABLED"] == "true"
-    assert environment["GEN_I2V_WORKER_SOURCE_REVISION"] == "b" * 40
-    assert environment["GEN_I2V_WORKER_PRIVATE_MANIFEST_SOURCE_SHA256"] == "c" * 64
-    assert environment["AWS_SESSION_TOKEN"].startswith("temporary-")
-    assert len(json.loads(environment["GEN_I2V_WORKER_MODEL_OBJECTS_JSON"])) == 14
-    assert "CIVITAI" not in " ".join(environment)
-
-
-@pytest.mark.asyncio
-async def test_routine_deploy_keeps_legacy_four_role_worker_environment_healthy() -> None:
+def test_routine_deploy_keeps_legacy_four_role_worker_manifest_healthy() -> None:
     full = json.loads(_manifest())
     legacy_manifest = json.dumps(
         {**full, "objects": full["objects"][:4]},
@@ -237,13 +201,9 @@ async def test_routine_deploy_keeps_legacy_four_role_worker_environment_healthy(
         lora_worker_enabled=False,
         manifest=legacy_manifest,
     )
-    provider = I2VRuntimeEnvironment(settings=settings, resolver=_Resolver())  # type: ignore[arg-type]
+    objects = i2v_worker_model_objects(settings)
 
-    environment = await provider.resolve()
-
-    objects = json.loads(environment["GEN_I2V_WORKER_MODEL_OBJECTS_JSON"])
-    assert environment["GEN_I2V_WORKER_LORA_WORKER_ENABLED"] == "false"
-    assert [item["role"] for item in objects] == [
+    assert [item.role for item in objects] == [
         "diffusion_model_high",
         "diffusion_model_low",
         "text_encoder",
@@ -288,16 +248,14 @@ async def test_routine_deploy_ignores_live_legacy_lora_roles_when_worker_is_off(
     ]
 
 
-def test_runtime_config_keeps_ten_hour_warm_session_and_exact_5090() -> None:
+def test_runtime_config_is_single_flight_and_exactly_bound_to_runpod() -> None:
     config = i2v_runtime_config_from_settings(_settings())
 
-    assert config.salad.warm_idle_seconds == 36_000
-    assert config.salad.gpu_class_name == "RTX 5090 (32 GB)"
-    assert config.salad.storage_bytes == 268_435_456_000
-    assert config.salad.max_replicas == 1
-    assert config.salad.readiness_probe_path == (
-        f"/ready/capability/{'c' * 64}/{_worker_artifact_identity_sha256(_settings())}/{'b' * 40}"
-    )
+    assert config.endpoint_id == "endpoint123"
+    assert config.claim_url == "https://staging.example/api/v1/i2v/runpod/claim"
+    assert config.execution_timeout_seconds == 21_600
+    assert config.job_ttl_seconds == 604_800
+    assert config.worker_image.endswith("@sha256:" + "a" * 64)
     assert config.reviewed_loras_enabled is True
 
 
@@ -311,7 +269,7 @@ def test_public_lora_gate_does_not_control_worker_capability() -> None:
 
 @pytest.mark.asyncio
 async def test_attempt_grants_and_uploaded_object_are_exactly_bound() -> None:
-    store = MemoryObjectStore(bucket="private-i2v")
+    store = MemoryObjectStore(bucket="private-models")
     source = await store.write_bytes_if_absent(
         key="i2v/input.png",
         body=b"input",
@@ -321,7 +279,12 @@ async def test_attempt_grants_and_uploaded_object_are_exactly_bound() -> None:
     )
     job = _job(input_version=source.version_id)
     attempt = _attempt(job)
-    builder = I2VSignedGrantBuilder(store=store, expires_in=3600)
+    builder = I2VRunPodGrantBuilder(
+        store=store,
+        expires_in=3600,
+        model_objects=(),
+        output_prefix="i2v/outputs",
+    )
 
     grants = await builder.build(job=job, attempt=attempt)
     assert grants["output_grant"]["object_key"] == (
@@ -345,7 +308,7 @@ async def test_attempt_grants_and_uploaded_object_are_exactly_bound() -> None:
         attempt=attempt,
         output=I2VOutputRegistration(
             storage_backend="memory",
-            storage_bucket="private-i2v",
+            storage_bucket="private-models",
             object_key=output_key,
             object_version_id=stored.version_id,
             sha256=hashlib.sha256(body).hexdigest(),

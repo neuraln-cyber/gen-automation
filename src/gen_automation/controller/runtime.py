@@ -42,6 +42,7 @@ from gen_automation.domain.runtime_bindings import (
 from gen_automation.integrations.civitai.client import CivitaiClient
 from gen_automation.integrations.mega import MegaCmdClient
 from gen_automation.integrations.patreon import PatreonPublicationDriver
+from gen_automation.integrations.runpod.client import RunPodClient
 from gen_automation.integrations.salad.client import SALAD_QUEUE_JOB_PAGE_SIZE, SaladClient
 from gen_automation.integrations.salad.models import JSONValue
 from gen_automation.integrations.semantic_vlm import SemanticVlmClient
@@ -75,8 +76,11 @@ from gen_automation.services.generation_control import (
 from gen_automation.services.i2v_environment import (
     I2VRuntimeEnvironment,
     i2v_runtime_config_from_settings,
+    i2v_salad_runtime_config_from_settings,
+    i2v_worker_model_objects,
 )
-from gen_automation.services.i2v_media import I2VSignedGrantBuilder
+from gen_automation.services.i2v_media import I2VRunPodGrantBuilder, I2VSignedGrantBuilder
+from gen_automation.services.i2v_runpod_runtime import I2VRunPodRuntime
 from gen_automation.services.i2v_runtime import I2V_SINGLETON_WORKER_ID, I2VRuntime
 from gen_automation.services.lora_runtime import LoraRuntime
 from gen_automation.services.managed_artifact_manifest import (
@@ -691,6 +695,7 @@ class ControllerWorkloads:
         instance_id: str,
         salad_client: SaladClient | None,
         object_store: ObjectStore | None,
+        runpod_client: RunPodClient | None = None,
         secret_resolver: RuntimeSecretResolver | None = None,
         x_oauth_provider: XOAuthProvider | None = None,
         mega_client: MegaSetDeliveryClient | None = None,
@@ -703,6 +708,7 @@ class ControllerWorkloads:
         self.sessions = sessions
         self.instance_id = instance_id
         self.salad_client = salad_client
+        self.runpod_client = runpod_client
         self.object_store = object_store
         self.secret_resolver = secret_resolver
         self.x_oauth_provider = x_oauth_provider
@@ -710,26 +716,44 @@ class ControllerWorkloads:
         self.semantic_vlm_client = semantic_vlm_client
         self.patreon_driver = patreon_driver
         self.i2v_runtime = (
-            I2VRuntime(
+            I2VRunPodRuntime(
                 config=i2v_runtime_config_from_settings(settings),
                 sessions=sessions,
-                salad_client=salad_client,
-                worker_id=I2V_SINGLETON_WORKER_ID,
-                input_builder=I2VSignedGrantBuilder(
+                runpod_client=runpod_client,
+                input_builder=I2VRunPodGrantBuilder(
                     store=object_store,
                     expires_in=settings.i2v_object_grant_ttl_seconds,
+                    model_objects=i2v_worker_model_objects(settings),
                     output_prefix=settings.i2v_output_prefix,
-                ),
-                environment_provider=I2VRuntimeEnvironment(
-                    settings=settings,
-                    resolver=secret_resolver,
                 ),
             )
             if settings.i2v_enabled
-            and salad_client is not None
+            and settings.i2v_runpod_enabled
+            and runpod_client is not None
             and object_store is not None
-            and secret_resolver is not None
-            else None
+            else (
+                I2VRuntime(
+                    config=i2v_salad_runtime_config_from_settings(settings),
+                    sessions=sessions,
+                    salad_client=salad_client,
+                    worker_id=I2V_SINGLETON_WORKER_ID,
+                    input_builder=I2VSignedGrantBuilder(
+                        store=object_store,
+                        expires_in=settings.i2v_object_grant_ttl_seconds,
+                        output_prefix=settings.i2v_output_prefix,
+                    ),
+                    environment_provider=I2VRuntimeEnvironment(
+                        settings=settings,
+                        resolver=secret_resolver,
+                    ),
+                )
+                if settings.i2v_enabled
+                and not settings.i2v_runpod_enabled
+                and salad_client is not None
+                and object_store is not None
+                and secret_resolver is not None
+                else None
+            )
         )
         if settings.i2v_enabled and self.i2v_runtime is None:
             raise RuntimeError("validated I2V runtime dependencies are unavailable")
@@ -2110,6 +2134,7 @@ def build_controller_runtime(
     sessions: async_sessionmaker[AsyncSession],
     salad_client: SaladClient | None,
     object_store: ObjectStore | None,
+    runpod_client: RunPodClient | None = None,
     secret_resolver: RuntimeSecretResolver | None = None,
     x_oauth_provider: XOAuthProvider | None = None,
     mega_client: MegaSetDeliveryClient | None = None,
@@ -2133,6 +2158,7 @@ def build_controller_runtime(
         sessions=sessions,
         instance_id=instance_id,
         salad_client=salad_client,
+        runpod_client=runpod_client,
         object_store=object_store,
         secret_resolver=secret_resolver,
         x_oauth_provider=x_oauth_provider,

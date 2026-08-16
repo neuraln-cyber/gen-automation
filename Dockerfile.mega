@@ -75,6 +75,7 @@ RUN test -n "${MEGACMD_DEB_URL}" \
 
 COPY alembic.ini ./
 COPY migrations ./migrations
+COPY scripts/runpod_i2v_seed_volume.py ./scripts/runpod_i2v_seed_volume.py
 COPY src ./src
 
 USER 10001:10001

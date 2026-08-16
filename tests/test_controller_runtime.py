@@ -17,7 +17,7 @@ from gen_automation.controller.runtime import (
     build_controller_runtime,
 )
 from gen_automation.db.session import Database
-from gen_automation.services.i2v_runtime import I2V_SINGLETON_WORKER_ID
+from gen_automation.services.i2v import I2V_RUNTIME_WORKER_ID
 from gen_automation.storage.memory import MemoryObjectStore
 
 
@@ -28,15 +28,21 @@ def test_controller_workloads_use_stable_singleton_i2v_worker_id(
 
     class _Runtime:
         def __init__(self, **kwargs: object) -> None:
-            captured.append(str(kwargs["worker_id"]))
+            self.worker_id = I2V_RUNTIME_WORKER_ID
+            captured.append(self.worker_id)
 
-    monkeypatch.setattr("gen_automation.controller.runtime.I2VRuntime", _Runtime)
+    monkeypatch.setattr("gen_automation.controller.runtime.I2VRunPodRuntime", _Runtime)
     monkeypatch.setattr(
         "gen_automation.controller.runtime.i2v_runtime_config_from_settings",
         lambda _settings: object(),
     )
+    monkeypatch.setattr(
+        "gen_automation.controller.runtime.i2v_worker_model_objects",
+        lambda _settings: (),
+    )
     settings = SimpleNamespace(
         i2v_enabled=True,
+        i2v_runpod_enabled=True,
         i2v_object_grant_ttl_seconds=3600,
         i2v_output_prefix="i2v/outputs",
         lora_manager_enabled=False,
@@ -45,13 +51,14 @@ def test_controller_workloads_use_stable_singleton_i2v_worker_id(
         "settings": settings,
         "sessions": object(),
         "salad_client": object(),
+        "runpod_client": object(),
         "object_store": MemoryObjectStore(),
         "secret_resolver": object(),
     }
     ControllerWorkloads(instance_id="controller-old", **dependencies)  # type: ignore[arg-type]
     ControllerWorkloads(instance_id="controller-new", **dependencies)  # type: ignore[arg-type]
 
-    assert captured == [I2V_SINGLETON_WORKER_ID, I2V_SINGLETON_WORKER_ID]
+    assert captured == [I2V_RUNTIME_WORKER_ID, I2V_RUNTIME_WORKER_ID]
 
 
 @pytest.mark.asyncio

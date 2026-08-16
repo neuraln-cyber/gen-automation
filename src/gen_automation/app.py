@@ -42,6 +42,7 @@ from gen_automation.db.session import Database
 from gen_automation.integrations.civitai import CivitaiClient
 from gen_automation.integrations.danbooru import DanbooruAutocompleteClient
 from gen_automation.integrations.patreon import PatreonSidecarDriver
+from gen_automation.integrations.runpod.client import RunPodClient
 from gen_automation.integrations.salad.client import SaladClient
 from gen_automation.integrations.salad.webhooks import SaladWebhookVerifier
 from gen_automation.integrations.semantic_vlm import SemanticVlmClient
@@ -127,6 +128,7 @@ class _AppIntegrations:
     civitai_client: CivitaiClient | None
     danbooru_tag_autocomplete_service: DanbooruTagAutocompleteService
     salad_client: SaladClient | None
+    runpod_client: RunPodClient | None
     semantic_vlm_client: SemanticVlmClient | None
     patreon_driver: PatreonSidecarDriver | None
 
@@ -184,6 +186,25 @@ async def _build_app_integrations(settings: Settings) -> AsyncIterator[_AppInteg
                 timeout=settings.salad_request_timeout_seconds,
             )
 
+        runpod_client: RunPodClient | None = None
+        if settings.i2v_enabled and settings.i2v_runpod_enabled:
+            api_key = settings.i2v_runpod_api_key
+            endpoint_id = settings.i2v_runpod_endpoint_id
+            if api_key is None or endpoint_id is None:
+                raise RuntimeError("validated RunPod I2V settings are incomplete")
+            runpod_http_client = httpx2.AsyncClient(
+                follow_redirects=False,
+                trust_env=False,
+                limits=httpx2.Limits(max_connections=2, max_keepalive_connections=1),
+            )
+            cleanup.push_async_callback(runpod_http_client.aclose)
+            runpod_client = RunPodClient(
+                http_client=runpod_http_client,
+                api_key=api_key.get_secret_value(),
+                endpoint_id=endpoint_id,
+                timeout=30,
+            )
+
         semantic_vlm_client: SemanticVlmClient | None = None
         if settings.semantic_anatomy_enabled:
             endpoint = settings.semantic_anatomy_endpoint_url
@@ -231,6 +252,7 @@ async def _build_app_integrations(settings: Settings) -> AsyncIterator[_AppInteg
             civitai_client=civitai_client,
             danbooru_tag_autocomplete_service=danbooru_tag_autocomplete_service,
             salad_client=salad_client,
+            runpod_client=runpod_client,
             semantic_vlm_client=semantic_vlm_client,
             patreon_driver=patreon_driver,
         )
@@ -250,6 +272,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             model_artifact_store = integrations.model_artifact_store
             civitai_client = integrations.civitai_client
             salad_client = integrations.salad_client
+            runpod_client = integrations.runpod_client
             semantic_vlm_client = integrations.semantic_vlm_client
             patreon_driver = integrations.patreon_driver
             controller_runtime: ControllerRuntime | None = None
@@ -324,6 +347,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     settings=resolved_settings,
                     sessions=database.sessions,
                     salad_client=salad_client,
+                    runpod_client=runpod_client,
                     object_store=object_store,
                     secret_resolver=runtime_secret_resolver,
                     x_oauth_provider=x_oauth_provider,

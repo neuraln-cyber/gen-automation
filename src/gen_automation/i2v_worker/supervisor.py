@@ -66,12 +66,13 @@ class WorkerSupervisor:
     async def _run(self) -> None:
         try:
             _ensure_directories(self.settings)
-            await asyncio.to_thread(_verify_gpu_runtime)
+            await asyncio.to_thread(_verify_gpu_runtime, self.settings)
             self.face_detector = await asyncio.to_thread(
                 preflight_face_stabilizer,
                 device="cpu",
             )
-            await S3ModelBootstrapper(self.settings).bootstrap()
+            if not self.settings.models_prepared:
+                await S3ModelBootstrapper(self.settings).bootstrap()
             self.comfy = _start_process(
                 _comfy_command(self.settings),
                 cwd=self.settings.comfy_root,
@@ -88,16 +89,8 @@ class WorkerSupervisor:
                     raise WorkerStartupError("ComfyUI exited during startup")
                 await asyncio.sleep(2)
             self.ready = True
-            if self.settings.queue_worker_enabled:
-                self.queue_worker = _start_process(
-                    (self.settings.queue_worker_path.as_posix(),),
-                    cwd=self.settings.runtime_root,
-                    environment=_queue_environment(),
-                )
             while not self._stopping:
-                if self.comfy.poll() is not None or (
-                    self.queue_worker is not None and self.queue_worker.poll() is not None
-                ):
+                if self.comfy.poll() is not None:
                     raise WorkerStartupError("worker child process exited")
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
@@ -135,7 +128,7 @@ def _ensure_directories(settings: I2VWorkerSettings) -> None:
             raise WorkerStartupError("worker runtime path is invalid")
 
 
-def _verify_gpu_runtime() -> None:
+def _verify_gpu_runtime(settings: I2VWorkerSettings) -> None:
     try:
         import torch  # type: ignore[import-not-found]
 
@@ -143,11 +136,12 @@ def _verify_gpu_runtime() -> None:
             torch.__version__.split("+", 1)[0] != "2.9.1"
             or not torch.cuda.is_available()
             or torch.cuda.device_count() != 1
-            or torch.cuda.get_device_name(0) != "NVIDIA GeForce RTX 5090"
+            or torch.cuda.get_device_name(0) not in settings.allowed_gpu_names
+            or torch.cuda.get_device_properties(0).total_memory < settings.minimum_gpu_vram_bytes
         ):
             raise ValueError
     except (ImportError, RuntimeError, ValueError):
-        raise WorkerStartupError("exact RTX 5090 runtime is unavailable") from None
+        raise WorkerStartupError("supported RunPod GPU runtime is unavailable") from None
 
 
 def _comfy_command(settings: I2VWorkerSettings) -> tuple[str, ...]:
@@ -212,17 +206,6 @@ def _child_environment() -> dict[str, str]:
             "NO_PROXY": "127.0.0.1,localhost,::1",
         }
     )
-    return environment
-
-
-def _queue_environment() -> dict[str, str]:
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if key in {"HOME", "LANG", "LC_ALL", "PATH", "SSL_CERT_DIR", "SSL_CERT_FILE"}
-        or key.startswith("SALAD_")
-    }
-    environment["SALAD_LOG_LEVEL"] = "error"
     return environment
 
 

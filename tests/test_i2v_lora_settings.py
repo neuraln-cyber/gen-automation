@@ -26,6 +26,7 @@ def test_reviewed_lora_selections_are_frozen_in_catalog_order() -> None:
 
     assert normalized == {
         "steps": 4,
+        "runpod_authorization": "sfw",
         "loras": [
             {"catalog_id": "wan-general-nsfw-v0.08a", "strength": 0.3},
             {"catalog_id": "smoothmix-xxx-animations-wan22", "strength": 1.0},

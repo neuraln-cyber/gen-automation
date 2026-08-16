@@ -39,6 +39,11 @@ def normalize_i2v_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     """
 
     normalized = dict(settings)
+    authorization = normalized.setdefault("runpod_authorization", "sfw")
+    if authorization not in {"sfw", "written_permission"}:
+        raise I2VLoraSelectionError(
+            "RunPod authorization must be SFW or covered by written permission"
+        )
     if "loras" not in normalized:
         return normalized
     raw_loras = normalized["loras"]

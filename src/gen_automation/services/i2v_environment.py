@@ -20,6 +20,8 @@ from gen_automation.i2v_worker.manifest_contract import (
     required_i2v_model_roles,
     validated_i2v_manifest_objects,
 )
+from gen_automation.i2v_worker.models import ModelObject
+from gen_automation.services.i2v_runpod_runtime import I2VRunPodRuntimeConfig
 from gen_automation.services.i2v_runtime import I2VRuntimeConfig
 from gen_automation.services.i2v_salad import I2VSaladConfig
 from gen_automation.services.runtime_secrets import (
@@ -34,6 +36,8 @@ class I2VEnvironmentError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class I2VRuntimeEnvironment:
+    """Legacy Salad bootstrap environment retained only for rollback."""
+
     settings: Settings
     resolver: RuntimeSecretResolver
 
@@ -58,25 +62,52 @@ class I2VRuntimeEnvironment:
             "AWS_SECRET_ACCESS_KEY": resolved[WORKER_ARTIFACT_SECRET_ACCESS_KEY_BINDING],
             "AWS_SESSION_TOKEN": resolved[WORKER_ARTIFACT_SESSION_TOKEN_BINDING],
         }
-        source_manifest_sha256 = self.settings.i2v_private_manifest_source_sha256
-        if source_manifest_sha256 is not None:
-            environment["GEN_I2V_WORKER_PRIVATE_MANIFEST_SOURCE_SHA256"] = source_manifest_sha256
-        source_revision = self.settings.i2v_worker_source_revision
-        if source_revision is not None:
-            environment["GEN_I2V_WORKER_SOURCE_REVISION"] = source_revision
+        if self.settings.i2v_private_manifest_source_sha256 is not None:
+            environment["GEN_I2V_WORKER_PRIVATE_MANIFEST_SOURCE_SHA256"] = (
+                self.settings.i2v_private_manifest_source_sha256
+            )
+        if self.settings.i2v_worker_source_revision is not None:
+            environment["GEN_I2V_WORKER_SOURCE_REVISION"] = self.settings.i2v_worker_source_revision
         endpoint = resolved.get(WORKER_ARTIFACT_ENDPOINT_URL_BINDING)
         if endpoint is not None:
             environment["GEN_I2V_WORKER_S3_ENDPOINT_URL"] = endpoint
         return environment
 
 
-def i2v_runtime_config_from_settings(settings: Settings) -> I2VRuntimeConfig:
+def i2v_runtime_config_from_settings(settings: Settings) -> I2VRunPodRuntimeConfig:
+    if (
+        not settings.i2v_enabled
+        or settings.i2v_worker_image is None
+        or settings.i2v_runpod_endpoint_id is None
+        or settings.i2v_runpod_api_key is None
+        or settings.i2v_runpod_claim_url is None
+    ):
+        raise I2VEnvironmentError("validated I2V settings are incomplete")
+    return I2VRunPodRuntimeConfig(
+        endpoint_id=settings.i2v_runpod_endpoint_id,
+        worker_image=settings.i2v_worker_image,
+        claim_url=str(settings.i2v_runpod_claim_url),
+        claim_secret=settings.i2v_runpod_api_key.get_secret_value(),
+        worker_lease_seconds=settings.i2v_worker_lease_seconds,
+        execution_timeout_seconds=settings.i2v_runpod_execution_timeout_seconds,
+        job_ttl_seconds=settings.i2v_runpod_job_ttl_seconds,
+        submission_claim_timeout_seconds=(settings.i2v_runpod_submission_claim_timeout_seconds),
+        queue_timeout_seconds=settings.i2v_runpod_queue_timeout_seconds,
+        terminal_grace_seconds=settings.i2v_runpod_terminal_grace_seconds,
+        output_prefix=settings.i2v_output_prefix,
+        reviewed_loras_enabled=settings.i2v_lora_worker_enabled,
+    )
+
+
+def i2v_salad_runtime_config_from_settings(settings: Settings) -> I2VRuntimeConfig:
+    """Build the retired provider contract for an explicit rollback only."""
+
     if (
         not settings.i2v_enabled
         or settings.i2v_worker_image is None
         or settings.i2v_salad_gpu_class_id is None
     ):
-        raise I2VEnvironmentError("validated I2V settings are incomplete")
+        raise I2VEnvironmentError("validated I2V rollback settings are incomplete")
     readiness_probe_path = "/ready"
     if settings.i2v_lora_worker_enabled:
         source_manifest_sha256 = settings.i2v_private_manifest_source_sha256
@@ -138,6 +169,14 @@ def i2v_worker_identity(settings: Settings) -> tuple[str, str]:
         hashlib.sha256(model_objects.encode("utf-8")).hexdigest(),
         _worker_artifact_identity_sha256(settings),
     )
+
+
+def i2v_worker_model_objects(settings: Settings) -> tuple[ModelObject, ...]:
+    try:
+        raw = json.loads(_worker_model_objects(settings))
+        return tuple(ModelObject.model_validate(item) for item in raw)
+    except (TypeError, ValueError):
+        raise I2VEnvironmentError("I2V private model manifest is invalid") from None
 
 
 def _artifact_region(settings: Settings) -> str:
