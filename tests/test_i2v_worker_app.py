@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -460,6 +461,8 @@ def test_stable_expression_post_render_guard_fails_without_encode_or_upload(
     supervisor = _Supervisor()
     calls = {"execute": 0, "encode": 0, "upload": 0}
     caplog.set_level("WARNING", logger="gen_automation.i2v_worker.app")
+    app_logger = logging.getLogger("gen_automation.i2v_worker.app")
+    app_logger.addHandler(caplog.handler)
 
     async def download(*_args: Any, **_kwargs: Any) -> None:
         destination = _args[2]
@@ -507,8 +510,11 @@ def test_stable_expression_post_render_guard_fails_without_encode_or_upload(
     job = _job()
     job["settings_snapshot"] = {"face_fidelity": "stable_expression"}
 
-    with TestClient(app) as client:
-        response = client.post("/jobs/i2v", json=job)
+    try:
+        with TestClient(app) as client:
+            response = client.post("/jobs/i2v", json=job)
+    finally:
+        app_logger.removeHandler(caplog.handler)
 
     assert response.status_code == 422
     assert response.json() == {"detail": "stable-expression face contract failed"}
@@ -528,6 +534,8 @@ def test_stable_expression_internal_failure_is_generic_500_and_safely_logged(
     settings = _settings(tmp_path)
     supervisor = _Supervisor()
     caplog.set_level("WARNING", logger="gen_automation.i2v_worker.app")
+    app_logger = logging.getLogger("gen_automation.i2v_worker.app")
+    app_logger.addHandler(caplog.handler)
 
     async def download(*_args: Any, **_kwargs: Any) -> None:
         destination = _args[2]
@@ -556,8 +564,11 @@ def test_stable_expression_internal_failure_is_generic_500_and_safely_logged(
     job = _job()
     job["settings_snapshot"] = {"face_fidelity": "stable_expression"}
 
-    with TestClient(app) as client:
-        response = client.post("/jobs/i2v", json=job)
+    try:
+        with TestClient(app) as client:
+            response = client.post("/jobs/i2v", json=job)
+    finally:
+        app_logger.removeHandler(caplog.handler)
 
     assert response.status_code == 500
     assert response.json() == {"detail": "generation failed"}
