@@ -115,6 +115,7 @@
   color: var(--danger, #fda4af);
 }
 .generation-progress-next { justify-self: start; }
+.generation-progress-next[hidden] { display: none !important; }
 .generation-progress-error { margin: 0; }
 .generation-stop-status {
   margin: -.2rem 0 0;

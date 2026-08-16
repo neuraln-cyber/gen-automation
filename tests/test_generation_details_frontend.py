@@ -242,6 +242,25 @@ def test_generation_form_uses_one_responsive_progressive_builder() -> None:
     assert 'form.addEventListener("gen-automation:profile-changed", render)' in script
 
 
+def test_live_generation_exposes_failures_and_hides_unready_review_action() -> None:
+    template = (
+        ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "new_set_status.html"
+    ).read_text(encoding="utf-8")
+    styles = (ROOT / "src" / "gen_automation" / "static" / "dashboard_ux.css").read_text(
+        encoding="utf-8"
+    )
+    script = (ROOT / "src" / "gen_automation" / "static" / "dashboard.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "release.jobs.failed }} failed" in template
+    assert "unfinished_jobs }} remaining" in template
+    assert ".generation-progress-next[hidden] { display: none !important; }" in styles
+    assert "const failedJobs = safeCount(payload.jobs.failed)" in script
+    assert "jobSummary.push(`${failedJobs} failed`)" in script
+    assert "jobSummary.push(`${unfinishedJobs} remaining`)" in script
+
+
 def test_fresh_generation_queue_uses_an_editable_250_image_final_set_cap() -> None:
     template = (
         ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "new_set.html"
