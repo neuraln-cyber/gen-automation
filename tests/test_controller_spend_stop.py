@@ -631,7 +631,7 @@ async def test_submit_reuses_active_runtime_then_refreshes_same_manifest_at_idle
         ) -> SaladContainerGroup:
             del client, resolver, environment_overrides
             refreshes.append(deployment.id)
-            return cast(SaladContainerGroup, object())
+            return _group(deployment.container_group_name, deployment.queue_name)
 
         async def fake_submit(
             *args: object,

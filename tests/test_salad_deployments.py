@@ -59,6 +59,7 @@ from gen_automation.services.salad_deployments import (
     _remote_drift_code,
     _validate_local_deployment,
     deterministic_provider_name,
+    ensure_container_group_queue_admission,
     provision_deployment_step,
     reconcile_deployment,
     refresh_container_group_runtime,
@@ -851,6 +852,92 @@ async def test_refresh_fails_closed_when_pending_group_never_applies() -> None:
             convergence_timeout_seconds=0.01,
             poll_interval_seconds=0.001,
         )
+
+
+@pytest.mark.asyncio
+async def test_queue_admission_starts_stopped_group_and_waits_for_exact_attachment() -> None:
+    deployment = unpersisted_deployment(provider_configuration())
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    stopped = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        status="stopped",
+        replicas=1,
+        running=0,
+        finish_time=NOW,
+    )
+    deploying = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        status="deploying",
+        replicas=1,
+        running=0,
+    )
+    client = FakeClient()
+    client.groups[deployment.container_group_name] = deploying
+    client.queues[deployment.queue_name] = make_queue(
+        deployment.queue_name,
+        group_name=deployment.container_group_name,
+    )
+    client.get_group_results = [stopped, deploying]
+
+    result = await ensure_container_group_queue_admission(
+        deployment,
+        client,
+        convergence_timeout_seconds=1,
+        poll_interval_seconds=0,
+    )
+
+    assert result is deploying
+    assert client.start_names == [deployment.container_group_name]
+    assert [call[0] for call in client.calls] == [
+        "get_group",
+        "start_group",
+        "get_group",
+        "get_queue",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_queue_admission_refuses_detached_group_before_job_submission() -> None:
+    deployment = unpersisted_deployment(provider_configuration())
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    stopped = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        status="stopped",
+        replicas=1,
+        running=0,
+        finish_time=NOW,
+    )
+    deploying = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        status="deploying",
+        replicas=1,
+        running=0,
+    )
+    client = FakeClient()
+    client.groups[deployment.container_group_name] = deploying
+    client.queues[deployment.queue_name] = make_queue(deployment.queue_name)
+    client.get_group_results = [stopped]
+
+    with pytest.raises(
+        SaladDeploymentValidationError,
+        match="did not become eligible for queue admission",
+    ):
+        await ensure_container_group_queue_admission(
+            deployment,
+            client,
+            convergence_timeout_seconds=0.01,
+            poll_interval_seconds=0.001,
+        )
+
+    assert client.start_names == [deployment.container_group_name]
 
 
 def test_naive_controller_timestamp_is_rejected() -> None:

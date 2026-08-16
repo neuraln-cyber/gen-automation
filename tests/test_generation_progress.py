@@ -175,6 +175,28 @@ def test_generation_progress_fails_closed_for_terminal_jobs_and_incomplete_ranki
     assert ranking_error.code == "ranking_incomplete"
 
 
+def test_generation_progress_keeps_polling_while_other_jobs_can_finish() -> None:
+    stage, error = _generation_progress_stage(
+        release=_release(),
+        state_counts={GenerationState.FAILED: 1, GenerationState.QUEUED: 45},
+        attempt_counts={},
+        generated_outputs=0,
+        expected_outputs=340,
+        scoring_run=None,
+        scoring_progress=None,
+        ranking_count=0,
+        ready_for_review=False,
+        failed_jobs=1,
+    )
+
+    assert stage.key == GenerationProgressStage.ERROR
+    assert error == GenerationProgressError(
+        code="generation_failed",
+        message="1 generation job needs attention. The other 45 jobs will continue automatically.",
+        retryable=True,
+    )
+
+
 @pytest.mark.parametrize(
     ("stage_key", "step"),
     (

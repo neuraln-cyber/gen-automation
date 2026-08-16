@@ -120,6 +120,7 @@ from gen_automation.services.salad import (
     submit_prepared_attempt,
 )
 from gen_automation.services.salad_deployments import (
+    ensure_container_group_queue_admission,
     provision_deployment_step,
     reconcile_deployment,
     refresh_container_group_runtime,
@@ -1629,6 +1630,7 @@ class ControllerWorkloads:
             attempt_state, job_parameters = attempt_context
             required_lora_sha256s = _required_lora_sha256s(job_parameters)
             active_attempt_id: UUID | None = None
+            cold_queue_admission_required = False
             resident = _resident_managed_lora_sha256s(deployment.runtime_managed_lora_sha256s)
             if attempt_state == GenerationAttemptState.CREATED:
                 active_attempt_id = await session.scalar(
@@ -1695,6 +1697,9 @@ class ControllerWorkloads:
                             self.secret_resolver,
                             environment_overrides=self._manifest_environment(effective_manifest),
                         )
+                        cold_queue_admission_required = (
+                            refreshed.status.strip().lower() == "stopped"
+                        )
                         deployment.runtime_artifact_manifest_sha256 = effective_manifest.sha256
                         deployment.runtime_managed_lora_sha256s = sorted(
                             effective_manifest.managed_lora_sha256s
@@ -1715,6 +1720,9 @@ class ControllerWorkloads:
                             self.salad_client,
                             self.secret_resolver,
                             environment_overrides=self._manifest_environment(effective_manifest),
+                        )
+                        cold_queue_admission_required = (
+                            refreshed.status.strip().lower() == "stopped"
                         )
                         deployment.runtime_artifact_manifest_sha256 = effective_manifest.sha256
                         deployment.runtime_managed_lora_sha256s = sorted(
@@ -1750,12 +1758,13 @@ class ControllerWorkloads:
                         salad_deployment_id=str(deployment.id),
                         generation_attempt_id=str(event.aggregate_id),
                     )
-                    await refresh_container_group_runtime(
+                    refreshed = await refresh_container_group_runtime(
                         deployment,
                         self.salad_client,
                         self.secret_resolver,
                         environment_overrides=self._manifest_environment(effective_manifest),
                     )
+                    cold_queue_admission_required = refreshed.status.strip().lower() == "stopped"
                     deployment.runtime_artifact_manifest_sha256 = effective_manifest.sha256
                     deployment.runtime_managed_lora_sha256s = sorted(
                         effective_manifest.managed_lora_sha256s
@@ -1769,6 +1778,11 @@ class ControllerWorkloads:
                         generation_attempt_id=str(event.aggregate_id),
                         active_generation_attempt_id=str(active_attempt_id),
                     )
+            if cold_queue_admission_required:
+                await ensure_container_group_queue_admission(
+                    deployment,
+                    self.salad_client,
+                )
             input_provider = SaladWorkerJobInputProvider(
                 session=session,
                 store=self.object_store,

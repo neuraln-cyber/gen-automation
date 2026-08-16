@@ -5953,6 +5953,8 @@
       liveGenerated = Math.max(liveGenerated, safeCount(payload.images.generated));
       const completedJobs = safeCount(payload.jobs.completed);
       const totalJobs = safeCount(payload.jobs.total);
+      const failedJobs = safeCount(payload.jobs.failed);
+      const unfinishedJobs = Math.max(0, totalJobs - completedJobs - failedJobs);
 
       panel.dataset.progressStage = stageKey;
       if (stageBadge) {
@@ -5968,7 +5970,12 @@
         detail.textContent = payload.stage.detail;
       }
       renderImageProgress(liveGenerated, liveExpected);
-      if (jobCount) jobCount.textContent = `${completedJobs} / ${totalJobs} complete`;
+      if (jobCount) {
+        const jobSummary = [`${completedJobs} / ${totalJobs} complete`];
+        if (failedJobs > 0) jobSummary.push(`${failedJobs} failed`);
+        if (unfinishedJobs > 0) jobSummary.push(`${unfinishedJobs} remaining`);
+        jobCount.textContent = jobSummary.join(" · ");
+      }
       if (activeJobs) activeJobs.textContent = String(safeCount(payload.jobs.active));
       if (scoringCount) {
         scoringCount.textContent = isRecord(payload.scoring)

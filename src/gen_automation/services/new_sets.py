@@ -1308,6 +1308,17 @@ def _generation_progress_stage(
     release_unhealthy = release.health == ResourceHealth.BLOCKED or (
         stop_requested and release.health != ResourceHealth.HEALTHY
     )
+    terminal_jobs = sum(
+        state_counts.get(state, 0)
+        for state in (
+            GenerationState.SUCCEEDED,
+            GenerationState.FAILED,
+            GenerationState.DEAD_LETTER,
+            GenerationState.CANCELLED,
+        )
+    )
+    total_jobs = sum(state_counts.values())
+    unfinished_jobs = max(0, total_jobs - terminal_jobs)
     # An operator stop deliberately turns provider/job failures into a reviewable
     # partial set. Integrity failures still mark the release unhealthy and must
     # remain fail-closed, but a terminal GPU job by itself must not hide the
@@ -1334,11 +1345,27 @@ def _generation_progress_stage(
             GenerationProgressError(
                 code=error_code,
                 message=(
-                    "One or more generation jobs need operator attention."
+                    (
+                        f"{failed_jobs} generation "
+                        f"{'job needs' if failed_jobs == 1 else 'jobs need'} attention. "
+                        f"The other {unfinished_jobs} "
+                        f"{'job will' if unfinished_jobs == 1 else 'jobs will'} "
+                        "continue automatically."
+                    )
+                    if failed_jobs and unfinished_jobs
+                    else (
+                        f"{failed_jobs} generation "
+                        f"{'job needs' if failed_jobs == 1 else 'jobs need'} "
+                        "operator attention."
+                    )
                     if failed_jobs
                     else "The release is unhealthy and its retained images need operator attention."
                 ),
-                retryable=False,
+                # A failed job must not freeze the live page while independent
+                # queued/running jobs are still eligible to finish.  The
+                # frontend treats retryable errors as non-terminal and keeps
+                # polling until the remaining durable jobs settle.
+                retryable=bool(failed_jobs and unfinished_jobs and not release_unhealthy),
             ),
         )
     if release.phase == ReleasePhase.CANCELLED:

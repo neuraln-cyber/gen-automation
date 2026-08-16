@@ -95,6 +95,8 @@ _WORKER_RESTART_POLICY = "on_failure"
 _SALAD_DEFAULT_SHM_SIZE = 64
 _RUNTIME_REFRESH_CONVERGENCE_TIMEOUT_SECONDS = 60.0
 _RUNTIME_REFRESH_POLL_SECONDS = 1.0
+_QUEUE_ADMISSION_CONVERGENCE_TIMEOUT_SECONDS = 120.0
+_QUEUE_ADMISSION_POLL_SECONDS = 1.0
 _WORKER_STARTUP_PROBE: JSONObject = {
     "http": {
         "headers": [],
@@ -1536,6 +1538,73 @@ async def refresh_container_group_runtime(
         ) from None
     except Exception:
         raise SaladDeploymentValidationError("container group runtime update failed") from None
+
+
+async def ensure_container_group_queue_admission(
+    deployment: SaladDeployment,
+    client: SaladDeploymentClient,
+    *,
+    convergence_timeout_seconds: float = _QUEUE_ADMISSION_CONVERGENCE_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = _QUEUE_ADMISSION_POLL_SECONDS,
+) -> SaladContainerGroup:
+    """Prove the exact image group is attached to its queue before a job POST."""
+
+    if (
+        deployment.provider_queue_id is None
+        or deployment.provider_container_group_id is None
+        or not deployment.is_current
+        or deployment.state != SaladDeploymentState.ACTIVE
+        or deployment.desired_state != DesiredDeploymentState.ACTIVE
+    ):
+        raise SaladDeploymentValidationError("deployment is not ready for queue admission")
+    try:
+        initial = await client.get_container_group(deployment.container_group_name)
+        _validate_runtime_group(deployment, initial)
+        if initial.pending_change:
+            raise SaladDeploymentValidationError("container group has a pending change")
+        if _is_authoritatively_stopped(initial):
+            await client.start_container_group(deployment.container_group_name)
+
+        async with asyncio.timeout(convergence_timeout_seconds):
+            while True:
+                group = await client.get_container_group(deployment.container_group_name)
+                _validate_runtime_group(deployment, group)
+                if group.status.strip().lower() == "failed":
+                    raise SaladDeploymentValidationError("container group failed before admission")
+                queue = await client.get_queue(deployment.queue_name)
+                if (
+                    str(queue.id) != deployment.provider_queue_id
+                    or queue.name != deployment.queue_name
+                ):
+                    raise SaladDeploymentValidationError("queue identity does not match deployment")
+                if (
+                    not group.pending_change
+                    and not _is_authoritatively_stopped(group)
+                    and _queue_contains_exact_group(queue, deployment)
+                ):
+                    return group
+                await asyncio.sleep(poll_interval_seconds)
+    except SaladDeploymentValidationError:
+        raise
+    except TimeoutError:
+        raise SaladDeploymentValidationError(
+            "container group did not become eligible for queue admission"
+        ) from None
+    except Exception:
+        raise SaladDeploymentValidationError(
+            "container group queue admission could not be verified"
+        ) from None
+
+
+def _queue_contains_exact_group(
+    queue: SaladQueue,
+    deployment: SaladDeployment,
+) -> bool:
+    return any(
+        item.get("name") == deployment.container_group_name
+        and str(item.get("id")) == deployment.provider_container_group_id
+        for item in queue.container_groups
+    )
 
 
 def _validate_runtime_group(

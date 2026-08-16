@@ -180,7 +180,12 @@
       </div>
       <div>
         <dt>GPU jobs</dt>
-        <dd data-progress-job-count>{{ release.jobs.completed }} / {{ release.jobs.total }} complete</dd>
+        {% set unfinished_jobs = release.jobs.total - release.jobs.completed - release.jobs.failed %}
+        <dd data-progress-job-count>
+          {{ release.jobs.completed }} / {{ release.jobs.total }} complete{% if release.jobs.failed %}
+            &middot; {{ release.jobs.failed }} failed{% endif %}{% if unfinished_jobs > 0 %}
+            &middot; {{ unfinished_jobs }} remaining{% endif %}
+        </dd>
       </div>
       <div>
         <dt>Active jobs</dt>
