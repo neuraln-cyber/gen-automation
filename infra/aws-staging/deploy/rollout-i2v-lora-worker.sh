@@ -840,10 +840,14 @@ assert_container_flags "$maintenance_id" false false false false
 # recycle-promote variant prepares its complete target before STOP and performs
 # STOP -> PATCH while stopped -> START -> Ready inside this single invocation.
 diagnostic_arguments=()
+provider_operation_timeout=12000s
 if [ "$operation" = "recycle-promote" ]; then
   diagnostic_arguments=(--diagnostic-output /run/i2v-lora-rollout/rollout-diagnostic.json)
+  # A cold RTX 5090 may need the full reviewed 220-minute recycle budget plus
+  # an independent 30-minute provider rollback inside the one-off watchdog.
+  provider_operation_timeout=15120s
 fi
-if ! run_one_off "$original_env" "$maintenance_id" 12000s "$operation" \
+if ! run_one_off "$original_env" "$maintenance_id" "$provider_operation_timeout" "$operation" \
   --expected-worker-image "$expected_worker_image" \
   --expected-worker-source-revision "$expected_worker_source_revision" \
   --expected-private-manifest-bucket "$manifest_bucket" \

@@ -847,12 +847,12 @@ async def test_recover_inflight_accepts_deferred_exact_prior_patch(
     assert not marker.exists()
 
 
-def test_recycle_promote_cold_bootstrap_budget_is_bounded_to_150_minutes() -> None:
+def test_recycle_promote_cold_bootstrap_budget_is_bounded_to_220_minutes() -> None:
     timeout = inspect.signature(rollout.recycle_promote_reviewed_worker).parameters[
         "timeout_seconds"
     ]
 
-    assert timeout.default == 9_000
+    assert timeout.default == 13_200
 
 
 def test_exact_ready_instance_requires_one_current_running_ready_replica() -> None:

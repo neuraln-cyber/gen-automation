@@ -1092,7 +1092,11 @@ async def recycle_promote_reviewed_worker(
     rollback_state_output: Path,
     provider_mutation_marker_output: Path,
     diagnostic_output: Path | None = None,
-    timeout_seconds: float = 9_000,
+    # Salad's documented long-tail cold pulls plus the reviewed 37 GiB model
+    # bootstrap can exceed 150 minutes even when the instance is healthy. Keep
+    # the provider operation bounded, but leave enough room for both phases on
+    # a genuinely cold RTX 5090 node.
+    timeout_seconds: float = 13_200,
 ) -> I2VLoraRolloutResult:
     """Atomically replace an exact idle degraded worker with the reviewed target."""
 

@@ -683,24 +683,23 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
     assert '[ "$remaining" -gt 0 ] || return 1' in rollout
     assert 'sleep "$((remaining < 5 ? remaining : 5))"' in rollout
     assert 'timeout --signal=TERM --kill-after=60s "$timeout_seconds"' in rollout
-    for bound in ("900s dry-run", "1900s rollback", '12000s "$operation"'):
+    for bound in ("900s dry-run", "1900s rollback", "provider_operation_timeout=15120s"):
         assert bound in rollout
     # Worst-case automatic recovery fits inside the RunShellScript execution
     # budget. The separate SSM delivery allowance plus execution then fits
     # inside polling, which fits inside OIDC, which fits inside the job timeout.
-    worst_run_one_off_dry_run = 900 + 60
     worst_restart = 600
-    worst_run_one_off_promote = 12_000 + 60
+    worst_run_one_off_promote = 15_120 + 60
     worst_run_one_off_preflight = 900 + 60
     # The outer watchdog is 1900s, while the shared provider rollback deadline
     # is 1800s plus the one-off process's 60s termination grace.
     worst_run_one_off_rollback = 1_800 + 60
-    worst_full_sequence = (
-        worst_run_one_off_dry_run
-        + worst_restart
+    worst_recycle_success = (
+        worst_restart + worst_run_one_off_promote + worst_run_one_off_preflight + worst_restart
+    )
+    worst_recycle_failure = (
+        worst_restart
         + worst_run_one_off_promote
-        + worst_run_one_off_preflight
-        + worst_restart
         # Failure cleanup returns to maintenance before touching the provider.
         + worst_restart
         + worst_run_one_off_rollback
@@ -712,7 +711,7 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
     oidc_timeout = 20_400
     workflow_timeout = 350 * 60
     github_hosted_job_maximum = 360 * 60
-    assert worst_full_sequence < execution_timeout
+    assert max(worst_recycle_success, worst_recycle_failure) < execution_timeout
     assert execution_timeout + delivery_timeout < polling_timeout < oidc_timeout < workflow_timeout
     assert workflow_timeout <= github_hosted_job_maximum
     assert 'systemctl restart --no-block "$service_name"' in rollout
@@ -767,7 +766,9 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
     assert promotion.index('run_one_off "$original_env" "$initial_container" 900s dry-run') < (
         promotion.index('restart_into "$maintenance_env"')
     )
-    atomic_provider_operation = 'run_one_off "$original_env" "$maintenance_id" 12000s "$operation"'
+    atomic_provider_operation = (
+        'run_one_off "$original_env" "$maintenance_id" "$provider_operation_timeout" "$operation"'
+    )
     assert promotion.index('restart_into "$maintenance_env"') < promotion.index(
         atomic_provider_operation
     )
@@ -871,10 +872,13 @@ def test_i2v_lora_worker_rollout_is_bounded_queue_preserving_and_two_phase() -> 
     assert "restart_into" not in finalize
     assert "provider-mutation-attempted" not in finalize
     assert "1900s rollback" not in finalize
-    actual_failure = promotion.split(
-        'if ! run_one_off "$original_env" "$maintenance_id" 12000s "$operation"',
-        maxsplit=1,
-    )[1].split("\nfi\n", maxsplit=1)[0]
+    provider_operation = (
+        'if ! run_one_off "$original_env" "$maintenance_id" '
+        '"$provider_operation_timeout" "$operation"'
+    )
+    actual_failure = promotion.split(provider_operation, maxsplit=1)[1].split("\nfi\n", maxsplit=1)[
+        0
+    ]
     assert 'if [ "$operation" = "recycle-promote" ]; then' in actual_failure
     assert actual_failure.count('print_rollout_diagnostic "$diagnostic_output"') == 1
     assert "merge_saved_i2v_profile" in rollout
