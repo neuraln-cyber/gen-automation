@@ -28,6 +28,7 @@ DOCKERFILE = ROOT / "Dockerfile.i2v-worker"
 LOCK = ROOT / "requirements-i2v-worker.lock"
 FACE_LOCK = ROOT / "requirements-i2v-face.lock"
 FACE_NOTICES = ROOT / "THIRD_PARTY_LICENSES.md"
+FACE_STABILIZER = ROOT / "src/gen_automation/i2v_worker/face_stabilizer.py"
 NAG_PATCH = ROOT / "patches/comfyui-nag/chroma-stream-blocks.patch"
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 WORKFLOW = ROOT / "workflows/dasiwa-wan22-i2v-v1.api.json"
@@ -564,7 +565,11 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
         "211e581f5a4670acbbe08fff36a35e9946039d2eea28b80394632d036d1be527",
     ):
         assert identity in dockerfile
-    assert "from anime_face_detector.detector import LandmarkDetector" in dockerfile
+    detector_import = "from anime_face_detector.detector import LandmarkDetector"
+    assert detector_import in dockerfile
+    face_stabilizer = FACE_STABILIZER.read_text(encoding="utf-8")
+    assert detector_import in face_stabilizer
+    assert "from anime_face_detector import LandmarkDetector" not in face_stabilizer
     assert "device='cpu'" in dockerfile
     assert "assert len(result)==1" in dockerfile
     assert "assert float(confidence.min())>=0.60" in dockerfile
