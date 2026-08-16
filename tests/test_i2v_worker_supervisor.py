@@ -98,7 +98,7 @@ async def test_supervisor_loads_one_cpu_face_detector_before_bootstrap(
 
     OrderedBootstrapper.calls = 0
 
-    monkeypatch.setattr(module, "_verify_gpu_runtime", lambda: events.append("gpu"))
+    monkeypatch.setattr(module, "_verify_gpu_runtime", lambda _settings: events.append("gpu"))
     monkeypatch.setattr(module, "preflight_face_stabilizer", load_detector)
     monkeypatch.setattr(module, "S3ModelBootstrapper", OrderedBootstrapper)
     monkeypatch.setattr(module, "ComfyClient", _ComfyClient)
@@ -145,7 +145,7 @@ async def test_face_detector_load_failure_fails_before_model_or_comfy_start(
         calls["start"] += 1
         return _Process()
 
-    monkeypatch.setattr(module, "_verify_gpu_runtime", lambda: None)
+    monkeypatch.setattr(module, "_verify_gpu_runtime", lambda _settings: None)
     monkeypatch.setattr(module, "preflight_face_stabilizer", fail_detector)
     monkeypatch.setattr(module, "S3ModelBootstrapper", UnexpectedBootstrapper)
     monkeypatch.setattr(module, "_start_process", start_process)

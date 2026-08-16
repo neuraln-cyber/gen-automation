@@ -91,7 +91,7 @@ class _Supervisor:
 def _job() -> dict[str, object]:
     expires = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
     return {
-        "schema": "i2v-salad-job/v1",
+        "schema": "i2v-job/v2",
         "job_id": str(uuid4()),
         "attempt_id": str(uuid4()),
         "request_sha256": SHA,
@@ -257,7 +257,7 @@ def test_generation_returns_exact_wire_result_and_cleans_runtime(
 
     assert response.status_code == 200, response.text
     result = response.json()
-    assert result["schema"] == "i2v-salad-result/v1"
+    assert result["schema"] == "i2v-result/v2"
     assert result["output"]["frame_count"] == 81
     assert result["output"]["metadata"]["codec"] == "h264"
     assert result["output"]["metadata"]["loras"] == []

@@ -46,5 +46,6 @@ comfy-angle
 boto3>=1.39,<2
 fastapi>=0.140,<1
 httpx2>=2.7,<3
+runpod==1.11.0
 structlog>=25.4,<26
 uvicorn[standard]>=0.40,<1

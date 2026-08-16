@@ -33,8 +33,10 @@ from gen_automation.integrations.salad.models import (
 )
 from gen_automation.services.i2v_environment import (
     I2VRuntimeEnvironment,
-    i2v_runtime_config_from_settings,
     i2v_worker_identity,
+)
+from gen_automation.services.i2v_environment import (
+    i2v_salad_runtime_config_from_settings as i2v_runtime_config_from_settings,
 )
 from gen_automation.services.i2v_salad import (
     I2V_SALAD_GPU_CLASS_NAME,

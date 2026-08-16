@@ -618,19 +618,12 @@ def test_salad_accepts_a_complete_fail_closed_test_configuration() -> None:
     assert settings.salad_container_priority == SaladContainerPriority.LOW
 
 
-def test_i2v_defaults_to_one_exact_5090_without_small_queue_or_runtime_caps() -> None:
-    settings = Settings(
-        i2v_salad_prefetch=10_000,
-        i2v_worker_lease_seconds=30 * 24 * 60 * 60,
-        i2v_salad_max_replicas=32,
-        i2v_salad_storage_bytes=2 * 1024 * 1024 * 1024 * 1024,
-    )
+def test_i2v_runpod_defaults_are_single_flight_and_cover_long_renders() -> None:
+    settings = Settings()
 
-    assert settings.i2v_salad_gpu_class_name == "RTX 5090 (32 GB)"
-    assert settings.i2v_salad_prefetch == 10_000
-    assert settings.i2v_worker_lease_seconds == 30 * 24 * 60 * 60
-    assert settings.i2v_salad_max_replicas == 32
-    assert settings.i2v_salad_storage_bytes == 2 * 1024 * 1024 * 1024 * 1024
+    assert settings.i2v_runpod_max_active_jobs == 1
+    assert settings.i2v_runpod_execution_timeout_seconds == 6 * 60 * 60
+    assert settings.i2v_runpod_job_ttl_seconds == 7 * 24 * 60 * 60
 
 
 def test_i2v_accepts_complete_digest_pinned_configuration() -> None:
@@ -665,7 +658,10 @@ def test_i2v_accepts_complete_digest_pinned_configuration() -> None:
         salad_worker_artifact_bucket="private-models",
         salad_worker_artifact_region="eu-central-1",
         i2v_enabled=True,
-        i2v_salad_gpu_class_id="851399fb-7329-4195-a042-d6514b28cf33",
+        i2v_runpod_enabled=True,
+        i2v_runpod_endpoint_id="endpoint123",
+        i2v_runpod_api_key="not-a-secret-for-unit-tests",
+        i2v_runpod_claim_url="https://staging.example/api/v1/i2v/runpod/claim",
         i2v_worker_image=f"registry.example/i2v-worker@sha256:{'b' * 64}",
         i2v_model_manifest_json=manifest,
         i2v_model_manifest_sha256=hashlib.sha256(manifest.encode()).hexdigest(),
@@ -673,7 +669,7 @@ def test_i2v_accepts_complete_digest_pinned_configuration() -> None:
     settings = Settings(**values)
 
     assert settings.i2v_enabled
-    assert settings.i2v_salad_priority == SaladContainerPriority.HIGH
+    assert settings.i2v_runpod_max_active_jobs == 1
     assert settings.i2v_object_grant_ttl_seconds == 7 * 24 * 60 * 60
 
     with pytest.raises(

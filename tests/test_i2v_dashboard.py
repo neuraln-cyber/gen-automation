@@ -38,6 +38,18 @@ def test_i2v_dashboard_exposes_focused_generation_controls(client: TestClient) -
     assert "Looped delivery is capped at 25 seconds" in response.text
     assert 'name="match_source_aspect" checked' in response.text
     assert 'name="face_fidelity"' in response.text
+    assert response.text.count('name="runpod_authorization"') == 1
+    assert 'id="i2v-runpod-authorization"' in response.text
+    assert 'type="checkbox"' in response.text
+    assert "I confirm this NSFW generation is authorized" in response.text
+    assert "Leave unchecked for an SFW generation." in response.text
+    assert (
+        "I confirm this NSFW generation is authorized and I have written permission"
+        in response.text
+    )
+    assert response.text.index('name="runpod_authorization"') < response.text.index(
+        "data-advanced-settings"
+    )
     assert '<option value="stable_expression" selected>' in response.text
     assert "Stable expression + one natural blink" in response.text
     assert "effective negative guidance at CFG 1" in response.text
@@ -124,6 +136,10 @@ def test_i2v_dashboard_default_submit_controls_are_constraint_valid(
     assert "presetName.disabled = true" in script
     assert 'presetDialog.addEventListener("close"' in script
     assert 'face_fidelity: "stable_expression"' in script
+    assert 'runpod_authorization: "sfw"' in script
+    assert 'root.querySelector("#i2v-runpod-authorization")' in script
+    assert 'authorization.checked ? "written_permission" : "sfw"' in script
+    assert 'authorization.checked = value === "written_permission"' in script
 
 
 def test_i2v_dashboard_uses_only_the_backend_reviewed_lora_catalog() -> None:

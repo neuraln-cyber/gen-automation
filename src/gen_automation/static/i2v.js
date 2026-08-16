@@ -71,6 +71,7 @@
     color_transfer: false,
     tiled_vae: false,
     face_fidelity: "stable_expression",
+    runpod_authorization: "sfw",
     loras: [],
   };
   let saveTimer = null;
@@ -344,6 +345,8 @@
       else if (numbers.has(field.name)) settings[field.name] = Number(field.value);
       else settings[field.name] = field.value;
     });
+    const authorization = root.querySelector("#i2v-runpod-authorization");
+    settings.runpod_authorization = authorization.checked ? "written_permission" : "sfw";
     settings.loras = [...state.loraSelections].map(([catalogId, strength]) => ({
       catalog_id: catalogId,
       strength,
@@ -355,6 +358,11 @@
     const resolved = { ...workerSettingDefaults, ...settings };
     Object.entries(resolved).forEach(([name, value]) => {
       if (name === "loras") return;
+      if (name === "runpod_authorization") {
+        const authorization = root.querySelector("#i2v-runpod-authorization");
+        authorization.checked = value === "written_permission";
+        return;
+      }
       const field = advanced.querySelector(`[name="${CSS.escape(name)}"]`);
       if (!field) return;
       if (field.type === "checkbox") field.checked = Boolean(value);

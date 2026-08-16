@@ -34,6 +34,8 @@ LOCAL_SESSION_SECRET = "local-development-only"  # noqa: S105
 SALAD_API_BASE_URL = "https://api.salad.com/api/public"
 SALAD_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,61}[a-z0-9]$")
 SALAD_WORKER_IMAGE_PATTERN = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
+RUNPOD_ENDPOINT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{5,64}$")
+RUNPOD_API_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._-]{20,512}$")
 WORKER_SIGNING_KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 WORKER_ARTIFACT_BUCKET_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,254}$")
 AWS_IAM_ROLE_ARN_PATTERN = (
@@ -542,6 +544,31 @@ class Settings(BaseSettings):
     # exact artifacts and readiness identity are verified, and can be rolled
     # back without changing its manifest.
     i2v_lora_profile_enabled: bool = False
+    # RunPod is enabled only after its immutable endpoint has been provisioned.
+    # The false state exists solely to make the one-time provider cutover and
+    # rollback atomic; it is removed with the retired Salad I2V path afterward.
+    i2v_runpod_enabled: bool = False
+    i2v_runpod_endpoint_id: str | None = None
+    i2v_runpod_api_key: SecretStr | None = None
+    i2v_runpod_claim_url: AnyHttpUrl | None = None
+    i2v_runpod_execution_timeout_seconds: int = Field(default=6 * 60 * 60, ge=60)
+    i2v_runpod_submission_claim_timeout_seconds: int = Field(
+        default=30 * 60,
+        ge=60,
+        le=60 * 60,
+    )
+    i2v_runpod_queue_timeout_seconds: int = Field(
+        default=30 * 60,
+        ge=60,
+        le=6 * 60 * 60,
+    )
+    i2v_runpod_terminal_grace_seconds: int = Field(default=5 * 60, ge=30, le=30 * 60)
+    i2v_runpod_job_ttl_seconds: int = Field(
+        default=7 * 24 * 60 * 60,
+        ge=60 * 60,
+        le=7 * 24 * 60 * 60,
+    )
+    i2v_runpod_max_active_jobs: int = Field(default=1, ge=1, le=1)
     i2v_salad_queue_name: str = "i2v-jobs-v1"
     i2v_salad_container_group_name: str = "i2v-worker-v1"
     i2v_worker_image: str | None = None
@@ -958,22 +985,41 @@ class Settings(BaseSettings):
         if self.i2v_lora_profile_enabled and not self.i2v_lora_worker_enabled:
             errors.append("I2V LoRA profile requires a LoRA-capable worker")
         if self.i2v_enabled:
-            if not self.salad_enabled:
-                errors.append("I2V requires the SaladCloud integration")
             if not self.storage_enabled:
                 errors.append("I2V requires private object storage")
             if not self.background_runtime_enabled:
                 errors.append("I2V requires the background runtime")
-            if self.i2v_salad_gpu_class_id is None:
-                errors.append("I2V requires the exact Salad RTX 5090 GPU class ID")
-            if self.i2v_salad_gpu_class_name != "RTX 5090 (32 GB)":
-                errors.append("I2V GPU class must be RTX 5090 (32 GB)")
-            for label, value in (
-                ("queue name", self.i2v_salad_queue_name),
-                ("container group name", self.i2v_salad_container_group_name),
-            ):
-                if SALAD_NAME_PATTERN.fullmatch(value) is None:
-                    errors.append(f"invalid I2V SaladCloud {label}")
+            if self.i2v_runpod_enabled:
+                if (
+                    self.i2v_runpod_endpoint_id is None
+                    or RUNPOD_ENDPOINT_ID_PATTERN.fullmatch(self.i2v_runpod_endpoint_id) is None
+                ):
+                    errors.append("I2V requires a valid RunPod Serverless endpoint ID")
+                runpod_api_key = _secret_value(self.i2v_runpod_api_key)
+                if (
+                    runpod_api_key is None
+                    or RUNPOD_API_KEY_PATTERN.fullmatch(runpod_api_key) is None
+                ):
+                    errors.append("I2V requires a valid RunPod API key")
+                claim_url = (
+                    str(self.i2v_runpod_claim_url) if self.i2v_runpod_claim_url is not None else ""
+                )
+                claim_parts = _split_https_url(claim_url)
+                if (
+                    claim_parts is None
+                    or claim_parts.path != "/api/v1/i2v/runpod/claim"
+                    or claim_parts.query
+                ):
+                    errors.append("I2V requires the exact HTTPS RunPod claim callback URL")
+                if self.i2v_runpod_job_ttl_seconds < self.i2v_runpod_execution_timeout_seconds:
+                    errors.append("I2V RunPod job TTL must cover its execution timeout")
+                if self.i2v_runpod_queue_timeout_seconds >= self.i2v_runpod_job_ttl_seconds:
+                    errors.append("I2V RunPod queue timeout must be lower than its job TTL")
+            else:
+                if not self.salad_enabled:
+                    errors.append("I2V rollback mode requires the SaladCloud integration")
+                if self.i2v_salad_gpu_class_id is None:
+                    errors.append("I2V rollback mode requires the exact Salad GPU class ID")
             if self.i2v_worker_image is None:
                 errors.append("I2V requires an immutable worker image")
             elif SALAD_WORKER_IMAGE_PATTERN.fullmatch(self.i2v_worker_image) is None:

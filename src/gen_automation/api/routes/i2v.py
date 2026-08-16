@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import timedelta
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -50,9 +51,11 @@ from gen_automation.services.dashboard_previews import (
     load_or_create_dashboard_preview,
 )
 from gen_automation.services.i2v import (
+    I2V_RUNTIME_WORKER_ID,
     I2VConflictError,
     I2VInputError,
     I2VNotFoundError,
+    bind_i2v_runpod_execution,
     create_i2v_job,
     create_i2v_preset,
     delete_i2v_preset,
@@ -76,6 +79,10 @@ from gen_automation.services.i2v_media import (
     list_i2v_library_images,
     presign_i2v_output_download,
     register_i2v_generation_asset,
+)
+from gen_automation.services.i2v_runpod_claims import (
+    I2VRunPodClaimError,
+    verify_i2v_runpod_claim_token,
 )
 from gen_automation.storage.base import ObjectStore
 
@@ -135,6 +142,10 @@ class JobCreate(_RequestModel):
 
 class JobBatchRead(BaseModel):
     jobs: tuple[I2VJobSnapshot, ...]
+
+
+class RunPodExecutionClaim(_RequestModel):
+    provider_job_id: str = Field(min_length=5, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
 
 
 class QueueMove(_RequestModel):
@@ -564,6 +575,49 @@ async def enqueue_jobs(
     except (I2VInputError, I2VNotFoundError, I2VConflictError) as error:
         raise _core_http_error(error) from error
     return JobBatchRead(jobs=tuple(created))
+
+
+@router.post("/runpod/claim", status_code=status.HTTP_204_NO_CONTENT)
+async def claim_runpod_execution(
+    payload: RunPodExecutionClaim,
+    request: Request,
+    session: Session,
+) -> Response:
+    settings: Settings = request.app.state.settings
+    api_key = settings.i2v_runpod_api_key
+    authorization = request.headers.get("authorization", "")
+    scheme, separator, token = authorization.partition(" ")
+    if (
+        not settings.i2v_runpod_enabled
+        or api_key is None
+        or separator != " "
+        or scheme.casefold() != "bearer"
+        or not token
+    ):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid claim")
+    try:
+        identity = verify_i2v_runpod_claim_token(
+            token,
+            secret=api_key.get_secret_value(),
+        )
+        await bind_i2v_runpod_execution(
+            session,
+            job_id=identity.job_id,
+            attempt_id=identity.attempt_id,
+            request_sha256=identity.request_sha256,
+            submission_key=identity.submission_key,
+            provider_job_id=payload.provider_job_id,
+            worker_id=I2V_RUNTIME_WORKER_ID,
+            lease_duration=timedelta(seconds=settings.i2v_worker_lease_seconds),
+        )
+    except I2VRunPodClaimError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid claim",
+        ) from None
+    except (I2VNotFoundError, I2VConflictError):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="claim rejected") from None
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.patch("/queue", response_model=tuple[I2VJobSnapshot, ...])

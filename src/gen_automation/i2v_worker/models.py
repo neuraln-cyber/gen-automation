@@ -158,6 +158,9 @@ class GenerationSettings(_StrictModel):
     color_transfer: Literal[False] = False
     tiled_vae: Literal[False] = False
     face_fidelity: Literal["off", "stable_expression"] = "off"
+    # Operator attestation only. The application deliberately does not infer or
+    # classify content; the owner chooses the applicable RunPod authorization.
+    runpod_authorization: Literal["sfw", "written_permission"] = "sfw"
     loras: list[LoraSelection] = Field(
         default_factory=list,
         max_length=MAX_REVIEWED_LORA_SELECTIONS,
@@ -185,7 +188,8 @@ class GenerationSettings(_StrictModel):
 
 
 class I2VJob(_StrictModel):
-    schema_version: Literal["i2v-salad-job/v1"] = Field(
+    schema_version: Literal["i2v-job/v2"] = Field(
+        default="i2v-job/v2",
         alias="schema",
         serialization_alias="schema",
     )
@@ -217,8 +221,8 @@ class OutputResult(_StrictModel):
 
 
 class I2VResult(_StrictModel):
-    schema_version: Literal["i2v-salad-result/v1"] = Field(
-        default="i2v-salad-result/v1",
+    schema_version: Literal["i2v-result/v2"] = Field(
+        default="i2v-result/v2",
         alias="schema",
         serialization_alias="schema",
     )

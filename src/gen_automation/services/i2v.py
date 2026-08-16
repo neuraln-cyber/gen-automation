@@ -63,6 +63,17 @@ class I2VConflictError(I2VError):
     """A command conflicts with the current durable state."""
 
 
+I2V_RUNTIME_WORKER_ID = "controller:i2v:singleton"
+
+
+def i2v_job_snapshot(row: I2VJob) -> I2VJobSnapshot:
+    return _job_snapshot(row)
+
+
+def i2v_attempt_snapshot(row: I2VAttempt) -> I2VAttemptSnapshot:
+    return _attempt_snapshot(row)
+
+
 async def register_i2v_input(
     session: AsyncSession,
     *,
@@ -571,6 +582,76 @@ async def adopt_validated_i2v_provider_attempt(
     attempt.provider_job_id = normalized_provider_job_id
     attempt.updated_at = timestamp
     await _commit(session, "the provider-backed I2V attempt changed concurrently")
+    return I2VClaim(job=_job_snapshot(job), attempt=_attempt_snapshot(attempt))
+
+
+async def bind_i2v_runpod_execution(
+    session: AsyncSession,
+    *,
+    job_id: UUID,
+    attempt_id: UUID,
+    request_sha256: str,
+    submission_key: str,
+    provider_job_id: str,
+    worker_id: str,
+    lease_duration: timedelta,
+    now: datetime | None = None,
+) -> I2VClaim:
+    """Atomically allow exactly one RunPod job to execute an I2V attempt."""
+
+    from gen_automation.services.i2v_runpod_claims import i2v_runpod_submission_key
+
+    normalized_provider_job_id = _nonempty_text(provider_job_id, "provider job id")
+    normalized_worker = _nonempty_text(worker_id, "worker id")
+    if lease_duration <= timedelta(0):
+        raise I2VInputError("lease duration must be positive")
+    timestamp = _now(now)
+    job = await session.scalar(select(I2VJob).where(I2VJob.id == job_id).with_for_update())
+    attempt = await session.scalar(
+        select(I2VAttempt)
+        .where(I2VAttempt.id == attempt_id, I2VAttempt.job_id == job_id)
+        .with_for_update()
+    )
+    if (
+        job is None
+        or attempt is None
+        or job.state
+        not in {
+            I2VJobState.CLAIMED,
+            I2VJobState.RUNNING,
+            I2VJobState.CANCEL_REQUESTED,
+        }
+        or attempt.state not in {I2VAttemptState.CREATED, I2VAttemptState.RUNNING}
+        or attempt.attempt_no != job.attempt_count
+        or job.request_sha256 != request_sha256
+        or submission_key
+        != i2v_runpod_submission_key(
+            job_id=job_id,
+            attempt_id=attempt_id,
+            attempt_no=attempt.attempt_no,
+            request_sha256=job.request_sha256,
+        )
+        or attempt.request_metadata.get("submission_key") != submission_key
+        or attempt.provider_job_id not in {None, normalized_provider_job_id}
+    ):
+        raise I2VConflictError("the RunPod I2V execution claim conflicts")
+    attempt.provider_job_id = normalized_provider_job_id
+    metadata = dict(attempt.request_metadata)
+    metadata.update(
+        {
+            "submission_state": "submitted",
+            "provider": "runpod",
+            "provider_job_id": normalized_provider_job_id,
+            "worker_claimed_at": timestamp.isoformat(),
+        }
+    )
+    attempt.request_metadata = metadata
+    attempt.worker_id = normalized_worker
+    attempt.updated_at = timestamp
+    job.lease_owner = normalized_worker
+    job.lease_expires_at = timestamp + lease_duration
+    job.updated_at = timestamp
+    await _commit(session, "the RunPod I2V execution claim changed concurrently")
     return I2VClaim(job=_job_snapshot(job), attempt=_attempt_snapshot(attempt))
 
 

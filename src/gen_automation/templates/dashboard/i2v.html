@@ -143,6 +143,15 @@
           <textarea id="i2v-negative" name="negative_prompt" rows="4" maxlength="100000" data-negative-prompt placeholder="camera shake, background drift, identity change, anatomy deformation, flicker, frozen hold"></textarea>
         </label>
 
+        <fieldset class="i2v-prompt" id="i2v-runpod-authorization-group">
+          <legend>Content authorization <small>Saved with this exact queued video</small></legend>
+          <label>
+            <input id="i2v-runpod-authorization" type="checkbox" name="runpod_authorization" value="written_permission">
+            I confirm this NSFW generation is authorized and I have written permission
+          </label>
+          <small>Leave unchecked for an SFW generation.</small>
+        </fieldset>
+
         <details class="i2v-advanced" data-advanced-settings>
           <summary><span><strong>Advanced settings</strong><small>DaSiWa WAN 2.2 baseline · all values are saved with the job</small></span><span aria-hidden="true">⌄</span></summary>
           <div class="i2v-settings-grid">

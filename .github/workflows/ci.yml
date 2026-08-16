@@ -169,7 +169,7 @@ jobs:
           docker run --rm
           --entrypoint /opt/i2v-venv/bin/python
           gen-automation-i2v-worker:test
-          -c 'import gen_automation.i2v_worker.main'
+          -c 'import runpod; import gen_automation.i2v_worker.runpod_handler; assert runpod.__version__ == "1.11.0"'
       - name: Build semantic gateway image
         run: >-
           docker build

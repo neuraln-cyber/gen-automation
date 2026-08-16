@@ -29,6 +29,7 @@ LOCK = ROOT / "requirements-i2v-worker.lock"
 FACE_LOCK = ROOT / "requirements-i2v-face.lock"
 FACE_NOTICES = ROOT / "THIRD_PARTY_LICENSES.md"
 FACE_STABILIZER = ROOT / "src/gen_automation/i2v_worker/face_stabilizer.py"
+RUNPOD_HANDLER = ROOT / "src/gen_automation/i2v_worker/runpod_handler.py"
 NAG_PATCH = ROOT / "patches/comfyui-nag/chroma-stream-blocks.patch"
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 WORKFLOW = ROOT / "workflows/dasiwa-wan22-i2v-v1.api.json"
@@ -92,7 +93,7 @@ def _settings(tmp_path: Path, *, lora_worker_enabled: bool = True) -> I2VWorkerS
 def _job() -> dict[str, object]:
     expires = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
     return {
-        "schema": "i2v-salad-job/v1",
+        "schema": "i2v-job/v2",
         "job_id": str(uuid4()),
         "attempt_id": str(uuid4()),
         "request_sha256": SHA,
@@ -130,8 +131,8 @@ def _job() -> dict[str, object]:
 def test_job_contract_is_strict_and_uses_wire_schema_alias() -> None:
     parsed = I2VJob.model_validate_json(json.dumps(_job()), strict=True)
 
-    assert parsed.schema_version == "i2v-salad-job/v1"
-    assert parsed.model_dump(mode="json", by_alias=True)["schema"] == "i2v-salad-job/v1"
+    assert parsed.schema_version == "i2v-job/v2"
+    assert parsed.model_dump(mode="json", by_alias=True)["schema"] == "i2v-job/v2"
     invalid = _job()
     invalid["unexpected"] = True
     with pytest.raises(ValidationError):
@@ -505,19 +506,12 @@ def test_comfy_command_uses_supported_base_directory_and_only_pinned_nag(tmp_pat
 def test_image_is_model_free_pinned_and_non_root() -> None:
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
     from_lines = [line for line in dockerfile.splitlines() if line.startswith("FROM ")]
-    go_image = (
-        "golang:1.26.2-alpine@"
-        "sha256:f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739500e08c86393a21b1"
-    )
     pytorch_image = (
         "pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime@"
         "sha256:7b324d212a4450795b49edba9949b7cdc72429148a64e974334bfe5774d51385"
     )
 
-    assert from_lines == [
-        f"FROM {go_image} AS salad-queue-worker-builder",
-        f"FROM {pytorch_image}",
-    ]
+    assert from_lines == [f"FROM {pytorch_image}"]
     assert all("@sha256:" in line for line in from_lines)
     assert "c2bcbecd82ec5ae66594340b395c24ef0217b238" in dockerfile
     assert "ef8a641be08983cf5f06669f70719b6eecce3c7f" in dockerfile
@@ -540,7 +534,14 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
     nag_install = dockerfile.index("ARG COMFYUI_NAG_COMMIT=")
     assert nag_install > heavyweight_runtime_end
     assert "COMFYUI_NAG" not in dockerfile[:heavyweight_runtime_end]
-    assert "USER 10002:10002" in dockerfile
+    assert "USER 0:0" in dockerfile
+    assert "COPY --chmod=0555 scripts/i2v-runpod-entrypoint.sh" in dockerfile
+    entrypoint = (ROOT / "scripts/i2v-runpod-entrypoint.sh").read_text(encoding="utf-8")
+    assert "stat -c '%d' \"$volume_root\"" in entrypoint
+    assert 'find "$namespace" -xdev' in entrypoint
+    assert '--reuid "$worker_uid"' in entrypoint
+    assert '--regid "$worker_gid"' in entrypoint
+    assert "--no-new-privs" in entrypoint
     assert "COPY i2v-models" not in dockerfile
     detector_urls = {
         (
@@ -587,7 +588,18 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
         "211e581f5a4670acbbe08fff36a35e9946039d2eea28b80394632d036d1be527",
     ):
         assert identity in notices
-    assert "--start-period=60m" in dockerfile
+    assert "gen_automation.i2v_worker.runpod_handler" in entrypoint
+    handler = RUNPOD_HANDLER.read_text(encoding="utf-8")
+    assert '"schema": "gen-automation/i2v-runpod-runtime/v1"' in handler
+    for metric in (
+        "worker_reused",
+        "volume_bootstrap_ms",
+        "worker_startup_ms",
+        "generation_ms",
+        "total_handler_ms",
+    ):
+        assert f'"{metric}"' in handler
+    assert 'org.opencontainers.image.runpod-sdk.version="1.11.0"' in dockerfile
     assert "--system-site-packages" in dockerfile
     assert "--require-hashes" in dockerfile
     assert "--no-deps" in dockerfile
@@ -601,13 +613,10 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
     assert "scipy==1.17.1" in lock
     for package in ("torch==2.9.1", "torchvision==0.24.1", "torchaudio==2.9.1"):
         assert package in lock
+    assert "runpod==1.11.0" in lock
     assert "'/opt/i2v-venv/' not in module.__file__" in dockerfile
-    assert (
-        hashlib.sha256(
-            (ROOT / "patches/salad-queue-worker/strict-http-status.patch").read_bytes()
-        ).hexdigest()
-        in dockerfile
-    )
+    assert "salad-http-job-queue-worker" not in dockerfile
+    assert "strict-http-status.patch" not in dockerfile
 
 
 def test_ci_builds_smokes_and_scans_the_model_free_worker() -> None:
@@ -616,7 +625,7 @@ def test_ci_builds_smokes_and_scans_the_model_free_worker() -> None:
     assert "docker build" in workflow
     assert "--file Dockerfile.i2v-worker" in workflow
     assert "--tag gen-automation-i2v-worker:test" in workflow
-    assert "import gen_automation.i2v_worker.main" in workflow
+    assert "import gen_automation.i2v_worker.runpod_handler" in workflow
     assert "image: gen-automation-i2v-worker:test" in workflow
     assert "output-file: i2v-worker.spdx.json" in workflow
     assert "sbom: i2v-worker.spdx.json" in workflow

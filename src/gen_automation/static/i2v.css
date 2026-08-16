@@ -62,6 +62,10 @@
 .i2v-prompt > span { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .4rem; }
 .i2v-prompt small, .i2v-settings-grid small { color: var(--muted); font-weight: 500; }
 .i2v-prompt textarea, .i2v-dialog textarea { padding: .72rem; resize: vertical; line-height: 1.5; }
+#i2v-runpod-authorization-group { margin: 0; padding: 0; border: 0; }
+#i2v-runpod-authorization-group > label { display: flex; align-items: center; gap: .5rem; font-size: .82rem; font-weight: 600; }
+#i2v-runpod-authorization-group input[type="checkbox"] { width: auto; margin: 0; }
+#i2v-runpod-authorization-group > small { display: block; margin-top: .25rem; color: var(--muted); }
 .i2v-advanced { border: 1px solid var(--border); border-radius: .85rem; background: rgba(255, 255, 255, .018); }
 .i2v-advanced > summary { display: flex; min-height: 3.6rem; align-items: center; justify-content: space-between; gap: 1rem; padding: .8rem; cursor: pointer; list-style: none; }
 .i2v-advanced > summary::-webkit-details-marker { display: none; }
