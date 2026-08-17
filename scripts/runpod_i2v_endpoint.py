@@ -21,7 +21,12 @@ ENDPOINT_NAME = "gen-automation-i2v-staging"
 VOLUME_NAME = "gen-automation-i2v-models-staging"
 VOLUME_SIZE_GB = 100
 DATA_CENTER_ID = "EU-RO-1"
-GPU_TYPES = ("NVIDIA A40", "NVIDIA RTX A6000", "NVIDIA L40S")
+GPU_TYPES = (
+    "NVIDIA GeForce RTX 5090",
+    "NVIDIA A40",
+    "NVIDIA RTX A6000",
+    "NVIDIA L40S",
+)
 SPEND_SWITCH = "GEN_AUTOMATION_RUNPOD_I2V_SPEND_ALLOWED"
 STATE_SCHEMA = "gen-automation/runpod-i2v-state/v1"
 IMAGE_PATTERN = re.compile(
@@ -198,6 +203,7 @@ def _spec(
         "dockerEntrypoint": [],
         "dockerStartCmd": [],
         "env": {
+            "GEN_I2V_WORKER_ALLOWED_GPU_NAMES_CSV": ",".join(GPU_TYPES),
             "GEN_I2V_WORKER_MODEL_OBJECTS_JSON": model_objects_json,
             "GEN_I2V_WORKER_ENVIRONMENT": "production",
             "GEN_I2V_WORKER_LORA_WORKER_ENABLED": "true",
@@ -421,22 +427,61 @@ def apply(spec: dict[str, dict[str, Any]], *, state_file: Path) -> dict[str, Any
         expected=spec["volume"],
         verify=_verify_volume,
     )
-    template = _ensure_created(
-        api_key=api_key,
-        state=state,
-        state_file=state_file,
+    template = _find_unique(
+        api_key,
+        path="/templates?includeEndpointBoundTemplates=true",
+        name=str(spec["template"]["name"]),
         kind="template",
-        list_path="/templates?includeEndpointBoundTemplates=true",
-        create_path="/templates",
-        expected=spec["template"],
-        verify=_verify_template,
     )
+    if template is None:
+        template = _ensure_created(
+            api_key=api_key,
+            state=state,
+            state_file=state_file,
+            kind="template",
+            list_path="/templates?includeEndpointBoundTemplates=true",
+            create_path="/templates",
+            expected=spec["template"],
+            verify=_verify_template,
+        )
+    else:
+        try:
+            _verify_template(template, spec["template"])
+        except RuntimeError:
+            template_id = _required_id(template, "template")
+            update_fields = (
+                "containerDiskInGb",
+                "dockerEntrypoint",
+                "dockerStartCmd",
+                "env",
+                "imageName",
+                "isPublic",
+                "name",
+                "ports",
+                "readme",
+                "volumeInGb",
+                "volumeMountPath",
+            )
+            template = _mutate(
+                api_key,
+                f"/templates/{urllib.parse.quote(template_id, safe='')}",
+                method="PATCH",
+                payload={field: spec["template"][field] for field in update_fields},
+            )
+            _verify_template(template, spec["template"])
+        template_state = _resource_state(state, "template")
+        template_state.update({"id": _required_id(template, "template"), "verified_at": _now()})
+        state["updated_at"] = _now()
+        _write_state(state_file, state)
     volume_id = _required_id(volume, "volume")
     template_id = _required_id(template, "template")
     endpoint_payload = {
         **spec["endpoint"],
         "templateId": template_id,
         "networkVolumeId": volume_id,
+    }
+    endpoint_patch_payload = {
+        key: value for key, value in endpoint_payload.items() if key != "computeType"
     }
     endpoint = _find_unique(
         api_key,
@@ -466,7 +511,7 @@ def apply(spec: dict[str, dict[str, Any]], *, state_file: Path) -> dict[str, Any
             api_key,
             f"/endpoints/{urllib.parse.quote(endpoint_id, safe='')}",
             method="PATCH",
-            payload=endpoint_payload,
+            payload=endpoint_patch_payload,
         )
     else:
         try:
@@ -482,7 +527,7 @@ def apply(spec: dict[str, dict[str, Any]], *, state_file: Path) -> dict[str, Any
                 api_key,
                 f"/endpoints/{urllib.parse.quote(endpoint_id, safe='')}",
                 method="PATCH",
-                payload=endpoint_payload,
+                payload=endpoint_patch_payload,
             )
     _verify_endpoint(
         endpoint,

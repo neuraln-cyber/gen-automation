@@ -188,6 +188,8 @@ verify_preseed_identity() {
     --security-opt no-new-privileges:true \
     --pids-limit 128 \
     --env-file "$env_file" \
+    --env GEN_AUTOMATION_I2V_ENABLED=true \
+    --env GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED=true \
     --volume "$preseed_state:/run/preseed-state.json:ro" \
     --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,uid=10001,gid=10001,mode=1770 \
     --entrypoint python3.12 \
