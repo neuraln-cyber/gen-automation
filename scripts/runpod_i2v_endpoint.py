@@ -214,6 +214,7 @@ def _spec(
             "GEN_I2V_WORKER_LORA_WORKER_ENABLED": "true",
             "GEN_I2V_WORKER_SOURCE_REVISION": source_revision,
             "GEN_I2V_WORKER_PRIVATE_MANIFEST_SOURCE_SHA256": (manifest_source_sha256),
+            "GEN_I2V_WORKER_REQUIRE_PRESEEDED_VOLUME": "true",
             "GEN_I2V_WORKER_VOLUME_ROOT": "/runpod-volume",
         },
         "isPublic": False,

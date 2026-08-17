@@ -77,6 +77,7 @@ def test_plan_scales_to_zero_and_preserves_provider_neutral_worker_contract() ->
     assert spec["endpoint"]["flashboot"] is True
     assert spec["template"]["dockerEntrypoint"] == []
     assert spec["template"]["env"]["GEN_I2V_WORKER_LORA_WORKER_ENABLED"] == "true"
+    assert spec["template"]["env"]["GEN_I2V_WORKER_REQUIRE_PRESEEDED_VOLUME"] == "true"
     assert "AWS_" not in json.dumps(spec)
     assert "RUNPOD_API_KEY" not in json.dumps(spec)
 
