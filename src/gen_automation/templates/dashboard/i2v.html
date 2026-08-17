@@ -21,14 +21,14 @@
         <h1>Image to video</h1>
         <p class="lede">
           Pick a generation or upload an image, describe the motion, and keep the
-          RTX 5090 fed with an ordered queue. Presets preserve every advanced setting.
+          RunPod GPU fed with an ordered queue. Presets preserve every advanced setting.
         </p>
       </div>
       <aside class="i2v-worker" data-worker-card aria-live="polite">
         <div class="i2v-worker-heading">
           <span class="i2v-worker-dot unknown" data-worker-dot aria-hidden="true"></span>
           <div>
-            <small>RTX 5090 worker</small>
+            <small>RunPod video worker</small>
             <strong data-worker-state>Checking provider state…</strong>
           </div>
         </div>
@@ -41,7 +41,7 @@
       </aside>
     </header>
 
-    <output class="i2v-banner" data-global-status aria-live="polite"{% if hires_profile_enabled %} hidden{% endif %}>{% if not hires_profile_enabled %}Higher-resolution submissions are paused while the matching RTX 5090 worker is rolled out.{% endif %}</output>
+    <output class="i2v-banner" data-global-status aria-live="polite"{% if hires_profile_enabled %} hidden{% endif %}>{% if not hires_profile_enabled %}Higher-resolution submissions are paused while the matching RunPod worker is rolled out.{% endif %}</output>
 
     <div class="i2v-workspace">
       <section class="panel i2v-source-panel" aria-labelledby="i2v-source-heading">
