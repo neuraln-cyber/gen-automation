@@ -66,10 +66,15 @@ def test_plan_scales_to_zero_and_preserves_provider_neutral_worker_contract() ->
     assert spec["endpoint"]["workersMin"] == 0
     assert spec["endpoint"]["workersMax"] == 1
     assert spec["endpoint"]["gpuTypeIds"] == [
+        "NVIDIA RTX PRO 4500 Blackwell",
+        "NVIDIA GeForce RTX 5090",
         "NVIDIA A40",
         "NVIDIA RTX A6000",
         "NVIDIA L40S",
     ]
+    assert spec["template"]["env"]["GEN_I2V_WORKER_ALLOWED_GPU_NAMES_CSV"] == (
+        ",".join(spec["endpoint"]["gpuTypeIds"])
+    )
     assert spec["endpoint"]["flashboot"] is True
     assert spec["template"]["dockerEntrypoint"] == []
     assert spec["template"]["env"]["GEN_I2V_WORKER_LORA_WORKER_ENABLED"] == "true"
@@ -200,3 +205,64 @@ def test_apply_temporarily_warms_then_scales_existing_endpoint_to_zero(
     assert module.apply(cold_spec, state_file=state_file)["status"] == "ready"
     assert resources["/endpoints"][0]["workersMin"] == 0
     assert patches == [1, 0]
+
+
+def test_apply_updates_existing_template_with_mutable_fields_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    spec = _spec(module)
+    state_file = tmp_path / "state.json"
+    monkeypatch.setenv(module.SPEND_SWITCH, "true")
+    monkeypatch.setenv("RUNPOD_API_KEY", "test-key-never-persisted")
+    volume = {**spec["volume"], "id": "volume-1"}
+    template = {
+        **spec["template"],
+        "id": "template-1",
+        "env": {
+            key: value
+            for key, value in spec["template"]["env"].items()
+            if key != "GEN_I2V_WORKER_ALLOWED_GPU_NAMES_CSV"
+        },
+    }
+    endpoint = {
+        **spec["endpoint"],
+        "id": "endpoint-1",
+        "templateId": "template-1",
+        "networkVolumeId": "volume-1",
+    }
+    resources = {
+        "/networkvolumes": [volume],
+        "/templates?includeEndpointBoundTemplates=true": [template],
+        "/endpoints": [endpoint],
+    }
+    mutations: list[tuple[str, str, dict[str, Any]]] = []
+
+    def fake_list(_api_key: str, path: str) -> list[dict[str, Any]]:
+        return resources[path]
+
+    def fake_mutate(
+        _api_key: str,
+        path: str,
+        *,
+        method: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        mutations.append((method, path, payload))
+        assert path == "/templates/template-1"
+        assert method == "PATCH"
+        assert "category" not in payload
+        assert "isServerless" not in payload
+        updated = {**template, **payload}
+        resources["/templates?includeEndpointBoundTemplates=true"][:] = [updated]
+        return updated
+
+    monkeypatch.setattr(module, "_list", fake_list)
+    monkeypatch.setattr(module, "_mutate", fake_mutate)
+
+    assert module.apply(spec, state_file=state_file)["status"] == "ready"
+    assert len(mutations) == 1
+    assert mutations[0][2]["env"]["GEN_I2V_WORKER_ALLOWED_GPU_NAMES_CSV"] == (
+        ",".join(spec["endpoint"]["gpuTypeIds"])
+    )
