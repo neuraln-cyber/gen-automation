@@ -722,6 +722,7 @@ class ControllerWorkloads:
                 runpod_client=runpod_client,
                 input_builder=I2VRunPodGrantBuilder(
                     store=object_store,
+                    model_store=model_artifact_store.store,
                     expires_in=settings.i2v_object_grant_ttl_seconds,
                     model_objects=i2v_worker_model_objects(settings),
                     output_prefix=settings.i2v_output_prefix,
@@ -731,6 +732,7 @@ class ControllerWorkloads:
             and settings.i2v_runpod_enabled
             and runpod_client is not None
             and object_store is not None
+            and model_artifact_store is not None
             else (
                 I2VRuntime(
                     config=i2v_salad_runtime_config_from_settings(settings),

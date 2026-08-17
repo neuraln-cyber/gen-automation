@@ -15,6 +15,8 @@ aws_region="eu-central-1"
 
 operation=""
 network_volume_id=""
+worker_image=""
+worker_source_revision=""
 rollback_armed=0
 
 fail() {
@@ -30,6 +32,8 @@ rewrite_env() {
   chown --reference="$env_file" "$temporary"
   CUTOVER_MODE="$mode" \
   CUTOVER_NETWORK_VOLUME_ID="$network_volume_id" \
+  CUTOVER_WORKER_IMAGE="$worker_image" \
+  CUTOVER_WORKER_SOURCE_REVISION="$worker_source_revision" \
   CUTOVER_RUNPOD_KEY="${CUTOVER_RUNPOD_KEY:-}" \
   python3 - "$env_file" "$temporary" <<'PY'
 import os
@@ -70,14 +74,22 @@ if mode == "enable":
             "GEN_AUTOMATION_I2V_RUNPOD_NETWORK_VOLUME_ID": os.environ[
                 "CUTOVER_NETWORK_VOLUME_ID"
             ],
+            "GEN_AUTOMATION_I2V_WORKER_IMAGE": os.environ["CUTOVER_WORKER_IMAGE"],
+            "GEN_AUTOMATION_I2V_WORKER_SOURCE_REVISION": os.environ[
+                "CUTOVER_WORKER_SOURCE_REVISION"
+            ],
             "GEN_AUTOMATION_I2V_RUNPOD_API_KEY": os.environ["CUTOVER_RUNPOD_KEY"],
             "GEN_AUTOMATION_I2V_RUNPOD_CLAIM_URL": (
                 public_base + "/api/v1/i2v/runpod/claim"
             ),
         }
     )
+optional_empty = {
+    "GEN_AUTOMATION_I2V_RUNPOD_ENDPOINT_ID",
+    "GEN_AUTOMATION_I2V_RUNPOD_NETWORK_VOLUME_ID",
+}
 for key, value in values.items():
-    if (not value and key != "GEN_AUTOMATION_I2V_RUNPOD_ENDPOINT_ID") or any(
+    if (not value and key not in optional_empty) or any(
         character in value for character in "\r\n\0"
     ):
         raise SystemExit("invalid environment value")
@@ -191,7 +203,7 @@ verify_preseed_identity() {
   [[ "$image" =~ ^ghcr[.]io/neuraln-cyber/gen-automation/control-plane-mega@sha256:[0-9a-f]{64}$ ]] ||
     fail "deployed control-plane image is not an immutable official digest"
   /usr/bin/docker run --rm --init --interactive --read-only \
-    --user 10001:10001 \
+    --user 0:0 \
     --cap-drop ALL \
     --cap-add DAC_READ_SEARCH \
     --security-opt no-new-privileges:true \
@@ -289,7 +301,13 @@ cleanup() {
   set +e
   if [ "$status" -ne 0 ] && [ "$rollback_armed" -eq 1 ]; then
     printf '%s\n' "Cutover failed; restoring the prior provider configuration." >&2
-    restore_original || printf '%s\n' "Automatic rollback requires operator attention." >&2
+    if restore_original; then
+      rm -f -- "$marker" "$original_env"
+      rmdir -- "$active_root" ||
+        printf '%s\n' "Automatic rollback cleanup requires operator attention." >&2
+    else
+      printf '%s\n' "Automatic rollback requires operator attention." >&2
+    fi
   fi
   unset CUTOVER_RUNPOD_KEY
   exit "$status"
@@ -297,15 +315,23 @@ cleanup() {
 trap cleanup EXIT
 
 [ "$(id -u)" -eq 0 ] || fail "run as root through AWS Systems Manager"
-[ "$#" -ge 1 ] || fail "usage: $0 --enable --network-volume-id <id> | --rollback"
+[ "$#" -ge 1 ] ||
+  fail "usage: $0 --enable --network-volume-id <id> --worker-image <ref> --worker-source-revision <sha> | --rollback"
 case "$1" in
   --enable)
-    [ "$#" -eq 3 ] && [ "$2" = "--network-volume-id" ] ||
-      fail "enable requires --network-volume-id"
+    [ "$#" -eq 7 ] && [ "$2" = "--network-volume-id" ] &&
+      [ "$4" = "--worker-image" ] && [ "$6" = "--worker-source-revision" ] ||
+      fail "enable requires exact network volume, worker image, and worker source"
     operation="enable"
     network_volume_id="$3"
+    worker_image="$5"
+    worker_source_revision="$7"
     [[ "$network_volume_id" =~ ^[A-Za-z0-9_-]{3,128}$ ]] ||
       fail "invalid network volume ID"
+    [[ "$worker_image" =~ ^ghcr[.]io/neuraln-cyber/gen-automation/i2v-worker@sha256:[0-9a-f]{64}$ ]] ||
+      fail "invalid immutable I2V worker image"
+    [[ "$worker_source_revision" =~ ^[0-9a-f]{40}$ ]] ||
+      fail "invalid I2V worker source revision"
     ;;
   --rollback)
     [ "$#" -eq 1 ] || fail "rollback accepts no additional arguments"
@@ -371,7 +397,8 @@ rewrite_env enable
 unset CUTOVER_RUNPOD_KEY
 restart_control_plane
 
-python3 - "$marker" "$network_volume_id" "$env_file" <<'PY'
+python3 - "$marker" "$network_volume_id" "$worker_image" "$worker_source_revision" \
+  "$env_file" <<'PY'
 import hashlib
 import json
 import os
@@ -379,10 +406,12 @@ import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
-environment = pathlib.Path(sys.argv[3]).read_bytes()
+environment = pathlib.Path(sys.argv[5]).read_bytes()
 payload = {
     "schema": "gen-automation/i2v-runpod-cutover/v1",
     "network_volume_id": sys.argv[2],
+    "worker_image": sys.argv[3],
+    "worker_source_revision": sys.argv[4],
     "cutover_env_sha256": hashlib.sha256(environment).hexdigest(),
 }
 path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")

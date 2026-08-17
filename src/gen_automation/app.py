@@ -94,18 +94,16 @@ async def _browser_authentication_exception_handler(
     return await http_exception_handler(request, error)
 
 
-async def _build_lora_integrations(
-    settings: Settings,
-) -> tuple[S3ObjectStore, ModelArtifactStore, CivitaiClient]:
+def _build_model_object_store(settings: Settings) -> S3ObjectStore:
     bucket = settings.salad_worker_artifact_bucket
     region = settings.salad_worker_artifact_region
     if bucket is None or region is None:
-        raise RuntimeError("validated LoRA private-storage settings are incomplete")
+        raise RuntimeError("validated model private-storage settings are incomplete")
     access_key = settings.salad_worker_artifact_access_key_id
     secret_key = settings.salad_worker_artifact_secret_access_key
     session_token = settings.salad_worker_artifact_session_token
     artifact_endpoint = settings.salad_worker_artifact_endpoint_url
-    model_store = S3ObjectStore(
+    return S3ObjectStore(
         bucket=bucket.get_secret_value(),
         region=region.get_secret_value(),
         endpoint_url=(
@@ -115,6 +113,12 @@ async def _build_lora_integrations(
         secret_access_key=(secret_key.get_secret_value() if secret_key is not None else None),
         session_token=(session_token.get_secret_value() if session_token is not None else None),
     )
+
+
+async def _build_lora_integrations(
+    settings: Settings,
+) -> tuple[S3ObjectStore, ModelArtifactStore, CivitaiClient]:
+    model_store = _build_model_object_store(settings)
     try:
         token = await load_civitai_api_key(settings)
         if token is None:
@@ -170,6 +174,10 @@ async def _build_app_integrations(settings: Settings) -> AsyncIterator[_AppInteg
             ) = await _build_lora_integrations(settings)
             cleanup.push_async_callback(model_object_store.close)
             cleanup.push_async_callback(civitai_client.close)
+        elif settings.i2v_enabled and settings.i2v_runpod_enabled:
+            model_object_store = _build_model_object_store(settings)
+            model_artifact_store = ModelArtifactStore(model_object_store)
+            cleanup.push_async_callback(model_object_store.close)
 
         salad_client: SaladClient | None = None
         if settings.salad_enabled:

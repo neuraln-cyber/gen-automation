@@ -199,6 +199,7 @@ class I2VRunPodGrantBuilder:
     """Issue input/output plus immutable model grants for one RunPod job."""
 
     store: ObjectStore
+    model_store: ObjectStore
     expires_in: int
     model_objects: tuple[ModelObject, ...]
     output_prefix: str = "i2v/outputs"
@@ -219,11 +220,11 @@ class I2VRunPodGrantBuilder:
         grants: list[JSONValue] = []
         try:
             for model in self.model_objects:
-                if model.bucket != self.store.bucket:
+                if model.bucket != self.model_store.bucket:
                     raise I2VMediaConflictError(
                         "I2V model object is outside the configured private store"
                     )
-                url = await self.store.presign_download(
+                url = await self.model_store.presign_download(
                     key=model.key,
                     version_id=model.version_id,
                     expires_in=self.expires_in,
