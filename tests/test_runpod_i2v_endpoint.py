@@ -186,6 +186,7 @@ def test_apply_temporarily_warms_then_scales_existing_endpoint_to_zero(
     ) -> dict[str, Any]:
         assert path == "/endpoints/endpoint-1"
         assert method == "PATCH"
+        assert "computeType" not in payload
         patches.append(int(payload["workersMin"]))
         updated = {**payload, "id": "endpoint-1"}
         resources["/endpoints"][:] = [updated]

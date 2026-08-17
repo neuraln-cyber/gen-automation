@@ -438,6 +438,9 @@ def apply(spec: dict[str, dict[str, Any]], *, state_file: Path) -> dict[str, Any
         "templateId": template_id,
         "networkVolumeId": volume_id,
     }
+    endpoint_patch_payload = {
+        key: value for key, value in endpoint_payload.items() if key != "computeType"
+    }
     endpoint = _find_unique(
         api_key,
         path="/endpoints",
@@ -466,7 +469,7 @@ def apply(spec: dict[str, dict[str, Any]], *, state_file: Path) -> dict[str, Any
             api_key,
             f"/endpoints/{urllib.parse.quote(endpoint_id, safe='')}",
             method="PATCH",
-            payload=endpoint_payload,
+            payload=endpoint_patch_payload,
         )
     else:
         try:
@@ -482,7 +485,7 @@ def apply(spec: dict[str, dict[str, Any]], *, state_file: Path) -> dict[str, Any
                 api_key,
                 f"/endpoints/{urllib.parse.quote(endpoint_id, safe='')}",
                 method="PATCH",
-                payload=endpoint_payload,
+                payload=endpoint_patch_payload,
             )
     _verify_endpoint(
         endpoint,
