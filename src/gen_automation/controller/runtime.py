@@ -124,6 +124,7 @@ from gen_automation.services.salad import (
     submit_prepared_attempt,
 )
 from gen_automation.services.salad_deployments import (
+    effective_worker_min_replicas,
     ensure_container_group_queue_admission,
     provision_deployment_step,
     reconcile_deployment,
@@ -1805,9 +1806,17 @@ class ControllerWorkloads:
                         active_generation_attempt_id=str(active_attempt_id),
                     )
             if cold_queue_admission_required:
+                effective_min_replicas = await effective_worker_min_replicas(
+                    session,
+                    salad_deployment_id=deployment.id,
+                    now=datetime.now(UTC),
+                )
+                if effective_min_replicas != 1:
+                    raise RuntimeError("durable Salad queue admission demand is unavailable")
                 await ensure_container_group_queue_admission(
                     deployment,
                     self.salad_client,
+                    effective_min_replicas=effective_min_replicas,
                 )
             input_provider = SaladWorkerJobInputProvider(
                 session=session,

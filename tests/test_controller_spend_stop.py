@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -35,6 +35,7 @@ from gen_automation.domain.enums import (
     GenerationAttemptState,
     GenerationState,
     OutboxStatus,
+    ReleasePhase,
     SaladDeploymentPurpose,
     SaladDeploymentState,
 )
@@ -707,6 +708,130 @@ async def test_submit_reuses_active_runtime_then_refreshes_same_manifest_at_idle
             second.generation_attempt_id,
             second.generation_attempt_id,
         ]
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cold_submit_uses_claimed_outbox_demand_before_queue_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'cold-admission.db').as_posix()}")
+    await database.create_schema()
+    try:
+        context = await _seed_submission_database(database)
+        async with database.sessions() as session:
+            attempt = await session.get(GenerationAttempt, context.attempt_id)
+            event = await session.scalar(
+                select(OutboxEvent).where(OutboxEvent.aggregate_id == context.attempt_id)
+            )
+            release = await session.scalar(select(Release))
+            assert attempt is not None
+            assert event is not None
+            assert release is not None
+            release.phase = ReleasePhase.GENERATING
+            event.status = OutboxStatus.PROCESSING
+            event.attempts = 1
+            event.lease_owner = "controller-submit"
+            event.lease_expires_at = datetime.now(UTC) + timedelta(minutes=5)
+            await session.commit()
+            outbox_id = event.id
+
+        admissions: list[tuple[UUID, int]] = []
+        submissions: list[UUID] = []
+
+        async def fake_refresh(
+            deployment: SaladDeployment,
+            client: object,
+            resolver: object,
+            *,
+            environment_overrides: Mapping[str, str] | None = None,
+        ) -> SaladContainerGroup:
+            del client, resolver, environment_overrides
+            group = _group(deployment.container_group_name, deployment.queue_name)
+            return replace(
+                group,
+                current_state=replace(
+                    group.current_state,
+                    status="stopped",
+                    description="stopped",
+                    running_count=0,
+                    start_time=None,
+                    finish_time=NOW,
+                ),
+            )
+
+        async def fake_admission(
+            deployment: SaladDeployment,
+            client: object,
+            *,
+            effective_min_replicas: int,
+        ) -> SaladContainerGroup:
+            del client
+            admissions.append((deployment.id, effective_min_replicas))
+            return _group(deployment.container_group_name, deployment.queue_name)
+
+        async def fake_submit(
+            *args: object,
+            generation_attempt_id: UUID,
+            **kwargs: object,
+        ) -> SubmissionResult:
+            del args, kwargs
+            submissions.append(generation_attempt_id)
+            return SubmissionResult(
+                generation_attempt_id=generation_attempt_id,
+                attempt_state=GenerationAttemptState.CREATED,
+                generation_job_state=GenerationState.CLAIMED,
+                disposition=SubmissionDisposition.SUBMITTED,
+                mutation_effect=MutationEffect.CONFIRMED,
+                provider_external_id="provider-job",
+            )
+
+        monkeypatch.setattr(
+            controller_runtime,
+            "refresh_container_group_runtime",
+            fake_refresh,
+        )
+        monkeypatch.setattr(
+            controller_runtime,
+            "ensure_container_group_queue_admission",
+            fake_admission,
+        )
+        monkeypatch.setattr(
+            ControllerWorkloads,
+            "_effective_artifact_manifest",
+            _empty_effective_artifact_manifest,
+        )
+        monkeypatch.setattr(controller_runtime, "submit_prepared_attempt", fake_submit)
+        workloads = ControllerWorkloads(
+            settings=Settings(
+                worker_signing_key_id="worker-key-1",
+                worker_signing_private_key=WORKER_SIGNING_PRIVATE_KEY,
+            ),
+            sessions=database.sessions,
+            instance_id="controller-cold-admission-test",
+            salad_client=cast(SaladClient, object()),
+            object_store=cast(ObjectStore, object()),
+        )
+        claimed = ClaimedOutboxEvent(
+            id=outbox_id,
+            topic=SALAD_JOB_SUBMIT_TOPIC,
+            dedupe_key=f"{SALAD_JOB_SUBMIT_TOPIC}:{context.attempt_id}",
+            correlation_id=str(context.attempt_id),
+            aggregate_type=GENERATION_ATTEMPT_AGGREGATE,
+            aggregate_id=context.attempt_id,
+            payload={"generation_attempt_id": str(context.attempt_id)},
+            attempt=1,
+            max_attempts=10,
+            lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+
+        await workloads._submit_event(claimed, progress=_SubmissionProgress())
+
+        assert len(admissions) == 1
+        assert admissions[0][1] == 1
+        assert submissions == [context.attempt_id]
     finally:
         await database.dispose()
 
