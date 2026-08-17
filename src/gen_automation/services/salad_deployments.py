@@ -17,6 +17,7 @@ from gen_automation.db.models import (
     AuditEvent,
     GenerationAttempt,
     GenerationJob,
+    OutboxEvent,
     ProviderBudgetGuard,
     Release,
     ReleaseVersion,
@@ -27,6 +28,7 @@ from gen_automation.domain.enums import (
     DesiredDeploymentState,
     GenerationAttemptState,
     GenerationState,
+    OutboxStatus,
     ReleasePhase,
     SaladDeploymentPurpose,
     SaladDeploymentState,
@@ -60,6 +62,10 @@ from gen_automation.services.budgets import (
 )
 from gen_automation.services.experiment_warm_leases import (
     effective_experiment_min_replicas,
+)
+from gen_automation.services.outbox import (
+    GENERATION_ATTEMPT_AGGREGATE,
+    SALAD_JOB_SUBMIT_TOPIC,
 )
 from gen_automation.services.runtime_secrets import (
     RuntimeSecretResolutionError,
@@ -766,13 +772,43 @@ async def effective_worker_min_replicas(
             AuditEvent.action == _GENERATION_STOP_REQUESTED_ACTION,
         )
     )
-    # A local queued/retryable job has not crossed the provider boundary yet.
-    # Raising the minimum here can start a scaled-to-zero group before the
-    # runtime refresh replaces its short-lived artifact credentials. Keep the
-    # group at zero until either a warm lease records the refreshed provider
-    # version above or submission records durable provider work below. Salad's
-    # queue autoscaler then supplies the same demand signal without booting a
-    # stale container.
+    # A merely pending local job has not crossed the runtime-refresh boundary
+    # yet, so it must not start a worker with stale short-lived credentials.
+    # Once the submit outbox event is durably claimed, however, that processing
+    # lease is the exact admission demand which owns the refresh and subsequent
+    # provider POST. Keep one worker through that cold-admission window. The
+    # lease is released on every definitely-unstarted failure, so it cannot
+    # leave an idle worker behind.
+    claimed_admission_id = await session.scalar(
+        select(OutboxEvent.id)
+        .join(GenerationAttempt, GenerationAttempt.id == OutboxEvent.aggregate_id)
+        .join(GenerationJob, GenerationJob.id == GenerationAttempt.job_id)
+        .join(ReleaseVersion, ReleaseVersion.id == GenerationJob.release_version_id)
+        .join(Release, Release.id == ReleaseVersion.release_id)
+        .where(
+            OutboxEvent.topic == SALAD_JOB_SUBMIT_TOPIC,
+            OutboxEvent.aggregate_type == GENERATION_ATTEMPT_AGGREGATE,
+            OutboxEvent.status == OutboxStatus.PROCESSING,
+            OutboxEvent.lease_expires_at.is_not(None),
+            OutboxEvent.lease_expires_at > now,
+            GenerationAttempt.salad_deployment_id == salad_deployment_id,
+            GenerationAttempt.provider == _PROVIDER,
+            GenerationAttempt.state == GenerationAttemptState.CREATED,
+            GenerationJob.provider == _PROVIDER,
+            GenerationJob.state == GenerationState.CLAIMED,
+            Release.phase.in_(_GENERATION_ACTIVE_RELEASE_PHASES),
+            Release.current_version_no == ReleaseVersion.version_no,
+            ~stop_marker,
+        )
+        .order_by(OutboxEvent.created_at, OutboxEvent.id)
+        .limit(1)
+    )
+    if claimed_admission_id is not None:
+        return 1
+
+    # After the provider POST is durably recorded, the attempt itself becomes
+    # the demand signal. Salad's queue autoscaler then keeps the same worker
+    # available until that provider work becomes terminal.
     active_attempt_id = await session.scalar(
         select(GenerationAttempt.id)
         .join(GenerationJob, GenerationJob.id == GenerationAttempt.job_id)
@@ -1544,10 +1580,11 @@ async def ensure_container_group_queue_admission(
     deployment: SaladDeployment,
     client: SaladDeploymentClient,
     *,
+    effective_min_replicas: int,
     convergence_timeout_seconds: float = _QUEUE_ADMISSION_CONVERGENCE_TIMEOUT_SECONDS,
     poll_interval_seconds: float = _QUEUE_ADMISSION_POLL_SECONDS,
 ) -> SaladContainerGroup:
-    """Prove the exact image group is attached to its queue before a job POST."""
+    """Hold one exact worker and prove its queue attachment before a job POST."""
 
     if (
         deployment.provider_queue_id is None
@@ -1557,9 +1594,52 @@ async def ensure_container_group_queue_admission(
         or deployment.desired_state != DesiredDeploymentState.ACTIVE
     ):
         raise SaladDeploymentValidationError("deployment is not ready for queue admission")
+    if effective_min_replicas != 1:
+        raise SaladDeploymentValidationError("durable queue admission demand is required")
     try:
         initial = await client.get_container_group(deployment.container_group_name)
-        _validate_runtime_group(deployment, initial)
+        try:
+            _validate_runtime_group(
+                deployment,
+                initial,
+                effective_min_replicas=effective_min_replicas,
+            )
+        except SaladDeploymentValidationError:
+            # A stopped idle group is expected to retain the configured zero
+            # minimum until a submit event is durably claimed. Accept only that
+            # exact zero-minimum contract before raising it for this admission;
+            # every other drift remains fatal.
+            _validate_runtime_group(deployment, initial, effective_min_replicas=0)
+            updated = await client.update_container_group(
+                deployment.container_group_name,
+                {
+                    "queue_autoscaler": _desired_queue_autoscaler(
+                        deployment,
+                        min_replicas=effective_min_replicas,
+                    )
+                },
+            )
+            _validate_runtime_group(
+                deployment,
+                updated,
+                effective_min_replicas=effective_min_replicas,
+            )
+            if updated.version < initial.version:
+                raise SaladDeploymentValidationError(
+                    "queue admission autoscaler update was not accepted"
+                ) from None
+            target_version = max(initial.version + 1, updated.version)
+            async with asyncio.timeout(convergence_timeout_seconds):
+                while True:
+                    initial = await client.get_container_group(deployment.container_group_name)
+                    _validate_runtime_group(
+                        deployment,
+                        initial,
+                        effective_min_replicas=effective_min_replicas,
+                    )
+                    if initial.version >= target_version and not initial.pending_change:
+                        break
+                    await asyncio.sleep(poll_interval_seconds)
         if initial.pending_change:
             raise SaladDeploymentValidationError("container group has a pending change")
         if _is_authoritatively_stopped(initial):
@@ -1568,7 +1648,11 @@ async def ensure_container_group_queue_admission(
         async with asyncio.timeout(convergence_timeout_seconds):
             while True:
                 group = await client.get_container_group(deployment.container_group_name)
-                _validate_runtime_group(deployment, group)
+                _validate_runtime_group(
+                    deployment,
+                    group,
+                    effective_min_replicas=effective_min_replicas,
+                )
                 if group.status.strip().lower() == "failed":
                     raise SaladDeploymentValidationError("container group failed before admission")
                 queue = await client.get_queue(deployment.queue_name)
@@ -1610,13 +1694,22 @@ def _queue_contains_exact_group(
 def _validate_runtime_group(
     deployment: SaladDeployment,
     group: SaladContainerGroup,
+    *,
+    effective_min_replicas: int | None = None,
 ) -> None:
     if (
         group.name != deployment.container_group_name
         or str(group.id) != deployment.provider_container_group_id
     ):
         raise SaladDeploymentValidationError("container group identity does not match deployment")
-    if _group_configuration_drift(deployment, group) is not None:
+    if (
+        _group_configuration_drift(
+            deployment,
+            group,
+            effective_min_replicas=effective_min_replicas,
+        )
+        is not None
+    ):
         raise SaladDeploymentValidationError(
             "container group configuration does not match deployment"
         )

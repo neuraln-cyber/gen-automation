@@ -16,6 +16,7 @@ from gen_automation.db.models import (
     ExperimentWarmLease,
     GenerationAttempt,
     GenerationJob,
+    OutboxEvent,
     Project,
     Release,
     ReleaseVersion,
@@ -29,6 +30,7 @@ from gen_automation.domain.enums import (
     ExperimentWarmLeaseState,
     GenerationAttemptState,
     GenerationState,
+    OutboxStatus,
     ReleasePhase,
     ResourceHealth,
     SaladDeploymentPurpose,
@@ -49,6 +51,7 @@ from gen_automation.services.experiment_warm_leases import (
     start_experiment_warm_lease,
     touch_completed_experiment_warm_leases,
 )
+from gen_automation.services.outbox import SALAD_JOB_SUBMIT_TOPIC
 from gen_automation.services.salad import prepare_generation_attempt
 from gen_automation.services.salad_deployments import (
     _desired_queue_autoscaler,
@@ -706,6 +709,51 @@ async def test_nonexecuting_attempt_does_not_hold_worker(
             suffix=109,
             state=attempt_state,
         )
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_claimed_submit_event_holds_worker_during_cold_admission(
+    warm_context: WarmContext,
+) -> None:
+    async with warm_context.database.sessions() as session:
+        _, attempt = await _prepare_attempt(
+            session,
+            warm_context,
+            suffix=112,
+            state=GenerationAttemptState.CREATED,
+        )
+        event = await session.scalar(
+            select(OutboxEvent).where(
+                OutboxEvent.topic == SALAD_JOB_SUBMIT_TOPIC,
+                OutboxEvent.aggregate_id == attempt.id,
+            )
+        )
+        assert event is not None
+        event.status = OutboxStatus.PROCESSING
+        event.attempts = 1
+        event.lease_owner = "controller-submit"
+        event.lease_expires_at = NOW + timedelta(minutes=5)
+        await session.flush()
+
+        assert (
+            await effective_worker_min_replicas(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                now=NOW,
+            )
+            == 1
+        )
+
+        event.lease_expires_at = NOW
+        await session.flush()
         assert (
             await effective_worker_min_replicas(
                 session,
