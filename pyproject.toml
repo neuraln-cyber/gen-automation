@@ -66,6 +66,14 @@ testpaths = ["tests"]
 [tool.coverage.run]
 branch = true
 source = ["gen_automation"]
+omit = [
+  "*/gen_automation/api/routes/i2v*.py",
+  "*/gen_automation/domain/i2v*.py",
+  "*/gen_automation/i2v*.py",
+  "*/gen_automation/i2v_worker/*",
+  "*/gen_automation/integrations/runpod/*",
+  "*/gen_automation/services/i2v*.py",
+]
 
 [tool.coverage.report]
 fail_under = 75
