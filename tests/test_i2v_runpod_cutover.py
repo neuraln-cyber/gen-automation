@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
+from typing import Any, Self
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "infra/aws-staging/deploy/cutover-i2v-runpod.sh"
 ENV_EXAMPLE = ROOT / "infra/aws-staging/deploy/control-plane.env.example"
+ABSENT = object()
 
 
 def _script() -> str:
@@ -55,8 +59,11 @@ def test_cutover_freezes_and_proves_zero_work_before_enabling_runpod() -> None:
     assert script.count("https://rest.runpod.io/v1/pods?computeType=GPU") == 1
     assert '"https://rest.runpod.io/v1/endpoints/"' in script
     assert '"https://rest.runpod.io/v1/templates/"' in script
-    assert 'endpoint.get("flashboot") is not True' in script
-    assert 'endpoint.get("dataCenterIds") != [data_center_id]' in script
+    assert '"flashboot" in endpoint and endpoint["flashboot"] is not True' in script
+    assert 'if "dataCenterIds" in endpoint:' in script
+    assert 'endpoint_data_centers = endpoint["dataCenterIds"]' in script
+    assert 'endpoint_data_centers.split(",")' in script
+    assert "endpoint_data_centers != [data_center_id]" in script
     assert 'template.get("imageName") != worker_image' in script
     assert 'environment.get("GEN_I2V_WORKER_REQUIRE_PRESEEDED_VOLUME") != "true"' in script
     assert 'volume.get("dataCenterId")' in script
@@ -67,6 +74,103 @@ def test_cutover_freezes_and_proves_zero_work_before_enabling_runpod() -> None:
     assert 'pod["name"].startswith("gen-automation-i2v-")' in script
     assert script.count("--env GEN_AUTOMATION_I2V_ENABLED=true") == 1
     assert script.count("--env GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED=true") == 1
+
+
+@pytest.mark.parametrize(
+    ("endpoint_data_centers", "endpoint_flashboot", "accepted"),
+    [
+        (ABSENT, None, True),
+        (None, None, False),
+        ("US-IL-1", None, True),
+        (["US-IL-1"], True, True),
+        ("US-IL-1", False, False),
+        ("US-IL-1,", None, False),
+        (",US-IL-1", None, False),
+        ("US-IL-1,EU-RO-1", None, False),
+    ],
+)
+def test_provider_verifier_accepts_documented_datacenter_serializations(
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint_data_centers: object,
+    endpoint_flashboot: bool | None,
+    accepted: bool,
+) -> None:
+    program = next(
+        item
+        for item in re.findall(r"<<'PY'\n(.*?)\nPY", _script(), flags=re.DOTALL)
+        if "https://rest.runpod.io/v1/networkvolumes" in item
+    )
+    endpoint_id = "endpoint-1"
+    volume_id = "volume-1"
+    template_id = "template-1"
+    image = "ghcr.io/example/i2v-worker@sha256:" + "a" * 64
+    revision = "b" * 40
+    endpoint: dict[str, object] = {
+        "id": endpoint_id,
+        "name": "gen-automation-i2v-staging",
+        "networkVolumeId": volume_id,
+        "workersMin": 0,
+        "workersMax": 1,
+        "templateId": template_id,
+    }
+    if endpoint_data_centers is not ABSENT:
+        endpoint["dataCenterIds"] = endpoint_data_centers
+    if endpoint_flashboot is not None:
+        endpoint["flashboot"] = endpoint_flashboot
+    payloads = {
+        "https://rest.runpod.io/v1/networkvolumes": [
+            {"id": volume_id, "dataCenterId": "US-IL-1", "size": 100}
+        ],
+        "https://rest.runpod.io/v1/pods?computeType=GPU": [],
+        f"https://rest.runpod.io/v1/endpoints/{endpoint_id}": endpoint,
+        f"https://rest.runpod.io/v1/templates/{template_id}": {
+            "id": template_id,
+            "imageName": image,
+            "env": {
+                "GEN_I2V_WORKER_SOURCE_REVISION": revision,
+                "GEN_I2V_WORKER_VOLUME_ROOT": "/runpod-volume",
+                "GEN_I2V_WORKER_REQUIRE_PRESEEDED_VOLUME": "true",
+                "GEN_I2V_WORKER_LORA_WORKER_ENABLED": "true",
+            },
+        },
+    }
+
+    class _Response:
+        def __init__(self, payload: object) -> None:
+            self._body = json.dumps(payload).encode()
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def read(self, _: int) -> bytes:
+            return self._body
+
+    def fake_urlopen(request: Any, *, timeout: int) -> _Response:
+        assert timeout == 30
+        return _Response(payloads[request.full_url])
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    environment = {
+        "CUTOVER_RUNPOD_MODE": "serverless",
+        "CUTOVER_ENDPOINT_ID": endpoint_id,
+        "CUTOVER_NETWORK_VOLUME_ID": volume_id,
+        "CUTOVER_WORKER_IMAGE": image,
+        "CUTOVER_WORKER_SOURCE_REVISION": revision,
+        "CUTOVER_RUNPOD_KEY": "test-key",
+        "CUTOVER_PRESEED_VOLUME_ID": volume_id,
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    compiled = compile(program, "cutover-i2v-runpod-provider", "exec")
+    if accepted:
+        exec(compiled, {})  # noqa: S102
+    else:
+        with pytest.raises(SystemExit, match="RunPod provider verification failed"):
+            exec(compiled, {})  # noqa: S102
 
 
 def test_cutover_freeze_allows_both_provider_coordinates_to_be_empty(tmp_path: Path) -> None:

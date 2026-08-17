@@ -224,12 +224,25 @@ try:
         endpoint_volumes = endpoint.get("networkVolumeIds")
         if endpoint.get("networkVolumeId") != volume_id and endpoint_volumes != [volume_id]:
             raise ValueError
+        if "dataCenterIds" in endpoint:
+            endpoint_data_centers = endpoint["dataCenterIds"]
+            if isinstance(endpoint_data_centers, str):
+                endpoint_data_centers = [
+                    item.strip() for item in endpoint_data_centers.split(",")
+                ]
+            elif not (
+                isinstance(endpoint_data_centers, list)
+                and all(isinstance(item, str) for item in endpoint_data_centers)
+            ):
+                raise ValueError
+            if endpoint_data_centers != [data_center_id]:
+                raise ValueError
+        if "flashboot" in endpoint and endpoint["flashboot"] is not True:
+            raise ValueError
         if (
             endpoint.get("name") != "gen-automation-i2v-staging"
-            or endpoint.get("dataCenterIds") != [data_center_id]
             or endpoint.get("workersMin") != 0
             or endpoint.get("workersMax") != 1
-            or endpoint.get("flashboot") is not True
         ):
             raise ValueError
         template_id = endpoint.get("templateId")
