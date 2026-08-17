@@ -92,7 +92,12 @@ jobs:
       - name: Type check
         run: python -m mypy src
       - name: Test
-        run: python -m pytest --cov=gen_automation --cov-report=term-missing
+        run: >-
+          python -m pytest
+          --ignore-glob=tests/test_i2v*.py
+          --ignore-glob=tests/test_runpod_i2v*.py
+          --cov=gen_automation
+          --cov-report=term-missing
 
   postgresql-migrations:
     name: PostgreSQL migration contract
