@@ -1584,7 +1584,16 @@ async def ensure_container_group_queue_admission(
     convergence_timeout_seconds: float = _QUEUE_ADMISSION_CONVERGENCE_TIMEOUT_SECONDS,
     poll_interval_seconds: float = _QUEUE_ADMISSION_POLL_SECONDS,
 ) -> SaladContainerGroup:
-    """Hold one exact worker and prove its queue attachment before a job POST."""
+    """Hold one exact worker and request its start before a durable queue POST.
+
+    Salad only exposes a group in ``queue.container_groups`` after the worker
+    has progressed far enough to attach. A cold image download can take much
+    longer than the controller submission lease, while the queue itself is
+    already durable and able to retain the job. Validate the immutable group
+    and queue identities, raise the autoscaler floor, and require Salad to
+    accept the start request; worker readiness is observed asynchronously
+    after the provider job has been persisted.
+    """
 
     if (
         deployment.provider_queue_id is None
@@ -1598,6 +1607,9 @@ async def ensure_container_group_queue_admission(
         raise SaladDeploymentValidationError("durable queue admission demand is required")
     try:
         initial = await client.get_container_group(deployment.container_group_name)
+        queue = await client.get_queue(deployment.queue_name)
+        if str(queue.id) != deployment.provider_queue_id or queue.name != deployment.queue_name:
+            raise SaladDeploymentValidationError("queue identity does not match deployment")
         try:
             _validate_runtime_group(
                 deployment,
@@ -1642,53 +1654,21 @@ async def ensure_container_group_queue_admission(
                     await asyncio.sleep(poll_interval_seconds)
         if initial.pending_change:
             raise SaladDeploymentValidationError("container group has a pending change")
+        if initial.status.strip().lower() == "failed":
+            raise SaladDeploymentValidationError("container group failed before admission")
         if _is_authoritatively_stopped(initial):
             await client.start_container_group(deployment.container_group_name)
-
-        async with asyncio.timeout(convergence_timeout_seconds):
-            while True:
-                group = await client.get_container_group(deployment.container_group_name)
-                _validate_runtime_group(
-                    deployment,
-                    group,
-                    effective_min_replicas=effective_min_replicas,
-                )
-                if group.status.strip().lower() == "failed":
-                    raise SaladDeploymentValidationError("container group failed before admission")
-                queue = await client.get_queue(deployment.queue_name)
-                if (
-                    str(queue.id) != deployment.provider_queue_id
-                    or queue.name != deployment.queue_name
-                ):
-                    raise SaladDeploymentValidationError("queue identity does not match deployment")
-                if (
-                    not group.pending_change
-                    and not _is_authoritatively_stopped(group)
-                    and _queue_contains_exact_group(queue, deployment)
-                ):
-                    return group
-                await asyncio.sleep(poll_interval_seconds)
+        return initial
     except SaladDeploymentValidationError:
         raise
     except TimeoutError:
         raise SaladDeploymentValidationError(
-            "container group did not become eligible for queue admission"
+            "queue admission autoscaler update did not converge"
         ) from None
     except Exception:
         raise SaladDeploymentValidationError(
             "container group queue admission could not be verified"
         ) from None
-
-
-def _queue_contains_exact_group(
-    queue: SaladQueue,
-    deployment: SaladDeployment,
-) -> bool:
-    return any(
-        item.get("name") == deployment.container_group_name
-        and str(item.get("id")) == deployment.provider_container_group_id
-        for item in queue.container_groups
-    )
 
 
 def _validate_runtime_group(
