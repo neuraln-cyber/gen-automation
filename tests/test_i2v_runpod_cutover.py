@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -43,6 +45,10 @@ def test_cutover_freezes_and_proves_zero_work_before_enabling_runpod() -> None:
     assert "--cap-drop ALL" in script
     assert "--cap-add DAC_READ_SEARCH" in script
     assert "--security-opt no-new-privileges:true" in script
+    assert script.count("--user 0:0") == 1
+    assert script.count("--user 10001:10001") == 1
+    assert '"GEN_AUTOMATION_I2V_RUNPOD_ENDPOINT_ID",' in script
+    assert '"GEN_AUTOMATION_I2V_RUNPOD_NETWORK_VOLUME_ID",' in script
     assert "salad.com" not in script
     assert "https://api.runpod.ai/v2/" not in script
     assert script.count("https://rest.runpod.io/v1/networkvolumes") == 1
@@ -52,6 +58,64 @@ def test_cutover_freezes_and_proves_zero_work_before_enabling_runpod() -> None:
     assert 'pod["name"].startswith("gen-automation-i2v-")' in script
     assert script.count("--env GEN_AUTOMATION_I2V_ENABLED=true") == 1
     assert script.count("--env GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED=true") == 1
+
+
+def test_cutover_freeze_allows_both_provider_coordinates_to_be_empty(tmp_path: Path) -> None:
+    program = re.findall(r"<<'PY'\n(.*?)\nPY", _script(), flags=re.DOTALL)[0]
+    source = tmp_path / "source.env"
+    target = tmp_path / "target.env"
+    source.write_text(
+        "GEN_AUTOMATION_PUBLIC_BASE_URL=https://staging.example\n",
+        encoding="utf-8",
+    )
+    environment = {
+        **os.environ,
+        "CUTOVER_MODE": "freeze",
+        "CUTOVER_NETWORK_VOLUME_ID": "",
+        "CUTOVER_WORKER_IMAGE": "",
+        "CUTOVER_WORKER_SOURCE_REVISION": "",
+        "CUTOVER_RUNPOD_KEY": "",
+    }
+
+    subprocess.run(  # noqa: S603 - executes only the repository's embedded Python.
+        [sys.executable, "-c", program, str(source), str(target)],
+        check=True,
+        env=environment,
+    )
+
+    frozen = target.read_text(encoding="utf-8")
+    assert "GEN_AUTOMATION_I2V_RUNPOD_ENDPOINT_ID=\n" in frozen
+    assert "GEN_AUTOMATION_I2V_RUNPOD_NETWORK_VOLUME_ID=\n" in frozen
+
+
+def test_cutover_enable_pins_exact_worker_image_and_source(tmp_path: Path) -> None:
+    program = re.findall(r"<<'PY'\n(.*?)\nPY", _script(), flags=re.DOTALL)[0]
+    source = tmp_path / "source.env"
+    target = tmp_path / "target.env"
+    source.write_text(
+        "GEN_AUTOMATION_PUBLIC_BASE_URL=https://staging.example\n",
+        encoding="utf-8",
+    )
+    image = "ghcr.io/neuraln-cyber/gen-automation/i2v-worker@sha256:" + "a" * 64
+    revision = "b" * 40
+    environment = {
+        **os.environ,
+        "CUTOVER_MODE": "enable",
+        "CUTOVER_NETWORK_VOLUME_ID": "volume123",
+        "CUTOVER_WORKER_IMAGE": image,
+        "CUTOVER_WORKER_SOURCE_REVISION": revision,
+        "CUTOVER_RUNPOD_KEY": "not-a-real-runpod-api-key",
+    }
+
+    subprocess.run(  # noqa: S603 - executes only the repository's embedded Python.
+        [sys.executable, "-c", program, str(source), str(target)],
+        check=True,
+        env=environment,
+    )
+
+    enabled = target.read_text(encoding="utf-8")
+    assert f"GEN_AUTOMATION_I2V_WORKER_IMAGE={image}\n" in enabled
+    assert f"GEN_AUTOMATION_I2V_WORKER_SOURCE_REVISION={revision}\n" in enabled
 
 
 def test_cutover_reads_one_fixed_secret_and_never_prints_it() -> None:
@@ -71,6 +135,8 @@ def test_cutover_has_exact_automatic_and_manual_rollback_contract() -> None:
     assert 'lock_file="/run/lock/gen-automation-control-plane-update.lock"' in script
     assert "flock --exclusive --wait 120" in script
     assert "Cutover failed; restoring the prior provider configuration." in script
+    assert "if restore_original; then" in script
+    assert script.count('rmdir -- "$active_root"') == 2
     assert '"cutover_env_sha256"' in script
     assert "no active RunPod cutover exists" in script
     assert "rm -rf" not in script

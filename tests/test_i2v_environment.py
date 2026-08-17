@@ -17,6 +17,7 @@ from gen_automation.domain.i2v import (
     I2VOutputRegistration,
 )
 from gen_automation.i2v_worker.lora_catalog import LORA_ARTIFACTS_BY_ROLE
+from gen_automation.i2v_worker.models import ModelObject
 from gen_automation.services.i2v_environment import (
     _worker_model_objects,
     i2v_runtime_config_from_settings,
@@ -96,7 +97,11 @@ def _settings(
     )
 
 
-def _job(*, input_version: str = "input-v1") -> I2VJobSnapshot:
+def _job(
+    *,
+    input_version: str = "input-v1",
+    input_bucket: str = "private-models",
+) -> I2VJobSnapshot:
     job_id = uuid4()
     return I2VJobSnapshot(
         job_id=job_id,
@@ -107,7 +112,7 @@ def _job(*, input_version: str = "input-v1") -> I2VJobSnapshot:
         negative_prompt="jitter",
         input_snapshot={
             "storage_backend": "memory",
-            "storage_bucket": "private-models",
+            "storage_bucket": input_bucket,
             "object_key": "i2v/input.png",
             "object_version_id": input_version,
             "sha256": hashlib.sha256(b"input").hexdigest(),
@@ -295,6 +300,7 @@ async def test_attempt_grants_and_uploaded_object_are_exactly_bound() -> None:
     attempt = _attempt(job)
     builder = I2VRunPodGrantBuilder(
         store=store,
+        model_store=store,
         expires_in=3600,
         model_objects=(),
         output_prefix="i2v/outputs",
@@ -335,3 +341,51 @@ async def test_attempt_grants_and_uploaded_object_are_exactly_bound() -> None:
             byte_size=len(body),
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_runpod_grants_use_separate_asset_and_model_stores() -> None:
+    asset_store = MemoryObjectStore(bucket="private-assets")
+    model_store = MemoryObjectStore(bucket="private-models")
+    source = await asset_store.write_bytes_if_absent(
+        key="i2v/input.png",
+        body=b"input",
+        content_type="image/png",
+        metadata={"sha256": hashlib.sha256(b"input").hexdigest()},
+        max_bytes=10,
+    )
+    model_body = b"model"
+    model_sha256 = hashlib.sha256(model_body).hexdigest()
+    model_key = f"worker/i2v/sha256/{model_sha256}"
+    model = await model_store.write_bytes_if_absent(
+        key=model_key,
+        body=model_body,
+        content_type="application/x-safetensors",
+        metadata={"sha256": model_sha256},
+        max_bytes=10,
+    )
+    job = _job(input_version=source.version_id, input_bucket=asset_store.bucket)
+    attempt = _attempt(job)
+    builder = I2VRunPodGrantBuilder(
+        store=asset_store,
+        model_store=model_store,
+        expires_in=3600,
+        model_objects=(
+            ModelObject(
+                role="diffusion_model_high",
+                bucket=model_store.bucket,
+                key=model_key,
+                version_id=model.version_id,
+                byte_size=len(model_body),
+                sha256=model_sha256,
+                install_path="models/diffusion_models/model.safetensors",
+            ),
+        ),
+        output_prefix="i2v/outputs",
+    )
+
+    grants = await builder.build(job=job, attempt=attempt)
+
+    assert grants["input_grant"]["url"].startswith("memory://private-assets/")
+    assert grants["output_grant"]["url"].startswith("memory://private-assets/")
+    assert grants["model_grants"][0]["url"].startswith("memory://private-models/")

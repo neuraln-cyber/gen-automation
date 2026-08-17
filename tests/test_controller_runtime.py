@@ -53,6 +53,7 @@ def test_controller_workloads_use_stable_singleton_i2v_worker_id(
         "salad_client": object(),
         "runpod_client": object(),
         "object_store": MemoryObjectStore(),
+        "model_artifact_store": SimpleNamespace(store=MemoryObjectStore(bucket="models")),
         "secret_resolver": object(),
     }
     ControllerWorkloads(instance_id="controller-old", **dependencies)  # type: ignore[arg-type]
