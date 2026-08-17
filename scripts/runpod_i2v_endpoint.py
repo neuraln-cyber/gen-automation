@@ -18,10 +18,10 @@ from typing import Any, cast
 
 RUNPOD_API_ROOT = "https://rest.runpod.io/v1"
 ENDPOINT_NAME = "gen-automation-i2v-staging"
-VOLUME_NAME = "gen-automation-i2v-models-staging"
+VOLUME_NAME_PREFIX = "gen-automation-i2v-models-staging"
 VOLUME_SIZE_GB = 100
-DATA_CENTER_ID = "EU-RO-1"
-# RunPod's Serverless endpoint API accepts this exact pool for the EU-RO-1 volume.
+DATA_CENTER_ID = "US-IL-1"
+# RunPod canonicalizes the compatible 32/48 GB Serverless pools to these IDs.
 GPU_TYPES = (
     "NVIDIA GeForce RTX 5090",
     "NVIDIA A40",
@@ -180,6 +180,7 @@ def _spec(
     model_objects_json: str,
     model_objects_sha256: str,
     workers_min: int = 0,
+    data_center_id: str = DATA_CENTER_ID,
 ) -> dict[str, dict[str, Any]]:
     match = IMAGE_PATTERN.fullmatch(image)
     if match is None:
@@ -190,11 +191,14 @@ def _spec(
         raise RuntimeError("private manifest source identity is invalid")
     if workers_min not in (0, 1):
         raise RuntimeError("minimum workers must be zero or one")
+    if re.fullmatch(r"[A-Z]{2,4}-[A-Z]{2,4}-[0-9]", data_center_id) is None:
+        raise RuntimeError("RunPod datacenter is invalid")
     template_name = f"gen-automation-i2v-{match.group(1)[:16]}"
+    volume_name = f"{VOLUME_NAME_PREFIX}-{data_center_id.casefold()}"
     volume = {
-        "name": VOLUME_NAME,
+        "name": volume_name,
         "size": VOLUME_SIZE_GB,
-        "dataCenterId": DATA_CENTER_ID,
+        "dataCenterId": data_center_id,
     }
     template = {
         "imageName": image,
@@ -229,7 +233,7 @@ def _spec(
         "gpuCount": 1,
         "allowedCudaVersions": ["12.8", "12.9", "13.0"],
         "minCudaVersion": "12.8",
-        "dataCenterIds": [DATA_CENTER_ID],
+        "dataCenterIds": [data_center_id],
         "flashboot": True,
         "workersMin": workers_min,
         "workersMax": 1,
@@ -557,7 +561,7 @@ def status(spec: dict[str, dict[str, Any]]) -> dict[str, Any]:
     volume = _find_unique(
         api_key,
         path="/networkvolumes",
-        name=VOLUME_NAME,
+        name=str(spec["volume"]["name"]),
         kind="volume",
     )
     template = _find_unique(
@@ -601,6 +605,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-objects-file", type=Path, required=True)
     parser.add_argument("--state-file", type=Path)
     parser.add_argument("--workers-min", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--data-center-id", default=DATA_CENTER_ID)
     parser.add_argument("--acknowledge-spend", action="store_true")
     return parser
 
@@ -615,6 +620,7 @@ def main() -> int:
         model_objects_json=model_objects_json,
         model_objects_sha256=model_objects_sha256,
         workers_min=args.workers_min,
+        data_center_id=args.data_center_id,
     )
     if args.action == "plan":
         result: dict[str, Any] = {

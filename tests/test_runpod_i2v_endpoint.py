@@ -59,9 +59,9 @@ def test_plan_scales_to_zero_and_preserves_provider_neutral_worker_contract() ->
     spec = _spec(module)
 
     assert spec["volume"] == {
-        "name": module.VOLUME_NAME,
+        "name": f"{module.VOLUME_NAME_PREFIX}-{module.DATA_CENTER_ID.casefold()}",
         "size": 100,
-        "dataCenterId": "EU-RO-1",
+        "dataCenterId": "US-IL-1",
     }
     assert spec["endpoint"]["workersMin"] == 0
     assert spec["endpoint"]["workersMax"] == 1
