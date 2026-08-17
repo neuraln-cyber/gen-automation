@@ -625,6 +625,40 @@ def test_fullscreen_uses_preview_then_cancellable_active_only_exact_upgrade() ->
     assert "cancelExactUpgrade({ cancelInFlight: true })" in close
 
 
+def test_fullscreen_keeps_preview_visible_until_exact_image_is_fully_opaque() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+    reveal = script.split("const revealExactImage =", 1)[1].split(
+        "const revealExactImageAfterDecode",
+        1,
+    )[0]
+    finish = script.split("const finishExactReveal =", 1)[1].split(
+        "const revealExactImage =",
+        1,
+    )[0]
+    transition = script.split('viewer.image.addEventListener("transitionend"', 1)[1].split(
+        "let touchStart",
+        1,
+    )[0]
+    cancellation = script.split("const cancelExactUpgrade", 1)[1].split(
+        "const finishExactReveal",
+        1,
+    )[0]
+
+    assert "EXACT_IMAGE_REVEAL_FALLBACK_MS = 250" in script
+    assert "if (!wasLoading && exactRevealTimer !== null)" in reveal
+    assert 'viewer.image.classList.remove("is-loading")' in reveal
+    assert reveal.index('viewer.image.classList.remove("is-loading")') < reveal.index(
+        "exactRevealTimer = window.setTimeout("
+    )
+    crossfade_branch = reveal.split("if (shouldCrossfade)", 1)[1].split("} else {", 1)[0]
+    assert "viewer.placeholder.hidden = true" not in crossfade_branch
+    assert 'viewer.image.classList.contains("is-loading")' in finish
+    assert "viewer.placeholder.hidden = true" in finish
+    assert 'event.propertyName !== "opacity"' in transition
+    assert "finishExactReveal()" in transition
+    assert "cancelExactReveal()" in cancellation
+
+
 def test_fullscreen_defect_picker_is_optional_exact_and_per_image() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
     styles = STYLES.read_text(encoding="utf-8")
