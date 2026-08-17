@@ -14,7 +14,7 @@ ssm_parameter="/gen-automation-staging/runpod/inference-api-key"
 aws_region="eu-central-1"
 
 operation=""
-endpoint_id=""
+network_volume_id=""
 rollback_armed=0
 
 fail() {
@@ -29,7 +29,7 @@ rewrite_env() {
   chmod 0600 "$temporary"
   chown --reference="$env_file" "$temporary"
   CUTOVER_MODE="$mode" \
-  CUTOVER_ENDPOINT_ID="$endpoint_id" \
+  CUTOVER_NETWORK_VOLUME_ID="$network_volume_id" \
   CUTOVER_RUNPOD_KEY="${CUTOVER_RUNPOD_KEY:-}" \
   python3 - "$env_file" "$temporary" <<'PY'
 import os
@@ -45,6 +45,9 @@ values = {
     "GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED": "false",
     "GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED": "false",
     "GEN_AUTOMATION_I2V_RUNPOD_ENABLED": "false",
+    "GEN_AUTOMATION_I2V_RUNPOD_MODE": "pod",
+    "GEN_AUTOMATION_I2V_RUNPOD_ENDPOINT_ID": "",
+    "GEN_AUTOMATION_I2V_RUNPOD_NETWORK_VOLUME_ID": "",
 }
 if mode == "enable":
     public_base = None
@@ -62,8 +65,10 @@ if mode == "enable":
             "GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED": "true",
             "GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED": "true",
             "GEN_AUTOMATION_I2V_RUNPOD_ENABLED": "true",
-            "GEN_AUTOMATION_I2V_RUNPOD_ENDPOINT_ID": os.environ[
-                "CUTOVER_ENDPOINT_ID"
+            "GEN_AUTOMATION_I2V_RUNPOD_MODE": "pod",
+            "GEN_AUTOMATION_I2V_RUNPOD_ENDPOINT_ID": "",
+            "GEN_AUTOMATION_I2V_RUNPOD_NETWORK_VOLUME_ID": os.environ[
+                "CUTOVER_NETWORK_VOLUME_ID"
             ],
             "GEN_AUTOMATION_I2V_RUNPOD_API_KEY": os.environ["CUTOVER_RUNPOD_KEY"],
             "GEN_AUTOMATION_I2V_RUNPOD_CLAIM_URL": (
@@ -71,8 +76,10 @@ if mode == "enable":
             ),
         }
     )
-for value in values.values():
-    if not value or any(character in value for character in "\r\n\0"):
+for key, value in values.items():
+    if (not value and key != "GEN_AUTOMATION_I2V_RUNPOD_ENDPOINT_ID") or any(
+        character in value for character in "\r\n\0"
+    ):
         raise SystemExit("invalid environment value")
 
 lines = source.read_text(encoding="utf-8").splitlines()
@@ -117,8 +124,8 @@ restart_control_plane() {
   wait_for_control_plane || fail "control plane did not become ready"
 }
 
-verify_runpod_endpoint() {
-  CUTOVER_ENDPOINT_ID="$endpoint_id" \
+verify_runpod_provider() {
+  CUTOVER_NETWORK_VOLUME_ID="$network_volume_id" \
   CUTOVER_RUNPOD_KEY="$CUTOVER_RUNPOD_KEY" \
   CUTOVER_PRESEED_VOLUME_ID="$PRESEED_VOLUME_ID" \
   python3 - <<'PY'
@@ -126,9 +133,9 @@ import json
 import os
 import urllib.request
 
-endpoint_id = os.environ["CUTOVER_ENDPOINT_ID"]
+volume_id = os.environ["CUTOVER_NETWORK_VOLUME_ID"]
 api_key = os.environ["CUTOVER_RUNPOD_KEY"]
-volume_id = os.environ["CUTOVER_PRESEED_VOLUME_ID"]
+preseed_volume_id = os.environ["CUTOVER_PRESEED_VOLUME_ID"]
 try:
     def get_json(url: str) -> object:
         request = urllib.request.Request(
@@ -139,36 +146,38 @@ try:
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.loads(response.read(64 * 1024))
 
-    health = get_json(f"https://api.runpod.ai/v2/{endpoint_id}/health")
-    if not isinstance(health, dict):
+    if volume_id != preseed_volume_id:
         raise ValueError
-    jobs = health["jobs"]
-    workers = health["workers"]
-    for section, names in (
-        (jobs, ("completed", "failed", "inProgress", "inQueue", "retried")),
-        (workers, ("idle", "running")),
+    volumes = get_json("https://rest.runpod.io/v1/networkvolumes")
+    if not isinstance(volumes, list):
+        raise ValueError
+    matches = [item for item in volumes if isinstance(item, dict) and item.get("id") == volume_id]
+    if len(matches) != 1:
+        raise ValueError
+    volume = matches[0]
+    if volume.get("dataCenterId") != "EU-RO-1":
+        raise ValueError
+    if not isinstance(volume.get("size"), int) or volume["size"] < 40:
+        raise ValueError
+    pods = get_json("https://rest.runpod.io/v1/pods?computeType=GPU")
+    if not isinstance(pods, list):
+        raise ValueError
+    if any(
+        isinstance(pod, dict)
+        and isinstance(pod.get("name"), str)
+        and pod["name"].startswith("gen-automation-i2v-")
+        and (
+            pod.get("networkVolumeId") == volume_id
+            or (
+                isinstance(pod.get("networkVolume"), dict)
+                and pod["networkVolume"].get("id") == volume_id
+            )
+        )
+        for pod in pods
     ):
-        if not isinstance(section, dict):
-            raise ValueError
-        if any(not isinstance(section.get(name), int) or section[name] < 0 for name in names):
-            raise ValueError
-    if workers["idle"] + workers["running"] < 1:
-        raise ValueError
-
-    endpoint = get_json(f"https://rest.runpod.io/v1/endpoints/{endpoint_id}")
-    if not isinstance(endpoint, dict) or endpoint.get("id") != endpoint_id:
-        raise ValueError
-    if endpoint.get("name") != "gen-automation-i2v-staging":
-        raise ValueError
-    attached = endpoint.get("networkVolumeId")
-    if attached != volume_id:
-        alternatives = endpoint.get("networkVolumeIds")
-        if alternatives != [volume_id]:
-            raise ValueError
-    if endpoint.get("workersMin") != 1 or endpoint.get("workersMax") != 1:
         raise ValueError
 except Exception:
-    raise SystemExit("RunPod endpoint health verification failed") from None
+    raise SystemExit("RunPod Pod provider verification failed") from None
 PY
 }
 
@@ -288,13 +297,15 @@ cleanup() {
 trap cleanup EXIT
 
 [ "$(id -u)" -eq 0 ] || fail "run as root through AWS Systems Manager"
-[ "$#" -ge 1 ] || fail "usage: $0 --enable --endpoint-id <id> | --rollback"
+[ "$#" -ge 1 ] || fail "usage: $0 --enable --network-volume-id <id> | --rollback"
 case "$1" in
   --enable)
-    [ "$#" -eq 3 ] && [ "$2" = "--endpoint-id" ] || fail "enable requires --endpoint-id"
+    [ "$#" -eq 3 ] && [ "$2" = "--network-volume-id" ] ||
+      fail "enable requires --network-volume-id"
     operation="enable"
-    endpoint_id="$3"
-    [[ "$endpoint_id" =~ ^[A-Za-z0-9_-]{5,64}$ ]] || fail "invalid endpoint ID"
+    network_volume_id="$3"
+    [[ "$network_volume_id" =~ ^[A-Za-z0-9_-]{3,128}$ ]] ||
+      fail "invalid network volume ID"
     ;;
   --rollback)
     [ "$#" -eq 1 ] || fail "rollback accepts no additional arguments"
@@ -344,7 +355,7 @@ PRESEED_VOLUME_ID="$(verify_preseed_identity)"
 [[ "$PRESEED_VOLUME_ID" =~ ^[A-Za-z0-9_-]{3,128}$ ]] ||
   fail "RunPod volume preseed proof is invalid"
 export PRESEED_VOLUME_ID
-verify_runpod_endpoint
+verify_runpod_provider
 
 install -d -o root -g root -m 0700 "$active_root"
 cp -- "$env_file" "$original_env"
@@ -360,7 +371,7 @@ rewrite_env enable
 unset CUTOVER_RUNPOD_KEY
 restart_control_plane
 
-python3 - "$marker" "$endpoint_id" "$env_file" <<'PY'
+python3 - "$marker" "$network_volume_id" "$env_file" <<'PY'
 import hashlib
 import json
 import os
@@ -371,7 +382,7 @@ path = pathlib.Path(sys.argv[1])
 environment = pathlib.Path(sys.argv[3]).read_bytes()
 payload = {
     "schema": "gen-automation/i2v-runpod-cutover/v1",
-    "endpoint_id": sys.argv[2],
+    "network_volume_id": sys.argv[2],
     "cutover_env_sha256": hashlib.sha256(environment).hexdigest(),
 }
 path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")

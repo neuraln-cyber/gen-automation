@@ -129,14 +129,19 @@ class GrantBuilder(I2VRunPodJobInputBuilder):
 
 class FakeRunPod:
     endpoint_id = "endpoint123"
+    provider_id = endpoint_id
 
     def __init__(self) -> None:
         self.job: RunPodJob | None = None
         self.last_input: dict[str, JSONValue] | None = None
         self.cancel_calls = 0
+        self.reap_calls = 0
 
     async def health(self) -> RunPodEndpointHealth:
         return RunPodEndpointHealth(0, 0, 0, 0, 0, 0, 0)
+
+    async def reap_idle(self) -> None:
+        self.reap_calls += 1
 
     async def submit(
         self,
@@ -243,6 +248,18 @@ class MissingRunPod(FakeRunPod):
         raise RunPodAPIError(status_code=404, message="missing")
 
 
+class UnavailableStatusRunPod(FakeRunPod):
+    def __init__(self) -> None:
+        super().__init__()
+        self.status_unavailable = False
+
+    async def get_job(self, job_id: str) -> RunPodJob:
+        assert self.job is not None and job_id == self.job.id
+        if self.status_unavailable:
+            raise RunPodTransportError("worker status is unavailable")
+        return self.job
+
+
 async def _job(database: Database, owner_id: UUID, input_id: UUID) -> UUID:
     async with database.sessions() as session:
         job = await create_i2v_job(
@@ -267,7 +284,7 @@ async def test_runpod_runtime_preserves_queue_and_completes_exact_output(
     provider = FakeRunPod()
     runtime = I2VRunPodRuntime(
         config=I2VRunPodRuntimeConfig(
-            endpoint_id=provider.endpoint_id,
+            provider_id=provider.provider_id,
             worker_image=IMAGE,
             claim_url="https://staging.example/api/v1/i2v/runpod/claim",
             claim_secret=CLAIM_KEY,
@@ -306,6 +323,87 @@ async def test_runpod_runtime_preserves_queue_and_completes_exact_output(
 
 
 @pytest.mark.asyncio
+async def test_running_job_cost_bound_terminates_provider_and_fails_attempt(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, input_id = runtime_database
+    job_id = await _job(database, owner_id, input_id)
+    provider = FakeRunPod()
+    runtime = I2VRunPodRuntime(
+        config=I2VRunPodRuntimeConfig(
+            provider_id=provider.provider_id,
+            worker_image=IMAGE,
+            claim_url="https://staging.example/api/v1/i2v/runpod/claim",
+            claim_secret=CLAIM_KEY,
+            worker_lease_seconds=86_400,
+            execution_timeout_seconds=21_600,
+            job_ttl_seconds=604_800,
+        ),
+        sessions=database.sessions,
+        runpod_client=provider,  # type: ignore[arg-type]
+        input_builder=GrantBuilder(),
+    )
+
+    assert (await runtime.run_cycle(now=NOW)).action == "deployment_observed"
+    assert (await runtime.run_cycle(now=NOW + timedelta(seconds=1))).action == "job_claimed"
+    assert (
+        await runtime.run_cycle(now=NOW + timedelta(seconds=2))
+    ).action == "provider_job_submitted"
+    provider.set_status(RunPodJobStatus.IN_PROGRESS)
+    assert (await runtime.run_cycle(now=NOW + timedelta(seconds=3))).action == ("inference_started")
+    assert (await runtime.run_cycle(now=NOW + timedelta(seconds=21_604))).action == (
+        "provider_execution_timeout_failed"
+    )
+    assert provider.cancel_calls == 1
+    async with database.sessions() as session:
+        job = await session.get(I2VJob, job_id)
+        assert job is not None and job.state == I2VJobState.FAILED
+
+    await runtime.run_cycle(now=NOW + timedelta(seconds=21_605))
+    assert provider.reap_calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_cost_bound_terminates_provider_even_when_worker_status_is_unavailable(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, input_id = runtime_database
+    job_id = await _job(database, owner_id, input_id)
+    provider = UnavailableStatusRunPod()
+    runtime = I2VRunPodRuntime(
+        config=I2VRunPodRuntimeConfig(
+            provider_id=provider.provider_id,
+            worker_image=IMAGE,
+            claim_url="https://staging.example/api/v1/i2v/runpod/claim",
+            claim_secret=CLAIM_KEY,
+            worker_lease_seconds=86_400,
+            execution_timeout_seconds=21_600,
+            job_ttl_seconds=604_800,
+        ),
+        sessions=database.sessions,
+        runpod_client=provider,  # type: ignore[arg-type]
+        input_builder=GrantBuilder(),
+    )
+
+    assert (await runtime.run_cycle(now=NOW)).action == "deployment_observed"
+    assert (await runtime.run_cycle(now=NOW + timedelta(seconds=1))).action == "job_claimed"
+    assert (
+        await runtime.run_cycle(now=NOW + timedelta(seconds=2))
+    ).action == "provider_job_submitted"
+    provider.set_status(RunPodJobStatus.IN_PROGRESS)
+    assert (await runtime.run_cycle(now=NOW + timedelta(seconds=3))).action == ("inference_started")
+    provider.status_unavailable = True
+
+    assert (await runtime.run_cycle(now=NOW + timedelta(seconds=21_604))).action == (
+        "provider_execution_timeout_failed"
+    )
+    assert provider.cancel_calls == 1
+    async with database.sessions() as session:
+        job = await session.get(I2VJob, job_id)
+        assert job is not None and job.state == I2VJobState.FAILED
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_submit_is_never_retried_and_worker_claim_adopts_it(
     runtime_database: tuple[Database, UUID, UUID],
 ) -> None:
@@ -314,7 +412,7 @@ async def test_ambiguous_submit_is_never_retried_and_worker_claim_adopts_it(
     provider = AmbiguousRunPod()
     runtime = I2VRunPodRuntime(
         config=I2VRunPodRuntimeConfig(
-            endpoint_id=provider.endpoint_id,
+            provider_id=provider.provider_id,
             worker_image=IMAGE,
             claim_url="https://staging.example/api/v1/i2v/runpod/claim",
             claim_secret=CLAIM_KEY,
@@ -370,7 +468,7 @@ async def test_ambiguous_submit_fails_bounded_without_a_worker_claim(
     provider = AmbiguousRunPod()
     runtime = I2VRunPodRuntime(
         config=I2VRunPodRuntimeConfig(
-            endpoint_id=provider.endpoint_id,
+            provider_id=provider.provider_id,
             worker_image=IMAGE,
             claim_url="https://staging.example/api/v1/i2v/runpod/claim",
             claim_secret=CLAIM_KEY,
@@ -405,7 +503,7 @@ async def test_queue_allocation_timeout_cancels_once_then_fails_terminally(
     provider = FakeRunPod()
     runtime = I2VRunPodRuntime(
         config=I2VRunPodRuntimeConfig(
-            endpoint_id=provider.endpoint_id,
+            provider_id=provider.provider_id,
             worker_image=IMAGE,
             claim_url="https://staging.example/api/v1/i2v/runpod/claim",
             claim_secret=CLAIM_KEY,
@@ -446,7 +544,7 @@ async def test_unbound_cancel_never_waits_for_an_ambiguous_provider_job(
     provider = AmbiguousRunPod()
     runtime = I2VRunPodRuntime(
         config=I2VRunPodRuntimeConfig(
-            endpoint_id=provider.endpoint_id,
+            provider_id=provider.provider_id,
             worker_image=IMAGE,
             claim_url="https://staging.example/api/v1/i2v/runpod/claim",
             claim_secret=CLAIM_KEY,
@@ -487,7 +585,7 @@ async def test_missing_bound_provider_job_fails_after_a_short_grace(
     provider = MissingRunPod()
     runtime = I2VRunPodRuntime(
         config=I2VRunPodRuntimeConfig(
-            endpoint_id=provider.endpoint_id,
+            provider_id=provider.provider_id,
             worker_image=IMAGE,
             claim_url="https://staging.example/api/v1/i2v/runpod/claim",
             claim_secret=CLAIM_KEY,

@@ -71,6 +71,11 @@ class Environment(StrEnum):
     PRODUCTION = "production"
 
 
+class I2VRunPodMode(StrEnum):
+    SERVERLESS = "serverless"
+    POD = "pod"
+
+
 class SaladContainerPriority(StrEnum):
     HIGH = "high"
     MEDIUM = "medium"
@@ -544,11 +549,12 @@ class Settings(BaseSettings):
     # exact artifacts and readiness identity are verified, and can be rolled
     # back without changing its manifest.
     i2v_lora_profile_enabled: bool = False
-    # RunPod is enabled only after its immutable endpoint has been provisioned.
-    # The false state exists solely to make the one-time provider cutover and
-    # rollback atomic; it is removed with the retired Salad I2V path afterward.
+    # RunPod is enabled only after its immutable worker and persistent model
+    # volume have been verified. The false state keeps cutover/rollback atomic.
     i2v_runpod_enabled: bool = False
+    i2v_runpod_mode: I2VRunPodMode = I2VRunPodMode.SERVERLESS
     i2v_runpod_endpoint_id: str | None = None
+    i2v_runpod_network_volume_id: str | None = None
     i2v_runpod_api_key: SecretStr | None = None
     i2v_runpod_claim_url: AnyHttpUrl | None = None
     i2v_runpod_execution_timeout_seconds: int = Field(default=6 * 60 * 60, ge=60)
@@ -990,11 +996,21 @@ class Settings(BaseSettings):
             if not self.background_runtime_enabled:
                 errors.append("I2V requires the background runtime")
             if self.i2v_runpod_enabled:
-                if (
-                    self.i2v_runpod_endpoint_id is None
-                    or RUNPOD_ENDPOINT_ID_PATTERN.fullmatch(self.i2v_runpod_endpoint_id) is None
-                ):
-                    errors.append("I2V requires a valid RunPod Serverless endpoint ID")
+                if self.i2v_runpod_mode == I2VRunPodMode.SERVERLESS:
+                    if (
+                        self.i2v_runpod_endpoint_id is None
+                        or RUNPOD_ENDPOINT_ID_PATTERN.fullmatch(self.i2v_runpod_endpoint_id) is None
+                    ):
+                        errors.append("I2V requires a valid RunPod Serverless endpoint ID")
+                else:
+                    if (
+                        self.i2v_runpod_network_volume_id is None
+                        or RUNPOD_ENDPOINT_ID_PATTERN.fullmatch(self.i2v_runpod_network_volume_id)
+                        is None
+                    ):
+                        errors.append("I2V Pod mode requires a valid RunPod network volume ID")
+                    if self.i2v_runpod_endpoint_id is not None:
+                        errors.append("I2V Pod mode must not configure a Serverless endpoint ID")
                 runpod_api_key = _secret_value(self.i2v_runpod_api_key)
                 if (
                     runpod_api_key is None

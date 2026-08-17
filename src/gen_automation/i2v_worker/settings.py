@@ -40,6 +40,7 @@ class I2VWorkerSettings(BaseSettings):
     artifact_chunk_bytes: int = Field(default=64 * 1024 * 1024, ge=1024 * 1024)
     comfy_poll_seconds: float = Field(default=1, gt=0)
     models_prepared: bool = False
+    require_preseeded_volume: bool = False
     minimum_gpu_vram_bytes: int = Field(default=31 * 1024 * 1024 * 1024, gt=0)
     allowed_gpu_names_csv: str = "NVIDIA A40,NVIDIA RTX A6000,NVIDIA L40S,NVIDIA GeForce RTX 5090"
     lora_worker_enabled: bool = False

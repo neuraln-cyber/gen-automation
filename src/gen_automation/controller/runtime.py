@@ -42,7 +42,7 @@ from gen_automation.domain.runtime_bindings import (
 from gen_automation.integrations.civitai.client import CivitaiClient
 from gen_automation.integrations.mega import MegaCmdClient
 from gen_automation.integrations.patreon import PatreonPublicationDriver
-from gen_automation.integrations.runpod.client import RunPodClient
+from gen_automation.integrations.runpod.protocol import RunPodProvider
 from gen_automation.integrations.salad.client import SALAD_QUEUE_JOB_PAGE_SIZE, SaladClient
 from gen_automation.integrations.salad.models import JSONValue
 from gen_automation.integrations.semantic_vlm import SemanticVlmClient
@@ -695,7 +695,7 @@ class ControllerWorkloads:
         instance_id: str,
         salad_client: SaladClient | None,
         object_store: ObjectStore | None,
-        runpod_client: RunPodClient | None = None,
+        runpod_client: RunPodProvider | None = None,
         secret_resolver: RuntimeSecretResolver | None = None,
         x_oauth_provider: XOAuthProvider | None = None,
         mega_client: MegaSetDeliveryClient | None = None,
@@ -2134,7 +2134,7 @@ def build_controller_runtime(
     sessions: async_sessionmaker[AsyncSession],
     salad_client: SaladClient | None,
     object_store: ObjectStore | None,
-    runpod_client: RunPodClient | None = None,
+    runpod_client: RunPodProvider | None = None,
     secret_resolver: RuntimeSecretResolver | None = None,
     x_oauth_provider: XOAuthProvider | None = None,
     mega_client: MegaSetDeliveryClient | None = None,

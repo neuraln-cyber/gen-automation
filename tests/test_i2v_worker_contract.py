@@ -589,6 +589,8 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
     ):
         assert identity in notices
     assert "gen_automation.i2v_worker.runpod_handler" in entrypoint
+    assert "gen_automation.i2v_worker.runpod_pod_api" in entrypoint
+    assert "GEN_I2V_WORKER_RUNPOD_MODE:-serverless" in entrypoint
     handler = RUNPOD_HANDLER.read_text(encoding="utf-8")
     assert '"schema": "gen-automation/i2v-runpod-runtime/v1"' in handler
     for metric in (
@@ -626,6 +628,7 @@ def test_ci_builds_smokes_and_scans_the_model_free_worker() -> None:
     assert "--file Dockerfile.i2v-worker" in workflow
     assert "--tag gen-automation-i2v-worker:test" in workflow
     assert "import gen_automation.i2v_worker.runpod_handler" in workflow
+    assert "import gen_automation.i2v_worker.runpod_pod_api" in workflow
     assert "image: gen-automation-i2v-worker:test" in workflow
     assert "output-file: i2v-worker.spdx.json" in workflow
     assert "sbom: i2v-worker.spdx.json" in workflow

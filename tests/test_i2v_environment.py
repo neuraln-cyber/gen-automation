@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 from pydantic import SecretStr
 
-from gen_automation.config import Settings
+from gen_automation.config import I2VRunPodMode, Settings
 from gen_automation.domain.i2v import (
     I2VAttemptSnapshot,
     I2VAttemptState,
@@ -251,12 +251,26 @@ async def test_routine_deploy_ignores_live_legacy_lora_roles_when_worker_is_off(
 def test_runtime_config_is_single_flight_and_exactly_bound_to_runpod() -> None:
     config = i2v_runtime_config_from_settings(_settings())
 
-    assert config.endpoint_id == "endpoint123"
+    assert config.provider_id == "endpoint123"
     assert config.claim_url == "https://staging.example/api/v1/i2v/runpod/claim"
     assert config.execution_timeout_seconds == 21_600
     assert config.job_ttl_seconds == 604_800
     assert config.worker_image.endswith("@sha256:" + "a" * 64)
     assert config.reviewed_loras_enabled is True
+
+
+def test_runtime_config_binds_pod_mode_to_the_persistent_volume() -> None:
+    settings = _settings().model_copy(
+        update={
+            "i2v_runpod_mode": I2VRunPodMode.POD,
+            "i2v_runpod_endpoint_id": None,
+            "i2v_runpod_network_volume_id": "volume123",
+        }
+    )
+
+    config = i2v_runtime_config_from_settings(settings)
+
+    assert config.provider_id == "pod-volume123"
 
 
 def test_public_lora_gate_does_not_control_worker_capability() -> None:
