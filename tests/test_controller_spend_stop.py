@@ -770,7 +770,21 @@ async def test_cold_submit_uses_claimed_outbox_demand_before_queue_admission(
         ) -> SaladContainerGroup:
             del client
             admissions.append((deployment.id, effective_min_replicas))
-            return _group(deployment.container_group_name, deployment.queue_name)
+            group = _group(deployment.container_group_name, deployment.queue_name)
+            # A provider-accepted start can still read back as stopped until
+            # the cold allocation appears. The durable queue POST must not
+            # wait for image download or worker attachment.
+            return replace(
+                group,
+                current_state=replace(
+                    group.current_state,
+                    status="stopped",
+                    description="stopped",
+                    running_count=0,
+                    start_time=None,
+                    finish_time=NOW,
+                ),
+            )
 
         async def fake_submit(
             *args: object,

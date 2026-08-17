@@ -855,7 +855,7 @@ async def test_refresh_fails_closed_when_pending_group_never_applies() -> None:
 
 
 @pytest.mark.asyncio
-async def test_queue_admission_starts_stopped_group_and_waits_for_exact_attachment() -> None:
+async def test_queue_admission_starts_stopped_group_without_waiting_for_attachment() -> None:
     deployment = unpersisted_deployment(provider_configuration())
     deployment.provider_queue_id = str(QUEUE_ID)
     deployment.provider_container_group_id = str(GROUP_ID)
@@ -867,20 +867,6 @@ async def test_queue_admission_starts_stopped_group_and_waits_for_exact_attachme
         replicas=1,
         running=0,
         finish_time=NOW,
-    )
-    deploying = make_group(
-        deployment.container_group_name,
-        deployment.queue_name,
-        status="deploying",
-        replicas=1,
-        running=0,
-        version=2,
-        autoscaler={
-            "min_replicas": 1,
-            "max_replicas": 1,
-            "desired_queue_length": 1,
-            "polling_period": 30,
-        },
     )
     admitted_stopped = make_group(
         deployment.container_group_name,
@@ -898,12 +884,11 @@ async def test_queue_admission_starts_stopped_group_and_waits_for_exact_attachme
         },
     )
     client = FakeClient()
-    client.groups[deployment.container_group_name] = deploying
-    client.queues[deployment.queue_name] = make_queue(
-        deployment.queue_name,
-        group_name=deployment.container_group_name,
-    )
-    client.get_group_results = [stopped, admitted_stopped, deploying]
+    client.groups[deployment.container_group_name] = admitted_stopped
+    # A cold worker is not listed as attached yet. The durable queue can still
+    # accept work while Salad downloads and starts the exact group.
+    client.queues[deployment.queue_name] = make_queue(deployment.queue_name)
+    client.get_group_results = [stopped, admitted_stopped]
     client.update_group_result = admitted_stopped
 
     result = await ensure_container_group_queue_admission(
@@ -914,7 +899,7 @@ async def test_queue_admission_starts_stopped_group_and_waits_for_exact_attachme
         poll_interval_seconds=0,
     )
 
-    assert result is deploying
+    assert result is admitted_stopped
     assert client.start_names == [deployment.container_group_name]
     assert client.updated_group_patches == [
         {
@@ -928,16 +913,15 @@ async def test_queue_admission_starts_stopped_group_and_waits_for_exact_attachme
     ]
     assert [call[0] for call in client.calls] == [
         "get_group",
+        "get_queue",
         "update_group",
         "get_group",
         "start_group",
-        "get_group",
-        "get_queue",
     ]
 
 
 @pytest.mark.asyncio
-async def test_queue_admission_refuses_detached_group_before_job_submission() -> None:
+async def test_queue_admission_refuses_wrong_queue_identity_before_provider_mutation() -> None:
     deployment = unpersisted_deployment(provider_configuration())
     deployment.provider_queue_id = str(QUEUE_ID)
     deployment.provider_container_group_id = str(GROUP_ID)
@@ -950,54 +934,27 @@ async def test_queue_admission_refuses_detached_group_before_job_submission() ->
         running=0,
         finish_time=NOW,
     )
-    deploying = make_group(
-        deployment.container_group_name,
-        deployment.queue_name,
-        status="deploying",
-        replicas=1,
-        running=0,
-        version=2,
-        autoscaler={
-            "min_replicas": 1,
-            "max_replicas": 1,
-            "desired_queue_length": 1,
-            "polling_period": 30,
-        },
-    )
-    admitted_stopped = make_group(
-        deployment.container_group_name,
-        deployment.queue_name,
-        status="stopped",
-        replicas=1,
-        running=0,
-        finish_time=NOW,
-        version=2,
-        autoscaler={
-            "min_replicas": 1,
-            "max_replicas": 1,
-            "desired_queue_length": 1,
-            "polling_period": 30,
-        },
-    )
     client = FakeClient()
-    client.groups[deployment.container_group_name] = deploying
-    client.queues[deployment.queue_name] = make_queue(deployment.queue_name)
-    client.get_group_results = [stopped, admitted_stopped]
-    client.update_group_result = admitted_stopped
+    client.groups[deployment.container_group_name] = stopped
+    client.queues[deployment.queue_name] = make_queue(
+        deployment.queue_name,
+        queue_id=uuid4(),
+    )
+    client.get_group_results = [stopped]
 
     with pytest.raises(
         SaladDeploymentValidationError,
-        match="did not become eligible for queue admission",
+        match="queue identity does not match deployment",
     ):
         await ensure_container_group_queue_admission(
             deployment,
             client,
             effective_min_replicas=1,
-            convergence_timeout_seconds=0.01,
-            poll_interval_seconds=0.001,
         )
 
-    assert client.start_names == [deployment.container_group_name]
+    assert client.start_names == []
+    assert client.updated_group_patches == []
+    assert [call[0] for call in client.calls] == ["get_group", "get_queue"]
 
 
 @pytest.mark.asyncio
