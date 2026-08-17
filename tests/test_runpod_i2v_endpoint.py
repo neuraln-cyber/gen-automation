@@ -66,7 +66,6 @@ def test_plan_scales_to_zero_and_preserves_provider_neutral_worker_contract() ->
     assert spec["endpoint"]["workersMin"] == 0
     assert spec["endpoint"]["workersMax"] == 1
     assert spec["endpoint"]["gpuTypeIds"] == [
-        "NVIDIA RTX PRO 4500 Blackwell",
         "NVIDIA GeForce RTX 5090",
         "NVIDIA A40",
         "NVIDIA RTX A6000",
