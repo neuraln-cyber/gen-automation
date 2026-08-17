@@ -317,6 +317,9 @@ def _abort_upload(
 def _upload_model(
     *,
     source: S3Client,
+    source_bucket: str,
+    source_key: str,
+    source_version_id: str | None,
     destination: S3Client,
     volume_id: str,
     artifact_identity: str,
@@ -373,11 +376,13 @@ def _upload_model(
             flush=True,
         )
 
-        source_response = source.get_object(
-            Bucket=model.bucket,
-            Key=model.key,
-            VersionId=model.version_id,
-        )
+        source_request: dict[str, object] = {
+            "Bucket": source_bucket,
+            "Key": source_key,
+        }
+        if source_version_id is not None:
+            source_request["VersionId"] = source_version_id
+        source_response = source.get_object(**source_request)
         if source_response.get("ContentLength") != model.byte_size:
             raise RuntimeError("source model object size drifted")
         body = source_response["Body"]
@@ -454,6 +459,9 @@ def apply(
     endpoint: str,
     datacenter: str,
     part_bytes: int,
+    source_runpod_volume_id: str | None = None,
+    source_runpod_endpoint: str | None = None,
+    source_runpod_datacenter: str | None = None,
 ) -> dict[str, object]:
     if os.environ.get(SPEND_SWITCH, "").casefold() != "true":
         raise RuntimeError(f"volume upload requires {SPEND_SWITCH}=true")
@@ -481,11 +489,44 @@ def apply(
         models=models,
     )
     _write_state(state_file, state)
-    source = _source_client(aws_profile)
+    if source_runpod_volume_id is None:
+        source = _source_client(aws_profile)
+    else:
+        if source_runpod_volume_id == volume_id:
+            raise RuntimeError("source and destination RunPod volumes must differ")
+        if source_runpod_endpoint is None or source_runpod_datacenter is None:
+            raise RuntimeError("RunPod source volume endpoint is incomplete")
+        source = _runpod_client(
+            endpoint=source_runpod_endpoint,
+            datacenter=source_runpod_datacenter,
+        )
+        source_marker = _marker_payload(
+            volume_id=source_runpod_volume_id,
+            artifact_identity=artifact_identity,
+            model_objects_sha256=model_objects_sha256,
+            models=models,
+        )
+        if not _remote_ready(
+            source,
+            volume_id=source_runpod_volume_id,
+            marker=source_marker,
+            artifact_identity=artifact_identity,
+            models=models,
+        ):
+            raise RuntimeError("source RunPod volume is not exactly preseeded")
     object_states = cast(dict[str, dict[str, Any]], state["objects"])
     for model in models:
+        source_bucket = source_runpod_volume_id or model.bucket
+        source_key = (
+            _object_key(artifact_identity, model)
+            if source_runpod_volume_id is not None
+            else model.key
+        )
         _upload_model(
             source=source,
+            source_bucket=source_bucket,
+            source_key=source_key,
+            source_version_id=(None if source_runpod_volume_id is not None else model.version_id),
             destination=destination,
             volume_id=volume_id,
             artifact_identity=artifact_identity,
@@ -564,6 +605,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--network-volume-id", required=True)
     parser.add_argument("--state-file", type=Path)
     parser.add_argument("--aws-profile")
+    parser.add_argument("--source-runpod-volume-id")
+    parser.add_argument("--source-runpod-datacenter")
+    parser.add_argument("--source-runpod-endpoint")
     parser.add_argument("--datacenter", default=DEFAULT_DATACENTER)
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
     parser.add_argument(
@@ -584,6 +628,24 @@ def main() -> int:
         raise RuntimeError("RunPod datacenter is invalid")
     if args.endpoint != f"https://s3api-{args.datacenter.casefold()}.runpod.io/":
         raise RuntimeError("RunPod S3 endpoint does not match the datacenter")
+    source_options = (
+        args.source_runpod_volume_id,
+        args.source_runpod_datacenter,
+        args.source_runpod_endpoint,
+    )
+    if any(source_options) and not all(source_options):
+        raise RuntimeError("RunPod source volume options must be provided together")
+    if args.source_runpod_volume_id is not None:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{3,128}", args.source_runpod_volume_id):
+            raise RuntimeError("source RunPod volume ID is invalid")
+        if not re.fullmatch(r"[A-Z]{2,4}-[A-Z]{2,4}-[0-9]", args.source_runpod_datacenter):
+            raise RuntimeError("source RunPod datacenter is invalid")
+        if args.source_runpod_endpoint != (
+            f"https://s3api-{args.source_runpod_datacenter.casefold()}.runpod.io/"
+        ):
+            raise RuntimeError("source RunPod S3 endpoint does not match the datacenter")
+        if args.aws_profile is not None:
+            raise RuntimeError("AWS and RunPod sources are mutually exclusive")
     models, model_objects_sha256 = _read_models(args.model_objects_file.resolve())
     artifact_identity = _artifact_identity(models)
     if args.action == "plan":
@@ -604,6 +666,9 @@ def main() -> int:
             endpoint=args.endpoint,
             datacenter=args.datacenter,
             part_bytes=args.part_bytes,
+            source_runpod_volume_id=args.source_runpod_volume_id,
+            source_runpod_endpoint=args.source_runpod_endpoint,
+            source_runpod_datacenter=args.source_runpod_datacenter,
         )
     else:
         result = status(

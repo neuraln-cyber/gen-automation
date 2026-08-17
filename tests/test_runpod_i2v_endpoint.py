@@ -59,14 +59,13 @@ def test_plan_scales_to_zero_and_preserves_provider_neutral_worker_contract() ->
     spec = _spec(module)
 
     assert spec["volume"] == {
-        "name": module.VOLUME_NAME,
+        "name": f"{module.VOLUME_NAME_PREFIX}-{module.DATA_CENTER_ID.casefold()}",
         "size": 100,
-        "dataCenterId": "EU-RO-1",
+        "dataCenterId": "US-IL-1",
     }
     assert spec["endpoint"]["workersMin"] == 0
     assert spec["endpoint"]["workersMax"] == 1
     assert spec["endpoint"]["gpuTypeIds"] == [
-        "NVIDIA RTX PRO 4500 Blackwell",
         "NVIDIA GeForce RTX 5090",
         "NVIDIA A40",
         "NVIDIA RTX A6000",
@@ -78,6 +77,7 @@ def test_plan_scales_to_zero_and_preserves_provider_neutral_worker_contract() ->
     assert spec["endpoint"]["flashboot"] is True
     assert spec["template"]["dockerEntrypoint"] == []
     assert spec["template"]["env"]["GEN_I2V_WORKER_LORA_WORKER_ENABLED"] == "true"
+    assert spec["template"]["env"]["GEN_I2V_WORKER_REQUIRE_PRESEEDED_VOLUME"] == "true"
     assert "AWS_" not in json.dumps(spec)
     assert "RUNPOD_API_KEY" not in json.dumps(spec)
 

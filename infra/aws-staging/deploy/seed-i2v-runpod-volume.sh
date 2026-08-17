@@ -4,13 +4,17 @@ set -Eeuo pipefail
 deploy_env="/etc/gen-automation/deploy.env"
 compose_file="/opt/gen-automation/deploy/compose.yaml"
 state_root="/var/lib/gen-automation/runpod-i2v"
-state_file="$state_root/preseed-state.json"
+state_file=""
+active_state_file="$state_root/preseed-state.json"
 lock_file="/run/lock/gen-automation-i2v-runpod-seed.lock"
 access_parameter="/gen-automation-staging/runpod/s3-access-key-id"
 secret_parameter="/gen-automation-staging/runpod/s3-secret-access-key"
 aws_region="eu-central-1"
 
 volume_id=""
+datacenter="EU-RO-1"
+source_runpod_volume_id=""
+source_runpod_datacenter=""
 work_root=""
 credentials_file=""
 model_objects_file=""
@@ -35,10 +39,42 @@ cleanup() {
 trap cleanup EXIT
 
 [ "$(id -u)" -eq 0 ] || fail "run as root through AWS Systems Manager"
-[ "$#" -eq 2 ] && [ "$1" = "--network-volume-id" ] ||
-  fail "usage: $0 --network-volume-id <id>"
-volume_id="$2"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --network-volume-id)
+      [ "$#" -ge 2 ] || fail "missing network volume ID"
+      volume_id="$2"
+      shift 2
+      ;;
+    --datacenter)
+      [ "$#" -ge 2 ] || fail "missing RunPod datacenter"
+      datacenter="$2"
+      shift 2
+      ;;
+    --source-runpod-volume-id)
+      [ "$#" -ge 2 ] || fail "missing source RunPod volume ID"
+      source_runpod_volume_id="$2"
+      shift 2
+      ;;
+    --source-runpod-datacenter)
+      [ "$#" -ge 2 ] || fail "missing source RunPod datacenter"
+      source_runpod_datacenter="$2"
+      shift 2
+      ;;
+    *) fail "unknown argument: $1" ;;
+  esac
+done
 [[ "$volume_id" =~ ^[A-Za-z0-9_-]{3,128}$ ]] || fail "invalid network volume ID"
+[[ "$datacenter" =~ ^[A-Z]{2,4}-[A-Z]{2,4}-[0-9]$ ]] || fail "invalid RunPod datacenter"
+if [ -n "$source_runpod_volume_id" ] || [ -n "$source_runpod_datacenter" ]; then
+  [[ "$source_runpod_volume_id" =~ ^[A-Za-z0-9_-]{3,128}$ ]] ||
+    fail "invalid source RunPod volume ID"
+  [[ "$source_runpod_datacenter" =~ ^[A-Z]{2,4}-[A-Z]{2,4}-[0-9]$ ]] ||
+    fail "invalid source RunPod datacenter"
+  [ "$source_runpod_volume_id" != "$volume_id" ] ||
+    fail "source and destination RunPod volumes must differ"
+fi
+state_file="$state_root/preseed-state-$volume_id.json"
 for command in aws docker flock mktemp python3; do
   command -v "$command" >/dev/null || fail "$command is required"
 done
@@ -119,6 +155,22 @@ unset RUNPOD_S3_ACCESS_KEY_ID RUNPOD_S3_SECRET_ACCESS_KEY
 
 chown 10001:10001 "$state_root"
 chmod 0700 "$state_root"
+seed_args=(
+  /app/scripts/runpod_i2v_seed_volume.py apply
+  --model-objects-file /run/seed/model-objects.json
+  --network-volume-id "$volume_id"
+  --state-file "/run/state/$(basename "$state_file")"
+  --datacenter "$datacenter"
+  --endpoint "https://s3api-${datacenter,,}.runpod.io/"
+  --acknowledge-upload
+)
+if [ -n "$source_runpod_volume_id" ]; then
+  seed_args+=(
+    --source-runpod-volume-id "$source_runpod_volume_id"
+    --source-runpod-datacenter "$source_runpod_datacenter"
+    --source-runpod-endpoint "https://s3api-${source_runpod_datacenter,,}.runpod.io/"
+  )
+fi
 /usr/bin/docker run --rm --init --read-only --network host \
   --user 10001:10001 \
   --cap-drop ALL \
@@ -130,14 +182,13 @@ chmod 0700 "$state_root"
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=128m,uid=10001,gid=10001,mode=1770 \
   --entrypoint python3.12 \
   "$image_ref" \
-  /app/scripts/runpod_i2v_seed_volume.py apply \
-  --model-objects-file /run/seed/model-objects.json \
-  --network-volume-id "$volume_id" \
-  --state-file /run/state/preseed-state.json \
-  --acknowledge-upload
-chown root:root "$state_root" "$state_file"
+  "${seed_args[@]}"
+state_temporary="$state_root/.preseed-state.json.partial"
+install -o root -g root -m 0600 "$state_file" "$state_temporary"
+mv -f -- "$state_temporary" "$active_state_file"
+chown root:root "$state_root" "$state_file" "$active_state_file"
 chmod 0700 "$state_root"
-chmod 0600 "$state_file"
+chmod 0600 "$state_file" "$active_state_file"
 
 rm -f -- "$credentials_file" "$model_objects_file"
 printf '%s\n' "I2V RunPod network volume preseed completed."

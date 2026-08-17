@@ -15,6 +15,9 @@ def test_runpod_volume_seed_is_exact_scoped_and_non_gpu() -> None:
     assert "if len(models) != 14" in script
     assert "/app/scripts/runpod_i2v_seed_volume.py apply" in script
     assert "--network-volume-id" in script
+    assert "--source-runpod-volume-id" in script
+    assert "--source-runpod-datacenter" in script
+    assert '"https://s3api-${datacenter,,}.runpod.io/"' in script
     assert "--acknowledge-upload" in script
     assert "--read-only --network host" in script
     assert "--cap-drop ALL" in script
@@ -31,4 +34,5 @@ def test_runpod_volume_seed_never_prints_or_persists_credentials_in_state() -> N
     assert 'rm -f -- "$credentials_file" "$model_objects_file"' in script
     assert "RUNPOD_S3_SECRET_ACCESS_KEY=%s" in script
     assert "preseed-state.json" in script
+    assert "preseed-state-$volume_id.json" in script
     assert "printf '%s\\n' \"$RUNPOD_S3" not in script
