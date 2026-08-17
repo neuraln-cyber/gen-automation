@@ -21,15 +21,12 @@ ENDPOINT_NAME = "gen-automation-i2v-staging"
 VOLUME_NAME = "gen-automation-i2v-models-staging"
 VOLUME_SIZE_GB = 100
 DATA_CENTER_ID = "EU-RO-1"
-# Prefer the fastest/cost-effective cards first, then widen to compatible 48 GB
-# fallbacks so a single-worker endpoint does not wait on one constrained host pool.
+# RunPod's Serverless endpoint API accepts this exact pool for the EU-RO-1 volume.
 GPU_TYPES = (
     "NVIDIA GeForce RTX 5090",
     "NVIDIA A40",
     "NVIDIA RTX A6000",
     "NVIDIA L40S",
-    "NVIDIA L40",
-    "NVIDIA RTX 6000 Ada Generation",
 )
 SPEND_SWITCH = "GEN_AUTOMATION_RUNPOD_I2V_SPEND_ALLOWED"
 STATE_SCHEMA = "gen-automation/runpod-i2v-state/v1"
