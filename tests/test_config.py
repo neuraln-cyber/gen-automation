@@ -623,6 +623,7 @@ def test_i2v_runpod_defaults_are_single_flight_and_cover_long_renders() -> None:
 
     assert settings.i2v_runpod_max_active_jobs == 1
     assert settings.i2v_runpod_execution_timeout_seconds == 6 * 60 * 60
+    assert settings.i2v_runpod_queue_timeout_seconds == 6 * 60 * 60
     assert settings.i2v_runpod_job_ttl_seconds == 7 * 24 * 60 * 60
     assert settings.i2v_runpod_mode.value == "serverless"
 

@@ -20,10 +20,22 @@ network_volume_id=""
 worker_image=""
 worker_source_revision=""
 rollback_armed=0
+rollback_recovery_armed=0
+rollback_recovery_env=""
 
 fail() {
   printf '%s\n' "I2V RunPod cutover failed: $*" >&2
   return 1
+}
+
+load_runpod_key() {
+  CUTOVER_RUNPOD_KEY="$(
+    aws ssm get-parameter --region "$aws_region" --name "$ssm_parameter" \
+      --with-decryption --query Parameter.Value --output text
+  )"
+  [[ "$CUTOVER_RUNPOD_KEY" =~ ^[A-Za-z0-9._-]{20,512}$ ]] ||
+    fail "RunPod API key is unavailable"
+  export CUTOVER_RUNPOD_KEY
 }
 
 rewrite_env() {
@@ -58,6 +70,7 @@ values = {
     "GEN_AUTOMATION_I2V_RUNPOD_MODE": "pod",
     "GEN_AUTOMATION_I2V_RUNPOD_ENDPOINT_ID": "",
     "GEN_AUTOMATION_I2V_RUNPOD_NETWORK_VOLUME_ID": "",
+    "GEN_AUTOMATION_I2V_RUNPOD_QUEUE_TIMEOUT_SECONDS": "21600",
 }
 if mode == "enable":
     if runpod_mode not in {"pod", "serverless"}:
@@ -156,7 +169,10 @@ verify_runpod_provider() {
   CUTOVER_WORKER_SOURCE_REVISION="$worker_source_revision" \
   CUTOVER_RUNPOD_KEY="$CUTOVER_RUNPOD_KEY" \
   CUTOVER_PRESEED_VOLUME_ID="$PRESEED_VOLUME_ID" \
+  CUTOVER_PRESEED_MODEL_OBJECTS_SHA256="$PRESEED_MODEL_OBJECTS_SHA256" \
+  CUTOVER_PRESEED_MANIFEST_SOURCE_SHA256="$PRESEED_MANIFEST_SOURCE_SHA256" \
   python3 - <<'PY'
+import hashlib
 import json
 import os
 import re
@@ -170,6 +186,17 @@ worker_image = os.environ["CUTOVER_WORKER_IMAGE"]
 worker_source_revision = os.environ["CUTOVER_WORKER_SOURCE_REVISION"]
 api_key = os.environ["CUTOVER_RUNPOD_KEY"]
 preseed_volume_id = os.environ["CUTOVER_PRESEED_VOLUME_ID"]
+preseed_model_objects_sha256 = os.environ["CUTOVER_PRESEED_MODEL_OBJECTS_SHA256"]
+preseed_manifest_source_sha256 = os.environ[
+    "CUTOVER_PRESEED_MANIFEST_SOURCE_SHA256"
+]
+canonical_gpu_names = [
+    "NVIDIA RTX PRO 4500 Blackwell",
+    "NVIDIA GeForce RTX 5090",
+    "NVIDIA A40",
+    "NVIDIA RTX A6000",
+    "NVIDIA L40S",
+]
 try:
     def get_json(url: str) -> object:
         request = urllib.request.Request(
@@ -179,6 +206,21 @@ try:
         )
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.loads(response.read(64 * 1024))
+
+    def post_json(url: str, payload: dict[str, object]) -> object:
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload, separators=(",", ":")).encode(),
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "gen-automation-staging/1.0",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read(2 * 1024 * 1024))
 
     if volume_id != preseed_volume_id:
         raise ValueError
@@ -222,7 +264,7 @@ try:
         if not isinstance(endpoint, dict) or endpoint.get("id") != endpoint_id:
             raise ValueError
         endpoint_volumes = endpoint.get("networkVolumeIds")
-        if endpoint.get("networkVolumeId") != volume_id and endpoint_volumes != [volume_id]:
+        if endpoint.get("networkVolumeId") != volume_id or endpoint_volumes != [volume_id]:
             raise ValueError
         if "dataCenterIds" in endpoint:
             endpoint_data_centers = endpoint["dataCenterIds"]
@@ -237,12 +279,28 @@ try:
                 raise ValueError
             if endpoint_data_centers != [data_center_id]:
                 raise ValueError
-        if "flashboot" in endpoint and endpoint["flashboot"] is not True:
+        allowed_cuda_versions = endpoint.get("allowedCudaVersions")
+        if isinstance(allowed_cuda_versions, str):
+            allowed_cuda_versions = [
+                item.strip() for item in allowed_cuda_versions.split(",")
+            ]
+        if allowed_cuda_versions != ["12.8", "12.9", "13.0"]:
+            raise ValueError
+        if endpoint.get("minCudaVersion") != "12.8":
+            raise ValueError
+        if endpoint.get("flashboot") is not True:
+            raise ValueError
+        if "computeType" in endpoint and endpoint["computeType"] != "GPU":
             raise ValueError
         if (
             endpoint.get("name") != "gen-automation-i2v-staging"
+            or endpoint.get("gpuCount") != 1
             or endpoint.get("workersMin") != 0
             or endpoint.get("workersMax") != 1
+            or endpoint.get("idleTimeout") != 60
+            or endpoint.get("executionTimeoutMs") != 21600000
+            or endpoint.get("scalerType") != "QUEUE_DELAY"
+            or endpoint.get("scalerValue") != 1
         ):
             raise ValueError
         template_id = endpoint.get("templateId")
@@ -253,16 +311,101 @@ try:
             + urllib.parse.quote(template_id, safe="")
         )
         environment = template.get("env") if isinstance(template, dict) else None
+        allowed_gpu_names = (
+            environment.get("GEN_I2V_WORKER_ALLOWED_GPU_NAMES_CSV", "").split(",")
+            if isinstance(environment, dict)
+            else []
+        )
+        model_objects_json = (
+            environment.get("GEN_I2V_WORKER_MODEL_OBJECTS_JSON")
+            if isinstance(environment, dict)
+            else None
+        )
+        try:
+            model_objects = json.loads(model_objects_json)
+            canonical_model_objects = json.dumps(
+                model_objects,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        except (TypeError, json.JSONDecodeError):
+            raise ValueError from None
         if (
             not isinstance(template, dict)
             or template.get("imageName") != worker_image
             or not isinstance(environment, dict)
             or environment.get("GEN_I2V_WORKER_SOURCE_REVISION") != worker_source_revision
+            or not isinstance(model_objects, list)
+            or len(model_objects) != 14
+            or hashlib.sha256(canonical_model_objects.encode()).hexdigest()
+            != preseed_model_objects_sha256
+            or environment.get("GEN_I2V_WORKER_PRIVATE_MANIFEST_SOURCE_SHA256")
+            != preseed_manifest_source_sha256
             or environment.get("GEN_I2V_WORKER_VOLUME_ROOT") != "/runpod-volume"
             or environment.get("GEN_I2V_WORKER_REQUIRE_PRESEEDED_VOLUME") != "true"
             or environment.get("GEN_I2V_WORKER_LORA_WORKER_ENABLED") != "true"
+            or allowed_gpu_names != canonical_gpu_names
+            or any(not item for item in allowed_gpu_names)
+            or endpoint.get("gpuTypeIds") != canonical_gpu_names
         ):
             raise ValueError
+        graphql = post_json(
+            "https://api.runpod.io/graphql",
+            {
+                "query": (
+                    "query { myself { endpoints { id locations networkVolumeId "
+                    "templateId workersMax workersMin pods { id machine { dataCenterId } "
+                    "networkVolume { id dataCenterId } } } } }"
+                )
+            },
+        )
+        if not isinstance(graphql, dict) or graphql.get("errors") is not None:
+            raise ValueError
+        myself = graphql.get("data", {}).get("myself")
+        graphql_endpoints = myself.get("endpoints") if isinstance(myself, dict) else None
+        matches = (
+            [
+                item
+                for item in graphql_endpoints
+                if isinstance(item, dict) and item.get("id") == endpoint_id
+            ]
+            if isinstance(graphql_endpoints, list)
+            else []
+        )
+        if len(matches) != 1:
+            raise ValueError
+        scheduled = matches[0]
+        scheduled_locations = scheduled.get("locations")
+        if isinstance(scheduled_locations, str):
+            scheduled_locations = [item.strip() for item in scheduled_locations.split(",")]
+        if (
+            scheduled_locations != [data_center_id]
+            or scheduled.get("networkVolumeId") != volume_id
+            or scheduled.get("templateId") != template_id
+            or scheduled.get("workersMin") != 0
+            or scheduled.get("workersMax") != 1
+        ):
+            raise ValueError
+        scheduled_pods = scheduled.get("pods")
+        if not isinstance(scheduled_pods, list):
+            raise ValueError
+        for pod in scheduled_pods:
+            if not isinstance(pod, dict):
+                raise ValueError
+            machine = pod.get("machine")
+            pod_volume = pod.get("networkVolume")
+            if machine is not None and (
+                not isinstance(machine, dict)
+                or machine.get("dataCenterId") != data_center_id
+            ):
+                raise ValueError
+            if pod_volume is not None and (
+                not isinstance(pod_volume, dict)
+                or pod_volume.get("id") != volume_id
+                or pod_volume.get("dataCenterId") != data_center_id
+            ):
+                raise ValueError
     elif provider_mode != "pod" or endpoint_id:
         raise ValueError
 except Exception:
@@ -299,7 +442,9 @@ from gen_automation.config import Settings
 from gen_automation.services.i2v_environment import i2v_worker_identity
 
 state = json.loads(pathlib.Path("/run/preseed-state.json").read_text(encoding="utf-8"))
-objects_sha, artifact_sha = i2v_worker_identity(Settings())
+settings = Settings()
+objects_sha, artifact_sha = i2v_worker_identity(settings)
+manifest_source_sha = settings.i2v_private_manifest_source_sha256
 volume_id = state.get("network_volume_id")
 if (
     state.get("schema") != "gen-automation/i2v-runpod-preseed-state/v1"
@@ -308,9 +453,11 @@ if (
     or state.get("artifact_identity_sha256") != artifact_sha
     or not isinstance(volume_id, str)
     or not volume_id
+    or not isinstance(manifest_source_sha, str)
+    or len(manifest_source_sha) != 64
 ):
     raise SystemExit(1)
-print(volume_id)
+print(volume_id, objects_sha, manifest_source_sha, sep="\t")
 PY
 }
 
@@ -361,21 +508,155 @@ asyncio.run(main())
 PY
 }
 
+assert_zero_runpod_work() {
+  CUTOVER_RUNPOD_KEY="$CUTOVER_RUNPOD_KEY" \
+  python3 - "$marker" <<'PY'
+import json
+import os
+import pathlib
+import re
+import sys
+import urllib.parse
+import urllib.request
+
+try:
+    state_path = pathlib.Path(sys.argv[1])
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if state.get("schema") != "gen-automation/i2v-runpod-cutover/v1":
+        raise ValueError
+    provider_mode = state.get("runpod_mode")
+    endpoint_id = state.get("endpoint_id")
+    volume_id = state.get("network_volume_id")
+    if (
+        provider_mode not in {"pod", "serverless"}
+        or not isinstance(volume_id, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]{3,128}", volume_id) is None
+        or (
+            provider_mode == "serverless"
+            and (
+                not isinstance(endpoint_id, str)
+                or re.fullmatch(r"[A-Za-z0-9_-]{3,128}", endpoint_id) is None
+            )
+        )
+        or (provider_mode == "pod" and endpoint_id is not None)
+    ):
+        raise ValueError
+
+    def get_json(url: str) -> object:
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {os.environ['CUTOVER_RUNPOD_KEY']}",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read(64 * 1024))
+
+    if provider_mode == "serverless":
+        health = get_json(
+            "https://api.runpod.ai/v2/"
+            + urllib.parse.quote(endpoint_id, safe="")
+            + "/health"
+        )
+        jobs = health.get("jobs") if isinstance(health, dict) else None
+        workers = health.get("workers") if isinstance(health, dict) else None
+        for counters, names in (
+            (jobs, ("inQueue", "inProgress")),
+            (workers, ("initializing", "running")),
+        ):
+            if not isinstance(counters, dict):
+                raise ValueError
+            for name in names:
+                value = counters.get(name)
+                if not isinstance(value, int) or isinstance(value, bool) or value != 0:
+                    raise ValueError
+    else:
+        pods = get_json("https://rest.runpod.io/v1/pods?computeType=GPU")
+        if not isinstance(pods, list):
+            raise ValueError
+        for pod in pods:
+            if not isinstance(pod, dict):
+                raise ValueError
+            pod_volume = pod.get("networkVolumeId")
+            if pod_volume is None and isinstance(pod.get("networkVolume"), dict):
+                pod_volume = pod["networkVolume"].get("id")
+            if (
+                isinstance(pod.get("name"), str)
+                and pod["name"].startswith("gen-automation-i2v-")
+                and pod_volume == volume_id
+            ):
+                raise ValueError
+except Exception:
+    raise SystemExit("RunPod rollback work verification failed") from None
+PY
+}
+
+replace_env_atomically() {
+  local source="$1"
+  local suffix="$2"
+  local temporary=""
+  [ -f "$source" ] && [ ! -L "$source" ] || return 1
+  temporary="$(mktemp "${env_file}.${suffix}.XXXXXX")" || return 1
+  if ! cp -- "$source" "$temporary" ||
+    ! chmod --reference="$env_file" "$temporary" ||
+    ! chown --reference="$env_file" "$temporary" ||
+    ! mv -- "$temporary" "$env_file"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+}
+
 restore_original() {
   [ -f "$original_env" ] || return 1
-  local temporary
-  temporary="$(mktemp "${env_file}.rollback.XXXXXX")"
-  cp -- "$original_env" "$temporary"
-  chmod --reference="$env_file" "$temporary"
-  chown --reference="$env_file" "$temporary"
-  mv -- "$temporary" "$env_file"
+  replace_env_atomically "$original_env" rollback || return 1
   restart_control_plane
+}
+
+arm_manual_rollback_recovery() {
+  local snapshot=""
+  snapshot="$(mktemp "$(dirname "$active_root")/.rollback-recovery.XXXXXX")" ||
+    return 1
+  if ! cp -- "$env_file" "$snapshot" || ! chmod 0600 "$snapshot" ||
+    ! chown root:root "$snapshot"; then
+    rm -f -- "$snapshot"
+    return 1
+  fi
+  rollback_recovery_env="$snapshot"
+  rollback_recovery_armed=1
+}
+
+recover_manual_rollback_service() {
+  local recovery_status=0
+  [ -n "$rollback_recovery_env" ] || return 1
+  replace_env_atomically "$rollback_recovery_env" recovery || recovery_status=1
+  /usr/local/libexec/gen-automation-validate-deployment || recovery_status=1
+  /usr/bin/docker compose \
+    --env-file "$deploy_env" \
+    -f "$compose_file" \
+    config --quiet || recovery_status=1
+  systemctl restart --no-block "$service_name" || recovery_status=1
+  wait_for_control_plane || recovery_status=1
+  return "$recovery_status"
 }
 
 cleanup() {
   local status=$?
   trap - EXIT
   set +e
+  if [ "$status" -ne 0 ] && [ "$rollback_recovery_armed" -eq 1 ]; then
+    printf '%s\n' \
+      "Manual rollback failed; restoring the active RunPod configuration." >&2
+    if recover_manual_rollback_service; then
+      rm -f -- "$rollback_recovery_env"
+      rollback_recovery_armed=0
+      rollback_recovery_env=""
+    else
+      printf '%s\n' \
+        "Manual rollback service recovery requires operator attention; the root-only recovery snapshot was retained." >&2
+    fi
+  fi
   if [ "$status" -ne 0 ] && [ "$rollback_armed" -eq 1 ]; then
     printf '%s\n' "Cutover failed; restoring the prior provider configuration." >&2
     if restore_original; then
@@ -447,21 +728,59 @@ exec 9>"$lock_file"
 flock --exclusive --wait 120 9 || fail "another control-plane update holds the lock"
 
 if [ "$operation" = "rollback" ]; then
-  [ -f "$marker" ] && [ -f "$original_env" ] || fail "no active RunPod cutover exists"
+  [ -f "$marker" ] && [ ! -L "$marker" ] &&
+    [ -f "$original_env" ] && [ ! -L "$original_env" ] ||
+    fail "no active RunPod cutover exists"
   python3 - "$marker" "$env_file" <<'PY'
 import hashlib
 import json
 import pathlib
+import re
 import sys
 
 marker = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 actual = hashlib.sha256(pathlib.Path(sys.argv[2]).read_bytes()).hexdigest()
-if marker.get("schema") != "gen-automation/i2v-runpod-cutover/v1" or marker.get(
-    "cutover_env_sha256"
-) != actual:
+mode = marker.get("runpod_mode")
+endpoint_id = marker.get("endpoint_id")
+volume_id = marker.get("network_volume_id")
+worker_image = marker.get("worker_image")
+worker_source_revision = marker.get("worker_source_revision")
+if (
+    marker.get("schema") != "gen-automation/i2v-runpod-cutover/v1"
+    or marker.get("cutover_env_sha256") != actual
+    or mode not in {"pod", "serverless"}
+    or not isinstance(volume_id, str)
+    or re.fullmatch(r"[A-Za-z0-9_-]{3,128}", volume_id) is None
+    or (
+        mode == "serverless"
+        and (
+            not isinstance(endpoint_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{3,128}", endpoint_id) is None
+        )
+    )
+    or (mode == "pod" and endpoint_id is not None)
+    or not isinstance(worker_image, str)
+    or re.fullmatch(
+        r"ghcr[.]io/neuraln-cyber/gen-automation/i2v-worker@sha256:[0-9a-f]{64}",
+        worker_image,
+    )
+    is None
+    or not isinstance(worker_source_revision, str)
+    or re.fullmatch(r"[0-9a-f]{40}", worker_source_revision) is None
+):
     raise SystemExit(1)
 PY
+  load_runpod_key
+  arm_manual_rollback_recovery || fail "could not arm rollback service recovery"
+  systemctl stop "$service_name"
+  [ "$(systemctl show --property=ActiveState --value "$service_name")" = "inactive" ] ||
+    fail "control plane did not stop for rollback"
+  assert_zero_i2v_work || fail "I2V queue or attempt work is not zero"
+  assert_zero_runpod_work || fail "RunPod provider work is not zero"
   restore_original
+  rm -f -- "$rollback_recovery_env"
+  rollback_recovery_env=""
+  rollback_recovery_armed=0
   rm -f -- "$marker" "$original_env"
   rmdir -- "$active_root"
   printf '%s\n' "I2V provider rollback completed."
@@ -469,15 +788,16 @@ PY
 fi
 
 [ ! -e "$active_root" ] || fail "an active provider cutover already exists"
-CUTOVER_RUNPOD_KEY="$(
-  aws ssm get-parameter --region "$aws_region" --name "$ssm_parameter" \
-    --with-decryption --query Parameter.Value --output text
-)"
-[[ "$CUTOVER_RUNPOD_KEY" =~ ^[A-Za-z0-9._-]{20,512}$ ]] || fail "RunPod API key is unavailable"
-export CUTOVER_RUNPOD_KEY
-PRESEED_VOLUME_ID="$(verify_preseed_identity)"
+load_runpod_key
+PRESEED_IDENTITY="$(verify_preseed_identity)"
+IFS=$'\t' read -r PRESEED_VOLUME_ID PRESEED_MODEL_OBJECTS_SHA256 \
+  PRESEED_MANIFEST_SOURCE_SHA256 <<<"$PRESEED_IDENTITY"
 [[ "$PRESEED_VOLUME_ID" =~ ^[A-Za-z0-9_-]{3,128}$ ]] ||
   fail "RunPod volume preseed proof is invalid"
+[[ "$PRESEED_MODEL_OBJECTS_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
+  fail "RunPod model-object preseed proof is invalid"
+[[ "$PRESEED_MANIFEST_SOURCE_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
+  fail "RunPod private-manifest preseed proof is invalid"
 export PRESEED_VOLUME_ID
 verify_runpod_provider
 

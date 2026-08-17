@@ -17,6 +17,9 @@ def test_runpod_volume_seed_is_exact_scoped_and_non_gpu() -> None:
     assert "--network-volume-id" in script
     assert "--source-runpod-volume-id" in script
     assert "--source-runpod-datacenter" in script
+    assert "--adopt-ready-only" in script
+    assert "seed_args+=(--adopt-ready-only)" in script
+    assert "adopt-ready-only cannot use a source volume" in script
     assert '"https://s3api-${datacenter,,}.runpod.io/"' in script
     assert "--acknowledge-upload" in script
     assert "--read-only --network host" in script
