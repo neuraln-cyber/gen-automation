@@ -67,7 +67,10 @@ chmod 0700 "$work_root"
 model_objects_file="$work_root/model-objects.json"
 credentials_file="$work_root/runpod-s3.env"
 
-/usr/bin/docker exec --interactive "$container_id" python3.12 - >"$model_objects_file" <<'PY'
+/usr/bin/docker exec --interactive \
+  --env GEN_AUTOMATION_I2V_ENABLED=true \
+  --env GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED=true \
+  "$container_id" python3.12 - >"$model_objects_file" <<'PY'
 import json
 from gen_automation.config import Settings
 from gen_automation.services.i2v_environment import i2v_worker_model_objects

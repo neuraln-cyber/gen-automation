@@ -9,6 +9,8 @@ def test_runpod_volume_seed_is_exact_scoped_and_non_gpu() -> None:
 
     assert "/gen-automation-staging/runpod/s3-access-key-id" in script
     assert "/gen-automation-staging/runpod/s3-secret-access-key" in script
+    assert "--env GEN_AUTOMATION_I2V_ENABLED=true" in script
+    assert "--env GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED=true" in script
     assert "i2v_worker_model_objects(Settings())" in script
     assert "if len(models) != 14" in script
     assert "/app/scripts/runpod_i2v_seed_volume.py apply" in script
