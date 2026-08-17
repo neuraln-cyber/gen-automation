@@ -22,6 +22,7 @@ VOLUME_NAME = "gen-automation-i2v-models-staging"
 VOLUME_SIZE_GB = 100
 DATA_CENTER_ID = "EU-RO-1"
 GPU_TYPES = (
+    "NVIDIA RTX PRO 4500 Blackwell",
     "NVIDIA GeForce RTX 5090",
     "NVIDIA A40",
     "NVIDIA RTX A6000",

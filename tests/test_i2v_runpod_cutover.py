@@ -53,6 +53,10 @@ def test_cutover_freezes_and_proves_zero_work_before_enabling_runpod() -> None:
     assert "https://api.runpod.ai/v2/" not in script
     assert script.count("https://rest.runpod.io/v1/networkvolumes") == 1
     assert script.count("https://rest.runpod.io/v1/pods?computeType=GPU") == 1
+    assert '"https://rest.runpod.io/v1/endpoints/"' in script
+    assert '"https://rest.runpod.io/v1/templates/"' in script
+    assert 'endpoint.get("flashboot") is not True' in script
+    assert 'template.get("imageName") != worker_image' in script
     assert 'preseed_state="/var/lib/gen-automation/runpod-i2v/preseed-state.json"' in script
     assert 'state.get("status") != "ready"' in script
     assert 'pod["name"].startswith("gen-automation-i2v-")' in script
@@ -71,6 +75,8 @@ def test_cutover_freeze_allows_both_provider_coordinates_to_be_empty(tmp_path: P
     environment = {
         **os.environ,
         "CUTOVER_MODE": "freeze",
+        "CUTOVER_RUNPOD_MODE": "",
+        "CUTOVER_ENDPOINT_ID": "",
         "CUTOVER_NETWORK_VOLUME_ID": "",
         "CUTOVER_WORKER_IMAGE": "",
         "CUTOVER_WORKER_SOURCE_REVISION": "",
@@ -101,6 +107,8 @@ def test_cutover_enable_pins_exact_worker_image_and_source(tmp_path: Path) -> No
     environment = {
         **os.environ,
         "CUTOVER_MODE": "enable",
+        "CUTOVER_RUNPOD_MODE": "pod",
+        "CUTOVER_ENDPOINT_ID": "",
         "CUTOVER_NETWORK_VOLUME_ID": "volume123",
         "CUTOVER_WORKER_IMAGE": image,
         "CUTOVER_WORKER_SOURCE_REVISION": revision,
@@ -116,6 +124,39 @@ def test_cutover_enable_pins_exact_worker_image_and_source(tmp_path: Path) -> No
     enabled = target.read_text(encoding="utf-8")
     assert f"GEN_AUTOMATION_I2V_WORKER_IMAGE={image}\n" in enabled
     assert f"GEN_AUTOMATION_I2V_WORKER_SOURCE_REVISION={revision}\n" in enabled
+
+
+def test_cutover_serverless_enable_pins_endpoint_and_volume(tmp_path: Path) -> None:
+    program = re.findall(r"<<'PY'\n(.*?)\nPY", _script(), flags=re.DOTALL)[0]
+    source = tmp_path / "source.env"
+    target = tmp_path / "target.env"
+    source.write_text(
+        "GEN_AUTOMATION_PUBLIC_BASE_URL=https://staging.example\n",
+        encoding="utf-8",
+    )
+    image = "ghcr.io/neuraln-cyber/gen-automation/i2v-worker@sha256:" + "a" * 64
+    revision = "b" * 40
+    environment = {
+        **os.environ,
+        "CUTOVER_MODE": "enable",
+        "CUTOVER_RUNPOD_MODE": "serverless",
+        "CUTOVER_ENDPOINT_ID": "endpoint123",
+        "CUTOVER_NETWORK_VOLUME_ID": "volume123",
+        "CUTOVER_WORKER_IMAGE": image,
+        "CUTOVER_WORKER_SOURCE_REVISION": revision,
+        "CUTOVER_RUNPOD_KEY": "not-a-real-runpod-api-key",
+    }
+
+    subprocess.run(  # noqa: S603 - executes only the repository's embedded Python.
+        [sys.executable, "-c", program, str(source), str(target)],
+        check=True,
+        env=environment,
+    )
+
+    enabled = target.read_text(encoding="utf-8")
+    assert "GEN_AUTOMATION_I2V_RUNPOD_MODE=serverless\n" in enabled
+    assert "GEN_AUTOMATION_I2V_RUNPOD_ENDPOINT_ID=endpoint123\n" in enabled
+    assert "GEN_AUTOMATION_I2V_RUNPOD_NETWORK_VOLUME_ID=volume123\n" in enabled
 
 
 def test_cutover_reads_one_fixed_secret_and_never_prints_it() -> None:

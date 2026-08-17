@@ -14,6 +14,8 @@ ssm_parameter="/gen-automation-staging/runpod/inference-api-key"
 aws_region="eu-central-1"
 
 operation=""
+runpod_mode=""
+endpoint_id=""
 network_volume_id=""
 worker_image=""
 worker_source_revision=""
@@ -31,6 +33,8 @@ rewrite_env() {
   chmod 0600 "$temporary"
   chown --reference="$env_file" "$temporary"
   CUTOVER_MODE="$mode" \
+  CUTOVER_RUNPOD_MODE="$runpod_mode" \
+  CUTOVER_ENDPOINT_ID="$endpoint_id" \
   CUTOVER_NETWORK_VOLUME_ID="$network_volume_id" \
   CUTOVER_WORKER_IMAGE="$worker_image" \
   CUTOVER_WORKER_SOURCE_REVISION="$worker_source_revision" \
@@ -43,6 +47,8 @@ import sys
 source = pathlib.Path(sys.argv[1])
 target = pathlib.Path(sys.argv[2])
 mode = os.environ["CUTOVER_MODE"]
+runpod_mode = os.environ["CUTOVER_RUNPOD_MODE"] or "pod"
+endpoint_id = os.environ["CUTOVER_ENDPOINT_ID"]
 values = {
     "GEN_AUTOMATION_I2V_ENABLED": "false",
     "GEN_AUTOMATION_I2V_HIRES_PROFILE_ENABLED": "false",
@@ -54,6 +60,12 @@ values = {
     "GEN_AUTOMATION_I2V_RUNPOD_NETWORK_VOLUME_ID": "",
 }
 if mode == "enable":
+    if runpod_mode not in {"pod", "serverless"}:
+        raise SystemExit("invalid RunPod mode")
+    if runpod_mode == "serverless" and not endpoint_id:
+        raise SystemExit("missing RunPod Serverless endpoint ID")
+    if runpod_mode == "pod" and endpoint_id:
+        raise SystemExit("Pod mode must not configure a Serverless endpoint ID")
     public_base = None
     for line in source.read_text(encoding="utf-8").splitlines():
         if line.startswith("GEN_AUTOMATION_PUBLIC_BASE_URL="):
@@ -69,8 +81,8 @@ if mode == "enable":
             "GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED": "true",
             "GEN_AUTOMATION_I2V_LORA_PROFILE_ENABLED": "true",
             "GEN_AUTOMATION_I2V_RUNPOD_ENABLED": "true",
-            "GEN_AUTOMATION_I2V_RUNPOD_MODE": "pod",
-            "GEN_AUTOMATION_I2V_RUNPOD_ENDPOINT_ID": "",
+            "GEN_AUTOMATION_I2V_RUNPOD_MODE": runpod_mode,
+            "GEN_AUTOMATION_I2V_RUNPOD_ENDPOINT_ID": endpoint_id,
             "GEN_AUTOMATION_I2V_RUNPOD_NETWORK_VOLUME_ID": os.environ[
                 "CUTOVER_NETWORK_VOLUME_ID"
             ],
@@ -137,15 +149,24 @@ restart_control_plane() {
 }
 
 verify_runpod_provider() {
+  CUTOVER_RUNPOD_MODE="$runpod_mode" \
+  CUTOVER_ENDPOINT_ID="$endpoint_id" \
   CUTOVER_NETWORK_VOLUME_ID="$network_volume_id" \
+  CUTOVER_WORKER_IMAGE="$worker_image" \
+  CUTOVER_WORKER_SOURCE_REVISION="$worker_source_revision" \
   CUTOVER_RUNPOD_KEY="$CUTOVER_RUNPOD_KEY" \
   CUTOVER_PRESEED_VOLUME_ID="$PRESEED_VOLUME_ID" \
   python3 - <<'PY'
 import json
 import os
+import urllib.parse
 import urllib.request
 
+provider_mode = os.environ["CUTOVER_RUNPOD_MODE"]
+endpoint_id = os.environ["CUTOVER_ENDPOINT_ID"]
 volume_id = os.environ["CUTOVER_NETWORK_VOLUME_ID"]
+worker_image = os.environ["CUTOVER_WORKER_IMAGE"]
+worker_source_revision = os.environ["CUTOVER_WORKER_SOURCE_REVISION"]
 api_key = os.environ["CUTOVER_RUNPOD_KEY"]
 preseed_volume_id = os.environ["CUTOVER_PRESEED_VOLUME_ID"]
 try:
@@ -188,8 +209,44 @@ try:
         for pod in pods
     ):
         raise ValueError
+    if provider_mode == "serverless":
+        endpoint = get_json(
+            "https://rest.runpod.io/v1/endpoints/"
+            + urllib.parse.quote(endpoint_id, safe="")
+        )
+        if not isinstance(endpoint, dict) or endpoint.get("id") != endpoint_id:
+            raise ValueError
+        endpoint_volumes = endpoint.get("networkVolumeIds")
+        if endpoint.get("networkVolumeId") != volume_id and endpoint_volumes != [volume_id]:
+            raise ValueError
+        if (
+            endpoint.get("name") != "gen-automation-i2v-staging"
+            or endpoint.get("workersMin") != 0
+            or endpoint.get("workersMax") != 1
+            or endpoint.get("flashboot") is not True
+        ):
+            raise ValueError
+        template_id = endpoint.get("templateId")
+        if not isinstance(template_id, str) or not template_id:
+            raise ValueError
+        template = get_json(
+            "https://rest.runpod.io/v1/templates/"
+            + urllib.parse.quote(template_id, safe="")
+        )
+        environment = template.get("env") if isinstance(template, dict) else None
+        if (
+            not isinstance(template, dict)
+            or template.get("imageName") != worker_image
+            or not isinstance(environment, dict)
+            or environment.get("GEN_I2V_WORKER_SOURCE_REVISION") != worker_source_revision
+            or environment.get("GEN_I2V_WORKER_VOLUME_ROOT") != "/runpod-volume"
+            or environment.get("GEN_I2V_WORKER_LORA_WORKER_ENABLED") != "true"
+        ):
+            raise ValueError
+    elif provider_mode != "pod" or endpoint_id:
+        raise ValueError
 except Exception:
-    raise SystemExit("RunPod Pod provider verification failed") from None
+    raise SystemExit("RunPod provider verification failed") from None
 PY
 }
 
@@ -316,16 +373,37 @@ trap cleanup EXIT
 
 [ "$(id -u)" -eq 0 ] || fail "run as root through AWS Systems Manager"
 [ "$#" -ge 1 ] ||
-  fail "usage: $0 --enable --network-volume-id <id> --worker-image <ref> --worker-source-revision <sha> | --rollback"
+  fail "usage: $0 --enable --network-volume-id <id> --worker-image <ref> --worker-source-revision <sha> | --enable-serverless --endpoint-id <id> --network-volume-id <id> --worker-image <ref> --worker-source-revision <sha> | --rollback"
 case "$1" in
   --enable)
     [ "$#" -eq 7 ] && [ "$2" = "--network-volume-id" ] &&
       [ "$4" = "--worker-image" ] && [ "$6" = "--worker-source-revision" ] ||
       fail "enable requires exact network volume, worker image, and worker source"
     operation="enable"
+    runpod_mode="pod"
     network_volume_id="$3"
     worker_image="$5"
     worker_source_revision="$7"
+    [[ "$network_volume_id" =~ ^[A-Za-z0-9_-]{3,128}$ ]] ||
+      fail "invalid network volume ID"
+    [[ "$worker_image" =~ ^ghcr[.]io/neuraln-cyber/gen-automation/i2v-worker@sha256:[0-9a-f]{64}$ ]] ||
+      fail "invalid immutable I2V worker image"
+    [[ "$worker_source_revision" =~ ^[0-9a-f]{40}$ ]] ||
+      fail "invalid I2V worker source revision"
+    ;;
+  --enable-serverless)
+    [ "$#" -eq 9 ] && [ "$2" = "--endpoint-id" ] &&
+      [ "$4" = "--network-volume-id" ] && [ "$6" = "--worker-image" ] &&
+      [ "$8" = "--worker-source-revision" ] ||
+      fail "serverless enable requires exact endpoint, network volume, worker image, and worker source"
+    operation="enable"
+    runpod_mode="serverless"
+    endpoint_id="$3"
+    network_volume_id="$5"
+    worker_image="$7"
+    worker_source_revision="$9"
+    [[ "$endpoint_id" =~ ^[A-Za-z0-9_-]{3,128}$ ]] ||
+      fail "invalid RunPod Serverless endpoint ID"
     [[ "$network_volume_id" =~ ^[A-Za-z0-9_-]{3,128}$ ]] ||
       fail "invalid network volume ID"
     [[ "$worker_image" =~ ^ghcr[.]io/neuraln-cyber/gen-automation/i2v-worker@sha256:[0-9a-f]{64}$ ]] ||
@@ -397,8 +475,8 @@ rewrite_env enable
 unset CUTOVER_RUNPOD_KEY
 restart_control_plane
 
-python3 - "$marker" "$network_volume_id" "$worker_image" "$worker_source_revision" \
-  "$env_file" <<'PY'
+python3 - "$marker" "$runpod_mode" "$endpoint_id" "$network_volume_id" "$worker_image" \
+  "$worker_source_revision" "$env_file" <<'PY'
 import hashlib
 import json
 import os
@@ -406,12 +484,14 @@ import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
-environment = pathlib.Path(sys.argv[5]).read_bytes()
+environment = pathlib.Path(sys.argv[7]).read_bytes()
 payload = {
     "schema": "gen-automation/i2v-runpod-cutover/v1",
-    "network_volume_id": sys.argv[2],
-    "worker_image": sys.argv[3],
-    "worker_source_revision": sys.argv[4],
+    "runpod_mode": sys.argv[2],
+    "endpoint_id": sys.argv[3] or None,
+    "network_volume_id": sys.argv[4],
+    "worker_image": sys.argv[5],
+    "worker_source_revision": sys.argv[6],
     "cutover_env_sha256": hashlib.sha256(environment).hexdigest(),
 }
 path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
