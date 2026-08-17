@@ -462,9 +462,12 @@ def apply(
     source_runpod_volume_id: str | None = None,
     source_runpod_endpoint: str | None = None,
     source_runpod_datacenter: str | None = None,
+    adopt_ready_only: bool = False,
 ) -> dict[str, object]:
     if os.environ.get(SPEND_SWITCH, "").casefold() != "true":
         raise RuntimeError(f"volume upload requires {SPEND_SWITCH}=true")
+    if adopt_ready_only and source_runpod_volume_id is not None:
+        raise RuntimeError("adopt-ready-only cannot use a source volume")
     artifact_identity = _artifact_identity(models)
     marker = _marker_payload(
         volume_id=volume_id,
@@ -501,6 +504,8 @@ def apply(
         state.update({"status": "ready", "updated_at": completed_at, "completed_at": completed_at})
         _write_state(state_file, state)
         return _result(volume_id, artifact_identity, models, ready=True)
+    if adopt_ready_only:
+        raise RuntimeError("RunPod volume is not exactly ready for adoption")
     state = _load_state(
         state_file,
         volume_id=volume_id,
@@ -637,6 +642,7 @@ def _parser() -> argparse.ArgumentParser:
         choices=(64 * 1024 * 1024, 128 * 1024 * 1024, 256 * 1024 * 1024),
     )
     parser.add_argument("--acknowledge-upload", action="store_true")
+    parser.add_argument("--adopt-ready-only", action="store_true")
     return parser
 
 
@@ -653,6 +659,8 @@ def main() -> int:
         args.source_runpod_datacenter,
         args.source_runpod_endpoint,
     )
+    if args.adopt_ready_only and any(source_options):
+        raise RuntimeError("adopt-ready-only cannot use a source volume")
     if any(source_options) and not all(source_options):
         raise RuntimeError("RunPod source volume options must be provided together")
     if args.source_runpod_volume_id is not None:
@@ -689,6 +697,7 @@ def main() -> int:
             source_runpod_volume_id=args.source_runpod_volume_id,
             source_runpod_endpoint=args.source_runpod_endpoint,
             source_runpod_datacenter=args.source_runpod_datacenter,
+            adopt_ready_only=args.adopt_ready_only,
         )
     else:
         result = status(

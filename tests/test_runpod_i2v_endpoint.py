@@ -70,11 +70,11 @@ def test_plan_scales_to_zero_and_preserves_provider_neutral_worker_contract() ->
     assert spec["endpoint"]["workersMin"] == 0
     assert spec["endpoint"]["workersMax"] == 1
     assert spec["endpoint"]["gpuTypeIds"] == [
+        "NVIDIA RTX PRO 4500 Blackwell",
         "NVIDIA GeForce RTX 5090",
         "NVIDIA A40",
         "NVIDIA RTX A6000",
         "NVIDIA L40S",
-        "NVIDIA RTX PRO 4500 Blackwell",
     ]
     assert spec["template"]["env"]["GEN_I2V_WORKER_ALLOWED_GPU_NAMES_CSV"] == (
         ",".join(spec["endpoint"]["gpuTypeIds"])
@@ -141,6 +141,7 @@ def test_graphql_readback_uses_bearer_auth_without_leaking_key_in_url(
     def fake_urlopen(request: Any, *, timeout: int) -> _Response:
         assert request.full_url == module.RUNPOD_GRAPHQL_ROOT
         assert request.headers["Authorization"] == "Bearer test-secret-key"
+        assert request.headers["User-agent"] == "gen-automation-staging/1.0"
         assert timeout == 60
         return _Response()
 

@@ -24,11 +24,11 @@ VOLUME_SIZE_GB = 100
 DATA_CENTER_ID = "EU-RO-1"
 # RunPod canonicalizes the compatible 32/48 GB Serverless pools to these IDs.
 GPU_TYPES = (
+    "NVIDIA RTX PRO 4500 Blackwell",
     "NVIDIA GeForce RTX 5090",
     "NVIDIA A40",
     "NVIDIA RTX A6000",
     "NVIDIA L40S",
-    "NVIDIA RTX PRO 4500 Blackwell",
 )
 SPEND_SWITCH = "GEN_AUTOMATION_RUNPOD_I2V_SPEND_ALLOWED"
 STATE_SCHEMA = "gen-automation/runpod-i2v-state/v1"
@@ -124,6 +124,7 @@ def _graphql_endpoint(api_key: str, endpoint_id: str) -> dict[str, Any]:
             "Accept": "application/json",
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "User-Agent": "gen-automation-staging/1.0",
         },
         method="POST",
     )

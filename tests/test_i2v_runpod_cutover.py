@@ -18,11 +18,11 @@ SCRIPT = ROOT / "infra/aws-staging/deploy/cutover-i2v-runpod.sh"
 ENV_EXAMPLE = ROOT / "infra/aws-staging/deploy/control-plane.env.example"
 ABSENT = object()
 CANONICAL_GPU_NAMES = (
+    "NVIDIA RTX PRO 4500 Blackwell",
     "NVIDIA GeForce RTX 5090",
     "NVIDIA A40",
     "NVIDIA RTX A6000",
     "NVIDIA L40S",
-    "NVIDIA RTX PRO 4500 Blackwell",
 )
 
 
@@ -232,6 +232,7 @@ def test_provider_verifier_accepts_documented_datacenter_serializations(
         if request.full_url == "https://api.runpod.io/graphql":
             assert request.method == "POST"
             assert request.headers["Authorization"] == "Bearer test-key"
+            assert request.headers["User-agent"] == "gen-automation-staging/1.0"
         return _Response(payloads[request.full_url])
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)

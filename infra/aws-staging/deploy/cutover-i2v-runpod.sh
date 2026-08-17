@@ -191,11 +191,11 @@ preseed_manifest_source_sha256 = os.environ[
     "CUTOVER_PRESEED_MANIFEST_SOURCE_SHA256"
 ]
 canonical_gpu_names = [
+    "NVIDIA RTX PRO 4500 Blackwell",
     "NVIDIA GeForce RTX 5090",
     "NVIDIA A40",
     "NVIDIA RTX A6000",
     "NVIDIA L40S",
-    "NVIDIA RTX PRO 4500 Blackwell",
 ]
 try:
     def get_json(url: str) -> object:
@@ -215,6 +215,7 @@ try:
                 "Accept": "application/json",
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
+                "User-Agent": "gen-automation-staging/1.0",
             },
             method="POST",
         )

@@ -244,6 +244,7 @@ def test_preseed_adopts_exact_ready_volume_without_opening_a_source(
         endpoint=module.DEFAULT_ENDPOINT,
         datacenter=module.DEFAULT_DATACENTER,
         part_bytes=64 * 1024 * 1024,
+        adopt_ready_only=True,
     )
 
     assert result["ready"] is True
@@ -251,6 +252,79 @@ def test_preseed_adopts_exact_ready_volume_without_opening_a_source(
     assert state["status"] == "ready"
     assert all(item["status"] == "completed" for item in state["objects"].values())
     assert destination.uploaded_parts == 0
+
+
+def test_preseed_adopt_only_rejects_mismatch_before_source_or_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load()
+    objects_file, _source_objects = _objects(tmp_path)
+    models, objects_sha = module._read_models(objects_file)
+    destination = _S3()
+    state_file = tmp_path / "adopt-mismatch-state.json"
+
+    monkeypatch.setattr(module, "_runpod_client", lambda **_kwargs: destination)
+    monkeypatch.setattr(
+        module,
+        "_source_client",
+        lambda _profile: pytest.fail("adopt-only must not open the source"),
+    )
+    monkeypatch.setattr(
+        module,
+        "_load_state",
+        lambda *_args, **_kwargs: pytest.fail("adopt-only mismatch must not load state"),
+    )
+    monkeypatch.setenv(module.SPEND_SWITCH, "true")
+
+    with pytest.raises(RuntimeError, match="not exactly ready for adoption"):
+        module.apply(
+            models=models,
+            model_objects_sha256=objects_sha,
+            volume_id="volume-mismatch",
+            state_file=state_file,
+            aws_profile=None,
+            endpoint=module.DEFAULT_ENDPOINT,
+            datacenter=module.DEFAULT_DATACENTER,
+            part_bytes=64 * 1024 * 1024,
+            adopt_ready_only=True,
+        )
+
+    assert not state_file.exists()
+    assert destination.objects == {}
+    assert destination.uploads == {}
+    assert destination.uploaded_parts == 0
+
+
+def test_preseed_adopt_only_rejects_source_volume_before_opening_clients(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load()
+    objects_file, _source_objects = _objects(tmp_path)
+    models, objects_sha = module._read_models(objects_file)
+    monkeypatch.setattr(
+        module,
+        "_runpod_client",
+        lambda **_kwargs: pytest.fail("invalid adopt-only input must not open a client"),
+    )
+    monkeypatch.setenv(module.SPEND_SWITCH, "true")
+
+    with pytest.raises(RuntimeError, match="cannot use a source volume"):
+        module.apply(
+            models=models,
+            model_objects_sha256=objects_sha,
+            volume_id="volume-destination",
+            state_file=tmp_path / "unused-state.json",
+            aws_profile=None,
+            endpoint=module.DEFAULT_ENDPOINT,
+            datacenter=module.DEFAULT_DATACENTER,
+            part_bytes=64 * 1024 * 1024,
+            source_runpod_volume_id="volume-source",
+            source_runpod_endpoint="https://s3api-eu-ro-1.runpod.io/",
+            source_runpod_datacenter="EU-RO-1",
+            adopt_ready_only=True,
+        )
 
 
 def test_preseed_refuses_unowned_existing_destination_object(tmp_path: Path) -> None:

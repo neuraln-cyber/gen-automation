@@ -15,6 +15,7 @@ volume_id=""
 datacenter="EU-RO-1"
 source_runpod_volume_id=""
 source_runpod_datacenter=""
+adopt_ready_only=0
 work_root=""
 credentials_file=""
 model_objects_file=""
@@ -61,6 +62,10 @@ while [ "$#" -gt 0 ]; do
       source_runpod_datacenter="$2"
       shift 2
       ;;
+    --adopt-ready-only)
+      adopt_ready_only=1
+      shift
+      ;;
     *) fail "unknown argument: $1" ;;
   esac
 done
@@ -73,6 +78,9 @@ if [ -n "$source_runpod_volume_id" ] || [ -n "$source_runpod_datacenter" ]; then
     fail "invalid source RunPod datacenter"
   [ "$source_runpod_volume_id" != "$volume_id" ] ||
     fail "source and destination RunPod volumes must differ"
+fi
+if [ "$adopt_ready_only" -eq 1 ] && [ -n "$source_runpod_volume_id" ]; then
+  fail "adopt-ready-only cannot use a source volume"
 fi
 state_file="$state_root/preseed-state-$volume_id.json"
 for command in aws docker flock mktemp python3; do
@@ -170,6 +178,9 @@ if [ -n "$source_runpod_volume_id" ]; then
     --source-runpod-datacenter "$source_runpod_datacenter"
     --source-runpod-endpoint "https://s3api-${source_runpod_datacenter,,}.runpod.io/"
   )
+fi
+if [ "$adopt_ready_only" -eq 1 ]; then
+  seed_args+=(--adopt-ready-only)
 fi
 /usr/bin/docker run --rm --init --read-only --network host \
   --user 10001:10001 \
