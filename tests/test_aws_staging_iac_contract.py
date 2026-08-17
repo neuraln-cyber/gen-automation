@@ -320,3 +320,25 @@ def test_runtime_can_list_only_managed_lora_model_prefixes() -> None:
         "worker/i2v/sha256/*",
     ]
     assert runtime_policy.count('"s3:ListBucket"') == 2
+
+
+def test_control_plane_can_read_only_exact_runpod_runtime_parameters() -> None:
+    iam = (INFRA / "iam.tf").read_text(encoding="utf-8")
+    policy = iam.split(
+        'data "aws_iam_policy_document" "runpod_inference_key_read" {',
+        maxsplit=1,
+    )[1].split(
+        'resource "aws_iam_role_policy" "runpod_inference_key_read" {',
+        maxsplit=1,
+    )[0]
+
+    for parameter in (
+        "inference-api-key",
+        "s3-access-key-id",
+        "s3-secret-access-key",
+    ):
+        exact_arn = f"parameter/${{local.name}}/runpod/{parameter}"
+        assert policy.count(exact_arn) == 2
+    assert "parameter/${local.name}/runpod/*" not in policy
+    assert 'actions = ["ssm:GetParameter"]' in policy
+    assert 'sid    = "DenyOtherRuntimeParameterReads"' in policy
