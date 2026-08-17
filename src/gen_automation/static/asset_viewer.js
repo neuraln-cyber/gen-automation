@@ -7,6 +7,7 @@
     "The exact full-size image could not be loaded. The lightweight preview remains available."
   );
   const EXACT_IMAGE_UPGRADE_DELAY_MS = 150;
+  const EXACT_IMAGE_REVEAL_FALLBACK_MS = 250;
   const INSPECTION_BATCH_SIZE = 25;
   const INSPECTION_IDLE_FLUSH_MS = 5000;
   const INSPECTION_RETRY_MS = 2500;
@@ -450,6 +451,7 @@
     let inspectionAbortController = null;
     let completionInspectionHandoff = false;
     let exactUpgradeTimer = null;
+    let exactRevealTimer = null;
     let returnFocus = null;
 
     const resetViewerScroll = () => {
@@ -512,9 +514,15 @@
       }
     };
 
+    const cancelExactReveal = () => {
+      if (exactRevealTimer !== null) window.clearTimeout(exactRevealTimer);
+      exactRevealTimer = null;
+    };
+
     const cancelExactUpgrade = ({ cancelInFlight = false } = {}) => {
       if (exactUpgradeTimer !== null) window.clearTimeout(exactUpgradeTimer);
       exactUpgradeTimer = null;
+      cancelExactReveal();
       if (
         cancelInFlight
         && (!viewer.image.complete || viewer.image.naturalWidth <= 0)
@@ -523,10 +531,38 @@
       }
     };
 
+    const finishExactReveal = () => {
+      if (viewer.image.classList.contains("is-loading") || !markViewerImageLoaded()) return false;
+      cancelExactReveal();
+      viewer.placeholder.hidden = true;
+      return true;
+    };
+
     const revealExactImage = () => {
       if (!markViewerImageLoaded()) return false;
+      const wasLoading = viewer.image.classList.contains("is-loading");
+      if (!wasLoading && exactRevealTimer !== null) {
+        if (announcement === IMAGE_LOAD_ERROR) announce("");
+        return true;
+      }
+      const shouldCrossfade = (
+        wasLoading
+        && !viewer.placeholder.hidden
+        && Boolean(viewer.placeholder.getAttribute("src"))
+        && !window.matchMedia("(prefers-reduced-motion: reduce)").matches
+      );
+      cancelExactReveal();
       viewer.image.classList.remove("is-loading");
-      viewer.placeholder.hidden = true;
+      if (shouldCrossfade) {
+        // Keep the preview composited underneath until the exact layer is
+        // fully opaque; hiding it here would expose the black viewer surface.
+        exactRevealTimer = window.setTimeout(
+          finishExactReveal,
+          EXACT_IMAGE_REVEAL_FALLBACK_MS,
+        );
+      } else {
+        viewer.placeholder.hidden = true;
+      }
       if (announcement === IMAGE_LOAD_ERROR) announce("");
       return true;
     };
@@ -1516,6 +1552,10 @@
     viewer.image.addEventListener("load", () => {
       resetViewerScroll();
       revealExactImageAfterDecode();
+    });
+    viewer.image.addEventListener("transitionend", (event) => {
+      if (event.propertyName !== "opacity") return;
+      finishExactReveal();
     });
     let touchStart = null;
     viewer.media.addEventListener("touchstart", (event) => {
