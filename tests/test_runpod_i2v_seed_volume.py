@@ -199,6 +199,60 @@ def test_preseed_streams_exact_versioned_objects_once_and_reconciles(
         )
 
 
+def test_preseed_adopts_exact_ready_volume_without_opening_a_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load()
+    objects_file, source_objects = _objects(tmp_path)
+    models, objects_sha = module._read_models(objects_file)
+    destination = _S3()
+    volume_id = "volume-ready"
+    identity = module._artifact_identity(models)
+    marker = module._marker_payload(
+        volume_id=volume_id,
+        artifact_identity=identity,
+        model_objects_sha256=objects_sha,
+        models=models,
+    )
+    destination.put_object(
+        Bucket=volume_id,
+        Key=module._marker_key(identity),
+        Body=module._canonical_json(marker),
+        ContentType="application/json",
+    )
+    for model in models:
+        destination.objects[(volume_id, module._object_key(identity, model))] = source_objects[
+            (model.bucket, model.key, model.version_id)
+        ]
+
+    monkeypatch.setattr(module, "_runpod_client", lambda **_kwargs: destination)
+    monkeypatch.setattr(
+        module,
+        "_source_client",
+        lambda _profile: pytest.fail("a ready volume must not open the source"),
+    )
+    monkeypatch.setenv(module.SPEND_SWITCH, "true")
+    state_file = tmp_path / "adopted-state.json"
+
+    result = module.apply(
+        models=models,
+        model_objects_sha256=objects_sha,
+        volume_id=volume_id,
+        state_file=state_file,
+        aws_profile=None,
+        endpoint=module.DEFAULT_ENDPOINT,
+        datacenter=module.DEFAULT_DATACENTER,
+        part_bytes=64 * 1024 * 1024,
+    )
+
+    assert result["ready"] is True
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert state["status"] == "ready"
+    assert all(item["status"] == "completed" for item in state["objects"].values())
+    assert destination.uploaded_parts == 0
+
+
 def test_preseed_refuses_unowned_existing_destination_object(tmp_path: Path) -> None:
     module = _load()
     objects_file, source_objects = _objects(tmp_path)

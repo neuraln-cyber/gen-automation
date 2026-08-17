@@ -564,7 +564,7 @@ class Settings(BaseSettings):
         le=60 * 60,
     )
     i2v_runpod_queue_timeout_seconds: int = Field(
-        default=30 * 60,
+        default=6 * 60 * 60,
         ge=60,
         le=6 * 60 * 60,
     )

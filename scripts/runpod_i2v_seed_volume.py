@@ -480,6 +480,26 @@ def apply(
         artifact_identity=artifact_identity,
         models=models,
     ):
+        state = _load_state(
+            state_file,
+            volume_id=volume_id,
+            artifact_identity=artifact_identity,
+            model_objects_sha256=model_objects_sha256,
+            models=models,
+        )
+        completed_at = _now()
+        object_states = cast(dict[str, dict[str, Any]], state["objects"])
+        for model in models:
+            object_states[model.role].update(
+                {
+                    "status": "completed",
+                    "upload_id": None,
+                    "completion_attempted": True,
+                    "completed_at": completed_at,
+                }
+            )
+        state.update({"status": "ready", "updated_at": completed_at, "completed_at": completed_at})
+        _write_state(state_file, state)
         return _result(volume_id, artifact_identity, models, ready=True)
     state = _load_state(
         state_file,

@@ -17,19 +17,22 @@ from pathlib import Path
 from typing import Any, cast
 
 RUNPOD_API_ROOT = "https://rest.runpod.io/v1"
+RUNPOD_GRAPHQL_ROOT = "https://api.runpod.io/graphql"
 ENDPOINT_NAME = "gen-automation-i2v-staging"
 VOLUME_NAME_PREFIX = "gen-automation-i2v-models-staging"
 VOLUME_SIZE_GB = 100
-DATA_CENTER_ID = "US-IL-1"
+DATA_CENTER_ID = "EU-RO-1"
 # RunPod canonicalizes the compatible 32/48 GB Serverless pools to these IDs.
 GPU_TYPES = (
     "NVIDIA GeForce RTX 5090",
     "NVIDIA A40",
     "NVIDIA RTX A6000",
     "NVIDIA L40S",
+    "NVIDIA RTX PRO 4500 Blackwell",
 )
 SPEND_SWITCH = "GEN_AUTOMATION_RUNPOD_I2V_SPEND_ALLOWED"
 STATE_SCHEMA = "gen-automation/runpod-i2v-state/v1"
+PRESEED_STATE_SCHEMA = "gen-automation/i2v-runpod-preseed-state/v1"
 IMAGE_PATTERN = re.compile(
     r"^ghcr[.]io/neuraln-cyber/gen-automation/i2v-worker@sha256:([0-9a-f]{64})$"
 )
@@ -108,6 +111,43 @@ def _get(api_key: str, path: str) -> dict[str, Any] | None:
     return value
 
 
+def _graphql_endpoint(api_key: str, endpoint_id: str) -> dict[str, Any]:
+    query = (
+        "query { myself { endpoints { id name locations networkVolumeId "
+        "templateId workersMax workersMin pods { id machine { dataCenterId } "
+        "networkVolume { id dataCenterId } } } } }"
+    )
+    request = urllib.request.Request(
+        RUNPOD_GRAPHQL_ROOT,
+        data=json.dumps({"query": query}, separators=(",", ":")).encode(),
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310
+            payload = json.loads(response.read(2 * 1024 * 1024))
+    except (urllib.error.URLError, UnicodeDecodeError, json.JSONDecodeError):
+        raise RuntimeError("RunPod GraphQL endpoint verification failed") from None
+    if not isinstance(payload, dict) or payload.get("errors") is not None:
+        raise RuntimeError("RunPod GraphQL endpoint verification failed")
+    try:
+        endpoints = payload["data"]["myself"]["endpoints"]
+    except (KeyError, TypeError):
+        raise RuntimeError("RunPod GraphQL endpoint verification failed") from None
+    if not isinstance(endpoints, list):
+        raise RuntimeError("RunPod GraphQL endpoint verification failed")
+    matches = [
+        item for item in endpoints if isinstance(item, dict) and item.get("id") == endpoint_id
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("RunPod GraphQL endpoint verification failed")
+    return cast(dict[str, Any], matches[0])
+
+
 def _mutate(
     api_key: str,
     path: str,
@@ -141,7 +181,7 @@ def _find_unique(
     return candidates[0] if candidates else None
 
 
-def _read_model_objects(path: Path) -> tuple[str, str]:
+def _read_model_objects(path: Path) -> tuple[str, str, str]:
     try:
         metadata = path.lstat()
         if path.is_symlink() or not path.is_file() or metadata.st_size > 64 * 1024:
@@ -169,7 +209,53 @@ def _read_model_objects(path: Path) -> tuple[str, str]:
         ):
             raise RuntimeError("model objects file is invalid")
     raw = json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
-    return raw, hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    artifact_identity = [
+        {
+            "role": item["role"],
+            "byte_size": item["byte_size"],
+            "sha256": item["sha256"],
+            "version_id": item["version_id"],
+        }
+        for item in value
+    ]
+    artifact_identity_json = json.dumps(
+        artifact_identity,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return (
+        raw,
+        hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        hashlib.sha256(artifact_identity_json.encode("utf-8")).hexdigest(),
+    )
+
+
+def _read_adopted_preseed_volume_id(
+    path: Path,
+    *,
+    model_objects_sha256: str,
+    artifact_identity_sha256: str,
+) -> str:
+    try:
+        metadata = path.lstat()
+        if path.is_symlink() or not path.is_file() or metadata.st_size > 128 * 1024:
+            raise ValueError
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        raise RuntimeError("adopted RunPod preseed state is invalid") from None
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != PRESEED_STATE_SCHEMA
+        or value.get("status") != "ready"
+        or value.get("model_objects_sha256") != model_objects_sha256
+        or value.get("artifact_identity_sha256") != artifact_identity_sha256
+    ):
+        raise RuntimeError("adopted RunPod preseed state is invalid")
+    volume_id = value.get("network_volume_id")
+    if not isinstance(volume_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{3,128}", volume_id) is None:
+        raise RuntimeError("adopted RunPod preseed state is invalid")
+    return volume_id
 
 
 def _spec(
@@ -179,6 +265,7 @@ def _spec(
     manifest_source_sha256: str,
     model_objects_json: str,
     model_objects_sha256: str,
+    network_volume_id: str,
     workers_min: int = 0,
     data_center_id: str = DATA_CENTER_ID,
 ) -> dict[str, dict[str, Any]]:
@@ -189,13 +276,20 @@ def _spec(
         raise RuntimeError("worker source revision is invalid")
     if SHA256_PATTERN.fullmatch(manifest_source_sha256) is None:
         raise RuntimeError("private manifest source identity is invalid")
+    if re.fullmatch(r"[A-Za-z0-9_-]{3,128}", network_volume_id) is None:
+        raise RuntimeError("adopted RunPod network volume ID is invalid")
     if workers_min not in (0, 1):
         raise RuntimeError("minimum workers must be zero or one")
     if re.fullmatch(r"[A-Z]{2,4}-[A-Z]{2,4}-[0-9]", data_center_id) is None:
         raise RuntimeError("RunPod datacenter is invalid")
     template_name = f"gen-automation-i2v-{match.group(1)[:16]}"
-    volume_name = f"{VOLUME_NAME_PREFIX}-{data_center_id.casefold()}"
+    volume_name = (
+        VOLUME_NAME_PREFIX
+        if data_center_id == "EU-RO-1"
+        else f"{VOLUME_NAME_PREFIX}-{data_center_id.casefold()}"
+    )
     volume = {
+        "id": network_volume_id,
         "name": volume_name,
         "size": VOLUME_SIZE_GB,
         "dataCenterId": data_center_id,
@@ -259,14 +353,14 @@ def _template_id(endpoint: dict[str, Any]) -> str | None:
 
 def _strings(value: object) -> list[str]:
     if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
+        return [item.strip() for item in value.split(",")]
     if isinstance(value, list) and all(isinstance(item, str) for item in value):
         return value
     return []
 
 
 def _verify_volume(actual: dict[str, Any], expected: dict[str, Any]) -> None:
-    fields = ("name", "size", "dataCenterId")
+    fields = ("id", "name", "size", "dataCenterId")
     mismatches = [field for field in fields if actual.get(field) != expected[field]]
     if mismatches:
         raise RuntimeError(f"RunPod network volume drift: {', '.join(mismatches)}")
@@ -311,18 +405,75 @@ def _verify_endpoint(
         "scalerValue",
     )
     mismatches = [field for field in fields if actual.get(field) != expected[field]]
+    if "computeType" in actual and actual["computeType"] != expected["computeType"]:
+        mismatches.append("computeType")
     if _template_id(actual) != template_id:
         mismatches.append("templateId")
     if _strings(actual.get("gpuTypeIds")) != expected["gpuTypeIds"]:
         mismatches.append("gpuTypeIds")
-    if actual.get("networkVolumeId") != volume_id:
-        volume_ids = _strings(actual.get("networkVolumeIds"))
-        if volume_ids != [volume_id]:
-            mismatches.append("networkVolumeId")
-    if actual.get("minCudaVersion") not in (None, expected["minCudaVersion"]):
+    if "dataCenterIds" in actual and (
+        _strings(actual["dataCenterIds"]) != expected["dataCenterIds"]
+    ):
+        mismatches.append("dataCenterIds")
+    if _strings(actual.get("allowedCudaVersions")) != expected["allowedCudaVersions"]:
+        mismatches.append("allowedCudaVersions")
+    if actual.get("minCudaVersion") != expected["minCudaVersion"]:
         mismatches.append("minCudaVersion")
+    if actual.get("flashboot") is not expected["flashboot"]:
+        mismatches.append("flashboot")
+    if actual.get("networkVolumeId") != volume_id:
+        mismatches.append("networkVolumeId")
+    if _strings(actual.get("networkVolumeIds")) != [volume_id]:
+        mismatches.append("networkVolumeIds")
     if mismatches:
         raise RuntimeError(f"RunPod endpoint drift: {', '.join(mismatches)}")
+
+
+def _verify_endpoint_scheduler(
+    actual: dict[str, Any],
+    *,
+    expected_data_center_id: str,
+    template_id: str,
+    volume_id: str,
+    workers_min: int,
+    workers_max: int,
+) -> None:
+    mismatches: list[str] = []
+    if _strings(actual.get("locations")) != [expected_data_center_id]:
+        mismatches.append("locations")
+    if actual.get("networkVolumeId") != volume_id:
+        mismatches.append("networkVolumeId")
+    if actual.get("templateId") != template_id:
+        mismatches.append("templateId")
+    if actual.get("workersMin") != workers_min:
+        mismatches.append("workersMin")
+    if actual.get("workersMax") != workers_max:
+        mismatches.append("workersMax")
+    pods = actual.get("pods")
+    if not isinstance(pods, list):
+        mismatches.append("pods")
+    else:
+        for pod in pods:
+            if not isinstance(pod, dict):
+                mismatches.append("pods")
+                break
+            machine = pod.get("machine")
+            network_volume = pod.get("networkVolume")
+            if machine is not None and (
+                not isinstance(machine, dict)
+                or machine.get("dataCenterId") != expected_data_center_id
+            ):
+                mismatches.append("pod.dataCenterId")
+                break
+            if network_volume is not None and (
+                not isinstance(network_volume, dict)
+                or network_volume.get("id") != volume_id
+                or network_volume.get("dataCenterId") != expected_data_center_id
+            ):
+                mismatches.append("pod.networkVolume")
+                break
+    if mismatches:
+        raise RuntimeError(f"RunPod endpoint scheduler drift: {', '.join(mismatches)}")
 
 
 def _write_state(path: Path, state: dict[str, Any]) -> None:
@@ -421,18 +572,21 @@ def apply(spec: dict[str, dict[str, Any]], *, state_file: Path) -> dict[str, Any
     if os.environ.get(SPEND_SWITCH, "").casefold() != "true":
         raise RuntimeError(f"paid provisioning requires {SPEND_SWITCH}=true")
     api_key = _api_key()
+    volume = _find_unique(
+        api_key,
+        path="/networkvolumes",
+        name=str(spec["volume"]["name"]),
+        kind="volume",
+    )
+    if volume is None:
+        raise RuntimeError("adopted RunPod network volume is unavailable")
+    _verify_volume(volume, spec["volume"])
     state = _load_or_create_state(state_file, spec)
     _write_state(state_file, state)
-    volume = _ensure_created(
-        api_key=api_key,
-        state=state,
-        state_file=state_file,
-        kind="volume",
-        list_path="/networkvolumes",
-        create_path="/networkvolumes",
-        expected=spec["volume"],
-        verify=_verify_volume,
-    )
+    volume_state = _resource_state(state, "volume")
+    volume_state.update({"id": _required_id(volume, "volume"), "verified_at": _now()})
+    state["updated_at"] = _now()
+    _write_state(state_file, state)
     template = _find_unique(
         api_key,
         path="/templates?includeEndpointBoundTemplates=true",
@@ -485,6 +639,7 @@ def apply(spec: dict[str, dict[str, Any]], *, state_file: Path) -> dict[str, Any
         **spec["endpoint"],
         "templateId": template_id,
         "networkVolumeId": volume_id,
+        "networkVolumeIds": [volume_id],
     }
     endpoint_patch_payload = {
         key: value for key, value in endpoint_payload.items() if key != "computeType"
@@ -542,6 +697,14 @@ def apply(spec: dict[str, dict[str, Any]], *, state_file: Path) -> dict[str, Any
         volume_id=volume_id,
     )
     endpoint_id = _required_id(endpoint, "endpoint")
+    _verify_endpoint_scheduler(
+        _graphql_endpoint(api_key, endpoint_id),
+        expected_data_center_id=str(spec["volume"]["dataCenterId"]),
+        template_id=template_id,
+        volume_id=volume_id,
+        workers_min=int(spec["endpoint"]["workersMin"]),
+        workers_max=int(spec["endpoint"]["workersMax"]),
+    )
     endpoint_state = _resource_state(state, "endpoint")
     endpoint_state.update({"id": endpoint_id, "verified_at": _now()})
     state.update(
@@ -589,9 +752,18 @@ def status(spec: dict[str, dict[str, Any]]) -> dict[str, Any]:
         template_id=template_id,
         volume_id=volume_id,
     )
+    endpoint_id = _required_id(endpoint, "endpoint")
+    _verify_endpoint_scheduler(
+        _graphql_endpoint(api_key, endpoint_id),
+        expected_data_center_id=str(spec["volume"]["dataCenterId"]),
+        template_id=template_id,
+        volume_id=volume_id,
+        workers_min=int(spec["endpoint"]["workersMin"]),
+        workers_max=int(spec["endpoint"]["workersMax"]),
+    )
     return {
         "ready": True,
-        "endpoint_id": _required_id(endpoint, "endpoint"),
+        "endpoint_id": endpoint_id,
         "template_id": template_id,
         "network_volume_id": volume_id,
     }
@@ -604,6 +776,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--manifest-source-sha256", required=True)
     parser.add_argument("--model-objects-file", type=Path, required=True)
+    parser.add_argument("--preseed-state-file", type=Path, required=True)
     parser.add_argument("--state-file", type=Path)
     parser.add_argument("--workers-min", type=int, choices=(0, 1), default=0)
     parser.add_argument("--data-center-id", default=DATA_CENTER_ID)
@@ -613,13 +786,23 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
-    model_objects_json, model_objects_sha256 = _read_model_objects(args.model_objects_file)
+    (
+        model_objects_json,
+        model_objects_sha256,
+        artifact_identity_sha256,
+    ) = _read_model_objects(args.model_objects_file)
+    network_volume_id = _read_adopted_preseed_volume_id(
+        args.preseed_state_file,
+        model_objects_sha256=model_objects_sha256,
+        artifact_identity_sha256=artifact_identity_sha256,
+    )
     spec = _spec(
         image=args.image,
         source_revision=args.source_revision,
         manifest_source_sha256=args.manifest_source_sha256,
         model_objects_json=model_objects_json,
         model_objects_sha256=model_objects_sha256,
+        network_volume_id=network_volume_id,
         workers_min=args.workers_min,
         data_center_id=args.data_center_id,
     )
@@ -628,6 +811,7 @@ def main() -> int:
             "mutates_runpod": False,
             "spec": spec,
             "model_objects_sha256": model_objects_sha256,
+            "artifact_identity_sha256": artifact_identity_sha256,
         }
     elif args.action == "apply":
         if not args.acknowledge_spend or args.state_file is None:
