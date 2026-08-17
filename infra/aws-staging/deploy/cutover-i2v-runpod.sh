@@ -159,6 +159,7 @@ verify_runpod_provider() {
   python3 - <<'PY'
 import json
 import os
+import re
 import urllib.parse
 import urllib.request
 
@@ -188,7 +189,11 @@ try:
     if len(matches) != 1:
         raise ValueError
     volume = matches[0]
-    if volume.get("dataCenterId") != "EU-RO-1":
+    data_center_id = volume.get("dataCenterId")
+    if (
+        not isinstance(data_center_id, str)
+        or re.fullmatch(r"[A-Z]{2,4}-[A-Z]{2,4}-[0-9]", data_center_id) is None
+    ):
         raise ValueError
     if not isinstance(volume.get("size"), int) or volume["size"] < 40:
         raise ValueError
@@ -221,6 +226,7 @@ try:
             raise ValueError
         if (
             endpoint.get("name") != "gen-automation-i2v-staging"
+            or endpoint.get("dataCenterIds") != [data_center_id]
             or endpoint.get("workersMin") != 0
             or endpoint.get("workersMax") != 1
             or endpoint.get("flashboot") is not True
@@ -240,6 +246,7 @@ try:
             or not isinstance(environment, dict)
             or environment.get("GEN_I2V_WORKER_SOURCE_REVISION") != worker_source_revision
             or environment.get("GEN_I2V_WORKER_VOLUME_ROOT") != "/runpod-volume"
+            or environment.get("GEN_I2V_WORKER_REQUIRE_PRESEEDED_VOLUME") != "true"
             or environment.get("GEN_I2V_WORKER_LORA_WORKER_ENABLED") != "true"
         ):
             raise ValueError

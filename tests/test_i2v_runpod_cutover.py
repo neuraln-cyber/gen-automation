@@ -56,7 +56,12 @@ def test_cutover_freezes_and_proves_zero_work_before_enabling_runpod() -> None:
     assert '"https://rest.runpod.io/v1/endpoints/"' in script
     assert '"https://rest.runpod.io/v1/templates/"' in script
     assert 'endpoint.get("flashboot") is not True' in script
+    assert 'endpoint.get("dataCenterIds") != [data_center_id]' in script
     assert 'template.get("imageName") != worker_image' in script
+    assert 'environment.get("GEN_I2V_WORKER_REQUIRE_PRESEEDED_VOLUME") != "true"' in script
+    assert 'volume.get("dataCenterId")' in script
+    assert "data_center_id) is None" in script
+    assert '"EU-RO-1"' not in script
     assert 'preseed_state="/var/lib/gen-automation/runpod-i2v/preseed-state.json"' in script
     assert 'state.get("status") != "ready"' in script
     assert 'pod["name"].startswith("gen-automation-i2v-")' in script
