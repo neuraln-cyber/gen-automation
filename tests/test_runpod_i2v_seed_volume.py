@@ -219,6 +219,9 @@ def test_preseed_refuses_unowned_existing_destination_object(tmp_path: Path) -> 
     with pytest.raises(RuntimeError, match="unexpected object already exists"):
         module._upload_model(
             source=source,
+            source_bucket=models[0].bucket,
+            source_key=models[0].key,
+            source_version_id=models[0].version_id,
             destination=destination,
             volume_id="volume-test",
             artifact_identity=identity,
@@ -237,3 +240,75 @@ def test_preseed_plan_does_not_require_credentials(tmp_path: Path) -> None:
     assert module.main.__module__ == "runpod_i2v_seed_volume"
     models, _objects_sha = module._read_models(objects_file)
     assert module._marker_key(module._artifact_identity(models)).endswith("/preseed.json")
+
+
+def test_preseed_can_copy_an_exact_runpod_volume_without_aws(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load()
+    objects_file, _source_objects = _objects(tmp_path)
+    models, objects_sha = module._read_models(objects_file)
+    identity = module._artifact_identity(models)
+    source = _S3()
+    destination = _S3()
+    source_volume = "volume-source"
+    destination_volume = "volume-destination"
+    source_marker = module._marker_payload(
+        volume_id=source_volume,
+        artifact_identity=identity,
+        model_objects_sha256=objects_sha,
+        models=models,
+    )
+    source.put_object(
+        Bucket=source_volume,
+        Key=module._marker_key(identity),
+        Body=module._canonical_json(source_marker),
+        ContentType="application/json",
+    )
+    expected: dict[str, bytes] = {}
+    for model in models:
+        body = model.role.encode("ascii")[: model.byte_size].ljust(model.byte_size, b"_")
+        # The fixture's hashes bind different short bodies, so preserve those exact bytes.
+        body = {
+            "diffusion_model_high": b"high",
+            "diffusion_model_low": b"low",
+            "text_encoder": b"text",
+            "vae": b"vae",
+        }[model.role]
+        key = module._object_key(identity, model)
+        source.objects[(source_volume, key)] = body
+        expected[key] = body
+
+    def runpod_client(*, endpoint: str, datacenter: str) -> _S3:
+        if endpoint == "https://s3api-eu-ro-1.runpod.io/" and datacenter == "EU-RO-1":
+            return source
+        assert endpoint == "https://s3api-us-ks-2.runpod.io/"
+        assert datacenter == "US-KS-2"
+        return destination
+
+    monkeypatch.setattr(module, "_runpod_client", runpod_client)
+    monkeypatch.setattr(
+        module,
+        "_source_client",
+        lambda _profile: pytest.fail("AWS source must not be opened"),
+    )
+    monkeypatch.setenv(module.SPEND_SWITCH, "true")
+
+    result = module.apply(
+        models=models,
+        model_objects_sha256=objects_sha,
+        volume_id=destination_volume,
+        state_file=tmp_path / "runpod-copy-state.json",
+        aws_profile=None,
+        endpoint="https://s3api-us-ks-2.runpod.io/",
+        datacenter="US-KS-2",
+        part_bytes=64 * 1024 * 1024,
+        source_runpod_volume_id=source_volume,
+        source_runpod_endpoint="https://s3api-eu-ro-1.runpod.io/",
+        source_runpod_datacenter="EU-RO-1",
+    )
+
+    assert result["ready"] is True
+    for key, body in expected.items():
+        assert destination.objects[(destination_volume, key)] == body
