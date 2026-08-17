@@ -49,6 +49,8 @@ def test_cutover_freezes_and_proves_zero_work_before_enabling_runpod() -> None:
     assert 'preseed_state="/var/lib/gen-automation/runpod-i2v/preseed-state.json"' in script
     assert 'state.get("status") != "ready"' in script
     assert 'endpoint.get("workersMin") != 1' in script
+    assert script.count("--env GEN_AUTOMATION_I2V_ENABLED=true") == 1
+    assert script.count("--env GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED=true") == 1
 
 
 def test_cutover_reads_one_fixed_secret_and_never_prints_it() -> None:
