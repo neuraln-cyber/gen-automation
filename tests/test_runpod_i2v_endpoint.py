@@ -70,6 +70,8 @@ def test_plan_scales_to_zero_and_preserves_provider_neutral_worker_contract() ->
         "NVIDIA A40",
         "NVIDIA RTX A6000",
         "NVIDIA L40S",
+        "NVIDIA L40",
+        "NVIDIA RTX 6000 Ada Generation",
     ]
     assert spec["template"]["env"]["GEN_I2V_WORKER_ALLOWED_GPU_NAMES_CSV"] == (
         ",".join(spec["endpoint"]["gpuTypeIds"])
