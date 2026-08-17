@@ -28,6 +28,8 @@ from gen_automation.domain.enums import (
     DesiredDeploymentState,
     GenerationAttemptState,
     GenerationState,
+    ReleasePhase,
+    ResourceHealth,
     SaladDeploymentPurpose,
     SaladDeploymentState,
 )
@@ -101,6 +103,7 @@ async def seed_context(session: AsyncSession) -> SeededContext:
         slug="release-one",
         title="Release One",
         desired_accepted_count=4,
+        phase=ReleasePhase.READY,
     )
     session.add(release)
     await session.flush()
@@ -607,6 +610,77 @@ async def test_submission_issues_grants_immediately_and_never_persists_them(
     assert SIGNED_UPLOAD_URL not in persisted
     assert "private generation prompt" not in persisted
     assert "provider output" not in persisted
+
+
+@pytest.mark.parametrize(
+    "stale_lifecycle",
+    [
+        "terminal_job",
+        "stop_requested",
+        "superseded_version",
+        "terminal_release",
+        "blocked_release",
+    ],
+)
+@pytest.mark.asyncio
+async def test_submission_fences_stale_lifecycle_before_provider_contact(
+    database: Database,
+    stale_lifecycle: str,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        job = await session.get(GenerationJob, context.job_id)
+        assert job is not None
+        version = await session.get(ReleaseVersion, job.release_version_id)
+        assert version is not None
+        release = await session.get(Release, version.release_id)
+        assert release is not None
+        if stale_lifecycle == "terminal_job":
+            job.state = GenerationState.CANCELLED
+        elif stale_lifecycle == "stop_requested":
+            session.add(
+                AuditEvent(
+                    actor="test-owner",
+                    action="release.generation_stop_requested",
+                    resource_type="release",
+                    resource_id=release.id,
+                    correlation_id=f"generation-stop:{release.id}",
+                    detail={"assets_retained": True},
+                    occurred_at=NOW + timedelta(seconds=1),
+                )
+            )
+        elif stale_lifecycle == "superseded_version":
+            release.current_version_no = 2
+        elif stale_lifecycle == "terminal_release":
+            release.phase = ReleasePhase.CANCELLED
+        else:
+            release.health = ResourceHealth.BLOCKED
+        await session.commit()
+
+        uploads = FakeUploadIntentProvider()
+        client = FakeSaladClient()
+        result = await submit_prepared_attempt(
+            session,
+            client,
+            uploads,
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW + timedelta(seconds=2),
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        job = await session.get(GenerationJob, context.job_id)
+
+    assert result.disposition == SubmissionDisposition.CANCELLED
+    assert result.mutation_effect == MutationEffect.DEFINITELY_NOT_STARTED
+    assert not uploads.calls
+    assert not client.create_calls
+    assert attempt is not None
+    assert attempt.state == GenerationAttemptState.FAILED
+    assert attempt.error_code == "stale_submission_lifecycle"
+    assert job is not None
+    assert job.state == GenerationState.CANCELLED
 
 
 @pytest.mark.asyncio

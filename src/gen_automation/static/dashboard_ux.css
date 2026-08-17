@@ -1638,8 +1638,10 @@ body.asset-viewer-open { overflow: hidden; }
   padding: clamp(.35rem, 1.5vw, 1rem);
 }
 
+.asset-viewer-placeholder,
 .asset-viewer-image {
   display: block;
+  grid-area: 1 / 1;
   width: 100%;
   max-width: 100%;
   height: 100%;
@@ -1649,6 +1651,24 @@ body.asset-viewer-open { overflow: hidden; }
   justify-self: center;
   align-self: center;
   object-fit: contain;
+}
+
+.asset-viewer-placeholder {
+  z-index: 0;
+}
+
+.asset-viewer-placeholder[hidden] {
+  display: none;
+}
+
+.asset-viewer-image {
+  z-index: 1;
+  opacity: 1;
+  transition: opacity 120ms ease-out;
+}
+
+.asset-viewer-image.is-loading {
+  opacity: 0;
 }
 
 .asset-viewer[data-asset-viewer-mode="actual"] .asset-viewer-media,

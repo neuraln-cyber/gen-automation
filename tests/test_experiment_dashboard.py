@@ -214,15 +214,21 @@ def test_experiment_lab_is_the_full_automation_builder_plus_warm_controls(
     assert 'data-automation-draft-scope="experiment"' in lab.text
     assert 'data-automation-draft-scope="automation"' in automation.text
     assert 'data-warm-status-url="/dashboard/experiments/warm-session"' in lab.text
-    assert "Queue warm batch plan" in lab.text
-    assert "any Automation batch plan" in lab.text
+    assert "Interactive testing" in lab.text
+    assert "Queue test" in lab.text
+    assert 'data-warm-duration-minutes="15"' in lab.text
+    assert 'data-warm-duration-minutes="90"' in lab.text
+    assert "Start 90 min focus" in lab.text
     assert "data-experiment-form" not in lab.text
     assert "variant_plan" not in lab.text
     assert "outputs_per_variant" not in lab.text
     assert "paired_seeds" not in lab.text
     assert "comparison" not in lab.text.casefold()
     assert "queued variants" not in script.text
-    assert "GPU warm for follow-up batches" in script.text
+    assert "Focus session · GPU ready for follow-up tests" in script.text
+    assert "configuredDuration === 90" in script.text
+    assert "duration_minutes: durationMinutes" in script.text
+    assert "hardSeconds - seconds >= 15 * 60" in script.text
     assert 'document.querySelector("[data-automation-draft-scope]")' in script.text
     assert 'if (draftScope === "automation") return scopedStorageKey(key);' in script.text
 
@@ -349,7 +355,8 @@ def test_experiment_lab_queues_large_multi_batch_automation_and_reuses_one_warm_
 
     status_page = client.get(first.headers["location"])
     assert status_page.status_code == 200
-    assert "Queue next warm batch" in status_page.text
+    assert "Queue next test" in status_page.text
+    assert 'data-warm-duration-minutes="90"' in status_page.text
     assert "data-experiment-warm-session" in status_page.text
     assert "data-generation-progress" in status_page.text
     assert 'data-automation-draft-scope="experiment"' in status_page.text
@@ -458,6 +465,28 @@ def test_warm_session_routes_are_exact_authenticated_and_idempotent(client: Test
     assert ended.json()["state"] == "ending"
     assert final.status_code == 200
     assert final.json()["state"] == "ending"
+
+
+def test_focus_session_can_hold_the_shared_worker_for_ninety_minutes(
+    client: TestClient,
+) -> None:
+    _seed_warm_deployment(client)
+    page = client.get("/dashboard/experiments/new")
+    csrf = _hidden_value(page.text, "csrf_token")
+
+    started = client.post(
+        "/dashboard/experiments/warm-session/start",
+        json={"duration_minutes": 90},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert started.status_code == 200
+    payload = started.json()
+    assert payload["state"] == "starting"
+    assert payload["idle_ttl_seconds"] == 90 * 60
+    assert payload["controller_auto_stop_minutes"] == 90
+    assert payload["hard_remaining_seconds"] >= (89 * 60)
+    assert payload["max_cost_usd"] == "0.54"
 
 
 def test_optional_auto_warm_failure_does_not_fail_a_queued_lab_set(

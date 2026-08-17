@@ -15,12 +15,44 @@ from gen_automation.domain.enums import AssetKind, AssetState
 from gen_automation.services import dashboard_previews
 from gen_automation.services.dashboard_previews import DashboardPreview
 from gen_automation.services.outbound_image_privacy import require_metadata_free_image
-from gen_automation.storage.base import ObjectStore
+from gen_automation.storage.base import ObjectMetadata, ObjectStore
 from gen_automation.storage.memory import MemoryObjectStore
 
 ASSET_ID = UUID("00000000-0000-4000-8000-00000000d501")
 RELEASE_ID = UUID("00000000-0000-4000-8000-00000000d502")
 NOW = datetime(2026, 8, 8, 12, tzinfo=UTC)
+
+
+class CountingMemoryObjectStore(MemoryObjectStore):
+    def __init__(self, *, bucket: str) -> None:
+        super().__init__(bucket=bucket)
+        self.head_calls = 0
+        self.read_calls = 0
+
+    async def head(
+        self,
+        key: str,
+        *,
+        version_id: str | None = None,
+    ) -> ObjectMetadata | None:
+        self.head_calls += 1
+        return await super().head(key, version_id=version_id)
+
+    async def read_bytes(
+        self,
+        key: str,
+        *,
+        max_bytes: int,
+        version_id: str | None = None,
+        etag: str | None = None,
+    ) -> bytes:
+        self.read_calls += 1
+        return await super().read_bytes(
+            key,
+            max_bytes=max_bytes,
+            version_id=version_id,
+            etag=etag,
+        )
 
 
 def _source_png() -> bytes:
@@ -104,7 +136,7 @@ async def _seed_preview_asset(
 def test_preview_is_small_private_revalidated_and_raw_master_remains_exact(
     client: TestClient,
 ) -> None:
-    store = MemoryObjectStore(bucket="preview-private")
+    store = CountingMemoryObjectStore(bucket="preview-private")
     client.app.state.object_store = store
     source = _source_png()
     assert client.portal is not None
@@ -128,10 +160,14 @@ def test_preview_is_small_private_revalidated_and_raw_master_remains_exact(
 
     preview_objects = [key for key in store.objects if key.startswith("dashboard-previews/")]
     assert len(preview_objects) == 1
+    store.head_calls = 0
+    store.read_calls = 0
     cached = client.get(preview_url, headers={"If-None-Match": preview.headers["etag"]})
     assert cached.status_code == 304
     assert cached.content == b""
     assert cached.headers["cache-control"] == "private, no-cache, must-revalidate"
+    assert store.head_calls == 0
+    assert store.read_calls == 0
     assert [key for key in store.objects if key.startswith("dashboard-previews/")] == (
         preview_objects
     )
@@ -152,7 +188,10 @@ def test_stale_or_malformed_preview_urls_fail_closed_without_cache(
     assert client.portal is not None
     source_sha256 = client.portal.call(_seed_preview_asset, client, store, source)
 
-    stale = client.get(f"/dashboard/assets/{ASSET_ID}/previews/dashboard-preview-v1/{'0' * 16}.jpg")
+    stale = client.get(
+        f"/dashboard/assets/{ASSET_ID}/previews/dashboard-preview-v1/{'0' * 16}.jpg",
+        headers={"If-None-Match": dashboard_previews.dashboard_preview_etag(source_sha256)},
+    )
     malformed = client.get(
         f"/dashboard/assets/{ASSET_ID}/previews/dashboard-preview-v1/{source_sha256[:15]}.jpg"
     )

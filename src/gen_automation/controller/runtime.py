@@ -48,7 +48,7 @@ from gen_automation.integrations.salad.models import JSONValue
 from gen_automation.integrations.semantic_vlm import SemanticVlmClient
 from gen_automation.quality import DEFAULT_QUALITY_CONFIG
 from gen_automation.semantic import SemanticAssessmentResult
-from gen_automation.services.budgets import ensure_budget_guard
+from gen_automation.services.budgets import ensure_budget_guard, preflight_attempt_budget
 from gen_automation.services.collection import (
     ClaimedCollectionJob,
     claim_collection_jobs,
@@ -114,12 +114,14 @@ from gen_automation.services.runtime_secrets import (
     configured_runtime_binding_references,
 )
 from gen_automation.services.salad import (
+    MutationEffect,
     SaladDeploymentConfig,
     SaladUploadIntentProvider,
     SubmissionDisposition,
     SubmissionResult,
     create_deployment_version,
     fail_definitely_unstarted_submission,
+    fence_stale_prepared_attempt,
     reconcile_generation_attempt,
     submit_prepared_attempt,
 )
@@ -175,6 +177,18 @@ _RUNTIME_REFRESH_BLOCKING_ATTEMPT_STATES = (
     GenerationAttemptState.UNKNOWN,
     GenerationAttemptState.CANCEL_REQUESTED,
 )
+_RUNTIME_REFRESH_REMOTE_OR_AMBIGUOUS_STATES = (
+    GenerationAttemptState.SUBMITTED,
+    GenerationAttemptState.RUNNING,
+    GenerationAttemptState.UNKNOWN,
+    GenerationAttemptState.CANCEL_REQUESTED,
+)
+_TERMINAL_GENERATION_JOB_STATES = (
+    GenerationState.SUCCEEDED,
+    GenerationState.FAILED,
+    GenerationState.DEAD_LETTER,
+    GenerationState.CANCELLED,
+)
 _DEPLOYMENT_WORK_STATES = (
     SaladDeploymentState.PLANNED,
     SaladDeploymentState.PROVISIONING,
@@ -188,6 +202,50 @@ _DEPLOYMENT_WORK_STATES = (
 
 class _RuntimeArtifactManifestBusyError(RuntimeError):
     """A different immutable worker manifest is still serving active work."""
+
+
+async def _runtime_refresh_blocking_attempt_id(
+    session: AsyncSession,
+    *,
+    salad_deployment_id: UUID,
+) -> UUID | None:
+    """Return work that makes a deployment-wide runtime refresh unsafe.
+
+    Remote and ambiguous attempt states always win over a stale parent lifecycle.
+    The sole row that can be ignored is an inconsistent SUBMITTING attempt whose
+    parent is terminal and which carries none of the durable submission markers
+    written before the provider request can begin.
+    """
+
+    return await session.scalar(
+        select(GenerationAttempt.id)
+        .join(GenerationJob, GenerationJob.id == GenerationAttempt.job_id)
+        .where(
+            GenerationAttempt.salad_deployment_id == salad_deployment_id,
+            GenerationAttempt.provider == "salad",
+            GenerationAttempt.state.in_(_RUNTIME_REFRESH_BLOCKING_ATTEMPT_STATES),
+            or_(
+                GenerationJob.state.not_in(_TERMINAL_GENERATION_JOB_STATES),
+                GenerationAttempt.state.in_(_RUNTIME_REFRESH_REMOTE_OR_AMBIGUOUS_STATES),
+                and_(
+                    GenerationAttempt.state == GenerationAttemptState.SUBMITTING,
+                    or_(
+                        GenerationAttempt.provider_external_id.is_not(None),
+                        GenerationAttempt.submit_started_at.is_not(None),
+                        GenerationAttempt.submitted_at.is_not(None),
+                        GenerationAttempt.started_at.is_not(None),
+                        GenerationAttempt.last_observed_at.is_not(None),
+                        GenerationAttempt.unknown_since.is_not(None),
+                        GenerationAttempt.provider_state.is_not(None),
+                        GenerationAttempt.response_metadata.is_not(None),
+                        GenerationAttempt.cost_reservation_microusd > 0,
+                        GenerationAttempt.reservation_released_at.is_not(None),
+                    ),
+                ),
+            ),
+        )
+        .limit(1)
+    )
 
 
 def _required_lora_sha256s(parameters: Mapping[str, object]) -> frozenset[str]:
@@ -1103,13 +1161,9 @@ class ControllerWorkloads:
             if deployment is None or lease is None:
                 await session.rollback()
                 return housekeeping_worked
-            active_attempt_id = await session.scalar(
-                select(GenerationAttempt.id)
-                .where(
-                    GenerationAttempt.salad_deployment_id == deployment.id,
-                    GenerationAttempt.state.in_(_RUNTIME_REFRESH_BLOCKING_ATTEMPT_STATES),
-                )
-                .limit(1)
+            active_attempt_id = await _runtime_refresh_blocking_attempt_id(
+                session,
+                salad_deployment_id=deployment.id,
             )
             if active_attempt_id is not None:
                 await session.rollback()
@@ -1646,27 +1700,51 @@ class ControllerWorkloads:
                 raise RuntimeError("generation attempt deployment is unavailable")
             attempt_context = (
                 await session.execute(
-                    select(GenerationAttempt.state, GenerationJob.parameters)
+                    select(GenerationAttempt, GenerationJob)
                     .join(GenerationJob, GenerationJob.id == GenerationAttempt.job_id)
                     .where(GenerationAttempt.id == event.aggregate_id)
-                    .with_for_update(of=GenerationAttempt)
+                    .with_for_update()
                 )
             ).one_or_none()
             if attempt_context is None:
                 raise RuntimeError("generation attempt is unavailable")
-            attempt_state, job_parameters = attempt_context
+            attempt, job = attempt_context
+            attempt_state = attempt.state
+            job_parameters = job.parameters
+            if attempt_state in {
+                GenerationAttemptState.CREATED,
+                GenerationAttemptState.SUBMITTING,
+            }:
+                stale_result = await fence_stale_prepared_attempt(
+                    session,
+                    generation_attempt_id=event.aggregate_id,
+                )
+                if stale_result is not None:
+                    return stale_result
+            if attempt_state == GenerationAttemptState.CREATED:
+                budget_decision = await preflight_attempt_budget(
+                    session,
+                    provider="salad",
+                    amount_microusd=deployment.max_hourly_cost_microusd,
+                )
+                if not budget_decision.accepted:
+                    await session.commit()
+                    return SubmissionResult(
+                        generation_attempt_id=attempt.id,
+                        attempt_state=attempt.state,
+                        generation_job_state=job.state,
+                        disposition=SubmissionDisposition.BUDGET_BLOCKED,
+                        mutation_effect=MutationEffect.DEFINITELY_NOT_STARTED,
+                        provider_external_id=attempt.provider_external_id,
+                    )
             required_lora_sha256s = _required_lora_sha256s(job_parameters)
             active_attempt_id: UUID | None = None
             cold_queue_admission_required = False
             resident = _resident_managed_lora_sha256s(deployment.runtime_managed_lora_sha256s)
             if attempt_state == GenerationAttemptState.CREATED:
-                active_attempt_id = await session.scalar(
-                    select(GenerationAttempt.id)
-                    .where(
-                        GenerationAttempt.salad_deployment_id == deployment.id,
-                        GenerationAttempt.state.in_(_RUNTIME_REFRESH_BLOCKING_ATTEMPT_STATES),
-                    )
-                    .limit(1)
+                active_attempt_id = await _runtime_refresh_blocking_attempt_id(
+                    session,
+                    salad_deployment_id=deployment.id,
                 )
             try:
                 effective_manifest = await self._effective_artifact_manifest(
@@ -1895,13 +1973,14 @@ class ControllerWorkloads:
             retry_at = result.retry_not_before or (
                 datetime.now(UTC) + timedelta(seconds=self.settings.background_retry_delay_seconds)
             )
-            await self._fail_submit_lease(
-                event,
-                worker_id=worker_id,
-                error_code="provider_budget_blocked",
-                external_effect=ExternalEffect.DEFINITELY_NOT_STARTED,
-                retry_not_before=retry_at,
-            )
+            async with self.sessions() as session:
+                await defer_unstarted_outbox_event(
+                    session,
+                    event_id=event.id,
+                    worker_id=worker_id,
+                    retry_not_before=retry_at,
+                    reason_code="provider_budget_blocked",
+                )
             return
         async with self.sessions() as session:
             await succeed_outbox_event(

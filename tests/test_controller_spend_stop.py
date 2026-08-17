@@ -10,7 +10,7 @@ from typing import cast
 from uuid import UUID
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import gen_automation.controller.runtime as controller_runtime
@@ -23,6 +23,7 @@ from gen_automation.db.models import (
     GenerationJob,
     OutboxEvent,
     Project,
+    ProviderBudgetGuard,
     ProviderSpendEntry,
     Release,
     ReleaseVersion,
@@ -31,6 +32,7 @@ from gen_automation.db.models import (
 from gen_automation.db.session import Database
 from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import (
+    BudgetState,
     DesiredDeploymentState,
     GenerationAttemptState,
     GenerationState,
@@ -38,6 +40,7 @@ from gen_automation.domain.enums import (
     ReleasePhase,
     SaladDeploymentPurpose,
     SaladDeploymentState,
+    SpendEntryType,
 )
 from gen_automation.domain.signing import encode_base64url
 from gen_automation.gpu_worker.artifacts import ArtifactManifest
@@ -58,6 +61,7 @@ from gen_automation.services.outbox import (
     GENERATION_ATTEMPT_AGGREGATE,
     SALAD_JOB_SUBMIT_TOPIC,
     ClaimedOutboxEvent,
+    claim_outbox_events,
 )
 from gen_automation.services.salad import (
     MutationEffect,
@@ -521,6 +525,7 @@ async def _seed_submission_database(database: Database) -> SubmissionContext:
             slug="release",
             title="Release",
             desired_accepted_count=1,
+            phase=ReleasePhase.READY,
         )
         session.add(release)
         await session.flush()
@@ -578,6 +583,369 @@ async def _seed_submission_database(database: Database) -> SubmissionContext:
             attempt_id=prepared.generation_attempt_id,
             job_id=job.id,
         )
+
+
+@pytest.mark.asyncio
+async def test_budget_block_defers_without_consuming_outbox_attempt(tmp_path: Path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'budget-defer.db').as_posix()}")
+    await database.create_schema()
+    try:
+        context = await _seed_submission_database(database)
+        transition_at = datetime.now(UTC)
+        async with database.sessions() as session:
+            claimed = await claim_outbox_events(
+                session,
+                worker_id="controller-submit",
+                limit=1,
+                lease_seconds=60,
+                topics={SALAD_JOB_SUBMIT_TOPIC},
+                now=transition_at,
+            )
+            assert len(claimed) == 1
+            job = await session.get(GenerationJob, context.job_id)
+            assert job is not None
+            job.state = GenerationState.RETRY_WAIT
+            job.last_error_code = "provider_budget_blocked"
+            await session.commit()
+
+        workloads = ControllerWorkloads(
+            settings=Settings(),
+            sessions=database.sessions,
+            instance_id="controller-budget-defer-test",
+            salad_client=None,
+            object_store=None,
+        )
+        retry_at = transition_at + timedelta(minutes=1)
+        await workloads._transition_submit_result(
+            claimed[0],
+            result=SubmissionResult(
+                generation_attempt_id=context.attempt_id,
+                attempt_state=GenerationAttemptState.CREATED,
+                generation_job_state=GenerationState.RETRY_WAIT,
+                disposition=SubmissionDisposition.BUDGET_BLOCKED,
+                mutation_effect=MutationEffect.DEFINITELY_NOT_STARTED,
+                provider_external_id=None,
+                retry_not_before=retry_at,
+            ),
+            worker_id="controller-submit",
+        )
+
+        async with database.sessions() as session:
+            event = await session.scalar(
+                select(OutboxEvent).where(OutboxEvent.aggregate_id == context.attempt_id)
+            )
+            attempt = await session.get(GenerationAttempt, context.attempt_id)
+            assert event is not None
+            assert attempt is not None
+            assert event.status == OutboxStatus.PENDING
+            assert event.attempts == 0
+            assert event.available_at.replace(tzinfo=UTC) == retry_at
+            assert event.last_error_code == "provider_budget_blocked"
+            assert attempt.state == GenerationAttemptState.CREATED
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_budget_preflight_blocks_runtime_then_reopens_the_cold_queue_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'budget-runtime-fence.db').as_posix()}")
+    await database.create_schema()
+    try:
+        context = await _seed_submission_database(database)
+        transition_at = datetime.now(UTC)
+        async with database.sessions() as session:
+            guard = await session.scalar(select(ProviderBudgetGuard))
+            assert guard is not None
+            session.add(
+                ProviderSpendEntry(
+                    budget_guard_id=guard.id,
+                    dedupe_key="blocked-before-runtime-refresh",
+                    entry_type=SpendEntryType.USAGE,
+                    # The guard is OPEN at $99 committed, but this deployment's
+                    # $2 reservation would cross the $100 daily ceiling.
+                    amount_microusd=99_000_000,
+                    effective_at=transition_at,
+                    source_reference="test",
+                    detail={},
+                    created_at=transition_at,
+                )
+            )
+            await session.commit()
+
+        async with database.sessions() as session:
+            claimed = await claim_outbox_events(
+                session,
+                worker_id="controller-submit",
+                limit=1,
+                lease_seconds=60,
+                topics={SALAD_JOB_SUBMIT_TOPIC},
+                now=transition_at,
+            )
+            assert len(claimed) == 1
+
+        async def forbidden(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise AssertionError("a blocked budget must prevent every provider runtime mutation")
+
+        monkeypatch.setattr(ControllerWorkloads, "_effective_artifact_manifest", forbidden)
+        monkeypatch.setattr(controller_runtime, "refresh_container_group_runtime", forbidden)
+        monkeypatch.setattr(
+            controller_runtime,
+            "ensure_container_group_queue_admission",
+            forbidden,
+        )
+        monkeypatch.setattr(controller_runtime, "submit_prepared_attempt", forbidden)
+        workloads = ControllerWorkloads(
+            settings=Settings(
+                worker_signing_key_id="worker-key-1",
+                worker_signing_private_key=WORKER_SIGNING_PRIVATE_KEY,
+            ),
+            sessions=database.sessions,
+            instance_id="controller-budget-runtime-fence-test",
+            salad_client=cast(SaladClient, object()),
+            object_store=cast(ObjectStore, object()),
+        )
+
+        result = await workloads._submit_event(claimed[0], progress=_SubmissionProgress())
+        assert result.disposition == SubmissionDisposition.BUDGET_BLOCKED
+        assert result.mutation_effect == MutationEffect.DEFINITELY_NOT_STARTED
+        await workloads._transition_submit_result(
+            claimed[0],
+            result=result,
+            worker_id="controller-submit",
+        )
+
+        async with database.sessions() as session:
+            event = await session.get(OutboxEvent, claimed[0].id)
+            attempt = await session.get(GenerationAttempt, context.attempt_id)
+            job = await session.get(GenerationJob, context.job_id)
+            assert event is not None
+            assert attempt is not None
+            assert job is not None
+            assert event.status == OutboxStatus.PENDING
+            assert event.attempts == 0
+            assert event.last_error_code == "provider_budget_blocked"
+            assert attempt.state == GenerationAttemptState.CREATED
+            assert attempt.submit_started_at is None
+            assert attempt.provider_external_id is None
+            assert job.state == GenerationState.CLAIMED
+            guard = await session.scalar(select(ProviderBudgetGuard))
+            assert guard is not None
+            assert guard.state == BudgetState.BLOCKED
+            retry_at = event.available_at.replace(tzinfo=UTC)
+            await session.execute(delete(ProviderSpendEntry))
+            await session.commit()
+
+        admissions: list[tuple[UUID, int]] = []
+        submissions: list[UUID] = []
+
+        async def cold_refresh(
+            deployment: SaladDeployment,
+            client: object,
+            resolver: object,
+            *,
+            environment_overrides: Mapping[str, str] | None = None,
+        ) -> SaladContainerGroup:
+            del client, resolver, environment_overrides
+            group = _group(deployment.container_group_name, deployment.queue_name)
+            return replace(
+                group,
+                current_state=replace(
+                    group.current_state,
+                    status="stopped",
+                    description="stopped",
+                    running_count=0,
+                    start_time=None,
+                    finish_time=transition_at,
+                ),
+            )
+
+        async def cold_admission(
+            deployment: SaladDeployment,
+            client: object,
+            *,
+            effective_min_replicas: int,
+        ) -> SaladContainerGroup:
+            del client
+            admissions.append((deployment.id, effective_min_replicas))
+            return _group(deployment.container_group_name, deployment.queue_name)
+
+        async def successful_submit(
+            *args: object,
+            generation_attempt_id: UUID,
+            **kwargs: object,
+        ) -> SubmissionResult:
+            del args, kwargs
+            submissions.append(generation_attempt_id)
+            return SubmissionResult(
+                generation_attempt_id=generation_attempt_id,
+                attempt_state=GenerationAttemptState.CREATED,
+                generation_job_state=GenerationState.CLAIMED,
+                disposition=SubmissionDisposition.SUBMITTED,
+                mutation_effect=MutationEffect.CONFIRMED,
+                provider_external_id="provider-job",
+            )
+
+        monkeypatch.setattr(
+            ControllerWorkloads,
+            "_effective_artifact_manifest",
+            _empty_effective_artifact_manifest,
+        )
+        monkeypatch.setattr(controller_runtime, "refresh_container_group_runtime", cold_refresh)
+        monkeypatch.setattr(
+            controller_runtime,
+            "ensure_container_group_queue_admission",
+            cold_admission,
+        )
+        monkeypatch.setattr(controller_runtime, "submit_prepared_attempt", successful_submit)
+        async with database.sessions() as session:
+            reclaimed = await claim_outbox_events(
+                session,
+                worker_id="controller-submit",
+                limit=1,
+                lease_seconds=60,
+                topics={SALAD_JOB_SUBMIT_TOPIC},
+                now=retry_at + timedelta(seconds=1),
+            )
+            assert len(reclaimed) == 1
+
+        resumed = await workloads._submit_event(reclaimed[0], progress=_SubmissionProgress())
+        assert resumed.disposition == SubmissionDisposition.SUBMITTED
+        assert admissions and admissions[0][1] == 1
+        assert submissions == [context.attempt_id]
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stale_created_attempt_is_fenced_before_runtime_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'stale-submit.db').as_posix()}")
+    await database.create_schema()
+    try:
+        context = await _seed_submission_database(database)
+        async with database.sessions() as session:
+            job = await session.get(GenerationJob, context.job_id)
+            assert job is not None
+            job.state = GenerationState.CANCELLED
+            await session.commit()
+
+        async def forbidden_manifest(*args: object, **kwargs: object) -> EffectiveArtifactManifest:
+            del args, kwargs
+            raise AssertionError("stale work must be fenced before a runtime refresh")
+
+        monkeypatch.setattr(
+            ControllerWorkloads,
+            "_effective_artifact_manifest",
+            forbidden_manifest,
+        )
+        workloads = ControllerWorkloads(
+            settings=Settings(
+                worker_signing_key_id="worker-key-1",
+                worker_signing_private_key=WORKER_SIGNING_PRIVATE_KEY,
+            ),
+            sessions=database.sessions,
+            instance_id="controller-stale-submit-test",
+            salad_client=cast(SaladClient, object()),
+            object_store=cast(ObjectStore, object()),
+        )
+        event = ClaimedOutboxEvent(
+            id=UUID("a26536aa-b97e-4ad6-b019-d712e15a860b"),
+            topic=SALAD_JOB_SUBMIT_TOPIC,
+            dedupe_key=f"{SALAD_JOB_SUBMIT_TOPIC}:{context.attempt_id}",
+            correlation_id=str(context.attempt_id),
+            aggregate_type=GENERATION_ATTEMPT_AGGREGATE,
+            aggregate_id=context.attempt_id,
+            payload={"generation_attempt_id": str(context.attempt_id)},
+            attempt=1,
+            max_attempts=3,
+            lease_expires_at=NOW + timedelta(minutes=5),
+        )
+
+        result = await workloads._submit_event(event, progress=_SubmissionProgress())
+
+        assert result.disposition == SubmissionDisposition.CANCELLED
+        assert result.mutation_effect == MutationEffect.DEFINITELY_NOT_STARTED
+        async with database.sessions() as session:
+            attempt = await session.get(GenerationAttempt, context.attempt_id)
+            job = await session.get(GenerationJob, context.job_id)
+            assert attempt is not None
+            assert job is not None
+            assert attempt.state == GenerationAttemptState.FAILED
+            assert job.state == GenerationState.CANCELLED
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_terminal_markerless_submitting_orphan_is_fenced_before_runtime_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'stale-submitting.db').as_posix()}")
+    await database.create_schema()
+    try:
+        context = await _seed_submission_database(database)
+        async with database.sessions() as session:
+            job = await session.get(GenerationJob, context.job_id)
+            attempt = await session.get(GenerationAttempt, context.attempt_id)
+            assert job is not None
+            assert attempt is not None
+            job.state = GenerationState.CANCELLED
+            attempt.state = GenerationAttemptState.SUBMITTING
+            await session.commit()
+
+        async def forbidden_manifest(*args: object, **kwargs: object) -> EffectiveArtifactManifest:
+            del args, kwargs
+            raise AssertionError("a local orphan must be fenced before runtime work")
+
+        monkeypatch.setattr(
+            ControllerWorkloads,
+            "_effective_artifact_manifest",
+            forbidden_manifest,
+        )
+        workloads = ControllerWorkloads(
+            settings=Settings(
+                worker_signing_key_id="worker-key-1",
+                worker_signing_private_key=WORKER_SIGNING_PRIVATE_KEY,
+            ),
+            sessions=database.sessions,
+            instance_id="controller-stale-submitting-test",
+            salad_client=cast(SaladClient, object()),
+            object_store=cast(ObjectStore, object()),
+        )
+        event = ClaimedOutboxEvent(
+            id=UUID("c72554ea-399e-4795-bf96-c2991e009a9a"),
+            topic=SALAD_JOB_SUBMIT_TOPIC,
+            dedupe_key=f"{SALAD_JOB_SUBMIT_TOPIC}:{context.attempt_id}",
+            correlation_id=str(context.attempt_id),
+            aggregate_type=GENERATION_ATTEMPT_AGGREGATE,
+            aggregate_id=context.attempt_id,
+            payload={"generation_attempt_id": str(context.attempt_id)},
+            attempt=1,
+            max_attempts=3,
+            lease_expires_at=NOW + timedelta(minutes=5),
+        )
+
+        result = await workloads._submit_event(event, progress=_SubmissionProgress())
+
+        assert result.disposition == SubmissionDisposition.CANCELLED
+        assert result.mutation_effect == MutationEffect.DEFINITELY_NOT_STARTED
+        async with database.sessions() as session:
+            attempt = await session.get(GenerationAttempt, context.attempt_id)
+            job = await session.get(GenerationJob, context.job_id)
+            assert attempt is not None
+            assert job is not None
+            assert attempt.state == GenerationAttemptState.FAILED
+            assert attempt.unknown_since is None
+            assert job.state == GenerationState.CANCELLED
+    finally:
+        await database.dispose()
 
 
 @pytest.mark.asyncio
@@ -694,10 +1062,14 @@ async def test_submit_reuses_active_runtime_then_refreshes_same_manifest_at_idle
         assert submissions == [second.generation_attempt_id]
 
         async with database.sessions() as session:
+            first_job = await session.get(GenerationJob, first.job_id)
             first_attempt = await session.get(GenerationAttempt, first.attempt_id)
+            assert first_job is not None
             assert first_attempt is not None
-            first_attempt.state = GenerationAttemptState.FAILED
-            first_attempt.completed_at = NOW
+            # Simulate the legacy orphan that caused a completed/cancelled set to
+            # pin runtime refreshes: SUBMITTING was recorded without any durable
+            # reservation/submission marker, then the parent became terminal.
+            first_job.state = GenerationState.CANCELLED
             await session.commit()
 
         # With no other active provider attempt, this is the idle-to-active
@@ -961,9 +1333,23 @@ async def test_submit_refreshes_idle_resident_lora_superset_without_evicting_it(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("active_attempt_state", "active_job_state", "provider_external_id"),
+    [
+        (
+            GenerationAttemptState.RUNNING,
+            GenerationState.RUNNING,
+            "provider-active-manifest-attempt",
+        ),
+        (GenerationAttemptState.UNKNOWN, GenerationState.CANCELLED, None),
+    ],
+)
 async def test_submit_defers_an_incompatible_lora_rollout_while_work_is_active(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    active_attempt_state: GenerationAttemptState,
+    active_job_state: GenerationState,
+    provider_external_id: str | None,
 ) -> None:
     database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'active-manifest-defer.db').as_posix()}")
     await database.create_schema()
@@ -980,8 +1366,12 @@ async def test_submit_defers_an_incompatible_lora_rollout_while_work_is_active(
             assert first_attempt is not None
             first_job.parameters = {"seed": 1, "loras": [{"sha256": lora_a}]}
             first_job.parameters_sha256 = canonical_sha256(first_job.parameters)
-            first_attempt.state = GenerationAttemptState.RUNNING
-            first_attempt.provider_external_id = "provider-active-manifest-attempt"
+            first_job.state = active_job_state
+            first_attempt.state = active_attempt_state
+            first_attempt.provider_external_id = provider_external_id
+            first_attempt.unknown_since = (
+                NOW if active_attempt_state == GenerationAttemptState.UNKNOWN else None
+            )
             deployment.runtime_managed_lora_sha256s = [lora_a]
             deployment.runtime_artifact_manifest_sha256 = canonical_sha256(
                 {"managed_loras": (lora_a,)}

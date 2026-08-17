@@ -611,6 +611,7 @@
         data-batch-index="{{ item.master.batch_index }}"
         data-batch-image-number="{{ item.master.batch_image_number }}"
         data-decision="{{ decision_value }}"
+        data-asset-preview-url="{{ item.master.preview_url }}"
         data-asset-view-url="{{ item.master.view_url }}"
         data-inspected="{{ 'true' if item.inspected else 'false' }}"
         data-selected-for-x="{{ 'true' if item.current.selected_for_x else 'false' }}"
@@ -637,8 +638,9 @@
             alt="Rank {{ item.master.rank }} generated image"
             width="{{ item.master.width }}"
             height="{{ item.master.height }}"
-            loading="lazy"
+            loading="{{ 'eager' if loop.index <= 2 else 'lazy' }}"
             decoding="async"
+            {% if loop.index <= 2 %}fetchpriority="high"{% endif %}
           >
           <span class="asset-rank-badge">#{{ item.master.rank }}</span>
           <span class="asset-rank-badge asset-score-badge">

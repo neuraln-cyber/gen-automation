@@ -8,15 +8,15 @@
       <div class="page-header-copy">
         {% if experiment_mode %}
           <p class="page-kicker">Experiment Lab</p>
-          <h1>Warm batch queue</h1>
+          <h1>Interactive testing</h1>
         {% else %}
           <p class="page-kicker">Create</p>
           <h1>New set</h1>
         {% endif %}
         <p class="lede">
           {% if experiment_mode %}
-            The complete New Automation workflow, with one warm GPU kept ready between
-            back-to-back batches and separate submissions.
+            The complete New Automation workflow, with one GPU kept ready between quick
+            prompt, style, and LoRA tests. One-image tests and larger batches use the same path.
           {% else %}
             Choose a look, build the queue, then launch.
           {% endif %}
@@ -43,15 +43,16 @@
       data-csrf-token="{{ csrf_token }}"
     >
       <div>
-        <span class="experiment-eyebrow">Warm GPU session</span>
-        <strong data-warm-session-heading>One allocation &middot; any Automation batch plan</strong>
+        <span class="experiment-eyebrow">Interactive GPU session</span>
+        <strong data-warm-session-heading>Standard mode &middot; 15-minute reuse</strong>
         <p data-warm-session-status>
-          The first submission starts the GPU. Keep submitting freely while the session is
-          warm; each batch is split into safe provider jobs automatically.
+          A queued test starts the bounded 15-minute follow-up window automatically. Start a
+          Focus session now when you want the worker ready while you edit and across more tests.
         </p>
       </div>
       <div class="experiment-warm-actions" hidden data-warm-session-actions>
-        <button class="secondary-button" type="button" data-warm-start>Start 15-minute session</button>
+        <button class="secondary-button" type="button" data-warm-start data-warm-duration-minutes="15">Start 15 min</button>
+        <button class="primary-button" type="button" data-warm-start data-warm-duration-minutes="90">Start 90 min focus</button>
         <button class="secondary-button" type="button" data-warm-extend>+15 minutes</button>
         <button class="text-button danger" type="button" data-warm-end>End now</button>
       </div>
@@ -930,7 +931,7 @@
             <button class="text-button" type="button" data-automation-draft-clear>Clear draft</button>
           </div>
           <button class="primary-button queue-submit" type="submit" {% if not options.ready %}disabled{% endif %}>
-            {{ 'Queue warm batch plan' if experiment_mode else 'Queue set' }}
+            {{ 'Queue test' if experiment_mode else 'Queue set' }}
           </button>
         </section>
       </aside>
@@ -940,7 +941,7 @@
           <span><span data-mobile-summary-jobs>0</span> GPU jobs &middot; final set <span data-mobile-summary-target>0</span></span>
         </div>
         <button class="primary-button queue-submit" type="submit" {% if not options.ready %}disabled{% endif %}>
-          {{ 'Queue warm batch plan' if experiment_mode else 'Queue set' }}
+          {{ 'Queue test' if experiment_mode else 'Queue set' }}
         </button>
       </div>
     </div>

@@ -59,7 +59,8 @@ from gen_automation.services.dashboard_previews import (
     DashboardPreviewNotFoundError,
     DashboardPreviewRenderError,
     DashboardPreviewStorageError,
-    load_or_create_dashboard_preview,
+    load_or_create_resolved_dashboard_preview,
+    resolve_dashboard_preview_source,
 )
 from gen_automation.services.generation_details import (
     GenerationDetailsNotFoundError,
@@ -224,13 +225,24 @@ async def dashboard_asset_preview(
         )
     settings: Settings = request.app.state.settings
     try:
-        preview = await load_or_create_dashboard_preview(
+        source = await resolve_dashboard_preview_source(
             session,
             store,
             asset_id=asset_id,
             source_token=source_token,
             max_master_bytes=settings.storage_max_image_bytes,
         )
+        headers = {
+            "Cache-Control": DASHBOARD_PREVIEW_CACHE_CONTROL,
+            "Content-Disposition": "inline",
+            "ETag": source.etag,
+            "Vary": "Cookie",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": content_security_policy(settings.environment),
+        }
+        if _etag_matches(request.headers.get("if-none-match"), source.etag):
+            return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+        preview = await load_or_create_resolved_dashboard_preview(store, source=source)
     except DashboardPreviewNotFoundError:
         return _secure_response(
             request,
@@ -256,16 +268,6 @@ async def dashboard_asset_preview(
             ),
         )
 
-    headers = {
-        "Cache-Control": DASHBOARD_PREVIEW_CACHE_CONTROL,
-        "Content-Disposition": "inline",
-        "ETag": preview.etag,
-        "Vary": "Cookie",
-        "X-Content-Type-Options": "nosniff",
-        "Content-Security-Policy": content_security_policy(settings.environment),
-    }
-    if _etag_matches(request.headers.get("if-none-match"), preview.etag):
-        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
     return Response(
         content=preview.data,
         media_type=DASHBOARD_PREVIEW_CONTENT_TYPE,

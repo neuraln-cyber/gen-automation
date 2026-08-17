@@ -223,6 +223,46 @@ async def reevaluate_budget_guard(
     )
 
 
+async def preflight_attempt_budget(
+    session: AsyncSession,
+    *,
+    provider: str,
+    amount_microusd: int,
+    now: datetime | None = None,
+) -> ReservationDecision:
+    """Check a proposed reservation without changing an attempt.
+
+    The provider guard remains locked in the caller's transaction, so runtime
+    admission can safely happen before ``reserve_attempt_budget`` repeats the
+    same check and records the durable reservation.
+    """
+
+    provider = _validated_provider(provider)
+    _validate_positive_microusd(amount_microusd)
+    evaluated_at = _as_utc(now or datetime.now(UTC))
+    guard = await _require_guard_locked(session, provider)
+    snapshot = await _evaluate_locked(session, guard, evaluated_at)
+    reason = _limit_reason(snapshot, additional_microusd=amount_microusd)
+    _set_guard_state(
+        session,
+        guard,
+        reason=reason,
+        evaluated_at=evaluated_at,
+    )
+    await session.flush()
+    return ReservationDecision(
+        accepted=reason is None,
+        replayed=False,
+        reason=reason,
+        requested_microusd=amount_microusd,
+        snapshot=replace(
+            snapshot,
+            state=guard.state,
+            blocked_reason=guard.blocked_reason,
+        ),
+    )
+
+
 async def reserve_attempt_budget(
     session: AsyncSession,
     *,

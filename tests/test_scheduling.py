@@ -245,6 +245,252 @@ async def test_dispatch_respects_existing_inflight_capacity(
 
 
 @pytest.mark.asyncio
+async def test_dispatch_ignores_clean_created_attempt_owned_by_terminal_job(
+    scheduling_context: SchedulingContext,
+) -> None:
+    async with scheduling_context.database.sessions() as session:
+        first = await dispatch_generation_jobs(
+            session,
+            salad_deployment_id=scheduling_context.deployment_id,
+            gpu_allocation_enabled=True,
+            max_inflight=1,
+            now=NOW,
+        )
+        assert len(first.dispatched) == 1
+
+    async with scheduling_context.database.sessions() as session:
+        job = await session.get(GenerationJob, scheduling_context.job_ids[0])
+        attempt = await session.scalar(
+            select(GenerationAttempt).where(
+                GenerationAttempt.job_id == scheduling_context.job_ids[0]
+            )
+        )
+        assert job is not None
+        assert attempt is not None
+        assert attempt.state == GenerationAttemptState.CREATED
+        job.state = GenerationState.CANCELLED
+        await session.commit()
+
+    async with scheduling_context.database.sessions() as session:
+        second = await dispatch_generation_jobs(
+            session,
+            salad_deployment_id=scheduling_context.deployment_id,
+            gpu_allocation_enabled=True,
+            max_inflight=1,
+            now=NOW,
+        )
+
+    assert [item.generation_job_id for item in second.dispatched] == [scheduling_context.job_ids[1]]
+    assert second.available_slots == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_ignores_markerless_submitting_orphan_from_terminal_job(
+    scheduling_context: SchedulingContext,
+) -> None:
+    async with scheduling_context.database.sessions() as session:
+        first = await dispatch_generation_jobs(
+            session,
+            salad_deployment_id=scheduling_context.deployment_id,
+            gpu_allocation_enabled=True,
+            max_inflight=1,
+            now=NOW,
+        )
+        assert len(first.dispatched) == 1
+
+    async with scheduling_context.database.sessions() as session:
+        job = await session.get(GenerationJob, scheduling_context.job_ids[0])
+        attempt = await session.scalar(
+            select(GenerationAttempt).where(
+                GenerationAttempt.job_id == scheduling_context.job_ids[0]
+            )
+        )
+        assert job is not None
+        assert attempt is not None
+        job.state = GenerationState.CANCELLED
+        attempt.state = GenerationAttemptState.SUBMITTING
+        await session.commit()
+
+    async with scheduling_context.database.sessions() as session:
+        second = await dispatch_generation_jobs(
+            session,
+            salad_deployment_id=scheduling_context.deployment_id,
+            gpu_allocation_enabled=True,
+            max_inflight=1,
+            now=NOW,
+        )
+
+    assert [item.generation_job_id for item in second.dispatched] == [scheduling_context.job_ids[1]]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_keeps_marked_submitting_attempt_inflight_after_parent_terminal(
+    scheduling_context: SchedulingContext,
+) -> None:
+    async with scheduling_context.database.sessions() as session:
+        first = await dispatch_generation_jobs(
+            session,
+            salad_deployment_id=scheduling_context.deployment_id,
+            gpu_allocation_enabled=True,
+            max_inflight=1,
+            now=NOW,
+        )
+        assert len(first.dispatched) == 1
+
+    async with scheduling_context.database.sessions() as session:
+        job = await session.get(GenerationJob, scheduling_context.job_ids[0])
+        attempt = await session.scalar(
+            select(GenerationAttempt).where(
+                GenerationAttempt.job_id == scheduling_context.job_ids[0]
+            )
+        )
+        assert job is not None
+        assert attempt is not None
+        job.state = GenerationState.CANCELLED
+        attempt.state = GenerationAttemptState.SUBMITTING
+        attempt.submit_started_at = NOW
+        await session.commit()
+
+    async with scheduling_context.database.sessions() as session:
+        second = await dispatch_generation_jobs(
+            session,
+            salad_deployment_id=scheduling_context.deployment_id,
+            gpu_allocation_enabled=True,
+            max_inflight=1,
+            now=NOW,
+        )
+
+    assert second.dispatched == ()
+    assert second.available_slots == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_ignores_clean_created_attempt_from_superseded_release_version(
+    scheduling_context: SchedulingContext,
+) -> None:
+    async with scheduling_context.database.sessions() as session:
+        first = await dispatch_generation_jobs(
+            session,
+            salad_deployment_id=scheduling_context.deployment_id,
+            gpu_allocation_enabled=True,
+            max_inflight=1,
+            now=NOW,
+        )
+        assert len(first.dispatched) == 1
+
+    async with scheduling_context.database.sessions() as session:
+        release = await session.get(Release, scheduling_context.release_id)
+        old_version = await session.scalar(
+            select(ReleaseVersion).where(ReleaseVersion.release_id == scheduling_context.release_id)
+        )
+        old_job = await session.get(GenerationJob, scheduling_context.job_ids[0])
+        assert release is not None
+        assert old_version is not None
+        assert old_job is not None
+        new_version = ReleaseVersion(
+            release_id=release.id,
+            version_no=2,
+            specification=old_version.specification,
+            specification_sha256=old_version.specification_sha256,
+            created_by="test",
+            created_at=NOW + timedelta(seconds=1),
+        )
+        session.add(new_version)
+        await session.flush()
+        checks = list(
+            (
+                await session.scalars(
+                    select(ComplianceCheck).where(
+                        ComplianceCheck.release_version_id == old_version.id
+                    )
+                )
+            ).all()
+        )
+        session.add_all(
+            [
+                ComplianceCheck(
+                    release_version_id=new_version.id,
+                    check_type=check.check_type,
+                    result=check.result,
+                    evidence=check.evidence,
+                    checked_by="test",
+                    checked_at=NOW + timedelta(seconds=1),
+                )
+                for check in checks
+            ]
+        )
+        parameters = {**old_job.parameters, "ordinal": 0}
+        new_job = GenerationJob(
+            release_version_id=new_version.id,
+            logical_key="9" * 64,
+            parameters=parameters,
+            parameters_sha256=canonical_sha256(parameters),
+            provider="salad",
+            state=GenerationState.QUEUED,
+            priority=50,
+            expected_output_count=2,
+            attempt_count=0,
+            max_attempts=3,
+        )
+        session.add(new_job)
+        release.current_version_no = 2
+        await session.commit()
+        new_job_id = new_job.id
+
+    async with scheduling_context.database.sessions() as session:
+        second = await dispatch_generation_jobs(
+            session,
+            salad_deployment_id=scheduling_context.deployment_id,
+            gpu_allocation_enabled=True,
+            max_inflight=1,
+            now=NOW + timedelta(seconds=2),
+        )
+
+    assert [item.generation_job_id for item in second.dispatched] == [new_job_id]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_keeps_ambiguous_provider_attempt_as_inflight_after_parent_terminal(
+    scheduling_context: SchedulingContext,
+) -> None:
+    async with scheduling_context.database.sessions() as session:
+        first = await dispatch_generation_jobs(
+            session,
+            salad_deployment_id=scheduling_context.deployment_id,
+            gpu_allocation_enabled=True,
+            max_inflight=1,
+            now=NOW,
+        )
+        assert len(first.dispatched) == 1
+
+    async with scheduling_context.database.sessions() as session:
+        job = await session.get(GenerationJob, scheduling_context.job_ids[0])
+        attempt = await session.scalar(
+            select(GenerationAttempt).where(
+                GenerationAttempt.job_id == scheduling_context.job_ids[0]
+            )
+        )
+        assert job is not None
+        assert attempt is not None
+        job.state = GenerationState.CANCELLED
+        attempt.state = GenerationAttemptState.UNKNOWN
+        attempt.unknown_since = NOW
+        await session.commit()
+
+    async with scheduling_context.database.sessions() as session:
+        second = await dispatch_generation_jobs(
+            session,
+            salad_deployment_id=scheduling_context.deployment_id,
+            gpu_allocation_enabled=True,
+            max_inflight=1,
+            now=NOW,
+        )
+
+    assert second.dispatched == ()
+    assert second.available_slots == 0
+
+
+@pytest.mark.asyncio
 async def test_dispatch_waits_for_retry_time_and_release_phase(
     scheduling_context: SchedulingContext,
 ) -> None:

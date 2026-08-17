@@ -10,7 +10,10 @@ versions are frozen into the release when the form is submitted.
 Experiment Lab. Its only additional behavior is the deployment-wide warm GPU
 panel: the first Lab submission starts or touches the bounded warm lease, and
 the status page offers a one-click path back to queue another independent batch
-plan. Experiment Lab has no comparison variants or Lab-specific image-count
+plan. A submission opens the default 15-minute follow-up window; operators may also
+prewarm that window or explicitly start the 90-minute Focus session while iterating.
+Experiment Lab has no comparison
+variants or Lab-specific image-count
 cap; Automation's existing form, provider-job, storage, deliverability, and
 budget invariants remain authoritative.
 
@@ -85,8 +88,11 @@ uninstalled capability already exists.
 
 The complete in-progress automation is also autosaved as a device-local draft,
 including its ordered prompt queue. It is restored after refresh or session
-interruption and cleared only after the successful status page loads (or when
-the operator explicitly clears it).
+interruption. A normal Automation draft is cleared after the successful status
+page loads. An Experiment Lab submission instead retains the reusable profile and
+prompt queue while clearing its title, slug, and submission identity, so the next
+test cannot collide with or replay the queued run. Either draft can be cleared
+explicitly by the operator.
 
 The form also freezes Clip skip (default `2`), separate face-detailer positive
 and negative prompts, and the face mask feather control used as the closest
