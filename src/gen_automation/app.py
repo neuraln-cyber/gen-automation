@@ -35,7 +35,7 @@ from gen_automation.auth.runtime import (
     assert_authentication_bootstrapped,
     build_authentication_runtime,
 )
-from gen_automation.config import Environment, Settings, XAuthMode, get_settings
+from gen_automation.config import Environment, I2VRunPodMode, Settings, XAuthMode, get_settings
 from gen_automation.controller.runtime import ControllerRuntime, build_controller_runtime
 from gen_automation.db import models as _models  # noqa: F401
 from gen_automation.db.session import Database
@@ -43,6 +43,8 @@ from gen_automation.integrations.civitai import CivitaiClient
 from gen_automation.integrations.danbooru import DanbooruAutocompleteClient
 from gen_automation.integrations.patreon import PatreonSidecarDriver
 from gen_automation.integrations.runpod.client import RunPodClient
+from gen_automation.integrations.runpod.pod_client import RunPodPodClient
+from gen_automation.integrations.runpod.protocol import RunPodProvider
 from gen_automation.integrations.salad.client import SaladClient
 from gen_automation.integrations.salad.webhooks import SaladWebhookVerifier
 from gen_automation.integrations.semantic_vlm import SemanticVlmClient
@@ -52,6 +54,10 @@ from gen_automation.services.admin_enrollment import AdminEnrollmentService
 from gen_automation.services.authentication import AuthenticationService
 from gen_automation.services.civitai_secrets import load_civitai_api_key
 from gen_automation.services.danbooru_tags import DanbooruTagAutocompleteService
+from gen_automation.services.i2v_environment import (
+    i2v_worker_identity,
+    i2v_worker_model_objects_json,
+)
 from gen_automation.services.publication_runtime import XOAuthProvider
 from gen_automation.services.runtime_secrets import (
     RuntimeSecretResolver,
@@ -128,7 +134,7 @@ class _AppIntegrations:
     civitai_client: CivitaiClient | None
     danbooru_tag_autocomplete_service: DanbooruTagAutocompleteService
     salad_client: SaladClient | None
-    runpod_client: RunPodClient | None
+    runpod_client: RunPodProvider | None
     semantic_vlm_client: SemanticVlmClient | None
     patreon_driver: PatreonSidecarDriver | None
 
@@ -186,11 +192,10 @@ async def _build_app_integrations(settings: Settings) -> AsyncIterator[_AppInteg
                 timeout=settings.salad_request_timeout_seconds,
             )
 
-        runpod_client: RunPodClient | None = None
+        runpod_client: RunPodProvider | None = None
         if settings.i2v_enabled and settings.i2v_runpod_enabled:
             api_key = settings.i2v_runpod_api_key
-            endpoint_id = settings.i2v_runpod_endpoint_id
-            if api_key is None or endpoint_id is None:
+            if api_key is None:
                 raise RuntimeError("validated RunPod I2V settings are incomplete")
             runpod_http_client = httpx2.AsyncClient(
                 follow_redirects=False,
@@ -198,12 +203,48 @@ async def _build_app_integrations(settings: Settings) -> AsyncIterator[_AppInteg
                 limits=httpx2.Limits(max_connections=2, max_keepalive_connections=1),
             )
             cleanup.push_async_callback(runpod_http_client.aclose)
-            runpod_client = RunPodClient(
-                http_client=runpod_http_client,
-                api_key=api_key.get_secret_value(),
-                endpoint_id=endpoint_id,
-                timeout=30,
-            )
+            if settings.i2v_runpod_mode == I2VRunPodMode.POD:
+                volume_id = settings.i2v_runpod_network_volume_id
+                worker_image = settings.i2v_worker_image
+                if volume_id is None or worker_image is None:
+                    raise RuntimeError("validated RunPod I2V Pod settings are incomplete")
+                worker_environment = {
+                    "GEN_I2V_WORKER_ENVIRONMENT": "production",
+                    "GEN_I2V_WORKER_MODEL_OBJECTS_JSON": (i2v_worker_model_objects_json(settings)),
+                    "GEN_I2V_WORKER_ALLOWED_GPU_NAMES_CSV": ("NVIDIA RTX PRO 4500 Blackwell"),
+                    "GEN_I2V_WORKER_LORA_WORKER_ENABLED": (
+                        "true" if settings.i2v_lora_worker_enabled else "false"
+                    ),
+                }
+                if settings.i2v_worker_source_revision is not None:
+                    worker_environment["GEN_I2V_WORKER_SOURCE_REVISION"] = (
+                        settings.i2v_worker_source_revision
+                    )
+                if settings.i2v_private_manifest_source_sha256 is not None:
+                    worker_environment["GEN_I2V_WORKER_PRIVATE_MANIFEST_SOURCE_SHA256"] = (
+                        settings.i2v_private_manifest_source_sha256
+                    )
+                model_objects_sha256, artifact_identity_sha256 = i2v_worker_identity(settings)
+                runpod_client = RunPodPodClient(
+                    http_client=runpod_http_client,
+                    api_key=api_key.get_secret_value(),
+                    worker_image=worker_image,
+                    network_volume_id=volume_id,
+                    worker_environment=worker_environment,
+                    expected_model_objects_sha256=model_objects_sha256,
+                    expected_artifact_identity_sha256=artifact_identity_sha256,
+                    expected_source_revision=settings.i2v_worker_source_revision,
+                )
+            else:
+                endpoint_id = settings.i2v_runpod_endpoint_id
+                if endpoint_id is None:
+                    raise RuntimeError("validated RunPod I2V Serverless settings are incomplete")
+                runpod_client = RunPodClient(
+                    http_client=runpod_http_client,
+                    api_key=api_key.get_secret_value(),
+                    endpoint_id=endpoint_id,
+                    timeout=30,
+                )
 
         semantic_vlm_client: SemanticVlmClient | None = None
         if settings.semantic_anatomy_enabled:

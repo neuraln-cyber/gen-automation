@@ -1,4 +1,4 @@
-"""Durable single-flight I2V runtime backed by RunPod Serverless Queue."""
+"""Durable single-flight I2V runtime backed by an exact RunPod provider."""
 
 from __future__ import annotations
 
@@ -25,7 +25,6 @@ from gen_automation.domain.i2v import (
 from gen_automation.domain.i2v_loras import I2VLoraSettingsKind, classify_i2v_lora_settings
 from gen_automation.i2v_worker.models import I2VResult
 from gen_automation.i2v_worker.runpod_models import RunPodI2VInput
-from gen_automation.integrations.runpod.client import RunPodClient
 from gen_automation.integrations.runpod.errors import (
     RunPodAPIError,
     RunPodRateLimitError,
@@ -38,6 +37,7 @@ from gen_automation.integrations.runpod.models import (
     RunPodJob,
     RunPodJobStatus,
 )
+from gen_automation.integrations.runpod.protocol import RunPodProvider
 from gen_automation.services.i2v import (
     I2V_RUNTIME_WORKER_ID,
     acknowledge_i2v_cancellation,
@@ -62,7 +62,7 @@ _ACTIVE_JOB_STATES = (
 )
 _ACTIVE_ATTEMPT_STATES = (I2VAttemptState.CREATED, I2VAttemptState.RUNNING)
 _DEFINITELY_REJECTED_STATUS_CODES = frozenset({400, 401, 403, 404, 422})
-_GPU_CLASS = "RunPod Serverless 32GB+"
+_GPU_CLASS = "RunPod 32GB+"
 
 
 class I2VRunPodRuntimeError(Exception):
@@ -92,7 +92,7 @@ class I2VRunPodJobInputBuilder(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class I2VRunPodRuntimeConfig:
-    endpoint_id: str
+    provider_id: str
     worker_image: str
     claim_url: str
     claim_secret: str
@@ -120,11 +120,11 @@ class I2VRunPodRuntime:
         *,
         config: I2VRunPodRuntimeConfig,
         sessions: async_sessionmaker[AsyncSession],
-        runpod_client: RunPodClient,
+        runpod_client: RunPodProvider,
         input_builder: I2VRunPodJobInputBuilder,
     ) -> None:
-        if runpod_client.endpoint_id != config.endpoint_id:
-            raise I2VRunPodRuntimeConfigurationError("RunPod endpoint identity mismatch")
+        if runpod_client.provider_id != config.provider_id:
+            raise I2VRunPodRuntimeConfigurationError("RunPod provider identity mismatch")
         self.config = config
         self.sessions = sessions
         self.runpod_client = runpod_client
@@ -142,6 +142,11 @@ class I2VRunPodRuntime:
             if action is not None:
                 return I2VRunPodRuntimeCycle(action=action, changed=True)
             return I2VRunPodRuntimeCycle(action="provider_unchanged", changed=False)
+
+        # On-demand Pods cannot be stopped while a network volume is attached.
+        # Once durable state proves no attempt is active, remove any exact managed
+        # Pod left behind by a terminal job or a controller restart.
+        await self.runpod_client.reap_idle()
 
         async with self.sessions() as session:
             queued_settings = (
@@ -272,6 +277,30 @@ class I2VRunPodRuntime:
                 now=now,
             )
             return "attempt_prepared"
+        execution_started_at = attempt.started_at
+        if (
+            execution_started_at is None
+            and attempt.request_metadata.get("provider_status") == RunPodJobStatus.IN_PROGRESS.value
+        ):
+            execution_started_at = _metadata_datetime(attempt, "provider_observed_at")
+        if (
+            job.state != I2VJobState.CANCEL_REQUESTED
+            and execution_started_at is not None
+            and now
+            >= _as_utc(execution_started_at)
+            + timedelta(seconds=self.config.execution_timeout_seconds)
+        ):
+            # Enforce the paid-compute bound before asking the worker for status.
+            # A crashed Pod API must not keep a live GPU billed indefinitely.
+            await self.runpod_client.cancel(attempt.provider_job_id)
+            await self._fail_attempt(
+                job,
+                attempt,
+                error_code="runpod_execution_timeout",
+                error_detail="RunPod I2V execution exceeded its cost bound.",
+                now=now,
+            )
+            return "provider_execution_timeout_failed"
         try:
             remote = await self.runpod_client.get_job(attempt.provider_job_id)
         except RunPodAPIError as error:
@@ -677,7 +706,7 @@ class I2VRunPodRuntime:
             existing = await session.scalar(
                 select(I2VWorkerDeployment).where(
                     I2VWorkerDeployment.provider == "runpod",
-                    I2VWorkerDeployment.provider_group_id == self.config.endpoint_id,
+                    I2VWorkerDeployment.provider_group_id == self.config.provider_id,
                 )
             )
             fresh = (
@@ -699,7 +728,7 @@ class I2VRunPodRuntime:
                 session,
                 registration=I2VWorkerDeploymentRegistration(
                     provider="runpod",
-                    provider_group_id=self.config.endpoint_id,
+                    provider_group_id=self.config.provider_id,
                     provider_instance_id=None,
                     state=state,
                     gpu_class=_GPU_CLASS,

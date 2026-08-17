@@ -1,4 +1,4 @@
-"""RunPod Serverless entry point for the existing DaSiWa I2V pipeline."""
+"""Shared RunPod adapter for the existing DaSiWa I2V pipeline."""
 
 from __future__ import annotations
 
@@ -48,6 +48,11 @@ class RunPodI2VHandler:
             _LOGGER.exception("RunPod I2V handler failed")
             raise RunPodHandlerError("I2V generation failed") from None
         return result
+
+    def close(self) -> None:
+        if self._initialized:
+            self._runner.run(self.supervisor.stop())
+        self._runner.close()
 
     async def _handle(self, event: RunPodI2VEvent) -> dict[str, Any]:
         handler_started = time.monotonic()

@@ -89,6 +89,8 @@ class RunPodVolumeBootstrapper:
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         with _exclusive_lock(root / ".hydrate.lock"):
             if not self._ready(root, models):
+                if self.settings.require_preseeded_volume:
+                    raise ModelBootstrapError("preseeded model volume is unavailable")
                 for model in models:
                     self._materialize(root, model, grants_by_role[model.role])
                 self._write_marker(root, models)

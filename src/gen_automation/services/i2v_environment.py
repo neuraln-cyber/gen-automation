@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from gen_automation.config import Settings
+from gen_automation.config import I2VRunPodMode, Settings
 from gen_automation.domain.runtime_bindings import (
     WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING,
     WORKER_ARTIFACT_ENDPOINT_URL_BINDING,
@@ -78,13 +78,21 @@ def i2v_runtime_config_from_settings(settings: Settings) -> I2VRunPodRuntimeConf
     if (
         not settings.i2v_enabled
         or settings.i2v_worker_image is None
-        or settings.i2v_runpod_endpoint_id is None
         or settings.i2v_runpod_api_key is None
         or settings.i2v_runpod_claim_url is None
     ):
         raise I2VEnvironmentError("validated I2V settings are incomplete")
+    provider_id: str
+    if settings.i2v_runpod_mode == I2VRunPodMode.POD:
+        if settings.i2v_runpod_network_volume_id is None:
+            raise I2VEnvironmentError("validated I2V Pod settings are incomplete")
+        provider_id = f"pod-{settings.i2v_runpod_network_volume_id}"
+    else:
+        if settings.i2v_runpod_endpoint_id is None:
+            raise I2VEnvironmentError("validated I2V Serverless settings are incomplete")
+        provider_id = settings.i2v_runpod_endpoint_id
     return I2VRunPodRuntimeConfig(
-        endpoint_id=settings.i2v_runpod_endpoint_id,
+        provider_id=provider_id,
         worker_image=settings.i2v_worker_image,
         claim_url=str(settings.i2v_runpod_claim_url),
         claim_secret=settings.i2v_runpod_api_key.get_secret_value(),
@@ -177,6 +185,12 @@ def i2v_worker_model_objects(settings: Settings) -> tuple[ModelObject, ...]:
         return tuple(ModelObject.model_validate(item) for item in raw)
     except (TypeError, ValueError):
         raise I2VEnvironmentError("I2V private model manifest is invalid") from None
+
+
+def i2v_worker_model_objects_json(settings: Settings) -> str:
+    """Return the exact canonical worker manifest without exposing storage credentials."""
+
+    return _worker_model_objects(settings)
 
 
 def _artifact_region(settings: Settings) -> str:

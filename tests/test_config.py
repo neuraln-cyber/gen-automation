@@ -624,6 +624,7 @@ def test_i2v_runpod_defaults_are_single_flight_and_cover_long_renders() -> None:
     assert settings.i2v_runpod_max_active_jobs == 1
     assert settings.i2v_runpod_execution_timeout_seconds == 6 * 60 * 60
     assert settings.i2v_runpod_job_ttl_seconds == 7 * 24 * 60 * 60
+    assert settings.i2v_runpod_mode.value == "serverless"
 
 
 def test_i2v_accepts_complete_digest_pinned_configuration() -> None:
@@ -671,6 +672,27 @@ def test_i2v_accepts_complete_digest_pinned_configuration() -> None:
     assert settings.i2v_enabled
     assert settings.i2v_runpod_max_active_jobs == 1
     assert settings.i2v_object_grant_ttl_seconds == 7 * 24 * 60 * 60
+
+    pod_values = {
+        **values,
+        "i2v_runpod_mode": "pod",
+        "i2v_runpod_endpoint_id": None,
+        "i2v_runpod_network_volume_id": "volume123",
+    }
+    pod_settings = Settings(**pod_values)
+    assert pod_settings.i2v_runpod_mode.value == "pod"
+    assert pod_settings.i2v_runpod_network_volume_id == "volume123"
+
+    with pytest.raises(
+        ValidationError,
+        match="Pod mode must not configure a Serverless endpoint ID",
+    ):
+        Settings(
+            **{
+                **pod_values,
+                "i2v_runpod_endpoint_id": "endpoint123",
+            }
+        )
 
     with pytest.raises(
         ValidationError,

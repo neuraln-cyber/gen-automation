@@ -140,6 +140,33 @@ def test_volume_execution_claim_rejects_same_paid_submission_twice(tmp_path: Pat
         )
 
 
+def test_required_preseed_never_falls_back_to_billable_model_download(tmp_path: Path) -> None:
+    settings, bodies = _settings(tmp_path)
+    settings = settings.model_copy(update={"require_preseeded_volume": True})
+    expires_at = datetime.now(UTC) + timedelta(hours=1)
+    grants = tuple(
+        RunPodModelGrant(
+            role=model.role,
+            url=f"https://models.example/{name}",
+            expires_at=expires_at,
+            byte_size=model.byte_size,
+            sha256=model.sha256,
+        )
+        for model, name in zip(
+            settings.model_objects,
+            ("high", "low", "text", "vae"),
+            strict=True,
+        )
+    )
+    client = _Client(bodies)
+    bootstrapper = RunPodVolumeBootstrapper(settings, http_client=client)  # type: ignore[arg-type]
+
+    with pytest.raises(ModelBootstrapError, match="preseeded"):
+        bootstrapper.bootstrap(grants)
+
+    assert client.calls == []
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Windows symlinks require developer mode")
 def test_volume_adopts_preseeded_files_without_network_download(tmp_path: Path) -> None:
     settings, bodies = _settings(tmp_path)

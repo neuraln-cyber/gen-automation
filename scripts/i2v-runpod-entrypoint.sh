@@ -24,9 +24,14 @@ find "$namespace" -xdev \( ! -user "$worker_uid" -o ! -group "$worker_gid" \) \
   -exec chown "$worker_uid:$worker_gid" {} +
 find "$namespace" -xdev -type d -exec chmod 0700 {} +
 
+module="gen_automation.i2v_worker.runpod_handler"
+if [ "${GEN_I2V_WORKER_RUNPOD_MODE:-serverless}" = "pod" ]; then
+  module="gen_automation.i2v_worker.runpod_pod_api"
+fi
+
 exec setpriv \
   --reuid "$worker_uid" \
   --regid "$worker_gid" \
   --init-groups \
   --no-new-privs \
-  /opt/i2v-venv/bin/python -m gen_automation.i2v_worker.runpod_handler
+  /opt/i2v-venv/bin/python -m "$module"

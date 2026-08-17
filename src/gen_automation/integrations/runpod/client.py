@@ -56,6 +56,7 @@ class RunPodClient:
         self._http_client = http_client
         self.__api_key = api_key
         self.endpoint_id = endpoint_id
+        self.provider_id = endpoint_id
         self.base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._endpoint_path = f"/{quote(endpoint_id, safe='')}"
@@ -113,6 +114,11 @@ class RunPodClient:
             return parse_health(data)
         except ValueError as exc:
             raise RunPodProtocolError(str(exc)) from exc
+
+    async def reap_idle(self) -> None:
+        """Serverless owns worker scale-to-zero; no controller cleanup is needed."""
+
+        return None
 
     def _parse_job(self, data: JSONObject) -> RunPodJob:
         try:

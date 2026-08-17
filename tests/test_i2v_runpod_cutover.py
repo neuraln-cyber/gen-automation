@@ -34,9 +34,9 @@ def test_cutover_freezes_and_proves_zero_work_before_enabling_runpod() -> None:
     zero_work = script.index("assert_zero_i2v_work ||")
     secret = script.index("aws ssm get-parameter")
     preseed = script.index('PRESEED_VOLUME_ID="$(verify_preseed_identity)"', secret)
-    endpoint_health = script.index("\nverify_runpod_endpoint\n", secret)
+    provider_health = script.index("\nverify_runpod_provider\n", secret)
     enable = script.index("rewrite_env enable")
-    assert secret < preseed < endpoint_health < freeze < zero_work < enable
+    assert secret < preseed < provider_health < freeze < zero_work < enable
     assert "I2VJobState.QUEUED" in script
     assert "I2VAttemptState.CREATED" in script
     assert "--interactive" in script
@@ -44,11 +44,12 @@ def test_cutover_freezes_and_proves_zero_work_before_enabling_runpod() -> None:
     assert "--cap-add DAC_READ_SEARCH" in script
     assert "--security-opt no-new-privileges:true" in script
     assert "salad.com" not in script
-    assert script.count("https://api.runpod.ai/v2/") == 1
-    assert script.count("https://rest.runpod.io/v1/endpoints/") == 1
+    assert "https://api.runpod.ai/v2/" not in script
+    assert script.count("https://rest.runpod.io/v1/networkvolumes") == 1
+    assert script.count("https://rest.runpod.io/v1/pods?computeType=GPU") == 1
     assert 'preseed_state="/var/lib/gen-automation/runpod-i2v/preseed-state.json"' in script
     assert 'state.get("status") != "ready"' in script
-    assert 'endpoint.get("workersMin") != 1' in script
+    assert 'pod["name"].startswith("gen-automation-i2v-")' in script
     assert script.count("--env GEN_AUTOMATION_I2V_ENABLED=true") == 1
     assert script.count("--env GEN_AUTOMATION_I2V_LORA_WORKER_ENABLED=true") == 1
 
@@ -79,7 +80,9 @@ def test_staging_environment_declares_provider_cutover_fields_once() -> None:
     environment = ENV_EXAMPLE.read_text(encoding="utf-8")
     for key in (
         "GEN_AUTOMATION_I2V_RUNPOD_ENABLED",
+        "GEN_AUTOMATION_I2V_RUNPOD_MODE",
         "GEN_AUTOMATION_I2V_RUNPOD_ENDPOINT_ID",
+        "GEN_AUTOMATION_I2V_RUNPOD_NETWORK_VOLUME_ID",
         "GEN_AUTOMATION_I2V_RUNPOD_API_KEY",
         "GEN_AUTOMATION_I2V_RUNPOD_CLAIM_URL",
         "GEN_AUTOMATION_I2V_RUNPOD_SUBMISSION_CLAIM_TIMEOUT_SECONDS",
