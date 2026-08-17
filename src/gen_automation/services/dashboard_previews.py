@@ -87,7 +87,22 @@ class DashboardPreview:
 
     @property
     def etag(self) -> str:
-        return f'"{DASHBOARD_PREVIEW_VERSION}-{self.sha256}"'
+        return dashboard_preview_etag(self.source_sha256)
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardPreviewSource:
+    """Validated immutable source identity for one dashboard preview."""
+
+    asset_id: UUID
+    object_key: str
+    object_version_id: str | None
+    byte_size: int
+    source_sha256: str
+
+    @property
+    def etag(self) -> str:
+        return dashboard_preview_etag(self.source_sha256)
 
 
 def dashboard_preview_url(*, asset_id: UUID, source_sha256: str) -> str:
@@ -100,15 +115,25 @@ def dashboard_preview_url(*, asset_id: UUID, source_sha256: str) -> str:
     )
 
 
-async def load_or_create_dashboard_preview(
+def dashboard_preview_etag(source_sha256: str) -> str:
+    """Return an opaque ETag fixed by source identity and renderer version."""
+
+    normalized_sha256 = _source_sha256(source_sha256)
+    digest = hashlib.sha256(
+        f"{DASHBOARD_PREVIEW_VERSION}\0{normalized_sha256}".encode("ascii")
+    ).hexdigest()
+    return f'"{DASHBOARD_PREVIEW_VERSION}-{digest}"'
+
+
+async def resolve_dashboard_preview_source(
     session: AsyncSession,
     store: ObjectStore,
     *,
     asset_id: UUID,
     source_token: str,
     max_master_bytes: int,
-) -> DashboardPreview:
-    """Load an immutable preview, rendering and storing it once if necessary."""
+) -> DashboardPreviewSource:
+    """Validate the authenticated, content-addressed source without reading S3 bytes."""
 
     if (
         isinstance(max_master_bytes, bool)
@@ -144,14 +169,52 @@ async def load_or_create_dashboard_preview(
         raise DashboardPreviewConflictError("raw master belongs to another object store")
     if asset.byte_size <= 0 or asset.byte_size > max_master_bytes:
         raise DashboardPreviewConflictError("raw master exceeds the preview safety limit")
+    return DashboardPreviewSource(
+        asset_id=asset.id,
+        object_key=asset.object_key,
+        object_version_id=asset.object_version_id,
+        byte_size=asset.byte_size,
+        source_sha256=source_sha256,
+    )
 
-    key = _preview_object_key(asset_id=asset.id, source_sha256=source_sha256)
+
+async def load_or_create_dashboard_preview(
+    session: AsyncSession,
+    store: ObjectStore,
+    *,
+    asset_id: UUID,
+    source_token: str,
+    max_master_bytes: int,
+) -> DashboardPreview:
+    """Load an immutable preview, rendering and storing it once if necessary."""
+
+    source = await resolve_dashboard_preview_source(
+        session,
+        store,
+        asset_id=asset_id,
+        source_token=source_token,
+        max_master_bytes=max_master_bytes,
+    )
+    return await load_or_create_resolved_dashboard_preview(store, source=source)
+
+
+async def load_or_create_resolved_dashboard_preview(
+    store: ObjectStore,
+    *,
+    source: DashboardPreviewSource,
+) -> DashboardPreview:
+    """Load or render bytes for an already validated immutable source."""
+
+    key = _preview_object_key(
+        asset_id=source.asset_id,
+        source_sha256=source.source_sha256,
+    )
     try:
         cached = await _read_cached_preview(
             store,
             key=key,
-            asset_id=asset.id,
-            source_sha256=source_sha256,
+            asset_id=source.asset_id,
+            source_sha256=source.source_sha256,
         )
         if cached is not None:
             return cached
@@ -163,27 +226,27 @@ async def load_or_create_dashboard_preview(
             cached = await _read_cached_preview(
                 store,
                 key=key,
-                asset_id=asset.id,
-                source_sha256=source_sha256,
+                asset_id=source.asset_id,
+                source_sha256=source.source_sha256,
             )
             if cached is not None:
                 return cached
-            source = await store.read_bytes(
-                asset.object_key,
-                max_bytes=asset.byte_size,
-                version_id=asset.object_version_id,
+            source_bytes = await store.read_bytes(
+                source.object_key,
+                max_bytes=source.byte_size,
+                version_id=source.object_version_id,
             )
-            if len(source) != asset.byte_size or not hmac.compare_digest(
-                hashlib.sha256(source).hexdigest(),
-                source_sha256,
+            if len(source_bytes) != source.byte_size or not hmac.compare_digest(
+                hashlib.sha256(source_bytes).hexdigest(),
+                source.source_sha256,
             ):
                 raise DashboardPreviewConflictError("raw master identity changed")
-            rendered = await render_dashboard_preview_isolated(source)
+            rendered = await render_dashboard_preview_isolated(source_bytes)
             metadata = {
                 "kind": "dashboard-preview",
                 "preview-version": DASHBOARD_PREVIEW_VERSION,
-                "source-asset-id": str(asset.id),
-                "source-sha256": source_sha256,
+                "source-asset-id": str(source.asset_id),
+                "source-sha256": source.source_sha256,
                 "width": str(rendered.width),
                 "height": str(rendered.height),
             }
@@ -201,8 +264,8 @@ async def load_or_create_dashboard_preview(
                 existing = await _read_cached_preview(
                     store,
                     key=key,
-                    asset_id=asset.id,
-                    source_sha256=source_sha256,
+                    asset_id=source.asset_id,
+                    source_sha256=source.source_sha256,
                 )
                 if existing is None:
                     raise DashboardPreviewStorageError(

@@ -4,7 +4,7 @@ from typing import Any
 from uuid import UUID
 
 from pydantic import ValidationError
-from sqlalchemy import exists, func, or_, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.db.models import (
@@ -39,14 +39,20 @@ _DISPATCHABLE_RELEASE_PHASES = frozenset(
         ReleasePhase.GENERATING,
     }
 )
-_INFLIGHT_ATTEMPT_STATES = frozenset(
+_REMOTE_OR_AMBIGUOUS_INFLIGHT_ATTEMPT_STATES = frozenset(
     {
-        GenerationAttemptState.CREATED,
-        GenerationAttemptState.SUBMITTING,
         GenerationAttemptState.SUBMITTED,
         GenerationAttemptState.RUNNING,
         GenerationAttemptState.UNKNOWN,
         GenerationAttemptState.CANCEL_REQUESTED,
+    }
+)
+_TERMINAL_JOB_STATES = frozenset(
+    {
+        GenerationState.SUCCEEDED,
+        GenerationState.FAILED,
+        GenerationState.DEAD_LETTER,
+        GenerationState.CANCELLED,
     }
 )
 _REQUIRED_COMPLIANCE_CHECKS = frozenset(
@@ -256,9 +262,73 @@ async def dispatch_generation_jobs(
         await session.scalar(
             select(func.count())
             .select_from(GenerationAttempt)
+            .join(GenerationJob, GenerationJob.id == GenerationAttempt.job_id)
+            .join(
+                ReleaseVersion,
+                ReleaseVersion.id == GenerationJob.release_version_id,
+            )
+            .join(Release, Release.id == ReleaseVersion.release_id)
             .where(
                 GenerationAttempt.salad_deployment_id == deployment.id,
-                GenerationAttempt.state.in_(_INFLIGHT_ATTEMPT_STATES),
+                GenerationAttempt.provider == "salad",
+                or_(
+                    # Once a provider request may exist, the attempt remains a
+                    # capacity blocker until its own state becomes terminal. A
+                    # stopped/failed parent is not proof that remote work ended.
+                    GenerationAttempt.state.in_(_REMOTE_OR_AMBIGUOUS_INFLIGHT_ATTEMPT_STATES),
+                    # Modern SUBMITTING rows always carry the durable marker
+                    # written before provider contact. Ignore only a legacy
+                    # markerless orphan whose parent is already terminal.
+                    and_(
+                        GenerationAttempt.state == GenerationAttemptState.SUBMITTING,
+                        or_(
+                            GenerationJob.state.not_in(_TERMINAL_JOB_STATES),
+                            GenerationAttempt.provider_external_id.is_not(None),
+                            GenerationAttempt.submit_started_at.is_not(None),
+                            GenerationAttempt.submitted_at.is_not(None),
+                            GenerationAttempt.started_at.is_not(None),
+                            GenerationAttempt.last_observed_at.is_not(None),
+                            GenerationAttempt.unknown_since.is_not(None),
+                            GenerationAttempt.provider_state.is_not(None),
+                            GenerationAttempt.response_metadata.is_not(None),
+                            GenerationAttempt.cost_reservation_microusd > 0,
+                            GenerationAttempt.reservation_released_at.is_not(None),
+                        ),
+                    ),
+                    # CREATED is the sole definitely-unstarted state. Count a
+                    # clean row only while its owning lifecycle can still submit
+                    # it; stale rows from cancelled/terminal sets must not pin
+                    # every local backlog slot forever.
+                    and_(
+                        GenerationAttempt.state == GenerationAttemptState.CREATED,
+                        or_(
+                            and_(
+                                GenerationJob.state.not_in(_TERMINAL_JOB_STATES),
+                                Release.phase.in_(_DISPATCHABLE_RELEASE_PHASES),
+                                Release.current_version_no == ReleaseVersion.version_no,
+                                ~exists(
+                                    select(AuditEvent.id).where(
+                                        AuditEvent.resource_type == "release",
+                                        AuditEvent.resource_id == Release.id,
+                                        AuditEvent.action == GENERATION_STOP_REQUESTED_ACTION,
+                                    )
+                                ),
+                            ),
+                            # Corrupt/legacy CREATED rows carrying evidence of a
+                            # started submission remain fail-closed.
+                            GenerationAttempt.provider_external_id.is_not(None),
+                            GenerationAttempt.submit_started_at.is_not(None),
+                            GenerationAttempt.submitted_at.is_not(None),
+                            GenerationAttempt.started_at.is_not(None),
+                            GenerationAttempt.last_observed_at.is_not(None),
+                            GenerationAttempt.unknown_since.is_not(None),
+                            GenerationAttempt.provider_state.is_not(None),
+                            GenerationAttempt.response_metadata.is_not(None),
+                            GenerationAttempt.cost_reservation_microusd > 0,
+                            GenerationAttempt.reservation_released_at.is_not(None),
+                        ),
+                    ),
+                ),
             )
         )
         or 0

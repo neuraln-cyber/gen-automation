@@ -4,8 +4,9 @@
   const STORAGE_KEY = "gen-automation.asset-density.v1";
   const DENSITIES = Object.freeze(["comfortable", "compact", "large"]);
   const IMAGE_LOAD_ERROR = (
-    "The full-size preview could not be loaded. Reload the page to refresh its private link."
+    "The exact full-size image could not be loaded. The lightweight preview remains available."
   );
+  const EXACT_IMAGE_UPGRADE_DELAY_MS = 150;
   const INSPECTION_BATCH_SIZE = 25;
   const INSPECTION_IDLE_FLUSH_MS = 5000;
   const INSPECTION_RETRY_MS = 2500;
@@ -125,8 +126,14 @@
   }
 
   function isVisible(card) {
-    if (card.hidden || card.getAttribute("aria-hidden") === "true") return false;
-    return card.getClientRects().length > 0;
+    if (card.closest('[hidden], [aria-hidden="true"]')) return false;
+    const experimentColumn = card.closest(".experiment-result-column");
+    return !(
+      experimentColumn
+      && typeof window.matchMedia === "function"
+      && window.matchMedia("(max-width: 700px)").matches
+      && !experimentColumn.classList.contains("mobile-selected")
+    );
   }
 
   function visibleCards() {
@@ -160,6 +167,15 @@
     );
   }
 
+  function previewFor(card) {
+    const image = imageFor(card);
+    return (
+      card.dataset.assetPreviewUrl
+      || (image && (image.currentSrc || image.src))
+      || ""
+    );
+  }
+
   function cardDetails(card) {
     const image = imageFor(card);
     const download = downloadFor(card);
@@ -168,6 +184,7 @@
       downloadHref: download && download.href ? download.href : "",
       rank: cardRank(card),
       score: cardScore(card),
+      preview: previewFor(card),
       source: sourceFor(card),
     };
   }
@@ -215,14 +232,22 @@
     previous.type = "button";
     previous.dataset.assetViewerPrevious = "";
     previous.setAttribute("aria-label", "View previous image");
+    const placeholder = createElement("img", "asset-viewer-placeholder");
+    placeholder.dataset.assetViewerPlaceholder = "";
+    placeholder.alt = "";
+    placeholder.decoding = "async";
+    placeholder.fetchPriority = "high";
+    placeholder.setAttribute("aria-hidden", "true");
+    placeholder.hidden = true;
     const image = createElement("img", "asset-viewer-image");
     image.dataset.assetViewerDisplay = "";
     image.decoding = "async";
+    image.fetchPriority = "high";
     const next = createElement("button", "asset-viewer-step asset-viewer-next", "\u2192");
     next.type = "button";
     next.dataset.assetViewerNext = "";
     next.setAttribute("aria-label", "View next image");
-    media.append(previous, image, next);
+    media.append(previous, placeholder, image, next);
 
     const footer = createElement("footer", "asset-viewer-footer");
     const status = createElement("p", "asset-viewer-status");
@@ -390,6 +415,7 @@
       media,
       more,
       next,
+      placeholder,
       previous,
       score,
       select,
@@ -423,6 +449,7 @@
     let inspectionRequestPromise = null;
     let inspectionAbortController = null;
     let completionInspectionHandoff = false;
+    let exactUpgradeTimer = null;
     let returnFocus = null;
 
     const resetViewerScroll = () => {
@@ -483,6 +510,47 @@
       if (assetId && successfullyViewedSources.get(assetId) === requestedSource) {
         successfullyViewedSources.delete(assetId);
       }
+    };
+
+    const cancelExactUpgrade = ({ cancelInFlight = false } = {}) => {
+      if (exactUpgradeTimer !== null) window.clearTimeout(exactUpgradeTimer);
+      exactUpgradeTimer = null;
+      if (
+        cancelInFlight
+        && (!viewer.image.complete || viewer.image.naturalWidth <= 0)
+      ) {
+        viewer.image.removeAttribute("src");
+      }
+    };
+
+    const revealExactImage = () => {
+      if (!markViewerImageLoaded()) return false;
+      viewer.image.classList.remove("is-loading");
+      viewer.placeholder.hidden = true;
+      if (announcement === IMAGE_LOAD_ERROR) announce("");
+      return true;
+    };
+
+    const revealExactImageAfterDecode = () => {
+      if (!viewer.image.complete || viewer.image.naturalWidth <= 0) return;
+      if (typeof viewer.image.decode !== "function") {
+        revealExactImage();
+        return;
+      }
+      void viewer.image.decode().then(revealExactImage, revealExactImage);
+    };
+
+    const scheduleExactUpgrade = ({ assetId, source, delay }) => {
+      exactUpgradeTimer = window.setTimeout(() => {
+        exactUpgradeTimer = null;
+        if (
+          !activeCard
+          || activeCard.dataset.assetId !== assetId
+          || normalizedSource(sourceFor(activeCard)) !== normalizedSource(source)
+        ) return;
+        viewer.image.src = source;
+        revealExactImageAfterDecode();
+      }, delay);
     };
 
     const inspectionConfiguration = () => {
@@ -1008,6 +1076,7 @@
       if (!viewer.dialog.open) return;
       if (activeCard) queueInspection(activeCard);
       void flushInspectionQueue(true);
+      cancelExactUpgrade({ cancelInFlight: true });
       viewer.dialog.close();
     };
 
@@ -1038,17 +1107,57 @@
       window.requestAnimationFrame(resetViewerScroll);
 
       if (details.source) {
-        viewer.image.dataset.inspectionAssetId = activeCard.dataset.assetId || "";
-        viewer.image.dataset.inspectionSource = details.source;
-        viewer.image.src = details.source;
+        const assetId = activeCard.dataset.assetId || "";
+        const requestedSource = normalizedSource(details.source);
+        const currentSource = normalizedSource(viewer.image.currentSrc || viewer.image.src);
+        const sameExactRequest = (
+          viewer.image.dataset.inspectionAssetId === assetId
+          && normalizedSource(viewer.image.dataset.inspectionSource || "") === requestedSource
+          && (
+            exactUpgradeTimer !== null
+            || (
+              currentSource === requestedSource
+              && (!viewer.image.complete || viewer.image.naturalWidth > 0)
+            )
+          )
+        );
         viewer.image.hidden = false;
-        // Cached images may already be complete and do not reliably emit another load event.
-        if (viewer.image.complete && viewer.image.naturalWidth > 0) markViewerImageLoaded();
+        if (sameExactRequest) {
+          revealExactImageAfterDecode();
+        } else {
+          cancelExactUpgrade({ cancelInFlight: true });
+          viewer.image.dataset.inspectionAssetId = assetId;
+          viewer.image.dataset.inspectionSource = details.source;
+          viewer.image.classList.add("is-loading");
+          viewer.image.removeAttribute("src");
+
+          const previewSource = normalizedSource(details.preview);
+          if (previewSource && previewSource !== requestedSource) {
+            if (normalizedSource(viewer.placeholder.currentSrc || viewer.placeholder.src)
+                !== previewSource) {
+              viewer.placeholder.src = details.preview;
+            }
+            viewer.placeholder.hidden = false;
+          } else {
+            viewer.placeholder.hidden = true;
+            viewer.placeholder.removeAttribute("src");
+          }
+          scheduleExactUpgrade({
+            assetId,
+            source: details.source,
+            delay: previewSource && previewSource !== requestedSource
+              ? EXACT_IMAGE_UPGRADE_DELAY_MS
+              : 0,
+          });
+        }
       } else {
+        cancelExactUpgrade({ cancelInFlight: true });
         delete viewer.image.dataset.inspectionAssetId;
         delete viewer.image.dataset.inspectionSource;
         viewer.image.removeAttribute("src");
         viewer.image.hidden = true;
+        viewer.placeholder.removeAttribute("src");
+        viewer.placeholder.hidden = true;
         viewer.status.textContent = "This preview is unavailable. Reload the page and try again.";
         viewer.status.hidden = false;
       }
@@ -1381,6 +1490,7 @@
       }
     });
     viewer.dialog.addEventListener("close", () => {
+      cancelExactUpgrade({ cancelInFlight: true });
       if (activeCard) queueInspection(activeCard);
       void flushInspectionQueue(true);
       document.body.classList.remove("asset-viewer-open");
@@ -1390,13 +1500,22 @@
       activeCard = null;
     });
     viewer.image.addEventListener("error", () => {
+      const requestedSource = normalizedSource(viewer.image.dataset.inspectionSource || "");
+      const renderedSource = normalizedSource(viewer.image.currentSrc || viewer.image.src);
+      if (
+        !activeCard
+        || activeCard.dataset.assetId !== viewer.image.dataset.inspectionAssetId
+        || !requestedSource
+        || requestedSource !== renderedSource
+      ) return;
       clearFailedViewerImage();
+      viewer.image.classList.add("is-loading");
+      viewer.placeholder.hidden = !viewer.placeholder.getAttribute("src");
       announce(IMAGE_LOAD_ERROR);
     });
     viewer.image.addEventListener("load", () => {
       resetViewerScroll();
-      markViewerImageLoaded();
-      if (announcement === IMAGE_LOAD_ERROR) announce("");
+      revealExactImageAfterDecode();
     });
     let touchStart = null;
     viewer.media.addEventListener("touchstart", (event) => {

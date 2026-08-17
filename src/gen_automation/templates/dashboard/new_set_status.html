@@ -19,7 +19,7 @@
       </div>
       <div class="generation-page-actions">
         {% if experiment_mode %}
-          <a class="primary-button" href="/dashboard/experiments/new">Queue next warm batch</a>
+          <a class="primary-button" href="/dashboard/experiments/new">Queue next test</a>
         {% endif %}
         <span
           class="status {{ release.stage.key.value }}"
@@ -54,16 +54,17 @@
       data-csrf-token="{{ warm_session_csrf_token }}"
     >
       <div>
-        <span class="experiment-eyebrow">Warm GPU session</span>
+        <span class="experiment-eyebrow">Interactive GPU session</span>
         <strong data-warm-session-heading>Checking the shared worker</strong>
         <p data-warm-session-status>
-          Queue another Automation batch plan while this run continues; the same compatible
-          worker is reused between submissions.
+          Queue another quick test while this run continues; the same compatible worker and
+          resident model stack are reused between submissions.
         </p>
       </div>
       {% if warm_session_csrf_token %}
         <div class="experiment-warm-actions" hidden data-warm-session-actions>
-          <button class="secondary-button" type="button" data-warm-start>Start 15-minute session</button>
+          <button class="secondary-button" type="button" data-warm-start data-warm-duration-minutes="15">Start 15 min</button>
+          <button class="primary-button" type="button" data-warm-start data-warm-duration-minutes="90">Start 90 min focus</button>
           <button class="secondary-button" type="button" data-warm-extend>+15 minutes</button>
           <button class="text-button danger" type="button" data-warm-end>End now</button>
         </div>

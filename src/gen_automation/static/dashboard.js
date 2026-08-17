@@ -1893,10 +1893,20 @@
       timer = window.setTimeout(save, 500);
     };
 
+    const flush = () => {
+      if (timer !== null) window.clearTimeout(timer);
+      timer = null;
+      save();
+    };
+
     form.addEventListener("input", schedule);
     form.addEventListener("change", schedule);
     form.addEventListener("gen-automation:builder-updated", schedule);
     form.addEventListener("gen-automation:profile-changed", schedule);
+    // The status page preserves the submitted Experiment profile. Persist the
+    // final form state synchronously so an immediate Queue click cannot retain
+    // an older debounced draft after navigation.
+    form.addEventListener("submit", flush);
     if (form.dataset.automationDraftRestored === "true") {
       setStatus("Draft restored from this device.", "success");
     }
@@ -1918,6 +1928,7 @@
   const clearAutomationDraftAfterQueue = () => {
     const progress = document.querySelector("[data-generation-progress]");
     if (!(progress instanceof HTMLElement)) return;
+    const draftScope = progress.dataset.automationDraftScope || "automation";
     const submittedDraftId = progress.dataset.submittedDraftId || "";
     if (!submittedDraftId) return;
     try {
@@ -1926,7 +1937,30 @@
       const draft = readStoredAutomationDraft();
       window.sessionStorage.removeItem(submissionKey);
       if (!draft || draft.submission_id !== submittedDraftId) return;
-      window.localStorage.removeItem(scopedAutomationDraftKey(AUTOMATION_DRAFT_STORAGE_KEY));
+      if (draftScope === "experiment") {
+        // Interactive tests deliberately reuse the expensive-to-rebuild profile and
+        // batch plan. Clear only release identity so the next submission cannot
+        // collide with the queued run or replay its idempotency key.
+        window.localStorage.setItem(
+          scopedAutomationDraftKey(AUTOMATION_DRAFT_STORAGE_KEY),
+          JSON.stringify({
+            schema_version: 1,
+            saved_at: new Date().toISOString(),
+            title: "",
+            slug: "",
+            seed: typeof draft.seed === "string" ? draft.seed : "",
+            desired_accepted_count: typeof draft.desired_accepted_count === "string"
+              ? draft.desired_accepted_count
+              : "",
+            submission_id: "",
+            target_follows_queue: draft.target_follows_queue === true,
+            profile: isRecord(draft.profile) ? draft.profile : {},
+            batch_plan: draft.batch_plan.slice(0, 50),
+          }),
+        );
+      } else {
+        window.localStorage.removeItem(scopedAutomationDraftKey(AUTOMATION_DRAFT_STORAGE_KEY));
+      }
     } catch (_error) {
       // A private-browser storage failure does not affect the queued run.
     }
@@ -5598,6 +5632,7 @@
       card.dataset.assetId = asset.assetId;
       card.dataset.assetLabel = label;
       card.dataset.assetPosition = String(asset.position);
+      card.dataset.assetPreviewUrl = asset.previewUrl;
       card.dataset.assetViewUrl = asset.viewUrl;
 
       const media = createNode("div", "asset-media");
@@ -7182,23 +7217,43 @@
         if (actions) actions.hidden = false;
         const state = ["off", "starting", "warm", "ending"].includes(payload.state)
           ? payload.state : "off";
-        if (heading) heading.textContent = state === "warm" ? "GPU warm for follow-up batches" : `Warm session: ${state}`;
+        if (heading) {
+          heading.textContent = state === "warm"
+            ? "Focus session · GPU ready for follow-up tests"
+            : state === "starting"
+              ? "Focus session · allocating one GPU"
+              : state === "ending"
+                ? "Returning to standard mode"
+                : "Standard mode · starts from zero";
+        }
         const seconds = Math.max(0, integerValue(payload.remaining_seconds, 0));
+        const hardSeconds = Math.max(0, integerValue(payload.hard_remaining_seconds, 0));
+        const canExtend = (
+          state === "warm"
+          && payload.usable === true
+          && hardSeconds - seconds >= 15 * 60
+        );
         const cost = typeof payload.hourly_rate_usd === "string" ? payload.hourly_rate_usd : "";
+        const maximumCost = typeof payload.max_cost_usd === "string" ? payload.max_cost_usd : "";
         if (statusNode) {
           if (state === "warm") {
-            statusNode.textContent = `${Math.ceil(seconds / 60)} minutes remain${cost ? ` at up to $${cost}/hour` : ""}.`;
+            statusNode.textContent = (
+              `${Math.ceil(seconds / 60)} idle minutes remain`
+              + `${cost ? ` at up to $${cost}/hour` : ""}. `
+              + `Absolute auto-stop in ${Math.ceil(hardSeconds / 60)} minutes`
+              + `${maximumCost ? ` · session cap $${maximumCost}` : ""}.`
+            );
           } else if (state === "starting") {
             statusNode.textContent = "Allocating the single GPU now. Keep editing; queued batches will reuse it when ready.";
           } else if (state === "ending") {
             statusNode.textContent = "Releasing the warm worker and returning to scale-to-zero.";
           } else {
-            statusNode.textContent = "Warm batch mode is off. Normal Automation queues still scale from zero safely.";
+            statusNode.textContent = "Focus is off. The next Lab test scales from zero and starts a bounded 15-minute follow-up window.";
           }
         }
         buttons.forEach((button) => {
           if (button.hasAttribute("data-warm-start")) button.hidden = state !== "off";
-          if (button.hasAttribute("data-warm-extend")) button.hidden = state !== "warm";
+          if (button.hasAttribute("data-warm-extend")) button.hidden = !canExtend;
           if (button.hasAttribute("data-warm-end")) button.hidden = !["starting", "warm"].includes(state);
         });
         return state;
@@ -7241,7 +7296,14 @@
         if (!url) return;
         buttons.forEach((item) => { item.disabled = true; });
         try {
-          const body = button.hasAttribute("data-warm-end") ? {} : { duration_minutes: 15 };
+          const configuredDuration = integerValue(button.dataset.warmDurationMinutes, 15);
+          const durationMinutes = button.hasAttribute("data-warm-start")
+            && configuredDuration === 90
+            ? 90
+            : 15;
+          const body = button.hasAttribute("data-warm-end")
+            ? {}
+            : { duration_minutes: durationMinutes };
           const response = await fetch(url, {
             method: "POST",
             credentials: "same-origin",
@@ -7292,13 +7354,20 @@
       const card = createNode("article", "asset-card experiment-asset-card");
       card.dataset.assetCard = "";
       card.dataset.assetId = id;
+      card.dataset.assetPreviewUrl = preview;
+      card.dataset.assetViewUrl = view;
       card.dataset.outputIndex = String(Math.max(0, integerValue(asset.output_index, 0)));
       const link = createNode("a", "asset-preview-link");
       link.href = view;
+      link.dataset.assetViewerTrigger = "";
       const image = document.createElement("img");
+      image.className = "asset-preview";
+      image.dataset.assetViewerImage = "";
       image.src = preview;
       image.alt = `Generated sample ${Math.max(0, integerValue(asset.output_index, 0)) + 1}`;
       image.loading = "lazy";
+      image.decoding = "async";
+      image.referrerPolicy = "no-referrer";
       image.width = Math.max(1, integerValue(asset.width, 1));
       image.height = Math.max(1, integerValue(asset.height, 1));
       link.append(image);
@@ -7309,6 +7378,7 @@
       if (download) {
         const anchor = createNode("a", "text-button", "Download");
         anchor.href = download;
+        anchor.dataset.assetDownload = "";
         footer.append(anchor);
       }
       card.append(footer);

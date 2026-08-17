@@ -179,8 +179,10 @@ bounded editing lease around the complete New Automation workflow:
 - compatible workflow, checkpoint, and LoRA stacks reuse the same one-replica
   worker; a required dynamic manifest change is serialized at an idle boundary;
 - a ready worker remains at autoscaler minimum `1` only while the lease is live;
-- the default idle window is 15 minutes and validated experiment activity resets
-  that window without moving the absolute deadline;
+- Standard Lab submission starts from zero and opens the default 15-minute
+  follow-up window; the explicit Focus control can prewarm the worker and select
+  either that 15-minute hold or a 90-minute working session. Validated experiment
+  activity resets the chosen idle window without moving the absolute deadline;
 - the controller targets an absolute 90-minute auto-stop and then restores
   autoscaler minimum `0`; this is a controller safety boundary, not a
   provider-enforced billing cap; and

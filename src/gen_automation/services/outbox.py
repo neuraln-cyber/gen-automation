@@ -6,15 +6,17 @@ from re import fullmatch
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from gen_automation.db.models import (
     AuditEvent,
     GenerationAttempt,
     GenerationJob,
     OutboxEvent,
+    ProviderBudgetGuard,
 )
 from gen_automation.domain.enums import (
     GenerationAttemptState,
@@ -38,6 +40,29 @@ _TERMINAL_JOB_STATES = frozenset(
         GenerationState.DEAD_LETTER,
         GenerationState.CANCELLED,
     }
+)
+_DEFINITELY_UNSTARTED_JOB_STATES = frozenset(
+    {
+        GenerationState.QUEUED,
+        GenerationState.CLAIMED,
+        GenerationState.RETRY_WAIT,
+    }
+)
+_NONTERMINAL_ATTEMPT_STATES = frozenset(
+    {
+        GenerationAttemptState.CREATED,
+        GenerationAttemptState.SUBMITTING,
+        GenerationAttemptState.SUBMITTED,
+        GenerationAttemptState.RUNNING,
+        GenerationAttemptState.UNKNOWN,
+        GenerationAttemptState.CANCEL_REQUESTED,
+    }
+)
+_DEFINITELY_UNSTARTED_EXHAUSTED_DETAIL = (
+    "The Salad submission event exhausted before any provider request could start."
+)
+_DEFINITELY_UNSTARTED_EXPIRED_DETAIL = (
+    "The Salad submission lease expired before any provider request could start."
 )
 
 
@@ -302,11 +327,7 @@ async def _mark_salad_attempt_unknown(
     ):
         return False
 
-    attempt = await session.scalar(
-        select(GenerationAttempt)
-        .where(GenerationAttempt.id == event.aggregate_id)
-        .with_for_update()
-    )
+    job, attempt = await _lock_salad_job_then_attempt(session, event=event)
     if (
         attempt is None
         or attempt.provider != "salad"
@@ -319,9 +340,6 @@ async def _mark_salad_attempt_unknown(
     attempt.error_code = "submit_outcome_unknown"
     attempt.error_detail = "Submission lease expired before a durable provider result."
     attempt.lock_version += 1
-    job = await session.scalar(
-        select(GenerationJob).where(GenerationJob.id == attempt.job_id).with_for_update()
-    )
     if job is not None and job.state not in _TERMINAL_JOB_STATES:
         job.state = GenerationState.UNKNOWN
         job.last_error_code = "submit_outcome_unknown"
@@ -337,6 +355,144 @@ async def _mark_salad_attempt_unknown(
             resource_id=attempt.id,
             correlation_id=event.correlation_id,
             detail={"outbox_event_id": str(event.id)},
+            occurred_at=occurred_at,
+        )
+    )
+    return True
+
+
+async def _lock_salad_job_then_attempt(
+    session: AsyncSession,
+    *,
+    event: OutboxEvent,
+) -> tuple[GenerationJob | None, GenerationAttempt | None]:
+    """Serialize Salad aggregate repair in the operator-stop lock order."""
+
+    await session.scalar(
+        select(ProviderBudgetGuard.id)
+        .where(ProviderBudgetGuard.provider == "salad")
+        .with_for_update()
+    )
+    # The immutable foreign-key lookup is intentionally non-locking. Row locks
+    # then follow the canonical job -> attempt order used by operator stop.
+    job_id = await session.scalar(
+        select(GenerationAttempt.job_id).where(GenerationAttempt.id == event.aggregate_id)
+    )
+    if job_id is None:
+        return None, None
+    job = await session.scalar(
+        select(GenerationJob).where(GenerationJob.id == job_id).with_for_update()
+    )
+    attempt = await session.scalar(
+        select(GenerationAttempt)
+        .where(GenerationAttempt.id == event.aggregate_id)
+        .with_for_update()
+    )
+    if attempt is not None and attempt.job_id != job_id:
+        return None, attempt
+    return job, attempt
+
+
+async def _fail_exhausted_salad_attempt_before_submission(
+    session: AsyncSession,
+    *,
+    event: OutboxEvent,
+    occurred_at: datetime,
+    actor: str,
+    error_code: str,
+    safe_error_detail: str | None,
+    audit_action: str = "generation_attempt.outbox_exhausted_before_submission",
+) -> bool:
+    """Repair only a Salad aggregate that is provably still unsubmitted."""
+
+    if (
+        event.topic != SALAD_JOB_SUBMIT_TOPIC
+        or event.aggregate_type != GENERATION_ATTEMPT_AGGREGATE
+    ):
+        return False
+
+    job, attempt = await _lock_salad_job_then_attempt(session, event=event)
+    if (
+        attempt is None
+        or attempt.provider != "salad"
+        or attempt.state
+        not in {
+            GenerationAttemptState.CREATED,
+            GenerationAttemptState.SUBMITTING,
+        }
+        or attempt.provider_external_id is not None
+        or attempt.submit_started_at is not None
+        or attempt.submitted_at is not None
+        or attempt.started_at is not None
+        or attempt.last_observed_at is not None
+        or attempt.unknown_since is not None
+        or attempt.provider_state is not None
+        or attempt.response_metadata is not None
+        or attempt.cost_reservation_microusd != 0
+        or attempt.reservation_released_at is not None
+    ):
+        return False
+
+    if job is None:
+        return False
+    if attempt.state == GenerationAttemptState.SUBMITTING and job.state not in _TERMINAL_JOB_STATES:
+        # Markerless SUBMITTING is an impossible modern state. It is safe to
+        # repair only when the owning lifecycle is already terminal; otherwise
+        # preserve the ambiguous-state reconciliation path.
+        return False
+    other_active_attempt_id = await session.scalar(
+        select(GenerationAttempt.id)
+        .where(
+            GenerationAttempt.job_id == attempt.job_id,
+            GenerationAttempt.id != attempt.id,
+            GenerationAttempt.state.in_(_NONTERMINAL_ATTEMPT_STATES),
+        )
+        .limit(1)
+    )
+    owns_current_local_attempt = (
+        attempt.state == GenerationAttemptState.CREATED
+        and job.attempt_count == attempt.attempt_no
+        and job.state in _DEFINITELY_UNSTARTED_JOB_STATES
+        and other_active_attempt_id is None
+    )
+    if (
+        job.state not in _TERMINAL_JOB_STATES
+        and job.attempt_count == attempt.attempt_no
+        and not owns_current_local_attempt
+    ):
+        # A current CREATED row paired with a remote/ambiguous job state is not
+        # enough proof to release capacity. Leave it for explicit reconciliation.
+        return False
+
+    detail = safe_error_detail or _DEFINITELY_UNSTARTED_EXHAUSTED_DETAIL
+    attempt.state = GenerationAttemptState.FAILED
+    attempt.completed_at = occurred_at
+    attempt.error_code = error_code
+    attempt.error_detail = detail
+    attempt.lock_version += 1
+
+    if owns_current_local_attempt:
+        retryable = job.attempt_count < job.max_attempts
+        job.state = GenerationState.RETRY_WAIT if retryable else GenerationState.DEAD_LETTER
+        job.retry_at = occurred_at if retryable else None
+        job.lease_owner = None
+        job.lease_expires_at = None
+        job.last_error_code = error_code
+        job.last_error_detail = detail
+        job.lock_version += 1
+
+    session.add(
+        AuditEvent(
+            actor=actor,
+            action=audit_action,
+            resource_type="generation_attempt",
+            resource_id=attempt.id,
+            correlation_id=event.correlation_id,
+            detail={
+                "outbox_event_id": str(event.id),
+                "error_code": error_code,
+                "provider_contacted": False,
+            },
             occurred_at=occurred_at,
         )
     )
@@ -399,16 +555,32 @@ async def _recover_expired_in_transaction(
         event.lease_owner = None
         event.lease_expires_at = None
         event.processed_at = now
-        event.last_error_code = "ambiguous_external_effect"
-        event.last_error_detail = (
-            "The processing lease expired and replay could duplicate an external effect."
-        )
-        marked_unknown = await _mark_salad_attempt_unknown(
+        marked_failed = await _fail_exhausted_salad_attempt_before_submission(
             session,
             event=event,
             occurred_at=now,
             actor=actor,
+            error_code="outbox_lease_expired_before_submission",
+            safe_error_detail=_DEFINITELY_UNSTARTED_EXPIRED_DETAIL,
+            audit_action="generation_attempt.outbox_lease_expired_before_submission",
         )
+        if marked_failed:
+            event.last_error_code = "lease_expired_before_effect"
+            event.last_error_detail = _DEFINITELY_UNSTARTED_EXPIRED_DETAIL
+            reason = "lease_expired_before_effect"
+            marked_unknown = False
+        else:
+            event.last_error_code = "ambiguous_external_effect"
+            event.last_error_detail = (
+                "The processing lease expired and replay could duplicate an external effect."
+            )
+            reason = "ambiguous_external_effect"
+            marked_unknown = await _mark_salad_attempt_unknown(
+                session,
+                event=event,
+                occurred_at=now,
+                actor=actor,
+            )
         attempts_marked_unknown += int(marked_unknown)
         dead_lettered += 1
         _add_audit(
@@ -418,8 +590,9 @@ async def _recover_expired_in_transaction(
             action="outbox.dead_lettered",
             detail={
                 "attempt": event.attempts,
-                "reason": "ambiguous_external_effect",
+                "reason": reason,
                 "attempt_marked_unknown": marked_unknown,
+                "attempt_marked_failed": marked_failed,
             },
             occurred_at=now,
         )
@@ -486,13 +659,106 @@ async def _dead_letter_exhausted_pending(
         event.processed_at = now
         event.last_error_code = "attempt_limit_exhausted"
         event.last_error_detail = "The outbox event exhausted its processing attempt limit."
+        attempt_marked_failed = await _fail_exhausted_salad_attempt_before_submission(
+            session,
+            event=event,
+            occurred_at=now,
+            actor=actor,
+            error_code="outbox_attempt_limit_exhausted",
+            safe_error_detail=None,
+        )
         _add_audit(
             session,
             event=event,
             actor=actor,
             action="outbox.dead_lettered",
-            detail={"attempt": event.attempts, "reason": "attempt_limit_exhausted"},
+            detail={
+                "attempt": event.attempts,
+                "reason": "attempt_limit_exhausted",
+                "attempt_marked_failed": attempt_marked_failed,
+            },
             occurred_at=now,
+        )
+
+
+async def _repair_dead_lettered_unstarted_salad_attempts(
+    session: AsyncSession,
+    *,
+    now: datetime,
+    limit: int,
+    actor: str,
+) -> None:
+    """Repair legacy dead letters whose aggregate proves no provider effect began."""
+
+    other_attempt = aliased(GenerationAttempt)
+    events = list(
+        (
+            await session.scalars(
+                select(OutboxEvent)
+                .join(
+                    GenerationAttempt,
+                    GenerationAttempt.id == OutboxEvent.aggregate_id,
+                )
+                .join(GenerationJob, GenerationJob.id == GenerationAttempt.job_id)
+                .where(
+                    OutboxEvent.status == OutboxStatus.DEAD_LETTER,
+                    OutboxEvent.topic == SALAD_JOB_SUBMIT_TOPIC,
+                    OutboxEvent.aggregate_type == GENERATION_ATTEMPT_AGGREGATE,
+                    GenerationAttempt.provider == "salad",
+                    GenerationAttempt.state.in_(
+                        {
+                            GenerationAttemptState.CREATED,
+                            GenerationAttemptState.SUBMITTING,
+                        }
+                    ),
+                    GenerationAttempt.provider_external_id.is_(None),
+                    GenerationAttempt.submit_started_at.is_(None),
+                    GenerationAttempt.submitted_at.is_(None),
+                    GenerationAttempt.started_at.is_(None),
+                    GenerationAttempt.last_observed_at.is_(None),
+                    GenerationAttempt.unknown_since.is_(None),
+                    GenerationAttempt.provider_state.is_(None),
+                    GenerationAttempt.response_metadata.is_(None),
+                    GenerationAttempt.cost_reservation_microusd == 0,
+                    GenerationAttempt.reservation_released_at.is_(None),
+                    or_(
+                        and_(
+                            GenerationAttempt.state == GenerationAttemptState.SUBMITTING,
+                            GenerationJob.state.in_(_TERMINAL_JOB_STATES),
+                        ),
+                        and_(
+                            GenerationAttempt.state == GenerationAttemptState.CREATED,
+                            or_(
+                                GenerationJob.state.in_(_TERMINAL_JOB_STATES),
+                                GenerationJob.attempt_count != GenerationAttempt.attempt_no,
+                                and_(
+                                    GenerationJob.state.in_(_DEFINITELY_UNSTARTED_JOB_STATES),
+                                    ~exists(
+                                        select(other_attempt.id).where(
+                                            other_attempt.job_id == GenerationAttempt.job_id,
+                                            other_attempt.id != GenerationAttempt.id,
+                                            other_attempt.state.in_(_NONTERMINAL_ATTEMPT_STATES),
+                                        )
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+                .order_by(OutboxEvent.processed_at, OutboxEvent.created_at, OutboxEvent.id)
+                .limit(limit)
+                .with_for_update(of=OutboxEvent, skip_locked=True)
+            )
+        ).all()
+    )
+    for event in events:
+        await _fail_exhausted_salad_attempt_before_submission(
+            session,
+            event=event,
+            occurred_at=now,
+            actor=actor,
+            error_code="outbox_dead_lettered_before_submission",
+            safe_error_detail=None,
         )
 
 
@@ -535,6 +801,13 @@ async def claim_outbox_events(
         limit=max(limit * 4, 100),
         actor=normalized_worker_id,
     )
+    if normalized_topics is None or SALAD_JOB_SUBMIT_TOPIC in normalized_topics:
+        await _repair_dead_lettered_unstarted_salad_attempts(
+            session,
+            now=claimed_at,
+            limit=max(limit * 4, 100),
+            actor=normalized_worker_id,
+        )
 
     query = (
         select(OutboxEvent)
@@ -651,12 +924,11 @@ async def defer_unstarted_outbox_event(
 ) -> TransitionResult:
     """Release a lease without consuming an attempt before any effect can start.
 
-    This is intentionally narrower than a retryable failure.  Salad submission
-    uses it when the current worker runtime has a different immutable artifact
-    manifest and still has active work.  The prepared generation attempt must
-    remain in CREATED, proving that no provider request was started.  The claim
-    increment is returned so a long-running batch cannot exhaust the outbox
-    merely while a compatible idle boundary is awaited.
+    This is intentionally narrower than a retryable failure. Salad submission
+    uses it while a controller precondition (such as an artifact boundary or
+    provider budget) prevents the request from starting. The prepared attempt
+    must remain in CREATED. The claim increment is returned so waiting on that
+    precondition cannot exhaust the outbox.
     """
 
     normalized_worker_id = _validate_nonempty(worker_id, name="worker_id", max_length=200)
@@ -691,9 +963,7 @@ async def defer_unstarted_outbox_event(
     event.lease_expires_at = None
     event.processed_at = None
     event.last_error_code = normalized_reason
-    event.last_error_detail = (
-        "Submission is waiting for a compatible idle worker-artifact boundary."
-    )
+    event.last_error_detail = "Submission is waiting for a controller precondition."
     _add_audit(
         session,
         event=event,
@@ -767,12 +1037,22 @@ async def fail_outbox_event(
     event.status = OutboxStatus.DEAD_LETTER
     event.processed_at = failed_at
     marked_unknown = False
+    marked_failed = False
     if external_effect == ExternalEffect.MAY_HAVE_STARTED:
         marked_unknown = await _mark_salad_attempt_unknown(
             session,
             event=event,
             occurred_at=failed_at,
             actor=normalized_worker_id,
+        )
+    else:
+        marked_failed = await _fail_exhausted_salad_attempt_before_submission(
+            session,
+            event=event,
+            occurred_at=failed_at,
+            actor=normalized_worker_id,
+            error_code=normalized_error_code,
+            safe_error_detail=normalized_error_detail,
         )
     _add_audit(
         session,
@@ -784,6 +1064,7 @@ async def fail_outbox_event(
             "error_code": normalized_error_code,
             "external_effect": external_effect.value,
             "attempt_marked_unknown": marked_unknown,
+            "attempt_marked_failed": marked_failed,
         },
         occurred_at=failed_at,
     )

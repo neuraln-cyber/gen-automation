@@ -78,6 +78,10 @@ def test_new_set_builder_frontend_keeps_batch_edits_safe_and_actionable(
     assert "AUTOMATION_DRAFT_STORAGE_KEY" in script.text
     assert "restoreAutomationDraft" in script.text
     assert "clearAutomationDraftAfterQueue" in script.text
+    assert 'draftScope === "experiment"' in script.text
+    assert 'title: ""' in script.text
+    assert 'slug: ""' in script.text
+    assert 'form.addEventListener("submit", flush)' in script.text
     assert "knownWildcards" in script.text
     assert "Unknown wildcard:" in script.text
     assert "parseBatchSequence" in script.text

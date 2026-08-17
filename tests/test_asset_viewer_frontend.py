@@ -22,6 +22,11 @@ def test_asset_viewer_is_safe_progressive_enhancement() -> None:
     assert "new Image()" not in script
     assert "preloadedSources" not in script
     assert "preload(sourceFor" not in script
+    assert "EXACT_IMAGE_UPGRADE_DELAY_MS = 150" in script
+    assert "assetViewerPlaceholder" in script
+    assert "card.getClientRects()" not in script
+    assert 'window.matchMedia("(max-width: 700px)")' in script
+    assert 'experimentColumn.classList.contains("mobile-selected")' in script
     assert "visibleCards()" in script
     assert "Download exact raw master" in script
     assert "assetViewerSelect" in script
@@ -424,9 +429,35 @@ def test_review_grid_uses_cached_previews_but_fullscreen_keeps_exact_master() ->
     )
 
     assert 'src="{{ item.master.preview_url }}"' in template
+    assert 'data-asset-preview-url="{{ item.master.preview_url }}"' in template
     assert 'data-asset-view-url="{{ item.master.view_url }}"' in template
+    assert "card.dataset.assetPreviewUrl" in viewer
     assert "card.dataset.assetViewUrl" in viewer
     assert "|| (image && (image.currentSrc || image.src))" in viewer
+
+
+def test_review_prioritizes_only_the_first_two_cached_thumbnails() -> None:
+    template = (
+        ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "review_task.html"
+    ).read_text(encoding="utf-8")
+
+    assert "loading=\"{{ 'eager' if loop.index <= 2 else 'lazy' }}\"" in template
+    assert '{% if loop.index <= 2 %}fetchpriority="high"{% endif %}' in template
+
+
+def test_live_experiment_cards_keep_preview_exact_and_download_sources_separate() -> None:
+    script = (ROOT / "src" / "gen_automation" / "static" / "dashboard.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "card.dataset.assetPreviewUrl = preview;" in script
+    assert "card.dataset.assetViewUrl = view;" in script
+    assert 'link.dataset.assetViewerTrigger = "";' in script
+    assert 'image.className = "asset-preview";' in script
+    assert 'image.dataset.assetViewerImage = "";' in script
+    assert 'image.decoding = "async";' in script
+    assert 'image.referrerPolicy = "no-referrer";' in script
+    assert 'anchor.dataset.assetDownload = "";' in script
 
 
 def test_review_ui_treats_the_configured_size_as_a_maximum_goal() -> None:
@@ -554,10 +585,44 @@ def test_fullscreen_inspection_requires_successfully_loaded_exact_asset_source()
     assert "normalizedSource(sourceFor(activeCard)) !== requestedSource" in script
     assert "viewer.image.dataset.inspectionAssetId" in render
     assert "viewer.image.dataset.inspectionSource" in render
-    assert "viewer.image.complete && viewer.image.naturalWidth > 0" in render
-    assert "markViewerImageLoaded()" in render
+    assert "revealExactImageAfterDecode()" in render
+    reveal = script.split("const revealExactImage =", 1)[1].split(
+        "const revealExactImageAfterDecode",
+        1,
+    )[0]
+    assert "markViewerImageLoaded()" in reveal
     assert "clearFailedViewerImage()" in image_events
-    assert "markViewerImageLoaded()" in image_events
+    assert "revealExactImageAfterDecode()" in image_events
+
+
+def test_fullscreen_uses_preview_then_cancellable_active_only_exact_upgrade() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+    creation = script.split("function createViewer()", 1)[1].split(
+        "function initializeAssetViewer()",
+        1,
+    )[0]
+    scheduler = script.split("const scheduleExactUpgrade", 1)[1].split(
+        "const inspectionConfiguration",
+        1,
+    )[0]
+    render = script.split("const renderCard", 1)[1].split("const step", 1)[0]
+    close = script.split("const closeViewer", 1)[1].split("const renderCard", 1)[0]
+
+    assert 'createElement("img", "asset-viewer-placeholder")' in creation
+    assert 'placeholder.setAttribute("aria-hidden", "true")' in creation
+    assert 'image.fetchPriority = "high"' in creation
+    assert "viewer.placeholder.src = details.preview" in render
+    assert "viewer.placeholder.hidden = false" in render
+    assert "sameExactRequest" in render
+    assert 'viewer.image.classList.add("is-loading")' in render
+    assert "scheduleExactUpgrade({" in render
+    assert "delay: previewSource && previewSource !== requestedSource" in render
+    assert "viewer.image.src = source" in scheduler
+    assert "activeCard.dataset.assetId !== assetId" in scheduler
+    assert "normalizedSource(sourceFor(activeCard)) !== normalizedSource(source)" in scheduler
+    assert "sourceFor(previousCard)" not in render
+    assert "sourceFor(nextCard)" not in render
+    assert "cancelExactUpgrade({ cancelInFlight: true })" in close
 
 
 def test_fullscreen_defect_picker_is_optional_exact_and_per_image() -> None:

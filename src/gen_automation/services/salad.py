@@ -19,6 +19,7 @@ from gen_automation.db.models import (
     GenerationJob,
     OutboxEvent,
     ProviderBudgetGuard,
+    Release,
     ReleaseVersion,
     SaladDeployment,
 )
@@ -28,6 +29,8 @@ from gen_automation.domain.enums import (
     DesiredDeploymentState,
     GenerationAttemptState,
     GenerationState,
+    ReleasePhase,
+    ResourceHealth,
     SaladDeploymentPurpose,
     SaladDeploymentState,
 )
@@ -123,6 +126,28 @@ _PREPARABLE_JOB_STATES = frozenset(
         GenerationState.RETRY_WAIT,
     }
 )
+_SUBMITTABLE_PREPARED_JOB_STATES = frozenset(
+    {
+        GenerationState.CLAIMED,
+        GenerationState.RETRY_WAIT,
+    }
+)
+_REMOTE_OR_AMBIGUOUS_JOB_STATES = frozenset(
+    {
+        GenerationState.SUBMITTING,
+        GenerationState.RUNNING,
+        GenerationState.COLLECTING,
+        GenerationState.VERIFYING,
+        GenerationState.UNKNOWN,
+        GenerationState.CANCEL_REQUESTED,
+    }
+)
+_SUBMITTABLE_RELEASE_PHASES = frozenset(
+    {
+        ReleasePhase.READY,
+        ReleasePhase.GENERATING,
+    }
+)
 _BLOCKING_ATTEMPT_STATES = frozenset(
     {
         GenerationAttemptState.CREATED,
@@ -172,6 +197,7 @@ class SubmissionDisposition(StrEnum):
     BUDGET_BLOCKED = "budget_blocked"
     RETRY_WAIT = "retry_wait"
     FAILED = "failed"
+    CANCELLED = "cancelled"
     UNKNOWN = "unknown"
 
 
@@ -622,6 +648,169 @@ async def prepare_generation_attempt(
     )
 
 
+async def _prepared_submission_stale_reason(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+) -> str | None:
+    if attempt.attempt_no != job.attempt_count:
+        return "superseded_generation_attempt"
+    if job.state in _TERMINAL_JOB_STATES:
+        return "terminal_generation_job"
+
+    lifecycle = (
+        await session.execute(
+            select(ReleaseVersion, Release)
+            .join(Release, Release.id == ReleaseVersion.release_id)
+            .where(ReleaseVersion.id == job.release_version_id)
+        )
+    ).one_or_none()
+    if lifecycle is None:
+        return "release_lifecycle_unavailable"
+    version, release = lifecycle
+    if release.current_version_no != version.version_no:
+        return "superseded_release_version"
+    if release.health != ResourceHealth.HEALTHY:
+        return "release_health_blocked"
+    if release.phase not in _SUBMITTABLE_RELEASE_PHASES:
+        return "release_not_dispatchable"
+    if await _operator_generation_stop_requested(session, job=job):
+        return "generation_stop_requested"
+    if job.state not in _SUBMITTABLE_PREPARED_JOB_STATES:
+        return "generation_job_not_submittable"
+    return None
+
+
+def _attempt_has_submission_evidence(attempt: GenerationAttempt) -> bool:
+    return bool(
+        attempt.provider_external_id is not None
+        or attempt.submit_started_at is not None
+        or attempt.submitted_at is not None
+        or attempt.started_at is not None
+        or attempt.last_observed_at is not None
+        or attempt.unknown_since is not None
+        or attempt.provider_state is not None
+        or attempt.response_metadata is not None
+        or attempt.cost_reservation_microusd > 0
+        or attempt.reservation_released_at is not None
+    )
+
+
+async def _fence_stale_prepared_submission(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    occurred_at: datetime,
+) -> SubmissionResult | None:
+    reason = await _prepared_submission_stale_reason(
+        session,
+        attempt=attempt,
+        job=job,
+    )
+    if reason is None:
+        return None
+
+    current_attempt = attempt.attempt_no == job.attempt_count
+    ambiguous = _attempt_has_submission_evidence(attempt) or (
+        current_attempt and job.state in _REMOTE_OR_AMBIGUOUS_JOB_STATES
+    )
+    if ambiguous:
+        attempt.state = GenerationAttemptState.UNKNOWN
+        attempt.unknown_since = attempt.unknown_since or occurred_at
+        attempt.error_code = "stale_submission_lifecycle_ambiguous"
+        attempt.error_detail = (
+            "The stale submission has durable activity evidence and requires reconciliation."
+        )
+        attempt.lock_version += 1
+        if current_attempt and job.state not in _TERMINAL_JOB_STATES:
+            job.state = GenerationState.UNKNOWN
+            job.last_error_code = "stale_submission_lifecycle_ambiguous"
+            job.last_error_detail = (
+                "The stale Salad submission lifecycle is ambiguous; no retry was attempted."
+            )
+            job.lock_version += 1
+        session.add(
+            _audit(
+                action="generation_attempt.stale_submission_ambiguous",
+                attempt=attempt,
+                detail={"reason": reason, "provider_contacted": False},
+                occurred_at=occurred_at,
+            )
+        )
+        await session.flush()
+        return _submission_result(
+            attempt,
+            job,
+            SubmissionDisposition.UNKNOWN,
+            MutationEffect.MAY_HAVE_STARTED,
+        )
+
+    # A local pre-submit cancellation is recorded as FAILED because the schema
+    # reserves CANCELLED for attempts that have a provider identity.
+    attempt.state = GenerationAttemptState.FAILED
+    attempt.completed_at = occurred_at
+    attempt.error_code = "stale_submission_lifecycle"
+    attempt.error_detail = "The prepared submission no longer belongs to active generation work."
+    attempt.lock_version += 1
+    if current_attempt and job.state not in _TERMINAL_JOB_STATES:
+        job.state = GenerationState.CANCELLED
+        job.retry_at = None
+        job.lease_owner = None
+        job.lease_expires_at = None
+        job.last_error_code = "stale_submission_lifecycle"
+        job.last_error_detail = (
+            "The prepared Salad submission was cancelled before provider contact."
+        )
+        job.lock_version += 1
+    session.add(
+        _audit(
+            action="generation_attempt.stale_submission_cancelled",
+            attempt=attempt,
+            detail={"reason": reason, "provider_contacted": False},
+            occurred_at=occurred_at,
+        )
+    )
+    await session.flush()
+    return _submission_result(
+        attempt,
+        job,
+        SubmissionDisposition.CANCELLED,
+        MutationEffect.DEFINITELY_NOT_STARTED,
+    )
+
+
+async def fence_stale_prepared_attempt(
+    session: AsyncSession,
+    *,
+    generation_attempt_id: UUID,
+    now: datetime | None = None,
+) -> SubmissionResult | None:
+    """Resolve stale local work before any runtime or provider mutation."""
+
+    occurred_at = _as_utc(now or datetime.now(UTC))
+    attempt, job, _ = await _load_attempt_context(
+        session,
+        generation_attempt_id,
+        lock=True,
+    )
+    if attempt.state not in {
+        GenerationAttemptState.CREATED,
+        GenerationAttemptState.SUBMITTING,
+    }:
+        return None
+    result = await _fence_stale_prepared_submission(
+        session,
+        attempt=attempt,
+        job=job,
+        occurred_at=occurred_at,
+    )
+    if result is not None:
+        await session.commit()
+    return result
+
+
 async def submit_prepared_attempt(
     session: AsyncSession,
     client: SaladQueueClient,
@@ -677,6 +866,16 @@ async def submit_prepared_attempt(
         )
         await session.rollback()
         return result
+
+    stale_result = await _fence_stale_prepared_submission(
+        session,
+        attempt=attempt,
+        job=job,
+        occurred_at=submitted_at,
+    )
+    if stale_result is not None:
+        await session.commit()
+        return stale_result
 
     _require_submittable_deployment(deployment)
     decision = await reserve_attempt_budget(
