@@ -33,10 +33,11 @@ def safetensors_bytes(
     *,
     data: bytes = b"\x00\x00\x00\x00",
     tensor_name: str = "lora_A.weight",
+    metadata: dict[str, str] | None = None,
 ) -> bytes:
     header = json.dumps(
         {
-            "__metadata__": {"format": "pt"},
+            "__metadata__": metadata or {"format": "pt"},
             tensor_name: {
                 "dtype": "F32",
                 "shape": [1],
@@ -156,6 +157,27 @@ async def test_manual_upload_hashes_exact_version_validates_header_and_promotes(
         version_id=source.version_id,
     )
     assert await store.head(source_key, version_id=source.version_id) is None
+
+
+@pytest.mark.asyncio
+async def test_manual_upload_accepts_bounded_training_metadata() -> None:
+    store = MemoryObjectStore(bucket="managed-models")
+    manager = ModelArtifactStore(store)
+    identifier = str(uuid4())
+    source_key = quarantine_key(identifier)
+    body = safetensors_bytes(metadata={"ss_datasets": "x" * 13_787})
+    store.put_for_test(source_key, body, content_type=QUARANTINE_CONTENT_TYPE)
+    source = await store.head(source_key)
+    assert source is not None and source.version_id is not None
+
+    result = await manager.promote_quarantine(
+        quarantine_key=source_key,
+        version_id=source.version_id,
+        etag=source.etag,
+        target_filename="Metadata Heavy LoRA.safetensors",
+    )
+
+    assert result.sha256 == hashlib.sha256(body).hexdigest()
 
 
 @pytest.mark.asyncio
