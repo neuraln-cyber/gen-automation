@@ -2971,6 +2971,284 @@ async def test_reconciliation_uses_status_to_start_stopped_active_group_with_dem
     )
 
     async with deployment_context.database.sessions() as session:
+        observed_at = NOW + timedelta(minutes=1)
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=observed_at,
+        )
+        await session.commit()
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+
+    assert result.action == DeploymentAction.START_REQUESTED
+    assert result.state == SaladDeploymentState.PROVISIONING
+    assert result.error_code == "provider_start_pending"
+    assert deployment.unknown_since is not None
+    assert deployment.unknown_since.replace(tzinfo=UTC) == observed_at
+    assert client.start_names == [group_name]
+    assert client.updated_group_patches == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("elapsed", "expected_state", "expected_error"),
+    [
+        (timedelta(minutes=29), SaladDeploymentState.PROVISIONING, "provider_start_pending"),
+        (timedelta(minutes=30), SaladDeploymentState.DEGRADED, "provider_start_stalled"),
+    ],
+)
+async def test_reconciliation_bounds_zero_ready_start_wait_without_provider_mutation(
+    deployment_context: DeploymentContext,
+    monkeypatch: pytest.MonkeyPatch,
+    elapsed: timedelta,
+    expected_state: SaladDeploymentState,
+    expected_error: str,
+) -> None:
+    await make_fully_provisioned(deployment_context)
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.queues[queue_name] = make_queue(queue_name)
+    client.groups[group_name] = make_group(
+        group_name,
+        queue_name,
+        status="deploying",
+        autoscaler={
+            "min_replicas": 1,
+            "max_replicas": 1,
+            "desired_queue_length": 1,
+            "polling_period": 30,
+        },
+    )
+
+    async def demand_one_worker(*_args: object, **_kwargs: object) -> int:
+        return 1
+
+    monkeypatch.setattr(
+        deployment_service,
+        "effective_worker_min_replicas",
+        demand_one_worker,
+    )
+    first_observed_at = NOW + timedelta(minutes=1)
+
+    async with deployment_context.database.sessions() as session:
+        first = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=first_observed_at,
+        )
+        await session.commit()
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=first_observed_at + elapsed,
+        )
+        await session.commit()
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+
+    assert first.state == SaladDeploymentState.PROVISIONING
+    assert first.error_code == "provider_start_pending"
+    assert result.state == expected_state
+    assert result.error_code == expected_error
+    assert deployment.unknown_since is not None
+    assert deployment.unknown_since.replace(tzinfo=UTC) == first_observed_at
+    assert client.start_names == []
+    assert client.updated_group_patches == []
+    assert client.stop_names == []
+
+
+@pytest.mark.asyncio
+async def test_accepted_start_is_not_repeated_and_keeps_one_stall_clock(
+    deployment_context: DeploymentContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await make_fully_provisioned(deployment_context)
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.queues[queue_name] = make_queue(queue_name)
+    warm_autoscaler = {
+        "min_replicas": 1,
+        "max_replicas": 1,
+        "desired_queue_length": 1,
+        "polling_period": 30,
+    }
+    client.groups[group_name] = make_group(
+        group_name,
+        queue_name,
+        status="stopped",
+        start_time=None,
+        finish_time=NOW,
+        autoscaler=warm_autoscaler,
+    )
+    demand = 1
+
+    async def demand_worker(*_args: object, **_kwargs: object) -> int:
+        return demand
+
+    monkeypatch.setattr(
+        deployment_service,
+        "effective_worker_min_replicas",
+        demand_worker,
+    )
+    first_observed_at = NOW + timedelta(minutes=1)
+
+    async with deployment_context.database.sessions() as session:
+        first = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=first_observed_at,
+        )
+        await session.commit()
+        second = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=first_observed_at + timedelta(minutes=15),
+        )
+        await session.commit()
+        client.groups[group_name] = make_group(
+            group_name,
+            queue_name,
+            status="deploying",
+            autoscaler=warm_autoscaler,
+        )
+        third = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=first_observed_at + timedelta(minutes=20),
+        )
+        await session.commit()
+        stalled = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=first_observed_at + timedelta(minutes=30),
+        )
+        await session.commit()
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+        stalled_since = deployment.unknown_since
+
+        demand = 0
+        client.groups[group_name] = make_group(
+            group_name,
+            queue_name,
+            status="stopped",
+            start_time=None,
+            finish_time=first_observed_at + timedelta(minutes=31),
+        )
+        idle = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=first_observed_at + timedelta(minutes=31),
+        )
+        await session.commit()
+        await session.refresh(deployment)
+
+    assert first.action == DeploymentAction.START_REQUESTED
+    assert first.error_code == "provider_start_pending"
+    assert second.state == SaladDeploymentState.PROVISIONING
+    assert second.error_code == "provider_start_pending"
+    assert third.state == SaladDeploymentState.PROVISIONING
+    assert third.error_code == "provider_start_pending"
+    assert stalled.state == SaladDeploymentState.DEGRADED
+    assert stalled.error_code == "provider_start_stalled"
+    assert stalled_since is not None
+    assert stalled_since.replace(tzinfo=UTC) == first_observed_at
+    assert client.start_names == [group_name]
+    assert client.updated_group_patches == []
+    assert client.stop_names == []
+    assert idle.state == SaladDeploymentState.ACTIVE
+    assert idle.error_code is None
+    assert deployment.unknown_since is None
+
+
+@pytest.mark.asyncio
+async def test_ready_start_readback_clears_wait_tracking(
+    deployment_context: DeploymentContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await make_fully_provisioned(deployment_context)
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.queues[queue_name] = make_queue(queue_name)
+    autoscaler = {
+        "min_replicas": 1,
+        "max_replicas": 1,
+        "desired_queue_length": 1,
+        "polling_period": 30,
+    }
+    client.groups[group_name] = make_group(
+        group_name,
+        queue_name,
+        status="deploying",
+        autoscaler=autoscaler,
+    )
+
+    async def demand_one_worker(*_args: object, **_kwargs: object) -> int:
+        return 1
+
+    monkeypatch.setattr(
+        deployment_service,
+        "effective_worker_min_replicas",
+        demand_one_worker,
+    )
+    first_observed_at = NOW + timedelta(minutes=1)
+
+    async with deployment_context.database.sessions() as session:
+        await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=first_observed_at,
+        )
+        await session.commit()
+        client.groups[group_name] = make_group(
+            group_name,
+            queue_name,
+            status="running",
+            replicas=1,
+            running=1,
+            autoscaler=autoscaler,
+        )
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=first_observed_at + timedelta(minutes=31),
+        )
+        await session.commit()
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
+
+    assert result.state == SaladDeploymentState.ACTIVE
+    assert result.error_code is None
+    assert deployment.unknown_since is None
+    assert deployment.observed_replicas == 1
+    assert deployment.ready_replicas == 1
+    assert client.start_names == []
+    assert client.updated_group_patches == []
+    assert client.stop_names == []
+
+
+@pytest.mark.asyncio
+async def test_zero_ready_deploying_group_remains_valid_while_idle(
+    deployment_context: DeploymentContext,
+) -> None:
+    await make_fully_provisioned(deployment_context)
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.queues[queue_name] = make_queue(queue_name)
+    client.groups[group_name] = make_group(group_name, queue_name, status="deploying")
+
+    async with deployment_context.database.sessions() as session:
         result = await reconcile_deployment(
             session,
             deployment_id=deployment_context.deployment_id,
@@ -2978,12 +3256,15 @@ async def test_reconciliation_uses_status_to_start_stopped_active_group_with_dem
             now=NOW + timedelta(minutes=1),
         )
         await session.commit()
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        assert deployment is not None
 
-    assert result.action == DeploymentAction.START_REQUESTED
-    assert result.state == SaladDeploymentState.PROVISIONING
-    assert result.error_code == "provider_start_pending"
-    assert client.start_names == [group_name]
+    assert result.state == SaladDeploymentState.ACTIVE
+    assert result.error_code is None
+    assert deployment.unknown_since is None
+    assert client.start_names == []
     assert client.updated_group_patches == []
+    assert client.stop_names == []
 
 
 @pytest.mark.asyncio

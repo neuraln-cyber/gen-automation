@@ -89,6 +89,7 @@ from gen_automation.services.releases import create_project, create_release
 from gen_automation.services.wildcards import list_wildcard_libraries
 
 _PROVIDER_STATUS_STALE_AFTER = timedelta(minutes=5)
+_PROVIDER_START_STALL_AFTER = timedelta(minutes=30)
 _PROVIDER_PREPARATION_ERROR_CODES = frozenset(
     {
         "provider_image_preparation_pending",
@@ -1573,6 +1574,28 @@ def _overlay_provider_preparation(
 ) -> tuple[GenerationProgressStageView, GenerationProgressError | None]:
     if stage.key not in {GenerationProgressStage.QUEUED, GenerationProgressStage.GPU_STARTING}:
         return stage, error
+    if error is not None:
+        return stage, error
+    if _provider_start_is_stalled(deployment, now=now):
+        return (
+            _stage(
+                GenerationProgressStage.ERROR,
+                step=stage.step,
+                label="GPU worker start stalled",
+                detail=(
+                    "The cloud provider accepted the worker start, but no ready GPU appeared "
+                    "within 30 minutes. The system will keep checking automatically."
+                ),
+            ),
+            GenerationProgressError(
+                code="provider_start_stalled",
+                message=(
+                    "The GPU worker did not become ready within 30 minutes. You can stop this "
+                    "run safely; no generated images will be discarded."
+                ),
+                retryable=True,
+            ),
+        )
     snapshot = _provider_preparation_snapshot(deployment, now=now)
     if snapshot is None:
         return stage, error
@@ -1611,6 +1634,33 @@ def _overlay_provider_preparation(
         ),
         error,
     )
+
+
+def _provider_start_is_stalled(
+    deployment: SaladDeployment | None,
+    *,
+    now: datetime,
+) -> bool:
+    if (
+        deployment is None
+        or not deployment.is_current
+        or deployment.state != SaladDeploymentState.DEGRADED
+        or deployment.last_error_code != "provider_start_stalled"
+        or deployment.last_observed_at is None
+        or deployment.ready_replicas != 0
+        or deployment.unknown_since is None
+    ):
+        return False
+    observed_at = _stored_as_utc(deployment.last_observed_at)
+    current_time = _stored_as_utc(now)
+    age = current_time - observed_at
+    if age < timedelta(0) or age > _PROVIDER_STATUS_STALE_AFTER:
+        return False
+    start_wait_age = current_time - _stored_as_utc(deployment.unknown_since)
+    if start_wait_age < _PROVIDER_START_STALL_AFTER:
+        return False
+    fields = _strict_provider_start_status_fields(deployment.provider_status)
+    return bool(fields is not None and fields["pending"] == "0")
 
 
 def _provider_preparation_snapshot(
@@ -1674,6 +1724,30 @@ def _strict_provider_status_fields(status: str | None) -> dict[str, str] | None:
     if not 0 <= int(queue_digits) <= 999_999_999:
         return None
     if fields["group"] not in _PROVIDER_GROUP_STATUSES:
+        return None
+    return fields
+
+
+def _strict_provider_start_status_fields(status: str | None) -> dict[str, str] | None:
+    if status is None or not status.isascii():
+        return None
+    fields: dict[str, str] = {}
+    for item in status.split(";"):
+        key, separator, value = item.partition("=")
+        if not separator or not key or not value or key in fields:
+            return None
+        fields[key] = value
+    if set(fields) != {"queue", "group", "pending"}:
+        return None
+    queue_value = fields["queue"]
+    queue_digits = queue_value[:-1] if queue_value.endswith("+") else queue_value
+    if not queue_digits.isdecimal() or not queue_digits.isascii():
+        return None
+    if not 0 <= int(queue_digits) <= 999_999_999:
+        return None
+    if fields["group"] not in _PROVIDER_GROUP_STATUSES - {"failed"}:
+        return None
+    if fields["pending"] not in {"0", "1"}:
         return None
     return fields
 
