@@ -1,6 +1,3 @@
-import hashlib
-import json
-import math
 import re
 from pathlib import Path
 
@@ -221,17 +218,24 @@ def test_salad_artifact_reader_is_disabled_and_exact_version_only() -> None:
     variables = (INFRA / "variables.tf").read_text(encoding="utf-8")
     tfvars = (INFRA / "terraform.tfvars.example").read_text(encoding="utf-8")
     reader_policy = source.split(
-        'data "aws_iam_policy_document" "salad_worker_artifact_reader_shard" {',
+        'data "aws_iam_policy_document" "salad_worker_artifact_reader" {',
         maxsplit=1,
     )[1].split(
-        'resource "aws_iam_policy" "salad_worker_artifact_reader_shard" {',
+        'resource "aws_iam_role_policy" "salad_worker_artifact_reader" {',
         maxsplit=1,
     )[0]
-    managed_lora_policy = iam.split(
-        'data "aws_iam_policy_document" "salad_worker_managed_lora_reader" {',
+    reader_resource = iam.split(
+        'resource "aws_iam_role_policy" "salad_worker_artifact_reader" {',
         maxsplit=1,
     )[1].split(
-        'resource "aws_iam_policy" "salad_worker_managed_lora_reader" {',
+        'data "aws_iam_policy_document" "runtime" {',
+        maxsplit=1,
+    )[0]
+    artifact_variable = variables.split(
+        'variable "salad_worker_artifact_object_versions" {',
+        maxsplit=1,
+    )[1].split(
+        'variable "github_actions_deploy_enabled" {',
         maxsplit=1,
     )[0]
     control_policy = source.split(
@@ -252,95 +256,106 @@ def test_salad_artifact_reader_is_disabled_and_exact_version_only() -> None:
     assert "length(var.salad_worker_artifact_object_versions) > 0" in source
     assert "max_session_duration = 43200" in source
     assert "identifiers = [aws_iam_role.control_plane.arn]" in source
-    assert "salad_worker_artifact_policy_shard_size = 5" in locals_source
+    assert "salad_worker_artifact_inline_policy_max_characters = 10240" in locals_source
     assert "sort(" in locals_source
     assert "keys(var.salad_worker_artifact_object_versions)" in locals_source
-    assert 'format("%02d", shard_index)' in locals_source
+    assert "salad_worker_artifact_policy_shards" not in locals_source
     assert "length(var.salad_worker_artifact_object_versions) <= 40" in variables
     assert 'trimspace(version_id) != ""' in variables
     assert 'version_id != "null"' in variables
     assert "length(version_id) <= 1024" in variables
+    assert re.search(r"regex\([^)]*version_id", artifact_variable) is None
     assert 'actions   = ["s3:GetObjectVersion"]' in reader_policy
     assert 'variable = "s3:VersionId"' in reader_policy
     assert "statement.value" in reader_policy
-    assert "for_each = each.value" in reader_policy
-    assert "i2v/manifests/sha256/" in variables
+    assert "for_each = local.salad_worker_artifact_sorted_keys" in reader_policy
+    assert "var.salad_worker_artifact_object_versions[statement.value]" in reader_policy
     assert "diffusion-models|loras|detectors|text-encoders|vae" in variables
     assert "worker/diffusion-models/" in tfvars
     assert "worker/text-encoders/" in tfvars
     assert "worker/vae/" in tfvars
-    assert 'resource "aws_iam_policy" "salad_worker_artifact_reader_shard"' in iam
-    assert 'resource "aws_iam_role_policy_attachment" "salad_worker_artifact_reader_shard"' in iam
-    assert 'resource "aws_iam_policy" "salad_worker_managed_lora_reader"' in iam
-    assert 'resource "aws_iam_role_policy_attachment" "salad_worker_managed_lora_reader"' in iam
-    assert 'resource "aws_iam_role_policy" "salad_worker_artifact_reader"' not in iam
-    assert "policy = each.value.minified_json" in iam
-    assert "length(each.value.minified_json) <= 6144" in iam
+    assert 'resource "aws_iam_role_policy" "salad_worker_artifact_reader"' in iam
+    assert 'resource "aws_iam_policy" "salad_worker_artifact_reader_shard"' not in iam
     assert (
-        "policy = data.aws_iam_policy_document.salad_worker_managed_lora_reader[0].minified_json"
-        in iam
+        'resource "aws_iam_role_policy_attachment" "salad_worker_artifact_reader_shard"'
+        not in iam
+    )
+    assert 'resource "aws_iam_policy" "salad_worker_managed_lora_reader"' not in iam
+    assert 'resource "aws_iam_role_policy_attachment" "salad_worker_managed_lora_reader"' not in iam
+    assert 'name   = "${local.name}-pinned-artifacts"' in reader_resource
+    assert (
+        "policy = data.aws_iam_policy_document.salad_worker_artifact_reader[0].minified_json"
+        in reader_resource
     )
     assert (
-        "length(data.aws_iam_policy_document.salad_worker_managed_lora_reader"
-        "[0].minified_json)" in iam
+        "length(data.aws_iam_policy_document.salad_worker_artifact_reader"
+        "[0].minified_json)" in reader_resource
     )
-    assert iam.count("precondition {") >= 2
-    assert 'actions   = ["s3:GetObjectVersion"]' in managed_lora_policy
-    assert '"${aws_s3_bucket.models.arn}/worker/managed-loras/sha256/*"' in (managed_lora_policy)
-    assert "ReadPinnedI2vManifest" in control_policy
-    assert 'actions   = ["s3:GetObjectVersion"]' in control_policy
-    assert 'variable = "s3:VersionId"' in control_policy
+    assert "<= local.salad_worker_artifact_inline_policy_max_characters" in reader_resource
+    assert "precondition {" in reader_resource
+    assert re.search(r"\bsid\s*=", reader_policy) is None
+    assert reader_policy.count('actions   = ["s3:GetObjectVersion"]') == 2
+    assert reader_policy.count("condition {") == 1
+    assert '"${aws_s3_bucket.models.arn}/worker/managed-loras/sha256/*"' in reader_policy
     assert re.search(r'"s3:(?:GetObject|ListBucket|PutObject|DeleteObject)"', reader_policy) is None
-    assert (
-        re.search(r'"s3:(?:GetObject|ListBucket|PutObject|DeleteObject)"', managed_lora_policy)
-        is None
-    )
     assert 'sid       = "AssumeSaladArtifactReader"' in control_policy
     assert 'actions   = ["sts:AssumeRole"]' in control_policy
     assert "aws_iam_role.salad_worker_artifact_reader[0].arn" in control_policy
     assert '"${aws_s3_bucket.models.arn}/*"' not in control_policy
 
 
-def test_salad_artifact_reader_shards_fit_iam_managed_policy_quotas() -> None:
+def test_salad_artifact_reader_hard_blocks_the_rendered_inline_policy_quota() -> None:
+    iam = (INFRA / "iam.tf").read_text(encoding="utf-8")
     locals_source = (INFRA / "locals.tf").read_text(encoding="utf-8")
     variables = (INFRA / "variables.tf").read_text(encoding="utf-8")
 
-    shard_size_match = re.search(
-        r"salad_worker_artifact_policy_shard_size\s*=\s*(\d+)", locals_source
+    quota_match = re.search(
+        r"salad_worker_artifact_inline_policy_max_characters\s*=\s*(\d+)",
+        locals_source,
     )
     entry_limit_match = re.search(
         r"length\(var\.salad_worker_artifact_object_versions\)\s*<=\s*(\d+)",
         variables,
     )
-    assert shard_size_match is not None
+    reader_resource = iam.split(
+        'resource "aws_iam_role_policy" "salad_worker_artifact_reader" {',
+        maxsplit=1,
+    )[1].split(
+        'data "aws_iam_policy_document" "runtime" {',
+        maxsplit=1,
+    )[0]
+
+    assert quota_match is not None
     assert entry_limit_match is not None
-
-    shard_size = int(shard_size_match.group(1))
+    assert int(quota_match.group(1)) == 10240
     entry_limit = int(entry_limit_match.group(1))
-    key_limit = 512
-    version_limit = 256
-    maximum_bucket_arn = "arn:aws:s3:::" + ("b" * 63)
-    statements = []
-    for index in range(shard_size):
-        object_key = ("worker/loras/" + ("a" * key_limit))[:key_limit]
-        object_key = f"{object_key[:-2]}{index:02d}"
-        statements.append(
-            {
-                "Sid": "ReadPinnedArtifact"
-                + hashlib.sha256(object_key.encode("ascii")).hexdigest()[:16],
-                "Effect": "Allow",
-                "Action": "s3:GetObjectVersion",
-                "Resource": f"{maximum_bucket_arn}/{object_key}",
-                "Condition": {"StringEquals": {"s3:VersionId": "A" * version_limit}},
-            }
-        )
-    policy = json.dumps(
-        {"Version": "2012-10-17", "Statement": statements},
-        separators=(",", ":"),
+    assert entry_limit == 40
+    assert "lifecycle {" in reader_resource
+    assert "precondition {" in reader_resource
+    assert (
+        "length(data.aws_iam_policy_document.salad_worker_artifact_reader"
+        "[0].minified_json)" in reader_resource
     )
+    assert "<= local.salad_worker_artifact_inline_policy_max_characters" in reader_resource
+    assert "10,240-character aggregate inline-policy quota" in reader_resource
 
-    assert len(policy) <= 6144
-    assert math.ceil(entry_limit / shard_size) + 1 <= 10
+
+def test_salad_artifact_reader_documents_the_required_state_reconciliation() -> None:
+    onboarding = (ROOT / "docs" / "artifact-onboarding.md").read_text(encoding="utf-8")
+
+    assert "One-time state reconciliation after the interrupted shard rollout" in onboarding
+    assert "removed" in onboarding
+    assert "from OpenTofu state" in onboarding
+    assert "restored directly with `PutRolePolicy`" in onboarding
+    assert "Do not run a general apply" in onboarding
+    assert (
+        "tofu import 'aws_iam_role_policy.salad_worker_artifact_reader[0]' "
+        "'gen-automation-staging-salad-artifact-reader:"
+        "gen-automation-staging-pinned-artifacts'"
+        in onboarding
+    )
+    assert "must show no IAM content change" in onboarding
+    assert re.search(r"no managed-policy or attachment\s+creation", onboarding)
 
 
 def test_reviewed_i2v_source_manifest_is_exactly_inventoried_for_host_read() -> None:

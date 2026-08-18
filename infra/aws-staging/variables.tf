@@ -230,7 +230,7 @@ variable "civitai_api_secret_arn" {
 }
 
 variable "salad_worker_artifact_object_versions" {
-  description = "Exact model-bucket object keys and immutable S3 VersionIds readable by Salad workers. Empty disables the reader role."
+  description = "Exact model-bucket object keys and immutable S3 VersionIds readable by Salad workers. Empty disables the reader role; nonempty input must render within the role's 10,240-character aggregate inline-policy quota."
   type        = map(string)
   default     = {}
 
