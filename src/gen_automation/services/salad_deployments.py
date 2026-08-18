@@ -1703,6 +1703,20 @@ def _validate_runtime_group(
         or str(group.id) != deployment.provider_container_group_id
     ):
         raise SaladDeploymentValidationError("container group identity does not match deployment")
+    if effective_min_replicas is None:
+        autoscaler = group.raw.get("queue_autoscaler")
+        observed_min_replicas = (
+            autoscaler.get("min_replicas") if isinstance(autoscaler, dict) else None
+        )
+        if (
+            not isinstance(observed_min_replicas, int)
+            or isinstance(observed_min_replicas, bool)
+            or observed_min_replicas not in {0, 1}
+        ):
+            raise SaladDeploymentValidationError(
+                "container group configuration does not match deployment"
+            )
+        effective_min_replicas = observed_min_replicas
     if (
         _group_configuration_drift(
             deployment,

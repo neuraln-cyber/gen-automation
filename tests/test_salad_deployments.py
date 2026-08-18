@@ -751,6 +751,42 @@ async def test_refresh_container_group_runtime_injects_only_resolved_ephemeral_v
 
 
 @pytest.mark.asyncio
+async def test_refresh_container_group_runtime_accepts_active_warm_autoscaler() -> None:
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    warm_autoscaler = {
+        "polling_period": 30,
+        "min_replicas": 1,
+        "max_replicas": 1,
+        "desired_queue_length": 1,
+    }
+    preflight = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        autoscaler=warm_autoscaler,
+    )
+    applied = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        version=2,
+        autoscaler=warm_autoscaler,
+    )
+    client = FakeClient()
+    client.groups[deployment.container_group_name] = applied
+    client.get_group_results = [preflight, applied]
+    client.update_group_result = applied
+
+    result = await refresh_container_group_runtime(
+        deployment,
+        client,
+        FakeResolver({WORKER_MODEL_MANIFEST_JSON_BINDING: LIVE_VALUE}),
+    )
+
+    assert result is applied
+
+
+@pytest.mark.asyncio
 async def test_refresh_waits_for_pending_group_version_to_apply() -> None:
     deployment = unpersisted_deployment(provider_configuration(with_binding=True))
     deployment.provider_container_group_id = str(GROUP_ID)
