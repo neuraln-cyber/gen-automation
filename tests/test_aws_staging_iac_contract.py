@@ -277,8 +277,7 @@ def test_salad_artifact_reader_is_disabled_and_exact_version_only() -> None:
     assert 'resource "aws_iam_role_policy" "salad_worker_artifact_reader"' in iam
     assert 'resource "aws_iam_policy" "salad_worker_artifact_reader_shard"' not in iam
     assert (
-        'resource "aws_iam_role_policy_attachment" "salad_worker_artifact_reader_shard"'
-        not in iam
+        'resource "aws_iam_role_policy_attachment" "salad_worker_artifact_reader_shard"' not in iam
     )
     assert 'resource "aws_iam_policy" "salad_worker_managed_lora_reader"' not in iam
     assert 'resource "aws_iam_role_policy_attachment" "salad_worker_managed_lora_reader"' not in iam
@@ -351,8 +350,7 @@ def test_salad_artifact_reader_documents_the_required_state_reconciliation() -> 
     assert (
         "tofu import 'aws_iam_role_policy.salad_worker_artifact_reader[0]' "
         "'gen-automation-staging-salad-artifact-reader:"
-        "gen-automation-staging-pinned-artifacts'"
-        in onboarding
+        "gen-automation-staging-pinned-artifacts'" in onboarding
     )
     assert "must show no IAM content change" in onboarding
     assert re.search(r"no managed-policy or attachment\s+creation", onboarding)
