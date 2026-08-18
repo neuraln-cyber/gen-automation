@@ -875,7 +875,8 @@ async def test_queue_admission_starts_stopped_group_without_waiting_for_attachme
         replicas=1,
         running=0,
         finish_time=NOW,
-        version=2,
+        # Autoscaler-only updates may retain the current group version.
+        version=1,
         autoscaler={
             "min_replicas": 1,
             "max_replicas": 1,

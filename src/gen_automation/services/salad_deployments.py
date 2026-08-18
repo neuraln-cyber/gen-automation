@@ -1658,7 +1658,10 @@ async def ensure_container_group_queue_admission(
                 raise SaladDeploymentValidationError(
                     "queue admission autoscaler update was not accepted"
                 ) from None
-            target_version = max(initial.version + 1, updated.version)
+            # Salad can apply an autoscaler-only PATCH without incrementing the
+            # container-group version. The exact read-back contract below is
+            # the authoritative convergence signal.
+            target_version = updated.version
             async with asyncio.timeout(convergence_timeout_seconds):
                 while True:
                     initial = await client.get_container_group(deployment.container_group_name)
