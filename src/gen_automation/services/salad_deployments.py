@@ -689,7 +689,6 @@ async def _reconcile_locked(
             else "Provider image preparation is pending; reconciliation remains read-only."
         )
     else:
-        deployment.unknown_since = None
         repair_result = await _request_active_contract_repair(
             session,
             deployment,
@@ -712,9 +711,24 @@ async def _reconcile_locked(
             provider_status == "stopped" and effective_min_replicas == 1
         )
         if drift_code is not None or unhealthy_status:
+            deployment.unknown_since = None
             deployment.state = SaladDeploymentState.DEGRADED
             deployment.last_error_code = drift_code or "provider_group_unhealthy"
             deployment.last_error_detail = "Provider resources do not match the active deployment."
+        elif effective_min_replicas == 1 and group.current_state.running_count == 0:
+            stalled = _record_start_wait(deployment, observed_at=observed_at)
+            deployment.state = (
+                SaladDeploymentState.DEGRADED if stalled else SaladDeploymentState.PROVISIONING
+            )
+            deployment.last_error_code = (
+                "provider_start_stalled" if stalled else "provider_start_pending"
+            )
+            deployment.last_error_detail = (
+                "Provider container group start stopped reporting ready capacity; "
+                "reconciliation remains read-only."
+                if stalled
+                else "Provider container group start is awaiting read-back."
+            )
         else:
             deployment.state = SaladDeploymentState.ACTIVE
             deployment.activated_at = deployment.activated_at or observed_at
@@ -880,6 +894,7 @@ async def _request_active_contract_repair(
                 observed_at=observed_at,
             )
         deployment.state = SaladDeploymentState.PROVISIONING
+        deployment.unknown_since = None
         deployment.last_error_code = "provider_autoscaler_repair_pending"
         deployment.last_error_detail = "Provider queue autoscaler repair is awaiting read-back."
         deployment.reconcile_after = observed_at + _RECONCILE_DELAY
@@ -915,6 +930,7 @@ async def _request_active_contract_repair(
                 observed_at=observed_at,
             )
         deployment.state = SaladDeploymentState.PROVISIONING
+        deployment.unknown_since = observed_at
         deployment.last_error_code = "provider_start_pending"
         deployment.last_error_detail = "Provider container group start is awaiting read-back."
         deployment.reconcile_after = observed_at + _RECONCILE_DELAY
@@ -2169,6 +2185,24 @@ def _record_pending_preparation(
     current_snapshot = _parse_safe_preparation_snapshot(deployment.provider_status)
     previous_snapshot = _parse_safe_preparation_snapshot(previous_provider_status)
     if current_snapshot is None or current_snapshot != previous_snapshot:
+        deployment.unknown_since = observed_at
+        return False
+    if deployment.unknown_since is None:
+        deployment.unknown_since = observed_at
+        return False
+    unchanged_since = _stored_as_utc(deployment.unknown_since)
+    return observed_at - unchanged_since >= _PROVIDER_PENDING_STALL_AFTER
+
+
+def _record_start_wait(
+    deployment: SaladDeployment,
+    *,
+    observed_at: datetime,
+) -> bool:
+    if deployment.last_error_code not in {
+        "provider_start_pending",
+        "provider_start_stalled",
+    }:
         deployment.unknown_since = observed_at
         return False
     if deployment.unknown_since is None:
