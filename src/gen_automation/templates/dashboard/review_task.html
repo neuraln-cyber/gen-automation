@@ -346,9 +346,17 @@
 
     {% if summary.state.value != "open" %}
       <p class="terminal-state" role="status">
-        Review task {{ summary.state.value }}. This set is now read-only.
+        Review task {{ summary.state.value }}. The finished-set contents are read-only.
       </p>
       {% if summary.state.value == "completed" and principal.role.value == "owner" %}
+        {% if x_selection_editability.allowed %}
+          <p class="muted">
+            You can still choose up to four finished-set images for X below. This does not
+            reopen the review or change the files already sent to MEGA or another destination.
+          </p>
+        {% elif x_selection_editability.blocked_reason %}
+          <p class="muted">{{ x_selection_editability.blocked_reason }}</p>
+        {% endif %}
         <a
           class="primary-action"
           href="/dashboard/review-tasks/{{ summary.task_id }}/delivery"
@@ -962,44 +970,44 @@
             </div>
           </details>
 
-          {% if summary.state.value == "open" %}
-            {% if item.x_selection_idempotency_key %}
-              <form
-                class="decision-form"
-                method="post"
-                action="/dashboard/review-tasks/{{ summary.task_id }}/x-selections"
-                data-x-selection-form
-                data-asset-id="{{ item.master.asset_id }}"
+          {% if item.x_selection_idempotency_key %}
+            <form
+              class="decision-form"
+              method="post"
+              action="/dashboard/review-tasks/{{ summary.task_id }}/x-selections"
+              data-x-selection-form
+              data-asset-id="{{ item.master.asset_id }}"
+            >
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input
+                type="hidden"
+                name="idempotency_key"
+                value="{{ item.x_selection_idempotency_key }}"
               >
-                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                <input
-                  type="hidden"
-                  name="idempotency_key"
-                  value="{{ item.x_selection_idempotency_key }}"
+              <input
+                type="hidden"
+                name="expected_lock_version"
+                value="{{ summary.lock_version }}"
+              >
+              <input type="hidden" name="asset_id" value="{{ item.master.asset_id }}">
+              <input
+                type="hidden"
+                name="selected"
+                value="{{ 'false' if item.current.selected_for_x else 'true' }}"
+              >
+              {% if decision_value == "accept" or item.current.selected_for_x %}
+                <button
+                  class="secondary-button x-toggle{% if item.current.selected_for_x %} selected{% endif %}"
+                  type="submit"
                 >
-                <input
-                  type="hidden"
-                  name="expected_lock_version"
-                  value="{{ summary.lock_version }}"
-                >
-                <input type="hidden" name="asset_id" value="{{ item.master.asset_id }}">
-                <input
-                  type="hidden"
-                  name="selected"
-                  value="{{ 'false' if item.current.selected_for_x else 'true' }}"
-                >
-                {% if decision_value == "accept" or item.current.selected_for_x %}
-                  <button
-                    class="secondary-button x-toggle{% if item.current.selected_for_x %} selected{% endif %}"
-                    type="submit"
-                  >
-                    {{ "Remove from X" if item.current.selected_for_x else "Select as X teaser" }}
-                  </button>
-                {% else %}
-                  <p class="decision-help">Keep this image before selecting it as an X teaser.</p>
-                {% endif %}
-              </form>
-            {% endif %}
+                  {{ "Remove from X" if item.current.selected_for_x else "Select as X teaser" }}
+                </button>
+              {% else %}
+                <p class="decision-help">Keep this image before selecting it as an X teaser.</p>
+              {% endif %}
+            </form>
+          {% endif %}
+          {% if summary.state.value == "open" %}
             <form
               class="decision-form"
               method="post"
