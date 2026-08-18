@@ -76,19 +76,48 @@ terminal transcript.
 After onboarding, copy every exact worker-artifact key and returned non-null S3
 VersionId into the OpenTofu
 `salad_worker_artifact_object_versions` map. Applying that map creates the
-disabled-by-default Salad reader role. OpenTofu sorts the map and partitions
-the exact key/VersionId grants into bounded customer-managed policy shards;
-each statement still permits only `s3:GetObjectVersion` for one key with its
-matching `s3:VersionId`. The separate managed-LoRA prefix policy preserves the
-existing content-addressed dynamic-LoRA path. The input and rendered-document
-checks fail closed before IAM's policy-size or role-attachment quotas can be
-exceeded. Sorted shard membership can change whenever the artifact map changes,
-and a migration from the legacy inline policy can temporarily remove reader
-access if an apply is interrupted. Apply every artifact-map change from a
-reviewed saved plan only with no active image jobs, warm lease, queued provider
-work, or GPU replica. It never grants an unversioned read. Copy the reader
-role's nonsecret output ARN to
+disabled-by-default Salad reader role. OpenTofu sorts the map and renders one
+compact inline policy with no statement Sids: one statement per exact object
+key and matching `s3:VersionId`, followed by the existing content-addressed
+managed-LoRA prefix. Every statement permits only `s3:GetObjectVersion`. A
+resource precondition measures the exact minified document and blocks the plan
+if it exceeds IAM's 10,240-character aggregate inline-policy quota for the
+dedicated reader role. Apply every artifact-map change from a reviewed saved
+plan only with no active image jobs, warm lease, queued provider work, or GPU
+replica. It never grants an unversioned read. Copy the reader role's nonsecret
+output ARN to
 `GEN_AUTOMATION_SALAD_WORKER_ARTIFACT_ROLE_ARN`.
+
+### One-time state reconciliation after the interrupted shard rollout
+
+The superseded customer-managed-policy rollout removed
+`aws_iam_role_policy.salad_worker_artifact_reader` from OpenTofu state before it
+failed. The exact inline policy was restored directly with `PutRolePolicy`, so
+live IAM has the policy while the state does not. Do not run a general apply in
+that condition, and never recreate or retry saved plan
+`63e269a364bcfb95274e278a6e961cd37faf8e027719989af09a61de79bb630a`.
+
+After this inline-policy configuration is merged, reconcile it in a dedicated
+maintenance window:
+
+1. Re-run the normal zero-work gate and take a recoverable version of the
+   remote state.
+2. Read state and IAM without mutation. Confirm that the inline policy named
+   `gen-automation-staging-pinned-artifacts` exists on role
+   `gen-automation-staging-salad-artifact-reader`, that the inline resource
+   address is absent from state, and that no shard or managed-LoRA policies are
+   attached to the role. Stop on any different preimage.
+3. From the initialized `infra/aws-staging` root, make the only state mutation:
+
+   ```powershell
+   tofu import 'aws_iam_role_policy.salad_worker_artifact_reader[0]' 'gen-automation-staging-salad-artifact-reader:gen-automation-staging-pinned-artifacts'
+   ```
+
+   This import adopts the existing policy at the AWS provider's documented
+   `role_name:role_policy_name` ID; it must not issue an IAM policy write.
+4. Generate a new narrowly reviewed saved plan. With an unchanged artifact
+   map, it must show no IAM content change and no managed-policy or attachment
+   creation. Keep unrelated infrastructure drift out of the plan.
 
 ## Upload the large files
 

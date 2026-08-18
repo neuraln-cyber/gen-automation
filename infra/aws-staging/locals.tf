@@ -15,31 +15,13 @@ locals {
     "${var.name_prefix}-${data.aws_caller_identity.current.account_id}-${var.aws_region}-models"
   )
   salad_worker_artifact_role_enabled = length(var.salad_worker_artifact_object_versions) > 0
-  # Customer-managed policies have a 6,144-character document quota. Keep each
-  # exact key/VersionId grant in a deterministic, conservatively small shard;
-  # the variable bounds below keep at most eight exact-reader policies plus the
-  # separate managed-LoRA policy under IAM's ten-policy role attachment quota.
-  salad_worker_artifact_policy_shard_size = 5
+  # IAM permits at most 10,240 aggregate inline-policy characters on a role.
+  # This dedicated reader role has exactly one inline policy, whose rendered
+  # minified document is checked against this limit before any write.
+  salad_worker_artifact_inline_policy_max_characters = 10240
   salad_worker_artifact_sorted_keys = sort(
     keys(var.salad_worker_artifact_object_versions)
   )
-  salad_worker_artifact_policy_shards = {
-    for shard_index in range(ceil(
-      length(local.salad_worker_artifact_sorted_keys)
-      / local.salad_worker_artifact_policy_shard_size
-    )) :
-    format("%02d", shard_index) => {
-      for object_key in slice(
-        local.salad_worker_artifact_sorted_keys,
-        shard_index * local.salad_worker_artifact_policy_shard_size,
-        min(
-          (shard_index + 1) * local.salad_worker_artifact_policy_shard_size,
-          length(local.salad_worker_artifact_sorted_keys),
-        ),
-      ) :
-      object_key => var.salad_worker_artifact_object_versions[object_key]
-    }
-  }
   github_actions_manages_oidc_provider = (
     var.github_actions_deploy_enabled && var.github_actions_oidc_provider_arn == null
   )

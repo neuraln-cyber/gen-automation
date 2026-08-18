@@ -169,90 +169,55 @@ resource "aws_iam_role" "salad_worker_artifact_reader" {
   }
 }
 
-data "aws_iam_policy_document" "salad_worker_artifact_reader_shard" {
-  for_each = local.salad_worker_artifact_policy_shards
+data "aws_iam_policy_document" "salad_worker_artifact_reader" {
+  count = local.salad_worker_artifact_role_enabled ? 1 : 0
 
   dynamic "statement" {
-    for_each = each.value
+    # A list, rather than the input map, makes statement ordering explicit and
+    # keeps the rendered policy stable when callers supply maps in a new order.
+    for_each = local.salad_worker_artifact_sorted_keys
 
     content {
-      sid       = "ReadPinnedArtifact${substr(sha256(statement.key), 0, 16)}"
+      effect    = "Allow"
       actions   = ["s3:GetObjectVersion"]
-      resources = ["${aws_s3_bucket.models.arn}/${statement.key}"]
+      resources = ["${aws_s3_bucket.models.arn}/${statement.value}"]
 
       condition {
         test     = "StringEquals"
         variable = "s3:VersionId"
-        values   = [statement.value]
+        values = [
+          var.salad_worker_artifact_object_versions[statement.value]
+        ]
       }
     }
   }
-}
-
-resource "aws_iam_policy" "salad_worker_artifact_reader_shard" {
-  for_each = data.aws_iam_policy_document.salad_worker_artifact_reader_shard
-
-  name   = "${local.name}-pinned-artifacts-${each.key}"
-  policy = each.value.minified_json
-
-  lifecycle {
-    precondition {
-      condition     = length(each.value.minified_json) <= 6144
-      error_message = "A Salad worker pinned-artifact policy exceeds IAM's 6,144-character managed-policy quota."
-    }
-  }
-
-  tags = {
-    Name = "${local.name}-pinned-artifacts-${each.key}"
-  }
-}
-
-resource "aws_iam_role_policy_attachment" "salad_worker_artifact_reader_shard" {
-  for_each = aws_iam_policy.salad_worker_artifact_reader_shard
-
-  role       = aws_iam_role.salad_worker_artifact_reader[0].name
-  policy_arn = each.value.arn
-}
-
-data "aws_iam_policy_document" "salad_worker_managed_lora_reader" {
-  count = local.salad_worker_artifact_role_enabled ? 1 : 0
 
   # Managed LoRAs are immutable, content-addressed objects. The signed worker
   # manifest still pins the exact key, VersionId, byte size, and SHA-256; this
   # prefix grant removes the need for an OpenTofu/IAM rollout per LoRA.
   statement {
-    sid       = "ReadVersionPinnedManagedLoras"
+    effect    = "Allow"
     actions   = ["s3:GetObjectVersion"]
     resources = ["${aws_s3_bucket.models.arn}/worker/managed-loras/sha256/*"]
   }
 }
 
-resource "aws_iam_policy" "salad_worker_managed_lora_reader" {
+resource "aws_iam_role_policy" "salad_worker_artifact_reader" {
   count = local.salad_worker_artifact_role_enabled ? 1 : 0
 
-  name   = "${local.name}-managed-lora-artifacts"
-  policy = data.aws_iam_policy_document.salad_worker_managed_lora_reader[0].minified_json
+  name   = "${local.name}-pinned-artifacts"
+  role   = aws_iam_role.salad_worker_artifact_reader[0].id
+  policy = data.aws_iam_policy_document.salad_worker_artifact_reader[0].minified_json
 
   lifecycle {
     precondition {
       condition = (
-        length(data.aws_iam_policy_document.salad_worker_managed_lora_reader[0].minified_json)
-        <= 6144
+        length(data.aws_iam_policy_document.salad_worker_artifact_reader[0].minified_json)
+        <= local.salad_worker_artifact_inline_policy_max_characters
       )
-      error_message = "The Salad worker managed-LoRA policy exceeds IAM's 6,144-character managed-policy quota."
+      error_message = "The Salad worker artifact reader policy exceeds IAM's 10,240-character aggregate inline-policy quota."
     }
   }
-
-  tags = {
-    Name = "${local.name}-managed-lora-artifacts"
-  }
-}
-
-resource "aws_iam_role_policy_attachment" "salad_worker_managed_lora_reader" {
-  count = local.salad_worker_artifact_role_enabled ? 1 : 0
-
-  role       = aws_iam_role.salad_worker_artifact_reader[0].name
-  policy_arn = aws_iam_policy.salad_worker_managed_lora_reader[0].arn
 }
 
 data "aws_iam_policy_document" "runtime" {
