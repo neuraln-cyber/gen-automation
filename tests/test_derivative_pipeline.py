@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -28,6 +29,7 @@ from gen_automation.db.models import (
     ScoringRun,
 )
 from gen_automation.db.session import Database
+from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.deliverability import patreon_full_output_byte_budget
 from gen_automation.domain.enums import (
     AdminRole,
@@ -60,6 +62,7 @@ from gen_automation.services.review import (
     create_review_task,
     transition_review_task,
 )
+from tests.factories import valid_release_payload
 from tests.image_privacy_assertions import PRIVATE_MASTER_PROMPT
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
@@ -116,6 +119,7 @@ async def approved_context(tmp_path: Path) -> AsyncIterator[ApprovedContext]:
         UUID("71000000-0000-4000-8000-000000000002"),
     )
     raw_payloads = (_raw_png(0), _raw_png(1))
+    specification = cast(dict[str, object], valid_release_payload()["specification"])
     async with database.sessions() as session:
         owner = _owner()
         project = Project(slug="derivative", name="Derivative")
@@ -135,8 +139,8 @@ async def approved_context(tmp_path: Path) -> AsyncIterator[ApprovedContext]:
         version = ReleaseVersion(
             release_id=release.id,
             version_no=1,
-            specification={"schema_version": 1},
-            specification_sha256="a" * 64,
+            specification=specification,
+            specification_sha256=canonical_sha256(specification),
             created_by="test",
             created_at=NOW,
         )
