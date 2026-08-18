@@ -48,6 +48,8 @@ def _deployment(
     last_error_code: str = "provider_image_preparation_pending",
     last_observed_at: datetime = NOW,
     is_current: bool = True,
+    ready_replicas: int | None = 0,
+    unknown_since: datetime | None = NOW - timedelta(minutes=30),
 ) -> SaladDeployment:
     return SaladDeployment(
         version_no=1,
@@ -64,6 +66,8 @@ def _deployment(
         provider_status=provider_status,
         last_observed_at=last_observed_at,
         last_error_code=last_error_code,
+        ready_replicas=ready_replicas,
+        unknown_since=unknown_since,
     )
 
 
@@ -297,6 +301,26 @@ def test_gpu_start_stall_is_visible_retryable_and_keeps_polling(
     )
 
 
+@pytest.mark.parametrize("group_status", ("running", "unknown"))
+def test_gpu_start_stall_uses_zero_ready_count_over_provider_status_label(
+    group_status: str,
+) -> None:
+    stage, error = _overlay_provider_preparation(
+        _stage(key=GenerationProgressStage.GPU_STARTING, step=2),
+        None,
+        deployment=_deployment(
+            state=SaladDeploymentState.DEGRADED,
+            provider_status=f"queue=0;group={group_status};pending=0",
+            last_error_code="provider_start_stalled",
+        ),
+        now=NOW,
+    )
+
+    assert stage.key == GenerationProgressStage.ERROR
+    assert error is not None
+    assert error.code == "provider_start_stalled"
+
+
 @pytest.mark.parametrize(
     "deployment",
     (
@@ -324,11 +348,38 @@ def test_gpu_start_stall_is_visible_retryable_and_keeps_polling(
         ),
         _deployment(
             state=SaladDeploymentState.DEGRADED,
-            provider_status="queue=0;group=running;pending=0",
+            provider_status="queue=0;group=failed;pending=0",
             last_error_code="provider_start_stalled",
         ),
+        _deployment(
+            state=SaladDeploymentState.DEGRADED,
+            provider_status="queue=0;group=running;pending=0",
+            last_error_code="provider_start_stalled",
+            ready_replicas=1,
+        ),
+        _deployment(
+            state=SaladDeploymentState.DEGRADED,
+            provider_status="queue=0;group=deploying;pending=0",
+            last_error_code="provider_start_stalled",
+            unknown_since=None,
+        ),
+        _deployment(
+            state=SaladDeploymentState.DEGRADED,
+            provider_status="queue=0;group=deploying;pending=0",
+            last_error_code="provider_start_stalled",
+            unknown_since=NOW - timedelta(minutes=29),
+        ),
     ),
-    ids=("stale", "not-current", "wrong-state", "malformed", "ready-status"),
+    ids=(
+        "stale",
+        "not-current",
+        "wrong-state",
+        "malformed",
+        "failed-status",
+        "ready-replica",
+        "no-clock",
+        "under-bound",
+    ),
 )
 def test_gpu_start_stall_falls_back_for_stale_or_incoherent_state(
     deployment: SaladDeployment,
