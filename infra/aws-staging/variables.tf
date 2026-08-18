@@ -235,20 +235,23 @@ variable "salad_worker_artifact_object_versions" {
   default     = {}
 
   validation {
-    condition = alltrue([
-      for object_key, version_id in var.salad_worker_artifact_object_versions :
-      can(regex(
-        "^worker/((checkpoints|diffusion-models|loras|detectors|text-encoders|vae)/[A-Za-z0-9][A-Za-z0-9._/-]*|i2v/sha256/[0-9a-f]{64}|i2v/manifests/sha256/[0-9a-f]{64}\\.json)$",
-        object_key,
-      ))
-      && !strcontains(object_key, "..")
-      && !strcontains(object_key, "//")
-      && !endswith(object_key, "/")
-      && trimspace(version_id) != ""
-      && version_id != "null"
-      && length(version_id) <= 1024
-    ])
-    error_message = "Artifact entries must use a reviewed worker model, support-artifact, or I2V manifest key and a non-null immutable VersionId."
+    condition = (
+      length(var.salad_worker_artifact_object_versions) <= 40
+      && alltrue([
+        for object_key, version_id in var.salad_worker_artifact_object_versions :
+        can(regex(
+          "^worker/((checkpoints|diffusion-models|loras|detectors|text-encoders|vae)/[A-Za-z0-9][A-Za-z0-9._/-]*|i2v/sha256/[0-9a-f]{64}|i2v/manifests/sha256/[0-9a-f]{64}\\.json)$",
+          object_key,
+        ))
+        && !strcontains(object_key, "..")
+        && !strcontains(object_key, "//")
+        && !endswith(object_key, "/")
+        && trimspace(version_id) != ""
+        && version_id != "null"
+        && length(version_id) <= 1024
+      ])
+    )
+    error_message = "At most 40 artifact entries may use reviewed worker model, support-artifact, or I2V manifest keys and nonblank, non-null immutable VersionIds of at most 1,024 characters."
   }
 }
 

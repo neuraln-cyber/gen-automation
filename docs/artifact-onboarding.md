@@ -76,7 +76,18 @@ terminal transcript.
 After onboarding, copy every exact worker-artifact key and returned non-null S3
 VersionId into the OpenTofu
 `salad_worker_artifact_object_versions` map. Applying that map creates the
-disabled-by-default Salad reader role; copy its nonsecret output ARN to
+disabled-by-default Salad reader role. OpenTofu sorts the map and partitions
+the exact key/VersionId grants into bounded customer-managed policy shards;
+each statement still permits only `s3:GetObjectVersion` for one key with its
+matching `s3:VersionId`. The separate managed-LoRA prefix policy preserves the
+existing content-addressed dynamic-LoRA path. The input and rendered-document
+checks fail closed before IAM's policy-size or role-attachment quotas can be
+exceeded. Sorted shard membership can change whenever the artifact map changes,
+and a migration from the legacy inline policy can temporarily remove reader
+access if an apply is interrupted. Apply every artifact-map change from a
+reviewed saved plan only with no active image jobs, warm lease, queued provider
+work, or GPU replica. It never grants an unversioned read. Copy the reader
+role's nonsecret output ARN to
 `GEN_AUTOMATION_SALAD_WORKER_ARTIFACT_ROLE_ARN`.
 
 ## Upload the large files
