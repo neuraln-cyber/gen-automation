@@ -295,6 +295,9 @@ async def bootstrap_worker_models(
             settings.checkpoint_root,
             settings.lora_root,
             settings.detector_root,
+            settings.diffusion_model_root,
+            settings.text_encoder_root,
+            settings.vae_root,
         )
         ensure_runtime_directories(settings)
         manifest = load_artifact_manifest(settings.model_manifest_json.get_secret_value())
@@ -307,6 +310,9 @@ async def bootstrap_worker_models(
                 checkpoint_root=settings.checkpoint_root,
                 lora_root=settings.lora_root,
                 detector_root=settings.detector_root,
+                diffusion_model_root=settings.diffusion_model_root,
+                text_encoder_root=settings.text_encoder_root,
+                vae_root=settings.vae_root,
             )
         finally:
             await resolved_downloader.close()

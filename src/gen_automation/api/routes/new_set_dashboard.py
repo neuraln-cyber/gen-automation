@@ -30,7 +30,7 @@ from gen_automation.api.security import (
 from gen_automation.config import Settings
 from gen_automation.db.session import get_session
 from gen_automation.domain.deliverability import MAX_ACCEPTED_IMAGES_PER_RELEASE
-from gen_automation.domain.enums import AdminRole
+from gen_automation.domain.enums import AdminRole, GenerationModelFamily
 from gen_automation.domain.generation_limits import (
     MAX_OUTPUTS_PER_GENERATION_JOB,
     MAX_SAFE_OUTPUTS_PER_SIGNED_GENERATION_JOB,
@@ -95,7 +95,10 @@ async def dashboard_new_set(
             heading="New Set is unavailable",
             message="Your account cannot create releases.",
         )
-    options = await list_new_set_options(session)
+    options = await list_new_set_options(
+        session,
+        experiment_mode=_is_experiment_mode(request),
+    )
     try:
         return new_set_form_response(
             request,
@@ -136,7 +139,10 @@ async def submit_dashboard_new_set(
     try:
         form = await read_new_set_form(request)
     except BrowserNewSetFormError as error:
-        options = await list_new_set_options(session)
+        options = await list_new_set_options(
+            session,
+            experiment_mode=experiment_mode,
+        )
         return new_set_form_response(
             request,
             principal=principal,
@@ -177,6 +183,7 @@ async def submit_dashboard_new_set(
             idempotency_key=form.idempotency_key,
             settings=settings,
             actor=str(manager.user_id),
+            experiment_mode=experiment_mode,
         )
         should_ensure_warm = experiment_mode and not (
             result.release_replayed and result.generation_plan_replayed
@@ -583,7 +590,10 @@ async def _submission_error(
     status_code: int,
     message: str,
 ) -> Response:
-    options = await list_new_set_options(session)
+    options = await list_new_set_options(
+        session,
+        experiment_mode=_is_experiment_mode(request),
+    )
     return new_set_form_response(
         request,
         principal=principal,
@@ -658,6 +668,7 @@ def _is_experiment_mode(request: Request) -> bool:
 
 
 def _default_values(options: NewSetOptions) -> dict[str, str]:
+    checkpoint_id, workflow_id = _preferred_model_pair_ids(options)
     values = {
         "slug": "",
         "title": "",
@@ -680,8 +691,8 @@ def _default_values(options: NewSetOptions) -> dict[str, str]:
         "camera_prompt": "",
         "duo_isolation_mode": "balanced",
         "duo_quality_mode": "standard",
-        "checkpoint_id": (str(options.checkpoints[0].approval_id) if options.checkpoints else ""),
-        "workflow_id": _preferred_workflow_id(options),
+        "checkpoint_id": checkpoint_id,
+        "workflow_id": workflow_id,
         "prompt": "",
         "negative_prompt": "",
         "detailer_prompt": "sexy, expressive, ",
@@ -715,18 +726,30 @@ def _default_values(options: NewSetOptions) -> dict[str, str]:
     return values
 
 
-def _preferred_workflow_id(options: NewSetOptions) -> str:
-    if not options.workflows:
-        return ""
-    preferred = next(
+def _preferred_model_pair_ids(options: NewSetOptions) -> tuple[str, str]:
+    available_families = options.model_families
+    if not available_families:
+        return "", ""
+    preferred_family = (
+        GenerationModelFamily.ILLUSTRIOUS
+        if GenerationModelFamily.ILLUSTRIOUS in available_families
+        else available_families[0]
+    )
+    checkpoint = next(
+        option for option in options.checkpoints if option.model_family == preferred_family
+    )
+    compatible_workflows = tuple(
+        workflow for workflow in options.workflows if workflow.model_family == preferred_family
+    )
+    workflow = next(
         (
             workflow
-            for workflow in options.workflows
+            for workflow in compatible_workflows
             if workflow.name.casefold() == "illustrious base detailer"
         ),
-        options.workflows[0],
+        compatible_workflows[0],
     )
-    return str(preferred.approval_id)
+    return str(checkpoint.approval_id), str(workflow.approval_id)
 
 
 def _form_csrf_token(

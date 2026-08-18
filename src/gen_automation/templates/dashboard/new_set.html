@@ -464,6 +464,22 @@
 
           <div class="form-grid">
             <label>
+              Model family
+              <select data-model-family-picker aria-describedby="model-family-help">
+                {% if not options.model_families %}<option value="">No compatible model families</option>{% endif %}
+                {% for family in options.model_families %}
+                  <option value="{{ family.value }}">{{ family.value | capitalize }}</option>
+                {% endfor %}
+              </select>
+              <small id="model-family-help">
+                {% if experiment_mode %}
+                  Anima is isolated to Experiment Lab while its license and output profile are validated.
+                {% else %}
+                  Production sets currently use the approved Illustrious family.
+                {% endif %}
+              </small>
+            </label>
+            <label>
               Checkpoint
               <select name="checkpoint_id" required>
                 {% if not options.checkpoints %}<option value="">No approved checkpoints</option>{% endif %}
@@ -472,6 +488,7 @@
                     value="{{ checkpoint.approval_id }}"
                     data-checkpoint-name="{{ checkpoint.name }}"
                     data-checkpoint-sha256="{{ checkpoint.sha256 }}"
+                    data-model-family="{{ checkpoint.model_family.value }}"
                     {% if form_values['checkpoint_id'] == checkpoint.approval_id|string %}selected{% endif %}
                   >{{ checkpoint.name }}</option>
                 {% endfor %}
@@ -487,6 +504,7 @@
                     data-workflow-name="{{ workflow.name }}"
                     data-workflow-version="{{ workflow.version }}"
                     data-workflow-sha256="{{ workflow.sha256 }}"
+                    data-model-family="{{ workflow.model_family.value }}"
                     data-upscaler-enabled="{{ 'true' if workflow.has_hires_pass else 'false' }}"
                     data-detailer-enabled="{{ 'true' if workflow.has_face_detailer else 'false' }}"
                     data-regional-prompting="{{ 'true' if workflow.has_regional_prompting else 'false' }}"
@@ -551,6 +569,7 @@
                           data-lora-id="{{ lora.approval_id }}"
                           data-lora-name="{{ lora.name }}"
                           data-lora-sha256="{{ lora.sha256 }}"
+                          data-model-family="{{ lora.model_family.value }}"
                           {% if readiness_status %}data-lora-readiness="{{ readiness_status }}"{% endif %}
                           aria-pressed="false"
                         >
@@ -599,6 +618,8 @@
                           {% set readiness_status = lora.readiness_status | default('', true) %}
                           <option
                             value="{{ lora.approval_id }}"
+                            data-model-family="{{ lora.model_family.value }}"
+                            data-lora-sha256="{{ lora.sha256 }}"
                             {% if readiness_status %}data-lora-readiness="{{ readiness_status }}"{% endif %}
                             {% if form_values['lora_' ~ slot ~ '_id'] == lora.approval_id|string %}selected{% endif %}
                           >{{ lora.name }} &middot; {{ lora.sha256[:12] }}{% if readiness_status %} &middot; {{ readiness_status | replace('_', ' ') }}{% endif %}</option>
@@ -667,9 +688,10 @@
           <details class="form-disclosure">
             <summary>Sampler and CLIP <span>Advanced</span></summary>
             <div class="disclosure-body form-grid">
-              <label>
+              <label data-clip-skip-field>
                 Clip skip
-                <input type="number" name="clip_skip" value="{{ form_values['clip_skip'] }}" min="1" max="12" step="1" required>
+                <input type="number" name="clip_skip" value="{{ form_values['clip_skip'] }}" min="1" max="12" step="1" required data-clip-skip-control>
+                <small data-clip-skip-help>Applied by Illustrious workflows.</small>
               </label>
               <label>
                 Sampler

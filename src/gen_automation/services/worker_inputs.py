@@ -73,6 +73,9 @@ CONTROLLED_DUO_MARKER_NODE_CLASS = "GenAutomationControlledDuoV2"
 MULTI_PROMPT_SHARED_NODE_CLASSES = frozenset(
     {
         "CheckpointLoaderSimple",
+        "UNETLoader",
+        "CLIPLoader",
+        "VAELoader",
         CONTROLLED_DUO_MARKER_NODE_CLASS,
         CONTROLLED_TRIO_MARKER_NODE_CLASS,
         LORA_CHAIN_NODE_CLASS,
@@ -123,6 +126,18 @@ class _ResolvedJobParameters:
             "workflow": self.workflow.model_dump(mode="json"),
             "generation": generation_binding,
         }
+        if runtime.primary_kind == ArtifactKind.DIFFUSION_MODEL:
+            bindings["diffusion_model"] = {
+                "runtime_filename": runtime.checkpoint_filename,
+            }
+        if runtime.text_encoder_filename is not None:
+            bindings["text_encoder"] = {
+                "runtime_filename": runtime.text_encoder_filename,
+            }
+        if runtime.vae_filename is not None:
+            bindings["vae"] = {
+                "runtime_filename": runtime.vae_filename,
+            }
         controlled_duo = _controlled_duo_bindings(selected_generation)
         if controlled_duo is not None:
             bindings["controlled_duo"] = controlled_duo
@@ -150,9 +165,12 @@ class _ResolvedJobParameters:
 
 @dataclass(frozen=True)
 class _RuntimeArtifactBindings:
+    primary_kind: ArtifactKind
     checkpoint_filename: str
     lora_filenames: tuple[str, ...]
     detector_filename: str | None
+    text_encoder_filename: str | None
+    vae_filename: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,11 +421,20 @@ def _resolve_runtime_artifacts(
     if len({lora.sha256 for lora in resolved.loras}) != len(resolved.loras):
         raise WorkerInputError("generation artifacts do not match the worker manifest")
 
-    checkpoint = _resolve_manifest_artifact(
-        manifest,
-        resolved.checkpoint,
-        kind=ArtifactKind.CHECKPOINT,
+    primaries = tuple(
+        artifact
+        for artifact in manifest.artifacts
+        if artifact.kind in {ArtifactKind.CHECKPOINT, ArtifactKind.DIFFUSION_MODEL}
+        and artifact.sha256 == resolved.checkpoint.sha256
     )
+    if len(primaries) != 1:
+        raise WorkerInputError("generation artifacts do not match the worker manifest")
+    checkpoint = primaries[0]
+    if (
+        checkpoint.source_object_id is not None
+        and checkpoint.source_object_id != resolved.checkpoint.storage_key
+    ):
+        raise WorkerInputError("generation artifacts do not match the worker manifest")
     loras = tuple(
         _resolve_manifest_artifact(manifest, lora, kind=ArtifactKind.LORA)
         for lora in resolved.loras
@@ -417,10 +444,22 @@ def _resolve_runtime_artifacts(
     )
     if len(detectors) > 1:
         raise WorkerInputError("generation supports at most one face detector")
+    text_encoders = tuple(
+        artifact for artifact in manifest.artifacts if artifact.kind == ArtifactKind.TEXT_ENCODER
+    )
+    vaes = tuple(artifact for artifact in manifest.artifacts if artifact.kind == ArtifactKind.VAE)
+    if checkpoint.kind == ArtifactKind.CHECKPOINT:
+        if text_encoders or vaes:
+            raise WorkerInputError("generation artifacts do not match the worker manifest")
+    elif len(text_encoders) != 1 or len(vaes) != 1:
+        raise WorkerInputError("Anima runtime support artifacts are unavailable")
     return _RuntimeArtifactBindings(
+        primary_kind=checkpoint.kind,
         checkpoint_filename=checkpoint.target_filename,
         lora_filenames=tuple(lora.target_filename for lora in loras),
         detector_filename=detectors[0].target_filename if detectors else None,
+        text_encoder_filename=(text_encoders[0].target_filename if text_encoders else None),
+        vae_filename=vaes[0].target_filename if vaes else None,
     )
 
 
@@ -1328,7 +1367,7 @@ def _replace_chain_references(
     *,
     chain_node_id: str,
     model_source: tuple[str, int],
-    clip_source: tuple[str, int],
+    clip_source: tuple[str, int] | None,
 ) -> object:
     if isinstance(value, list):
         if value and value[0] == chain_node_id:
@@ -1337,6 +1376,8 @@ def _replace_chain_references(
             if value[1] == 0:
                 return list(model_source)
             if value[1] == 1:
+                if clip_source is None:
+                    raise WorkerInputError("workflow LoRA chain is invalid")
                 return list(clip_source)
             raise WorkerInputError("workflow LoRA chain is invalid")
         return [
@@ -1379,16 +1420,23 @@ def _expand_bounded_lora_chain(
 
     chain_node_id, directive = directives[0]
     inputs = directive.get("inputs")
-    if not isinstance(inputs, dict) or set(inputs) != {"model", "clip"}:
+    if not isinstance(inputs, dict):
+        raise WorkerInputError("workflow LoRA chain is invalid")
+    model_only = set(inputs) == {"model", "mode"} and inputs.get("mode") == "model_only"
+    model_and_clip = set(inputs) == {"model", "clip"}
+    if not model_only and not model_and_clip:
         raise WorkerInputError("workflow LoRA chain is invalid")
     model_source = _require_comfy_link(inputs["model"], output_index=0)
-    clip_source = _require_comfy_link(inputs["clip"], output_index=1)
-    if model_source[0] != clip_source[0]:
+    clip_source = _require_comfy_link(inputs["clip"], output_index=1) if model_and_clip else None
+    if clip_source is not None and model_source[0] != clip_source[0]:
         raise WorkerInputError("workflow LoRA chain is invalid")
-    checkpoint_node = workflow.get(model_source[0])
+    primary_node = workflow.get(model_source[0])
+    expected_primary_class = "UNETLoader" if model_only else "CheckpointLoaderSimple"
+    expected_primary_kind = ArtifactKind.DIFFUSION_MODEL if model_only else ArtifactKind.CHECKPOINT
     if (
-        not isinstance(checkpoint_node, dict)
-        or checkpoint_node.get("class_type") != "CheckpointLoaderSimple"
+        runtime.primary_kind != expected_primary_kind
+        or not isinstance(primary_node, dict)
+        or primary_node.get("class_type") != expected_primary_class
     ):
         raise WorkerInputError("workflow LoRA chain is invalid")
 
@@ -1405,7 +1453,8 @@ def _expand_bounded_lora_chain(
     terminal_clip = clip_source
     if generated_ids:
         terminal_model = (generated_ids[-1], 0)
-        terminal_clip = (generated_ids[-1], 1)
+        if not model_only:
+            terminal_clip = (generated_ids[-1], 1)
     rendered = {
         node_id: _replace_chain_references(
             node,
@@ -1424,18 +1473,31 @@ def _expand_bounded_lora_chain(
         runtime.lora_filenames,
         strict=True,
     ):
-        rendered[node_id] = {
-            "class_type": "LoraLoader",
-            "inputs": {
-                "model": list(previous_model),
-                "clip": list(previous_clip),
-                "lora_name": filename,
-                "strength_model": lora.weight,
-                "strength_clip": lora.weight,
-            },
-        }
+        if model_only:
+            rendered[node_id] = {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {
+                    "model": list(previous_model),
+                    "lora_name": filename,
+                    "strength_model": lora.weight,
+                },
+            }
+        else:
+            if previous_clip is None:
+                raise WorkerInputError("workflow LoRA chain is invalid")
+            rendered[node_id] = {
+                "class_type": "LoraLoader",
+                "inputs": {
+                    "model": list(previous_model),
+                    "clip": list(previous_clip),
+                    "lora_name": filename,
+                    "strength_model": lora.weight,
+                    "strength_clip": lora.weight,
+                },
+            }
         previous_model = (node_id, 0)
-        previous_clip = (node_id, 1)
+        if not model_only:
+            previous_clip = (node_id, 1)
     return rendered
 
 
@@ -1446,10 +1508,14 @@ def _validate_runtime_artifact_nodes(
     runtime: _RuntimeArtifactBindings,
 ) -> None:
     checkpoints: list[str] = []
+    diffusion_models: list[str] = []
+    text_encoders: list[str] = []
+    vaes: list[str] = []
     detectors: list[str] = []
     detailer_count = 0
     output_node_count = 0
     loras: dict[str, tuple[object, object]] = {}
+    model_only_loras: dict[str, object] = {}
     for raw_node in workflow.values():
         if not isinstance(raw_node, dict):
             raise WorkerInputError("workflow template is invalid")
@@ -1462,14 +1528,42 @@ def _validate_runtime_artifact_nodes(
             if not isinstance(checkpoint_name, str):
                 raise WorkerInputError("workflow artifact binding is invalid")
             checkpoints.append(checkpoint_name)
+        elif node_class == "UNETLoader":
+            diffusion_name = inputs.get("unet_name")
+            if not isinstance(diffusion_name, str):
+                raise WorkerInputError("workflow artifact binding is invalid")
+            diffusion_models.append(diffusion_name)
+        elif node_class == "CLIPLoader":
+            text_encoder_name = inputs.get("clip_name")
+            if not isinstance(text_encoder_name, str):
+                raise WorkerInputError("workflow artifact binding is invalid")
+            text_encoders.append(text_encoder_name)
+        elif node_class == "VAELoader":
+            vae_name = inputs.get("vae_name")
+            if not isinstance(vae_name, str):
+                raise WorkerInputError("workflow artifact binding is invalid")
+            vaes.append(vae_name)
         elif node_class == "LoraLoader":
             lora_name = inputs.get("lora_name")
-            if not isinstance(lora_name, str) or lora_name in loras:
+            if (
+                not isinstance(lora_name, str)
+                or lora_name in loras
+                or lora_name in model_only_loras
+            ):
                 raise WorkerInputError("workflow artifact binding is invalid")
             loras[lora_name] = (
                 inputs.get("strength_model"),
                 inputs.get("strength_clip"),
             )
+        elif node_class == "LoraLoaderModelOnly":
+            lora_name = inputs.get("lora_name")
+            if (
+                not isinstance(lora_name, str)
+                or lora_name in loras
+                or lora_name in model_only_loras
+            ):
+                raise WorkerInputError("workflow artifact binding is invalid")
+            model_only_loras[lora_name] = inputs.get("strength_model")
         elif node_class == "UltralyticsDetectorProvider":
             detector_name = inputs.get("model_name")
             if not isinstance(detector_name, str):
@@ -1480,16 +1574,35 @@ def _validate_runtime_artifact_nodes(
         elif node_class in {"SaveImage", "SaveImageWebsocket"}:
             output_node_count += 1
 
-    if checkpoints != [runtime.checkpoint_filename]:
-        raise WorkerInputError("workflow artifact binding is invalid")
     expected_loras = dict(
         zip(runtime.lora_filenames, (lora.weight for lora in resolved.loras), strict=True)
     )
-    if set(loras) != set(expected_loras):
-        raise WorkerInputError("workflow artifact binding is invalid")
-    for filename, weight in expected_loras.items():
-        if loras[filename] != (weight, weight):
+    if runtime.primary_kind == ArtifactKind.CHECKPOINT:
+        if (
+            checkpoints != [runtime.checkpoint_filename]
+            or diffusion_models
+            or text_encoders
+            or vaes
+            or model_only_loras
+            or set(loras) != set(expected_loras)
+        ):
             raise WorkerInputError("workflow artifact binding is invalid")
+        for filename, weight in expected_loras.items():
+            if loras[filename] != (weight, weight):
+                raise WorkerInputError("workflow artifact binding is invalid")
+    else:
+        if (
+            checkpoints
+            or diffusion_models != [runtime.checkpoint_filename]
+            or text_encoders != [runtime.text_encoder_filename]
+            or vaes != [runtime.vae_filename]
+            or loras
+            or set(model_only_loras) != set(expected_loras)
+        ):
+            raise WorkerInputError("workflow artifact binding is invalid")
+        for filename, weight in expected_loras.items():
+            if model_only_loras[filename] != weight:
+                raise WorkerInputError("workflow artifact binding is invalid")
     allowed_detailer_counts = {0, 1}
     if resolved.output_generations:
         allowed_detailer_counts.add(len(resolved.output_generations))

@@ -19,6 +19,7 @@ from gen_automation.domain.controlled_duo import (
 )
 from gen_automation.domain.enums import (
     ApprovalStatus,
+    GenerationModelFamily,
     ManagedLoraLifecycle,
     ModelArtifactKind,
 )
@@ -98,7 +99,9 @@ def _validate_artifact(
         or approval.source_url != str(specification.source_url)
         or approval.storage_key != specification.storage_key
         or approval.license_url != str(specification.license_url)
-        or not approval.commercial_use_approved
+        or approval.commercial_use_approved != specification.commercial_use_approved
+        or approval.experiment_only != specification.experiment_only
+        or not (approval.commercial_use_approved or approval.experiment_only)
         or not approval.adult_use_approved
         or not approval.safetensors_verified
         or approval.evidence_sha256 != canonical_sha256(approval.evidence)
@@ -106,7 +109,7 @@ def _validate_artifact(
         or approval.revoked_by_user_id is not None
     ):
         raise _approval_error(expected_kind.value)
-    return {
+    evidence = {
         "approval_id": str(approval.id),
         "approval_version": approval.approval_version,
         "approved_by_user_id": str(approval.approved_by_user_id),
@@ -115,6 +118,16 @@ def _validate_artifact(
         "evidence_sha256": approval.evidence_sha256,
         "kind": approval.kind.value,
     }
+    if approval.experiment_only:
+        evidence.update(
+            {
+                "commercial_use_approved": approval.commercial_use_approved,
+                "experiment_only": True,
+            }
+        )
+    if approval.model_family != GenerationModelFamily.ILLUSTRIOUS:
+        evidence["model_family"] = approval.model_family.value
+    return evidence
 
 
 def _validate_workflow(
@@ -165,7 +178,7 @@ def _validate_workflow(
         raise ReleaseApprovalError(
             "single-character composition requires an approved standard workflow"
         )
-    return {
+    evidence = {
         "approval_id": str(approval.id),
         "approval_version": approval.approval_version,
         "approved_by_user_id": str(approval.approved_by_user_id),
@@ -175,6 +188,9 @@ def _validate_workflow(
         "capabilities": sorted(str(item) for item in capabilities),
         "reviewed_node_classes": sorted(approval.reviewed_node_classes),
     }
+    if approval.model_family != GenerationModelFamily.ILLUSTRIOUS:
+        evidence["model_family"] = approval.model_family.value
+    return evidence
 
 
 async def validate_release_approvals(
@@ -237,9 +253,10 @@ async def validate_release_approvals(
             )
         ).all()
     )
+    checkpoint_approval = artifacts_by_hash.get(specification.checkpoint.sha256)
     checkpoint_evidence = _validate_artifact(
         specification.checkpoint,
-        artifacts_by_hash.get(specification.checkpoint.sha256),
+        checkpoint_approval,
         expected_kind=ModelArtifactKind.CHECKPOINT,
     )
     lora_evidence: list[dict[str, Any]] = []
@@ -267,17 +284,32 @@ async def validate_release_approvals(
         .with_for_update(read=True)
     )
     workflow_evidence = _validate_workflow(specification, workflow_approval)
+    if checkpoint_approval is None or workflow_approval is None:
+        # The validators above fail closed first; this guard keeps the family
+        # comparison explicit for static analysis and future refactors.
+        raise ReleaseApprovalError("model-family approvals are unavailable")
+    selected_family = checkpoint_approval.model_family
+    if workflow_approval.model_family != selected_family or any(
+        artifacts_by_hash[lora.sha256].model_family != selected_family
+        for lora in specification.loras
+    ):
+        raise ReleaseApprovalError("checkpoint, workflow, and LoRAs must use the same model family")
 
+    artifact_license_gate: dict[str, Any] = {
+        "gate_version": 1,
+        "checkpoint": checkpoint_evidence,
+        "loras": lora_evidence,
+    }
+    if specification.experiment_only:
+        artifact_license_gate["experiment_only"] = True
+    if selected_family != GenerationModelFamily.ILLUSTRIOUS:
+        artifact_license_gate["model_family"] = selected_family.value
     checks: dict[str, dict[str, Any]] = {
         "adult_subject_gate": {
             "gate_version": 1,
             "subjects": subject_evidence,
         },
-        "artifact_license_gate": {
-            "gate_version": 1,
-            "checkpoint": checkpoint_evidence,
-            "loras": lora_evidence,
-        },
+        "artifact_license_gate": artifact_license_gate,
         "workflow_integrity_gate": {
             "gate_version": 1,
             "workflow": workflow_evidence,

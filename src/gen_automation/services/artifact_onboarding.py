@@ -70,6 +70,7 @@ from gen_automation.storage.base import (
 )
 
 MAX_PLAN_BYTES = 256 * 1024
+MAX_BASE_MANIFEST_BYTES = 256 * 1024
 MAX_PLAN_DEPTH = 32
 MAX_PLAN_ITEMS = 4_096
 _ONBOARDING_NODE_CLASSES = DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES | {
@@ -87,6 +88,7 @@ class ArtifactOnboardingError(Exception):
 class OnboardedWorkflow:
     name: str
     version: str
+    model_family: str
     object_key: str
     sha256: str
     reviewed_node_classes: tuple[str, ...]
@@ -124,6 +126,8 @@ def parse_onboarding_plan(raw: bytes) -> ArtifactOnboardingPlan:
         UnicodeDecodeError,
         json.JSONDecodeError,
         RecursionError,
+        TypeError,
+        UnicodeEncodeError,
         ValidationError,
         ValueError,
     ):
@@ -141,6 +145,18 @@ async def onboard_artifacts(
     """Validate inventory, ensure workflow objects, and idempotently approve it."""
 
     actor = await _active_owner(session, username=plan.owner_username)
+    retained_manifest = (
+        _load_base_manifest(plan.base_manifest_path, plan_directory=plan_directory)
+        if plan.base_manifest_path is not None
+        else None
+    )
+    if retained_manifest is not None:
+        for retained_entry in retained_manifest.artifacts:
+            await _require_remote_artifact(
+                artifact_store,
+                retained_entry,
+                retained=True,
+            )
     manifest_entries: list[ModelArtifactSpec] = []
     for entry in plan.artifacts:
         manifest_entry = _manifest_entry(entry, plan_directory=plan_directory)
@@ -159,7 +175,7 @@ async def onboard_artifacts(
             ) from None
         manifest_entries.append(manifest_entry)
     try:
-        manifest = create_artifact_manifest(manifest_entries)
+        manifest = _union_artifact_catalog(retained_manifest, manifest_entries)
     except ValidationError:
         raise ArtifactOnboardingError("artifact inventory cannot form a worker manifest") from None
 
@@ -167,7 +183,7 @@ async def onboard_artifacts(
         _validate_workflow(entry, plan_directory=plan_directory) for entry in plan.workflows
     )
     if any("FaceDetailer" in workflow.node_classes for workflow in validated_workflows) and not any(
-        entry.kind == ArtifactKind.DETECTOR for entry in plan.artifacts
+        entry.kind == ArtifactKind.DETECTOR for entry in manifest.artifacts
     ):
         raise ArtifactOnboardingError("a FaceDetailer workflow requires one detector artifact")
     for workflow in validated_workflows:
@@ -175,7 +191,8 @@ async def onboard_artifacts(
 
     artifact_approvals: list[ApprovalMutationResult] = []
     for entry, manifest_entry in zip(plan.artifacts, manifest_entries, strict=True):
-        if entry.kind == ArtifactKind.DETECTOR:
+        semantic_kind = _approval_kind(entry.kind)
+        if semantic_kind is None:
             continue
         approval_plan = entry.approval
         if approval_plan is None:
@@ -183,11 +200,13 @@ async def onboard_artifacts(
         model_command = ModelArtifactApprovalCreate(
             artifact_sha256=manifest_entry.sha256,
             name=approval_plan.name,
-            kind=ModelArtifactKind(entry.kind.value),
+            kind=semantic_kind,
+            model_family=approval_plan.model_family,
             source_url=approval_plan.source_url,
             storage_key=entry.object_key,
             license_url=approval_plan.license_url,
             commercial_use_approved=approval_plan.commercial_use_approved,
+            experiment_only=approval_plan.experiment_only,
             adult_use_approved=approval_plan.adult_use_approved,
             safetensors_verified=approval_plan.safetensors_verified,
             evidence=approval_plan.evidence,
@@ -215,6 +234,7 @@ async def onboard_artifacts(
             workflow_sha256=workflow.sha256,
             name=workflow.entry.name,
             version=workflow.entry.version,
+            model_family=workflow.entry.model_family,
             object_key=workflow.entry.object_key,
             reviewed_node_classes=list(workflow.node_classes),
             capabilities=workflow.entry.capabilities,
@@ -238,6 +258,7 @@ async def onboard_artifacts(
             OnboardedWorkflow(
                 name=workflow.entry.name,
                 version=workflow.entry.version,
+                model_family=workflow.entry.model_family.value,
                 object_key=workflow.entry.object_key,
                 sha256=workflow.sha256,
                 reviewed_node_classes=workflow.node_classes,
@@ -251,6 +272,105 @@ async def onboard_artifacts(
         artifact_approvals=tuple(artifact_approvals),
         workflows=tuple(onboarded_workflows),
     )
+
+
+def _approval_kind(kind: ArtifactKind) -> ModelArtifactKind | None:
+    """Map worker layout roles onto release-selectable compliance roles."""
+
+    if kind in {ArtifactKind.CHECKPOINT, ArtifactKind.DIFFUSION_MODEL}:
+        return ModelArtifactKind.CHECKPOINT
+    if kind == ArtifactKind.LORA:
+        return ModelArtifactKind.LORA
+    if kind in {ArtifactKind.DETECTOR, ArtifactKind.TEXT_ENCODER, ArtifactKind.VAE}:
+        return None
+    raise ArtifactOnboardingError("artifact kind has no compliance-registry mapping")
+
+
+def _load_base_manifest(
+    value: str,
+    *,
+    plan_directory: Path,
+) -> ArtifactManifest:
+    path = _resolve_local_path(plan_directory, value)
+    body = _read_regular_file(
+        path,
+        max_bytes=MAX_BASE_MANIFEST_BYTES,
+        subject="base artifact manifest",
+    )
+    try:
+        parsed = json.loads(
+            body,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+        _validate_json_shape(parsed, counter=[0])
+        normalized = json.dumps(
+            parsed,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return ArtifactManifest.model_validate_json(normalized, strict=True)
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        TypeError,
+        UnicodeEncodeError,
+        ValidationError,
+        ValueError,
+    ):
+        raise ArtifactOnboardingError("base artifact manifest is invalid") from None
+
+
+def _union_artifact_catalog(
+    retained_manifest: ArtifactManifest | None,
+    new_entries: list[ModelArtifactSpec],
+) -> ArtifactManifest:
+    retained_entries = list(retained_manifest.artifacts) if retained_manifest is not None else []
+    catalog = list(retained_entries)
+    by_digest = {entry.sha256: entry for entry in retained_entries}
+    by_name = {entry.logical_name.casefold(): entry for entry in retained_entries}
+    by_target = {
+        (entry.kind, entry.target_filename.casefold()): entry for entry in retained_entries
+    }
+    by_source = {
+        entry.source_object_id: entry
+        for entry in retained_entries
+        if entry.source_object_id is not None
+    }
+    if len(by_source) != len(retained_entries):
+        raise ArtifactOnboardingError(
+            "retained artifact catalog contains a duplicate or non-object source identity"
+        )
+    for entry in new_entries:
+        source_collision = (
+            by_source.get(entry.source_object_id) if entry.source_object_id is not None else None
+        )
+        colliding = {
+            candidate
+            for candidate in (
+                by_digest.get(entry.sha256),
+                by_name.get(entry.logical_name.casefold()),
+                by_target.get((entry.kind, entry.target_filename.casefold())),
+                source_collision,
+            )
+            if candidate is not None
+        }
+        if colliding:
+            if len(colliding) == 1 and entry in colliding:
+                continue
+            raise ArtifactOnboardingError(
+                f"new worker artifact {entry.logical_name!r} conflicts with the retained catalog"
+            )
+        catalog.append(entry)
+        by_digest[entry.sha256] = entry
+        by_name[entry.logical_name.casefold()] = entry
+        by_target[(entry.kind, entry.target_filename.casefold())] = entry
+        if entry.source_object_id is not None:
+            by_source[entry.source_object_id] = entry
+    return create_artifact_manifest(catalog)
 
 
 async def _active_owner(session: AsyncSession, *, username: str | None) -> AdminUser:
@@ -327,18 +447,31 @@ def _manifest_entry(
 async def _require_remote_artifact(
     store: ObjectStore,
     artifact: ModelArtifactSpec,
+    *,
+    retained: bool = False,
 ) -> str:
     object_key = artifact.source_object_id
     if object_key is None:
-        raise ArtifactOnboardingError("artifact object key is unavailable")
+        message = (
+            "retained catalog artifacts require an object key"
+            if retained
+            else "artifact object key is unavailable"
+        )
+        raise ArtifactOnboardingError(message)
+    expected_version_id = artifact.source_object_version_id if retained else None
+    if retained and expected_version_id is None:
+        raise ArtifactOnboardingError(
+            f"retained worker artifact {artifact.logical_name!r} is not version-pinned"
+        )
     try:
-        metadata = await store.head(object_key)
+        metadata = await store.head(object_key, version_id=expected_version_id)
     except ObjectStoreError:
         raise ArtifactOnboardingError(
             f"could not inspect worker artifact {artifact.logical_name!r}"
         ) from None
     if metadata is None:
-        raise ArtifactOnboardingError(f"worker artifact {artifact.logical_name!r} is not uploaded")
+        state = "retained version is unavailable" if retained else "is not uploaded"
+        raise ArtifactOnboardingError(f"worker artifact {artifact.logical_name!r} {state}")
     if (
         metadata.byte_size != artifact.exact_size_bytes
         or metadata.metadata.get("sha256") != artifact.sha256
@@ -354,6 +487,10 @@ async def _require_remote_artifact(
         raise ArtifactOnboardingError(
             f"worker artifact {artifact.logical_name!r} is not in versioned storage"
         )
+    if retained and metadata.version_id != expected_version_id:
+        raise ArtifactOnboardingError(
+            f"retained worker artifact {artifact.logical_name!r} changed object version"
+        )
     return metadata.version_id
 
 
@@ -363,7 +500,7 @@ def _validate_workflow(
     plan_directory: Path,
 ) -> _ValidatedWorkflow:
     path = _resolve_local_path(plan_directory, entry.local_path)
-    body = _read_regular_file(path, max_bytes=MAX_WORKFLOW_BYTES)
+    body = _read_regular_file(path, max_bytes=MAX_WORKFLOW_BYTES, subject="workflow")
     try:
         graph = _parse_workflow_template(body)
         validate_approved_workflow(graph, _ONBOARDING_NODE_CLASSES)
@@ -579,13 +716,13 @@ def _resolve_local_path(plan_directory: Path, value: str) -> Path:
         raise ArtifactOnboardingError(f"local file {value!r} is unavailable") from None
 
 
-def _read_regular_file(path: Path, *, max_bytes: int) -> bytes:
+def _read_regular_file(path: Path, *, max_bytes: int, subject: str) -> bytes:
     try:
         before = path.lstat()
         if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
             raise OSError
         if before.st_size <= 0 or before.st_size > max_bytes:
-            raise ArtifactOnboardingError("workflow file size is invalid")
+            raise ArtifactOnboardingError(f"{subject} file size is invalid")
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(path, flags)
         try:
@@ -605,9 +742,9 @@ def _read_regular_file(path: Path, *, max_bytes: int) -> bytes:
     except ArtifactOnboardingError:
         raise
     except OSError:
-        raise ArtifactOnboardingError("workflow file is unavailable") from None
+        raise ArtifactOnboardingError(f"{subject} file is unavailable") from None
     if len(body) != before.st_size or len(body) > max_bytes:
-        raise ArtifactOnboardingError("workflow file changed while it was read")
+        raise ArtifactOnboardingError(f"{subject} file changed while it was read")
     return body
 
 
@@ -674,8 +811,10 @@ def _registry_state(
             "adult_use_approved": approval.adult_use_approved,
             "artifact_sha256": approval.artifact_sha256,
             "commercial_use_approved": approval.commercial_use_approved,
+            "experiment_only": approval.experiment_only,
             "evidence": approval.evidence,
             "kind": approval.kind.value,
+            "model_family": approval.model_family.value,
             "license_url": approval.license_url,
             "name": approval.name,
             "safetensors_verified": approval.safetensors_verified,
@@ -686,6 +825,7 @@ def _registry_state(
         record = {
             "evidence": approval.evidence,
             "name": approval.name,
+            "model_family": approval.model_family.value,
             "object_key": approval.object_key,
             "capabilities": approval.capabilities,
             "reviewed_node_classes": approval.reviewed_node_classes,

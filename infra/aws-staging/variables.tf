@@ -238,7 +238,7 @@ variable "salad_worker_artifact_object_versions" {
     condition = alltrue([
       for object_key, version_id in var.salad_worker_artifact_object_versions :
       can(regex(
-        "^worker/((checkpoints|loras|detectors)/[A-Za-z0-9][A-Za-z0-9._/-]*|i2v/sha256/[0-9a-f]{64}|i2v/manifests/sha256/[0-9a-f]{64}\\.json)$",
+        "^worker/((checkpoints|diffusion-models|loras|detectors|text-encoders|vae)/[A-Za-z0-9][A-Za-z0-9._/-]*|i2v/sha256/[0-9a-f]{64}|i2v/manifests/sha256/[0-9a-f]{64}\\.json)$",
         object_key,
       ))
       && !strcontains(object_key, "..")
@@ -248,7 +248,7 @@ variable "salad_worker_artifact_object_versions" {
       && version_id != "null"
       && length(version_id) <= 1024
     ])
-    error_message = "Artifact entries must use a reviewed worker model or I2V manifest key and a non-null immutable VersionId."
+    error_message = "Artifact entries must use a reviewed worker model, support-artifact, or I2V manifest key and a non-null immutable VersionId."
   }
 }
 

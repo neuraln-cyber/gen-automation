@@ -47,6 +47,7 @@ from gen_automation.domain.enums import (
     AssetKind,
     AssetState,
     GenerationAttemptState,
+    GenerationModelFamily,
     GenerationState,
     ManagedLoraLifecycle,
     ModelArtifactKind,
@@ -410,6 +411,7 @@ class ArtifactOption:
     approval_id: UUID
     name: str
     sha256: str
+    model_family: GenerationModelFamily = GenerationModelFamily.ILLUSTRIOUS
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,6 +428,7 @@ class WorkflowOption:
     supports_controlled_trio_v1: bool
     supports_duo_strict_isolation: bool
     supports_duo_high_quality: bool
+    model_family: GenerationModelFamily = GenerationModelFamily.ILLUSTRIOUS
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,8 +447,15 @@ class NewSetOptions:
     wildcards: tuple[WildcardOption, ...]
 
     @property
+    def model_families(self) -> tuple[GenerationModelFamily, ...]:
+        checkpoint_families = {option.model_family for option in self.checkpoints}
+        workflow_families = {option.model_family for option in self.workflows}
+        available = checkpoint_families.intersection(workflow_families)
+        return tuple(family for family in GenerationModelFamily if family in available)
+
+    @property
     def ready(self) -> bool:
-        return bool(self.subjects and self.checkpoints and self.workflows)
+        return bool(self.subjects and self.model_families)
 
 
 def _workflow_option(row: WorkflowApproval) -> WorkflowOption | None:
@@ -463,6 +473,7 @@ def _workflow_option(row: WorkflowApproval) -> WorkflowOption | None:
         name=row.name,
         version=row.version,
         sha256=row.workflow_sha256,
+        model_family=row.model_family,
         has_hires_pass="LatentUpscaleBy" in row.reviewed_node_classes,
         has_face_detailer="FaceDetailer" in row.reviewed_node_classes,
         has_regional_prompting=(WorkflowCapability.REGIONAL_PROMPTING_V1 in capabilities),
@@ -563,7 +574,14 @@ class NewSetStatus:
     planned_outputs: int = 0
 
 
-async def list_new_set_options(session: AsyncSession) -> NewSetOptions:
+async def list_new_set_options(
+    session: AsyncSession,
+    *,
+    experiment_mode: bool = False,
+) -> NewSetOptions:
+    allowed_families = {GenerationModelFamily.ILLUSTRIOUS}
+    if experiment_mode:
+        allowed_families.add(GenerationModelFamily.ANIMA)
     subjects = tuple(
         SubjectOption(
             approval_id=row.id,
@@ -594,7 +612,6 @@ async def list_new_set_options(session: AsyncSession) -> NewSetOptions:
                 .where(
                     ModelArtifactApproval.status == ApprovalStatus.APPROVED,
                     ModelArtifactApproval.is_current.is_(True),
-                    ModelArtifactApproval.commercial_use_approved.is_(True),
                     ModelArtifactApproval.adult_use_approved.is_(True),
                     ModelArtifactApproval.safetensors_verified.is_(True),
                 )
@@ -618,18 +635,24 @@ async def list_new_set_options(session: AsyncSession) -> NewSetOptions:
             approval_id=row.id,
             name=row.name,
             sha256=row.artifact_sha256,
+            model_family=row.model_family,
         )
         for row in artifacts
         if row.kind == ModelArtifactKind.CHECKPOINT
+        and row.model_family in allowed_families
+        and _artifact_available_for_mode(row, experiment_mode=experiment_mode)
     )
     loras = tuple(
         ArtifactOption(
             approval_id=row.id,
             name=row.name,
             sha256=row.artifact_sha256,
+            model_family=row.model_family,
         )
         for row in artifacts
         if row.kind == ModelArtifactKind.LORA
+        and row.model_family in allowed_families
+        and _artifact_available_for_mode(row, experiment_mode=experiment_mode)
         and (
             (
                 row.id not in managed_lora_lifecycles
@@ -650,7 +673,7 @@ async def list_new_set_options(session: AsyncSession) -> NewSetOptions:
         )
     ).all():
         option = _workflow_option(row)
-        if option is not None:
+        if option is not None and option.model_family in allowed_families:
             workflow_options.append(option)
     workflows = tuple(workflow_options)
     wildcard_libraries = await list_wildcard_libraries(session)
@@ -678,6 +701,7 @@ async def create_and_approve_new_set(
     idempotency_key: str,
     settings: Settings,
     actor: str,
+    experiment_mode: bool = False,
 ) -> NewSetResult:
     if not 8 <= len(idempotency_key) <= 200 or any(
         character.isspace() or ord(character) < 32 for character in idempotency_key
@@ -699,16 +723,25 @@ async def create_and_approve_new_set(
         session,
         command.checkpoint_approval_id,
         expected_kind=ModelArtifactKind.CHECKPOINT,
+        experiment_mode=experiment_mode,
     )
     lora_rows = [
         await _approved_artifact(
             session,
             selection.approval_id,
             expected_kind=ModelArtifactKind.LORA,
+            experiment_mode=experiment_mode,
         )
         for selection in command.loras
     ]
     workflow = await _approved_workflow(session, command.workflow_approval_id)
+    model_family = checkpoint.model_family
+    if workflow.model_family != model_family or any(
+        lora.model_family != model_family for lora in lora_rows
+    ):
+        raise NewSetInputError("checkpoint, workflow, and LoRAs must use the same model family")
+    if model_family == GenerationModelFamily.ANIMA and not experiment_mode:
+        raise NewSetInputError("Anima is currently available only through Experiment Lab")
     workflow_capabilities = effective_workflow_capabilities(
         workflow.capabilities or (),
         reviewed_node_classes=workflow.reviewed_node_classes,
@@ -891,8 +924,9 @@ async def create_and_approve_new_set(
             storage_key=checkpoint.storage_key,
             sha256=checkpoint.artifact_sha256,
             license_url=checkpoint.license_url,
-            commercial_use_approved=True,
+            commercial_use_approved=checkpoint.commercial_use_approved,
             adult_use_approved=True,
+            experiment_only=checkpoint.experiment_only,
         ),
         loras=[
             LoraSpecification(
@@ -901,8 +935,9 @@ async def create_and_approve_new_set(
                 storage_key=row.storage_key,
                 sha256=row.artifact_sha256,
                 license_url=row.license_url,
-                commercial_use_approved=True,
+                commercial_use_approved=row.commercial_use_approved,
                 adult_use_approved=True,
+                experiment_only=row.experiment_only,
                 weight=selection.weight,
             )
             for row, selection in zip(lora_rows, command.loras, strict=True)
@@ -941,6 +976,7 @@ async def create_and_approve_new_set(
         idempotency_key=f"{idempotency_key}:generation-plan",
         settings=settings,
         actor=actor,
+        experiment_mode=experiment_mode,
     )
     return NewSetResult(
         project=project,
@@ -1742,6 +1778,7 @@ async def _approved_artifact(
     approval_id: UUID,
     *,
     expected_kind: ModelArtifactKind,
+    experiment_mode: bool,
 ) -> ModelArtifactApproval:
     artifact = await session.scalar(
         select(ModelArtifactApproval).where(
@@ -1749,13 +1786,20 @@ async def _approved_artifact(
             ModelArtifactApproval.kind == expected_kind,
             ModelArtifactApproval.status == ApprovalStatus.APPROVED,
             ModelArtifactApproval.is_current.is_(True),
-            ModelArtifactApproval.commercial_use_approved.is_(True),
             ModelArtifactApproval.adult_use_approved.is_(True),
             ModelArtifactApproval.safetensors_verified.is_(True),
         )
     )
     if artifact is None:
         raise NewSetInputError(f"the selected {expected_kind.value} is no longer approved")
+    if artifact.experiment_only and not experiment_mode:
+        raise NewSetInputError(
+            f"the selected {expected_kind.value} is available only through Experiment Lab"
+        )
+    if not _artifact_available_for_mode(artifact, experiment_mode=experiment_mode):
+        raise NewSetInputError(
+            f"the selected {expected_kind.value} is not approved for this generation mode"
+        )
     if expected_kind == ModelArtifactKind.LORA:
         lifecycle = await session.scalar(
             select(ManagedLoraArtifact.lifecycle)
@@ -1767,6 +1811,16 @@ async def _approved_artifact(
         ) or (lifecycle is not None and lifecycle != ManagedLoraLifecycle.ACTIVE):
             raise NewSetInputError("the selected lora is not active on the worker")
     return artifact
+
+
+def _artifact_available_for_mode(
+    artifact: ModelArtifactApproval,
+    *,
+    experiment_mode: bool,
+) -> bool:
+    if artifact.experiment_only:
+        return experiment_mode
+    return artifact.commercial_use_approved
 
 
 async def _approved_workflow(

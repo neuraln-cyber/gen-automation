@@ -454,6 +454,32 @@ async def test_selected_context_rejects_release_from_another_project(
 
 
 @pytest.mark.asyncio
+async def test_selected_context_rejects_experiment_only_release(
+    storybook_fixture: StorybookFixture,
+) -> None:
+    async with storybook_fixture.database.sessions() as session:
+        release = await session.get(Release, storybook_fixture.release_id)
+        version = await session.get(ReleaseVersion, storybook_fixture.release_version_id)
+        assert release is not None and version is not None
+        specification = ReleaseSpecification.model_validate(version.specification)
+        checkpoint = specification.checkpoint.model_copy(
+            update={"commercial_use_approved": False, "experiment_only": True}
+        )
+        experiment_specification = specification.model_copy(update={"checkpoint": checkpoint})
+        frozen = experiment_specification.model_dump(mode="json")
+        version.specification = frozen
+        version.specification_sha256 = canonical_sha256(frozen)
+        release.phase = ReleasePhase.APPROVED
+        await session.commit()
+
+        with pytest.raises(StorybookSourceAuthorizationError, match="experiment-only"):
+            await build_storybook_source_context(
+                session,
+                request=_selected_request(storybook_fixture),
+            )
+
+
+@pytest.mark.asyncio
 async def test_selected_context_rejects_asset_ids_disguised_as_selection_ids(
     storybook_fixture: StorybookFixture,
 ) -> None:

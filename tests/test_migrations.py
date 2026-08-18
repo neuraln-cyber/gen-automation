@@ -109,7 +109,7 @@ def test_semantic_feedback_report_uses_jsonb_on_postgresql() -> None:
     assert isinstance(report_type, postgresql.JSONB)
 
 
-def test_fresh_i2v_revision_is_the_migration_head() -> None:
+def test_fresh_schema_revision_is_the_migration_head() -> None:
     configuration = Config("alembic.ini")
     scripts = ScriptDirectory.from_config(configuration)
     independent_targets_revision = scripts.get_revision("20260808_0024")
@@ -126,6 +126,7 @@ def test_fresh_i2v_revision_is_the_migration_head() -> None:
     hq_revision = scripts.get_revision("20260811_0035")
     retired_video_revision = scripts.get_revision("20260811_0036")
     revision = scripts.get_revision("20260812_0037")
+    txt2img_family_revision = scripts.get_revision("20260818_0038")
 
     assert independent_targets_revision is not None
     assert independent_targets_revision.down_revision == "20260808_0023"
@@ -155,7 +156,9 @@ def test_fresh_i2v_revision_is_the_migration_head() -> None:
     assert retired_video_revision.down_revision == "20260811_0035"
     assert revision is not None
     assert revision.down_revision == "20260811_0036"
-    assert scripts.get_current_head() == "20260812_0037"
+    assert txt2img_family_revision is not None
+    assert txt2img_family_revision.down_revision == "20260812_0037"
+    assert scripts.get_current_head() == "20260818_0038"
 
 
 def test_hq_video_profile_migration_replaces_dimension_constraint(monkeypatch) -> None:

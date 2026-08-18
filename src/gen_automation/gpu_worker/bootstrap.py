@@ -158,13 +158,23 @@ class WorkerRuntimeSettings(BaseSettings):
             errors.append("production artifact storage requires an explicit read-only identity")
         if any(
             not _is_container_absolute_path(path)
-            for path in (self.checkpoint_root, self.lora_root, self.detector_root)
+            for path in (
+                self.checkpoint_root,
+                self.diffusion_model_root,
+                self.lora_root,
+                self.text_encoder_root,
+                self.vae_root,
+                self.detector_root,
+            )
         ):
             errors.append("model roots must be absolute")
         elif (
             self.checkpoint_root.parent != self.lora_root.parent
             or self.checkpoint_root.name != "checkpoints"
+            or self.diffusion_model_root != self.checkpoint_root.parent / "diffusion_models"
             or self.lora_root.name != "loras"
+            or self.text_encoder_root != self.checkpoint_root.parent / "text_encoders"
+            or self.vae_root != self.checkpoint_root.parent / "vae"
             or self.detector_root != self.checkpoint_root.parent / "ultralytics" / "bbox"
         ):
             errors.append("model roots must use the fixed ComfyUI model directories")
@@ -173,7 +183,15 @@ class WorkerRuntimeSettings(BaseSettings):
             or not _is_container_absolute_path(self.comfy_main)
             or not _is_container_absolute_path(self.comfy_runtime_root)
             or self.comfy_python == self.comfy_main
-            or self.comfy_runtime_root in {self.checkpoint_root, self.lora_root, self.detector_root}
+            or self.comfy_runtime_root
+            in {
+                self.checkpoint_root,
+                self.diffusion_model_root,
+                self.lora_root,
+                self.text_encoder_root,
+                self.vae_root,
+                self.detector_root,
+            }
         ):
             errors.append("Comfy executable paths must be distinct and absolute")
         if self.worker_host not in {_WORKER_BIND_HOST, "::"}:
@@ -218,6 +236,18 @@ class WorkerRuntimeSettings(BaseSettings):
             readiness_timeout_seconds=self.readiness_timeout_seconds,
             approved_workflow_node_classes=self.approved_workflow_node_classes,
         )
+
+    @property
+    def diffusion_model_root(self) -> Path:
+        return self.checkpoint_root.parent / "diffusion_models"
+
+    @property
+    def text_encoder_root(self) -> Path:
+        return self.checkpoint_root.parent / "text_encoders"
+
+    @property
+    def vae_root(self) -> Path:
+        return self.checkpoint_root.parent / "vae"
 
 
 def _is_container_absolute_path(path: Path) -> bool:
@@ -311,10 +341,24 @@ def ensure_model_roots(
     checkpoint_root: Path,
     lora_root: Path,
     detector_root: Path | None = None,
+    diffusion_model_root: Path | None = None,
+    text_encoder_root: Path | None = None,
+    vae_root: Path | None = None,
 ) -> None:
     """Create expected model directories and reject links/non-directories."""
 
-    roots = tuple(path for path in (checkpoint_root, lora_root, detector_root) if path is not None)
+    roots = tuple(
+        path
+        for path in (
+            checkpoint_root,
+            diffusion_model_root,
+            lora_root,
+            text_encoder_root,
+            vae_root,
+            detector_root,
+        )
+        if path is not None
+    )
     for path in roots:
         try:
             path.mkdir(mode=0o700, parents=True, exist_ok=True)

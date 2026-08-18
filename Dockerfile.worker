@@ -116,6 +116,8 @@ RUN python -c "import sys; assert sys.version_info[:2] == (3, 12)" \
     && /opt/worker-venv/bin/python -m pip install --only-binary=:all: --require-hashes --no-deps -r requirements.lock \
     && /opt/worker-venv/bin/python -m pip install --only-binary=:all: --require-hashes --no-deps -r requirements-comfy.lock \
     && /opt/worker-venv/bin/python -c "import cv2, dill, matplotlib, piexif, segment_anything, skimage, ultralytics; import torch, torchaudio, torchvision; assert all('/opt/worker-venv/' not in module.__file__ for module in (torch, torchaudio, torchvision)); assert torch.__version__.split('+')[0] == '2.11.0'; assert torchvision.__version__.split('+')[0] == '0.26.0'; assert torchaudio.__version__.split('+')[0] == '2.11.0'" \
+    && test -d /opt/comfyui/comfy/ldm/anima \
+    && test -f /opt/comfyui/comfy/text_encoders/anima.py \
     && grep -Fq '"FaceDetailer": FaceDetailer' \
         /opt/comfyui/custom_nodes/ComfyUI-Impact-Pack/__init__.py \
     && grep -Fq '"UltralyticsDetectorProvider": UltralyticsDetectorProvider' \
@@ -148,12 +150,18 @@ RUN groupadd --system --gid 10001 worker \
         worker \
     && mkdir --parents \
         /opt/comfyui/models/checkpoints \
+        /opt/comfyui/models/diffusion_models \
         /opt/comfyui/models/loras \
+        /opt/comfyui/models/text_encoders \
+        /opt/comfyui/models/vae \
         /opt/comfyui/models/ultralytics/bbox \
         /opt/worker/runtime \
     && chown --recursive 10001:10001 \
         /opt/comfyui/models/checkpoints \
+        /opt/comfyui/models/diffusion_models \
         /opt/comfyui/models/loras \
+        /opt/comfyui/models/text_encoders \
+        /opt/comfyui/models/vae \
         /opt/comfyui/models/ultralytics/bbox \
         /opt/worker/runtime
 

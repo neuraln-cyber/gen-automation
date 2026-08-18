@@ -353,6 +353,7 @@ async def approve_and_expand_generation_plan(
     idempotency_key: str,
     settings: Settings,
     actor: str = "owner",
+    experiment_mode: bool = False,
 ) -> GenerationPlanResult:
     """Revalidate a frozen release and expand it into deterministic jobs."""
     scope = f"release:{release_id}:approve-generation"
@@ -381,6 +382,18 @@ async def approve_and_expand_generation_plan(
         raise GenerationPlanNotFoundError("release not found")
     if release.current_version_no != version.version_no:
         raise GenerationPlanConflictError("current release version changed concurrently")
+    if canonical_sha256(version.specification) != version.specification_sha256:
+        raise GenerationPlanConflictError("frozen release specification digest mismatch")
+    try:
+        specification = ReleaseSpecification.model_validate(version.specification)
+    except ValidationError:
+        raise GenerationPlanConflictError(
+            "frozen release specification no longer passes validation"
+        ) from None
+    if specification.experiment_only and not experiment_mode:
+        raise GenerationPlanConflictError(
+            "experiment-only release generation requires trusted Experiment Lab approval"
+        )
 
     request_sha256 = canonical_sha256(
         {
@@ -411,14 +424,6 @@ async def approve_and_expand_generation_plan(
         ReleasePhase.READY,
     }:
         raise GenerationPlanConflictError("release phase does not allow generation-plan approval")
-    if canonical_sha256(version.specification) != version.specification_sha256:
-        raise GenerationPlanConflictError("frozen release specification digest mismatch")
-    try:
-        specification = ReleaseSpecification.model_validate(version.specification)
-    except ValidationError:
-        raise GenerationPlanConflictError(
-            "frozen release specification no longer passes validation"
-        ) from None
 
     try:
         approval_snapshot = await validate_release_approvals(session, specification)
@@ -429,6 +434,7 @@ async def approve_and_expand_generation_plan(
             effective_manifest = await effective_artifact_manifest_from_settings(
                 session,
                 settings=settings,
+                required_checkpoint_sha256=specification.checkpoint.sha256,
                 required_lora_sha256s=tuple(lora.sha256 for lora in specification.loras),
             )
         except (ManagedArtifactManifestError, ValueError) as error:
@@ -436,7 +442,7 @@ async def approve_and_expand_generation_plan(
                 "selected model stack does not fit the safe worker runtime"
             ) from error
         if not any(
-            artifact.kind == ArtifactKind.CHECKPOINT
+            artifact.kind in {ArtifactKind.CHECKPOINT, ArtifactKind.DIFFUSION_MODEL}
             and artifact.sha256 == specification.checkpoint.sha256
             for artifact in effective_manifest.manifest.artifacts
         ):

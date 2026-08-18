@@ -57,7 +57,10 @@ Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 class ArtifactKind(StrEnum):
     CHECKPOINT = "checkpoint"
     DETECTOR = "detector"
+    DIFFUSION_MODEL = "diffusion_model"
     LORA = "lora"
+    TEXT_ENCODER = "text_encoder"
+    VAE = "vae"
 
 
 class ModelArtifactSpec(BaseModel):
@@ -599,6 +602,9 @@ async def bootstrap_artifacts(
     checkpoint_root: Path,
     lora_root: Path,
     detector_root: Path | None = None,
+    diffusion_model_root: Path | None = None,
+    text_encoder_root: Path | None = None,
+    vae_root: Path | None = None,
 ) -> ArtifactBootstrapResult:
     """Materialize a verified manifest into explicitly supplied model roots."""
 
@@ -606,19 +612,32 @@ async def bootstrap_artifacts(
         raise ArtifactBootstrapError("artifact bootstrap failed")
     checkpoint = _root_from_path(checkpoint_root)
     lora = _root_from_path(lora_root)
-    has_detector = any(artifact.kind == ArtifactKind.DETECTOR for artifact in manifest.artifacts)
-    detector = _root_from_path(detector_root) if detector_root is not None else None
-    if has_detector and detector is None:
+    optional_root_paths = {
+        ArtifactKind.DETECTOR: detector_root,
+        ArtifactKind.DIFFUSION_MODEL: diffusion_model_root,
+        ArtifactKind.TEXT_ENCODER: text_encoder_root,
+        ArtifactKind.VAE: vae_root,
+    }
+    optional_roots = {
+        kind: _root_from_path(path) if path is not None else None
+        for kind, path in optional_root_paths.items()
+    }
+    if any(
+        any(artifact.kind == kind for artifact in manifest.artifacts) and root is None
+        for kind, root in optional_roots.items()
+    ):
         raise ArtifactBootstrapError("artifact bootstrap failed")
-    roots_to_compare = tuple(root for root in (checkpoint, lora, detector) if root is not None)
+    roots_to_compare = tuple(
+        root for root in (checkpoint, lora, *optional_roots.values()) if root is not None
+    )
     identities = {(root.device, root.inode) for root in roots_to_compare}
     if len(identities) != len(roots_to_compare):
         raise ArtifactBootstrapError("artifact bootstrap failed")
 
     roots = {
         ArtifactKind.CHECKPOINT: checkpoint,
-        ArtifactKind.DETECTOR: detector,
         ArtifactKind.LORA: lora,
+        **optional_roots,
     }
     prepared: list[tuple[ModelArtifactSpec, _Root, Path, bool]] = []
     required_bytes_by_device: dict[int, int] = {}

@@ -1,5 +1,6 @@
 {
   "version": "v1",
+  "base_manifest_path": null,
   "artifacts": [
     {
       "logical_name": "illustrious-v1",
@@ -9,9 +10,11 @@
       "local_path": "../models/illustrious-v1.safetensors",
       "approval": {
         "name": "Illustrious checkpoint v1",
+        "model_family": "illustrious",
         "source_url": "https://models.example.invalid/replace-with-checkpoint-source",
         "license_url": "https://models.example.invalid/replace-with-checkpoint-license",
         "commercial_use_approved": true,
+        "experiment_only": false,
         "adult_use_approved": true,
         "safetensors_verified": true,
         "evidence": {
@@ -32,9 +35,11 @@
       "local_path": "../models/style-lora-v1.safetensors",
       "approval": {
         "name": "Style LoRA v1",
+        "model_family": "illustrious",
         "source_url": "https://models.example.invalid/replace-with-lora-source",
         "license_url": "https://models.example.invalid/replace-with-lora-license",
         "commercial_use_approved": true,
+        "experiment_only": false,
         "adult_use_approved": true,
         "safetensors_verified": true,
         "evidence": {
@@ -59,6 +64,7 @@
     {
       "name": "Illustrious base",
       "version": "1",
+      "model_family": "illustrious",
       "object_key": "workflows/by-sha256/1d099e8ed6a73ddf30cce4b8a5970aa17de16377fd248f5a654a32f65fba9834.json",
       "local_path": "../workflows/illustrious-sdxl-base-v1.json",
       "evidence": {
@@ -73,6 +79,7 @@
     {
       "name": "Illustrious base detailer",
       "version": "1",
+      "model_family": "illustrious",
       "object_key": "workflows/by-sha256/0cbfadda4e4ca9d915253f22b62010e6f78a38bb9ab052caff5c29ab0a1303fd.json",
       "local_path": "../workflows/illustrious-sdxl-base-detailer-v1.json",
       "evidence": {
@@ -87,6 +94,7 @@
     {
       "name": "Illustrious hires",
       "version": "1",
+      "model_family": "illustrious",
       "object_key": "workflows/by-sha256/207992e773506c2d199a7e1037d8d677ecde44353582032d953d4b0fe1410152.json",
       "local_path": "../workflows/illustrious-sdxl-hires-v1.json",
       "evidence": {
@@ -101,6 +109,7 @@
     {
       "name": "Illustrious hires detailer",
       "version": "1",
+      "model_family": "illustrious",
       "object_key": "workflows/by-sha256/d0b9a01f848632ca6f5c0635f4f10e3bd0c5255fd827c7b6f88caf17de865a20.json",
       "local_path": "../workflows/illustrious-sdxl-hires-detailer-v1.json",
       "evidence": {
@@ -115,6 +124,7 @@
     {
       "name": "Illustrious couple base",
       "version": "1",
+      "model_family": "illustrious",
       "object_key": "workflows/by-sha256/539bfdf81d9668b6e0c60c77034ac5ff3c4d233e468c1f3dd1fe398415892923.json",
       "local_path": "../workflows/illustrious-sdxl-couple-base-v1.json",
       "evidence": {
@@ -129,6 +139,7 @@
     {
       "name": "Illustrious couple base detailer",
       "version": "1",
+      "model_family": "illustrious",
       "object_key": "workflows/by-sha256/62f8db236c95a5c88f130c1fc10fa34dbc7455dba45695081aa5bc19d2bde890.json",
       "local_path": "../workflows/illustrious-sdxl-couple-base-detailer-v1.json",
       "evidence": {
@@ -143,6 +154,7 @@
     {
       "name": "Illustrious couple hires",
       "version": "1",
+      "model_family": "illustrious",
       "object_key": "workflows/by-sha256/b674f45c8b62f6742b74c1364f4c6b172ef2ed3446f4e29034e1c1da3727773c.json",
       "local_path": "../workflows/illustrious-sdxl-couple-hires-v1.json",
       "evidence": {
@@ -157,6 +169,7 @@
     {
       "name": "Illustrious couple hires detailer",
       "version": "1",
+      "model_family": "illustrious",
       "object_key": "workflows/by-sha256/9f2d863469bcc6ab069244c72797e19aa8a95aa9f253170fdd5066a754fe586e.json",
       "local_path": "../workflows/illustrious-sdxl-couple-hires-detailer-v1.json",
       "evidence": {
@@ -171,6 +184,7 @@
     {
       "name": "Illustrious Controlled Duo balanced",
       "version": "2",
+      "model_family": "illustrious",
       "object_key": "workflows/by-sha256/22b44fda25e43bf6b4bf7cc289d36c6aaa69eef3ef188d6f527a496c4d3f5205.json",
       "local_path": "../workflows/illustrious-sdxl-controlled-duo-balanced-v2.json",
       "capabilities": [
@@ -191,6 +205,7 @@
     {
       "name": "Illustrious Controlled Duo strict",
       "version": "2",
+      "model_family": "illustrious",
       "object_key": "workflows/by-sha256/3a8db7bbfc75f472d5a5048052773410bf202382c8b76b2a8241f5ad7a1495f2.json",
       "local_path": "../workflows/illustrious-sdxl-controlled-duo-strict-v2.json",
       "capabilities": [
@@ -212,6 +227,7 @@
     {
       "name": "Illustrious Controlled Trio balanced",
       "version": "1",
+      "model_family": "illustrious",
       "object_key": "workflows/by-sha256/100a3ed840007591f2cfcc0f3277f787f351caeef82610b46952bb826428f71a.json",
       "local_path": "../workflows/illustrious-sdxl-controlled-trio-balanced-v1.json",
       "capabilities": [

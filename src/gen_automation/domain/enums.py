@@ -347,6 +347,13 @@ class ModelArtifactKind(StrEnum):
     LORA = "lora"
 
 
+class GenerationModelFamily(StrEnum):
+    """Compatible txt2img model, workflow, and LoRA families."""
+
+    ILLUSTRIOUS = "illustrious"
+    ANIMA = "anima"
+
+
 class ManagedLoraLifecycle(StrEnum):
     """Durable deployment lifecycle for one content-addressed LoRA."""
 

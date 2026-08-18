@@ -467,6 +467,64 @@ def test_warm_session_routes_are_exact_authenticated_and_idempotent(client: Test
     assert final.json()["state"] == "ending"
 
 
+def test_manual_warm_start_freezes_the_selected_checkpoint_stack(client: TestClient) -> None:
+    options = _seed_options(client)
+    _configure_worker_manifest(client, options)
+    _seed_warm_deployment(client)
+    page = client.get("/dashboard/experiments/new")
+    csrf = _hidden_value(page.text, "csrf_token")
+    headers = {"X-CSRF-Token": csrf}
+    checkpoint_sha256 = options.checkpoints[0].sha256
+
+    malformed = client.post(
+        "/dashboard/experiments/warm-session/start",
+        json={
+            "duration_minutes": 15,
+            "requested_checkpoint_sha256": "not-a-digest",
+            "requested_lora_sha256s": [],
+        },
+        headers=headers,
+    )
+    unavailable = client.post(
+        "/dashboard/experiments/warm-session/start",
+        json={
+            "duration_minutes": 15,
+            "requested_checkpoint_sha256": "f" * 64,
+            "requested_lora_sha256s": [],
+        },
+        headers=headers,
+    )
+    started = client.post(
+        "/dashboard/experiments/warm-session/start",
+        json={
+            "duration_minutes": 15,
+            "requested_checkpoint_sha256": checkpoint_sha256,
+            "requested_lora_sha256s": [],
+        },
+        headers=headers,
+    )
+
+    assert malformed.status_code == 422
+    assert unavailable.status_code == 409
+    assert started.status_code == 200
+    assert started.json()["requested_checkpoint_sha256"] == checkpoint_sha256
+    assert started.json()["requested_lora_sha256s"] == []
+
+    database = client.app.state.database
+    assert client.portal is not None
+
+    async def selection() -> tuple[str | None, list[str] | None]:
+        async with database.sessions() as session:
+            lease = await session.scalar(select(ExperimentWarmLease))
+            assert lease is not None
+            return lease.requested_checkpoint_sha256, lease.requested_lora_sha256s
+
+    assert client.portal.call(selection) == (checkpoint_sha256, [])
+    script = client.get("/static/dashboard.js")
+    assert "requested_checkpoint_sha256: checkpointSha256" in script.text
+    assert "requested_lora_sha256s: Array.from(new Set(loraSha256s))" in script.text
+
+
 def test_focus_session_can_hold_the_shared_worker_for_ninety_minutes(
     client: TestClient,
 ) -> None:
