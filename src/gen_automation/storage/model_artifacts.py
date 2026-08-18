@@ -30,6 +30,7 @@ from gen_automation.storage.base import (
 MAX_MANAGED_LORA_BYTES = 4 * 1024 * 1024 * 1024
 MAX_SAFETENSORS_HEADER_BYTES = 16 * 1024 * 1024
 MAX_SAFETENSORS_TENSORS = 100_000
+MAX_SAFETENSORS_METADATA_VALUE_CHARS = 64 * 1024
 DEFAULT_MULTIPART_PART_BYTES = 8 * 1024 * 1024
 MIN_MULTIPART_PART_BYTES = 5 * 1024 * 1024
 MAX_MULTIPART_PART_BYTES = 100 * 1024 * 1024
@@ -536,7 +537,7 @@ def _inspect_safetensors_header(
                 or not isinstance(item, str)
                 or not key
                 or len(key) > 500
-                or len(item) > 10_000
+                or len(item) > MAX_SAFETENSORS_METADATA_VALUE_CHARS
             ):
                 raise ModelArtifactValidationError("Safetensors metadata is invalid")
         metadata_keys = tuple(sorted(metadata_value))
