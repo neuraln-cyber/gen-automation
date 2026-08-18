@@ -244,6 +244,10 @@ def test_salad_artifact_reader_is_disabled_and_exact_version_only() -> None:
     assert 'variable = "s3:VersionId"' in reader_policy
     assert "statement.value" in reader_policy
     assert "i2v/manifests/sha256/" in variables
+    assert "diffusion-models|loras|detectors|text-encoders|vae" in variables
+    assert "worker/diffusion-models/" in tfvars
+    assert "worker/text-encoders/" in tfvars
+    assert "worker/vae/" in tfvars
     assert "ReadPinnedI2vManifest" in control_policy
     assert 'actions   = ["s3:GetObjectVersion"]' in control_policy
     assert 'variable = "s3:VersionId"' in control_policy

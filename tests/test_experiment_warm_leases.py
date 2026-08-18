@@ -11,6 +11,8 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import gen_automation.services.experiment_warm_leases as warm_lease_service
+from gen_automation.config import Settings
 from gen_automation.db.models import (
     AuditEvent,
     ExperimentWarmLease,
@@ -51,6 +53,7 @@ from gen_automation.services.experiment_warm_leases import (
     start_experiment_warm_lease,
     touch_completed_experiment_warm_leases,
 )
+from gen_automation.services.managed_artifact_manifest import ManagedArtifactManifestError
 from gen_automation.services.outbox import SALAD_JOB_SUBMIT_TOPIC
 from gen_automation.services.salad import prepare_generation_attempt
 from gen_automation.services.salad_deployments import (
@@ -266,6 +269,8 @@ async def test_allocation_does_not_consume_the_idle_testing_window(
         assert started.expires_at == started.hard_expires_at
         assert started.idle_ttl_seconds == 15 * 60
         assert started.max_cost_microusd == 540_000
+        assert started.requested_checkpoint_sha256 is None
+        assert started.requested_lora_sha256s is None
         assert (
             await effective_experiment_min_replicas(
                 session,
@@ -315,6 +320,104 @@ async def test_allocation_does_not_consume_the_idle_testing_window(
         assert active.provider_version == 9
         assert active.expires_at == activated_at + timedelta(minutes=15)
         assert active.remaining_seconds == 15 * 60
+
+
+@pytest.mark.asyncio
+async def test_explicit_warm_selection_is_validated_frozen_and_idempotent(
+    warm_context: WarmContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_sha256 = "b" * 64
+    lora_sha256s = ("d" * 64, "c" * 64)
+    validations: list[tuple[str, tuple[str, ...]]] = []
+
+    async def validate_manifest(
+        _session: AsyncSession,
+        *,
+        settings: Settings,
+        required_checkpoint_sha256: str,
+        required_lora_sha256s: tuple[str, ...],
+        **_kwargs: object,
+    ) -> object:
+        del settings
+        validations.append((required_checkpoint_sha256, required_lora_sha256s))
+        return object()
+
+    monkeypatch.setattr(
+        warm_lease_service,
+        "effective_artifact_manifest_from_settings",
+        validate_manifest,
+    )
+    async with warm_context.database.sessions() as session:
+        started = await start_experiment_warm_lease(
+            session,
+            salad_deployment_id=warm_context.deployment_id,
+            actor="test",
+            requested_checkpoint_sha256=checkpoint_sha256,
+            requested_lora_sha256s=lora_sha256s,
+            settings=Settings(),
+            now=NOW,
+        )
+        assert started.requested_checkpoint_sha256 == checkpoint_sha256
+        assert started.requested_lora_sha256s == tuple(sorted(lora_sha256s))
+        lease = await session.get(ExperimentWarmLease, started.lease_id)
+        assert lease is not None
+        assert lease.requested_checkpoint_sha256 == checkpoint_sha256
+        assert lease.requested_lora_sha256s == sorted(lora_sha256s)
+        await session.commit()
+
+    async with warm_context.database.sessions() as session:
+        replay = await ensure_experiment_warm_lease(
+            session,
+            actor="test",
+            requested_checkpoint_sha256=checkpoint_sha256,
+            requested_lora_sha256s=tuple(reversed(lora_sha256s)),
+            settings=Settings(),
+            now=NOW + timedelta(seconds=1),
+        )
+        assert replay.lease_id == started.lease_id
+        with pytest.raises(ExperimentWarmLeaseConflictError, match=r"different.*stack"):
+            await ensure_experiment_warm_lease(
+                session,
+                actor="test",
+                requested_checkpoint_sha256="e" * 64,
+                requested_lora_sha256s=(),
+                settings=Settings(),
+                now=NOW + timedelta(seconds=2),
+            )
+
+    assert validations == [
+        (checkpoint_sha256, tuple(sorted(lora_sha256s))),
+        (checkpoint_sha256, tuple(sorted(lora_sha256s))),
+        ("e" * 64, ()),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_invalid_explicit_warm_manifest_fails_before_lease_creation(
+    warm_context: WarmContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def reject_manifest(*_args: object, **_kwargs: object) -> object:
+        raise ManagedArtifactManifestError("missing")
+
+    monkeypatch.setattr(
+        warm_lease_service,
+        "effective_artifact_manifest_from_settings",
+        reject_manifest,
+    )
+    async with warm_context.database.sessions() as session:
+        with pytest.raises(ExperimentWarmLeaseConflictError, match="selection is unavailable"):
+            await start_experiment_warm_lease(
+                session,
+                salad_deployment_id=warm_context.deployment_id,
+                actor="test",
+                requested_checkpoint_sha256="f" * 64,
+                requested_lora_sha256s=(),
+                settings=Settings(),
+                now=NOW,
+            )
+        assert await session.scalar(select(ExperimentWarmLease.id)) is None
 
 
 @pytest.mark.asyncio

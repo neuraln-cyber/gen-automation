@@ -86,6 +86,7 @@ from gen_automation.services.lora_runtime import LoraRuntime
 from gen_automation.services.managed_artifact_manifest import (
     EffectiveArtifactManifest,
     ManagedArtifactManifestError,
+    default_checkpoint_sha256_from_settings,
     effective_artifact_manifest_from_settings,
 )
 from gen_automation.services.mega_set_delivery import (
@@ -266,6 +267,21 @@ def _required_lora_sha256s(parameters: Mapping[str, object]) -> frozenset[str]:
             raise RuntimeError("generation LoRA identity is invalid")
         hashes.add(sha256)
     return frozenset(hashes)
+
+
+def _required_checkpoint_sha256(parameters: Mapping[str, object]) -> str:
+    raw_checkpoint = parameters.get("checkpoint")
+    if not isinstance(raw_checkpoint, dict):
+        raise RuntimeError("generation primary model parameters are invalid")
+    sha256 = raw_checkpoint.get("sha256")
+    if (
+        not isinstance(sha256, str)
+        or len(sha256) != 64
+        or sha256 != sha256.lower()
+        or any(character not in "0123456789abcdef" for character in sha256)
+    ):
+        raise RuntimeError("generation primary model identity is invalid")
+    return sha256
 
 
 def _resident_managed_lora_sha256s(value: object) -> frozenset[str] | None:
@@ -840,11 +856,13 @@ class ControllerWorkloads:
         self,
         session: AsyncSession,
         *,
+        required_checkpoint_sha256: str,
         required_lora_sha256s: Sequence[str] = (),
     ) -> EffectiveArtifactManifest:
         return await effective_artifact_manifest_from_settings(
             session,
             settings=self.settings,
+            required_checkpoint_sha256=required_checkpoint_sha256,
             required_lora_sha256s=required_lora_sha256s,
         )
 
@@ -1187,10 +1205,19 @@ class ControllerWorkloads:
             required_lora_sha256s = (
                 _required_lora_sha256s(pending_parameters)
                 if pending_parameters is not None
-                else frozenset()
+                else frozenset(lease.requested_lora_sha256s or ())
+            )
+            required_checkpoint_sha256 = (
+                _required_checkpoint_sha256(pending_parameters)
+                if pending_parameters is not None
+                else (
+                    lease.requested_checkpoint_sha256
+                    or default_checkpoint_sha256_from_settings(self.settings)
+                )
             )
             effective_manifest = await self._effective_artifact_manifest(
                 session,
+                required_checkpoint_sha256=required_checkpoint_sha256,
                 required_lora_sha256s=tuple(sorted(required_lora_sha256s)),
             )
             refreshed = await refresh_container_group_runtime(
@@ -1738,6 +1765,7 @@ class ControllerWorkloads:
                         provider_external_id=attempt.provider_external_id,
                     )
             required_lora_sha256s = _required_lora_sha256s(job_parameters)
+            required_checkpoint_sha256 = _required_checkpoint_sha256(job_parameters)
             active_attempt_id: UUID | None = None
             cold_queue_admission_required = False
             resident = _resident_managed_lora_sha256s(deployment.runtime_managed_lora_sha256s)
@@ -1749,6 +1777,7 @@ class ControllerWorkloads:
             try:
                 effective_manifest = await self._effective_artifact_manifest(
                     session,
+                    required_checkpoint_sha256=required_checkpoint_sha256,
                     required_lora_sha256s=tuple(
                         sorted(required_lora_sha256s | (resident or frozenset()))
                     ),
@@ -1758,6 +1787,7 @@ class ControllerWorkloads:
                     raise _RuntimeArtifactManifestBusyError from None
                 effective_manifest = await self._effective_artifact_manifest(
                     session,
+                    required_checkpoint_sha256=required_checkpoint_sha256,
                     required_lora_sha256s=tuple(sorted(required_lora_sha256s)),
                 )
             if (
@@ -1768,6 +1798,7 @@ class ControllerWorkloads:
             ):
                 effective_manifest = await self._effective_artifact_manifest(
                     session,
+                    required_checkpoint_sha256=required_checkpoint_sha256,
                     required_lora_sha256s=tuple(sorted(required_lora_sha256s)),
                 )
             if attempt_state != GenerationAttemptState.CREATED:

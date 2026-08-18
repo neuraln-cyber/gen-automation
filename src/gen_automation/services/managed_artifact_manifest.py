@@ -1,9 +1,11 @@
-"""Build the exact worker manifest from static artifacts plus active managed LoRAs.
+"""Build a demand-scoped worker manifest from the immutable artifact catalog.
 
-The deployment manifest remains the authority for checkpoints, detectors, and
-operator-managed LoRAs.  Dashboard onboarding may only append immutable LoRA
-objects whose catalog lifecycle is ACTIVE and whose compliance approval is
-still current.  Nothing in this module performs provider or storage I/O.
+The deployment manifest remains the authority for every selectable primary,
+support artifact, detector, and operator-managed LoRA. Runtime callers select
+one primary, the pinned static LoRAs approved for that family, and the exact
+dynamic LoRA stack; Anima additionally receives the pinned text encoder and
+VAE. Dashboard onboarding may append only immutable active LoRAs with current
+approval. Nothing here performs provider or storage I/O.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from gen_automation.config import Settings
 from gen_automation.db.models import ManagedLoraArtifact, ModelArtifactApproval
 from gen_automation.domain.enums import (
     ApprovalStatus,
+    GenerationModelFamily,
     ManagedLoraLifecycle,
     ModelArtifactKind,
 )
@@ -51,19 +54,40 @@ class EffectiveArtifactManifest:
         return self.manifest.manifest_sha256
 
 
+def default_checkpoint_sha256_from_settings(settings: Settings) -> str:
+    """Return the sole legacy checkpoint used for a model-agnostic warm start."""
+
+    raw_manifest = settings.salad_worker_model_manifest_json
+    expected_sha256 = settings.salad_worker_model_manifest_sha256
+    if raw_manifest is None or expected_sha256 is None:
+        raise ManagedArtifactManifestError("worker artifact configuration is unavailable")
+    baseline = load_artifact_manifest(raw_manifest.get_secret_value())
+    if baseline.manifest_sha256 != expected_sha256.get_secret_value():
+        raise ManagedArtifactManifestError("worker artifact manifest trust anchor changed")
+    checkpoints = tuple(
+        artifact for artifact in baseline.artifacts if artifact.kind == ArtifactKind.CHECKPOINT
+    )
+    if len(checkpoints) != 1:
+        raise ManagedArtifactManifestError("default worker checkpoint is not uniquely pinned")
+    return checkpoints[0].sha256
+
+
 async def effective_artifact_manifest_from_settings(
     session: AsyncSession,
     *,
     settings: Settings,
     additional_artifact_ids: Collection[UUID] = (),
+    required_checkpoint_sha256: str | None = None,
     required_lora_sha256s: Collection[str] | None = None,
 ) -> EffectiveArtifactManifest:
-    """Load the pinned baseline and merge only the managed LoRAs in scope.
+    """Load the pinned catalog and build the exact manifest needed by one job.
 
     ``None`` retains the catalog-wide validation mode used by administrative
     callers.  A concrete collection is the runtime mode: the worker manifest
-    contains the static baseline plus only the LoRAs required by one compatible
-    batch.  This keeps cold-worker S3 egress independent of library size.
+    contains one primary, its small family-compatible static LoRA bundle, only
+    the dynamic LoRAs required by one compatible batch, and family-specific
+    support artifacts. This preserves warm prompt/style iteration without
+    downloading the other family's multi-gigabyte core.
     """
 
     raw_manifest = settings.salad_worker_model_manifest_json
@@ -79,6 +103,7 @@ async def effective_artifact_manifest_from_settings(
         baseline=baseline,
         expected_bucket=artifact_bucket.get_secret_value(),
         additional_artifact_ids=additional_artifact_ids,
+        required_checkpoint_sha256=required_checkpoint_sha256,
         required_lora_sha256s=required_lora_sha256s,
     )
     artifact_bytes = sum(artifact.max_size_bytes for artifact in effective.manifest.artifacts)
@@ -98,12 +123,19 @@ async def build_effective_artifact_manifest(
     baseline: ArtifactManifest,
     expected_bucket: str,
     additional_artifact_ids: Collection[UUID] = (),
+    required_checkpoint_sha256: str | None = None,
     required_lora_sha256s: Collection[str] | None = None,
 ) -> EffectiveArtifactManifest:
-    """Merge the selected managed LoRAs into a validated deterministic manifest."""
+    """Select one family stack and merge its managed LoRAs deterministically."""
 
     additional_ids = tuple(additional_artifact_ids)
     required_hashes = None if required_lora_sha256s is None else frozenset(required_lora_sha256s)
+    if required_checkpoint_sha256 is not None and (
+        len(required_checkpoint_sha256) != 64
+        or required_checkpoint_sha256 != required_checkpoint_sha256.lower()
+        or any(character not in "0123456789abcdef" for character in required_checkpoint_sha256)
+    ):
+        raise ManagedArtifactManifestError("required primary model identity is invalid")
     if required_hashes is not None and any(
         not isinstance(value, str)
         or len(value) != 64
@@ -112,6 +144,71 @@ async def build_effective_artifact_manifest(
         for value in required_hashes
     ):
         raise ManagedArtifactManifestError("required LoRA identity is invalid")
+    all_baseline_artifacts = list(baseline.artifacts)
+    selected_family: GenerationModelFamily | None = None
+    family_static_lora_hashes: frozenset[str] | None = None
+    primary: ModelArtifactSpec | None = None
+    if required_checkpoint_sha256 is not None:
+        primary_matches = [
+            artifact
+            for artifact in all_baseline_artifacts
+            if artifact.kind in {ArtifactKind.CHECKPOINT, ArtifactKind.DIFFUSION_MODEL}
+            and artifact.sha256 == required_checkpoint_sha256
+        ]
+        if len(primary_matches) != 1:
+            raise ManagedArtifactManifestError(
+                "required primary model is not present in the pinned baseline"
+            )
+        primary = primary_matches[0]
+        selected_family = (
+            GenerationModelFamily.ANIMA
+            if primary.kind == ArtifactKind.DIFFUSION_MODEL
+            else GenerationModelFamily.ILLUSTRIOUS
+        )
+        primary_approval = await session.scalar(
+            select(ModelArtifactApproval.id).where(
+                ModelArtifactApproval.artifact_sha256 == primary.sha256,
+                ModelArtifactApproval.kind == ModelArtifactKind.CHECKPOINT,
+                ModelArtifactApproval.model_family == selected_family,
+                ModelArtifactApproval.status == ApprovalStatus.APPROVED,
+                ModelArtifactApproval.is_current.is_(True),
+                or_(
+                    ModelArtifactApproval.commercial_use_approved.is_(True),
+                    ModelArtifactApproval.experiment_only.is_(True),
+                ),
+                ModelArtifactApproval.adult_use_approved.is_(True),
+                ModelArtifactApproval.safetensors_verified.is_(True),
+            )
+        )
+        if primary_approval is None:
+            raise ManagedArtifactManifestError(
+                "required primary model family approval is unavailable"
+            )
+        baseline_lora_hashes = tuple(
+            artifact.sha256
+            for artifact in all_baseline_artifacts
+            if artifact.kind == ArtifactKind.LORA
+        )
+        if baseline_lora_hashes:
+            approved_family_lora_hashes = await session.scalars(
+                select(ModelArtifactApproval.artifact_sha256).where(
+                    ModelArtifactApproval.artifact_sha256.in_(baseline_lora_hashes),
+                    ModelArtifactApproval.kind == ModelArtifactKind.LORA,
+                    ModelArtifactApproval.model_family == selected_family,
+                    ModelArtifactApproval.status == ApprovalStatus.APPROVED,
+                    ModelArtifactApproval.is_current.is_(True),
+                    or_(
+                        ModelArtifactApproval.commercial_use_approved.is_(True),
+                        ModelArtifactApproval.experiment_only.is_(True),
+                    ),
+                    ModelArtifactApproval.adult_use_approved.is_(True),
+                    ModelArtifactApproval.safetensors_verified.is_(True),
+                )
+            )
+            family_static_lora_hashes = frozenset(approved_family_lora_hashes.all())
+        else:
+            family_static_lora_hashes = frozenset()
+
     active_or_draining = or_(
         ManagedLoraArtifact.lifecycle == ManagedLoraLifecycle.ACTIVE,
         and_(
@@ -133,6 +230,16 @@ async def build_effective_artifact_manifest(
         if additional_ids
         else selected_catalog
     )
+    managed_approval_predicates = [
+        ModelArtifactApproval.status == ApprovalStatus.APPROVED,
+        ModelArtifactApproval.is_current.is_(True),
+        ModelArtifactApproval.kind == ModelArtifactKind.LORA,
+        ModelArtifactApproval.commercial_use_approved.is_(True),
+        ModelArtifactApproval.adult_use_approved.is_(True),
+        ModelArtifactApproval.safetensors_verified.is_(True),
+    ]
+    if selected_family is not None:
+        managed_approval_predicates.append(ModelArtifactApproval.model_family == selected_family)
     rows = list(
         (
             await session.execute(
@@ -143,12 +250,7 @@ async def build_effective_artifact_manifest(
                 )
                 .where(
                     lifecycle_predicate,
-                    ModelArtifactApproval.status == ApprovalStatus.APPROVED,
-                    ModelArtifactApproval.is_current.is_(True),
-                    ModelArtifactApproval.kind == ModelArtifactKind.LORA,
-                    ModelArtifactApproval.commercial_use_approved.is_(True),
-                    ModelArtifactApproval.adult_use_approved.is_(True),
-                    ModelArtifactApproval.safetensors_verified.is_(True),
+                    *managed_approval_predicates,
                 )
                 .order_by(
                     ManagedLoraArtifact.display_name,
@@ -157,14 +259,49 @@ async def build_effective_artifact_manifest(
             )
         ).all()
     )
-    artifacts = list(baseline.artifacts)
-    baseline_hashes = {artifact.sha256 for artifact in artifacts}
+    artifacts = list(all_baseline_artifacts)
+    if required_checkpoint_sha256 is not None:
+        if primary is None or family_static_lora_hashes is None:
+            raise ManagedArtifactManifestError("required primary model family is unavailable")
+        if primary.kind == ArtifactKind.DIFFUSION_MODEL:
+            text_encoders = [
+                artifact
+                for artifact in all_baseline_artifacts
+                if artifact.kind == ArtifactKind.TEXT_ENCODER
+            ]
+            vaes = [
+                artifact for artifact in all_baseline_artifacts if artifact.kind == ArtifactKind.VAE
+            ]
+            if len(text_encoders) != 1 or len(vaes) != 1:
+                raise ManagedArtifactManifestError(
+                    "Anima runtime support artifacts are not uniquely pinned"
+                )
+        artifacts = [
+            artifact
+            for artifact in all_baseline_artifacts
+            if (
+                (
+                    artifact.kind in {ArtifactKind.CHECKPOINT, ArtifactKind.DIFFUSION_MODEL}
+                    and artifact.sha256 == required_checkpoint_sha256
+                )
+                or (
+                    artifact.kind == ArtifactKind.LORA
+                    and artifact.sha256 in family_static_lora_hashes
+                )
+                or artifact.kind == ArtifactKind.DETECTOR
+                or (
+                    primary.kind == ArtifactKind.DIFFUSION_MODEL
+                    and artifact.kind in {ArtifactKind.TEXT_ENCODER, ArtifactKind.VAE}
+                )
+            )
+        ]
+    baseline_hashes = {artifact.sha256 for artifact in all_baseline_artifacts}
     available_lora_hashes = {
         artifact.sha256 for artifact in artifacts if artifact.kind == ArtifactKind.LORA
     }
-    baseline_names = {artifact.logical_name.casefold() for artifact in artifacts}
+    baseline_names = {artifact.logical_name.casefold() for artifact in all_baseline_artifacts}
     baseline_targets = {
-        (artifact.kind, artifact.target_filename.casefold()) for artifact in artifacts
+        (artifact.kind, artifact.target_filename.casefold()) for artifact in all_baseline_artifacts
     }
     managed_hashes: set[str] = set()
     for managed, approval in rows:

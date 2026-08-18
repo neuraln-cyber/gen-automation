@@ -1,30 +1,38 @@
 # Artifact and workflow onboarding
 
 `gen-automation-artifacts` is the one-off operator path for checkpoints,
-LoRAs, the optional face detector, and the bundled ComfyUI workflows. Adding
-an artifact is an edit-and-rerun operation; no database row or worker manifest
-is written by hand.
+diffusion models, LoRAs, model-family support files, the optional face
+detector, and the bundled ComfyUI workflows. Adding an artifact is an
+edit-and-rerun operation; no database row or worker manifest is written by
+hand.
 
 The command:
 
 1. resolves the one active owner, or the `owner_username` named in the plan;
 2. hashes and format-checks each mounted `.safetensors` or detector `.pt` file
    with the same validators used during GPU-worker bootstrap;
-3. verifies that the exact worker-artifact object key already has the same byte
+3. when `base_manifest_path` is set, validates the self-verifying currently
+   deployed catalog and rechecks every retained artifact at its exact object
+   key and immutable VersionId;
+4. verifies that each new worker-artifact object key already has the same byte
    size and `sha256` object metadata, then pins its non-null object VersionId in
-   the worker manifest;
-4. parses each workflow with duplicate-key, depth, item-count, and size bounds,
+   the catalog;
+5. unions retained and new entries deterministically, rejecting changed or
+   colliding identities, logical names, object keys, and runtime targets;
+6. parses each workflow with duplicate-key, depth, item-count, and size bounds,
    then rejects every node class outside the worker allowlist;
-5. requires the workflow SHA-256 in its content-addressed object key, uploads
+7. requires the workflow SHA-256 in its content-addressed object key, uploads
    it with a create-only write, or verifies the existing object byte-for-byte;
-6. creates or reaffirms the current checkpoint, LoRA, and workflow compliance
-   approvals through the existing audited registry service; and
-7. writes canonical `ArtifactManifest` JSON plus its separate SHA-256 trust
-   anchor.
+8. creates or reaffirms the current primary-model, LoRA, and workflow
+   compliance approvals through the existing audited registry service while
+   retaining the explicit `model_family`; and
+9. writes canonical `ArtifactManifest` catalog JSON plus its separate SHA-256
+   trust anchor.
 
-It never proxies a multi-gigabyte model through FastAPI. Checkpoints, LoRAs,
-and detector files cross the large-file boundary directly into the private
-worker artifact bucket. This keeps memory use and cloud egress predictable.
+It never proxies a multi-gigabyte model through FastAPI. Primary models,
+LoRAs, text encoders, VAEs, and detector files cross the large-file boundary
+directly into the private worker artifact bucket. This keeps memory use and
+cloud egress predictable.
 
 ## Prerequisites
 
@@ -90,11 +98,72 @@ The onboarding command refuses a missing object, a size mismatch, or absent or
 different `sha256` metadata. The GPU worker independently downloads and hashes
 the complete object before ComfyUI starts.
 
+## Anima family onboarding
+
+The pinned artifact catalog retains all approved static families. Its Anima
+entries use these roles:
+
+- one or more `diffusion_model` entries for the selectable primary model;
+- exactly one `text_encoder` and one `vae` support entry; and
+- zero or more `lora` entries whose approvals also declare
+  `"model_family": "anima"`.
+
+The onboarding service maps a `diffusion_model` to the existing semantic
+`checkpoint` approval kind. This preserves the release contract: the user
+selects one primary model regardless of whether ComfyUI loads it with
+`CheckpointLoaderSimple` or `UNETLoader`. Text encoders, VAEs, and detectors
+are not release-selectable. They therefore have no model approval block or
+registry row; their exact key, VersionId, size, SHA-256, target filename, and
+manifest trust anchor still fail closed at worker bootstrap.
+
+Use the exact-key namespaces `worker/diffusion-models/`,
+`worker/text-encoders/`, and `worker/vae/`. Add every resulting immutable
+VersionId to `salad_worker_artifact_object_versions`, just as for existing
+checkpoint and LoRA objects. Append Anima's primary model, text encoder, VAE,
+and LoRAs to the pinned catalog by setting `base_manifest_path` to an exact
+read-only copy of the currently deployed catalog. The generated catalog must
+retain the Illustrious entries. At job admission, the controller derives a
+demand-scoped runtime manifest containing only the selected primary model,
+selected family-compatible LoRAs, and that family's required support files.
+Consequently, catalog membership does not cause an Illustrious replica to
+download unused Anima bytes or pay their cold-start egress cost.
+
+[`examples/anima-artifact-onboarding-plan.template.json`](../examples/anima-artifact-onboarding-plan.template.json)
+pins the researched MiaoMiao Anima Base, Qwen text encoder, Qwen image VAE,
+three Anima LoRAs, and bundled Anima workflow by exact SHA-256 and byte size.
+Its `base_manifest_path` deliberately points at
+`../catalog/current-deployed-artifact-manifest.json`; replace or mount that
+file with the exact catalog currently pinned in deployment configuration. The
+command refuses a missing or invalid base manifest, a retained artifact whose
+pinned remote version is unavailable or has mismatched metadata, and any new
+entry that conflicts with the retained catalog. Before running, compare the
+base file's `manifest_sha256` with the separately deployed
+`GEN_AUTOMATION_SALAD_WORKER_MODEL_MANIFEST_SHA256` trust anchor; abort the
+handoff if they differ.
+Its selectable artifacts are truthfully marked
+`"commercial_use_approved": false` and `"experiment_only": true`. Stock
+Anima's license permits internal non-production testing and evaluation; those
+approvals do not authorize the normal production queue, public hosting, or
+commercial generation. Copy the template, independently validate the mounted
+Safetensors, review the version-specific evidence, and keep it on the bounded
+experiment path. Changing `experiment_only` to false requires separate,
+documented rights that permit the intended deployment; never change the flag
+merely to bypass the route gate.
+
+Every selectable artifact approval and workflow entry carries
+`model_family`. Existing plans default to `illustrious` for compatibility, but
+operator plans should set the field explicitly. A workflow family must match a
+primary model family in the same plan. Exact Civitai model-version URLs are
+accepted only in canonical `https://civitai.com/models/<id>?modelVersionId=<id>`
+form; arbitrary query strings remain rejected.
+
 ## Edit and apply the plan
 
-Copy
-`examples/artifact-onboarding-plan.json`, replace its model paths, object keys,
-source/license evidence, and optional owner username, then run:
+Copy `examples/artifact-onboarding-plan.json`, replace its model paths, object
+keys, source/license evidence, explicit model-family fields, and optional owner
+username, then run. That generic example sets `base_manifest_path` to `null`
+because it describes an initial bootstrap; replace it with the deployed
+catalog path for every update:
 
 ```bash
 python -m gen_automation.artifact_onboarding_cli \
@@ -111,6 +180,7 @@ docker run --rm \
   --mount type=bind,src="$PWD/examples",dst=/config,readonly \
   --mount type=bind,src="$PWD/models",dst=/models,readonly \
   --mount type=bind,src="$PWD/workflows",dst=/workflows,readonly \
+  --mount type=bind,src="$PWD/catalog",dst=/catalog,readonly \
   --mount type=bind,src="$PWD/restricted-output",dst=/restricted-output \
   ghcr.io/neuraln-cyber/gen-automation/control-plane:<immutable-tag> \
   python -m gen_automation.artifact_onboarding_cli \
@@ -118,14 +188,22 @@ docker run --rm \
   --manifest-out /restricted-output/artifact-manifest.json
 ```
 
-For that container layout, use `/models/...` and `/workflows/...` local paths
-in the mounted copy of the plan.
+For that container layout, use `/models/...`, `/workflows/...`, and
+`/catalog/current-deployed-artifact-manifest.json` local paths in the mounted
+copy of the plan.
 
 Paths in the plan are relative to the plan file unless absolute. A local model
 path is recommended because it lets this command independently hash and
 format-check the bytes. For an object that is already uploaded and not mounted,
 remove `local_path` and set both `sha256` and `exact_size_bytes`; the exact
 remote object metadata is still verified.
+
+Omit `base_manifest_path` only when bootstrapping the first catalog. Every
+additive update must use the exact currently deployed catalog as its base. The
+CLI protects that file like every other input: neither `--manifest-out` nor
+`--sha256-out` may overwrite it. An unchanged new entry already present in the
+base is deduplicated; any changed identity, name, source key, VersionId, or
+runtime target fails closed.
 
 The default trust-anchor sidecar is
 `artifact-manifest.json.sha256`. Put the JSON file's contents into
@@ -140,8 +218,11 @@ and SHA-256 are emitted. Editing model bytes requires a new object version (a
 new content-addressed key is still recommended) and a fresh run. Editing a
 workflow requires a new object key containing the new full SHA-256.
 
-Checkpoint and LoRA approvals retain the existing explicit commercial-use,
-adult-use, license, evidence, and Safetensors assertions. The detector is not a
-release-selectable model and therefore has no model-registry row; its exact
-source key, archive format, byte size, SHA-256, and separately deployed
-manifest trust anchor are enforced at worker startup.
+Primary-model and LoRA approvals retain explicit usage-scope, adult-use,
+license, evidence, Safetensors, and model-family assertions. Production
+approvals require `commercial_use_approved`; a non-commercial approval must be
+`experiment_only` and is rejected by normal production submission. The
+detector, text encoder, and VAE are not release-selectable models and therefore
+have no model-registry rows; their exact source keys, formats, byte sizes,
+SHA-256 values, and separately deployed manifest trust anchor are enforced at
+worker startup.

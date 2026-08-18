@@ -1,3 +1,4 @@
+import re
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 
@@ -6,6 +7,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StringConstraints,
     field_validator,
     model_validator,
@@ -16,6 +18,7 @@ from gen_automation.domain.controlled_duo import (
     WorkflowCapability,
     require_coherent_workflow_capabilities,
 )
+from gen_automation.domain.enums import GenerationModelFamily
 from gen_automation.gpu_worker.artifacts import (
     MAX_ARTIFACT_BYTES,
     MAX_ARTIFACTS,
@@ -38,9 +41,11 @@ class ModelApprovalPlan(StrictOnboardingModel):
     """The explicit rights and format assertions required by the existing registry."""
 
     name: str = Field(min_length=1, max_length=200)
+    model_family: GenerationModelFamily = GenerationModelFamily.ILLUSTRIOUS
     source_url: AnyHttpUrl
     license_url: AnyHttpUrl
-    commercial_use_approved: Literal[True]
+    commercial_use_approved: StrictBool
+    experiment_only: StrictBool = False
     adult_use_approved: Literal[True]
     safetensors_verified: Literal[True]
     evidence: ApprovalEvidence
@@ -55,17 +60,31 @@ class ModelApprovalPlan(StrictOnboardingModel):
     @field_validator("source_url", "license_url")
     @classmethod
     def validate_external_url(cls, value: AnyHttpUrl) -> AnyHttpUrl:
+        exact_civitai_version = bool(
+            (value.host or "").casefold() == "civitai.com"
+            and re.fullmatch(r"/models/[1-9][0-9]*", value.path or "")
+            and value.query is not None
+            and re.fullmatch(r"modelVersionId=[1-9][0-9]*", value.query)
+        )
         if (
             value.scheme != "https"
             or value.username is not None
             or value.password is not None
-            or value.query is not None
+            or (value.query is not None and not exact_civitai_version)
             or value.fragment is not None
         ):
             raise ValueError(
                 "model source and license URLs must be canonical credential-free HTTPS"
             )
         return value
+
+    @model_validator(mode="after")
+    def require_permitted_usage_scope(self) -> "ModelApprovalPlan":
+        if not self.commercial_use_approved and not self.experiment_only:
+            raise ValueError(
+                "non-commercial model approval must be restricted to experiment-only use"
+            )
+        return self
 
 
 class ArtifactOnboardingEntry(StrictOnboardingModel):
@@ -119,19 +138,31 @@ class ArtifactOnboardingEntry(StrictOnboardingModel):
             and self.max_size_bytes < self.exact_size_bytes
         ):
             raise ValueError("artifact maximum size cannot be lower than its exact size")
-        if self.kind == ArtifactKind.DETECTOR:
+        if self.kind in {
+            ArtifactKind.DETECTOR,
+            ArtifactKind.TEXT_ENCODER,
+            ArtifactKind.VAE,
+        }:
             if self.approval is not None:
                 raise ValueError(
-                    "detectors are protected by the worker manifest, not model approval"
+                    f"{self.kind.value} artifacts are protected by the worker manifest, "
+                    "not model approval"
                 )
         elif self.approval is None:
-            raise ValueError("checkpoint and LoRA entries require an approval block")
+            raise ValueError("selectable model artifacts require an approval block")
+        if (
+            self.kind == ArtifactKind.DIFFUSION_MODEL
+            and self.approval is not None
+            and self.approval.model_family != GenerationModelFamily.ANIMA
+        ):
+            raise ValueError("diffusion model approvals must use the Anima model family")
         return self
 
 
 class WorkflowOnboardingEntry(StrictOnboardingModel):
     name: str = Field(min_length=1, max_length=200)
     version: str = Field(min_length=1, max_length=100)
+    model_family: GenerationModelFamily = GenerationModelFamily.ILLUSTRIOUS
     object_key: str = Field(min_length=1, max_length=1_024)
     local_path: LocalPath
     capabilities: list[WorkflowCapability] = Field(default_factory=list, max_length=16)
@@ -174,19 +205,20 @@ class WorkflowOnboardingEntry(StrictOnboardingModel):
 class ArtifactOnboardingPlan(StrictOnboardingModel):
     version: Literal["v1"]
     owner_username: str | None = Field(default=None, min_length=1, max_length=200)
+    base_manifest_path: LocalPath | None = None
     artifacts: list[ArtifactOnboardingEntry] = Field(
         min_length=1,
         max_length=MAX_ARTIFACTS,
     )
     workflows: list[WorkflowOnboardingEntry] = Field(default_factory=list, max_length=16)
 
-    @field_validator("owner_username")
+    @field_validator("owner_username", "base_manifest_path")
     @classmethod
-    def validate_owner_username(cls, value: str | None) -> str | None:
+    def validate_optional_text(cls, value: str | None) -> str | None:
         if value is not None and (
             value != value.strip() or any(ord(character) < 32 for character in value)
         ):
-            raise ValueError("owner username must be trimmed visible text")
+            raise ValueError("optional onboarding text must be trimmed visible text")
         return value
 
     @model_validator(mode="after")
@@ -213,10 +245,31 @@ class ArtifactOnboardingPlan(StrictOnboardingModel):
         ):
             if len(values) != len(set(values)):
                 raise ValueError(message)
-        if not any(entry.kind == ArtifactKind.CHECKPOINT for entry in self.artifacts):
-            raise ValueError("artifact inventory requires at least one checkpoint")
+        primary_kinds = {ArtifactKind.CHECKPOINT, ArtifactKind.DIFFUSION_MODEL}
+        if not any(entry.kind in primary_kinds for entry in self.artifacts):
+            raise ValueError("artifact inventory requires at least one primary model")
         if sum(entry.kind == ArtifactKind.DETECTOR for entry in self.artifacts) > 1:
             raise ValueError("artifact inventory supports at most one detector")
+        diffusion_models = sum(
+            entry.kind == ArtifactKind.DIFFUSION_MODEL for entry in self.artifacts
+        )
+        text_encoders = sum(entry.kind == ArtifactKind.TEXT_ENCODER for entry in self.artifacts)
+        vaes = sum(entry.kind == ArtifactKind.VAE for entry in self.artifacts)
+        if diffusion_models:
+            if text_encoders != 1 or vaes != 1:
+                raise ValueError(
+                    "a diffusion-model inventory requires exactly one text encoder and one VAE"
+                )
+        elif text_encoders or vaes:
+            raise ValueError("text encoder and VAE support artifacts require a diffusion model")
+
+        primary_families = {
+            entry.approval.model_family
+            for entry in self.artifacts
+            if entry.kind in primary_kinds and entry.approval is not None
+        }
+        if any(workflow.model_family not in primary_families for workflow in self.workflows):
+            raise ValueError("workflow model family requires a matching primary model")
         return self
 
 

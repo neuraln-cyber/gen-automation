@@ -237,6 +237,10 @@ async def _selected_image_context(
         raise StorybookSourceConflictError(
             "selected release specification no longer passes validation"
         ) from None
+    if specification.experiment_only:
+        raise StorybookSourceAuthorizationError(
+            "experiment-only model outputs cannot be reused for storybooks"
+        )
 
     try:
         approval_snapshot = await validate_release_approvals(session, specification)

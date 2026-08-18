@@ -15,7 +15,11 @@ from gen_automation.domain.controlled_duo import (
     WorkflowCapability,
     require_coherent_workflow_capabilities,
 )
-from gen_automation.domain.enums import ApprovalStatus, ModelArtifactKind
+from gen_automation.domain.enums import (
+    ApprovalStatus,
+    GenerationModelFamily,
+    ModelArtifactKind,
+)
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 Slug = Annotated[
@@ -97,13 +101,21 @@ class ModelArtifactApprovalCreate(StrictComplianceModel):
     artifact_sha256: Sha256
     name: str = Field(min_length=1, max_length=200)
     kind: ModelArtifactKind
+    model_family: GenerationModelFamily = GenerationModelFamily.ILLUSTRIOUS
     source_url: AnyHttpUrl
     storage_key: str = Field(min_length=1, max_length=1_024)
     license_url: AnyHttpUrl
-    commercial_use_approved: Literal[True]
+    commercial_use_approved: bool
     adult_use_approved: Literal[True]
     safetensors_verified: Literal[True]
+    experiment_only: bool = False
     evidence: ApprovalEvidence
+
+    @model_validator(mode="after")
+    def require_approved_usage_scope(self) -> "ModelArtifactApprovalCreate":
+        if not self.commercial_use_approved and not self.experiment_only:
+            raise ValueError("non-commercial artifacts must be restricted to experiment-only use")
+        return self
 
     @field_validator("name")
     @classmethod
@@ -125,6 +137,7 @@ class WorkflowApprovalCreate(StrictComplianceModel):
     workflow_sha256: Sha256
     name: str = Field(min_length=1, max_length=200)
     version: str = Field(min_length=1, max_length=100)
+    model_family: GenerationModelFamily = GenerationModelFamily.ILLUSTRIOUS
     object_key: str = Field(min_length=1, max_length=1_024)
     reviewed_node_classes: list[str] = Field(min_length=1, max_length=128)
     capabilities: list[WorkflowCapability] = Field(default_factory=list, max_length=16)

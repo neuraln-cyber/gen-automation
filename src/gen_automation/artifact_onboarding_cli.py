@@ -154,6 +154,11 @@ def _validate_output_paths(
     sha256_path: Path,
 ) -> None:
     protected_paths = {plan_path}
+    if plan.base_manifest_path is not None:
+        base_manifest_path = Path(plan.base_manifest_path)
+        if not base_manifest_path.is_absolute():
+            base_manifest_path = plan_directory / base_manifest_path
+        protected_paths.add(base_manifest_path.resolve(strict=True))
     for value in (
         *(entry.local_path for entry in plan.artifacts if entry.local_path is not None),
         *(entry.local_path for entry in plan.workflows),

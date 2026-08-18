@@ -59,11 +59,14 @@ class ArtifactSpecification(StrictModel):
     license_url: AnyHttpUrl
     commercial_use_approved: bool
     adult_use_approved: bool
+    experiment_only: bool = False
 
     @model_validator(mode="after")
     def require_licence_approval(self) -> "ArtifactSpecification":
-        if not self.commercial_use_approved or not self.adult_use_approved:
-            raise ValueError("artifact requires commercial-use and adult-use approval")
+        if not self.adult_use_approved:
+            raise ValueError("artifact requires adult-use approval")
+        if not self.commercial_use_approved and not self.experiment_only:
+            raise ValueError("non-commercial artifacts must be restricted to experiment-only use")
         if not self.storage_key.lower().endswith(".safetensors"):
             raise ValueError("production model artifacts must use Safetensors")
         return self
@@ -388,6 +391,10 @@ class ReleaseSpecification(StrictModel):
                 generation=self.generation,
             ),
         )
+
+    @property
+    def experiment_only(self) -> bool:
+        return self.checkpoint.experiment_only or any(lora.experiment_only for lora in self.loras)
 
 
 class ProjectCreate(StrictModel):

@@ -25,7 +25,12 @@ from gen_automation.domain.compliance_registry import (
     SubjectApprovalCreate,
     WorkflowApprovalCreate,
 )
-from gen_automation.domain.enums import AdminRole, ApprovalStatus, ManagedLoraLifecycle
+from gen_automation.domain.enums import (
+    AdminRole,
+    ApprovalStatus,
+    GenerationModelFamily,
+    ManagedLoraLifecycle,
+)
 from gen_automation.services.compliance import canonical_source_sha256
 
 RegistryName = Literal["subject", "model_artifact", "workflow"]
@@ -202,11 +207,18 @@ async def approve_model_artifact(
 ) -> ApprovalMutationResult:
     approved_at = _as_utc(now or datetime.now(UTC))
     key = _idempotency_key(idempotency_key)
+    request_payload = command.model_dump(mode="json")
+    if command.model_family == GenerationModelFamily.ILLUSTRIOUS:
+        # Preserve request hashes for pre-family idempotency records.
+        request_payload.pop("model_family")
+    if not command.experiment_only:
+        # Preserve request hashes for pre-scope idempotency records.
+        request_payload.pop("experiment_only")
     request_sha256 = _request_sha256(
         registry="model_artifact",
         action="approve",
         actor_user_id=actor_user_id,
-        command=command.model_dump(mode="json"),
+        command=request_payload,
     )
     replay = await _idempotency_replay(
         session,
@@ -289,10 +301,12 @@ async def approve_model_artifact(
         artifact_sha256=command.artifact_sha256,
         name=command.name,
         kind=command.kind,
+        model_family=command.model_family,
         source_url=str(command.source_url),
         storage_key=command.storage_key,
         license_url=str(command.license_url),
-        commercial_use_approved=True,
+        commercial_use_approved=command.commercial_use_approved,
+        experiment_only=command.experiment_only,
         adult_use_approved=True,
         safetensors_verified=True,
         evidence=evidence,
@@ -328,11 +342,15 @@ async def approve_workflow(
 ) -> ApprovalMutationResult:
     approved_at = _as_utc(now or datetime.now(UTC))
     key = _idempotency_key(idempotency_key)
+    request_payload = command.model_dump(mode="json")
+    if command.model_family == GenerationModelFamily.ILLUSTRIOUS:
+        # Preserve request hashes for pre-family idempotency records.
+        request_payload.pop("model_family")
     request_sha256 = _request_sha256(
         registry="workflow",
         action="approve",
         actor_user_id=actor_user_id,
-        command=command.model_dump(mode="json"),
+        command=request_payload,
     )
     replay = await _idempotency_replay(
         session,
@@ -386,6 +404,7 @@ async def approve_workflow(
         workflow_sha256=command.workflow_sha256,
         name=command.name,
         version=command.version,
+        model_family=command.model_family,
         object_key=command.object_key,
         reviewed_node_classes=command.reviewed_node_classes,
         capabilities=[str(item) for item in command.capabilities],
@@ -797,10 +816,12 @@ def _artifact_matches(
         and approval.is_current
         and approval.name == command.name
         and approval.kind == command.kind
+        and approval.model_family == command.model_family
         and approval.source_url == str(command.source_url)
         and approval.storage_key == command.storage_key
         and approval.license_url == str(command.license_url)
-        and approval.commercial_use_approved
+        and approval.commercial_use_approved == command.commercial_use_approved
+        and approval.experiment_only == command.experiment_only
         and approval.adult_use_approved
         and approval.safetensors_verified
         and approval.evidence == evidence
@@ -820,6 +841,7 @@ def _workflow_matches(
         and approval.is_current
         and approval.name == command.name
         and approval.version == command.version
+        and approval.model_family == command.model_family
         and approval.object_key == command.object_key
         and approval.reviewed_node_classes == command.reviewed_node_classes
         and approval.capabilities == [str(item) for item in command.capabilities]
@@ -872,10 +894,12 @@ def _validate_current_approval(
                 artifact_sha256=approval.artifact_sha256,
                 name=approval.name,
                 kind=approval.kind,
+                model_family=approval.model_family,
                 source_url=approval.source_url,
                 storage_key=approval.storage_key,
                 license_url=approval.license_url,
                 commercial_use_approved=approval.commercial_use_approved,
+                experiment_only=approval.experiment_only,
                 adult_use_approved=approval.adult_use_approved,
                 safetensors_verified=approval.safetensors_verified,
                 evidence=evidence,
@@ -887,6 +911,7 @@ def _validate_current_approval(
                 workflow_sha256=approval.workflow_sha256,
                 name=approval.name,
                 version=approval.version,
+                model_family=approval.model_family,
                 object_key=approval.object_key,
                 reviewed_node_classes=approval.reviewed_node_classes,
                 capabilities=approval.capabilities,

@@ -2714,6 +2714,12 @@ def _require_current_publishable_release(
         raise PublicationConflictError(
             "publication requires the exact current publishable release version"
         )
+    try:
+        specification = ReleaseSpecification.model_validate(version.specification)
+    except ValidationError:
+        raise PublicationConflictError("frozen release specification is invalid") from None
+    if specification.experiment_only:
+        raise PublicationConflictError("experiment-only model outputs cannot enter publication")
 
 
 def _require_single_target_owner(
@@ -2735,9 +2741,9 @@ async def _require_current_compliance_approvals(
     release_version: ReleaseVersion,
 ) -> None:
     try:
-        specification = ReleaseSpecification.model_validate(release_version.specification)
-        if canonical_sha256(specification) != release_version.specification_sha256:
+        if canonical_sha256(release_version.specification) != release_version.specification_sha256:
             raise PublicationConflictError("frozen release specification digest is invalid")
+        specification = ReleaseSpecification.model_validate(release_version.specification)
         await validate_release_approvals(session, specification)
     except (ValidationError, ReleaseApprovalError) as error:
         raise PublicationConflictError(

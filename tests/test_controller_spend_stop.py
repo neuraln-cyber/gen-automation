@@ -79,14 +79,25 @@ WORKER_SIGNING_PRIVATE_KEY = encode_base64url(bytes(range(1, 33)))
 RUNTIME_MANIFEST = '{"artifacts":[],"manifest_sha256":"' + ("0" * 64) + '"}'
 QUEUE_ID = UUID("3d59eff3-8f46-4743-ab42-c5bdd56a04ca")
 GROUP_ID = UUID("e1f35986-d00a-44d0-a0c6-59dda919b07b")
+TEST_CHECKPOINT_SHA256 = "9" * 64
+
+
+def _runtime_job_parameters(seed: int, loras: list[dict[str, str]]) -> dict[str, object]:
+    return {
+        "seed": seed,
+        "checkpoint": {"sha256": TEST_CHECKPOINT_SHA256},
+        "loras": loras,
+    }
 
 
 async def _empty_effective_artifact_manifest(
     _workloads: ControllerWorkloads,
     _session: AsyncSession,
     *,
+    required_checkpoint_sha256: str,
     required_lora_sha256s: tuple[str, ...] = (),
 ) -> EffectiveArtifactManifest:
+    assert required_checkpoint_sha256 == TEST_CHECKPOINT_SHA256
     del required_lora_sha256s
     manifest = ArtifactManifest.model_construct(
         version="v1",
@@ -104,8 +115,10 @@ async def _selected_effective_artifact_manifest(
     _workloads: ControllerWorkloads,
     _session: AsyncSession,
     *,
+    required_checkpoint_sha256: str,
     required_lora_sha256s: tuple[str, ...] = (),
 ) -> EffectiveArtifactManifest:
+    assert required_checkpoint_sha256 == TEST_CHECKPOINT_SHA256
     selected = tuple(sorted(required_lora_sha256s))
     digest = canonical_sha256({"managed_loras": selected})
     manifest = ArtifactManifest.model_construct(
@@ -559,11 +572,12 @@ async def _seed_submission_database(database: Database) -> SubmissionContext:
         )
         session.add_all([version, deployment])
         await session.flush()
+        parameters = _runtime_job_parameters(1, [])
         job = GenerationJob(
             release_version_id=version.id,
             logical_key="d" * 64,
-            parameters={"seed": 1, "loras": []},
-            parameters_sha256=canonical_sha256({"seed": 1, "loras": []}),
+            parameters=parameters,
+            parameters_sha256=canonical_sha256(parameters),
             provider="salad",
             state=GenerationState.QUEUED,
             expected_output_count=1,
@@ -965,11 +979,12 @@ async def test_submit_reuses_active_runtime_then_refreshes_same_manifest_at_idle
             assert first_job is not None
             assert first_attempt is not None
 
+            second_parameters = _runtime_job_parameters(2, [])
             second_job = GenerationJob(
                 release_version_id=first_job.release_version_id,
                 logical_key="e" * 64,
-                parameters={"seed": 2, "loras": []},
-                parameters_sha256=canonical_sha256({"seed": 2, "loras": []}),
+                parameters=second_parameters,
+                parameters_sha256=canonical_sha256(second_parameters),
                 provider="salad",
                 state=GenerationState.QUEUED,
                 expected_output_count=1,
@@ -1243,7 +1258,7 @@ async def test_submit_refreshes_idle_resident_lora_superset_without_evicting_it(
             assert job is not None
             assert deployment is not None
             assert outbox is not None
-            job.parameters = {"seed": 1, "loras": [{"sha256": lora_a}]}
+            job.parameters = _runtime_job_parameters(1, [{"sha256": lora_a}])
             job.parameters_sha256 = canonical_sha256(job.parameters)
             deployment.runtime_managed_lora_sha256s = [lora_a, lora_b]
             deployment.runtime_artifact_manifest_sha256 = resident_digest
@@ -1364,7 +1379,7 @@ async def test_submit_defers_an_incompatible_lora_rollout_while_work_is_active(
             assert deployment is not None
             assert first_job is not None
             assert first_attempt is not None
-            first_job.parameters = {"seed": 1, "loras": [{"sha256": lora_a}]}
+            first_job.parameters = _runtime_job_parameters(1, [{"sha256": lora_a}])
             first_job.parameters_sha256 = canonical_sha256(first_job.parameters)
             first_job.state = active_job_state
             first_attempt.state = active_attempt_state
@@ -1376,11 +1391,12 @@ async def test_submit_defers_an_incompatible_lora_rollout_while_work_is_active(
             deployment.runtime_artifact_manifest_sha256 = canonical_sha256(
                 {"managed_loras": (lora_a,)}
             )
+            second_parameters = _runtime_job_parameters(2, [{"sha256": lora_b}])
             second_job = GenerationJob(
                 release_version_id=first_job.release_version_id,
                 logical_key="f" * 64,
-                parameters={"seed": 2, "loras": [{"sha256": lora_b}]},
-                parameters_sha256=canonical_sha256({"seed": 2, "loras": [{"sha256": lora_b}]}),
+                parameters=second_parameters,
+                parameters_sha256=canonical_sha256(second_parameters),
                 provider="salad",
                 state=GenerationState.QUEUED,
                 expected_output_count=1,
@@ -1529,6 +1545,115 @@ async def test_experiment_warm_lease_refreshes_first_submit_once_then_reuses_run
             lease = await session.get(ExperimentWarmLease, started.lease_id)
             assert lease is not None
             assert lease.provider_version == 1
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending_job", [False, True])
+async def test_manual_warm_selection_is_used_only_without_a_pending_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pending_job: bool,
+) -> None:
+    suffix = "pending" if pending_job else "manual"
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / f'warm-{suffix}.db').as_posix()}")
+    await database.create_schema()
+    try:
+        context = await _seed_submission_database(database)
+        manual_checkpoint = "8" * 64
+        manual_lora = "7" * 64
+        pending_lora = "6" * 64
+        async with database.sessions() as session:
+            deployment = await session.scalar(select(SaladDeployment))
+            job = await session.get(GenerationJob, context.job_id)
+            assert deployment is not None and job is not None
+            started = await start_experiment_warm_lease(
+                session,
+                salad_deployment_id=deployment.id,
+                actor="test",
+                now=datetime.now(UTC),
+            )
+            lease = await session.get(ExperimentWarmLease, started.lease_id)
+            assert lease is not None
+            lease.requested_checkpoint_sha256 = manual_checkpoint
+            lease.requested_lora_sha256s = [manual_lora]
+            if pending_job:
+                job.parameters = _runtime_job_parameters(
+                    1,
+                    [{"sha256": pending_lora}],
+                )
+                job.parameters_sha256 = canonical_sha256(job.parameters)
+            else:
+                await session.execute(
+                    delete(OutboxEvent).where(OutboxEvent.aggregate_id == context.attempt_id)
+                )
+                await session.execute(
+                    delete(GenerationAttempt).where(GenerationAttempt.id == context.attempt_id)
+                )
+                await session.execute(
+                    delete(GenerationJob).where(GenerationJob.id == context.job_id)
+                )
+            await session.commit()
+
+        selections: list[tuple[str, tuple[str, ...]]] = []
+
+        async def selected_manifest(
+            _workloads: ControllerWorkloads,
+            _session: AsyncSession,
+            *,
+            required_checkpoint_sha256: str,
+            required_lora_sha256s: tuple[str, ...] = (),
+        ) -> EffectiveArtifactManifest:
+            selection = (required_checkpoint_sha256, tuple(required_lora_sha256s))
+            selections.append(selection)
+            digest = canonical_sha256(selection)
+            manifest = ArtifactManifest.model_construct(
+                version="v1",
+                artifacts=(),
+                manifest_sha256=digest,
+            )
+            return EffectiveArtifactManifest(
+                manifest=manifest,
+                manifest_json=('{"artifacts":[],"manifest_sha256":"' + digest + '"}'),
+                managed_lora_sha256s=frozenset(required_lora_sha256s),
+            )
+
+        async def fake_refresh(
+            deployment: SaladDeployment,
+            client: object,
+            resolver: object,
+            *,
+            environment_overrides: Mapping[str, str] | None = None,
+        ) -> SaladContainerGroup:
+            del client, resolver, environment_overrides
+            return _group(deployment.container_group_name, deployment.queue_name)
+
+        monkeypatch.setattr(
+            ControllerWorkloads,
+            "_effective_artifact_manifest",
+            selected_manifest,
+        )
+        monkeypatch.setattr(
+            controller_runtime,
+            "refresh_container_group_runtime",
+            fake_refresh,
+        )
+        workloads = ControllerWorkloads(
+            settings=Settings().model_copy(update={"gpu_allocation_enabled": True}),
+            sessions=database.sessions,
+            instance_id=f"controller-warm-{suffix}-selection-test",
+            salad_client=cast(SaladClient, object()),
+            object_store=None,
+        )
+
+        assert await workloads.experiment_warm_once() is True
+        assert selections == [
+            (
+                TEST_CHECKPOINT_SHA256 if pending_job else manual_checkpoint,
+                (pending_lora,) if pending_job else (manual_lora,),
+            )
+        ]
     finally:
         await database.dispose()
 

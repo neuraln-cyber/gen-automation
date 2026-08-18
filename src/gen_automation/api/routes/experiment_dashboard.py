@@ -1,5 +1,6 @@
 import hmac
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 
@@ -62,6 +63,13 @@ _MANAGER_ROLES = frozenset({AdminRole.OWNER, AdminRole.ADMIN})
 _MAX_WARM_REQUEST_BYTES = 4 * 1024
 
 
+@dataclass(frozen=True, slots=True)
+class _WarmRequest:
+    duration_seconds: int
+    requested_checkpoint_sha256: str | None = None
+    requested_lora_sha256s: tuple[str, ...] | None = None
+
+
 @router.get(
     "/experiments/new",
     response_class=HTMLResponse,
@@ -80,7 +88,7 @@ async def dashboard_new_experiment(
             heading="Experiment Lab is unavailable",
             message="Your account cannot create generation experiments.",
         )
-    options = await list_new_set_options(session)
+    options = await list_new_set_options(session, experiment_mode=True)
     try:
         return new_set_form_response(
             request,
@@ -163,11 +171,18 @@ async def start_dashboard_experiment_warm_session(
 ) -> Response:
     try:
         manager = await _require_warm_manager(request, session)
-        duration_seconds = await _read_warm_request(request, duration_required=True)
+        warm_request = await _read_warm_request(
+            request,
+            duration_required=True,
+            artifact_selection_allowed=True,
+        )
         current = await ensure_experiment_warm_lease(
             session,
             actor=str(manager.user_id),
-            duration_seconds=duration_seconds,
+            duration_seconds=warm_request.duration_seconds,
+            requested_checkpoint_sha256=warm_request.requested_checkpoint_sha256,
+            requested_lora_sha256s=warm_request.requested_lora_sha256s,
+            settings=request.app.state.settings,
         )
         await session.commit()
     except HTTPException as error:
@@ -204,7 +219,7 @@ async def extend_dashboard_experiment_warm_session(
 ) -> Response:
     try:
         manager = await _require_warm_manager(request, session)
-        extension_seconds = await _read_warm_request(request, duration_required=True)
+        warm_request = await _read_warm_request(request, duration_required=True)
         current = await get_current_experiment_warm_lease_status(session)
         if current is None:
             raise ExperimentWarmLeaseNotFoundError("experiment warm session was not found")
@@ -212,7 +227,7 @@ async def extend_dashboard_experiment_warm_session(
             session,
             lease_id=current.lease_id,
             actor=str(manager.user_id),
-            extension_seconds=extension_seconds,
+            extension_seconds=warm_request.duration_seconds,
         )
         await session.commit()
     except HTTPException as error:
@@ -443,7 +458,12 @@ async def _require_warm_manager(
     return manager
 
 
-async def _read_warm_request(request: Request, *, duration_required: bool) -> int:
+async def _read_warm_request(
+    request: Request,
+    *,
+    duration_required: bool,
+    artifact_selection_allowed: bool = False,
+) -> _WarmRequest:
     content_type = request.headers.get("content-type", "")
     if content_type.partition(";")[0].strip().lower() != "application/json":
         raise HTTPException(
@@ -483,11 +503,23 @@ async def _read_warm_request(request: Request, *, duration_required: bool) -> in
         )
     except (UnicodeDecodeError, ValueError):
         raise HTTPException(status_code=400, detail="invalid JSON body") from None
-    expected = {"duration_minutes"} if duration_required else set()
-    if not isinstance(payload, dict) or set(payload) != expected:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid JSON fields")
+    fields = frozenset(payload)
+    duration_fields = frozenset({"duration_minutes"}) if duration_required else frozenset()
+    selection_fields = frozenset(
+        {
+            "requested_checkpoint_sha256",
+            "requested_lora_sha256s",
+        }
+    )
+    expected_fields = {duration_fields}
+    if duration_required and artifact_selection_allowed:
+        expected_fields.add(duration_fields | selection_fields)
+    if fields not in expected_fields:
         raise HTTPException(status_code=400, detail="invalid JSON fields")
     if not duration_required:
-        return 0
+        return _WarmRequest(duration_seconds=0)
     duration_minutes: object = payload["duration_minutes"]
     if (
         isinstance(duration_minutes, bool)
@@ -495,7 +527,33 @@ async def _read_warm_request(request: Request, *, duration_required: bool) -> in
         or not 1 <= duration_minutes <= 90
     ):
         raise HTTPException(status_code=422, detail="invalid warm duration")
-    return duration_minutes * 60
+    if not selection_fields.issubset(fields):
+        return _WarmRequest(duration_seconds=duration_minutes * 60)
+    checkpoint_sha256 = payload["requested_checkpoint_sha256"]
+    lora_sha256s = payload["requested_lora_sha256s"]
+    if not _valid_warm_sha256(checkpoint_sha256):
+        raise HTTPException(status_code=422, detail="invalid requested checkpoint")
+    if (
+        not isinstance(lora_sha256s, list)
+        or len(lora_sha256s) > 8
+        or any(not _valid_warm_sha256(value) for value in lora_sha256s)
+        or len(lora_sha256s) != len(set(lora_sha256s))
+    ):
+        raise HTTPException(status_code=422, detail="invalid requested LoRA stack")
+    return _WarmRequest(
+        duration_seconds=duration_minutes * 60,
+        requested_checkpoint_sha256=checkpoint_sha256,
+        requested_lora_sha256s=tuple(lora_sha256s),
+    )
+
+
+def _valid_warm_sha256(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.lower()
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 async def _warm_deployment_available(session: AsyncSession) -> bool:
@@ -535,6 +593,8 @@ def _warm_status_payload(
         hard_remaining_seconds = 0
         idle_ttl_seconds = DEFAULT_EXPERIMENT_WARM_LEASE_SECONDS
         max_cost_usd = None
+        requested_checkpoint_sha256 = None
+        requested_lora_sha256s = None
     else:
         state = {
             ExperimentWarmLeaseState.STARTING: "starting",
@@ -549,6 +609,12 @@ def _warm_status_payload(
         hard_remaining_seconds = current.hard_remaining_seconds
         idle_ttl_seconds = current.idle_ttl_seconds
         max_cost_usd = f"{current.max_cost_microusd / 1_000_000:.2f}"
+        requested_checkpoint_sha256 = current.requested_checkpoint_sha256
+        requested_lora_sha256s = (
+            list(current.requested_lora_sha256s)
+            if current.requested_lora_sha256s is not None
+            else None
+        )
     return {
         "schema_version": 1,
         "available": available,
@@ -562,6 +628,8 @@ def _warm_status_payload(
         "idle_ttl_seconds": idle_ttl_seconds,
         "hourly_rate_usd": f"{settings.salad_max_hourly_cost_usd:.2f}",
         "max_cost_usd": max_cost_usd,
+        "requested_checkpoint_sha256": requested_checkpoint_sha256,
+        "requested_lora_sha256s": requested_lora_sha256s,
         "controller_auto_stop_minutes": 90,
     }
 

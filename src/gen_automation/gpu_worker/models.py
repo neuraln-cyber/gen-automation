@@ -30,6 +30,7 @@ DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES = frozenset(
     {
         "CheckpointLoaderSimple",
         "CLIPSetLastLayer",
+        "CLIPLoader",
         "CLIPTextEncode",
         "ConditioningCombine",
         "ConditioningSetAreaPercentage",
@@ -40,12 +41,15 @@ DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES = frozenset(
         "KSampler",
         "LatentUpscaleBy",
         "LoraLoader",
+        "LoraLoaderModelOnly",
         "MaskComposite",
         "SaveImage",
         "SaveImageWebsocket",
         "SetLatentNoiseMask",
         "SolidMask",
         "VAEDecode",
+        "VAELoader",
+        "UNETLoader",
         "UltralyticsDetectorProvider",
     }
 )

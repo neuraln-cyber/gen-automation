@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
@@ -7,6 +8,7 @@ from uuid import UUID
 from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from gen_automation.config import Settings
 from gen_automation.db.models import (
     AuditEvent,
     ExperimentWarmLease,
@@ -22,6 +24,10 @@ from gen_automation.domain.enums import (
     SaladDeploymentState,
 )
 from gen_automation.services.budgets import BudgetSnapshot, reevaluate_budget_guard
+from gen_automation.services.managed_artifact_manifest import (
+    ManagedArtifactManifestError,
+    effective_artifact_manifest_from_settings,
+)
 
 DEFAULT_EXPERIMENT_WARM_LEASE_SECONDS = 15 * 60
 MAX_EXPERIMENT_WARM_LEASE_SECONDS = 90 * 60
@@ -74,6 +80,8 @@ class ExperimentWarmLeaseStatus:
     idle_ttl_seconds: int
     max_cost_microusd: int
     provider_version: int | None
+    requested_checkpoint_sha256: str | None
+    requested_lora_sha256s: tuple[str, ...] | None
     ready: bool
     usable: bool
     remaining_seconds: int
@@ -107,6 +115,65 @@ def _validate_duration(duration_seconds: int) -> int:
     ):
         raise ValueError("warm lease duration must be between 60 and 5400 seconds")
     return duration_seconds
+
+
+def _validate_sha256(value: str, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _requested_artifact_selection(
+    *,
+    requested_checkpoint_sha256: str | None,
+    requested_lora_sha256s: Collection[str] | None,
+) -> tuple[str | None, tuple[str, ...] | None]:
+    if requested_checkpoint_sha256 is None:
+        if requested_lora_sha256s is not None and len(requested_lora_sha256s) != 0:
+            raise ValueError("requested LoRAs require a requested checkpoint")
+        return None, None
+    checkpoint_sha256 = _validate_sha256(
+        requested_checkpoint_sha256,
+        label="requested checkpoint",
+    )
+    lora_sha256s = tuple(requested_lora_sha256s or ())
+    if len(lora_sha256s) > 8:
+        raise ValueError("at most 8 requested LoRAs are supported")
+    if len(lora_sha256s) != len(set(lora_sha256s)):
+        raise ValueError("requested LoRA identities must be unique")
+    validated_loras = tuple(
+        sorted(_validate_sha256(value, label="requested LoRA") for value in lora_sha256s)
+    )
+    return checkpoint_sha256, validated_loras
+
+
+async def _validate_requested_artifact_manifest(
+    session: AsyncSession,
+    *,
+    settings: Settings | None,
+    requested_checkpoint_sha256: str | None,
+    requested_lora_sha256s: tuple[str, ...] | None,
+) -> None:
+    if requested_checkpoint_sha256 is None:
+        return
+    if settings is None:
+        raise ValueError("settings are required for an explicit warm artifact selection")
+    try:
+        await effective_artifact_manifest_from_settings(
+            session,
+            settings=settings,
+            required_checkpoint_sha256=requested_checkpoint_sha256,
+            required_lora_sha256s=requested_lora_sha256s or (),
+        )
+    except ManagedArtifactManifestError as error:
+        raise ExperimentWarmLeaseConflictError(
+            "requested warm artifact selection is unavailable"
+        ) from error
 
 
 def _maximum_cost(max_hourly_cost_microusd: int, duration_seconds: int) -> int:
@@ -203,6 +270,12 @@ def _status(
         idle_ttl_seconds=lease.idle_ttl_seconds,
         max_cost_microusd=lease.max_cost_microusd,
         provider_version=lease.provider_version,
+        requested_checkpoint_sha256=lease.requested_checkpoint_sha256,
+        requested_lora_sha256s=(
+            tuple(lease.requested_lora_sha256s)
+            if lease.requested_lora_sha256s is not None
+            else None
+        ),
         ready=(
             usable
             and lease.state == ExperimentWarmLeaseState.ACTIVE
@@ -246,6 +319,9 @@ async def start_experiment_warm_lease(
     salad_deployment_id: UUID,
     actor: str,
     duration_seconds: int = DEFAULT_EXPERIMENT_WARM_LEASE_SECONDS,
+    requested_checkpoint_sha256: str | None = None,
+    requested_lora_sha256s: Collection[str] | None = None,
+    settings: Settings | None = None,
     now: datetime | None = None,
 ) -> ExperimentWarmLeaseStatus:
     """Create one cost-preflighted, absolute warm lease without mutating Salad yet."""
@@ -253,6 +329,16 @@ async def start_experiment_warm_lease(
     requested_at = _as_utc(now or datetime.now(UTC))
     duration_seconds = _validate_duration(duration_seconds)
     actor = _validate_actor(actor)
+    requested_checkpoint_sha256, normalized_lora_sha256s = _requested_artifact_selection(
+        requested_checkpoint_sha256=requested_checkpoint_sha256,
+        requested_lora_sha256s=requested_lora_sha256s,
+    )
+    await _validate_requested_artifact_manifest(
+        session,
+        settings=settings,
+        requested_checkpoint_sha256=requested_checkpoint_sha256,
+        requested_lora_sha256s=normalized_lora_sha256s,
+    )
     budget = await reevaluate_budget_guard(session, provider="salad", now=requested_at)
     deployment = await session.scalar(
         select(SaladDeployment).where(SaladDeployment.id == salad_deployment_id).with_for_update()
@@ -312,6 +398,10 @@ async def start_experiment_warm_lease(
         hard_expires_at=hard_expires_at,
         idle_ttl_seconds=duration_seconds,
         max_cost_microusd=maximum_cost,
+        requested_checkpoint_sha256=requested_checkpoint_sha256,
+        requested_lora_sha256s=(
+            list(normalized_lora_sha256s) if normalized_lora_sha256s is not None else None
+        ),
         created_by=actor,
         lock_version=1,
     )
@@ -328,6 +418,10 @@ async def start_experiment_warm_lease(
             "duration_seconds": duration_seconds,
             "hard_max_seconds": MAX_EXPERIMENT_WARM_LEASE_SECONDS,
             "max_cost_microusd": maximum_cost,
+            "requested_checkpoint_sha256": requested_checkpoint_sha256,
+            "requested_lora_sha256s": (
+                list(normalized_lora_sha256s) if normalized_lora_sha256s is not None else None
+            ),
         },
     )
     await session.flush()
@@ -392,6 +486,9 @@ async def ensure_experiment_warm_lease(
     *,
     actor: str,
     duration_seconds: int = DEFAULT_EXPERIMENT_WARM_LEASE_SECONDS,
+    requested_checkpoint_sha256: str | None = None,
+    requested_lora_sha256s: Collection[str] | None = None,
+    settings: Settings | None = None,
     now: datetime | None = None,
 ) -> ExperimentWarmLeaseStatus:
     """Idempotently start or renew the current deployment's experiment hold."""
@@ -399,6 +496,10 @@ async def ensure_experiment_warm_lease(
     ensured_at = _as_utc(now or datetime.now(UTC))
     duration_seconds = _validate_duration(duration_seconds)
     actor = _validate_actor(actor)
+    requested_checkpoint_sha256, normalized_lora_sha256s = _requested_artifact_selection(
+        requested_checkpoint_sha256=requested_checkpoint_sha256,
+        requested_lora_sha256s=requested_lora_sha256s,
+    )
     deployment_id = await session.scalar(
         select(SaladDeployment.id)
         .where(
@@ -427,12 +528,30 @@ async def ensure_experiment_warm_lease(
         )
         .with_for_update()
     )
+    if lease is not None:
+        await _validate_requested_artifact_manifest(
+            session,
+            settings=settings,
+            requested_checkpoint_sha256=requested_checkpoint_sha256,
+            requested_lora_sha256s=normalized_lora_sha256s,
+        )
     durable_runtime_hold = (
         lease is not None
         and lease.state == ExperimentWarmLeaseState.ACTIVE
         and _as_utc(lease.hard_expires_at) > ensured_at
         and await _has_busy_or_unobserved_completion(session, lease)
     )
+    if (
+        lease is not None
+        and requested_checkpoint_sha256 is not None
+        and (
+            lease.requested_checkpoint_sha256 != requested_checkpoint_sha256
+            or tuple(lease.requested_lora_sha256s or ()) != normalized_lora_sha256s
+        )
+    ):
+        raise ExperimentWarmLeaseConflictError(
+            "a different experiment artifact stack is already warm"
+        )
     if lease is not None and (_is_usable(lease, ensured_at) or durable_runtime_hold):
         if lease.state == ExperimentWarmLeaseState.ACTIVE:
             touch_experiment_warm_lease_locked(
@@ -451,6 +570,9 @@ async def ensure_experiment_warm_lease(
         salad_deployment_id=deployment.id,
         actor=actor,
         duration_seconds=duration_seconds,
+        requested_checkpoint_sha256=requested_checkpoint_sha256,
+        requested_lora_sha256s=normalized_lora_sha256s,
+        settings=settings,
         now=ensured_at,
     )
 

@@ -1,0 +1,153 @@
+{
+  "version": "v1",
+  "base_manifest_path": "../catalog/current-deployed-artifact-manifest.json",
+  "artifacts": [
+    {
+      "logical_name": "miaomiao-anima-base",
+      "kind": "diffusion_model",
+      "object_key": "worker/diffusion-models/sha256/07b344f82494b8197d53d8bfcf099bbfa77406226e7b52aa4a1bee826197db23/miaomiaoHarem_animaBase.safetensors",
+      "target_filename": "miaomiaoHarem_animaBase.safetensors",
+      "local_path": "../models/anima/miaomiaoHarem_animaBase.safetensors",
+      "sha256": "07b344f82494b8197d53d8bfcf099bbfa77406226e7b52aa4a1bee826197db23",
+      "exact_size_bytes": 4182218328,
+      "approval": {
+        "name": "MiaoMiao Harem Anima Base",
+        "model_family": "anima",
+        "source_url": "https://civitai.com/models/934764?modelVersionId=2967371",
+        "license_url": "https://huggingface.co/circlestone-labs/Anima/blob/main/LICENSE.md",
+        "commercial_use_approved": false,
+        "experiment_only": true,
+        "adult_use_approved": true,
+        "safetensors_verified": true,
+        "evidence": {
+          "summary": "Reviewed for the experiment-only lane: the stock Anima license permits internal non-production testing and evaluation, but this approval does not authorize production or commercial generation.",
+          "source_urls": [
+            "https://civitai.com/models/934764?modelVersionId=2967371",
+            "https://huggingface.co/circlestone-labs/Anima/blob/main/LICENSE.md"
+          ],
+          "document_sha256s": [],
+          "internal_reference": "ANIMA-EXPERIMENT-ONLY-2026-08"
+        }
+      }
+    },
+    {
+      "logical_name": "qwen-3-06b-base",
+      "kind": "text_encoder",
+      "object_key": "worker/text-encoders/sha256/cd2a512003e2f9f3cd3c32a9c3573f820bb28c940f73c57b1ddaa983d9223eba/qwen_3_06b_base.safetensors",
+      "target_filename": "qwen_3_06b_base.safetensors",
+      "local_path": "../models/anima/qwen_3_06b_base.safetensors",
+      "sha256": "cd2a512003e2f9f3cd3c32a9c3573f820bb28c940f73c57b1ddaa983d9223eba",
+      "exact_size_bytes": 1192135096
+    },
+    {
+      "logical_name": "qwen-image-vae",
+      "kind": "vae",
+      "object_key": "worker/vae/sha256/a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f/qwen_image_vae.safetensors",
+      "target_filename": "qwen_image_vae.safetensors",
+      "local_path": "../models/anima/qwen_image_vae.safetensors",
+      "sha256": "a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f",
+      "exact_size_bytes": 253806246
+    },
+    {
+      "logical_name": "moriimee-anima",
+      "kind": "lora",
+      "object_key": "worker/loras/sha256/11cf1f1e91881d5aa85672d3c20d01491f2a691049b14b06600ef60b233e6555/MoriiMee_Anima_epoch_10.safetensors",
+      "target_filename": "MoriiMee_Anima_epoch_10.safetensors",
+      "local_path": "../models/anima/MoriiMee_Anima_epoch_10.safetensors",
+      "sha256": "11cf1f1e91881d5aa85672d3c20d01491f2a691049b14b06600ef60b233e6555",
+      "exact_size_bytes": 138663768,
+      "approval": {
+        "name": "MoriiMee Gothic Niji Anima epoch 10",
+        "model_family": "anima",
+        "source_url": "https://civitai.com/models/915918?modelVersionId=3124327",
+        "license_url": "https://civitai.com/models/915918?modelVersionId=3124327",
+        "commercial_use_approved": false,
+        "experiment_only": true,
+        "adult_use_approved": true,
+        "safetensors_verified": true,
+        "evidence": {
+          "summary": "Version-specific source and usage terms reviewed for non-production experiment-only use with Anima.",
+          "source_urls": [
+            "https://civitai.com/models/915918?modelVersionId=3124327"
+          ],
+          "document_sha256s": [],
+          "internal_reference": "MORIIMEE-ANIMA-EXPERIMENT-ONLY-2026-08"
+        }
+      }
+    },
+    {
+      "logical_name": "748cm-anima",
+      "kind": "lora",
+      "object_key": "worker/loras/sha256/d7b7e19efe0462a84ab8953ff74d69a67bdf05e7f6a6351453451121afde98e3/748cm_TA_EP4.safetensors",
+      "target_filename": "748cm_TA_EP4.safetensors",
+      "local_path": "../models/anima/748cm_TA_EP4.safetensors",
+      "sha256": "d7b7e19efe0462a84ab8953ff74d69a67bdf05e7f6a6351453451121afde98e3",
+      "exact_size_bytes": 46018592,
+      "approval": {
+        "name": "748cm style Anima EP4",
+        "model_family": "anima",
+        "source_url": "https://civitai.com/models/2626310?modelVersionId=2948641",
+        "license_url": "https://civitai.com/models/2626310?modelVersionId=2948641",
+        "commercial_use_approved": false,
+        "experiment_only": true,
+        "adult_use_approved": true,
+        "safetensors_verified": true,
+        "evidence": {
+          "summary": "Version-specific source and usage terms reviewed for non-production experiment-only use with Anima.",
+          "source_urls": [
+            "https://civitai.com/models/2626310?modelVersionId=2948641"
+          ],
+          "document_sha256s": [],
+          "internal_reference": "748CM-ANIMA-EXPERIMENT-ONLY-2026-08"
+        }
+      }
+    },
+    {
+      "logical_name": "androjuniarto-anima",
+      "kind": "lora",
+      "object_key": "worker/loras/sha256/8c5e6fbf6e0e74ef07a9875e4bdbe92bf190df3307643df315b4c3611dac39a3/androjuniarto.safetensors",
+      "target_filename": "androjuniarto.safetensors",
+      "local_path": "../models/anima/androjuniarto.safetensors",
+      "sha256": "8c5e6fbf6e0e74ef07a9875e4bdbe92bf190df3307643df315b4c3611dac39a3",
+      "exact_size_bytes": 69453584,
+      "approval": {
+        "name": "Androjuniarto style Anima",
+        "model_family": "anima",
+        "source_url": "https://civitai.com/models/2791498?modelVersionId=3145847",
+        "license_url": "https://civitai.com/models/2791498?modelVersionId=3145847",
+        "commercial_use_approved": false,
+        "experiment_only": true,
+        "adult_use_approved": true,
+        "safetensors_verified": true,
+        "evidence": {
+          "summary": "Version-specific source and usage terms reviewed for non-production experiment-only use with Anima.",
+          "source_urls": [
+            "https://civitai.com/models/2791498?modelVersionId=3145847"
+          ],
+          "document_sha256s": [],
+          "internal_reference": "ANDROJUNIARTO-ANIMA-EXPERIMENT-ONLY-2026-08"
+        }
+      }
+    }
+  ],
+  "workflows": [
+    {
+      "name": "Anima base",
+      "version": "1",
+      "model_family": "anima",
+      "object_key": "workflows/by-sha256/97a102f72e7ff26d64710262203421c034336759e450ad30e848701d96a6709e.json",
+      "local_path": "../workflows/anima-base-v1.json",
+      "evidence": {
+        "summary": "Reviewed the exact bundled Anima core-node ComfyUI graph.",
+        "source_urls": [
+          "https://github.com/Comfy-Org/docs/blob/main/tutorials/image/anima/anima.mdx",
+          "https://github.com/Comfy-Org/workflow_templates/blob/main/templates/image_anima_base_v1.json"
+        ],
+        "document_sha256s": [
+          "97a102f72e7ff26d64710262203421c034336759e450ad30e848701d96a6709e"
+        ],
+        "internal_reference": "WORKFLOW-ANIMA-BASE-V1"
+      }
+    }
+  ]
+}

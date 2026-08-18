@@ -442,6 +442,10 @@
       if (!option && name) {
         option = options.find((candidate) => candidate.dataset.loraName === name);
       }
+      if (option && option.dataset.modelFamily !== form.dataset.modelFamily) {
+        missing.push(`${name || "Saved LoRA"} is incompatible with the selected model family.`);
+        return;
+      }
       const id = option?.dataset.loraId || "";
       const weight = String(item.weight ?? "1");
       const numericWeight = Number(weight);
@@ -607,6 +611,13 @@
         ],
         `Checkpoint ${checkpointName}`,
       );
+      const checkpointControl = namedControl(form, "checkpoint_id");
+      if (checkpointControl instanceof HTMLSelectElement && checkpointControl.value) {
+        // Select the compatible family before resolving the workflow and LoRA
+        // stack. The applying flag keeps the profile's exact saved sampler
+        // settings intact instead of replacing them with family defaults.
+        checkpointControl.dispatchEvent(new Event("change", { bubbles: true }));
+      }
     }
     const workflowName = typeof matches.workflow_name === "string" ? matches.workflow_name : "";
     const workflowVersion = typeof matches.workflow_version === "string"
@@ -620,10 +631,13 @@
       matchRequiredSelect(
         "workflow_id",
         [
-          (option) => Boolean(workflowId && option.value === workflowId),
+          (option) => Boolean(option.dataset.modelFamily === form.dataset.modelFamily
+            && workflowId && option.value === workflowId),
           (option) => Boolean(workflowSha256
+            && option.dataset.modelFamily === form.dataset.modelFamily
             && (option.dataset.workflowSha256 || "").toLowerCase() === workflowSha256),
-          (option) => Boolean(workflowName && option.dataset.workflowName === workflowName
+          (option) => Boolean(option.dataset.modelFamily === form.dataset.modelFamily
+            && workflowName && option.dataset.workflowName === workflowName
             && (!workflowVersion || option.dataset.workflowVersion === workflowVersion)),
         ],
         workflowName
@@ -783,6 +797,163 @@
     return true;
   }
 
+  function initializeModelFamilyPicker() {
+    const form = document.querySelector("[data-automation-form]");
+    const picker = form?.querySelector("[data-model-family-picker]");
+    const checkpoint = form && namedControl(form, "checkpoint_id");
+    const workflow = form && namedControl(form, "workflow_id");
+    if (!(form instanceof HTMLFormElement)
+        || !(picker instanceof HTMLSelectElement)
+        || !(checkpoint instanceof HTMLSelectElement)
+        || !(workflow instanceof HTMLSelectElement)) return;
+
+    const availableFamilies = new Set(
+      Array.from(picker.options).map((option) => option.value).filter(Boolean),
+    );
+    const optionFamily = (option) => option?.dataset.modelFamily || "";
+    const checkpointFamily = () => optionFamily(checkpoint.selectedOptions.item(0));
+    const familyDefaults = Object.freeze({
+      illustrious: Object.freeze({
+        width: "1144",
+        height: "1480",
+        steps: "30",
+        cfg: "6.0",
+        sampler: "euler_ancestral",
+        scheduler: "karras",
+        clip_skip: "2",
+      }),
+      anima: Object.freeze({
+        width: "896",
+        height: "1152",
+        steps: "30",
+        cfg: "4.5",
+        sampler: "euler",
+        scheduler: "normal",
+        clip_skip: "1",
+      }),
+    });
+    const familySettingNames = Object.freeze([
+      "width", "height", "steps", "cfg", "sampler", "scheduler", "clip_skip",
+    ]);
+    const cachedFamilySettings = new Map();
+    const collectFamilySettings = () => Object.fromEntries(
+      familySettingNames.flatMap((name) => {
+        const control = namedControl(form, name);
+        return control instanceof HTMLInputElement || control instanceof HTMLSelectElement
+          ? [[name, control.value]]
+          : [];
+      }),
+    );
+    const applyFamilySettings = (family) => {
+      const settings = cachedFamilySettings.get(family) || familyDefaults[family];
+      if (!settings) return;
+      familySettingNames.forEach((name) => {
+        const control = namedControl(form, name);
+        if (!(control instanceof HTMLInputElement)
+            && !(control instanceof HTMLSelectElement)) return;
+        const value = settings[name];
+        if (typeof value !== "string") return;
+        control.value = value;
+        control.dispatchEvent(new Event("input", { bubbles: true }));
+        control.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+    };
+    const updateClipSkip = (family) => {
+      const control = form.querySelector("[data-clip-skip-control]");
+      const help = form.querySelector("[data-clip-skip-help]");
+      if (!(control instanceof HTMLInputElement)) return;
+      const ignored = family === "anima";
+      control.readOnly = ignored;
+      if (ignored) control.setAttribute("aria-disabled", "true");
+      else control.removeAttribute("aria-disabled");
+      if (help) {
+        help.textContent = ignored
+          ? "Not used by the Anima workflow."
+          : "Applied by Illustrious workflows.";
+      }
+    };
+    let syncing = false;
+
+    const filterSelect = (control, family, { preserveEmpty = false } = {}) => {
+      let firstMatch = null;
+      Array.from(control.options).forEach((option) => {
+        const matches = !option.value || optionFamily(option) === family;
+        option.hidden = !matches;
+        option.disabled = !matches;
+        if (option.value && matches && !firstMatch) firstMatch = option;
+      });
+      const selected = control.selectedOptions.item(0);
+      if (selected?.value && optionFamily(selected) === family) return false;
+      if (preserveEmpty) {
+        const changed = Boolean(selected?.value);
+        control.value = "";
+        return changed;
+      }
+      control.value = firstMatch?.value || "";
+      return true;
+    };
+
+    const render = ({ applyDefaults = false } = {}) => {
+      if (syncing) return;
+      syncing = true;
+      const family = availableFamilies.has(picker.value) ? picker.value : "";
+      const previousFamily = form.dataset.modelFamily || "";
+      if (applyDefaults && previousFamily && previousFamily !== family) {
+        cachedFamilySettings.set(previousFamily, collectFamilySettings());
+        applyFamilySettings(family);
+      }
+      form.dataset.modelFamily = family;
+      updateClipSkip(family);
+      const checkpointChanged = filterSelect(checkpoint, family);
+      const workflowChanged = filterSelect(workflow, family);
+
+      form.querySelectorAll("[data-lora-option]").forEach((button) => {
+        const matches = optionFamily(button) === family;
+        button.disabled = !matches;
+        const item = button.closest("li");
+        if (item) item.hidden = !matches;
+      });
+      form.querySelectorAll("[data-lora-native-slot]").forEach((slot) => {
+        const idControl = slot.querySelector("[data-lora-native-id]");
+        const weightControl = slot.querySelector("[data-lora-native-weight]");
+        if (!(idControl instanceof HTMLSelectElement)) return;
+        filterSelect(idControl, family, { preserveEmpty: true });
+        const selected = idControl.selectedOptions.item(0);
+        if (selected?.value && optionFamily(selected) !== family) idControl.value = "";
+        if (!idControl.value && weightControl instanceof HTMLInputElement) {
+          weightControl.value = "";
+        }
+      });
+      syncing = false;
+
+      form.dispatchEvent(new CustomEvent("gen-automation:model-family-changed", {
+        detail: { modelFamily: family },
+      }));
+      if (checkpointChanged) checkpoint.dispatchEvent(new Event("change", { bubbles: true }));
+      if (workflowChanged) workflow.dispatchEvent(new Event("change", { bubbles: true }));
+      form.dispatchEvent(new CustomEvent("gen-automation:profile-changed"));
+    };
+
+    const initialFamily = checkpointFamily();
+    if (availableFamilies.has(initialFamily)) picker.value = initialFamily;
+    picker.addEventListener("change", () => {
+      const selectedCheckpointFamily = checkpointFamily();
+      if (form.dataset.applyingAutomationProfile === "true"
+          && availableFamilies.has(selectedCheckpointFamily)) {
+        picker.value = selectedCheckpointFamily;
+      }
+      render({ applyDefaults: form.dataset.applyingAutomationProfile !== "true" });
+    });
+    checkpoint.addEventListener("change", () => {
+      if (syncing) return;
+      const family = checkpointFamily();
+      if (!availableFamilies.has(family) || family === picker.value) return;
+      picker.value = family;
+      render({ applyDefaults: form.dataset.applyingAutomationProfile !== "true" });
+    });
+    render();
+  }
+
   function initializeLoraPicker() {
     const form = document.querySelector("[data-automation-form]");
     const picker = document.querySelector("[data-lora-picker]");
@@ -844,12 +1015,15 @@
 
     const updateCatalogFilter = () => {
       const query = searchInput ? searchInput.value.trim().toLowerCase() : "";
+      const modelFamily = form.dataset.modelFamily || "";
       let visible = 0;
       catalogOptions.forEach((button) => {
         const haystack = `${button.dataset.loraName || ""} ${button.dataset.loraSha256 || ""}`
           .toLowerCase();
         const listItem = button.closest("li");
-        const matches = !query || haystack.includes(query);
+        const matchesFamily = button.dataset.modelFamily === modelFamily;
+        const matches = matchesFamily && (!query || haystack.includes(query));
+        button.disabled = !matchesFamily;
         if (listItem) listItem.hidden = !matches;
         if (matches) visible += 1;
       });
@@ -920,7 +1094,8 @@
     };
 
     const addSelection = (id) => {
-      if (!optionById.has(id)) return;
+      const option = optionById.get(id);
+      if (!option || option.dataset.modelFamily !== form.dataset.modelFamily) return;
       if (selections.some((item) => item.id === id)) {
         removeSelection(id);
         return;
@@ -941,7 +1116,9 @@
       const idControl = slot.querySelector("[data-lora-native-id]");
       const weightControl = slot.querySelector("[data-lora-native-weight]");
       const id = idControl ? idControl.value : "";
-      if (!id || !optionById.has(id) || selections.some((item) => item.id === id)) return;
+      const option = optionById.get(id);
+      if (!id || !option || option.dataset.modelFamily !== form.dataset.modelFamily
+          || selections.some((item) => item.id === id)) return;
       selections.push({
         id,
         weight: weightControl && weightControl.value.trim() ? weightControl.value : "1",
@@ -1063,12 +1240,30 @@
       selections = requested.slice(0, maximum).flatMap((item) => {
         const id = item && typeof item.id === "string" ? item.id : "";
         const weight = String(item?.weight ?? "1");
-        if (!optionById.has(id) || seen.has(id) || !validWeight(weight)) return [];
+        const option = optionById.get(id);
+        if (!option || option.dataset.modelFamily !== form.dataset.modelFamily
+            || seen.has(id) || !validWeight(weight)) return [];
         seen.add(id);
         return [{ id, weight }];
       });
       renderSelections();
       setFeedback("Generation preset LoRA stack applied.", "success");
+    });
+
+    form.addEventListener("gen-automation:model-family-changed", (event) => {
+      const family = event.detail?.modelFamily || "";
+      const kept = selections.filter((selection) => (
+        optionById.get(selection.id)?.dataset.modelFamily === family
+      ));
+      const removed = selections.length - kept.length;
+      selections = kept;
+      renderSelections();
+      if (removed > 0) {
+        setFeedback(
+          `${removed} incompatible LoRA${removed === 1 ? " was" : "s were"} removed.`,
+          "warning",
+        );
+      }
     });
 
     form.addEventListener("submit", syncCanonicalSlots, { capture: true });
@@ -7205,6 +7400,28 @@
       const csrf = panel.dataset.csrfToken || "";
       let endpointAvailable = false;
       let statusTimer = 0;
+      const selectedArtifactStack = () => {
+        const form = document.querySelector("[data-automation-form]");
+        if (!(form instanceof HTMLFormElement)) return {};
+        const checkpoint = namedControl(form, "checkpoint_id");
+        const selectedCheckpoint = checkpoint instanceof HTMLSelectElement
+          ? checkpoint.selectedOptions.item(0)
+          : null;
+        const checkpointSha256 = selectedCheckpoint?.dataset.checkpointSha256 || "";
+        if (!/^[0-9a-f]{64}$/.test(checkpointSha256)) return null;
+        const loraSha256s = [];
+        for (const slot of form.querySelectorAll("[data-lora-native-slot]")) {
+          const control = slot.querySelector("[data-lora-native-id]");
+          if (!(control instanceof HTMLSelectElement) || !control.value) continue;
+          const sha256 = control.selectedOptions.item(0)?.dataset.loraSha256 || "";
+          if (!/^[0-9a-f]{64}$/.test(sha256)) return null;
+          loraSha256s.push(sha256);
+        }
+        return {
+          requested_checkpoint_sha256: checkpointSha256,
+          requested_lora_sha256s: Array.from(new Set(loraSha256s)),
+        };
+      };
       const safeEndpoint = (value) => {
         try {
           const url = new URL(value, window.location.href);
@@ -7304,6 +7521,11 @@
           const body = button.hasAttribute("data-warm-end")
             ? {}
             : { duration_minutes: durationMinutes };
+          if (button.hasAttribute("data-warm-start")) {
+            const artifactStack = selectedArtifactStack();
+            if (artifactStack === null) throw new Error("warm artifact selection unavailable");
+            Object.assign(body, artifactStack);
+          }
           const response = await fetch(url, {
             method: "POST",
             credentials: "same-origin",
@@ -7838,6 +8060,7 @@
     });
   }
 
+  initializeModelFamilyPicker();
   const experimentFormPresent = Boolean(document.querySelector("[data-experiment-form]"));
   const reusedImageSettings = consumePendingImageProfile();
   if (!reusedImageSettings && !experimentFormPresent) restoreAutomationDraft();

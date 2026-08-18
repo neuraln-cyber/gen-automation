@@ -10,6 +10,7 @@ from gen_automation.db.session import Database
 from gen_automation.domain.enums import (
     AdminRole,
     ApprovalStatus,
+    GenerationModelFamily,
     LoraImportSource,
     ManagedLoraLifecycle,
     ModelArtifactKind,
@@ -68,6 +69,158 @@ def _baseline(*, sha256: str = "f" * 64, kind: ArtifactKind = ArtifactKind.CHECK
             ),
         )
     )
+
+
+def _multi_family_baseline():
+    return create_artifact_manifest(
+        tuple(
+            ModelArtifactSpec(
+                logical_name=name,
+                kind=kind,
+                source_object_id=f"models/{name}.safetensors",
+                source_object_version_id="version-1",
+                sha256=sha256,
+                exact_size_bytes=1024,
+                max_size_bytes=1024,
+                target_filename=f"{name}.safetensors",
+            )
+            for name, kind, sha256 in (
+                ("illustrious", ArtifactKind.CHECKPOINT, "a" * 64),
+                ("illustrious-style", ArtifactKind.LORA, "b" * 64),
+                ("anima", ArtifactKind.DIFFUSION_MODEL, "c" * 64),
+                ("anima-text", ArtifactKind.TEXT_ENCODER, "d" * 64),
+                ("anima-vae", ArtifactKind.VAE, "e" * 64),
+                ("anima-style", ArtifactKind.LORA, "f" * 64),
+            )
+        )
+    )
+
+
+async def _add_family_approval(
+    database: Database,
+    *,
+    owner_id: UUID,
+    sha256: str,
+    name: str,
+    kind: ModelArtifactKind,
+    family: GenerationModelFamily,
+) -> None:
+    experiment_only = family == GenerationModelFamily.ANIMA
+    async with database.sessions() as session:
+        session.add(
+            ModelArtifactApproval(
+                artifact_sha256=sha256,
+                name=name,
+                kind=kind,
+                model_family=family,
+                source_url=f"https://models.example.test/{name}",
+                storage_key=f"models/{name}.safetensors",
+                license_url=f"https://models.example.test/{name}/license",
+                commercial_use_approved=not experiment_only,
+                experiment_only=experiment_only,
+                adult_use_approved=True,
+                safetensors_verified=True,
+                evidence={"summary": "Test family approval"},
+                evidence_sha256="8" * 64,
+                status=ApprovalStatus.APPROVED,
+                is_current=True,
+                approval_version=1,
+                approved_by_user_id=owner_id,
+                approved_at=NOW,
+            )
+        )
+        await session.commit()
+
+
+async def test_runtime_manifest_selects_only_the_requested_model_family(
+    manifest_database: tuple[Database, UUID],
+) -> None:
+    database, owner_id = manifest_database
+    for sha256, name, kind, family in (
+        ("a" * 64, "illustrious", ModelArtifactKind.CHECKPOINT, GenerationModelFamily.ILLUSTRIOUS),
+        ("b" * 64, "illustrious-style", ModelArtifactKind.LORA, GenerationModelFamily.ILLUSTRIOUS),
+        ("c" * 64, "anima", ModelArtifactKind.CHECKPOINT, GenerationModelFamily.ANIMA),
+        ("f" * 64, "anima-style", ModelArtifactKind.LORA, GenerationModelFamily.ANIMA),
+    ):
+        await _add_family_approval(
+            database,
+            owner_id=owner_id,
+            sha256=sha256,
+            name=name,
+            kind=kind,
+            family=family,
+        )
+    async with database.sessions() as session:
+        illustrious = await build_effective_artifact_manifest(
+            session,
+            baseline=_multi_family_baseline(),
+            expected_bucket=BUCKET,
+            required_checkpoint_sha256="a" * 64,
+            required_lora_sha256s=("b" * 64,),
+        )
+        anima = await build_effective_artifact_manifest(
+            session,
+            baseline=_multi_family_baseline(),
+            expected_bucket=BUCKET,
+            required_checkpoint_sha256="c" * 64,
+            required_lora_sha256s=(),
+        )
+        anima_with_style_selected = await build_effective_artifact_manifest(
+            session,
+            baseline=_multi_family_baseline(),
+            expected_bucket=BUCKET,
+            required_checkpoint_sha256="c" * 64,
+            required_lora_sha256s=("f" * 64,),
+        )
+
+    assert {(artifact.kind, artifact.sha256) for artifact in illustrious.manifest.artifacts} == {
+        (ArtifactKind.CHECKPOINT, "a" * 64),
+        (ArtifactKind.LORA, "b" * 64),
+    }
+    assert {(artifact.kind, artifact.sha256) for artifact in anima.manifest.artifacts} == {
+        (ArtifactKind.DIFFUSION_MODEL, "c" * 64),
+        (ArtifactKind.LORA, "f" * 64),
+        (ArtifactKind.TEXT_ENCODER, "d" * 64),
+        (ArtifactKind.VAE, "e" * 64),
+    }
+    assert anima.sha256 == anima_with_style_selected.sha256
+
+
+async def test_runtime_manifest_rejects_missing_primary_or_anima_support(
+    manifest_database: tuple[Database, UUID],
+) -> None:
+    database, owner_id = manifest_database
+    await _add_family_approval(
+        database,
+        owner_id=owner_id,
+        sha256="c" * 64,
+        name="anima",
+        kind=ModelArtifactKind.CHECKPOINT,
+        family=GenerationModelFamily.ANIMA,
+    )
+    async with database.sessions() as session:
+        with pytest.raises(ManagedArtifactManifestError, match="required primary model"):
+            await build_effective_artifact_manifest(
+                session,
+                baseline=_multi_family_baseline(),
+                expected_bucket=BUCKET,
+                required_checkpoint_sha256="9" * 64,
+                required_lora_sha256s=(),
+            )
+        with pytest.raises(ManagedArtifactManifestError, match="support artifacts"):
+            await build_effective_artifact_manifest(
+                session,
+                baseline=create_artifact_manifest(
+                    tuple(
+                        artifact
+                        for artifact in _multi_family_baseline().artifacts
+                        if artifact.kind != ArtifactKind.VAE
+                    )
+                ),
+                expected_bucket=BUCKET,
+                required_checkpoint_sha256="c" * 64,
+                required_lora_sha256s=(),
+            )
 
 
 async def _add_managed(

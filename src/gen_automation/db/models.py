@@ -41,6 +41,7 @@ from gen_automation.domain.enums import (
     ExperimentWarmLeaseState,
     FinishedSetArchiveState,
     GenerationAttemptState,
+    GenerationModelFamily,
     GenerationState,
     InboxStatus,
     LoraImportJobState,
@@ -911,6 +912,8 @@ class ExperimentWarmLease(UuidPrimaryKeyMixin, TimestampMixin, Base):
     idle_ttl_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     max_cost_microusd: Mapped[int] = mapped_column(BigInteger, nullable=False)
     provider_version: Mapped[int | None] = mapped_column(Integer)
+    requested_checkpoint_sha256: Mapped[str | None] = mapped_column(String(64))
+    requested_lora_sha256s: Mapped[list[str] | None] = mapped_column(JSON_TYPE)
     created_by: Mapped[str] = mapped_column(String(200), nullable=False)
     lock_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
@@ -4271,7 +4274,10 @@ class ModelArtifactApproval(UuidPrimaryKeyMixin, TimestampMixin, Base):
             postgresql_where=text("is_current"),
             sqlite_where=text("is_current = 1"),
         ),
-        CheckConstraint("commercial_use_approved = true", name="commercial_use_required"),
+        CheckConstraint(
+            "commercial_use_approved = true OR experiment_only = true",
+            name="approved_usage_scope",
+        ),
         CheckConstraint("adult_use_approved = true", name="adult_use_required"),
         CheckConstraint("safetensors_verified = true", name="safetensors_required"),
         CheckConstraint("approval_version > 0", name="positive_approval_version"),
@@ -4301,10 +4307,27 @@ class ModelArtifactApproval(UuidPrimaryKeyMixin, TimestampMixin, Base):
         ),
         nullable=False,
     )
+    model_family: Mapped[GenerationModelFamily] = mapped_column(
+        Enum(
+            GenerationModelFamily,
+            name="generation_model_family",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=20,
+        ),
+        nullable=False,
+        default=GenerationModelFamily.ILLUSTRIOUS,
+    )
     source_url: Mapped[str] = mapped_column(Text, nullable=False)
     storage_key: Mapped[str] = mapped_column(String(1024), nullable=False)
     license_url: Mapped[str] = mapped_column(Text, nullable=False)
     commercial_use_approved: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    experiment_only: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+    )
     adult_use_approved: Mapped[bool] = mapped_column(Boolean, nullable=False)
     safetensors_verified: Mapped[bool] = mapped_column(Boolean, nullable=False)
     evidence: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, nullable=False)
@@ -4703,6 +4726,18 @@ class WorkflowApproval(UuidPrimaryKeyMixin, TimestampMixin, Base):
     workflow_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     version: Mapped[str] = mapped_column(String(100), nullable=False)
+    model_family: Mapped[GenerationModelFamily] = mapped_column(
+        Enum(
+            GenerationModelFamily,
+            name="workflow_generation_model_family",
+            native_enum=False,
+            create_constraint=True,
+            values_callable=lambda members: [member.value for member in members],
+            length=20,
+        ),
+        nullable=False,
+        default=GenerationModelFamily.ILLUSTRIOUS,
+    )
     object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
     reviewed_node_classes: Mapped[list[str]] = mapped_column(JSON_TYPE, nullable=False)
     capabilities: Mapped[list[str]] = mapped_column(JSON_TYPE, nullable=False, default=list)

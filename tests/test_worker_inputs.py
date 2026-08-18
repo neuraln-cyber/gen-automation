@@ -28,6 +28,7 @@ from gen_automation.gpu_worker.artifacts import (
     ArtifactManifest,
     ModelArtifactSpec,
     calculate_manifest_sha256,
+    create_artifact_manifest,
 )
 from gen_automation.gpu_worker.models import (
     DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES,
@@ -58,6 +59,9 @@ SIGNING_PRIVATE_KEY = encode_base64url(bytes(range(1, 33)))
 VERIFICATION_PUBLIC_KEY = derive_public_key(SIGNING_PRIVATE_KEY)
 WORKFLOW_BODY = (
     Path(__file__).resolve().parents[1] / "workflows" / "illustrious-sdxl-base-v1.json"
+).read_bytes()
+ANIMA_WORKFLOW_BODY = (
+    Path(__file__).resolve().parents[1] / "workflows" / "anima-base-v1.json"
 ).read_bytes()
 HIRES_WORKFLOW_BODY = (
     Path(__file__).resolve().parents[1] / "workflows" / "illustrious-sdxl-hires-v1.json"
@@ -415,6 +419,74 @@ def _profile_context(
         workflow_body=workflow_body,
         job_context=job_context,
         artifact_manifest=manifest,
+    )
+
+
+def _anima_context(context: WorkerInputContext) -> WorkerInputContext:
+    context.store.put_for_test(
+        context.workflow_key,
+        ANIMA_WORKFLOW_BODY,
+        content_type="application/json",
+    )
+    parameters = dict(context.job_context.parameters)
+    parameters["checkpoint"] = {
+        **dict(parameters["checkpoint"]),  # type: ignore[arg-type]
+        "name": "anima-base.safetensors",
+        "storage_key": "models/anima-base.safetensors",
+        "sha256": "c" * 64,
+    }
+    parameters["workflow"] = {
+        **dict(parameters["workflow"]),  # type: ignore[arg-type]
+        "name": "anima-base",
+        "sha256": hashlib.sha256(ANIMA_WORKFLOW_BODY).hexdigest(),
+    }
+    manifest = create_artifact_manifest(
+        (
+            ModelArtifactSpec(
+                logical_name="anima-base",
+                kind=ArtifactKind.DIFFUSION_MODEL,
+                source_object_id="models/anima-base.safetensors",
+                sha256="c" * 64,
+                exact_size_bytes=100,
+                max_size_bytes=100,
+                target_filename="anima-base-runtime.safetensors",
+            ),
+            ModelArtifactSpec(
+                logical_name="anima-text",
+                kind=ArtifactKind.TEXT_ENCODER,
+                source_object_id="models/anima-text.safetensors",
+                sha256="d" * 64,
+                exact_size_bytes=100,
+                max_size_bytes=100,
+                target_filename="anima-text-runtime.safetensors",
+            ),
+            ModelArtifactSpec(
+                logical_name="anima-vae",
+                kind=ArtifactKind.VAE,
+                source_object_id="models/anima-vae.safetensors",
+                sha256="e" * 64,
+                exact_size_bytes=100,
+                max_size_bytes=100,
+                target_filename="anima-vae-runtime.safetensors",
+            ),
+            next(
+                artifact
+                for artifact in context.artifact_manifest.artifacts
+                if artifact.kind == ArtifactKind.LORA
+            ),
+        )
+    )
+    return replace(
+        context,
+        workflow_body=ANIMA_WORKFLOW_BODY,
+        artifact_manifest=manifest,
+        job_context=SaladJobInputContext(
+            **{
+                **context.job_context.__dict__,
+                "parameters": parameters,
+                "parameters_sha256": canonical_sha256(parameters),
+            }
+        ),
     )
 
 
@@ -1898,6 +1970,55 @@ async def test_synthetic_production_prompt_reaches_immutable_raw_masters(
         AssetState.AVAILABLE,
     ]
     assert all(asset.object_key in worker_input_context.store.objects for asset in assets)
+
+
+@pytest.mark.asyncio
+async def test_anima_uses_split_runtime_artifacts_and_model_only_loras(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _anima_context(worker_input_context)
+
+    workflow = GenerateEnvelope.model_validate(
+        await _build(context),
+        strict=True,
+    ).payload.workflow
+
+    assert workflow["1"]["inputs"]["unet_name"] == "anima-base-runtime.safetensors"
+    assert workflow["3"]["inputs"]["clip_name"] == "anima-text-runtime.safetensors"
+    assert workflow["4"]["inputs"]["vae_name"] == "anima-vae-runtime.safetensors"
+    assert workflow["2-lora-1"] == {
+        "class_type": "LoraLoaderModelOnly",
+        "inputs": {
+            "model": ["1", 0],
+            "lora_name": "style-runtime.safetensors",
+            "strength_model": 0.75,
+        },
+    }
+    assert workflow["8"]["inputs"]["model"] == ["2-lora-1", 0]
+    assert not any(
+        node["class_type"] in {"CheckpointLoaderSimple", "LoraLoader"} for node in workflow.values()
+    )
+    validate_approved_workflow(workflow, DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
+
+
+@pytest.mark.asyncio
+async def test_anima_rejects_a_missing_split_runtime_artifact(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _anima_context(worker_input_context)
+    context = replace(
+        context,
+        artifact_manifest=create_artifact_manifest(
+            tuple(
+                artifact
+                for artifact in context.artifact_manifest.artifacts
+                if artifact.kind != ArtifactKind.VAE
+            )
+        ),
+    )
+
+    with pytest.raises(WorkerInputError, match="support artifacts"):
+        await _build(context)
 
 
 @pytest.mark.asyncio
