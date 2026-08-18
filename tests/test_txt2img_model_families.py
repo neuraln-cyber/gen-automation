@@ -333,7 +333,7 @@ def test_generic_generation_plan_route_rejects_experiment_only_release(
     assert "trusted Experiment Lab approval" in response.json()["detail"]
 
 
-def test_shared_new_set_page_exposes_anima_only_in_experiment_lab(
+def test_shared_new_set_page_exposes_anima_in_normal_and_experiment_modes(
     client: TestClient,
 ) -> None:
     database = client.app.state.database
@@ -352,12 +352,15 @@ def test_shared_new_set_page_exposes_anima_only_in_experiment_lab(
     assert normal.status_code == 200
     assert experiment.status_code == 200
     assert script.status_code == 200
-    assert "MiaoMiao Anima Base" not in normal.text
+    assert "MiaoMiao Anima Base" in normal.text
     assert "data-model-family-picker" in normal.text
-    assert 'value="anima"' not in normal.text
+    assert 'value="anima"' in normal.text
+    assert 'data-model-family="anima"' in normal.text
+    assert "Anima is available here" in normal.text
     assert "MiaoMiao Anima Base" in experiment.text
     assert 'value="anima"' in experiment.text
     assert 'data-model-family="anima"' in experiment.text
+    assert "explicit warm-session controls" in experiment.text
     assert "initializeModelFamilyPicker" in script.text
     assert "gen-automation:model-family-changed" in script.text
     assert 'width: "896"' in script.text

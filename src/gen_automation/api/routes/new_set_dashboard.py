@@ -97,7 +97,7 @@ async def dashboard_new_set(
         )
     options = await list_new_set_options(
         session,
-        experiment_mode=_is_experiment_mode(request),
+        experiment_mode=True,
     )
     try:
         return new_set_form_response(
@@ -141,7 +141,7 @@ async def submit_dashboard_new_set(
     except BrowserNewSetFormError as error:
         options = await list_new_set_options(
             session,
-            experiment_mode=experiment_mode,
+            experiment_mode=True,
         )
         return new_set_form_response(
             request,
@@ -183,7 +183,7 @@ async def submit_dashboard_new_set(
             idempotency_key=form.idempotency_key,
             settings=settings,
             actor=str(manager.user_id),
-            experiment_mode=experiment_mode,
+            experiment_mode=True,
         )
         should_ensure_warm = experiment_mode and not (
             result.release_replayed and result.generation_plan_replayed
@@ -592,7 +592,7 @@ async def _submission_error(
 ) -> Response:
     options = await list_new_set_options(
         session,
-        experiment_mode=_is_experiment_mode(request),
+        experiment_mode=True,
     )
     return new_set_form_response(
         request,
