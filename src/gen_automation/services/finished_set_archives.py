@@ -1898,8 +1898,10 @@ async def _adopt_public_png_if_present(
     existing = await store.head(key)
     if existing is None:
         return None
-    cached, _body = await _load_cached_public_png(
-        store,
+    # The part builder reads this exact immutable version and validates its
+    # bytes once.  Avoid downloading the whole PNG here only to repeat that
+    # same read moments later.
+    return _cached_public_png_from_metadata(
         key=key,
         metadata=existing,
         static_metadata=_public_png_static_metadata(
@@ -1911,7 +1913,6 @@ async def _adopt_public_png_if_present(
         expected_width=source_width,
         expected_height=source_height,
     )
-    return cached
 
 
 async def _render_or_adopt_public_png(
@@ -2038,26 +2039,27 @@ async def _render_or_adopt_public_png(
             ) from error
         return adopted
     assert stored is not None
-    cached, _body = await _load_cached_public_png(
-        store,
+    # The successful write used the locally validated artifact bytes.  The
+    # part builder still reads back and validates the persisted version once.
+    return _cached_public_png_from_metadata(
         key=key,
         metadata=stored,
         static_metadata=static_metadata,
         expected_width=source_width,
         expected_height=source_height,
     )
-    return cached
 
 
-async def _load_cached_public_png(
-    store: ObjectStore,
+def _cached_public_png_from_metadata(
     *,
     key: str,
     metadata: ObjectMetadata,
     static_metadata: dict[str, str],
     expected_width: int,
     expected_height: int,
-) -> tuple[_CachedPublicPng, bytes]:
+) -> _CachedPublicPng:
+    """Validate immutable cache identity without downloading the object body."""
+
     values = metadata.metadata
     try:
         sha256 = values["sha256"]
@@ -2092,36 +2094,52 @@ async def _load_cached_public_png(
         raise _FinishedSetArchiveContractError(
             "a cached public PNG does not match its frozen render identity"
         )
+    return _CachedPublicPng(
+        object_key=key,
+        object_version_id=metadata.version_id,
+        sha256=sha256,
+        byte_size=byte_size,
+        width=width,
+        height=height,
+        recipe_sha256=_PUBLIC_PNG_RECIPE_SHA256,
+        lineage_sha256=lineage_sha256,
+        renderer_version=DERIVATIVE_RENDERER_VERSION,
+        pillow_version=PILLOW_VERSION,
+    )
+
+
+async def _load_cached_public_png(
+    store: ObjectStore,
+    *,
+    key: str,
+    metadata: ObjectMetadata,
+    static_metadata: dict[str, str],
+    expected_width: int,
+    expected_height: int,
+) -> tuple[_CachedPublicPng, bytes]:
+    cached = _cached_public_png_from_metadata(
+        key=key,
+        metadata=metadata,
+        static_metadata=static_metadata,
+        expected_width=expected_width,
+        expected_height=expected_height,
+    )
     body = await store.read_bytes(
         key,
-        version_id=metadata.version_id,
+        version_id=cached.object_version_id,
         max_bytes=_MAX_PUBLIC_PNG_BYTES,
     )
     _validate_public_png_bytes(
         body,
-        sha256=sha256,
-        width=width,
-        height=height,
+        sha256=cached.sha256,
+        width=cached.width,
+        height=cached.height,
     )
-    if len(body) != byte_size:
+    if len(body) != cached.byte_size:
         raise _FinishedSetArchiveContractError(
             "a cached public PNG does not match its immutable byte size"
         )
-    return (
-        _CachedPublicPng(
-            object_key=key,
-            object_version_id=metadata.version_id,
-            sha256=sha256,
-            byte_size=byte_size,
-            width=width,
-            height=height,
-            recipe_sha256=_PUBLIC_PNG_RECIPE_SHA256,
-            lineage_sha256=lineage_sha256,
-            renderer_version=DERIVATIVE_RENDERER_VERSION,
-            pillow_version=PILLOW_VERSION,
-        ),
-        body,
-    )
+    return cached, body
 
 
 def _public_png_cache_key(

@@ -228,6 +228,13 @@ async def test_archive_is_available_without_preparing_any_destination(
         and kwargs["recipe"].full.encoding.image_format.value == "PNG"
         for _source, kwargs in _trusted_test_isolated_renderer
     )
+    public_png_reads = [
+        key
+        for key, _max_bytes, _version_id, _etag in prepared.store.read_requests
+        if key.startswith("public-media/public-png-v1/")
+    ]
+    assert len(public_png_reads) == 2
+    assert len(set(public_png_reads)) == 2
 
     async with approved.database.sessions() as session:
         snapshot = await load_finished_set_archive(
@@ -382,6 +389,13 @@ async def test_archive_adopts_a_completed_write_after_response_loss(
     assert second.archive_id == first.archive_id
     assert len(_trusted_test_isolated_renderer) == 2
     assert not any(key.startswith("raw/") for key, *_rest in store.read_requests)
+    public_png_reads = [
+        key
+        for key, _max_bytes, _version_id, _etag in store.read_requests
+        if key.startswith("public-media/public-png-v1/")
+    ]
+    assert len(public_png_reads) == 2
+    assert len(set(public_png_reads)) == 2
 
     async with approved.database.sessions() as session:
         snapshot = await load_finished_set_archive(
