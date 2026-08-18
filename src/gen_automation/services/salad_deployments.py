@@ -704,11 +704,12 @@ async def _reconcile_locked(
 
     if not group.pending_change:
         provider_status = group.status.strip().lower()
+        start_wait_active = _start_wait_is_active(deployment)
         # A manually or provider-stopped group is a valid idle state while the
         # durable demand calculation remains zero. Starting it here would fight
         # the operator stop and allocate an otherwise unneeded GPU.
         unhealthy_status = provider_status == "failed" or (
-            provider_status == "stopped" and effective_min_replicas == 1
+            provider_status == "stopped" and effective_min_replicas == 1 and not start_wait_active
         )
         if drift_code is not None or unhealthy_status:
             deployment.unknown_since = None
@@ -918,6 +919,7 @@ async def _request_active_contract_repair(
         drift_code is None
         and effective_min_replicas == 1
         and group.status.strip().lower() == "stopped"
+        and not _start_wait_is_active(deployment)
     ):
         try:
             await client.start_container_group(deployment.container_group_name)
@@ -2210,6 +2212,17 @@ def _record_start_wait(
         return False
     unchanged_since = _stored_as_utc(deployment.unknown_since)
     return observed_at - unchanged_since >= _PROVIDER_PENDING_STALL_AFTER
+
+
+def _start_wait_is_active(deployment: SaladDeployment) -> bool:
+    return bool(
+        deployment.unknown_since is not None
+        and deployment.last_error_code
+        in {
+            "provider_start_pending",
+            "provider_start_stalled",
+        }
+    )
 
 
 async def _verify_persisted_queue(

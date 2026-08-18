@@ -262,6 +262,122 @@ def test_worker_image_preparation_stall_is_visible_retryable_and_keeps_polling()
 
 
 @pytest.mark.parametrize(
+    ("stage_key", "step"),
+    (
+        (GenerationProgressStage.QUEUED, 1),
+        (GenerationProgressStage.GPU_STARTING, 2),
+    ),
+)
+def test_gpu_start_stall_is_visible_retryable_and_keeps_polling(
+    stage_key: GenerationProgressStage,
+    step: int,
+) -> None:
+    stage, error = _overlay_provider_preparation(
+        _stage(key=stage_key, step=step),
+        None,
+        deployment=_deployment(
+            state=SaladDeploymentState.DEGRADED,
+            provider_status="queue=0;group=deploying;pending=0",
+            last_error_code="provider_start_stalled",
+        ),
+        now=NOW,
+    )
+
+    assert stage.key == GenerationProgressStage.ERROR
+    assert stage.step == step
+    assert stage.label == "GPU worker start stalled"
+    assert "no ready GPU" in stage.detail
+    assert error == GenerationProgressError(
+        code="provider_start_stalled",
+        message=(
+            "The GPU worker did not become ready within 30 minutes. You can stop this "
+            "run safely; no generated images will be discarded."
+        ),
+        retryable=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "deployment",
+    (
+        _deployment(
+            state=SaladDeploymentState.DEGRADED,
+            provider_status="queue=0;group=deploying;pending=0",
+            last_error_code="provider_start_stalled",
+            last_observed_at=NOW - timedelta(minutes=6),
+        ),
+        _deployment(
+            state=SaladDeploymentState.DEGRADED,
+            provider_status="queue=0;group=deploying;pending=0",
+            last_error_code="provider_start_stalled",
+            is_current=False,
+        ),
+        _deployment(
+            state=SaladDeploymentState.PROVISIONING,
+            provider_status="queue=0;group=deploying;pending=0",
+            last_error_code="provider_start_stalled",
+        ),
+        _deployment(
+            state=SaladDeploymentState.DEGRADED,
+            provider_status="queue=0;group=deploying;pending=0;raw=unsafe",
+            last_error_code="provider_start_stalled",
+        ),
+        _deployment(
+            state=SaladDeploymentState.DEGRADED,
+            provider_status="queue=0;group=running;pending=0",
+            last_error_code="provider_start_stalled",
+        ),
+    ),
+    ids=("stale", "not-current", "wrong-state", "malformed", "ready-status"),
+)
+def test_gpu_start_stall_falls_back_for_stale_or_incoherent_state(
+    deployment: SaladDeployment,
+) -> None:
+    original = _stage(key=GenerationProgressStage.QUEUED, step=1)
+    stage, error = _overlay_provider_preparation(
+        original,
+        None,
+        deployment=deployment,
+        now=NOW,
+    )
+
+    assert stage is original
+    assert error is None
+
+
+def test_gpu_start_stall_never_masks_existing_error_or_active_generation() -> None:
+    deployment = _deployment(
+        state=SaladDeploymentState.DEGRADED,
+        provider_status="queue=0;group=deploying;pending=0",
+        last_error_code="provider_start_stalled",
+    )
+    existing_error = GenerationProgressError(
+        code="existing",
+        message="Existing generation status.",
+        retryable=False,
+    )
+    queued = _stage(key=GenerationProgressStage.QUEUED, step=1)
+    queued_stage, queued_error = _overlay_provider_preparation(
+        queued,
+        existing_error,
+        deployment=deployment,
+        now=NOW,
+    )
+    generating = _stage(key=GenerationProgressStage.GENERATING, step=3)
+    generating_stage, generating_error = _overlay_provider_preparation(
+        generating,
+        None,
+        deployment=deployment,
+        now=NOW,
+    )
+
+    assert queued_stage is queued
+    assert queued_error is existing_error
+    assert generating_stage is generating
+    assert generating_error is None
+
+
+@pytest.mark.parametrize(
     "deployment",
     (
         _deployment(
