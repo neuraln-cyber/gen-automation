@@ -1,0 +1,250 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": {
+        "$gen": "diffusion_model.runtime_filename"
+      },
+      "weight_dtype": "default"
+    }
+  },
+  "2": {
+    "class_type": "GenAutomationLoraChain",
+    "inputs": {
+      "mode": "model_only",
+      "model": [
+        "1",
+        0
+      ]
+    }
+  },
+  "3": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": {
+        "$gen": "text_encoder.runtime_filename"
+      },
+      "device": "default",
+      "type": "stable_diffusion"
+    }
+  },
+  "4": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": {
+        "$gen": "vae.runtime_filename"
+      }
+    }
+  },
+  "5": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "3",
+        0
+      ],
+      "text": {
+        "$gen": "generation.prompt"
+      }
+    }
+  },
+  "6": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "3",
+        0
+      ],
+      "text": {
+        "$gen": "generation.negative_prompt"
+      }
+    }
+  },
+  "7": {
+    "class_type": "EmptyLatentImage",
+    "inputs": {
+      "batch_size": {
+        "$gen": "generation.outputs_per_job"
+      },
+      "height": {
+        "$gen": "generation.height"
+      },
+      "width": {
+        "$gen": "generation.width"
+      }
+    }
+  },
+  "8": {
+    "class_type": "KSampler",
+    "inputs": {
+      "cfg": {
+        "$gen": "generation.cfg"
+      },
+      "denoise": 1.0,
+      "latent_image": [
+        "7",
+        0
+      ],
+      "model": [
+        "2",
+        0
+      ],
+      "negative": [
+        "6",
+        0
+      ],
+      "positive": [
+        "5",
+        0
+      ],
+      "sampler_name": {
+        "$gen": "generation.sampler"
+      },
+      "scheduler": {
+        "$gen": "generation.scheduler"
+      },
+      "seed": {
+        "$gen": "generation.seed"
+      },
+      "steps": {
+        "$gen": "generation.steps"
+      }
+    }
+  },
+  "9": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "8",
+        0
+      ],
+      "vae": [
+        "4",
+        0
+      ]
+    }
+  },
+  "13": {
+    "class_type": "UltralyticsDetectorProvider",
+    "inputs": {
+      "model_name": {
+        "$gen": "detector.comfy_name"
+      }
+    }
+  },
+  "16": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "3",
+        0
+      ],
+      "text": {
+        "$gen": "generation.detailer_prompt"
+      }
+    }
+  },
+  "17": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "3",
+        0
+      ],
+      "text": {
+        "$gen": "generation.detailer_negative_prompt"
+      }
+    }
+  },
+  "14": {
+    "class_type": "FaceDetailer",
+    "inputs": {
+      "bbox_crop_factor": {
+        "$gen": "generation.detailer_bbox_crop_factor"
+      },
+      "bbox_detector": [
+        "13",
+        0
+      ],
+      "bbox_dilation": {
+        "$gen": "generation.detailer_bbox_dilation"
+      },
+      "bbox_threshold": {
+        "$gen": "generation.detailer_bbox_threshold"
+      },
+      "cfg": {
+        "$gen": "generation.cfg"
+      },
+      "clip": [
+        "3",
+        0
+      ],
+      "cycle": 1,
+      "denoise": {
+        "$gen": "generation.detailer_denoise"
+      },
+      "drop_size": 10,
+      "feather": {
+        "$gen": "generation.detailer_feather"
+      },
+      "force_inpaint": true,
+      "guide_size": {
+        "$gen": "generation.detailer_guide_size"
+      },
+      "guide_size_for": true,
+      "image": [
+        "9",
+        0
+      ],
+      "max_size": {
+        "$gen": "generation.detailer_max_size"
+      },
+      "model": [
+        "2",
+        0
+      ],
+      "negative": [
+        "17",
+        0
+      ],
+      "noise_mask": true,
+      "positive": [
+        "16",
+        0
+      ],
+      "sam_bbox_expansion": 0,
+      "sam_detection_hint": "none",
+      "sam_dilation": 0,
+      "sam_mask_hint_threshold": 0.7,
+      "sam_mask_hint_use_negative": "False",
+      "sam_threshold": 0.93,
+      "sampler_name": {
+        "$gen": "generation.sampler"
+      },
+      "scheduler": {
+        "$gen": "generation.scheduler"
+      },
+      "seed": {
+        "$gen": "generation.seed"
+      },
+      "steps": {
+        "$gen": "generation.steps"
+      },
+      "vae": [
+        "4",
+        0
+      ],
+      "wildcard": ""
+    }
+  },
+  "15": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "gen-automation-anima-detailer",
+      "images": [
+        "14",
+        0
+      ]
+    }
+  }
+}

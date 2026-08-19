@@ -148,6 +148,23 @@
         ],
         "internal_reference": "WORKFLOW-ANIMA-BASE-V1"
       }
+    },
+    {
+      "name": "Anima base detailer",
+      "version": "1",
+      "model_family": "anima",
+      "object_key": "workflows/by-sha256/cc3af1aa5c45e275f62de86b24aee1f65218ddee5f6f72eaebb925eb23fec467.json",
+      "local_path": "../workflows/anima-base-detailer-v1.json",
+      "evidence": {
+        "summary": "Reviewed the exact bundled Anima graph with the pinned face detector and FaceDetailer pass.",
+        "source_urls": [
+          "https://github.com/ltdrdata/ComfyUI-Impact-Pack"
+        ],
+        "document_sha256s": [
+          "cc3af1aa5c45e275f62de86b24aee1f65218ddee5f6f72eaebb925eb23fec467"
+        ],
+        "internal_reference": "WORKFLOW-ANIMA-BASE-DETAILER-V1"
+      }
     }
   ]
 }
