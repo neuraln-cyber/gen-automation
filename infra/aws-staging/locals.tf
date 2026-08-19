@@ -14,13 +14,23 @@ locals {
   model_bucket_name = lower(
     "${var.name_prefix}-${data.aws_caller_identity.current.account_id}-${var.aws_region}-models"
   )
-  salad_worker_artifact_role_enabled = length(var.salad_worker_artifact_object_versions) > 0
+  salad_worker_artifact_role_enabled = (
+    length(var.salad_worker_artifact_object_versions) > 0
+    || length(var.salad_worker_artifact_extension_object_versions) > 0
+  )
   # IAM permits at most 10,240 aggregate inline-policy characters on a role.
   # This dedicated reader role has exactly one inline policy, whose rendered
   # minified document is checked against this limit before any write.
   salad_worker_artifact_inline_policy_max_characters = 10240
   salad_worker_artifact_sorted_keys = sort(
     keys(var.salad_worker_artifact_object_versions)
+  )
+  salad_worker_artifact_extension_policy_enabled = (
+    length(var.salad_worker_artifact_extension_object_versions) > 0
+  )
+  salad_worker_artifact_extension_policy_max_characters = 6144
+  salad_worker_artifact_extension_sorted_keys = sort(
+    keys(var.salad_worker_artifact_extension_object_versions)
   )
   github_actions_manages_oidc_provider = (
     var.github_actions_deploy_enabled && var.github_actions_oidc_provider_arn == null

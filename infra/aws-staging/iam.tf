@@ -220,6 +220,56 @@ resource "aws_iam_role_policy" "salad_worker_artifact_reader" {
   }
 }
 
+data "aws_iam_policy_document" "salad_worker_artifact_reader_extension" {
+  count = local.salad_worker_artifact_extension_policy_enabled ? 1 : 0
+
+  dynamic "statement" {
+    for_each = local.salad_worker_artifact_extension_sorted_keys
+
+    content {
+      effect    = "Allow"
+      actions   = ["s3:GetObjectVersion"]
+      resources = ["${aws_s3_bucket.models.arn}/${statement.value}"]
+
+      condition {
+        test     = "StringEquals"
+        variable = "s3:VersionId"
+        values = [
+          var.salad_worker_artifact_extension_object_versions[statement.value]
+        ]
+      }
+    }
+  }
+}
+
+resource "aws_iam_policy" "salad_worker_artifact_reader_extension" {
+  count = local.salad_worker_artifact_extension_policy_enabled ? 1 : 0
+
+  name   = "${local.name}-pinned-artifact-extensions"
+  policy = data.aws_iam_policy_document.salad_worker_artifact_reader_extension[0].minified_json
+
+  lifecycle {
+    precondition {
+      condition = (
+        length(data.aws_iam_policy_document.salad_worker_artifact_reader_extension[0].minified_json)
+        <= local.salad_worker_artifact_extension_policy_max_characters
+      )
+      error_message = "The Salad worker artifact-reader extension exceeds IAM's 6,144-character customer-managed-policy quota."
+    }
+  }
+
+  tags = {
+    Name = "${local.name}-pinned-artifact-extensions"
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "salad_worker_artifact_reader_extension" {
+  count = local.salad_worker_artifact_extension_policy_enabled ? 1 : 0
+
+  role       = aws_iam_role.salad_worker_artifact_reader[0].name
+  policy_arn = aws_iam_policy.salad_worker_artifact_reader_extension[0].arn
+}
+
 data "aws_iam_policy_document" "runtime" {
   statement {
     sid = "AssetBucketMetadata"

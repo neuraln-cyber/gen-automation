@@ -40,6 +40,10 @@ salad_worker_artifact_object_versions = {
   # "worker/i2v/sha256/<exact-64-hex-sha256>" = "opaque-s3-version-id"
 }
 
+# Keep empty until the compact inline policy reaches its hard IAM quota. Entries
+# here remain exact key + exact VersionId reads in one additive managed policy.
+salad_worker_artifact_extension_object_versions = {}
+
 # Exchange GitHub's main-branch OIDC token for a short-lived, exact-instance
 # SSM deploy role. This avoids AWS access keys and routine AWS browser logins.
 github_actions_deploy_enabled            = true
