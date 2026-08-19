@@ -243,11 +243,45 @@ data "aws_iam_policy_document" "models_bucket" {
       values   = ["false"]
     }
   }
+
+  dynamic "statement" {
+    for_each = local.salad_worker_artifact_extension_sorted_keys
+
+    content {
+      effect = "Allow"
+
+      principals {
+        type        = "AWS"
+        identifiers = [aws_iam_role.salad_worker_artifact_reader[0].arn]
+      }
+
+      actions   = ["s3:GetObjectVersion"]
+      resources = ["${aws_s3_bucket.models.arn}/${statement.value}"]
+
+      condition {
+        test     = "StringEquals"
+        variable = "s3:VersionId"
+        values = [
+          var.salad_worker_artifact_extension_object_versions[statement.value]
+        ]
+      }
+    }
+  }
 }
 
 resource "aws_s3_bucket_policy" "models" {
   bucket = aws_s3_bucket.models.id
   policy = data.aws_iam_policy_document.models_bucket.json
+
+  lifecycle {
+    precondition {
+      condition = (
+        length(data.aws_iam_policy_document.models_bucket.minified_json)
+        <= local.models_bucket_policy_max_characters
+      )
+      error_message = "The models bucket policy exceeds Amazon S3's 20,480-character policy limit."
+    }
+  }
 
   depends_on = [aws_s3_bucket_public_access_block.models]
 }
