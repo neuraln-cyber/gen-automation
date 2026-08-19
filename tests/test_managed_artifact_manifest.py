@@ -230,6 +230,7 @@ async def _add_managed(
     index: int,
     lifecycle: ManagedLoraLifecycle = ManagedLoraLifecycle.ACTIVE,
     activated: bool = True,
+    experiment_only: bool = False,
 ) -> str:
     sha256 = f"{index:064x}"
     key = f"worker/managed-loras/sha256/{sha256}.safetensors"
@@ -241,7 +242,8 @@ async def _add_managed(
             source_url=f"https://models.example.test/{index}",
             storage_key=key,
             license_url=f"https://models.example.test/{index}/license",
-            commercial_use_approved=True,
+            commercial_use_approved=not experiment_only,
+            experiment_only=experiment_only,
             adult_use_approved=True,
             safetensors_verified=True,
             evidence={"summary": "Test approval"},
@@ -285,6 +287,30 @@ async def _add_managed(
         )
         await session.commit()
     return sha256
+
+
+async def test_selected_experiment_only_managed_lora_is_runnable(
+    manifest_database: tuple[Database, UUID],
+) -> None:
+    database, owner_id = manifest_database
+    selected = await _add_managed(
+        database,
+        owner_id=owner_id,
+        index=73,
+        experiment_only=True,
+    )
+    async with database.sessions() as session:
+        effective = await build_effective_artifact_manifest(
+            session,
+            baseline=_baseline(),
+            expected_bucket=BUCKET,
+            required_lora_sha256s=(selected,),
+        )
+    assert effective.managed_lora_sha256s == frozenset({selected})
+    assert {artifact.sha256 for artifact in effective.manifest.artifacts} == {
+        "f" * 64,
+        selected,
+    }
 
 
 async def test_required_lora_cannot_be_satisfied_by_a_wrong_kind_baseline(

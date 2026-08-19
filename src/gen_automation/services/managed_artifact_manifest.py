@@ -234,7 +234,10 @@ async def build_effective_artifact_manifest(
         ModelArtifactApproval.status == ApprovalStatus.APPROVED,
         ModelArtifactApproval.is_current.is_(True),
         ModelArtifactApproval.kind == ModelArtifactKind.LORA,
-        ModelArtifactApproval.commercial_use_approved.is_(True),
+        or_(
+            ModelArtifactApproval.commercial_use_approved.is_(True),
+            ModelArtifactApproval.experiment_only.is_(True),
+        ),
         ModelArtifactApproval.adult_use_approved.is_(True),
         ModelArtifactApproval.safetensors_verified.is_(True),
     ]
