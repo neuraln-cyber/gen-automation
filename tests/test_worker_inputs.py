@@ -63,6 +63,9 @@ WORKFLOW_BODY = (
 ANIMA_WORKFLOW_BODY = (
     Path(__file__).resolve().parents[1] / "workflows" / "anima-base-v1.json"
 ).read_bytes()
+ANIMA_DETAILER_WORKFLOW_BODY = (
+    Path(__file__).resolve().parents[1] / "workflows" / "anima-base-detailer-v1.json"
+).read_bytes()
 HIRES_WORKFLOW_BODY = (
     Path(__file__).resolve().parents[1] / "workflows" / "illustrious-sdxl-hires-v1.json"
 ).read_bytes()
@@ -422,10 +425,15 @@ def _profile_context(
     )
 
 
-def _anima_context(context: WorkerInputContext) -> WorkerInputContext:
+def _anima_context(
+    context: WorkerInputContext,
+    *,
+    workflow_body: bytes = ANIMA_WORKFLOW_BODY,
+    detector: bool = False,
+) -> WorkerInputContext:
     context.store.put_for_test(
         context.workflow_key,
-        ANIMA_WORKFLOW_BODY,
+        workflow_body,
         content_type="application/json",
     )
     parameters = dict(context.job_context.parameters)
@@ -438,47 +446,59 @@ def _anima_context(context: WorkerInputContext) -> WorkerInputContext:
     parameters["workflow"] = {
         **dict(parameters["workflow"]),  # type: ignore[arg-type]
         "name": "anima-base",
-        "sha256": hashlib.sha256(ANIMA_WORKFLOW_BODY).hexdigest(),
+        "sha256": hashlib.sha256(workflow_body).hexdigest(),
     }
-    manifest = create_artifact_manifest(
-        (
+    artifacts = [
+        ModelArtifactSpec(
+            logical_name="anima-base",
+            kind=ArtifactKind.DIFFUSION_MODEL,
+            source_object_id="models/anima-base.safetensors",
+            sha256="c" * 64,
+            exact_size_bytes=100,
+            max_size_bytes=100,
+            target_filename="anima-base-runtime.safetensors",
+        ),
+        ModelArtifactSpec(
+            logical_name="anima-text",
+            kind=ArtifactKind.TEXT_ENCODER,
+            source_object_id="models/anima-text.safetensors",
+            sha256="d" * 64,
+            exact_size_bytes=100,
+            max_size_bytes=100,
+            target_filename="anima-text-runtime.safetensors",
+        ),
+        ModelArtifactSpec(
+            logical_name="anima-vae",
+            kind=ArtifactKind.VAE,
+            source_object_id="models/anima-vae.safetensors",
+            sha256="e" * 64,
+            exact_size_bytes=100,
+            max_size_bytes=100,
+            target_filename="anima-vae-runtime.safetensors",
+        ),
+        next(
+            artifact
+            for artifact in context.artifact_manifest.artifacts
+            if artifact.kind == ArtifactKind.LORA
+        ),
+    ]
+    if detector:
+        artifacts.insert(
+            3,
             ModelArtifactSpec(
-                logical_name="anima-base",
-                kind=ArtifactKind.DIFFUSION_MODEL,
-                source_object_id="models/anima-base.safetensors",
-                sha256="c" * 64,
+                logical_name="face-yolov8m",
+                kind=ArtifactKind.DETECTOR,
+                source_object_id="detectors/face-yolov8m.pt",
+                sha256="f" * 64,
                 exact_size_bytes=100,
                 max_size_bytes=100,
-                target_filename="anima-base-runtime.safetensors",
-            ),
-            ModelArtifactSpec(
-                logical_name="anima-text",
-                kind=ArtifactKind.TEXT_ENCODER,
-                source_object_id="models/anima-text.safetensors",
-                sha256="d" * 64,
-                exact_size_bytes=100,
-                max_size_bytes=100,
-                target_filename="anima-text-runtime.safetensors",
-            ),
-            ModelArtifactSpec(
-                logical_name="anima-vae",
-                kind=ArtifactKind.VAE,
-                source_object_id="models/anima-vae.safetensors",
-                sha256="e" * 64,
-                exact_size_bytes=100,
-                max_size_bytes=100,
-                target_filename="anima-vae-runtime.safetensors",
-            ),
-            next(
-                artifact
-                for artifact in context.artifact_manifest.artifacts
-                if artifact.kind == ArtifactKind.LORA
+                target_filename="face-yolov8m.pt",
             ),
         )
-    )
+    manifest = create_artifact_manifest(tuple(artifacts))
     return replace(
         context,
-        workflow_body=ANIMA_WORKFLOW_BODY,
+        workflow_body=workflow_body,
         artifact_manifest=manifest,
         job_context=SaladJobInputContext(
             **{
@@ -1998,6 +2018,36 @@ async def test_anima_uses_split_runtime_artifacts_and_model_only_loras(
     assert not any(
         node["class_type"] in {"CheckpointLoaderSimple", "LoraLoader"} for node in workflow.values()
     )
+    validate_approved_workflow(workflow, DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
+
+
+@pytest.mark.asyncio
+async def test_anima_detailer_uses_split_runtime_artifacts_and_face_detector(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _anima_context(
+        worker_input_context,
+        workflow_body=ANIMA_DETAILER_WORKFLOW_BODY,
+        detector=True,
+    )
+
+    workflow = GenerateEnvelope.model_validate(
+        await _build(context),
+        strict=True,
+    ).payload.workflow
+
+    assert workflow["13"] == {
+        "class_type": "UltralyticsDetectorProvider",
+        "inputs": {"model_name": "bbox/face-yolov8m.pt"},
+    }
+    assert workflow["14"]["class_type"] == "FaceDetailer"
+    assert workflow["14"]["inputs"]["image"] == ["9", 0]
+    assert workflow["14"]["inputs"]["model"] == ["2-lora-1", 0]
+    assert workflow["14"]["inputs"]["clip"] == ["3", 0]
+    assert workflow["14"]["inputs"]["vae"] == ["4", 0]
+    assert workflow["14"]["inputs"]["positive"] == ["16", 0]
+    assert workflow["14"]["inputs"]["negative"] == ["17", 0]
+    assert workflow["15"]["inputs"]["images"] == ["14", 0]
     validate_approved_workflow(workflow, DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
 
 

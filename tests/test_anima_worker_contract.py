@@ -16,6 +16,7 @@ from gen_automation.gpu_worker.models import (
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = ROOT / "workflows" / "anima-base-v1.json"
+DETAILER_WORKFLOW_PATH = ROOT / "workflows" / "anima-base-detailer-v1.json"
 
 
 def _safetensors(label: str) -> bytes:
@@ -127,6 +128,44 @@ def test_anima_workflow_uses_native_loaders_and_a_model_only_lora_chain() -> Non
         "CLIPSetLastLayer",
         "LoraLoader",
     }.intersection(node["class_type"] for node in workflow.values())
+
+    workflow["2"] = {
+        "class_type": "LoraLoaderModelOnly",
+        "inputs": {
+            "lora_name": "style.safetensors",
+            "model": ["1", 0],
+            "strength_model": 0.5,
+        },
+    }
+    validate_approved_workflow(workflow, DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES)
+
+
+def test_anima_detailer_workflow_preserves_native_loaders_and_refines_the_decoded_face() -> None:
+    workflow = json.loads(DETAILER_WORKFLOW_PATH.read_text(encoding="utf-8"))
+
+    assert workflow["1"] == {
+        "class_type": "UNETLoader",
+        "inputs": {
+            "unet_name": {"$gen": "diffusion_model.runtime_filename"},
+            "weight_dtype": "default",
+        },
+    }
+    assert workflow["2"] == {
+        "class_type": "GenAutomationLoraChain",
+        "inputs": {"mode": "model_only", "model": ["1", 0]},
+    }
+    assert workflow["3"]["class_type"] == "CLIPLoader"
+    assert workflow["4"]["class_type"] == "VAELoader"
+    assert workflow["13"] == {
+        "class_type": "UltralyticsDetectorProvider",
+        "inputs": {"model_name": {"$gen": "detector.comfy_name"}},
+    }
+    assert workflow["14"]["class_type"] == "FaceDetailer"
+    assert workflow["14"]["inputs"]["image"] == ["9", 0]
+    assert workflow["14"]["inputs"]["model"] == ["2", 0]
+    assert workflow["14"]["inputs"]["clip"] == ["3", 0]
+    assert workflow["14"]["inputs"]["vae"] == ["4", 0]
+    assert workflow["15"]["inputs"]["images"] == ["14", 0]
 
     workflow["2"] = {
         "class_type": "LoraLoaderModelOnly",
