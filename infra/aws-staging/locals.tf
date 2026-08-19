@@ -25,10 +25,9 @@ locals {
   salad_worker_artifact_sorted_keys = sort(
     keys(var.salad_worker_artifact_object_versions)
   )
-  salad_worker_artifact_extension_policy_enabled = (
-    length(var.salad_worker_artifact_extension_object_versions) > 0
-  )
-  salad_worker_artifact_extension_policy_max_characters = 6144
+  # Amazon S3 bucket policies permit at most 20,480 characters. The complete
+  # models-bucket policy is checked before an exact-version extension write.
+  models_bucket_policy_max_characters = 20480
   salad_worker_artifact_extension_sorted_keys = sort(
     keys(var.salad_worker_artifact_extension_object_versions)
   )

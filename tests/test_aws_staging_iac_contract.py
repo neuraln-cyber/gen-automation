@@ -341,43 +341,42 @@ def test_salad_artifact_reader_hard_blocks_the_rendered_inline_policy_quota() ->
 
 def test_salad_artifact_reader_extension_is_additive_and_exact_version_only() -> None:
     iam = (INFRA / "iam.tf").read_text(encoding="utf-8")
+    storage = (INFRA / "storage.tf").read_text(encoding="utf-8")
     locals_source = (INFRA / "locals.tf").read_text(encoding="utf-8")
     variables = (INFRA / "variables.tf").read_text(encoding="utf-8")
     tfvars = (INFRA / "terraform.tfvars.example").read_text(encoding="utf-8")
 
-    policy = iam.split(
-        'data "aws_iam_policy_document" "salad_worker_artifact_reader_extension" {',
+    policy = storage.split(
+        'data "aws_iam_policy_document" "models_bucket" {',
         maxsplit=1,
     )[1].split(
-        'resource "aws_iam_policy" "salad_worker_artifact_reader_extension" {',
+        'resource "aws_s3_bucket_policy" "models" {',
         maxsplit=1,
     )[0]
-    resource = iam.split(
-        'resource "aws_iam_policy" "salad_worker_artifact_reader_extension" {',
+    resource = storage.split(
+        'resource "aws_s3_bucket_policy" "models" {',
         maxsplit=1,
-    )[1].split(
-        'data "aws_iam_policy_document" "runtime" {',
-        maxsplit=1,
-    )[0]
+    )[1]
+    extension = policy.split('dynamic "statement" {', maxsplit=1)[1]
 
     assert 'variable "salad_worker_artifact_extension_object_versions"' in variables
     assert "salad_worker_artifact_extension_object_versions = {}" in tfvars
-    assert "salad_worker_artifact_extension_policy_max_characters = 6144" in locals_source
+    assert "models_bucket_policy_max_characters = 20480" in locals_source
     assert "local.salad_worker_artifact_extension_sorted_keys" in policy
+    assert "aws_iam_role.salad_worker_artifact_reader[0].arn" in policy
     assert 'actions   = ["s3:GetObjectVersion"]' in policy
     assert 'variable = "s3:VersionId"' in policy
     assert "var.salad_worker_artifact_extension_object_versions[statement.value]" in policy
-    assert re.search(r"\bsid\s*=", policy) is None
+    assert re.search(r"\bsid\s*=", extension) is None
     assert '"s3:GetObject"' not in policy
     assert '"s3:ListBucket"' not in policy
-    assert 'name   = "${local.name}-pinned-artifact-extensions"' in resource
+    assert 'resource "aws_iam_policy" "salad_worker_artifact_reader_extension"' not in iam
     assert (
         'resource "aws_iam_role_policy_attachment" '
-        '"salad_worker_artifact_reader_extension"' in resource
+        '"salad_worker_artifact_reader_extension"' not in iam
     )
-    assert "aws_iam_role.salad_worker_artifact_reader[0].name" in resource
-    assert "<= local.salad_worker_artifact_extension_policy_max_characters" in resource
-    assert "6,144-character customer-managed-policy quota" in resource
+    assert "<= local.models_bucket_policy_max_characters" in resource
+    assert "20,480-character policy limit" in resource
 
 
 def test_salad_artifact_reader_documents_the_required_state_reconciliation() -> None:
