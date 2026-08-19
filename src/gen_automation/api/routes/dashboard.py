@@ -90,6 +90,7 @@ from gen_automation.services.review import (
     apply_bulk_review_action,
     create_review_task,
     get_review_summary,
+    get_review_x_selection_editability,
     set_review_x_selection,
     transition_review_task,
 )
@@ -590,6 +591,10 @@ async def dashboard_review_task(
             semantic_severe_confidence_micros=semantic_threshold,
             semantic_enforcement_mode=settings.semantic_anatomy_mode,
         )
+        x_selection_editability = await get_review_x_selection_editability(
+            session,
+            review_task_id=review_task_id,
+        )
         release = await load_ranked_scoring_run(
             session,
             store=store,
@@ -689,6 +694,7 @@ async def dashboard_review_task(
             inspected_asset_ids=inspected_asset_ids,
             semantic_mode=semantic_mode,
             severe_confidence_micros=semantic_threshold,
+            x_selection_editable=x_selection_editability.allowed,
         )
     except RankingIntegrityError:
         return _error_response(
@@ -761,6 +767,7 @@ async def dashboard_review_task(
                 "cancel_idempotency_key": cancel_idempotency_key,
                 "bulk_action_idempotency_key": bulk_action_idempotency_key,
                 "inspection_idempotency_key": inspection_idempotency_key,
+                "x_selection_editability": x_selection_editability,
                 # Keep browser mutations same-origin even when TLS terminates at
                 # the trusted ingress.  Uvicorn intentionally ignores proxy
                 # headers, so an absolute ``request.url_for`` would otherwise
@@ -1230,6 +1237,7 @@ def _review_assets(
     inspected_asset_ids: frozenset[UUID],
     semantic_mode: str,
     severe_confidence_micros: int,
+    x_selection_editable: bool,
 ) -> ReviewAssetGroups:
     decisions = {decision.asset_id: decision for decision in summary.assets}
     if set(decisions) != {master.asset_id for master in masters}:
@@ -1287,7 +1295,15 @@ def _review_assets(
                         str(summary.lock_version),
                     ),
                 )
-                if is_open and principal.role == AdminRole.OWNER
+                if (
+                    x_selection_editable
+                    and principal.role == AdminRole.OWNER
+                    and (
+                        is_open
+                        or decisions[master.asset_id].decision == ReviewDecisionValue.ACCEPT
+                        or decisions[master.asset_id].selected_for_x
+                    )
+                )
                 else None
             ),
         )

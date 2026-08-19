@@ -30,6 +30,8 @@ from gen_automation.db.models import (
     ScoringRun,
     SemanticAnatomyFeedback,
     SemanticAssessment,
+    XTeaserRevision,
+    XTeaserRevisionHead,
 )
 from gen_automation.db.session import Database
 from gen_automation.domain.enums import (
@@ -62,6 +64,8 @@ from gen_automation.services.review import (
     apply_bulk_review_action,
     create_review_task,
     get_review_summary,
+    get_review_x_selection_editability,
+    set_review_x_selection,
     transition_review_task,
 )
 from gen_automation.services.review_inspections import record_review_inspections
@@ -1787,6 +1791,127 @@ async def test_completion_shrinks_target_to_accepted_count_and_is_terminal(
         assert completed_audit.detail["configured_accepted_count"] == 2
         assert completed_audit.detail["final_accepted_count"] == 1
         assert completed_audit.detail["desired_accepted_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_completed_review_allows_late_x_selection_without_reopening_final_set(
+    review_context: ReviewContext,
+) -> None:
+    task = await _create_task(review_context, key="create-late-x-selection-review")
+    accepted_asset_id = review_context.ranked_asset_ids[0]
+
+    async with review_context.database.sessions() as session:
+        await append_review_decision(
+            session,
+            review_task_id=task.task_id,
+            asset_id=accepted_asset_id,
+            decision=ReviewDecisionValue.ACCEPT,
+            decided_by_user_id=review_context.reviewer_id,
+            expected_lock_version=1,
+            idempotency_key="accept-late-x-source",
+        )
+    async with review_context.database.sessions() as session:
+        completed = await transition_review_task(
+            session,
+            review_task_id=task.task_id,
+            target_state=ReviewTaskState.COMPLETED,
+            changed_by_user_id=review_context.reviewer_id,
+            expected_lock_version=2,
+            idempotency_key="complete-before-late-x-selection",
+        )
+    assert completed.lock_version == 3
+
+    async with review_context.database.sessions() as session:
+        editability = await get_review_x_selection_editability(
+            session,
+            review_task_id=task.task_id,
+        )
+        selected = await set_review_x_selection(
+            session,
+            review_task_id=task.task_id,
+            asset_id=accepted_asset_id,
+            selected=True,
+            selected_by_user_id=review_context.owner_id,
+            expected_lock_version=3,
+        )
+    assert editability.allowed is True
+    assert selected.selected_count == 1
+
+    async with review_context.database.sessions() as session:
+        with pytest.raises(ReviewConflictError, match="finalized set"):
+            await set_review_x_selection(
+                session,
+                review_task_id=task.task_id,
+                asset_id=review_context.ranked_asset_ids[1],
+                selected=True,
+                selected_by_user_id=review_context.owner_id,
+                expected_lock_version=3,
+            )
+
+    async with review_context.database.sessions() as session:
+        revision = XTeaserRevision(
+            id=uuid4(),
+            review_task_id=task.task_id,
+            release_version_id=review_context.release_version_id,
+            revision_no=1,
+            watermark_asset_id=accepted_asset_id,
+            request_sha256="e" * 64,
+            created_by_user_id=review_context.owner_id,
+            created_at=NOW + timedelta(minutes=10),
+        )
+        session.add(revision)
+        await session.flush()
+        session.add(
+            XTeaserRevisionHead(
+                id=uuid4(),
+                review_task_id=task.task_id,
+                release_version_id=review_context.release_version_id,
+                active_revision_id=revision.id,
+                pending_revision_id=None,
+                lock_version=1,
+                updated_at=NOW + timedelta(minutes=10),
+            )
+        )
+        await session.commit()
+
+    async with review_context.database.sessions() as session:
+        editability = await get_review_x_selection_editability(
+            session,
+            review_task_id=task.task_id,
+        )
+        with pytest.raises(ReviewConflictError, match="teasers have already been prepared"):
+            await set_review_x_selection(
+                session,
+                review_task_id=task.task_id,
+                asset_id=accepted_asset_id,
+                selected=False,
+                selected_by_user_id=review_context.owner_id,
+                expected_lock_version=3,
+            )
+    assert editability.allowed is False
+
+    async with review_context.database.sessions() as session:
+        stored_task = await session.get(ReviewTask, task.task_id)
+        frozen_selection_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(ReleaseSelection)
+                .where(ReleaseSelection.review_task_id == task.task_id)
+            )
+            or 0
+        )
+        x_selected = tuple(
+            await session.scalars(
+                select(ReviewXSelection.asset_id).where(
+                    ReviewXSelection.review_task_id == task.task_id
+                )
+            )
+        )
+    assert stored_task is not None
+    assert stored_task.state == ReviewTaskState.COMPLETED
+    assert stored_task.lock_version == 3
+    assert frozen_selection_count == 1
+    assert x_selected == (accepted_asset_id,)
 
 
 @pytest.mark.asyncio

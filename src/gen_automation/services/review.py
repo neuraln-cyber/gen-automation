@@ -18,6 +18,7 @@ from gen_automation.db.models import (
     GenerationJob,
     IdempotencyRecord,
     OutboxEvent,
+    PublicationIntent,
     Release,
     ReleaseSelection,
     ReleaseVersion,
@@ -27,6 +28,7 @@ from gen_automation.db.models import (
     ReviewXSelection,
     ScoringRun,
     SemanticAssessment,
+    XTeaserRevisionHead,
 )
 from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import (
@@ -34,6 +36,8 @@ from gen_automation.domain.enums import (
     AssetKind,
     AssetState,
     OutboxStatus,
+    PublicationIntentState,
+    PublicationTarget,
     ReleasePhase,
     ReviewBulkAction,
     ReviewDecisionValue,
@@ -63,6 +67,11 @@ _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _RETRYABLE_TRANSITION_SQLSTATES = frozenset({"55P03", "57014"})
 _REVIEW_TRANSITION_LOCK_TIMEOUT = "5s"
 _REVIEW_TRANSITION_STATEMENT_TIMEOUT = "20s"
+_BLOCKING_X_PUBLICATION_STATES = tuple(
+    state
+    for state in PublicationIntentState
+    if state not in {PublicationIntentState.FAILED, PublicationIntentState.CANCELLED}
+)
 
 SEMANTIC_SEVERE_OVERRIDE_REASON_CODE = "semantic_severe_override"
 SEMANTIC_SEVERE_OVERRIDE_AUDIT_ACTION = "review.semantic_severe_overridden"
@@ -128,6 +137,12 @@ class ReviewXSelectionResult:
     selected: bool
     selected_count: int
     replayed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewXSelectionEditability:
+    allowed: bool
+    blocked_reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1224,6 +1239,66 @@ async def _transition_review_task(
     return result
 
 
+async def get_review_x_selection_editability(
+    session: AsyncSession,
+    *,
+    review_task_id: UUID,
+) -> ReviewXSelectionEditability:
+    """Return whether the owner may still change this review's X image choices."""
+
+    task = await session.get(ReviewTask, review_task_id)
+    if task is None:
+        raise ReviewNotFoundError("review task was not found")
+    return await _review_x_selection_editability(session, task=task, lock=False)
+
+
+async def _review_x_selection_editability(
+    session: AsyncSession,
+    *,
+    task: ReviewTask,
+    lock: bool,
+) -> ReviewXSelectionEditability:
+    if task.state == ReviewTaskState.OPEN:
+        return ReviewXSelectionEditability(allowed=True, blocked_reason=None)
+    if task.state != ReviewTaskState.COMPLETED:
+        return ReviewXSelectionEditability(
+            allowed=False,
+            blocked_reason="X image choices are unavailable for a cancelled review.",
+        )
+
+    revision_query = select(XTeaserRevisionHead).where(
+        XTeaserRevisionHead.review_task_id == task.id
+    )
+    if lock:
+        revision_query = revision_query.with_for_update()
+    revision_head = await session.scalar(revision_query)
+    if revision_head is not None and (
+        revision_head.active_revision_id is not None
+        or revision_head.pending_revision_id is not None
+    ):
+        return ReviewXSelectionEditability(
+            allowed=False,
+            blocked_reason=(
+                "X image choices are locked because watermarked X teasers have already "
+                "been prepared."
+            ),
+        )
+
+    publication_query = select(PublicationIntent).where(
+        PublicationIntent.release_version_id == task.release_version_id,
+        PublicationIntent.target == PublicationTarget.X,
+        PublicationIntent.state.in_(_BLOCKING_X_PUBLICATION_STATES),
+    )
+    if lock:
+        publication_query = publication_query.with_for_update()
+    if await session.scalar(publication_query) is not None:
+        return ReviewXSelectionEditability(
+            allowed=False,
+            blocked_reason="X image choices are locked because X delivery has been prepared.",
+        )
+    return ReviewXSelectionEditability(allowed=True, blocked_reason=None)
+
+
 async def set_review_x_selection(
     session: AsyncSession,
     *,
@@ -1234,25 +1309,36 @@ async def set_review_x_selection(
     expected_lock_version: int,
     now: datetime | None = None,
 ) -> ReviewXSelectionResult:
-    """Select or unselect one ranked image for X while its review is open."""
+    """Select an X image during review or after finalization but before X preparation."""
 
     if not isinstance(selected, bool):
         raise ReviewInputError("selected must be a boolean")
     expected_version = _validate_lock_version(expected_lock_version)
     await _require_active_owner(session, selected_by_user_id)
     task = await _load_task_locked(session, review_task_id)
-    if task.state != ReviewTaskState.OPEN:
-        raise ReviewConflictError("X image selection is frozen after review completion")
     if task.lock_version != expected_version:
         raise ReviewConflictError("review task lock version is stale")
-    ranked_asset_id = await session.scalar(
-        select(AssetRanking.asset_id).where(
-            AssetRanking.scoring_run_id == task.scoring_run_id,
-            AssetRanking.asset_id == asset_id,
+    editability = await _review_x_selection_editability(session, task=task, lock=True)
+    if not editability.allowed:
+        raise ReviewConflictError(editability.blocked_reason or "X image selection is unavailable")
+    if task.state == ReviewTaskState.COMPLETED:
+        accepted_asset_id = await session.scalar(
+            select(ReleaseSelection.asset_id).where(
+                ReleaseSelection.review_task_id == task.id,
+                ReleaseSelection.asset_id == asset_id,
+            )
         )
-    )
-    if ranked_asset_id is None:
-        raise ReviewNotFoundError("ranked review asset was not found")
+        if accepted_asset_id is None:
+            raise ReviewConflictError("only images in the finalized set can be selected for X")
+    else:
+        ranked_asset_id = await session.scalar(
+            select(AssetRanking.asset_id).where(
+                AssetRanking.scoring_run_id == task.scoring_run_id,
+                AssetRanking.asset_id == asset_id,
+            )
+        )
+        if ranked_asset_id is None:
+            raise ReviewNotFoundError("ranked review asset was not found")
 
     existing = await session.scalar(
         select(ReviewXSelection)
@@ -1329,6 +1415,7 @@ async def set_review_x_selection(
                 "asset_id": str(asset_id),
                 "selected": selected,
                 "selected_count": selected_count,
+                "post_completion": task.state == ReviewTaskState.COMPLETED,
             },
             occurred_at=changed_at,
         )

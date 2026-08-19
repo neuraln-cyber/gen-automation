@@ -907,6 +907,66 @@ def test_owner_selects_and_removes_specific_x_image_from_review_dashboard(
     assert asyncio.run(_x_selected_assets(context, task_id=task_id)) == ()
 
 
+def test_owner_can_choose_x_images_after_review_completion(
+    tmp_path: Path,
+) -> None:
+    context = asyncio.run(_seed_review_api(_settings(tmp_path / "browser-late-x-selection.db")))
+    task_id = asyncio.run(_create_task(context))
+    app = create_app(context.settings)
+    detail_action = f"/dashboard/review-tasks/{task_id}"
+    decision_action = f"{detail_action}/decisions"
+    complete_action = f"{detail_action}:complete"
+    x_action = f"{detail_action}/x-selections"
+
+    with TestClient(
+        app,
+        base_url=ORIGIN,
+        client=("192.0.2.95", 50001),
+    ) as client:
+        app.state.object_store = SameOriginReviewStore()
+        _login(client, context.settings, context.users[AdminRole.OWNER])
+        open_page = client.get(detail_action)
+        accepted = client.post(
+            decision_action,
+            data={
+                **_forms(open_page.text, decision_action)[0].fields,
+                "decision": "accept",
+            },
+            headers=_FORM_HEADERS,
+            follow_redirects=False,
+        )
+        assert accepted.status_code == 303
+        ready_page = client.get(detail_action)
+        completed = client.post(
+            complete_action,
+            data=_one_form(ready_page.text, complete_action).fields,
+            headers=_FORM_HEADERS,
+            follow_redirects=False,
+        )
+        completed_page = client.get(detail_action)
+        completed_x_forms = _forms(completed_page.text, x_action)
+        selected = client.post(
+            x_action,
+            data=completed_x_forms[0].fields,
+            headers=_FORM_HEADERS,
+            follow_redirects=False,
+        )
+        selected_page = client.get(detail_action)
+
+    assert completed.status_code == 303
+    assert completed_page.status_code == 200
+    assert "The finished-set contents are read-only" in completed_page.text
+    assert "You can still choose up to four finished-set images for X" in completed_page.text
+    assert len(completed_x_forms) == 1
+    assert completed_x_forms[0].fields["selected"] == "true"
+    assert selected.status_code == 303
+    assert "Selected for X</dt><dd>1 / 4" in selected_page.text
+    assert asyncio.run(_review_state_and_actor(context, task_id=task_id))[0] == (
+        ReviewTaskState.COMPLETED
+    )
+    assert asyncio.run(_x_selected_assets(context, task_id=task_id)) == (context.asset_ids[0],)
+
+
 def test_review_dashboard_exposes_progressive_bulk_controls(tmp_path: Path) -> None:
     context = asyncio.run(_seed_review_api(_settings(tmp_path / "browser-bulk-ui.db")))
     task_id = asyncio.run(_create_task(context))
