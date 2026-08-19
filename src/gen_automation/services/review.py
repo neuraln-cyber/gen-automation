@@ -1320,9 +1320,7 @@ async def set_review_x_selection(
         raise ReviewConflictError("review task lock version is stale")
     editability = await _review_x_selection_editability(session, task=task, lock=True)
     if not editability.allowed:
-        raise ReviewConflictError(
-            editability.blocked_reason or "X image selection is unavailable"
-        )
+        raise ReviewConflictError(editability.blocked_reason or "X image selection is unavailable")
     if task.state == ReviewTaskState.COMPLETED:
         accepted_asset_id = await session.scalar(
             select(ReleaseSelection.asset_id).where(

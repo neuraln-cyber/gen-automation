@@ -964,9 +964,7 @@ def test_owner_can_choose_x_images_after_review_completion(
     assert asyncio.run(_review_state_and_actor(context, task_id=task_id))[0] == (
         ReviewTaskState.COMPLETED
     )
-    assert asyncio.run(_x_selected_assets(context, task_id=task_id)) == (
-        context.asset_ids[0],
-    )
+    assert asyncio.run(_x_selected_assets(context, task_id=task_id)) == (context.asset_ids[0],)
 
 
 def test_review_dashboard_exposes_progressive_bulk_controls(tmp_path: Path) -> None:
