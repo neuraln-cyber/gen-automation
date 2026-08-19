@@ -88,6 +88,17 @@ replica. It never grants an unversioned read. Copy the reader role's nonsecret
 output ARN to
 `GEN_AUTOMATION_SALAD_WORKER_ARTIFACT_ROLE_ARN`.
 
+When the existing inline policy has no safe quota headroom, place only the new
+exact key/VersionId pairs in
+`salad_worker_artifact_extension_object_versions`. This creates one additive
+customer-managed policy and attaches it to the same reader role without
+changing or removing the existing inline policy. The extension policy is
+sorted deterministically, contains only `s3:GetObjectVersion`, applies one
+exact `s3:VersionId` condition per exact object key, and hard-blocks above
+IAM's 6,144-character customer-managed-policy limit. Apply it from a saved,
+narrowly reviewed zero-work plan; never move existing grants between the two
+maps during artifact onboarding.
+
 ### One-time state reconciliation after the interrupted shard rollout
 
 The superseded customer-managed-policy rollout removed

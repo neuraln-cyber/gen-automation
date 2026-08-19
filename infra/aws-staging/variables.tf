@@ -255,6 +255,32 @@ variable "salad_worker_artifact_object_versions" {
   }
 }
 
+variable "salad_worker_artifact_extension_object_versions" {
+  description = "Additional exact model-bucket object keys and immutable S3 VersionIds readable by Salad workers through one additive customer-managed policy. Use this only after the compact inline policy is full."
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition = (
+      length(var.salad_worker_artifact_extension_object_versions) <= 20
+      && alltrue([
+        for object_key, version_id in var.salad_worker_artifact_extension_object_versions :
+        can(regex(
+          "^worker/((checkpoints|diffusion-models|loras|detectors|text-encoders|vae)/[A-Za-z0-9][A-Za-z0-9._/-]*|i2v/sha256/[0-9a-f]{64}|i2v/manifests/sha256/[0-9a-f]{64}\\.json)$",
+          object_key,
+        ))
+        && !strcontains(object_key, "..")
+        && !strcontains(object_key, "//")
+        && !endswith(object_key, "/")
+        && trimspace(version_id) != ""
+        && version_id != "null"
+        && length(version_id) <= 1024
+      ])
+    )
+    error_message = "At most 20 extension entries may use reviewed worker model, support-artifact, or I2V manifest keys and nonblank, non-null immutable VersionIds of at most 1,024 characters."
+  }
+}
+
 variable "github_actions_deploy_enabled" {
   description = "Create a short-lived GitHub Actions OIDC role for main-branch deployments to the staging control plane."
   type        = bool
