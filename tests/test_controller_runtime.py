@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from gen_automation.app import create_app
 from gen_automation.config import Environment, Settings
+from gen_automation.controller import runtime as controller_runtime
 from gen_automation.controller.runtime import (
     ControllerRuntime,
     ControllerRuntimeSnapshot,
@@ -19,6 +20,10 @@ from gen_automation.controller.runtime import (
 from gen_automation.db.session import Database
 from gen_automation.services.i2v import I2V_RUNTIME_WORKER_ID
 from gen_automation.storage.memory import MemoryObjectStore
+
+
+def test_image_reconciliation_scan_covers_full_provider_history_window() -> None:
+    assert controller_runtime._IMAGE_RECONCILIATION_JOB_SCAN_LIMIT == 500
 
 
 def test_controller_workloads_use_stable_singleton_i2v_worker_id(

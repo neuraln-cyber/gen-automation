@@ -251,7 +251,13 @@ async def dispatch_generation_jobs(
         raise GenerationSchedulingConflictError("Salad deployment was not found")
     if (
         not deployment.is_current
-        or deployment.state != SaladDeploymentState.ACTIVE
+        or (
+            deployment.state != SaladDeploymentState.ACTIVE
+            and not (
+                deployment.state == SaladDeploymentState.PROVISIONING
+                and deployment.last_error_code == "provider_start_pending"
+            )
+        )
         or deployment.desired_state != DesiredDeploymentState.ACTIVE
         or deployment.provider_queue_id is None
         or deployment.provider_container_group_id is None

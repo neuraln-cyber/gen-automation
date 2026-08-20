@@ -794,6 +794,33 @@ async def test_submission_rechecks_deployment_kill_switch(database: Database) ->
 
 
 @pytest.mark.asyncio
+async def test_submission_allows_exact_provider_start_pending_state(database: Database) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        deployment = await session.get(SaladDeployment, context.deployment_id)
+        assert deployment is not None
+        deployment.state = SaladDeploymentState.PROVISIONING
+        deployment.last_error_code = "provider_start_pending"
+        await session.commit()
+        uploads = FakeUploadIntentProvider()
+        client = FakeSaladClient()
+
+        result = await submit_prepared_attempt(
+            session,
+            client,
+            uploads,
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+
+    assert result.disposition == SubmissionDisposition.SUBMITTED
+    assert len(client.create_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_upload_intent_failure_is_definite_and_releases_reservation(
     database: Database,
 ) -> None:
