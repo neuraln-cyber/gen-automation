@@ -32,6 +32,7 @@ from gen_automation.domain.enums import (
     DesiredDeploymentState,
     ExperimentWarmLeaseState,
     GenerationAttemptState,
+    GenerationModelFamily,
     GenerationState,
     LoraImportJobState,
     ManagedLoraLifecycle,
@@ -478,6 +479,7 @@ async def test_civitai_advisory_size_does_not_reject_verified_bytes(
                 license_url=resolved.canonical_source_url,
                 commercial_use_attested=True,
                 adult_use_attested=True,
+                model_family=GenerationModelFamily.ANIMA,
                 target_filename=resolved.target_filename,
                 expected_sha256=resolved.sha256,
                 expected_byte_size=resolved.declared_size_bytes,
@@ -496,8 +498,15 @@ async def test_civitai_advisory_size_does_not_reject_verified_bytes(
     async with database.sessions() as session:
         job = await session.get(LoraImportJob, created.job.job_id)
         artifact = await session.scalar(select(ManagedLoraArtifact))
+        approval = await session.scalar(
+            select(ModelArtifactApproval).where(
+                ModelArtifactApproval.artifact_sha256 == resolved.sha256
+            )
+        )
         assert job is not None
         assert artifact is not None
+        assert approval is not None
+        assert approval.model_family == GenerationModelFamily.ANIMA
         assert job.state == LoraImportJobState.COMPLETED
         assert job.progress_bytes == len(body)
         assert job.total_bytes == len(body)

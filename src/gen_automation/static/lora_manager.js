@@ -253,6 +253,10 @@
     });
   }
 
+  function inferredModelFamily(baseModel) {
+    return /(^|\s)anima($|\s)/i.test(stringValue(baseModel)) ? "anima" : "illustrious";
+  }
+
   function initializeCivitaiImport() {
     const resolveForm = root.querySelector("[data-lora-civitai-resolve-form]");
     const importForm = root.querySelector("[data-lora-civitai-import-form]");
@@ -267,6 +271,7 @@
     const versionChoice = root.querySelector("[data-lora-version-choice]");
     const versionSelect = root.querySelector("[data-lora-version-select]");
     const fileSelect = root.querySelector("[data-lora-resolved-file]");
+    const familySelect = root.querySelector("[data-lora-resolved-model-family]");
     const nameInput = root.querySelector("[data-lora-resolved-name]");
     const commercialInput = importForm.elements.namedItem("commercial_use_attested");
     const adultInput = importForm.elements.namedItem("adult_use_attested");
@@ -335,6 +340,9 @@
       if (meta) meta.textContent = [value.versionName, value.baseModel].filter(Boolean).join(" - ");
       if (baseModel) baseModel.textContent = value.baseModel || "Unknown";
       if (nameInput instanceof HTMLInputElement) nameInput.value = value.name || value.versionName;
+      if (familySelect instanceof HTMLSelectElement) {
+        familySelect.value = inferredModelFamily(value.baseModel);
+      }
       if (modelId instanceof HTMLInputElement) modelId.value = value.modelId;
       if (versionId instanceof HTMLInputElement) versionId.value = value.versionId;
       if (source instanceof HTMLAnchorElement) {
@@ -476,7 +484,11 @@
         || !importForm.reportValidity()
         || !(resolved.commercialImageAllowed || resolved.commercialUseOverrideApplied)
       ) return;
-      if (!(fileSelect instanceof HTMLSelectElement) || !(nameInput instanceof HTMLInputElement)) return;
+      if (
+        !(fileSelect instanceof HTMLSelectElement)
+        || !(familySelect instanceof HTMLSelectElement)
+        || !(nameInput instanceof HTMLInputElement)
+      ) return;
       const selectedFile = resolved.files.find((candidate) => candidate.id === fileSelect.value);
       if (!selectedFile) {
         setMessage(importStatus, "Choose a Safetensors file.", "error");
@@ -495,6 +507,7 @@
           expected_sha256: selectedFile.sha256 || null,
           expected_byte_size: selectedFile.sizeBytes || null,
           expected_metadata: {},
+          model_family: familySelect.value,
           trigger_words: resolved.triggerWords,
           civitai_model_id: Number(resolved.modelId),
           civitai_version_id: Number(resolved.versionId),
@@ -582,6 +595,7 @@
       const triggerWords = form.elements.namedItem("trigger_words");
       const sourceUrl = form.elements.namedItem("source_url");
       const licenseUrl = form.elements.namedItem("license_url");
+      const modelFamily = form.elements.namedItem("model_family");
       const commercial = form.elements.namedItem("commercial_use_attested");
       const adult = form.elements.namedItem("adult_use_attested");
       form.setAttribute("aria-busy", "true");
@@ -625,6 +639,7 @@
           expected_sha256: null,
           expected_byte_size: file.size,
           expected_metadata: {},
+          model_family: modelFamily instanceof HTMLSelectElement ? modelFamily.value : "",
           trigger_words: normalizedTriggerWords,
           commercial_use_attested: commercial instanceof HTMLInputElement && commercial.checked,
           adult_use_attested: adult instanceof HTMLInputElement && adult.checked,

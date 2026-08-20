@@ -24,13 +24,17 @@ from gen_automation.domain.compliance_registry import (
 from gen_automation.domain.enums import (
     ApprovalStatus,
     DesiredDeploymentState,
+    GenerationModelFamily,
     LoraImportSource,
     ManagedLoraLifecycle,
     ModelArtifactKind,
     SaladDeploymentPurpose,
     SaladDeploymentState,
 )
-from gen_automation.domain.lora_catalog import VerifiedLoraArtifact
+from gen_automation.domain.lora_catalog import (
+    LORA_MODEL_FAMILY_METADATA_KEY,
+    VerifiedLoraArtifact,
+)
 from gen_automation.integrations.civitai import (
     CivitaiAPIError,
     CivitaiError,
@@ -87,6 +91,18 @@ class LoraRuntimeConfigurationError(RuntimeError):
 
 
 _PROVIDER_IDLE_FRESHNESS_SECONDS = 120
+
+
+def _import_model_family(metadata: dict[str, object]) -> GenerationModelFamily:
+    value = metadata.get(LORA_MODEL_FAMILY_METADATA_KEY)
+    if value is None:
+        return GenerationModelFamily.ILLUSTRIOUS
+    if not isinstance(value, str):
+        raise ModelArtifactValidationError("LoRA import model family is invalid")
+    try:
+        return GenerationModelFamily(value)
+    except ValueError as error:
+        raise ModelArtifactValidationError("LoRA import model family is invalid") from error
 
 
 class LoraRuntime:
@@ -362,6 +378,7 @@ class LoraRuntime:
             artifact_sha256=stored.sha256,
             name=claim.job.display_name,
             kind=ModelArtifactKind.LORA,
+            model_family=_import_model_family(claim.job.expected_metadata),
             source_url=claim.job.canonical_source_url,
             storage_key=stored.key,
             license_url=claim.job.license_url,

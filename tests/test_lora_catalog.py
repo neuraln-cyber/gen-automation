@@ -22,6 +22,7 @@ from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import (
     AdminRole,
     ApprovalStatus,
+    GenerationModelFamily,
     LoraImportJobState,
     LoraImportSource,
     ManagedLoraLifecycle,
@@ -30,6 +31,7 @@ from gen_automation.domain.enums import (
 from gen_automation.domain.lora_catalog import (
     CIVITAI_COMMERCIAL_USE_OVERRIDE_METADATA_KEY,
     CIVITAI_COMMERCIAL_USE_OVERRIDE_SCHEMA,
+    LORA_MODEL_FAMILY_METADATA_KEY,
     CivitaiLoraImportCreate,
     LoraDependencySummary,
     ManualLoraImportCreate,
@@ -104,6 +106,7 @@ def _manual() -> ManualLoraImportCreate:
         license_url="https://models.example.test/akali-lora/license",
         commercial_use_attested=True,
         adult_use_attested=True,
+        model_family=GenerationModelFamily.ANIMA,
         target_filename="akali-style.safetensors",
         expected_sha256=SHA,
         expected_byte_size=1_024,
@@ -119,6 +122,7 @@ def _civitai() -> CivitaiLoraImportCreate:
         license_url="https://civitai.com/models/1234/akali",
         commercial_use_attested=True,
         adult_use_attested=True,
+        model_family=GenerationModelFamily.ANIMA,
         target_filename="akali-civitai.safetensors",
         civitai_model_id=1234,
         civitai_version_id=5678,
@@ -128,6 +132,38 @@ def _civitai() -> CivitaiLoraImportCreate:
         expected_metadata={"provider": "civitai"},
         trigger_words=["akali"],
     )
+
+
+@pytest.mark.parametrize("source", ["manual", "civitai"])
+async def test_created_import_persists_after_request_session_closes(
+    lora_database: tuple[Database, UUID, UUID],
+    source: str,
+) -> None:
+    database, owner_id, _reviewer_id = lora_database
+    async with database.sessions() as session:
+        if source == "manual":
+            created = await create_manual_import_job(
+                session,
+                command=_manual(),
+                model_bucket=MODEL_BUCKET,
+                actor_user_id=owner_id,
+                idempotency_key="persist-manual-import",
+                now=NOW,
+            )
+        else:
+            created = await create_civitai_import_job(
+                session,
+                command=_civitai(),
+                actor_user_id=owner_id,
+                idempotency_key="persist-civitai-import",
+                now=NOW,
+            )
+        job_id = created.job.job_id
+
+    async with database.sessions() as session:
+        persisted = await session.get(LoraImportJob, job_id)
+        assert persisted is not None
+        assert persisted.expected_metadata[LORA_MODEL_FAMILY_METADATA_KEY] == "anima"
 
 
 async def test_civitai_commercial_override_is_durable_and_audited(
@@ -144,6 +180,7 @@ async def test_civitai_commercial_override_is_durable_and_audited(
             now=NOW,
         )
         marker = created.job.expected_metadata[CIVITAI_COMMERCIAL_USE_OVERRIDE_METADATA_KEY]
+        assert created.job.expected_metadata[LORA_MODEL_FAMILY_METADATA_KEY] == "anima"
         assert created.job.commercial_use_override_attested is True
         assert marker == {
             "schema": CIVITAI_COMMERCIAL_USE_OVERRIDE_SCHEMA,

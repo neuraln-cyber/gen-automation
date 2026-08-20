@@ -144,6 +144,13 @@
                   Safetensors file
                   <select name="file_id" required data-lora-resolved-file></select>
                 </label>
+                <label>
+                  Model family
+                  <select name="model_family" required data-lora-resolved-model-family>
+                    <option value="illustrious">Illustrious</option>
+                    <option value="anima">Anima</option>
+                  </select>
+                </label>
               </div>
               <dl class="lora-source-facts">
                 <div><dt>Base model</dt><dd data-lora-resolved-base-model>Unknown</dd></div>
@@ -233,6 +240,13 @@
                 <label>
                   License or permissions URL
                   <input name="license_url" type="url" inputmode="url" required maxlength="2048" placeholder="https://...">
+                </label>
+                <label>
+                  Model family
+                  <select name="model_family" required>
+                    <option value="illustrious">Illustrious</option>
+                    <option value="anima">Anima</option>
+                  </select>
                 </label>
               </div>
               <fieldset class="lora-rights-attestations">
