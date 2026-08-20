@@ -229,6 +229,43 @@ async def test_resolve_explicit_version_supports_managed_lora_types(
 
 
 @pytest.mark.asyncio
+async def test_provider_download_metadata_drops_opaque_query_parameters() -> None:
+    downloaded: list[httpx2.Request] = []
+    version = version_payload()
+    files = cast(list[dict[str, Any]], version["files"])
+    files[0]["downloadUrl"] = (
+        "https://civitai.com/api/download/models/456"
+        "?type=Model&format=SafeTensor&providerToken=opaque"
+    )
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == "/api/v1/model-versions/456":
+            return httpx2.Response(200, json=version, request=request)
+        if request.url.path == "/api/v1/models/123":
+            return httpx2.Response(
+                200,
+                json=model_payload(version=version),
+                request=request,
+            )
+        downloaded.append(request)
+        return httpx2.Response(200, content=b"model-bytes", request=request)
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http_client:
+        client = CivitaiClient(api_token=TOKEN, http_client=http_client)
+        resolved = await client.resolve_lora("https://civitai.red/models/123?modelVersionId=456")
+        async with client.open_download(resolved) as chunks:
+            body = b"".join([chunk async for chunk in chunks])
+
+    assert body == b"model-bytes"
+    assert len(downloaded) == 1
+    assert downloaded[0].url == httpx2.URL(
+        "https://civitai.com/api/download/models/456?type=Model&format=SafeTensor"
+    )
+    assert downloaded[0].headers["authorization"] == f"Bearer {TOKEN}"
+    assert "providerToken" not in json.dumps(resolved.durable_provenance())
+
+
+@pytest.mark.asyncio
 async def test_fractional_provider_size_is_only_a_nearest_byte_estimate() -> None:
     # This is the fractional size from Civitai's published API example. Its
     # binary float product is one fraction above the real integer byte count.

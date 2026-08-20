@@ -216,6 +216,81 @@ def test_manual_route_creates_idempotent_grant_and_freezes_exact_upload(
     assert len(library.json()["imports"]) == 1
 
 
+def test_manual_route_captures_uploaded_object_without_browser_s3_headers(
+    client: TestClient,
+) -> None:
+    bucket = "test-lora-capture-bucket"
+    memory = MemoryObjectStore(bucket=bucket)
+    client.app.state.settings.lora_manager_enabled = True
+    client.app.state.settings.salad_worker_artifact_bucket = SecretStr(bucket)
+    client.app.state.model_artifact_store = ModelArtifactStore(memory)
+    database = client.app.state.database
+    assert client.portal is not None
+
+    async def seed_owner() -> None:
+        async with database.sessions() as session:
+            if await session.get(AdminUser, UUID(int=0)) is None:
+                session.add(
+                    AdminUser(
+                        id=UUID(int=0),
+                        username_normalized="local-developer",
+                        display_name="Local Developer",
+                        password_hash="disabled-test-password-hash",  # noqa: S106
+                        role=AdminRole.OWNER,
+                        is_active=True,
+                        failed_login_count=0,
+                        password_changed_at=datetime.now(UTC),
+                        credential_version=1,
+                        lock_version=1,
+                    )
+                )
+                await session.commit()
+
+    client.portal.call(seed_owner)
+    body = _safetensors_bytes()
+    command = {
+        "display_name": "Captured upload",
+        "canonical_source_url": "https://models.example.test/captured-upload",
+        "license_url": "https://models.example.test/captured-upload/license",
+        "commercial_use_attested": True,
+        "adult_use_attested": True,
+        "target_filename": "captured-upload.safetensors",
+        "expected_sha256": hashlib.sha256(body).hexdigest(),
+        "expected_byte_size": len(body),
+        "expected_metadata": {},
+        "trigger_words": ["captured style"],
+    }
+    created = client.post(
+        "/api/v1/loras/imports/manual",
+        json=command,
+        headers={"Idempotency-Key": "route-manual-capture-create"},
+    )
+    assert created.status_code == 201, created.text
+    job_id = UUID(created.json()["import"]["id"])
+    staging_key = f"onboarding/loras/{job_id}/source.safetensors"
+    memory.put_for_test(
+        staging_key,
+        body,
+        content_type=QUARANTINE_CONTENT_TYPE,
+        metadata={
+            "artifact-kind": "managed-lora",
+            "format": "safetensors",
+            "upload-id": str(job_id),
+        },
+    )
+
+    headers = {"Idempotency-Key": "route-manual-capture"}
+    captured = client.post(f"/api/v1/loras/imports/{job_id}:capture", headers=headers)
+    replay = client.post(f"/api/v1/loras/imports/{job_id}:capture", headers=headers)
+
+    assert captured.status_code == 200, captured.text
+    assert captured.json()["import"]["status"] == "queued"
+    assert captured.headers["idempotency-replayed"] == "false"
+    assert replay.status_code == 200, replay.text
+    assert replay.headers["idempotency-replayed"] == "true"
+    assert replay.json()["import"]["id"] == str(job_id)
+
+
 def test_civitai_route_rejects_an_invalid_url_as_input(client: TestClient) -> None:
     client.app.state.settings.lora_manager_enabled = True
     client.app.state.civitai_client = cast(CivitaiClient, object())

@@ -545,13 +545,7 @@
       });
       request.addEventListener("load", () => {
         if (request.status >= 200 && request.status < 300) {
-          const versionId = stringValue(request.getResponseHeader("x-amz-version-id"));
-          const etag = stringValue(request.getResponseHeader("ETag")).replace(/^"|"$/g, "");
-          if (!versionId || !etag) {
-            reject(new Error("The upload completed without immutable S3 version details. Retry it."));
-            return;
-          }
-          resolve({ objectVersionId: versionId, objectEtag: etag });
+          resolve({ stored: true });
         }
         else reject(new Error(`Private-storage upload failed (${request.status || "network error"}).`));
       });
@@ -665,25 +659,19 @@
           if (progressMeter instanceof HTMLProgressElement) progressMeter.value = percentage;
           if (progressPercent) progressPercent.textContent = `${percentage}% - ${formatBytes(loaded)} of ${formatBytes(boundedTotal)}`;
         });
-        if (progressLabel) progressLabel.textContent = "Upload complete; starting server-side Safetensors verification";
+        if (progressLabel) progressLabel.textContent = "Upload complete; capturing its immutable storage version";
         setMessage(status, "Upload complete. Verification does not use a GPU.", "success");
         const completion = {
-          url: `/api/v1/loras/imports/${encodeURIComponent(createdImportId)}:complete`,
-          body: {
-            object_version_id: uploaded.objectVersionId,
-            object_etag: uploaded.objectEtag,
-            byte_size: file.size,
-          },
+          url: `/api/v1/loras/imports/${encodeURIComponent(createdImportId)}:capture`,
           idempotencyKey: stableMutationKey(
             form,
-            `complete:${createdImportId}:${uploaded.objectVersionId}:${uploaded.objectEtag}:${file.size}`,
-            "manual-complete",
+            `capture:${createdImportId}:${file.size}`,
+            "manual-capture",
           ),
         };
         pendingManualCompletions.set(form, completion);
         await requestJson(completion.url, {
           method: "POST",
-          body: completion.body,
           idempotencyKey: completion.idempotencyKey,
         });
         pendingManualCompletions.delete(form);

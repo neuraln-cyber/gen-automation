@@ -121,7 +121,7 @@ def test_lora_manager_javascript_uploads_directly_and_polls_durable_progress() -
     assert 'headers["Idempotency-Key"] = idempotencyKey' in script
     assert 'const stableMutationKey = (owner, fingerprint, scope = "default") =>' in script
     assert '"manual-create"' in script
-    assert '"manual-complete"' in script
+    assert '"manual-capture"' in script
     assert "pendingManualCompletions.set(form, completion)" in script
     assert "pendingManualCompletions.delete(form)" in script
     assert "crypto.randomUUID()" in script
@@ -140,10 +140,11 @@ def test_lora_manager_javascript_uploads_directly_and_polls_durable_progress() -
     assert "normalizeCivitaiVersions" in script
     assert "requestBody.version_id = Number(selectedVersionId)" in script
     assert "No version was selected for you" in script
-    assert 'request.getResponseHeader("x-amz-version-id")' in script
-    assert 'request.getResponseHeader("ETag")' in script
-    assert "object_version_id: uploaded.objectVersionId" in script
-    assert "object_etag: uploaded.objectEtag" in script
+    assert "resolve({ stored: true })" in script
+    assert 'request.getResponseHeader("x-amz-version-id")' not in script
+    assert 'request.getResponseHeader("ETag")' not in script
+    assert "}:capture`" in script
+    assert '"manual-capture"' in script
     assert "download_url" not in script
     assert ".innerHTML" not in script
     assert 'document.addEventListener("visibilitychange"' in script
