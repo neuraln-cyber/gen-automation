@@ -364,19 +364,14 @@ def test_experiment_lab_queues_large_multi_batch_automation_and_reuses_one_warm_
     lab_page = client.get(first.headers["location"])
     assert lab_page.status_code == 200
     assert f'data-experiment-release-id="{releases[0].id}"' in lab_page.text
-    assert f'data-progress-url="/dashboard/releases/{releases[0].id}/progress"' in (
-        lab_page.text
-    )
+    assert f'data-progress-url="/dashboard/releases/{releases[0].id}/progress"' in (lab_page.text)
     assert (
-        f'data-assets-url="/dashboard/releases/{releases[0].id}/generated-assets"'
-        in lab_page.text
+        f'data-assets-url="/dashboard/releases/{releases[0].id}/generated-assets"' in lab_page.text
     )
     assert "data-experiment-lab-output" in lab_page.text
     assert "data-experiment-results" not in lab_page.text
 
-    status_page = client.get(
-        f"/dashboard/releases/{releases[0].id}/status?mode=experiment"
-    )
+    status_page = client.get(f"/dashboard/releases/{releases[0].id}/status?mode=experiment")
     assert status_page.status_code == 200
     assert "Queue next test" in status_page.text
     assert 'data-warm-duration-minutes="90"' in status_page.text
@@ -590,9 +585,7 @@ def test_optional_auto_warm_failure_does_not_fail_a_queued_lab_set(
     )
 
     assert response.status_code == 303
-    assert response.headers["location"].startswith(
-        "/dashboard/experiments/new?release="
-    )
+    assert response.headers["location"].startswith("/dashboard/experiments/new?release=")
     assert "warm=unavailable" in response.headers["location"]
     status_page = client.get(response.headers["location"])
     assert status_page.status_code == 200

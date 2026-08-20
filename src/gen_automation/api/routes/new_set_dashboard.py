@@ -282,9 +282,7 @@ async def submit_dashboard_new_set(
     if warm_failed:
         query.append("warm=unavailable")
     if experiment_mode:
-        destination = (
-            f"/dashboard/experiments/new?release={result.release.id}&{'&'.join(query)}"
-        )
+        destination = f"/dashboard/experiments/new?release={result.release.id}&{'&'.join(query)}"
     else:
         destination = f"/dashboard/releases/{result.release.id}/status?{'&'.join(query)}"
     return _secure_response(
@@ -663,12 +661,9 @@ def new_set_form_response(
                 ),
                 "max_accepted_images_per_release": MAX_ACCEPTED_IMAGES_PER_RELEASE,
                 "experiment_mode": resolved_experiment_mode,
-                "experiment_release": (
-                    experiment_release if resolved_experiment_mode else None
-                ),
+                "experiment_release": (experiment_release if resolved_experiment_mode else None),
                 "warm_unavailable": (
-                    resolved_experiment_mode
-                    and request.query_params.get("warm") == "unavailable"
+                    resolved_experiment_mode and request.query_params.get("warm") == "unavailable"
                 ),
             },
             status_code=status_code,
