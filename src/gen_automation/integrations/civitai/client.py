@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import cast
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx2
 
@@ -46,6 +46,7 @@ MAX_METADATA_DEPTH = 32
 MAX_DOWNLOAD_REDIRECTS = 10
 _API_BASE = "https://civitai.com/api/v1"
 _DOWNLOAD_PATH = re.compile(r"^/api/download/models/[1-9][0-9]{0,18}/?$")
+_DOWNLOAD_SELECTOR_KEYS = frozenset({"type", "format", "size", "fp"})
 _SAFE_FILENAME_CHARACTER = re.compile(r"[^A-Za-z0-9._ -]+")
 
 
@@ -482,8 +483,22 @@ def _provider_download_url(value: str) -> str:
         parsed.path
     ):
         raise CivitaiProtocolError("Civitai file download URL is not a provider download endpoint")
-    parse_civitai_url(sanitized)
-    return sanitized
+    # ``downloadUrl`` is provider-owned metadata and Civitai may append opaque
+    # short-lived or tracking parameters. Retain only documented file selectors
+    # so multi-file versions still resolve to the scanned Safetensors candidate.
+    # User-pasted download URLs remain subject to the stricter public parser.
+    selectors: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for key, raw_value in parse_qsl(parsed.query, keep_blank_values=True):
+        if key not in _DOWNLOAD_SELECTOR_KEYS:
+            continue
+        if key in seen or not raw_value or len(raw_value) > 100:
+            raise CivitaiProtocolError("Civitai file download selectors are invalid")
+        seen.add(key)
+        selectors.append((key, raw_value))
+    canonical = urlunsplit(("https", "civitai.com", parsed.path, urlencode(selectors), ""))
+    parse_civitai_url(canonical)
+    return canonical
 
 
 def _target_filename(value: str) -> str:

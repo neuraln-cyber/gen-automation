@@ -205,6 +205,36 @@ class ModelArtifactStore:
             grant=grant,
         )
 
+    async def capture_quarantine_upload(
+        self,
+        *,
+        upload_id: UUID | str,
+        expected_size_bytes: int,
+    ) -> ObjectMetadata:
+        """Freeze the immutable identity of one completed browser upload."""
+
+        identifier = _canonical_uuid(upload_id)
+        if (
+            isinstance(expected_size_bytes, bool)
+            or not isinstance(expected_size_bytes, int)
+            or not 10 <= expected_size_bytes <= MAX_MANAGED_LORA_BYTES
+        ):
+            raise ValueError("expected LoRA byte size is invalid")
+        key = f"{QUARANTINE_KEY_PREFIX}/{identifier}/source.safetensors"
+        uploaded = await self.store.head(key)
+        if uploaded is None:
+            raise ObjectNotFoundError("manual LoRA upload was not found")
+        _validate_source_metadata(uploaded, supplied_etag=None)
+        if uploaded.byte_size != expected_size_bytes:
+            raise ModelArtifactIntegrityError("manual LoRA byte size does not match")
+        if (
+            uploaded.metadata.get("artifact-kind") != "managed-lora"
+            or uploaded.metadata.get("format") != "safetensors"
+            or uploaded.metadata.get("upload-id") != identifier
+        ):
+            raise ModelArtifactIntegrityError("manual LoRA upload metadata is inconsistent")
+        return uploaded
+
     async def promote_quarantine(
         self,
         *,

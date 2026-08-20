@@ -312,6 +312,83 @@ async def complete_manual_lora_upload(
     )
 
 
+@router.post("/imports/{job_id}:capture", response_model=LoraMutationRead)
+async def capture_manual_lora_upload(
+    job_id: UUID,
+    request: Request,
+    response: Response,
+    session: Session,
+    principal: ComplianceMutationPrincipal,
+    idempotency_key: IdempotencyKey,
+) -> LoraMutationRead:
+    """Capture the exact S3 version after a successful browser form upload."""
+
+    _enabled_settings(request)
+    try:
+        snapshot = await get_lora_import_job(
+            session,
+            job_id=job_id,
+            actor_user_id=principal.user_id,
+        )
+        if snapshot.source_type != LoraImportSource.MANUAL:
+            raise LoraCatalogConflictError("only a manual import can accept an upload version")
+        expected_size = snapshot.expected_byte_size
+        if expected_size is None:
+            raise LoraCatalogConflictError("manual import has no expected upload size")
+        if snapshot.state == LoraImportJobState.AWAITING_UPLOAD:
+            completion_lock_version = snapshot.lock_version
+            uploaded = await _model_store(request).capture_quarantine_upload(
+                upload_id=snapshot.job_id,
+                expected_size_bytes=expected_size,
+            )
+            if uploaded.version_id is None or uploaded.etag is None:
+                raise ModelArtifactError("manual upload has no immutable object identity")
+            completion = ManualUploadCompletion(
+                object_version_id=uploaded.version_id,
+                object_etag=uploaded.etag,
+                byte_size=uploaded.byte_size,
+            )
+        elif (
+            snapshot.staging_object_version_id is not None
+            and snapshot.staging_object_etag is not None
+            and snapshot.staging_byte_size is not None
+        ):
+            # A lost HTTP response may be replayed after the import controller
+            # has already advanced. Reconstruct the original immutable input;
+            # the service idempotency record still proves the exact request.
+            completion = ManualUploadCompletion(
+                object_version_id=snapshot.staging_object_version_id,
+                object_etag=snapshot.staging_object_etag,
+                byte_size=snapshot.staging_byte_size,
+            )
+            completion_lock_version = 1
+        else:
+            raise LoraCatalogConflictError("manual import is not awaiting an uploaded object")
+        result = await mark_manual_upload_complete(
+            session,
+            job_id=snapshot.job_id,
+            completion=completion,
+            expected_lock_version=completion_lock_version,
+            actor_user_id=principal.user_id,
+            idempotency_key=idempotency_key,
+        )
+    except (
+        LoraCatalogInputError,
+        LoraCatalogNotFoundError,
+        LoraCatalogConflictError,
+        ModelArtifactError,
+    ) as error:
+        raise _catalog_http_error(error) from error
+    except ObjectStoreError as error:
+        raise _catalog_http_error(error) from error
+    response.headers["Idempotency-Replayed"] = str(result.replayed).lower()
+    return LoraMutationRead(
+        import_=_import_read(result.job),
+        changed=result.changed,
+        replayed=result.replayed,
+    )
+
+
 @router.post("/imports/{job_id}:retry", response_model=LoraMutationRead)
 async def retry_lora_import(
     job_id: UUID,
