@@ -3,8 +3,9 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
@@ -47,7 +48,11 @@ from gen_automation.services.experiments import (
     experiment_progress_payload,
     load_experiment_status,
 )
-from gen_automation.services.new_sets import list_new_set_options
+from gen_automation.services.new_sets import (
+    NewSetNotFoundError,
+    list_new_set_options,
+    load_new_set_status,
+)
 from gen_automation.services.progressive_assets import (
     AvailableRawMaster,
     ProgressiveAssetIntegrityError,
@@ -79,6 +84,7 @@ async def dashboard_new_experiment(
     request: Request,
     session: Session,
     principal: ReleaseReader,
+    release_id: Annotated[UUID | None, Query(alias="release")] = None,
 ) -> Response:
     if principal.role not in _MANAGER_ROLES:
         return _error_response(
@@ -89,12 +95,25 @@ async def dashboard_new_experiment(
             message="Your account cannot create generation experiments.",
         )
     options = await list_new_set_options(session, experiment_mode=True)
+    active_release = None
+    if release_id is not None:
+        try:
+            active_release = await load_new_set_status(session, release_id=release_id)
+        except NewSetNotFoundError:
+            return _error_response(
+                request,
+                principal=principal,
+                status_code=status.HTTP_404_NOT_FOUND,
+                heading="Experiment run not found",
+                message="The selected Experiment Lab run no longer exists.",
+            )
     try:
         return new_set_form_response(
             request,
             principal=principal,
             options=options,
             experiment_mode=True,
+            experiment_release=active_release,
         )
     except (CsrfValidationError, HTTPException):
         return _error_response(

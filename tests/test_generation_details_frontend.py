@@ -226,9 +226,9 @@ def test_generation_form_uses_one_responsive_progressive_builder() -> None:
         encoding="utf-8"
     )
 
-    assert '<div class="automation-create">' in template
+    assert '<div class="automation-create{% if experiment_mode %}' in template
     assert "<h1>New set</h1>" in template
-    assert 'class="automation-jump-nav"' in template
+    assert 'class="automation-jump-nav{% if experiment_mode %}' in template
     assert 'class="step-panel form-disclosure automation-settings-panel"' in template
     assert "data-image-settings-summary" in template
     assert 'class="batch-prompts-grid"' in template
@@ -240,6 +240,50 @@ def test_generation_form_uses_one_responsive_progressive_builder() -> None:
 
     assert "initializeImageSettingsSummary" in script
     assert 'form.addEventListener("gen-automation:profile-changed", render)' in script
+
+
+def test_experiment_lab_has_a_scoped_workspace_gallery_and_exact_settings_reuse() -> None:
+    template = (
+        ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "new_set.html"
+    ).read_text(encoding="utf-8")
+    styles = (ROOT / "src" / "gen_automation" / "static" / "dashboard_ux.css").read_text(
+        encoding="utf-8"
+    )
+    script = (ROOT / "src" / "gen_automation" / "static" / "dashboard.js").read_text(
+        encoding="utf-8"
+    )
+
+    for contract in (
+        "data-experiment-lab-workspace",
+        "data-experiment-lab-output",
+        "data-experiment-lab-active-image",
+        "data-experiment-lab-gallery",
+        "data-experiment-lab-reuse",
+        "data-warm-countdown-value",
+    ):
+        assert contract in template
+    assert ".experiment-lab-form .automation-layout" in styles
+    assert ".experiment-lab-active-media img" in styles
+    assert ".experiment-lab-thumbnail.is-selected" in styles
+    assert ".experiment-lab-form .automation-sidebar { display: grid; }" in styles
+
+    workspace = script.split("function initializeExperimentLabWorkspace", maxsplit=1)[1].split(
+        "function initializeExperimentResults", maxsplit=1
+    )[0]
+    assert "generation_details_url" in workspace
+    assert "sanitizedGenerationDetails" in workspace
+    assert "applyGenerationDetailsToExperimentLab" in workspace
+    assert "gen-automation:assets-updated" in workspace
+    assert "payload.next_cursor" in workspace
+    assert "button.dataset.experimentLabThumbnail" in workspace
+    assert "innerHTML" not in workspace
+
+    warm = script.split("function initializeExperimentWarmSession", maxsplit=1)[1].split(
+        "function initializeExperimentLabWorkspace", maxsplit=1
+    )[0]
+    assert "payload.expires_at" in warm
+    assert "payload.hard_expires_at" in warm
+    assert "window.setInterval(renderCountdown, 1000)" in warm
 
 
 def test_live_generation_exposes_failures_and_hides_unready_review_action() -> None:
