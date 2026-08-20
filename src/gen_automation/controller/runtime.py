@@ -1093,7 +1093,13 @@ class ControllerWorkloads:
                 .where(
                     SaladDeployment.is_current.is_(True),
                     SaladDeployment.purpose == SaladDeploymentPurpose.IMAGE,
-                    SaladDeployment.state == SaladDeploymentState.ACTIVE,
+                    or_(
+                        SaladDeployment.state == SaladDeploymentState.ACTIVE,
+                        and_(
+                            SaladDeployment.state == SaladDeploymentState.PROVISIONING,
+                            SaladDeployment.last_error_code == "provider_start_pending",
+                        ),
+                    ),
                     SaladDeployment.desired_state == DesiredDeploymentState.ACTIVE,
                 )
                 .limit(1)
