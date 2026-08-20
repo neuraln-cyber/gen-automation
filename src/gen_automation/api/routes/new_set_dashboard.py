@@ -60,6 +60,7 @@ from gen_automation.services.new_sets import (
     NewSetInputError,
     NewSetNotFoundError,
     NewSetOptions,
+    NewSetStatus,
     create_and_approve_new_set,
     list_new_set_options,
     load_new_set_status,
@@ -278,14 +279,16 @@ async def submit_dashboard_new_set(
         )
 
     query = [f"draft={form.submission_id}"]
-    if experiment_mode:
-        query.append("mode=experiment")
     if warm_failed:
         query.append("warm=unavailable")
+    if experiment_mode:
+        destination = f"/dashboard/experiments/new?release={result.release.id}&{'&'.join(query)}"
+    else:
+        destination = f"/dashboard/releases/{result.release.id}/status?{'&'.join(query)}"
     return _secure_response(
         request,
         RedirectResponse(
-            url=f"/dashboard/releases/{result.release.id}/status?{'&'.join(query)}",
+            url=destination,
             status_code=status.HTTP_303_SEE_OTHER,
         ),
     )
@@ -617,6 +620,7 @@ def new_set_form_response(
     error_message: str | None = None,
     status_code: int = status.HTTP_200_OK,
     experiment_mode: bool | None = None,
+    experiment_release: NewSetStatus | None = None,
 ) -> Response:
     settings: Settings = request.app.state.settings
     resolved_submission_id = submission_id or uuid4()
@@ -657,6 +661,10 @@ def new_set_form_response(
                 ),
                 "max_accepted_images_per_release": MAX_ACCEPTED_IMAGES_PER_RELEASE,
                 "experiment_mode": resolved_experiment_mode,
+                "experiment_release": (experiment_release if resolved_experiment_mode else None),
+                "warm_unavailable": (
+                    resolved_experiment_mode and request.query_params.get("warm") == "unavailable"
+                ),
             },
             status_code=status_code,
         ),

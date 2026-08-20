@@ -5144,25 +5144,31 @@
     );
     assign("interaction_prompt", preferredPromptText(details.prompts.interaction));
     assign("camera_prompt", preferredPromptText(details.prompts.camera));
-    assign("detailer_prompt", preferredPromptText(details.prompts.detailer_positive));
-    assign("detailer_negative_prompt", preferredPromptText(details.prompts.detailer_negative));
+    assign(
+      "detailer_prompt",
+      details.prompts.detailer_positive?.inherited === true
+        ? ""
+        : preferredPromptText(details.prompts.detailer_positive),
+    );
+    assign(
+      "detailer_negative_prompt",
+      details.prompts.detailer_negative?.inherited === true
+        ? ""
+        : preferredPromptText(details.prompts.detailer_negative),
+    );
     ["width", "height", "cfg", "steps", "sampler", "scheduler", "clip_skip"].forEach((name) => {
       assign(name, details.sampling[name]);
     });
-    if (details.hires.enabled === true) {
-      assign("hires_scale", details.hires.scale);
-      assign("hires_denoise", details.hires.denoise);
-      assign("hires_upscale_method", details.hires.upscale_method);
-    }
-    if (details.detailer.enabled === true) {
-      assign("detailer_guide_size", details.detailer.guide_size);
-      assign("detailer_max_size", details.detailer.max_size);
-      assign("detailer_denoise", details.detailer.denoise);
-      assign("detailer_bbox_threshold", details.detailer.bbox_threshold);
-      assign("detailer_bbox_dilation", details.detailer.bbox_dilation);
-      assign("detailer_bbox_crop_factor", details.detailer.bbox_crop_factor);
-      assign("detailer_feather", details.detailer.feather);
-    }
+    assign("hires_scale", details.hires.scale);
+    assign("hires_denoise", details.hires.denoise);
+    assign("hires_upscale_method", details.hires.upscale_method);
+    assign("detailer_guide_size", details.detailer.guide_size);
+    assign("detailer_max_size", details.detailer.max_size);
+    assign("detailer_denoise", details.detailer.denoise);
+    assign("detailer_bbox_threshold", details.detailer.bbox_threshold);
+    assign("detailer_bbox_dilation", details.detailer.bbox_dilation);
+    assign("detailer_bbox_crop_factor", details.detailer.bbox_crop_factor);
+    assign("detailer_feather", details.detailer.feather);
     return {
       schema_version: 1,
       fields,
@@ -5185,6 +5191,65 @@
           : "",
         workflow_sha256: details.workflow.sha256 || "",
       },
+    };
+  };
+
+  const experimentBatchFromDetails = (details) => {
+    const prompt = (name) => preferredPromptText(details.prompts[name]);
+    const controlled = details.composition.mode === "single" ? {} : {
+      character_a_prompt: prompt("character_a"),
+      character_b_prompt: prompt("character_b"),
+      character_c_prompt: details.composition.mode === "trio" ? prompt("character_c") : null,
+      character_a_pose_prompt: prompt("character_a_pose"),
+      character_b_pose_prompt: prompt("character_b_pose"),
+      character_c_pose_prompt: details.composition.mode === "trio"
+        ? prompt("character_c_pose") : null,
+      character_a_negative_prompt: prompt("character_a_negative"),
+      character_b_negative_prompt: prompt("character_b_negative"),
+      character_c_negative_prompt: details.composition.mode === "trio"
+        ? prompt("character_c_negative") : null,
+      interaction_prompt: prompt("interaction"),
+      camera_prompt: prompt("camera"),
+    };
+    return {
+      name: `${details.batch?.name || "Reused image"} remix`.slice(0, 100),
+      image_count: 1,
+      prompt: prompt("positive"),
+      negative_prompt: prompt("negative"),
+      detailer_prompt: details.prompts.detailer_positive?.inherited === true
+        ? null : prompt("detailer_positive"),
+      detailer_negative_prompt: details.prompts.detailer_negative?.inherited === true
+        ? null : prompt("detailer_negative"),
+      ...Object.fromEntries(CONTROLLED_BATCH_OVERRIDE_FIELDS.map((name) => [name, null])),
+      ...controlled,
+      seed: hasDisplayValue(details.sampling.seed) ? String(details.sampling.seed) : null,
+    };
+  };
+
+  const applyGenerationDetailsToExperimentLab = (form, details) => {
+    const result = applyAutomationProfile(form, automationProfileFromDetails(details));
+    if (!result.applied) return { applied: false, missing: [] };
+    const replacement = {
+      batch_plan: [experimentBatchFromDetails(details)],
+      replaced: false,
+    };
+    form.dispatchEvent(new CustomEvent("gen-automation:replace-batch-plan", {
+      detail: replacement,
+    }));
+    [
+      ["outputs_per_job", "1"],
+      ["planned_job_count", "1"],
+      ["desired_accepted_count", "1"],
+    ].forEach(([name, value]) => {
+      const control = namedControl(form, name);
+      if (!(control instanceof HTMLInputElement)) return;
+      control.value = value;
+      control.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    form.dispatchEvent(new CustomEvent("gen-automation:profile-changed"));
+    return {
+      applied: replacement.replaced,
+      missing: result.missing,
     };
   };
 
@@ -7396,10 +7461,69 @@
       const statusNode = panel.querySelector("[data-warm-session-status]");
       const heading = panel.querySelector("[data-warm-session-heading]");
       const actions = panel.querySelector("[data-warm-session-actions]");
+      const countdownValue = panel.querySelector("[data-warm-countdown-value]");
+      const countdownLabel = panel.querySelector("[data-warm-countdown-label]");
+      const countdownDetail = panel.querySelector("[data-warm-countdown-detail]");
       const buttons = Array.from(panel.querySelectorAll("[data-warm-start], [data-warm-extend], [data-warm-end]"));
       const csrf = panel.dataset.csrfToken || "";
       let endpointAvailable = false;
       let statusTimer = 0;
+      let countdownTimer = 0;
+      let countdownTarget = 0;
+      let countdownState = "off";
+      let hardStopTarget = 0;
+      const parseTimestamp = (value) => {
+        if (typeof value !== "string") return 0;
+        const parsed = Date.parse(value);
+        return Number.isFinite(parsed) ? parsed : 0;
+      };
+      const formatCountdown = (seconds) => {
+        const bounded = Math.max(0, Math.floor(seconds));
+        const hours = Math.floor(bounded / 3600);
+        const minutes = Math.floor((bounded % 3600) / 60);
+        const remainder = bounded % 60;
+        return hours > 0
+          ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
+          : `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+      };
+      const renderCountdown = () => {
+        if (!(countdownValue instanceof HTMLElement)) return;
+        if (countdownState === "ending") {
+          countdownValue.textContent = "Releasing";
+          if (countdownLabel) countdownLabel.textContent = "GPU session";
+          if (countdownDetail) countdownDetail.textContent = "Waiting for provider confirmation";
+          return;
+        }
+        if (!["warm", "starting"].includes(countdownState) || countdownTarget <= 0) {
+          countdownValue.textContent = "--:--";
+          if (countdownLabel) countdownLabel.textContent = "GPU auto-stop";
+          if (countdownDetail) countdownDetail.textContent = "Starts after a test is queued";
+          return;
+        }
+        countdownValue.textContent = formatCountdown((countdownTarget - Date.now()) / 1000);
+        if (countdownLabel) countdownLabel.textContent = countdownState === "warm"
+          ? "Idle auto-stop" : "Allocation hard stop";
+        if (countdownDetail) {
+          const hardRemaining = hardStopTarget > 0
+            ? formatCountdown((hardStopTarget - Date.now()) / 1000)
+            : "--:--";
+          countdownDetail.textContent = countdownState === "warm"
+            ? `Absolute session cap in ${hardRemaining}`
+            : "The countdown continues if allocation is delayed";
+        }
+      };
+      const syncCountdown = (payload, state) => {
+        window.clearInterval(countdownTimer);
+        countdownState = state;
+        hardStopTarget = parseTimestamp(payload.hard_expires_at);
+        countdownTarget = state === "warm"
+          ? parseTimestamp(payload.expires_at)
+          : state === "starting" ? hardStopTarget : 0;
+        renderCountdown();
+        if (["warm", "starting"].includes(state) && countdownTarget > 0) {
+          countdownTimer = window.setInterval(renderCountdown, 1000);
+        }
+      };
       const selectedArtifactStack = () => {
         const form = document.querySelector("[data-automation-form]");
         if (!(form instanceof HTMLFormElement)) return {};
@@ -7434,6 +7558,7 @@
         if (actions) actions.hidden = false;
         const state = ["off", "starting", "warm", "ending"].includes(payload.state)
           ? payload.state : "off";
+        syncCountdown(payload, state);
         if (heading) {
           heading.textContent = state === "warm"
             ? "Focus session · GPU ready for follow-up tests"
@@ -7542,7 +7667,301 @@
           buttons.forEach((item) => { item.disabled = false; });
         }
       }));
+      window.addEventListener("pagehide", () => {
+        window.clearTimeout(statusTimer);
+        window.clearInterval(countdownTimer);
+      }, { once: true });
     });
+  }
+
+  function initializeExperimentLabWorkspace() {
+    const workspace = document.querySelector("[data-experiment-lab-workspace]");
+    const form = workspace?.querySelector("[data-experiment-lab-form]");
+    const root = workspace?.querySelector("[data-experiment-lab-output]");
+    if (!(workspace instanceof HTMLElement)
+        || !(form instanceof HTMLFormElement)
+        || !(root instanceof HTMLElement)) return;
+
+    const title = namedControl(form, "title");
+    const slug = namedControl(form, "slug");
+    const submission = namedControl(form, "submission_id");
+    if (title instanceof HTMLInputElement && slug instanceof HTMLInputElement
+        && !title.value.trim() && !slug.value.trim()) {
+      const now = new Date();
+      const date = now.toISOString().slice(0, 10);
+      const time = now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      const suffix = submission instanceof HTMLInputElement
+        ? submission.value.replaceAll("-", "").slice(0, 8)
+        : Date.now().toString(36);
+      title.value = `Experiment ${date} ${time}`;
+      slug.value = `experiment-${date}-${suffix}`;
+      title.dispatchEvent(new Event("input", { bubbles: true }));
+      slug.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+
+    const gallery = root.querySelector("[data-experiment-lab-gallery]");
+    const galleryHeading = root.querySelector("[data-experiment-lab-gallery-heading]");
+    const empty = root.querySelector("[data-experiment-lab-output-empty]");
+    const active = root.querySelector("[data-experiment-lab-active]");
+    const activeImage = root.querySelector("[data-experiment-lab-active-image]");
+    const activeTitle = root.querySelector("[data-experiment-lab-active-title]");
+    const activeMeta = root.querySelector("[data-experiment-lab-active-meta]");
+    const activeOpen = root.querySelector("[data-experiment-lab-active-open]");
+    const reuseButton = root.querySelector("[data-experiment-lab-reuse]");
+    const reuseStatus = root.querySelector("[data-experiment-lab-reuse-status]");
+    const count = root.querySelector("[data-experiment-lab-output-count]");
+    const progress = root.querySelector("[data-experiment-lab-progress]");
+    const progressbar = root.querySelector("[data-experiment-lab-progressbar]");
+    const progressFill = root.querySelector("[data-experiment-lab-progress-fill]");
+    const progressLabel = root.querySelector("[data-experiment-lab-progress-label]");
+    const stage = root.querySelector("[data-experiment-lab-stage]");
+    const networkStatus = root.querySelector("[data-experiment-lab-network-status]");
+    if (!(gallery instanceof HTMLOListElement)) return;
+
+    const assets = new Map();
+    let selectedAssetId = "";
+    let cursor = "";
+    let expected = Math.max(0, integerValue(root.dataset.expectedImages, 0));
+    let progressTimer = 0;
+    let assetTimer = 0;
+    let progressTerminal = false;
+    let assetRefreshRunning = false;
+    const assetIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+    const safeUrl = (value) => {
+      if (typeof value !== "string" || value.length === 0 || value.length > 16_384) return "";
+      try {
+        const url = new URL(value, window.location.href);
+        return url.origin === window.location.origin ? url.href : "";
+      } catch (_error) { return ""; }
+    };
+    const progressUrl = safeUrl(root.dataset.progressUrl || "");
+    const assetsUrl = safeUrl(root.dataset.assetsUrl || "");
+    const safeAssetUrl = (value, id) => {
+      const url = safeUrl(value);
+      return url && new URL(url).pathname.toLowerCase().startsWith(
+        `/dashboard/assets/${id.toLowerCase()}/`,
+      ) ? url : "";
+    };
+    const normalizedAsset = (item) => {
+      if (!isRecord(item) || typeof item.asset_id !== "string"
+          || !assetIdPattern.test(item.asset_id)) return null;
+      const id = item.asset_id.toLowerCase();
+      const previewUrl = safeAssetUrl(item.preview_url, id);
+      const viewUrl = safeAssetUrl(item.view_url, id);
+      const detailsUrl = safeAssetUrl(item.generation_details_url, id);
+      if (!previewUrl || !viewUrl || !detailsUrl) return null;
+      return {
+        id,
+        batchName: typeof item.batch_name === "string" ? item.batch_name.slice(0, 120) : "",
+        detailsUrl,
+        downloadUrl: safeAssetUrl(item.download_url, id),
+        height: Math.max(1, integerValue(item.height, 1)),
+        position: Math.max(1, integerValue(item.queue_position, assets.size + 1)),
+        previewUrl,
+        viewUrl,
+        width: Math.max(1, integerValue(item.width, 1)),
+      };
+    };
+    const setReuseStatus = (message, tone = "") => {
+      if (!(reuseStatus instanceof HTMLElement)) return;
+      reuseStatus.textContent = message;
+      reuseStatus.className = `experiment-lab-reuse-status${tone ? ` ${tone}` : ""}`;
+    };
+    const reuseAsset = async (asset) => {
+      if (!asset || !asset.detailsUrl) return;
+      if (reuseButton instanceof HTMLButtonElement) reuseButton.disabled = true;
+      setReuseStatus("Loading exact settings…");
+      try {
+        const response = await fetch(asset.detailsUrl, {
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        if (!response.ok || response.redirected) throw new Error("details unavailable");
+        const details = sanitizedGenerationDetails(await response.json());
+        if (!details.available) throw new Error("details unavailable");
+        const result = applyGenerationDetailsToExperimentLab(form, details);
+        if (!result.applied) throw new Error("settings unavailable");
+        const warning = result.missing.length > 0 ? ` ${result.missing.join(" ")}` : "";
+        setReuseStatus(`Image ${asset.position} settings loaded into the controls.${warning}`, result.missing.length ? "warning" : "success");
+      } catch (_error) {
+        setReuseStatus("The exact settings could not be loaded. The current controls were left unchanged.", "warning");
+      } finally {
+        if (reuseButton instanceof HTMLButtonElement) reuseButton.disabled = false;
+      }
+    };
+    const selectAsset = (asset, reuse = false) => {
+      if (!asset) return;
+      selectedAssetId = asset.id;
+      gallery.querySelectorAll("[data-experiment-lab-thumbnail]").forEach((button) => {
+        const selected = button.dataset.assetId === asset.id;
+        button.classList.toggle("is-selected", selected);
+        button.setAttribute("aria-current", selected ? "true" : "false");
+      });
+      if (active instanceof HTMLElement) active.hidden = false;
+      if (empty instanceof HTMLElement) empty.hidden = true;
+      if (activeImage instanceof HTMLImageElement) {
+        activeImage.src = asset.previewUrl;
+        activeImage.alt = `Generated image ${asset.position}${asset.batchName ? ` from ${asset.batchName}` : ""}`;
+        activeImage.width = asset.width;
+        activeImage.height = asset.height;
+      }
+      if (activeTitle) activeTitle.textContent = `Image ${asset.position}`;
+      if (activeMeta) activeMeta.textContent = [
+        asset.batchName || "Generated",
+        `${asset.width} × ${asset.height}`,
+      ].join(" · ");
+      if (reuse) reuseAsset(asset);
+    };
+    const addAsset = (asset) => {
+      const card = createNode("li", "experiment-lab-thumbnail-card");
+      card.dataset.assetCard = "";
+      card.dataset.assetId = asset.id;
+      card.dataset.assetLabel = `Image ${asset.position}`;
+      card.dataset.assetPreviewUrl = asset.previewUrl;
+      card.dataset.assetViewUrl = asset.viewUrl;
+      const button = createNode("button", "experiment-lab-thumbnail");
+      button.type = "button";
+      button.dataset.experimentLabThumbnail = "";
+      button.dataset.assetId = asset.id;
+      button.setAttribute("aria-label", `Select generated image ${asset.position}`);
+      const image = document.createElement("img");
+      image.className = "asset-preview";
+      image.src = asset.previewUrl;
+      image.alt = "";
+      image.loading = "lazy";
+      image.decoding = "async";
+      image.referrerPolicy = "no-referrer";
+      image.width = asset.width;
+      image.height = asset.height;
+      button.append(image, createNode("span", "", String(asset.position)));
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        selectAsset(asset, true);
+      });
+      const open = createNode("a", "experiment-lab-thumbnail-open", "Full screen");
+      open.href = asset.viewUrl;
+      open.dataset.assetViewerTrigger = "";
+      card.append(button, open);
+      asset.card = card;
+      asset.open = open;
+      gallery.append(card);
+      if (galleryHeading instanceof HTMLElement) galleryHeading.hidden = false;
+    };
+    const renderCount = () => {
+      if (count) count.textContent = expected > 0
+        ? `${assets.size} / ${expected}` : `${assets.size} image${assets.size === 1 ? "" : "s"}`;
+    };
+    const scheduleAssets = (delay = 3000) => {
+      window.clearTimeout(assetTimer);
+      if (!progressTerminal || assets.size < expected) {
+        assetTimer = window.setTimeout(refreshAssets, Math.min(30_000, Math.max(2_000, delay)));
+      }
+    };
+    async function refreshAssets() {
+      if (!assetsUrl || assetRefreshRunning) return;
+      assetRefreshRunning = true;
+      try {
+        let pages = 0;
+        let hasMore = true;
+        while (hasMore && pages < 8) {
+          const url = new URL(assetsUrl);
+          url.searchParams.set("limit", "64");
+          if (cursor) url.searchParams.set("cursor", cursor);
+          const response = await fetch(url.href, {
+            credentials: "same-origin",
+            cache: "no-store",
+            headers: { Accept: "application/json" },
+          });
+          if (!response.ok || response.redirected) throw new Error("assets unavailable");
+          const payload = await response.json();
+          const items = isRecord(payload) && Array.isArray(payload.assets) ? payload.assets : null;
+          if (items === null) throw new Error("invalid assets");
+          let latest = null;
+          items.forEach((item) => {
+            const asset = normalizedAsset(item);
+            if (!asset || assets.has(asset.id)) return;
+            assets.set(asset.id, asset);
+            addAsset(asset);
+            latest = asset;
+          });
+          if (latest && !selectedAssetId) selectAsset(latest, false);
+          if (typeof payload.next_cursor === "string" && payload.next_cursor.length <= 4096) {
+            cursor = payload.next_cursor;
+          }
+          hasMore = payload.has_more === true;
+          pages += 1;
+        }
+        renderCount();
+        if (networkStatus) networkStatus.textContent = assets.size > 0
+          ? "Verified images update automatically. Select one to restore its exact controls."
+          : "Waiting for the first verified image…";
+        document.dispatchEvent(new CustomEvent("gen-automation:assets-updated", {
+          detail: { root: gallery },
+        }));
+      } catch (_error) {
+        if (networkStatus) networkStatus.textContent = "Live results were interrupted; retrying automatically.";
+      } finally {
+        assetRefreshRunning = false;
+        scheduleAssets();
+      }
+    }
+    const scheduleProgress = (delay = 3000) => {
+      window.clearTimeout(progressTimer);
+      if (!progressTerminal) {
+        progressTimer = window.setTimeout(refreshProgress, Math.min(30_000, Math.max(2_000, delay)));
+      }
+    };
+    async function refreshProgress() {
+      if (!progressUrl) return;
+      try {
+        const response = await fetch(progressUrl, {
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+        });
+        if (!response.ok || response.redirected) throw new Error("progress unavailable");
+        const payload = await response.json();
+        if (!isRecord(payload) || !isRecord(payload.stage) || !isRecord(payload.images)) {
+          throw new Error("invalid progress");
+        }
+        const generated = Math.max(0, integerValue(payload.images.generated, 0));
+        expected = Math.max(0, integerValue(payload.images.expected, expected));
+        const percent = Math.max(0, Math.min(100, Number(payload.images.percent) || 0));
+        if (progress instanceof HTMLElement) progress.hidden = false;
+        if (stage) stage.textContent = typeof payload.stage.label === "string"
+          ? payload.stage.label : "Generating";
+        if (progressLabel) progressLabel.textContent = `${generated} / ${expected} images`;
+        if (progressFill instanceof HTMLElement) progressFill.style.width = `${percent}%`;
+        if (progressbar instanceof HTMLElement) {
+          progressbar.setAttribute("aria-valuemax", String(Math.max(1, expected)));
+          progressbar.setAttribute("aria-valuenow", String(generated));
+        }
+        renderCount();
+        progressTerminal = payload.ready_for_review === true
+          || ["review", "cancelled", "error"].includes(payload.stage.key);
+        await refreshAssets();
+        scheduleProgress(integerValue(payload.poll_after_ms, 3000));
+      } catch (_error) {
+        if (networkStatus) networkStatus.textContent = "Run status is temporarily unavailable; retrying automatically.";
+        scheduleProgress(6000);
+      }
+    }
+
+    if (activeOpen instanceof HTMLButtonElement) {
+      activeOpen.addEventListener("click", () => assets.get(selectedAssetId)?.open?.click());
+    }
+    if (reuseButton instanceof HTMLButtonElement) {
+      reuseButton.addEventListener("click", () => reuseAsset(assets.get(selectedAssetId)));
+    }
+    renderCount();
+    if (assetsUrl) window.setTimeout(refreshAssets, 200);
+    if (progressUrl) window.setTimeout(refreshProgress, 200);
+    window.addEventListener("pagehide", () => {
+      window.clearTimeout(assetTimer);
+      window.clearTimeout(progressTimer);
+    }, { once: true });
   }
 
   function initializeExperimentResults() {
@@ -8088,6 +8507,7 @@
   initializeWatermarkComposers();
   initializeXPublishingControls();
   initializeExperimentLab();
+  initializeExperimentLabWorkspace();
   initializeExperimentWarmSession();
   initializeExperimentResults();
   initializeReviewBootstrap();

@@ -214,8 +214,13 @@ def test_experiment_lab_is_the_full_automation_builder_plus_warm_controls(
     assert 'data-automation-draft-scope="experiment"' in lab.text
     assert 'data-automation-draft-scope="automation"' in automation.text
     assert 'data-warm-status-url="/dashboard/experiments/warm-session"' in lab.text
-    assert "Interactive testing" in lab.text
-    assert "Queue test" in lab.text
+    assert "Experiment Lab" in lab.text
+    assert "Run current queue" in lab.text
+    assert "Generated images" in lab.text
+    assert "Send settings to controls" in lab.text
+    assert "data-experiment-lab-workspace" in lab.text
+    assert "data-experiment-lab-output" in lab.text
+    assert "data-warm-countdown-value" in lab.text
     assert 'data-warm-duration-minutes="15"' in lab.text
     assert 'data-warm-duration-minutes="90"' in lab.text
     assert "Start 90 min focus" in lab.text
@@ -229,6 +234,9 @@ def test_experiment_lab_is_the_full_automation_builder_plus_warm_controls(
     assert "configuredDuration === 90" in script.text
     assert "duration_minutes: durationMinutes" in script.text
     assert "hardSeconds - seconds >= 15 * 60" in script.text
+    assert "initializeExperimentLabWorkspace();" in script.text
+    assert "applyGenerationDetailsToExperimentLab" in script.text
+    assert "Idle auto-stop" in script.text
     assert 'document.querySelector("[data-automation-draft-scope]")' in script.text
     assert 'if (draftScope === "automation") return scopedStorageKey(key);' in script.text
 
@@ -294,7 +302,7 @@ def test_experiment_lab_queues_large_multi_batch_automation_and_reuses_one_warm_
     assert first.status_code == 303
     assert replay.status_code == 303
     assert first.headers["location"] == replay.headers["location"]
-    assert "&mode=experiment" in first.headers["location"]
+    assert first.headers["location"].startswith("/dashboard/experiments/new?release=")
     assert client.portal.call(lease_snapshot) == before_replay
 
     second_page = client.get("/dashboard/experiments/new")
@@ -353,7 +361,17 @@ def test_experiment_lab_queues_large_multi_batch_automation_and_reuses_one_warm_
     assert second_version.specification["generation"]["width"] == 1152
     assert second_version.specification["generation"]["steps"] == 40
 
-    status_page = client.get(first.headers["location"])
+    lab_page = client.get(first.headers["location"])
+    assert lab_page.status_code == 200
+    assert f'data-experiment-release-id="{releases[0].id}"' in lab_page.text
+    assert f'data-progress-url="/dashboard/releases/{releases[0].id}/progress"' in (lab_page.text)
+    assert (
+        f'data-assets-url="/dashboard/releases/{releases[0].id}/generated-assets"' in lab_page.text
+    )
+    assert "data-experiment-lab-output" in lab_page.text
+    assert "data-experiment-results" not in lab_page.text
+
+    status_page = client.get(f"/dashboard/releases/{releases[0].id}/status?mode=experiment")
     assert status_page.status_code == 200
     assert "Queue next test" in status_page.text
     assert 'data-warm-duration-minutes="90"' in status_page.text
@@ -567,10 +585,12 @@ def test_optional_auto_warm_failure_does_not_fail_a_queued_lab_set(
     )
 
     assert response.status_code == 303
-    assert "mode=experiment" in response.headers["location"]
+    assert response.headers["location"].startswith("/dashboard/experiments/new?release=")
     assert "warm=unavailable" in response.headers["location"]
     status_page = client.get(response.headers["location"])
     assert status_page.status_code == 200
-    assert "This set was queued, but the optional warm hold could not be started" in (
-        status_page.text
+    assert (
+        "The experiment was queued, but the optional warm follow-up session could not be started"
+        in status_page.text
     )
+    assert "Generation continues normally and can be followed in Results" in status_page.text

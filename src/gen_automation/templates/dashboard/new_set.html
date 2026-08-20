@@ -1,34 +1,46 @@
 {% extends "dashboard/base.html" %}
 
 {% block content %}
-  <div class="automation-create">
+  <div class="automation-create{% if experiment_mode %} experiment-lab-workspace{% endif %}"{% if experiment_mode %} data-experiment-lab-workspace{% endif %}>
   <a class="back automation-back" href="/dashboard">&larr; All sets</a>
   <header class="page-header new-automation-header">
     <div class="page-header-row">
       <div class="page-header-copy">
         {% if experiment_mode %}
-          <p class="page-kicker">Experiment Lab</p>
-          <h1>Interactive testing</h1>
+          <p class="page-kicker">Creative workspace</p>
+          <h1>Experiment Lab</h1>
         {% else %}
           <p class="page-kicker">Create</p>
           <h1>New set</h1>
         {% endif %}
         <p class="lede">
           {% if experiment_mode %}
-            The complete New Automation workflow, with one GPU kept ready between quick
-            prompt, style, and LoRA tests. One-image tests and larger batches use the same path.
+            Generate, inspect, and refine Illustrious or Anima without leaving the workspace.
+            Every result keeps its exact prompt, model, LoRA, wildcard, and sampling settings.
           {% else %}
             Choose a look, build the queue, then launch.
           {% endif %}
         </p>
       </div>
-      <a class="secondary-button" href="/dashboard/wildcards">Manage wildcards</a>
+      <div class="experiment-lab-header-actions">
+        <a class="secondary-button" href="/dashboard/wildcards">Manage wildcards</a>
+        {% if experiment_mode %}
+          <a class="secondary-button" href="/dashboard/new-set">Production set</a>
+        {% endif %}
+      </div>
     </div>
-    <nav class="automation-jump-nav" aria-label="{{ 'Experiment Lab' if experiment_mode else 'New set' }} sections">
-      <a href="#set-details"><span>1</span> Set details</a>
-      <a href="#generation-setup"><span>2</span> Generation</a>
-      <a href="#batch-builder"><span>3</span> Batches</a>
-      <a href="#final-set-target"><span>4</span> Finish</a>
+    <nav class="automation-jump-nav{% if experiment_mode %} experiment-lab-jump-nav{% endif %}" aria-label="{{ 'Experiment Lab' if experiment_mode else 'New set' }} sections">
+      {% if experiment_mode %}
+        <a href="#generation-setup"><span>1</span> Model &amp; style</a>
+        <a href="#experiment-prompts"><span>2</span> Prompts</a>
+        <a href="#batch-builder"><span>3</span> Queue</a>
+        <a href="#experiment-output"><span>4</span> Results</a>
+      {% else %}
+        <a href="#set-details"><span>1</span> Set details</a>
+        <a href="#generation-setup"><span>2</span> Generation</a>
+        <a href="#batch-builder"><span>3</span> Batches</a>
+        <a href="#final-set-target"><span>4</span> Finish</a>
+      {% endif %}
     </nav>
   </header>
 
@@ -42,13 +54,18 @@
       data-warm-end-url="/dashboard/experiments/warm-session/end"
       data-csrf-token="{{ csrf_token }}"
     >
-      <div>
+      <div class="experiment-warm-copy">
         <span class="experiment-eyebrow">Interactive GPU session</span>
         <strong data-warm-session-heading>Standard mode &middot; 15-minute reuse</strong>
         <p data-warm-session-status>
           A queued test starts the bounded 15-minute follow-up window automatically. Start a
           Focus session now when you want the worker ready while you edit and across more tests.
         </p>
+      </div>
+      <div class="experiment-warm-countdown" data-warm-countdown aria-live="polite">
+        <span data-warm-countdown-label>GPU auto-stop</span>
+        <strong data-warm-countdown-value>--:--</strong>
+        <small data-warm-countdown-detail>Starts after a test is queued</small>
       </div>
       <div class="experiment-warm-actions" hidden data-warm-session-actions>
         <button class="secondary-button" type="button" data-warm-start data-warm-duration-minutes="15">Start 15 min</button>
@@ -62,6 +79,12 @@
   {% if error_message %}
     <div class="form-error" role="alert">{{ error_message }}</div>
   {% endif %}
+  {% if warm_unavailable %}
+    <div class="form-error" role="alert">
+      The experiment was queued, but the optional warm follow-up session could not be started.
+      Generation continues normally and can be followed in Results.
+    </div>
+  {% endif %}
 
   {% if not options.ready %}
     <section class="panel review-entry automation-readiness-warning">
@@ -71,11 +94,13 @@
   {% endif %}
 
   <form
-    class="set-form automation-form automation-create-form"
+    class="set-form automation-form automation-create-form{% if experiment_mode %} experiment-lab-form{% endif %}"
     method="post"
     action="/dashboard/new-set{% if experiment_mode %}?mode=experiment{% endif %}"
     autocomplete="off"
     data-automation-form
+    {% if experiment_mode %}data-experiment-lab-form{% endif %}
+    {% if experiment_release %}data-experiment-release-id="{{ experiment_release.release_id }}"{% endif %}
     data-automation-draft-scope="{{ 'experiment' if experiment_mode else 'automation' }}"
     data-signed-outputs-per-job-cap="{{ max_safe_outputs_per_signed_generation_job }}"
     data-server-error="{{ 'true' if error_message else 'false' }}"
@@ -91,27 +116,27 @@
           <legend class="visually-hidden">Set details</legend>
           <div class="automation-panel-heading">
             <div>
-              <span class="automation-section-label">Set details</span>
-              <h2>Name this set</h2>
+              <span class="automation-section-label">{{ 'Workspace' if experiment_mode else 'Set details' }}</span>
+              <h2>{{ 'Experiment identity' if experiment_mode else 'Name this set' }}</h2>
             </div>
-            <span class="automation-panel-hint">Autosaved locally</span>
+            <span class="automation-panel-hint">{{ 'Optional · generated automatically' if experiment_mode else 'Autosaved locally' }}</span>
           </div>
           <div class="automation-title-row">
             <label class="automation-title-field">
-              Set name
+              {{ 'Experiment name' if experiment_mode else 'Set name' }}
               <input
                 type="text"
                 name="title"
                 value="{{ form_values['title'] }}"
                 minlength="1"
                 maxlength="300"
-                placeholder="Tsunade &middot; August set"
+                placeholder="{{ 'Optional · e.g. Anima LoRA weight test' if experiment_mode else 'Tsunade · August set' }}"
                 data-title-input
                 required
               >
             </label>
             <details class="compact-disclosure automation-name-advanced">
-              <summary>URL name</summary>
+              <summary>{{ 'Run ID' if experiment_mode else 'URL name' }}</summary>
               <label>
                 URL slug
                 <input
@@ -534,7 +559,7 @@
             </label>
           </div>
 
-          <details class="form-disclosure">
+          <details class="form-disclosure"{% if experiment_mode %} open{% endif %}>
             <summary>LoRA stack <span data-lora-summary>Optional &middot; up to 8</span></summary>
             <div class="disclosure-body">
               <section class="lora-picker" data-lora-picker data-max-selections="8" hidden>
@@ -646,7 +671,7 @@
           </details>
         </fieldset>
 
-        <details class="step-panel form-disclosure automation-settings-panel">
+        <details class="step-panel form-disclosure automation-settings-panel"{% if experiment_mode %} open{% endif %}>
           <summary class="automation-settings-summary">
             <span>
               <small class="automation-section-label">Generation</small>
@@ -771,7 +796,7 @@
           </div>
         </details>
 
-        <details class="step-panel form-disclosure automation-defaults-panel">
+        <details class="step-panel form-disclosure automation-defaults-panel" id="experiment-prompts"{% if experiment_mode %} open{% endif %}>
           <summary>
             Prompt defaults
             <span>For new batches</span>
@@ -852,8 +877,8 @@
           <div class="section-heading">
             <div class="automation-panel-heading">
               <div>
-                <span class="automation-section-label">Ordered queue</span>
-                <h2>Batches</h2>
+                <span class="automation-section-label">{{ 'Generation queue' if experiment_mode else 'Ordered queue' }}</span>
+                <h2>{{ 'Prompt runs' if experiment_mode else 'Batches' }}</h2>
               </div>
               <span class="automation-queue-count" data-queue-summary>1 batch &middot; 0 images</span>
             </div>
@@ -924,12 +949,70 @@
         </details>
       </div>
 
-      <aside class="automation-sidebar" aria-label="Set summary">
+      <aside class="automation-sidebar" aria-label="{{ 'Experiment output and launch' if experiment_mode else 'Set summary' }}">
+        {% if experiment_mode %}
+          <section
+            class="panel experiment-lab-output"
+            id="experiment-output"
+            data-experiment-lab-output
+            {% if experiment_release %}
+              data-progress-url="/dashboard/releases/{{ experiment_release.release_id }}/progress"
+              data-assets-url="/dashboard/releases/{{ experiment_release.release_id }}/generated-assets"
+              data-expected-images="{{ experiment_release.images.expected }}"
+            {% endif %}
+          >
+            <div class="experiment-lab-output-heading">
+              <div>
+                <span class="automation-section-label">Output</span>
+                <h2>Generated images</h2>
+              </div>
+              <span class="experiment-lab-output-count" data-experiment-lab-output-count>
+                {% if experiment_release %}0 / {{ experiment_release.images.expected }}{% else %}0 images{% endif %}
+              </span>
+            </div>
+            <div class="experiment-lab-run-progress"{% if not experiment_release %} hidden{% endif %} data-experiment-lab-progress>
+              <div>
+                <strong data-experiment-lab-stage>{% if experiment_release %}{{ experiment_release.stage.label }}{% else %}Ready{% endif %}</strong>
+                <span data-experiment-lab-progress-label>{% if experiment_release %}{{ experiment_release.images.generated }} / {{ experiment_release.images.expected }} images{% else %}No active run{% endif %}</span>
+              </div>
+              <div class="experiment-lab-progress-track" role="progressbar" aria-label="Experiment generation progress" aria-valuemin="0" aria-valuemax="{{ experiment_release.images.expected if experiment_release else 1 }}" aria-valuenow="{{ experiment_release.images.generated if experiment_release else 0 }}" data-experiment-lab-progressbar>
+                <span style="width: {{ experiment_release.images.percent if experiment_release else 0 }}%" data-experiment-lab-progress-fill></span>
+              </div>
+            </div>
+            <div class="experiment-lab-output-empty" data-experiment-lab-output-empty>
+              <span aria-hidden="true">&#10022;</span>
+              <strong>Your next result appears here</strong>
+              <p>Choose any checkpoint, workflow, LoRA stack, prompt, wildcard, or sampler setting and generate without leaving the Lab.</p>
+            </div>
+            <div class="experiment-lab-active-result" data-experiment-lab-active hidden>
+              <button class="experiment-lab-active-media" type="button" data-experiment-lab-active-open aria-label="Open selected image full screen">
+                <img alt="" decoding="async" fetchpriority="high" referrerpolicy="no-referrer" data-experiment-lab-active-image>
+                <span class="experiment-lab-active-badge" data-experiment-lab-active-badge>Current</span>
+              </button>
+              <div class="experiment-lab-active-toolbar">
+                <div>
+                  <strong data-experiment-lab-active-title>Selected image</strong>
+                  <span data-experiment-lab-active-meta></span>
+                </div>
+                <button class="primary-button" type="button" data-experiment-lab-reuse>Send settings to controls</button>
+              </div>
+              <output class="experiment-lab-reuse-status" data-experiment-lab-reuse-status aria-live="polite"></output>
+            </div>
+            <div class="experiment-lab-gallery-heading" data-experiment-lab-gallery-heading hidden>
+              <strong>Run images</strong>
+              <span>Select one to inspect or reuse</span>
+            </div>
+            <ol class="experiment-lab-gallery" data-asset-grid data-experiment-lab-gallery aria-label="Generated images in queue order"></ol>
+            <p class="experiment-lab-network-status" role="status" aria-live="polite" data-experiment-lab-network-status>
+              {% if experiment_release %}Loading verified results&hellip;{% else %}No run selected yet.{% endif %}
+            </p>
+          </section>
+        {% endif %}
         <section class="panel automation-summary-card">
           <div class="automation-panel-heading">
             <div>
-              <span class="automation-section-label">Final step</span>
-              <h2>Launch</h2>
+              <span class="automation-section-label">{{ 'Generate' if experiment_mode else 'Final step' }}</span>
+              <h2>{{ 'Run current queue' if experiment_mode else 'Launch' }}</h2>
             </div>
           </div>
           <dl class="automation-totals" aria-live="polite">
@@ -941,19 +1024,21 @@
           <p class="summary-note" id="summary-note">
             Add a prompt and image count to prepare this set.
           </p>
-          <details class="summary-help">
-            <summary>How the final set works</summary>
-            <p class="decision-help">
-              Fresh queues default to a 250-image cap, which you can edit anytime. For example:
-              generate 400; keep the best 250. Other masters may remain undecided.
-            </p>
-          </details>
+          {% if not experiment_mode %}
+            <details class="summary-help">
+              <summary>How the final set works</summary>
+              <p class="decision-help">
+                Fresh queues default to a 250-image cap, which you can edit anytime. For example:
+                generate 400; keep the best 250. Other masters may remain undecided.
+              </p>
+            </details>
+          {% endif %}
           <div class="automation-draft-row">
             <span data-automation-draft-status>Draft autosaves on this device.</span>
             <button class="text-button" type="button" data-automation-draft-clear>Clear draft</button>
           </div>
           <button class="primary-button queue-submit" type="submit" {% if not options.ready %}disabled{% endif %}>
-            {{ 'Queue test' if experiment_mode else 'Queue set' }}
+            {{ 'Generate' if experiment_mode else 'Queue set' }}
           </button>
         </section>
       </aside>
@@ -963,7 +1048,7 @@
           <span><span data-mobile-summary-jobs>0</span> GPU jobs &middot; final set <span data-mobile-summary-target>0</span></span>
         </div>
         <button class="primary-button queue-submit" type="submit" {% if not options.ready %}disabled{% endif %}>
-          {{ 'Queue test' if experiment_mode else 'Queue set' }}
+          {{ 'Generate' if experiment_mode else 'Queue set' }}
         </button>
       </div>
     </div>
