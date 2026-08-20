@@ -24,12 +24,14 @@ from pydantic import (
 )
 
 from gen_automation.domain.canonical import canonical_json_bytes
+from gen_automation.domain.enums import GenerationModelFamily
 
 MAX_MANAGED_LORA_BYTES = 4 * 1024 * 1024 * 1024
 MAX_LORA_METADATA_BYTES = 16 * 1024
 MAX_LORA_TRIGGER_WORDS = 100
 CIVITAI_COMMERCIAL_USE_OVERRIDE_METADATA_KEY = "civitai_commercial_use_override"
 CIVITAI_COMMERCIAL_USE_OVERRIDE_SCHEMA = "civitai-commercial-use-override/v1"
+LORA_MODEL_FAMILY_METADATA_KEY = "model_family"
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 VisibleName = Annotated[str, StringConstraints(min_length=1, max_length=200)]
@@ -69,6 +71,7 @@ class _ImportCreateBase(StrictLoraCatalogModel):
     license_url: AnyHttpUrl
     commercial_use_attested: Literal[True]
     adult_use_attested: Literal[True]
+    model_family: GenerationModelFamily = GenerationModelFamily.ILLUSTRIOUS
     target_filename: str = Field(min_length=13, max_length=236)
     expected_sha256: Sha256 | None = None
     expected_byte_size: int | None = Field(
@@ -107,6 +110,8 @@ class _ImportCreateBase(StrictLoraCatalogModel):
     @field_validator("expected_metadata")
     @classmethod
     def validate_expected_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if LORA_MODEL_FAMILY_METADATA_KEY in value:
+            raise ValueError("LoRA model-family metadata is server-managed")
         validate_lora_durable_metadata(value)
         return value
 

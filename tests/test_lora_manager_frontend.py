@@ -96,6 +96,8 @@ def test_lora_manager_template_keeps_rights_and_provider_secrets_server_side() -
     assert 'name="target_filename"' in source
     assert 'pattern="[A-Za-z0-9][A-Za-z0-9._ -]*\\.safetensors"' in source
     assert 'name="trigger_words"' in source
+    assert source.count('name="model_family"') == 2
+    assert "data-lora-resolved-model-family" in source
     assert "Nothing is selected automatically" in source
     assert "data-lora-version-select" in source
     assert 'pattern="https://(www\\.)?civitai\\.(com|red)/.*"' in source
@@ -137,6 +139,11 @@ def test_lora_manager_javascript_uploads_directly_and_polls_durable_progress() -
     assert "target_filename" in script
     assert 'targetFilename.value = `${sanitizedStem || "uploaded-lora"}.safetensors`' in script
     assert "normalizedTriggerWords" in script
+    assert "inferredModelFamily" in script
+    assert "model_family: familySelect.value" in script
+    assert (
+        'model_family: modelFamily instanceof HTMLSelectElement ? modelFamily.value : ""' in script
+    )
     assert "normalizeCivitaiVersions" in script
     assert "requestBody.version_id = Number(selectedVersionId)" in script
     assert "No version was selected for you" in script

@@ -39,6 +39,7 @@ from gen_automation.domain.ids import uuid7
 from gen_automation.domain.lora_catalog import (
     CIVITAI_COMMERCIAL_USE_OVERRIDE_METADATA_KEY,
     CIVITAI_COMMERCIAL_USE_OVERRIDE_SCHEMA,
+    LORA_MODEL_FAMILY_METADATA_KEY,
     CivitaiLoraImportCreate,
     LoraDependencySummary,
     ManualLoraImportCreate,
@@ -243,7 +244,7 @@ async def create_manual_import_job(
         target_filename=command.target_filename,
         expected_sha256=command.expected_sha256,
         expected_byte_size=command.expected_byte_size,
-        expected_metadata=command.expected_metadata,
+        expected_metadata=_import_expected_metadata(command),
         trigger_words=command.trigger_words,
         progress_bytes=0,
         total_bytes=command.expected_byte_size,
@@ -322,7 +323,7 @@ async def create_civitai_import_job(
     await _require_actor(session, actor_user_id)
     if CIVITAI_COMMERCIAL_USE_OVERRIDE_METADATA_KEY in command.expected_metadata:
         raise LoraCatalogInputError("Civitai commercial-use override metadata is server-managed")
-    expected_metadata = dict(command.expected_metadata)
+    expected_metadata = _import_expected_metadata(command)
     if command.commercial_use_override_attested:
         expected_metadata[CIVITAI_COMMERCIAL_USE_OVERRIDE_METADATA_KEY] = {
             "schema": CIVITAI_COMMERCIAL_USE_OVERRIDE_SCHEMA,
@@ -396,6 +397,14 @@ async def create_civitai_import_job(
         now=created_at,
     )
     return LoraImportMutationResult(job=_job_snapshot(job), changed=True, replayed=False)
+
+
+def _import_expected_metadata(
+    command: ManualLoraImportCreate | CivitaiLoraImportCreate,
+) -> dict[str, Any]:
+    metadata = dict(command.expected_metadata)
+    metadata[LORA_MODEL_FAMILY_METADATA_KEY] = command.model_family.value
+    return metadata
 
 
 async def mark_manual_upload_complete(
