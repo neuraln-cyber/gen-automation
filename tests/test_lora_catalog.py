@@ -134,6 +134,38 @@ def _civitai() -> CivitaiLoraImportCreate:
     )
 
 
+@pytest.mark.parametrize("source", ["manual", "civitai"])
+async def test_created_import_persists_after_request_session_closes(
+    lora_database: tuple[Database, UUID, UUID],
+    source: str,
+) -> None:
+    database, owner_id, _reviewer_id = lora_database
+    async with database.sessions() as session:
+        if source == "manual":
+            created = await create_manual_import_job(
+                session,
+                command=_manual(),
+                model_bucket=MODEL_BUCKET,
+                actor_user_id=owner_id,
+                idempotency_key="persist-manual-import",
+                now=NOW,
+            )
+        else:
+            created = await create_civitai_import_job(
+                session,
+                command=_civitai(),
+                actor_user_id=owner_id,
+                idempotency_key="persist-civitai-import",
+                now=NOW,
+            )
+        job_id = created.job.job_id
+
+    async with database.sessions() as session:
+        persisted = await session.get(LoraImportJob, job_id)
+        assert persisted is not None
+        assert persisted.expected_metadata[LORA_MODEL_FAMILY_METADATA_KEY] == "anima"
+
+
 async def test_civitai_commercial_override_is_durable_and_audited(
     lora_database: tuple[Database, UUID, UUID],
 ) -> None:

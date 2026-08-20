@@ -284,6 +284,7 @@ async def create_manual_import_job(
         },
         now=created_at,
     )
+    await session.commit()
     return LoraImportMutationResult(job=_job_snapshot(job), changed=True, replayed=False)
 
 
@@ -396,6 +397,7 @@ async def create_civitai_import_job(
         },
         now=created_at,
     )
+    await session.commit()
     return LoraImportMutationResult(job=_job_snapshot(job), changed=True, replayed=False)
 
 
