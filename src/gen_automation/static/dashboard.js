@@ -762,6 +762,44 @@
     }
   };
 
+  const experimentDraftForNextRun = (draft) => ({
+    schema_version: 1,
+    saved_at: new Date().toISOString(),
+    title: "",
+    slug: "",
+    seed: typeof draft.seed === "string" ? draft.seed : "",
+    desired_accepted_count: typeof draft.desired_accepted_count === "string"
+      ? draft.desired_accepted_count
+      : "",
+    submission_id: "",
+    target_follows_queue: draft.target_follows_queue === true,
+    profile: isRecord(draft.profile) ? draft.profile : {},
+    batch_plan: draft.batch_plan.slice(0, 50),
+  });
+
+  const resetQueuedExperimentDraftIdentity = () => {
+    const form = document.querySelector("[data-experiment-lab-form]");
+    const releaseId = form?.dataset.experimentReleaseId || "";
+    if (!(form instanceof HTMLFormElement) || !releaseId) return;
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const submittedDraftId = new URLSearchParams(window.location.search).get("draft") || "";
+    if (!uuidPattern.test(releaseId) || !uuidPattern.test(submittedDraftId)) return;
+    try {
+      const draft = readStoredAutomationDraft();
+      if (!draft || draft.submission_id !== submittedDraftId) return;
+      window.localStorage.setItem(
+        scopedAutomationDraftKey(AUTOMATION_DRAFT_STORAGE_KEY),
+        JSON.stringify(experimentDraftForNextRun(draft)),
+      );
+      const submissionKey = scopedAutomationDraftKey(AUTOMATION_DRAFT_SUBMISSION_KEY);
+      if (window.sessionStorage.getItem(submissionKey) === submittedDraftId) {
+        window.sessionStorage.removeItem(submissionKey);
+      }
+    } catch (_error) {
+      // A private-browser storage failure must not prevent the queued run from loading.
+    }
+  };
+
   function restoreAutomationDraft() {
     const form = document.querySelector("[data-automation-form]");
     const planData = document.querySelector("#batch-plan-data");
@@ -1292,6 +1330,7 @@
     const titleInput = form.querySelector("[data-title-input]");
     const slugInput = form.querySelector("[data-slug-input]");
     const submitButtons = Array.from(form.querySelectorAll(".queue-submit"));
+    const experimentLabMode = form.matches("[data-experiment-lab-form]");
     const serverDisabled = submitButtons.some((button) => button.disabled);
     const maximumProviderJobs = 10_000;
     const signedOutputsPerJobCap = Math.max(
@@ -1465,6 +1504,20 @@
       seed: null,
     });
 
+    const syncExperimentTopPromptsFromFirstBatch = () => {
+      if (!experimentLabMode) return;
+      const first = batchRows()[0];
+      if (!first) return;
+      if (defaultPrompt instanceof HTMLTextAreaElement) {
+        defaultPrompt.value = field(first, "prompt").value;
+        previousDefaultPrompt = defaultPrompt.value;
+      }
+      if (defaultNegative instanceof HTMLTextAreaElement) {
+        defaultNegative.value = field(first, "negative_prompt").value;
+        previousDefaultNegative = defaultNegative.value;
+      }
+    };
+
     const addBatch = (batch, before = null, deferUpdate = false) => {
       const fragment = template.content.cloneNode(true);
       const row = fragment.querySelector("[data-batch-row]");
@@ -1507,6 +1560,7 @@
       if (collapseAllButton instanceof HTMLButtonElement) {
         collapseAllButton.textContent = "Collapse all";
       }
+      syncExperimentTopPromptsFromFirstBatch();
       updateBuilder();
       return true;
     };
@@ -1743,6 +1797,7 @@
         }
       }
     });
+    syncExperimentTopPromptsFromFirstBatch();
 
     form.addEventListener("gen-automation:replace-batch-plan", (event) => {
       if (!(event instanceof CustomEvent)
@@ -1841,6 +1896,14 @@
       )) lastPrompt = event.target;
     });
 
+    list.addEventListener("input", (event) => {
+      if (!experimentLabMode || event.target.closest("[data-batch-row]") !== batchRows()[0]) {
+        return;
+      }
+      if (event.target.matches('[data-batch-field="prompt"], [data-batch-field="negative_prompt"]')) {
+        syncExperimentTopPromptsFromFirstBatch();
+      }
+    });
     list.addEventListener("input", updateBuilder);
     list.addEventListener("click", (event) => {
       const button = event.target.closest("[data-batch-action]");
@@ -1866,6 +1929,7 @@
         button.setAttribute("aria-expanded", String(!collapsed));
         button.textContent = collapsed ? "Expand" : "Collapse";
       }
+      syncExperimentTopPromptsFromFirstBatch();
       updateBuilder();
     });
 
@@ -1907,8 +1971,12 @@
         return;
       }
       const rows = batchRows();
-      rows.forEach((row) => {
+      (experimentLabMode ? rows.slice(0, 1) : rows).forEach((row) => {
         const prompt = field(row, "prompt");
+        if (experimentLabMode) {
+          prompt.value = defaultPrompt.value;
+          return;
+        }
         if (prompt.value === previousDefaultPrompt) prompt.value = defaultPrompt.value;
       });
       previousDefaultPrompt = defaultPrompt.value;
@@ -1920,8 +1988,12 @@
         return;
       }
       const rows = batchRows();
-      rows.forEach((row) => {
+      (experimentLabMode ? rows.slice(0, 1) : rows).forEach((row) => {
         const negativePrompt = field(row, "negative_prompt");
+        if (experimentLabMode) {
+          negativePrompt.value = defaultNegative.value;
+          return;
+        }
         if (negativePrompt.value === previousDefaultNegative) {
           negativePrompt.value = defaultNegative.value;
         }
@@ -2088,16 +2160,7 @@
         // collide with the queued run or replay its idempotency key.
         window.localStorage.setItem(
           scopedAutomationDraftKey(AUTOMATION_DRAFT_STORAGE_KEY),
-          JSON.stringify({
-            schema_version: 1,
-            saved_at: new Date().toISOString(),
-            title: "",
-            slug: "",
-            seed: typeof draft.seed === "string" ? draft.seed : "",
-            submission_id: "",
-            profile: isRecord(draft.profile) ? draft.profile : {},
-            batch_plan: draft.batch_plan.slice(0, 50),
-          }),
+          JSON.stringify(experimentDraftForNextRun(draft)),
         );
       } else {
         window.localStorage.removeItem(scopedAutomationDraftKey(AUTOMATION_DRAFT_STORAGE_KEY));
@@ -8426,6 +8489,7 @@
 
   initializeModelFamilyPicker();
   const experimentFormPresent = Boolean(document.querySelector("[data-experiment-form]"));
+  resetQueuedExperimentDraftIdentity();
   const reusedImageSettings = consumePendingImageProfile();
   if (!reusedImageSettings && !experimentFormPresent) restoreAutomationDraft();
   initializeSamePageScrollPreservation();

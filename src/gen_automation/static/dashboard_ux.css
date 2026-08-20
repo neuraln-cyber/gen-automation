@@ -4827,6 +4827,63 @@ body.asset-viewer-open { overflow: hidden; }
 }
 
 .experiment-lab-workspace .experiment-warm-actions { justify-content: flex-end; }
+.experiment-lab-prompt-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(11rem, 14rem);
+  gap: .8rem;
+  margin-bottom: .8rem;
+  align-items: stretch;
+}
+
+.experiment-lab-prompt-panel {
+  display: grid;
+  min-width: 0;
+  gap: .65rem;
+  padding: .85rem;
+  border-color: var(--lab-line);
+  background: var(--lab-panel);
+  box-shadow: none;
+}
+
+.experiment-lab-prompt-heading { align-items: end; }
+.experiment-lab-prompt-heading h2 { margin: .08rem 0 0; font-size: 1rem; }
+.experiment-lab-primary-prompts { display: grid; gap: .55rem; }
+.experiment-lab-primary-prompts > label { display: grid; gap: .28rem; }
+.experiment-lab-primary-prompts > label > textarea {
+  min-height: 7.5rem;
+  resize: vertical;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Consolas, monospace);
+  line-height: 1.45;
+}
+
+.experiment-lab-primary-prompts > label:nth-of-type(2) > textarea { min-height: 5.25rem; }
+.experiment-lab-detailer-prompts { margin-top: .05rem; background: rgba(8, 10, 18, .24); }
+.experiment-lab-prompt-actions {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: .7rem;
+  padding: .85rem;
+  border-color: var(--lab-line);
+  background:
+    linear-gradient(145deg, color-mix(in srgb, var(--accent, #ff76d5) 14%, transparent), transparent 60%),
+    var(--lab-panel-raised);
+  box-shadow: none;
+}
+
+.experiment-lab-prompt-actions .queue-submit {
+  min-height: 5rem;
+  font-size: 1rem;
+}
+
+.experiment-lab-prompt-actions p {
+  margin: 0;
+  color: var(--muted);
+  font-size: .72rem;
+  line-height: 1.45;
+}
+
+.experiment-lab-prompt-actions .text-button { justify-self: start; }
 .experiment-lab-form .automation-layout {
   grid-template-columns: minmax(33rem, 1.08fr) minmax(28rem, .92fr);
   gap: .8rem;
@@ -5040,6 +5097,10 @@ body.asset-viewer-open { overflow: hidden; }
   .experiment-lab-workspace { padding-bottom: 6rem; }
   .experiment-lab-workspace .experiment-warm-panel { grid-template-columns: minmax(0, 1fr) auto; }
   .experiment-lab-workspace .experiment-warm-actions { grid-column: 1 / -1; justify-content: flex-start; }
+  .experiment-lab-prompt-shell { grid-template-columns: minmax(0, 1fr); }
+  .experiment-lab-prompt-actions { grid-template-columns: minmax(8rem, .4fr) minmax(0, 1fr); align-items: center; }
+  .experiment-lab-prompt-actions .automation-section-label { grid-column: 1 / -1; }
+  .experiment-lab-prompt-actions .queue-submit { min-height: 3.5rem; }
   .experiment-lab-form .automation-sidebar { display: grid; }
   .experiment-lab-form .mobile-queue-dock { display: none; }
 }
@@ -5050,6 +5111,11 @@ body.asset-viewer-open { overflow: hidden; }
   .experiment-lab-header-actions a { flex: 1 1 auto; }
   .experiment-lab-workspace .experiment-warm-panel { grid-template-columns: minmax(0, 1fr); }
   .experiment-warm-countdown { justify-items: start; }
+  .experiment-lab-prompt-actions { grid-template-columns: minmax(0, 1fr); }
+  .experiment-lab-prompt-actions .automation-section-label { grid-column: auto; }
+  .experiment-lab-prompt-heading { align-items: stretch; flex-direction: column; }
+  .experiment-lab-primary-prompts > label > textarea { min-height: 8.5rem; }
+  .experiment-lab-primary-prompts > label:nth-of-type(2) > textarea { min-height: 6.5rem; }
   .experiment-lab-form .automation-title-row { grid-template-columns: minmax(0, 1fr); }
   .experiment-lab-active-media,
   .experiment-lab-output-empty { min-height: 20rem; }

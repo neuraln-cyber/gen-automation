@@ -221,6 +221,18 @@ def test_experiment_lab_is_the_full_automation_builder_plus_warm_controls(
     assert "Send settings to controls" in lab.text
     assert "data-experiment-lab-workspace" in lab.text
     assert "data-experiment-lab-output" in lab.text
+    assert "data-experiment-lab-primary-prompts" in lab.text
+    assert 'aria-label="Generate experiment"' in lab.text
+    assert lab.text.index("data-experiment-lab-primary-prompts") < lab.text.index(
+        'id="generation-setup"'
+    )
+    assert "Positive prompt" in lab.text
+    assert "Negative prompt" in lab.text
+    assert "Default positive prompt" not in lab.text
+    assert "Default positive prompt" in automation.text
+    assert automation.text.index('id="generation-setup"') < automation.text.index(
+        'id="experiment-prompts"'
+    )
     assert "data-warm-countdown-value" in lab.text
     assert 'data-warm-duration-minutes="15"' in lab.text
     assert 'data-warm-duration-minutes="90"' in lab.text
@@ -240,6 +252,10 @@ def test_experiment_lab_is_the_full_automation_builder_plus_warm_controls(
     assert "Idle auto-stop" in script.text
     assert 'document.querySelector("[data-automation-draft-scope]")' in script.text
     assert 'if (draftScope === "automation") return scopedStorageKey(key);' in script.text
+    assert "resetQueuedExperimentDraftIdentity();" in script.text
+    assert "experimentDraftForNextRun(draft)" in script.text
+    assert 'form?.dataset.experimentReleaseId || ""' in script.text
+    assert 'new URLSearchParams(window.location.search).get("draft")' in script.text
 
     legacy_post = client.post("/dashboard/experiments/new", data={}, follow_redirects=False)
     assert legacy_post.status_code == 303
@@ -305,6 +321,11 @@ def test_experiment_lab_queues_large_multi_batch_automation_and_reuses_one_warm_
     assert first.headers["location"] == replay.headers["location"]
     assert first.headers["location"].startswith("/dashboard/experiments/new?release=")
     assert client.portal.call(lease_snapshot) == before_replay
+    first_result = client.get(first.headers["location"])
+    assert first_result.status_code == 200
+    assert "data-experiment-release-id=" in first_result.text
+    assert re.search(r'name="title"\s+value=""', first_result.text) is not None
+    assert re.search(r'name="slug"\s+value=""', first_result.text) is not None
 
     second_page = client.get("/dashboard/experiments/new")
     second_form = _automation_form(

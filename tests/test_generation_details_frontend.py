@@ -255,6 +255,7 @@ def test_experiment_lab_has_a_scoped_workspace_gallery_and_exact_settings_reuse(
 
     for contract in (
         "data-experiment-lab-workspace",
+        "data-experiment-lab-primary-prompts",
         "data-experiment-lab-output",
         "data-experiment-lab-active-image",
         "data-experiment-lab-gallery",
@@ -263,6 +264,9 @@ def test_experiment_lab_has_a_scoped_workspace_gallery_and_exact_settings_reuse(
     ):
         assert contract in template
     assert ".experiment-lab-form .automation-layout" in styles
+    assert ".experiment-lab-prompt-shell" in styles
+    assert ".experiment-lab-primary-prompts" in styles
+    assert ".experiment-lab-prompt-actions .queue-submit" in styles
     assert ".experiment-lab-active-media img" in styles
     assert ".experiment-lab-thumbnail.is-selected" in styles
     assert ".experiment-lab-form .automation-sidebar { display: grid; }" in styles
@@ -284,6 +288,24 @@ def test_experiment_lab_has_a_scoped_workspace_gallery_and_exact_settings_reuse(
     assert "payload.expires_at" in warm
     assert "payload.hard_expires_at" in warm
     assert "window.setInterval(renderCountdown, 1000)" in warm
+
+    identity_reset = script.split("const resetQueuedExperimentDraftIdentity", maxsplit=1)[
+        1
+    ].split("function restoreAutomationDraft", maxsplit=1)[0]
+    assert "data-experiment-lab-form" in identity_reset
+    assert "experimentReleaseId" in identity_reset
+    assert "submittedDraftId" in identity_reset
+    assert "draft.submission_id !== submittedDraftId" in identity_reset
+    assert "experimentDraftForNextRun(draft)" in identity_reset
+
+    builder = script.split("function initializeAutomationBuilder", maxsplit=1)[1].split(
+        "function initializeAutomationDraft", maxsplit=1
+    )[0]
+    assert 'form.matches("[data-experiment-lab-form]")' in builder
+    assert "syncExperimentTopPromptsFromFirstBatch" in builder
+    assert "experimentLabMode ? rows.slice(0, 1) : rows" in builder
+    assert 'field(first, "prompt").value' in builder
+    assert 'field(first, "negative_prompt").value' in builder
 
 
 def test_live_generation_exposes_failures_and_hides_unready_review_action() -> None:
