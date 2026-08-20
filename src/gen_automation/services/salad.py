@@ -2162,7 +2162,11 @@ def _require_submittable_deployment(deployment: SaladDeployment) -> None:
         raise SaladServiceConflictError("v1 Salad deployment exceeds one replica")
     if not deployment.is_current:
         raise SaladServiceConflictError("Salad deployment is not current")
-    if deployment.state != SaladDeploymentState.ACTIVE:
+    start_pending = (
+        deployment.state == SaladDeploymentState.PROVISIONING
+        and deployment.last_error_code == "provider_start_pending"
+    )
+    if deployment.state != SaladDeploymentState.ACTIVE and not start_pending:
         raise SaladServiceConflictError("Salad deployment is not active")
     if deployment.desired_state != DesiredDeploymentState.ACTIVE:
         raise SaladServiceConflictError("Salad deployment is stopped")
