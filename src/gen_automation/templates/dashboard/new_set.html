@@ -103,6 +103,7 @@
     {% if experiment_release %}data-experiment-release-id="{{ experiment_release.release_id }}"{% endif %}
     data-automation-draft-scope="{{ 'experiment' if experiment_mode else 'automation' }}"
     data-signed-outputs-per-job-cap="{{ max_safe_outputs_per_signed_generation_job }}"
+    data-max-final-set-size="{{ max_accepted_images_per_release }}"
     data-server-error="{{ 'true' if error_message else 'false' }}"
   >
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -853,25 +854,6 @@
           </div>
         </details>
 
-        <section class="automation-final-target automation-queue-target" id="final-set-target">
-          <label>
-            Final set size
-            <span class="automation-target-input">
-              <input
-                type="number"
-                name="desired_accepted_count"
-                value="{{ form_values['desired_accepted_count'] }}"
-                min="1"
-                max="{{ max_accepted_images_per_release }}"
-                data-desired-count
-                required
-              >
-              <span>maximum images to keep</span>
-            </span>
-          </label>
-          <button class="text-button" type="button" data-match-queue-target>Keep all generated</button>
-        </section>
-
         <fieldset class="step-panel batch-builder-panel automation-batches-panel" id="batch-builder" hidden>
           <legend class="visually-hidden">Batch queue</legend>
           <div class="section-heading">
@@ -1019,7 +1001,7 @@
             <div><dt>Batches</dt><dd id="summary-batches">1</dd></div>
             <div><dt>Images</dt><dd id="summary-images">0</dd></div>
             <div><dt>GPU jobs</dt><dd id="summary-jobs">0</dd></div>
-            <div><dt>Final set size</dt><dd id="summary-target">0</dd></div>
+            <div><dt>Maximum final set</dt><dd id="summary-target">0</dd></div>
           </dl>
           <p class="summary-note" id="summary-note">
             Add a prompt and image count to prepare this set.

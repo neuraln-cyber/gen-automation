@@ -234,7 +234,17 @@ class NewSetSubmission(BaseModel):
     detailer_bbox_crop_factor: float = Field(default=3.0, ge=1.0, le=5.0)
     detailer_feather: int = Field(default=4, ge=0, le=128)
     planned_job_count: int = Field(ge=1, le=10_000)
-    desired_accepted_count: int = Field(ge=1, le=MAX_ACCEPTED_IMAGES_PER_RELEASE)
+
+    @model_validator(mode="before")
+    @classmethod
+    def ignore_legacy_final_set_target(cls, value: object) -> object:
+        """Accept stale browser drafts while ignoring their retired target field."""
+
+        if not isinstance(value, dict) or "desired_accepted_count" not in value:
+            return value
+        normalized = dict(value)
+        normalized.pop("desired_accepted_count", None)
+        return normalized
 
     @field_validator("title", "sampler", "scheduler")
     @classmethod
@@ -370,13 +380,6 @@ class NewSetSubmission(BaseModel):
             raise ValueError("prompt must not be blank")
         if self.effective_planned_job_count > 10_000:
             raise ValueError("generation plan supports at most 10000 provider jobs")
-        planned_outputs = (
-            sum(batch.image_count for batch in self.batches)
-            if self.batches
-            else self.planned_job_count * self.outputs_per_job
-        )
-        if self.desired_accepted_count > planned_outputs:
-            raise ValueError("desired accepted count exceeds the planned output count")
         if self.detailer_max_size < self.detailer_guide_size:
             raise ValueError("detailer maximum size must cover its guide size")
         return self
@@ -397,6 +400,20 @@ class NewSetSubmission(BaseModel):
         return sum(
             (batch.image_count + outputs_per_job - 1) // outputs_per_job for batch in self.batches
         )
+
+    @property
+    def planned_output_count(self) -> int:
+        """Return the authoritative maximum number of images this plan can produce."""
+
+        if self.batches:
+            return sum(batch.image_count for batch in self.batches)
+        return self.planned_job_count * self.outputs_per_job
+
+    @property
+    def desired_accepted_count(self) -> int:
+        """Use the largest final set supported for this generation plan."""
+
+        return min(self.planned_output_count, MAX_ACCEPTED_IMAGES_PER_RELEASE)
 
 
 @dataclass(frozen=True, slots=True)

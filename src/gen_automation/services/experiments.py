@@ -166,7 +166,6 @@ async def create_experiment(
                 "seed": seed,
                 "outputs_per_job": command.outputs_per_variant,
                 "planned_job_count": 1,
-                "desired_accepted_count": command.outputs_per_variant,
                 "batches": (),
             }
         )

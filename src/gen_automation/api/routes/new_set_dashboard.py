@@ -726,7 +726,6 @@ def _default_values(options: NewSetOptions) -> dict[str, str]:
         "detailer_bbox_crop_factor": "1.5",
         "detailer_feather": "4",
         "planned_job_count": "1",
-        "desired_accepted_count": "4",
     }
     for slot in range(1, 9):
         values[f"lora_{slot}_id"] = ""

@@ -786,13 +786,9 @@
     setTextControl("title", draft.title);
     setTextControl("slug", draft.slug);
     setTextControl("seed", draft.seed);
-    setTextControl("desired_accepted_count", draft.desired_accepted_count);
     const result = applyAutomationProfile(form, draft.profile);
     planData.value = JSON.stringify(draft.batch_plan.slice(0, 50));
     form.dataset.automationDraftRestored = "true";
-    if (typeof draft.target_follows_queue === "boolean") {
-      form.dataset.restoredTargetFollowsQueue = String(draft.target_follows_queue);
-    }
     form.dataset.profileImportWarning = result.missing.join(" ");
     return true;
   }
@@ -1281,8 +1277,6 @@
     const collapseAllButton = form.querySelector("[data-collapse-batches]");
     const outputsPerJob = form.querySelector("[data-outputs-per-job]");
     const plannedJobCount = form.querySelector("[data-planned-job-count]");
-    const desiredCount = form.querySelector("[data-desired-count]");
-    const matchQueueTarget = form.querySelector("[data-match-queue-target]");
     const randomEachSeedButton = form.querySelector("[data-random-each-seed]");
     const randomSeedButton = form.querySelector("[data-random-seed]");
     const batchSequenceInput = form.querySelector("[data-batch-sequence-input]");
@@ -1308,14 +1302,7 @@
     let slugWasEdited = Boolean(slugInput && slugInput.value.trim());
     let previousDefaultPrompt = defaultPrompt ? defaultPrompt.value : "";
     let previousDefaultNegative = defaultNegative ? defaultNegative.value : "";
-    const defaultFinalSetCap = 250;
-    const restoredTargetFollowsQueue = typeof form.dataset.restoredTargetFollowsQueue === "string";
-    let targetFollowsQueue = restoredTargetFollowsQueue
-      ? form.dataset.restoredTargetFollowsQueue === "true"
-      : false;
-    let targetUsesSmartDefault = !restoredTargetFollowsQueue
-      && Boolean(desiredCount && !planData.value.trim());
-    delete form.dataset.restoredTargetFollowsQueue;
+    const maximumFinalSetSize = Math.max(1, integerValue(form.dataset.maxFinalSetSize, 500));
 
     builder.hidden = false;
     document.documentElement.classList.add("dashboard-enhanced");
@@ -1590,12 +1577,6 @@
         (total, row) => total + Math.max(0, integerValue(field(row, "image_count").value)),
         0,
       );
-      if (desiredCount) {
-        const target = integerValue(desiredCount.value);
-        desiredCount.setCustomValidity(
-          target > totalImages ? "The final-set target cannot exceed generated images." : "",
-        );
-      }
       let invalidDetailerSize = false;
       if (detailerGuideSize instanceof HTMLInputElement
           && detailerMaxSize instanceof HTMLInputElement) {
@@ -1665,16 +1646,8 @@
         row.querySelector('[data-batch-action="down"]').disabled = index === rows.length - 1;
         row.querySelector('[data-batch-action="remove"]').disabled = rows.length === 1;
       });
+      const finalSetSize = Math.min(totalImages, maximumFinalSetSize);
       if (plannedJobCount) plannedJobCount.value = Math.max(1, totalJobs);
-      if (desiredCount && (targetFollowsQueue || targetUsesSmartDefault)
-          && form.dataset.applyingAutomationProfile !== "true") {
-        const maximumAccepted = Math.max(1, integerValue(desiredCount.max, 500));
-        const automaticMaximum = targetFollowsQueue
-          ? maximumAccepted
-          : Math.min(maximumAccepted, defaultFinalSetCap);
-        desiredCount.value = String(Math.max(1, Math.min(automaticMaximum, totalImages)));
-      }
-      form.dataset.targetFollowsQueue = String(targetFollowsQueue);
       addButtons.forEach((button) => { button.disabled = rows.length >= 50; });
       planData.value = JSON.stringify(rows.map(readRow));
 
@@ -1690,21 +1663,20 @@
       if (batchesSummary) batchesSummary.textContent = String(rows.length);
       if (imagesSummary) imagesSummary.textContent = totalImages.toLocaleString();
       if (jobsSummary) jobsSummary.textContent = totalJobs.toLocaleString();
-      if (targetSummary) targetSummary.textContent = String(integerValue(desiredCount && desiredCount.value));
+      if (targetSummary) targetSummary.textContent = finalSetSize.toLocaleString();
       queueSummaries.forEach((item) => {
         item.textContent = `${rows.length.toLocaleString()} batch${rows.length === 1 ? "" : "es"} · ${totalImages.toLocaleString()} images`;
       });
       mobileImageSummaries.forEach((item) => { item.textContent = totalImages.toLocaleString(); });
       mobileJobSummaries.forEach((item) => { item.textContent = totalJobs.toLocaleString(); });
       mobileTargetSummaries.forEach((item) => {
-        item.textContent = String(integerValue(desiredCount && desiredCount.value));
+        item.textContent = finalSetSize.toLocaleString();
       });
 
       const validity = setBatchValidity();
       const unknownWildcard = validity.hasUnknownWildcard;
       const missingPrompt = rows.some((row) => !field(row, "prompt").value.trim());
       const tooManyJobs = totalJobs > maximumProviderJobs;
-      const targetTooLarge = desiredCount && integerValue(desiredCount.value) > totalImages;
       if (note) {
         if (missingPrompt) {
           note.textContent = "Every batch needs a prompt structure before this run can start.";
@@ -1714,9 +1686,6 @@
           note.className = "summary-note warning";
         } else if (tooManyJobs) {
           note.textContent = `Reduce the queue to ${maximumProviderJobs.toLocaleString()} GPU jobs or fewer.`;
-          note.className = "summary-note warning";
-        } else if (targetTooLarge) {
-          note.textContent = "Reduce the final-set target or generate more images.";
           note.className = "summary-note warning";
         } else if (validity.invalidDetailerSize) {
           note.textContent = "Face maximum size must be at least the guide size.";
@@ -1734,7 +1703,6 @@
           || missingPrompt
           || unknownWildcard
           || tooManyJobs
-          || Boolean(targetTooLarge)
           || validity.invalidDetailerSize
           || totalImages < 1;
       });
@@ -1915,19 +1883,6 @@
     [detailerGuideSize, detailerMaxSize].forEach((control) => {
       if (control instanceof HTMLInputElement) control.addEventListener("input", updateBuilder);
     });
-    desiredCount && desiredCount.addEventListener("input", () => {
-      targetFollowsQueue = false;
-      targetUsesSmartDefault = false;
-      updateBuilder();
-    });
-    if (matchQueueTarget instanceof HTMLButtonElement) {
-      matchQueueTarget.addEventListener("click", () => {
-        targetFollowsQueue = true;
-        targetUsesSmartDefault = false;
-        updateBuilder();
-        desiredCount.focus();
-      });
-    }
     if (randomSeedButton instanceof HTMLButtonElement && defaultSeed instanceof HTMLInputElement) {
       randomSeedButton.addEventListener("click", () => {
         const values = new Uint32Array(2);
@@ -2060,7 +2015,6 @@
         const title = namedControl(form, "title");
         const slug = namedControl(form, "slug");
         const seed = namedControl(form, "seed");
-        const desiredCount = namedControl(form, "desired_accepted_count");
         const submissionId = namedControl(form, "submission_id");
         window.localStorage.setItem(scopedAutomationDraftKey(AUTOMATION_DRAFT_STORAGE_KEY), JSON.stringify({
           schema_version: 1,
@@ -2068,11 +2022,7 @@
           title: title instanceof HTMLInputElement ? title.value : "",
           slug: slug instanceof HTMLInputElement ? slug.value : "",
           seed: seed instanceof HTMLInputElement ? seed.value : "",
-          desired_accepted_count: desiredCount instanceof HTMLInputElement
-            ? desiredCount.value
-            : "",
           submission_id: submissionId instanceof HTMLInputElement ? submissionId.value : "",
-          target_follows_queue: form.dataset.targetFollowsQueue === "true",
           profile: collectAutomationProfile(form),
           batch_plan: batchPlan.slice(0, 50),
         }));
@@ -2144,11 +2094,7 @@
             title: "",
             slug: "",
             seed: typeof draft.seed === "string" ? draft.seed : "",
-            desired_accepted_count: typeof draft.desired_accepted_count === "string"
-              ? draft.desired_accepted_count
-              : "",
             submission_id: "",
-            target_follows_queue: draft.target_follows_queue === true,
             profile: isRecord(draft.profile) ? draft.profile : {},
             batch_plan: draft.batch_plan.slice(0, 50),
           }),
@@ -5239,7 +5185,6 @@
     [
       ["outputs_per_job", "1"],
       ["planned_job_count", "1"],
-      ["desired_accepted_count", "1"],
     ].forEach(([name, value]) => {
       const control = namedControl(form, name);
       if (!(control instanceof HTMLInputElement)) return;

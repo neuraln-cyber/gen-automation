@@ -413,6 +413,108 @@ async def create_review_task(
     return result
 
 
+async def expand_review_target_to_ranked_assets(
+    session: AsyncSession,
+    *,
+    review_task_id: UUID,
+    changed_by_user_id: UUID,
+    expected_lock_version: int,
+    idempotency_key: str,
+    now: datetime | None = None,
+) -> ReviewTaskResult:
+    """Raise an open review ceiling to its immutable ranked-asset count."""
+
+    normalized_key = _validate_idempotency_key(idempotency_key)
+    expected_version = _validate_lock_version(expected_lock_version)
+    scope = f"review-task:{review_task_id}:expand-target"
+    request_sha256 = canonical_sha256(
+        {
+            "review_task_id": str(review_task_id),
+            "changed_by_user_id": str(changed_by_user_id),
+            "expected_lock_version": expected_version,
+        }
+    )
+    await _require_active_owner(session, changed_by_user_id)
+    replay = await _task_idempotency_replay(
+        session,
+        scope=scope,
+        idempotency_key=normalized_key,
+        request_sha256=request_sha256,
+    )
+    if replay is not None:
+        return replay
+
+    task = await _load_task_locked(session, review_task_id)
+    if task.state != ReviewTaskState.OPEN:
+        raise ReviewConflictError("review task is not open")
+    if task.lock_version != expected_version:
+        raise ReviewConflictError("review task lock version is stale")
+    await _validate_task_ranking_snapshot(session, task, recompute=False)
+    if task.desired_accepted_count >= task.ranked_asset_count:
+        raise ReviewConflictError("review task already allows every ranked image")
+
+    release_version = await session.get(ReleaseVersion, task.release_version_id)
+    if release_version is None:
+        raise ReviewConflictError("review task release version is unavailable")
+    release = await session.scalar(
+        select(Release).where(Release.id == release_version.release_id).with_for_update()
+    )
+    if (
+        release is None
+        or release.current_version_no != release_version.version_no
+        or release.phase != ReleasePhase.REVIEWING
+    ):
+        raise ReviewConflictError("review task is stale or its release is not reviewing")
+
+    changed_at = _as_utc(now or datetime.now(UTC))
+    previous_target = task.desired_accepted_count
+    task.desired_accepted_count = task.ranked_asset_count
+    task.lock_version = expected_version + 1
+    release.desired_accepted_count = task.ranked_asset_count
+    release.lock_version += 1
+    result = _task_result(task, replayed=False)
+    session.add(
+        AuditEvent(
+            actor=_audit_actor(changed_by_user_id),
+            action="review.target_expanded",
+            resource_type="review_task",
+            resource_id=task.id,
+            correlation_id=normalized_key,
+            detail={
+                "previous_desired_accepted_count": previous_target,
+                "desired_accepted_count": task.desired_accepted_count,
+                "ranked_asset_count": task.ranked_asset_count,
+                "release_id": str(release.id),
+            },
+            occurred_at=changed_at,
+        )
+    )
+    session.add(
+        _idempotency_record(
+            scope=scope,
+            key=normalized_key,
+            request_sha256=request_sha256,
+            status=200,
+            body=_task_response_body(result),
+            created_at=changed_at,
+        )
+    )
+    try:
+        await session.commit()
+    except IntegrityError as error:
+        await session.rollback()
+        replay = await _task_idempotency_replay(
+            session,
+            scope=scope,
+            idempotency_key=normalized_key,
+            request_sha256=request_sha256,
+        )
+        if replay is not None:
+            return replay
+        raise ReviewConflictError("review target could not be expanded") from error
+    return result
+
+
 async def append_review_decision(
     session: AsyncSession,
     *,

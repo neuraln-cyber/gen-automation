@@ -5410,9 +5410,9 @@ event.listen(
     ).execute_if(dialect="postgresql"),
 )
 
-# A review task's identity is immutable. Open tasks may only advance their
-# optimistic lock or make one terminal transition. Completion may atomically
-# shrink the configured ceiling and must exactly match that final target.
+# A review task's identity is immutable. An owner may expand an open task's
+# target up to its frozen ranking count. Completion may atomically shrink that
+# ceiling and must exactly match the final accepted-image count.
 event.listen(
     ReviewDecision.__table__,
     "after_create",
@@ -5437,9 +5437,13 @@ event.listen(
         "THEN RAISE(ABORT, 'review task identity is immutable') END; "
         "SELECT CASE WHEN "
         "OLD.desired_accepted_count IS NOT NEW.desired_accepted_count "
-        "AND NEW.state IS NOT 'completed' "
-        "THEN RAISE(ABORT, "
-        "'review task acceptance target may shrink only on completion') END; "
+        "AND NEW.state IS 'open' AND (NEW.desired_accepted_count IS NULL "
+        "OR NEW.desired_accepted_count < OLD.desired_accepted_count "
+        "OR NEW.desired_accepted_count > OLD.ranked_asset_count) "
+        "THEN RAISE(ABORT, 'open review target expansion is invalid') END; "
+        "SELECT CASE WHEN OLD.desired_accepted_count IS NOT "
+        "NEW.desired_accepted_count AND NEW.state NOT IN ('open', 'completed') "
+        "THEN RAISE(ABORT, 'review task acceptance target is immutable') END; "
         "SELECT CASE WHEN NEW.state = 'completed' AND ("
         "NEW.desired_accepted_count IS NULL "
         "OR NEW.desired_accepted_count <= 0 "
@@ -5499,9 +5503,14 @@ event.listen(
         "RAISE EXCEPTION 'review task identity is immutable'; "
         "END IF; "
         "IF OLD.desired_accepted_count IS DISTINCT FROM NEW.desired_accepted_count "
-        "AND NEW.state <> 'completed' THEN "
-        "RAISE EXCEPTION "
-        "'review task acceptance target may shrink only on completion'; "
+        "AND NEW.state = 'open' AND (NEW.desired_accepted_count IS NULL "
+        "OR NEW.desired_accepted_count < OLD.desired_accepted_count "
+        "OR NEW.desired_accepted_count > OLD.ranked_asset_count) THEN "
+        "RAISE EXCEPTION 'open review target expansion is invalid'; "
+        "END IF; "
+        "IF OLD.desired_accepted_count IS DISTINCT FROM NEW.desired_accepted_count "
+        "AND NEW.state NOT IN ('open', 'completed') THEN "
+        "RAISE EXCEPTION 'review task acceptance target is immutable'; "
         "END IF; "
         "IF NEW.state = 'completed' AND (NEW.desired_accepted_count IS NULL "
         "OR NEW.desired_accepted_count <= 0 "

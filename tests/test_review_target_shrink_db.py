@@ -19,19 +19,43 @@ from tests.test_review_service import (
 
 
 @pytest.mark.asyncio
-async def test_database_rejects_target_change_before_completion(
+async def test_database_rejects_open_target_shrink(
     review_context: ReviewContext,  # noqa: F811
 ) -> None:
     task = await _create_task(review_context)
 
     async with review_context.database.sessions() as session:
-        with pytest.raises(IntegrityError, match="may shrink only on completion"):
+        with pytest.raises(IntegrityError, match="open review target expansion is invalid"):
             await session.execute(
                 update(ReviewTask)
                 .where(ReviewTask.id == task.task_id)
                 .values(desired_accepted_count=1, lock_version=2)
             )
         await session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_database_allows_open_target_expansion_to_ranked_count(
+    review_context: ReviewContext,  # noqa: F811
+) -> None:
+    task = await _create_task(review_context)
+
+    async with review_context.database.sessions() as session:
+        await session.execute(
+            update(ReviewTask)
+            .where(ReviewTask.id == task.task_id)
+            .values(
+                desired_accepted_count=len(review_context.ranked_asset_ids),
+                lock_version=2,
+            )
+        )
+        await session.commit()
+
+    async with review_context.database.sessions() as session:
+        stored = await session.get(ReviewTask, task.task_id)
+        assert stored is not None
+        assert stored.desired_accepted_count == len(review_context.ranked_asset_ids)
+        assert stored.lock_version == 2
 
 
 @pytest.mark.asyncio

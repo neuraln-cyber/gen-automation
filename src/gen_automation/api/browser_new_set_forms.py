@@ -54,13 +54,15 @@ _FIELDS = frozenset(
         "detailer_bbox_crop_factor",
         "detailer_feather",
         "planned_job_count",
-        "desired_accepted_count",
         *(f"lora_{slot}_id" for slot in _LORA_SLOTS),
         *(f"lora_{slot}_weight" for slot in _LORA_SLOTS),
     }
 )
 _OPTIONAL_FIELDS = frozenset(
     {
+        # Accepted only for forms rendered before the automatic-final-size rollout.
+        # The submitted value is ignored; the server derives the target from the plan.
+        "desired_accepted_count",
         "batch_plan",
         "subject_2_id",
         "subject_3_id",
@@ -220,10 +222,6 @@ async def read_new_set_form(request: Request) -> BrowserNewSetForm:
                 label="Detailer feather",
             ),
             planned_job_count=_integer(values["planned_job_count"], label="Planned jobs"),
-            desired_accepted_count=_integer(
-                values["desired_accepted_count"],
-                label="Desired accepted images",
-            ),
         )
     except ValidationError as error:
         raise BrowserNewSetFormError(
@@ -517,7 +515,6 @@ def _validation_message(error: ValidationError) -> str:
         "detailer_bbox_crop_factor": "Detailer crop factor",
         "detailer_feather": "Detailer feather",
         "planned_job_count": "Planned jobs",
-        "desired_accepted_count": "Desired accepted images",
     }
     label = labels.get(str(location[0]), "Generation plan") if location else "Generation plan"
     detail = str(first["msg"]).removeprefix("Value error, ")

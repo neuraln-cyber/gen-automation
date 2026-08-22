@@ -87,7 +87,8 @@ def test_new_set_builder_frontend_keeps_batch_edits_safe_and_actionable(
     assert "parseBatchSequence" in script.text
     assert "promptForSequenceWildcard" in script.text
     assert "lines.length > 50" in script.text
-    assert "targetFollowsQueue" in script.text
+    assert "targetFollowsQueue" not in script.text
+    assert "const finalSetSize = Math.min(totalImages, maximumFinalSetSize)" in script.text
     assert "selectWorkflowForMode" in script.text
     assert "initializeControlledDuoBuilders" in script.text
     assert "initializeCharacterComposition" not in script.text
@@ -222,7 +223,7 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert "data-automation-preset-import" in page.text
     assert "data-automation-draft-status" in page.text
     assert "data-automation-storage-scope" in page.text
-    assert "data-match-queue-target" in page.text
+    assert "data-match-queue-target" not in page.text
     assert "data-random-each-seed" in page.text
     assert "data-random-seed" in page.text
     assert 'name="seed" value="-1" min="-1"' in page.text
@@ -237,8 +238,7 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
         assert page.text.count(f'name="lora_{slot}_id"') == 1
         assert page.text.count(f'name="lora_{slot}_weight"') == 1
     assert 'class="mobile-queue-dock"' in page.text
-    assert re.search(r'name="desired_accepted_count"\s+value="4"', page.text)
-    assert re.search(r'name="desired_accepted_count"[\s\S]{0,160}max="500"', page.text)
+    assert 'name="desired_accepted_count"' not in page.text
     form = {
         "csrf_token": _hidden_value(page.text, "csrf_token"),
         "submission_id": _hidden_value(page.text, "submission_id"),
@@ -288,7 +288,6 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
         "detailer_bbox_crop_factor": "2.8",
         "detailer_feather": "4",
         "planned_job_count": "3",
-        "desired_accepted_count": "10",
     }
 
     first = client.post("/dashboard/new-set", data=form, follow_redirects=False)
@@ -318,6 +317,7 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert [project.slug for project in projects] == ["main"]
     assert len(releases) == 1
     assert releases[0].phase == ReleasePhase.READY
+    assert releases[0].desired_accepted_count == 12
     assert len(jobs) == 3
     assert version.specification["generation"]["cfg"] == 6.5
     assert version.specification["generation"]["hires_scale"] == 1.75

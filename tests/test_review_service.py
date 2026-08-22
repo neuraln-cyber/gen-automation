@@ -63,6 +63,7 @@ from gen_automation.services.review import (
     append_review_decision,
     apply_bulk_review_action,
     create_review_task,
+    expand_review_target_to_ranked_assets,
     get_review_summary,
     get_review_x_selection_editability,
     set_review_x_selection,
@@ -557,6 +558,59 @@ async def test_create_task_snapshots_frozen_run_and_naturally_replays(
             )
             == 3
         )
+
+
+@pytest.mark.asyncio
+async def test_owner_expands_open_review_target_without_changing_decisions(
+    review_context: ReviewContext,
+) -> None:
+    task = await _create_task(review_context, key="create-expandable-review")
+    async with review_context.database.sessions() as session:
+        accepted = await append_review_decision(
+            session,
+            review_task_id=task.task_id,
+            asset_id=review_context.ranked_asset_ids[0],
+            decision=ReviewDecisionValue.ACCEPT,
+            decided_by_user_id=review_context.reviewer_id,
+            expected_lock_version=1,
+            idempotency_key="accept-before-target-expansion",
+            now=NOW + timedelta(minutes=2),
+        )
+
+    async with review_context.database.sessions() as session:
+        expanded = await expand_review_target_to_ranked_assets(
+            session,
+            review_task_id=task.task_id,
+            changed_by_user_id=review_context.owner_id,
+            expected_lock_version=accepted.task_lock_version,
+            idempotency_key="expand-review-to-ranking",
+            now=NOW + timedelta(minutes=3),
+        )
+
+    assert expanded.desired_accepted_count == len(review_context.ranked_asset_ids)
+    assert expanded.lock_version == 3
+    async with review_context.database.sessions() as session:
+        stored = await session.get(ReviewTask, task.task_id)
+        release = await session.get(Release, review_context.release_id)
+        summary = await get_review_summary(session, review_task_id=task.task_id)
+        audit_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(AuditEvent)
+                .where(
+                    AuditEvent.action == "review.target_expanded",
+                    AuditEvent.resource_id == task.task_id,
+                )
+            )
+            or 0
+        )
+
+    assert stored is not None
+    assert release is not None
+    assert stored.desired_accepted_count == len(review_context.ranked_asset_ids)
+    assert release.desired_accepted_count == len(review_context.ranked_asset_ids)
+    assert summary.accepted_count == 1
+    assert audit_count == 1
 
 
 @pytest.mark.asyncio

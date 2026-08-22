@@ -398,6 +398,27 @@
             Keep all {{ summary.undecided_count }} undecided
           </button>
         {% endif %}
+        {% if expand_target_idempotency_key %}
+          <form
+            method="post"
+            action="/dashboard/review-tasks/{{ summary.task_id }}:expand-target"
+          >
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input
+              type="hidden"
+              name="idempotency_key"
+              value="{{ expand_target_idempotency_key }}"
+            >
+            <input
+              type="hidden"
+              name="expected_lock_version"
+              value="{{ summary.lock_version }}"
+            >
+            <button class="secondary-button" type="submit">
+              Allow all {{ summary.ranked_asset_count }} ranked images
+            </button>
+          </form>
+        {% endif %}
         <form
           method="post"
           action="/dashboard/review-tasks/{{ summary.task_id }}:complete"
