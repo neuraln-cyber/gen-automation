@@ -1000,6 +1000,41 @@ def test_review_dashboard_exposes_progressive_bulk_controls(tmp_path: Path) -> N
     assert "data-bulk-selection-status" in page.text
 
 
+def test_owner_can_expand_open_review_to_every_ranked_image(tmp_path: Path) -> None:
+    context = asyncio.run(_seed_review_api(_settings(tmp_path / "browser-expand-target.db")))
+    asyncio.run(_set_release_final_set_goal(context, desired_accepted_count=1))
+    release_id = asyncio.run(_release_id(context))
+    task_id = asyncio.run(_create_task(context))
+    app = create_app(context.settings)
+    detail_action = f"/dashboard/review-tasks/{task_id}"
+    expand_action = f"{detail_action}:expand-target"
+
+    with TestClient(
+        app,
+        base_url=ORIGIN,
+        client=("192.0.2.97", 50001),
+    ) as client:
+        app.state.object_store = SameOriginReviewStore()
+        _login(client, context.settings, context.users[AdminRole.OWNER])
+        open_page = client.get(detail_action)
+        expand_form = _one_form(open_page.text, expand_action)
+        expanded = client.post(
+            expand_action,
+            data=expand_form.fields,
+            headers=_FORM_HEADERS,
+            follow_redirects=False,
+        )
+        updated_page = client.get(detail_action)
+        summary = client.get(f"/api/v1/review-tasks/{task_id}")
+
+    assert expanded.status_code == 303
+    assert expanded.headers["location"] == f"/dashboard/releases/{release_id}"
+    assert "Allow all" not in updated_page.text
+    assert _forms(updated_page.text, expand_action) == []
+    assert summary.status_code == 200
+    assert summary.json()["desired_accepted_count"] == len(context.asset_ids)
+
+
 def test_review_dashboard_can_complete_a_nonempty_subset_below_goal(tmp_path: Path) -> None:
     context = asyncio.run(_seed_review_api(_settings(tmp_path / "browser-subset-ui.db")))
     asyncio.run(_set_release_final_set_goal(context, desired_accepted_count=2))

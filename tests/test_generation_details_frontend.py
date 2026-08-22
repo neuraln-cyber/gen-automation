@@ -233,8 +233,8 @@ def test_generation_form_uses_one_responsive_progressive_builder() -> None:
     assert "data-image-settings-summary" in template
     assert 'class="batch-prompts-grid"' in template
     assert "data-queue-summary" in template
-    assert template.count('name="desired_accepted_count"') == 1
-    assert template.index('id="final-set-target"') < template.index('id="batch-builder"')
+    assert 'name="desired_accepted_count"' not in template
+    assert 'id="final-set-target"' not in template
     assert ".automation-create-form .automation-sidebar { display: none; }" in styles
     assert ".automation-create-form .mobile-queue-dock { display: none !important; }" in styles
 
@@ -305,7 +305,7 @@ def test_live_generation_exposes_failures_and_hides_unready_review_action() -> N
     assert "jobSummary.push(`${unfinishedJobs} remaining`)" in script
 
 
-def test_fresh_generation_queue_uses_an_editable_250_image_final_set_cap() -> None:
+def test_fresh_generation_queue_automatically_keeps_every_planned_image_eligible() -> None:
     template = (
         ROOT / "src" / "gen_automation" / "templates" / "dashboard" / "new_set.html"
     ).read_text(encoding="utf-8")
@@ -313,17 +313,15 @@ def test_fresh_generation_queue_uses_an_editable_250_image_final_set_cap() -> No
         encoding="utf-8"
     )
 
-    assert "Final set size" in template
-    assert "maximum images to keep" in template
-    assert "Fresh queues default to a 250-image cap" in template
-    assert "generate 400; keep the best 250" in template
-    assert "Other masters may remain undecided" in template
-    assert "Keep all generated" in template
-    assert "const defaultFinalSetCap = 250" in script
-    assert "targetUsesSmartDefault" in script
-    assert ": Math.min(maximumAccepted, defaultFinalSetCap)" in script
-    assert "targetUsesSmartDefault = false" in script
-    assert "targetFollowsQueue = true" in script
+    assert "Maximum final set" in template
+    assert 'name="desired_accepted_count"' not in template
+    assert "maximum images to keep" not in template
+    assert "Keep all generated" not in template
+    assert "const defaultFinalSetCap" not in script
+    assert "targetUsesSmartDefault" not in script
+    assert "targetFollowsQueue" not in script
+    assert "const finalSetSize = Math.min(totalImages, maximumFinalSetSize)" in script
+    assert "targetSummary.textContent = finalSetSize.toLocaleString()" in script
 
 
 def test_batch_negative_prompt_is_visible_editable_and_tracks_shared_defaults() -> None:

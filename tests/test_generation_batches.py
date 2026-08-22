@@ -242,10 +242,22 @@ def test_large_wildcard_queue_preserves_stage_order_and_derives_all_jobs() -> No
     )
 
     assert command.effective_planned_job_count == 86
-    assert command.desired_accepted_count == 300
+    assert command.desired_accepted_count == 340
     assert [batch.name for batch in command.batches] == [item[0] for item in ordered_batches]
     assert [batch.image_count for batch in command.batches] == [item[1] for item in ordered_batches]
     assert sum(batch.image_count for batch in command.batches) == 340
+
+    capped = NewSetSubmission.model_validate(
+        {
+            **command.model_dump(),
+            "batches": (),
+            "prompt": "portrait",
+            "outputs_per_job": 25,
+            "planned_job_count": 21,
+        }
+    )
+    assert capped.planned_output_count == 525
+    assert capped.desired_accepted_count == 500
 
 
 def test_new_set_submission_accepts_one_twenty_five_image_provider_job() -> None:

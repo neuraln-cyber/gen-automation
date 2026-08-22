@@ -206,10 +206,11 @@ def test_experiment_lab_is_the_full_automation_builder_plus_warm_controls(
         "data-automation-presets",
         "data-lora-picker",
         'name="outputs_per_job"',
-        'name="desired_accepted_count"',
     ):
         assert contract in automation.text
         assert contract in lab.text
+    assert 'name="desired_accepted_count"' not in automation.text
+    assert 'name="desired_accepted_count"' not in lab.text
     assert 'action="/dashboard/new-set?mode=experiment"' in lab.text
     assert 'data-automation-draft-scope="experiment"' in lab.text
     assert 'data-automation-draft-scope="automation"' in automation.text

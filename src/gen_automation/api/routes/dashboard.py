@@ -89,6 +89,7 @@ from gen_automation.services.review import (
     append_review_decision,
     apply_bulk_review_action,
     create_review_task,
+    expand_review_target_to_ranked_assets,
     get_review_summary,
     get_review_x_selection_editability,
     set_review_x_selection,
@@ -708,6 +709,7 @@ async def dashboard_review_task(
     cancel_idempotency_key = None
     bulk_action_idempotency_key = None
     inspection_idempotency_key = None
+    expand_target_idempotency_key = None
     if summary.state == ReviewTaskState.OPEN:
         complete_idempotency_key = review_form_idempotency_key(
             settings,
@@ -733,6 +735,16 @@ async def dashboard_review_task(
             action="inspection-token",
             parts=(str(review_task_id),),
         )
+        if (
+            principal.role == AdminRole.OWNER
+            and summary.desired_accepted_count < summary.ranked_asset_count
+        ):
+            expand_target_idempotency_key = review_form_idempotency_key(
+                settings,
+                session_id=principal.session_id,
+                action="expand-target",
+                parts=(str(review_task_id), str(summary.lock_version)),
+            )
     completion_non_count_ready = (
         summary.state == ReviewTaskState.OPEN
         and all(
@@ -767,6 +779,7 @@ async def dashboard_review_task(
                 "cancel_idempotency_key": cancel_idempotency_key,
                 "bulk_action_idempotency_key": bulk_action_idempotency_key,
                 "inspection_idempotency_key": inspection_idempotency_key,
+                "expand_target_idempotency_key": expand_target_idempotency_key,
                 "x_selection_editability": x_selection_editability,
                 # Keep browser mutations same-origin even when TLS terminates at
                 # the trusted ingress.  Uvicorn intentionally ignores proxy
@@ -1121,6 +1134,52 @@ async def dashboard_review_x_selection(
             selected=form.selected,
             selected_by_user_id=principal.user_id,
             expected_lock_version=form.expected_lock_version,
+        )
+    except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
+        return _service_error_response(request, principal, error)
+    return await _review_redirect(request, session, review_task_id)
+
+
+@router.post(
+    "/review-tasks/{review_task_id}:expand-target",
+    response_class=HTMLResponse,
+    response_model=None,
+    name="dashboard_expand_review_target",
+)
+async def dashboard_expand_review_target(
+    review_task_id: UUID,
+    request: Request,
+    session: Session,
+    principal: ReviewReader,
+) -> Response:
+    origin_error = _origin_error_response(request, principal)
+    if origin_error is not None:
+        return origin_error
+    if principal.role != AdminRole.OWNER:
+        return _security_error_response(request, principal)
+    try:
+        form = await read_transition_form(request)
+    except BrowserReviewFormError as error:
+        return _invalid_form_response(request, principal, error.status_code)
+    if form.inspected_asset_ids or not _valid_form_csrf(request, principal, form.csrf_token):
+        return _security_error_response(request, principal)
+
+    settings: Settings = request.app.state.settings
+    expected_key = review_form_idempotency_key(
+        settings,
+        session_id=principal.session_id,
+        action="expand-target",
+        parts=(str(review_task_id), str(form.expected_lock_version)),
+    )
+    if not form_key_matches(form.idempotency_key, expected_key):
+        return _invalid_form_response(request, principal, status.HTTP_400_BAD_REQUEST)
+    try:
+        await expand_review_target_to_ranked_assets(
+            session,
+            review_task_id=review_task_id,
+            changed_by_user_id=principal.user_id,
+            expected_lock_version=form.expected_lock_version,
+            idempotency_key=form.idempotency_key,
         )
     except (ReviewInputError, ReviewNotFoundError, ReviewConflictError) as error:
         return _service_error_response(request, principal, error)
