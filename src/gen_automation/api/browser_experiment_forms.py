@@ -377,7 +377,6 @@ def _decode_variant_plan(
             ),
             detailer_feather=_whole(item["detailer_feather"], label="Feather"),
             planned_job_count=1,
-            desired_accepted_count=outputs_per_variant,
         )
         variants.append(
             ExperimentVariantSubmission(
