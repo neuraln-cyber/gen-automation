@@ -225,8 +225,6 @@
     close.type = "button";
     close.dataset.assetViewerClose = "";
     close.setAttribute("aria-label", "Close full-screen image viewer");
-    headerActions.append(fitToggle, close);
-    header.append(heading, headerActions);
 
     const media = createElement("div", "asset-viewer-media");
     const previous = createElement("button", "asset-viewer-step asset-viewer-previous", "\u2190");
@@ -250,7 +248,6 @@
     next.setAttribute("aria-label", "View next image");
     media.append(previous, placeholder, image, next);
 
-    const footer = createElement("footer", "asset-viewer-footer");
     const status = createElement("p", "asset-viewer-status");
     status.setAttribute("role", "status");
     status.hidden = true;
@@ -265,14 +262,14 @@
       "Moving past keeps this image. Remove takes it out of the final set; its raw master is retained.",
     );
     exclusionHelp.hidden = true;
-    const markOut = createElement("button", "asset-viewer-mark-out", "Remove from set");
+    const markOut = createElement("button", "asset-viewer-mark-out", "Reject");
     markOut.type = "button";
     markOut.dataset.assetViewerMarkOut = "";
     markOut.hidden = true;
     const anatomyReject = createElement(
       "button",
       "asset-viewer-anatomy-reject",
-      "Remove + anatomy label",
+      "Reject + anatomy",
     );
     anatomyReject.type = "button";
     anatomyReject.dataset.assetViewerAnatomyReject = "";
@@ -283,19 +280,21 @@
     const defectPickerSummary = createElement(
       "summary",
       "asset-viewer-defect-picker-summary",
-      "Defect: Not specified (optional)",
+      "Defect",
     );
     const defectPickerHelp = createElement(
       "p",
       "asset-viewer-defect-picker-help",
       "Generic is enough. Choose a type only when it is obvious; the label stays provisional until the set is finished.",
     );
+    const defectPickerPanel = createElement("div", "asset-viewer-defect-picker-panel");
     const defectChips = createElement("div", "asset-viewer-defect-chips");
     defectChips.dataset.assetViewerDefectChips = "";
     defectChips.setAttribute("role", "radiogroup");
     defectChips.setAttribute("aria-label", "Optional anatomy defect type");
-    defectPicker.append(defectPickerSummary, defectPickerHelp, defectChips);
-    const select = createElement("button", "asset-viewer-select", "Select for bulk action");
+    defectPickerPanel.append(defectPickerHelp, defectChips);
+    defectPicker.append(defectPickerSummary, defectPickerPanel);
+    const select = createElement("button", "asset-viewer-select", "Select");
     select.type = "button";
     select.dataset.assetViewerSelect = "";
     select.setAttribute("aria-pressed", "false");
@@ -306,7 +305,7 @@
     bulk.setAttribute("aria-label", "Actions for selected images");
     bulk.hidden = true;
     const bulkHeading = createElement("div", "asset-viewer-bulk-heading");
-    const bulkCount = createElement("strong", "asset-viewer-bulk-count", "0 images selected");
+    const bulkCount = createElement("strong", "asset-viewer-bulk-count", "0 selected");
     bulkCount.dataset.assetViewerBulkCount = "";
     bulkCount.setAttribute("role", "status");
     bulkCount.setAttribute("aria-live", "polite");
@@ -322,35 +321,21 @@
     bulkWarning.setAttribute("aria-live", "polite");
     bulkWarning.hidden = true;
     const bulkActions = createElement("div", "asset-viewer-bulk-actions");
-    const bulkAccept = createElement(
-      "button",
-      "asset-viewer-bulk-action accept",
-      "Accept selected",
-    );
-    bulkAccept.type = "button";
-    bulkAccept.dataset.assetViewerBulkAction = "accept";
-    const bulkReject = createElement(
-      "button",
-      "asset-viewer-bulk-action reject",
-      "Reject selected",
-    );
-    bulkReject.type = "button";
-    bulkReject.dataset.assetViewerBulkAction = "reject";
     const bulkXAdd = createElement(
       "button",
       "asset-viewer-bulk-action x-add",
-      "Mark selected for X",
+      "Add to X",
     );
     bulkXAdd.type = "button";
     bulkXAdd.dataset.assetViewerBulkAction = "x_add";
     const bulkXRemove = createElement(
       "button",
       "asset-viewer-bulk-action x-remove",
-      "Unmark selected from X",
+      "Remove from X",
     );
     bulkXRemove.type = "button";
     bulkXRemove.dataset.assetViewerBulkAction = "x_remove";
-    bulkActions.append(bulkAccept, bulkReject, bulkXAdd, bulkXRemove);
+    bulkActions.append(bulkXAdd, bulkXRemove);
     bulk.append(bulkHeading, bulkWarning, bulkActions);
     const settings = createElement("button", "asset-viewer-settings", "Prompt & settings");
     settings.type = "button";
@@ -375,29 +360,29 @@
     const moreBody = createElement("div", "asset-viewer-more-body");
     moreBody.append(settings, copyClean, downloadClean, download);
     more.append(moreSummary, moreBody);
-    footer.append(
-      status,
-      shortcuts,
-      exclusionHelp,
+    heading.append(shortcuts, exclusionHelp);
+    headerActions.append(
       markOut,
       anatomyReject,
       defectPicker,
       select,
       bulk,
       more,
+      fitToggle,
+      close,
     );
+    header.append(heading, headerActions);
+    media.append(status);
 
-    shell.append(header, media, footer);
+    shell.append(header, media);
     dialog.append(shell);
     document.body.append(dialog);
     return {
       close,
       anatomyReject,
       bulk,
-      bulkAccept,
       bulkClear,
       bulkCount,
-      bulkReject,
       bulkWarning,
       bulkXAdd,
       bulkXRemove,
@@ -937,7 +922,10 @@
       context.anatomyIssue.value = allowed ? value : "anatomy";
       context.anatomyIssue.dispatchEvent(new Event("change", { bubbles: true }));
       const selected = context.anatomyIssue.selectedOptions[0];
-      viewer.defectPickerSummary.textContent = `Defect: ${defectLabel(selected)} (optional)`;
+      const selectedLabel = defectLabel(selected);
+      viewer.defectPickerSummary.textContent = selectedLabel === "Not specified"
+        ? "Defect"
+        : `Defect: ${selectedLabel}`;
       Array.from(viewer.defectChips.querySelectorAll("[data-defect-code]")).forEach((chip) => {
         const isSelected = chip.dataset.defectCode === context.anatomyIssue.value;
         chip.setAttribute("aria-checked", String(isSelected));
@@ -999,7 +987,7 @@
       const pending = Number.parseInt(activeCard?.dataset.reviewPendingCount || "0", 10) > 0;
       viewer.markOut.disabled = context.alreadyRejected && !context.anatomyLabeled;
       viewer.markOut.textContent = context.anatomyLabeled
-          ? "Remove anatomy label"
+          ? "Remove label"
           : context.alreadyRejected
             ? pending ? "Rejected · saving" : "Rejected"
             : "Reject";
@@ -1014,12 +1002,12 @@
 
       viewer.anatomyReject.disabled = context.anatomyLabeled;
       viewer.anatomyReject.textContent = context.anatomyLabeled
-          ? "Provisional anatomy label set"
+          ? "Anatomy set"
           : context.alreadyRejected
             ? context.savedAnatomyIssue
-              ? "Update provisional anatomy label"
-              : "Add provisional anatomy label"
-            : "Reject + anatomy label";
+              ? "Update anatomy"
+              : "Add anatomy"
+            : "Reject + anatomy";
       viewer.anatomyReject.setAttribute(
         "aria-label",
         context.alreadyRejected
@@ -1029,8 +1017,6 @@
     };
 
     const viewerBulkButtons = Object.freeze({
-      accept: viewer.bulkAccept,
-      reject: viewer.bulkReject,
       x_add: viewer.bulkXAdd,
       x_remove: viewer.bulkXRemove,
     });
@@ -1066,15 +1052,22 @@
         "aria-pressed",
         String(Boolean(currentSelection instanceof HTMLInputElement && currentSelection.checked)),
       );
-      viewer.select.textContent = currentSelection instanceof HTMLInputElement && currentSelection.checked
-        ? "Remove current from selection"
-        : "Add current to selection";
+      const currentSelected = Boolean(
+        currentSelection instanceof HTMLInputElement && currentSelection.checked,
+      );
+      viewer.select.textContent = currentSelected ? "Selected" : "Select";
+      viewer.select.setAttribute(
+        "aria-label",
+        currentSelected
+          ? "Remove current image from selection"
+          : "Add current image to selection",
+      );
 
       viewer.bulk.hidden = !form;
       if (!form) return;
 
       const countMessage = (
-        `${selected} image${selected === 1 ? "" : "s"} selected`
+        `${selected} selected`
         + (hiddenSelected ? ` \u00b7 ${hiddenSelected} hidden by filter` : "")
       );
       if (viewer.bulkCount.textContent !== countMessage) {

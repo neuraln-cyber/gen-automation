@@ -42,7 +42,7 @@ def test_asset_viewer_is_safe_progressive_enhancement() -> None:
     assert "Navigate" in script
     assert "assetViewerMarkOut" in script
     assert "assetViewerAnatomyReject" in script
-    assert "Remove + anatomy label" in script
+    assert "Reject + anatomy" in script
     assert "data-review-inspection-form" in script
     assert "queueInspection(activeCard)" in script
     assert "flushInspectionQueue(true)" in script
@@ -79,7 +79,7 @@ def test_asset_viewer_is_safe_progressive_enhancement() -> None:
     assert "Copy clean image" in script
     assert "Download clean PNG" in script
     assert "Download exact raw master" in script
-    assert "Select for bulk action" in script
+    assert 'createElement("button", "asset-viewer-select", "Select")' in script
     assert 'viewer.media.addEventListener("touchstart"' in script
     assert "cleanPngFor" in script
     assert "new URL(source, window.location.href)" in script
@@ -227,7 +227,7 @@ def test_asset_viewer_rejects_immediately_through_the_active_cards_own_form() ->
     assert "bulkReject" not in submission
 
 
-def test_fullscreen_bulk_actions_proxy_the_existing_atomic_form() -> None:
+def test_fullscreen_keeps_only_compact_x_bulk_actions_in_the_header() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
     creation = script.split("function createViewer()", 1)[1].split(
         "function initializeAssetViewer()",
@@ -248,11 +248,16 @@ def test_fullscreen_bulk_actions_proxy_the_existing_atomic_form() -> None:
     assert 'bulkCount.setAttribute("aria-live", "polite")' in creation
     assert 'bulkWarning.setAttribute("role", "status")' in creation
     assert 'bulkWarning.setAttribute("aria-live", "polite")' in creation
-    assert "Accept selected" in creation
-    assert "Reject selected" in creation
-    assert "Mark selected for X" in creation
-    assert "Unmark selected from X" in creation
+    assert "Accept selected" not in creation
+    assert "Reject selected" not in creation
+    assert 'dataset.assetViewerBulkAction = "accept"' not in creation
+    assert 'dataset.assetViewerBulkAction = "reject"' not in creation
+    assert "Add to X" in creation
+    assert "Remove from X" in creation
     assert 'bulkClear.dataset.assetViewerBulkClear = ""' in creation
+    assert 'createElement("footer", "asset-viewer-footer")' not in creation
+    assert "shell.append(header, media)" in creation
+    assert "headerActions.append(" in creation
 
     assert 'document.querySelector("[data-bulk-action-form]")' in script
     assert 'button[name="action"][value="${action}"]' in script
@@ -292,8 +297,9 @@ def test_fullscreen_bulk_selection_stays_synced_during_navigation_and_refresh() 
     assert 'selection.dispatchEvent(new Event("change", { bubbles: true }))' in selector
     assert "syncViewerBulkControls()" in selector
     assert "checked = false" not in step
-    assert "Remove current from selection" in script
-    assert "Add current to selection" in script
+    assert 'viewer.select.textContent = currentSelected ? "Selected" : "Select"' in script
+    assert "Remove current image from selection" in script
+    assert "Add current image to selection" in script
 
 
 def test_asset_viewer_has_no_staged_exclusion_queue_or_save_step() -> None:
@@ -353,10 +359,9 @@ def test_asset_grid_uses_intrinsic_image_ratio_and_viewer_is_responsive() -> Non
     assert ".asset-viewer-bulk" in styles
     assert ".asset-viewer-bulk-actions" in styles
     assert ".asset-viewer-bulk-warning" in styles
-    assert "grid-template-columns: repeat(2, minmax(0, 1fr))" in styles
-    assert (
-        ".asset-viewer-bulk-action,\n  .asset-viewer-bulk-clear { min-height: 2.75rem; }" in styles
-    )
+    assert "grid-template-rows: auto minmax(0, 1fr);" in styles
+    assert ".asset-viewer-footer" not in styles
+    assert ".asset-viewer-defect-picker-panel" in styles
     assert ".asset-viewer-more-body" in styles
     assert ".asset-viewer-previous" in styles
     assert ".asset-viewer-next" in styles
