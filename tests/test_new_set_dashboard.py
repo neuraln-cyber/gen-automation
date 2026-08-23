@@ -197,6 +197,10 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     assert 'name="batch_plan"' in page.text
     assert 'id="batch-row-template"' in page.text
     batch_template = page.text.split('<template id="batch-row-template">', maxsplit=1)[1]
+    assert 'data-batch-field="orientation"' in batch_template
+    assert '<option value="inherit">Set default</option>' in batch_template
+    assert '<option value="portrait">Portrait</option>' in batch_template
+    assert '<option value="landscape">Landscape</option>' in batch_template
     overrides = batch_template.index('<details class="batch-overrides">')
     negative_editor = batch_template.index('data-batch-field="negative_prompt"')
     assert negative_editor < overrides

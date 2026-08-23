@@ -168,6 +168,11 @@ def test_generation_presets_capture_and_restore_complete_ordered_batch_queues() 
     assert "Save preset" in template
     assert 'aria-atomic="true"' in template
     assert "normalizeAutomationPresetBatchPlan" in script
+    assert "const hasWidth = batch.width !== null" in script
+    assert "if (hasWidth !== hasHeight) return null;" in script
+    assert 'const orientation = field(row, "orientation").value;' in script
+    assert "? { width: shortSide, height: longSide }" in script
+    assert '? (batch.width < batch.height ? "portrait"' in script
     assert "collectAutomationPresetBatchPlan" in script
     assert "summarizeAutomationBatchPlan" in script
     assert "JSON.stringify(requested).length > 400_000" in script
