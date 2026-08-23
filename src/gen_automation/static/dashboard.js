@@ -1429,6 +1429,12 @@
     };
 
     const batchRows = () => Array.from(list.querySelectorAll("[data-batch-row]"));
+    const clearBatchSeedOverrides = () => {
+      batchRows().forEach((row) => {
+        const seedInput = field(row, "seed");
+        if (seedInput instanceof HTMLInputElement) seedInput.value = "";
+      });
+    };
     const wildcardPattern = /__([a-z0-9]+(?:[._/-][a-z0-9]+)*)__/g;
     const knownWildcards = new Set(
       Array.from(template.content.querySelectorAll("[data-batch-wildcard] option")).flatMap(
@@ -1807,6 +1813,12 @@
         }
       }
     });
+    // Experiment remixes used to persist the selected image's materialized seed in both
+    // the shared field and the batch override. A visible -1 must mean random per image,
+    // including when an older browser draft still contains that hidden fixed override.
+    if (experimentLabMode
+        && defaultSeed instanceof HTMLInputElement
+        && defaultSeed.value.trim() === "-1") clearBatchSeedOverrides();
     syncExperimentTopPromptsFromFirstBatch();
 
     form.addEventListener("gen-automation:replace-batch-plan", (event) => {
@@ -1817,6 +1829,13 @@
     form.addEventListener("gen-automation:refresh-batch-plan", updateBuilder);
     form.addEventListener("gen-automation:profile-changed", updateBuilder);
     form.addEventListener("input", (event) => {
+      if (event.target === defaultSeed
+          && defaultSeed instanceof HTMLInputElement
+          && defaultSeed.value.trim() === "-1") {
+        clearBatchSeedOverrides();
+        updateBuilder();
+        return;
+      }
       if (event.target instanceof HTMLTextAreaElement
           && event.target.matches("[data-wildcard-aware]")) updateBuilder();
     });
@@ -5253,7 +5272,10 @@
         ? null : prompt("detailer_negative"),
       ...Object.fromEntries(CONTROLLED_BATCH_OVERRIDE_FIELDS.map((name) => [name, null])),
       ...controlled,
-      seed: hasDisplayValue(details.sampling.seed) ? String(details.sampling.seed) : null,
+      // The shared seed field already receives the materialized image seed. Leaving the
+      // batch override empty preserves exact replay while allowing a later shared -1 to
+      // actually switch the remix back to random-per-image behavior.
+      seed: null,
     };
   };
 
