@@ -266,7 +266,9 @@ def test_experiment_lab_has_a_scoped_workspace_gallery_and_exact_settings_reuse(
     assert ".experiment-lab-form .automation-layout" in styles
     assert ".experiment-lab-prompt-shell" in styles
     assert ".experiment-lab-primary-prompts" in styles
+    assert ".experiment-lab-title-field" in styles
     assert ".experiment-lab-prompt-actions .queue-submit" in styles
+    assert '[data-composition-mode="single"] .character-composition-grid' in styles
     assert ".experiment-lab-active-media img" in styles
     assert ".experiment-lab-thumbnail.is-selected" in styles
     assert ".experiment-lab-form .automation-sidebar { display: grid; }" in styles
@@ -289,9 +291,9 @@ def test_experiment_lab_has_a_scoped_workspace_gallery_and_exact_settings_reuse(
     assert "payload.hard_expires_at" in warm
     assert "window.setInterval(renderCountdown, 1000)" in warm
 
-    identity_reset = script.split("const resetQueuedExperimentDraftIdentity", maxsplit=1)[
-        1
-    ].split("function restoreAutomationDraft", maxsplit=1)[0]
+    identity_reset = script.split("const resetQueuedExperimentDraftIdentity", maxsplit=1)[1].split(
+        "function restoreAutomationDraft", maxsplit=1
+    )[0]
     assert "data-experiment-lab-form" in identity_reset
     assert "experimentReleaseId" in identity_reset
     assert "submittedDraftId" in identity_reset

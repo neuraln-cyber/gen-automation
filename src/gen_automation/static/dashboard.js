@@ -15,6 +15,12 @@
     .slice(0, 80)
     .replace(/-+$/g, "");
 
+  const automaticExperimentSlug = (title, submissionId) => {
+    const base = slugify(title).slice(0, 70).replace(/-+$/g, "") || "experiment";
+    const suffix = String(submissionId || "").toLowerCase().replace(/[^0-9a-f]/g, "").slice(0, 8);
+    return suffix ? `${base}-${suffix}` : base;
+  };
+
   const optionalText = (value) => value.trim() === "" ? null : value;
 
   const AUTOMATION_PRESET_STORAGE_KEY = "gen-automation:generation-presets:v1";
@@ -1331,14 +1337,18 @@
     const slugInput = form.querySelector("[data-slug-input]");
     const submitButtons = Array.from(form.querySelectorAll(".queue-submit"));
     const experimentLabMode = form.matches("[data-experiment-lab-form]");
+    const automaticSlug = experimentLabMode
+      && slugInput instanceof HTMLInputElement
+      && slugInput.hasAttribute("data-automatic-slug");
     const serverDisabled = submitButtons.some((button) => button.disabled);
+    const submissionId = namedControl(form, "submission_id")?.value || "";
     const maximumProviderJobs = 10_000;
     const signedOutputsPerJobCap = Math.max(
       1,
       integerValue(form.dataset.signedOutputsPerJobCap, 8),
     );
     let lastPrompt = null;
-    let slugWasEdited = Boolean(slugInput && slugInput.value.trim());
+    let slugWasEdited = !automaticSlug && Boolean(slugInput && slugInput.value.trim());
     let previousDefaultPrompt = defaultPrompt ? defaultPrompt.value : "";
     let previousDefaultNegative = defaultNegative ? defaultNegative.value : "";
     const maximumFinalSetSize = Math.max(1, integerValue(form.dataset.maxFinalSetSize, 500));
@@ -2001,11 +2011,23 @@
       previousDefaultNegative = defaultNegative.value;
       updateBuilder();
     });
+    if (automaticSlug && titleInput && slugInput) {
+      slugInput.value = automaticExperimentSlug(titleInput.value, submissionId);
+    }
     titleInput && titleInput.addEventListener("input", () => {
-      if (slugInput && !slugWasEdited) slugInput.value = slugify(titleInput.value);
+      if (slugInput && (automaticSlug || !slugWasEdited)) {
+        slugInput.value = automaticSlug
+          ? automaticExperimentSlug(titleInput.value, submissionId)
+          : slugify(titleInput.value);
+      }
     });
     slugInput && slugInput.addEventListener("input", () => {
-      slugWasEdited = Boolean(slugInput.value.trim());
+      if (!automaticSlug) slugWasEdited = Boolean(slugInput.value.trim());
+    });
+    form.addEventListener("submit", () => {
+      if (automaticSlug && titleInput && slugInput) {
+        slugInput.value = automaticExperimentSlug(titleInput.value, submissionId);
+      }
     });
 
     form.addEventListener("invalid", (event) => {

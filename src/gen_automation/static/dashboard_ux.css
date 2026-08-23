@@ -4829,7 +4829,7 @@ body.asset-viewer-open { overflow: hidden; }
 .experiment-lab-workspace .experiment-warm-actions { justify-content: flex-end; }
 .experiment-lab-prompt-shell {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(11rem, 14rem);
+  grid-template-columns: minmax(0, 1fr) minmax(15rem, 18rem);
   gap: .8rem;
   margin-bottom: .8rem;
   align-items: stretch;
@@ -4871,6 +4871,20 @@ body.asset-viewer-open { overflow: hidden; }
   box-shadow: none;
 }
 
+.experiment-lab-title-field {
+  display: grid;
+  gap: .3rem;
+  color: var(--muted);
+  font-size: .72rem;
+  font-weight: 750;
+}
+
+.experiment-lab-title-field input {
+  min-width: 0;
+  padding: .58rem .65rem;
+  font-size: .78rem;
+}
+
 .experiment-lab-prompt-actions .queue-submit {
   min-height: 5rem;
   font-size: 1rem;
@@ -4891,6 +4905,16 @@ body.asset-viewer-open { overflow: hidden; }
 }
 
 .experiment-lab-form .automation-main { gap: .55rem; }
+.experiment-lab-form[data-composition-mode="single"] .character-composition-grid {
+  display: none;
+}
+
+.experiment-lab-form .composition-builder {
+  margin-top: .55rem;
+  padding: .62rem;
+}
+
+.experiment-lab-form .composition-heading { margin-bottom: 0; }
 .experiment-lab-form fieldset.step-panel,
 .experiment-lab-form details.step-panel,
 .experiment-lab-form .automation-summary-card,

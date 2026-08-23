@@ -187,6 +187,7 @@
     autocomplete="off"
     data-automation-form
     {% if experiment_mode %}data-experiment-lab-form{% endif %}
+    {% if experiment_mode %}data-composition-mode="{{ form_values['composition_mode'] }}"{% endif %}
     {% if experiment_release %}data-experiment-release-id="{{ experiment_release.release_id }}"{% endif %}
     data-automation-draft-scope="{{ 'experiment' if experiment_mode else 'automation' }}"
     data-signed-outputs-per-job-cap="{{ max_safe_outputs_per_signed_generation_job }}"
@@ -202,11 +203,31 @@
       <div class="experiment-lab-prompt-shell">
         {{ prompt_defaults_panel(form_values, true) }}
         <aside class="panel experiment-lab-prompt-actions" aria-label="Generate experiment">
-          <span class="automation-section-label">Generate</span>
+          <label class="experiment-lab-title-field">
+            <span>Run title</span>
+            <input
+              type="text"
+              name="title"
+              value="{{ form_values['title'] }}"
+              minlength="1"
+              maxlength="300"
+              placeholder="Anima LoRA weight test"
+              autocomplete="off"
+              data-title-input
+              required
+            >
+          </label>
+          <input
+            type="hidden"
+            name="slug"
+            value="{{ form_values['slug'] }}"
+            data-slug-input
+            data-automatic-slug
+          >
           <button class="primary-button queue-submit" type="submit" {% if not options.ready %}disabled{% endif %}>
             Generate
           </button>
-          <p>Uses the model, LoRAs, sampler, and prompt-run settings below.</p>
+          <p>The URL follows the run title automatically. Uses the settings below.</p>
           <a class="text-button" href="#generation-setup">Review settings</a>
         </aside>
       </div>
@@ -214,6 +235,7 @@
 
     <div class="automation-layout">
       <div class="automation-main">
+        {% if not experiment_mode %}
         <fieldset class="step-panel automation-identity-panel" id="set-details">
           <legend class="visually-hidden">Set details</legend>
           <div class="automation-panel-heading">
@@ -256,6 +278,7 @@
             </details>
           </div>
         </fieldset>
+        {% endif %}
 
         <fieldset class="step-panel automation-profile-panel" id="generation-setup">
           <legend class="visually-hidden">Approved generation inputs</legend>
@@ -296,7 +319,7 @@
           {% set trio_available = options.workflows | selectattr('supports_controlled_trio_v1') | list | length > 0 %}
           <section class="composition-builder" data-composition-builder data-new-set-composition data-controlled-duo-builder data-trio-available="{{ 'true' if trio_available else 'false' }}">
             <div class="composition-heading">
-              <strong>Characters</strong>
+              <strong>{{ 'Composition' if experiment_mode else 'Characters' }}</strong>
               <div class="composition-mode" role="radiogroup" aria-label="Character composition">
                 <label>
                   <input

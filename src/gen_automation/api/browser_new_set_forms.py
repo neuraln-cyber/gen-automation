@@ -3,6 +3,7 @@ import hmac
 import json
 import math
 import re
+import unicodedata
 from dataclasses import dataclass
 from urllib.parse import parse_qs
 from uuid import UUID
@@ -120,6 +121,15 @@ async def read_new_set_form(request: Request) -> BrowserNewSetForm:
     try:
         csrf_token = _bounded(values["csrf_token"], label="Security token", maximum=200)
         submission_id = _uuid(values["submission_id"], label="Submission")
+        query_string = request.scope.get("query_string", b"")
+        query = parse_qs(
+            query_string.decode("ascii", "strict") if isinstance(query_string, bytes) else ""
+        )
+        if query.get("mode") == ["experiment"] and not values["slug"]:
+            values["slug"] = _automatic_experiment_slug(
+                values["title"],
+                submission_id=submission_id,
+            )
         idempotency_key = values["idempotency_key"]
         if _FORM_KEY.fullmatch(idempotency_key) is None:
             raise _bad_request("The form expired or was changed. Reload New Set and try again.")
@@ -239,6 +249,12 @@ async def read_new_set_form(request: Request) -> BrowserNewSetForm:
         command=command,
         values=values,
     )
+
+
+def _automatic_experiment_slug(title: str, *, submission_id: UUID) -> str:
+    ascii_title = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode("ascii")
+    base = re.sub(r"[^a-z0-9]+", "-", ascii_title.casefold()).strip("-")[:70].rstrip("-")
+    return f"{base or 'experiment'}-{submission_id.hex[:8]}"
 
 
 async def read_generation_stop_form(request: Request) -> BrowserGenerationStopForm:
