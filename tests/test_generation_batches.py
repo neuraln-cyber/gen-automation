@@ -10,13 +10,14 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from gen_automation.config import Settings
-from gen_automation.db.models import GenerationJob, ReleaseVersion, WorkflowApproval
+from gen_automation.db.models import GenerationJob, Release, ReleaseVersion, WorkflowApproval
 from gen_automation.db.session import Database
 from gen_automation.domain.release_spec import ProjectCreate, ReleaseCreate, ReleaseSpecification
 from gen_automation.domain.wildcards import WildcardCreate
 from gen_automation.services.generation import approve_and_expand_generation_plan
 from gen_automation.services.new_sets import (
     NewSetBatchSubmission,
+    NewSetInputError,
     NewSetSubmission,
     create_and_approve_new_set,
     list_new_set_options,
@@ -52,6 +53,39 @@ def test_batch_submission_accepts_the_random_per_image_seed_sentinel() -> None:
     )
 
     assert batch.seed == -1
+
+
+def test_batch_submission_dimensions_are_optional_but_must_be_a_valid_pair() -> None:
+    legacy = NewSetBatchSubmission.model_validate(
+        {"name": "Inherited size", "image_count": 4, "prompt": "portrait"}
+    )
+    landscape = NewSetBatchSubmission.model_validate(
+        {
+            "name": "Landscape",
+            "image_count": 4,
+            "prompt": "wide scene",
+            "width": 1480,
+            "height": 1144,
+        }
+    )
+
+    assert (legacy.width, legacy.height) == (None, None)
+    assert (landscape.width, landscape.height) == (1480, 1144)
+
+    with pytest.raises(ValidationError, match="provided together"):
+        NewSetBatchSubmission.model_validate(
+            {"name": "Partial", "image_count": 4, "prompt": "portrait", "width": 1480}
+        )
+    with pytest.raises(ValidationError, match="multiple of 8"):
+        NewSetBatchSubmission.model_validate(
+            {
+                "name": "Misaligned",
+                "image_count": 4,
+                "prompt": "portrait",
+                "width": 1479,
+                "height": 1144,
+            }
+        )
 
 
 def test_new_set_submission_requires_a_complete_distinct_duo() -> None:
@@ -538,6 +572,8 @@ async def test_new_set_service_freezes_a_batch_queue_with_inherited_prompt_setti
                     "name": "Five images",
                     "image_count": 5,
                     "prompt": "first queue prompt",
+                    "width": 1480,
+                    "height": 1144,
                 },
                 {
                     "name": "Three images",
@@ -547,8 +583,8 @@ async def test_new_set_service_freezes_a_batch_queue_with_inherited_prompt_setti
                 },
             ),
             seed=100,
-            width=1024,
-            height=1024,
+            width=1144,
+            height=1480,
             cfg=6,
             steps=30,
             sampler="euler_ancestral",
@@ -585,7 +621,72 @@ async def test_new_set_service_freezes_a_batch_queue_with_inherited_prompt_setti
     assert frozen_batches[1]["generation"]["negative_prompt"] == ""
     assert frozen_batches[0]["generation"]["seed"] == 100
     assert frozen_batches[1]["generation"]["seed"] == 105
-    assert sorted(job.expected_output_count for job in jobs) == [1, 3, 4]
+    assert version.specification["generation"]["width"] == 1480
+    assert version.specification["generation"]["height"] == 1144
+    assert [
+        (batch["generation"]["width"], batch["generation"]["height"]) for batch in frozen_batches
+    ] == [(1480, 1144), (1144, 1480)]
+
+    jobs.sort(key=lambda job: int(job.parameters["ordinal"]))
+    assert [job.expected_output_count for job in jobs] == [4, 1, 3]
+    assert [
+        (job.parameters["generation"]["width"], job.parameters["generation"]["height"])
+        for job in jobs
+    ] == [(1480, 1144), (1480, 1144), (1144, 1480)]
+    assert [
+        (output["width"], output["height"])
+        for job in jobs
+        for output in job.parameters["output_generations"]
+    ] == [(1480, 1144)] * 5 + [(1144, 1480)] * 3
+
+
+async def test_new_set_rejects_an_undeliverable_batch_before_creating_a_release(
+    batch_database: Database,
+) -> None:
+    payload = valid_release_payload()
+    async with batch_database.sessions() as session:
+        await seed_release_approvals(session, payload)
+        options = await list_new_set_options(session)
+        command = NewSetSubmission(
+            slug="oversized-batch",
+            title="Oversized batch",
+            subject_approval_id=options.subjects[0].approval_id,
+            checkpoint_approval_id=options.checkpoints[0].approval_id,
+            workflow_approval_id=options.workflows[0].approval_id,
+            prompt="",
+            batches=(
+                {
+                    "name": "Too large",
+                    "image_count": 1,
+                    "prompt": "portrait",
+                    "width": 4096,
+                    "height": 4096,
+                },
+            ),
+            seed=100,
+            width=1024,
+            height=1024,
+            cfg=6,
+            steps=30,
+            sampler="euler_ancestral",
+            scheduler="karras",
+            outputs_per_job=1,
+            planned_job_count=1,
+        )
+
+        with pytest.raises(NewSetInputError, match="exceeds"):
+            await create_and_approve_new_set(
+                session,
+                command=command,
+                idempotency_key="new-set-oversized-batch",
+                settings=Settings(),
+                actor="fixture-owner",
+            )
+
+    async with batch_database.sessions() as session:
+        releases = list((await session.scalars(select(Release))).all())
+
+    assert releases == []
 
 
 async def test_new_set_service_freezes_two_subjects_and_regional_prompts_in_order(
@@ -742,7 +843,13 @@ def test_browser_new_set_accepts_the_optional_batch_plan_json_field(
         "batch_plan": json.dumps(
             [
                 {"name": "Five images", "image_count": 5, "prompt": "first"},
-                {"name": "Three images", "image_count": 3, "prompt": "second"},
+                {
+                    "name": "Three images",
+                    "image_count": 3,
+                    "prompt": "second",
+                    "width": 1480,
+                    "height": 1144,
+                },
             ]
         ),
     }

@@ -160,6 +160,8 @@ class NewSetBatchSubmission(BaseModel):
     detailer_prompt: str | None = Field(default=None, max_length=20_000)
     detailer_negative_prompt: str | None = Field(default=None, max_length=20_000)
     seed: int | None = Field(default=None, ge=-1, le=(2**63) - 1)
+    width: int | None = Field(default=None, ge=512, le=4096, multiple_of=8)
+    height: int | None = Field(default=None, ge=512, le=4096, multiple_of=8)
 
     @field_validator("name")
     @classmethod
@@ -174,6 +176,12 @@ class NewSetBatchSubmission(BaseModel):
         if not value.strip():
             raise ValueError("batch prompt must not be blank")
         return value
+
+    @model_validator(mode="after")
+    def require_complete_dimensions(self) -> "NewSetBatchSubmission":
+        if (self.width is None) != (self.height is None):
+            raise ValueError("batch width and height must be provided together")
+        return self
 
 
 class NewSetSubmission(BaseModel):
@@ -870,6 +878,8 @@ async def create_and_approve_new_set(
             ),
             "seed": batch_seed,
         }
+        if batch.width is not None and batch.height is not None:
+            overrides.update(width=batch.width, height=batch.height)
         for field_name in (
             "character_a_prompt",
             "character_b_prompt",
@@ -892,8 +902,17 @@ async def create_and_approve_new_set(
             )
         except ValidationError:
             raise NewSetInputError(
-                f"generation batch {batch.name!r} contains invalid prompt overrides"
+                f"generation batch {batch.name!r} contains invalid generation overrides"
             ) from None
+        try:
+            require_generation_deliverability(
+                width=batch_generation.width,
+                height=batch_generation.height,
+                hires_scale=batch_generation.hires_scale,
+                workflow_node_classes=workflow.reviewed_node_classes,
+            )
+        except DeliverabilityError as error:
+            raise NewSetInputError(str(error)) from error
         generation_batches.append(
             GenerationBatchSpecification(
                 name=batch.name,

@@ -297,6 +297,20 @@
       if (typeof batch.prompt !== "string"
           || !batch.prompt.trim() || batch.prompt.length > 20_000) return null;
 
+      const hasWidth = batch.width !== null && typeof batch.width !== "undefined";
+      const hasHeight = batch.height !== null && typeof batch.height !== "undefined";
+      if (hasWidth !== hasHeight) return null;
+      let width = null;
+      let height = null;
+      if (hasWidth) {
+        if (!Number.isInteger(batch.width) || batch.width < 512 || batch.width > 4096
+            || batch.width % 8 !== 0
+            || !Number.isInteger(batch.height) || batch.height < 512 || batch.height > 4096
+            || batch.height % 8 !== 0) return null;
+        width = batch.width;
+        height = batch.height;
+      }
+
       const optionalPrompts = {};
       let optionalPromptsValid = true;
       optionalPromptFields.forEach((fieldName) => {
@@ -351,6 +365,8 @@
         detailer_negative_prompt: optionalPrompts.detailer_negative_prompt,
         ...controlledOverrides,
         seed,
+        width,
+        height,
       });
     }
     return normalized;
@@ -1331,6 +1347,8 @@
     const defaultDetailer = form.querySelector("[data-default-detailer]");
     const defaultDetailerNegative = form.querySelector("[data-default-detailer-negative]");
     const defaultSeed = form.querySelector("[data-default-seed]");
+    const widthInput = namedControl(form, "width");
+    const heightInput = namedControl(form, "height");
     const detailerGuideSize = namedControl(form, "detailer_guide_size");
     const detailerMaxSize = namedControl(form, "detailer_max_size");
     const titleInput = form.querySelector("[data-title-input]");
@@ -1402,6 +1420,16 @@
 
     const readRow = (row) => {
       const seedInput = field(row, "seed");
+      const orientation = field(row, "orientation").value;
+      const defaultWidth = integerValue(widthInput?.value, 0);
+      const defaultHeight = integerValue(heightInput?.value, 0);
+      const shortSide = Math.min(defaultWidth, defaultHeight);
+      const longSide = Math.max(defaultWidth, defaultHeight);
+      const dimensions = orientation === "portrait"
+        ? { width: shortSide, height: longSide }
+        : orientation === "landscape"
+          ? { width: longSide, height: shortSide }
+          : { width: null, height: null };
       const activeFields = activeControlledOverrideFields();
       const controlledOverrides = Object.fromEntries(
         CONTROLLED_BATCH_OVERRIDE_FIELDS.map((name) => {
@@ -1425,6 +1453,7 @@
         ...controlledOverrides,
         // Keep the decimal text exact; valid backend seeds extend beyond JS's safe integer range.
         seed: seedInput.value.trim() === "" ? null : seedInput.value.trim(),
+        ...dimensions,
       };
     };
 
@@ -1491,6 +1520,8 @@
           detailer_negative_prompt: null,
           ...emptyControlledBatchOverrides(),
           seed: null,
+          width: null,
+          height: null,
         };
       });
     };
@@ -1518,6 +1549,8 @@
       detailer_negative_prompt: null,
       ...emptyControlledBatchOverrides(),
       seed: null,
+      width: null,
+      height: null,
     });
 
     const syncExperimentTopPromptsFromFirstBatch = () => {
@@ -1552,6 +1585,10 @@
         }
       });
       field(row, "seed").value = batch.seed ?? "";
+      const orientation = field(row, "orientation");
+      orientation.value = batch.width !== null && batch.height !== null
+        ? (batch.width < batch.height ? "portrait" : batch.width > batch.height ? "landscape" : "inherit")
+        : "inherit";
       list.insertBefore(fragment, before);
       renderBatchOverrideControls(row);
       if (!deferUpdate) updateBuilder();
@@ -1696,8 +1733,11 @@
         const meta = row.querySelector("[data-batch-meta]");
         const wildcardSummary = row.querySelector("[data-batch-wildcard-summary]");
         const jobs = Math.ceil(imageCount / perJob);
+        const dimensions = readRow(row);
+        const effectiveWidth = dimensions.width ?? integerValue(widthInput?.value, 0);
+        const effectiveHeight = dimensions.height ?? integerValue(heightInput?.value, 0);
         if (meta) {
-          meta.textContent = `${imageCount.toLocaleString()} images · ${jobs.toLocaleString()} GPU job${jobs === 1 ? "" : "s"} · ${uniqueWildcards.length} wildcard${uniqueWildcards.length === 1 ? "" : "s"}`;
+          meta.textContent = `${imageCount.toLocaleString()} images · ${jobs.toLocaleString()} GPU job${jobs === 1 ? "" : "s"} · ${effectiveWidth}×${effectiveHeight} · ${uniqueWildcards.length} wildcard${uniqueWildcards.length === 1 ? "" : "s"}`;
         }
         if (wildcardSummary) {
           wildcardSummary.replaceChildren(
@@ -1800,6 +1840,8 @@
         detailer_negative_prompt: null,
         ...emptyControlledBatchOverrides(),
         seed: null,
+        width: null,
+        height: null,
       }];
     }
     initialBatches.forEach((batch, index) => {
@@ -1838,6 +1880,7 @@
       }
       if (event.target instanceof HTMLTextAreaElement
           && event.target.matches("[data-wildcard-aware]")) updateBuilder();
+      if (event.target === widthInput || event.target === heightInput) updateBuilder();
     });
 
     if (batchSequenceApply instanceof HTMLButtonElement
@@ -1916,7 +1959,9 @@
         renderBatchOverrideControls(row);
         insertPromptToken(field(row, targetName), token);
         event.target.value = "";
+        return;
       }
+      if (event.target.matches('[data-batch-field="orientation"]')) updateBuilder();
     });
 
     list.addEventListener("focusin", (event) => {

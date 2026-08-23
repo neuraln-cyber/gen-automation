@@ -3385,7 +3385,7 @@ body.asset-viewer-open { overflow: hidden; }
 
 .automation-create-form .batch-card-body { gap: .65rem; padding: .7rem; }
 .automation-create-form .batch-identity-grid {
-  grid-template-columns: minmax(0, 1fr) minmax(8rem, .25fr);
+  grid-template-columns: minmax(0, 1fr) minmax(8rem, .25fr) minmax(8rem, .25fr);
   gap: .6rem;
 }
 

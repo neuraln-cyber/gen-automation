@@ -1133,6 +1133,14 @@
             Images to generate
             <input type="number" min="1" max="80000" value="4" inputmode="numeric" data-batch-field="image_count" required>
           </label>
+          <label>
+            Size
+            <select data-batch-field="orientation" aria-label="Batch image orientation">
+              <option value="inherit">Set default</option>
+              <option value="portrait">Portrait</option>
+              <option value="landscape">Landscape</option>
+            </select>
+          </label>
         </div>
         <div class="batch-prompts-grid">
         <div class="batch-prompt-editor">
