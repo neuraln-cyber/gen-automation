@@ -308,6 +308,21 @@ def test_experiment_lab_has_a_scoped_workspace_gallery_and_exact_settings_reuse(
     assert "experimentLabMode ? rows.slice(0, 1) : rows" in builder
     assert 'field(first, "prompt").value' in builder
     assert 'field(first, "negative_prompt").value' in builder
+    assert "const clearBatchSeedOverrides" in builder
+    assert 'defaultSeed.value.trim() === "-1"' in builder
+    assert "event.target === defaultSeed" in builder
+
+    reuse = script.split("const automationProfileFromDetails", maxsplit=1)[1].split(
+        "const reuseImageSettingsButton", maxsplit=1
+    )[0]
+    assert (
+        'seed: hasDisplayValue(details.sampling.seed) ? String(details.sampling.seed) : ""' in reuse
+    )
+    experiment_batch = reuse.split("const experimentBatchFromDetails", maxsplit=1)[1].split(
+        "const applyGenerationDetailsToExperimentLab", maxsplit=1
+    )[0]
+    assert "seed: null" in experiment_batch
+    assert "details.sampling.seed) ? String(details.sampling.seed) : null" not in experiment_batch
 
 
 def test_live_generation_exposes_failures_and_hides_unready_review_action() -> None:
