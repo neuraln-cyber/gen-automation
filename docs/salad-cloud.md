@@ -297,7 +297,7 @@ Security/resource limits:
 | Settings | Purpose |
 | --- | --- |
 | `GEN_WORKER_MAX_BODY_BYTES`, `GEN_WORKER_MAX_SIGNATURE_TTL_SECONDS`, `GEN_WORKER_CLOCK_SKEW_SECONDS` | Bound signed queue requests and authorization time windows. |
-| `GEN_WORKER_MAX_OUTPUTS`, `GEN_WORKER_MAX_OUTPUT_BYTES`, `GEN_WORKER_MAX_TOTAL_OUTPUT_BYTES` | Bound output count, individual bytes, and aggregate bytes. The worker defaults to 25 outputs per provider job and retains a hard ceiling of 32. |
+| `GEN_WORKER_MAX_OUTPUTS`, `GEN_WORKER_MAX_OUTPUT_BYTES`, `GEN_WORKER_MAX_TOTAL_OUTPUT_BYTES` | Bound output count, individual bytes, and aggregate bytes. The worker defaults to 25 outputs per provider job, a 256 MiB aggregate output budget, and retains a hard count ceiling of 32. |
 | `GEN_WORKER_MAX_IMAGE_DIMENSION`, `GEN_WORKER_MAX_IMAGE_PIXELS` | Bound decoded output geometry. |
 | `GEN_WORKER_MAX_REPLAY_ENTRIES` | Bounds the in-process duplicate receipt cache. |
 | `GEN_WORKER_UPLOAD_TIMEOUT_SECONDS`, `GEN_WORKER_READINESS_TIMEOUT_SECONDS` | Bound presigned uploads and readiness checks. |
@@ -305,10 +305,17 @@ Security/resource limits:
 
 The current defaults are recorded in `.env.example`. Tightening them is a
 deployment change; expanding them requires a security and cost review.
-Generation plans use a controller-side fan-out of at most eight outputs per
-signed provider job while preserving the exact user batch total. The rendered
-graph is preflighted against the signed-envelope budget before upload intents
-are created, and each serialized upload grant has its own fail-closed byte limit.
+Generation plans use a controller-side fan-out of at most 25 outputs per
+provider job while preserving the exact user batch total. Requests with up to
+eight outputs remain inline and are preflighted against the 256 KiB signed
+envelope. Larger current-version requests store the bounded canonical payload
+under the private, versioned `staging/worker-requests/` prefix and submit only a
+signed, content-addressed, version-pinned download reference. The worker
+authenticates that reference before downloading, then verifies its exact origin,
+byte length, digest, job ID, and attempt ID. Existing storage lifecycle rules
+expire current and noncurrent staging versions after seven days. Every rendered
+graph, referenced payload, and serialized upload grant also has an independent
+fail-closed byte limit.
 
 No GPU-worker credential is required during the present local development
 stage. Create the dedicated model-read identity, controller signing key and worker

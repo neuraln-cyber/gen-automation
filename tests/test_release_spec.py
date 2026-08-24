@@ -56,7 +56,7 @@ def test_generation_dimensions_accept_latent_multiples_of_eight() -> None:
         ReleaseCreate.model_validate(payload)
 
 
-def test_legacy_generation_job_parses_twenty_five_but_new_writes_are_split() -> None:
+def test_legacy_and_current_generation_jobs_support_twenty_five_outputs() -> None:
     payload = valid_release_payload()
     generation = payload["specification"]["generation"]  # type: ignore[index]
     generation["outputs_per_job"] = 25
@@ -66,8 +66,9 @@ def test_legacy_generation_job_parses_twenty_five_but_new_writes_are_split() -> 
     assert legacy.generation.outputs_per_job == 25
     assert legacy.worker_request_budget_version == 1
 
-    with pytest.raises(ValidationError, match="at most 8 outputs"):
-        ReleaseCreate.model_validate(payload)
+    current = ReleaseCreate.model_validate(payload)
+    assert current.specification.generation.outputs_per_job == 25
+    assert current.specification.worker_request_budget_version == 2
 
     generation["outputs_per_job"] = 26
     with pytest.raises(ValidationError, match="less than or equal to 25"):

@@ -923,7 +923,7 @@ async def create_and_approve_new_set(
         implicit_seed_offset += batch.image_count
     if not generation_batches and effective_outputs_per_job != command.outputs_per_job:
         # Preserve the exact user-requested image count while transparently
-        # splitting a large Controlled Trio request into signed-envelope-safe
+        # splitting any future composition-specific bounded request into safe
         # provider jobs. The batch remains unrestricted from the user's point
         # of view; only the internal fan-out changes.
         generation_batches.append(

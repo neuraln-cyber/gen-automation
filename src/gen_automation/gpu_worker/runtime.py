@@ -23,8 +23,71 @@ class MultipartUploader(Protocol):
     ) -> None: ...
 
 
+class PayloadDownloader(Protocol):
+    async def download(
+        self,
+        *,
+        url: str,
+        expected_bytes: int,
+    ) -> bytes: ...
+
+
 class WorkerUploadError(Exception):
     """A redacted upload failure safe for the worker service layer."""
+
+
+class WorkerPayloadDownloadError(Exception):
+    """A redacted referenced-payload failure safe for the worker boundary."""
+
+
+@dataclass
+class HttpxPayloadDownloader:
+    """No-redirect, identity-encoded adapter for private request payloads."""
+
+    client: httpx2.AsyncClient
+    timeout_seconds: float = 60.0
+
+    async def download(
+        self,
+        *,
+        url: str,
+        expected_bytes: int,
+    ) -> bytes:
+        body = bytearray()
+        try:
+            async with self.client.stream(
+                "GET",
+                url,
+                headers={"Accept": "application/json", "Accept-Encoding": "identity"},
+                timeout=self.timeout_seconds,
+                follow_redirects=False,
+            ) as response:
+                if response.status_code != 200:
+                    raise WorkerPayloadDownloadError("request payload download failed")
+                content_encoding = response.headers.get("content-encoding", "identity")
+                if content_encoding.casefold() not in {"", "identity"}:
+                    raise WorkerPayloadDownloadError("request payload download failed")
+                declared = response.headers.get("content-length")
+                if declared is not None:
+                    try:
+                        declared_bytes = int(declared)
+                    except ValueError:
+                        raise WorkerPayloadDownloadError(
+                            "request payload download failed"
+                        ) from None
+                    if declared_bytes != expected_bytes:
+                        raise WorkerPayloadDownloadError("request payload download failed")
+                async for chunk in response.aiter_bytes(64 * 1024):
+                    body.extend(chunk)
+                    if len(body) > expected_bytes:
+                        raise WorkerPayloadDownloadError("request payload download failed")
+        except WorkerPayloadDownloadError:
+            raise
+        except (httpx2.TimeoutException, httpx2.TransportError):
+            raise WorkerPayloadDownloadError("request payload download failed") from None
+        if len(body) != expected_bytes:
+            raise WorkerPayloadDownloadError("request payload download failed")
+        return bytes(body)
 
 
 @dataclass

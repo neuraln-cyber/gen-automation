@@ -96,13 +96,15 @@ def test_release_requires_three_distinct_subjects_and_trio_capability() -> None:
         ReleaseCreate.model_validate(payload)
 
 
-def test_direct_trio_specs_cannot_bypass_the_safe_internal_fanout() -> None:
+def test_direct_trio_specs_support_twenty_five_but_not_twenty_six_outputs() -> None:
     payload = _controlled_trio_release_payload()
     generation = payload["specification"]["generation"]  # type: ignore[index]
     assert isinstance(generation, dict)
-    generation["outputs_per_job"] = 9
+    generation["outputs_per_job"] = 25
+    assert ReleaseCreate.model_validate(payload).specification.generation.outputs_per_job == 25
 
-    with pytest.raises(ValidationError, match="at most 8 outputs"):
+    generation["outputs_per_job"] = 26
+    with pytest.raises(ValidationError, match="less than or equal to 25"):
         ReleaseCreate.model_validate(payload)
 
 
@@ -220,7 +222,7 @@ async def test_new_set_service_freezes_trio_batch_overrides(tmp_path: Path) -> N
                 ).all()
             )
             assert version is not None
-            assert len(jobs) == 4
+            assert len(jobs) == 2
             job = jobs[0]
             generation = version.specification["generation"]
             assert generation["composition_mode"] == "trio"
@@ -231,10 +233,10 @@ async def test_new_set_service_freezes_trio_batch_overrides(tmp_path: Path) -> N
             assert generation["character_b_negative_prompt"] == ""
             assert generation["interaction_prompt"] == "A and C reaching toward seated B"
             assert generation["camera_prompt"] == "overhead wide shot"
-            assert generation["outputs_per_job"] == 8
-            assert version.specification["planned_job_count"] == 4
+            assert generation["outputs_per_job"] == 25
+            assert version.specification["planned_job_count"] == 2
             assert version.specification["generation_batches"][0]["image_count"] == 29
-            assert sorted(item.expected_output_count for item in jobs) == [5, 8, 8, 8]
+            assert sorted(item.expected_output_count for item in jobs) == [4, 25]
             assert version.specification["workflow"]["capabilities"] == ["controlled_trio_v1"]
             assert job.parameters["output_generations"][0]["character_c_pose_prompt"] == (
                 "reclining and looking toward A"
@@ -303,17 +305,11 @@ async def test_trio_legacy_plan_preserves_all_images_when_automatically_chunked(
                 ).all()
             )
         assert version is not None
-        assert version.specification["schema_version"] == 2
-        assert version.specification["planned_job_count"] == 7
-        assert version.specification["generation"]["outputs_per_job"] == 8
-        assert version.specification["generation_batches"] == [
-            {
-                "name": "Default batch",
-                "image_count": 50,
-                "generation": version.specification["generation"],
-            }
-        ]
-        assert sorted(job.expected_output_count for job in jobs) == [2, 8, 8, 8, 8, 8, 8]
+        assert version.specification["schema_version"] == 1
+        assert version.specification["planned_job_count"] == 2
+        assert version.specification["generation"]["outputs_per_job"] == 25
+        assert "generation_batches" not in version.specification
+        assert sorted(job.expected_output_count for job in jobs) == [25, 25]
         assert sum(job.expected_output_count for job in jobs) == 50
     finally:
         await database.dispose()

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import threading
@@ -16,12 +17,17 @@ from gen_automation.domain.signing import derive_public_key, encode_base64url
 from gen_automation.gpu_worker.app import create_worker_app
 from gen_automation.gpu_worker.models import (
     GenerateEnvelope,
+    GeneratePayloadReference,
+    ReferencedGenerateEnvelope,
     UploadGrant,
     WorkerEnvironment,
     WorkerSettings,
 )
 from gen_automation.gpu_worker.runtime import (
     HttpxMultipartUploader,
+    HttpxPayloadDownloader,
+    PayloadDownloader,
+    WorkerPayloadDownloadError,
     WorkerUploadError,
 )
 from gen_automation.gpu_worker.security import calculate_signature
@@ -96,6 +102,19 @@ class FakeUploader:
         if self.error is not None:
             raise self.error
         self.uploads.append(RecordedUpload(grant=grant, content=content, media_type=media_type))
+
+
+@dataclass
+class FakePayloadDownloader:
+    body: bytes
+    error: Exception | None = None
+    calls: list[tuple[str, int]] = field(default_factory=list)
+
+    async def download(self, *, url: str, expected_bytes: int) -> bytes:
+        self.calls.append((url, expected_bytes))
+        if self.error is not None:
+            raise self.error
+        return self.body
 
 
 def _settings(**overrides: object) -> WorkerSettings:
@@ -235,6 +254,7 @@ def _client(
     *,
     executor: FakeExecutor | None = None,
     uploader: FakeUploader | None = None,
+    payload_downloader: PayloadDownloader | None = None,
     settings: WorkerSettings | None = None,
 ) -> tuple[TestClient, FakeExecutor, FakeUploader]:
     resolved_executor = executor or FakeExecutor()
@@ -243,9 +263,38 @@ def _client(
         settings=settings or _settings(),
         executor=resolved_executor,
         uploader=resolved_uploader,
+        payload_downloader=payload_downloader,
         now=lambda: NOW,
     )
     return TestClient(app), resolved_executor, resolved_uploader
+
+
+def _signed_referenced_request(payload: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
+    body = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    envelope = ReferencedGenerateEnvelope(
+        version="v2",
+        key_id="worker-key-1",
+        issued_at=NOW - 5,
+        expires_at=NOW + 60,
+        payload=GeneratePayloadReference(
+            job_id=str(payload["job_id"]),
+            attempt_id=str(payload["attempt_id"]),
+            url=f"{UPLOAD_ORIGIN}/staging/worker-requests/request.json",
+            sha256=hashlib.sha256(body).hexdigest(),
+            byte_size=len(body),
+        ),
+        signature="A" * 86,
+    )
+    signed = envelope.model_copy(
+        update={"signature": calculate_signature(envelope, TEST_PRIVATE_KEY)}
+    )
+    return signed.model_dump(mode="json"), body
 
 
 def test_production_settings_fail_closed() -> None:
@@ -615,6 +664,128 @@ def test_multi_prompt_job_executes_and_uploads_each_image_in_order() -> None:
     assert [upload.grant.output_index for upload in uploader.uploads] == [0, 1, 2]
 
 
+def test_referenced_twenty_five_output_job_executes_and_uploads_in_order() -> None:
+    inline = _unsigned_request(uploads=25)
+    payload = inline["payload"]
+    payload["workflow"] = _progressive_workflow(25)
+    request, body = _signed_referenced_request(payload)
+    downloader = FakePayloadDownloader(body=body)
+    client, executor, uploader = _client(payload_downloader=downloader)
+
+    with client:
+        response = client.post("/jobs/generate", json=request)
+
+    assert response.status_code == 200
+    assert downloader.calls == [
+        (
+            f"{UPLOAD_ORIGIN}/staging/worker-requests/request.json",
+            len(body),
+        )
+    ]
+    assert [item["output_index"] for item in response.json()["outputs"]] == list(range(25))
+    assert len(executor.workflows) == 25
+    assert [upload.grant.output_index for upload in uploader.uploads] == list(range(25))
+
+
+def test_referenced_payload_hash_mismatch_is_rejected_before_generation() -> None:
+    inline = _unsigned_request(uploads=9)
+    payload = inline["payload"]
+    payload["workflow"] = _progressive_workflow(9)
+    request, body = _signed_referenced_request(payload)
+    downloader = FakePayloadDownloader(body=body + b" ")
+    client, executor, uploader = _client(payload_downloader=downloader)
+
+    with client:
+        response = client.post("/jobs/generate", json=request)
+
+    assert response.status_code == 400
+    assert executor.workflows == []
+    assert uploader.uploads == []
+
+
+def test_referenced_payload_is_not_downloaded_until_outer_signature_is_valid() -> None:
+    inline = _unsigned_request(uploads=9)
+    inline["payload"]["workflow"] = _progressive_workflow(9)
+    request, body = _signed_referenced_request(inline["payload"])
+    request["payload"]["byte_size"] += 1
+    downloader = FakePayloadDownloader(body=body)
+    client, executor, uploader = _client(payload_downloader=downloader)
+
+    with client:
+        response = client.post("/jobs/generate", json=request)
+
+    assert response.status_code == 401
+    assert downloader.calls == []
+    assert executor.workflows == []
+    assert uploader.uploads == []
+
+
+def test_referenced_payload_origin_and_inner_identity_fail_closed() -> None:
+    inline = _unsigned_request(uploads=9)
+    inline["payload"]["workflow"] = _progressive_workflow(9)
+    request, body = _signed_referenced_request(inline["payload"])
+
+    request["payload"]["url"] = "https://untrusted.example/staging/request.json"
+    unsigned = ReferencedGenerateEnvelope.model_validate(request, strict=True)
+    request["signature"] = calculate_signature(unsigned, TEST_PRIVATE_KEY)
+    bad_origin_downloader = FakePayloadDownloader(body=body)
+    client, bad_origin_executor, bad_origin_uploader = _client(
+        payload_downloader=bad_origin_downloader
+    )
+    with client:
+        bad_origin = client.post("/jobs/generate", json=request)
+
+    request, body = _signed_referenced_request(inline["payload"])
+    request["payload"]["attempt_id"] = "different-attempt"
+    unsigned = ReferencedGenerateEnvelope.model_validate(request, strict=True)
+    request["signature"] = calculate_signature(unsigned, TEST_PRIVATE_KEY)
+    downloader = FakePayloadDownloader(body=body)
+    client, executor, uploader = _client(payload_downloader=downloader)
+    with client:
+        mismatched_identity = client.post("/jobs/generate", json=request)
+
+    assert bad_origin.status_code == 400
+    assert bad_origin_downloader.calls == []
+    assert bad_origin_executor.workflows == []
+    assert bad_origin_uploader.uploads == []
+    assert mismatched_identity.status_code == 400
+    assert executor.workflows == []
+    assert uploader.uploads == []
+
+
+def test_referenced_payload_transport_failure_is_retryable_and_redacted() -> None:
+    inline = _unsigned_request(uploads=9)
+    inline["payload"]["workflow"] = _progressive_workflow(9)
+    request, body = _signed_referenced_request(inline["payload"])
+    downloader = FakePayloadDownloader(
+        body=body,
+        error=WorkerPayloadDownloadError("private signed URL"),
+    )
+    client, executor, uploader = _client(payload_downloader=downloader)
+
+    with client:
+        response = client.post("/jobs/generate", json=request)
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "request payload unavailable"}
+    assert "private" not in response.text
+    assert executor.workflows == []
+    assert uploader.uploads == []
+
+
+def test_worker_rejects_twenty_six_outputs_before_generation() -> None:
+    request = _unsigned_request(uploads=26)
+    request["payload"]["workflow"] = _progressive_workflow(26)
+    client, executor, uploader = _client()
+
+    with client:
+        response = client.post("/jobs/generate", json=_sign_request(request))
+
+    assert response.status_code == 400
+    assert executor.workflows == []
+    assert uploader.uploads == []
+
+
 def test_ed25519_authenticates_the_payload_and_upload_grants() -> None:
     request = _signed_request()
     request["payload"]["workflow"]["2"]["inputs"]["steps"] = 21
@@ -911,3 +1082,27 @@ async def test_httpx_adapter_posts_multipart_without_following_redirects() -> No
     assert b'name="file"' in body
     assert b"image-bytes" in body
     assert b"private-policy-value" in body
+
+
+@pytest.mark.asyncio
+async def test_httpx_payload_downloader_rejects_redirects_without_a_second_request() -> None:
+    requests: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return httpx2.Response(307, headers={"location": f"{UPLOAD_ORIGIN}/redirected"})
+
+    async with httpx2.AsyncClient(
+        transport=httpx2.MockTransport(handler),
+        follow_redirects=False,
+        trust_env=False,
+    ) as client:
+        adapter = HttpxPayloadDownloader(client=client)
+        with pytest.raises(WorkerPayloadDownloadError, match="download failed"):
+            await adapter.download(
+                url=f"{UPLOAD_ORIGIN}/staging/worker-requests/request.json",
+                expected_bytes=123,
+            )
+
+    assert len(requests) == 1
+    assert requests[0].headers["accept-encoding"] == "identity"

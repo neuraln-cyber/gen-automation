@@ -111,7 +111,7 @@ class WorkerRuntimeSettings(BaseSettings):
         le=100 * 1024 * 1024,
     )
     max_total_output_bytes: int = Field(
-        default=100 * 1024 * 1024,
+        default=256 * 1024 * 1024,
         ge=1024,
         le=512 * 1024 * 1024,
     )

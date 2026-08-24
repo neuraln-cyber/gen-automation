@@ -997,7 +997,7 @@
               <input type="number" name="planned_job_count" value="{{ form_values['planned_job_count'] }}" min="1" max="10000" data-planned-job-count required>
             </label>
             </div>
-            <p class="muted">Larger jobs reduce pauses between batches. Every batch is automatically split into signed-request-safe internal chunks without changing its image count.</p>
+            <p class="muted">Larger jobs reduce provider handoffs. Each job can contain up to 25 sequential images; larger batches are split without changing their total image count.</p>
           </div>
         </details>
       </div>

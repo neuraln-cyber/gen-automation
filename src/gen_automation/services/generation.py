@@ -29,8 +29,10 @@ from gen_automation.domain.enums import (
     ResourceHealth,
 )
 from gen_automation.domain.generation_limits import (
+    MAX_INLINE_OUTPUTS_PER_SIGNED_GENERATION_JOB,
     MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB,
     MAX_SIGNED_PROMPT_BUDGET_BYTES_PER_GENERATION_JOB,
+    referenced_worker_prompt_budget_bytes,
     signed_worker_prompt_budget_bytes,
     utf8_prompt_bytes,
 )
@@ -264,15 +266,23 @@ def _job_parameters(
         )
     )
     prompt_bytes = utf8_prompt_bytes(output_prompt_values)
+    referenced = (
+        specification.worker_request_budget_version >= 2
+        and plan.expected_output_count > MAX_INLINE_OUTPUTS_PER_SIGNED_GENERATION_JOB
+    )
     budgeted_prompt_bytes = (
-        signed_worker_prompt_budget_bytes(output_prompt_values)
-        if specification.worker_request_budget_version >= 2
-        else prompt_bytes
+        referenced_worker_prompt_budget_bytes(output_prompt_values)
+        if referenced
+        else (
+            signed_worker_prompt_budget_bytes(output_prompt_values)
+            if specification.worker_request_budget_version >= 2
+            else prompt_bytes
+        )
     )
     prompt_budget_limit = (
-        MAX_SIGNED_PROMPT_BUDGET_BYTES_PER_GENERATION_JOB
-        if specification.worker_request_budget_version >= 2
-        else MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB
+        MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB
+        if referenced or specification.worker_request_budget_version < 2
+        else MAX_SIGNED_PROMPT_BUDGET_BYTES_PER_GENERATION_JOB
     )
     if budgeted_prompt_bytes > prompt_budget_limit:
         raise GenerationPlanConflictError(
