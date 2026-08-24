@@ -3062,9 +3062,27 @@ def _attempt_watchdog_is_due(
     }:
         return False
 
-    envelope_started_at = (
-        attempt.submit_started_at or attempt.submitted_at or remote_job.create_time
-    )
+    if (
+        attempt.state == GenerationAttemptState.CANCEL_REQUESTED
+        and attempt.error_code == SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
+    ):
+        envelope_started_at = (
+            attempt.started_at
+            or attempt.submit_started_at
+            or attempt.submitted_at
+            or remote_job.create_time
+        )
+    elif remote_job.status == SaladJobStatus.RUNNING:
+        # Queue time is not execution time. On the first RUNNING observation,
+        # apply_salad_job_observation persists the provider update timestamp as
+        # started_at; later reconciliations measure only the actual run window.
+        if attempt.started_at is None:
+            return False
+        envelope_started_at = attempt.started_at
+    else:
+        envelope_started_at = (
+            attempt.submit_started_at or attempt.submitted_at or remote_job.create_time
+        )
     return reconciled_at >= _stored_as_utc(envelope_started_at) + timedelta(seconds=timeout_seconds)
 
 
