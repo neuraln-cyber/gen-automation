@@ -33,6 +33,8 @@ from gen_automation.gpu_worker.artifacts import (
 from gen_automation.gpu_worker.models import (
     DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES,
     GenerateEnvelope,
+    GeneratePayload,
+    ReferencedGenerateEnvelope,
     UploadGrant,
     WorkerEnvironment,
     WorkerSettings,
@@ -51,7 +53,7 @@ from gen_automation.services.worker_inputs import (
     WorkerInputError,
     _controlled_duo_bindings,
 )
-from gen_automation.storage.base import PresignedUpload
+from gen_automation.storage.base import ObjectStoreError, PresignedUpload
 from gen_automation.storage.memory import MemoryObjectStore
 
 NOW = 2_000_000_000
@@ -141,6 +143,22 @@ class _HttpsMemoryObjectStore(MemoryObjectStore):
             fields=grant.fields,
             headers=grant.headers,
         )
+
+    async def presign_download(
+        self,
+        *,
+        key: str,
+        expires_in: int,
+        download_name: str | None = None,
+        version_id: str | None = None,
+    ) -> str:
+        await super().presign_download(
+            key=key,
+            expires_in=expires_in,
+            download_name=download_name,
+            version_id=version_id,
+        )
+        return f"{UPLOAD_ORIGIN}/{key}?expires={expires_in}&version={version_id}"
 
 
 def _png(color: tuple[int, int, int]) -> bytes:
@@ -828,6 +846,8 @@ async def test_one_provider_job_allows_independent_regional_prompts_per_output(
 
 async def _legacy_twenty_five_output_context(
     worker_input_context: WorkerInputContext,
+    *,
+    current_budget: bool = False,
 ) -> tuple[WorkerInputContext, dict[str, object]]:
     context = _profile_context(
         worker_input_context,
@@ -859,6 +879,8 @@ async def _legacy_twenty_five_output_context(
             ],
         }
     )
+    if current_budget:
+        parameters["worker_request_budget_version"] = 2
     parameters_sha256 = canonical_sha256(parameters)
     async with context.database.sessions() as session:
         job = await session.get(GenerationJob, context.job_context.generation_job_id)
@@ -896,6 +918,62 @@ async def test_legacy_compact_twenty_five_output_job_remains_compatible(
     async with context.database.sessions() as session:
         asset_count = int(await session.scalar(select(func.count(Asset.id))) or 0)
     assert asset_count == 25
+
+
+@pytest.mark.asyncio
+async def test_current_twenty_five_output_job_uses_a_compact_referenced_payload(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context, _parameters = await _legacy_twenty_five_output_context(
+        worker_input_context,
+        current_budget=True,
+    )
+
+    result = await _build(context)
+    serialized = json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    envelope = ReferencedGenerateEnvelope.model_validate(result, strict=True)
+
+    assert len(serialized) < 256 * 1024
+    assert envelope.payload.job_id == str(context.job_context.generation_job_id)
+    assert envelope.payload.attempt_id == str(context.job_context.generation_attempt_id)
+    matching = [
+        (key, stored)
+        for key, stored in context.store.objects.items()
+        if key.startswith(f"staging/worker-requests/{context.job_context.generation_attempt_id}/")
+    ]
+    assert len(matching) == 1
+    key, stored = matching[0]
+    assert key.endswith(f"/{envelope.payload.sha256}.json")
+    assert len(stored.body) == envelope.payload.byte_size
+    assert hashlib.sha256(stored.body).hexdigest() == envelope.payload.sha256
+    payload = GeneratePayload.model_validate_json(stored.body, strict=True)
+    assert [grant.output_index for grant in payload.uploads] == list(range(25))
+
+    async with context.database.sessions() as session:
+        asset_count = int(await session.scalar(select(func.count(Asset.id))) or 0)
+    assert asset_count == 25
+
+
+@pytest.mark.asyncio
+async def test_referenced_payload_storage_failure_rolls_back_all_upload_intents(
+    worker_input_context: WorkerInputContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context, _parameters = await _legacy_twenty_five_output_context(
+        worker_input_context,
+        current_budget=True,
+    )
+
+    async def fail_store(**_kwargs: object) -> object:
+        raise ObjectStoreError("unavailable")
+
+    monkeypatch.setattr(context.store, "write_bytes_if_absent", fail_store)
+    with pytest.raises(WorkerInputError, match="payload storage is unavailable"):
+        await _build(context)
+
+    async with context.database.sessions() as session:
+        asset_count = int(await session.scalar(select(func.count(Asset.id))) or 0)
+    assert asset_count == 0
 
 
 @pytest.mark.asyncio

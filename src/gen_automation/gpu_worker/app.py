@@ -1,6 +1,8 @@
 import asyncio
 import base64
 import binascii
+import hashlib
+import hmac
 import io
 import json
 import math
@@ -23,8 +25,10 @@ from gen_automation.domain.deliverability import require_comfy_workflow_delivera
 from gen_automation.gpu_worker.models import (
     ComfyOutput,
     GenerateEnvelope,
+    GeneratePayload,
     GenerateResponse,
     JsonObject,
+    SignedGenerateEnvelope,
     UploadedOutput,
     WorkerSettings,
     validate_approved_workflow,
@@ -33,13 +37,18 @@ from gen_automation.gpu_worker.models import (
 from gen_automation.gpu_worker.runtime import (
     ComfyExecutor,
     HttpxMultipartUploader,
+    HttpxPayloadDownloader,
     MultipartUploader,
+    PayloadDownloader,
+    WorkerPayloadDownloadError,
     WorkerUploadError,
 )
 from gen_automation.gpu_worker.security import AuthorizationError, verify_authorization
 
 MAX_JSON_DEPTH = 64
+MAX_JSON_ITEMS = 50_000
 _OUTPUTS_ADAPTER = TypeAdapter(list[ComfyOutput])
+_ENVELOPE_ADAPTER: TypeAdapter[SignedGenerateEnvelope] = TypeAdapter(SignedGenerateEnvelope)
 _OUTPUT_BRANCH_PATTERN = re.compile(r"^output-(\d{2})-")
 _EXPECTED_FORMATS = {
     "image/png": "PNG",
@@ -105,7 +114,17 @@ def _execute_if_ready(executor: ComfyExecutor, workflow: JsonObject) -> object:
     return executor.execute(workflow)
 
 
-def _validate_json(value: object, *, depth: int = 0) -> object:
+def _validate_json(
+    value: object,
+    *,
+    depth: int = 0,
+    counter: list[int] | None = None,
+) -> object:
+    if counter is None:
+        counter = [0]
+    counter[0] += 1
+    if counter[0] > MAX_JSON_ITEMS:
+        raise WorkerRequestError("invalid request")
     if depth > MAX_JSON_DEPTH:
         raise WorkerRequestError("invalid request")
     if value is None or isinstance(value, (bool, str, int)):
@@ -115,13 +134,13 @@ def _validate_json(value: object, *, depth: int = 0) -> object:
             raise WorkerRequestError("invalid request")
         return value
     if isinstance(value, list):
-        return [_validate_json(item, depth=depth + 1) for item in value]
+        return [_validate_json(item, depth=depth + 1, counter=counter) for item in value]
     if isinstance(value, dict):
         result: dict[str, object] = {}
         for key, item in value.items():
             if not isinstance(key, str):
                 raise WorkerRequestError("invalid request")
-            result[key] = _validate_json(item, depth=depth + 1)
+            result[key] = _validate_json(item, depth=depth + 1, counter=counter)
         return result
     raise WorkerRequestError("invalid request")
 
@@ -157,15 +176,56 @@ async def _read_bounded_body(request: Request, max_body_bytes: int) -> bytes:
     return b"".join(parts)
 
 
-def _parse_envelope(body: bytes) -> GenerateEnvelope:
+def _parse_envelope(body: bytes) -> SignedGenerateEnvelope:
     try:
         raw: Any = json.loads(body, object_pairs_hook=_unique_json_object)
         validated = _validate_json(raw)
         if not isinstance(validated, dict):
             raise WorkerRequestError("invalid request")
-        return GenerateEnvelope.model_validate(validated, strict=True)
+        return _ENVELOPE_ADAPTER.validate_python(validated, strict=True)
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError, ValidationError):
         raise WorkerRequestError("invalid request") from None
+
+
+def _parse_generate_payload(body: bytes) -> GeneratePayload:
+    try:
+        raw: Any = json.loads(body, object_pairs_hook=_unique_json_object)
+        validated = _validate_json(raw)
+        if not isinstance(validated, dict):
+            raise WorkerRequestError("invalid request")
+        return GeneratePayload.model_validate(validated, strict=True)
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError, ValidationError):
+        raise WorkerRequestError("invalid request") from None
+
+
+async def _resolve_generate_payload(
+    envelope: SignedGenerateEnvelope,
+    *,
+    settings: WorkerSettings,
+    downloader: PayloadDownloader,
+) -> GeneratePayload:
+    if isinstance(envelope, GenerateEnvelope):
+        return envelope.payload
+    reference = envelope.payload
+    try:
+        validate_upload_url(reference.url, settings.upload_origin)
+    except ValueError:
+        raise WorkerRequestError("invalid request") from None
+    try:
+        body = await downloader.download(
+            url=reference.url,
+            expected_bytes=reference.byte_size,
+        )
+    except WorkerPayloadDownloadError:
+        raise
+    if len(body) != reference.byte_size or not hmac.compare_digest(
+        hashlib.sha256(body).hexdigest(), reference.sha256
+    ):
+        raise WorkerRequestError("invalid request")
+    payload = _parse_generate_payload(body)
+    if payload.job_id != reference.job_id or payload.attempt_id != reference.attempt_id:
+        raise WorkerRequestError("invalid request")
+    return payload
 
 
 def _decode_and_verify_outputs(
@@ -236,6 +296,7 @@ def create_worker_app(
     settings: WorkerSettings,
     executor: ComfyExecutor,
     uploader: MultipartUploader | None = None,
+    payload_downloader: PayloadDownloader | None = None,
     now: Callable[[], float] = time.time,
 ) -> FastAPI:
     if settings is None or executor is None:
@@ -247,12 +308,23 @@ def create_worker_app(
     readiness_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu-ready")
     replay_cache: OrderedDict[str, tuple[int, str, GenerateResponse]] = OrderedDict()
     resolved_uploader = uploader
+    resolved_payload_downloader = payload_downloader
     if resolved_uploader is None:
         owned_client = httpx2.AsyncClient(
             follow_redirects=False,
             trust_env=False,
         )
         resolved_uploader = HttpxMultipartUploader(
+            client=owned_client,
+            timeout_seconds=settings.upload_timeout_seconds,
+        )
+    if resolved_payload_downloader is None:
+        if owned_client is None:
+            owned_client = httpx2.AsyncClient(
+                follow_redirects=False,
+                trust_env=False,
+            )
+        resolved_payload_downloader = HttpxPayloadDownloader(
             client=owned_client,
             timeout_seconds=settings.upload_timeout_seconds,
         )
@@ -319,19 +391,30 @@ def create_worker_app(
         except AuthorizationError:
             raise HTTPException(status_code=401, detail="invalid authorization") from None
 
-        if len(envelope.payload.uploads) > settings.max_outputs:
+        try:
+            payload = await _resolve_generate_payload(
+                envelope,
+                settings=settings,
+                downloader=resolved_payload_downloader,
+            )
+        except WorkerPayloadDownloadError:
+            raise HTTPException(status_code=502, detail="request payload unavailable") from None
+        except WorkerRequestError:
+            raise HTTPException(status_code=400, detail="invalid request") from None
+
+        if len(payload.uploads) > settings.max_outputs:
             raise HTTPException(status_code=400, detail="invalid request")
         try:
-            for grant in envelope.payload.uploads:
+            for grant in payload.uploads:
                 validate_upload_url(grant.url, settings.upload_origin)
             validate_approved_workflow(
-                envelope.payload.workflow,
+                payload.workflow,
                 settings.approved_workflow_node_classes,
             )
-            require_comfy_workflow_deliverability(envelope.payload.workflow)
+            require_comfy_workflow_deliverability(payload.workflow)
             progressive_workflows = _progressive_workflows(
-                envelope.payload.workflow,
-                expected_count=len(envelope.payload.uploads),
+                payload.workflow,
+                expected_count=len(payload.uploads),
             )
             for _output_index, workflow in progressive_workflows:
                 validate_approved_workflow(
@@ -355,7 +438,7 @@ def create_worker_app(
             for attempt_id in expired:
                 replay_cache.pop(attempt_id, None)
 
-            cached = replay_cache.get(envelope.payload.attempt_id)
+            cached = replay_cache.get(payload.attempt_id)
             if cached is not None:
                 _cache_expires_at, cached_signature, cached_response = cached
                 if cached_signature != envelope.signature:
@@ -363,11 +446,11 @@ def create_worker_app(
                         status_code=409,
                         detail="request conflicts with completed attempt",
                     )
-                replay_cache.move_to_end(envelope.payload.attempt_id)
+                replay_cache.move_to_end(payload.attempt_id)
                 return cached_response
 
             loop = asyncio.get_running_loop()
-            grants_by_index = {grant.output_index: grant for grant in envelope.payload.uploads}
+            grants_by_index = {grant.output_index: grant for grant in payload.uploads}
             uploaded: list[UploadedOutput] = []
             total_output_bytes = 0
             for branch_output_index, workflow in progressive_workflows:
@@ -383,9 +466,7 @@ def create_worker_app(
                 except Exception:
                     raise HTTPException(status_code=502, detail="generation failed") from None
 
-                expected_branch_count = (
-                    len(envelope.payload.uploads) if branch_output_index is None else 1
-                )
+                expected_branch_count = len(payload.uploads) if branch_output_index is None else 1
                 try:
                     outputs = await loop.run_in_executor(
                         execution_pool,
@@ -437,13 +518,13 @@ def create_worker_app(
                     )
 
             response = GenerateResponse(
-                job_id=envelope.payload.job_id,
-                attempt_id=envelope.payload.attempt_id,
+                job_id=payload.job_id,
+                attempt_id=payload.attempt_id,
                 outputs=uploaded,
             )
             while len(replay_cache) >= settings.max_replay_entries:
                 replay_cache.popitem(last=False)
-            replay_cache[envelope.payload.attempt_id] = (
+            replay_cache[payload.attempt_id] = (
                 envelope.expires_at + settings.clock_skew_seconds,
                 envelope.signature,
                 response,

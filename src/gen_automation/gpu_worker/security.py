@@ -4,7 +4,7 @@ import time
 from collections.abc import Callable
 
 from gen_automation.domain.signing import sign_message, verify_message
-from gen_automation.gpu_worker.models import GenerateEnvelope, WorkerSettings
+from gen_automation.gpu_worker.models import SignedGenerateEnvelope, WorkerSettings
 
 
 class AuthorizationError(Exception):
@@ -25,7 +25,7 @@ def _reject_non_finite(value: object) -> None:
             _reject_non_finite(item)
 
 
-def canonical_signing_payload(envelope: GenerateEnvelope) -> bytes:
+def canonical_signing_payload(envelope: SignedGenerateEnvelope) -> bytes:
     unsigned: dict[str, object] = {
         "expires_at": envelope.expires_at,
         "issued_at": envelope.issued_at,
@@ -46,12 +46,12 @@ def canonical_signing_payload(envelope: GenerateEnvelope) -> bytes:
         raise AuthorizationError("invalid authorization") from None
 
 
-def calculate_signature(envelope: GenerateEnvelope, private_key: str) -> str:
+def calculate_signature(envelope: SignedGenerateEnvelope, private_key: str) -> str:
     return sign_message(private_key, canonical_signing_payload(envelope))
 
 
 def verify_authorization(
-    envelope: GenerateEnvelope,
+    envelope: SignedGenerateEnvelope,
     settings: WorkerSettings,
     *,
     now: Callable[[], float] = time.time,

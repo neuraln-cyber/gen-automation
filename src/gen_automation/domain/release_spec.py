@@ -24,10 +24,12 @@ from gen_automation.domain.controlled_duo import (
 )
 from gen_automation.domain.deliverability import MAX_ACCEPTED_IMAGES_PER_RELEASE
 from gen_automation.domain.generation_limits import (
+    MAX_INLINE_OUTPUTS_PER_SIGNED_GENERATION_JOB,
     MAX_OUTPUTS_PER_GENERATION_JOB,
     MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB,
     MAX_SAFE_OUTPUTS_PER_SIGNED_GENERATION_JOB,
     MAX_SIGNED_PROMPT_BUDGET_BYTES_PER_GENERATION_JOB,
+    referenced_worker_prompt_budget_bytes,
     signed_worker_prompt_budget_bytes,
     utf8_prompt_bytes,
 )
@@ -442,27 +444,41 @@ class ReleaseCreate(StrictModel):
             )
         for batch in self.specification.ordered_generation_batches:
             generation = batch.generation
-            prompt_budget = signed_worker_prompt_budget_bytes(
-                (
-                    generation.prompt,
-                    generation.character_a_prompt,
-                    generation.character_b_prompt,
-                    generation.character_a_pose_prompt,
-                    generation.character_b_pose_prompt,
-                    generation.character_c_prompt,
-                    generation.character_c_pose_prompt,
-                    generation.character_a_negative_prompt,
-                    generation.character_b_negative_prompt,
-                    generation.character_c_negative_prompt,
-                    generation.interaction_prompt,
-                    generation.camera_prompt,
-                    generation.negative_prompt,
-                    generation.detailer_prompt,
-                    generation.detailer_negative_prompt,
-                ),
-                outputs_per_job=generation.outputs_per_job,
+            prompt_values = (
+                generation.prompt,
+                generation.character_a_prompt,
+                generation.character_b_prompt,
+                generation.character_a_pose_prompt,
+                generation.character_b_pose_prompt,
+                generation.character_c_prompt,
+                generation.character_c_pose_prompt,
+                generation.character_a_negative_prompt,
+                generation.character_b_negative_prompt,
+                generation.character_c_negative_prompt,
+                generation.interaction_prompt,
+                generation.camera_prompt,
+                generation.negative_prompt,
+                generation.detailer_prompt,
+                generation.detailer_negative_prompt,
             )
-            if prompt_budget > MAX_SIGNED_PROMPT_BUDGET_BYTES_PER_GENERATION_JOB:
+            referenced = generation.outputs_per_job > MAX_INLINE_OUTPUTS_PER_SIGNED_GENERATION_JOB
+            prompt_budget = (
+                referenced_worker_prompt_budget_bytes(
+                    prompt_values,
+                    outputs_per_job=generation.outputs_per_job,
+                )
+                if referenced
+                else signed_worker_prompt_budget_bytes(
+                    prompt_values,
+                    outputs_per_job=generation.outputs_per_job,
+                )
+            )
+            prompt_budget_limit = (
+                MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB
+                if referenced
+                else MAX_SIGNED_PROMPT_BUDGET_BYTES_PER_GENERATION_JOB
+            )
+            if prompt_budget > prompt_budget_limit:
                 raise ValueError("prompt text is too large for one signed provider job")
 
         capabilities = frozenset(self.specification.workflow.capabilities)

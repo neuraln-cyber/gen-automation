@@ -16,6 +16,7 @@ from gen_automation.domain.generation_limits import MAX_OUTPUTS_PER_GENERATION_J
 from gen_automation.domain.signing import SigningMaterialError, validate_public_key
 
 MAX_HARD_BODY_BYTES = 1024 * 1024
+MAX_HARD_REFERENCED_PAYLOAD_BYTES = 1024 * 1024
 MAX_HARD_OUTPUT_BYTES = 100 * 1024 * 1024
 MAX_HARD_TOTAL_OUTPUT_BYTES = 512 * 1024 * 1024
 MAX_HARD_OUTPUTS = 32
@@ -124,7 +125,7 @@ class WorkerSettings(BaseModel):
         le=MAX_HARD_OUTPUT_BYTES,
     )
     max_total_output_bytes: int = Field(
-        default=100 * 1024 * 1024,
+        default=256 * 1024 * 1024,
         ge=1024,
         le=MAX_HARD_TOTAL_OUTPUT_BYTES,
     )
@@ -236,6 +237,37 @@ class GenerateEnvelope(BaseModel):
             pattern=r"^[A-Za-z0-9_-]{86}$",
         ),
     ]
+
+
+class GeneratePayloadReference(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    job_id: BoundedId
+    attempt_id: BoundedId
+    url: Annotated[str, StringConstraints(min_length=9, max_length=8192)] = Field(repr=False)
+    sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    byte_size: int = Field(ge=1, le=MAX_HARD_REFERENCED_PAYLOAD_BYTES)
+
+
+class ReferencedGenerateEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    version: Literal["v2"]
+    key_id: Annotated[str, StringConstraints(min_length=1, max_length=128)]
+    issued_at: int = Field(ge=0)
+    expires_at: int = Field(ge=0)
+    payload: GeneratePayloadReference
+    signature: Annotated[
+        str,
+        StringConstraints(
+            min_length=86,
+            max_length=86,
+            pattern=r"^[A-Za-z0-9_-]{86}$",
+        ),
+    ]
+
+
+type SignedGenerateEnvelope = GenerateEnvelope | ReferencedGenerateEnvelope
 
 
 class ComfyOutput(BaseModel):

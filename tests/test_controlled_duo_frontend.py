@@ -198,7 +198,7 @@ def test_controlled_trio_is_capability_gated_balanced_and_pose_free() -> None:
     assert "Controlled Trio v1 is reviewed for balanced identity-region guidance only." in script
     assert "These are optional identity-region guides, not pose choices." in controls
     assert "data-signed-outputs-per-job-cap" in new_set
-    assert "automatically split into signed-request-safe internal chunks" in new_set
+    assert "Each job can contain up to 25 sequential images" in new_set
     assert "Math.min(requestedPerJob, signedOutputsPerJobCap)" in script
     assert "your batch sizes are unchanged" in script
     assert script.count('interaction: "",') >= 11

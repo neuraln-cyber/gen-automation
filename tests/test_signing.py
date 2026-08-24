@@ -13,6 +13,8 @@ from gen_automation.domain.signing import (
 from gen_automation.gpu_worker.models import (
     GenerateEnvelope,
     GeneratePayload,
+    GeneratePayloadReference,
+    ReferencedGenerateEnvelope,
     UploadGrant,
     WorkerEnvironment,
     WorkerSettings,
@@ -68,6 +70,26 @@ def _signed_envelope(
 ) -> GenerateEnvelope:
     unsigned = _unsigned_envelope(key_id=key_id)
     return unsigned.model_copy(update={"signature": calculate_signature(unsigned, private_key)})
+
+
+def _signed_referenced_envelope() -> ReferencedGenerateEnvelope:
+    unsigned = ReferencedGenerateEnvelope(
+        version="v2",
+        key_id="worker-key-1",
+        issued_at=NOW - 5,
+        expires_at=NOW + 60,
+        payload=GeneratePayloadReference(
+            job_id="job-1",
+            attempt_id="attempt-1",
+            url="https://uploads.example.test/staging/worker-requests/attempt-1/payload.json",
+            sha256="a" * 64,
+            byte_size=1234,
+        ),
+        signature="A" * 86,
+    )
+    return unsigned.model_copy(
+        update={"signature": calculate_signature(unsigned, PRIMARY_PRIVATE_KEY)}
+    )
 
 
 def _worker_settings(**verification_keys: str) -> WorkerSettings:
@@ -187,6 +209,20 @@ def test_worker_public_key_rotation_accepts_both_active_key_ids() -> None:
     serialized = settings.model_dump_json()
     assert PRIMARY_PRIVATE_KEY not in serialized
     assert ROTATED_PRIVATE_KEY not in serialized
+
+
+def test_referenced_envelope_signature_binds_the_exact_private_payload_reference() -> None:
+    envelope = _signed_referenced_envelope()
+
+    verify_authorization(envelope, _worker_settings(), now=lambda: NOW)
+
+    tampered = envelope.model_copy(
+        update={
+            "payload": envelope.payload.model_copy(update={"byte_size": 1235}),
+        }
+    )
+    with pytest.raises(AuthorizationError, match="invalid authorization"):
+        verify_authorization(tampered, _worker_settings(), now=lambda: NOW)
 
 
 @pytest.mark.parametrize(

@@ -59,11 +59,12 @@ the queue total or 250 images, matching the normal workflow of generating roughl
 all generated** explicitly makes it follow the queue. Unknown wildcard tokens are
 rejected in the batch card before submission.
 
-Every queue keeps the exact requested batch image counts. Internally, the
-controller splits it into provider jobs of at most eight outputs so the rendered
-workflow, JSON-escaped prompts, and temporary upload grants remain inside the
-signed 256 KiB worker request. This is transport chunking, not a user-visible
-batch-size limit.
+Every queue keeps the exact requested batch image counts. The controller can
+place up to 25 outputs in one provider job. Jobs of up to eight outputs carry the
+full signed request inline; larger jobs carry a signed, immutable reference to
+the same bounded request in private object storage. The provider-facing queue
+message therefore remains below 256 KiB without changing the requested image
+count.
 
 The configured final-set size is a maximum review goal, not a requirement to keep
 every generated master. An open review can be completed with any non-empty accepted

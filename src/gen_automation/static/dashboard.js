@@ -1363,7 +1363,7 @@
     const maximumProviderJobs = 10_000;
     const signedOutputsPerJobCap = Math.max(
       1,
-      integerValue(form.dataset.signedOutputsPerJobCap, 8),
+      integerValue(form.dataset.signedOutputsPerJobCap, 25),
     );
     let lastPrompt = null;
     let slugWasEdited = !automaticSlug && Boolean(slugInput && slugInput.value.trim());

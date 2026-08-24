@@ -384,14 +384,14 @@ def test_experiment_lab_queues_large_multi_batch_automation_and_reuses_one_warm_
     releases, jobs, versions, leases = client.portal.call(state)
     assert [release.slug for release in releases] == [automatic_first_slug, "warm-lab-second"]
     assert len(leases) == 1
-    assert len(jobs) == 21
+    assert len(jobs) == 16
     first_version = next(version for version in versions if version.release_id == releases[0].id)
     assert len(first_version.specification["generation_batches"]) == 13
     assert first_version.specification["generation_batches"][0]["image_count"] == 61
     first_job_outputs = sorted(
         job.expected_output_count for job in jobs if job.release_version_id == first_version.id
     )
-    assert first_job_outputs == [5] * 13 + [8] * 7
+    assert first_job_outputs == [5] * 12 + [11, 25, 25]
     second_version = next(version for version in versions if version.release_id == releases[1].id)
     assert second_version.specification["generation"]["width"] == 1152
     assert second_version.specification["generation"]["steps"] == 40

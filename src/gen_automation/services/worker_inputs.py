@@ -25,9 +25,10 @@ from gen_automation.domain.deliverability import (
     require_comfy_workflow_deliverability,
 )
 from gen_automation.domain.generation_limits import (
+    MAX_INLINE_OUTPUTS_PER_SIGNED_GENERATION_JOB,
     MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB,
-    MAX_SAFE_OUTPUTS_PER_SIGNED_GENERATION_JOB,
     MAX_SIGNED_PROMPT_BUDGET_BYTES_PER_GENERATION_JOB,
+    referenced_worker_prompt_budget_bytes,
     signed_worker_prompt_budget_bytes,
     utf8_prompt_bytes,
 )
@@ -45,8 +46,11 @@ from gen_automation.gpu_worker.artifacts import (
 )
 from gen_automation.gpu_worker.models import (
     KEY_ID_PATTERN,
+    MAX_HARD_REFERENCED_PAYLOAD_BYTES,
     GenerateEnvelope,
     GeneratePayload,
+    GeneratePayloadReference,
+    ReferencedGenerateEnvelope,
     UploadGrant,
 )
 from gen_automation.gpu_worker.security import calculate_signature
@@ -58,12 +62,20 @@ from gen_automation.services.controlled_trio import (
     prepare_controlled_trio_template,
 )
 from gen_automation.services.salad import SaladJobInputContext
-from gen_automation.storage.base import ObjectStore, ObjectStoreError
+from gen_automation.storage.base import (
+    ObjectAlreadyExistsError,
+    ObjectConflictError,
+    ObjectStore,
+    ObjectStoreError,
+)
 
 MAX_WORKFLOW_BYTES = 192 * 1024
+MAX_RENDERED_WORKFLOW_BYTES = 512 * 1024
 MAX_ENVELOPE_BYTES = 256 * 1024
 MAX_SERIALIZED_UPLOAD_GRANT_BYTES = 12 * 1024
 MAX_SIGNED_ENVELOPE_FIXED_OVERHEAD_BYTES = 16 * 1024
+REFERENCED_PAYLOAD_CONTENT_TYPE = "application/vnd.gen-automation.generate-payload+json"
+REFERENCED_PAYLOAD_PREFIX = "staging/worker-requests"
 MAX_JSON_DEPTH = 64
 MAX_JSON_ITEMS = 50_000
 MIN_POST_ACCEPTANCE_UPLOAD_SECONDS = 3600
@@ -92,6 +104,7 @@ class WorkerInputError(Exception):
 
 @dataclass(frozen=True)
 class _ResolvedJobParameters:
+    worker_request_budget_version: Literal[1, 2]
     checkpoint: ArtifactSpecification
     loras: tuple[LoraSpecification, ...]
     workflow: WorkflowSpecification
@@ -584,19 +597,28 @@ def _resolve_job_parameters(context: SaladJobInputContext) -> _ResolvedJobParame
             )
         )
         prompt_bytes = utf8_prompt_bytes(output_prompt_values)
+        referenced = (
+            worker_request_budget_version >= 2
+            and context.expected_output_count > MAX_INLINE_OUTPUTS_PER_SIGNED_GENERATION_JOB
+        )
         budgeted_prompt_bytes = (
-            signed_worker_prompt_budget_bytes(output_prompt_values)
-            if worker_request_budget_version >= 2
-            else prompt_bytes
+            referenced_worker_prompt_budget_bytes(output_prompt_values)
+            if referenced
+            else (
+                signed_worker_prompt_budget_bytes(output_prompt_values)
+                if worker_request_budget_version >= 2
+                else prompt_bytes
+            )
         )
         prompt_budget_limit = (
-            MAX_SIGNED_PROMPT_BUDGET_BYTES_PER_GENERATION_JOB
-            if worker_request_budget_version >= 2
-            else MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB
+            MAX_PROMPT_TEXT_BYTES_PER_GENERATION_JOB
+            if referenced or worker_request_budget_version < 2
+            else MAX_SIGNED_PROMPT_BUDGET_BYTES_PER_GENERATION_JOB
         )
         if budgeted_prompt_bytes > prompt_budget_limit:
             raise WorkerInputError("generation prompt text exceeds the worker request budget")
     return _ResolvedJobParameters(
+        worker_request_budget_version=worker_request_budget_version,
         checkpoint=checkpoint,
         loras=loras,
         workflow=workflow,
@@ -1666,6 +1688,68 @@ async def _load_workflow(
     return rendered
 
 
+async def _store_referenced_generate_payload(
+    store: ObjectStore,
+    *,
+    attempt_id: str,
+    body: bytes,
+    expires_in: int,
+) -> tuple[str, str]:
+    payload_sha256 = hashlib.sha256(body).hexdigest()
+    key = f"{REFERENCED_PAYLOAD_PREFIX}/{attempt_id}/{payload_sha256}.json"
+    metadata = {
+        "kind": "salad-worker-request-v2",
+        "sha256": payload_sha256,
+    }
+    try:
+        stored = await store.write_bytes_if_absent(
+            key=key,
+            body=body,
+            content_type=REFERENCED_PAYLOAD_CONTENT_TYPE,
+            metadata=metadata,
+            max_bytes=MAX_HARD_REFERENCED_PAYLOAD_BYTES,
+        )
+    except ObjectAlreadyExistsError:
+        try:
+            existing_metadata = await store.head(key)
+            if existing_metadata is None or existing_metadata.version_id is None:
+                raise WorkerInputError("worker request payload storage is unavailable")
+            existing = await store.read_bytes(
+                key,
+                max_bytes=MAX_HARD_REFERENCED_PAYLOAD_BYTES,
+                version_id=existing_metadata.version_id,
+                etag=existing_metadata.etag,
+            )
+        except ObjectStoreError:
+            raise WorkerInputError("worker request payload storage is unavailable") from None
+        if not hmac.compare_digest(existing, body):
+            raise WorkerInputError("worker request payload integrity check failed") from None
+        stored = existing_metadata
+    except ObjectConflictError:
+        raise WorkerInputError("worker request payload storage is unavailable") from None
+    except ObjectStoreError:
+        raise WorkerInputError("worker request payload storage is unavailable") from None
+
+    if (
+        stored.byte_size != len(body)
+        or stored.key != key
+        or stored.content_type != REFERENCED_PAYLOAD_CONTENT_TYPE
+        or stored.version_id is None
+        or stored.metadata.get("kind") != metadata["kind"]
+        or not hmac.compare_digest(stored.metadata.get("sha256", ""), payload_sha256)
+    ):
+        raise WorkerInputError("worker request payload integrity check failed")
+    try:
+        url = await store.presign_download(
+            key=key,
+            expires_in=expires_in,
+            version_id=stored.version_id,
+        )
+    except ObjectStoreError:
+        raise WorkerInputError("worker request payload storage is unavailable") from None
+    return url, payload_sha256
+
+
 @dataclass
 class SaladWorkerJobInputProvider:
     session: AsyncSession
@@ -1679,6 +1763,7 @@ class SaladWorkerJobInputProvider:
     upload_content_type: UploadContentType = "image/png"
     max_upload_bytes: int = 100 * 1024 * 1024
     max_workflow_bytes: int = MAX_WORKFLOW_BYTES
+    max_rendered_workflow_bytes: int = MAX_RENDERED_WORKFLOW_BYTES
     max_envelope_bytes: int = MAX_ENVELOPE_BYTES
     now: Callable[[], float] = time.time
 
@@ -1704,6 +1789,12 @@ class SaladWorkerJobInputProvider:
             raise ValueError("worker upload grant TTL does not cover execution")
         if not 1024 <= self.max_workflow_bytes <= MAX_WORKFLOW_BYTES:
             raise ValueError("workflow byte limit is invalid")
+        if (
+            not self.max_workflow_bytes
+            <= self.max_rendered_workflow_bytes
+            <= (MAX_RENDERED_WORKFLOW_BYTES)
+        ):
+            raise ValueError("rendered workflow byte limit is invalid")
         if not 4096 <= self.max_envelope_bytes <= MAX_ENVELOPE_BYTES:
             raise ValueError("worker envelope byte limit is invalid")
 
@@ -1736,15 +1827,19 @@ class SaladWorkerJobInputProvider:
         rendered_workflow_bytes = len(
             json.dumps(workflow, ensure_ascii=False, allow_nan=False).encode("utf-8")
         )
-        if rendered_workflow_bytes > self.max_workflow_bytes:
+        if rendered_workflow_bytes > self.max_rendered_workflow_bytes:
             raise WorkerInputError("rendered workflow exceeds the configured size limit")
         reserved_envelope_bytes = (
             rendered_workflow_bytes
             + context.expected_output_count * MAX_SERIALIZED_UPLOAD_GRANT_BYTES
             + MAX_SIGNED_ENVELOPE_FIXED_OVERHEAD_BYTES
         )
+        inline_payload = (
+            resolved.worker_request_budget_version == 1
+            or context.expected_output_count <= MAX_INLINE_OUTPUTS_PER_SIGNED_GENERATION_JOB
+        )
         if (
-            context.expected_output_count <= MAX_SAFE_OUTPUTS_PER_SIGNED_GENERATION_JOB
+            context.expected_output_count <= MAX_INLINE_OUTPUTS_PER_SIGNED_GENERATION_JOB
             and reserved_envelope_bytes > self.max_envelope_bytes
         ):
             raise WorkerInputError("rendered workflow cannot fit the signed worker request budget")
@@ -1797,20 +1892,57 @@ class SaladWorkerJobInputProvider:
                 raise WorkerInputError("worker upload grant exceeds the request budget")
             grants.append(grant)
 
-        issued_at = int(self.now())
-        envelope = GenerateEnvelope(
-            version="v1",
-            key_id=self.signing_key_id,
-            issued_at=issued_at,
-            expires_at=issued_at + self.signature_ttl_seconds,
-            payload=GeneratePayload(
-                job_id=str(context.generation_job_id),
-                attempt_id=str(context.generation_attempt_id),
-                workflow=workflow,
-                uploads=grants,
-            ),
-            signature="A" * 86,
+        payload = GeneratePayload(
+            job_id=str(context.generation_job_id),
+            attempt_id=str(context.generation_attempt_id),
+            workflow=workflow,
+            uploads=grants,
         )
+        issued_at = int(self.now())
+        if inline_payload:
+            envelope: GenerateEnvelope | ReferencedGenerateEnvelope = GenerateEnvelope(
+                version="v1",
+                key_id=self.signing_key_id,
+                issued_at=issued_at,
+                expires_at=issued_at + self.signature_ttl_seconds,
+                payload=payload,
+                signature="A" * 86,
+            )
+        else:
+            payload_bytes = json.dumps(
+                payload.model_dump(mode="json"),
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            if len(payload_bytes) > MAX_HARD_REFERENCED_PAYLOAD_BYTES:
+                await self.session.rollback()
+                raise WorkerInputError("worker request payload exceeds the configured size limit")
+            try:
+                payload_url, payload_sha256 = await _store_referenced_generate_payload(
+                    self.store,
+                    attempt_id=str(context.generation_attempt_id),
+                    body=payload_bytes,
+                    expires_in=self.upload_grant_ttl_seconds,
+                )
+            except WorkerInputError:
+                await self.session.rollback()
+                raise
+            envelope = ReferencedGenerateEnvelope(
+                version="v2",
+                key_id=self.signing_key_id,
+                issued_at=issued_at,
+                expires_at=issued_at + self.signature_ttl_seconds,
+                payload=GeneratePayloadReference(
+                    job_id=payload.job_id,
+                    attempt_id=payload.attempt_id,
+                    url=payload_url,
+                    sha256=payload_sha256,
+                    byte_size=len(payload_bytes),
+                ),
+                signature="A" * 86,
+            )
         signature = calculate_signature(
             envelope,
             self.signing_private_key.get_secret_value(),

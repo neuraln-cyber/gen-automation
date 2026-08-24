@@ -322,7 +322,7 @@ def test_new_set_submission_accepts_one_twenty_five_image_provider_job() -> None
         }
     )
 
-    assert command.effective_planned_job_count == 4
+    assert command.effective_planned_job_count == 1
 
 
 async def test_generation_batches_split_exact_counts_and_keep_ordered_prompt_metadata(
@@ -777,11 +777,11 @@ async def test_new_set_service_freezes_two_subjects_and_regional_prompts_in_orde
     assert generation["composition_mode"] == "duo"
     assert generation["character_a_prompt"] == "nico robin (one piece), adult woman"
     assert generation["character_b_prompt"] == "boa hancock (one piece), adult woman"
-    assert generation["outputs_per_job"] == 8
-    assert version.specification["schema_version"] == 2
-    assert version.specification["planned_job_count"] == 4
-    assert version.specification["generation_batches"][0]["image_count"] == 25
-    assert sorted(job.expected_output_count for job in jobs) == [1, 8, 8, 8]
+    assert generation["outputs_per_job"] == 25
+    assert version.specification["schema_version"] == 1
+    assert version.specification["planned_job_count"] == 1
+    assert "generation_batches" not in version.specification
+    assert [job.expected_output_count for job in jobs] == [25]
 
 
 def test_browser_new_set_accepts_the_optional_batch_plan_json_field(
