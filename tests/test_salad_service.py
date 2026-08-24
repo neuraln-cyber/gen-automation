@@ -1754,12 +1754,28 @@ async def test_attempt_watchdog_cancels_then_retries_only_after_provider_confirm
             "submission_key": attempt.submission_key,
             "request_sha256": attempt.request_sha256,
         }
-        running = remote_job(
+        started = remote_job(
             status=SaladJobStatus.RUNNING,
             metadata=metadata,
-            update_time=NOW + timedelta(minutes=104),
+            update_time=NOW + timedelta(minutes=1),
         )
-        cancel_client = FakeSaladClient(get_result=running)
+        cancel_client = FakeSaladClient(get_result=started)
+
+        started_result = await reconcile_generation_attempt(
+            session,
+            cancel_client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=105 * 60,
+            now=NOW + timedelta(minutes=1),
+        )
+        assert started_result.observation.attempt_state == GenerationAttemptState.RUNNING
+        assert not cancel_client.cancel_calls
+
+        cancel_client.get_result = remote_job(
+            status=SaladJobStatus.RUNNING,
+            metadata=metadata,
+            update_time=NOW + timedelta(minutes=106),
+        )
 
         cancel_requested = await reconcile_generation_attempt(
             session,
@@ -1808,7 +1824,7 @@ async def test_attempt_watchdog_cancels_then_retries_only_after_provider_confirm
 
 
 @pytest.mark.asyncio
-async def test_attempt_watchdog_leaves_active_attempt_before_deadline(
+async def test_attempt_watchdog_ignores_queue_wait_and_uses_running_deadline(
     database: Database,
 ) -> None:
     async with database.sessions() as session:
@@ -1835,7 +1851,66 @@ async def test_attempt_watchdog_leaves_active_attempt_before_deadline(
             get_result=remote_job(
                 status=SaladJobStatus.RUNNING,
                 metadata=metadata,
-                update_time=NOW + timedelta(minutes=104),
+                update_time=NOW + timedelta(minutes=100),
+            )
+        )
+
+        started = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=105 * 60,
+            now=NOW + timedelta(minutes=100),
+        )
+        assert started.observation.attempt_state == GenerationAttemptState.RUNNING
+        assert not client.cancel_calls
+
+        client.get_result = remote_job(
+            status=SaladJobStatus.RUNNING,
+            metadata=metadata,
+            update_time=NOW + timedelta(minutes=100),
+        )
+        result = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=105 * 60,
+            now=NOW + timedelta(minutes=204, seconds=59),
+        )
+
+    assert result.observation.attempt_state == GenerationAttemptState.RUNNING
+    assert not client.cancel_calls
+
+
+@pytest.mark.asyncio
+async def test_attempt_watchdog_still_bounds_pending_queue_wait(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+        client = FakeSaladClient(
+            get_result=remote_job(
+                status=SaladJobStatus.PENDING,
+                metadata=metadata,
+                update_time=NOW + timedelta(minutes=106),
             )
         )
 
@@ -1844,11 +1919,11 @@ async def test_attempt_watchdog_leaves_active_attempt_before_deadline(
             client,
             generation_attempt_id=attempt_id,
             attempt_watchdog_seconds=105 * 60,
-            now=NOW + timedelta(minutes=104, seconds=59),
+            now=NOW + timedelta(minutes=106),
         )
 
-    assert result.observation.attempt_state == GenerationAttemptState.RUNNING
-    assert not client.cancel_calls
+    assert result.observation.attempt_state == GenerationAttemptState.CANCEL_REQUESTED
+    assert client.cancel_calls == [("generation-v1", str(REMOTE_JOB_ID))]
 
 
 @pytest.mark.asyncio
