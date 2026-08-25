@@ -13,7 +13,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import partial
-from typing import Any
+from typing import Any, cast
 
 import httpx2
 from fastapi import FastAPI, HTTPException, Request
@@ -62,6 +62,10 @@ class WorkerRequestError(Exception):
 
 
 class WorkerOutputError(Exception):
+    pass
+
+
+class FatalWorkerOutputError(WorkerOutputError):
     pass
 
 
@@ -276,7 +280,14 @@ def _decode_and_verify_outputs(
                     or getattr(image, "n_frames", 1) != 1
                 ):
                     raise WorkerOutputError("generation output invalid")
-                image.verify()
+                image.load()
+                with image.convert("RGB") as rgb_image:
+                    rgb_extrema = cast(
+                        tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
+                        rgb_image.getextrema(),
+                    )
+                if all(channel_maximum <= 4 for _channel_minimum, channel_maximum in rgb_extrema):
+                    raise FatalWorkerOutputError("generation output invalid")
         except WorkerOutputError:
             raise
         except (
@@ -297,6 +308,7 @@ def create_worker_app(
     executor: ComfyExecutor,
     uploader: MultipartUploader | None = None,
     payload_downloader: PayloadDownloader | None = None,
+    worker_restart_event: asyncio.Event | None = None,
     now: Callable[[], float] = time.time,
 ) -> FastAPI:
     if settings is None or executor is None:
@@ -482,6 +494,13 @@ def create_worker_app(
                             max_image_pixels=settings.max_image_pixels,
                         ),
                     )
+                except FatalWorkerOutputError:
+                    if worker_restart_event is not None:
+                        worker_restart_event.set()
+                    raise HTTPException(
+                        status_code=502,
+                        detail="generation output invalid",
+                    ) from None
                 except WorkerOutputError:
                     raise HTTPException(
                         status_code=502,
