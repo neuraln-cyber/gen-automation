@@ -52,6 +52,21 @@ def _image_bytes(media_type: str = "image/png") -> bytes:
     return output.getvalue()
 
 
+def _solid_image_bytes(color: tuple[int, int, int]) -> bytes:
+    image = Image.new("RGB", (2, 2), color=color)
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
+def _output_for_content(content: bytes, index: int = 0) -> dict[str, object]:
+    return {
+        "output_index": index,
+        "media_type": "image/png",
+        "data_base64": base64.b64encode(content).decode(),
+    }
+
+
 def _output(index: int = 0, media_type: str = "image/png") -> dict[str, object]:
     return {
         "output_index": index,
@@ -1030,6 +1045,86 @@ def test_decoded_output_size_is_bounded() -> None:
 
     assert response.status_code == 502
     assert uploader.uploads == []
+
+
+def test_near_black_output_requests_restart_before_upload() -> None:
+    restart_event = asyncio.Event()
+    executor = FakeExecutor(outputs=[_output_for_content(_solid_image_bytes((4, 4, 4)))])
+    uploader = FakeUploader()
+    app = create_worker_app(
+        settings=_settings(),
+        executor=executor,
+        uploader=uploader,
+        worker_restart_event=restart_event,
+        now=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/jobs/generate", json=_signed_request())
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "generation output invalid"}
+    assert restart_event.is_set()
+    assert uploader.uploads == []
+
+
+def test_dark_nonblank_output_is_accepted_without_restart() -> None:
+    restart_event = asyncio.Event()
+    executor = FakeExecutor(outputs=[_output_for_content(_solid_image_bytes((5, 0, 0)))])
+    uploader = FakeUploader()
+    app = create_worker_app(
+        settings=_settings(),
+        executor=executor,
+        uploader=uploader,
+        worker_restart_event=restart_event,
+        now=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/jobs/generate", json=_signed_request())
+
+    assert response.status_code == 200
+    assert not restart_event.is_set()
+    assert len(uploader.uploads) == 1
+
+
+def test_progressive_job_stops_after_near_black_output_and_requests_restart() -> None:
+    @dataclass
+    class SequentialExecutor(FakeExecutor):
+        generated_outputs: list[dict[str, object]] = field(default_factory=list)
+
+        def execute(self, workflow: dict[str, object]) -> object:
+            output_index = len(self.workflows)
+            self.workflows.append(workflow)
+            return [self.generated_outputs[output_index]]
+
+    restart_event = asyncio.Event()
+    executor = SequentialExecutor(
+        generated_outputs=[
+            _output_for_content(_image_bytes()),
+            _output_for_content(_solid_image_bytes((0, 0, 0))),
+            _output_for_content(_image_bytes()),
+        ]
+    )
+    uploader = FakeUploader()
+    request = _unsigned_request(uploads=3)
+    request["payload"]["workflow"] = _progressive_workflow(3)
+    app = create_worker_app(
+        settings=_settings(),
+        executor=executor,
+        uploader=uploader,
+        worker_restart_event=restart_event,
+        now=lambda: NOW,
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/jobs/generate", json=_sign_request(request))
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "generation output invalid"}
+    assert restart_event.is_set()
+    assert len(executor.workflows) == 2
+    assert [upload.grant.output_index for upload in uploader.uploads] == [0]
 
 
 def test_executor_and_upload_failures_are_redacted() -> None:

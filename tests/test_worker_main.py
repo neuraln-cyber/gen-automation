@@ -119,6 +119,7 @@ async def test_worker_lifecycle_handoff_closes_every_owned_resource(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
+    restart_events: list[asyncio.Event] = []
 
     class FakeServer:
         def __init__(self) -> None:
@@ -141,8 +142,8 @@ async def test_worker_lifecycle_handoff_closes_every_owned_resource(
             await self.exit_event.wait()
 
     class FakeProcess:
-        def poll(self) -> int:
-            return 0
+        def poll(self) -> None:
+            return None
 
     class FakeExecutor:
         def close(self) -> None:
@@ -182,7 +183,14 @@ async def test_worker_lifecycle_handoff_closes_every_owned_resource(
     monkeypatch.setattr(worker_main, "ComfyExecutor", lambda **_kwargs: FakeExecutor())
     monkeypatch.setattr(worker_main, "start_comfy", lambda _settings: process)
     monkeypatch.setattr(worker_main, "start_salad_queue_worker", lambda _settings: None)
-    monkeypatch.setattr(worker_main, "create_worker_app", lambda **_kwargs: FakeApplication())
+
+    def create_application(**kwargs: object) -> FakeApplication:
+        restart_event = cast(asyncio.Event, kwargs["worker_restart_event"])
+        restart_events.append(restart_event)
+        restart_event.set()
+        return FakeApplication()
+
+    monkeypatch.setattr(worker_main, "create_worker_app", create_application)
     monkeypatch.setattr(
         worker_main,
         "stop_comfy",
@@ -190,13 +198,15 @@ async def test_worker_lifecycle_handoff_closes_every_owned_resource(
     )
 
     stage = ["runtime_settings"]
-    child_exited = await _serve_worker_lifecycle(
+    restart_required = await _serve_worker_lifecycle(
         _settings(),
         startup_stage=stage,
         startup_started_at=worker_main.time.monotonic(),
     )
 
-    assert child_exited is True
+    assert restart_required is True
+    assert len(restart_events) == 1
+    assert restart_events[0].is_set()
     assert events == [
         "models_bootstrapped",
         "lifespan_entered",
@@ -331,6 +341,27 @@ def test_main_reports_model_bootstrap_exception(
     assert "exception=ArtifactBootstrapError" in stderr
     assert "message=artifact bootstrap failed" in stderr
     assert WORKER_SIGNING_PRIVATE_KEY not in stderr
+
+
+def test_main_exits_nonzero_when_worker_restart_is_requested(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def request_restart(
+        _settings: WorkerRuntimeSettings,
+        **_kwargs: object,
+    ) -> bool:
+        return True
+
+    monkeypatch.setattr(worker_main, "WorkerRuntimeSettings", _settings)
+    monkeypatch.setattr(worker_main, "harden_parent_process", lambda _environment: None)
+    monkeypatch.setattr(worker_main, "_serve_worker_lifecycle", request_restart)
+
+    with pytest.raises(SystemExit) as raised:
+        worker_main.main()
+
+    assert raised.value.code == 78
+    assert "stage=managed_child_monitor" in capsys.readouterr().err
 
 
 def test_worker_runtime_settings_contain_only_verification_keys() -> None:
@@ -640,3 +671,23 @@ async def test_monitor_does_not_mark_normal_server_shutdown() -> None:
     )
 
     assert not child_exit_event.is_set()
+
+
+class _RunningProcess:
+    def poll(self) -> None:
+        return None
+
+
+async def test_monitor_gracefully_stops_server_after_worker_restart_request() -> None:
+    server = _MonitorServer()
+    worker_restart_event = asyncio.Event()
+    worker_restart_event.set()
+
+    await _monitor_comfy(
+        (cast("subprocess.Popen[bytes]", cast(Any, _RunningProcess())),),
+        cast(Any, server),
+        worker_restart_event,
+    )
+
+    assert server.should_exit
+    assert worker_restart_event.is_set()

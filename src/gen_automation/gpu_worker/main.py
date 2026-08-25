@@ -413,14 +413,24 @@ def _signal_process_group(process_id: int, signal_number: int) -> None:
 async def _monitor_comfy(
     processes: tuple[subprocess.Popen[bytes], ...],
     server: uvicorn.Server,
-    child_exit_event: asyncio.Event,
+    worker_restart_event: asyncio.Event,
 ) -> None:
     while not server.should_exit:
-        if any(process.poll() is not None for process in processes):
-            child_exit_event.set()
+        if worker_restart_event.is_set() or any(
+            process.poll() is not None for process in processes
+        ):
+            worker_restart_event.set()
             server.should_exit = True
             return
-        await asyncio.sleep(COMFY_MONITOR_INTERVAL_SECONDS)
+        try:
+            await asyncio.wait_for(
+                worker_restart_event.wait(),
+                timeout=COMFY_MONITOR_INTERVAL_SECONDS,
+            )
+        except TimeoutError:
+            continue
+        server.should_exit = True
+        return
 
 
 async def serve_worker(
@@ -432,9 +442,11 @@ async def serve_worker(
     port: int,
     log_level: str,
 ) -> bool:
+    worker_restart_event = asyncio.Event()
     application = create_worker_app(
         settings=settings,
         executor=executor,
+        worker_restart_event=worker_restart_event,
     )
     configuration = uvicorn.Config(
         application,
@@ -450,15 +462,14 @@ async def serve_worker(
         timeout_keep_alive=5,
     )
     server = uvicorn.Server(configuration)
-    child_exit_event = asyncio.Event()
-    monitor = asyncio.create_task(_monitor_comfy(processes, server, child_exit_event))
+    monitor = asyncio.create_task(_monitor_comfy(processes, server, worker_restart_event))
     try:
         await server.serve()
     finally:
         monitor.cancel()
         with suppress(asyncio.CancelledError):
             await monitor
-    return child_exit_event.is_set()
+    return worker_restart_event.is_set()
 
 
 async def _bootstrap_probe_application(
@@ -573,6 +584,7 @@ async def _serve_worker_lifecycle(
     monitor: asyncio.Task[None] | None = None
     worker_lifespan: Any | None = None
     worker_lifespan_started = False
+    worker_restart_event = asyncio.Event()
     try:
         startup_stage[0] = "bootstrap_probe_server"
         await _wait_for_server_start(server, server_task)
@@ -627,7 +639,11 @@ async def _serve_worker_lifecycle(
         queue_process = start_salad_queue_worker(settings)
         startup_stage[0] = "worker_settings"
         worker_settings = settings.to_worker_settings()
-        application = create_worker_app(settings=worker_settings, executor=executor)
+        application = create_worker_app(
+            settings=worker_settings,
+            executor=executor,
+            worker_restart_event=worker_restart_event,
+        )
         worker_lifespan = application.router.lifespan_context(application)
         await worker_lifespan.__aenter__()
         worker_lifespan_started = True
@@ -641,10 +657,11 @@ async def _serve_worker_lifecycle(
         gc.collect()
 
         monitored_processes = (process, queue_process) if queue_process is not None else (process,)
-        child_exit_event = asyncio.Event()
-        monitor = asyncio.create_task(_monitor_comfy(monitored_processes, server, child_exit_event))
+        monitor = asyncio.create_task(
+            _monitor_comfy(monitored_processes, server, worker_restart_event)
+        )
         await server_task
-        return child_exit_event.is_set()
+        return worker_restart_event.is_set()
     finally:
         server.should_exit = True
         if monitor is not None:
@@ -720,7 +737,7 @@ def main() -> None:
         settings = WorkerRuntimeSettings()
         startup_stage[0] = "process_hardening"
         harden_parent_process(settings.environment)
-        child_exited = asyncio.run(
+        restart_required = asyncio.run(
             _serve_worker_lifecycle(
                 settings,
                 startup_stage=startup_stage,
@@ -736,7 +753,7 @@ def main() -> None:
     ) as error:
         _startup_failure(startup_stage[0], error)
 
-    if child_exited:
+    if restart_required:
         _startup_failure("managed_child_monitor")
 
 
