@@ -1456,6 +1456,9 @@ class ControllerWorkloads:
                     ),
                     list_page_size=SALAD_QUEUE_JOB_PAGE_SIZE,
                     attempt_watchdog_seconds=self.settings.salad_attempt_watchdog_seconds,
+                    output_progress_watchdog_seconds=(
+                        self.settings.salad_output_progress_watchdog_seconds
+                    ),
                 )
                 return True
 

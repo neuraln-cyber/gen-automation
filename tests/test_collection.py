@@ -246,6 +246,60 @@ async def test_running_job_publishes_each_staged_master_independently(
     ]
 
 
+@pytest.mark.asyncio
+async def test_running_retry_progressively_cleans_exact_available_master_intent(
+    collection_context: CollectionContext,
+) -> None:
+    _stage(collection_context.store, collection_context.intents[0], _png("red"))
+    async with collection_context.database.sessions() as session:
+        job = await session.get(GenerationJob, collection_context.job_id)
+        assert job is not None
+        job.state = GenerationState.RUNNING
+        await session.commit()
+        published = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="progressive-collector",
+            max_image_bytes=1_000_000,
+        )
+        original = await session.get(Asset, collection_context.intents[0].asset_id)
+        assert original is not None
+        original_master_key = original.object_key
+        original_available_at = original.available_at
+
+        replacement_intents = await create_raw_master_upload_intents(
+            session,
+            collection_context.store,
+            generation_job_id=collection_context.job_id,
+            max_bytes=1_000_000,
+            rotate_incomplete_uploads=True,
+        )
+
+    assert published.finalized is True
+    replacement = replacement_intents[0]
+    assert replacement.state == AssetState.AVAILABLE
+    _stage(collection_context.store, replacement, _png("red"))
+
+    async with collection_context.database.sessions() as session:
+        cleaned = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="progressive-collector",
+            max_image_bytes=1_000_000,
+        )
+        retained = await session.get(Asset, replacement.asset_id)
+
+    assert cleaned.asset_id == replacement.asset_id
+    assert cleaned.finalized is False
+    assert retained is not None
+    assert retained.state == AssetState.AVAILABLE
+    assert retained.object_key == original_master_key
+    assert retained.available_at == original_available_at
+    assert retained.asset_metadata["staging_cleanup"] == "completed"
+    assert isinstance(retained.asset_metadata["staging_cleaned_at"], str)
+    assert replacement.staging_key not in collection_context.store.objects
+
+
 @pytest.mark.parametrize(
     "job_state",
     (GenerationState.SUBMITTING, GenerationState.UNKNOWN),

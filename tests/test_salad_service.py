@@ -281,12 +281,13 @@ def remote_job(
     update_time: datetime,
     job_id: UUID = REMOTE_JOB_ID,
     output: JSONValue | None = None,
+    events: tuple[SaladJobEvent, ...] | None = None,
 ) -> SaladQueueJob:
     return SaladQueueJob(
         id=job_id,
         input={"private": "provider input is not persisted"},
         status=status,
-        events=(SaladJobEvent(action="updated", time=update_time),),
+        events=events or (SaladJobEvent(action="updated", time=update_time),),
         create_time=NOW,
         update_time=update_time,
         metadata=metadata,
@@ -308,6 +309,69 @@ async def prepared_attempt(
     )
     await session.commit()
     return prepared.generation_attempt_id
+
+
+def enable_runtime_admission(attempt: GenerationAttempt) -> None:
+    request_metadata = dict(attempt.request_metadata)
+    request_metadata["runtime_admission"] = {
+        "version": "v1",
+        "provider_group_version": 7,
+        "artifact_manifest_sha256": "7" * 64,
+    }
+    attempt.request_metadata = request_metadata
+    attempt.lock_version += 1
+
+
+async def add_progress_watchdog_assets(
+    session: AsyncSession,
+    context: SeededContext,
+) -> tuple[UUID, UUID]:
+    job = await session.get(GenerationJob, context.job_id)
+    assert job is not None
+    version = await session.get(ReleaseVersion, job.release_version_id)
+    assert version is not None
+    retained = Asset(
+        release_id=version.release_id,
+        generation_job_id=job.id,
+        output_index=0,
+        kind=AssetKind.RAW_MASTER,
+        state=AssetState.AVAILABLE,
+        storage_backend="memory",
+        storage_bucket="test-assets",
+        staging_object_key=f"staging/{job.id}/0/current",
+        object_key=f"masters/{job.id}/0.png",
+        object_version_id="retained-version",
+        sha256="8" * 64,
+        content_type="image/png",
+        image_format="PNG",
+        width=1024,
+        height=1024,
+        byte_size=4096,
+        asset_metadata={
+            "declared_content_type": "image/png",
+            "upload_attempt_id": str(uuid4()),
+            "staging_cleanup": "not_started",
+        },
+        available_at=NOW - timedelta(minutes=1),
+    )
+    staged = Asset(
+        release_id=version.release_id,
+        generation_job_id=job.id,
+        output_index=1,
+        kind=AssetKind.RAW_MASTER,
+        state=AssetState.UPLOADING,
+        storage_backend="memory",
+        storage_bucket="test-assets",
+        staging_object_key=f"staging/{job.id}/1/current",
+        asset_metadata={
+            "declared_content_type": "image/png",
+            "upload_attempt_id": str(uuid4()),
+            "staging_cleanup": "not_started",
+        },
+    )
+    session.add_all((retained, staged))
+    await session.flush()
+    return retained.id, staged.id
 
 
 async def superseded_running_attempt(
@@ -2021,6 +2085,8 @@ async def test_attempt_watchdog_cancels_then_retries_only_after_provider_confirm
         assert cancel_client.cancel_calls == [("generation-v1", str(REMOTE_JOB_ID))]
         assert pending_attempt is not None
         assert pending_attempt.error_code == (SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE)
+        assert pending_attempt.response_metadata is not None
+        assert pending_attempt.response_metadata["watchdog_reason"] == ("runtime_envelope_expired")
         assert pending_attempt.reservation_released_at is None
         assert pending_job is not None
         assert pending_job.state == GenerationState.RUNNING
@@ -2127,6 +2193,8 @@ async def test_attempt_watchdog_still_bounds_pending_queue_wait(
         )
         attempt = await session.get(GenerationAttempt, attempt_id)
         assert attempt is not None
+        enable_runtime_admission(attempt)
+        await session.commit()
         metadata: JSONObject = {
             "generation_attempt_id": str(attempt.id),
             "generation_job_id": str(attempt.job_id),
@@ -2137,20 +2205,847 @@ async def test_attempt_watchdog_still_bounds_pending_queue_wait(
             get_result=remote_job(
                 status=SaladJobStatus.PENDING,
                 metadata=metadata,
-                update_time=NOW + timedelta(minutes=106),
+                update_time=NOW + timedelta(minutes=1),
             )
         )
+
+        still_pending = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=105 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=15),
+        )
+        assert still_pending.observation.attempt_state == GenerationAttemptState.SUBMITTED
+        assert client.cancel_calls == []
 
         result = await reconcile_generation_attempt(
             session,
             client,
             generation_attempt_id=attempt_id,
             attempt_watchdog_seconds=105 * 60,
+            output_progress_watchdog_seconds=10 * 60,
             now=NOW + timedelta(minutes=106),
         )
 
     assert result.observation.attempt_state == GenerationAttemptState.CANCEL_REQUESTED
     assert client.cancel_calls == [("generation-v1", str(REMOTE_JOB_ID))]
+
+
+@pytest.mark.asyncio
+async def test_output_progress_watchdog_uses_latest_provider_run_epoch_after_requeue(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        enable_runtime_admission(attempt)
+        await session.commit()
+        provider_metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+        first_started_at = NOW + timedelta(minutes=1)
+        first_events = (
+            SaladJobEvent(action="created", time=NOW),
+            SaladJobEvent(action="started", time=first_started_at),
+        )
+        client = FakeSaladClient(
+            get_result=remote_job(
+                status=SaladJobStatus.RUNNING,
+                metadata=provider_metadata,
+                update_time=first_started_at,
+                events=first_events,
+            )
+        )
+        await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=105 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=first_started_at,
+        )
+
+        failed_at = NOW + timedelta(minutes=2)
+        failed_events = (*first_events, SaladJobEvent(action="failed", time=failed_at))
+        client.get_result = remote_job(
+            status=SaladJobStatus.PENDING,
+            metadata=provider_metadata,
+            update_time=failed_at,
+            events=failed_events,
+        )
+        requeued = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=105 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=20),
+        )
+        assert requeued.observation.attempt_state == GenerationAttemptState.RUNNING
+        assert client.cancel_calls == []
+
+        restarted_at = NOW + timedelta(minutes=21)
+        restarted_events = (*failed_events, SaladJobEvent(action="started", time=restarted_at))
+        client.get_result = remote_job(
+            status=SaladJobStatus.RUNNING,
+            metadata=provider_metadata,
+            update_time=restarted_at,
+            events=restarted_events,
+        )
+        restarted = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=105 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=restarted_at,
+        )
+        restarted_attempt = await session.get(GenerationAttempt, attempt_id)
+        assert restarted.observation.attempt_state == GenerationAttemptState.RUNNING
+        assert restarted_attempt is not None
+        assert restarted_attempt.started_at is not None
+        assert restarted_attempt.started_at.replace(tzinfo=UTC) == first_started_at
+        assert (
+            restarted_attempt.response_metadata["provider_run_epoch_started_at"]
+            == restarted_at.isoformat()
+        )
+        assert client.cancel_calls == []
+
+        # An event outside the provider create/update interval cannot keep resetting
+        # the short timer. The original started_at still bounds the hard envelope.
+        client.get_result = remote_job(
+            status=SaladJobStatus.RUNNING,
+            metadata=provider_metadata,
+            update_time=restarted_at,
+            events=(
+                *restarted_events,
+                SaladJobEvent(action="started", time=NOW + timedelta(minutes=40)),
+            ),
+        )
+        still_running = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=105 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=30, seconds=59),
+        )
+        assert still_running.observation.attempt_state == GenerationAttemptState.RUNNING
+        assert client.cancel_calls == []
+
+        stalled = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=105 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=31),
+        )
+        cancelled_attempt = await session.get(GenerationAttempt, attempt_id)
+
+    assert stalled.observation.attempt_state == GenerationAttemptState.CANCEL_REQUESTED
+    assert client.cancel_calls == [("generation-v1", str(REMOTE_JOB_ID))]
+    assert cancelled_attempt is not None
+    assert cancelled_attempt.response_metadata["watchdog_reason"] == (
+        "accepted_output_progress_stalled"
+    )
+    assert cancelled_attempt.response_metadata["watchdog_anchor_at"] == restarted_at.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_hard_watchdog_bounds_requeued_pending_job_with_older_provider_update(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        enable_runtime_admission(attempt)
+        await session.commit()
+        provider_metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+        first_started_at = NOW + timedelta(minutes=1)
+        first_events = (
+            SaladJobEvent(action="created", time=NOW),
+            SaladJobEvent(action="started", time=first_started_at),
+        )
+        client = FakeSaladClient(
+            get_result=remote_job(
+                status=SaladJobStatus.RUNNING,
+                metadata=provider_metadata,
+                update_time=first_started_at,
+                events=first_events,
+            )
+        )
+        await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=105 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=first_started_at,
+        )
+
+        # Salad's requeued PENDING snapshot can regress both state and its
+        # provider update clock. Exact ID+metadata and the locked hard deadline,
+        # not that older clock, fence the eventual DELETE.
+        failed_at = NOW + timedelta(seconds=30)
+        client.get_result = remote_job(
+            status=SaladJobStatus.PENDING,
+            metadata=provider_metadata,
+            update_time=failed_at,
+            events=(*first_events, SaladJobEvent(action="failed", time=failed_at)),
+        )
+        still_requeued = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=105 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=15),
+        )
+        assert still_requeued.observation.attempt_state == GenerationAttemptState.RUNNING
+        assert client.cancel_calls == []
+
+        bounded = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=105 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=106),
+        )
+        cancelled_attempt = await session.get(GenerationAttempt, attempt_id)
+
+    assert bounded.observation.attempt_state == GenerationAttemptState.CANCEL_REQUESTED
+    assert client.cancel_calls == [("generation-v1", str(REMOTE_JOB_ID))]
+    assert cancelled_attempt is not None
+    assert cancelled_attempt.response_metadata["watchdog_reason"] == "runtime_envelope_expired"
+
+
+@pytest.mark.asyncio
+async def test_output_watchdog_bounds_future_provider_stored_and_progress_timestamps(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        enable_runtime_admission(attempt)
+        retained_asset_id, _ = await add_progress_watchdog_assets(session, context)
+        await session.commit()
+        provider_metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+        far_future = datetime.max.replace(tzinfo=UTC)
+        observed_start = NOW + timedelta(minutes=1)
+        client = FakeSaladClient(
+            get_result=remote_job(
+                status=SaladJobStatus.RUNNING,
+                metadata=provider_metadata,
+                update_time=far_future,
+                events=(
+                    SaladJobEvent(action="created", time=NOW),
+                    SaladJobEvent(action="started", time=far_future),
+                ),
+            )
+        )
+        await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=30 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=observed_start,
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        retained = await session.get(Asset, retained_asset_id)
+        assert attempt is not None
+        assert retained is not None
+        assert attempt.last_observed_at is not None
+        assert attempt.last_observed_at.replace(tzinfo=UTC) == observed_start
+        assert attempt.started_at is not None
+        assert attempt.started_at.replace(tzinfo=UTC) == observed_start
+        assert attempt.response_metadata["provider_update_time"] == observed_start.isoformat()
+
+        poisoned_metadata = dict(attempt.response_metadata)
+        poisoned_metadata["provider_run_epoch_started_at"] = far_future.isoformat()
+        attempt.response_metadata = poisoned_metadata
+        attempt.started_at = far_future
+        attempt.last_observed_at = far_future
+        retained.available_at = far_future
+        retained_metadata = dict(retained.asset_metadata)
+        retained_metadata.update(
+            {
+                "staging_cleanup": "completed",
+                "staging_cleaned_at": far_future.isoformat(),
+            }
+        )
+        retained.asset_metadata = retained_metadata
+        await session.commit()
+
+        bounded = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=30 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=14),
+        )
+        cancelled_attempt = await session.get(GenerationAttempt, attempt_id)
+
+    assert bounded.observation.attempt_state == GenerationAttemptState.CANCEL_REQUESTED
+    assert client.cancel_calls == [("generation-v1", str(REMOTE_JOB_ID))]
+    assert cancelled_attempt is not None
+    assert cancelled_attempt.response_metadata["watchdog_reason"] == (
+        "accepted_output_progress_stalled"
+    )
+    assert cancelled_attempt.response_metadata["watchdog_anchor_at"] != far_future.isoformat()
+    assert (
+        cancelled_attempt.response_metadata["provider_update_time"]
+        == (NOW + timedelta(minutes=14)).isoformat()
+    )
+
+
+@pytest.mark.asyncio
+async def test_hard_watchdog_deadline_overflow_fails_closed(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        provider_metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+        latest_time = datetime.max.replace(tzinfo=UTC)
+        client = FakeSaladClient(
+            get_result=remote_job(
+                status=SaladJobStatus.RUNNING,
+                metadata=provider_metadata,
+                update_time=latest_time,
+            )
+        )
+        await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=105 * 60,
+            now=latest_time,
+        )
+        bounded = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=105 * 60,
+            now=latest_time,
+        )
+        cancelled_attempt = await session.get(GenerationAttempt, attempt_id)
+
+    assert bounded.observation.attempt_state == GenerationAttemptState.CANCEL_REQUESTED
+    assert client.cancel_calls == [("generation-v1", str(REMOTE_JOB_ID))]
+    assert cancelled_attempt is not None
+    assert cancelled_attempt.response_metadata["watchdog_anchor_at"] == latest_time.isoformat()
+    assert cancelled_attempt.response_metadata["watchdog_deadline_at"] == latest_time.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_output_progress_watchdog_recovers_orphaned_running_provider_job_without_asset_loss(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        enable_runtime_admission(attempt)
+        retained_asset_id, staged_asset_id = await add_progress_watchdog_assets(
+            session,
+            context,
+        )
+        await session.commit()
+        provider_metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+        frozen_running = remote_job(
+            status=SaladJobStatus.RUNNING,
+            metadata=provider_metadata,
+            update_time=NOW + timedelta(minutes=1),
+        )
+        client = FakeSaladClient(
+            get_result=frozen_running,
+            cancel_error=SaladTransportError("connection reset after DELETE"),
+        )
+
+        started = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=30 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=1),
+        )
+        assert started.observation.attempt_state == GenerationAttemptState.RUNNING
+        assert client.cancel_calls == []
+
+        # One pre-existing accepted prefix output receives a bounded two-minute
+        # grace. With no cleanup or newly accepted output, this is now stalled.
+        cancel_requested = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=30 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=14),
+        )
+        pending_attempt = await session.get(GenerationAttempt, attempt_id)
+        assert pending_attempt is not None
+        assert cancel_requested.observation.attempt_state == (
+            GenerationAttemptState.CANCEL_REQUESTED
+        )
+        assert cancel_requested.error_code == "salad_attempt_watchdog_cancel_unavailable"
+        assert pending_attempt.provider_external_id == str(REMOTE_JOB_ID)
+        assert pending_attempt.last_observed_at is not None
+        assert pending_attempt.last_observed_at.replace(tzinfo=UTC) == NOW + timedelta(minutes=1)
+        assert pending_attempt.response_metadata is not None
+        assert pending_attempt.response_metadata["watchdog_reason"] == (
+            "accepted_output_progress_stalled"
+        )
+        assert pending_attempt.response_metadata["accepted_output_count"] == 1
+        assert pending_attempt.response_metadata["preexisting_output_grace_count"] == 1
+        assert pending_attempt.error_detail == (
+            "The manifest-bound Salad attempt stopped producing accepted output progress; "
+            "cancellation was requested."
+        )
+        deferred_audit_detail = await session.scalar(
+            select(AuditEvent.detail).where(
+                AuditEvent.resource_type == "generation_attempt",
+                AuditEvent.resource_id == attempt_id,
+                AuditEvent.action == "generation_attempt.watchdog_cancel_deferred",
+            )
+        )
+        assert deferred_audit_detail is not None
+        assert deferred_audit_detail["reason"] == "accepted_output_progress_stalled"
+        assert client.cancel_calls == [("generation-v1", str(REMOTE_JOB_ID))]
+        assert client.create_calls == []
+
+        # A transport failure after DELETE cannot prove whether Salad accepted
+        # it. Reconciliation retries only the same exact cancellation; it never
+        # posts another job or creates another attempt while that identity is active.
+        # A provider PENDING-after-RUNNING regression with an update clock older
+        # than retained last_observed_at does not erase the durable exact intent.
+        client.cancel_error = None
+        client.get_result = remote_job(
+            status=SaladJobStatus.PENDING,
+            metadata=provider_metadata,
+            update_time=NOW + timedelta(seconds=30),
+        )
+        repeated = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=30 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=15),
+        )
+        attempts_before_terminal = int(
+            await session.scalar(
+                select(func.count(GenerationAttempt.id)).where(
+                    GenerationAttempt.job_id == context.job_id
+                )
+            )
+            or 0
+        )
+        watchdog_audits = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.resource_type == "generation_attempt",
+                    AuditEvent.resource_id == attempt_id,
+                    AuditEvent.action == "generation_attempt.watchdog_cancel_requested",
+                )
+            )
+            or 0
+        )
+        assert repeated.observation.attempt_state == GenerationAttemptState.CANCEL_REQUESTED
+        assert client.cancel_calls == [
+            ("generation-v1", str(REMOTE_JOB_ID)),
+            ("generation-v1", str(REMOTE_JOB_ID)),
+        ]
+        assert client.create_calls == []
+        assert attempts_before_terminal == 1
+        assert watchdog_audits == 1
+
+        confirmed = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(
+                get_result=remote_job(
+                    status=SaladJobStatus.CANCELLED,
+                    metadata=provider_metadata,
+                    update_time=NOW + timedelta(minutes=16),
+                )
+            ),
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=30 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=16),
+        )
+        final_attempt = await session.get(GenerationAttempt, attempt_id)
+        retrying_job = await session.get(GenerationJob, context.job_id)
+        retained_asset = await session.get(Asset, retained_asset_id)
+        staged_asset = await session.get(Asset, staged_asset_id)
+
+    assert confirmed.observation.attempt_state == GenerationAttemptState.FAILED
+    assert confirmed.observation.generation_job_state == GenerationState.RETRY_WAIT
+    assert final_attempt is not None
+    assert final_attempt.provider_external_id == str(REMOTE_JOB_ID)
+    assert final_attempt.error_code == SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE
+    assert retrying_job is not None
+    assert retrying_job.state == GenerationState.RETRY_WAIT
+    assert retrying_job.max_attempts == 4
+    assert retained_asset is not None
+    assert retained_asset.state == AssetState.AVAILABLE
+    assert retained_asset.object_key is not None
+    assert staged_asset is not None
+    assert staged_asset.state == AssetState.UPLOADING
+    assert staged_asset.staging_object_key is not None
+
+
+@pytest.mark.asyncio
+async def test_output_progress_watchdog_allows_slow_first_output(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        enable_runtime_admission(attempt)
+        await session.commit()
+        provider_metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+        client = FakeSaladClient(
+            get_result=remote_job(
+                status=SaladJobStatus.RUNNING,
+                metadata=provider_metadata,
+                update_time=NOW + timedelta(minutes=1),
+            )
+        )
+        await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=30 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=1),
+        )
+        # Runtime-bound first-image model loading gets the complete base window.
+        slow_first_output = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=30 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=10, seconds=59),
+        )
+
+    assert slow_first_output.observation.attempt_state == GenerationAttemptState.RUNNING
+    assert client.cancel_calls == []
+
+
+@pytest.mark.asyncio
+async def test_output_progress_watchdog_ignores_legacy_job_without_runtime_admission(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        provider_metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+        client = FakeSaladClient(
+            get_result=remote_job(
+                status=SaladJobStatus.RUNNING,
+                metadata=provider_metadata,
+                update_time=NOW + timedelta(minutes=1),
+            )
+        )
+        await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=30 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=1),
+        )
+
+        # A legacy job may still be in an old boot/runtime handoff. Only the
+        # existing full runtime envelope applies without the durable v1 marker.
+        legacy_running = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=30 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=15),
+        )
+
+    assert legacy_running.observation.attempt_state == GenerationAttemptState.RUNNING
+    assert client.cancel_calls == []
+
+
+@pytest.mark.asyncio
+async def test_exact_current_intent_cleanup_resets_partial_retry_progress_deadline(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        enable_runtime_admission(attempt)
+        retained_asset_id, _ = await add_progress_watchdog_assets(session, context)
+        await session.commit()
+        provider_metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+        client = FakeSaladClient(
+            get_result=remote_job(
+                status=SaladJobStatus.RUNNING,
+                metadata=provider_metadata,
+                update_time=NOW + timedelta(minutes=1),
+            )
+        )
+        await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=30 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=1),
+        )
+
+        retained = await session.get(Asset, retained_asset_id)
+        assert retained is not None
+        exact_intent_metadata = dict(retained.asset_metadata)
+        exact_intent_metadata.update(
+            {
+                "staging_cleanup": "completed",
+                "staging_cleaned_at": (NOW + timedelta(minutes=12)).isoformat(),
+            }
+        )
+        retained.asset_metadata = exact_intent_metadata
+        await session.commit()
+
+        still_progressing = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=30 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=21, seconds=59),
+        )
+        assert still_progressing.observation.attempt_state == GenerationAttemptState.RUNNING
+        assert client.cancel_calls == []
+
+        stalled_after_cleanup = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=30 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=22),
+        )
+        pending_attempt = await session.get(GenerationAttempt, attempt_id)
+
+    assert stalled_after_cleanup.observation.attempt_state == (
+        GenerationAttemptState.CANCEL_REQUESTED
+    )
+    assert client.cancel_calls == [("generation-v1", str(REMOTE_JOB_ID))]
+    assert pending_attempt is not None
+    assert pending_attempt.response_metadata is not None
+    assert pending_attempt.response_metadata["latest_progress_output_index"] == 0
+    assert pending_attempt.response_metadata["preexisting_output_grace_count"] == 0
+    assert (
+        pending_attempt.response_metadata["watchdog_anchor_at"]
+        == (NOW + timedelta(minutes=12)).isoformat()
+    )
+
+
+@pytest.mark.asyncio
+async def test_operator_stop_precedes_due_output_progress_watchdog(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        enable_runtime_admission(attempt)
+        await session.commit()
+        provider_metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+        client = FakeSaladClient(
+            get_result=remote_job(
+                status=SaladJobStatus.RUNNING,
+                metadata=provider_metadata,
+                update_time=NOW + timedelta(minutes=1),
+            )
+        )
+        await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=30 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=1),
+        )
+        await mark_operator_stop(session, context)
+
+        stopped = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=30 * 60,
+            output_progress_watchdog_seconds=10 * 60,
+            now=NOW + timedelta(minutes=14),
+        )
+        final_attempt = await session.get(GenerationAttempt, attempt_id)
+        watchdog_audits = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.resource_type == "generation_attempt",
+                    AuditEvent.resource_id == attempt_id,
+                    AuditEvent.action == "generation_attempt.watchdog_cancel_requested",
+                )
+            )
+            or 0
+        )
+
+    assert stopped.error_code == OPERATOR_STOP_CANCEL_REQUESTED_ERROR_CODE
+    assert final_attempt is not None
+    assert final_attempt.error_code == OPERATOR_STOP_CANCEL_REQUESTED_ERROR_CODE
+    assert client.cancel_calls == [("generation-v1", str(REMOTE_JOB_ID))]
+    assert watchdog_audits == 0
 
 
 @pytest.mark.asyncio

@@ -483,6 +483,11 @@ class Settings(BaseSettings):
     worker_signing_private_key: SecretStr | None = None
     worker_signature_ttl_seconds: int = Field(default=7200, ge=5, le=7200)
     salad_attempt_watchdog_seconds: int = Field(default=105 * 60, ge=60, le=6900)
+    # Once a manifest-bound worker has actually claimed a RUNNING queue job,
+    # accepted output progress should arrive regularly. This shorter fence
+    # recovers provider jobs orphaned by a container exit without weakening the
+    # full runtime/signature envelope above.
+    salad_output_progress_watchdog_seconds: int = Field(default=10 * 60, ge=300, le=3600)
     worker_upload_grant_ttl_seconds: int = Field(default=14400, ge=3600, le=14400)
     salad_worker_allowed_upload_origin: SecretStr | None = None
     salad_worker_model_manifest_json: SecretStr | None = None
