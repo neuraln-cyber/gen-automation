@@ -8037,7 +8037,10 @@
         }
         renderCount();
         progressTerminal = payload.ready_for_review === true
-          || ["review", "cancelled", "error"].includes(payload.stage.key);
+          || ["review", "cancelled"].includes(payload.stage.key)
+          || (payload.stage.key === "error"
+            && isRecord(payload.error)
+            && payload.error.retryable === false);
         await refreshAssets();
         scheduleProgress(integerValue(payload.poll_after_ms, 3000));
       } catch (_error) {

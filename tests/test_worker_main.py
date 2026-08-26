@@ -25,6 +25,8 @@ from gen_automation.gpu_worker.bootstrap import (
     WorkerRuntimeSettings,
 )
 from gen_automation.gpu_worker.main import (
+    _ManagedChild,
+    _ManagedChildren,
     _monitor_comfy,
     _serve_worker_lifecycle,
     _SwitchableWorkerApplication,
@@ -115,6 +117,53 @@ async def test_bootstrap_probe_is_live_but_not_ready_and_hands_off_in_place() ->
     assert await _asgi_request(router, "/health") == (204, b"")
 
 
+async def test_switchable_router_tracks_generation_until_application_returns_and_cancels() -> None:
+    router = _SwitchableWorkerApplication()
+    response_sent = asyncio.Event()
+    release_response = asyncio.Event()
+
+    async def generation_application(
+        _scope: object,
+        _receive: object,
+        send: Any,
+    ) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"{}", "more_body": False})
+        response_sent.set()
+        await release_response.wait()
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message: dict[str, Any]) -> None:
+        return None
+
+    router.activate(cast(Any, generation_application))
+    request = asyncio.create_task(
+        router(
+            cast(
+                Any,
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/jobs/generate",
+                },
+            ),
+            receive,
+            cast(Any, send),
+        )
+    )
+    await response_sent.wait()
+
+    assert router.has_unsafe_active_request()
+
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    assert not router.has_unsafe_active_request()
+
+
 async def test_worker_lifecycle_handoff_closes_every_owned_resource(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -146,6 +195,9 @@ async def test_worker_lifecycle_handoff_closes_every_owned_resource(
             return None
 
     class FakeExecutor:
+        def is_ready(self) -> bool:
+            return True
+
         def close(self) -> None:
             events.append("executor_closed")
 
@@ -642,22 +694,38 @@ class _MonitorServer:
 
 
 class _ExitedProcess:
+    pid = 101
+
     def poll(self) -> int:
         return 0
 
 
-async def test_monitor_marks_an_unexpected_child_exit() -> None:
+async def test_monitor_marks_an_unexpected_child_exit(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     server = _MonitorServer()
     child_exit_event = asyncio.Event()
 
     await _monitor_comfy(
-        (cast("subprocess.Popen[bytes]", cast(Any, _ExitedProcess())),),
+        _ManagedChildren(
+            comfy=_ManagedChild(
+                "comfy",
+                cast("subprocess.Popen[bytes]", cast(Any, _ExitedProcess())),
+                1.0,
+            ),
+            queue_worker=None,
+        ),
         cast(Any, server),
         child_exit_event,
+        monotonic=lambda: 3.5,
     )
 
     assert server.should_exit
     assert child_exit_event.is_set()
+    stderr = capsys.readouterr().err
+    assert "role=comfy pid=101 returncode=0" in stderr
+    assert "signal=none signal_name=none uptime_seconds=2.500" in stderr
+    assert "reason=child_exited" in stderr
 
 
 async def test_monitor_does_not_mark_normal_server_shutdown() -> None:
@@ -665,7 +733,14 @@ async def test_monitor_does_not_mark_normal_server_shutdown() -> None:
     child_exit_event = asyncio.Event()
 
     await _monitor_comfy(
-        (cast("subprocess.Popen[bytes]", cast(Any, _ExitedProcess())),),
+        _ManagedChildren(
+            comfy=_ManagedChild(
+                "comfy",
+                cast("subprocess.Popen[bytes]", cast(Any, _ExitedProcess())),
+                1.0,
+            ),
+            queue_worker=None,
+        ),
         cast(Any, server),
         child_exit_event,
     )
@@ -674,20 +749,274 @@ async def test_monitor_does_not_mark_normal_server_shutdown() -> None:
 
 
 class _RunningProcess:
+    pid = 102
+
     def poll(self) -> None:
         return None
 
 
-async def test_monitor_gracefully_stops_server_after_worker_restart_request() -> None:
+async def test_monitor_gracefully_stops_server_after_worker_restart_request(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     server = _MonitorServer()
     worker_restart_event = asyncio.Event()
     worker_restart_event.set()
 
     await _monitor_comfy(
-        (cast("subprocess.Popen[bytes]", cast(Any, _RunningProcess())),),
+        _ManagedChildren(
+            comfy=_ManagedChild(
+                "comfy",
+                cast("subprocess.Popen[bytes]", cast(Any, _RunningProcess())),
+                1.0,
+            ),
+            queue_worker=None,
+        ),
         cast(Any, server),
         worker_restart_event,
     )
 
     assert server.should_exit
     assert worker_restart_event.is_set()
+    assert "reason=blank_or_fatal_output_requested" in capsys.readouterr().err
+
+
+class _SupervisedProcess:
+    def __init__(self, pid: int, returncode: int | None) -> None:
+        self.pid = pid
+        self.returncode = returncode
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+
+def _managed_children(
+    *,
+    queue_process: _SupervisedProcess,
+) -> _ManagedChildren:
+    return _ManagedChildren(
+        comfy=_ManagedChild(
+            "comfy",
+            cast(
+                "subprocess.Popen[bytes]",
+                cast(Any, _SupervisedProcess(200, None)),
+            ),
+            0.0,
+        ),
+        queue_worker=_ManagedChild(
+            "salad_queue_worker",
+            cast("subprocess.Popen[bytes]", cast(Any, queue_process)),
+            0.0,
+        ),
+    )
+
+
+async def test_monitor_restarts_idle_queue_worker_with_exact_diagnostics(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server = _MonitorServer()
+    worker_restart_event = asyncio.Event()
+    children = _managed_children(queue_process=_SupervisedProcess(201, -9))
+    replacement = _SupervisedProcess(202, None)
+    waits: list[float] = []
+
+    async def wait_for_event(_event: asyncio.Event, delay_seconds: float) -> bool:
+        waits.append(delay_seconds)
+        if len(waits) == 2:
+            server.should_exit = True
+        return False
+
+    await _monitor_comfy(
+        children,
+        cast(Any, server),
+        worker_restart_event,
+        start_queue_worker=lambda: cast(
+            "subprocess.Popen[bytes]",
+            cast(Any, replacement),
+        ),
+        unsafe_request_active=lambda: False,
+        comfy_health_check=lambda: True,
+        monotonic=lambda: 10.0,
+        wait_for_event=wait_for_event,
+    )
+
+    assert children.queue_worker is not None
+    assert cast(Any, children.queue_worker.process) is replacement
+    assert not worker_restart_event.is_set()
+    assert waits == [1.0, 1.0]
+    stderr = capsys.readouterr().err
+    assert "role=salad_queue_worker pid=201 returncode=-9 signal=9" in stderr
+    assert "uptime_seconds=10.000" in stderr
+    assert "previous_pid=201 previous_returncode=-9" in stderr
+    assert "new_pid=202 restart_ordinal=1 backoff_seconds=1.000" in stderr
+
+
+async def test_monitor_fails_closed_when_queue_dies_during_generation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server = _MonitorServer()
+    worker_restart_event = asyncio.Event()
+    starts: list[bool] = []
+
+    def record_start() -> None:
+        starts.append(True)
+
+    await _monitor_comfy(
+        _managed_children(queue_process=_SupervisedProcess(211, 1)),
+        cast(Any, server),
+        worker_restart_event,
+        start_queue_worker=record_start,
+        unsafe_request_active=lambda: True,
+        comfy_health_check=lambda: True,
+        monotonic=lambda: 2.0,
+    )
+
+    assert not starts
+    assert server.should_exit
+    assert worker_restart_event.is_set()
+    assert "reason=unsafe_active_request" in capsys.readouterr().err
+
+
+async def test_monitor_does_not_restart_queue_when_comfy_is_unhealthy(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server = _MonitorServer()
+    worker_restart_event = asyncio.Event()
+    starts: list[bool] = []
+
+    def record_start() -> None:
+        starts.append(True)
+
+    async def finish_backoff(_event: asyncio.Event, _delay_seconds: float) -> bool:
+        return False
+
+    await _monitor_comfy(
+        _managed_children(queue_process=_SupervisedProcess(216, 1)),
+        cast(Any, server),
+        worker_restart_event,
+        start_queue_worker=record_start,
+        unsafe_request_active=lambda: False,
+        comfy_health_check=lambda: False,
+        monotonic=lambda: 2.0,
+        wait_for_event=finish_backoff,
+    )
+
+    assert not starts
+    assert server.should_exit
+    assert worker_restart_event.is_set()
+    assert "role=comfy reason=health_check_failed" in capsys.readouterr().err
+
+
+async def test_monitor_never_restarts_queue_after_blank_output_request() -> None:
+    server = _MonitorServer()
+    worker_restart_event = asyncio.Event()
+    starts: list[bool] = []
+
+    def record_start() -> None:
+        starts.append(True)
+
+    async def request_restart(_event: asyncio.Event, _timeout: float) -> bool:
+        worker_restart_event.set()
+        return True
+
+    await _monitor_comfy(
+        _managed_children(queue_process=_SupervisedProcess(221, 1)),
+        cast(Any, server),
+        worker_restart_event,
+        start_queue_worker=record_start,
+        unsafe_request_active=lambda: False,
+        comfy_health_check=lambda: True,
+        monotonic=lambda: 2.0,
+        wait_for_event=request_restart,
+    )
+
+    assert not starts
+    assert server.should_exit
+    assert worker_restart_event.is_set()
+
+
+async def test_monitor_exits_after_consecutive_queue_restart_budget() -> None:
+    server = _MonitorServer()
+    worker_restart_event = asyncio.Event()
+    children = _managed_children(queue_process=_SupervisedProcess(231, 1))
+    replacements = iter(_SupervisedProcess(pid, 1) for pid in range(232, 235))
+    waits: list[float] = []
+
+    async def wait_for_event(_event: asyncio.Event, delay_seconds: float) -> bool:
+        waits.append(delay_seconds)
+        return False
+
+    await _monitor_comfy(
+        children,
+        cast(Any, server),
+        worker_restart_event,
+        start_queue_worker=lambda: cast(
+            "subprocess.Popen[bytes]",
+            cast(Any, next(replacements)),
+        ),
+        unsafe_request_active=lambda: False,
+        comfy_health_check=lambda: True,
+        monotonic=lambda: 10.0,
+        wait_for_event=wait_for_event,
+    )
+
+    assert waits == [1.0, 2.0, 4.0]
+    assert server.should_exit
+    assert worker_restart_event.is_set()
+
+
+async def test_monitor_bounds_queue_spawn_oserror_retries(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server = _MonitorServer()
+    worker_restart_event = asyncio.Event()
+    attempts = 0
+    waits: list[float] = []
+
+    def fail_start() -> None:
+        nonlocal attempts
+        attempts += 1
+        raise OSError("spawn failed")
+
+    async def wait_for_event(_event: asyncio.Event, delay_seconds: float) -> bool:
+        waits.append(delay_seconds)
+        return False
+
+    await _monitor_comfy(
+        _managed_children(queue_process=_SupervisedProcess(241, 1)),
+        cast(Any, server),
+        worker_restart_event,
+        start_queue_worker=fail_start,
+        unsafe_request_active=lambda: False,
+        comfy_health_check=lambda: True,
+        monotonic=lambda: 10.0,
+        wait_for_event=wait_for_event,
+    )
+
+    assert attempts == 3
+    assert waits == [1.0, 2.0, 4.0]
+    assert server.should_exit
+    assert worker_restart_event.is_set()
+    assert "reason=restart_budget_exhausted" in capsys.readouterr().err
+
+
+async def test_monitor_fails_closed_on_internal_exception(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server = _MonitorServer()
+    worker_restart_event = asyncio.Event()
+
+    def fail_clock() -> float:
+        raise ValueError("unexpected monitor failure")
+
+    await _monitor_comfy(
+        _managed_children(queue_process=_SupervisedProcess(251, None)),
+        cast(Any, server),
+        worker_restart_event,
+        monotonic=fail_clock,
+    )
+
+    assert server.should_exit
+    assert worker_restart_event.is_set()
+    stderr = capsys.readouterr().err
+    assert "exception=ValueError" in stderr
+    assert "reason=monitor_exception" in stderr

@@ -31,6 +31,10 @@ from gen_automation.services.compliance import (
     validate_release_approvals,
 )
 from gen_automation.services.generation_control import GENERATION_STOP_REQUESTED_ACTION
+from gen_automation.services.generation_recovery import (
+    DEFAULT_INFRASTRUCTURE_RECOVERY_SWEEP_LIMIT,
+    recover_dead_lettered_infrastructure_jobs,
+)
 from gen_automation.services.salad import PreparedAttempt, prepare_generation_attempt
 
 _DISPATCHABLE_RELEASE_PHASES = frozenset(
@@ -243,6 +247,20 @@ async def dispatch_generation_jobs(
     if limit <= 0 or limit > 1_000:
         raise ValueError("limit must be between 1 and 1000")
     scheduled_at = _as_utc(now or datetime.now(UTC))
+
+    recovery = await recover_dead_lettered_infrastructure_jobs(
+        session,
+        actor=actor,
+        limit=min(limit, DEFAULT_INFRASTRUCTURE_RECOVERY_SWEEP_LIMIT),
+        now=scheduled_at,
+    )
+    if recovery.recovered_job_ids:
+        # Recovery is durable independently of current queue capacity or the
+        # deployment lock below. A full provider queue must not roll a grant
+        # back and leave the job permanently dead-lettered.
+        await session.commit()
+    else:
+        await session.rollback()
 
     deployment = await session.scalar(
         select(SaladDeployment).where(SaladDeployment.id == salad_deployment_id).with_for_update()

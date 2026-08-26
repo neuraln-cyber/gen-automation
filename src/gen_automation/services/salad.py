@@ -51,10 +51,19 @@ from gen_automation.integrations.salad.models import (
     SaladQueueJobPage,
 )
 from gen_automation.services.budgets import (
+    reevaluate_budget_guard,
     release_attempt_reservation,
     reserve_attempt_budget,
 )
 from gen_automation.services.generation_control import GENERATION_STOP_REQUESTED_ACTION
+from gen_automation.services.generation_recovery import (
+    SALAD_JOB_FAILED_ERROR_CODE,
+    SALAD_PROVIDER_CANCELLED_ERROR_CODE,
+    SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE,
+    SALAD_RATE_LIMITED_ERROR_CODE,
+    InfrastructureRetrySource,
+    grant_infrastructure_retry,
+)
 from gen_automation.services.outbox import (
     GENERATION_ATTEMPT_AGGREGATE,
     SALAD_JOB_SUBMIT_TOPIC,
@@ -81,6 +90,10 @@ _DEPLOYMENT_ROLLOVER_PROVIDER_SCAN_INCONCLUSIVE_ERROR_CODE = (
 )
 _DEPLOYMENT_ROLLOVER_ABSENCE_CONFIRMATIONS = 3
 _DEPLOYMENT_ROLLOVER_ABSENCE_TRACKER_KEY = "deployment_rollover_absence_confirmation"
+_PROVIDER_ABSENCE_CONFIRMATIONS = 3
+_PROVIDER_ABSENCE_TRACKER_KEY = "provider_absence_confirmation"
+_PROVIDER_ABSENCE_PENDING_ERROR_CODE = "salad_provider_absence_pending"
+_PROVIDER_SCAN_INCONCLUSIVE_ERROR_CODE = "salad_provider_scan_inconclusive"
 OPERATOR_STOP_CANCEL_REQUESTED_ERROR_CODE = "operator_generation_stop_cancel_requested"
 _OPERATOR_STOP_CANCEL_UNAVAILABLE_ERROR_CODE = "operator_generation_stop_cancel_unavailable"
 _OPERATOR_STOP_PROVIDER_ABSENT_ERROR_CODE = "operator_generation_stop_provider_absent"
@@ -92,6 +105,9 @@ _OPERATOR_STOP_PROVIDER_SCAN_INCONCLUSIVE_ERROR_CODE = (
 )
 _OPERATOR_STOP_ABSENCE_CONFIRMATIONS = 3
 _OPERATOR_STOP_ABSENCE_TRACKER_KEY = "operator_stop_absence_confirmation"
+_DEFAULT_JOB_INPUT_DEFER_SECONDS = 30
+_MAX_JOB_INPUT_DEFER_SECONDS = 3600
+_JOB_INPUT_DEFERRED_ERROR_CODE = "salad_job_input_deferred"
 _SECRET_KEY_MARKERS = frozenset(
     {
         "secret",
@@ -183,6 +199,24 @@ class SaladServiceNotFoundError(SaladServiceError):
 
 class SaladServiceConflictError(SaladServiceError):
     pass
+
+
+class SaladJobInputDeferredError(SaladServiceError):
+    """The worker input is definitely unstarted but temporarily unsafe to build."""
+
+    def __init__(
+        self,
+        *,
+        retry_after_seconds: int = _DEFAULT_JOB_INPUT_DEFER_SECONDS,
+    ) -> None:
+        if (
+            not isinstance(retry_after_seconds, int)
+            or isinstance(retry_after_seconds, bool)
+            or not 1 <= retry_after_seconds <= _MAX_JOB_INPUT_DEFER_SECONDS
+        ):
+            raise ValueError("retry_after_seconds must be between 1 and 3600")
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__("Salad worker input preparation is temporarily deferred")
 
 
 class MutationEffect(StrEnum):
@@ -899,6 +933,7 @@ async def submit_prepared_attempt(
         )
 
     job.state = GenerationState.SUBMITTING
+    job.retry_at = None
     job.last_error_code = None
     job.last_error_detail = None
     job.lock_version += 1
@@ -920,6 +955,29 @@ async def submit_prepared_attempt(
     )
     try:
         job_input = await upload_intent_provider.build_job_input(context)
+    except SaladJobInputDeferredError as error:
+        await session.rollback()
+        attempt, job, _ = await _load_attempt_context(
+            session,
+            generation_attempt_id,
+            lock=True,
+        )
+        retry_at = submitted_at + timedelta(seconds=error.retry_after_seconds)
+        await _rearm_deferred_job_input(
+            session,
+            attempt=attempt,
+            job=job,
+            retry_at=retry_at,
+            occurred_at=submitted_at,
+        )
+        await session.commit()
+        return _submission_result(
+            attempt,
+            job,
+            SubmissionDisposition.BUDGET_BLOCKED,
+            MutationEffect.DEFINITELY_NOT_STARTED,
+            retry_not_before=retry_at,
+        )
     except Exception:
         await session.rollback()
         attempt, job, _ = await _load_attempt_context(
@@ -974,19 +1032,32 @@ async def submit_prepared_attempt(
             session,
             attempt=attempt,
             job=job,
-            error_code="salad_rate_limited",
+            error_code=SALAD_RATE_LIMITED_ERROR_CODE,
             safe_error_detail="Salad rejected the request before creating a job.",
-            job_state=GenerationState.RETRY_WAIT,
+            job_state=_retry_or_fail(job),
             occurred_at=submitted_at,
+            retry_at=(retry_at if job.attempt_count < job.max_attempts else None),
+        )
+        await grant_infrastructure_retry(
+            session,
+            attempt=attempt,
+            job=job,
+            source=InfrastructureRetrySource.SUBMISSION,
+            actor="salad-controller",
             retry_at=retry_at,
+            occurred_at=submitted_at,
         )
         await session.commit()
         return _submission_result(
             attempt,
             job,
-            SubmissionDisposition.RETRY_WAIT,
+            (
+                SubmissionDisposition.RETRY_WAIT
+                if job.state == GenerationState.RETRY_WAIT
+                else SubmissionDisposition.FAILED
+            ),
             MutationEffect.DEFINITELY_NOT_STARTED,
-            retry_not_before=retry_at,
+            retry_not_before=(retry_at if job.state == GenerationState.RETRY_WAIT else None),
         )
     except SaladAPIError as error:
         attempt, job, _ = await _load_attempt_context(
@@ -1177,15 +1248,39 @@ async def apply_salad_job_observation(
     remote_id = str(remote_job.id)
     if attempt.provider_external_id is not None and attempt.provider_external_id != remote_id:
         raise SaladServiceConflictError("Salad observation has another provider job ID")
+    _reset_provider_absence_tracking(
+        session,
+        attempt=attempt,
+        reason="exact_provider_job_matched",
+        occurred_at=controller_time,
+    )
 
     provider_update_time = _as_utc(remote_job.update_time)
     last_observed_at = (
         _stored_as_utc(attempt.last_observed_at) if attempt.last_observed_at is not None else None
     )
+    equal_timestamp_forward_terminal = (
+        last_observed_at is not None
+        and provider_update_time == last_observed_at
+        and remote_job.status
+        in {
+            SaladJobStatus.SUCCEEDED,
+            SaladJobStatus.FAILED,
+            SaladJobStatus.CANCELLED,
+        }
+        and attempt.state not in _TERMINAL_ATTEMPT_STATES
+    )
+    # A marker-only UNKNOWN attempt has no provider clock baseline yet; its
+    # controller recovery timestamp must not hide the first exact metadata
+    # match. Once a provider identity is bound, older/equal regressions are
+    # compared strictly against provider update time.
     if (
-        attempt.state != GenerationAttemptState.UNKNOWN
+        attempt.provider_external_id is not None
         and last_observed_at is not None
-        and provider_update_time <= last_observed_at
+        and (
+            provider_update_time < last_observed_at
+            or (provider_update_time == last_observed_at and not equal_timestamp_forward_terminal)
+        )
     ):
         return _observation_result(attempt, job, applied=False, stale=True)
 
@@ -1202,16 +1297,51 @@ async def apply_salad_job_observation(
         and attempt.state == GenerationAttemptState.CANCEL_REQUESTED
         and attempt.error_code == SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
     )
+    operator_stop_requested = (
+        remote_job.status == SaladJobStatus.CANCELLED
+        and await _operator_generation_stop_requested(session, job=job)
+    )
     deployment_rollover_cancelled = (
         remote_job.status == SaladJobStatus.CANCELLED
         and _deployment_rollover_cancel_was_requested(attempt)
-        and not await _operator_generation_stop_requested(session, job=job)
+        and not operator_stop_requested
     )
+    spontaneous_provider_cancel = (
+        remote_job.status == SaladJobStatus.CANCELLED
+        and not operator_stop_requested
+        and not watchdog_cancelled
+        and not deployment_rollover_cancelled
+    )
+    failure_error_code: str | None = None
+    failure_error_detail: str | None = None
+    if worker_output_valid is False:
+        failure_error_code = "salad_worker_output_invalid"
+        failure_error_detail = "Salad reported success without a valid worker output contract."
+    elif watchdog_cancelled:
+        failure_error_code = SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE
+        failure_error_detail = (
+            "The Salad attempt exceeded its runtime envelope and was cancelled for retry."
+        )
+    elif deployment_rollover_cancelled:
+        failure_error_code = DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE
+        failure_error_detail = (
+            "The Salad deployment was superseded; the cancelled job will retry on the "
+            "current deployment."
+        )
+    elif remote_job.status == SaladJobStatus.FAILED:
+        failure_error_code = SALAD_JOB_FAILED_ERROR_CODE
+        failure_error_detail = "Salad reported a failed queue job."
+    elif spontaneous_provider_cancel:
+        failure_error_code = SALAD_PROVIDER_CANCELLED_ERROR_CODE
+        failure_error_detail = (
+            "Salad cancelled the provider job without an operator stop; generation will retry."
+        )
     target_state = (
         GenerationAttemptState.FAILED
-        if worker_output_valid is False or watchdog_cancelled or deployment_rollover_cancelled
+        if failure_error_code is not None
         else _attempt_state(remote_job.status)
     )
+    current_attempt = attempt.attempt_no == job.attempt_count
 
     if attempt.state in _TERMINAL_ATTEMPT_STATES:
         if attempt.state != target_state:
@@ -1242,29 +1372,8 @@ async def apply_salad_job_observation(
         "event_count": len(remote_job.events),
         **({"worker_output_valid": worker_output_valid} if worker_output_valid is not None else {}),
     }
-    attempt.error_code = (
-        "salad_worker_output_invalid"
-        if worker_output_valid is False
-        else (
-            SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE
-            if watchdog_cancelled
-            else (DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE if deployment_rollover_cancelled else None)
-        )
-    )
-    attempt.error_detail = (
-        "Salad reported success without a valid worker output contract."
-        if worker_output_valid is False
-        else (
-            "The Salad attempt exceeded its runtime envelope and was cancelled for retry."
-            if watchdog_cancelled
-            else (
-                "The Salad deployment was superseded; the cancelled job will retry "
-                "on the current deployment."
-                if deployment_rollover_cancelled
-                else None
-            )
-        )
-    )
+    attempt.error_code = failure_error_code
+    attempt.error_detail = failure_error_detail
     attempt.unknown_since = None
     attempt.submitted_at = attempt.submitted_at or _as_utc(remote_job.create_time)
     attempt.state = target_state
@@ -1274,44 +1383,22 @@ async def apply_salad_job_observation(
         attempt.completed_at = attempt.completed_at or provider_update_time
     attempt.lock_version += 1
 
-    if job.state not in _TERMINAL_JOB_STATES:
+    if current_attempt and target_state == GenerationAttemptState.FAILED:
+        await grant_infrastructure_retry(
+            session,
+            attempt=attempt,
+            job=job,
+            source=InfrastructureRetrySource.RECONCILER,
+            actor="salad-controller",
+            retry_at=controller_time,
+            occurred_at=controller_time,
+        )
+
+    if current_attempt and job.state not in _TERMINAL_JOB_STATES:
         job.state = _job_state_for_observation(job, target_state)
         job.retry_at = None
-        job.last_error_code = (
-            (
-                "salad_worker_output_invalid"
-                if worker_output_valid is False
-                else (
-                    SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE
-                    if watchdog_cancelled
-                    else (
-                        DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE
-                        if deployment_rollover_cancelled
-                        else "salad_job_failed"
-                    )
-                )
-            )
-            if target_state == GenerationAttemptState.FAILED
-            else None
-        )
-        job.last_error_detail = (
-            (
-                "Salad reported success without a valid worker output contract."
-                if worker_output_valid is False
-                else (
-                    "The Salad attempt exceeded its runtime envelope and was cancelled for retry."
-                    if watchdog_cancelled
-                    else (
-                        "The Salad deployment was superseded; the job will retry on the "
-                        "current deployment."
-                        if deployment_rollover_cancelled
-                        else "Salad reported a failed queue job."
-                    )
-                )
-            )
-            if target_state == GenerationAttemptState.FAILED
-            else None
-        )
+        job.last_error_code = failure_error_code
+        job.last_error_detail = failure_error_detail
         job.lock_version += 1
 
     session.add(
@@ -1425,12 +1512,19 @@ async def reconcile_generation_attempt(
         await session.rollback()
         return result
 
+    # Provider absence has no timestamp or revision of its own. Fence it to the
+    # exact local attempt revision and provider lookup mode that initiated the
+    # request so a webhook/reconciler commit during provider I/O cannot turn a
+    # stale miss into another confirmation.
+    absence_attempt_lock_version = attempt.lock_version
+    queried_provider_external_id = attempt.provider_external_id
+
     source = ReconciliationSource.GET
     try:
-        if attempt.provider_external_id is not None:
+        if queried_provider_external_id is not None:
             remote_job = await client.get_job(
                 deployment.queue_name,
-                attempt.provider_external_id,
+                queried_provider_external_id,
             )
         else:
             source = ReconciliationSource.LIST
@@ -1454,6 +1548,19 @@ async def reconcile_generation_attempt(
                     generation_attempt_id,
                     lock=True,
                 )
+                if not _absence_observation_still_applies(
+                    attempt,
+                    source=source,
+                    queried_provider_external_id=queried_provider_external_id,
+                    expected_lock_version=absence_attempt_lock_version,
+                ):
+                    return await _stale_reconciliation_result(
+                        session,
+                        attempt=attempt,
+                        job=job,
+                        source=source,
+                        matched=False,
+                    )
                 if await _operator_generation_stop_requested(session, job=job):
                     if not scan_exhaustive:
                         _reset_operator_stop_absence_tracking(
@@ -1599,11 +1706,63 @@ async def reconcile_generation_attempt(
                         matched=False,
                         error_code=_DEPLOYMENT_ROLLOVER_PROVIDER_ABSENCE_PENDING_ERROR_CODE,
                     )
+                if not scan_exhaustive:
+                    _reset_provider_absence_tracking(
+                        session,
+                        attempt=attempt,
+                        reason="provider_list_scan_inconclusive",
+                        occurred_at=reconciled_at,
+                    )
+                    await _mark_outcome_unknown(
+                        session,
+                        attempt=attempt,
+                        job=job,
+                        error_code=_PROVIDER_SCAN_INCONCLUSIVE_ERROR_CODE,
+                        occurred_at=reconciled_at,
+                    )
+                    await session.commit()
+                    return ReconciliationResult(
+                        observation=_observation_result(
+                            attempt,
+                            job,
+                            applied=False,
+                            stale=False,
+                        ),
+                        source=source,
+                        matched=False,
+                        error_code=_PROVIDER_SCAN_INCONCLUSIVE_ERROR_CODE,
+                    )
+                confirmations = await _record_provider_absence_confirmation(
+                    session,
+                    attempt=attempt,
+                    source=source,
+                    occurred_at=reconciled_at,
+                )
+                if confirmations >= _PROVIDER_ABSENCE_CONFIRMATIONS:
+                    applied = await _mark_provider_job_absent(
+                        session,
+                        attempt=attempt,
+                        job=job,
+                        absence_source=source,
+                        occurred_at=reconciled_at,
+                    )
+                    await session.commit()
+                    return ReconciliationResult(
+                        observation=_observation_result(
+                            attempt,
+                            job,
+                            applied=applied,
+                            stale=False,
+                        ),
+                        source=source,
+                        matched=False,
+                        error_code=SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE,
+                    )
                 await _mark_outcome_unknown(
                     session,
                     attempt=attempt,
                     job=job,
-                    error_code="salad_provider_job_not_found",
+                    error_code=_PROVIDER_ABSENCE_PENDING_ERROR_CODE,
                     occurred_at=reconciled_at,
                 )
                 await session.commit()
@@ -1616,7 +1775,7 @@ async def reconcile_generation_attempt(
                     ),
                     source=source,
                     matched=False,
-                    error_code="salad_provider_job_not_found",
+                    error_code=_PROVIDER_ABSENCE_PENDING_ERROR_CODE,
                 )
             if len(matches) != 1:
                 attempt, job, _ = await _load_attempt_context(
@@ -1631,6 +1790,12 @@ async def reconcile_generation_attempt(
                     occurred_at=reconciled_at,
                 )
                 _reset_deployment_rollover_absence_tracking(
+                    session,
+                    attempt=attempt,
+                    reason="duplicate_provider_match",
+                    occurred_at=reconciled_at,
+                )
+                _reset_provider_absence_tracking(
                     session,
                     attempt=attempt,
                     reason="duplicate_provider_match",
@@ -1667,6 +1832,23 @@ async def reconcile_generation_attempt(
             generation_attempt_id,
             lock=True,
         )
+        if (
+            error.status_code == 404
+            and source == ReconciliationSource.GET
+            and not _absence_observation_still_applies(
+                attempt,
+                source=source,
+                queried_provider_external_id=queried_provider_external_id,
+                expected_lock_version=absence_attempt_lock_version,
+            )
+        ):
+            return await _stale_reconciliation_result(
+                session,
+                attempt=attempt,
+                job=job,
+                source=source,
+                matched=False,
+            )
         if (
             error.status_code == 404
             and source == ReconciliationSource.GET
@@ -1768,6 +1950,52 @@ async def reconcile_generation_attempt(
                 matched=False,
                 error_code=_DEPLOYMENT_ROLLOVER_PROVIDER_ABSENCE_PENDING_ERROR_CODE,
             )
+        if error.status_code == 404 and source == ReconciliationSource.GET:
+            confirmations = await _record_provider_absence_confirmation(
+                session,
+                attempt=attempt,
+                source=source,
+                occurred_at=reconciled_at,
+            )
+            if confirmations >= _PROVIDER_ABSENCE_CONFIRMATIONS:
+                applied = await _mark_provider_job_absent(
+                    session,
+                    attempt=attempt,
+                    job=job,
+                    absence_source=source,
+                    occurred_at=reconciled_at,
+                )
+                await session.commit()
+                return ReconciliationResult(
+                    observation=_observation_result(
+                        attempt,
+                        job,
+                        applied=applied,
+                        stale=False,
+                    ),
+                    source=source,
+                    matched=False,
+                    error_code=SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE,
+                )
+            await _mark_outcome_unknown(
+                session,
+                attempt=attempt,
+                job=job,
+                error_code=_PROVIDER_ABSENCE_PENDING_ERROR_CODE,
+                occurred_at=reconciled_at,
+            )
+            await session.commit()
+            return ReconciliationResult(
+                observation=_observation_result(
+                    attempt,
+                    job,
+                    applied=False,
+                    stale=False,
+                ),
+                source=source,
+                matched=False,
+                error_code=_PROVIDER_ABSENCE_PENDING_ERROR_CODE,
+            )
         if _deployment_rollover_requested(deployment):
             _reset_deployment_rollover_absence_tracking(
                 session,
@@ -1777,6 +2005,13 @@ async def reconcile_generation_attempt(
             )
         if await _operator_generation_stop_requested(session, job=job):
             _reset_operator_stop_absence_tracking(
+                session,
+                attempt=attempt,
+                reason="provider_reconciliation_error",
+                occurred_at=reconciled_at,
+            )
+        if error.status_code != 404:
+            _reset_provider_absence_tracking(
                 session,
                 attempt=attempt,
                 reason="provider_reconciliation_error",
@@ -1824,6 +2059,12 @@ async def reconcile_generation_attempt(
                 reason="provider_reconciliation_unavailable",
                 occurred_at=reconciled_at,
             )
+        _reset_provider_absence_tracking(
+            session,
+            attempt=attempt,
+            reason="provider_reconciliation_unavailable",
+            occurred_at=reconciled_at,
+        )
         _note_reconciliation_error(
             session,
             attempt=attempt,
@@ -1843,11 +2084,22 @@ async def reconcile_generation_attempt(
         SaladJobStatus.RUNNING,
     } and await _operator_generation_stop_requested(session, job=job):
         queue_name = deployment.queue_name
-        attempt, job, _ = await _load_attempt_context(
+        attempt, job, deployment = await _load_attempt_context(
             session,
             generation_attempt_id,
             lock=True,
         )
+        if not (
+            _active_remote_mutation_still_applies(attempt, remote_job=remote_job)
+            and await _operator_generation_stop_requested(session, job=job)
+        ):
+            return await _stale_reconciliation_result(
+                session,
+                attempt=attempt,
+                job=job,
+                source=source,
+                matched=True,
+            )
         _persist_operator_stop_remote_identity(
             session,
             attempt=attempt,
@@ -1923,20 +2175,32 @@ async def reconcile_generation_attempt(
             error_code=OPERATOR_STOP_CANCEL_REQUESTED_ERROR_CODE,
         )
 
-    if (
-        remote_job.status in {SaladJobStatus.PENDING, SaladJobStatus.RUNNING}
-        and _deployment_rollover_requested(deployment)
-        and (
-            attempt.state != GenerationAttemptState.CANCEL_REQUESTED
-            or _deployment_rollover_cancel_was_requested(attempt)
-        )
-    ):
+    if remote_job.status in {
+        SaladJobStatus.PENDING,
+        SaladJobStatus.RUNNING,
+    } and _deployment_rollover_cancel_is_due(attempt, deployment=deployment):
         queue_name = deployment.queue_name
-        attempt, job, _ = await _load_attempt_context(
+        attempt, job, deployment = await _load_attempt_context(
             session,
             generation_attempt_id,
             lock=True,
         )
+        if not (
+            _deployment_rollover_remote_cancel_still_applies(
+                attempt=attempt,
+                job=job,
+                deployment=deployment,
+                remote_job=remote_job,
+            )
+            and not await _operator_generation_stop_requested(session, job=job)
+        ):
+            return await _stale_reconciliation_result(
+                session,
+                attempt=attempt,
+                job=job,
+                source=source,
+                matched=True,
+            )
         identity_persisted = _persist_deployment_rollover_remote_identity(
             session,
             attempt=attempt,
@@ -2016,8 +2280,67 @@ async def reconcile_generation_attempt(
         timeout_seconds=attempt_watchdog_seconds,
     ):
         assert attempt_watchdog_seconds is not None
+        queue_name = deployment.queue_name
+        attempt, job, deployment = await _load_attempt_context(
+            session,
+            generation_attempt_id,
+            lock=True,
+        )
+        if not (
+            job.state not in _TERMINAL_JOB_STATES
+            and _active_remote_mutation_still_applies(
+                attempt,
+                remote_job=remote_job,
+            )
+            and not await _operator_generation_stop_requested(session, job=job)
+            and not _deployment_rollover_cancel_is_due(
+                attempt,
+                deployment=deployment,
+            )
+            and _attempt_watchdog_is_due(
+                attempt,
+                remote_job=remote_job,
+                reconciled_at=reconciled_at,
+                timeout_seconds=attempt_watchdog_seconds,
+            )
+        ):
+            return await _stale_reconciliation_result(
+                session,
+                attempt=attempt,
+                job=job,
+                source=source,
+                matched=True,
+            )
+        applied = _mark_watchdog_cancel_requested(
+            session,
+            attempt=attempt,
+            job=job,
+            remote_job=remote_job,
+            occurred_at=reconciled_at,
+            timeout_seconds=attempt_watchdog_seconds,
+        )
+        exact_watchdog_intent = (
+            attempt.state == GenerationAttemptState.CANCEL_REQUESTED
+            and attempt.error_code == SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
+            and attempt.provider_external_id == str(remote_job.id)
+        )
+        # Persist the exact provider identity and retry intent before DELETE.
+        # A crash after this commit is reconciled as an infrastructure retry,
+        # never as an unclassified provider cancellation.
+        await session.commit()
+        if not applied and not exact_watchdog_intent:
+            return ReconciliationResult(
+                observation=_observation_result(
+                    attempt,
+                    job,
+                    applied=False,
+                    stale=True,
+                ),
+                source=source,
+                matched=True,
+            )
         try:
-            await client.cancel_job(deployment.queue_name, remote_job.id)
+            await client.cancel_job(queue_name, remote_job.id)
         except SaladAPIError as error:
             attempt, job, _ = await _load_attempt_context(
                 session,
@@ -2060,17 +2383,8 @@ async def reconcile_generation_attempt(
         attempt, job, _ = await _load_attempt_context(
             session,
             generation_attempt_id,
-            lock=True,
+            lock=False,
         )
-        applied = _mark_watchdog_cancel_requested(
-            session,
-            attempt=attempt,
-            job=job,
-            remote_job=remote_job,
-            occurred_at=reconciled_at,
-            timeout_seconds=attempt_watchdog_seconds,
-        )
-        await session.commit()
         return ReconciliationResult(
             observation=_observation_result(
                 attempt,
@@ -2125,6 +2439,7 @@ async def _load_attempt_context(
             SaladDeployment.id == GenerationAttempt.salad_deployment_id,
         )
         .where(GenerationAttempt.id == attempt_id)
+        .execution_options(populate_existing=True)
     )
     if lock:
         query = query.with_for_update()
@@ -2133,6 +2448,119 @@ async def _load_attempt_context(
         raise SaladServiceNotFoundError("generation attempt was not found")
     attempt, job, deployment = row
     return attempt, job, deployment
+
+
+def _absence_observation_still_applies(
+    attempt: GenerationAttempt,
+    *,
+    source: ReconciliationSource,
+    queried_provider_external_id: str | None,
+    expected_lock_version: int,
+) -> bool:
+    if attempt.state in _TERMINAL_ATTEMPT_STATES or attempt.lock_version != expected_lock_version:
+        return False
+    if source == ReconciliationSource.LIST:
+        return queried_provider_external_id is None and attempt.provider_external_id is None
+    if source == ReconciliationSource.GET:
+        return (
+            queried_provider_external_id is not None
+            and attempt.provider_external_id == queried_provider_external_id
+        )
+    return False
+
+
+def _active_remote_mutation_still_applies(
+    attempt: GenerationAttempt,
+    *,
+    remote_job: SaladQueueJob,
+) -> bool:
+    if (
+        remote_job.status not in {SaladJobStatus.PENDING, SaladJobStatus.RUNNING}
+        or attempt.state in _TERMINAL_ATTEMPT_STATES
+    ):
+        return False
+    remote_id = str(remote_job.id)
+    if attempt.provider_external_id not in {None, remote_id}:
+        return False
+    provider_update_time = _as_utc(remote_job.update_time)
+    last_observed_at = (
+        _stored_as_utc(attempt.last_observed_at) if attempt.last_observed_at is not None else None
+    )
+    if last_observed_at is not None and provider_update_time < last_observed_at:
+        return False
+    if attempt.state in {
+        GenerationAttemptState.UNKNOWN,
+        GenerationAttemptState.CANCEL_REQUESTED,
+    }:
+        return True
+    return _is_forward_transition(attempt.state, _attempt_state(remote_job.status))
+
+
+def _deployment_rollover_remote_cancel_still_applies(
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    deployment: SaladDeployment,
+    remote_job: SaladQueueJob,
+) -> bool:
+    """Fence rollover DELETE without treating provider status regressions as identity drift."""
+
+    if (
+        remote_job.status not in {SaladJobStatus.PENDING, SaladJobStatus.RUNNING}
+        or attempt.state in _TERMINAL_ATTEMPT_STATES
+        or attempt.attempt_no != job.attempt_count
+        or job.state in _TERMINAL_JOB_STATES
+        or not _deployment_rollover_cancel_is_due(attempt, deployment=deployment)
+    ):
+        return False
+
+    remote_id = str(remote_job.id)
+    if attempt.provider_external_id is None:
+        if not _remote_metadata_matches(attempt, remote_job):
+            return False
+    elif attempt.provider_external_id != remote_id:
+        return False
+
+    # This is provider cleanup for a durably stopped deployment, not a new dispatch.
+    # Release lifecycle changes therefore do not veto DELETE; the scheduler fences
+    # any later retry. Unlike a normal observation, cancelling an exact active
+    # provider identity remains safe when Salad reports PENDING after RUNNING, or
+    # returns an older/equal provider timestamp. The caller holds the budget guard
+    # and joined attempt/job/deployment locks, then checks the operator-stop marker.
+    return True
+
+
+def _deployment_rollover_cancel_is_due(
+    attempt: GenerationAttempt,
+    *,
+    deployment: SaladDeployment,
+) -> bool:
+    return _deployment_rollover_requested(deployment) and (
+        attempt.state != GenerationAttemptState.CANCEL_REQUESTED
+        or _deployment_rollover_cancel_was_requested(attempt)
+    )
+
+
+async def _stale_reconciliation_result(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    source: ReconciliationSource,
+    matched: bool,
+) -> ReconciliationResult:
+    result = ReconciliationResult(
+        observation=_observation_result(
+            attempt,
+            job,
+            applied=False,
+            stale=True,
+        ),
+        source=source,
+        matched=matched,
+    )
+    await session.rollback()
+    return result
 
 
 async def _operator_generation_stop_requested(
@@ -2382,6 +2810,97 @@ async def _mark_definite_failure(
             attempt_id=attempt.id,
             now=occurred_at,
         )
+    await session.flush()
+
+
+async def _rearm_deferred_job_input(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    retry_at: datetime,
+    occurred_at: datetime,
+) -> None:
+    """Release one pre-provider reservation and reuse its exact prepared attempt."""
+
+    if (
+        attempt.job_id != job.id
+        or attempt.attempt_no != job.attempt_count
+        or attempt.state != GenerationAttemptState.SUBMITTING
+        or attempt.provider_external_id is not None
+        or attempt.submitted_at is not None
+        or attempt.started_at is not None
+        or attempt.last_observed_at is not None
+        or attempt.unknown_since is not None
+        or attempt.provider_state is not None
+        or attempt.response_metadata is not None
+        or attempt.cost_reservation_microusd <= 0
+        or attempt.reservation_released_at is not None
+        or job.state != GenerationState.SUBMITTING
+        or job.state in _TERMINAL_JOB_STATES
+    ):
+        raise SaladServiceConflictError(
+            "deferred Salad worker input is no longer definitely unstarted"
+        )
+
+    reservation_microusd = attempt.cost_reservation_microusd
+    attempt.state = GenerationAttemptState.CREATED
+    attempt.cost_reservation_microusd = 0
+    attempt.reservation_released_at = None
+    attempt.submit_started_at = None
+    attempt.error_code = _JOB_INPUT_DEFERRED_ERROR_CODE
+    attempt.error_detail = (
+        "Worker input preparation is waiting for an in-progress asset verification."
+    )
+    attempt.lock_version += 1
+
+    # Keep the prepared attempt and its outbox event as the sole owners of this
+    # job.  RETRY_WAIT would also make the scheduler consider a replacement
+    # attempt while the same outbox event is waiting to retry.
+    job.state = GenerationState.CLAIMED
+    job.retry_at = retry_at
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.last_error_code = _JOB_INPUT_DEFERRED_ERROR_CODE
+    job.last_error_detail = (
+        "Generation will retry the same prepared attempt after asset verification."
+    )
+    job.lock_version += 1
+
+    session.add(
+        AuditEvent(
+            actor="system",
+            action="provider_budget.reservation_released",
+            resource_type="generation_attempt",
+            resource_id=attempt.id,
+            correlation_id=f"generation-attempt:{attempt.id}",
+            detail={
+                "amount_microusd": reservation_microusd,
+                "reason_code": _JOB_INPUT_DEFERRED_ERROR_CODE,
+                "prepared_attempt_rearmed": True,
+            },
+            occurred_at=occurred_at,
+        )
+    )
+    session.add(
+        _audit(
+            action="generation_attempt.job_input_deferred",
+            attempt=attempt,
+            detail={
+                "reason_code": _JOB_INPUT_DEFERRED_ERROR_CODE,
+                "retry_at": retry_at.isoformat(),
+                "reservation_microusd": reservation_microusd,
+                "provider_contacted": False,
+                "prepared_attempt_rearmed": True,
+            },
+            occurred_at=occurred_at,
+        )
+    )
+    await reevaluate_budget_guard(
+        session,
+        provider=_PROVIDER,
+        now=occurred_at,
+    )
     await session.flush()
 
 
@@ -2653,6 +3172,139 @@ def _reset_deployment_rollover_absence_tracking(
     return True
 
 
+async def _record_provider_absence_confirmation(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    source: ReconciliationSource,
+    occurred_at: datetime,
+) -> int:
+    response_metadata = dict(attempt.response_metadata or {})
+    previous = response_metadata.get(_PROVIDER_ABSENCE_TRACKER_KEY)
+    previous_source = previous.get("source") if isinstance(previous, dict) else None
+    previous_count_value = previous.get("count") if isinstance(previous, dict) else None
+    previous_count = (
+        previous_count_value
+        if isinstance(previous_count_value, int) and not isinstance(previous_count_value, bool)
+        else 0
+    )
+    confirmation = previous_count + 1 if previous_source == source.value else 1
+    response_metadata[_PROVIDER_ABSENCE_TRACKER_KEY] = {
+        "source": source.value,
+        "count": confirmation,
+        "observed_at": occurred_at.isoformat(),
+        "required_confirmations": _PROVIDER_ABSENCE_CONFIRMATIONS,
+    }
+    attempt.response_metadata = response_metadata
+    attempt.lock_version += 1
+    session.add(
+        _audit(
+            action="generation_attempt.provider_absence_observed",
+            attempt=attempt,
+            detail={
+                "source": source.value,
+                "confirmation": confirmation,
+                "required_confirmations": _PROVIDER_ABSENCE_CONFIRMATIONS,
+            },
+            occurred_at=occurred_at,
+        )
+    )
+    await session.flush()
+    return confirmation
+
+
+def _reset_provider_absence_tracking(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    reason: str,
+    occurred_at: datetime,
+) -> bool:
+    response_metadata = dict(attempt.response_metadata or {})
+    previous = response_metadata.pop(_PROVIDER_ABSENCE_TRACKER_KEY, None)
+    if previous is None:
+        return False
+    attempt.response_metadata = response_metadata
+    attempt.lock_version += 1
+    session.add(
+        _audit(
+            action="generation_attempt.provider_absence_reset",
+            attempt=attempt,
+            detail={"reason": reason, "previous": previous},
+            occurred_at=occurred_at,
+        )
+    )
+    return True
+
+
+async def _mark_provider_job_absent(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    absence_source: ReconciliationSource,
+    occurred_at: datetime,
+) -> bool:
+    if attempt.state in _TERMINAL_ATTEMPT_STATES:
+        return False
+
+    attempt.provider_state = "absent_after_reconciliation"
+    attempt.last_observed_at = occurred_at
+    attempt.response_metadata = {
+        "provider_absence_source": absence_source.value,
+        "provider_absent_after_reconciliation": True,
+        "required_confirmations": _PROVIDER_ABSENCE_CONFIRMATIONS,
+    }
+    attempt.state = GenerationAttemptState.FAILED
+    attempt.completed_at = occurred_at
+    attempt.unknown_since = None
+    attempt.error_code = SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE
+    attempt.error_detail = (
+        "Repeated exact provider observations confirmed that the Salad job is absent."
+    )
+    attempt.lock_version += 1
+
+    await grant_infrastructure_retry(
+        session,
+        attempt=attempt,
+        job=job,
+        source=InfrastructureRetrySource.RECONCILER,
+        actor="salad-controller",
+        retry_at=occurred_at,
+        occurred_at=occurred_at,
+    )
+    if job.state not in _TERMINAL_JOB_STATES:
+        job.state = _retry_or_fail(job)
+        job.retry_at = occurred_at if job.state == GenerationState.RETRY_WAIT else None
+        job.last_error_code = SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE
+        job.last_error_detail = (
+            "The missing provider job was confirmed absent; generation can retry safely."
+        )
+        job.lock_version += 1
+
+    session.add(
+        _audit(
+            action="generation_attempt.provider_absent",
+            attempt=attempt,
+            detail={
+                "source": absence_source.value,
+                "reason_code": SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE,
+                "assets_retained": True,
+            },
+            occurred_at=occurred_at,
+        )
+    )
+    if attempt.cost_reservation_microusd > 0 and attempt.reservation_released_at is None:
+        await release_attempt_reservation(
+            session,
+            provider=_PROVIDER,
+            attempt_id=attempt.id,
+            now=occurred_at,
+        )
+    await session.flush()
+    return True
+
+
 async def _mark_deployment_rollover_provider_absent(
     session: AsyncSession,
     *,
@@ -2679,6 +3331,16 @@ async def _mark_deployment_rollover_provider_absent(
         "remaining Salad job."
     )
     attempt.lock_version += 1
+
+    await grant_infrastructure_retry(
+        session,
+        attempt=attempt,
+        job=job,
+        source=InfrastructureRetrySource.RECONCILER,
+        actor="salad-controller",
+        retry_at=occurred_at,
+        occurred_at=occurred_at,
+    )
 
     if job.state not in _TERMINAL_JOB_STATES:
         job.state = _retry_or_fail(job)

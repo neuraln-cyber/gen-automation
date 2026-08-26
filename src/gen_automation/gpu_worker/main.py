@@ -9,8 +9,9 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, cast
 from urllib.parse import SplitResult, urlsplit
@@ -40,6 +41,11 @@ from gen_automation.gpu_worker.models import WorkerEnvironment, WorkerSettings
 
 COMFY_SHUTDOWN_GRACE_SECONDS = 20.0
 COMFY_MONITOR_INTERVAL_SECONDS = 1.0
+COMFY_HEALTH_CHECK_TIMEOUT_SECONDS = 5.0
+QUEUE_WORKER_MAX_CONSECUTIVE_RESTARTS = 3
+QUEUE_WORKER_RESTART_BACKOFF_BASE_SECONDS = 1.0
+QUEUE_WORKER_RESTART_BACKOFF_MAX_SECONDS = 4.0
+QUEUE_WORKER_RESTART_BUDGET_RESET_SECONDS = 300.0
 WORKER_SERVER_START_TIMEOUT_SECONDS = 10.0
 _PR_SET_DUMPABLE = 4
 _PR_SET_NO_NEW_PRIVS = 38
@@ -85,6 +91,39 @@ _QUEUE_CHILD_ENVIRONMENT_NAMES = frozenset(
         "SSL_CERT_FILE",
     }
 )
+
+
+@dataclass(frozen=True)
+class _QueueWorkerLaunchSettings:
+    salad_queue_worker_enabled: bool
+    salad_queue_worker_path: Path
+    salad_queue_worker_log_level: str
+    comfy_runtime_root: Path
+
+    @classmethod
+    def from_runtime_settings(
+        cls,
+        settings: WorkerRuntimeSettings,
+    ) -> "_QueueWorkerLaunchSettings":
+        return cls(
+            salad_queue_worker_enabled=settings.salad_queue_worker_enabled,
+            salad_queue_worker_path=settings.salad_queue_worker_path,
+            salad_queue_worker_log_level=settings.salad_queue_worker_log_level,
+            comfy_runtime_root=settings.comfy_runtime_root,
+        )
+
+
+@dataclass
+class _ManagedChild:
+    role: str
+    process: subprocess.Popen[bytes]
+    started_at: float
+
+
+@dataclass
+class _ManagedChildren:
+    comfy: _ManagedChild
+    queue_worker: _ManagedChild | None
 
 
 def _apply_linux_process_hardening() -> None:
@@ -272,7 +311,7 @@ def build_comfy_environment(source: Mapping[str, str]) -> dict[str, str]:
 
 
 def build_queue_worker_environment(
-    settings: WorkerRuntimeSettings,
+    settings: WorkerRuntimeSettings | _QueueWorkerLaunchSettings,
     source: Mapping[str, str],
 ) -> dict[str, str]:
     result = {
@@ -346,7 +385,7 @@ def start_comfy(
 
 
 def start_salad_queue_worker(
-    settings: WorkerRuntimeSettings,
+    settings: WorkerRuntimeSettings | _QueueWorkerLaunchSettings,
 ) -> subprocess.Popen[bytes] | None:
     if not settings.salad_queue_worker_enabled:
         return None
@@ -410,27 +449,349 @@ def _signal_process_group(process_id: int, signal_number: int) -> None:
     kill_group(process_id, signal_number)
 
 
-async def _monitor_comfy(
-    processes: tuple[subprocess.Popen[bytes], ...],
+def _child_exit_details(
+    child: _ManagedChild,
+    returncode: int,
+    *,
+    now: float,
+) -> tuple[int | None, str, float]:
+    signal_number = -returncode if returncode < 0 else None
+    signal_name = "none"
+    if signal_number is not None:
+        try:
+            signal_name = signal.Signals(signal_number).name
+        except ValueError:
+            signal_name = "unknown"
+    uptime_seconds = max(0.0, now - child.started_at)
+    return signal_number, signal_name, uptime_seconds
+
+
+def _log_child_exit(
+    child: _ManagedChild,
+    returncode: int,
+    *,
+    now: float,
+) -> tuple[int | None, str, float]:
+    signal_number, signal_name, uptime_seconds = _child_exit_details(
+        child,
+        returncode,
+        now=now,
+    )
+    signal_value = "none" if signal_number is None else str(signal_number)
+    print(
+        "GPU worker managed child exited: "
+        f"role={child.role} pid={child.process.pid} returncode={returncode} "
+        f"signal={signal_value} signal_name={signal_name} "
+        f"uptime_seconds={uptime_seconds:.3f}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return signal_number, signal_name, uptime_seconds
+
+
+def _request_controlled_worker_restart(
     server: uvicorn.Server,
     worker_restart_event: asyncio.Event,
+    *,
+    role: str,
+    reason: str,
+    consecutive_restarts: int,
 ) -> None:
+    print(
+        "GPU worker managed child recovery stopped: "
+        f"role={role} reason={reason} "
+        f"consecutive_restarts={consecutive_restarts}",
+        file=sys.stderr,
+        flush=True,
+    )
+    worker_restart_event.set()
+    server.should_exit = True
+
+
+def _stop_for_requested_worker_restart(
+    server: uvicorn.Server,
+    *,
+    consecutive_restarts: int,
+) -> None:
+    print(
+        "GPU worker managed restart requested: "
+        "reason=blank_or_fatal_output_requested "
+        f"consecutive_restarts={consecutive_restarts}",
+        file=sys.stderr,
+        flush=True,
+    )
+    server.should_exit = True
+
+
+async def _wait_for_event_or_timeout(
+    event: asyncio.Event,
+    timeout_seconds: float,
+) -> bool:
+    try:
+        await asyncio.wait_for(event.wait(), timeout=timeout_seconds)
+    except TimeoutError:
+        return False
+    return True
+
+
+async def _bounded_comfy_health_check(health_check: Callable[[], bool]) -> bool:
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(health_check),
+            timeout=COMFY_HEALTH_CHECK_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return False
+
+
+async def _monitor_comfy_impl(
+    children: _ManagedChildren,
+    server: uvicorn.Server,
+    worker_restart_event: asyncio.Event,
+    *,
+    start_queue_worker: Callable[[], subprocess.Popen[bytes] | None] | None = None,
+    unsafe_request_active: Callable[[], bool] = lambda: False,
+    comfy_health_check: Callable[[], bool] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    wait_for_event: Callable[[asyncio.Event, float], Awaitable[bool]] = (
+        _wait_for_event_or_timeout
+    ),
+) -> None:
+    consecutive_queue_restarts = 0
     while not server.should_exit:
-        if worker_restart_event.is_set() or any(
-            process.poll() is not None for process in processes
-        ):
-            worker_restart_event.set()
-            server.should_exit = True
-            return
-        try:
-            await asyncio.wait_for(
-                worker_restart_event.wait(),
-                timeout=COMFY_MONITOR_INTERVAL_SECONDS,
+        now = monotonic()
+        comfy_returncode = children.comfy.process.poll()
+        if comfy_returncode is not None:
+            _log_child_exit(children.comfy, comfy_returncode, now=now)
+            _request_controlled_worker_restart(
+                server,
+                worker_restart_event,
+                role=children.comfy.role,
+                reason="child_exited",
+                consecutive_restarts=consecutive_queue_restarts,
             )
-        except TimeoutError:
+            return
+
+        queue_child = children.queue_worker
+        if (
+            queue_child is not None
+            and consecutive_queue_restarts > 0
+            and now - queue_child.started_at >= QUEUE_WORKER_RESTART_BUDGET_RESET_SECONDS
+        ):
+            consecutive_queue_restarts = 0
+
+        queue_returncode = queue_child.process.poll() if queue_child is not None else None
+        if queue_child is not None and queue_returncode is not None:
+            signal_number, signal_name, uptime_seconds = _log_child_exit(
+                queue_child,
+                queue_returncode,
+                now=now,
+            )
+            if uptime_seconds >= QUEUE_WORKER_RESTART_BUDGET_RESET_SECONDS:
+                consecutive_queue_restarts = 0
+            children.queue_worker = None
+
+            if worker_restart_event.is_set():
+                _stop_for_requested_worker_restart(
+                    server,
+                    consecutive_restarts=consecutive_queue_restarts,
+                )
+                return
+            if unsafe_request_active():
+                _request_controlled_worker_restart(
+                    server,
+                    worker_restart_event,
+                    role=queue_child.role,
+                    reason="unsafe_active_request",
+                    consecutive_restarts=consecutive_queue_restarts,
+                )
+                return
+            if start_queue_worker is None or comfy_health_check is None:
+                _request_controlled_worker_restart(
+                    server,
+                    worker_restart_event,
+                    role=queue_child.role,
+                    reason="recovery_unavailable",
+                    consecutive_restarts=consecutive_queue_restarts,
+                )
+                return
+
+            while children.queue_worker is None:
+                if consecutive_queue_restarts >= QUEUE_WORKER_MAX_CONSECUTIVE_RESTARTS:
+                    _request_controlled_worker_restart(
+                        server,
+                        worker_restart_event,
+                        role=queue_child.role,
+                        reason="restart_budget_exhausted",
+                        consecutive_restarts=consecutive_queue_restarts,
+                    )
+                    return
+
+                restart_ordinal = consecutive_queue_restarts + 1
+                backoff_seconds = min(
+                    QUEUE_WORKER_RESTART_BACKOFF_BASE_SECONDS * (2 ** (restart_ordinal - 1)),
+                    QUEUE_WORKER_RESTART_BACKOFF_MAX_SECONDS,
+                )
+                if await wait_for_event(worker_restart_event, backoff_seconds):
+                    _stop_for_requested_worker_restart(
+                        server,
+                        consecutive_restarts=consecutive_queue_restarts,
+                    )
+                    return
+                if server.should_exit:
+                    return
+                if unsafe_request_active():
+                    _request_controlled_worker_restart(
+                        server,
+                        worker_restart_event,
+                        role=queue_child.role,
+                        reason="unsafe_active_request",
+                        consecutive_restarts=consecutive_queue_restarts,
+                    )
+                    return
+
+                now = monotonic()
+                comfy_returncode = children.comfy.process.poll()
+                if comfy_returncode is not None:
+                    _log_child_exit(children.comfy, comfy_returncode, now=now)
+                    _request_controlled_worker_restart(
+                        server,
+                        worker_restart_event,
+                        role=children.comfy.role,
+                        reason="child_exited",
+                        consecutive_restarts=consecutive_queue_restarts,
+                    )
+                    return
+                if not await _bounded_comfy_health_check(comfy_health_check):
+                    _request_controlled_worker_restart(
+                        server,
+                        worker_restart_event,
+                        role=children.comfy.role,
+                        reason="health_check_failed",
+                        consecutive_restarts=consecutive_queue_restarts,
+                    )
+                    return
+                if worker_restart_event.is_set():
+                    _stop_for_requested_worker_restart(
+                        server,
+                        consecutive_restarts=consecutive_queue_restarts,
+                    )
+                    return
+                if unsafe_request_active():
+                    _request_controlled_worker_restart(
+                        server,
+                        worker_restart_event,
+                        role=queue_child.role,
+                        reason="unsafe_active_request",
+                        consecutive_restarts=consecutive_queue_restarts,
+                    )
+                    return
+
+                consecutive_queue_restarts = restart_ordinal
+                try:
+                    restarted_process = start_queue_worker()
+                except (OSError, WorkerBootstrapConfigurationError):
+                    restarted_process = None
+                if restarted_process is None:
+                    print(
+                        "GPU worker managed child restart failed: "
+                        f"role={queue_child.role} previous_pid={queue_child.process.pid} "
+                        f"restart_ordinal={restart_ordinal} "
+                        f"backoff_seconds={backoff_seconds:.3f}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+
+                restarted_at = monotonic()
+                children.queue_worker = _ManagedChild(
+                    role=queue_child.role,
+                    process=restarted_process,
+                    started_at=restarted_at,
+                )
+                previous_signal = "none" if signal_number is None else str(signal_number)
+                print(
+                    "GPU worker managed child restarted: "
+                    f"role={queue_child.role} previous_pid={queue_child.process.pid} "
+                    f"previous_returncode={queue_returncode} "
+                    f"previous_signal={previous_signal} "
+                    f"previous_signal_name={signal_name} "
+                    f"previous_uptime_seconds={uptime_seconds:.3f} "
+                    f"new_pid={restarted_process.pid} "
+                    f"restart_ordinal={restart_ordinal} "
+                    f"backoff_seconds={backoff_seconds:.3f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                break
             continue
-        server.should_exit = True
-        return
+
+        if worker_restart_event.is_set():
+            _stop_for_requested_worker_restart(
+                server,
+                consecutive_restarts=consecutive_queue_restarts,
+            )
+            return
+        if await wait_for_event(
+            worker_restart_event,
+            COMFY_MONITOR_INTERVAL_SECONDS,
+        ):
+            _stop_for_requested_worker_restart(
+                server,
+                consecutive_restarts=consecutive_queue_restarts,
+            )
+            return
+
+
+async def _monitor_comfy(
+    children: _ManagedChildren | tuple[subprocess.Popen[bytes], ...],
+    server: uvicorn.Server,
+    worker_restart_event: asyncio.Event,
+    *,
+    start_queue_worker: Callable[[], subprocess.Popen[bytes] | None] | None = None,
+    unsafe_request_active: Callable[[], bool] = lambda: False,
+    comfy_health_check: Callable[[], bool] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    wait_for_event: Callable[[asyncio.Event, float], Awaitable[bool]] = (
+        _wait_for_event_or_timeout
+    ),
+) -> None:
+    try:
+        if isinstance(children, tuple):
+            if not 1 <= len(children) <= 2:
+                raise ValueError("invalid managed child count")
+            started_at = monotonic()
+            children = _ManagedChildren(
+                comfy=_ManagedChild("comfy", children[0], started_at),
+                queue_worker=(
+                    _ManagedChild("salad_queue_worker", children[1], started_at)
+                    if len(children) == 2
+                    else None
+                ),
+            )
+        await _monitor_comfy_impl(
+            children,
+            server,
+            worker_restart_event,
+            start_queue_worker=start_queue_worker,
+            unsafe_request_active=unsafe_request_active,
+            comfy_health_check=comfy_health_check,
+            monotonic=monotonic,
+            wait_for_event=wait_for_event,
+        )
+    except Exception as error:
+        print(
+            f"GPU worker managed child monitor failed: exception={type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+        _request_controlled_worker_restart(
+            server,
+            worker_restart_event,
+            role="managed_child_monitor",
+            reason="monitor_exception",
+            consecutive_restarts=0,
+        )
 
 
 async def serve_worker(
@@ -442,6 +803,8 @@ async def serve_worker(
     port: int,
     log_level: str,
 ) -> bool:
+    if not processes:
+        raise WorkerBootstrapConfigurationError("worker bootstrap configuration is invalid")
     worker_restart_event = asyncio.Event()
     application = create_worker_app(
         settings=settings,
@@ -462,7 +825,23 @@ async def serve_worker(
         timeout_keep_alive=5,
     )
     server = uvicorn.Server(configuration)
-    monitor = asyncio.create_task(_monitor_comfy(processes, server, worker_restart_event))
+    started_at = time.monotonic()
+    children = _ManagedChildren(
+        comfy=_ManagedChild("comfy", processes[0], started_at),
+        queue_worker=(
+            _ManagedChild("salad_queue_worker", processes[1], started_at)
+            if len(processes) > 1
+            else None
+        ),
+    )
+    monitor = asyncio.create_task(
+        _monitor_comfy(
+            children,
+            server,
+            worker_restart_event,
+            comfy_health_check=executor.is_ready,
+        )
+    )
     try:
         await server.serve()
     finally:
@@ -511,13 +890,28 @@ class _SwitchableWorkerApplication:
 
     def __init__(self) -> None:
         self._application: ASGIApp = _bootstrap_probe_application
+        self._unsafe_active_requests = 0
 
     def activate(self, application: ASGIApp) -> None:
         self._application = application
 
+    def has_unsafe_active_request(self) -> bool:
+        return self._unsafe_active_requests > 0
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         application = self._application
-        await application(scope, receive, send)
+        unsafe_request = (
+            scope["type"] == "http"
+            and scope.get("method") == "POST"
+            and scope.get("path") == "/jobs/generate"
+        )
+        if unsafe_request:
+            self._unsafe_active_requests += 1
+        try:
+            await application(scope, receive, send)
+        finally:
+            if unsafe_request:
+                self._unsafe_active_requests -= 1
 
 
 def _build_switchable_server(
@@ -580,6 +974,7 @@ async def _serve_worker_lifecycle(
     server_task = asyncio.create_task(server.serve())
     process: subprocess.Popen[bytes] | None = None
     queue_process: subprocess.Popen[bytes] | None = None
+    managed_children: _ManagedChildren | None = None
     executor: ComfyExecutor | None = None
     monitor: asyncio.Task[None] | None = None
     worker_lifespan: Any | None = None
@@ -635,8 +1030,19 @@ async def _serve_worker_lifecycle(
         )
         startup_stage[0] = "comfy_start"
         process = start_comfy(settings)
+        comfy_started_at = time.monotonic()
         startup_stage[0] = "queue_worker_start"
-        queue_process = start_salad_queue_worker(settings)
+        queue_launch_settings = _QueueWorkerLaunchSettings.from_runtime_settings(settings)
+        queue_process = start_salad_queue_worker(queue_launch_settings)
+        queue_started_at = time.monotonic()
+        managed_children = _ManagedChildren(
+            comfy=_ManagedChild("comfy", process, comfy_started_at),
+            queue_worker=(
+                _ManagedChild("salad_queue_worker", queue_process, queue_started_at)
+                if queue_process is not None
+                else None
+            ),
+        )
         startup_stage[0] = "worker_settings"
         worker_settings = settings.to_worker_settings()
         application = create_worker_app(
@@ -656,9 +1062,15 @@ async def _serve_worker_lifecycle(
         del settings
         gc.collect()
 
-        monitored_processes = (process, queue_process) if queue_process is not None else (process,)
         monitor = asyncio.create_task(
-            _monitor_comfy(monitored_processes, server, worker_restart_event)
+            _monitor_comfy(
+                managed_children,
+                server,
+                worker_restart_event,
+                start_queue_worker=lambda: start_salad_queue_worker(queue_launch_settings),
+                unsafe_request_active=router.has_unsafe_active_request,
+                comfy_health_check=executor.is_ready,
+            )
         )
         await server_task
         return worker_restart_event.is_set()
@@ -682,10 +1094,15 @@ async def _serve_worker_lifecycle(
         finally:
             if executor is not None:
                 executor.close()
-            if queue_process is not None:
-                stop_comfy(queue_process)
-            if process is not None:
-                stop_comfy(process)
+            if managed_children is not None:
+                if managed_children.queue_worker is not None:
+                    stop_comfy(managed_children.queue_worker.process)
+                stop_comfy(managed_children.comfy.process)
+            else:
+                if queue_process is not None:
+                    stop_comfy(queue_process)
+                if process is not None:
+                    stop_comfy(process)
 
 
 def _safe_startup_error_message(error: BaseException) -> str:

@@ -2,9 +2,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
 
 from gen_automation.db.models import (
     Asset,
@@ -26,10 +25,13 @@ from gen_automation.services.assets import (
     AssetBusyError,
     AssetQuarantinedError,
     AssetStorageUnavailableError,
+    AssetUploadSalvageRequiredError,
+    UploadIntent,
     UploadNotReadyError,
+    create_raw_master_upload_intents,
     finalize_raw_master,
 )
-from gen_automation.storage.base import ObjectStore
+from gen_automation.storage.base import ObjectStore, ObjectStoreError
 
 
 class CollectionError(Exception):
@@ -37,6 +39,10 @@ class CollectionError(Exception):
 
 
 class CollectionLeaseError(CollectionError):
+    pass
+
+
+class RetryUploadSalvageDeferredError(CollectionError):
     pass
 
 
@@ -93,6 +99,8 @@ _PROGRESSIVE_GENERATION_STATES = (
     GenerationState.SUBMITTING,
     GenerationState.RUNNING,
     GenerationState.UNKNOWN,
+    GenerationState.CANCEL_REQUESTED,
+    GenerationState.RETRY_WAIT,
 )
 _PROGRESSIVE_CANDIDATE_JOB_LIMIT = 8
 
@@ -101,6 +109,114 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+async def create_retry_safe_raw_master_upload_intents(
+    session: AsyncSession,
+    store: ObjectStore,
+    *,
+    generation_job_id: UUID,
+    expected_output_count: int,
+    content_type: str = "image/png",
+    expires_in: int = 600,
+    max_bytes: int = 100 * 1024 * 1024,
+    max_serialized_grant_bytes: int | None = None,
+    commit: bool = True,
+    actor: str = "controller",
+    verification_lease_seconds: int = 900,
+) -> list[UploadIntent]:
+    """Re-sign incomplete retry grants only after visible uploads are preserved.
+
+    ``create_raw_master_upload_intents`` serializes grant creation on the job and
+    raw asset rows. It re-signs a missing UPLOADING intent in place, and refuses
+    to proceed while an object is visible at that key. This bounded loop promotes
+    each visible exact intent before retrying. Busy verification leases and
+    inconclusive storage reads defer the whole rebuild.
+    """
+
+    if expected_output_count <= 0:
+        raise ValueError("expected_output_count must be positive")
+    salvaged_count = 0
+    while True:
+        try:
+            return await create_raw_master_upload_intents(
+                session,
+                store,
+                generation_job_id=generation_job_id,
+                content_type=content_type,
+                expires_in=expires_in,
+                max_bytes=max_bytes,
+                rotate_incomplete_uploads=True,
+                require_salvage_before_rotation=True,
+                max_serialized_grant_bytes=max_serialized_grant_bytes,
+                commit=commit,
+                actor=actor,
+            )
+        except AssetUploadSalvageRequiredError as pending:
+            await session.rollback()
+            if salvaged_count >= expected_output_count:
+                raise RetryUploadSalvageDeferredError(
+                    "retry upload salvage exceeded the expected output bound"
+                ) from pending
+            try:
+                await finalize_raw_master(
+                    session,
+                    store,
+                    asset_id=pending.asset_id,
+                    max_bytes=max_bytes,
+                    verification_lease_seconds=verification_lease_seconds,
+                    expected_staging_key=pending.staging_key,
+                    actor=actor,
+                )
+            except (UploadNotReadyError, AssetBusyError, AssetStorageUnavailableError) as error:
+                await session.rollback()
+                raise RetryUploadSalvageDeferredError(
+                    "retry upload salvage is not yet safe to rotate"
+                ) from error
+            salvaged_count += 1
+        except AssetBusyError as error:
+            await session.rollback()
+            raise RetryUploadSalvageDeferredError(
+                "raw-master verification is still in progress"
+            ) from error
+        except ObjectStoreError as error:
+            # A failed HEAD or presign may occur after earlier rows were changed
+            # in this transaction.  Roll the whole rotation attempt back so an
+            # inconclusive storage read cannot advance even one staging key.
+            await session.rollback()
+            raise RetryUploadSalvageDeferredError(
+                "object storage could not prove retry upload rotation safe"
+            ) from error
+
+
+async def _touch_missing_progressive_candidates(
+    session: AsyncSession,
+    *,
+    candidates: list[tuple[UUID, str]],
+    checked_at: datetime,
+) -> None:
+    """Durably rotate exact missing intents behind unchecked candidates."""
+
+    for asset_id, staging_key in candidates:
+        await session.execute(
+            update(Asset)
+            .where(
+                Asset.id == asset_id,
+                Asset.staging_object_key == staging_key,
+                or_(
+                    Asset.state == AssetState.UPLOADING,
+                    (
+                        (Asset.state == AssetState.VERIFYING)
+                        & or_(
+                            Asset.verification_lease_expires_at.is_(None),
+                            Asset.verification_lease_expires_at <= checked_at,
+                        )
+                    ),
+                ),
+            )
+            .values(updated_at=checked_at)
+        )
+    await session.commit()
 
 
 async def collect_next_ready_running_asset(
@@ -117,10 +233,11 @@ async def collect_next_ready_running_asset(
     The GPU worker uploads outputs in ``output_index`` order. Upload grants are
     durably committed while the provider request is still ``SUBMITTING``, so that
     state (and an ambiguous ``UNKNOWN`` response) must remain eligible or the
-    first outputs wait for the whole provider job to finish. Looking only at the
-    first unfinished output from each of a bounded number of jobs prevents one
-    cold or missing staging object from hiding uploads produced by another job.
-    The existing per-asset verification lease remains the concurrency boundary.
+    first outputs wait for the whole provider job to finish. A bounded scan of
+    the oldest unfinished intents, plus a conditional durable touch after an
+    exact miss, prevents cold objects from hiding later uploads without imposing
+    output-index ordering. The per-asset verification lease remains the
+    concurrency boundary.
     A durable operator stop broadens the scan to provider-active and terminal
     jobs so every successfully uploaded output is promoted before the partial set
     is frozen.
@@ -153,29 +270,6 @@ async def collect_next_ready_running_asset(
             )
         ),
     )
-    earlier_asset = aliased(Asset)
-    earlier_unfinished_asset = or_(
-        earlier_asset.state == AssetState.UPLOADING,
-        (
-            (earlier_asset.state == AssetState.VERIFYING)
-            & or_(
-                earlier_asset.verification_lease_expires_at.is_(None),
-                earlier_asset.verification_lease_expires_at <= collected_at,
-            )
-        ),
-    )
-    has_earlier_unfinished_output = (
-        select(earlier_asset.id)
-        .where(
-            earlier_asset.generation_job_id == Asset.generation_job_id,
-            earlier_asset.kind == AssetKind.RAW_MASTER,
-            earlier_unfinished_asset,
-            earlier_asset.staging_object_key.is_not(None),
-            earlier_asset.output_index < Asset.output_index,
-        )
-        .exists()
-    )
-
     candidates = list(
         await session.execute(
             select(
@@ -183,6 +277,7 @@ async def collect_next_ready_running_asset(
                 Asset.staging_object_key,
                 GenerationJob.id,
                 GenerationJob.state,
+                Asset.updated_at,
             )
             .join(GenerationJob, GenerationJob.id == Asset.generation_job_id)
             .join(ReleaseVersion, ReleaseVersion.id == GenerationJob.release_version_id)
@@ -194,11 +289,10 @@ async def collect_next_ready_running_asset(
                 Asset.kind == AssetKind.RAW_MASTER,
                 unfinished_asset,
                 Asset.staging_object_key.is_not(None),
-                ~has_earlier_unfinished_output,
             )
             .order_by(
+                Asset.updated_at,
                 GenerationJob.priority,
-                GenerationJob.updated_at,
                 GenerationJob.id,
                 Asset.output_index,
             )
@@ -210,20 +304,28 @@ async def collect_next_ready_running_asset(
         return ProgressiveCollectionResult(asset_id=None, finalized=False)
 
     first_asset_id = candidates[0][0]
-    for asset_id, staging_object_key, job_id, job_state in candidates:
+    missing_candidates: list[tuple[UUID, str]] = []
+    for asset_id, staging_object_key, job_id, job_state, _asset_updated_at in candidates:
         assert staging_object_key is not None
         if await store.head(staging_object_key) is not None:
             break
         if job_state in _TERMINAL_GENERATION_STATES:
-            await _quarantine_terminal_missing_stop_asset(
+            retired = await _quarantine_terminal_missing_stop_asset(
                 session,
                 asset_id=asset_id,
                 job_id=job_id,
                 worker_id=worker_id,
                 now=collected_at,
             )
-            return ProgressiveCollectionResult(asset_id=asset_id, finalized=False)
+            if retired:
+                return ProgressiveCollectionResult(asset_id=asset_id, finalized=False)
+        missing_candidates.append((asset_id, staging_object_key))
     else:
+        await _touch_missing_progressive_candidates(
+            session,
+            candidates=missing_candidates,
+            checked_at=collected_at,
+        )
         return ProgressiveCollectionResult(asset_id=first_asset_id, finalized=False)
 
     try:
@@ -233,6 +335,7 @@ async def collect_next_ready_running_asset(
             asset_id=asset_id,
             max_bytes=max_image_bytes,
             verification_lease_seconds=verification_lease_seconds,
+            expected_staging_key=staging_object_key,
             actor=worker_id,
         )
     except (UploadNotReadyError, AssetBusyError, AssetStorageUnavailableError):

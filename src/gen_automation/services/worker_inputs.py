@@ -54,14 +54,17 @@ from gen_automation.gpu_worker.models import (
     UploadGrant,
 )
 from gen_automation.gpu_worker.security import calculate_signature
-from gen_automation.services.assets import create_raw_master_upload_intents
+from gen_automation.services.collection import (
+    RetryUploadSalvageDeferredError,
+    create_retry_safe_raw_master_upload_intents,
+)
 from gen_automation.services.controlled_trio import (
     CONTROLLED_TRIO_MARKER_NODE_CLASS,
     ControlledTrioContractError,
     controlled_trio_bindings,
     prepare_controlled_trio_template,
 )
-from gen_automation.services.salad import SaladJobInputContext
+from gen_automation.services.salad import SaladJobInputContext, SaladJobInputDeferredError
 from gen_automation.storage.base import (
     ObjectAlreadyExistsError,
     ObjectConflictError,
@@ -1844,18 +1847,22 @@ class SaladWorkerJobInputProvider:
         ):
             raise WorkerInputError("rendered workflow cannot fit the signed worker request budget")
 
-        intents = await create_raw_master_upload_intents(
-            self.session,
-            self.store,
-            generation_job_id=context.generation_job_id,
-            content_type=self.upload_content_type,
-            expires_in=self.upload_grant_ttl_seconds,
-            max_bytes=self.max_upload_bytes,
-            rotate_incomplete_uploads=True,
-            max_serialized_grant_bytes=MAX_SERIALIZED_UPLOAD_GRANT_BYTES,
-            commit=False,
-            actor="salad-worker-input",
-        )
+        try:
+            intents = await create_retry_safe_raw_master_upload_intents(
+                self.session,
+                self.store,
+                generation_job_id=context.generation_job_id,
+                expected_output_count=context.expected_output_count,
+                content_type=self.upload_content_type,
+                expires_in=self.upload_grant_ttl_seconds,
+                max_bytes=self.max_upload_bytes,
+                max_serialized_grant_bytes=MAX_SERIALIZED_UPLOAD_GRANT_BYTES,
+                commit=False,
+                actor="salad-worker-input",
+            )
+        except RetryUploadSalvageDeferredError:
+            await self.session.rollback()
+            raise SaladJobInputDeferredError() from None
         if len(intents) != context.expected_output_count:
             await self.session.rollback()
             raise WorkerInputError("worker upload grant count is inconsistent")

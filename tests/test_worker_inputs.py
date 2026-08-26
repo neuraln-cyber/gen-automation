@@ -4,7 +4,7 @@ import io
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -46,7 +46,7 @@ from gen_automation.services.controlled_trio import (
     CONTROLLED_TRIO_MARKER_NODE_CLASS,
     controlled_trio_bindings,
 )
-from gen_automation.services.salad import SaladJobInputContext
+from gen_automation.services.salad import SaladJobInputContext, SaladJobInputDeferredError
 from gen_automation.services.worker_inputs import (
     CONTROLLED_DUO_MARKER_NODE_CLASS,
     SaladWorkerJobInputProvider,
@@ -2150,7 +2150,7 @@ async def test_anima_rejects_a_missing_split_runtime_artifact(
 
 
 @pytest.mark.asyncio
-async def test_rebuild_rotates_expiring_upload_grants(
+async def test_rebuild_resigns_incomplete_upload_grants_on_the_exact_intents(
     worker_input_context: WorkerInputContext,
 ) -> None:
     first = GenerateEnvelope.model_validate(await _build(worker_input_context), strict=True)
@@ -2159,9 +2159,81 @@ async def test_rebuild_rotates_expiring_upload_grants(
     assert [grant.asset_id for grant in first.payload.uploads] == [
         grant.asset_id for grant in second.payload.uploads
     ]
-    assert [grant.upload_attempt_id for grant in first.payload.uploads] != [
+    assert [grant.upload_attempt_id for grant in first.payload.uploads] == [
         grant.upload_attempt_id for grant in second.payload.uploads
     ]
+    assert [grant.fields["key"] for grant in first.payload.uploads] == [
+        grant.fields["key"] for grant in second.payload.uploads
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rebuild_maps_active_verification_to_salad_input_deferral(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    first = GenerateEnvelope.model_validate(await _build(worker_input_context), strict=True)
+    first_keys = [grant.fields["key"] for grant in first.payload.uploads]
+    first_attempt_ids = [grant.upload_attempt_id for grant in first.payload.uploads]
+    async with worker_input_context.database.sessions() as session:
+        asset = await session.scalar(
+            select(Asset).where(
+                Asset.generation_job_id == worker_input_context.job_context.generation_job_id,
+                Asset.output_index == 0,
+            )
+        )
+        assert asset is not None
+        asset.state = AssetState.VERIFYING
+        asset.verification_lease_owner = "active-collector"
+        asset.verification_lease_expires_at = datetime.now(UTC) + timedelta(minutes=5)
+        await session.commit()
+
+    with pytest.raises(SaladJobInputDeferredError):
+        await _build(worker_input_context)
+
+    async with worker_input_context.database.sessions() as session:
+        assets = list(
+            (
+                await session.scalars(
+                    select(Asset)
+                    .where(
+                        Asset.generation_job_id
+                        == worker_input_context.job_context.generation_job_id
+                    )
+                    .order_by(Asset.output_index)
+                )
+            ).all()
+        )
+
+    assert [asset.staging_object_key for asset in assets] == first_keys
+    assert [asset.asset_metadata["upload_attempt_id"] for asset in assets] == first_attempt_ids
+    assert assets[0].state == AssetState.VERIFYING
+    assert assets[1].state == AssetState.UPLOADING
+
+
+@pytest.mark.asyncio
+async def test_rebuild_salvages_visible_prior_upload_before_rotating_grant(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    first = GenerateEnvelope.model_validate(await _build(worker_input_context), strict=True)
+    original = _png((25, 50, 75))
+    await _StagingUploader(worker_input_context.store).upload(
+        grant=first.payload.uploads[0],
+        content=original,
+        media_type="image/png",
+    )
+
+    second = GenerateEnvelope.model_validate(await _build(worker_input_context), strict=True)
+    async with worker_input_context.database.sessions() as session:
+        asset = await session.get(Asset, UUID(first.payload.uploads[0].asset_id))
+
+    assert asset is not None
+    assert asset.state == AssetState.AVAILABLE
+    assert asset.object_key is not None
+    assert worker_input_context.store.objects[asset.object_key].body == original
+    assert second.payload.uploads[0].asset_id == first.payload.uploads[0].asset_id
+    assert second.payload.uploads[0].upload_attempt_id != (
+        first.payload.uploads[0].upload_attempt_id
+    )
 
 
 @pytest.mark.asyncio
