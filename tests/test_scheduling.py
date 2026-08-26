@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.db.models import (
     AuditEvent,
@@ -36,6 +37,7 @@ from gen_automation.services.compliance import validate_release_approvals
 from gen_automation.services.generation_recovery import (
     INFRASTRUCTURE_RETRY_GRANT_ACTION,
     SALAD_JOB_FAILED_ERROR_CODE,
+    SALAD_RATE_LIMITED_ERROR_CODE,
     recover_dead_lettered_infrastructure_jobs,
 )
 from gen_automation.services.scheduling import (
@@ -53,6 +55,50 @@ class SchedulingContext:
     release_id: UUID
     deployment_id: UUID
     job_ids: tuple[UUID, ...]
+
+
+async def seed_legacy_null_error_dead_letter(
+    session: AsyncSession,
+    context: SchedulingContext,
+    *,
+    job_error_code: str | None = SALAD_JOB_FAILED_ERROR_CODE,
+    provider_external_id: str | None = None,
+    provider_state: str | None = "failed",
+    attempt_state: GenerationAttemptState = GenerationAttemptState.FAILED,
+    attempt_no: int = 1,
+    job_attempt_count: int = 1,
+    max_attempts: int = 1,
+) -> tuple[UUID, UUID]:
+    job = await session.get(GenerationJob, context.job_ids[0])
+    deployment = await session.get(SaladDeployment, context.deployment_id)
+    assert job is not None
+    assert deployment is not None
+    job.state = GenerationState.DEAD_LETTER
+    job.attempt_count = job_attempt_count
+    job.max_attempts = max_attempts
+    job.last_error_code = job_error_code
+    job.last_error_detail = "Legacy controller recorded the provider failure on the job."
+    attempt = GenerationAttempt(
+        job_id=job.id,
+        salad_deployment_id=deployment.id,
+        attempt_no=attempt_no,
+        provider="salad",
+        provider_external_id=provider_external_id,
+        submission_key="a" * 64,
+        request_sha256="b" * 64,
+        state=attempt_state,
+        worker_image_digest=deployment.worker_image_digest,
+        request_metadata={"generation_job_id": str(job.id)},
+        completed_at=NOW,
+        last_observed_at=NOW,
+        provider_state=provider_state,
+        error_code=None,
+        error_detail=None,
+        created_at=NOW,
+    )
+    session.add(attempt)
+    await session.flush()
+    return job.id, attempt.id
 
 
 @pytest.fixture
@@ -658,6 +704,171 @@ async def test_dead_letter_recovery_commits_even_when_provider_queue_is_full(
     assert recovered.state == GenerationState.RETRY_WAIT
     assert recovered.max_attempts == 2
     assert grants == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_null_attempt_error_is_rearmed_once_across_sessions(
+    scheduling_context: SchedulingContext,
+) -> None:
+    async with scheduling_context.database.sessions() as seed_session:
+        job_id, attempt_id = await seed_legacy_null_error_dead_letter(
+            seed_session,
+            scheduling_context,
+            provider_external_id=str(uuid4()),
+            attempt_no=4,
+            job_attempt_count=4,
+            max_attempts=4,
+        )
+        await seed_session.commit()
+
+    async with scheduling_context.database.sessions() as first_session:
+        first = await recover_dead_lettered_infrastructure_jobs(
+            first_session,
+            actor="test-legacy-recovery",
+            now=NOW + timedelta(minutes=1),
+        )
+        await first_session.commit()
+
+    async with scheduling_context.database.sessions() as second_session:
+        second = await recover_dead_lettered_infrastructure_jobs(
+            second_session,
+            actor="test-legacy-recovery",
+            now=NOW + timedelta(minutes=2),
+        )
+        await second_session.commit()
+
+    async with scheduling_context.database.sessions() as verification:
+        job = await verification.get(GenerationJob, job_id)
+        attempt = await verification.get(GenerationAttempt, attempt_id)
+        grants = list(
+            (
+                await verification.scalars(
+                    select(AuditEvent).where(
+                        AuditEvent.resource_type == "generation_attempt",
+                        AuditEvent.resource_id == attempt_id,
+                        AuditEvent.action == INFRASTRUCTURE_RETRY_GRANT_ACTION,
+                    )
+                )
+            ).all()
+        )
+
+    assert first.scanned == 1
+    assert first.recovered_job_ids == (job_id,)
+    assert second.scanned == 0
+    assert second.recovered_job_ids == ()
+    assert job is not None
+    assert job.state == GenerationState.RETRY_WAIT
+    assert job.max_attempts == 5
+    assert job.last_error_code == SALAD_JOB_FAILED_ERROR_CODE
+    assert attempt is not None
+    assert attempt.error_code is None
+    assert len(grants) == 1
+    assert grants[0].detail["failure_code"] == SALAD_JOB_FAILED_ERROR_CODE
+    assert grants[0].detail["failure_code_source"] == "generation_job_legacy_fallback"
+
+
+@pytest.mark.parametrize(
+    "unsafe_case",
+    [
+        "missing_job_code",
+        "non_infrastructure_job_code",
+        "provider_identity_missing",
+        "provider_state_conflicts",
+        "rate_limit_without_provider_evidence",
+        "not_exact_latest_attempt",
+        "attempt_not_failed",
+        "retry_ceiling_reached",
+        "release_blocked",
+        "release_version_superseded",
+        "generation_stop_requested",
+    ],
+)
+@pytest.mark.asyncio
+async def test_legacy_null_attempt_error_recovery_fails_closed(
+    scheduling_context: SchedulingContext,
+    unsafe_case: str,
+) -> None:
+    job_error_code: str | None = SALAD_JOB_FAILED_ERROR_CODE
+    provider_external_id: str | None = str(uuid4())
+    provider_state: str | None = "failed"
+    attempt_state = GenerationAttemptState.FAILED
+    attempt_no = 1
+    job_attempt_count = 1
+    max_attempts = 1
+    if unsafe_case == "missing_job_code":
+        job_error_code = None
+    elif unsafe_case == "non_infrastructure_job_code":
+        job_error_code = "prompt_contract_failed"
+    elif unsafe_case == "provider_identity_missing":
+        provider_external_id = None
+    elif unsafe_case == "provider_state_conflicts":
+        provider_state = "cancelled"
+    elif unsafe_case == "rate_limit_without_provider_evidence":
+        job_error_code = SALAD_RATE_LIMITED_ERROR_CODE
+        provider_external_id = None
+        provider_state = None
+    elif unsafe_case == "not_exact_latest_attempt":
+        job_attempt_count = 2
+        max_attempts = 2
+    elif unsafe_case == "attempt_not_failed":
+        attempt_state = GenerationAttemptState.CANCELLED
+    elif unsafe_case == "retry_ceiling_reached":
+        max_attempts = 10
+
+    async with scheduling_context.database.sessions() as session:
+        job_id, _ = await seed_legacy_null_error_dead_letter(
+            session,
+            scheduling_context,
+            job_error_code=job_error_code,
+            provider_external_id=provider_external_id,
+            provider_state=provider_state,
+            attempt_state=attempt_state,
+            attempt_no=attempt_no,
+            job_attempt_count=job_attempt_count,
+            max_attempts=max_attempts,
+        )
+        release = await session.get(Release, scheduling_context.release_id)
+        assert release is not None
+        if unsafe_case == "release_blocked":
+            release.health = ResourceHealth.BLOCKED
+        elif unsafe_case == "release_version_superseded":
+            release.current_version_no += 1
+        elif unsafe_case == "generation_stop_requested":
+            session.add(
+                AuditEvent(
+                    actor="test-owner",
+                    action="release.generation_stop_requested",
+                    resource_type="release",
+                    resource_id=release.id,
+                    correlation_id=f"generation-stop:{release.id}",
+                    detail={"assets_retained": True},
+                    occurred_at=NOW + timedelta(seconds=1),
+                )
+            )
+        await session.commit()
+
+        summary = await recover_dead_lettered_infrastructure_jobs(
+            session,
+            actor="test-legacy-recovery",
+            now=NOW + timedelta(minutes=1),
+        )
+        await session.commit()
+        job = await session.get(GenerationJob, job_id)
+        grants = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action == INFRASTRUCTURE_RETRY_GRANT_ACTION
+                )
+            )
+            or 0
+        )
+
+    assert summary.scanned == 0
+    assert summary.recovered_job_ids == ()
+    assert job is not None
+    assert job.state == GenerationState.DEAD_LETTER
+    assert job.max_attempts == max_attempts
+    assert grants == 0
 
 
 @pytest.mark.asyncio
