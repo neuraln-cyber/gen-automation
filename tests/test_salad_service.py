@@ -1,4 +1,4 @@
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -28,6 +28,7 @@ from gen_automation.domain.enums import (
     DesiredDeploymentState,
     GenerationAttemptState,
     GenerationState,
+    OutboxStatus,
     ReleasePhase,
     ResourceHealth,
     SaladDeploymentPurpose,
@@ -50,7 +51,17 @@ from gen_automation.integrations.salad.models import (
     SaladQueueJobPage,
 )
 from gen_automation.services.budgets import ensure_budget_guard, reserve_attempt_budget
-from gen_automation.services.outbox import SALAD_JOB_SUBMIT_TOPIC
+from gen_automation.services.generation_recovery import (
+    INFRASTRUCTURE_RETRY_GRANT_ACTION,
+    SALAD_PROVIDER_CANCELLED_ERROR_CODE,
+    SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE,
+)
+from gen_automation.services.outbox import (
+    SALAD_JOB_SUBMIT_TOPIC,
+    claim_outbox_events,
+    defer_unstarted_outbox_event,
+    succeed_outbox_event,
+)
 from gen_automation.services.salad import (
     DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE,
     DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE,
@@ -61,6 +72,7 @@ from gen_automation.services.salad import (
     ReconciliationSource,
     SaladDeploymentConfig,
     SaladJobInputContext,
+    SaladJobInputDeferredError,
     SaladServiceConflictError,
     SaladServiceValidationError,
     SubmissionDisposition,
@@ -172,10 +184,15 @@ async def seed_context(session: AsyncSession) -> SeededContext:
 @dataclass
 class FakeUploadIntentProvider:
     fail: bool = False
+    defer_retry_seconds: int | None = None
     calls: list[SaladJobInputContext] = field(default_factory=list)
 
     async def build_job_input(self, context: SaladJobInputContext) -> JSONValue:
         self.calls.append(context)
+        if self.defer_retry_seconds is not None:
+            raise SaladJobInputDeferredError(
+                retry_after_seconds=self.defer_retry_seconds,
+            )
         if self.fail:
             raise RuntimeError(f"do not persist {SIGNED_UPLOAD_URL}")
         return {
@@ -204,6 +221,8 @@ class FakeSaladClient:
     list_calls: list[tuple[str, int, int]] = field(default_factory=list)
     cancel_error: Exception | None = None
     cancel_calls: list[tuple[str, str]] = field(default_factory=list)
+    before_get: Callable[[], Awaitable[None]] | None = None
+    before_list: Callable[[], Awaitable[None]] | None = None
 
     async def create_job(
         self,
@@ -225,6 +244,9 @@ class FakeSaladClient:
 
     async def get_job(self, queue_name: str, job_id: UUID | str) -> SaladQueueJob:
         self.get_calls.append((queue_name, str(job_id)))
+        if self.before_get is not None:
+            before_get, self.before_get = self.before_get, None
+            await before_get()
         if self.get_error is not None:
             raise self.get_error
         if self.get_result is None:
@@ -239,6 +261,9 @@ class FakeSaladClient:
         page_size: int = SALAD_QUEUE_JOB_PAGE_SIZE,
     ) -> SaladQueueJobPage:
         self.list_calls.append((queue_name, page, page_size))
+        if self.before_list is not None:
+            before_list, self.before_list = self.before_list, None
+            await before_list()
         if self.list_error is not None:
             raise self.list_error
         return SaladQueueJobPage(items=self.list_pages.get(page, ()))
@@ -852,6 +877,165 @@ async def test_upload_intent_failure_is_definite_and_releases_reservation(
 
 
 @pytest.mark.asyncio
+async def test_verifying_asset_defers_and_reuses_the_same_prepared_attempt(
+    database: Database,
+) -> None:
+    retry_delay_seconds = 45
+    worker_id = "salad-submit-test"
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await expected_worker_outputs(session, context)
+        verifying_asset = await session.scalar(
+            select(Asset)
+            .where(
+                Asset.generation_job_id == context.job_id,
+                Asset.kind == AssetKind.RAW_MASTER,
+                Asset.output_index == 0,
+            )
+            .with_for_update()
+        )
+        assert verifying_asset is not None
+        verifying_asset.state = AssetState.VERIFYING
+        verifying_asset.verification_lease_owner = "active-collector"
+        verifying_asset.verification_lease_expires_at = NOW + timedelta(minutes=5)
+        await session.commit()
+
+        first_claim = await claim_outbox_events(
+            session,
+            worker_id=worker_id,
+            limit=1,
+            lease_seconds=60,
+            topics=(SALAD_JOB_SUBMIT_TOPIC,),
+            now=NOW,
+        )
+        assert len(first_claim) == 1
+        event_id = first_claim[0].id
+        assert first_claim[0].aggregate_id == attempt_id
+        assert first_claim[0].attempt == 1
+
+        deferred_uploads = FakeUploadIntentProvider(
+            defer_retry_seconds=retry_delay_seconds,
+        )
+        client = FakeSaladClient()
+        deferred = await submit_prepared_attempt(
+            session,
+            client,
+            deferred_uploads,
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        job = await session.get(GenerationJob, context.job_id)
+        assert attempt is not None
+        assert job is not None
+        assert attempt.state == GenerationAttemptState.CREATED
+        assert attempt.cost_reservation_microusd == 0
+        assert attempt.reservation_released_at is None
+        assert attempt.submit_started_at is None
+        assert attempt.error_code == "salad_job_input_deferred"
+        assert job.state == GenerationState.CLAIMED
+        assert job.attempt_count == 1
+        assert job.max_attempts == 3
+        assert job.retry_at is not None
+        assert job.retry_at.replace(tzinfo=UTC) == NOW + timedelta(seconds=retry_delay_seconds)
+        assert not client.create_calls
+
+        deferred_event = await defer_unstarted_outbox_event(
+            session,
+            event_id=event_id,
+            worker_id=worker_id,
+            retry_not_before=NOW + timedelta(seconds=retry_delay_seconds),
+            reason_code="salad_job_input_deferred",
+            now=NOW + timedelta(seconds=1),
+        )
+        assert deferred_event.status == OutboxStatus.PENDING
+        event = await session.get(OutboxEvent, event_id)
+        assert event is not None
+        assert event.status == OutboxStatus.PENDING
+        assert event.attempts == 0
+
+        early_claim = await claim_outbox_events(
+            session,
+            worker_id=worker_id,
+            limit=1,
+            lease_seconds=60,
+            topics=(SALAD_JOB_SUBMIT_TOPIC,),
+            now=NOW + timedelta(seconds=retry_delay_seconds - 1),
+        )
+        assert early_claim == []
+        second_claim = await claim_outbox_events(
+            session,
+            worker_id=worker_id,
+            limit=1,
+            lease_seconds=60,
+            topics=(SALAD_JOB_SUBMIT_TOPIC,),
+            now=NOW + timedelta(seconds=retry_delay_seconds),
+        )
+        assert len(second_claim) == 1
+        assert second_claim[0].id == event_id
+        assert second_claim[0].aggregate_id == attempt_id
+        assert second_claim[0].attempt == 1
+
+        submitted = await submit_prepared_attempt(
+            session,
+            client,
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW + timedelta(seconds=retry_delay_seconds),
+        )
+        await succeed_outbox_event(
+            session,
+            event_id=event_id,
+            worker_id=worker_id,
+            now=NOW + timedelta(seconds=retry_delay_seconds + 1),
+        )
+        await session.refresh(attempt)
+        await session.refresh(job)
+        await session.refresh(event)
+        attempt_total = int(
+            await session.scalar(
+                select(func.count(GenerationAttempt.id)).where(
+                    GenerationAttempt.job_id == context.job_id
+                )
+            )
+            or 0
+        )
+        actions = list(
+            (
+                await session.scalars(
+                    select(AuditEvent.action).where(
+                        AuditEvent.resource_type == "generation_attempt",
+                        AuditEvent.resource_id == attempt_id,
+                    )
+                )
+            ).all()
+        )
+
+    assert deferred.disposition == SubmissionDisposition.BUDGET_BLOCKED
+    assert deferred.mutation_effect == MutationEffect.DEFINITELY_NOT_STARTED
+    assert deferred.retry_not_before == NOW + timedelta(seconds=retry_delay_seconds)
+    assert len(deferred_uploads.calls) == 1
+    assert submitted.disposition == SubmissionDisposition.SUBMITTED
+    assert submitted.generation_attempt_id == attempt_id
+    assert len(client.create_calls) == 1
+    assert attempt.state == GenerationAttemptState.SUBMITTED
+    assert job.state == GenerationState.RUNNING
+    assert job.attempt_count == 1
+    assert job.max_attempts == 3
+    assert attempt_total == 1
+    assert event.status == OutboxStatus.SUCCEEDED
+    assert event.attempts == 1
+    assert actions.count("provider_budget.reserved") == 2
+    assert actions.count("provider_budget.reservation_released") == 1
+    assert actions.count("generation_attempt.job_input_deferred") == 1
+
+
+@pytest.mark.asyncio
 async def test_exhausted_controller_attempts_dead_letter_the_job(
     database: Database,
 ) -> None:
@@ -1085,7 +1269,7 @@ async def test_reconciliation_without_a_metadata_match_stays_unknown(
 
     assert result.source == ReconciliationSource.LIST
     assert result.matched is False
-    assert result.error_code == "salad_provider_job_not_found"
+    assert result.error_code == "salad_provider_absence_pending"
     assert result.observation.attempt_state == GenerationAttemptState.UNKNOWN
 
 
@@ -1183,7 +1367,7 @@ async def test_reconciliation_preserves_the_200_job_scan_window(
                 request_id=None,
             ),
             GenerationAttemptState.UNKNOWN,
-            "salad_provider_job_not_found",
+            "salad_provider_absence_pending",
         ),
     ],
 )
@@ -2382,3 +2566,470 @@ async def test_succeeded_provider_job_with_invalid_worker_output_retries(
     assert retrying_job is not None
     assert retrying_job.state == GenerationState.RETRY_WAIT
     assert retrying_job.last_error_code == "salad_worker_output_invalid"
+
+
+@pytest.mark.asyncio
+async def test_infrastructure_failures_receive_only_two_idempotent_retry_slots(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        job = await session.get(GenerationJob, context.job_id)
+        assert job is not None
+        job.max_attempts = 1
+        await session.commit()
+
+        attempt_ids: list[UUID] = []
+        for attempt_no in range(1, 4):
+            prepared = await prepare_generation_attempt(
+                session,
+                generation_job_id=context.job_id,
+                salad_deployment_id=context.deployment_id,
+                idempotency_key=f"infra-failure-{attempt_no}",
+                now=NOW + timedelta(minutes=attempt_no),
+            )
+            await session.commit()
+            attempt_ids.append(prepared.generation_attempt_id)
+            failed = remote_job(
+                status=SaladJobStatus.FAILED,
+                metadata={},
+                update_time=NOW + timedelta(minutes=attempt_no, seconds=1),
+                job_id=uuid4(),
+            )
+            result = await apply_salad_job_observation(
+                session,
+                generation_attempt_id=prepared.generation_attempt_id,
+                remote_job=failed,
+                observed_at=NOW + timedelta(minutes=attempt_no, seconds=2),
+            )
+            await session.commit()
+            await session.refresh(job)
+            if attempt_no < 3:
+                assert result.generation_job_state == GenerationState.RETRY_WAIT
+                assert job.max_attempts == attempt_no + 1
+            else:
+                assert result.generation_job_state == GenerationState.DEAD_LETTER
+                assert job.max_attempts == 3
+
+        replay = await apply_salad_job_observation(
+            session,
+            generation_attempt_id=attempt_ids[-1],
+            remote_job=remote_job(
+                status=SaladJobStatus.FAILED,
+                metadata={},
+                update_time=NOW + timedelta(minutes=4),
+                job_id=UUID(
+                    str(
+                        (await session.get(GenerationAttempt, attempt_ids[-1])).provider_external_id
+                    )
+                ),
+            ),
+            observed_at=NOW + timedelta(minutes=4),
+        )
+        grants = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action == INFRASTRUCTURE_RETRY_GRANT_ACTION
+                )
+            )
+            or 0
+        )
+
+    assert replay.generation_job_state == GenerationState.DEAD_LETTER
+    assert grants == 2
+
+
+@pytest.mark.asyncio
+async def test_final_invalid_worker_output_does_not_extend_attempt_budget(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        job = await session.get(GenerationJob, context.job_id)
+        assert job is not None
+        job.max_attempts = 1
+        await session.commit()
+        attempt_id = await prepared_attempt(session, context)
+        result = await apply_salad_job_observation(
+            session,
+            generation_attempt_id=attempt_id,
+            remote_job=remote_job(
+                status=SaladJobStatus.SUCCEEDED,
+                metadata={},
+                update_time=NOW + timedelta(minutes=1),
+                output={"invalid": True},
+            ),
+            observed_at=NOW + timedelta(minutes=1),
+        )
+        await session.commit()
+        await session.refresh(job)
+        grants = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action == INFRASTRUCTURE_RETRY_GRANT_ACTION
+                )
+            )
+            or 0
+        )
+
+    assert result.generation_job_state == GenerationState.DEAD_LETTER
+    assert job.max_attempts == 1
+    assert grants == 0
+
+
+@pytest.mark.asyncio
+async def test_final_rate_limit_is_bounded_infrastructure_retry(database: Database) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        job = await session.get(GenerationJob, context.job_id)
+        assert job is not None
+        job.max_attempts = 1
+        await session.commit()
+        attempt_id = await prepared_attempt(session, context)
+        result = await submit_prepared_attempt(
+            session,
+            FakeSaladClient(
+                create_error=SaladRateLimitError(
+                    message="rate limited",
+                    response_body="",
+                    request_id=None,
+                    retry_after_seconds=30,
+                )
+            ),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        await session.refresh(job)
+
+    assert result.disposition == SubmissionDisposition.RETRY_WAIT
+    assert job.state == GenerationState.RETRY_WAIT
+    assert job.attempt_count == 1
+    assert job.max_attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_spontaneous_provider_cancel_retries_and_equal_time_terminal_wins(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        remote_id = uuid4()
+        running = remote_job(
+            status=SaladJobStatus.RUNNING,
+            metadata={},
+            update_time=NOW + timedelta(minutes=1),
+            job_id=remote_id,
+        )
+        await apply_salad_job_observation(
+            session,
+            generation_attempt_id=attempt_id,
+            remote_job=running,
+            observed_at=NOW + timedelta(minutes=1),
+        )
+        cancelled = remote_job(
+            status=SaladJobStatus.CANCELLED,
+            metadata={},
+            update_time=running.update_time,
+            job_id=remote_id,
+        )
+        result = await apply_salad_job_observation(
+            session,
+            generation_attempt_id=attempt_id,
+            remote_job=cancelled,
+            observed_at=NOW + timedelta(minutes=2),
+        )
+        await session.commit()
+        attempt = await session.get(GenerationAttempt, attempt_id)
+
+    assert result.applied is True
+    assert result.stale is False
+    assert result.attempt_state == GenerationAttemptState.FAILED
+    assert result.generation_job_state == GenerationState.RETRY_WAIT
+    assert attempt is not None
+    assert attempt.error_code == SALAD_PROVIDER_CANCELLED_ERROR_CODE
+
+
+@pytest.mark.asyncio
+async def test_unknown_provider_absence_requires_three_exact_confirmations(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(create_error=SaladTimeoutError("timeout")),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        results = []
+        for minute in range(1, 4):
+            results.append(
+                await reconcile_generation_attempt(
+                    session,
+                    FakeSaladClient(list_pages={1: ()}),
+                    generation_attempt_id=attempt_id,
+                    list_page_size=1,
+                    now=NOW + timedelta(minutes=minute),
+                )
+            )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        job = await session.get(GenerationJob, context.job_id)
+
+    assert [item.error_code for item in results[:2]] == [
+        "salad_provider_absence_pending",
+        "salad_provider_absence_pending",
+    ]
+    assert results[2].error_code == SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE
+    assert attempt is not None
+    assert attempt.state == GenerationAttemptState.FAILED
+    assert job is not None
+    assert job.state == GenerationState.RETRY_WAIT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", [ReconciliationSource.LIST, ReconciliationSource.GET])
+async def test_absence_does_not_overwrite_a_concurrent_terminal_commit(
+    database: Database,
+    source: ReconciliationSource,
+) -> None:
+    async with database.sessions() as session_a:
+        context = await seed_context(session_a)
+        attempt_id = await prepared_attempt(session_a, context)
+        submit_client = (
+            FakeSaladClient(create_error=SaladTimeoutError("timeout"))
+            if source == ReconciliationSource.LIST
+            else FakeSaladClient()
+        )
+        await submit_prepared_attempt(
+            session_a,
+            submit_client,
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        stale_attempt = await session_a.get(GenerationAttempt, attempt_id)
+        assert stale_attempt is not None
+
+        async def commit_terminal_state() -> None:
+            async with database.sessions() as session_b:
+                attempt_b = await session_b.get(GenerationAttempt, attempt_id)
+                job_b = await session_b.get(GenerationJob, context.job_id)
+                assert attempt_b is not None
+                assert job_b is not None
+                attempt_b.state = GenerationAttemptState.FAILED
+                attempt_b.completed_at = NOW + timedelta(minutes=1)
+                attempt_b.error_code = "concurrent_terminal_failure"
+                attempt_b.error_detail = "A concurrent terminal result must remain authoritative."
+                attempt_b.lock_version += 1
+                job_b.state = GenerationState.DEAD_LETTER
+                job_b.retry_at = None
+                job_b.last_error_code = "concurrent_terminal_failure"
+                job_b.last_error_detail = attempt_b.error_detail
+                job_b.lock_version += 1
+                await session_b.commit()
+
+        not_found = SaladAPIError(
+            status_code=404,
+            message="not found",
+            response_body="",
+            request_id=None,
+        )
+        client = (
+            FakeSaladClient(list_pages={1: ()}, before_list=commit_terminal_state)
+            if source == ReconciliationSource.LIST
+            else FakeSaladClient(get_error=not_found, before_get=commit_terminal_state)
+        )
+        result = await reconcile_generation_attempt(
+            session_a,
+            client,
+            generation_attempt_id=attempt_id,
+            list_page_size=1,
+            now=NOW + timedelta(minutes=2),
+        )
+
+    async with database.sessions() as verification:
+        attempt = await verification.get(GenerationAttempt, attempt_id)
+        job = await verification.get(GenerationJob, context.job_id)
+        actions = set(
+            (
+                await verification.scalars(
+                    select(AuditEvent.action).where(
+                        AuditEvent.resource_type == "generation_attempt",
+                        AuditEvent.resource_id == attempt_id,
+                    )
+                )
+            ).all()
+        )
+
+    assert result.source == source
+    assert result.matched is False
+    assert result.observation.stale is True
+    assert result.observation.attempt_state == GenerationAttemptState.FAILED
+    assert attempt is not None
+    assert attempt.state == GenerationAttemptState.FAILED
+    assert attempt.error_code == "concurrent_terminal_failure"
+    assert "provider_absence_confirmation" not in (attempt.response_metadata or {})
+    assert job is not None
+    assert job.state == GenerationState.DEAD_LETTER
+    assert job.max_attempts == 3
+    assert job.last_error_code == "concurrent_terminal_failure"
+    assert "generation_attempt.provider_absence_observed" not in actions
+    assert INFRASTRUCTURE_RETRY_GRANT_ACTION not in actions
+
+
+@pytest.mark.asyncio
+async def test_watchdog_does_not_delete_after_a_concurrent_fresher_running_commit(
+    database: Database,
+) -> None:
+    async with database.sessions() as session_a:
+        context = await seed_context(session_a)
+        attempt_id = await prepared_attempt(session_a, context)
+        await submit_prepared_attempt(
+            session_a,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        stale_attempt = await session_a.get(GenerationAttempt, attempt_id)
+        assert stale_attempt is not None
+        metadata: JSONObject = {
+            "generation_attempt_id": str(stale_attempt.id),
+            "generation_job_id": str(stale_attempt.job_id),
+            "submission_key": stale_attempt.submission_key,
+            "request_sha256": stale_attempt.request_sha256,
+        }
+
+        async def commit_fresher_running_state() -> None:
+            async with database.sessions() as session_b:
+                observation = await apply_salad_job_observation(
+                    session_b,
+                    generation_attempt_id=attempt_id,
+                    remote_job=remote_job(
+                        status=SaladJobStatus.RUNNING,
+                        metadata=metadata,
+                        update_time=NOW + timedelta(minutes=2),
+                    ),
+                    observed_at=NOW + timedelta(minutes=2),
+                )
+                assert observation.applied is True
+                await session_b.commit()
+
+        client = FakeSaladClient(
+            get_result=remote_job(
+                status=SaladJobStatus.PENDING,
+                metadata=metadata,
+                update_time=NOW + timedelta(minutes=1, seconds=30),
+            ),
+            before_get=commit_fresher_running_state,
+        )
+        result = await reconcile_generation_attempt(
+            session_a,
+            client,
+            generation_attempt_id=attempt_id,
+            attempt_watchdog_seconds=60,
+            now=NOW + timedelta(minutes=3),
+        )
+
+    async with database.sessions() as verification:
+        attempt = await verification.get(GenerationAttempt, attempt_id)
+        job = await verification.get(GenerationJob, context.job_id)
+        watchdog_audits = int(
+            await verification.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.resource_type == "generation_attempt",
+                    AuditEvent.resource_id == attempt_id,
+                    AuditEvent.action == "generation_attempt.watchdog_cancel_requested",
+                )
+            )
+            or 0
+        )
+
+    assert client.cancel_calls == []
+    assert result.observation.stale is True
+    assert result.observation.attempt_state == GenerationAttemptState.RUNNING
+    assert attempt is not None
+    assert attempt.state == GenerationAttemptState.RUNNING
+    assert attempt.started_at is not None
+    assert attempt.started_at.replace(tzinfo=UTC) == NOW + timedelta(minutes=2)
+    assert attempt.error_code is None
+    assert job is not None
+    assert job.state == GenerationState.RUNNING
+    assert watchdog_audits == 0
+
+
+@pytest.mark.asyncio
+async def test_exact_stale_provider_match_resets_absence_confirmations(
+    database: Database,
+) -> None:
+    not_found = SaladAPIError(
+        status_code=404,
+        message="not found",
+        response_body="",
+        request_id=None,
+    )
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        first_miss = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(get_error=not_found),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=1),
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        metadata: JSONObject = {
+            "generation_attempt_id": str(attempt.id),
+            "generation_job_id": str(attempt.job_id),
+            "submission_key": attempt.submission_key,
+            "request_sha256": attempt.request_sha256,
+        }
+        stale_match = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(
+                get_result=remote_job(
+                    status=SaladJobStatus.RUNNING,
+                    metadata=metadata,
+                    update_time=NOW,
+                )
+            ),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=2),
+        )
+        second_miss = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(get_error=not_found),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=3),
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+
+    assert first_miss.error_code == "salad_provider_absence_pending"
+    assert stale_match.observation.stale is True
+    assert second_miss.error_code == "salad_provider_absence_pending"
+    assert attempt is not None
+    tracker = (attempt.response_metadata or {})["provider_absence_confirmation"]
+    assert isinstance(tracker, dict)
+    assert tracker["count"] == 1

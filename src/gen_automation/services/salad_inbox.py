@@ -23,6 +23,12 @@ from gen_automation.domain.enums import (
 from gen_automation.integrations.salad.models import SaladJobStatus
 from gen_automation.services.budgets import release_attempt_reservation
 from gen_automation.services.generation_control import GENERATION_STOP_REQUESTED_ACTION
+from gen_automation.services.generation_recovery import (
+    SALAD_PROVIDER_CANCELLED_ERROR_CODE,
+    SALAD_WEBHOOK_JOB_FAILED_ERROR_CODE,
+    InfrastructureRetrySource,
+    grant_infrastructure_retry,
+)
 from gen_automation.services.salad import (
     DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE,
     DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_METADATA_KEY,
@@ -631,6 +637,25 @@ def _is_nonterminal_regression(
     }
 
 
+def _terminal_status_matches_attempt(
+    attempt: GenerationAttempt,
+    status: SaladJobStatus,
+) -> bool:
+    target = _SALAD_TERMINAL_TARGETS[status]
+    if attempt.state == target:
+        return True
+    return (
+        status == SaladJobStatus.CANCELLED
+        and attempt.state == GenerationAttemptState.FAILED
+        and attempt.error_code
+        in {
+            SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE,
+            DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE,
+            SALAD_PROVIDER_CANCELLED_ERROR_CODE,
+        }
+    )
+
+
 def _set_job_state(
     job: GenerationJob,
     *,
@@ -689,6 +714,10 @@ async def _apply_provider_state(
         previous_attempt_state == GenerationAttemptState.CANCEL_REQUESTED
         and attempt.error_code == SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
     )
+    operator_stop_requested = (
+        status == SaladJobStatus.CANCELLED
+        and await _operator_generation_stop_requested(session, job=job)
+    )
     deployment_rollover_cancel_requested = (
         (
             previous_attempt_state == GenerationAttemptState.CANCEL_REQUESTED
@@ -698,7 +727,13 @@ async def _apply_provider_state(
             (attempt.response_metadata or {}).get(DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_METADATA_KEY)
             is True
         )
-    ) and not await _operator_generation_stop_requested(session, job=job)
+    ) and not operator_stop_requested
+    spontaneous_provider_cancel = (
+        status == SaladJobStatus.CANCELLED
+        and not operator_stop_requested
+        and not watchdog_cancel_requested
+        and not deployment_rollover_cancel_requested
+    )
     attempt_changed = attempt.provider_state != status.value or (
         attempt.last_observed_at is None or _as_utc(attempt.last_observed_at) != observed_at
     )
@@ -748,15 +783,25 @@ async def _apply_provider_state(
         attempt.state = GenerationAttemptState.FAILED
         attempt.completed_at = observed_at
         attempt.unknown_since = None
-        attempt.error_code = "provider_job_failed"
+        attempt.error_code = SALAD_WEBHOOK_JOB_FAILED_ERROR_CODE
         attempt.error_detail = "Salad reported a definitive failed job."
+        retry_at = processed_at + timedelta(seconds=retry_delay_seconds)
+        await grant_infrastructure_retry(
+            session,
+            attempt=attempt,
+            job=job,
+            source=InfrastructureRetrySource.WEBHOOK,
+            actor=actor,
+            retry_at=retry_at,
+            occurred_at=processed_at,
+        )
         effective_attempt_count = max(job.attempt_count, attempt.attempt_no)
         if effective_attempt_count < job.max_attempts:
             _set_job_state(
                 job,
                 state=GenerationState.RETRY_WAIT,
-                retry_at=processed_at + timedelta(seconds=retry_delay_seconds),
-                error_code="provider_job_failed",
+                retry_at=retry_at,
+                error_code=SALAD_WEBHOOK_JOB_FAILED_ERROR_CODE,
                 error_detail="Salad reported a definitive failed job.",
             )
         else:
@@ -774,11 +819,19 @@ async def _apply_provider_state(
             )
             or attempt_changed
         )
-    elif watchdog_cancel_requested or deployment_rollover_cancel_requested:
+    elif (
+        watchdog_cancel_requested
+        or deployment_rollover_cancel_requested
+        or spontaneous_provider_cancel
+    ):
         retry_error_code = (
             SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE
             if watchdog_cancel_requested
-            else DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE
+            else (
+                DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE
+                if deployment_rollover_cancel_requested
+                else SALAD_PROVIDER_CANCELLED_ERROR_CODE
+            )
         )
         retry_error_detail = (
             "The Salad attempt exceeded its runtime envelope and was cancelled for retry."
@@ -786,6 +839,11 @@ async def _apply_provider_state(
             else (
                 "The Salad deployment was superseded; the cancelled job will retry on the "
                 "current deployment."
+                if deployment_rollover_cancel_requested
+                else (
+                    "Salad cancelled the provider job without an operator stop; "
+                    "generation will retry."
+                )
             )
         )
         attempt_changed = attempt_changed or (attempt.state != GenerationAttemptState.FAILED)
@@ -794,12 +852,22 @@ async def _apply_provider_state(
         attempt.unknown_since = None
         attempt.error_code = retry_error_code
         attempt.error_detail = retry_error_detail
+        retry_at = processed_at + timedelta(seconds=retry_delay_seconds)
+        await grant_infrastructure_retry(
+            session,
+            attempt=attempt,
+            job=job,
+            source=InfrastructureRetrySource.WEBHOOK,
+            actor=actor,
+            retry_at=retry_at,
+            occurred_at=processed_at,
+        )
         effective_attempt_count = max(job.attempt_count, attempt.attempt_no)
         if effective_attempt_count < job.max_attempts:
             _set_job_state(
                 job,
                 state=GenerationState.RETRY_WAIT,
-                retry_at=processed_at + timedelta(seconds=retry_delay_seconds),
+                retry_at=retry_at,
                 error_code=retry_error_code,
                 error_detail=retry_error_detail,
             )
@@ -995,6 +1063,29 @@ async def process_salad_webhook_receipt(
             attempt=attempt,
         )
 
+    if attempt.attempt_no != job.attempt_count:
+        _complete_receipt(receipt, processed_at=processed_at)
+        _audit(
+            session,
+            receipt=receipt,
+            actor=normalized_worker_id,
+            action="salad.webhook.superseded_attempt_ignored",
+            detail={
+                "generation_attempt_id": str(attempt.id),
+                "attempt_no": attempt.attempt_no,
+                "current_attempt_no": job.attempt_count,
+                "provider_status": provider_status.value,
+            },
+            occurred_at=processed_at,
+        )
+        await session.commit()
+        return _result(
+            receipt=receipt,
+            disposition=InboxDisposition.STALE_IGNORED,
+            attempt=attempt,
+            job=job,
+        )
+
     last_observed_at = (
         _as_utc(attempt.last_observed_at) if attempt.last_observed_at is not None else None
     )
@@ -1018,7 +1109,10 @@ async def process_salad_webhook_receipt(
 
     terminal_target = _SALAD_TERMINAL_TARGETS.get(provider_status)
     if attempt.state in _TERMINAL_ATTEMPT_STATES:
-        if terminal_target != attempt.state:
+        if terminal_target is None or not _terminal_status_matches_attempt(
+            attempt,
+            provider_status,
+        ):
             _dead_letter_locked(
                 session,
                 receipt=receipt,
@@ -1066,11 +1160,20 @@ async def process_salad_webhook_receipt(
             job=job,
         )
 
+    equal_timestamp_forward_terminal = (
+        last_observed_at is not None
+        and observed_at == last_observed_at
+        and terminal_target is not None
+        and attempt.state not in _TERMINAL_ATTEMPT_STATES
+    )
+    nonterminal_regression = _is_nonterminal_regression(attempt, provider_status)
     if (
         last_observed_at is not None
         and observed_at == last_observed_at
         and attempt.provider_state is not None
         and attempt.provider_state != provider_status.value
+        and not equal_timestamp_forward_terminal
+        and not nonterminal_regression
     ):
         _dead_letter_locked(
             session,
@@ -1088,7 +1191,7 @@ async def process_salad_webhook_receipt(
             job=job,
         )
 
-    if _is_nonterminal_regression(attempt, provider_status):
+    if nonterminal_regression:
         _complete_receipt(receipt, processed_at=processed_at)
         _audit(
             session,

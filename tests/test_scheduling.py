@@ -2,12 +2,13 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, select
 
 from gen_automation.db.models import (
+    AuditEvent,
     ComplianceCheck,
     GenerationAttempt,
     GenerationJob,
@@ -32,6 +33,11 @@ from gen_automation.domain.enums import (
 )
 from gen_automation.domain.release_spec import ReleaseSpecification
 from gen_automation.services.compliance import validate_release_approvals
+from gen_automation.services.generation_recovery import (
+    INFRASTRUCTURE_RETRY_GRANT_ACTION,
+    SALAD_JOB_FAILED_ERROR_CODE,
+    recover_dead_lettered_infrastructure_jobs,
+)
 from gen_automation.services.scheduling import (
     GenerationSchedulingConflictError,
     dispatch_generation_jobs,
@@ -575,6 +581,161 @@ async def test_dispatch_allows_exact_provider_start_pending_state(
         )
 
     assert len(result.dispatched) == 2
+
+
+@pytest.mark.asyncio
+async def test_dead_letter_recovery_commits_even_when_provider_queue_is_full(
+    scheduling_context: SchedulingContext,
+) -> None:
+    async with scheduling_context.database.sessions() as session:
+        first = await dispatch_generation_jobs(
+            session,
+            salad_deployment_id=scheduling_context.deployment_id,
+            gpu_allocation_enabled=True,
+            max_inflight=1,
+            now=NOW,
+        )
+        assert len(first.dispatched) == 1
+
+    async with scheduling_context.database.sessions() as session:
+        inflight_attempt = await session.get(
+            GenerationAttempt,
+            first.dispatched[0].generation_attempt_id,
+        )
+        dead_job = await session.get(GenerationJob, scheduling_context.job_ids[1])
+        deployment = await session.get(SaladDeployment, scheduling_context.deployment_id)
+        assert inflight_attempt is not None
+        assert dead_job is not None
+        assert deployment is not None
+        inflight_attempt.state = GenerationAttemptState.RUNNING
+        inflight_attempt.provider_external_id = str(uuid4())
+        dead_job.state = GenerationState.DEAD_LETTER
+        dead_job.attempt_count = 1
+        dead_job.max_attempts = 1
+        failed_attempt = GenerationAttempt(
+            job_id=dead_job.id,
+            salad_deployment_id=deployment.id,
+            attempt_no=1,
+            provider="salad",
+            provider_external_id=str(uuid4()),
+            submission_key="f" * 64,
+            request_sha256="e" * 64,
+            state=GenerationAttemptState.FAILED,
+            worker_image_digest=deployment.worker_image_digest,
+            request_metadata={"generation_job_id": str(dead_job.id)},
+            completed_at=NOW,
+            provider_state="failed",
+            error_code=SALAD_JOB_FAILED_ERROR_CODE,
+            error_detail="Salad reported a failed queue job.",
+            created_at=NOW,
+        )
+        session.add(failed_attempt)
+        await session.commit()
+
+    async with scheduling_context.database.sessions() as session:
+        full = await dispatch_generation_jobs(
+            session,
+            salad_deployment_id=scheduling_context.deployment_id,
+            gpu_allocation_enabled=True,
+            max_inflight=1,
+            now=NOW + timedelta(seconds=1),
+        )
+    assert full.available_slots == 0
+    assert full.dispatched == ()
+
+    async with scheduling_context.database.sessions() as session:
+        recovered = await session.get(GenerationJob, scheduling_context.job_ids[1])
+        grants = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action == INFRASTRUCTURE_RETRY_GRANT_ACTION
+                )
+            )
+            or 0
+        )
+
+    assert recovered is not None
+    assert recovered.state == GenerationState.RETRY_WAIT
+    assert recovered.max_attempts == 2
+    assert grants == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_limit_excludes_already_granted_rows_before_limiting(
+    scheduling_context: SchedulingContext,
+) -> None:
+    async with scheduling_context.database.sessions() as session:
+        version = await session.scalar(
+            select(ReleaseVersion).where(ReleaseVersion.release_id == scheduling_context.release_id)
+        )
+        deployment = await session.get(SaladDeployment, scheduling_context.deployment_id)
+        template = await session.get(GenerationJob, scheduling_context.job_ids[0])
+        assert version is not None
+        assert deployment is not None
+        assert template is not None
+        job_ids: list[UUID] = []
+        for index in range(17):
+            job = GenerationJob(
+                release_version_id=version.id,
+                logical_key=f"{index + 100:064x}",
+                parameters={**template.parameters, "ordinal": index + 100},
+                parameters_sha256=canonical_sha256({**template.parameters, "ordinal": index + 100}),
+                provider="salad",
+                state=GenerationState.DEAD_LETTER,
+                priority=200,
+                expected_output_count=1,
+                attempt_count=1,
+                max_attempts=(2 if index < 16 else 1),
+            )
+            session.add(job)
+            await session.flush()
+            attempt = GenerationAttempt(
+                job_id=job.id,
+                salad_deployment_id=deployment.id,
+                attempt_no=1,
+                provider="salad",
+                provider_external_id=str(uuid4()),
+                submission_key=f"{index + 200:064x}",
+                request_sha256=f"{index + 300:064x}",
+                state=GenerationAttemptState.FAILED,
+                worker_image_digest=deployment.worker_image_digest,
+                request_metadata={"generation_job_id": str(job.id)},
+                completed_at=NOW,
+                provider_state="failed",
+                error_code=SALAD_JOB_FAILED_ERROR_CODE,
+                error_detail="Salad reported a failed queue job.",
+                created_at=NOW + timedelta(seconds=index),
+            )
+            session.add(attempt)
+            await session.flush()
+            if index < 16:
+                session.add(
+                    AuditEvent(
+                        actor="test",
+                        action=INFRASTRUCTURE_RETRY_GRANT_ACTION,
+                        resource_type="generation_attempt",
+                        resource_id=attempt.id,
+                        correlation_id=str(attempt.id),
+                        detail={"generation_job_id": str(job.id), "grant_ordinal": 1},
+                        occurred_at=NOW,
+                    )
+                )
+            job_ids.append(job.id)
+        await session.commit()
+
+        summary = await recover_dead_lettered_infrastructure_jobs(
+            session,
+            actor="test-recovery",
+            limit=16,
+            now=NOW + timedelta(minutes=1),
+        )
+        await session.commit()
+        last_job = await session.get(GenerationJob, job_ids[-1])
+
+    assert summary.scanned == 1
+    assert summary.recovered_job_ids == (job_ids[-1],)
+    assert last_job is not None
+    assert last_job.state == GenerationState.RETRY_WAIT
 
 
 @pytest.mark.asyncio

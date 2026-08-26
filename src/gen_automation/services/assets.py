@@ -6,7 +6,7 @@ from string import hexdigits
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, or_, select, true, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -65,6 +65,22 @@ class AssetStorageUnavailableError(AssetServiceError):
 
 class AssetQuarantinedError(AssetServiceError):
     pass
+
+
+class AssetUploadSalvageRequiredError(AssetConflictError):
+    """A visible prior upload must be promoted before its intent can rotate."""
+
+    def __init__(
+        self,
+        *,
+        asset_id: UUID,
+        staging_key: str,
+        upload_attempt_id: UUID,
+    ) -> None:
+        self.asset_id = asset_id
+        self.staging_key = staging_key
+        self.upload_attempt_id = upload_attempt_id
+        super().__init__("a visible staged raw master must be salvaged before intent rotation")
 
 
 @dataclass(frozen=True)
@@ -172,6 +188,7 @@ async def create_raw_master_upload_intents(
     expires_in: int = 600,
     max_bytes: int = 100 * 1024 * 1024,
     rotate_incomplete_uploads: bool = False,
+    require_salvage_before_rotation: bool = False,
     max_serialized_grant_bytes: int | None = None,
     commit: bool = True,
     actor: str = "controller",
@@ -199,10 +216,12 @@ async def create_raw_master_upload_intents(
     existing_assets = (
         (
             await session.scalars(
-                select(Asset).where(
+                select(Asset)
+                .where(
                     Asset.generation_job_id == job.id,
                     Asset.kind == AssetKind.RAW_MASTER,
                 )
+                .with_for_update()
             )
         )
         .unique()
@@ -252,6 +271,26 @@ async def create_raw_master_upload_intents(
         if existing_content_type != content_type:
             raise AssetConflictError("an upload intent already exists with another content type")
 
+        if asset.state == AssetState.VERIFYING and rotate_incomplete_uploads:
+            # The job and raw-master rows are already serialized above. An
+            # active collector keeps ownership of the exact staging intent,
+            # but an abandoned lease must not defer every provider retry
+            # forever. The retry-safe path reclaims only an expired lease and
+            # deliberately preserves both the staging key and upload attempt.
+            if not require_salvage_before_rotation:
+                raise AssetBusyError("a raw master is being verified before intent rotation")
+            lease_expires_at = asset.verification_lease_expires_at
+            if lease_expires_at is not None:
+                if lease_expires_at.tzinfo is None:
+                    lease_expires_at = lease_expires_at.replace(tzinfo=UTC)
+                else:
+                    lease_expires_at = lease_expires_at.astimezone(UTC)
+                if lease_expires_at > datetime.now(UTC):
+                    raise AssetBusyError("a raw master is being verified before intent rotation")
+            asset.state = AssetState.UPLOADING
+            asset.verification_lease_owner = None
+            asset.verification_lease_expires_at = None
+
         if asset.state == AssetState.EXPECTED:
             upload_attempt_id = uuid7()
             asset.staging_object_key = _staging_key(
@@ -271,21 +310,44 @@ async def create_raw_master_upload_intents(
             asset.state = AssetState.UPLOADING
             issue_upload = True
         elif asset.state == AssetState.UPLOADING and rotate_incomplete_uploads:
-            upload_attempt_id = uuid7()
-            asset.staging_object_key = _staging_key(
-                release_id=release_version.release_id,
-                job_id=job.id,
-                asset_id=asset.id,
-                upload_attempt_id=upload_attempt_id,
-            )
-            metadata = dict(asset.asset_metadata)
-            metadata.update(
-                {
-                    "staging_cleanup": "not_started",
-                    "upload_attempt_id": str(upload_attempt_id),
-                }
-            )
-            asset.asset_metadata = metadata
+            if require_salvage_before_rotation:
+                current_staging_key = asset.staging_object_key
+                upload_attempt_value = asset.asset_metadata.get("upload_attempt_id")
+                if current_staging_key is None or not isinstance(upload_attempt_value, str):
+                    raise AssetConflictError("asset upload metadata is incomplete")
+                try:
+                    upload_attempt_id = UUID(upload_attempt_value)
+                except ValueError:
+                    raise AssetConflictError("asset upload metadata is invalid") from None
+                # The job and every raw-master row are locked while this exact
+                # key is checked.  A visible object is never abandoned merely
+                # because the provider attempt reached a retryable terminal
+                # state before the progressive collector observed it.
+                if await store.head(current_staging_key) is not None:
+                    raise AssetUploadSalvageRequiredError(
+                        asset_id=asset.id,
+                        staging_key=current_staging_key,
+                        upload_attempt_id=upload_attempt_id,
+                    )
+                # A negative HEAD cannot prove that the holder of an earlier
+                # signed grant has stopped uploading. Re-sign this exact intent
+                # so a late completion remains discoverable and collectable.
+            else:
+                upload_attempt_id = uuid7()
+                asset.staging_object_key = _staging_key(
+                    release_id=release_version.release_id,
+                    job_id=job.id,
+                    asset_id=asset.id,
+                    upload_attempt_id=upload_attempt_id,
+                )
+                metadata = dict(asset.asset_metadata)
+                metadata.update(
+                    {
+                        "staging_cleanup": "not_started",
+                        "upload_attempt_id": str(upload_attempt_id),
+                    }
+                )
+                asset.asset_metadata = metadata
             issued_asset_ids.append(str(asset.id))
             issue_upload = True
         elif asset.state == AssetState.AVAILABLE and rotate_incomplete_uploads:
@@ -301,6 +363,9 @@ async def create_raw_master_upload_intents(
                 upload_attempt_id=upload_attempt_id,
             )
             metadata = dict(asset.asset_metadata)
+            metadata.pop("staging_version_id", None)
+            metadata.pop("staging_etag", None)
+            metadata.pop("staging_cleaned_at", None)
             metadata.update(
                 {
                     "staging_cleanup": "not_started",
@@ -395,6 +460,7 @@ async def _claim_verification(
     *,
     asset_id: UUID,
     lease_seconds: int,
+    expected_staging_key: str | None = None,
 ) -> tuple[Asset, str]:
     now = datetime.now(UTC)
     lease_owner = str(uuid7())
@@ -408,12 +474,18 @@ async def _claim_verification(
             ),
         ),
     )
+    exact_staging_intent = (
+        Asset.staging_object_key == expected_staging_key
+        if expected_staging_key is not None
+        else true()
+    )
     claimed_id = await session.scalar(
         update(Asset)
         .where(
             Asset.id == asset_id,
             Asset.kind == AssetKind.RAW_MASTER,
             claimable,
+            exact_staging_intent,
         )
         .values(
             state=AssetState.VERIFYING,
@@ -427,14 +499,16 @@ async def _claim_verification(
     await session.commit()
 
     if claimed_id is not None:
-        claimed = await session.get(Asset, claimed_id)
+        claimed = await session.get(Asset, claimed_id, populate_existing=True)
         if claimed is None:
             raise AssetNotFoundError("asset disappeared after verification claim")
         return claimed, lease_owner
 
-    current = await session.get(Asset, asset_id)
+    current = await session.get(Asset, asset_id, populate_existing=True)
     if current is None or current.kind != AssetKind.RAW_MASTER:
         raise AssetNotFoundError("raw master asset not found")
+    if expected_staging_key is not None and current.staging_object_key != expected_staging_key:
+        raise AssetBusyError("asset upload intent changed before verification")
     if current.state == AssetState.AVAILABLE:
         raise _AlreadyAvailableError(current)
     if current.state == AssetState.VERIFYING:
@@ -644,6 +718,7 @@ async def _mark_available(
     promoted: ObjectMetadata,
     verified: VerifiedImage,
     staging: ObjectMetadata,
+    expected_staging_key: str | None,
     actor: str,
 ) -> Asset:
     now = datetime.now(UTC)
@@ -661,6 +736,11 @@ async def _mark_available(
             Asset.id == asset.id,
             Asset.state == AssetState.VERIFYING,
             Asset.verification_lease_owner == lease_owner,
+            (
+                Asset.staging_object_key == expected_staging_key
+                if expected_staging_key is not None
+                else true()
+            ),
         )
         .values(
             state=AssetState.AVAILABLE,
@@ -720,7 +800,7 @@ async def _mark_available(
         )
     )
     await session.commit()
-    available = await session.get(Asset, available_id)
+    available = await session.get(Asset, available_id, populate_existing=True)
     if available is None:
         raise AssetNotFoundError("asset disappeared after promotion")
     return available
@@ -730,15 +810,43 @@ async def _mark_staging_cleaned_up(
     session: AsyncSession,
     *,
     asset_id: UUID,
+    expected_staging_key: str,
+    expected_staging_version_id: str,
+    expected_upload_attempt_id: str,
     actor: str,
-) -> None:
-    asset = await session.get(Asset, asset_id)
+) -> bool:
+    exact_cleanup_intent = and_(
+        Asset.id == asset_id,
+        Asset.state == AssetState.AVAILABLE,
+        Asset.staging_object_key == expected_staging_key,
+        Asset.asset_metadata["upload_attempt_id"].as_string() == expected_upload_attempt_id,
+        or_(
+            Asset.asset_metadata["staging_version_id"].as_string().is_(None),
+            (Asset.asset_metadata["staging_version_id"].as_string() == expected_staging_version_id),
+        ),
+    )
+    asset = await session.scalar(
+        select(Asset)
+        .where(exact_cleanup_intent)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     if asset is None:
-        return
+        await session.commit()
+        return False
     metadata = dict(asset.asset_metadata)
     metadata["staging_cleanup"] = "completed"
+    metadata["staging_version_id"] = expected_staging_version_id
     metadata["staging_cleaned_at"] = datetime.now(UTC).isoformat()
-    asset.asset_metadata = metadata
+    cleaned_id = await session.scalar(
+        update(Asset)
+        .where(exact_cleanup_intent)
+        .values(asset_metadata=metadata)
+        .returning(Asset.id)
+    )
+    if cleaned_id is None:
+        await session.commit()
+        return False
     session.add(
         AuditEvent(
             actor=actor,
@@ -746,11 +854,15 @@ async def _mark_staging_cleaned_up(
             resource_type="asset",
             resource_id=asset.id,
             correlation_id=str(asset.id),
-            detail={},
+            detail={
+                "staging_object_key": expected_staging_key,
+                "staging_version_id": expected_staging_version_id,
+            },
             occurred_at=datetime.now(UTC),
         )
     )
     await session.commit()
+    return True
 
 
 async def finalize_raw_master(
@@ -761,6 +873,7 @@ async def finalize_raw_master(
     max_bytes: int,
     reported_sha256: str | None = None,
     verification_lease_seconds: int = 900,
+    expected_staging_key: str | None = None,
     actor: str = "controller",
 ) -> FinalizedAsset:
     normalized_reported_sha256 = _validate_reported_sha256(reported_sha256)
@@ -769,6 +882,7 @@ async def finalize_raw_master(
             session,
             asset_id=asset_id,
             lease_seconds=verification_lease_seconds,
+            expected_staging_key=expected_staging_key,
         )
     except _AlreadyAvailableError as existing:
         if (
@@ -795,19 +909,39 @@ async def finalize_raw_master(
             await session.commit()
             raise AssetConflictError("duplicate completion reported a different checksum") from None
         replayed = FinalizedAsset.from_model(existing.asset, replayed=True)
+        cleanup_asset_id = existing.asset.id
         cleanup_state = existing.asset.asset_metadata.get("staging_cleanup")
-        if cleanup_state != "completed" and existing.asset.staging_object_key is not None:
+        cleanup_key = existing.asset.staging_object_key
+        stored_cleanup_version = existing.asset.asset_metadata.get("staging_version_id")
+        cleanup_upload_attempt_id = existing.asset.asset_metadata.get("upload_attempt_id")
+        if (
+            cleanup_state != "completed"
+            and cleanup_key is not None
+            and isinstance(cleanup_upload_attempt_id, str)
+        ):
             try:
-                staging = await store.head(existing.asset.staging_object_key)
+                cleanup_version = (
+                    stored_cleanup_version if isinstance(stored_cleanup_version, str) else None
+                )
+                staging = await store.head(cleanup_key, version_id=cleanup_version)
+                if cleanup_version is None:
+                    if staging is None:
+                        return replayed
+                    if staging.version_id is None or staging.etag is None:
+                        raise ObjectStoreError("staging cleanup requires an exact object version")
+                    cleanup_version = staging.version_id
                 if staging is not None:
                     _validate_staging_metadata(existing.asset, staging)
                     await store.delete(
-                        existing.asset.staging_object_key,
-                        version_id=staging.version_id,
+                        cleanup_key,
+                        version_id=cleanup_version,
                     )
                 await _mark_staging_cleaned_up(
                     session,
-                    asset_id=existing.asset.id,
+                    asset_id=cleanup_asset_id,
+                    expected_staging_key=cleanup_key,
+                    expected_staging_version_id=cleanup_version,
+                    expected_upload_attempt_id=cleanup_upload_attempt_id,
                     actor=actor,
                 )
             except (ImageVerificationError, ObjectStoreError):
@@ -834,9 +968,11 @@ async def finalize_raw_master(
             actor=actor,
         )
         raise AssetQuarantinedError("asset has no staging object key")
+    claimed_staging_key = asset.staging_object_key
+    claimed_upload_attempt_id = str(asset.asset_metadata["upload_attempt_id"])
 
     try:
-        staging = await store.head(asset.staging_object_key)
+        staging = await store.head(claimed_staging_key)
         if staging is None:
             await _release_verification_claim(
                 session,
@@ -862,7 +998,7 @@ async def finalize_raw_master(
 
         _validate_staging_metadata(asset, staging)
         data = await store.read_bytes(
-            asset.staging_object_key,
+            claimed_staging_key,
             max_bytes=max_bytes,
             version_id=staging.version_id,
             etag=staging.etag,
@@ -928,12 +1064,15 @@ async def finalize_raw_master(
         promoted=promoted,
         verified=verified,
         staging=staging,
+        expected_staging_key=claimed_staging_key,
         actor=actor,
     )
+    finalized = FinalizedAsset.from_model(available, replayed=False)
 
+    assert staging.version_id is not None
     try:
         await store.delete(
-            asset.staging_object_key,
+            claimed_staging_key,
             version_id=staging.version_id,
         )
     except ObjectStoreError:
@@ -942,17 +1081,20 @@ async def finalize_raw_master(
         try:
             await _mark_staging_cleaned_up(
                 session,
-                asset_id=asset.id,
+                asset_id=asset_id,
+                expected_staging_key=claimed_staging_key,
+                expected_staging_version_id=staging.version_id,
+                expected_upload_attempt_id=claimed_upload_attempt_id,
                 actor=actor,
             )
         except SQLAlchemyError:
             await session.rollback()
         else:
-            refreshed = await session.get(Asset, asset.id)
+            refreshed = await session.get(Asset, asset_id, populate_existing=True)
             if refreshed is not None:
-                available = refreshed
+                finalized = FinalizedAsset.from_model(refreshed, replayed=False)
 
-    return FinalizedAsset.from_model(available, replayed=False)
+    return finalized
 
 
 async def presign_asset_download(

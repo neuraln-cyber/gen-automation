@@ -29,11 +29,14 @@ from gen_automation.domain.enums import (
 )
 from gen_automation.services.assets import UploadIntent, create_raw_master_upload_intents
 from gen_automation.services.collection import (
+    RetryUploadSalvageDeferredError,
     claim_collection_jobs,
     collect_generation_job,
     collect_next_ready_running_asset,
+    create_retry_safe_raw_master_upload_intents,
     load_stop_salvage_status,
 )
+from gen_automation.storage.base import ObjectStoreError
 from gen_automation.storage.memory import MemoryObjectStore
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
@@ -345,6 +348,117 @@ async def test_missing_older_job_does_not_hide_visible_later_job_master(
 
 
 @pytest.mark.asyncio
+async def test_eight_missing_candidates_rotate_so_ninth_visible_master_is_collected(
+    collection_context: CollectionContext,
+) -> None:
+    checked_at = NOW + timedelta(days=2)
+    async with collection_context.database.sessions() as session:
+        ready_job = await session.get(GenerationJob, collection_context.job_id)
+        ready_asset = await session.get(Asset, collection_context.intents[0].asset_id)
+        assert ready_job is not None and ready_asset is not None
+        ready_job.state = GenerationState.RUNNING
+        ready_asset.updated_at = NOW
+        release_version_id = ready_job.release_version_id
+        await session.commit()
+
+        missing_job = GenerationJob(
+            release_version_id=release_version_id,
+            logical_key="missing-progressive-batch",
+            parameters={"seed": 100},
+            parameters_sha256="a" * 64,
+            provider="salad",
+            state=GenerationState.RUNNING,
+            expected_output_count=8,
+        )
+        session.add(missing_job)
+        await session.commit()
+        missing_intents = await create_raw_master_upload_intents(
+            session,
+            collection_context.store,
+            generation_job_id=missing_job.id,
+            max_bytes=1_000_000,
+        )
+        for index, missing_intent in enumerate(missing_intents):
+            missing_asset = await session.get(Asset, missing_intent.asset_id)
+            assert missing_asset is not None
+            missing_asset.updated_at = NOW - timedelta(minutes=10 + index)
+        await session.commit()
+
+    _stage(collection_context.store, collection_context.intents[0], _png("cyan"))
+    async with collection_context.database.sessions() as session:
+        rotated = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="progressive-collector",
+            max_image_bytes=1_000_000,
+            now=checked_at,
+        )
+        collected = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="progressive-collector",
+            max_image_bytes=1_000_000,
+            now=checked_at + timedelta(microseconds=1),
+        )
+
+    assert rotated.finalized is False
+    assert rotated.asset_id != collection_context.intents[0].asset_id
+    assert collected.asset_id == collection_context.intents[0].asset_id
+    assert collected.finalized is True
+
+
+@pytest.mark.asyncio
+async def test_missing_candidate_touch_does_not_overwrite_concurrent_intent_change(
+    collection_context: CollectionContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_at = NOW + timedelta(days=2)
+    replacement_updated_at = NOW + timedelta(days=1)
+    intent = collection_context.intents[0]
+    replacement_key = f"{intent.staging_key}/replacement"
+    async with collection_context.database.sessions() as session:
+        job = await session.get(GenerationJob, collection_context.job_id)
+        asset = await session.get(Asset, intent.asset_id)
+        other_asset = await session.get(Asset, collection_context.intents[1].asset_id)
+        assert job is not None and asset is not None and other_asset is not None
+        job.state = GenerationState.RUNNING
+        asset.updated_at = NOW
+        other_asset.state = AssetState.QUARANTINED
+        await session.commit()
+
+    async def race_head(key: str):  # type: ignore[no-untyped-def]
+        assert key == intent.staging_key
+        async with collection_context.database.sessions() as racing_session:
+            racing_asset = await racing_session.get(Asset, intent.asset_id)
+            assert racing_asset is not None
+            racing_asset.staging_object_key = replacement_key
+            racing_asset.state = AssetState.VERIFYING
+            racing_asset.verification_lease_owner = "concurrent-collector"
+            racing_asset.verification_lease_expires_at = checked_at + timedelta(minutes=5)
+            racing_asset.updated_at = replacement_updated_at
+            await racing_session.commit()
+        return None
+
+    monkeypatch.setattr(collection_context.store, "head", race_head)
+    async with collection_context.database.sessions() as session:
+        result = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="progressive-collector",
+            max_image_bytes=1_000_000,
+            now=checked_at,
+        )
+        asset = await session.get(Asset, intent.asset_id)
+
+    assert result.asset_id == intent.asset_id
+    assert result.finalized is False
+    assert asset is not None
+    assert asset.state == AssetState.VERIFYING
+    assert asset.staging_object_key == replacement_key
+    assert asset.updated_at != checked_at
+
+
+@pytest.mark.asyncio
 async def test_stopped_terminal_job_salvages_uploaded_master_then_retires_absent_intent(
     collection_context: CollectionContext,
 ) -> None:
@@ -486,7 +600,7 @@ async def test_stopped_terminal_job_reclaims_expired_verification_lease(
 
 
 @pytest.mark.asyncio
-async def test_terminal_job_without_stop_marker_is_not_progressively_salvaged(
+async def test_terminal_job_without_stop_marker_is_not_progressively_scanned(
     collection_context: CollectionContext,
 ) -> None:
     _stage(collection_context.store, collection_context.intents[0], _png("green"))
@@ -514,6 +628,403 @@ async def test_terminal_job_without_stop_marker_is_not_progressively_salvaged(
     assert result.asset_id is None
     assert result.finalized is False
     assert asset is not None and asset.state == AssetState.UPLOADING
+
+
+@pytest.mark.asyncio
+async def test_retry_wait_salvages_later_staged_master_across_missing_index_gap(
+    collection_context: CollectionContext,
+) -> None:
+    missing_intent, staged_intent = collection_context.intents
+    staged_bytes = _png("blue")
+    _stage(collection_context.store, staged_intent, staged_bytes)
+    async with collection_context.database.sessions() as session:
+        job = await session.get(GenerationJob, collection_context.job_id)
+        assert job is not None
+        job.state = GenerationState.RETRY_WAIT
+        await session.commit()
+
+        result = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="progressive-collector",
+            max_image_bytes=1_000_000,
+            now=NOW,
+        )
+        assets = list(
+            (
+                await session.scalars(
+                    select(Asset)
+                    .where(Asset.generation_job_id == collection_context.job_id)
+                    .order_by(Asset.output_index)
+                )
+            ).all()
+        )
+
+    assert result.asset_id == staged_intent.asset_id
+    assert result.finalized is True
+    assert assets[0].id == missing_intent.asset_id
+    assert assets[0].state == AssetState.UPLOADING
+    assert assets[0].staging_object_key == missing_intent.staging_key
+    assert assets[1].id == staged_intent.asset_id
+    assert assets[1].state == AssetState.AVAILABLE
+    assert assets[1].object_key is not None
+    assert collection_context.store.objects[assets[1].object_key].body == staged_bytes
+
+
+@pytest.mark.asyncio
+async def test_retry_grant_rotation_salvages_exact_visible_staging_intent_first(
+    collection_context: CollectionContext,
+) -> None:
+    original_intent = collection_context.intents[0]
+    original_bytes = _png("green")
+    _stage(collection_context.store, original_intent, original_bytes)
+    async with collection_context.database.sessions() as session:
+        job = await session.get(GenerationJob, collection_context.job_id)
+        assert job is not None
+        job.state = GenerationState.RETRY_WAIT
+        await session.commit()
+
+        rotated = await create_retry_safe_raw_master_upload_intents(
+            session,
+            collection_context.store,
+            generation_job_id=job.id,
+            expected_output_count=job.expected_output_count,
+            max_bytes=1_000_000,
+            actor="retry-input-builder",
+        )
+        asset = await session.get(Asset, original_intent.asset_id)
+
+    assert asset is not None
+    assert asset.state == AssetState.AVAILABLE
+    assert asset.object_key is not None
+    immutable_master_key = asset.object_key
+    assert collection_context.store.objects[immutable_master_key].body == original_bytes
+    assert rotated[0].asset_id == original_intent.asset_id
+    assert rotated[0].staging_key != original_intent.staging_key
+    assert rotated[0].upload_url is not None
+    assert asset.object_key == immutable_master_key
+
+
+@pytest.mark.asyncio
+async def test_retry_grant_reuses_exact_intent_when_upload_finishes_after_head_miss(
+    collection_context: CollectionContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_intent = collection_context.intents[0]
+    late_bytes = _png("purple")
+    original_head = collection_context.store.head
+    completed_after_miss = False
+
+    async def miss_then_complete(key: str, *, version_id: str | None = None):  # type: ignore[no-untyped-def]
+        nonlocal completed_after_miss
+        if key == original_intent.staging_key and not completed_after_miss:
+            completed_after_miss = True
+            _stage(collection_context.store, original_intent, late_bytes)
+            return None
+        return await original_head(key, version_id=version_id)
+
+    monkeypatch.setattr(collection_context.store, "head", miss_then_complete)
+    async with collection_context.database.sessions() as session:
+        job = await session.get(GenerationJob, collection_context.job_id)
+        assert job is not None
+        job.state = GenerationState.RETRY_WAIT
+        await session.commit()
+
+        reissued = await create_retry_safe_raw_master_upload_intents(
+            session,
+            collection_context.store,
+            generation_job_id=job.id,
+            expected_output_count=job.expected_output_count,
+            max_bytes=1_000_000,
+            actor="retry-input-builder",
+        )
+        collected = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="progressive-collector",
+            max_image_bytes=1_000_000,
+            now=NOW,
+        )
+        asset = await session.get(Asset, original_intent.asset_id)
+
+    assert completed_after_miss is True
+    assert reissued[0].staging_key == original_intent.staging_key
+    assert reissued[0].upload_attempt_id == original_intent.upload_attempt_id
+    assert collected.asset_id == original_intent.asset_id
+    assert collected.finalized is True
+    assert asset is not None
+    assert asset.state == AssetState.AVAILABLE
+    assert asset.object_key is not None
+    assert collection_context.store.objects[asset.object_key].body == late_bytes
+
+
+@pytest.mark.asyncio
+async def test_progressive_finalize_is_fenced_to_candidate_staging_key(
+    collection_context: CollectionContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_intent = collection_context.intents[0]
+    _stage(collection_context.store, original_intent, _png("green"))
+    original_head = collection_context.store.head
+    replacement: UploadIntent | None = None
+
+    async with collection_context.database.sessions() as session:
+        job = await session.get(GenerationJob, collection_context.job_id)
+        other_asset = await session.get(Asset, collection_context.intents[1].asset_id)
+        assert job is not None and other_asset is not None
+        job.state = GenerationState.RETRY_WAIT
+        other_asset.state = AssetState.QUARANTINED
+        await session.commit()
+
+    async def rotate_after_candidate_head(
+        key: str,
+        *,
+        version_id: str | None = None,
+    ):  # type: ignore[no-untyped-def]
+        nonlocal replacement
+        observed = await original_head(key, version_id=version_id)
+        if key == original_intent.staging_key and replacement is None:
+            async with collection_context.database.sessions() as racing_session:
+                replacement = (
+                    await create_raw_master_upload_intents(
+                        racing_session,
+                        collection_context.store,
+                        generation_job_id=collection_context.job_id,
+                        max_bytes=1_000_000,
+                        rotate_incomplete_uploads=True,
+                    )
+                )[0]
+            _stage(collection_context.store, replacement, _png("blue"))
+        return observed
+
+    monkeypatch.setattr(collection_context.store, "head", rotate_after_candidate_head)
+    async with collection_context.database.sessions() as session:
+        result = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="progressive-collector",
+            max_image_bytes=1_000_000,
+            now=NOW,
+        )
+        asset = await session.get(Asset, original_intent.asset_id)
+
+    assert replacement is not None
+    assert result.asset_id == original_intent.asset_id
+    assert result.finalized is False
+    assert asset is not None
+    assert asset.state == AssetState.UPLOADING
+    assert asset.staging_object_key == replacement.staging_key
+    assert asset.object_key is None
+    assert original_intent.staging_key in collection_context.store.objects
+    assert replacement.staging_key in collection_context.store.objects
+
+
+@pytest.mark.asyncio
+async def test_retry_grant_defers_while_any_raw_master_is_verifying(
+    collection_context: CollectionContext,
+) -> None:
+    lease_expires_at = datetime.now(UTC) + timedelta(minutes=10)
+    async with collection_context.database.sessions() as session:
+        assets = list(
+            (
+                await session.scalars(
+                    select(Asset)
+                    .where(Asset.generation_job_id == collection_context.job_id)
+                    .order_by(Asset.output_index)
+                )
+            ).all()
+        )
+        for asset in assets:
+            asset.state = AssetState.VERIFYING
+            asset.verification_lease_owner = "active-collector"
+            asset.verification_lease_expires_at = lease_expires_at
+        await session.commit()
+
+        with pytest.raises(RetryUploadSalvageDeferredError, match="still in progress"):
+            await create_retry_safe_raw_master_upload_intents(
+                session,
+                collection_context.store,
+                generation_job_id=collection_context.job_id,
+                expected_output_count=2,
+                max_bytes=1_000_000,
+            )
+        unchanged = list(
+            (
+                await session.scalars(
+                    select(Asset)
+                    .where(Asset.generation_job_id == collection_context.job_id)
+                    .order_by(Asset.output_index)
+                )
+            ).all()
+        )
+
+    assert [asset.state for asset in unchanged] == [
+        AssetState.VERIFYING,
+        AssetState.VERIFYING,
+    ]
+    assert [asset.staging_object_key for asset in unchanged] == [
+        intent.staging_key for intent in collection_context.intents
+    ]
+
+
+@pytest.mark.asyncio
+async def test_retry_grant_reclaims_expired_verification_without_rotating_intent(
+    collection_context: CollectionContext,
+) -> None:
+    original_intent = collection_context.intents[0]
+    async with collection_context.database.sessions() as session:
+        asset = await session.get(Asset, original_intent.asset_id)
+        assert asset is not None
+        asset.state = AssetState.VERIFYING
+        asset.verification_lease_owner = "expired-collector"
+        asset.verification_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+        reissued = await create_retry_safe_raw_master_upload_intents(
+            session,
+            collection_context.store,
+            generation_job_id=collection_context.job_id,
+            expected_output_count=2,
+            max_bytes=1_000_000,
+            actor="retry-input-builder",
+        )
+        reclaimed = await session.get(Asset, original_intent.asset_id, populate_existing=True)
+
+    assert reissued[0].staging_key == original_intent.staging_key
+    assert reissued[0].upload_attempt_id == original_intent.upload_attempt_id
+    assert reclaimed is not None
+    assert reclaimed.state == AssetState.UPLOADING
+    assert reclaimed.staging_object_key == original_intent.staging_key
+    assert reclaimed.verification_lease_owner is None
+    assert reclaimed.verification_lease_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_progressive_miss_then_retry_reclaims_expired_verification(
+    collection_context: CollectionContext,
+) -> None:
+    original_intent = collection_context.intents[0]
+    checked_at = datetime.now(UTC)
+    async with collection_context.database.sessions() as session:
+        job = await session.get(GenerationJob, collection_context.job_id)
+        expired_asset = await session.get(Asset, original_intent.asset_id)
+        other_asset = await session.get(Asset, collection_context.intents[1].asset_id)
+        assert job is not None and expired_asset is not None and other_asset is not None
+        job.state = GenerationState.RETRY_WAIT
+        expired_asset.state = AssetState.VERIFYING
+        expired_asset.verification_lease_owner = "expired-progressive-collector"
+        expired_asset.verification_lease_expires_at = checked_at - timedelta(seconds=1)
+        other_asset.state = AssetState.QUARANTINED
+        await session.commit()
+
+        scanned = await collect_next_ready_running_asset(
+            session,
+            collection_context.store,
+            worker_id="progressive-collector",
+            max_image_bytes=1_000_000,
+            now=checked_at,
+        )
+        after_scan = await session.get(Asset, original_intent.asset_id, populate_existing=True)
+        assert after_scan is not None
+        assert after_scan.state == AssetState.VERIFYING
+
+        reissued = await create_retry_safe_raw_master_upload_intents(
+            session,
+            collection_context.store,
+            generation_job_id=collection_context.job_id,
+            expected_output_count=2,
+            max_bytes=1_000_000,
+            actor="retry-input-builder",
+        )
+        reclaimed = await session.get(Asset, original_intent.asset_id, populate_existing=True)
+
+    assert scanned.asset_id == original_intent.asset_id
+    assert scanned.finalized is False
+    assert reissued[0].staging_key == original_intent.staging_key
+    assert reissued[0].upload_attempt_id == original_intent.upload_attempt_id
+    assert reclaimed is not None
+    assert reclaimed.state == AssetState.UPLOADING
+    assert reclaimed.verification_lease_owner is None
+    assert reclaimed.verification_lease_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_retry_grant_salvages_visible_upload_from_expired_verification(
+    collection_context: CollectionContext,
+) -> None:
+    original_intent = collection_context.intents[0]
+    original_bytes = _png("orange")
+    _stage(collection_context.store, original_intent, original_bytes)
+    async with collection_context.database.sessions() as session:
+        asset = await session.get(Asset, original_intent.asset_id)
+        other_asset = await session.get(Asset, collection_context.intents[1].asset_id)
+        assert asset is not None and other_asset is not None
+        asset.state = AssetState.VERIFYING
+        asset.verification_lease_owner = "expired-collector"
+        asset.verification_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        other_asset.state = AssetState.QUARANTINED
+        await session.commit()
+
+        reissued = await create_retry_safe_raw_master_upload_intents(
+            session,
+            collection_context.store,
+            generation_job_id=collection_context.job_id,
+            expected_output_count=2,
+            max_bytes=1_000_000,
+            actor="retry-input-builder",
+        )
+        salvaged = await session.get(Asset, original_intent.asset_id, populate_existing=True)
+
+    assert salvaged is not None
+    assert salvaged.state == AssetState.AVAILABLE
+    assert salvaged.object_key is not None
+    assert collection_context.store.objects[salvaged.object_key].body == original_bytes
+    assert reissued[0].staging_key != original_intent.staging_key
+    assert reissued[0].upload_attempt_id != original_intent.upload_attempt_id
+
+
+@pytest.mark.asyncio
+async def test_retry_rotation_storage_head_failure_rolls_back_every_exact_key(
+    collection_context: CollectionContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def inconclusive_head(_key: str):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        raise ObjectStoreError("storage unavailable")
+
+    monkeypatch.setattr(collection_context.store, "head", inconclusive_head)
+    async with collection_context.database.sessions() as session:
+        with pytest.raises(RetryUploadSalvageDeferredError, match="could not prove"):
+            await create_retry_safe_raw_master_upload_intents(
+                session,
+                collection_context.store,
+                generation_job_id=collection_context.job_id,
+                expected_output_count=2,
+                max_bytes=1_000_000,
+            )
+        assets = list(
+            (
+                await session.scalars(
+                    select(Asset)
+                    .where(Asset.generation_job_id == collection_context.job_id)
+                    .order_by(Asset.output_index)
+                )
+            ).all()
+        )
+
+    assert calls == 2
+    assert [asset.staging_object_key for asset in assets] == [
+        intent.staging_key for intent in collection_context.intents
+    ]
+    assert [asset.state for asset in assets] == [
+        AssetState.UPLOADING,
+        AssetState.UPLOADING,
+    ]
 
 
 @pytest.mark.asyncio

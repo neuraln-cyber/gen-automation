@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from gen_automation.db.models import (
     AuditEvent,
@@ -26,8 +26,13 @@ from gen_automation.domain.enums import (
     GenerationAttemptState,
     GenerationState,
     InboxStatus,
+    ReleasePhase,
 )
 from gen_automation.services.budgets import ensure_budget_guard
+from gen_automation.services.generation_recovery import (
+    INFRASTRUCTURE_RETRY_GRANT_ACTION,
+    SALAD_PROVIDER_CANCELLED_ERROR_CODE,
+)
 from gen_automation.services.salad import (
     DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE,
     DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE,
@@ -114,6 +119,7 @@ async def _seed(
             slug="release",
             title="Release",
             desired_accepted_count=1,
+            phase=ReleasePhase.GENERATING,
         )
         session.add(release)
         await session.flush()
@@ -404,7 +410,7 @@ async def test_signed_success_requires_output_reconciliation_and_holds_reservati
     ("attempt_count", "max_attempts", "expected_job_state"),
     [
         (1, 3, GenerationState.RETRY_WAIT),
-        (3, 3, GenerationState.DEAD_LETTER),
+        (3, 3, GenerationState.RETRY_WAIT),
     ],
 )
 async def test_definitive_failure_retries_or_dead_letters_generation_job(
@@ -447,7 +453,7 @@ async def test_definitive_failure_retries_or_dead_letters_generation_job(
             assert job.retry_at is None
 
 
-async def test_definitive_cancel_cancels_attempt_and_job(
+async def test_unrequested_provider_cancel_is_bounded_infrastructure_retry(
     database: Database,
 ) -> None:
     context = await _seed(
@@ -467,8 +473,12 @@ async def test_definitive_cancel_cancels_attempt_and_job(
             now=NOW + timedelta(seconds=1),
         )
 
-    assert result.attempt_state == GenerationAttemptState.CANCELLED
-    assert result.job_state == GenerationState.CANCELLED
+    assert result.attempt_state == GenerationAttemptState.FAILED
+    assert result.job_state == GenerationState.RETRY_WAIT
+    async with database.sessions() as session:
+        attempt = await session.get(GenerationAttempt, context.attempt_id)
+        assert attempt is not None
+        assert attempt.error_code == SALAD_PROVIDER_CANCELLED_ERROR_CODE
 
 
 async def test_watchdog_cancel_confirmation_retries_generation_job(
@@ -923,16 +933,25 @@ async def test_same_timestamp_conflict_and_terminal_job_conflict_are_quarantined
         )
         assert len(claimed) == 2
 
-    for context in (same_timestamp, terminal_job):
-        async with database.sessions() as session:
-            result = await process_salad_webhook_receipt(
-                session,
-                receipt_id=context.receipt_id,
-                worker_id="inbox-worker",
-                now=NOW + timedelta(seconds=1),
-            )
-            assert result.disposition == InboxDisposition.TERMINAL_CONFLICT
-            assert result.receipt_status == InboxStatus.DEAD_LETTER
+    async with database.sessions() as session:
+        forward = await process_salad_webhook_receipt(
+            session,
+            receipt_id=same_timestamp.receipt_id,
+            worker_id="inbox-worker",
+            now=NOW + timedelta(seconds=1),
+        )
+    assert forward.disposition == InboxDisposition.APPLIED
+    assert forward.attempt_state == GenerationAttemptState.FAILED
+
+    async with database.sessions() as session:
+        conflict = await process_salad_webhook_receipt(
+            session,
+            receipt_id=terminal_job.receipt_id,
+            worker_id="inbox-worker",
+            now=NOW + timedelta(seconds=1),
+        )
+    assert conflict.disposition == InboxDisposition.TERMINAL_CONFLICT
+    assert conflict.receipt_status == InboxStatus.DEAD_LETTER
 
 
 async def test_prelinked_attempt_must_match_provider_external_id(
@@ -955,3 +974,77 @@ async def test_prelinked_attempt_must_match_provider_external_id(
 
     assert result.disposition == InboxDisposition.DEAD_LETTERED
     assert result.receipt_status == InboxStatus.DEAD_LETTER
+
+
+async def test_final_webhook_failure_grants_once_and_replay_is_idempotent(
+    database: Database,
+) -> None:
+    context = await _seed(
+        database,
+        provider_status="failed",
+        attempt_count=1,
+        job_max_attempts=1,
+    )
+    await _claim_one(database)
+    async with database.sessions() as session:
+        first = await process_salad_webhook_receipt(
+            session,
+            receipt_id=context.receipt_id,
+            worker_id="inbox-worker",
+            now=NOW + timedelta(seconds=1),
+        )
+        replay = await process_salad_webhook_receipt(
+            session,
+            receipt_id=context.receipt_id,
+            worker_id="inbox-worker",
+            now=NOW + timedelta(seconds=2),
+        )
+        job = await session.get(GenerationJob, context.job_id)
+        grants = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action == INFRASTRUCTURE_RETRY_GRANT_ACTION
+                )
+            )
+            or 0
+        )
+
+    assert first.job_state == GenerationState.RETRY_WAIT
+    assert replay.disposition == InboxDisposition.ALREADY_PROCESSED
+    assert job is not None
+    assert job.max_attempts == 2
+    assert grants == 1
+
+
+async def test_webhook_for_superseded_attempt_cannot_rearm_current_job(
+    database: Database,
+) -> None:
+    context = await _seed(database, provider_status="failed")
+    async with database.sessions() as session:
+        job = await session.get(GenerationJob, context.job_id)
+        assert job is not None
+        job.attempt_count = 2
+        await session.commit()
+    await _claim_one(database)
+    async with database.sessions() as session:
+        result = await process_salad_webhook_receipt(
+            session,
+            receipt_id=context.receipt_id,
+            worker_id="inbox-worker",
+            now=NOW + timedelta(seconds=1),
+        )
+        job = await session.get(GenerationJob, context.job_id)
+        grants = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action == INFRASTRUCTURE_RETRY_GRANT_ACTION
+                )
+            )
+            or 0
+        )
+
+    assert result.disposition == InboxDisposition.STALE_IGNORED
+    assert job is not None
+    assert job.state == GenerationState.RUNNING
+    assert job.max_attempts == 3
+    assert grants == 0

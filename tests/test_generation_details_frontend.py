@@ -287,6 +287,9 @@ def test_experiment_lab_has_a_scoped_workspace_gallery_and_exact_settings_reuse(
     assert "gen-automation:assets-updated" in workspace
     assert "payload.next_cursor" in workspace
     assert "button.dataset.experimentLabThumbnail" in workspace
+    assert "payload.error.retryable === false" in workspace
+    assert '["review", "cancelled"].includes(payload.stage.key)' in workspace
+    assert '["review", "cancelled", "error"].includes(payload.stage.key)' not in workspace
     assert "innerHTML" not in workspace
 
     warm = script.split("function initializeExperimentWarmSession", maxsplit=1)[1].split(

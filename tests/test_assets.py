@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -8,7 +9,9 @@ from uuid import UUID
 import pytest
 from PIL import Image
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 
+import gen_automation.services.assets as assets_service
 from gen_automation.db.models import (
     Asset,
     AuditEvent,
@@ -24,6 +27,7 @@ from gen_automation.services.assets import (
     AssetBusyError,
     AssetConflictError,
     AssetQuarantinedError,
+    AssetUploadSalvageRequiredError,
     UploadIntent,
     UploadNotReadyError,
     create_raw_master_upload_intents,
@@ -217,6 +221,66 @@ async def test_incomplete_upload_grants_can_be_rotated_for_a_new_provider_attemp
 
 
 @pytest.mark.asyncio
+async def test_visible_incomplete_upload_is_not_rotated_before_exact_salvage(
+    asset_context: AssetContext,
+) -> None:
+    store = MemoryObjectStore()
+    first = await create_intents(asset_context, store)
+    stage_upload(store, first[0], png_bytes("purple"))
+
+    async with asset_context.database.sessions() as session:
+        with pytest.raises(AssetUploadSalvageRequiredError) as captured:
+            await create_raw_master_upload_intents(
+                session,
+                store,
+                generation_job_id=asset_context.job_id,
+                max_bytes=1_000_000,
+                rotate_incomplete_uploads=True,
+                require_salvage_before_rotation=True,
+            )
+        await session.rollback()
+        asset = await session.get(Asset, first[0].asset_id)
+
+    assert captured.value.asset_id == first[0].asset_id
+    assert captured.value.staging_key == first[0].staging_key
+    assert captured.value.upload_attempt_id == first[0].upload_attempt_id
+    assert asset is not None
+    assert asset.state == AssetState.UPLOADING
+    assert asset.staging_object_key == first[0].staging_key
+
+
+@pytest.mark.asyncio
+async def test_verifying_upload_is_never_rotated_under_active_collector_lease(
+    asset_context: AssetContext,
+) -> None:
+    store = MemoryObjectStore()
+    first = await create_intents(asset_context, store)
+    async with asset_context.database.sessions() as session:
+        asset = await session.get(Asset, first[0].asset_id)
+        assert asset is not None
+        asset.state = AssetState.VERIFYING
+        asset.verification_lease_owner = "active-collector"
+        asset.verification_lease_expires_at = datetime.now(UTC) + timedelta(minutes=5)
+        await session.commit()
+
+        with pytest.raises(AssetBusyError, match="being verified"):
+            await create_raw_master_upload_intents(
+                session,
+                store,
+                generation_job_id=asset_context.job_id,
+                max_bytes=1_000_000,
+                rotate_incomplete_uploads=True,
+                require_salvage_before_rotation=True,
+            )
+        await session.rollback()
+        unchanged = await session.get(Asset, first[0].asset_id)
+
+    assert unchanged is not None
+    assert unchanged.state == AssetState.VERIFYING
+    assert unchanged.staging_object_key == first[0].staging_key
+
+
+@pytest.mark.asyncio
 async def test_provider_retry_reissues_and_cleans_grant_for_progressively_available_asset(
     asset_context: AssetContext,
 ) -> None:
@@ -260,6 +324,215 @@ async def test_provider_retry_reissues_and_cleans_grant_for_progressively_availa
     assert asset is not None
     assert asset.state == AssetState.AVAILABLE
     assert asset.asset_metadata["staging_cleanup"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_stale_exact_salvage_cannot_clean_new_available_asset_intent(
+    asset_context: AssetContext,
+) -> None:
+    store = MemoryObjectStore()
+    first = await create_intents(asset_context, store)
+    stage_upload(store, first[0], png_bytes("orange"))
+    async with asset_context.database.sessions() as session:
+        finalized = await finalize_raw_master(
+            session,
+            store,
+            asset_id=first[0].asset_id,
+            max_bytes=1_000_000,
+        )
+        rotated = await create_raw_master_upload_intents(
+            session,
+            store,
+            generation_job_id=asset_context.job_id,
+            max_bytes=1_000_000,
+            rotate_incomplete_uploads=True,
+        )
+
+        with pytest.raises(AssetBusyError, match="intent changed"):
+            await finalize_raw_master(
+                session,
+                store,
+                asset_id=first[0].asset_id,
+                max_bytes=1_000_000,
+                expected_staging_key=first[0].staging_key,
+            )
+        current = await session.get(Asset, first[0].asset_id)
+
+    assert current is not None
+    assert current.state == AssetState.AVAILABLE
+    assert current.object_key == finalized.object_key
+    assert current.staging_object_key == rotated[0].staging_key
+    assert current.asset_metadata["staging_cleanup"] == "not_started"
+
+
+@pytest.mark.asyncio
+async def test_exact_salvage_fresh_load_detects_two_session_intent_rotation(
+    asset_context: AssetContext,
+) -> None:
+    store = MemoryObjectStore()
+    first = await create_intents(asset_context, store)
+    async with asset_context.database.sessions() as stale_session:
+        cached = await stale_session.get(Asset, first[0].asset_id)
+        assert cached is not None
+        assert cached.staging_object_key == first[0].staging_key
+
+        async with asset_context.database.sessions() as rotating_session:
+            replacement = (
+                await create_raw_master_upload_intents(
+                    rotating_session,
+                    store,
+                    generation_job_id=asset_context.job_id,
+                    max_bytes=1_000_000,
+                    rotate_incomplete_uploads=True,
+                )
+            )[0]
+
+        with pytest.raises(AssetBusyError, match="intent changed"):
+            await finalize_raw_master(
+                stale_session,
+                store,
+                asset_id=first[0].asset_id,
+                max_bytes=1_000_000,
+                expected_staging_key=first[0].staging_key,
+            )
+        current = await stale_session.get(
+            Asset,
+            first[0].asset_id,
+            populate_existing=True,
+        )
+
+    assert current is not None
+    assert current.state == AssetState.UPLOADING
+    assert current.staging_object_key == replacement.staging_key
+
+
+@pytest.mark.asyncio
+async def test_verification_claim_fresh_load_replays_two_session_available_asset(
+    asset_context: AssetContext,
+) -> None:
+    store = MemoryObjectStore()
+    first = await create_intents(asset_context, store)
+    stage_upload(store, first[0], png_bytes("green"))
+    async with asset_context.database.sessions() as stale_session:
+        cached = await stale_session.get(Asset, first[0].asset_id)
+        assert cached is not None and cached.state == AssetState.UPLOADING
+
+        async with asset_context.database.sessions() as publishing_session:
+            published = await finalize_raw_master(
+                publishing_session,
+                store,
+                asset_id=first[0].asset_id,
+                max_bytes=1_000_000,
+            )
+
+        replayed = await finalize_raw_master(
+            stale_session,
+            store,
+            asset_id=first[0].asset_id,
+            max_bytes=1_000_000,
+        )
+
+    assert replayed.replayed is True
+    assert replayed.object_key == published.object_key
+
+
+@pytest.mark.asyncio
+async def test_post_publish_cleanup_never_deletes_or_marks_a_rotated_intent(
+    asset_context: AssetContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryObjectStore()
+    first = await create_intents(asset_context, store)
+    original_bytes = png_bytes("orange")
+    replacement_bytes = png_bytes("purple")
+    stage_upload(store, first[0], original_bytes)
+    original_delete = store.delete
+    delete_started = asyncio.Event()
+    resume_delete = asyncio.Event()
+    replacement: UploadIntent | None = None
+
+    async def pause_old_delete(
+        key: str,
+        *,
+        version_id: str | None = None,
+    ) -> None:
+        assert key == first[0].staging_key
+        delete_started.set()
+        await resume_delete.wait()
+        await original_delete(key, version_id=version_id)
+
+    monkeypatch.setattr(store, "delete", pause_old_delete)
+    async with asset_context.database.sessions() as publishing_session:
+        publish_task = asyncio.create_task(
+            finalize_raw_master(
+                publishing_session,
+                store,
+                asset_id=first[0].asset_id,
+                max_bytes=1_000_000,
+            )
+        )
+        await delete_started.wait()
+
+        async with asset_context.database.sessions() as rotating_session:
+            replacement = (
+                await create_raw_master_upload_intents(
+                    rotating_session,
+                    store,
+                    generation_job_id=asset_context.job_id,
+                    max_bytes=1_000_000,
+                    rotate_incomplete_uploads=True,
+                )
+            )[0]
+        stage_upload(store, replacement, replacement_bytes)
+        resume_delete.set()
+        finalized = await publish_task
+
+    async with asset_context.database.sessions() as inspection_session:
+        current = await inspection_session.get(Asset, first[0].asset_id)
+
+    assert replacement is not None
+    assert finalized.object_key in store.objects
+    assert store.objects[finalized.object_key].body == original_bytes
+    assert first[0].staging_key not in store.objects
+    assert replacement.staging_key in store.objects
+    assert store.objects[replacement.staging_key].body == replacement_bytes
+    assert current is not None
+    assert current.state == AssetState.AVAILABLE
+    assert current.staging_object_key == replacement.staging_key
+    assert current.asset_metadata["upload_attempt_id"] == str(replacement.upload_attempt_id)
+    assert current.asset_metadata["staging_cleanup"] == "not_started"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_database_failure_returns_published_asset_snapshot(
+    asset_context: AssetContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MemoryObjectStore()
+    first = await create_intents(asset_context, store)
+    original_bytes = png_bytes("blue")
+    stage_upload(store, first[0], original_bytes)
+
+    async def fail_cleanup(*_args: object, **_kwargs: object) -> bool:
+        raise SQLAlchemyError("cleanup metadata write failed")
+
+    monkeypatch.setattr(assets_service, "_mark_staging_cleaned_up", fail_cleanup)
+    async with asset_context.database.sessions() as session:
+        finalized = await finalize_raw_master(
+            session,
+            store,
+            asset_id=first[0].asset_id,
+            max_bytes=1_000_000,
+        )
+        current = await session.get(Asset, first[0].asset_id)
+
+    assert finalized.replayed is False
+    assert finalized.object_key in store.objects
+    assert store.objects[finalized.object_key].body == original_bytes
+    assert current is not None
+    assert current.state == AssetState.AVAILABLE
+    assert current.object_key == finalized.object_key
+    assert current.asset_metadata["staging_cleanup"] == "pending"
 
 
 @pytest.mark.asyncio
