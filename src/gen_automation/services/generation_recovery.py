@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID
 
-from sqlalchemy import exists, func, or_, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -46,6 +46,28 @@ INFRASTRUCTURE_FAILURE_ERROR_CODES = frozenset(
         SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE,
     }
 )
+
+# Historical controller versions could persist the definitive provider failure
+# only on the job while leaving the exact terminal attempt's ``error_code``
+# unset. Recovery may use that legacy fallback only when the attempt still
+# carries provider evidence that independently agrees with the job-level code.
+_LEGACY_FAILED_PROVIDER_ERROR_CODES = frozenset(
+    {
+        SALAD_JOB_FAILED_ERROR_CODE,
+        SALAD_WEBHOOK_JOB_FAILED_ERROR_CODE,
+    }
+)
+_LEGACY_CANCELLED_PROVIDER_ERROR_CODES = frozenset(
+    {
+        SALAD_WATCHDOG_EXPIRED_ERROR_CODE,
+        SALAD_DEPLOYMENT_SUPERSEDED_ERROR_CODE,
+        SALAD_PROVIDER_CANCELLED_ERROR_CODE,
+    }
+)
+_LEGACY_ABSENT_PROVIDER_STATES_BY_ERROR_CODE = {
+    SALAD_DEPLOYMENT_PROVIDER_ABSENT_ERROR_CODE: "absent_after_rollover",
+    SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE: "absent_after_reconciliation",
+}
 
 _RETRYABLE_RELEASE_PHASES = frozenset(
     {
@@ -108,6 +130,39 @@ def _provider_attempt_is_definitive(attempt: GenerationAttempt) -> bool:
     )
 
 
+def _legacy_job_failure_code(
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+) -> str | None:
+    """Return a job-level legacy code only when provider evidence agrees exactly."""
+
+    if (
+        attempt.error_code is not None
+        or job.last_error_code is None
+        or job.state != GenerationState.DEAD_LETTER
+        or job.provider != "salad"
+        or attempt.provider != "salad"
+    ):
+        return None
+    error_code = job.last_error_code
+    if error_code in _LEGACY_FAILED_PROVIDER_ERROR_CODES:
+        provider_evidence_matches = (
+            attempt.provider_external_id is not None and attempt.provider_state == "failed"
+        )
+    elif error_code in _LEGACY_CANCELLED_PROVIDER_ERROR_CODES:
+        provider_evidence_matches = (
+            attempt.provider_external_id is not None and attempt.provider_state == "cancelled"
+        )
+    else:
+        expected_provider_state = _LEGACY_ABSENT_PROVIDER_STATES_BY_ERROR_CODE.get(error_code)
+        provider_evidence_matches = (
+            expected_provider_state is not None
+            and attempt.provider_state == expected_provider_state
+        )
+    return error_code if provider_evidence_matches else None
+
+
 async def _release_allows_retry(
     session: AsyncSession,
     *,
@@ -158,15 +213,24 @@ async def grant_infrastructure_retry(
     and concurrent recovery sweeps idempotent under that lock.
     """
 
+    legacy_failure_code = (
+        _legacy_job_failure_code(attempt=attempt, job=job)
+        if source == InfrastructureRetrySource.SCHEDULER_RECOVERY
+        else None
+    )
+    failure_code = attempt.error_code or legacy_failure_code
+    failure_detail = (
+        job.last_error_detail if legacy_failure_code is not None else attempt.error_detail
+    )
     if (
         attempt.job_id != job.id
         or attempt.attempt_no != job.attempt_count
         or attempt.state != GenerationAttemptState.FAILED
         or attempt.completed_at is None
-        or attempt.error_code not in INFRASTRUCTURE_FAILURE_ERROR_CODES
+        or failure_code not in INFRASTRUCTURE_FAILURE_ERROR_CODES
         or job.state in _NON_RETRYABLE_JOB_STATES
         or job.max_attempts >= 10
-        or not _provider_attempt_is_definitive(attempt)
+        or (legacy_failure_code is None and not _provider_attempt_is_definitive(attempt))
         or not await _release_allows_retry(session, job=job)
     ):
         return InfrastructureRetryGrant(
@@ -216,8 +280,8 @@ async def grant_infrastructure_retry(
     job.retry_at = retry_not_before
     job.lease_owner = None
     job.lease_expires_at = None
-    job.last_error_code = attempt.error_code
-    job.last_error_detail = attempt.error_detail
+    job.last_error_code = failure_code
+    job.last_error_detail = failure_detail
     job.lock_version += 1
     session.add(
         AuditEvent(
@@ -229,7 +293,12 @@ async def grant_infrastructure_retry(
             detail={
                 "generation_job_id": str(job.id),
                 "attempt_no": attempt.attempt_no,
-                "failure_code": attempt.error_code,
+                "failure_code": failure_code,
+                "failure_code_source": (
+                    "generation_job_legacy_fallback"
+                    if legacy_failure_code is not None
+                    else "generation_attempt"
+                ),
                 "source": source.value,
                 "grant_ordinal": grant_ordinal,
                 "grant_limit": MAX_INFRASTRUCTURE_RETRY_GRANTS,
@@ -291,6 +360,55 @@ async def recover_dead_lettered_infrastructure_jobs(
             AuditEvent.action == _GENERATION_STOP_REQUESTED_ACTION,
         )
     )
+    provider_attempt_is_definitive = or_(
+        GenerationAttempt.provider_external_id.is_not(None),
+        and_(
+            GenerationAttempt.error_code == SALAD_DEPLOYMENT_PROVIDER_ABSENT_ERROR_CODE,
+            GenerationAttempt.provider_state == "absent_after_rollover",
+        ),
+        and_(
+            GenerationAttempt.error_code == SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE,
+            GenerationAttempt.provider_state == "absent_after_reconciliation",
+        ),
+        and_(
+            GenerationAttempt.error_code == SALAD_RATE_LIMITED_ERROR_CODE,
+            GenerationAttempt.provider_external_id.is_(None),
+        ),
+    )
+    legacy_job_failure_is_definitive = or_(
+        and_(
+            GenerationJob.last_error_code.in_(_LEGACY_FAILED_PROVIDER_ERROR_CODES),
+            GenerationAttempt.provider == "salad",
+            GenerationAttempt.provider_external_id.is_not(None),
+            GenerationAttempt.provider_state == "failed",
+        ),
+        and_(
+            GenerationJob.last_error_code.in_(_LEGACY_CANCELLED_PROVIDER_ERROR_CODES),
+            GenerationAttempt.provider == "salad",
+            GenerationAttempt.provider_external_id.is_not(None),
+            GenerationAttempt.provider_state == "cancelled",
+        ),
+        and_(
+            GenerationJob.last_error_code == SALAD_DEPLOYMENT_PROVIDER_ABSENT_ERROR_CODE,
+            GenerationAttempt.provider == "salad",
+            GenerationAttempt.provider_state == "absent_after_rollover",
+        ),
+        and_(
+            GenerationJob.last_error_code == SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE,
+            GenerationAttempt.provider == "salad",
+            GenerationAttempt.provider_state == "absent_after_reconciliation",
+        ),
+    )
+    recoverable_infrastructure_failure = or_(
+        and_(
+            GenerationAttempt.error_code.in_(INFRASTRUCTURE_FAILURE_ERROR_CODES),
+            provider_attempt_is_definitive,
+        ),
+        and_(
+            GenerationAttempt.error_code.is_(None),
+            legacy_job_failure_is_definitive,
+        ),
+    )
     rows = list(
         (
             await session.execute(
@@ -311,25 +429,7 @@ async def recover_dead_lettered_infrastructure_jobs(
                     GenerationAttempt.attempt_no == GenerationJob.attempt_count,
                     GenerationAttempt.state == GenerationAttemptState.FAILED,
                     GenerationAttempt.completed_at.is_not(None),
-                    GenerationAttempt.error_code.in_(INFRASTRUCTURE_FAILURE_ERROR_CODES),
-                    or_(
-                        GenerationAttempt.provider_external_id.is_not(None),
-                        (
-                            (
-                                GenerationAttempt.error_code
-                                == SALAD_DEPLOYMENT_PROVIDER_ABSENT_ERROR_CODE
-                            )
-                            & (GenerationAttempt.provider_state == "absent_after_rollover")
-                        ),
-                        (
-                            (GenerationAttempt.error_code == SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE)
-                            & (GenerationAttempt.provider_state == "absent_after_reconciliation")
-                        ),
-                        (
-                            (GenerationAttempt.error_code == SALAD_RATE_LIMITED_ERROR_CODE)
-                            & GenerationAttempt.provider_external_id.is_(None)
-                        ),
-                    ),
+                    recoverable_infrastructure_failure,
                     Release.current_version_no == ReleaseVersion.version_no,
                     Release.health == ResourceHealth.HEALTHY,
                     Release.phase.in_(_RETRYABLE_RELEASE_PHASES),
