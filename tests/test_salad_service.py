@@ -310,6 +310,49 @@ async def prepared_attempt(
     return prepared.generation_attempt_id
 
 
+async def superseded_running_attempt(
+    session: AsyncSession,
+) -> tuple[SeededContext, UUID, JSONObject, datetime]:
+    context = await seed_context(session)
+    attempt_id = await prepared_attempt(session, context)
+    await submit_prepared_attempt(
+        session,
+        FakeSaladClient(),
+        FakeUploadIntentProvider(),
+        generation_attempt_id=attempt_id,
+        webhook_url="https://controller.example.test/webhooks/salad",
+        reservation_microusd=500_000,
+        now=NOW,
+    )
+    attempt = await session.get(GenerationAttempt, attempt_id)
+    job = await session.get(GenerationJob, context.job_id)
+    deployment = await session.get(SaladDeployment, context.deployment_id)
+    assert attempt is not None
+    assert job is not None
+    assert deployment is not None
+
+    last_observed_at = NOW + timedelta(minutes=2)
+    attempt.state = GenerationAttemptState.RUNNING
+    attempt.provider_state = SaladJobStatus.RUNNING.value
+    attempt.started_at = last_observed_at
+    attempt.last_observed_at = last_observed_at
+    attempt.lock_version += 1
+    job.state = GenerationState.RUNNING
+    job.lock_version += 1
+    deployment.is_current = False
+    deployment.desired_state = DesiredDeploymentState.STOPPED
+    deployment.lock_version += 1
+    await session.commit()
+
+    metadata: JSONObject = {
+        "generation_attempt_id": str(attempt.id),
+        "generation_job_id": str(attempt.job_id),
+        "submission_key": attempt.submission_key,
+        "request_sha256": attempt.request_sha256,
+    }
+    return context, attempt_id, metadata, last_observed_at
+
+
 async def mark_operator_stop(
     session: AsyncSession,
     context: SeededContext,
@@ -2272,6 +2315,183 @@ async def test_superseded_deployment_cancels_then_retries_on_current_deployment(
     assert replacement_attempt is not None
     assert replacement_attempt.salad_deployment_id == current_deployment_id
     assert replacement_attempt.attempt_no == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_time_offset", "supersede_release"),
+    [
+        (timedelta(0), False),
+        (-timedelta(seconds=30), False),
+        (-timedelta(seconds=30), True),
+    ],
+    ids=[
+        "equal-provider-timestamp",
+        "older-provider-timestamp",
+        "older-provider-timestamp-release-superseded",
+    ],
+)
+async def test_superseded_running_attempt_cancels_exact_pending_provider_regression(
+    database: Database,
+    provider_time_offset: timedelta,
+    supersede_release: bool,
+) -> None:
+    async with database.sessions() as session:
+        context, attempt_id, metadata, last_observed_at = await superseded_running_attempt(session)
+
+        async def supersede_release_lifecycle() -> None:
+            async with database.sessions() as concurrent:
+                job = await concurrent.get(GenerationJob, context.job_id)
+                assert job is not None
+                version = await concurrent.get(ReleaseVersion, job.release_version_id)
+                assert version is not None
+                release = await concurrent.get(Release, version.release_id)
+                assert release is not None
+                release.current_version_no = version.version_no + 1
+                release.lock_version += 1
+                await concurrent.commit()
+
+        client = FakeSaladClient(
+            get_result=remote_job(
+                status=SaladJobStatus.PENDING,
+                metadata=metadata,
+                update_time=last_observed_at + provider_time_offset,
+            ),
+            before_get=supersede_release_lifecycle if supersede_release else None,
+        )
+
+        result = await reconcile_generation_attempt(
+            session,
+            client,
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=3),
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        job = await session.get(GenerationJob, context.job_id)
+        cancel_audits = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.resource_type == "generation_attempt",
+                    AuditEvent.resource_id == attempt_id,
+                    AuditEvent.action == "generation_attempt.deployment_rollover_cancel_requested",
+                )
+            )
+            or 0
+        )
+
+    assert client.cancel_calls == [("generation-v1", str(REMOTE_JOB_ID))]
+    assert result.observation.stale is False
+    assert result.observation.attempt_state == GenerationAttemptState.CANCEL_REQUESTED
+    assert result.error_code == DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE
+    assert attempt is not None
+    assert attempt.state == GenerationAttemptState.CANCEL_REQUESTED
+    assert attempt.error_code == DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE
+    assert attempt.response_metadata is not None
+    assert attempt.response_metadata["deployment_rollover_cancel_requested"] is True
+    assert attempt.last_observed_at is not None
+    assert attempt.last_observed_at.replace(tzinfo=UTC) == last_observed_at
+    assert job is not None
+    assert job.state == GenerationState.RUNNING
+    assert cancel_audits == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "concurrent_change",
+    ["terminal-attempt", "provider-id-drift", "deployment-reactivated"],
+)
+async def test_rollover_pending_cancel_rejects_concurrent_local_fence_changes(
+    database: Database,
+    concurrent_change: str,
+) -> None:
+    async with database.sessions() as session_a:
+        context, attempt_id, metadata, last_observed_at = await superseded_running_attempt(
+            session_a
+        )
+        drifted_provider_id = str(uuid4())
+
+        async def change_local_fence() -> None:
+            async with database.sessions() as session_b:
+                attempt_b = await session_b.get(GenerationAttempt, attempt_id)
+                job_b = await session_b.get(GenerationJob, context.job_id)
+                assert attempt_b is not None
+                assert job_b is not None
+                if concurrent_change == "terminal-attempt":
+                    attempt_b.state = GenerationAttemptState.FAILED
+                    attempt_b.completed_at = NOW + timedelta(minutes=2, seconds=10)
+                    attempt_b.error_code = "concurrent_terminal_failure"
+                    attempt_b.error_detail = "The terminal state remains authoritative."
+                    job_b.state = GenerationState.DEAD_LETTER
+                    job_b.retry_at = None
+                    job_b.last_error_code = attempt_b.error_code
+                    job_b.last_error_detail = attempt_b.error_detail
+                    job_b.lock_version += 1
+                    attempt_b.lock_version += 1
+                elif concurrent_change == "provider-id-drift":
+                    attempt_b.provider_external_id = drifted_provider_id
+                    attempt_b.lock_version += 1
+                else:
+                    deployment_b = await session_b.get(
+                        SaladDeployment,
+                        context.deployment_id,
+                    )
+                    assert deployment_b is not None
+                    deployment_b.is_current = True
+                    deployment_b.desired_state = DesiredDeploymentState.ACTIVE
+                    deployment_b.lock_version += 1
+                await session_b.commit()
+
+        client = FakeSaladClient(
+            get_result=remote_job(
+                status=SaladJobStatus.PENDING,
+                metadata=metadata,
+                update_time=last_observed_at - timedelta(seconds=30),
+            ),
+            before_get=change_local_fence,
+        )
+        result = await reconcile_generation_attempt(
+            session_a,
+            client,
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=3),
+        )
+
+    async with database.sessions() as verification:
+        attempt = await verification.get(GenerationAttempt, attempt_id)
+        job = await verification.get(GenerationJob, context.job_id)
+        deployment = await verification.get(SaladDeployment, context.deployment_id)
+        cancel_audits = int(
+            await verification.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.resource_type == "generation_attempt",
+                    AuditEvent.resource_id == attempt_id,
+                    AuditEvent.action == "generation_attempt.deployment_rollover_cancel_requested",
+                )
+            )
+            or 0
+        )
+
+    assert client.cancel_calls == []
+    assert result.observation.stale is True
+    assert attempt is not None
+    assert attempt.state != GenerationAttemptState.CANCEL_REQUESTED
+    assert attempt.error_code != DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE
+    assert job is not None
+    assert cancel_audits == 0
+    if concurrent_change == "terminal-attempt":
+        assert attempt.state == GenerationAttemptState.FAILED
+        assert attempt.error_code == "concurrent_terminal_failure"
+        assert job.state == GenerationState.DEAD_LETTER
+    elif concurrent_change == "provider-id-drift":
+        assert attempt.state == GenerationAttemptState.RUNNING
+        assert attempt.provider_external_id == drifted_provider_id
+        assert job.state == GenerationState.RUNNING
+    else:
+        assert deployment is not None
+        assert deployment.is_current is True
+        assert deployment.desired_state == DesiredDeploymentState.ACTIVE
+        assert attempt.state == GenerationAttemptState.RUNNING
+        assert job.state == GenerationState.RUNNING
 
 
 @pytest.mark.asyncio

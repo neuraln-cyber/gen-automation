@@ -2186,8 +2186,12 @@ async def reconcile_generation_attempt(
             lock=True,
         )
         if not (
-            _active_remote_mutation_still_applies(attempt, remote_job=remote_job)
-            and _deployment_rollover_cancel_is_due(attempt, deployment=deployment)
+            _deployment_rollover_remote_cancel_still_applies(
+                attempt=attempt,
+                job=job,
+                deployment=deployment,
+                remote_job=remote_job,
+            )
             and not await _operator_generation_stop_requested(session, job=job)
         ):
             return await _stale_reconciliation_result(
@@ -2490,6 +2494,40 @@ def _active_remote_mutation_still_applies(
     }:
         return True
     return _is_forward_transition(attempt.state, _attempt_state(remote_job.status))
+
+
+def _deployment_rollover_remote_cancel_still_applies(
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    deployment: SaladDeployment,
+    remote_job: SaladQueueJob,
+) -> bool:
+    """Fence rollover DELETE without treating provider status regressions as identity drift."""
+
+    if (
+        remote_job.status not in {SaladJobStatus.PENDING, SaladJobStatus.RUNNING}
+        or attempt.state in _TERMINAL_ATTEMPT_STATES
+        or attempt.attempt_no != job.attempt_count
+        or job.state in _TERMINAL_JOB_STATES
+        or not _deployment_rollover_cancel_is_due(attempt, deployment=deployment)
+    ):
+        return False
+
+    remote_id = str(remote_job.id)
+    if attempt.provider_external_id is None:
+        if not _remote_metadata_matches(attempt, remote_job):
+            return False
+    elif attempt.provider_external_id != remote_id:
+        return False
+
+    # This is provider cleanup for a durably stopped deployment, not a new dispatch.
+    # Release lifecycle changes therefore do not veto DELETE; the scheduler fences
+    # any later retry. Unlike a normal observation, cancelling an exact active
+    # provider identity remains safe when Salad reports PENDING after RUNNING, or
+    # returns an older/equal provider timestamp. The caller holds the budget guard
+    # and joined attempt/job/deployment locks, then checks the operator-stop marker.
+    return True
 
 
 def _deployment_rollover_cancel_is_due(
