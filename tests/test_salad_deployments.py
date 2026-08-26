@@ -28,6 +28,8 @@ from gen_automation.domain.enums import (
 from gen_automation.domain.runtime_bindings import (
     SALAD_WORKER_RUNTIME_BINDING_REFERENCES,
     WORKER_MODEL_MANIFEST_JSON_BINDING,
+    WORKER_MODEL_MANIFEST_SHA256_BINDING,
+    WORKER_RUNTIME_ADMISSION_ID_BINDING,
 )
 from gen_automation.integrations.salad.errors import (
     SaladAPIError,
@@ -51,6 +53,7 @@ from gen_automation.services.salad_deployments import (
     DeploymentAction,
     SaladDeploymentNotFoundError,
     SaladDeploymentValidationError,
+    SaladRuntimeAdmissionUnavailableError,
     _as_utc,
     _container_group_payload,
     _group_configuration_drift,
@@ -58,8 +61,10 @@ from gen_automation.services.salad_deployments import (
     _parse_runtime_bindings,
     _remote_drift_code,
     _validate_local_deployment,
+    container_group_runtime_admission_ready,
     deterministic_provider_name,
     ensure_container_group_queue_admission,
+    preflight_container_group_runtime_refresh,
     provision_deployment_step,
     reconcile_deployment,
     refresh_container_group_runtime,
@@ -71,6 +76,7 @@ CONFIG_SHA256 = "a" * 64
 QUEUE_ID = UUID("7dcd6922-50e9-4d56-89b5-91cde26f0211")
 GROUP_ID = UUID("ab3a4591-efc3-46c0-b06a-3d820c0ec100")
 INSTANCE_ID = "instance-creator-1"
+RUNTIME_ADMISSION_ID = "f" * 32
 LIVE_VALUE = "resolved-value-that-must-not-be-persisted"
 STARTUP_PROBE: dict[str, JSONValue] = {
     "http": {
@@ -165,6 +171,10 @@ def make_group(
     start_time: datetime | None = NOW,
     finish_time: datetime | None = None,
     autoscaler: Mapping[str, JSONValue] | None = None,
+    environment: Mapping[str, JSONValue] | None = None,
+    allocating: int = 0,
+    creating: int = 0,
+    stopping: int = 0,
 ) -> SaladContainerGroup:
     raw: dict[str, JSONValue] = {
         "id": str(group_id),
@@ -178,6 +188,7 @@ def make_group(
             },
             "priority": "low",
             "image_caching": True,
+            "environment_variables": dict(environment or {}),
         },
         "autostart_policy": True,
         "priority": "low",
@@ -210,10 +221,10 @@ def make_group(
         current_state=SaladContainerGroupState(
             status=status,
             description=status if description is None else description,
-            allocating_count=0,
-            creating_count=0,
+            allocating_count=allocating,
+            creating_count=creating,
             running_count=running,
-            stopping_count=0,
+            stopping_count=stopping,
             start_time=start_time,
             finish_time=finish_time,
         ),
@@ -891,7 +902,534 @@ async def test_refresh_fails_closed_when_pending_group_never_applies() -> None:
 
 
 @pytest.mark.asyncio
-async def test_queue_admission_starts_stopped_group_without_waiting_for_attachment() -> None:
+async def test_planned_runtime_refresh_adopts_matching_advanced_marker_without_repatch() -> None:
+    deployment = unpersisted_deployment(provider_configuration())
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    runtime_admission_id = "1" * 32
+    manifest_sha256 = "d" * 64
+    environment = {
+        WORKER_MODEL_MANIFEST_JSON_BINDING: '{"artifacts":[]}',
+        WORKER_MODEL_MANIFEST_SHA256_BINDING: manifest_sha256,
+        WORKER_RUNTIME_ADMISSION_ID_BINDING: runtime_admission_id,
+    }
+    pending = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        pending_change=True,
+        version=1,
+    )
+    applied = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        version=2,
+        environment=environment,
+        autoscaler={
+            "min_replicas": 1,
+            "max_replicas": 1,
+            "desired_queue_length": 1,
+            "polling_period": 30,
+        },
+    )
+    client = FakeClient()
+    client.groups[deployment.container_group_name] = applied
+    # This is the crash window: the PATCH was accepted, but its first readback
+    # still showed the old pending version and no marker. Replay waits, adopts
+    # the uniquely marked v2, and must never issue a second PATCH.
+    client.get_group_results = [pending, applied, applied]
+
+    result = await refresh_container_group_runtime(
+        deployment,
+        client,
+        None,
+        environment_overrides=environment,
+        expected_provider_version=1,
+        runtime_admission_id=runtime_admission_id,
+        effective_min_replicas=1,
+        convergence_timeout_seconds=1,
+        poll_interval_seconds=0,
+    )
+
+    assert result is applied
+    assert client.updated_group_patches == []
+
+
+@pytest.mark.asyncio
+async def test_planned_runtime_refresh_patches_only_the_exact_recorded_version() -> None:
+    deployment = unpersisted_deployment(provider_configuration())
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    runtime_admission_id = "2" * 32
+    environment = {
+        WORKER_MODEL_MANIFEST_JSON_BINDING: '{"artifacts":[]}',
+        WORKER_MODEL_MANIFEST_SHA256_BINDING: "e" * 64,
+        WORKER_RUNTIME_ADMISSION_ID_BINDING: runtime_admission_id,
+    }
+    old = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        version=4,
+        environment={WORKER_RUNTIME_ADMISSION_ID_BINDING: "0" * 32},
+    )
+    pending_old = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        pending_change=True,
+        version=4,
+        environment={WORKER_RUNTIME_ADMISSION_ID_BINDING: "0" * 32},
+    )
+    applied = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        version=5,
+        environment=environment,
+        autoscaler={
+            "min_replicas": 1,
+            "max_replicas": 1,
+            "desired_queue_length": 1,
+            "polling_period": 30,
+        },
+    )
+    client = FakeClient()
+    client.groups[deployment.container_group_name] = applied
+    client.get_group_results = [old, pending_old, applied]
+    client.update_group_result = pending_old
+
+    result = await refresh_container_group_runtime(
+        deployment,
+        client,
+        None,
+        environment_overrides=environment,
+        expected_provider_version=4,
+        runtime_admission_id=runtime_admission_id,
+        effective_min_replicas=1,
+        convergence_timeout_seconds=1,
+        poll_interval_seconds=0,
+    )
+
+    assert result is applied
+    assert len(client.updated_group_patches) == 1
+    assert set(client.updated_group_patches[0]) == {"container", "queue_autoscaler"}
+    patch_container = client.updated_group_patches[0]["container"]
+    assert isinstance(patch_container, dict)
+    assert patch_container["environment_variables"] == environment
+    patch_autoscaler = client.updated_group_patches[0]["queue_autoscaler"]
+    assert isinstance(patch_autoscaler, dict)
+    assert patch_autoscaler["min_replicas"] == 1
+
+
+@pytest.mark.asyncio
+async def test_planned_runtime_refresh_fails_closed_on_unmarked_advanced_version() -> None:
+    deployment = unpersisted_deployment(provider_configuration())
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    environment = {
+        WORKER_MODEL_MANIFEST_JSON_BINDING: '{"artifacts":[]}',
+        WORKER_MODEL_MANIFEST_SHA256_BINDING: "f" * 64,
+        WORKER_RUNTIME_ADMISSION_ID_BINDING: "3" * 32,
+    }
+    conflicting = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        version=8,
+        environment={WORKER_RUNTIME_ADMISSION_ID_BINDING: "4" * 32},
+    )
+    client = FakeClient()
+    client.groups[deployment.container_group_name] = conflicting
+
+    with pytest.raises(
+        SaladDeploymentValidationError,
+        match="advanced outside the planned update",
+    ):
+        await refresh_container_group_runtime(
+            deployment,
+            client,
+            None,
+            environment_overrides=environment,
+            expected_provider_version=7,
+            runtime_admission_id="3" * 32,
+        )
+    assert client.updated_group_patches == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_refresh_preflight_reports_provider_read_unavailability() -> None:
+    deployment = unpersisted_deployment(provider_configuration())
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    client = FakeClient()
+    client.get_group_error = SaladTransportError("transport unavailable")
+
+    with pytest.raises(SaladRuntimeAdmissionUnavailableError):
+        await preflight_container_group_runtime_refresh(deployment, client)
+
+
+@pytest.mark.asyncio
+async def test_runtime_refresh_preflight_defers_local_provider_preparation_then_resumes() -> None:
+    deployment = unpersisted_deployment(provider_configuration())
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.PROVISIONING
+    deployment.last_error_code = "provider_image_preparation_pending"
+    client = FakeClient()
+    client.groups[deployment.container_group_name] = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+    )
+
+    with pytest.raises(SaladRuntimeAdmissionUnavailableError, match="provider convergence"):
+        await preflight_container_group_runtime_refresh(deployment, client)
+
+    deployment.state = SaladDeploymentState.ACTIVE
+    deployment.last_error_code = None
+    observed = await preflight_container_group_runtime_refresh(deployment, client)
+    assert observed.version == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_admission_accepts_exact_attached_target_when_ready_flag_is_false() -> None:
+    manifest_sha256 = "d" * 64
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    group = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        replicas=1,
+        running=1,
+        version=2,
+        environment={
+            WORKER_MODEL_MANIFEST_SHA256_BINDING: manifest_sha256,
+            WORKER_RUNTIME_ADMISSION_ID_BINDING: RUNTIME_ADMISSION_ID,
+        },
+    )
+    client = FakeClient()
+    client.queues[deployment.queue_name] = make_queue(
+        deployment.queue_name,
+        group_name=deployment.container_group_name,
+    )
+    client.groups[deployment.container_group_name] = group
+    client.instance_pages[deployment.container_group_name] = SaladContainerGroupInstancePage(
+        instances=(
+            SaladContainerGroupInstance(
+                id=INSTANCE_ID,
+                machine_id="machine-creator-1",
+                state=SaladContainerGroupInstanceState.RUNNING,
+                update_time=NOW,
+                version=2,
+                # Salad reports this false for workers that are demonstrably
+                # attached and already processing queue jobs.
+                ready=False,
+                started=True,
+            ),
+        )
+    )
+
+    assert await container_group_runtime_admission_ready(
+        deployment,
+        client,
+        provider_version=2,
+        artifact_manifest_sha256=manifest_sha256,
+        runtime_admission_id=RUNTIME_ADMISSION_ID,
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_admission_defers_while_old_worker_can_still_consume() -> None:
+    manifest_sha256 = "d" * 64
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    group = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        replicas=1,
+        running=1,
+        stopping=1,
+        version=2,
+        environment={
+            WORKER_MODEL_MANIFEST_SHA256_BINDING: manifest_sha256,
+            WORKER_RUNTIME_ADMISSION_ID_BINDING: RUNTIME_ADMISSION_ID,
+        },
+    )
+    client = FakeClient()
+    client.queues[deployment.queue_name] = make_queue(
+        deployment.queue_name,
+        group_name=deployment.container_group_name,
+    )
+    client.groups[deployment.container_group_name] = group
+    client.instance_pages[deployment.container_group_name] = SaladContainerGroupInstancePage(
+        instances=(
+            SaladContainerGroupInstance(
+                id="old-instance",
+                machine_id="machine-creator-1",
+                state=SaladContainerGroupInstanceState.STOPPING,
+                update_time=NOW,
+                version=1,
+                ready=True,
+                started=True,
+            ),
+            SaladContainerGroupInstance(
+                id="target-instance",
+                machine_id="machine-creator-2",
+                state=SaladContainerGroupInstanceState.RUNNING,
+                update_time=NOW,
+                version=2,
+                ready=True,
+                started=True,
+            ),
+        )
+    )
+
+    assert not await container_group_runtime_admission_ready(
+        deployment,
+        client,
+        provider_version=2,
+        artifact_manifest_sha256=manifest_sha256,
+        runtime_admission_id=RUNTIME_ADMISSION_ID,
+    )
+
+    client.queues[deployment.queue_name] = make_queue(
+        deployment.queue_name,
+        group_name="unexpected-worker",
+        group_id=uuid4(),
+    )
+    # Salad's queue attachment readback can be empty or stale even while the
+    # exact worker is consuming. Runtime admission relies on the group's
+    # immutable queue_connection plus exact sole instance fencing instead.
+    assert not await container_group_runtime_admission_ready(
+        deployment,
+        client,
+        provider_version=2,
+        artifact_manifest_sha256=manifest_sha256,
+        runtime_admission_id=RUNTIME_ADMISSION_ID,
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_admission_fails_closed_on_version_or_manifest_drift() -> None:
+    manifest_sha256 = "d" * 64
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    client = FakeClient()
+    client.queues[deployment.queue_name] = make_queue(
+        deployment.queue_name,
+        group_name=deployment.container_group_name,
+    )
+    client.groups[deployment.container_group_name] = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        replicas=1,
+        running=1,
+        version=3,
+        environment={
+            WORKER_MODEL_MANIFEST_SHA256_BINDING: manifest_sha256,
+            WORKER_RUNTIME_ADMISSION_ID_BINDING: RUNTIME_ADMISSION_ID,
+        },
+    )
+
+    with pytest.raises(SaladDeploymentValidationError, match="version changed"):
+        await container_group_runtime_admission_ready(
+            deployment,
+            client,
+            provider_version=2,
+            artifact_manifest_sha256=manifest_sha256,
+            runtime_admission_id=RUNTIME_ADMISSION_ID,
+        )
+
+    client.groups[deployment.container_group_name] = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        replicas=1,
+        running=1,
+        version=2,
+        environment={
+            WORKER_MODEL_MANIFEST_SHA256_BINDING: "e" * 64,
+            WORKER_RUNTIME_ADMISSION_ID_BINDING: RUNTIME_ADMISSION_ID,
+        },
+    )
+    with pytest.raises(SaladDeploymentValidationError, match="manifest changed"):
+        await container_group_runtime_admission_ready(
+            deployment,
+            client,
+            provider_version=2,
+            artifact_manifest_sha256=manifest_sha256,
+            runtime_admission_id=RUNTIME_ADMISSION_ID,
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_admission_accepts_live_empty_queue_attachment_readback() -> None:
+    manifest_sha256 = "d" * 64
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    client = FakeClient()
+    client.queues[deployment.queue_name] = make_queue(deployment.queue_name)
+    client.groups[deployment.container_group_name] = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        replicas=1,
+        running=1,
+        version=2,
+        environment={
+            WORKER_MODEL_MANIFEST_SHA256_BINDING: manifest_sha256,
+            WORKER_RUNTIME_ADMISSION_ID_BINDING: RUNTIME_ADMISSION_ID,
+        },
+    )
+    client.instance_pages[deployment.container_group_name] = SaladContainerGroupInstancePage(
+        instances=(
+            SaladContainerGroupInstance(
+                id=INSTANCE_ID,
+                machine_id="machine-creator-1",
+                state=SaladContainerGroupInstanceState.RUNNING,
+                update_time=NOW,
+                version=2,
+                ready=False,
+                started=True,
+            ),
+        )
+    )
+
+    assert await container_group_runtime_admission_ready(
+        deployment,
+        client,
+        provider_version=2,
+        artifact_manifest_sha256=manifest_sha256,
+        runtime_admission_id=RUNTIME_ADMISSION_ID,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("observation", ["group", "queue", "instances"])
+async def test_runtime_admission_reports_transient_observation_unavailability(
+    observation: str,
+) -> None:
+    manifest_sha256 = "d" * 64
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    client = FakeClient()
+    client.queues[deployment.queue_name] = make_queue(
+        deployment.queue_name,
+        group_name=deployment.container_group_name,
+    )
+    client.groups[deployment.container_group_name] = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        replicas=1,
+        running=1,
+        version=2,
+        environment={
+            WORKER_MODEL_MANIFEST_SHA256_BINDING: manifest_sha256,
+            WORKER_RUNTIME_ADMISSION_ID_BINDING: RUNTIME_ADMISSION_ID,
+        },
+    )
+    if observation == "group":
+        client.get_group_error = api_error(503)
+    elif observation == "queue":
+        client.get_queue_error = api_error(503)
+    else:
+        client.list_instances_error = SaladTransportError("connection unavailable")
+
+    with pytest.raises(
+        SaladRuntimeAdmissionUnavailableError,
+        match="observation is unavailable",
+    ):
+        await container_group_runtime_admission_ready(
+            deployment,
+            client,
+            provider_version=2,
+            artifact_manifest_sha256=manifest_sha256,
+            runtime_admission_id=RUNTIME_ADMISSION_ID,
+        )
+
+
+@pytest.mark.asyncio
+async def test_marker_bound_queue_admission_defers_pending_minimum_without_repatch() -> None:
+    manifest_sha256 = "d" * 64
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    pending = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        pending_change=True,
+        version=2,
+        environment={
+            WORKER_MODEL_MANIFEST_SHA256_BINDING: manifest_sha256,
+            WORKER_RUNTIME_ADMISSION_ID_BINDING: RUNTIME_ADMISSION_ID,
+        },
+    )
+    client = FakeClient()
+    client.groups[deployment.container_group_name] = pending
+    client.queues[deployment.queue_name] = make_queue(deployment.queue_name)
+
+    with pytest.raises(SaladRuntimeAdmissionUnavailableError, match="pending provider change"):
+        await ensure_container_group_queue_admission(
+            deployment,
+            client,
+            effective_min_replicas=1,
+            artifact_manifest_sha256=manifest_sha256,
+            runtime_admission_id=RUNTIME_ADMISSION_ID,
+        )
+
+    assert client.updated_group_patches == []
+    assert client.start_names == []
+
+
+@pytest.mark.asyncio
+async def test_queue_admission_polls_pending_old_minimum_until_target_converges() -> None:
+    deployment = unpersisted_deployment(provider_configuration())
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    initial = make_group(deployment.container_group_name, deployment.queue_name)
+    pending_old = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        pending_change=True,
+        version=1,
+    )
+    settled = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        version=1,
+        autoscaler={
+            "min_replicas": 1,
+            "max_replicas": 1,
+            "desired_queue_length": 1,
+            "polling_period": 30,
+        },
+    )
+    client = FakeClient()
+    client.groups[deployment.container_group_name] = settled
+    client.queues[deployment.queue_name] = make_queue(deployment.queue_name)
+    client.get_group_results = [initial, pending_old, settled]
+    client.update_group_result = pending_old
+
+    admitted = await ensure_container_group_queue_admission(
+        deployment,
+        client,
+        effective_min_replicas=1,
+        poll_interval_seconds=0,
+    )
+
+    assert admitted == settled
+    assert len(client.updated_group_patches) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("post_start_version", [1, 2])
+async def test_queue_admission_returns_exact_post_start_provider_version(
+    post_start_version: int,
+) -> None:
     deployment = unpersisted_deployment(provider_configuration())
     deployment.provider_queue_id = str(QUEUE_ID)
     deployment.provider_container_group_id = str(GROUP_ID)
@@ -920,12 +1458,28 @@ async def test_queue_admission_starts_stopped_group_without_waiting_for_attachme
             "polling_period": 30,
         },
     )
+    post_start = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        status="running",
+        replicas=1,
+        running=0,
+        allocating=1,
+        finish_time=None,
+        version=post_start_version,
+        autoscaler={
+            "min_replicas": 1,
+            "max_replicas": 1,
+            "desired_queue_length": 1,
+            "polling_period": 30,
+        },
+    )
     client = FakeClient()
     client.groups[deployment.container_group_name] = admitted_stopped
     # A cold worker is not listed as attached yet. The durable queue can still
     # accept work while Salad downloads and starts the exact group.
     client.queues[deployment.queue_name] = make_queue(deployment.queue_name)
-    client.get_group_results = [stopped, admitted_stopped]
+    client.get_group_results = [stopped, admitted_stopped, post_start]
     client.update_group_result = admitted_stopped
 
     result = await ensure_container_group_queue_admission(
@@ -936,7 +1490,8 @@ async def test_queue_admission_starts_stopped_group_without_waiting_for_attachme
         poll_interval_seconds=0,
     )
 
-    assert result is admitted_stopped
+    assert result is post_start
+    assert result.version == post_start_version
     assert client.start_names == [deployment.container_group_name]
     assert client.updated_group_patches == [
         {
@@ -954,7 +1509,48 @@ async def test_queue_admission_starts_stopped_group_without_waiting_for_attachme
         "update_group",
         "get_group",
         "start_group",
+        "get_group",
     ]
+
+
+@pytest.mark.asyncio
+async def test_queue_admission_never_returns_stale_pre_start_version() -> None:
+    deployment = unpersisted_deployment(provider_configuration())
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    stopped = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        status="stopped",
+        replicas=1,
+        running=0,
+        finish_time=NOW,
+        version=1,
+        autoscaler={
+            "min_replicas": 1,
+            "max_replicas": 1,
+            "desired_queue_length": 1,
+            "polling_period": 30,
+        },
+    )
+    client = FakeClient()
+    client.groups[deployment.container_group_name] = stopped
+    client.queues[deployment.queue_name] = make_queue(deployment.queue_name)
+
+    with pytest.raises(
+        SaladRuntimeAdmissionUnavailableError,
+        match="did not converge",
+    ):
+        await ensure_container_group_queue_admission(
+            deployment,
+            client,
+            effective_min_replicas=1,
+            convergence_timeout_seconds=0.001,
+            poll_interval_seconds=0,
+        )
+
+    assert client.start_names == [deployment.container_group_name]
 
 
 @pytest.mark.asyncio

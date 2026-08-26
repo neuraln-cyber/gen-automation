@@ -31,6 +31,9 @@ PRIMARY_PUBLIC_KEY = derive_public_key(PRIMARY_PRIVATE_KEY)
 ROTATED_PRIVATE_KEY = encode_base64url(bytes(range(33, 65)))
 ROTATED_PUBLIC_KEY = derive_public_key(ROTATED_PRIVATE_KEY)
 MESSAGE = b"deterministic worker signing test"
+ARTIFACT_MANIFEST_SHA256 = "f" * 64
+RUNTIME_ADMISSION_ID = "1" * 32
+RUNTIME_WORKER_INSTANCE_ID = "instance-creator-1"
 
 
 def _unsigned_envelope(*, key_id: str = "worker-key-1") -> GenerateEnvelope:
@@ -42,6 +45,9 @@ def _unsigned_envelope(*, key_id: str = "worker-key-1") -> GenerateEnvelope:
         payload=GeneratePayload(
             job_id="job-1",
             attempt_id="attempt-1",
+            artifact_manifest_sha256=ARTIFACT_MANIFEST_SHA256,
+            runtime_admission_id=RUNTIME_ADMISSION_ID,
+            runtime_worker_instance_id=RUNTIME_WORKER_INSTANCE_ID,
             workflow={
                 "1": {
                     "class_type": "SaveImage",
@@ -97,6 +103,9 @@ def _worker_settings(**verification_keys: str) -> WorkerSettings:
         environment=WorkerEnvironment.TEST,
         verification_keys=verification_keys or {"worker-key-1": PRIMARY_PUBLIC_KEY},
         allowed_upload_origin="https://uploads.example.test",
+        artifact_manifest_sha256=ARTIFACT_MANIFEST_SHA256,
+        runtime_admission_id=RUNTIME_ADMISSION_ID,
+        runtime_worker_instance_id=RUNTIME_WORKER_INSTANCE_ID,
     )
 
 

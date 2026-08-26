@@ -1761,6 +1761,8 @@ class SaladWorkerJobInputProvider:
     signing_private_key: SecretStr
     artifact_manifest: ArtifactManifest
     artifact_manifest_sha256: str
+    runtime_admission_id: str
+    runtime_worker_instance_id: str
     signature_ttl_seconds: int = 7200
     upload_grant_ttl_seconds: int = 10800
     upload_content_type: UploadContentType = "image/png"
@@ -1782,6 +1784,17 @@ class SaladWorkerJobInputProvider:
             self.artifact_manifest_sha256,
         ):
             raise ValueError("worker artifact manifest trust anchor does not match")
+        if (
+            len(self.runtime_admission_id) != 32
+            or self.runtime_admission_id != self.runtime_admission_id.lower()
+            or any(character not in "0123456789abcdef" for character in self.runtime_admission_id)
+        ):
+            raise ValueError("worker runtime admission identifier is invalid")
+        if not 1 <= len(self.runtime_worker_instance_id) <= 128 or any(
+            character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-"
+            for character in self.runtime_worker_instance_id
+        ):
+            raise ValueError("worker runtime instance identifier is invalid")
         if not 5 <= self.signature_ttl_seconds <= 7200:
             raise ValueError("worker signature TTL must be between 5 and 7200 seconds")
         if (
@@ -1902,6 +1915,9 @@ class SaladWorkerJobInputProvider:
         payload = GeneratePayload(
             job_id=str(context.generation_job_id),
             attempt_id=str(context.generation_attempt_id),
+            artifact_manifest_sha256=self.artifact_manifest_sha256,
+            runtime_admission_id=self.runtime_admission_id,
+            runtime_worker_instance_id=self.runtime_worker_instance_id,
             workflow=workflow,
             uploads=grants,
         )

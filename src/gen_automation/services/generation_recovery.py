@@ -23,6 +23,8 @@ from gen_automation.domain.enums import (
 
 INFRASTRUCTURE_RETRY_GRANT_ACTION = "generation_attempt.infrastructure_retry_granted"
 MAX_INFRASTRUCTURE_RETRY_GRANTS = 2
+NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION = "generation_attempt.near_black_retry_granted"
+MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS = 1
 DEFAULT_INFRASTRUCTURE_RECOVERY_SWEEP_LIMIT = 16
 
 SALAD_JOB_FAILED_ERROR_CODE = "salad_job_failed"
@@ -33,6 +35,7 @@ SALAD_DEPLOYMENT_PROVIDER_ABSENT_ERROR_CODE = "salad_deployment_rollover_provide
 SALAD_RATE_LIMITED_ERROR_CODE = "salad_rate_limited"
 SALAD_PROVIDER_CANCELLED_ERROR_CODE = "salad_provider_cancelled"
 SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE = "salad_provider_job_absent"
+SALAD_WORKER_NEAR_BLACK_OUTPUT_ERROR_CODE = "salad_worker_near_black_output"
 
 INFRASTRUCTURE_FAILURE_ERROR_CODES = frozenset(
     {
@@ -318,6 +321,118 @@ async def grant_infrastructure_retry(
         granted=True,
         grant_ordinal=grant_ordinal,
         grant_limit=MAX_INFRASTRUCTURE_RETRY_GRANTS,
+    )
+
+
+async def grant_near_black_output_retry(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    source: InfrastructureRetrySource,
+    actor: str,
+    retry_at: datetime,
+    occurred_at: datetime,
+    failed_output_index: int,
+    uploaded_output_indices: tuple[int, ...],
+) -> InfrastructureRetryGrant:
+    """Grant one retry slot independent of the generic infrastructure budget."""
+
+    if (
+        attempt.job_id != job.id
+        or attempt.attempt_no != job.attempt_count
+        or attempt.state != GenerationAttemptState.FAILED
+        or attempt.completed_at is None
+        or attempt.error_code != SALAD_WORKER_NEAR_BLACK_OUTPUT_ERROR_CODE
+        or job.state in _NON_RETRYABLE_JOB_STATES
+        or job.max_attempts >= 10
+        or not _provider_attempt_is_definitive(attempt)
+        or not 0 <= failed_output_index < job.expected_output_count
+        or list(uploaded_output_indices) not in ([], list(range(failed_output_index)))
+        or not await _release_allows_retry(session, job=job)
+    ):
+        return InfrastructureRetryGrant(
+            granted=False,
+            grant_ordinal=0,
+            grant_limit=MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS,
+        )
+
+    existing_grant = await session.scalar(
+        select(AuditEvent.id)
+        .where(
+            AuditEvent.resource_type == "generation_attempt",
+            AuditEvent.resource_id == attempt.id,
+            AuditEvent.action == NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION,
+        )
+        .limit(1)
+    )
+    grant_count = int(
+        await session.scalar(
+            select(func.count(AuditEvent.id))
+            .join(
+                GenerationAttempt,
+                GenerationAttempt.id == AuditEvent.resource_id,
+            )
+            .where(
+                AuditEvent.resource_type == "generation_attempt",
+                AuditEvent.action == NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION,
+                GenerationAttempt.job_id == job.id,
+            )
+        )
+        or 0
+    )
+    if existing_grant is not None or grant_count >= MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS:
+        return InfrastructureRetryGrant(
+            granted=False,
+            grant_ordinal=grant_count,
+            grant_limit=MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS,
+        )
+
+    granted_at = _as_utc(occurred_at)
+    retry_not_before = _as_utc(retry_at)
+    previous_max_attempts = job.max_attempts
+    previous_job_state = job.state
+    grant_ordinal = grant_count + 1
+    job.max_attempts = previous_max_attempts + 1
+    job.state = GenerationState.RETRY_WAIT
+    job.retry_at = retry_not_before
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.last_error_code = attempt.error_code
+    job.last_error_detail = attempt.error_detail
+    job.lock_version += 1
+    session.add(
+        AuditEvent(
+            actor=actor,
+            action=NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION,
+            resource_type="generation_attempt",
+            resource_id=attempt.id,
+            correlation_id=str(attempt.id),
+            detail={
+                "generation_job_id": str(job.id),
+                "attempt_no": attempt.attempt_no,
+                "failure_code": attempt.error_code,
+                "source": source.value,
+                "grant_ordinal": grant_ordinal,
+                "grant_limit": MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS,
+                "previous_max_attempts": previous_max_attempts,
+                "new_max_attempts": job.max_attempts,
+                "previous_job_state": previous_job_state.value,
+                "new_job_state": job.state.value,
+                "provider_external_id": attempt.provider_external_id,
+                "salad_deployment_id": str(attempt.salad_deployment_id),
+                "failed_output_index": failed_output_index,
+                "uploaded_output_count": len(uploaded_output_indices),
+                "assets_retained": True,
+            },
+            occurred_at=granted_at,
+        )
+    )
+    await session.flush()
+    return InfrastructureRetryGrant(
+        granted=True,
+        grant_ordinal=grant_ordinal,
+        grant_limit=MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS,
     )
 
 

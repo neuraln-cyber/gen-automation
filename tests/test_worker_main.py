@@ -25,11 +25,14 @@ from gen_automation.gpu_worker.bootstrap import (
     WorkerRuntimeSettings,
 )
 from gen_automation.gpu_worker.main import (
+    _ComfyLaunchSettings,
     _ManagedChild,
     _ManagedChildren,
+    _manifest_requires_fp32_vae,
     _monitor_comfy,
     _serve_worker_lifecycle,
     _SwitchableWorkerApplication,
+    _wait_for_comfy_ready,
     bootstrap_worker_models,
     build_comfy_command,
     build_comfy_environment,
@@ -196,6 +199,7 @@ async def test_worker_lifecycle_handoff_closes_every_owned_resource(
 
     class FakeExecutor:
         def is_ready(self) -> bool:
+            events.append("comfy_ready")
             return True
 
         def close(self) -> None:
@@ -234,7 +238,11 @@ async def test_worker_lifecycle_handoff_closes_every_owned_resource(
     monkeypatch.setattr(worker_main, "write_verified_detector_whitelist", lambda *_args: None)
     monkeypatch.setattr(worker_main, "ComfyExecutor", lambda **_kwargs: FakeExecutor())
     monkeypatch.setattr(worker_main, "start_comfy", lambda _settings: process)
-    monkeypatch.setattr(worker_main, "start_salad_queue_worker", lambda _settings: None)
+    monkeypatch.setattr(
+        worker_main,
+        "start_salad_queue_worker",
+        lambda _settings: events.append("queue_started") or None,
+    )
 
     def create_application(**kwargs: object) -> FakeApplication:
         restart_event = cast(asyncio.Event, kwargs["worker_restart_event"])
@@ -262,10 +270,41 @@ async def test_worker_lifecycle_handoff_closes_every_owned_resource(
     assert events == [
         "models_bootstrapped",
         "lifespan_entered",
+        "comfy_ready",
+        "queue_started",
         "lifespan_exited",
         "executor_closed",
         "process_stopped",
     ]
+
+
+async def test_comfy_readiness_wait_is_bounded_before_queue_attachment() -> None:
+    class FakeProcess:
+        def poll(self) -> None:
+            return None
+
+    observations = iter((False, False, True))
+    now = 0.0
+    sleeps: list[float] = []
+
+    def health_check() -> bool:
+        return next(observations)
+
+    async def advance(delay: float) -> None:
+        nonlocal now
+        sleeps.append(delay)
+        now += delay
+
+    await _wait_for_comfy_ready(
+        cast(Any, FakeProcess()),
+        health_check,
+        timeout_seconds=1.0,
+        poll_interval_seconds=0.1,
+        monotonic=lambda: now,
+        sleep=advance,
+    )
+
+    assert sleeps == [0.1, 0.1]
 
 
 def test_parent_hardening_rejects_non_linux_production(
@@ -337,6 +376,8 @@ def _settings(content: bytes | None = None, **changes: object) -> WorkerRuntimeS
         "allowed_upload_origin": "https://uploads.example.test",
         "model_manifest_json": raw_manifest,
         "model_manifest_sha256": digest,
+        "runtime_admission_id": "1" * 32,
+        "runtime_worker_instance_id": "instance-creator-1",
         "artifact_bucket": "models-private",
         "checkpoint_root": Path("/opt/comfyui/models/checkpoints"),
         "lora_root": Path("/opt/comfyui/models/loras"),
@@ -427,6 +468,7 @@ def test_worker_runtime_settings_contain_only_verification_keys() -> None:
     assert not hasattr(settings, "signing_private_key")
     assert not hasattr(worker_settings, "signing_private_key")
     assert settings.model_bootstrap_timeout_seconds == 3600.0
+    assert settings.salad_queue_worker_log_level == "warn"
 
 
 def test_build_comfy_command_is_loopback_offline_and_narrowly_whitelisted() -> None:
@@ -445,6 +487,42 @@ def test_build_comfy_command_is_loopback_offline_and_narrowly_whitelisted() -> N
     assert "--disable-api-nodes" in command
     assert "--disable-metadata" in command
     assert "--enable-manager" not in command
+
+
+def test_explicit_vae_manifest_launches_comfy_with_fp32_vae_only() -> None:
+    settings = _settings()
+    split_launch = _ComfyLaunchSettings.from_runtime_settings(settings, fp32_vae=True)
+    checkpoint_launch = _ComfyLaunchSettings.from_runtime_settings(settings, fp32_vae=False)
+
+    assert "--fp32-vae" in build_comfy_command(split_launch)
+    assert "--fp32-vae" not in build_comfy_command(checkpoint_launch)
+    assert "--fp32-vae" not in build_comfy_command(settings)
+
+
+def test_fp32_vae_policy_is_scoped_to_anima_qwen_split_manifest() -> None:
+    def artifact(kind: ArtifactKind, logical_name: str) -> MaterializedArtifact:
+        return MaterializedArtifact(
+            logical_name=logical_name,
+            kind=kind,
+            target_filename=f"{logical_name}.safetensors",
+            sha256="a" * 64,
+            size_bytes=1024,
+            adopted_existing=False,
+        )
+
+    anima = (
+        artifact(ArtifactKind.DIFFUSION_MODEL, "miaomiao-anima-base"),
+        artifact(ArtifactKind.TEXT_ENCODER, "qwen-3-06b-base"),
+        artifact(ArtifactKind.VAE, "qwen-image-vae"),
+    )
+    other_split_model = (
+        artifact(ArtifactKind.DIFFUSION_MODEL, "other-model"),
+        artifact(ArtifactKind.TEXT_ENCODER, "other-text"),
+        artifact(ArtifactKind.VAE, "other-vae"),
+    )
+
+    assert _manifest_requires_fp32_vae(anima)
+    assert not _manifest_requires_fp32_vae(other_split_model)
 
 
 @pytest.mark.parametrize(
@@ -789,6 +867,247 @@ class _SupervisedProcess:
         return self.returncode
 
 
+async def test_monitor_recycles_comfy_in_place_after_fatal_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server = _MonitorServer()
+    worker_restart_event = asyncio.Event()
+    worker_recycle_event = asyncio.Event()
+    worker_recycle_event.set()
+    children = _managed_children(queue_process=_SupervisedProcess(301, None))
+    replacement_comfy = _SupervisedProcess(302, None)
+    replacement_queue = _SupervisedProcess(303, None)
+    events: list[str] = []
+
+    def stop_child(process: subprocess.Popen[bytes]) -> None:
+        events.append(f"stop:{cast(Any, process).pid}")
+
+    def start_comfy_process() -> subprocess.Popen[bytes]:
+        events.append("start:comfy")
+        return cast("subprocess.Popen[bytes]", cast(Any, replacement_comfy))
+
+    async def wait_for_ready(
+        process: subprocess.Popen[bytes],
+        _health_check: Any,
+    ) -> None:
+        assert cast(Any, process) is replacement_comfy
+        events.append("ready:comfy")
+
+    def start_queue_worker() -> subprocess.Popen[bytes]:
+        assert not worker_recycle_event.is_set()
+        events.append("start:queue")
+        return cast("subprocess.Popen[bytes]", cast(Any, replacement_queue))
+
+    async def finish_monitor(_event: asyncio.Event, _delay_seconds: float) -> bool:
+        server.should_exit = True
+        return False
+
+    await _monitor_comfy(
+        children,
+        cast(Any, server),
+        worker_restart_event,
+        worker_recycle_event=worker_recycle_event,
+        start_comfy_process=start_comfy_process,
+        start_queue_worker=start_queue_worker,
+        unsafe_request_active=lambda: False,
+        comfy_health_check=lambda: True,
+        monotonic=lambda: 10.0,
+        wait_for_event=finish_monitor,
+        stop_child=stop_child,
+        wait_for_comfy_ready=wait_for_ready,
+    )
+
+    assert events == [
+        "stop:301",
+        "stop:200",
+        "start:comfy",
+        "ready:comfy",
+        "start:queue",
+    ]
+    assert children.comfy.process is cast(Any, replacement_comfy)
+    assert children.queue_worker is not None
+    assert children.queue_worker.process is cast(Any, replacement_queue)
+    assert not worker_recycle_event.is_set()
+    assert not worker_restart_event.is_set()
+    assert "recycle_ordinal=1" in capsys.readouterr().err
+
+
+async def test_monitor_escalates_repeated_fatal_output_after_one_in_place_recycle(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server = _MonitorServer()
+    worker_restart_event = asyncio.Event()
+    worker_recycle_event = asyncio.Event()
+    worker_recycle_event.set()
+    children = _managed_children(queue_process=_SupervisedProcess(311, None))
+    replacement_comfy = _SupervisedProcess(312, None)
+    replacement_queue = _SupervisedProcess(313, None)
+    stopped: list[int] = []
+
+    async def wait_for_ready(
+        _process: subprocess.Popen[bytes],
+        _health_check: Any,
+    ) -> None:
+        return None
+
+    async def request_second_recycle(
+        _event: asyncio.Event,
+        _delay_seconds: float,
+    ) -> bool:
+        worker_recycle_event.set()
+        return False
+
+    await _monitor_comfy(
+        children,
+        cast(Any, server),
+        worker_restart_event,
+        worker_recycle_event=worker_recycle_event,
+        start_comfy_process=lambda: cast("subprocess.Popen[bytes]", cast(Any, replacement_comfy)),
+        start_queue_worker=lambda: cast("subprocess.Popen[bytes]", cast(Any, replacement_queue)),
+        unsafe_request_active=lambda: False,
+        comfy_health_check=lambda: True,
+        monotonic=lambda: 10.0,
+        wait_for_event=request_second_recycle,
+        stop_child=lambda process: stopped.append(cast(Any, process).pid),
+        wait_for_comfy_ready=wait_for_ready,
+    )
+
+    assert stopped == [311, 200]
+    assert server.should_exit
+    assert worker_restart_event.is_set()
+    assert worker_recycle_event.is_set()
+    assert "reason=fatal_output_recycle_budget_exhausted" in capsys.readouterr().err
+
+
+async def test_monitor_fails_closed_when_fatal_output_request_does_not_drain(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server = _MonitorServer()
+    worker_restart_event = asyncio.Event()
+    worker_recycle_event = asyncio.Event()
+    worker_recycle_event.set()
+    starts: list[str] = []
+
+    await _monitor_comfy(
+        _managed_children(queue_process=_SupervisedProcess(321, None)),
+        cast(Any, server),
+        worker_restart_event,
+        worker_recycle_event=worker_recycle_event,
+        start_comfy_process=lambda: starts.append("comfy") or cast(Any, None),
+        start_queue_worker=lambda: starts.append("queue") or cast(Any, None),
+        unsafe_request_active=lambda: True,
+        comfy_health_check=lambda: True,
+        monotonic=lambda: 10.0,
+        unsafe_request_drain_seconds=0.0,
+    )
+
+    assert starts == []
+    assert server.should_exit
+    assert worker_restart_event.is_set()
+    assert "reason=fatal_output_request_did_not_drain" in capsys.readouterr().err
+
+
+async def test_monitor_recycles_comfy_child_exit_without_rehydrating_models(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server = _MonitorServer()
+    worker_restart_event = asyncio.Event()
+    worker_recycle_event = asyncio.Event()
+    children = _ManagedChildren(
+        comfy=_ManagedChild(
+            "comfy",
+            cast(
+                "subprocess.Popen[bytes]",
+                cast(Any, _SupervisedProcess(331, 1)),
+            ),
+            0.0,
+        ),
+        queue_worker=_ManagedChild(
+            "salad_queue_worker",
+            cast(
+                "subprocess.Popen[bytes]",
+                cast(Any, _SupervisedProcess(332, None)),
+            ),
+            0.0,
+        ),
+    )
+    replacement_comfy = _SupervisedProcess(333, None)
+    replacement_queue = _SupervisedProcess(334, None)
+    stopped: list[int] = []
+
+    async def wait_for_ready(
+        _process: subprocess.Popen[bytes],
+        _health_check: Any,
+    ) -> None:
+        return None
+
+    async def finish_monitor(_event: asyncio.Event, _delay_seconds: float) -> bool:
+        server.should_exit = True
+        return False
+
+    await _monitor_comfy(
+        children,
+        cast(Any, server),
+        worker_restart_event,
+        worker_recycle_event=worker_recycle_event,
+        start_comfy_process=lambda: cast("subprocess.Popen[bytes]", cast(Any, replacement_comfy)),
+        start_queue_worker=lambda: cast("subprocess.Popen[bytes]", cast(Any, replacement_queue)),
+        unsafe_request_active=lambda: False,
+        comfy_health_check=lambda: True,
+        monotonic=lambda: 10.0,
+        wait_for_event=finish_monitor,
+        stop_child=lambda process: stopped.append(cast(Any, process).pid),
+        wait_for_comfy_ready=wait_for_ready,
+    )
+
+    assert stopped == [332]
+    assert children.comfy.process is cast(Any, replacement_comfy)
+    assert children.queue_worker is not None
+    assert children.queue_worker.process is cast(Any, replacement_queue)
+    assert not worker_recycle_event.is_set()
+    assert not worker_restart_event.is_set()
+    stderr = capsys.readouterr().err
+    assert "role=comfy pid=331 returncode=1" in stderr
+    assert "reason=comfy_child_exit" in stderr
+
+
+async def test_monitor_escalates_when_comfy_recycle_never_becomes_ready(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server = _MonitorServer()
+    worker_restart_event = asyncio.Event()
+    worker_recycle_event = asyncio.Event()
+    worker_recycle_event.set()
+    replacement_comfy = _SupervisedProcess(343, None)
+    stopped: list[int] = []
+
+    async def fail_readiness(
+        _process: subprocess.Popen[bytes],
+        _health_check: Any,
+    ) -> None:
+        raise WorkerBootstrapConfigurationError("not ready")
+
+    await _monitor_comfy(
+        _managed_children(queue_process=_SupervisedProcess(341, None)),
+        cast(Any, server),
+        worker_restart_event,
+        worker_recycle_event=worker_recycle_event,
+        start_comfy_process=lambda: cast("subprocess.Popen[bytes]", cast(Any, replacement_comfy)),
+        start_queue_worker=lambda: cast(Any, _SupervisedProcess(344, None)),
+        unsafe_request_active=lambda: False,
+        comfy_health_check=lambda: False,
+        monotonic=lambda: 10.0,
+        stop_child=lambda process: stopped.append(cast(Any, process).pid),
+        wait_for_comfy_ready=fail_readiness,
+    )
+
+    assert stopped == [341, 200, 343]
+    assert server.should_exit
+    assert worker_restart_event.is_set()
+    assert worker_recycle_event.is_set()
+    assert "reason=fatal_output_recycle_readiness_failed" in capsys.readouterr().err
+
+
 def _managed_children(
     *,
     queue_process: _SupervisedProcess,
@@ -868,12 +1187,89 @@ async def test_monitor_fails_closed_when_queue_dies_during_generation(
         unsafe_request_active=lambda: True,
         comfy_health_check=lambda: True,
         monotonic=lambda: 2.0,
+        unsafe_request_drain_seconds=0.0,
     )
 
     assert not starts
     assert server.should_exit
     assert worker_restart_event.is_set()
     assert "reason=unsafe_active_request" in capsys.readouterr().err
+
+
+async def test_monitor_lets_response_boundary_drain_before_restarting_queue() -> None:
+    server = _MonitorServer()
+    worker_restart_event = asyncio.Event()
+    children = _managed_children(queue_process=_SupervisedProcess(212, 1))
+    replacement = _SupervisedProcess(213, None)
+    request_active = True
+    starts: list[bool] = []
+    waits = 0
+
+    async def clear_response_boundary() -> None:
+        nonlocal request_active
+        await asyncio.sleep(0)
+        request_active = False
+
+    async def wait_for_event(_event: asyncio.Event, _delay_seconds: float) -> bool:
+        nonlocal waits
+        waits += 1
+        if waits == 2:
+            server.should_exit = True
+        return False
+
+    drain_task = asyncio.create_task(clear_response_boundary())
+    await _monitor_comfy(
+        children,
+        cast(Any, server),
+        worker_restart_event,
+        start_queue_worker=lambda: (
+            starts.append(True) or cast("subprocess.Popen[bytes]", cast(Any, replacement))
+        ),
+        unsafe_request_active=lambda: request_active,
+        comfy_health_check=lambda: True,
+        monotonic=lambda: 2.0,
+        wait_for_event=wait_for_event,
+        unsafe_request_drain_poll_seconds=0.0,
+    )
+    await drain_task
+
+    assert starts == [True]
+    assert children.queue_worker is not None
+    assert cast(Any, children.queue_worker.process) is replacement
+    assert not worker_restart_event.is_set()
+
+
+async def test_monitor_blank_output_signal_wins_after_active_request_drains(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server = _MonitorServer()
+    worker_restart_event = asyncio.Event()
+    worker_restart_event.set()
+    request_active = True
+    starts: list[bool] = []
+
+    async def clear_response_boundary() -> None:
+        nonlocal request_active
+        await asyncio.sleep(0)
+        request_active = False
+
+    drain_task = asyncio.create_task(clear_response_boundary())
+    await _monitor_comfy(
+        _managed_children(queue_process=_SupervisedProcess(214, 1)),
+        cast(Any, server),
+        worker_restart_event,
+        start_queue_worker=lambda: starts.append(True),
+        unsafe_request_active=lambda: request_active,
+        comfy_health_check=lambda: True,
+        monotonic=lambda: 2.0,
+        unsafe_request_drain_poll_seconds=0.0,
+    )
+    await drain_task
+
+    assert starts == []
+    assert server.should_exit
+    assert worker_restart_event.is_set()
+    assert "reason=blank_or_fatal_output_requested" in capsys.readouterr().err
 
 
 async def test_monitor_does_not_restart_queue_when_comfy_is_unhealthy(

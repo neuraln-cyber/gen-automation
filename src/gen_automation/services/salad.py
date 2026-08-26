@@ -36,7 +36,11 @@ from gen_automation.domain.enums import (
     SaladDeploymentState,
 )
 from gen_automation.domain.ids import uuid7
-from gen_automation.gpu_worker.models import GenerateResponse
+from gen_automation.gpu_worker.models import (
+    GenerateFailureResponse,
+    GenerateResponse,
+    GenerateWorkerResponse,
+)
 from gen_automation.integrations.salad.client import SALAD_QUEUE_JOB_PAGE_SIZE
 from gen_automation.integrations.salad.errors import (
     SaladAPIError,
@@ -62,8 +66,10 @@ from gen_automation.services.generation_recovery import (
     SALAD_PROVIDER_CANCELLED_ERROR_CODE,
     SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE,
     SALAD_RATE_LIMITED_ERROR_CODE,
+    SALAD_WORKER_NEAR_BLACK_OUTPUT_ERROR_CODE,
     InfrastructureRetrySource,
     grant_infrastructure_retry,
+    grant_near_black_output_retry,
 )
 from gen_automation.services.outbox import (
     GENERATION_ATTEMPT_AGGREGATE,
@@ -1316,13 +1322,18 @@ async def apply_salad_job_observation(
         return _observation_result(attempt, job, applied=False, stale=True)
 
     worker_output_valid: bool | None = None
+    worker_response: GenerateWorkerResponse | None = None
     if remote_job.status == SaladJobStatus.SUCCEEDED:
-        worker_output_valid = await _valid_worker_success_output(
+        worker_response = await _validated_worker_output(
             session,
             attempt=attempt,
             job=job,
             output=remote_job.output,
         )
+        worker_output_valid = worker_response is not None
+    worker_failure = (
+        worker_response if isinstance(worker_response, GenerateFailureResponse) else None
+    )
     watchdog_cancelled = (
         remote_job.status == SaladJobStatus.CANCELLED
         and attempt.state == GenerationAttemptState.CANCEL_REQUESTED
@@ -1351,6 +1362,12 @@ async def apply_salad_job_observation(
     if worker_output_valid is False:
         failure_error_code = "salad_worker_output_invalid"
         failure_error_detail = "Salad reported success without a valid worker output contract."
+    elif worker_failure is not None:
+        failure_error_code = SALAD_WORKER_NEAR_BLACK_OUTPUT_ERROR_CODE
+        failure_error_detail = (
+            "The worker detected a near-black generation output and requested one bounded "
+            "precision recovery retry."
+        )
     elif watchdog_cancelled:
         failure_error_code = SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE
         failure_error_detail = _watchdog_failure_detail(
@@ -1424,6 +1441,15 @@ async def apply_salad_job_observation(
             else {}
         ),
         **({"worker_output_valid": worker_output_valid} if worker_output_valid is not None else {}),
+        **(
+            {
+                "worker_failure_code": worker_failure.code,
+                "failed_output_index": worker_failure.failed_output_index,
+                "uploaded_output_count": len(worker_failure.outputs),
+            }
+            if worker_failure is not None
+            else {}
+        ),
     }
     attempt.error_code = failure_error_code
     attempt.error_detail = failure_error_detail
@@ -1451,19 +1477,41 @@ async def apply_salad_job_observation(
         attempt.completed_at = bounded_completed_at or provider_update_time
     attempt.lock_version += 1
 
+    near_black_retry_granted: bool | None = None
     if current_attempt and target_state == GenerationAttemptState.FAILED:
-        await grant_infrastructure_retry(
-            session,
-            attempt=attempt,
-            job=job,
-            source=InfrastructureRetrySource.RECONCILER,
-            actor="salad-controller",
-            retry_at=controller_time,
-            occurred_at=controller_time,
-        )
+        if worker_failure is not None:
+            near_black_retry_granted = (
+                await grant_near_black_output_retry(
+                    session,
+                    attempt=attempt,
+                    job=job,
+                    source=InfrastructureRetrySource.RECONCILER,
+                    actor="salad-controller",
+                    retry_at=controller_time,
+                    occurred_at=controller_time,
+                    failed_output_index=worker_failure.failed_output_index,
+                    uploaded_output_indices=tuple(
+                        output.output_index for output in worker_failure.outputs
+                    ),
+                )
+            ).granted
+        else:
+            await grant_infrastructure_retry(
+                session,
+                attempt=attempt,
+                job=job,
+                source=InfrastructureRetrySource.RECONCILER,
+                actor="salad-controller",
+                retry_at=controller_time,
+                occurred_at=controller_time,
+            )
 
     if current_attempt and job.state not in _TERMINAL_JOB_STATES:
-        job.state = _job_state_for_observation(job, target_state)
+        job.state = (
+            GenerationState.DEAD_LETTER
+            if worker_failure is not None and near_black_retry_granted is False
+            else _job_state_for_observation(job, target_state)
+        )
         job.retry_at = None
         job.last_error_code = failure_error_code
         job.last_error_detail = failure_error_detail
@@ -1509,23 +1557,36 @@ async def apply_salad_job_observation(
     return _observation_result(attempt, job, applied=True, stale=False)
 
 
-async def _valid_worker_success_output(
+async def _validated_worker_output(
     session: AsyncSession,
     *,
     attempt: GenerationAttempt,
     job: GenerationJob,
     output: JSONValue,
-) -> bool:
+) -> GenerateWorkerResponse | None:
     try:
-        response = GenerateResponse.model_validate(output, strict=True)
+        if isinstance(output, dict) and output.get("status") == "failed":
+            response: GenerateWorkerResponse = GenerateFailureResponse.model_validate(
+                output,
+                strict=True,
+            )
+        else:
+            response = GenerateResponse.model_validate(output, strict=True)
     except (TypeError, ValueError, ValidationError):
-        return False
+        return None
     if response.job_id != str(job.id) or response.attempt_id != str(attempt.id):
-        return False
-    if len(response.outputs) != job.expected_output_count:
-        return False
-    if [item.output_index for item in response.outputs] != list(range(job.expected_output_count)):
-        return False
+        return None
+    if isinstance(response, GenerateFailureResponse):
+        failure_output_indices = [item.output_index for item in response.outputs]
+        if (
+            response.failed_output_index >= job.expected_output_count
+            or failure_output_indices not in ([], list(range(response.failed_output_index)))
+        ):
+            return None
+    elif len(response.outputs) != job.expected_output_count or [
+        item.output_index for item in response.outputs
+    ] != list(range(job.expected_output_count)):
+        return None
 
     assets = list(
         (
@@ -1540,8 +1601,12 @@ async def _valid_worker_success_output(
         ).all()
     )
     if len(assets) != job.expected_output_count:
-        return False
-    for response_output, asset in zip(response.outputs, assets, strict=True):
+        return None
+    assets_by_index = {asset.output_index: asset for asset in assets}
+    for response_output in response.outputs:
+        asset = assets_by_index.get(response_output.output_index)
+        if asset is None:
+            return None
         upload_attempt_id = asset.asset_metadata.get("upload_attempt_id")
         if (
             asset.output_index != response_output.output_index
@@ -1549,8 +1614,8 @@ async def _valid_worker_success_output(
             or not isinstance(upload_attempt_id, str)
             or response_output.upload_attempt_id != upload_attempt_id
         ):
-            return False
-    return True
+            return None
+    return response
 
 
 async def reconcile_generation_attempt(
@@ -2753,11 +2818,16 @@ def _require_submittable_deployment(deployment: SaladDeployment) -> None:
         raise SaladServiceConflictError("v1 Salad deployment exceeds one replica")
     if not deployment.is_current:
         raise SaladServiceConflictError("Salad deployment is not current")
-    start_pending = (
+    runtime_admission_pending = (
         deployment.state == SaladDeploymentState.PROVISIONING
-        and deployment.last_error_code == "provider_start_pending"
+        and deployment.last_error_code
+        in {
+            "provider_autoscaler_repair_pending",
+            "provider_image_preparation_pending",
+            "provider_start_pending",
+        }
     )
-    if deployment.state != SaladDeploymentState.ACTIVE and not start_pending:
+    if deployment.state != SaladDeploymentState.ACTIVE and not runtime_admission_pending:
         raise SaladServiceConflictError("Salad deployment is not active")
     if deployment.desired_state != DesiredDeploymentState.ACTIVE:
         raise SaladServiceConflictError("Salad deployment is stopped")

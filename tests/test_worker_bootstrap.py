@@ -79,6 +79,8 @@ def _settings(**changes: object) -> WorkerRuntimeSettings:
         "allowed_upload_origin": "https://uploads.example.test",
         "model_manifest_json": _manifest_json(),
         "model_manifest_sha256": "a" * 64,
+        "runtime_admission_id": "1" * 32,
+        "runtime_worker_instance_id": "instance-creator-1",
         "artifact_bucket": "models-private",
         "checkpoint_root": Path("/models/checkpoints"),
         "lora_root": Path("/models/loras"),

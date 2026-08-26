@@ -59,6 +59,8 @@ from gen_automation.storage.memory import MemoryObjectStore
 NOW = 2_000_000_000
 SIGNING_PRIVATE_KEY = encode_base64url(bytes(range(1, 33)))
 VERIFICATION_PUBLIC_KEY = derive_public_key(SIGNING_PRIVATE_KEY)
+RUNTIME_ADMISSION_ID = "1" * 32
+RUNTIME_WORKER_INSTANCE_ID = "instance-creator-1"
 WORKFLOW_BODY = (
     Path(__file__).resolve().parents[1] / "workflows" / "illustrious-sdxl-base-v1.json"
 ).read_bytes()
@@ -377,6 +379,8 @@ async def _build(context: WorkerInputContext) -> dict[str, object]:
             signing_private_key=SecretStr(SIGNING_PRIVATE_KEY),
             artifact_manifest=context.artifact_manifest,
             artifact_manifest_sha256=context.artifact_manifest.manifest_sha256,
+            runtime_admission_id=RUNTIME_ADMISSION_ID,
+            runtime_worker_instance_id=RUNTIME_WORKER_INSTANCE_ID,
             now=lambda: NOW,
         )
         return await provider.build_job_input(context.job_context)
@@ -665,6 +669,9 @@ async def test_builds_signed_envelope_with_rendered_workflow_and_fresh_uploads(
         environment=WorkerEnvironment.TEST,
         verification_keys={"worker-key-1": VERIFICATION_PUBLIC_KEY},
         allowed_upload_origin="https://uploads.example.test",
+        artifact_manifest_sha256=worker_input_context.artifact_manifest.manifest_sha256,
+        runtime_admission_id=RUNTIME_ADMISSION_ID,
+        runtime_worker_instance_id=RUNTIME_WORKER_INSTANCE_ID,
     )
     verify_authorization(envelope, settings, now=lambda: NOW)
     assert len(envelope.signature) == 86
@@ -1708,6 +1715,8 @@ async def test_controlled_trio_envelope_budget_fails_before_upload_intents(
             signing_private_key=SecretStr(SIGNING_PRIVATE_KEY),
             artifact_manifest=context.artifact_manifest,
             artifact_manifest_sha256=context.artifact_manifest.manifest_sha256,
+            runtime_admission_id=RUNTIME_ADMISSION_ID,
+            runtime_worker_instance_id=RUNTIME_WORKER_INSTANCE_ID,
             max_envelope_bytes=4096,
             now=lambda: NOW,
         )
@@ -2017,6 +2026,9 @@ async def test_synthetic_production_prompt_reaches_immutable_raw_masters(
             environment=WorkerEnvironment.TEST,
             verification_keys={"worker-key-1": VERIFICATION_PUBLIC_KEY},
             allowed_upload_origin=UPLOAD_ORIGIN,
+            artifact_manifest_sha256=worker_input_context.artifact_manifest.manifest_sha256,
+            runtime_admission_id=RUNTIME_ADMISSION_ID,
+            runtime_worker_instance_id=RUNTIME_WORKER_INSTANCE_ID,
         ),
         executor=executor,
         uploader=uploader,
@@ -2254,6 +2266,8 @@ async def test_rejects_parameter_digest_mismatch(
             signing_private_key=SecretStr(SIGNING_PRIVATE_KEY),
             artifact_manifest=worker_input_context.artifact_manifest,
             artifact_manifest_sha256=(worker_input_context.artifact_manifest.manifest_sha256),
+            runtime_admission_id=RUNTIME_ADMISSION_ID,
+            runtime_worker_instance_id=RUNTIME_WORKER_INSTANCE_ID,
         )
         with pytest.raises(WorkerInputError, match="integrity"):
             await provider.build_job_input(bad_context)
@@ -2297,6 +2311,8 @@ async def test_rejects_release_artifact_outside_the_materialized_worker_manifest
             signing_private_key=SecretStr(SIGNING_PRIVATE_KEY),
             artifact_manifest=worker_input_context.artifact_manifest,
             artifact_manifest_sha256=(worker_input_context.artifact_manifest.manifest_sha256),
+            runtime_admission_id=RUNTIME_ADMISSION_ID,
+            runtime_worker_instance_id=RUNTIME_WORKER_INSTANCE_ID,
         )
         with pytest.raises(WorkerInputError, match="worker manifest"):
             await provider.build_job_input(context)
@@ -2335,6 +2351,8 @@ async def test_rejects_unknown_or_structural_template_bindings(
                 signing_private_key=SecretStr(SIGNING_PRIVATE_KEY),
                 artifact_manifest=worker_input_context.artifact_manifest,
                 artifact_manifest_sha256=(worker_input_context.artifact_manifest.manifest_sha256),
+                runtime_admission_id=RUNTIME_ADMISSION_ID,
+                runtime_worker_instance_id=RUNTIME_WORKER_INSTANCE_ID,
             )
             with pytest.raises(WorkerInputError, match="binding"):
                 await provider.build_job_input(bad_context)
@@ -2353,6 +2371,8 @@ async def test_upload_grant_ttl_must_cover_acceptance_and_execution(
                 signing_private_key=SecretStr(SIGNING_PRIVATE_KEY),
                 artifact_manifest=worker_input_context.artifact_manifest,
                 artifact_manifest_sha256=(worker_input_context.artifact_manifest.manifest_sha256),
+                runtime_admission_id=RUNTIME_ADMISSION_ID,
+                runtime_worker_instance_id=RUNTIME_WORKER_INSTANCE_ID,
                 signature_ttl_seconds=7200,
                 upload_grant_ttl_seconds=8000,
             )

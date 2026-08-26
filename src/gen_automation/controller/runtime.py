@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from functools import partial
 from time import monotonic
-from typing import cast
+from typing import NoReturn, cast
 from uuid import UUID, uuid4
 
 import structlog
@@ -21,6 +21,7 @@ from gen_automation.db.models import (
     ExperimentWarmLease,
     GenerationAttempt,
     GenerationJob,
+    OutboxEvent,
     ProviderBudgetGuard,
     Release,
     ReleaseVersion,
@@ -32,12 +33,16 @@ from gen_automation.domain.enums import (
     ExperimentWarmLeaseState,
     GenerationAttemptState,
     GenerationState,
+    OutboxStatus,
+    ReleasePhase,
+    ResourceHealth,
     SaladDeploymentPurpose,
     SaladDeploymentState,
 )
 from gen_automation.domain.runtime_bindings import (
     WORKER_MODEL_MANIFEST_JSON_BINDING,
     WORKER_MODEL_MANIFEST_SHA256_BINDING,
+    WORKER_RUNTIME_ADMISSION_ID_BINDING,
 )
 from gen_automation.integrations.civitai.client import CivitaiClient
 from gen_automation.integrations.mega import MegaCmdClient
@@ -100,6 +105,7 @@ from gen_automation.services.outbox import (
     ExternalEffect,
     OutboxError,
     claim_outbox_events,
+    defer_staged_runtime_admission_outbox_event,
     defer_unstarted_outbox_event,
     fail_outbox_event,
     succeed_outbox_event,
@@ -127,9 +133,13 @@ from gen_automation.services.salad import (
     submit_prepared_attempt,
 )
 from gen_automation.services.salad_deployments import (
+    SaladRuntimeAdmissionUnavailableError,
+    container_group_runtime_admission_ready,
     effective_worker_min_replicas,
     ensure_container_group_queue_admission,
+    preflight_container_group_runtime_refresh,
     provision_deployment_step,
+    read_container_group_runtime_admission_identity,
     reconcile_deployment,
     refresh_container_group_runtime,
 )
@@ -205,11 +215,254 @@ class _RuntimeArtifactManifestBusyError(RuntimeError):
     """A different immutable worker manifest is still serving active work."""
 
 
-async def _runtime_refresh_blocking_attempt_id(
+class _RuntimeAdmissionPendingError(RuntimeError):
+    """The exact replacement worker is not yet the sole ready queue consumer."""
+
+
+class _RuntimeAdmissionDeferredError(RuntimeError):
+    """The runtime target and outbox deferral were committed atomically."""
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeAdmissionTarget:
+    provider_group_version: int
+    artifact_manifest_sha256: str
+    rollout_id: str
+    worker_instance_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeAdmissionRefreshPlan:
+    provider_group_version_before_refresh: int
+    artifact_manifest_sha256: str
+    rollout_id: str
+
+
+_RUNTIME_ADMISSION_METADATA_KEY = "runtime_admission"
+_RUNTIME_ADMISSION_METADATA_VERSION = "v1"
+_RUNTIME_ADMISSION_REFRESH_PLAN_METADATA_KEY = "runtime_admission_refresh_plan"
+
+
+def _runtime_admission_target(attempt: GenerationAttempt) -> _RuntimeAdmissionTarget | None:
+    raw = attempt.request_metadata.get(_RUNTIME_ADMISSION_METADATA_KEY)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != {
+        "version",
+        "provider_group_version",
+        "artifact_manifest_sha256",
+        "rollout_id",
+        "worker_instance_id",
+    }:
+        raise RuntimeError("generation attempt runtime admission metadata is invalid")
+    provider_group_version = raw.get("provider_group_version")
+    artifact_manifest_sha256 = raw.get("artifact_manifest_sha256")
+    rollout_id = raw.get("rollout_id")
+    worker_instance_id = raw.get("worker_instance_id")
+    if (
+        raw.get("version") != _RUNTIME_ADMISSION_METADATA_VERSION
+        or not isinstance(provider_group_version, int)
+        or isinstance(provider_group_version, bool)
+        or provider_group_version <= 0
+        or not isinstance(artifact_manifest_sha256, str)
+        or len(artifact_manifest_sha256) != 64
+        or artifact_manifest_sha256 != artifact_manifest_sha256.lower()
+        or any(character not in "0123456789abcdef" for character in artifact_manifest_sha256)
+        or not isinstance(rollout_id, str)
+        or len(rollout_id) != 32
+        or rollout_id != rollout_id.lower()
+        or any(character not in "0123456789abcdef" for character in rollout_id)
+        or (
+            worker_instance_id is not None
+            and (
+                not isinstance(worker_instance_id, str)
+                or not 1 <= len(worker_instance_id) <= 128
+                or any(
+                    character
+                    not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-"
+                    for character in worker_instance_id
+                )
+            )
+        )
+    ):
+        raise RuntimeError("generation attempt runtime admission metadata is invalid")
+    return _RuntimeAdmissionTarget(
+        provider_group_version=provider_group_version,
+        artifact_manifest_sha256=artifact_manifest_sha256,
+        rollout_id=rollout_id,
+        worker_instance_id=worker_instance_id,
+    )
+
+
+def _record_runtime_admission_target(
+    attempt: GenerationAttempt,
+    target: _RuntimeAdmissionTarget,
+) -> None:
+    metadata = dict(attempt.request_metadata)
+    metadata[_RUNTIME_ADMISSION_METADATA_KEY] = {
+        "version": _RUNTIME_ADMISSION_METADATA_VERSION,
+        "provider_group_version": target.provider_group_version,
+        "artifact_manifest_sha256": target.artifact_manifest_sha256,
+        "rollout_id": target.rollout_id,
+        "worker_instance_id": target.worker_instance_id,
+    }
+    metadata.pop(_RUNTIME_ADMISSION_REFRESH_PLAN_METADATA_KEY, None)
+    attempt.request_metadata = metadata
+    attempt.lock_version += 1
+
+
+def _runtime_admission_refresh_plan(
+    attempt: GenerationAttempt,
+) -> _RuntimeAdmissionRefreshPlan | None:
+    raw = attempt.request_metadata.get(_RUNTIME_ADMISSION_REFRESH_PLAN_METADATA_KEY)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != {
+        "version",
+        "provider_group_version_before_refresh",
+        "artifact_manifest_sha256",
+        "rollout_id",
+    }:
+        raise RuntimeError("generation attempt runtime admission refresh plan is invalid")
+    provider_group_version = raw.get("provider_group_version_before_refresh")
+    artifact_manifest_sha256 = raw.get("artifact_manifest_sha256")
+    rollout_id = raw.get("rollout_id")
+    if (
+        raw.get("version") != _RUNTIME_ADMISSION_METADATA_VERSION
+        or not isinstance(provider_group_version, int)
+        or isinstance(provider_group_version, bool)
+        or provider_group_version <= 0
+        or not isinstance(artifact_manifest_sha256, str)
+        or len(artifact_manifest_sha256) != 64
+        or artifact_manifest_sha256 != artifact_manifest_sha256.lower()
+        or any(character not in "0123456789abcdef" for character in artifact_manifest_sha256)
+        or not isinstance(rollout_id, str)
+        or len(rollout_id) != 32
+        or rollout_id != rollout_id.lower()
+        or any(character not in "0123456789abcdef" for character in rollout_id)
+    ):
+        raise RuntimeError("generation attempt runtime admission refresh plan is invalid")
+    return _RuntimeAdmissionRefreshPlan(
+        provider_group_version_before_refresh=provider_group_version,
+        artifact_manifest_sha256=artifact_manifest_sha256,
+        rollout_id=rollout_id,
+    )
+
+
+def _record_runtime_admission_refresh_plan(
+    attempt: GenerationAttempt,
+    plan: _RuntimeAdmissionRefreshPlan,
+) -> None:
+    metadata = dict(attempt.request_metadata)
+    metadata[_RUNTIME_ADMISSION_REFRESH_PLAN_METADATA_KEY] = {
+        "version": _RUNTIME_ADMISSION_METADATA_VERSION,
+        "provider_group_version_before_refresh": (plan.provider_group_version_before_refresh),
+        "artifact_manifest_sha256": plan.artifact_manifest_sha256,
+        "rollout_id": plan.rollout_id,
+    }
+    attempt.request_metadata = metadata
+    attempt.lock_version += 1
+
+
+async def _runtime_admission_demand_attempts(
     session: AsyncSession,
     *,
     salad_deployment_id: UUID,
-) -> UUID | None:
+    excluding_attempt_id: UUID,
+) -> tuple[GenerationAttempt, ...]:
+    return tuple(
+        (
+            await session.scalars(
+                select(GenerationAttempt)
+                .join(GenerationJob, GenerationJob.id == GenerationAttempt.job_id)
+                .join(
+                    ReleaseVersion,
+                    ReleaseVersion.id == GenerationJob.release_version_id,
+                )
+                .join(Release, Release.id == ReleaseVersion.release_id)
+                .join(
+                    OutboxEvent,
+                    and_(
+                        OutboxEvent.aggregate_id == GenerationAttempt.id,
+                        OutboxEvent.topic == SALAD_JOB_SUBMIT_TOPIC,
+                        OutboxEvent.aggregate_type == GENERATION_ATTEMPT_AGGREGATE,
+                    ),
+                )
+                .where(
+                    GenerationAttempt.salad_deployment_id == salad_deployment_id,
+                    GenerationAttempt.id != excluding_attempt_id,
+                    GenerationAttempt.provider == "salad",
+                    GenerationAttempt.state == GenerationAttemptState.CREATED,
+                    GenerationJob.state == GenerationState.CLAIMED,
+                    GenerationJob.attempt_count == GenerationAttempt.attempt_no,
+                    Release.phase.in_((ReleasePhase.READY, ReleasePhase.GENERATING)),
+                    Release.health == ResourceHealth.HEALTHY,
+                    Release.current_version_no == ReleaseVersion.version_no,
+                    OutboxEvent.attempts < OutboxEvent.max_attempts,
+                    OutboxEvent.status.in_((OutboxStatus.PENDING, OutboxStatus.PROCESSING)),
+                    ~exists(
+                        select(AuditEvent.id).where(
+                            AuditEvent.resource_type == "release",
+                            AuditEvent.resource_id == Release.id,
+                            AuditEvent.action == GENERATION_STOP_REQUESTED_ACTION,
+                        )
+                    ),
+                )
+                .order_by(GenerationAttempt.created_at, GenerationAttempt.id)
+            )
+        ).all()
+    )
+
+
+async def _pending_runtime_admission_target(
+    session: AsyncSession,
+    *,
+    salad_deployment_id: UUID,
+    excluding_attempt_id: UUID,
+) -> _RuntimeAdmissionTarget | None:
+    attempts = await _runtime_admission_demand_attempts(
+        session,
+        salad_deployment_id=salad_deployment_id,
+        excluding_attempt_id=excluding_attempt_id,
+    )
+    targets = tuple(
+        target for attempt in attempts if (target := _runtime_admission_target(attempt)) is not None
+    )
+    return _coalesced_runtime_admission_target(
+        targets,
+        conflict_error="deployment has conflicting runtime admission targets",
+    )
+
+
+async def _pending_runtime_admission_refresh_plan(
+    session: AsyncSession,
+    *,
+    salad_deployment_id: UUID,
+    excluding_attempt_id: UUID,
+) -> _RuntimeAdmissionRefreshPlan | None:
+    attempts = await _runtime_admission_demand_attempts(
+        session,
+        salad_deployment_id=salad_deployment_id,
+        excluding_attempt_id=excluding_attempt_id,
+    )
+    plans = tuple(
+        plan
+        for attempt in attempts
+        if (plan := _runtime_admission_refresh_plan(attempt)) is not None
+    )
+    if not plans:
+        return None
+    first = plans[0]
+    if any(plan != first for plan in plans[1:]):
+        raise RuntimeError("deployment has conflicting runtime admission refresh plans")
+    return first
+
+
+async def _runtime_refresh_blocking_attempts(
+    session: AsyncSession,
+    *,
+    salad_deployment_id: UUID,
+) -> tuple[GenerationAttempt, ...]:
     """Return work that makes a deployment-wide runtime refresh unsafe.
 
     Remote and ambiguous attempt states always win over a stale parent lifecycle.
@@ -218,34 +471,99 @@ async def _runtime_refresh_blocking_attempt_id(
     written before the provider request can begin.
     """
 
-    return await session.scalar(
-        select(GenerationAttempt.id)
-        .join(GenerationJob, GenerationJob.id == GenerationAttempt.job_id)
-        .where(
-            GenerationAttempt.salad_deployment_id == salad_deployment_id,
-            GenerationAttempt.provider == "salad",
-            GenerationAttempt.state.in_(_RUNTIME_REFRESH_BLOCKING_ATTEMPT_STATES),
-            or_(
-                GenerationJob.state.not_in(_TERMINAL_GENERATION_JOB_STATES),
-                GenerationAttempt.state.in_(_RUNTIME_REFRESH_REMOTE_OR_AMBIGUOUS_STATES),
-                and_(
-                    GenerationAttempt.state == GenerationAttemptState.SUBMITTING,
+    return tuple(
+        (
+            await session.scalars(
+                select(GenerationAttempt)
+                .join(GenerationJob, GenerationJob.id == GenerationAttempt.job_id)
+                .where(
+                    GenerationAttempt.salad_deployment_id == salad_deployment_id,
+                    GenerationAttempt.provider == "salad",
+                    GenerationAttempt.state.in_(_RUNTIME_REFRESH_BLOCKING_ATTEMPT_STATES),
                     or_(
-                        GenerationAttempt.provider_external_id.is_not(None),
-                        GenerationAttempt.submit_started_at.is_not(None),
-                        GenerationAttempt.submitted_at.is_not(None),
-                        GenerationAttempt.started_at.is_not(None),
-                        GenerationAttempt.last_observed_at.is_not(None),
-                        GenerationAttempt.unknown_since.is_not(None),
-                        GenerationAttempt.provider_state.is_not(None),
-                        GenerationAttempt.response_metadata.is_not(None),
-                        GenerationAttempt.cost_reservation_microusd > 0,
-                        GenerationAttempt.reservation_released_at.is_not(None),
+                        GenerationJob.state.not_in(_TERMINAL_GENERATION_JOB_STATES),
+                        GenerationAttempt.state.in_(_RUNTIME_REFRESH_REMOTE_OR_AMBIGUOUS_STATES),
+                        and_(
+                            GenerationAttempt.state == GenerationAttemptState.SUBMITTING,
+                            or_(
+                                GenerationAttempt.provider_external_id.is_not(None),
+                                GenerationAttempt.submit_started_at.is_not(None),
+                                GenerationAttempt.submitted_at.is_not(None),
+                                GenerationAttempt.started_at.is_not(None),
+                                GenerationAttempt.last_observed_at.is_not(None),
+                                GenerationAttempt.unknown_since.is_not(None),
+                                GenerationAttempt.provider_state.is_not(None),
+                                GenerationAttempt.response_metadata.is_not(None),
+                                GenerationAttempt.cost_reservation_microusd > 0,
+                                GenerationAttempt.reservation_released_at.is_not(None),
+                            ),
+                        ),
                     ),
-                ),
-            ),
-        )
-        .limit(1)
+                )
+                .order_by(GenerationAttempt.created_at, GenerationAttempt.id)
+            )
+        ).all()
+    )
+
+
+async def _runtime_refresh_blocking_attempt_id(
+    session: AsyncSession,
+    *,
+    salad_deployment_id: UUID,
+) -> UUID | None:
+    attempts = await _runtime_refresh_blocking_attempts(
+        session,
+        salad_deployment_id=salad_deployment_id,
+    )
+    return attempts[0].id if attempts else None
+
+
+def _active_runtime_admission_target(
+    attempts: Sequence[GenerationAttempt],
+) -> _RuntimeAdmissionTarget | None:
+    if not attempts:
+        return None
+    targets: list[_RuntimeAdmissionTarget] = []
+    for attempt in attempts:
+        target = _runtime_admission_target(attempt)
+        if target is None:
+            raise RuntimeError("active generation attempt is missing runtime admission metadata")
+        targets.append(target)
+    return _coalesced_runtime_admission_target(
+        targets,
+        conflict_error="active generation attempts have conflicting runtime admissions",
+    )
+
+
+def _coalesced_runtime_admission_target(
+    targets: Sequence[_RuntimeAdmissionTarget],
+    *,
+    conflict_error: str,
+) -> _RuntimeAdmissionTarget | None:
+    if not targets:
+        return None
+    first = targets[0]
+    if any(
+        target.artifact_manifest_sha256 != first.artifact_manifest_sha256
+        or target.rollout_id != first.rollout_id
+        for target in targets[1:]
+    ):
+        raise RuntimeError(conflict_error)
+    provider_group_version = max(target.provider_group_version for target in targets)
+    candidate_instance_ids = {
+        target.worker_instance_id
+        for target in targets
+        if target.provider_group_version == provider_group_version
+        and target.worker_instance_id is not None
+    }
+    worker_instance_id = (
+        next(iter(candidate_instance_ids)) if len(candidate_instance_ids) == 1 else None
+    )
+    return _RuntimeAdmissionTarget(
+        provider_group_version=provider_group_version,
+        artifact_manifest_sha256=first.artifact_manifest_sha256,
+        rollout_id=first.rollout_id,
+        worker_instance_id=worker_instance_id,
     )
 
 
@@ -869,11 +1187,16 @@ class ControllerWorkloads:
     @staticmethod
     def _manifest_environment(
         effective: EffectiveArtifactManifest,
+        *,
+        runtime_admission_id: str | None = None,
     ) -> dict[str, str]:
-        return {
+        environment = {
             WORKER_MODEL_MANIFEST_JSON_BINDING: effective.manifest_json,
             WORKER_MODEL_MANIFEST_SHA256_BINDING: effective.sha256,
         }
+        if runtime_admission_id is not None:
+            environment[WORKER_RUNTIME_ADMISSION_ID_BINDING] = runtime_admission_id
+        return environment
 
     async def initialize(self) -> None:
         if self.salad_client is None:
@@ -1226,11 +1549,22 @@ class ControllerWorkloads:
                 required_checkpoint_sha256=required_checkpoint_sha256,
                 required_lora_sha256s=tuple(sorted(required_lora_sha256s)),
             )
+            warm_preflight = await preflight_container_group_runtime_refresh(
+                deployment,
+                self.salad_client,
+            )
+            warm_runtime_admission_id = uuid4().hex
             refreshed = await refresh_container_group_runtime(
                 deployment,
                 self.salad_client,
                 self.secret_resolver,
-                environment_overrides=self._manifest_environment(effective_manifest),
+                environment_overrides=self._manifest_environment(
+                    effective_manifest,
+                    runtime_admission_id=warm_runtime_admission_id,
+                ),
+                expected_provider_version=warm_preflight.version,
+                runtime_admission_id=warm_runtime_admission_id,
+                effective_min_replicas=1,
             )
             deployment.runtime_artifact_manifest_sha256 = effective_manifest.sha256
             deployment.runtime_managed_lora_sha256s = sorted(
@@ -1282,7 +1616,11 @@ class ControllerWorkloads:
         progress = _SubmissionProgress()
         try:
             async with asyncio.timeout(self.settings.background_submit_timeout_seconds):
-                result = await self._submit_event(event, progress=progress)
+                result = await self._submit_event(
+                    event,
+                    progress=progress,
+                    durable_runtime_admission_defer=True,
+                )
                 await self._transition_submit_result(
                     event,
                     result=result,
@@ -1304,6 +1642,32 @@ class ControllerWorkloads:
                 "salad_submission_deferred_for_worker_artifacts",
                 salad_generation_attempt_id=str(event.aggregate_id),
             )
+        except _RuntimeAdmissionDeferredError:
+            logger.info(
+                "salad_submission_deferred_for_runtime_admission",
+                salad_generation_attempt_id=str(event.aggregate_id),
+            )
+        except _RuntimeAdmissionPendingError:
+            async with self.sessions() as session:
+                await defer_unstarted_outbox_event(
+                    session,
+                    event_id=event.id,
+                    worker_id=worker_id,
+                    retry_not_before=(
+                        datetime.now(UTC)
+                        + timedelta(
+                            seconds=min(
+                                5,
+                                max(1, self.settings.background_retry_delay_seconds),
+                            )
+                        )
+                    ),
+                    reason_code="worker_runtime_admission_pending",
+                )
+            logger.info(
+                "salad_submission_deferred_for_runtime_admission",
+                salad_generation_attempt_id=str(event.aggregate_id),
+            )
         except asyncio.CancelledError:
             if progress.provider_post_started:
                 await self._fail_submit_lease(
@@ -1313,7 +1677,11 @@ class ControllerWorkloads:
                     external_effect=ExternalEffect.MAY_HAVE_STARTED,
                     retry_not_before=None,
                 )
-            else:
+            elif not await self._defer_staged_runtime_admission_if_safe(
+                event,
+                worker_id=worker_id,
+                reason_code="worker_runtime_admission_controller_shutdown",
+            ):
                 await self._resolve_definitely_unstarted_submit(
                     event,
                     worker_id=worker_id,
@@ -1329,7 +1697,11 @@ class ControllerWorkloads:
                     external_effect=ExternalEffect.MAY_HAVE_STARTED,
                     retry_not_before=None,
                 )
-            else:
+            elif not await self._defer_staged_runtime_admission_if_safe(
+                event,
+                worker_id=worker_id,
+                reason_code="worker_runtime_admission_controller_timeout",
+            ):
                 await self._resolve_definitely_unstarted_submit(
                     event,
                     worker_id=worker_id,
@@ -1705,6 +2077,7 @@ class ControllerWorkloads:
         event: ClaimedOutboxEvent,
         *,
         progress: _SubmissionProgress,
+        durable_runtime_admission_defer: bool = False,
     ) -> SubmissionResult:
         if self.salad_client is None or self.object_store is None:
             raise RuntimeError("Salad submission dependencies are unavailable")
@@ -1773,16 +2146,40 @@ class ControllerWorkloads:
                         mutation_effect=MutationEffect.DEFINITELY_NOT_STARTED,
                         provider_external_id=attempt.provider_external_id,
                     )
+            if attempt_state != GenerationAttemptState.CREATED:
+                # submit_prepared_attempt resolves recorded, cancelled, and
+                # outcome-unknown attempts before it can consult the upload
+                # provider or issue a provider POST. Do not require newly added
+                # runtime provenance from terminal legacy/stale outbox rows.
+                logger.info(
+                    "salad_runtime_refresh_skipped_for_recorded_attempt",
+                    salad_deployment_id=str(deployment.id),
+                    generation_attempt_id=str(event.aggregate_id),
+                    generation_attempt_state=attempt_state.value,
+                )
+                return await submit_prepared_attempt(
+                    session,
+                    self.salad_client,
+                    cast(SaladUploadIntentProvider, object()),
+                    generation_attempt_id=event.aggregate_id,
+                    webhook_url=(
+                        f"{str(self.settings.public_base_url).rstrip('/')}/webhooks/salad"
+                    ),
+                    reservation_microusd=deployment.max_hourly_cost_microusd,
+                    provider_post_started=progress.mark_provider_post_started,
+                )
             required_lora_sha256s = _required_lora_sha256s(job_parameters)
             required_checkpoint_sha256 = _required_checkpoint_sha256(job_parameters)
             active_attempt_id: UUID | None = None
-            cold_queue_admission_required = False
+            active_admission_target: _RuntimeAdmissionTarget | None = None
             resident = _resident_managed_lora_sha256s(deployment.runtime_managed_lora_sha256s)
             if attempt_state == GenerationAttemptState.CREATED:
-                active_attempt_id = await _runtime_refresh_blocking_attempt_id(
+                active_attempts = await _runtime_refresh_blocking_attempts(
                     session,
                     salad_deployment_id=deployment.id,
                 )
+                active_attempt_id = active_attempts[0].id if active_attempts else None
+                active_admission_target = _active_runtime_admission_target(active_attempts)
             try:
                 effective_manifest = await self._effective_artifact_manifest(
                     session,
@@ -1810,10 +2207,18 @@ class ControllerWorkloads:
                     required_checkpoint_sha256=required_checkpoint_sha256,
                     required_lora_sha256s=tuple(sorted(required_lora_sha256s)),
                 )
+            admission_target = _runtime_admission_target(attempt)
             if attempt_state != GenerationAttemptState.CREATED:
                 if deployment.runtime_artifact_manifest_sha256 != effective_manifest.sha256:
                     raise RuntimeError(
                         "recorded generation attempt no longer matches the worker manifest"
+                    )
+                if (
+                    admission_target is None
+                    or admission_target.artifact_manifest_sha256 != effective_manifest.sha256
+                ):
+                    raise RuntimeError(
+                        "recorded generation attempt is missing runtime admission provenance"
                     )
                 logger.info(
                     "salad_runtime_refresh_skipped_for_recorded_attempt",
@@ -1829,67 +2234,194 @@ class ControllerWorkloads:
                 runtime_matches = (
                     deployment.runtime_artifact_manifest_sha256 == effective_manifest.sha256
                 )
-                if warm_lease is not None:
-                    if (
-                        warm_lease.state == ExperimentWarmLeaseState.STARTING
-                        and warm_lease.provider_version is None
+                admission_plan = _runtime_admission_refresh_plan(attempt)
+                admission_recorded = False
+                admission_plan_recorded = False
+                if admission_target is not None and admission_plan is not None:
+                    raise RuntimeError(
+                        "generation attempt has conflicting runtime admission metadata"
+                    )
+                if admission_target is not None and (
+                    admission_target.artifact_manifest_sha256 != effective_manifest.sha256
+                    or not runtime_matches
+                ):
+                    raise RuntimeError(
+                        "recorded runtime admission no longer matches the worker manifest"
+                    )
+                if admission_plan is not None and (
+                    admission_plan.artifact_manifest_sha256 != effective_manifest.sha256
+                ):
+                    raise RuntimeError(
+                        "recorded runtime admission refresh plan no longer matches "
+                        "the worker manifest"
+                    )
+                if admission_target is None and active_attempt_id is None:
+                    pending_target = await _pending_runtime_admission_target(
+                        session,
+                        salad_deployment_id=deployment.id,
+                        excluding_attempt_id=attempt.id,
+                    )
+                    if pending_target is not None:
+                        if (
+                            pending_target.artifact_manifest_sha256 != effective_manifest.sha256
+                            or not runtime_matches
+                        ):
+                            raise _RuntimeArtifactManifestBusyError
+                        admission_target = pending_target
+                        _record_runtime_admission_target(attempt, admission_target)
+                        admission_recorded = True
+                    elif (
+                        warm_lease is not None
+                        and warm_lease.provider_version is not None
+                        and runtime_matches
                     ):
-                        if active_attempt_id is not None:
-                            raise _RuntimeArtifactManifestBusyError
-                        refreshed = await refresh_container_group_runtime(
+                        try:
+                            warm_identity = await read_container_group_runtime_admission_identity(
+                                deployment,
+                                self.salad_client,
+                                minimum_provider_version=warm_lease.provider_version,
+                                artifact_manifest_sha256=effective_manifest.sha256,
+                            )
+                        except SaladRuntimeAdmissionUnavailableError:
+                            await self._defer_runtime_admission(
+                                session,
+                                event,
+                                durable=durable_runtime_admission_defer,
+                                commit_changes=False,
+                            )
+                        if warm_identity is not None:
+                            warm_provider_version, warm_runtime_admission_id = warm_identity
+                            admission_target = _RuntimeAdmissionTarget(
+                                provider_group_version=warm_provider_version,
+                                artifact_manifest_sha256=effective_manifest.sha256,
+                                rollout_id=warm_runtime_admission_id,
+                            )
+                            _record_runtime_admission_target(attempt, admission_target)
+                            admission_recorded = True
+
+                if admission_target is None and active_admission_target is not None:
+                    if (
+                        active_admission_target.artifact_manifest_sha256
+                        != effective_manifest.sha256
+                        or not runtime_matches
+                    ):
+                        raise _RuntimeArtifactManifestBusyError
+                    admission_target = active_admission_target
+                    _record_runtime_admission_target(attempt, admission_target)
+                    admission_recorded = True
+
+                if admission_recorded:
+                    # Borrowed provenance must belong durably to this exact
+                    # outbox aggregate before any provider observation or
+                    # mutation. Otherwise an expired claim cannot prove replay.
+                    await self._defer_runtime_admission(
+                        session,
+                        event,
+                        durable=durable_runtime_admission_defer,
+                        commit_changes=True,
+                    )
+
+                if admission_target is not None:
+                    effective_min_replicas = await effective_worker_min_replicas(
+                        session,
+                        salad_deployment_id=deployment.id,
+                        now=datetime.now(UTC),
+                    )
+                    if effective_min_replicas != 1:
+                        raise RuntimeError("durable Salad runtime admission demand is unavailable")
+                    try:
+                        admitted = await ensure_container_group_queue_admission(
                             deployment,
                             self.salad_client,
-                            self.secret_resolver,
-                            environment_overrides=self._manifest_environment(effective_manifest),
+                            effective_min_replicas=effective_min_replicas,
+                            artifact_manifest_sha256=(admission_target.artifact_manifest_sha256),
+                            runtime_admission_id=admission_target.rollout_id,
                         )
-                        cold_queue_admission_required = (
-                            refreshed.status.strip().lower() == "stopped"
-                        )
-                        deployment.runtime_artifact_manifest_sha256 = effective_manifest.sha256
-                        deployment.runtime_managed_lora_sha256s = sorted(
-                            effective_manifest.managed_lora_sha256s
-                        )
-                        mark_experiment_warm_runtime_refreshed_locked(
+                    except SaladRuntimeAdmissionUnavailableError:
+                        await self._defer_runtime_admission(
                             session,
-                            warm_lease,
-                            provider_version=refreshed.version,
-                            actor=self._worker_id("submit"),
+                            event,
+                            durable=durable_runtime_admission_defer,
+                            commit_changes=False,
                         )
-                        deployment.ready_replicas = 0
-                        deployment.reconcile_after = datetime.now(UTC)
-                    elif not runtime_matches:
-                        if active_attempt_id is not None:
-                            raise _RuntimeArtifactManifestBusyError
-                        refreshed = await refresh_container_group_runtime(
+                    if admitted.version < admission_target.provider_group_version:
+                        raise RuntimeError("runtime admission provider version regressed")
+                    if admitted.version > admission_target.provider_group_version:
+                        admission_target = _RuntimeAdmissionTarget(
+                            provider_group_version=admitted.version,
+                            artifact_manifest_sha256=(admission_target.artifact_manifest_sha256),
+                            rollout_id=admission_target.rollout_id,
+                        )
+                        _record_runtime_admission_target(attempt, admission_target)
+                        # Never POST against a provider version until that exact
+                        # monotonic same-rollout target is durable.
+                        await self._defer_runtime_admission(
+                            session,
+                            event,
+                            durable=durable_runtime_admission_defer,
+                            commit_changes=True,
+                        )
+                    try:
+                        ready_instance_id = await container_group_runtime_admission_ready(
                             deployment,
                             self.salad_client,
-                            self.secret_resolver,
-                            environment_overrides=self._manifest_environment(effective_manifest),
+                            provider_version=admission_target.provider_group_version,
+                            artifact_manifest_sha256=(admission_target.artifact_manifest_sha256),
+                            runtime_admission_id=admission_target.rollout_id,
                         )
-                        cold_queue_admission_required = (
-                            refreshed.status.strip().lower() == "stopped"
+                    except SaladRuntimeAdmissionUnavailableError:
+                        logger.info(
+                            "salad_runtime_admission_observation_unavailable",
+                            salad_deployment_id=str(deployment.id),
+                            generation_attempt_id=str(event.aggregate_id),
+                            provider_group_version=(admission_target.provider_group_version),
                         )
-                        deployment.runtime_artifact_manifest_sha256 = effective_manifest.sha256
-                        deployment.runtime_managed_lora_sha256s = sorted(
-                            effective_manifest.managed_lora_sha256s
+                        await self._defer_runtime_admission(
+                            session,
+                            event,
+                            durable=durable_runtime_admission_defer,
+                            commit_changes=admission_recorded,
                         )
-                        warm_lease.provider_version = refreshed.version
-                        warm_lease.lock_version += 1
-                        deployment.ready_replicas = 0
-                        deployment.reconcile_after = datetime.now(UTC)
-                    if warm_lease.state == ExperimentWarmLeaseState.ACTIVE:
+                    if ready_instance_id is None:
+                        await self._defer_runtime_admission(
+                            session,
+                            event,
+                            durable=durable_runtime_admission_defer,
+                            commit_changes=admission_recorded,
+                        )
+                    if admission_target.worker_instance_id != ready_instance_id:
+                        admission_target = _RuntimeAdmissionTarget(
+                            provider_group_version=(admission_target.provider_group_version),
+                            artifact_manifest_sha256=(admission_target.artifact_manifest_sha256),
+                            rollout_id=admission_target.rollout_id,
+                            worker_instance_id=ready_instance_id,
+                        )
+                        _record_runtime_admission_target(attempt, admission_target)
+                        # The exact Salad instance ID is injected into that one
+                        # container and signed into the worker request. Persist
+                        # it, release the claim, then re-observe the same sole
+                        # instance on the next claim before any provider POST.
+                        await self._defer_runtime_admission(
+                            session,
+                            event,
+                            durable=durable_runtime_admission_defer,
+                            commit_changes=True,
+                        )
+                    logger.info(
+                        "salad_runtime_admission_ready",
+                        salad_deployment_id=str(deployment.id),
+                        generation_attempt_id=str(event.aggregate_id),
+                        provider_group_version=admission_target.provider_group_version,
+                    )
+                    if (
+                        warm_lease is not None
+                        and warm_lease.state == ExperimentWarmLeaseState.ACTIVE
+                    ):
                         touch_experiment_warm_lease_locked(
                             session,
                             warm_lease,
                             actor=self._worker_id("submit"),
                         )
-                    logger.debug(
-                        "salad_runtime_reused_for_experiment",
-                        salad_deployment_id=str(deployment.id),
-                        generation_attempt_id=str(event.aggregate_id),
-                        experiment_warm_lease_id=str(warm_lease.id),
-                        experiment_warm_lease_state=warm_lease.state.value,
-                    )
                 elif active_attempt_id is None:
                     # Bootstrap credentials are refreshed only at an idle-to-active
                     # boundary. PATCHing the container environment creates a Salad
@@ -1898,21 +2430,150 @@ class ControllerWorkloads:
                     # the running deployment while any durable provider work exists.
                     # A matching artifact digest does not prove that the independent,
                     # short-lived bootstrap credential set is still fresh.
+                    if admission_plan is None:
+                        pending_plan = await _pending_runtime_admission_refresh_plan(
+                            session,
+                            salad_deployment_id=deployment.id,
+                            excluding_attempt_id=attempt.id,
+                        )
+                        if pending_plan is not None:
+                            if pending_plan.artifact_manifest_sha256 != effective_manifest.sha256:
+                                raise _RuntimeArtifactManifestBusyError
+                            admission_plan = pending_plan
+                            _record_runtime_admission_refresh_plan(attempt, admission_plan)
+                            admission_plan_recorded = True
+
+                    if admission_plan_recorded:
+                        # A borrower owns no replay-safe PATCH provenance until
+                        # its copied plan and outbox deferral commit together.
+                        await self._defer_runtime_admission(
+                            session,
+                            event,
+                            durable=durable_runtime_admission_defer,
+                            commit_changes=True,
+                        )
+
+                    if admission_plan is None:
+                        try:
+                            preflight = await preflight_container_group_runtime_refresh(
+                                deployment,
+                                self.salad_client,
+                            )
+                        except SaladRuntimeAdmissionUnavailableError:
+                            logger.info(
+                                "salad_runtime_refresh_preflight_unavailable",
+                                salad_deployment_id=str(deployment.id),
+                                generation_attempt_id=str(event.aggregate_id),
+                            )
+                            await self._defer_runtime_admission(
+                                session,
+                                event,
+                                durable=durable_runtime_admission_defer,
+                                commit_changes=False,
+                            )
+                        admission_plan = _RuntimeAdmissionRefreshPlan(
+                            provider_group_version_before_refresh=preflight.version,
+                            artifact_manifest_sha256=effective_manifest.sha256,
+                            rollout_id=uuid4().hex,
+                        )
+                        _record_runtime_admission_refresh_plan(attempt, admission_plan)
+                        deployment.ready_replicas = 0
+                        deployment.reconcile_after = datetime.now(UTC)
+                        logger.info(
+                            "salad_runtime_refresh_planned_at_work_boundary",
+                            salad_deployment_id=str(deployment.id),
+                            generation_attempt_id=str(event.aggregate_id),
+                            provider_group_version_before_refresh=(
+                                admission_plan.provider_group_version_before_refresh
+                            ),
+                            runtime_admission_id=admission_plan.rollout_id,
+                            effective_min_replicas=1,
+                        )
+                        await self._defer_runtime_admission(
+                            session,
+                            event,
+                            durable=durable_runtime_admission_defer,
+                            commit_changes=True,
+                        )
+
+                    assert admission_plan is not None
+
                     logger.info(
                         "salad_runtime_refresh_at_work_boundary",
                         salad_deployment_id=str(deployment.id),
                         generation_attempt_id=str(event.aggregate_id),
+                        runtime_admission_id=admission_plan.rollout_id,
                     )
-                    refreshed = await refresh_container_group_runtime(
-                        deployment,
-                        self.salad_client,
-                        self.secret_resolver,
-                        environment_overrides=self._manifest_environment(effective_manifest),
-                    )
-                    cold_queue_admission_required = refreshed.status.strip().lower() == "stopped"
+                    try:
+                        refreshed = await refresh_container_group_runtime(
+                            deployment,
+                            self.salad_client,
+                            self.secret_resolver,
+                            environment_overrides=self._manifest_environment(
+                                effective_manifest,
+                                runtime_admission_id=admission_plan.rollout_id,
+                            ),
+                            expected_provider_version=(
+                                admission_plan.provider_group_version_before_refresh
+                            ),
+                            runtime_admission_id=admission_plan.rollout_id,
+                            effective_min_replicas=1,
+                        )
+                    except SaladRuntimeAdmissionUnavailableError:
+                        logger.info(
+                            "salad_runtime_refresh_observation_unavailable",
+                            salad_deployment_id=str(deployment.id),
+                            generation_attempt_id=str(event.aggregate_id),
+                            runtime_admission_id=admission_plan.rollout_id,
+                        )
+                        await self._defer_runtime_admission(
+                            session,
+                            event,
+                            durable=durable_runtime_admission_defer,
+                            commit_changes=admission_plan_recorded,
+                        )
                     deployment.runtime_artifact_manifest_sha256 = effective_manifest.sha256
                     deployment.runtime_managed_lora_sha256s = sorted(
                         effective_manifest.managed_lora_sha256s
+                    )
+                    admission_target = _RuntimeAdmissionTarget(
+                        provider_group_version=refreshed.version,
+                        artifact_manifest_sha256=effective_manifest.sha256,
+                        rollout_id=admission_plan.rollout_id,
+                    )
+                    _record_runtime_admission_target(attempt, admission_target)
+                    if warm_lease is not None:
+                        if (
+                            warm_lease.state == ExperimentWarmLeaseState.STARTING
+                            and warm_lease.provider_version is None
+                        ):
+                            mark_experiment_warm_runtime_refreshed_locked(
+                                session,
+                                warm_lease,
+                                provider_version=refreshed.version,
+                                actor=self._worker_id("submit"),
+                            )
+                        else:
+                            warm_lease.provider_version = refreshed.version
+                            warm_lease.lock_version += 1
+                        if warm_lease.state == ExperimentWarmLeaseState.ACTIVE:
+                            touch_experiment_warm_lease_locked(
+                                session,
+                                warm_lease,
+                                actor=self._worker_id("submit"),
+                            )
+                    deployment.ready_replicas = 0
+                    deployment.reconcile_after = datetime.now(UTC)
+                    # Persist the marker-bound provider version as a provisional
+                    # target before queue-floor/start observation. The pending
+                    # target is durable min=1 demand; its next claim re-ensures
+                    # admission and records any same-rollout version advance
+                    # before exact readiness can authorize a provider POST.
+                    await self._defer_runtime_admission(
+                        session,
+                        event,
+                        durable=durable_runtime_admission_defer,
+                        commit_changes=True,
                     )
                 elif not runtime_matches:
                     raise _RuntimeArtifactManifestBusyError
@@ -1923,19 +2584,10 @@ class ControllerWorkloads:
                         generation_attempt_id=str(event.aggregate_id),
                         active_generation_attempt_id=str(active_attempt_id),
                     )
-            if cold_queue_admission_required:
-                effective_min_replicas = await effective_worker_min_replicas(
-                    session,
-                    salad_deployment_id=deployment.id,
-                    now=datetime.now(UTC),
-                )
-                if effective_min_replicas != 1:
-                    raise RuntimeError("durable Salad queue admission demand is unavailable")
-                await ensure_container_group_queue_admission(
-                    deployment,
-                    self.salad_client,
-                    effective_min_replicas=effective_min_replicas,
-                )
+            if admission_target is None:
+                raise RuntimeError("generation attempt runtime admission is unavailable")
+            if admission_target.worker_instance_id is None:
+                raise RuntimeError("generation attempt runtime instance admission is unavailable")
             input_provider = SaladWorkerJobInputProvider(
                 session=session,
                 store=self.object_store,
@@ -1943,6 +2595,8 @@ class ControllerWorkloads:
                 signing_private_key=signing_private_key,
                 artifact_manifest=effective_manifest.manifest,
                 artifact_manifest_sha256=effective_manifest.sha256,
+                runtime_admission_id=admission_target.rollout_id,
+                runtime_worker_instance_id=admission_target.worker_instance_id,
                 signature_ttl_seconds=self.settings.worker_signature_ttl_seconds,
                 upload_grant_ttl_seconds=self.settings.worker_upload_grant_ttl_seconds,
                 max_upload_bytes=self.settings.storage_max_image_bytes,
@@ -1956,6 +2610,38 @@ class ControllerWorkloads:
                 reservation_microusd=deployment.max_hourly_cost_microusd,
                 provider_post_started=progress.mark_provider_post_started,
             )
+
+    async def _defer_runtime_admission(
+        self,
+        session: AsyncSession,
+        event: ClaimedOutboxEvent,
+        *,
+        durable: bool,
+        commit_changes: bool,
+    ) -> NoReturn:
+        if durable:
+            # The event is uniquely leased by this submit worker. Deferring it
+            # in the same transaction closes the process-exit window between
+            # persisting the exact rollout target and releasing the claim.
+            await defer_unstarted_outbox_event(
+                session,
+                event_id=event.id,
+                worker_id=self._worker_id("submit"),
+                retry_not_before=(
+                    datetime.now(UTC)
+                    + timedelta(
+                        seconds=min(
+                            5,
+                            max(1, self.settings.background_retry_delay_seconds),
+                        )
+                    )
+                ),
+                reason_code="worker_runtime_admission_pending",
+            )
+            raise _RuntimeAdmissionDeferredError
+        if commit_changes:
+            await session.commit()
+        raise _RuntimeAdmissionPendingError
 
     async def _pending_generation_stop_release_ids(
         self,
@@ -2078,6 +2764,40 @@ class ControllerWorkloads:
                 event_id=event.id,
                 worker_id=worker_id,
             )
+
+    async def _defer_staged_runtime_admission_if_safe(
+        self,
+        event: ClaimedOutboxEvent,
+        *,
+        worker_id: str,
+        reason_code: str,
+    ) -> bool:
+        try:
+            async with self.sessions() as session:
+                deferred = await defer_staged_runtime_admission_outbox_event(
+                    session,
+                    event_id=event.id,
+                    worker_id=worker_id,
+                    retry_not_before=(
+                        datetime.now(UTC)
+                        + timedelta(
+                            seconds=min(
+                                5,
+                                max(1, self.settings.background_retry_delay_seconds),
+                            )
+                        )
+                    ),
+                    reason_code=reason_code,
+                )
+            return deferred is not None
+        except OutboxError as error:
+            logger.warning(
+                "controller_runtime_admission_interrupt_defer_skipped",
+                controller_instance_id=self.instance_id,
+                outbox_event_id=str(event.id),
+                error_type=type(error).__name__,
+            )
+            return False
 
     async def _disable_gpu_allocations(
         self,

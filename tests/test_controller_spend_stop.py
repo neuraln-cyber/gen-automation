@@ -42,6 +42,7 @@ from gen_automation.domain.enums import (
     SaladDeploymentState,
     SpendEntryType,
 )
+from gen_automation.domain.runtime_bindings import WORKER_RUNTIME_ADMISSION_ID_BINDING
 from gen_automation.domain.signing import encode_base64url
 from gen_automation.gpu_worker.artifacts import ArtifactManifest
 from gen_automation.integrations.salad.client import SaladClient
@@ -69,7 +70,11 @@ from gen_automation.services.salad import (
     SubmissionResult,
     prepare_generation_attempt,
 )
-from gen_automation.services.salad_deployments import deterministic_provider_name
+from gen_automation.services.salad_deployments import (
+    deterministic_provider_name,
+    effective_worker_min_replicas,
+    reconcile_deployment,
+)
 from gen_automation.storage.base import ObjectStore
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
@@ -80,6 +85,7 @@ RUNTIME_MANIFEST = '{"artifacts":[],"manifest_sha256":"' + ("0" * 64) + '"}'
 QUEUE_ID = UUID("3d59eff3-8f46-4743-ab42-c5bdd56a04ca")
 GROUP_ID = UUID("e1f35986-d00a-44d0-a0c6-59dda919b07b")
 TEST_CHECKPOINT_SHA256 = "9" * 64
+RUNTIME_ADMISSION_ID = "f" * 32
 
 
 def _runtime_job_parameters(seed: int, loras: list[dict[str, str]]) -> dict[str, object]:
@@ -133,11 +139,35 @@ async def _selected_effective_artifact_manifest(
     )
 
 
+async def _runtime_admission_ready(*args: object, **kwargs: object) -> str:
+    del args, kwargs
+    return "instance-creator-1"
+
+
+async def _runtime_refresh_preflight(
+    deployment: SaladDeployment,
+    client: object,
+) -> SaladContainerGroup:
+    del client
+    return _group(deployment.container_group_name, deployment.queue_name)
+
+
+@pytest.fixture(autouse=True)
+def _stable_runtime_refresh_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        controller_runtime,
+        "preflight_container_group_runtime_refresh",
+        _runtime_refresh_preflight,
+    )
+
+
 class DeploymentOnlyClient:
     def __init__(self, *, queue: SaladQueue, group: SaladContainerGroup) -> None:
         self.queue = queue
         self.group = group
         self.stop_names: list[str] = []
+        self.start_names: list[str] = []
+        self.updated_group_patches: list[Mapping[str, JSONValue]] = []
         self.create_calls = 0
 
     async def create_queue(
@@ -191,6 +221,18 @@ class DeploymentOnlyClient:
 
     async def stop_container_group(self, container_group_name: str) -> None:
         self.stop_names.append(container_group_name)
+
+    async def start_container_group(self, container_group_name: str) -> None:
+        self.start_names.append(container_group_name)
+
+    async def update_container_group(
+        self,
+        container_group_name: str,
+        patch: Mapping[str, JSONValue],
+    ) -> SaladContainerGroup:
+        assert container_group_name == self.group.name
+        self.updated_group_patches.append(patch)
+        return self.group
 
 
 @dataclass(frozen=True)
@@ -600,6 +642,74 @@ async def _seed_submission_database(database: Database) -> SubmissionContext:
 
 
 @pytest.mark.asyncio
+async def test_staged_runtime_target_keeps_durable_worker_demand_until_superseded(
+    tmp_path: Path,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'target-demand.db').as_posix()}")
+    await database.create_schema()
+    try:
+        context = await _seed_submission_database(database)
+        async with database.sessions() as session:
+            attempt = await session.get(GenerationAttempt, context.attempt_id)
+            event = await session.scalar(
+                select(OutboxEvent).where(OutboxEvent.aggregate_id == context.attempt_id)
+            )
+            deployment = await session.scalar(select(SaladDeployment))
+            release = await session.scalar(select(Release))
+            assert attempt is not None
+            assert event is not None
+            assert deployment is not None
+            assert release is not None
+            attempt.request_metadata = {
+                **attempt.request_metadata,
+                "runtime_admission": {
+                    "version": "v1",
+                    "provider_group_version": 2,
+                    "artifact_manifest_sha256": "0" * 64,
+                    "rollout_id": RUNTIME_ADMISSION_ID,
+                    "worker_instance_id": None,
+                },
+            }
+            await session.flush()
+
+            assert event.status == OutboxStatus.PENDING
+            assert (
+                await effective_worker_min_replicas(
+                    session,
+                    salad_deployment_id=deployment.id,
+                    now=NOW,
+                )
+                == 1
+            )
+
+            event.status = OutboxStatus.PROCESSING
+            event.lease_owner = "controller-target-demand-test"
+            event.lease_expires_at = NOW - timedelta(seconds=1)
+            await session.flush()
+            assert (
+                await effective_worker_min_replicas(
+                    session,
+                    salad_deployment_id=deployment.id,
+                    now=NOW,
+                )
+                == 1
+            )
+
+            release.phase = ReleasePhase.CANCELLED
+            await session.flush()
+            assert (
+                await effective_worker_min_replicas(
+                    session,
+                    salad_deployment_id=deployment.id,
+                    now=NOW,
+                )
+                == 0
+            )
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
 async def test_budget_block_defers_without_consuming_outbox_attempt(tmp_path: Path) -> None:
     database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'budget-defer.db').as_posix()}")
     await database.create_schema()
@@ -762,8 +872,9 @@ async def test_budget_preflight_blocks_runtime_then_reopens_the_cold_queue_path(
             resolver: object,
             *,
             environment_overrides: Mapping[str, str] | None = None,
+            **runtime_refresh: object,
         ) -> SaladContainerGroup:
-            del client, resolver, environment_overrides
+            del client, resolver, environment_overrides, runtime_refresh
             group = _group(deployment.container_group_name, deployment.queue_name)
             return replace(
                 group,
@@ -782,8 +893,9 @@ async def test_budget_preflight_blocks_runtime_then_reopens_the_cold_queue_path(
             client: object,
             *,
             effective_min_replicas: int,
+            **runtime_identity: object,
         ) -> SaladContainerGroup:
-            del client
+            del client, runtime_identity
             admissions.append((deployment.id, effective_min_replicas))
             return _group(deployment.container_group_name, deployment.queue_name)
 
@@ -826,9 +938,22 @@ async def test_budget_preflight_blocks_runtime_then_reopens_the_cold_queue_path(
             )
             assert len(reclaimed) == 1
 
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(reclaimed[0], progress=_SubmissionProgress())
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(reclaimed[0], progress=_SubmissionProgress())
+        assert admissions == []
+        assert submissions == []
+        monkeypatch.setattr(
+            controller_runtime,
+            "container_group_runtime_admission_ready",
+            _runtime_admission_ready,
+        )
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(reclaimed[0], progress=_SubmissionProgress())
         resumed = await workloads._submit_event(reclaimed[0], progress=_SubmissionProgress())
         assert resumed.disposition == SubmissionDisposition.SUBMITTED
-        assert admissions and admissions[0][1] == 1
+        assert admissions and all(effective_min == 1 for _, effective_min in admissions)
         assert submissions == [context.attempt_id]
     finally:
         await database.dispose()
@@ -963,7 +1088,7 @@ async def test_terminal_markerless_submitting_orphan_is_fenced_before_runtime_re
 
 
 @pytest.mark.asyncio
-async def test_submit_reuses_active_runtime_then_refreshes_same_manifest_at_idle_boundary(
+async def test_submit_borrows_exact_active_runtime_without_refresh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1000,8 +1125,17 @@ async def test_submit_reuses_active_runtime_then_refreshes_same_manifest_at_idle
             )
             first_job.state = GenerationState.SUBMITTING
             first_attempt.state = GenerationAttemptState.SUBMITTING
+            first_attempt.request_metadata = {
+                **first_attempt.request_metadata,
+                "runtime_admission": {
+                    "version": "v1",
+                    "provider_group_version": 1,
+                    "artifact_manifest_sha256": "0" * 64,
+                    "rollout_id": RUNTIME_ADMISSION_ID,
+                    "worker_instance_id": "instance-creator-1",
+                },
+            }
             await session.commit()
-            deployment_id = deployment.id
 
         refreshes: list[UUID] = []
         submissions: list[UUID] = []
@@ -1012,8 +1146,9 @@ async def test_submit_reuses_active_runtime_then_refreshes_same_manifest_at_idle
             resolver: object,
             *,
             environment_overrides: Mapping[str, str] | None = None,
+            **runtime_refresh: object,
         ) -> SaladContainerGroup:
-            del client, resolver, environment_overrides
+            del client, resolver, environment_overrides, runtime_refresh
             refreshes.append(deployment.id)
             return _group(deployment.container_group_name, deployment.queue_name)
 
@@ -1033,15 +1168,36 @@ async def test_submit_reuses_active_runtime_then_refreshes_same_manifest_at_idle
                 provider_external_id="provider-job",
             )
 
+        async def fake_admission(
+            deployment: SaladDeployment,
+            client: object,
+            *,
+            effective_min_replicas: int,
+            **runtime_identity: object,
+        ) -> SaladContainerGroup:
+            del client, runtime_identity
+            assert effective_min_replicas == 1
+            return _group(deployment.container_group_name, deployment.queue_name)
+
         monkeypatch.setattr(
             controller_runtime,
             "refresh_container_group_runtime",
             fake_refresh,
         )
         monkeypatch.setattr(
+            controller_runtime,
+            "ensure_container_group_queue_admission",
+            fake_admission,
+        )
+        monkeypatch.setattr(
             ControllerWorkloads,
             "_effective_artifact_manifest",
             _empty_effective_artifact_manifest,
+        )
+        monkeypatch.setattr(
+            controller_runtime,
+            "container_group_runtime_admission_ready",
+            _runtime_admission_ready,
         )
         monkeypatch.setattr(controller_runtime, "submit_prepared_attempt", fake_submit)
         workloads = ControllerWorkloads(
@@ -1072,6 +1228,8 @@ async def test_submit_reuses_active_runtime_then_refreshes_same_manifest_at_idle
         # A durable provider attempt on this deployment means the model-bearing
         # worker is already warming/running; changing its environment here would
         # create a new Salad version and restart it between ordered batches.
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(event, progress=_SubmissionProgress())
         await workloads._submit_event(event, progress=_SubmissionProgress())
         assert refreshes == []
         assert submissions == [second.generation_attempt_id]
@@ -1087,14 +1245,241 @@ async def test_submit_reuses_active_runtime_then_refreshes_same_manifest_at_idle
             first_job.state = GenerationState.CANCELLED
             await session.commit()
 
-        # With no other active provider attempt, this is the idle-to-active
-        # boundary where refreshing short-lived bootstrap credentials is safe.
+        # This exact attempt retains its signed rollout/instance provenance even
+        # after the sibling becomes terminal; it must not repatch on replay.
         await workloads._submit_event(event, progress=_SubmissionProgress())
-        assert refreshes == [deployment_id]
+        assert refreshes == []
         assert submissions == [
             second.generation_attempt_id,
             second.generation_attempt_id,
         ]
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_three_inflight_attempts_share_one_exact_runtime_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(
+        f"sqlite+aiosqlite:///{(tmp_path / 'three-inflight-runtime.db').as_posix()}"
+    )
+    await database.create_schema()
+    try:
+        first = await _seed_submission_database(database)
+        async with database.sessions() as session:
+            deployment = await session.scalar(select(SaladDeployment))
+            first_job = await session.get(GenerationJob, first.job_id)
+            assert deployment is not None
+            assert first_job is not None
+            prepared = []
+            for index in (2, 3):
+                parameters = _runtime_job_parameters(index, [])
+                job = GenerationJob(
+                    release_version_id=first_job.release_version_id,
+                    logical_key=str(index) * 64,
+                    parameters=parameters,
+                    parameters_sha256=canonical_sha256(parameters),
+                    provider="salad",
+                    state=GenerationState.QUEUED,
+                    expected_output_count=1,
+                )
+                session.add(job)
+                await session.flush()
+                prepared.append(
+                    await prepare_generation_attempt(
+                        session,
+                        generation_job_id=job.id,
+                        salad_deployment_id=deployment.id,
+                        idempotency_key=f"three-inflight-{index}",
+                        now=NOW,
+                    )
+                )
+            await session.commit()
+            deployment_id = deployment.id
+
+        refreshes: list[UUID] = []
+        submissions: list[UUID] = []
+        readiness_checks: list[tuple[int, str]] = []
+        admissions: list[tuple[str, str]] = []
+
+        async def fake_refresh(
+            deployment: SaladDeployment,
+            client: object,
+            resolver: object,
+            *,
+            environment_overrides: Mapping[str, str] | None = None,
+            **runtime_refresh: object,
+        ) -> SaladContainerGroup:
+            del client, resolver, environment_overrides, runtime_refresh
+            refreshes.append(deployment.id)
+            return replace(
+                _group(deployment.container_group_name, deployment.queue_name),
+                version=6,
+            )
+
+        async def fake_admission(
+            deployment: SaladDeployment,
+            client: object,
+            *,
+            effective_min_replicas: int,
+            artifact_manifest_sha256: str | None = None,
+            runtime_admission_id: str | None = None,
+        ) -> SaladContainerGroup:
+            del client
+            assert effective_min_replicas == 1
+            assert artifact_manifest_sha256 == "0" * 64
+            assert runtime_admission_id is not None
+            admissions.append((artifact_manifest_sha256, runtime_admission_id))
+            return replace(
+                _group(deployment.container_group_name, deployment.queue_name),
+                version=6,
+            )
+
+        async def runtime_ready(
+            deployment: SaladDeployment,
+            client: object,
+            *,
+            provider_version: int,
+            artifact_manifest_sha256: str,
+            runtime_admission_id: str,
+        ) -> str:
+            del deployment, client
+            assert len(runtime_admission_id) == 32
+            readiness_checks.append((provider_version, artifact_manifest_sha256))
+            return "instance-creator-6"
+
+        async def fake_submit(
+            session: AsyncSession,
+            *args: object,
+            generation_attempt_id: UUID,
+            **kwargs: object,
+        ) -> SubmissionResult:
+            del args, kwargs
+            # Production commits the adopted target with the durable
+            # SUBMITTING marker before its provider POST.
+            await session.commit()
+            submissions.append(generation_attempt_id)
+            return SubmissionResult(
+                generation_attempt_id=generation_attempt_id,
+                attempt_state=GenerationAttemptState.CREATED,
+                generation_job_state=GenerationState.CLAIMED,
+                disposition=SubmissionDisposition.SUBMITTED,
+                mutation_effect=MutationEffect.CONFIRMED,
+                provider_external_id="provider-job",
+            )
+
+        monkeypatch.setattr(
+            ControllerWorkloads,
+            "_effective_artifact_manifest",
+            _empty_effective_artifact_manifest,
+        )
+        monkeypatch.setattr(controller_runtime, "refresh_container_group_runtime", fake_refresh)
+        monkeypatch.setattr(
+            controller_runtime,
+            "ensure_container_group_queue_admission",
+            fake_admission,
+        )
+        monkeypatch.setattr(
+            controller_runtime,
+            "container_group_runtime_admission_ready",
+            runtime_ready,
+        )
+        monkeypatch.setattr(controller_runtime, "submit_prepared_attempt", fake_submit)
+        workloads = ControllerWorkloads(
+            settings=Settings(
+                worker_signing_key_id="worker-key-1",
+                worker_signing_private_key=WORKER_SIGNING_PRIVATE_KEY,
+            ),
+            sessions=database.sessions,
+            instance_id="controller-three-inflight-test",
+            salad_client=cast(SaladClient, object()),
+            object_store=cast(ObjectStore, object()),
+        )
+
+        attempt_ids = [
+            first.attempt_id,
+            prepared[0].generation_attempt_id,
+            prepared[1].generation_attempt_id,
+        ]
+        outbox_ids = []
+        async with database.sessions() as session:
+            for attempt_id in attempt_ids:
+                outbox = await session.scalar(
+                    select(OutboxEvent).where(OutboxEvent.aggregate_id == attempt_id)
+                )
+                assert outbox is not None
+                outbox_ids.append(outbox.id)
+
+        def claimed_event(index: int) -> ClaimedOutboxEvent:
+            attempt_id = attempt_ids[index]
+            return ClaimedOutboxEvent(
+                id=outbox_ids[index],
+                topic=SALAD_JOB_SUBMIT_TOPIC,
+                dedupe_key=f"{SALAD_JOB_SUBMIT_TOPIC}:{attempt_id}",
+                correlation_id=str(attempt_id),
+                aggregate_type=GENERATION_ATTEMPT_AGGREGATE,
+                aggregate_id=attempt_id,
+                payload={"generation_attempt_id": str(attempt_id)},
+                attempt=1,
+                max_attempts=10,
+                lease_expires_at=NOW + timedelta(minutes=5),
+            )
+
+        # The first attempt creates exactly one runtime version and stages v6.
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(claimed_event(0), progress=_SubmissionProgress())
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(claimed_event(0), progress=_SubmissionProgress())
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(claimed_event(0), progress=_SubmissionProgress())
+        await workloads._submit_event(claimed_event(0), progress=_SubmissionProgress())
+        assert refreshes == [deployment_id]
+
+        # Keep each submitted attempt active while the next one is admitted.
+        for index in (0, 1):
+            async with database.sessions() as session:
+                attempt = await session.get(GenerationAttempt, attempt_ids[index])
+                job = await session.get(
+                    GenerationJob,
+                    first.job_id if index == 0 else prepared[0].generation_job_id,
+                )
+                assert attempt is not None
+                assert job is not None
+                attempt.state = GenerationAttemptState.RUNNING
+                attempt.provider_external_id = f"provider-job-{index}"
+                job.state = GenerationState.RUNNING
+                await session.commit()
+            with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+                await workloads._submit_event(
+                    claimed_event(index + 1),
+                    progress=_SubmissionProgress(),
+                )
+            await workloads._submit_event(claimed_event(index + 1), progress=_SubmissionProgress())
+
+        assert refreshes == [deployment_id]
+        assert submissions == attempt_ids
+        assert readiness_checks == [(6, "0" * 64)] * 4
+        assert len(admissions) == 4
+        assert len({rollout_id for _, rollout_id in admissions}) == 1
+        async with database.sessions() as session:
+            attempts = tuple(
+                (
+                    await session.scalars(
+                        select(GenerationAttempt).where(GenerationAttempt.id.in_(attempt_ids))
+                    )
+                ).all()
+            )
+            assert len(attempts) == 3
+            assert {
+                (
+                    attempt.request_metadata["runtime_admission"]["provider_group_version"],
+                    attempt.request_metadata["runtime_admission"]["artifact_manifest_sha256"],
+                    attempt.request_metadata["runtime_admission"]["worker_instance_id"],
+                )
+                for attempt in attempts
+            } == {(6, "0" * 64, "instance-creator-6")}
     finally:
         await database.dispose()
 
@@ -1125,7 +1510,9 @@ async def test_cold_submit_uses_claimed_outbox_demand_before_queue_admission(
             await session.commit()
             outbox_id = event.id
 
+        refreshes: list[UUID] = []
         admissions: list[tuple[UUID, int]] = []
+        readiness_checks: list[tuple[int, str]] = []
         submissions: list[UUID] = []
 
         async def fake_refresh(
@@ -1134,11 +1521,14 @@ async def test_cold_submit_uses_claimed_outbox_demand_before_queue_admission(
             resolver: object,
             *,
             environment_overrides: Mapping[str, str] | None = None,
+            **runtime_refresh: object,
         ) -> SaladContainerGroup:
-            del client, resolver, environment_overrides
+            del client, resolver, environment_overrides, runtime_refresh
+            refreshes.append(deployment.id)
             group = _group(deployment.container_group_name, deployment.queue_name)
             return replace(
                 group,
+                version=7,
                 current_state=replace(
                     group.current_state,
                     status="stopped",
@@ -1154,8 +1544,9 @@ async def test_cold_submit_uses_claimed_outbox_demand_before_queue_admission(
             client: object,
             *,
             effective_min_replicas: int,
+            **runtime_identity: object,
         ) -> SaladContainerGroup:
-            del client
+            del client, runtime_identity
             admissions.append((deployment.id, effective_min_replicas))
             group = _group(deployment.container_group_name, deployment.queue_name)
             # A provider-accepted start can still read back as stopped until
@@ -1163,6 +1554,10 @@ async def test_cold_submit_uses_claimed_outbox_demand_before_queue_admission(
             # wait for image download or worker attachment.
             return replace(
                 group,
+                # Queue-admission autoscaler convergence may advance the
+                # provider version before start is accepted. Persist this
+                # final exact readback, not the preceding runtime-PATCH version.
+                version=8,
                 current_state=replace(
                     group.current_state,
                     status="stopped",
@@ -1188,6 +1583,19 @@ async def test_cold_submit_uses_claimed_outbox_demand_before_queue_admission(
                 mutation_effect=MutationEffect.CONFIRMED,
                 provider_external_id="provider-job",
             )
+
+        async def exact_runtime_ready(
+            deployment: SaladDeployment,
+            client: object,
+            *,
+            provider_version: int,
+            artifact_manifest_sha256: str,
+            runtime_admission_id: str,
+        ) -> str:
+            del deployment, client
+            assert len(runtime_admission_id) == 32
+            readiness_checks.append((provider_version, artifact_manifest_sha256))
+            return "instance-creator-8"
 
         monkeypatch.setattr(
             controller_runtime,
@@ -1228,11 +1636,674 @@ async def test_cold_submit_uses_claimed_outbox_demand_before_queue_admission(
             lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
         )
 
-        await workloads._submit_event(claimed, progress=_SubmissionProgress())
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(claimed, progress=_SubmissionProgress())
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(claimed, progress=_SubmissionProgress())
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(claimed, progress=_SubmissionProgress())
 
         assert len(admissions) == 1
         assert admissions[0][1] == 1
+        assert refreshes
+        assert submissions == []
+        async with database.sessions() as session:
+            attempt = await session.get(GenerationAttempt, context.attempt_id)
+            assert attempt is not None
+            assert attempt.request_metadata["runtime_admission"] == {
+                "version": "v1",
+                "provider_group_version": 8,
+                "artifact_manifest_sha256": "0" * 64,
+                "rollout_id": attempt.request_metadata["runtime_admission"]["rollout_id"],
+                "worker_instance_id": None,
+            }
+        monkeypatch.setattr(
+            controller_runtime,
+            "container_group_runtime_admission_ready",
+            exact_runtime_ready,
+        )
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(claimed, progress=_SubmissionProgress())
+        await workloads._submit_event(claimed, progress=_SubmissionProgress())
+        assert refreshes == [admissions[0][0]]
+        assert admissions == [(admissions[0][0], 1)] * 3
+        assert readiness_checks == [(8, "0" * 64)] * 2
         assert submissions == [context.attempt_id]
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_rollout_is_staged_until_the_old_worker_is_gone_and_shared(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'staged-runtime.db').as_posix()}")
+    await database.create_schema()
+    try:
+        first = await _seed_submission_database(database)
+        lease_expires_at = datetime.now(UTC) + timedelta(minutes=5)
+        async with database.sessions() as session:
+            deployment = await session.scalar(select(SaladDeployment))
+            first_job = await session.get(GenerationJob, first.job_id)
+            first_outbox = await session.scalar(
+                select(OutboxEvent).where(OutboxEvent.aggregate_id == first.attempt_id)
+            )
+            release = await session.scalar(select(Release))
+            assert deployment is not None
+            assert first_job is not None
+            assert first_outbox is not None
+            assert release is not None
+            release.phase = ReleasePhase.GENERATING
+            first_outbox.status = OutboxStatus.PROCESSING
+            first_outbox.attempts = 1
+            first_outbox.lease_owner = "controller-submit-first"
+            first_outbox.lease_expires_at = lease_expires_at
+
+            second_parameters = _runtime_job_parameters(2, [])
+            second_job = GenerationJob(
+                release_version_id=first_job.release_version_id,
+                logical_key="f" * 64,
+                parameters=second_parameters,
+                parameters_sha256=canonical_sha256(second_parameters),
+                provider="salad",
+                state=GenerationState.QUEUED,
+                expected_output_count=1,
+            )
+            session.add(second_job)
+            await session.flush()
+            second = await prepare_generation_attempt(
+                session,
+                generation_job_id=second_job.id,
+                salad_deployment_id=deployment.id,
+                idempotency_key="staged-runtime-second",
+                now=NOW,
+            )
+            second_outbox = await session.get(OutboxEvent, second.outbox_event_id)
+            assert second_outbox is not None
+            second_outbox.status = OutboxStatus.PROCESSING
+            second_outbox.attempts = 1
+            second_outbox.lease_owner = "controller-submit-second"
+            second_outbox.lease_expires_at = lease_expires_at
+            await session.commit()
+            deployment_id = deployment.id
+
+        refreshes: list[UUID] = []
+        readiness_checks: list[tuple[int, str]] = []
+        submissions: list[UUID] = []
+        exact_worker_ready = False
+
+        async def fake_refresh(
+            deployment: SaladDeployment,
+            client: object,
+            resolver: object,
+            *,
+            environment_overrides: Mapping[str, str] | None = None,
+            **runtime_refresh: object,
+        ) -> SaladContainerGroup:
+            del client, resolver, environment_overrides, runtime_refresh
+            refreshes.append(deployment.id)
+            return replace(
+                _group(deployment.container_group_name, deployment.queue_name),
+                version=2,
+            )
+
+        async def runtime_ready(
+            deployment: SaladDeployment,
+            client: object,
+            *,
+            provider_version: int,
+            artifact_manifest_sha256: str,
+            runtime_admission_id: str,
+        ) -> str | None:
+            del deployment, client
+            assert len(runtime_admission_id) == 32
+            readiness_checks.append((provider_version, artifact_manifest_sha256))
+            return "instance-creator-2" if exact_worker_ready else None
+
+        async def fake_admission(
+            deployment: SaladDeployment,
+            client: object,
+            *,
+            effective_min_replicas: int,
+            **runtime_identity: object,
+        ) -> SaladContainerGroup:
+            del client, runtime_identity
+            assert effective_min_replicas == 1
+            return replace(
+                _group(deployment.container_group_name, deployment.queue_name),
+                version=2,
+            )
+
+        async def fake_submit(
+            *args: object,
+            generation_attempt_id: UUID,
+            **kwargs: object,
+        ) -> SubmissionResult:
+            del args, kwargs
+            submissions.append(generation_attempt_id)
+            return SubmissionResult(
+                generation_attempt_id=generation_attempt_id,
+                attempt_state=GenerationAttemptState.CREATED,
+                generation_job_state=GenerationState.CLAIMED,
+                disposition=SubmissionDisposition.SUBMITTED,
+                mutation_effect=MutationEffect.CONFIRMED,
+                provider_external_id="provider-job",
+            )
+
+        monkeypatch.setattr(
+            ControllerWorkloads,
+            "_effective_artifact_manifest",
+            _empty_effective_artifact_manifest,
+        )
+        monkeypatch.setattr(controller_runtime, "refresh_container_group_runtime", fake_refresh)
+        monkeypatch.setattr(
+            controller_runtime,
+            "container_group_runtime_admission_ready",
+            runtime_ready,
+        )
+        monkeypatch.setattr(
+            controller_runtime,
+            "ensure_container_group_queue_admission",
+            fake_admission,
+        )
+        monkeypatch.setattr(controller_runtime, "submit_prepared_attempt", fake_submit)
+        workloads = ControllerWorkloads(
+            settings=Settings(
+                worker_signing_key_id="worker-key-1",
+                worker_signing_private_key=WORKER_SIGNING_PRIVATE_KEY,
+            ),
+            sessions=database.sessions,
+            instance_id="controller-staged-runtime-test",
+            salad_client=cast(SaladClient, object()),
+            object_store=cast(ObjectStore, object()),
+        )
+        first_event = ClaimedOutboxEvent(
+            id=first_outbox.id,
+            topic=SALAD_JOB_SUBMIT_TOPIC,
+            dedupe_key=first_outbox.dedupe_key,
+            correlation_id=first_outbox.correlation_id,
+            aggregate_type=GENERATION_ATTEMPT_AGGREGATE,
+            aggregate_id=first.attempt_id,
+            payload=dict(first_outbox.payload),
+            attempt=1,
+            max_attempts=first_outbox.max_attempts,
+            lease_expires_at=lease_expires_at,
+        )
+        second_event = ClaimedOutboxEvent(
+            id=second.outbox_event_id,
+            topic=SALAD_JOB_SUBMIT_TOPIC,
+            dedupe_key=second_outbox.dedupe_key,
+            correlation_id=second_outbox.correlation_id,
+            aggregate_type=GENERATION_ATTEMPT_AGGREGATE,
+            aggregate_id=second.generation_attempt_id,
+            payload=dict(second_outbox.payload),
+            attempt=1,
+            max_attempts=second_outbox.max_attempts,
+            lease_expires_at=lease_expires_at,
+        )
+
+        # Claim one persists the PATCH plan; claim two applies it and durably
+        # stages v2 before any queue admission or provider job POST.
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(first_event, progress=_SubmissionProgress())
+        assert refreshes == []
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(first_event, progress=_SubmissionProgress())
+        assert refreshes == [deployment_id]
+        assert readiness_checks == []
+        assert submissions == []
+
+        # A controller can die after staging but before releasing its outbox
+        # lease. Until recovery settles that still-live aggregate, an expired
+        # PROCESSING row must continue fencing the exact target.
+        async with database.sessions() as session:
+            staged_outbox = await session.get(OutboxEvent, first_outbox.id)
+            assert staged_outbox is not None
+            staged_outbox.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+            await session.commit()
+
+        # A concurrent CREATED attempt first commits its own copy of the exact
+        # target. While an old consumer remains observable, it neither PATCHes
+        # again nor posts.
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(second_event, progress=_SubmissionProgress())
+        assert refreshes == [deployment_id]
+        assert readiness_checks == []
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(second_event, progress=_SubmissionProgress())
+        assert readiness_checks == [(2, "0" * 64)]
+        assert submissions == []
+        async with database.sessions() as session:
+            attempts = tuple(
+                (
+                    await session.scalars(
+                        select(GenerationAttempt).where(
+                            GenerationAttempt.id.in_(
+                                (first.attempt_id, second.generation_attempt_id)
+                            )
+                        )
+                    )
+                ).all()
+            )
+            assert len(attempts) == 2
+            assert {
+                attempt.request_metadata["runtime_admission"]["provider_group_version"]
+                for attempt in attempts
+            } == {2}
+
+        # Once the exact target is the sole ready consumer, only this claimed
+        # event is submitted and the staged rollout is never repeated.
+        exact_worker_ready = True
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(second_event, progress=_SubmissionProgress())
+        result = await workloads._submit_event(second_event, progress=_SubmissionProgress())
+        assert result.disposition == SubmissionDisposition.SUBMITTED
+        assert refreshes == [deployment_id]
+        assert readiness_checks == [(2, "0" * 64)] * 3
+        assert submissions == [second.generation_attempt_id]
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pending_runtime_target_ignores_stale_created_demand(tmp_path: Path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'stale-target.db').as_posix()}")
+    await database.create_schema()
+    try:
+        context = await _seed_submission_database(database)
+        excluded_attempt_id = UUID("991ae61a-6ead-42e9-be67-58a3d28f6b52")
+        async with database.sessions() as session:
+            deployment = await session.scalar(select(SaladDeployment))
+            attempt = await session.get(GenerationAttempt, context.attempt_id)
+            job = await session.get(GenerationJob, context.job_id)
+            outbox = await session.scalar(
+                select(OutboxEvent).where(OutboxEvent.aggregate_id == context.attempt_id)
+            )
+            assert deployment is not None
+            assert attempt is not None
+            assert job is not None
+            assert outbox is not None
+            attempt.request_metadata = {
+                **attempt.request_metadata,
+                "runtime_admission": {
+                    "version": "v1",
+                    "provider_group_version": 4,
+                    "artifact_manifest_sha256": "0" * 64,
+                    "rollout_id": RUNTIME_ADMISSION_ID,
+                    "worker_instance_id": None,
+                },
+            }
+            await session.commit()
+
+            target = await controller_runtime._pending_runtime_admission_target(
+                session,
+                salad_deployment_id=deployment.id,
+                excluding_attempt_id=excluded_attempt_id,
+            )
+            assert target == controller_runtime._RuntimeAdmissionTarget(
+                4,
+                "0" * 64,
+                RUNTIME_ADMISSION_ID,
+            )
+
+            outbox.status = OutboxStatus.DEAD_LETTER
+            await session.commit()
+            assert (
+                await controller_runtime._pending_runtime_admission_target(
+                    session,
+                    salad_deployment_id=deployment.id,
+                    excluding_attempt_id=excluded_attempt_id,
+                )
+                is None
+            )
+
+            outbox.status = OutboxStatus.PENDING
+            job.state = GenerationState.CANCELLED
+            await session.commit()
+            assert (
+                await controller_runtime._pending_runtime_admission_target(
+                    session,
+                    salad_deployment_id=deployment.id,
+                    excluding_attempt_id=excluded_attempt_id,
+                )
+                is None
+            )
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_transient_runtime_observation_defers_without_consuming_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(
+        f"sqlite+aiosqlite:///{(tmp_path / 'runtime-observation-defer.db').as_posix()}"
+    )
+    await database.create_schema()
+    try:
+        context = await _seed_submission_database(database)
+        refreshes: list[UUID] = []
+
+        async def fake_preflight(
+            deployment: SaladDeployment,
+            client: object,
+        ) -> SaladContainerGroup:
+            del client
+            return _group(deployment.container_group_name, deployment.queue_name)
+
+        async def fake_refresh(
+            deployment: SaladDeployment,
+            client: object,
+            resolver: object,
+            *,
+            environment_overrides: Mapping[str, str] | None = None,
+            expected_provider_version: int | None = None,
+            runtime_admission_id: str | None = None,
+            effective_min_replicas: int | None = None,
+        ) -> SaladContainerGroup:
+            del client, resolver
+            assert expected_provider_version == 1
+            assert runtime_admission_id is not None
+            assert effective_min_replicas == 1
+            assert environment_overrides is not None
+            assert (
+                environment_overrides[WORKER_RUNTIME_ADMISSION_ID_BINDING] == runtime_admission_id
+            )
+            refreshes.append(deployment.id)
+            return replace(
+                _group(deployment.container_group_name, deployment.queue_name),
+                version=5,
+            )
+
+        async def unavailable(*args: object, **kwargs: object) -> bool:
+            del args, kwargs
+            raise controller_runtime.SaladRuntimeAdmissionUnavailableError(
+                "provider readback unavailable"
+            )
+
+        async def fake_admission(
+            deployment: SaladDeployment,
+            client: object,
+            *,
+            effective_min_replicas: int,
+            **runtime_identity: object,
+        ) -> SaladContainerGroup:
+            del client, runtime_identity
+            assert effective_min_replicas == 1
+            return replace(
+                _group(deployment.container_group_name, deployment.queue_name),
+                version=5,
+            )
+
+        async def forbidden_submit(*args: object, **kwargs: object) -> SubmissionResult:
+            del args, kwargs
+            raise AssertionError("an inconclusive runtime observation must prevent POST")
+
+        monkeypatch.setattr(
+            ControllerWorkloads,
+            "_effective_artifact_manifest",
+            _empty_effective_artifact_manifest,
+        )
+        monkeypatch.setattr(
+            controller_runtime,
+            "preflight_container_group_runtime_refresh",
+            fake_preflight,
+        )
+        monkeypatch.setattr(controller_runtime, "refresh_container_group_runtime", fake_refresh)
+        monkeypatch.setattr(
+            controller_runtime,
+            "ensure_container_group_queue_admission",
+            fake_admission,
+        )
+        monkeypatch.setattr(controller_runtime, "submit_prepared_attempt", forbidden_submit)
+        workloads = ControllerWorkloads(
+            settings=Settings(
+                worker_signing_key_id="worker-key-1",
+                worker_signing_private_key=WORKER_SIGNING_PRIVATE_KEY,
+                background_retry_delay_seconds=1,
+            ).model_copy(update={"gpu_allocation_enabled": True}),
+            sessions=database.sessions,
+            instance_id="controller-runtime-observation-test",
+            salad_client=cast(SaladClient, object()),
+            object_store=cast(ObjectStore, object()),
+        )
+
+        # First claim commits the provider-version-fenced plan before any PATCH.
+        assert await workloads.submit_once() is True
+        async with database.sessions() as session:
+            event = await session.scalar(
+                select(OutboxEvent).where(OutboxEvent.aggregate_id == context.attempt_id)
+            )
+            attempt = await session.get(GenerationAttempt, context.attempt_id)
+            assert event is not None
+            assert attempt is not None
+            assert event.status == OutboxStatus.PENDING
+            assert event.attempts == 0
+            assert attempt.state == GenerationAttemptState.CREATED
+            assert "runtime_admission_refresh_plan" in attempt.request_metadata
+            event.available_at = datetime.now(UTC) - timedelta(seconds=1)
+            await session.commit()
+
+        # The second claim applies/adopts that one rollout and commits its exact
+        # target, again without consuming an outbox attempt or issuing a job POST.
+        assert await workloads.submit_once() is True
+        async with database.sessions() as session:
+            event = await session.scalar(
+                select(OutboxEvent).where(OutboxEvent.aggregate_id == context.attempt_id)
+            )
+            attempt = await session.get(GenerationAttempt, context.attempt_id)
+            assert event is not None
+            assert attempt is not None
+            assert event.status == OutboxStatus.PENDING
+            assert event.attempts == 0
+            assert attempt.request_metadata["runtime_admission"] == {
+                "version": "v1",
+                "provider_group_version": 5,
+                "artifact_manifest_sha256": "0" * 64,
+                "rollout_id": attempt.request_metadata["runtime_admission"]["rollout_id"],
+                "worker_instance_id": None,
+            }
+            assert "runtime_admission_refresh_plan" not in attempt.request_metadata
+            event.available_at = datetime.now(UTC) - timedelta(seconds=1)
+            await session.commit()
+
+        monkeypatch.setattr(
+            controller_runtime,
+            "container_group_runtime_admission_ready",
+            unavailable,
+        )
+        assert await workloads.submit_once() is True
+
+        assert len(refreshes) == 1
+        async with database.sessions() as session:
+            event = await session.scalar(
+                select(OutboxEvent).where(OutboxEvent.aggregate_id == context.attempt_id)
+            )
+            attempt = await session.get(GenerationAttempt, context.attempt_id)
+            job = await session.get(GenerationJob, context.job_id)
+            assert event is not None
+            assert attempt is not None
+            assert job is not None
+            assert event.status == OutboxStatus.PENDING
+            assert event.attempts == 0
+            assert event.last_error_code == "worker_runtime_admission_pending"
+            assert attempt.state == GenerationAttemptState.CREATED
+            assert attempt.submit_started_at is None
+            assert attempt.provider_external_id is None
+            assert job.state == GenerationState.CLAIMED
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_refresh_crash_replays_the_marked_rollout_without_repatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedControllerCrash(BaseException):
+        pass
+
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'runtime-refresh-crash.db').as_posix()}")
+    await database.create_schema()
+    try:
+        context = await _seed_submission_database(database)
+        remote_version = 1
+        remote_rollout_id: str | None = None
+        patch_count = 0
+        adoption_count = 0
+
+        async def fake_preflight(
+            deployment: SaladDeployment,
+            client: object,
+        ) -> SaladContainerGroup:
+            del client
+            return replace(
+                _group(deployment.container_group_name, deployment.queue_name),
+                version=remote_version,
+            )
+
+        async def crash_then_adopt_refresh(
+            deployment: SaladDeployment,
+            client: object,
+            resolver: object,
+            *,
+            environment_overrides: Mapping[str, str] | None = None,
+            expected_provider_version: int | None = None,
+            runtime_admission_id: str | None = None,
+            effective_min_replicas: int | None = None,
+        ) -> SaladContainerGroup:
+            nonlocal remote_version, remote_rollout_id, patch_count, adoption_count
+            del client, resolver
+            assert expected_provider_version == 1
+            assert runtime_admission_id is not None
+            assert effective_min_replicas == 1
+            assert environment_overrides is not None
+            assert (
+                environment_overrides[WORKER_RUNTIME_ADMISSION_ID_BINDING] == runtime_admission_id
+            )
+            if remote_rollout_id is None:
+                patch_count += 1
+                remote_rollout_id = runtime_admission_id
+                remote_version = 2
+                # The provider accepted the PATCH, but the SQL transaction that
+                # would replace the plan with the target never committed.
+                raise SimulatedControllerCrash
+            assert remote_rollout_id == runtime_admission_id
+            adoption_count += 1
+            return replace(
+                _group(deployment.container_group_name, deployment.queue_name),
+                version=remote_version,
+            )
+
+        async def forbidden_submit(*args: object, **kwargs: object) -> SubmissionResult:
+            del args, kwargs
+            raise AssertionError("runtime recovery must still precede the provider job POST")
+
+        monkeypatch.setattr(
+            ControllerWorkloads,
+            "_effective_artifact_manifest",
+            _empty_effective_artifact_manifest,
+        )
+        monkeypatch.setattr(
+            controller_runtime,
+            "preflight_container_group_runtime_refresh",
+            fake_preflight,
+        )
+        monkeypatch.setattr(
+            controller_runtime,
+            "refresh_container_group_runtime",
+            crash_then_adopt_refresh,
+        )
+        monkeypatch.setattr(controller_runtime, "submit_prepared_attempt", forbidden_submit)
+        workloads = ControllerWorkloads(
+            settings=Settings(
+                worker_signing_key_id="worker-key-1",
+                worker_signing_private_key=WORKER_SIGNING_PRIVATE_KEY,
+                background_retry_delay_seconds=1,
+            ).model_copy(update={"gpu_allocation_enabled": True}),
+            sessions=database.sessions,
+            instance_id="controller-runtime-crash-test",
+            salad_client=cast(SaladClient, object()),
+            object_store=cast(ObjectStore, object()),
+        )
+
+        # Claim one stores the immutable plan and releases its lease before PATCH.
+        assert await workloads.submit_once() is True
+        async with database.sessions() as session:
+            event = await session.scalar(
+                select(OutboxEvent).where(OutboxEvent.aggregate_id == context.attempt_id)
+            )
+            assert event is not None
+            event.available_at = datetime.now(UTC) - timedelta(seconds=1)
+            await session.commit()
+
+        # Claim two dies after the external PATCH. Its SQL work rolls back, so
+        # only the precommitted plan remains and the outbox lease expires.
+        with pytest.raises(SimulatedControllerCrash):
+            await workloads.submit_once()
+        async with database.sessions() as session:
+            event = await session.scalar(
+                select(OutboxEvent).where(OutboxEvent.aggregate_id == context.attempt_id)
+            )
+            attempt = await session.get(GenerationAttempt, context.attempt_id)
+            assert event is not None
+            assert attempt is not None
+            assert event.status == OutboxStatus.PROCESSING
+            assert "runtime_admission_refresh_plan" in attempt.request_metadata
+            assert "runtime_admission" not in attempt.request_metadata
+            event.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+            await session.commit()
+
+        # Deployment reconciliation can race expired-lease recovery. It must
+        # leave the already-applied marker+min=1 rollout untouched until this
+        # durable plan is adopted as an exact target.
+        async with database.sessions() as session:
+            deployment = await session.scalar(select(SaladDeployment))
+            assert deployment is not None
+            queue_name, group_name = _remote_names()
+            reconcile_client = DeploymentOnlyClient(
+                queue=_queue(queue_name),
+                group=replace(
+                    _group(group_name, queue_name),
+                    version=remote_version,
+                ),
+            )
+            reconciled = await reconcile_deployment(
+                session,
+                deployment_id=deployment.id,
+                client=cast(SaladClient, reconcile_client),
+                now=NOW + timedelta(minutes=1),
+            )
+            await session.commit()
+        assert reconciled.state == SaladDeploymentState.ACTIVE
+        assert reconcile_client.updated_group_patches == []
+        assert reconcile_client.start_names == []
+
+        # Expired-lease recovery can prove this exact plan never reached a job
+        # POST, reclaims it, and adopts the provider marker instead of PATCHing.
+        assert await workloads.submit_once() is True
+        assert patch_count == 1
+        assert adoption_count == 1
+        async with database.sessions() as session:
+            event = await session.scalar(
+                select(OutboxEvent).where(OutboxEvent.aggregate_id == context.attempt_id)
+            )
+            attempt = await session.get(GenerationAttempt, context.attempt_id)
+            assert event is not None
+            assert attempt is not None
+            assert event.status == OutboxStatus.PENDING
+            assert event.attempts == 1
+            assert attempt.state == GenerationAttemptState.CREATED
+            assert attempt.request_metadata["runtime_admission"] == {
+                "version": "v1",
+                "provider_group_version": 2,
+                "artifact_manifest_sha256": "0" * 64,
+                "rollout_id": remote_rollout_id,
+                "worker_instance_id": None,
+            }
+            assert "runtime_admission_refresh_plan" not in attempt.request_metadata
     finally:
         await database.dispose()
 
@@ -1275,8 +2346,9 @@ async def test_submit_refreshes_idle_resident_lora_superset_without_evicting_it(
             resolver: object,
             *,
             environment_overrides: Mapping[str, str] | None = None,
+            **runtime_refresh: object,
         ) -> SaladContainerGroup:
-            del client, resolver
+            del client, resolver, runtime_refresh
             refreshes.append((deployment.id, environment_overrides))
             return _group(deployment.container_group_name, deployment.queue_name)
 
@@ -1296,6 +2368,17 @@ async def test_submit_refreshes_idle_resident_lora_superset_without_evicting_it(
                 provider_external_id="provider-job",
             )
 
+        async def fake_admission(
+            deployment: SaladDeployment,
+            client: object,
+            *,
+            effective_min_replicas: int,
+            **runtime_identity: object,
+        ) -> SaladContainerGroup:
+            del client, runtime_identity
+            assert effective_min_replicas == 1
+            return _group(deployment.container_group_name, deployment.queue_name)
+
         monkeypatch.setattr(
             ControllerWorkloads,
             "_effective_artifact_manifest",
@@ -1305,6 +2388,11 @@ async def test_submit_refreshes_idle_resident_lora_superset_without_evicting_it(
             controller_runtime,
             "refresh_container_group_runtime",
             fake_refresh,
+        )
+        monkeypatch.setattr(
+            controller_runtime,
+            "ensure_container_group_queue_admission",
+            fake_admission,
         )
         monkeypatch.setattr(controller_runtime, "submit_prepared_attempt", fake_submit)
         workloads = ControllerWorkloads(
@@ -1330,18 +2418,29 @@ async def test_submit_refreshes_idle_resident_lora_superset_without_evicting_it(
             lease_expires_at=NOW + timedelta(minutes=5),
         )
 
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(event, progress=_SubmissionProgress())
+        assert refreshes == []
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(event, progress=_SubmissionProgress())
+        assert len(refreshes) == 1
+        refresh_deployment_id, refresh_environment = refreshes[0]
+        assert refresh_deployment_id == deployment_id
+        assert refresh_environment is not None
+        assert refresh_environment["GEN_WORKER_MODEL_MANIFEST_JSON"] == (
+            '{"artifacts":[],"manifest_sha256":"' + resident_digest + '"}'
+        )
+        assert refresh_environment["GEN_WORKER_MODEL_MANIFEST_SHA256"] == resident_digest
+        assert len(refresh_environment[WORKER_RUNTIME_ADMISSION_ID_BINDING]) == 32
+        assert submissions == []
+        monkeypatch.setattr(
+            controller_runtime,
+            "container_group_runtime_admission_ready",
+            _runtime_admission_ready,
+        )
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(event, progress=_SubmissionProgress())
         await workloads._submit_event(event, progress=_SubmissionProgress())
-        assert refreshes == [
-            (
-                deployment_id,
-                {
-                    "GEN_WORKER_MODEL_MANIFEST_JSON": (
-                        '{"artifacts":[],"manifest_sha256":"' + resident_digest + '"}'
-                    ),
-                    "GEN_WORKER_MODEL_MANIFEST_SHA256": resident_digest,
-                },
-            )
-        ]
         assert submissions == [context.attempt_id]
     finally:
         await database.dispose()
@@ -1388,9 +2487,18 @@ async def test_submit_defers_an_incompatible_lora_rollout_while_work_is_active(
                 NOW if active_attempt_state == GenerationAttemptState.UNKNOWN else None
             )
             deployment.runtime_managed_lora_sha256s = [lora_a]
-            deployment.runtime_artifact_manifest_sha256 = canonical_sha256(
-                {"managed_loras": (lora_a,)}
-            )
+            active_manifest_sha256 = canonical_sha256({"managed_loras": (lora_a,)})
+            deployment.runtime_artifact_manifest_sha256 = active_manifest_sha256
+            first_attempt.request_metadata = {
+                **first_attempt.request_metadata,
+                "runtime_admission": {
+                    "version": "v1",
+                    "provider_group_version": 1,
+                    "artifact_manifest_sha256": active_manifest_sha256,
+                    "rollout_id": RUNTIME_ADMISSION_ID,
+                    "worker_instance_id": "instance-active-1",
+                },
+            }
             second_parameters = _runtime_job_parameters(2, [{"sha256": lora_b}])
             second_job = GenerationJob(
                 release_version_id=first_job.release_version_id,
@@ -1477,8 +2585,9 @@ async def test_experiment_warm_lease_refreshes_first_submit_once_then_reuses_run
             resolver: object,
             *,
             environment_overrides: Mapping[str, str] | None = None,
+            **runtime_refresh: object,
         ) -> SaladContainerGroup:
-            del client, resolver, environment_overrides
+            del client, resolver, environment_overrides, runtime_refresh
             refreshes.append(deployment.id)
             return _group(deployment.container_group_name, deployment.queue_name)
 
@@ -1500,10 +2609,26 @@ async def test_experiment_warm_lease_refreshes_first_submit_once_then_reuses_run
                 provider_external_id="provider-job",
             )
 
+        async def fake_admission(
+            deployment: SaladDeployment,
+            client: object,
+            *,
+            effective_min_replicas: int,
+            **runtime_identity: object,
+        ) -> SaladContainerGroup:
+            del client, runtime_identity
+            assert effective_min_replicas == 1
+            return _group(deployment.container_group_name, deployment.queue_name)
+
         monkeypatch.setattr(
             controller_runtime,
             "refresh_container_group_runtime",
             fake_refresh,
+        )
+        monkeypatch.setattr(
+            controller_runtime,
+            "ensure_container_group_queue_admission",
+            fake_admission,
         )
         monkeypatch.setattr(
             ControllerWorkloads,
@@ -1536,6 +2661,17 @@ async def test_experiment_warm_lease_refreshes_first_submit_once_then_reuses_run
             lease_expires_at=NOW + timedelta(minutes=5),
         )
 
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(event, progress=_SubmissionProgress())
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(event, progress=_SubmissionProgress())
+        monkeypatch.setattr(
+            controller_runtime,
+            "container_group_runtime_admission_ready",
+            _runtime_admission_ready,
+        )
+        with pytest.raises(controller_runtime._RuntimeAdmissionPendingError):
+            await workloads._submit_event(event, progress=_SubmissionProgress())
         await workloads._submit_event(event, progress=_SubmissionProgress())
         await workloads._submit_event(event, progress=_SubmissionProgress())
 
@@ -1625,8 +2761,9 @@ async def test_manual_warm_selection_is_used_only_without_a_pending_job(
             resolver: object,
             *,
             environment_overrides: Mapping[str, str] | None = None,
+            **runtime_refresh: object,
         ) -> SaladContainerGroup:
-            del client, resolver, environment_overrides
+            del client, resolver, environment_overrides, runtime_refresh
             return _group(deployment.container_group_name, deployment.queue_name)
 
         monkeypatch.setattr(
@@ -1689,8 +2826,9 @@ async def test_submission_timeout_preserves_exact_pre_post_effect_boundary(
             event: object,
             *,
             progress: _SubmissionProgress,
+            durable_runtime_admission_defer: bool = False,
         ) -> object:
-            del event
+            del event, durable_runtime_admission_defer
             async with database.sessions() as session:
                 await reserve_attempt_budget(
                     session,
