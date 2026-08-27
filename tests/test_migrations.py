@@ -160,7 +160,7 @@ def test_fresh_schema_revision_is_the_migration_head() -> None:
     assert txt2img_family_revision is not None
     assert txt2img_family_revision.down_revision == "20260812_0037"
     assert review_target_revision.down_revision == "20260818_0038"
-    assert scripts.get_current_head() == "20260822_0039"
+    assert scripts.get_current_head() == "20260827_0040"
 
 
 def test_hq_video_profile_migration_replaces_dimension_constraint(monkeypatch) -> None:
