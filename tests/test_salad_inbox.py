@@ -1104,8 +1104,7 @@ async def test_failed_runtime_admission_webhook_waits_for_exact_turnover_reconci
         deferred_audit_count = int(
             await session.scalar(
                 select(func.count(AuditEvent.id)).where(
-                    AuditEvent.action
-                    == "salad.webhook.runtime_failure_deferred_to_reconciler"
+                    AuditEvent.action == "salad.webhook.runtime_failure_deferred_to_reconciler"
                 )
             )
             or 0

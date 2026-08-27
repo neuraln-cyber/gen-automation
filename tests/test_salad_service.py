@@ -4459,12 +4459,8 @@ async def test_runtime_turnover_waits_through_replacement_boot_and_transient_rea
             or 0
         )
 
-    assert not_ready.error_code == (
-        "salad_runtime_instance_turnover_reconciliation_pending"
-    )
-    assert unavailable.error_code == (
-        "salad_runtime_instance_turnover_reconciliation_pending"
-    )
+    assert not_ready.error_code == ("salad_runtime_instance_turnover_reconciliation_pending")
+    assert unavailable.error_code == ("salad_runtime_instance_turnover_reconciliation_pending")
     assert not_ready.observation.applied is False
     assert unavailable.observation.applied is False
     assert deferred_attempt_state == initial_state

@@ -1284,12 +1284,9 @@ async def process_salad_webhook_receipt(
             job=job,
         )
 
-    if (
-        job.state not in _TERMINAL_JOB_STATES
-        and _failed_runtime_admission_requires_reconciliation(
-            attempt,
-            provider_status=provider_status,
-        )
+    if job.state not in _TERMINAL_JOB_STATES and _failed_runtime_admission_requires_reconciliation(
+        attempt,
+        provider_status=provider_status,
     ):
         # A signed failure callback cannot prove whether Salad rotated the sole
         # manifest-bound worker after this job was admitted. Leave the current

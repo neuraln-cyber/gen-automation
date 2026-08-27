@@ -492,8 +492,7 @@ def _runtime_turnover_deployment_allows_retry(
         and deployment.administrative_stop_reason is None
         and deployment.max_replicas == 1
         and deployment_state_allows_admission
-        and deployment.runtime_artifact_manifest_sha256
-        == evidence.artifact_manifest_sha256
+        and deployment.runtime_artifact_manifest_sha256 == evidence.artifact_manifest_sha256
         and admission == expected_admission
         and evidence.provider_group_version > 0
         and len(evidence.artifact_manifest_sha256) == 64

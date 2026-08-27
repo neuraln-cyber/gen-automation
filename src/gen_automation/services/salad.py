@@ -143,9 +143,7 @@ SALAD_OUTPUT_PROGRESS_WATCHDOG_REASON = "accepted_output_progress_stalled"
 _RUNTIME_ENVELOPE_WATCHDOG_REASON = "runtime_envelope_expired"
 _RUNTIME_ADMISSION_METADATA_KEY = "runtime_admission"
 _RUNTIME_ADMISSION_METADATA_VERSION = "v1"
-_RUNTIME_TURNOVER_INHERITANCE_SKIPPED_METADATA_KEY = (
-    "runtime_turnover_inheritance_skipped"
-)
+_RUNTIME_TURNOVER_INHERITANCE_SKIPPED_METADATA_KEY = "runtime_turnover_inheritance_skipped"
 _NEAR_BLACK_RECOVERY_PLAN_SHA256_REQUEST_KEY = "near_black_seed_recovery_plan_sha256"
 _PROVIDER_RUN_EPOCH_STARTED_AT_METADATA_KEY = "provider_run_epoch_started_at"
 _PROVIDER_CLOCK_SKEW_SECONDS = 5 * 60
@@ -805,8 +803,7 @@ async def _runtime_turnover_retry_target(
         or source_admission != expected_source_admission
         or not valid_runtime_admission_target(expected_source_admission)
         or not valid_runtime_admission_target(expected_target)
-        or expected_source_admission["worker_instance_id"]
-        == expected_target["worker_instance_id"]
+        or expected_source_admission["worker_instance_id"] == expected_target["worker_instance_id"]
     ):
         raise SaladServiceConflictError("runtime turnover retry provenance is invalid")
 
@@ -824,15 +821,13 @@ async def _runtime_turnover_retry_target(
         "target_attempt_no": target_attempt_no,
     }
     if existing_attempt and stored_skipped_marker is not _MISSING_RUNTIME_ADMISSION:
-        if (
-            stored_target is not _MISSING_RUNTIME_ADMISSION
-            and not valid_runtime_admission_target(stored_target)
+        if stored_target is not _MISSING_RUNTIME_ADMISSION and not valid_runtime_admission_target(
+            stored_target
         ):
             raise SaladServiceConflictError("fresh runtime turnover target is invalid")
         if (
             not isinstance(stored_skipped_marker, dict)
-            or set(stored_skipped_marker)
-            != {*marker_source, "selected_artifact_manifest_sha256"}
+            or set(stored_skipped_marker) != {*marker_source, "selected_artifact_manifest_sha256"}
             or any(stored_skipped_marker.get(key) != value for key, value in marker_source.items())
         ):
             raise SaladServiceConflictError("runtime turnover skip marker is invalid")
@@ -842,8 +837,7 @@ async def _runtime_turnover_retry_target(
         if (
             stored_skipped_marker["source_deployment_id"]
             == stored_skipped_marker["selected_deployment_id"]
-            and selected_manifest
-            == stored_skipped_marker["source_artifact_manifest_sha256"]
+            and selected_manifest == stored_skipped_marker["source_artifact_manifest_sha256"]
         ):
             raise SaladServiceConflictError("runtime turnover skip marker is not stale")
         return _RuntimeTurnoverRetryInheritance(
@@ -857,22 +851,15 @@ async def _runtime_turnover_retry_target(
         != expected_target["artifact_manifest_sha256"]
     )
     if not existing_attempt and selected_context_is_stale:
-        if not _valid_optional_runtime_manifest(
-            deployment.runtime_artifact_manifest_sha256
-        ):
+        if not _valid_optional_runtime_manifest(deployment.runtime_artifact_manifest_sha256):
             raise SaladServiceConflictError("selected runtime manifest is invalid")
         return _RuntimeTurnoverRetryInheritance(
             skipped_marker={
                 **marker_source,
-                "selected_artifact_manifest_sha256": (
-                    deployment.runtime_artifact_manifest_sha256
-                ),
+                "selected_artifact_manifest_sha256": (deployment.runtime_artifact_manifest_sha256),
             }
         )
-    if (
-        stored_skipped_marker is not _MISSING_RUNTIME_ADMISSION
-        or selected_context_is_stale
-    ):
+    if stored_skipped_marker is not _MISSING_RUNTIME_ADMISSION or selected_context_is_stale:
         raise SaladServiceConflictError("runtime turnover retry context changed")
     if existing_attempt and stored_target is _MISSING_RUNTIME_ADMISSION:
         raise SaladServiceConflictError("runtime turnover retry is missing its target")
@@ -1039,9 +1026,7 @@ async def prepare_generation_attempt(
             mode="json"
         )
     if runtime_turnover_inheritance.target is not None:
-        request_metadata[_RUNTIME_ADMISSION_METADATA_KEY] = (
-            runtime_turnover_inheritance.target
-        )
+        request_metadata[_RUNTIME_ADMISSION_METADATA_KEY] = runtime_turnover_inheritance.target
     if runtime_turnover_inheritance.skipped_marker is not None:
         request_metadata[_RUNTIME_TURNOVER_INHERITANCE_SKIPPED_METADATA_KEY] = (
             runtime_turnover_inheritance.skipped_marker
@@ -2086,10 +2071,7 @@ def _runtime_instance_turnover_admission(
         _require_submittable_deployment(deployment)
     except SaladServiceConflictError:
         return None
-    if (
-        deployment.runtime_artifact_manifest_sha256
-        != raw_admission.get("artifact_manifest_sha256")
-    ):
+    if deployment.runtime_artifact_manifest_sha256 != raw_admission.get("artifact_manifest_sha256"):
         return None
     return dict(raw_admission)
 
@@ -2241,13 +2223,9 @@ async def _audit_runtime_instance_turnover_deferral(
                 "provider_status": remote_job.status.value,
                 "reason": assessment.defer_reason,
                 "provider_group_version": assessment.admission["provider_group_version"],
-                "artifact_manifest_sha256": assessment.admission[
-                    "artifact_manifest_sha256"
-                ],
+                "artifact_manifest_sha256": assessment.admission["artifact_manifest_sha256"],
                 "rollout_id": assessment.admission["rollout_id"],
-                "previous_worker_instance_id": assessment.admission[
-                    "worker_instance_id"
-                ],
+                "previous_worker_instance_id": assessment.admission["worker_instance_id"],
                 "assets_retained": True,
             },
             occurred_at=occurred_at,
