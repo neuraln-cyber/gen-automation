@@ -922,13 +922,15 @@ def test_anima_plan_requires_manifest_only_support_artifacts_without_approvals()
             "experiment_only": False,
         },
     }
-    with pytest.raises(ValueError, match="experiment-only"):
-        ArtifactOnboardingPlan.model_validate(
-            {
-                "version": "v1",
-                "artifacts": [non_commercial_without_scope, text_encoder, vae],
-            }
-        )
+    unrestricted_plan = ArtifactOnboardingPlan.model_validate(
+        {
+            "version": "v1",
+            "artifacts": [non_commercial_without_scope, text_encoder, vae],
+        }
+    )
+    assert unrestricted_plan.artifacts[0].approval is not None
+    assert unrestricted_plan.artifacts[0].approval.commercial_use_approved is False
+    assert unrestricted_plan.artifacts[0].approval.experiment_only is False
 
     string_scope = {
         **primary,

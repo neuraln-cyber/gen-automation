@@ -78,14 +78,6 @@ class ModelApprovalPlan(StrictOnboardingModel):
             )
         return value
 
-    @model_validator(mode="after")
-    def require_permitted_usage_scope(self) -> "ModelApprovalPlan":
-        if not self.commercial_use_approved and not self.experiment_only:
-            raise ValueError(
-                "non-commercial model approval must be restricted to experiment-only use"
-            )
-        return self
-
 
 class ArtifactOnboardingEntry(StrictOnboardingModel):
     logical_name: SafeName

@@ -4274,10 +4274,6 @@ class ModelArtifactApproval(UuidPrimaryKeyMixin, TimestampMixin, Base):
             postgresql_where=text("is_current"),
             sqlite_where=text("is_current = 1"),
         ),
-        CheckConstraint(
-            "commercial_use_approved = true OR experiment_only = true",
-            name="approved_usage_scope",
-        ),
         CheckConstraint("adult_use_approved = true", name="adult_use_required"),
         CheckConstraint("safetensors_verified = true", name="safetensors_required"),
         CheckConstraint("approval_version > 0", name="positive_approval_version"),

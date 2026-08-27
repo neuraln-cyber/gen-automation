@@ -1060,7 +1060,6 @@ async def complete_static_lora_import_duplicate(
         or not approval.is_current
         or approval.kind != ModelArtifactKind.LORA
         or approval.artifact_sha256 != artifact_sha256
-        or not approval.commercial_use_approved
         or not approval.adult_use_approved
         or not approval.safetensors_verified
         or approval.revoked_at is not None
@@ -1703,7 +1702,6 @@ def _validate_lora_approval(
         or approval.storage_key != verified.object_key
         or approval.source_url != job.canonical_source_url
         or approval.license_url != job.license_url
-        or not approval.commercial_use_approved
         or not approval.adult_use_approved
         or not approval.safetensors_verified
         or approval.revoked_at is not None

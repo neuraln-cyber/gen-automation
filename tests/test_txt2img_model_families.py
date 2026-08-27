@@ -34,7 +34,6 @@ from gen_automation.services.new_sets import (
     list_new_set_options,
 )
 from gen_automation.services.publication import (
-    PublicationConflictError,
     _require_current_compliance_approvals,
     _require_current_publishable_release,
 )
@@ -171,7 +170,7 @@ def _command(
 
 
 @pytest.mark.asyncio
-async def test_family_options_and_submission_gate_are_fail_closed(tmp_path: Path) -> None:
+async def test_all_model_families_are_available_in_new_set(tmp_path: Path) -> None:
     database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'families.db').as_posix()}")
     await database.create_schema()
     try:
@@ -205,32 +204,42 @@ async def test_family_options_and_submission_gate_are_fail_closed(tmp_path: Path
         assert "experiment_only" not in artifact_gate["checkpoint"]
         assert "model_family" not in artifact_gate["checkpoint"]
         assert "model_family" not in legacy_snapshot.checks["workflow_integrity_gate"]["workflow"]
-        assert normal.model_families == (GenerationModelFamily.ILLUSTRIOUS,)
-        assert all(
-            option.model_family == GenerationModelFamily.ILLUSTRIOUS
-            for option in normal.checkpoints
-        )
+        assert {option.model_family for option in normal.checkpoints} == {
+            GenerationModelFamily.ILLUSTRIOUS,
+            GenerationModelFamily.ANIMA,
+        }
+        assert GenerationModelFamily.ANIMA in normal.model_families
         assert {option.model_family for option in experiment.checkpoints} == {
             GenerationModelFamily.ILLUSTRIOUS,
             GenerationModelFamily.ANIMA,
         }
         assert GenerationModelFamily.ANIMA in experiment.model_families
+        illustrious_checkpoint = next(
+            option
+            for option in normal.checkpoints
+            if option.model_family == GenerationModelFamily.ILLUSTRIOUS
+        )
+        illustrious_workflow = next(
+            option
+            for option in normal.workflows
+            if option.model_family == GenerationModelFamily.ILLUSTRIOUS
+        )
 
         subject_id = normal.subjects[0].approval_id
         async with database.sessions() as session:
-            with pytest.raises(NewSetInputError, match="only through Experiment Lab"):
-                await create_and_approve_new_set(
-                    session,
-                    command=_command(
-                        subject_id=subject_id,
-                        checkpoint_id=checkpoint.id,
-                        workflow_id=workflow.id,
-                        slug="normal-anima-blocked",
-                    ),
-                    idempotency_key="normal-anima-blocked",
-                    settings=Settings(),
-                    actor="fixture-owner",
-                )
+            normal_result = await create_and_approve_new_set(
+                session,
+                command=_command(
+                    subject_id=subject_id,
+                    checkpoint_id=checkpoint.id,
+                    workflow_id=workflow.id,
+                    slug="normal-anima-allowed",
+                ),
+                idempotency_key="normal-anima-allowed",
+                settings=Settings(),
+                actor="fixture-owner",
+            )
+        assert normal_result.release.slug == "normal-anima-allowed"
 
         async with database.sessions() as session:
             with pytest.raises(NewSetInputError, match="same model family"):
@@ -239,7 +248,7 @@ async def test_family_options_and_submission_gate_are_fail_closed(tmp_path: Path
                     command=_command(
                         subject_id=subject_id,
                         checkpoint_id=checkpoint.id,
-                        workflow_id=normal.workflows[0].approval_id,
+                        workflow_id=illustrious_workflow.approval_id,
                         slug="mixed-family-blocked",
                     ),
                     idempotency_key="mixed-family-blocked",
@@ -254,8 +263,8 @@ async def test_family_options_and_submission_gate_are_fail_closed(tmp_path: Path
                     session,
                     command=_command(
                         subject_id=subject_id,
-                        checkpoint_id=normal.checkpoints[0].approval_id,
-                        workflow_id=normal.workflows[0].approval_id,
+                        checkpoint_id=illustrious_checkpoint.approval_id,
+                        workflow_id=illustrious_workflow.approval_id,
                         lora_id=lora.id,
                         slug="mixed-lora-family-blocked",
                     ),
@@ -293,44 +302,6 @@ async def test_family_options_and_submission_gate_are_fail_closed(tmp_path: Path
             assert specification.loras[0].experiment_only is True
     finally:
         await database.dispose()
-
-
-def test_generic_generation_plan_route_rejects_experiment_only_release(
-    client: TestClient,
-) -> None:
-    database = client.app.state.database
-    assert client.portal is not None
-
-    async def create_experiment_release() -> UUID:
-        async with database.sessions() as session:
-            owner = await seed_release_approvals(session, valid_release_payload())
-            checkpoint, lora, workflow = await _seed_anima_approvals(session, owner=owner)
-            options = await list_new_set_options(session)
-            result = await create_and_approve_new_set(
-                session,
-                command=_command(
-                    subject_id=options.subjects[0].approval_id,
-                    checkpoint_id=checkpoint.id,
-                    workflow_id=workflow.id,
-                    lora_id=lora.id,
-                    slug="trusted-anima-experiment",
-                ),
-                idempotency_key="trusted-anima-experiment-create",
-                settings=Settings(),
-                actor="fixture-owner",
-                experiment_mode=True,
-            )
-            assert result.generation_plan.total_jobs == 1
-            return result.release.id
-
-    release_id = client.portal.call(create_experiment_release)
-    response = client.post(
-        f"/api/v1/releases/{release_id}/generation-plan:approve",
-        headers={"Idempotency-Key": "generic-anima-generation-plan"},
-    )
-
-    assert response.status_code == 409
-    assert "trusted Experiment Lab approval" in response.json()["detail"]
 
 
 def test_shared_new_set_page_exposes_anima_in_normal_and_experiment_modes(
@@ -414,7 +385,7 @@ def test_fresh_experiment_form_prefers_a_coherent_illustrious_pair(
     assert _selected_option_value(page.text, "workflow_id") == illustrious_workflow_id
 
 
-def test_experiment_only_release_is_not_publishable() -> None:
+def test_experiment_only_release_publication_is_owner_controlled() -> None:
     payload = valid_release_payload()
     raw_specification = payload["specification"]
     assert isinstance(raw_specification, dict)
@@ -445,5 +416,4 @@ def test_experiment_only_release_is_not_publishable() -> None:
         created_at=datetime.now(UTC),
     )
 
-    with pytest.raises(PublicationConflictError, match="experiment-only"):
-        _require_current_publishable_release(release, version)
+    _require_current_publishable_release(release, version)

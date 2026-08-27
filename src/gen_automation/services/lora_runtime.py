@@ -449,7 +449,6 @@ class LoraRuntime:
                     ModelArtifactApproval.kind == ModelArtifactKind.LORA,
                     ModelArtifactApproval.status == ApprovalStatus.APPROVED,
                     ModelArtifactApproval.is_current.is_(True),
-                    ModelArtifactApproval.commercial_use_approved.is_(True),
                     ModelArtifactApproval.adult_use_approved.is_(True),
                     ModelArtifactApproval.safetensors_verified.is_(True),
                     ModelArtifactApproval.storage_key.not_like("worker/managed-loras/sha256/%"),

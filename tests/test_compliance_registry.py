@@ -307,12 +307,9 @@ def test_registry_commands_fail_closed_on_unsafe_inputs() -> None:
 
     artifact_payload = _artifact().model_dump(mode="json")
     artifact_payload["commercial_use_approved"] = False
-    with pytest.raises(ValidationError, match="experiment-only"):
-        ModelArtifactApprovalCreate.model_validate(artifact_payload)
-    artifact_payload["experiment_only"] = True
-    experiment_artifact = ModelArtifactApprovalCreate.model_validate(artifact_payload)
-    assert experiment_artifact.commercial_use_approved is False
-    assert experiment_artifact.experiment_only is True
+    unrestricted_artifact = ModelArtifactApprovalCreate.model_validate(artifact_payload)
+    assert unrestricted_artifact.commercial_use_approved is False
+    assert unrestricted_artifact.experiment_only is False
 
     workflow_payload = _workflow().model_dump(mode="json")
     workflow_payload["reviewed_node_classes"] = ["KSampler", "KSampler"]

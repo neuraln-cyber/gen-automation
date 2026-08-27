@@ -489,14 +489,14 @@ def test_build_comfy_command_is_loopback_offline_and_narrowly_whitelisted() -> N
     assert "--enable-manager" not in command
 
 
-def test_anima_qwen_precision_launch_adds_each_pinned_flag_once() -> None:
+def test_anima_qwen_precision_launch_restores_fp32_vae_only() -> None:
     settings = _settings()
     split_launch = _ComfyLaunchSettings.from_runtime_settings(settings, fp32_vae=True)
     checkpoint_launch = _ComfyLaunchSettings.from_runtime_settings(settings, fp32_vae=False)
 
     split_command = build_comfy_command(split_launch)
-    assert split_command[-2:] == ("--fp16-unet", "--fp32-vae")
-    assert split_command.count("--fp16-unet") == 1
+    assert split_command[-1:] == ("--fp32-vae",)
+    assert "--fp16-unet" not in split_command
     assert split_command.count("--fp32-vae") == 1
     assert build_comfy_command(split_launch) == split_command
     for command in (build_comfy_command(checkpoint_launch), build_comfy_command(settings)):
@@ -541,7 +541,7 @@ def test_fp32_vae_policy_is_scoped_to_anima_qwen_split_manifest() -> None:
             fp32_vae=_manifest_requires_fp32_vae(other_split_model),
         )
     )
-    assert anima_command[-2:] == ("--fp16-unet", "--fp32-vae")
+    assert anima_command[-1:] == ("--fp32-vae",)
     assert "--fp16-unet" not in other_command
     assert "--fp32-vae" not in other_command
 

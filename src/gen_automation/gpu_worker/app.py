@@ -7,14 +7,13 @@ import io
 import json
 import math
 import re
-import sys
 import time
 from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import partial
-from typing import Any, cast
+from typing import Any
 
 import httpx2
 from fastapi import FastAPI, HTTPException, Request
@@ -26,7 +25,6 @@ from gen_automation.domain.deliverability import require_comfy_workflow_delivera
 from gen_automation.gpu_worker.models import (
     ComfyOutput,
     GenerateEnvelope,
-    GenerateFailureResponse,
     GeneratePayload,
     GenerateResponse,
     GenerateWorkerResponse,
@@ -66,18 +64,6 @@ class WorkerRequestError(Exception):
 
 class WorkerOutputError(Exception):
     pass
-
-
-class FatalWorkerOutputError(WorkerOutputError):
-    def __init__(
-        self,
-        *,
-        output_index: int,
-        rgb_extrema: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
-    ) -> None:
-        super().__init__("generation output invalid")
-        self.output_index = output_index
-        self.rgb_extrema = rgb_extrema
 
 
 class WorkerNotReadyError(Exception):
@@ -292,16 +278,6 @@ def _decode_and_verify_outputs(
                 ):
                     raise WorkerOutputError("generation output invalid")
                 image.load()
-                with image.convert("RGB") as rgb_image:
-                    rgb_extrema = cast(
-                        tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
-                        rgb_image.getextrema(),
-                    )
-                if all(channel_maximum <= 4 for _channel_minimum, channel_maximum in rgb_extrema):
-                    raise FatalWorkerOutputError(
-                        output_index=output.output_index,
-                        rgb_extrema=rgb_extrema,
-                    )
         except WorkerOutputError:
             raise
         except (
@@ -527,33 +503,6 @@ def create_worker_app(
                             max_image_pixels=settings.max_image_pixels,
                         ),
                     )
-                except FatalWorkerOutputError as error:
-                    failed_output_index = (
-                        error.output_index if branch_output_index is None else branch_output_index
-                    )
-                    print(
-                        "GPU worker fatal output detected: "
-                        f"attempt_id={payload.attempt_id} reason=near_black "
-                        f"output_index={failed_output_index} "
-                        f"rgb_extrema={error.rgb_extrema} "
-                        "action=seed_retry_no_recycle",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    failure_response = GenerateFailureResponse(
-                        job_id=payload.job_id,
-                        attempt_id=payload.attempt_id,
-                        failed_output_index=failed_output_index,
-                        outputs=uploaded,
-                    )
-                    while len(replay_cache) >= settings.max_replay_entries:
-                        replay_cache.popitem(last=False)
-                    replay_cache[payload.attempt_id] = (
-                        envelope.expires_at + settings.clock_skew_seconds,
-                        envelope.signature,
-                        failure_response,
-                    )
-                    return failure_response
                 except WorkerOutputError:
                     raise HTTPException(
                         status_code=502,
