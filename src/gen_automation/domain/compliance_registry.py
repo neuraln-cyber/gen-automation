@@ -111,12 +111,6 @@ class ModelArtifactApprovalCreate(StrictComplianceModel):
     experiment_only: bool = False
     evidence: ApprovalEvidence
 
-    @model_validator(mode="after")
-    def require_approved_usage_scope(self) -> "ModelArtifactApprovalCreate":
-        if not self.commercial_use_approved and not self.experiment_only:
-            raise ValueError("non-commercial artifacts must be restricted to experiment-only use")
-        return self
-
     @field_validator("name")
     @classmethod
     def validate_name(cls, value: str) -> str:

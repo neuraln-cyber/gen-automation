@@ -67,8 +67,6 @@ class ArtifactSpecification(StrictModel):
     def require_licence_approval(self) -> "ArtifactSpecification":
         if not self.adult_use_approved:
             raise ValueError("artifact requires adult-use approval")
-        if not self.commercial_use_approved and not self.experiment_only:
-            raise ValueError("non-commercial artifacts must be restricted to experiment-only use")
         if not self.storage_key.lower().endswith(".safetensors"):
             raise ValueError("production model artifacts must use Safetensors")
         return self

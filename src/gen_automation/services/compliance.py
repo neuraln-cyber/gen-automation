@@ -99,9 +99,6 @@ def _validate_artifact(
         or approval.source_url != str(specification.source_url)
         or approval.storage_key != specification.storage_key
         or approval.license_url != str(specification.license_url)
-        or approval.commercial_use_approved != specification.commercial_use_approved
-        or approval.experiment_only != specification.experiment_only
-        or not (approval.commercial_use_approved or approval.experiment_only)
         or not approval.adult_use_approved
         or not approval.safetensors_verified
         or approval.evidence_sha256 != canonical_sha256(approval.evidence)

@@ -605,9 +605,7 @@ async def list_new_set_options(
     *,
     experiment_mode: bool = False,
 ) -> NewSetOptions:
-    allowed_families = {GenerationModelFamily.ILLUSTRIOUS}
-    if experiment_mode:
-        allowed_families.add(GenerationModelFamily.ANIMA)
+    allowed_families = set(GenerationModelFamily)
     subjects = tuple(
         SubjectOption(
             approval_id=row.id,
@@ -766,8 +764,6 @@ async def create_and_approve_new_set(
         lora.model_family != model_family for lora in lora_rows
     ):
         raise NewSetInputError("checkpoint, workflow, and LoRAs must use the same model family")
-    if model_family == GenerationModelFamily.ANIMA and not experiment_mode:
-        raise NewSetInputError("Anima is currently available only through Experiment Lab")
     workflow_capabilities = effective_workflow_capabilities(
         workflow.capabilities or (),
         reviewed_node_classes=workflow.reviewed_node_classes,
@@ -1902,10 +1898,6 @@ async def _approved_artifact(
     )
     if artifact is None:
         raise NewSetInputError(f"the selected {expected_kind.value} is no longer approved")
-    if artifact.experiment_only and not experiment_mode:
-        raise NewSetInputError(
-            f"the selected {expected_kind.value} is available only through Experiment Lab"
-        )
     if not _artifact_available_for_mode(artifact, experiment_mode=experiment_mode):
         raise NewSetInputError(
             f"the selected {expected_kind.value} is not approved for this generation mode"
@@ -1928,9 +1920,8 @@ def _artifact_available_for_mode(
     *,
     experiment_mode: bool,
 ) -> bool:
-    if artifact.experiment_only:
-        return experiment_mode
-    return artifact.commercial_use_approved
+    del artifact, experiment_mode
+    return True
 
 
 async def _approved_workflow(

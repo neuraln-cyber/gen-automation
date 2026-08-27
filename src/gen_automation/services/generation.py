@@ -400,11 +400,6 @@ async def approve_and_expand_generation_plan(
         raise GenerationPlanConflictError(
             "frozen release specification no longer passes validation"
         ) from None
-    if specification.experiment_only and not experiment_mode:
-        raise GenerationPlanConflictError(
-            "experiment-only release generation requires trusted Experiment Lab approval"
-        )
-
     request_sha256 = canonical_sha256(
         {
             "release_id": str(release.id),

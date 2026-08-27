@@ -544,9 +544,9 @@ def test_patreon_browser_uses_checksum_pinned_current_chrome() -> None:
 
     assert (
         "ADD --checksum="
-        "sha256:6572478310553cb25fdcb4ba2fb5459b472c2c765f5f68e9837d4964e8a87f1e" in dockerfile
+        "sha256:810fff32492ecf9519f8b7f513e17c2e05890bd85dbe3139ae80089eb4ee2f0b" in dockerfile
     )
-    assert "google-chrome-stable_151.0.7922.169-1_amd64.deb" in dockerfile
+    assert "google-chrome-beta_153.0.8010.12-1_amd64.deb" in dockerfile
     assert "playwright install-deps chromium" in dockerfile
     assert "playwright install --with-deps chromium" not in dockerfile
     assert publisher.count("channel=_BROWSER_CHANNEL") == 1

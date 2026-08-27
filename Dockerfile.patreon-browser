@@ -1,22 +1,22 @@
 # syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-FROM python:3.12-slim@sha256:cab2dbf575e971934a81e4622f5aba17aa7929719bd7e31033a3a83b97fd0464 AS chrome-stable
+FROM python:3.12-slim@sha256:cab2dbf575e971934a81e4622f5aba17aa7929719bd7e31033a3a83b97fd0464 AS chrome-beta
 
-ADD --checksum=sha256:6572478310553cb25fdcb4ba2fb5459b472c2c765f5f68e9837d4964e8a87f1e \
-    https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_151.0.7922.169-1_amd64.deb \
-    /tmp/google-chrome-stable.deb
+ADD --checksum=sha256:810fff32492ecf9519f8b7f513e17c2e05890bd85dbe3139ae80089eb4ee2f0b \
+    https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-beta/google-chrome-beta_153.0.8010.12-1_amd64.deb \
+    /tmp/google-chrome-beta.deb
 
 RUN mkdir -p /tmp/chrome-root /opt/google \
-    && dpkg-deb --extract /tmp/google-chrome-stable.deb /tmp/chrome-root \
-    && mv /tmp/chrome-root/opt/google/chrome /opt/google/chrome \
-    && rm -rf /tmp/chrome-root /tmp/google-chrome-stable.deb
+    && dpkg-deb --extract /tmp/google-chrome-beta.deb /tmp/chrome-root \
+    && mv /tmp/chrome-root/opt/google/chrome-beta /opt/google/chrome \
+    && rm -rf /tmp/chrome-root /tmp/google-chrome-beta.deb
 
 FROM python:3.12-slim@sha256:cab2dbf575e971934a81e4622f5aba17aa7929719bd7e31033a3a83b97fd0464
 
 LABEL org.opencontainers.image.title="gen-automation-patreon-browser" \
       org.opencontainers.image.description="Isolated official-UI Patreon publisher" \
       org.opencontainers.image.source="https://github.com/neuraln-cyber/gen-automation" \
-      org.opencontainers.image.google-chrome.version="151.0.7922.169"
+      org.opencontainers.image.google-chrome.version="153.0.8010.12-beta"
 
 ENV HOME=/home/app \
     PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -32,7 +32,7 @@ ENV HOME=/home/app \
 
 WORKDIR /app
 
-COPY --from=chrome-stable /opt/google/chrome /opt/google/chrome
+COPY --from=chrome-beta /opt/google/chrome /opt/google/chrome
 COPY requirements.lock requirements-patreon-browser.lock ./
 
 RUN python3.12 -m pip install \

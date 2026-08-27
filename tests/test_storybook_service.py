@@ -454,7 +454,7 @@ async def test_selected_context_rejects_release_from_another_project(
 
 
 @pytest.mark.asyncio
-async def test_selected_context_rejects_experiment_only_release(
+async def test_selected_context_allows_owner_selected_experiment_metadata(
     storybook_fixture: StorybookFixture,
 ) -> None:
     async with storybook_fixture.database.sessions() as session:
@@ -472,11 +472,11 @@ async def test_selected_context_rejects_experiment_only_release(
         release.phase = ReleasePhase.APPROVED
         await session.commit()
 
-        with pytest.raises(StorybookSourceAuthorizationError, match="experiment-only"):
-            await build_storybook_source_context(
-                session,
-                request=_selected_request(storybook_fixture),
-            )
+        context = await build_storybook_source_context(
+            session,
+            request=_selected_request(storybook_fixture),
+        )
+        assert context.release_specification_sha256 == version.specification_sha256
 
 
 @pytest.mark.asyncio

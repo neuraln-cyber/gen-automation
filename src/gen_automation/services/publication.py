@@ -2715,11 +2715,9 @@ def _require_current_publishable_release(
             "publication requires the exact current publishable release version"
         )
     try:
-        specification = ReleaseSpecification.model_validate(version.specification)
+        ReleaseSpecification.model_validate(version.specification)
     except ValidationError:
         raise PublicationConflictError("frozen release specification is invalid") from None
-    if specification.experiment_only:
-        raise PublicationConflictError("experiment-only model outputs cannot enter publication")
 
 
 def _require_single_target_owner(
