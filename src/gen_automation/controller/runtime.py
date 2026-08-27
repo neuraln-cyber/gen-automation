@@ -1422,6 +1422,10 @@ class ControllerWorkloads:
                             SaladDeployment.state == SaladDeploymentState.PROVISIONING,
                             SaladDeployment.last_error_code == "provider_start_pending",
                         ),
+                        and_(
+                            SaladDeployment.state == SaladDeploymentState.DEGRADED,
+                            SaladDeployment.last_error_code == "provider_start_stalled",
+                        ),
                     ),
                     SaladDeployment.desired_state == DesiredDeploymentState.ACTIVE,
                 )

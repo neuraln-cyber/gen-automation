@@ -957,15 +957,18 @@ async def test_submission_rechecks_deployment_kill_switch(database: Database) ->
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "pending_error_code",
+    ("deployment_state", "pending_error_code"),
     [
-        "provider_autoscaler_repair_pending",
-        "provider_image_preparation_pending",
-        "provider_start_pending",
+        (SaladDeploymentState.PROVISIONING, "provider_autoscaler_repair_pending"),
+        (SaladDeploymentState.PROVISIONING, "provider_image_preparation_pending"),
+        (SaladDeploymentState.PROVISIONING, "provider_start_pending"),
+        (SaladDeploymentState.DEGRADED, "provider_image_preparation_stalled"),
+        (SaladDeploymentState.DEGRADED, "provider_start_stalled"),
     ],
 )
 async def test_submission_allows_exact_runtime_admission_transitional_state(
     database: Database,
+    deployment_state: SaladDeploymentState,
     pending_error_code: str,
 ) -> None:
     async with database.sessions() as session:
@@ -973,7 +976,7 @@ async def test_submission_allows_exact_runtime_admission_transitional_state(
         attempt_id = await prepared_attempt(session, context)
         deployment = await session.get(SaladDeployment, context.deployment_id)
         assert deployment is not None
-        deployment.state = SaladDeploymentState.PROVISIONING
+        deployment.state = deployment_state
         deployment.last_error_code = pending_error_code
         await session.commit()
         uploads = FakeUploadIntentProvider()

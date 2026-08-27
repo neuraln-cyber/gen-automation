@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from uuid import UUID
 
@@ -310,6 +311,74 @@ def _group(name: str, queue_name: str) -> SaladContainerGroup:
             "queue_connection": {"queue_name": queue_name},
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_loop_reaches_scheduler_after_provider_start_stalls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'stalled-dispatch.db').as_posix()}")
+    await database.create_schema()
+    called: list[UUID] = []
+    try:
+        async with database.sessions() as session:
+            deployment = SaladDeployment(
+                version_no=1,
+                config_sha256=CONFIG_SHA256,
+                provider_configuration=_provider_configuration(),
+                worker_image_digest=IMAGE_DIGEST,
+                organization_name="organization",
+                project_name="project",
+                queue_name="generation",
+                provider_queue_id=str(QUEUE_ID),
+                container_group_name="worker",
+                provider_container_group_id=str(GROUP_ID),
+                purpose=SaladDeploymentPurpose.IMAGE,
+                state=SaladDeploymentState.DEGRADED,
+                desired_state=DesiredDeploymentState.ACTIVE,
+                is_current=True,
+                last_error_code="provider_start_stalled",
+                max_hourly_cost_microusd=3_600_000,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            session.add(deployment)
+            await session.commit()
+            deployment_id = deployment.id
+
+        async def fake_dispatch(
+            session: AsyncSession,
+            *,
+            salad_deployment_id: UUID,
+            **kwargs: object,
+        ) -> object:
+            del session, kwargs
+            called.append(salad_deployment_id)
+            return SimpleNamespace(dispatched=())
+
+        monkeypatch.setattr(controller_runtime, "dispatch_generation_jobs", fake_dispatch)
+        workloads = ControllerWorkloads(
+            settings=Settings().model_copy(update={"gpu_allocation_enabled": True}),
+            sessions=database.sessions,
+            instance_id="controller-stalled-dispatch-test",
+            salad_client=cast(SaladClient, object()),
+            object_store=None,
+        )
+
+        assert await workloads.dispatch_once() is False
+        assert called == [deployment_id]
+
+        async with database.sessions() as session:
+            deployment = await session.get(SaladDeployment, deployment_id)
+            assert deployment is not None
+            deployment.last_error_code = "provider_group_unhealthy"
+            await session.commit()
+
+        assert await workloads.dispatch_once() is False
+        assert called == [deployment_id]
+    finally:
+        await database.dispose()
 
 
 @pytest.mark.asyncio

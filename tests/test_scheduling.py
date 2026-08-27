@@ -630,6 +630,28 @@ async def test_dispatch_allows_exact_provider_start_pending_state(
 
 
 @pytest.mark.asyncio
+async def test_dispatch_allows_exact_provider_start_stalled_state(
+    scheduling_context: SchedulingContext,
+) -> None:
+    async with scheduling_context.database.sessions() as session:
+        deployment = await session.get(SaladDeployment, scheduling_context.deployment_id)
+        assert deployment is not None
+        deployment.state = SaladDeploymentState.DEGRADED
+        deployment.last_error_code = "provider_start_stalled"
+        await session.commit()
+
+        result = await dispatch_generation_jobs(
+            session,
+            salad_deployment_id=scheduling_context.deployment_id,
+            gpu_allocation_enabled=True,
+            max_inflight=2,
+            now=NOW,
+        )
+
+    assert len(result.dispatched) == 2
+
+
+@pytest.mark.asyncio
 async def test_dead_letter_recovery_commits_even_when_provider_queue_is_full(
     scheduling_context: SchedulingContext,
 ) -> None:

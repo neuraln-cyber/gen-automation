@@ -1065,11 +1065,22 @@ async def test_runtime_refresh_preflight_reports_provider_read_unavailability() 
 
 
 @pytest.mark.asyncio
-async def test_runtime_refresh_preflight_defers_local_provider_preparation_then_resumes() -> None:
+@pytest.mark.parametrize(
+    ("deployment_state", "error_code"),
+    [
+        (SaladDeploymentState.PROVISIONING, "provider_image_preparation_pending"),
+        (SaladDeploymentState.DEGRADED, "provider_image_preparation_stalled"),
+        (SaladDeploymentState.DEGRADED, "provider_start_stalled"),
+    ],
+)
+async def test_runtime_refresh_preflight_defers_local_provider_preparation_then_resumes(
+    deployment_state: SaladDeploymentState,
+    error_code: str,
+) -> None:
     deployment = unpersisted_deployment(provider_configuration())
     deployment.provider_container_group_id = str(GROUP_ID)
-    deployment.state = SaladDeploymentState.PROVISIONING
-    deployment.last_error_code = "provider_image_preparation_pending"
+    deployment.state = deployment_state
+    deployment.last_error_code = error_code
     client = FakeClient()
     client.groups[deployment.container_group_name] = make_group(
         deployment.container_group_name,
@@ -1372,6 +1383,86 @@ async def test_marker_bound_queue_admission_defers_pending_minimum_without_repat
     client.queues[deployment.queue_name] = make_queue(deployment.queue_name)
 
     with pytest.raises(SaladRuntimeAdmissionUnavailableError, match="pending provider change"):
+        await ensure_container_group_queue_admission(
+            deployment,
+            client,
+            effective_min_replicas=1,
+            artifact_manifest_sha256=manifest_sha256,
+            runtime_admission_id=RUNTIME_ADMISSION_ID,
+        )
+
+    assert client.updated_group_patches == []
+    assert client.start_names == []
+
+
+@pytest.mark.asyncio
+async def test_marker_bound_queue_admission_keeps_waiting_after_start_stalls() -> None:
+    manifest_sha256 = "d" * 64
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.DEGRADED
+    deployment.last_error_code = "provider_start_stalled"
+    stalled = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        status="deploying",
+        version=2,
+        autoscaler={
+            "min_replicas": 1,
+            "max_replicas": 1,
+            "desired_queue_length": 1,
+            "polling_period": 30,
+        },
+        environment={
+            WORKER_MODEL_MANIFEST_SHA256_BINDING: manifest_sha256,
+            WORKER_RUNTIME_ADMISSION_ID_BINDING: RUNTIME_ADMISSION_ID,
+        },
+    )
+    client = FakeClient()
+    client.groups[deployment.container_group_name] = stalled
+    client.queues[deployment.queue_name] = make_queue(deployment.queue_name)
+
+    admitted = await ensure_container_group_queue_admission(
+        deployment,
+        client,
+        effective_min_replicas=1,
+        artifact_manifest_sha256=manifest_sha256,
+        runtime_admission_id=RUNTIME_ADMISSION_ID,
+    )
+
+    assert admitted is stalled
+    assert client.updated_group_patches == []
+    assert client.start_names == []
+
+
+@pytest.mark.asyncio
+async def test_marker_bound_queue_admission_defers_stalled_image_preparation() -> None:
+    manifest_sha256 = "d" * 64
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.DEGRADED
+    deployment.last_error_code = "provider_image_preparation_stalled"
+    stalled = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        status="deploying",
+        pending_change=True,
+        version=2,
+        environment={
+            WORKER_MODEL_MANIFEST_SHA256_BINDING: manifest_sha256,
+            WORKER_RUNTIME_ADMISSION_ID_BINDING: RUNTIME_ADMISSION_ID,
+        },
+    )
+    client = FakeClient()
+    client.groups[deployment.container_group_name] = stalled
+    client.queues[deployment.queue_name] = make_queue(deployment.queue_name)
+
+    with pytest.raises(
+        SaladRuntimeAdmissionUnavailableError,
+        match="pending provider change",
+    ):
         await ensure_container_group_queue_admission(
             deployment,
             client,

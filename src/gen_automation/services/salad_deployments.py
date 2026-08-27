@@ -115,6 +115,24 @@ _QUEUE_ADMISSION_TRANSITIONAL_ERROR_CODES = frozenset(
         "provider_start_pending",
     }
 )
+_QUEUE_ADMISSION_STALLED_ERROR_CODES = frozenset(
+    {
+        "provider_image_preparation_stalled",
+        "provider_start_stalled",
+    }
+)
+
+
+def _runtime_admission_wait_is_safe(deployment: SaladDeployment) -> bool:
+    return (
+        deployment.state == SaladDeploymentState.PROVISIONING
+        and deployment.last_error_code in _QUEUE_ADMISSION_TRANSITIONAL_ERROR_CODES
+    ) or (
+        deployment.state == SaladDeploymentState.DEGRADED
+        and deployment.last_error_code in _QUEUE_ADMISSION_STALLED_ERROR_CODES
+    )
+
+
 _WORKER_STARTUP_PROBE: JSONObject = {
     "http": {
         "headers": [],
@@ -1694,10 +1712,7 @@ async def refresh_container_group_runtime(
         not deployment.is_current
         or (
             deployment.state != SaladDeploymentState.ACTIVE
-            and not (
-                deployment.state == SaladDeploymentState.PROVISIONING
-                and deployment.last_error_code in _QUEUE_ADMISSION_TRANSITIONAL_ERROR_CODES
-            )
+            and not _runtime_admission_wait_is_safe(deployment)
         )
         or deployment.desired_state != DesiredDeploymentState.ACTIVE
     ):
@@ -1877,8 +1892,7 @@ async def preflight_container_group_runtime_refresh(
         raise SaladDeploymentValidationError("container group is not provisioned")
     if (
         deployment.is_current
-        and deployment.state == SaladDeploymentState.PROVISIONING
-        and deployment.last_error_code in _QUEUE_ADMISSION_TRANSITIONAL_ERROR_CODES
+        and _runtime_admission_wait_is_safe(deployment)
         and deployment.desired_state == DesiredDeploymentState.ACTIVE
     ):
         raise SaladRuntimeAdmissionUnavailableError(
@@ -2026,10 +2040,7 @@ async def ensure_container_group_queue_admission(
         or not deployment.is_current
         or (
             deployment.state != SaladDeploymentState.ACTIVE
-            and not (
-                deployment.state == SaladDeploymentState.PROVISIONING
-                and deployment.last_error_code in _QUEUE_ADMISSION_TRANSITIONAL_ERROR_CODES
-            )
+            and not _runtime_admission_wait_is_safe(deployment)
         )
         or deployment.desired_state != DesiredDeploymentState.ACTIVE
     ):
