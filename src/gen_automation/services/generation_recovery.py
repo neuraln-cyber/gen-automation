@@ -13,13 +13,16 @@ from gen_automation.db.models import (
     GenerationJob,
     Release,
     ReleaseVersion,
+    SaladDeployment,
 )
 from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import (
+    DesiredDeploymentState,
     GenerationAttemptState,
     GenerationState,
     ReleasePhase,
     ResourceHealth,
+    SaladDeploymentState,
 )
 from gen_automation.domain.ids import uuid7
 from gen_automation.domain.near_black_recovery import (
@@ -31,6 +34,10 @@ from gen_automation.domain.near_black_recovery import (
 
 INFRASTRUCTURE_RETRY_GRANT_ACTION = "generation_attempt.infrastructure_retry_granted"
 MAX_INFRASTRUCTURE_RETRY_GRANTS = 2
+RUNTIME_INSTANCE_TURNOVER_RETRY_GRANT_ACTION = (
+    "generation_attempt.runtime_instance_turnover_retry_granted"
+)
+MAX_RUNTIME_INSTANCE_TURNOVER_RETRY_GRANTS = 2
 NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION = "generation_attempt.near_black_retry_granted"
 MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS = 1
 DEFAULT_INFRASTRUCTURE_RECOVERY_SWEEP_LIMIT = 16
@@ -94,6 +101,20 @@ _NON_RETRYABLE_JOB_STATES = frozenset(
     }
 )
 _GENERATION_STOP_REQUESTED_ACTION = "release.generation_stop_requested"
+_RUNTIME_ADMISSION_METADATA_VERSION = "v1"
+_RUNTIME_ADMISSION_TRANSITIONAL_ERROR_CODES = frozenset(
+    {
+        "provider_autoscaler_repair_pending",
+        "provider_image_preparation_pending",
+        "provider_start_pending",
+    }
+)
+_RUNTIME_ADMISSION_STALLED_ERROR_CODES = frozenset(
+    {
+        "provider_image_preparation_stalled",
+        "provider_start_stalled",
+    }
+)
 
 
 class InfrastructureRetrySource(StrEnum):
@@ -108,6 +129,16 @@ class InfrastructureRetryGrant:
     granted: bool
     grant_ordinal: int
     grant_limit: int
+
+
+@dataclass(frozen=True)
+class RuntimeInstanceTurnoverEvidence:
+    provider_external_id: str
+    provider_group_version: int
+    artifact_manifest_sha256: str
+    rollout_id: str
+    previous_worker_instance_id: str
+    current_worker_instance_id: str
 
 
 @dataclass(frozen=True)
@@ -262,6 +293,91 @@ async def _release_allows_retry(
     return not bool(stop_requested)
 
 
+async def _grant_bounded_infrastructure_retry(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    action: str,
+    grant_limit: int,
+    failure_code: str,
+    failure_detail: str | None,
+    source: InfrastructureRetrySource,
+    actor: str,
+    retry_at: datetime,
+    occurred_at: datetime,
+    audit_detail: dict[str, object],
+) -> InfrastructureRetryGrant:
+    existing_grant = await session.scalar(
+        select(AuditEvent.id)
+        .where(
+            AuditEvent.resource_type == "generation_attempt",
+            AuditEvent.resource_id == attempt.id,
+            AuditEvent.action == action,
+        )
+        .limit(1)
+    )
+    grant_count = int(
+        await session.scalar(
+            select(func.count(AuditEvent.id))
+            .join(GenerationAttempt, GenerationAttempt.id == AuditEvent.resource_id)
+            .where(
+                AuditEvent.resource_type == "generation_attempt",
+                AuditEvent.action == action,
+                GenerationAttempt.job_id == job.id,
+            )
+        )
+        or 0
+    )
+    if existing_grant is not None or grant_count >= grant_limit:
+        return InfrastructureRetryGrant(
+            granted=False,
+            grant_ordinal=grant_count,
+            grant_limit=grant_limit,
+        )
+
+    previous_max_attempts = job.max_attempts
+    previous_job_state = job.state
+    grant_ordinal = grant_count + 1
+    job.max_attempts = previous_max_attempts + 1
+    job.state = GenerationState.RETRY_WAIT
+    job.retry_at = _as_utc(retry_at)
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.last_error_code = failure_code
+    job.last_error_detail = failure_detail
+    job.lock_version += 1
+    session.add(
+        AuditEvent(
+            actor=actor,
+            action=action,
+            resource_type="generation_attempt",
+            resource_id=attempt.id,
+            correlation_id=str(attempt.id),
+            detail={
+                "generation_job_id": str(job.id),
+                "attempt_no": attempt.attempt_no,
+                "failure_code": failure_code,
+                "source": source.value,
+                "grant_ordinal": grant_ordinal,
+                "grant_limit": grant_limit,
+                "previous_max_attempts": previous_max_attempts,
+                "new_max_attempts": job.max_attempts,
+                "previous_job_state": previous_job_state.value,
+                "new_job_state": job.state.value,
+                **audit_detail,
+            },
+            occurred_at=_as_utc(occurred_at),
+        )
+    )
+    await session.flush()
+    return InfrastructureRetryGrant(
+        granted=True,
+        grant_ordinal=grant_ordinal,
+        grant_limit=grant_limit,
+    )
+
+
 async def grant_infrastructure_retry(
     session: AsyncSession,
     *,
@@ -305,85 +421,167 @@ async def grant_infrastructure_retry(
             grant_limit=MAX_INFRASTRUCTURE_RETRY_GRANTS,
         )
 
-    existing_grant = await session.scalar(
-        select(AuditEvent.id)
-        .where(
-            AuditEvent.resource_type == "generation_attempt",
-            AuditEvent.resource_id == attempt.id,
-            AuditEvent.action == INFRASTRUCTURE_RETRY_GRANT_ACTION,
-        )
-        .limit(1)
+    return await _grant_bounded_infrastructure_retry(
+        session,
+        attempt=attempt,
+        job=job,
+        action=INFRASTRUCTURE_RETRY_GRANT_ACTION,
+        grant_limit=MAX_INFRASTRUCTURE_RETRY_GRANTS,
+        failure_code=failure_code,
+        failure_detail=failure_detail,
+        source=source,
+        actor=actor,
+        retry_at=retry_at,
+        occurred_at=occurred_at,
+        audit_detail={
+            "failure_code_source": (
+                "generation_job_legacy_fallback"
+                if legacy_failure_code is not None
+                else "generation_attempt"
+            ),
+            "provider_external_id": attempt.provider_external_id,
+            "salad_deployment_id": str(attempt.salad_deployment_id),
+            "assets_retained": True,
+        },
     )
-    grant_count = int(
-        await session.scalar(
-            select(func.count(AuditEvent.id))
-            .join(
-                GenerationAttempt,
-                GenerationAttempt.id == AuditEvent.resource_id,
-            )
-            .where(
-                AuditEvent.resource_type == "generation_attempt",
-                AuditEvent.action == INFRASTRUCTURE_RETRY_GRANT_ACTION,
-                GenerationAttempt.job_id == job.id,
-            )
+
+
+def _runtime_instance_id_is_valid(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and 1 <= len(value) <= 128
+        and all(
+            character in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-"
+            for character in value
         )
-        or 0
     )
-    if existing_grant is not None or grant_count >= MAX_INFRASTRUCTURE_RETRY_GRANTS:
+
+
+def _runtime_turnover_deployment_allows_retry(
+    *,
+    attempt: GenerationAttempt,
+    deployment: SaladDeployment,
+    evidence: RuntimeInstanceTurnoverEvidence,
+) -> bool:
+    admission = attempt.request_metadata.get("runtime_admission")
+    deployment_state_allows_admission = (
+        deployment.state == SaladDeploymentState.ACTIVE
+        or (
+            deployment.state == SaladDeploymentState.PROVISIONING
+            and deployment.last_error_code in _RUNTIME_ADMISSION_TRANSITIONAL_ERROR_CODES
+        )
+        or (
+            deployment.state == SaladDeploymentState.DEGRADED
+            and deployment.last_error_code in _RUNTIME_ADMISSION_STALLED_ERROR_CODES
+        )
+    )
+    expected_admission = {
+        "version": _RUNTIME_ADMISSION_METADATA_VERSION,
+        "provider_group_version": evidence.provider_group_version,
+        "artifact_manifest_sha256": evidence.artifact_manifest_sha256,
+        "rollout_id": evidence.rollout_id,
+        "worker_instance_id": evidence.previous_worker_instance_id,
+    }
+    return bool(
+        attempt.salad_deployment_id == deployment.id
+        and attempt.worker_image_digest == deployment.worker_image_digest
+        and deployment.provider_queue_id is not None
+        and deployment.provider_container_group_id is not None
+        and deployment.is_current
+        and deployment.desired_state == DesiredDeploymentState.ACTIVE
+        and deployment.administrative_stop_reason is None
+        and deployment.max_replicas == 1
+        and deployment_state_allows_admission
+        and deployment.runtime_artifact_manifest_sha256
+        == evidence.artifact_manifest_sha256
+        and admission == expected_admission
+        and evidence.provider_group_version > 0
+        and len(evidence.artifact_manifest_sha256) == 64
+        and evidence.artifact_manifest_sha256 == evidence.artifact_manifest_sha256.lower()
+        and all(character in "0123456789abcdef" for character in evidence.artifact_manifest_sha256)
+        and len(evidence.rollout_id) == 32
+        and evidence.rollout_id == evidence.rollout_id.lower()
+        and all(character in "0123456789abcdef" for character in evidence.rollout_id)
+        and _runtime_instance_id_is_valid(evidence.previous_worker_instance_id)
+        and _runtime_instance_id_is_valid(evidence.current_worker_instance_id)
+        and evidence.previous_worker_instance_id != evidence.current_worker_instance_id
+    )
+
+
+async def grant_runtime_instance_turnover_retry(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    deployment: SaladDeployment,
+    evidence: RuntimeInstanceTurnoverEvidence,
+    source: InfrastructureRetrySource,
+    actor: str,
+    retry_at: datetime,
+    occurred_at: datetime,
+) -> InfrastructureRetryGrant:
+    """Grant a bounded retry after an exact admitted worker instance rotated.
+
+    The caller must hold the budget guard plus attempt, job, and deployment row
+    locks. Provider-side evidence is accepted only when it still matches the
+    attempt's immutable admission tuple and the current deployment remains
+    eligible for queue admission.
+    """
+
+    if (
+        attempt.job_id != job.id
+        or attempt.attempt_no != job.attempt_count
+        or attempt.state != GenerationAttemptState.FAILED
+        or attempt.completed_at is None
+        or attempt.error_code
+        not in {SALAD_JOB_FAILED_ERROR_CODE, SALAD_WEBHOOK_JOB_FAILED_ERROR_CODE}
+        or attempt.provider_external_id != evidence.provider_external_id
+        or attempt.provider_state != "failed"
+        or job.state
+        in {
+            GenerationState.SUCCEEDED,
+            GenerationState.FAILED,
+            GenerationState.DEAD_LETTER,
+            GenerationState.CANCELLED,
+        }
+        or job.max_attempts >= 10
+        or not _runtime_turnover_deployment_allows_retry(
+            attempt=attempt,
+            deployment=deployment,
+            evidence=evidence,
+        )
+        or not await _release_allows_retry(session, job=job)
+    ):
         return InfrastructureRetryGrant(
             granted=False,
-            grant_ordinal=grant_count,
-            grant_limit=MAX_INFRASTRUCTURE_RETRY_GRANTS,
+            grant_ordinal=0,
+            grant_limit=MAX_RUNTIME_INSTANCE_TURNOVER_RETRY_GRANTS,
         )
 
-    granted_at = _as_utc(occurred_at)
-    retry_not_before = _as_utc(retry_at)
-    previous_max_attempts = job.max_attempts
-    previous_job_state = job.state
-    grant_ordinal = grant_count + 1
-    job.max_attempts = previous_max_attempts + 1
-    job.state = GenerationState.RETRY_WAIT
-    job.retry_at = retry_not_before
-    job.lease_owner = None
-    job.lease_expires_at = None
-    job.last_error_code = failure_code
-    job.last_error_detail = failure_detail
-    job.lock_version += 1
-    session.add(
-        AuditEvent(
-            actor=actor,
-            action=INFRASTRUCTURE_RETRY_GRANT_ACTION,
-            resource_type="generation_attempt",
-            resource_id=attempt.id,
-            correlation_id=str(attempt.id),
-            detail={
-                "generation_job_id": str(job.id),
-                "attempt_no": attempt.attempt_no,
-                "failure_code": failure_code,
-                "failure_code_source": (
-                    "generation_job_legacy_fallback"
-                    if legacy_failure_code is not None
-                    else "generation_attempt"
-                ),
-                "source": source.value,
-                "grant_ordinal": grant_ordinal,
-                "grant_limit": MAX_INFRASTRUCTURE_RETRY_GRANTS,
-                "previous_max_attempts": previous_max_attempts,
-                "new_max_attempts": job.max_attempts,
-                "previous_job_state": previous_job_state.value,
-                "new_job_state": job.state.value,
-                "provider_external_id": attempt.provider_external_id,
-                "salad_deployment_id": str(attempt.salad_deployment_id),
-                "assets_retained": True,
-            },
-            occurred_at=granted_at,
-        )
-    )
-    await session.flush()
-    return InfrastructureRetryGrant(
-        granted=True,
-        grant_ordinal=grant_ordinal,
-        grant_limit=MAX_INFRASTRUCTURE_RETRY_GRANTS,
+    assert attempt.error_code is not None
+    return await _grant_bounded_infrastructure_retry(
+        session,
+        attempt=attempt,
+        job=job,
+        action=RUNTIME_INSTANCE_TURNOVER_RETRY_GRANT_ACTION,
+        grant_limit=MAX_RUNTIME_INSTANCE_TURNOVER_RETRY_GRANTS,
+        failure_code=attempt.error_code,
+        failure_detail=attempt.error_detail,
+        source=source,
+        actor=actor,
+        retry_at=retry_at,
+        occurred_at=occurred_at,
+        audit_detail={
+            "provider_external_id": evidence.provider_external_id,
+            "salad_deployment_id": str(deployment.id),
+            "provider_group_version": evidence.provider_group_version,
+            "artifact_manifest_sha256": evidence.artifact_manifest_sha256,
+            "rollout_id": evidence.rollout_id,
+            "previous_worker_instance_id": evidence.previous_worker_instance_id,
+            "current_worker_instance_id": evidence.current_worker_instance_id,
+            "retry_class": "runtime_instance_turnover",
+            "assets_retained": True,
+        },
     )
 
 

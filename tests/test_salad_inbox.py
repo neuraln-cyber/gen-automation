@@ -1059,6 +1059,71 @@ async def test_final_webhook_failure_grants_once_and_replay_is_idempotent(
     assert grants == 1
 
 
+async def test_failed_runtime_admission_webhook_waits_for_exact_turnover_reconciliation(
+    database: Database,
+) -> None:
+    context = await _seed(
+        database,
+        provider_status="failed",
+        attempt_count=1,
+        job_max_attempts=1,
+    )
+    async with database.sessions() as session:
+        attempt = await session.get(GenerationAttempt, context.attempt_id)
+        assert attempt is not None
+        request_metadata = dict(attempt.request_metadata)
+        request_metadata["runtime_admission"] = {
+            "version": "v1",
+            "provider_group_version": 3,
+            "artifact_manifest_sha256": "7" * 64,
+            "rollout_id": "1" * 32,
+            "worker_instance_id": "instance-old-44d8",
+        }
+        attempt.request_metadata = request_metadata
+        await session.commit()
+
+    await _claim_one(database)
+    async with database.sessions() as session:
+        result = await process_salad_webhook_receipt(
+            session,
+            receipt_id=context.receipt_id,
+            worker_id="inbox-worker",
+            now=NOW + timedelta(seconds=1),
+        )
+        attempt = await session.get(GenerationAttempt, context.attempt_id)
+        job = await session.get(GenerationJob, context.job_id)
+        receipt = await session.get(WebhookReceipt, context.receipt_id)
+        grant_count = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action == INFRASTRUCTURE_RETRY_GRANT_ACTION
+                )
+            )
+            or 0
+        )
+        deferred_audit_count = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action
+                    == "salad.webhook.runtime_failure_deferred_to_reconciler"
+                )
+            )
+            or 0
+        )
+
+    assert result.disposition == InboxDisposition.NO_CHANGE
+    assert receipt is not None
+    assert receipt.status == InboxStatus.SUCCEEDED
+    assert attempt is not None
+    assert attempt.state == GenerationAttemptState.SUBMITTED
+    assert attempt.provider_state is None
+    assert job is not None
+    assert job.state == GenerationState.RUNNING
+    assert job.max_attempts == 1
+    assert grant_count == 0
+    assert deferred_audit_count == 1
+
+
 async def test_webhook_for_superseded_attempt_cannot_rearm_current_job(
     database: Database,
 ) -> None:

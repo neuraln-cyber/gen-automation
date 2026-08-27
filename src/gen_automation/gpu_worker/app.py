@@ -531,14 +531,12 @@ def create_worker_app(
                     failed_output_index = (
                         error.output_index if branch_output_index is None else branch_output_index
                     )
-                    if recovery_event is not None:
-                        recovery_event.set()
                     print(
                         "GPU worker fatal output detected: "
                         f"attempt_id={payload.attempt_id} reason=near_black "
                         f"output_index={failed_output_index} "
                         f"rgb_extrema={error.rgb_extrema} "
-                        "action=comfy_recycle_requested",
+                        "action=seed_retry_no_recycle",
                         file=sys.stderr,
                         flush=True,
                     )

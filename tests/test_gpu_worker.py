@@ -1120,7 +1120,7 @@ def test_decoded_output_size_is_bounded() -> None:
     assert uploader.uploads == []
 
 
-def test_near_black_output_requests_recycle_and_blocks_next_request(
+def test_near_black_output_is_replayed_without_recycle_and_worker_keeps_serving(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     recycle_event = asyncio.Event()
@@ -1137,24 +1137,27 @@ def test_near_black_output_requests_recycle_and_blocks_next_request(
 
     with TestClient(app) as client:
         response = client.post("/jobs/generate", json=signed_request)
-        blocked = client.post("/jobs/generate", json=signed_request)
-        recycle_event.clear()
         replayed = client.post("/jobs/generate", json=signed_request)
+        next_attempt = client.post(
+            "/jobs/generate",
+            json=_signed_request(job_id="job-2", attempt_id="attempt-2"),
+        )
 
     assert response.status_code == 200
     assert response.json()["status"] == "failed"
     assert response.json()["code"] == "near_black_output"
     assert response.json()["failed_output_index"] == 0
     assert response.json()["outputs"] == []
-    assert blocked.status_code == 503
-    assert blocked.json() == {"detail": "worker recovery in progress"}
     assert replayed.json() == response.json()
-    assert len(executor.workflows) == 1
+    assert next_attempt.status_code == 200
+    assert next_attempt.json()["code"] == "near_black_output"
+    assert len(executor.workflows) == 2
     assert not recycle_event.is_set()
     assert uploader.uploads == []
     stderr = capsys.readouterr().err
     assert "reason=near_black output_index=0" in stderr
     assert "rgb_extrema=((4, 4), (4, 4), (4, 4))" in stderr
+    assert "action=seed_retry_no_recycle" in stderr
 
 
 def test_dark_nonblank_output_is_accepted_without_restart() -> None:
@@ -1177,7 +1180,7 @@ def test_dark_nonblank_output_is_accepted_without_restart() -> None:
     assert len(uploader.uploads) == 1
 
 
-def test_progressive_job_stops_after_near_black_output_and_requests_restart() -> None:
+def test_progressive_job_stops_after_near_black_output_without_requesting_restart() -> None:
     @dataclass
     class SequentialExecutor(FakeExecutor):
         generated_outputs: list[dict[str, object]] = field(default_factory=list)
@@ -1214,7 +1217,7 @@ def test_progressive_job_stops_after_near_black_output_and_requests_restart() ->
     assert response.json()["code"] == "near_black_output"
     assert response.json()["failed_output_index"] == 1
     assert [output["output_index"] for output in response.json()["outputs"]] == [0]
-    assert restart_event.is_set()
+    assert not restart_event.is_set()
     assert len(executor.workflows) == 2
     assert [upload.grant.output_index for upload in uploader.uploads] == [0]
 
