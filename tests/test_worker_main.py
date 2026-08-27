@@ -489,14 +489,19 @@ def test_build_comfy_command_is_loopback_offline_and_narrowly_whitelisted() -> N
     assert "--enable-manager" not in command
 
 
-def test_explicit_vae_manifest_launches_comfy_with_fp32_vae_only() -> None:
+def test_anima_qwen_precision_launch_adds_each_pinned_flag_once() -> None:
     settings = _settings()
     split_launch = _ComfyLaunchSettings.from_runtime_settings(settings, fp32_vae=True)
     checkpoint_launch = _ComfyLaunchSettings.from_runtime_settings(settings, fp32_vae=False)
 
-    assert "--fp32-vae" in build_comfy_command(split_launch)
-    assert "--fp32-vae" not in build_comfy_command(checkpoint_launch)
-    assert "--fp32-vae" not in build_comfy_command(settings)
+    split_command = build_comfy_command(split_launch)
+    assert split_command[-2:] == ("--fp16-unet", "--fp32-vae")
+    assert split_command.count("--fp16-unet") == 1
+    assert split_command.count("--fp32-vae") == 1
+    assert build_comfy_command(split_launch) == split_command
+    for command in (build_comfy_command(checkpoint_launch), build_comfy_command(settings)):
+        assert "--fp16-unet" not in command
+        assert "--fp32-vae" not in command
 
 
 def test_fp32_vae_policy_is_scoped_to_anima_qwen_split_manifest() -> None:
@@ -523,6 +528,22 @@ def test_fp32_vae_policy_is_scoped_to_anima_qwen_split_manifest() -> None:
 
     assert _manifest_requires_fp32_vae(anima)
     assert not _manifest_requires_fp32_vae(other_split_model)
+
+    anima_command = build_comfy_command(
+        _ComfyLaunchSettings.from_runtime_settings(
+            _settings(),
+            fp32_vae=_manifest_requires_fp32_vae(anima),
+        )
+    )
+    other_command = build_comfy_command(
+        _ComfyLaunchSettings.from_runtime_settings(
+            _settings(),
+            fp32_vae=_manifest_requires_fp32_vae(other_split_model),
+        )
+    )
+    assert anima_command[-2:] == ("--fp16-unet", "--fp32-vae")
+    assert "--fp16-unet" not in other_command
+    assert "--fp32-vae" not in other_command
 
 
 @pytest.mark.parametrize(
