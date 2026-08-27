@@ -3,7 +3,8 @@
 FROM golang:1.26.2-alpine@sha256:f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739500e08c86393a21b1 AS salad-queue-worker-builder
 
 ENV SALAD_QUEUE_WORKER_COMMIT=73d7a3c80a73f26339194e024cb47c8501c67f75 \
-    SALAD_QUEUE_WORKER_PATCH_SHA256=a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae
+    SALAD_QUEUE_WORKER_PATCH_SHA256=a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae \
+    SALAD_QUEUE_WORKER_HEARTBEAT_PATCH_SHA256=e19fcdf5b5f828e3435f027133017dbd68d46c4c0ab0321c2de7198719b06d18
 
 RUN apk add --no-cache git \
     && mkdir --parents /src \
@@ -17,13 +18,18 @@ RUN apk add --no-cache git \
 WORKDIR /src
 
 COPY patches/salad-queue-worker/strict-http-status.patch /tmp/strict-http-status.patch
+COPY patches/salad-queue-worker/job-stream-heartbeat-watchdog.patch /tmp/job-stream-heartbeat-watchdog.patch
 
 RUN printf '%s  %s\n' \
         "${SALAD_QUEUE_WORKER_PATCH_SHA256}" \
         /tmp/strict-http-status.patch \
+        "${SALAD_QUEUE_WORKER_HEARTBEAT_PATCH_SHA256}" \
+        /tmp/job-stream-heartbeat-watchdog.patch \
         | sha256sum -c - \
     && git apply --unidiff-zero --check /tmp/strict-http-status.patch \
     && git apply --unidiff-zero /tmp/strict-http-status.patch \
+    && git apply --check /tmp/job-stream-heartbeat-watchdog.patch \
+    && git apply /tmp/job-stream-heartbeat-watchdog.patch \
     && git diff --check
 
 RUN go mod download \
@@ -113,7 +119,8 @@ LABEL org.opencontainers.image.title="gen-automation-gpu-worker" \
       org.opencontainers.image.impact-pack.revision="429d0159ad429e64d2b3916e6e7be9c22d025c3c" \
       org.opencontainers.image.impact-subpack.revision="50c7b71a6a224734cc9b21963c6d1926816a97f1" \
       org.opencontainers.image.salad-queue-worker.revision="73d7a3c80a73f26339194e024cb47c8501c67f75" \
-      org.opencontainers.image.salad-queue-worker.patch-sha256="a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae"
+      org.opencontainers.image.salad-queue-worker.patch-sha256="a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae" \
+      org.opencontainers.image.salad-queue-worker.heartbeat-patch-sha256="e19fcdf5b5f828e3435f027133017dbd68d46c4c0ab0321c2de7198719b06d18"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     COMFYUI_COMMIT=700821e1364eaab0e8f21c538a2131719fec57bf \

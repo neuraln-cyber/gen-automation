@@ -10,6 +10,9 @@ COMFY_INPUT_PATH = ROOT / "requirements-comfy.in"
 COMFY_LOCK_PATH = ROOT / "requirements-comfy.lock"
 WORKER_BASE_PATH = ROOT / "requirements-worker-base.txt"
 SALAD_QUEUE_WORKER_PATCH_PATH = ROOT / "patches" / "salad-queue-worker" / "strict-http-status.patch"
+SALAD_QUEUE_WORKER_HEARTBEAT_PATCH_PATH = (
+    ROOT / "patches" / "salad-queue-worker" / "job-stream-heartbeat-watchdog.patch"
+)
 
 DOCKERFILE_FRONTEND = (
     "docker/dockerfile:1.7.1@"
@@ -30,6 +33,9 @@ IMPACT_PACK_COMMIT = "429d0159ad429e64d2b3916e6e7be9c22d025c3c"
 IMPACT_SUBPACK_COMMIT = "50c7b71a6a224734cc9b21963c6d1926816a97f1"
 SALAD_QUEUE_WORKER_COMMIT = "73d7a3c80a73f26339194e024cb47c8501c67f75"
 SALAD_QUEUE_WORKER_PATCH_SHA256 = "a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae"
+SALAD_QUEUE_WORKER_HEARTBEAT_PATCH_SHA256 = (
+    "e19fcdf5b5f828e3435f027133017dbd68d46c4c0ab0321c2de7198719b06d18"
+)
 
 
 def _dockerfile() -> str:
@@ -125,6 +131,33 @@ def test_salad_queue_worker_accepts_only_2xx_job_responses() -> None:
     assert 'name: "unauthorized", statusCode: http.StatusUnauthorized, wantError: true' in (
         patch_text
     )
+
+
+def test_salad_queue_worker_reconnects_a_silent_job_stream() -> None:
+    dockerfile = _logical_lines(_dockerfile())
+    patch = SALAD_QUEUE_WORKER_HEARTBEAT_PATCH_PATH.read_bytes()
+    patch_text = patch.decode("utf-8")
+
+    assert hashlib.sha256(patch).hexdigest() == SALAD_QUEUE_WORKER_HEARTBEAT_PATCH_SHA256
+    assert (
+        f"SALAD_QUEUE_WORKER_HEARTBEAT_PATCH_SHA256="
+        f"{SALAD_QUEUE_WORKER_HEARTBEAT_PATCH_SHA256}" in dockerfile
+    )
+    assert (
+        "COPY patches/salad-queue-worker/job-stream-heartbeat-watchdog.patch "
+        "/tmp/job-stream-heartbeat-watchdog.patch" in dockerfile
+    )
+    assert "git apply --check /tmp/job-stream-heartbeat-watchdog.patch" in dockerfile
+    assert "git apply /tmp/job-stream-heartbeat-watchdog.patch" in dockerfile
+    assert (
+        f'org.opencontainers.image.salad-queue-worker.heartbeat-patch-sha256="'
+        f'{SALAD_QUEUE_WORKER_HEARTBEAT_PATCH_SHA256}"' in dockerfile
+    )
+    assert "+const jobStreamSilenceTimeout = 2 * time.Minute" in patch_text
+    assert "+\t\t\tstreamCtx, cancelStream := context.WithCancel(authCtx)" in patch_text
+    assert '+\t\t\t\t\t\tlogger.Warn("job stream heartbeat timed out")' in patch_text
+    assert "+\t\t\t\t\t\tcancelStream()" in patch_text
+    assert "CurrentJobId: currentJobId" in patch_text
 
 
 def test_final_runtime_is_non_root_with_a_writable_non_root_home() -> None:
