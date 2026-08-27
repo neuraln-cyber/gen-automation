@@ -1,4 +1,5 @@
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -21,7 +22,7 @@ from gen_automation.db.models import (
     SaladDeployment,
 )
 from gen_automation.db.session import Database
-from gen_automation.domain.canonical import canonical_sha256
+from gen_automation.domain.canonical import canonical_json_bytes, canonical_sha256
 from gen_automation.domain.enums import (
     AssetKind,
     AssetState,
@@ -33,6 +34,10 @@ from gen_automation.domain.enums import (
     ResourceHealth,
     SaladDeploymentPurpose,
     SaladDeploymentState,
+)
+from gen_automation.domain.near_black_recovery import (
+    NEAR_BLACK_SEED_RECOVERY_METADATA_KEY,
+    NearBlackSeedRecoveryPlan,
 )
 from gen_automation.integrations.salad.client import SALAD_QUEUE_JOB_PAGE_SIZE
 from gen_automation.integrations.salad.errors import (
@@ -54,9 +59,13 @@ from gen_automation.services.budgets import ensure_budget_guard, reserve_attempt
 from gen_automation.services.generation_recovery import (
     INFRASTRUCTURE_RETRY_GRANT_ACTION,
     NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION,
+    SALAD_JOB_FAILED_ERROR_CODE,
     SALAD_PROVIDER_CANCELLED_ERROR_CODE,
     SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE,
     SALAD_WORKER_NEAR_BLACK_OUTPUT_ERROR_CODE,
+    InfrastructureRetrySource,
+    grant_infrastructure_retry,
+    grant_near_black_output_retry,
 )
 from gen_automation.services.outbox import (
     SALAD_JOB_SUBMIT_TOPIC,
@@ -324,6 +333,23 @@ def enable_runtime_admission(attempt: GenerationAttempt) -> None:
     }
     attempt.request_metadata = request_metadata
     attempt.lock_version += 1
+
+
+def enable_near_black_seed_recovery(
+    job: GenerationJob,
+    *,
+    seeds: tuple[int, ...] = (42, 43),
+) -> None:
+    parameters = dict(job.parameters)
+    parameters.update(
+        {
+            "schema_version": 2,
+            "generation": {"seed": seeds[0]},
+            "output_generations": [{"seed": seed} for seed in seeds],
+        }
+    )
+    job.parameters = parameters
+    job.parameters_sha256 = canonical_sha256(parameters)
 
 
 async def add_progress_watchdog_assets(
@@ -3735,6 +3761,7 @@ async def test_typed_near_black_output_gets_one_separate_bounded_retry(
         # Keep ordinary attempts available so a second deterministic near-black
         # result can prove that only the dedicated recovery grant permits retry.
         job.max_attempts = 4
+        enable_near_black_seed_recovery(job)
         await session.commit()
         attempt_id = await prepared_attempt(session, context)
         await submit_prepared_attempt(
@@ -3789,6 +3816,22 @@ async def test_typed_near_black_output_gets_one_separate_bounded_retry(
             )
             or 0
         )
+        grant_event = await session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.action == NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION,
+                AuditEvent.resource_id == attempt_id,
+            )
+        )
+        assert grant_event is not None
+        audited_plan_value = grant_event.detail[NEAR_BLACK_SEED_RECOVERY_METADATA_KEY]
+        audited_plan = NearBlackSeedRecoveryPlan.model_validate_json(
+            canonical_json_bytes(audited_plan_value),
+            strict=True,
+        )
+        assert audited_plan.source_grant_audit_event_id == str(grant_event.id)
+        assert audited_plan.source_generation_attempt_id == str(attempt_id)
+        assert audited_plan.source_attempt_no == 1
+        assert audited_plan.grant_ordinal == 1
 
         repeated = await apply_salad_job_observation(
             session,
@@ -3810,6 +3853,33 @@ async def test_typed_near_black_output_gets_one_separate_bounded_retry(
             or 0
         )
 
+        source_replay = await prepare_generation_attempt(
+            session,
+            generation_job_id=context.job_id,
+            salad_deployment_id=context.deployment_id,
+            idempotency_key="scheduler-claim-1",
+            now=NOW + timedelta(minutes=3),
+        )
+        source_attempt = await session.get(GenerationAttempt, attempt_id)
+        assert source_attempt is not None
+        assert source_replay.replayed is True
+        assert source_replay.generation_attempt_id == attempt_id
+        assert NEAR_BLACK_SEED_RECOVERY_METADATA_KEY not in source_attempt.request_metadata
+        assert (
+            source_replay.request_sha256
+            == source_attempt.request_sha256
+            == canonical_sha256(
+                {
+                    "generation_job_id": str(context.job_id),
+                    "release_version_id": str(job.release_version_id),
+                    "parameters_sha256": job.parameters_sha256,
+                    "salad_deployment_id": str(context.deployment_id),
+                    "deployment_config_sha256": "b" * 64,
+                    "worker_image_digest": IMAGE_DIGEST,
+                }
+            )
+        )
+
         second_prepared = await prepare_generation_attempt(
             session,
             generation_job_id=context.job_id,
@@ -3819,11 +3889,63 @@ async def test_typed_near_black_output_gets_one_separate_bounded_retry(
         )
         await session.commit()
         second_attempt_id = second_prepared.generation_attempt_id
+        second_attempt = await session.get(GenerationAttempt, second_attempt_id)
+        assert second_attempt is not None
+        assert (
+            second_attempt.request_metadata[NEAR_BLACK_SEED_RECOVERY_METADATA_KEY]
+            == audited_plan_value
+        )
+        expected_retry_request_sha256 = canonical_sha256(
+            {
+                "generation_job_id": str(context.job_id),
+                "release_version_id": str(job.release_version_id),
+                "parameters_sha256": job.parameters_sha256,
+                "salad_deployment_id": str(context.deployment_id),
+                "deployment_config_sha256": "b" * 64,
+                "worker_image_digest": IMAGE_DIGEST,
+                "near_black_seed_recovery_plan_sha256": audited_plan.plan_sha256,
+            }
+        )
+        assert second_attempt.request_sha256 == expected_retry_request_sha256
+
+        for provenance_field in (
+            "source_grant_audit_event_id",
+            "source_generation_attempt_id",
+        ):
+            second_attempt = await session.get(GenerationAttempt, second_attempt_id)
+            assert second_attempt is not None
+            tampered_metadata = deepcopy(second_attempt.request_metadata)
+            tampered_plan = deepcopy(tampered_metadata[NEAR_BLACK_SEED_RECOVERY_METADATA_KEY])
+            assert isinstance(tampered_plan, dict)
+            tampered_plan[provenance_field] = str(uuid4())
+            tampered_plan_payload = dict(tampered_plan)
+            tampered_plan_payload.pop("plan_sha256")
+            tampered_plan["plan_sha256"] = canonical_sha256(tampered_plan_payload)
+            tampered_metadata[NEAR_BLACK_SEED_RECOVERY_METADATA_KEY] = tampered_plan
+            second_attempt.request_metadata = tampered_metadata
+            uploads = FakeUploadIntentProvider()
+            with pytest.raises(SaladServiceConflictError, match="near-black recovery plan"):
+                await submit_prepared_attempt(
+                    session,
+                    FakeSaladClient(),
+                    uploads,
+                    generation_attempt_id=second_attempt_id,
+                    webhook_url="https://controller.example.test/webhooks/salad",
+                    reservation_microusd=500_000,
+                    now=NOW + timedelta(minutes=4),
+                )
+            assert not uploads.calls
+            assert second_attempt.state == GenerationAttemptState.CREATED
+            assert second_attempt.cost_reservation_microusd == 0
+            assert retrying_job.state == GenerationState.CLAIMED
+            await session.rollback()
+
         second_provider_job_id = uuid4()
+        retry_uploads = FakeUploadIntentProvider()
         await submit_prepared_attempt(
             session,
             FakeSaladClient(create_job_id=second_provider_job_id),
-            FakeUploadIntentProvider(),
+            retry_uploads,
             generation_attempt_id=second_attempt_id,
             webhook_url="https://controller.example.test/webhooks/salad",
             reservation_microusd=500_000,
@@ -3831,6 +3953,8 @@ async def test_typed_near_black_output_gets_one_separate_bounded_retry(
         )
         second_attempt = await session.get(GenerationAttempt, second_attempt_id)
         assert second_attempt is not None
+        assert retry_uploads.calls[0].near_black_seed_recovery_plan == audited_plan
+        assert retry_uploads.calls[0].generation_attempt_no == 2
         second_attempt_no = second_attempt.attempt_no
         second_metadata: JSONObject = {
             "generation_attempt_id": str(second_attempt.id),
@@ -3890,6 +4014,160 @@ async def test_typed_near_black_output_gets_one_separate_bounded_retry(
     assert final_job.max_attempts == 5
     assert final_job.state == GenerationState.DEAD_LETTER
     assert all_black_grants == 1
+
+
+@pytest.mark.asyncio
+async def test_unbuildable_near_black_plan_is_not_granted_and_dead_letters(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        job = await session.get(GenerationJob, context.job_id)
+        assert job is not None
+        enable_near_black_seed_recovery(job, seeds=(42, 42))
+        original_max_attempts = job.max_attempts
+        await session.commit()
+
+        attempt_id = await prepared_attempt(session, context)
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        worker_outputs = await expected_worker_outputs(session, context)
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        result = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(
+                get_result=remote_job(
+                    status=SaladJobStatus.SUCCEEDED,
+                    metadata={
+                        "generation_attempt_id": str(attempt.id),
+                        "generation_job_id": str(attempt.job_id),
+                        "submission_key": attempt.submission_key,
+                        "request_sha256": attempt.request_sha256,
+                    },
+                    update_time=NOW + timedelta(minutes=1),
+                    output={
+                        "version": "v1",
+                        "job_id": str(context.job_id),
+                        "attempt_id": str(attempt_id),
+                        "status": "failed",
+                        "code": "near_black_output",
+                        "failed_output_index": 1,
+                        "outputs": worker_outputs[:1],
+                    },
+                )
+            ),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=2),
+        )
+        await session.commit()
+        failed_job = await session.get(GenerationJob, context.job_id)
+        grant_count = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action == NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION,
+                    AuditEvent.resource_id == attempt_id,
+                )
+            )
+            or 0
+        )
+
+    assert result.observation.generation_job_state == GenerationState.DEAD_LETTER
+    assert failed_job is not None
+    assert failed_job.state == GenerationState.DEAD_LETTER
+    assert failed_job.max_attempts == original_max_attempts
+    assert grant_count == 0
+
+
+@pytest.mark.asyncio
+async def test_later_infrastructure_attempt_inherits_the_exact_near_black_plan(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        job = await session.get(GenerationJob, context.job_id)
+        assert job is not None
+        enable_near_black_seed_recovery(job)
+        await session.commit()
+
+        source_attempt_id = await prepared_attempt(session, context)
+        source_attempt = await session.get(GenerationAttempt, source_attempt_id)
+        job = await session.get(GenerationJob, context.job_id)
+        assert source_attempt is not None
+        assert job is not None
+        source_attempt.state = GenerationAttemptState.FAILED
+        source_attempt.completed_at = NOW
+        source_attempt.error_code = SALAD_WORKER_NEAR_BLACK_OUTPUT_ERROR_CODE
+        source_attempt.error_detail = "near-black"
+        source_attempt.provider_external_id = "near-black-source"
+        source_attempt.provider_state = "failed"
+        near_black_grant = await grant_near_black_output_retry(
+            session,
+            attempt=source_attempt,
+            job=job,
+            source=InfrastructureRetrySource.RECONCILER,
+            actor="test",
+            retry_at=NOW,
+            occurred_at=NOW,
+            failed_output_index=1,
+            uploaded_output_indices=(0,),
+        )
+        assert near_black_grant.granted is True
+        assert near_black_grant.grant_audit_event_id is not None
+        assert near_black_grant.recovery_plan is not None
+        await session.commit()
+
+        second = await prepare_generation_attempt(
+            session,
+            generation_job_id=context.job_id,
+            salad_deployment_id=context.deployment_id,
+            idempotency_key="near-black-recovery-attempt",
+            now=NOW + timedelta(minutes=1),
+        )
+        await session.commit()
+        second_attempt = await session.get(GenerationAttempt, second.generation_attempt_id)
+        job = await session.get(GenerationJob, context.job_id)
+        assert second_attempt is not None
+        assert job is not None
+        inherited_plan = second_attempt.request_metadata[NEAR_BLACK_SEED_RECOVERY_METADATA_KEY]
+        second_attempt.state = GenerationAttemptState.FAILED
+        second_attempt.completed_at = NOW + timedelta(minutes=2)
+        second_attempt.error_code = SALAD_JOB_FAILED_ERROR_CODE
+        second_attempt.error_detail = "provider failed"
+        second_attempt.provider_external_id = "infrastructure-retry-source"
+        second_attempt.provider_state = "failed"
+        infrastructure_grant = await grant_infrastructure_retry(
+            session,
+            attempt=second_attempt,
+            job=job,
+            source=InfrastructureRetrySource.RECONCILER,
+            actor="test",
+            retry_at=NOW + timedelta(minutes=2),
+            occurred_at=NOW + timedelta(minutes=2),
+        )
+        assert infrastructure_grant.granted is True
+        await session.commit()
+
+        third = await prepare_generation_attempt(
+            session,
+            generation_job_id=context.job_id,
+            salad_deployment_id=context.deployment_id,
+            idempotency_key="infrastructure-after-near-black",
+            now=NOW + timedelta(minutes=3),
+        )
+        await session.commit()
+        third_attempt = await session.get(GenerationAttempt, third.generation_attempt_id)
+
+    assert third_attempt is not None
+    assert third_attempt.request_metadata[NEAR_BLACK_SEED_RECOVERY_METADATA_KEY] == inherited_plan
+    assert third_attempt.request_sha256 == second.request_sha256
 
 
 @pytest.mark.asyncio

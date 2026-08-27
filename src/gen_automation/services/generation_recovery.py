@@ -14,11 +14,19 @@ from gen_automation.db.models import (
     Release,
     ReleaseVersion,
 )
+from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import (
     GenerationAttemptState,
     GenerationState,
     ReleasePhase,
     ResourceHealth,
+)
+from gen_automation.domain.ids import uuid7
+from gen_automation.domain.near_black_recovery import (
+    NEAR_BLACK_SEED_RECOVERY_METADATA_KEY,
+    NearBlackRecoveryPlanError,
+    NearBlackSeedRecoveryPlan,
+    build_near_black_seed_recovery_plan,
 )
 
 INFRASTRUCTURE_RETRY_GRANT_ACTION = "generation_attempt.infrastructure_retry_granted"
@@ -103,9 +111,64 @@ class InfrastructureRetryGrant:
 
 
 @dataclass(frozen=True)
+class NearBlackOutputRetryGrant:
+    granted: bool
+    grant_ordinal: int
+    grant_limit: int
+    grant_audit_event_id: UUID | None
+    recovery_plan: NearBlackSeedRecoveryPlan | None
+
+    def __post_init__(self) -> None:
+        if self.granted != (self.grant_audit_event_id is not None) or self.granted != (
+            self.recovery_plan is not None
+        ):
+            raise ValueError("near-black grant provenance is inconsistent")
+        if self.recovery_plan is not None and self.recovery_plan.source_grant_audit_event_id != str(
+            self.grant_audit_event_id
+        ):
+            raise ValueError("near-black grant plan belongs to another audit event")
+
+
+@dataclass(frozen=True)
 class InfrastructureRecoverySummary:
     scanned: int
     recovered_job_ids: tuple[UUID, ...]
+
+
+def require_near_black_original_output_seeds(job: GenerationJob) -> tuple[int, ...]:
+    """Return the immutable per-output seed map used to create the job."""
+
+    try:
+        parameters_match = canonical_sha256(job.parameters) == job.parameters_sha256
+    except (TypeError, ValueError):
+        parameters_match = False
+    raw_outputs = job.parameters.get("output_generations")
+    raw_generation = job.parameters.get("generation")
+    if (
+        not parameters_match
+        or job.parameters.get("schema_version") != 2
+        or not isinstance(raw_outputs, list)
+        or len(raw_outputs) != job.expected_output_count
+        or not isinstance(raw_generation, dict)
+    ):
+        raise NearBlackRecoveryPlanError("original job seeds are unavailable")
+    seeds: list[int] = []
+    for output in raw_outputs:
+        if not isinstance(output, dict):
+            raise NearBlackRecoveryPlanError("original job seeds are unavailable")
+        seed = output.get("seed")
+        if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed <= (2**63) - 1:
+            raise NearBlackRecoveryPlanError("original job seeds are unavailable")
+        seeds.append(seed)
+    base_seed = raw_generation.get("seed")
+    if (
+        not seeds
+        or not isinstance(base_seed, int)
+        or isinstance(base_seed, bool)
+        or base_seed != seeds[0]
+    ):
+        raise NearBlackRecoveryPlanError("original job seeds are unavailable")
+    return tuple(seeds)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -335,7 +398,7 @@ async def grant_near_black_output_retry(
     occurred_at: datetime,
     failed_output_index: int,
     uploaded_output_indices: tuple[int, ...],
-) -> InfrastructureRetryGrant:
+) -> NearBlackOutputRetryGrant:
     """Grant one retry slot independent of the generic infrastructure budget."""
 
     if (
@@ -351,10 +414,12 @@ async def grant_near_black_output_retry(
         or list(uploaded_output_indices) not in ([], list(range(failed_output_index)))
         or not await _release_allows_retry(session, job=job)
     ):
-        return InfrastructureRetryGrant(
+        return NearBlackOutputRetryGrant(
             granted=False,
             grant_ordinal=0,
             grant_limit=MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS,
+            grant_audit_event_id=None,
+            recovery_plan=None,
         )
 
     existing_grant = await session.scalar(
@@ -382,10 +447,12 @@ async def grant_near_black_output_retry(
         or 0
     )
     if existing_grant is not None or grant_count >= MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS:
-        return InfrastructureRetryGrant(
+        return NearBlackOutputRetryGrant(
             granted=False,
             grant_ordinal=grant_count,
             grant_limit=MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS,
+            grant_audit_event_id=None,
+            recovery_plan=None,
         )
 
     granted_at = _as_utc(occurred_at)
@@ -393,6 +460,27 @@ async def grant_near_black_output_retry(
     previous_max_attempts = job.max_attempts
     previous_job_state = job.state
     grant_ordinal = grant_count + 1
+    grant_audit_event_id = uuid7()
+    try:
+        recovery_plan = build_near_black_seed_recovery_plan(
+            generation_job_id=job.id,
+            source_grant_audit_event_id=grant_audit_event_id,
+            source_generation_attempt_id=attempt.id,
+            source_attempt_no=attempt.attempt_no,
+            grant_ordinal=grant_ordinal,
+            failed_output_index=failed_output_index,
+            expected_output_count=job.expected_output_count,
+            uploaded_output_indices=uploaded_output_indices,
+            original_seeds=require_near_black_original_output_seeds(job),
+        )
+    except NearBlackRecoveryPlanError:
+        return NearBlackOutputRetryGrant(
+            granted=False,
+            grant_ordinal=grant_count,
+            grant_limit=MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS,
+            grant_audit_event_id=None,
+            recovery_plan=None,
+        )
     job.max_attempts = previous_max_attempts + 1
     job.state = GenerationState.RETRY_WAIT
     job.retry_at = retry_not_before
@@ -403,6 +491,7 @@ async def grant_near_black_output_retry(
     job.lock_version += 1
     session.add(
         AuditEvent(
+            id=grant_audit_event_id,
             actor=actor,
             action=NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION,
             resource_type="generation_attempt",
@@ -424,15 +513,18 @@ async def grant_near_black_output_retry(
                 "failed_output_index": failed_output_index,
                 "uploaded_output_count": len(uploaded_output_indices),
                 "assets_retained": True,
+                NEAR_BLACK_SEED_RECOVERY_METADATA_KEY: recovery_plan.model_dump(mode="json"),
             },
             occurred_at=granted_at,
         )
     )
     await session.flush()
-    return InfrastructureRetryGrant(
+    return NearBlackOutputRetryGrant(
         granted=True,
         grant_ordinal=grant_ordinal,
         grant_limit=MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS,
+        grant_audit_event_id=grant_audit_event_id,
+        recovery_plan=recovery_plan,
     )
 
 

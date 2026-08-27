@@ -36,6 +36,12 @@ from gen_automation.domain.enums import (
     SaladDeploymentState,
 )
 from gen_automation.domain.ids import uuid7
+from gen_automation.domain.near_black_recovery import (
+    NEAR_BLACK_SEED_RECOVERY_METADATA_KEY,
+    NearBlackRecoveryPlanError,
+    NearBlackSeedRecoveryPlan,
+    require_near_black_seed_recovery_plan,
+)
 from gen_automation.gpu_worker.models import (
     GenerateFailureResponse,
     GenerateResponse,
@@ -62,6 +68,7 @@ from gen_automation.services.budgets import (
 )
 from gen_automation.services.generation_control import GENERATION_STOP_REQUESTED_ACTION
 from gen_automation.services.generation_recovery import (
+    NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION,
     SALAD_JOB_FAILED_ERROR_CODE,
     SALAD_PROVIDER_CANCELLED_ERROR_CODE,
     SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE,
@@ -70,6 +77,7 @@ from gen_automation.services.generation_recovery import (
     InfrastructureRetrySource,
     grant_infrastructure_retry,
     grant_near_black_output_retry,
+    require_near_black_original_output_seeds,
 )
 from gen_automation.services.outbox import (
     GENERATION_ATTEMPT_AGGREGATE,
@@ -119,6 +127,7 @@ SALAD_OUTPUT_PROGRESS_WATCHDOG_REASON = "accepted_output_progress_stalled"
 _RUNTIME_ENVELOPE_WATCHDOG_REASON = "runtime_envelope_expired"
 _RUNTIME_ADMISSION_METADATA_KEY = "runtime_admission"
 _RUNTIME_ADMISSION_METADATA_VERSION = "v1"
+_NEAR_BLACK_RECOVERY_PLAN_SHA256_REQUEST_KEY = "near_black_seed_recovery_plan_sha256"
 _PROVIDER_RUN_EPOCH_STARTED_AT_METADATA_KEY = "provider_run_epoch_started_at"
 _PROVIDER_CLOCK_SKEW_SECONDS = 5 * 60
 _PREEXISTING_OUTPUT_GRACE_SECONDS = 120
@@ -360,6 +369,8 @@ class SaladJobInputContext:
     parameters: Mapping[str, Any]
     parameters_sha256: str
     request_sha256: str
+    generation_attempt_no: int = 1
+    near_black_seed_recovery_plan: NearBlackSeedRecoveryPlan | None = None
 
 
 class SaladUploadIntentProvider(Protocol):
@@ -532,6 +543,152 @@ async def create_deployment_version(
     )
 
 
+def _generation_attempt_request_sha256(
+    *,
+    job: GenerationJob,
+    deployment: SaladDeployment,
+    recovery_plan: NearBlackSeedRecoveryPlan | None,
+) -> str:
+    payload: dict[str, object] = {
+        "generation_job_id": str(job.id),
+        "release_version_id": str(job.release_version_id),
+        "parameters_sha256": job.parameters_sha256,
+        "salad_deployment_id": str(deployment.id),
+        "deployment_config_sha256": deployment.config_sha256,
+        "worker_image_digest": deployment.worker_image_digest,
+    }
+    if recovery_plan is not None:
+        payload[_NEAR_BLACK_RECOVERY_PLAN_SHA256_REQUEST_KEY] = recovery_plan.plan_sha256
+    return canonical_sha256(payload)
+
+
+async def _load_near_black_grant(
+    session: AsyncSession,
+    *,
+    generation_job_id: UUID,
+) -> tuple[AuditEvent, GenerationAttempt] | None:
+    rows = list(
+        (
+            await session.execute(
+                select(AuditEvent, GenerationAttempt)
+                .join(GenerationAttempt, GenerationAttempt.id == AuditEvent.resource_id)
+                .where(
+                    AuditEvent.resource_type == "generation_attempt",
+                    AuditEvent.action == NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION,
+                    GenerationAttempt.job_id == generation_job_id,
+                )
+                .order_by(AuditEvent.occurred_at, AuditEvent.id)
+                .limit(2)
+            )
+        ).all()
+    )
+    if len(rows) > 1:
+        raise SaladServiceConflictError("generation job has conflicting near-black grants")
+    if not rows:
+        return None
+    return rows[0][0], rows[0][1]
+
+
+def _validated_near_black_recovery_plan(
+    *,
+    job: GenerationJob,
+    target_attempt_no: int,
+    audit_event: AuditEvent,
+    source_attempt: GenerationAttempt,
+    stored_plan: Mapping[str, object] | None = None,
+) -> NearBlackSeedRecoveryPlan:
+    grant_ordinal = audit_event.detail.get("grant_ordinal")
+    audited_plan_value = audit_event.detail.get(NEAR_BLACK_SEED_RECOVERY_METADATA_KEY)
+    if (
+        not isinstance(grant_ordinal, int)
+        or isinstance(grant_ordinal, bool)
+        or audit_event.detail.get("generation_job_id") != str(job.id)
+        or audit_event.detail.get("attempt_no") != source_attempt.attempt_no
+        or not isinstance(audited_plan_value, Mapping)
+    ):
+        raise SaladServiceConflictError("near-black recovery grant provenance is invalid")
+    try:
+        original_seeds = require_near_black_original_output_seeds(job)
+        audited_plan = require_near_black_seed_recovery_plan(
+            audited_plan_value,
+            generation_job_id=job.id,
+            expected_output_count=job.expected_output_count,
+            original_seeds=original_seeds,
+            source_grant_audit_event_id=audit_event.id,
+            source_generation_attempt_id=source_attempt.id,
+            source_attempt_no=source_attempt.attempt_no,
+            grant_ordinal=grant_ordinal,
+            target_attempt_no=target_attempt_no,
+        )
+        if stored_plan is None:
+            return audited_plan
+        persisted_plan = require_near_black_seed_recovery_plan(
+            stored_plan,
+            generation_job_id=job.id,
+            expected_output_count=job.expected_output_count,
+            original_seeds=original_seeds,
+            source_grant_audit_event_id=audit_event.id,
+            source_generation_attempt_id=source_attempt.id,
+            source_attempt_no=source_attempt.attempt_no,
+            grant_ordinal=grant_ordinal,
+            target_attempt_no=target_attempt_no,
+        )
+    except NearBlackRecoveryPlanError:
+        raise SaladServiceConflictError("near-black recovery plan is invalid") from None
+    if persisted_plan != audited_plan:
+        raise SaladServiceConflictError("near-black recovery plan differs from its grant")
+    return persisted_plan
+
+
+async def _existing_attempt_recovery_plan(
+    session: AsyncSession,
+    *,
+    job: GenerationJob,
+    attempt: GenerationAttempt,
+) -> NearBlackSeedRecoveryPlan | None:
+    grant = await _load_near_black_grant(session, generation_job_id=job.id)
+    has_stored_plan = NEAR_BLACK_SEED_RECOVERY_METADATA_KEY in attempt.request_metadata
+    if grant is None:
+        if has_stored_plan:
+            raise SaladServiceConflictError("near-black recovery plan has no grant")
+        return None
+    audit_event, source_attempt = grant
+    if attempt.attempt_no <= source_attempt.attempt_no:
+        if has_stored_plan:
+            raise SaladServiceConflictError("source attempt cannot inherit its recovery plan")
+        return None
+    if not has_stored_plan:
+        raise SaladServiceConflictError("later attempt is missing its near-black recovery plan")
+    stored_plan = attempt.request_metadata[NEAR_BLACK_SEED_RECOVERY_METADATA_KEY]
+    if not isinstance(stored_plan, Mapping):
+        raise SaladServiceConflictError("near-black recovery plan is invalid")
+    return _validated_near_black_recovery_plan(
+        job=job,
+        target_attempt_no=attempt.attempt_no,
+        audit_event=audit_event,
+        source_attempt=source_attempt,
+        stored_plan=stored_plan,
+    )
+
+
+async def _new_attempt_recovery_plan(
+    session: AsyncSession,
+    *,
+    job: GenerationJob,
+    target_attempt_no: int,
+) -> NearBlackSeedRecoveryPlan | None:
+    grant = await _load_near_black_grant(session, generation_job_id=job.id)
+    if grant is None:
+        return None
+    audit_event, source_attempt = grant
+    return _validated_near_black_recovery_plan(
+        job=job,
+        target_attempt_no=target_attempt_no,
+        audit_event=audit_event,
+        source_attempt=source_attempt,
+    )
+
+
 async def prepare_generation_attempt(
     session: AsyncSession,
     *,
@@ -574,16 +731,6 @@ async def prepare_generation_attempt(
             "idempotency_key": normalized_key,
         }
     )
-    request_sha256 = canonical_sha256(
-        {
-            "generation_job_id": str(job.id),
-            "release_version_id": str(job.release_version_id),
-            "parameters_sha256": job.parameters_sha256,
-            "salad_deployment_id": str(deployment.id),
-            "deployment_config_sha256": deployment.config_sha256,
-            "worker_image_digest": deployment.worker_image_digest,
-        }
-    )
     existing = await session.scalar(
         select(GenerationAttempt).where(
             GenerationAttempt.provider == _PROVIDER,
@@ -591,11 +738,19 @@ async def prepare_generation_attempt(
         )
     )
     if existing is not None:
-        if (
-            existing.job_id != job.id
-            or existing.salad_deployment_id != deployment.id
-            or existing.request_sha256 != request_sha256
-        ):
+        if existing.job_id != job.id or existing.salad_deployment_id != deployment.id:
+            raise SaladServiceConflictError("attempt idempotency key conflicts with stored request")
+        recovery_plan = await _existing_attempt_recovery_plan(
+            session,
+            job=job,
+            attempt=existing,
+        )
+        request_sha256 = _generation_attempt_request_sha256(
+            job=job,
+            deployment=deployment,
+            recovery_plan=recovery_plan,
+        )
+        if existing.request_sha256 != request_sha256:
             raise SaladServiceConflictError("attempt idempotency key conflicts with stored request")
         event = await session.scalar(
             select(OutboxEvent).where(
@@ -631,24 +786,41 @@ async def prepare_generation_attempt(
     if job.attempt_count >= job.max_attempts:
         raise SaladServiceConflictError("generation job has exhausted its attempt limit")
 
+    attempt_no = job.attempt_count + 1
+    recovery_plan = await _new_attempt_recovery_plan(
+        session,
+        job=job,
+        target_attempt_no=attempt_no,
+    )
+    request_sha256 = _generation_attempt_request_sha256(
+        job=job,
+        deployment=deployment,
+        recovery_plan=recovery_plan,
+    )
+    request_metadata: dict[str, object] = {
+        "generation_job_id": str(job.id),
+        "release_version_id": str(job.release_version_id),
+        "salad_deployment_id": str(deployment.id),
+        "deployment_version_no": deployment.version_no,
+        "parameters_sha256": job.parameters_sha256,
+        "deployment_config_sha256": deployment.config_sha256,
+    }
+    if recovery_plan is not None:
+        request_metadata[NEAR_BLACK_SEED_RECOVERY_METADATA_KEY] = recovery_plan.model_dump(
+            mode="json"
+        )
+
     attempt = GenerationAttempt(
         id=uuid7(),
         job_id=job.id,
         salad_deployment_id=deployment.id,
-        attempt_no=job.attempt_count + 1,
+        attempt_no=attempt_no,
         provider=_PROVIDER,
         submission_key=submission_key,
         request_sha256=request_sha256,
         state=GenerationAttemptState.CREATED,
         worker_image_digest=deployment.worker_image_digest,
-        request_metadata={
-            "generation_job_id": str(job.id),
-            "release_version_id": str(job.release_version_id),
-            "salad_deployment_id": str(deployment.id),
-            "deployment_version_no": deployment.version_no,
-            "parameters_sha256": job.parameters_sha256,
-            "deployment_config_sha256": deployment.config_sha256,
-        },
+        request_metadata=request_metadata,
         cost_reservation_microusd=0,
         lock_version=1,
         created_at=prepared_at,
@@ -937,6 +1109,18 @@ async def submit_prepared_attempt(
         return stale_result
 
     _require_submittable_deployment(deployment)
+    recovery_plan = await _existing_attempt_recovery_plan(
+        session,
+        job=job,
+        attempt=attempt,
+    )
+    expected_request_sha256 = _generation_attempt_request_sha256(
+        job=job,
+        deployment=deployment,
+        recovery_plan=recovery_plan,
+    )
+    if attempt.request_sha256 != expected_request_sha256:
+        raise SaladServiceConflictError("attempt request does not match its recovery metadata")
     decision = await reserve_attempt_budget(
         session,
         provider=_PROVIDER,
@@ -977,6 +1161,8 @@ async def submit_prepared_attempt(
         parameters=dict(job.parameters),
         parameters_sha256=job.parameters_sha256,
         request_sha256=attempt.request_sha256,
+        generation_attempt_no=attempt.attempt_no,
+        near_black_seed_recovery_plan=recovery_plan,
     )
     try:
         job_input = await upload_intent_provider.build_job_input(context)

@@ -20,6 +20,7 @@ from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.controlled_duo import DuoCompositionPreset, TrioCompositionPreset
 from gen_automation.domain.deliverability import require_comfy_workflow_deliverability
 from gen_automation.domain.enums import AssetState
+from gen_automation.domain.near_black_recovery import build_near_black_seed_recovery_plan
 from gen_automation.domain.release_spec import GenerationParameters
 from gen_automation.domain.signing import derive_public_key, encode_base64url
 from gen_automation.gpu_worker.app import create_worker_app
@@ -801,6 +802,127 @@ async def test_one_provider_job_renders_independent_prompt_branches(
         )
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_near_black_recovery_overlays_only_the_failed_multi_output_suffix(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _profile_context(
+        worker_input_context,
+        workflow_body=DETAILER_WORKFLOW_BODY,
+        detector=True,
+    )
+    parameters = dict(context.job_context.parameters)
+    generation = dict(parameters["generation"])  # type: ignore[arg-type]
+    first = {**generation, "outputs_per_job": 1}
+    second = {
+        **first,
+        "prompt": "second independently expanded wildcard prompt",
+        "seed": 43,
+    }
+    parameters.update(
+        {
+            "schema_version": 2,
+            "output_generations": [first, second],
+            "output_prompt_resolutions": [{"seed": 42}, {"seed": 43}],
+        }
+    )
+    plan = build_near_black_seed_recovery_plan(
+        generation_job_id=context.job_context.generation_job_id,
+        source_grant_audit_event_id=uuid4(),
+        source_generation_attempt_id=uuid4(),
+        source_attempt_no=1,
+        grant_ordinal=1,
+        failed_output_index=1,
+        expected_output_count=2,
+        uploaded_output_indices=(0,),
+        original_seeds=(42, 43),
+    )
+    job_context = replace(
+        context.job_context,
+        parameters=parameters,
+        parameters_sha256=canonical_sha256(parameters),
+        generation_attempt_no=2,
+        near_black_seed_recovery_plan=plan,
+    )
+    context = replace(context, job_context=job_context)
+
+    envelope = GenerateEnvelope.model_validate(await _build(context), strict=True)
+    sampler_seeds = {
+        node["inputs"]["seed"]
+        for node in envelope.payload.workflow.values()
+        if isinstance(node, dict)
+        and node.get("class_type") == "KSampler"
+        and isinstance(node.get("inputs"), dict)
+    }
+    recovery_seed = plan.seed_rewrites[0].recovery_seed
+
+    assert 42 in sampler_seeds
+    assert recovery_seed in sampler_seeds
+    assert 43 not in sampler_seeds
+    assert generation["seed"] == 42
+    assert second["seed"] == 43
+
+
+@pytest.mark.asyncio
+async def test_near_black_index_zero_updates_the_single_output_base_seed(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    parameters = dict(worker_input_context.job_context.parameters)
+    generation = dict(parameters["generation"])  # type: ignore[arg-type]
+    generation["outputs_per_job"] = 1
+    output_generation = dict(generation)
+    parameters.update(
+        {
+            "schema_version": 2,
+            "generation": generation,
+            "output_generations": [output_generation],
+            "output_prompt_resolutions": [{"seed": 42}],
+        }
+    )
+    plan = build_near_black_seed_recovery_plan(
+        generation_job_id=worker_input_context.job_context.generation_job_id,
+        source_grant_audit_event_id=uuid4(),
+        source_generation_attempt_id=uuid4(),
+        source_attempt_no=1,
+        grant_ordinal=1,
+        failed_output_index=0,
+        expected_output_count=1,
+        uploaded_output_indices=(),
+        original_seeds=(42,),
+    )
+    parameters_sha256 = canonical_sha256(parameters)
+    async with worker_input_context.database.sessions() as session:
+        job = await session.get(
+            GenerationJob,
+            worker_input_context.job_context.generation_job_id,
+        )
+        assert job is not None
+        job.expected_output_count = 1
+        job.parameters = parameters
+        job.parameters_sha256 = parameters_sha256
+        await session.commit()
+    context = replace(
+        worker_input_context,
+        job_context=replace(
+            worker_input_context.job_context,
+            expected_output_count=1,
+            parameters=parameters,
+            parameters_sha256=parameters_sha256,
+            generation_attempt_no=2,
+            near_black_seed_recovery_plan=plan,
+        ),
+    )
+
+    envelope = GenerateEnvelope.model_validate(await _build(context), strict=True)
+    sampler_node = envelope.payload.workflow["9"]
+    assert isinstance(sampler_node, dict)
+    sampler_inputs = sampler_node["inputs"]
+    assert isinstance(sampler_inputs, dict)
+
+    assert sampler_inputs["seed"] == plan.seed_rewrites[0].recovery_seed
+    assert generation["seed"] == 42
 
 
 @pytest.mark.asyncio
