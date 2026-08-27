@@ -272,8 +272,14 @@ async def dispatch_generation_jobs(
         or (
             deployment.state != SaladDeploymentState.ACTIVE
             and not (
-                deployment.state == SaladDeploymentState.PROVISIONING
-                and deployment.last_error_code == "provider_start_pending"
+                (
+                    deployment.state == SaladDeploymentState.PROVISIONING
+                    and deployment.last_error_code == "provider_start_pending"
+                )
+                or (
+                    deployment.state == SaladDeploymentState.DEGRADED
+                    and deployment.last_error_code == "provider_start_stalled"
+                )
             )
         )
         or deployment.desired_state != DesiredDeploymentState.ACTIVE

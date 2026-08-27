@@ -3012,6 +3012,13 @@ def _require_submittable_deployment(deployment: SaladDeployment) -> None:
             "provider_image_preparation_pending",
             "provider_start_pending",
         }
+    ) or (
+        deployment.state == SaladDeploymentState.DEGRADED
+        and deployment.last_error_code
+        in {
+            "provider_image_preparation_stalled",
+            "provider_start_stalled",
+        }
     )
     if deployment.state != SaladDeploymentState.ACTIVE and not runtime_admission_pending:
         raise SaladServiceConflictError("Salad deployment is not active")
