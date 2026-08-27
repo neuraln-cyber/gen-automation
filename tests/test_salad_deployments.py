@@ -1009,7 +1009,12 @@ async def test_planned_runtime_refresh_patches_only_the_exact_recorded_version()
 
     assert result is applied
     assert len(client.updated_group_patches) == 1
-    assert set(client.updated_group_patches[0]) == {"container", "queue_autoscaler"}
+    assert set(client.updated_group_patches[0]) == {
+        "container",
+        "queue_autoscaler",
+        "replicas",
+    }
+    assert client.updated_group_patches[0]["replicas"] == 1
     patch_container = client.updated_group_patches[0]["container"]
     assert isinstance(patch_container, dict)
     assert patch_container["environment_variables"] == environment
@@ -1396,7 +1401,7 @@ async def test_marker_bound_queue_admission_defers_pending_minimum_without_repat
 
 
 @pytest.mark.asyncio
-async def test_marker_bound_queue_admission_keeps_waiting_after_start_stalls() -> None:
+async def test_marker_bound_queue_admission_repairs_zero_replicas_after_start_stalls() -> None:
     manifest_sha256 = "d" * 64
     deployment = unpersisted_deployment(provider_configuration(with_binding=True))
     deployment.provider_queue_id = str(QUEUE_ID)
@@ -1419,9 +1424,29 @@ async def test_marker_bound_queue_admission_keeps_waiting_after_start_stalls() -
             WORKER_RUNTIME_ADMISSION_ID_BINDING: RUNTIME_ADMISSION_ID,
         },
     )
+    repaired = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        status="deploying",
+        replicas=1,
+        allocating=1,
+        version=2,
+        autoscaler={
+            "min_replicas": 1,
+            "max_replicas": 1,
+            "desired_queue_length": 1,
+            "polling_period": 30,
+        },
+        environment={
+            WORKER_MODEL_MANIFEST_SHA256_BINDING: manifest_sha256,
+            WORKER_RUNTIME_ADMISSION_ID_BINDING: RUNTIME_ADMISSION_ID,
+        },
+    )
     client = FakeClient()
-    client.groups[deployment.container_group_name] = stalled
+    client.groups[deployment.container_group_name] = repaired
     client.queues[deployment.queue_name] = make_queue(deployment.queue_name)
+    client.get_group_results = [stalled, repaired]
+    client.update_group_result = repaired
 
     admitted = await ensure_container_group_queue_admission(
         deployment,
@@ -1431,8 +1456,8 @@ async def test_marker_bound_queue_admission_keeps_waiting_after_start_stalls() -
         runtime_admission_id=RUNTIME_ADMISSION_ID,
     )
 
-    assert admitted is stalled
-    assert client.updated_group_patches == []
+    assert admitted is repaired
+    assert client.updated_group_patches == [{"replicas": 1}]
     assert client.start_names == []
 
 
@@ -1476,6 +1501,79 @@ async def test_marker_bound_queue_admission_defers_stalled_image_preparation() -
 
 
 @pytest.mark.asyncio
+async def test_ambiguous_replica_admission_replay_does_not_patch_twice() -> None:
+    manifest_sha256 = "d" * 64
+    environment = {
+        WORKER_MODEL_MANIFEST_SHA256_BINDING: manifest_sha256,
+        WORKER_RUNTIME_ADMISSION_ID_BINDING: RUNTIME_ADMISSION_ID,
+    }
+    autoscaler = {
+        "min_replicas": 1,
+        "max_replicas": 1,
+        "desired_queue_length": 1,
+        "polling_period": 30,
+    }
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    initial = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        status="running",
+        replicas=0,
+        version=2,
+        autoscaler=autoscaler,
+        environment=environment,
+    )
+    applied = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        status="running",
+        replicas=1,
+        allocating=1,
+        version=2,
+        autoscaler=autoscaler,
+        environment=environment,
+    )
+
+    class AmbiguousReplicaClient(FakeClient):
+        async def update_container_group(
+            self,
+            container_group_name: str,
+            patch: Mapping[str, JSONValue],
+        ) -> SaladContainerGroup:
+            await super().update_container_group(container_group_name, patch)
+            self.groups[container_group_name] = applied
+            raise SaladTransportError("response lost after provider acceptance")
+
+    client = AmbiguousReplicaClient()
+    client.groups[deployment.container_group_name] = initial
+    client.queues[deployment.queue_name] = make_queue(deployment.queue_name)
+
+    with pytest.raises(SaladRuntimeAdmissionUnavailableError):
+        await ensure_container_group_queue_admission(
+            deployment,
+            client,
+            effective_min_replicas=1,
+            artifact_manifest_sha256=manifest_sha256,
+            runtime_admission_id=RUNTIME_ADMISSION_ID,
+        )
+
+    admitted = await ensure_container_group_queue_admission(
+        deployment,
+        client,
+        effective_min_replicas=1,
+        artifact_manifest_sha256=manifest_sha256,
+        runtime_admission_id=RUNTIME_ADMISSION_ID,
+    )
+
+    assert admitted is applied
+    assert client.updated_group_patches == [{"replicas": 1}]
+    assert client.start_names == []
+
+
+@pytest.mark.asyncio
 async def test_queue_admission_polls_pending_old_minimum_until_target_converges() -> None:
     deployment = unpersisted_deployment(provider_configuration())
     deployment.provider_queue_id = str(QUEUE_ID)
@@ -1491,6 +1589,7 @@ async def test_queue_admission_polls_pending_old_minimum_until_target_converges(
     settled = make_group(
         deployment.container_group_name,
         deployment.queue_name,
+        replicas=1,
         version=1,
         autoscaler={
             "min_replicas": 1,

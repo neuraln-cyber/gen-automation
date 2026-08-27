@@ -1815,6 +1815,7 @@ async def refresh_container_group_runtime(
         if not isinstance(queue_autoscaler, dict):
             raise SaladDeploymentValidationError("provider queue_autoscaler is required")
         update_patch["queue_autoscaler"] = queue_autoscaler
+        update_patch["replicas"] = effective_min_replicas
     try:
         if already_applied:
             updated = preflight
@@ -2131,6 +2132,44 @@ async def ensure_container_group_queue_admission(
                         effective_min_replicas=effective_min_replicas,
                     )
                     if initial.version >= target_version:
+                        break
+                    await asyncio.sleep(poll_interval_seconds)
+        if initial.replicas == 0:
+            # Salad can accept min_replicas=1 while retaining a zero desired
+            # replica count indefinitely. The exact demand/queue/runtime
+            # identity above is durable before this one-field mutation. A
+            # replay reads replicas first and therefore does not repeat an
+            # accepted update whose response was lost.
+            updated = await client.update_container_group(
+                deployment.container_group_name,
+                {"replicas": effective_min_replicas},
+            )
+            _validate_runtime_group(
+                deployment,
+                updated,
+                effective_min_replicas=effective_min_replicas,
+            )
+            validate_runtime_identity(updated)
+            if updated.version < initial.version:
+                raise SaladDeploymentValidationError(
+                    "queue admission replica update was not accepted"
+                )
+            replica_update_version = updated.version
+            async with asyncio.timeout(convergence_timeout_seconds):
+                while True:
+                    observed = await client.get_container_group(deployment.container_group_name)
+                    _validate_runtime_group(
+                        deployment,
+                        observed,
+                        effective_min_replicas=effective_min_replicas,
+                    )
+                    validate_runtime_identity(observed)
+                    if observed.version < replica_update_version:
+                        raise SaladDeploymentValidationError(
+                            "container group version regressed after replica update"
+                        )
+                    if not observed.pending_change and observed.replicas == 1:
+                        initial = observed
                         break
                     await asyncio.sleep(poll_interval_seconds)
         if initial.pending_change:
