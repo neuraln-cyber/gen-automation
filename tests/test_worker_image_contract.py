@@ -22,6 +22,10 @@ PYTORCH_IMAGE = (
     "pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime@"
     "sha256:eee11b3b3872a8c838e35ef48f08b2d5def2080902c7f666831310ca1a0ef2be"
 )
+UBUNTU_IMAGE = (
+    "ubuntu:24.04@"
+    "sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517"
+)
 COMFYUI_COMMIT = "700821e1364eaab0e8f21c538a2131719fec57bf"
 IMPACT_PACK_COMMIT = "429d0159ad429e64d2b3916e6e7be9c22d025c3c"
 IMPACT_SUBPACK_COMMIT = "50c7b71a6a224734cc9b21963c6d1926816a97f1"
@@ -47,11 +51,13 @@ def test_builder_and_gpu_runtime_bases_are_exact_digest_pins() -> None:
     assert dockerfile.splitlines()[0] == f"# syntax={DOCKERFILE_FRONTEND}"
     assert from_lines == [
         f"FROM {GO_IMAGE} AS salad-queue-worker-builder",
-        f"FROM {PYTORCH_IMAGE}",
+        f"FROM {PYTORCH_IMAGE} AS pytorch-runtime",
+        "FROM pytorch-runtime AS pytorch-runtime-split",
+        f"FROM {UBUNTU_IMAGE}",
     ]
     assert all(
         re.fullmatch(r"FROM \S+@sha256:[0-9a-f]{64}(?: AS [a-z0-9-]+)?", line)
-        for line in from_lines
+        for line in (from_lines[0], from_lines[1], from_lines[3])
     )
     assert not re.search(r"^ARG\s+\w*(?:BASE|IMAGE)", dockerfile, flags=re.MULTILINE)
 
