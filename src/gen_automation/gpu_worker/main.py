@@ -164,7 +164,7 @@ class _ManagedChildren:
 def _manifest_requires_fp32_vae(
     artifacts: tuple[MaterializedArtifact, ...],
 ) -> bool:
-    """Enable decode-only precision for the exact Anima/Qwen split stack."""
+    """Select the exact Anima/Qwen split stack requiring pinned precision flags."""
 
     def identifies(artifact: MaterializedArtifact, token: str) -> bool:
         return token in artifact.logical_name.lower() or token in artifact.target_filename.lower()
@@ -353,7 +353,7 @@ def build_comfy_command(
         "--log-stdout",
     )
     if isinstance(settings, _ComfyLaunchSettings) and settings.fp32_vae:
-        return (*command, "--fp32-vae")
+        return (*command, "--fp16-unet", "--fp32-vae")
     return command
 
 
