@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-FROM pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime@sha256:7b324d212a4450795b49edba9949b7cdc72429148a64e974334bfe5774d51385
+FROM pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime@sha256:eee11b3b3872a8c838e35ef48f08b2d5def2080902c7f666831310ca1a0ef2be
 
 LABEL org.opencontainers.image.title="gen-automation-dasiwa-i2v-worker" \
       org.opencontainers.image.description="Model-free DaSiWa WAN 2.2 image-to-video worker" \
