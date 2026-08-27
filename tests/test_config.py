@@ -499,6 +499,7 @@ def test_gpu_allocation_accepts_complete_worker_security_configuration() -> None
     assert settings.gpu_allocation_enabled is True
     assert settings.worker_verification_public_key == WORKER_VERIFICATION_PUBLIC_KEY
     assert settings.salad_attempt_watchdog_seconds == 105 * 60
+    assert settings.salad_output_progress_watchdog_seconds == 10 * 60
 
 
 @pytest.mark.parametrize(

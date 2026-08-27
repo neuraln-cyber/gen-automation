@@ -7,6 +7,7 @@ import io
 import json
 import math
 import re
+import sys
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -25,8 +26,10 @@ from gen_automation.domain.deliverability import require_comfy_workflow_delivera
 from gen_automation.gpu_worker.models import (
     ComfyOutput,
     GenerateEnvelope,
+    GenerateFailureResponse,
     GeneratePayload,
     GenerateResponse,
+    GenerateWorkerResponse,
     JsonObject,
     SignedGenerateEnvelope,
     UploadedOutput,
@@ -66,7 +69,15 @@ class WorkerOutputError(Exception):
 
 
 class FatalWorkerOutputError(WorkerOutputError):
-    pass
+    def __init__(
+        self,
+        *,
+        output_index: int,
+        rgb_extrema: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
+    ) -> None:
+        super().__init__("generation output invalid")
+        self.output_index = output_index
+        self.rgb_extrema = rgb_extrema
 
 
 class WorkerNotReadyError(Exception):
@@ -287,7 +298,10 @@ def _decode_and_verify_outputs(
                         rgb_image.getextrema(),
                     )
                 if all(channel_maximum <= 4 for _channel_minimum, channel_maximum in rgb_extrema):
-                    raise FatalWorkerOutputError("generation output invalid")
+                    raise FatalWorkerOutputError(
+                        output_index=output.output_index,
+                        rgb_extrema=rgb_extrema,
+                    )
         except WorkerOutputError:
             raise
         except (
@@ -309,6 +323,7 @@ def create_worker_app(
     uploader: MultipartUploader | None = None,
     payload_downloader: PayloadDownloader | None = None,
     worker_restart_event: asyncio.Event | None = None,
+    worker_recycle_event: asyncio.Event | None = None,
     now: Callable[[], float] = time.time,
 ) -> FastAPI:
     if settings is None or executor is None:
@@ -318,7 +333,8 @@ def create_worker_app(
     execution_lock = asyncio.Lock()
     execution_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu-work")
     readiness_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu-ready")
-    replay_cache: OrderedDict[str, tuple[int, str, GenerateResponse]] = OrderedDict()
+    replay_cache: OrderedDict[str, tuple[int, str, GenerateWorkerResponse]] = OrderedDict()
+    recovery_event = worker_recycle_event or worker_restart_event
     resolved_uploader = uploader
     resolved_payload_downloader = payload_downloader
     if resolved_uploader is None:
@@ -386,8 +402,10 @@ def create_worker_app(
         status = "ready" if is_ready else "not_ready"
         return JSONResponse(status_code=status_code, content={"status": status, "version": "v1"})
 
-    @app.post("/jobs/generate", response_model=GenerateResponse)
-    async def generate(request: Request) -> GenerateResponse:
+    @app.post("/jobs/generate", response_model=GenerateWorkerResponse)
+    async def generate(request: Request) -> GenerateWorkerResponse:
+        if recovery_event is not None and recovery_event.is_set():
+            raise HTTPException(status_code=503, detail="worker recovery in progress")
         content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
             raise HTTPException(status_code=415, detail="application/json required")
@@ -414,6 +432,21 @@ def create_worker_app(
         except WorkerRequestError:
             raise HTTPException(status_code=400, detail="invalid request") from None
 
+        if (
+            not hmac.compare_digest(
+                payload.artifact_manifest_sha256,
+                settings.artifact_manifest_sha256,
+            )
+            or not hmac.compare_digest(
+                payload.runtime_admission_id,
+                settings.runtime_admission_id,
+            )
+            or not hmac.compare_digest(
+                payload.runtime_worker_instance_id,
+                settings.runtime_worker_instance_id,
+            )
+        ):
+            raise HTTPException(status_code=400, detail="invalid request")
         if len(payload.uploads) > settings.max_outputs:
             raise HTTPException(status_code=400, detail="invalid request")
         try:
@@ -494,13 +527,35 @@ def create_worker_app(
                             max_image_pixels=settings.max_image_pixels,
                         ),
                     )
-                except FatalWorkerOutputError:
-                    if worker_restart_event is not None:
-                        worker_restart_event.set()
-                    raise HTTPException(
-                        status_code=502,
-                        detail="generation output invalid",
-                    ) from None
+                except FatalWorkerOutputError as error:
+                    failed_output_index = (
+                        error.output_index if branch_output_index is None else branch_output_index
+                    )
+                    if recovery_event is not None:
+                        recovery_event.set()
+                    print(
+                        "GPU worker fatal output detected: "
+                        f"attempt_id={payload.attempt_id} reason=near_black "
+                        f"output_index={failed_output_index} "
+                        f"rgb_extrema={error.rgb_extrema} "
+                        "action=comfy_recycle_requested",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    failure_response = GenerateFailureResponse(
+                        job_id=payload.job_id,
+                        attempt_id=payload.attempt_id,
+                        failed_output_index=failed_output_index,
+                        outputs=uploaded,
+                    )
+                    while len(replay_cache) >= settings.max_replay_entries:
+                        replay_cache.popitem(last=False)
+                    replay_cache[payload.attempt_id] = (
+                        envelope.expires_at + settings.clock_skew_seconds,
+                        envelope.signature,
+                        failure_response,
+                    )
+                    return failure_response
                 except WorkerOutputError:
                     raise HTTPException(
                         status_code=502,

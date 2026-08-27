@@ -14,15 +14,25 @@ from gen_automation.db.models import (
     Release,
     ReleaseVersion,
 )
+from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import (
     GenerationAttemptState,
     GenerationState,
     ReleasePhase,
     ResourceHealth,
 )
+from gen_automation.domain.ids import uuid7
+from gen_automation.domain.near_black_recovery import (
+    NEAR_BLACK_SEED_RECOVERY_METADATA_KEY,
+    NearBlackRecoveryPlanError,
+    NearBlackSeedRecoveryPlan,
+    build_near_black_seed_recovery_plan,
+)
 
 INFRASTRUCTURE_RETRY_GRANT_ACTION = "generation_attempt.infrastructure_retry_granted"
 MAX_INFRASTRUCTURE_RETRY_GRANTS = 2
+NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION = "generation_attempt.near_black_retry_granted"
+MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS = 1
 DEFAULT_INFRASTRUCTURE_RECOVERY_SWEEP_LIMIT = 16
 
 SALAD_JOB_FAILED_ERROR_CODE = "salad_job_failed"
@@ -33,6 +43,7 @@ SALAD_DEPLOYMENT_PROVIDER_ABSENT_ERROR_CODE = "salad_deployment_rollover_provide
 SALAD_RATE_LIMITED_ERROR_CODE = "salad_rate_limited"
 SALAD_PROVIDER_CANCELLED_ERROR_CODE = "salad_provider_cancelled"
 SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE = "salad_provider_job_absent"
+SALAD_WORKER_NEAR_BLACK_OUTPUT_ERROR_CODE = "salad_worker_near_black_output"
 
 INFRASTRUCTURE_FAILURE_ERROR_CODES = frozenset(
     {
@@ -100,9 +111,64 @@ class InfrastructureRetryGrant:
 
 
 @dataclass(frozen=True)
+class NearBlackOutputRetryGrant:
+    granted: bool
+    grant_ordinal: int
+    grant_limit: int
+    grant_audit_event_id: UUID | None
+    recovery_plan: NearBlackSeedRecoveryPlan | None
+
+    def __post_init__(self) -> None:
+        if self.granted != (self.grant_audit_event_id is not None) or self.granted != (
+            self.recovery_plan is not None
+        ):
+            raise ValueError("near-black grant provenance is inconsistent")
+        if self.recovery_plan is not None and self.recovery_plan.source_grant_audit_event_id != str(
+            self.grant_audit_event_id
+        ):
+            raise ValueError("near-black grant plan belongs to another audit event")
+
+
+@dataclass(frozen=True)
 class InfrastructureRecoverySummary:
     scanned: int
     recovered_job_ids: tuple[UUID, ...]
+
+
+def require_near_black_original_output_seeds(job: GenerationJob) -> tuple[int, ...]:
+    """Return the immutable per-output seed map used to create the job."""
+
+    try:
+        parameters_match = canonical_sha256(job.parameters) == job.parameters_sha256
+    except (TypeError, ValueError):
+        parameters_match = False
+    raw_outputs = job.parameters.get("output_generations")
+    raw_generation = job.parameters.get("generation")
+    if (
+        not parameters_match
+        or job.parameters.get("schema_version") != 2
+        or not isinstance(raw_outputs, list)
+        or len(raw_outputs) != job.expected_output_count
+        or not isinstance(raw_generation, dict)
+    ):
+        raise NearBlackRecoveryPlanError("original job seeds are unavailable")
+    seeds: list[int] = []
+    for output in raw_outputs:
+        if not isinstance(output, dict):
+            raise NearBlackRecoveryPlanError("original job seeds are unavailable")
+        seed = output.get("seed")
+        if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed <= (2**63) - 1:
+            raise NearBlackRecoveryPlanError("original job seeds are unavailable")
+        seeds.append(seed)
+    base_seed = raw_generation.get("seed")
+    if (
+        not seeds
+        or not isinstance(base_seed, int)
+        or isinstance(base_seed, bool)
+        or base_seed != seeds[0]
+    ):
+        raise NearBlackRecoveryPlanError("original job seeds are unavailable")
+    return tuple(seeds)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -318,6 +384,147 @@ async def grant_infrastructure_retry(
         granted=True,
         grant_ordinal=grant_ordinal,
         grant_limit=MAX_INFRASTRUCTURE_RETRY_GRANTS,
+    )
+
+
+async def grant_near_black_output_retry(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    source: InfrastructureRetrySource,
+    actor: str,
+    retry_at: datetime,
+    occurred_at: datetime,
+    failed_output_index: int,
+    uploaded_output_indices: tuple[int, ...],
+) -> NearBlackOutputRetryGrant:
+    """Grant one retry slot independent of the generic infrastructure budget."""
+
+    if (
+        attempt.job_id != job.id
+        or attempt.attempt_no != job.attempt_count
+        or attempt.state != GenerationAttemptState.FAILED
+        or attempt.completed_at is None
+        or attempt.error_code != SALAD_WORKER_NEAR_BLACK_OUTPUT_ERROR_CODE
+        or job.state in _NON_RETRYABLE_JOB_STATES
+        or job.max_attempts >= 10
+        or not _provider_attempt_is_definitive(attempt)
+        or not 0 <= failed_output_index < job.expected_output_count
+        or list(uploaded_output_indices) not in ([], list(range(failed_output_index)))
+        or not await _release_allows_retry(session, job=job)
+    ):
+        return NearBlackOutputRetryGrant(
+            granted=False,
+            grant_ordinal=0,
+            grant_limit=MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS,
+            grant_audit_event_id=None,
+            recovery_plan=None,
+        )
+
+    existing_grant = await session.scalar(
+        select(AuditEvent.id)
+        .where(
+            AuditEvent.resource_type == "generation_attempt",
+            AuditEvent.resource_id == attempt.id,
+            AuditEvent.action == NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION,
+        )
+        .limit(1)
+    )
+    grant_count = int(
+        await session.scalar(
+            select(func.count(AuditEvent.id))
+            .join(
+                GenerationAttempt,
+                GenerationAttempt.id == AuditEvent.resource_id,
+            )
+            .where(
+                AuditEvent.resource_type == "generation_attempt",
+                AuditEvent.action == NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION,
+                GenerationAttempt.job_id == job.id,
+            )
+        )
+        or 0
+    )
+    if existing_grant is not None or grant_count >= MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS:
+        return NearBlackOutputRetryGrant(
+            granted=False,
+            grant_ordinal=grant_count,
+            grant_limit=MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS,
+            grant_audit_event_id=None,
+            recovery_plan=None,
+        )
+
+    granted_at = _as_utc(occurred_at)
+    retry_not_before = _as_utc(retry_at)
+    previous_max_attempts = job.max_attempts
+    previous_job_state = job.state
+    grant_ordinal = grant_count + 1
+    grant_audit_event_id = uuid7()
+    try:
+        recovery_plan = build_near_black_seed_recovery_plan(
+            generation_job_id=job.id,
+            source_grant_audit_event_id=grant_audit_event_id,
+            source_generation_attempt_id=attempt.id,
+            source_attempt_no=attempt.attempt_no,
+            grant_ordinal=grant_ordinal,
+            failed_output_index=failed_output_index,
+            expected_output_count=job.expected_output_count,
+            uploaded_output_indices=uploaded_output_indices,
+            original_seeds=require_near_black_original_output_seeds(job),
+        )
+    except NearBlackRecoveryPlanError:
+        return NearBlackOutputRetryGrant(
+            granted=False,
+            grant_ordinal=grant_count,
+            grant_limit=MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS,
+            grant_audit_event_id=None,
+            recovery_plan=None,
+        )
+    job.max_attempts = previous_max_attempts + 1
+    job.state = GenerationState.RETRY_WAIT
+    job.retry_at = retry_not_before
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.last_error_code = attempt.error_code
+    job.last_error_detail = attempt.error_detail
+    job.lock_version += 1
+    session.add(
+        AuditEvent(
+            id=grant_audit_event_id,
+            actor=actor,
+            action=NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION,
+            resource_type="generation_attempt",
+            resource_id=attempt.id,
+            correlation_id=str(attempt.id),
+            detail={
+                "generation_job_id": str(job.id),
+                "attempt_no": attempt.attempt_no,
+                "failure_code": attempt.error_code,
+                "source": source.value,
+                "grant_ordinal": grant_ordinal,
+                "grant_limit": MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS,
+                "previous_max_attempts": previous_max_attempts,
+                "new_max_attempts": job.max_attempts,
+                "previous_job_state": previous_job_state.value,
+                "new_job_state": job.state.value,
+                "provider_external_id": attempt.provider_external_id,
+                "salad_deployment_id": str(attempt.salad_deployment_id),
+                "failed_output_index": failed_output_index,
+                "uploaded_output_count": len(uploaded_output_indices),
+                "assets_retained": True,
+                NEAR_BLACK_SEED_RECOVERY_METADATA_KEY: recovery_plan.model_dump(mode="json"),
+            },
+            occurred_at=granted_at,
+        )
+    )
+    await session.flush()
+    return NearBlackOutputRetryGrant(
+        granted=True,
+        grant_ordinal=grant_ordinal,
+        grant_limit=MAX_NEAR_BLACK_OUTPUT_RETRY_GRANTS,
+        grant_audit_event_id=grant_audit_event_id,
+        recovery_plan=recovery_plan,
     )
 
 

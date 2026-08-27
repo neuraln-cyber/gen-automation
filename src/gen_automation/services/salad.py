@@ -26,6 +26,7 @@ from gen_automation.db.models import (
 from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import (
     AssetKind,
+    AssetState,
     DesiredDeploymentState,
     GenerationAttemptState,
     GenerationState,
@@ -35,7 +36,17 @@ from gen_automation.domain.enums import (
     SaladDeploymentState,
 )
 from gen_automation.domain.ids import uuid7
-from gen_automation.gpu_worker.models import GenerateResponse
+from gen_automation.domain.near_black_recovery import (
+    NEAR_BLACK_SEED_RECOVERY_METADATA_KEY,
+    NearBlackRecoveryPlanError,
+    NearBlackSeedRecoveryPlan,
+    require_near_black_seed_recovery_plan,
+)
+from gen_automation.gpu_worker.models import (
+    GenerateFailureResponse,
+    GenerateResponse,
+    GenerateWorkerResponse,
+)
 from gen_automation.integrations.salad.client import SALAD_QUEUE_JOB_PAGE_SIZE
 from gen_automation.integrations.salad.errors import (
     SaladAPIError,
@@ -57,12 +68,16 @@ from gen_automation.services.budgets import (
 )
 from gen_automation.services.generation_control import GENERATION_STOP_REQUESTED_ACTION
 from gen_automation.services.generation_recovery import (
+    NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION,
     SALAD_JOB_FAILED_ERROR_CODE,
     SALAD_PROVIDER_CANCELLED_ERROR_CODE,
     SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE,
     SALAD_RATE_LIMITED_ERROR_CODE,
+    SALAD_WORKER_NEAR_BLACK_OUTPUT_ERROR_CODE,
     InfrastructureRetrySource,
     grant_infrastructure_retry,
+    grant_near_black_output_retry,
+    require_near_black_original_output_seeds,
 )
 from gen_automation.services.outbox import (
     GENERATION_ATTEMPT_AGGREGATE,
@@ -108,6 +123,14 @@ _OPERATOR_STOP_ABSENCE_TRACKER_KEY = "operator_stop_absence_confirmation"
 _DEFAULT_JOB_INPUT_DEFER_SECONDS = 30
 _MAX_JOB_INPUT_DEFER_SECONDS = 3600
 _JOB_INPUT_DEFERRED_ERROR_CODE = "salad_job_input_deferred"
+SALAD_OUTPUT_PROGRESS_WATCHDOG_REASON = "accepted_output_progress_stalled"
+_RUNTIME_ENVELOPE_WATCHDOG_REASON = "runtime_envelope_expired"
+_RUNTIME_ADMISSION_METADATA_KEY = "runtime_admission"
+_RUNTIME_ADMISSION_METADATA_VERSION = "v1"
+_NEAR_BLACK_RECOVERY_PLAN_SHA256_REQUEST_KEY = "near_black_seed_recovery_plan_sha256"
+_PROVIDER_RUN_EPOCH_STARTED_AT_METADATA_KEY = "provider_run_epoch_started_at"
+_PROVIDER_CLOCK_SKEW_SECONDS = 5 * 60
+_PREEXISTING_OUTPUT_GRACE_SECONDS = 120
 _SECRET_KEY_MARKERS = frozenset(
     {
         "secret",
@@ -242,6 +265,17 @@ class ReconciliationSource(StrEnum):
 
 
 @dataclass(frozen=True)
+class _AttemptWatchdogDecision:
+    reason: str
+    timeout_seconds: int
+    anchor_at: datetime
+    deadline_at: datetime
+    accepted_output_count: int | None = None
+    latest_progress_output_index: int | None = None
+    preexisting_output_grace_count: int = 0
+
+
+@dataclass(frozen=True)
 class SaladDeploymentConfig:
     organization_name: str
     project_name: str
@@ -335,6 +369,8 @@ class SaladJobInputContext:
     parameters: Mapping[str, Any]
     parameters_sha256: str
     request_sha256: str
+    generation_attempt_no: int = 1
+    near_black_seed_recovery_plan: NearBlackSeedRecoveryPlan | None = None
 
 
 class SaladUploadIntentProvider(Protocol):
@@ -507,6 +543,152 @@ async def create_deployment_version(
     )
 
 
+def _generation_attempt_request_sha256(
+    *,
+    job: GenerationJob,
+    deployment: SaladDeployment,
+    recovery_plan: NearBlackSeedRecoveryPlan | None,
+) -> str:
+    payload: dict[str, object] = {
+        "generation_job_id": str(job.id),
+        "release_version_id": str(job.release_version_id),
+        "parameters_sha256": job.parameters_sha256,
+        "salad_deployment_id": str(deployment.id),
+        "deployment_config_sha256": deployment.config_sha256,
+        "worker_image_digest": deployment.worker_image_digest,
+    }
+    if recovery_plan is not None:
+        payload[_NEAR_BLACK_RECOVERY_PLAN_SHA256_REQUEST_KEY] = recovery_plan.plan_sha256
+    return canonical_sha256(payload)
+
+
+async def _load_near_black_grant(
+    session: AsyncSession,
+    *,
+    generation_job_id: UUID,
+) -> tuple[AuditEvent, GenerationAttempt] | None:
+    rows = list(
+        (
+            await session.execute(
+                select(AuditEvent, GenerationAttempt)
+                .join(GenerationAttempt, GenerationAttempt.id == AuditEvent.resource_id)
+                .where(
+                    AuditEvent.resource_type == "generation_attempt",
+                    AuditEvent.action == NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION,
+                    GenerationAttempt.job_id == generation_job_id,
+                )
+                .order_by(AuditEvent.occurred_at, AuditEvent.id)
+                .limit(2)
+            )
+        ).all()
+    )
+    if len(rows) > 1:
+        raise SaladServiceConflictError("generation job has conflicting near-black grants")
+    if not rows:
+        return None
+    return rows[0][0], rows[0][1]
+
+
+def _validated_near_black_recovery_plan(
+    *,
+    job: GenerationJob,
+    target_attempt_no: int,
+    audit_event: AuditEvent,
+    source_attempt: GenerationAttempt,
+    stored_plan: Mapping[str, object] | None = None,
+) -> NearBlackSeedRecoveryPlan:
+    grant_ordinal = audit_event.detail.get("grant_ordinal")
+    audited_plan_value = audit_event.detail.get(NEAR_BLACK_SEED_RECOVERY_METADATA_KEY)
+    if (
+        not isinstance(grant_ordinal, int)
+        or isinstance(grant_ordinal, bool)
+        or audit_event.detail.get("generation_job_id") != str(job.id)
+        or audit_event.detail.get("attempt_no") != source_attempt.attempt_no
+        or not isinstance(audited_plan_value, Mapping)
+    ):
+        raise SaladServiceConflictError("near-black recovery grant provenance is invalid")
+    try:
+        original_seeds = require_near_black_original_output_seeds(job)
+        audited_plan = require_near_black_seed_recovery_plan(
+            audited_plan_value,
+            generation_job_id=job.id,
+            expected_output_count=job.expected_output_count,
+            original_seeds=original_seeds,
+            source_grant_audit_event_id=audit_event.id,
+            source_generation_attempt_id=source_attempt.id,
+            source_attempt_no=source_attempt.attempt_no,
+            grant_ordinal=grant_ordinal,
+            target_attempt_no=target_attempt_no,
+        )
+        if stored_plan is None:
+            return audited_plan
+        persisted_plan = require_near_black_seed_recovery_plan(
+            stored_plan,
+            generation_job_id=job.id,
+            expected_output_count=job.expected_output_count,
+            original_seeds=original_seeds,
+            source_grant_audit_event_id=audit_event.id,
+            source_generation_attempt_id=source_attempt.id,
+            source_attempt_no=source_attempt.attempt_no,
+            grant_ordinal=grant_ordinal,
+            target_attempt_no=target_attempt_no,
+        )
+    except NearBlackRecoveryPlanError:
+        raise SaladServiceConflictError("near-black recovery plan is invalid") from None
+    if persisted_plan != audited_plan:
+        raise SaladServiceConflictError("near-black recovery plan differs from its grant")
+    return persisted_plan
+
+
+async def _existing_attempt_recovery_plan(
+    session: AsyncSession,
+    *,
+    job: GenerationJob,
+    attempt: GenerationAttempt,
+) -> NearBlackSeedRecoveryPlan | None:
+    grant = await _load_near_black_grant(session, generation_job_id=job.id)
+    has_stored_plan = NEAR_BLACK_SEED_RECOVERY_METADATA_KEY in attempt.request_metadata
+    if grant is None:
+        if has_stored_plan:
+            raise SaladServiceConflictError("near-black recovery plan has no grant")
+        return None
+    audit_event, source_attempt = grant
+    if attempt.attempt_no <= source_attempt.attempt_no:
+        if has_stored_plan:
+            raise SaladServiceConflictError("source attempt cannot inherit its recovery plan")
+        return None
+    if not has_stored_plan:
+        raise SaladServiceConflictError("later attempt is missing its near-black recovery plan")
+    stored_plan = attempt.request_metadata[NEAR_BLACK_SEED_RECOVERY_METADATA_KEY]
+    if not isinstance(stored_plan, Mapping):
+        raise SaladServiceConflictError("near-black recovery plan is invalid")
+    return _validated_near_black_recovery_plan(
+        job=job,
+        target_attempt_no=attempt.attempt_no,
+        audit_event=audit_event,
+        source_attempt=source_attempt,
+        stored_plan=stored_plan,
+    )
+
+
+async def _new_attempt_recovery_plan(
+    session: AsyncSession,
+    *,
+    job: GenerationJob,
+    target_attempt_no: int,
+) -> NearBlackSeedRecoveryPlan | None:
+    grant = await _load_near_black_grant(session, generation_job_id=job.id)
+    if grant is None:
+        return None
+    audit_event, source_attempt = grant
+    return _validated_near_black_recovery_plan(
+        job=job,
+        target_attempt_no=target_attempt_no,
+        audit_event=audit_event,
+        source_attempt=source_attempt,
+    )
+
+
 async def prepare_generation_attempt(
     session: AsyncSession,
     *,
@@ -549,16 +731,6 @@ async def prepare_generation_attempt(
             "idempotency_key": normalized_key,
         }
     )
-    request_sha256 = canonical_sha256(
-        {
-            "generation_job_id": str(job.id),
-            "release_version_id": str(job.release_version_id),
-            "parameters_sha256": job.parameters_sha256,
-            "salad_deployment_id": str(deployment.id),
-            "deployment_config_sha256": deployment.config_sha256,
-            "worker_image_digest": deployment.worker_image_digest,
-        }
-    )
     existing = await session.scalar(
         select(GenerationAttempt).where(
             GenerationAttempt.provider == _PROVIDER,
@@ -566,11 +738,19 @@ async def prepare_generation_attempt(
         )
     )
     if existing is not None:
-        if (
-            existing.job_id != job.id
-            or existing.salad_deployment_id != deployment.id
-            or existing.request_sha256 != request_sha256
-        ):
+        if existing.job_id != job.id or existing.salad_deployment_id != deployment.id:
+            raise SaladServiceConflictError("attempt idempotency key conflicts with stored request")
+        recovery_plan = await _existing_attempt_recovery_plan(
+            session,
+            job=job,
+            attempt=existing,
+        )
+        request_sha256 = _generation_attempt_request_sha256(
+            job=job,
+            deployment=deployment,
+            recovery_plan=recovery_plan,
+        )
+        if existing.request_sha256 != request_sha256:
             raise SaladServiceConflictError("attempt idempotency key conflicts with stored request")
         event = await session.scalar(
             select(OutboxEvent).where(
@@ -606,24 +786,41 @@ async def prepare_generation_attempt(
     if job.attempt_count >= job.max_attempts:
         raise SaladServiceConflictError("generation job has exhausted its attempt limit")
 
+    attempt_no = job.attempt_count + 1
+    recovery_plan = await _new_attempt_recovery_plan(
+        session,
+        job=job,
+        target_attempt_no=attempt_no,
+    )
+    request_sha256 = _generation_attempt_request_sha256(
+        job=job,
+        deployment=deployment,
+        recovery_plan=recovery_plan,
+    )
+    request_metadata: dict[str, object] = {
+        "generation_job_id": str(job.id),
+        "release_version_id": str(job.release_version_id),
+        "salad_deployment_id": str(deployment.id),
+        "deployment_version_no": deployment.version_no,
+        "parameters_sha256": job.parameters_sha256,
+        "deployment_config_sha256": deployment.config_sha256,
+    }
+    if recovery_plan is not None:
+        request_metadata[NEAR_BLACK_SEED_RECOVERY_METADATA_KEY] = recovery_plan.model_dump(
+            mode="json"
+        )
+
     attempt = GenerationAttempt(
         id=uuid7(),
         job_id=job.id,
         salad_deployment_id=deployment.id,
-        attempt_no=job.attempt_count + 1,
+        attempt_no=attempt_no,
         provider=_PROVIDER,
         submission_key=submission_key,
         request_sha256=request_sha256,
         state=GenerationAttemptState.CREATED,
         worker_image_digest=deployment.worker_image_digest,
-        request_metadata={
-            "generation_job_id": str(job.id),
-            "release_version_id": str(job.release_version_id),
-            "salad_deployment_id": str(deployment.id),
-            "deployment_version_no": deployment.version_no,
-            "parameters_sha256": job.parameters_sha256,
-            "deployment_config_sha256": deployment.config_sha256,
-        },
+        request_metadata=request_metadata,
         cost_reservation_microusd=0,
         lock_version=1,
         created_at=prepared_at,
@@ -912,6 +1109,18 @@ async def submit_prepared_attempt(
         return stale_result
 
     _require_submittable_deployment(deployment)
+    recovery_plan = await _existing_attempt_recovery_plan(
+        session,
+        job=job,
+        attempt=attempt,
+    )
+    expected_request_sha256 = _generation_attempt_request_sha256(
+        job=job,
+        deployment=deployment,
+        recovery_plan=recovery_plan,
+    )
+    if attempt.request_sha256 != expected_request_sha256:
+        raise SaladServiceConflictError("attempt request does not match its recovery metadata")
     decision = await reserve_attempt_budget(
         session,
         provider=_PROVIDER,
@@ -952,6 +1161,8 @@ async def submit_prepared_attempt(
         parameters=dict(job.parameters),
         parameters_sha256=job.parameters_sha256,
         request_sha256=attempt.request_sha256,
+        generation_attempt_no=attempt.attempt_no,
+        near_black_seed_recovery_plan=recovery_plan,
     )
     try:
         job_input = await upload_intent_provider.build_job_input(context)
@@ -1255,9 +1466,21 @@ async def apply_salad_job_observation(
         occurred_at=controller_time,
     )
 
-    provider_update_time = _as_utc(remote_job.update_time)
+    provider_create_time = _provider_timestamp_at_observation(
+        remote_job.create_time,
+        observed_at=controller_time,
+    )
+    provider_update_time = _provider_timestamp_at_observation(
+        remote_job.update_time,
+        observed_at=controller_time,
+    )
     last_observed_at = (
-        _stored_as_utc(attempt.last_observed_at) if attempt.last_observed_at is not None else None
+        _clock_skew_bounded_timestamp(
+            attempt.last_observed_at,
+            observed_at=controller_time,
+        )
+        if attempt.last_observed_at is not None
+        else None
     )
     equal_timestamp_forward_terminal = (
         last_observed_at is not None
@@ -1285,17 +1508,25 @@ async def apply_salad_job_observation(
         return _observation_result(attempt, job, applied=False, stale=True)
 
     worker_output_valid: bool | None = None
+    worker_response: GenerateWorkerResponse | None = None
     if remote_job.status == SaladJobStatus.SUCCEEDED:
-        worker_output_valid = await _valid_worker_success_output(
+        worker_response = await _validated_worker_output(
             session,
             attempt=attempt,
             job=job,
             output=remote_job.output,
         )
+        worker_output_valid = worker_response is not None
+    worker_failure = (
+        worker_response if isinstance(worker_response, GenerateFailureResponse) else None
+    )
     watchdog_cancelled = (
         remote_job.status == SaladJobStatus.CANCELLED
         and attempt.state == GenerationAttemptState.CANCEL_REQUESTED
         and attempt.error_code == SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
+    )
+    watchdog_reason = (
+        (attempt.response_metadata or {}).get("watchdog_reason") if watchdog_cancelled else None
     )
     operator_stop_requested = (
         remote_job.status == SaladJobStatus.CANCELLED
@@ -1317,10 +1548,17 @@ async def apply_salad_job_observation(
     if worker_output_valid is False:
         failure_error_code = "salad_worker_output_invalid"
         failure_error_detail = "Salad reported success without a valid worker output contract."
+    elif worker_failure is not None:
+        failure_error_code = SALAD_WORKER_NEAR_BLACK_OUTPUT_ERROR_CODE
+        failure_error_detail = (
+            "The worker detected a near-black generation output and requested one bounded "
+            "precision recovery retry."
+        )
     elif watchdog_cancelled:
         failure_error_code = SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE
-        failure_error_detail = (
-            "The Salad attempt exceeded its runtime envelope and was cancelled for retry."
+        failure_error_detail = _watchdog_failure_detail(
+            watchdog_reason,
+            cancellation_requested=False,
         )
     elif deployment_rollover_cancelled:
         failure_error_code = DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE
@@ -1365,37 +1603,101 @@ async def apply_salad_job_observation(
     attempt.provider_external_id = remote_id
     attempt.provider_state = remote_job.status.value
     attempt.last_observed_at = provider_update_time
+    provider_run_epoch_started_at = (
+        _provider_run_epoch_started_at(
+            attempt,
+            remote_job=remote_job,
+            observed_at=controller_time,
+        )
+        if remote_job.status == SaladJobStatus.RUNNING
+        else None
+    )
     attempt.response_metadata = {
         "provider_status": remote_job.status.value,
-        "provider_create_time": _as_utc(remote_job.create_time).isoformat(),
+        "provider_create_time": provider_create_time.isoformat(),
         "provider_update_time": provider_update_time.isoformat(),
         "event_count": len(remote_job.events),
+        **(
+            {
+                _PROVIDER_RUN_EPOCH_STARTED_AT_METADATA_KEY: (
+                    provider_run_epoch_started_at.isoformat()
+                )
+            }
+            if provider_run_epoch_started_at is not None
+            else {}
+        ),
         **({"worker_output_valid": worker_output_valid} if worker_output_valid is not None else {}),
+        **(
+            {
+                "worker_failure_code": worker_failure.code,
+                "failed_output_index": worker_failure.failed_output_index,
+                "uploaded_output_count": len(worker_failure.outputs),
+            }
+            if worker_failure is not None
+            else {}
+        ),
     }
     attempt.error_code = failure_error_code
     attempt.error_detail = failure_error_detail
     attempt.unknown_since = None
-    attempt.submitted_at = attempt.submitted_at or _as_utc(remote_job.create_time)
+    bounded_submitted_at = (
+        _clock_skew_bounded_timestamp(attempt.submitted_at, observed_at=controller_time)
+        if attempt.submitted_at is not None
+        else None
+    )
+    attempt.submitted_at = bounded_submitted_at or provider_create_time
     attempt.state = target_state
     if target_state == GenerationAttemptState.RUNNING:
-        attempt.started_at = attempt.started_at or provider_update_time
+        bounded_started_at = (
+            _clock_skew_bounded_timestamp(attempt.started_at, observed_at=controller_time)
+            if attempt.started_at is not None
+            else None
+        )
+        attempt.started_at = bounded_started_at or provider_update_time
     if target_state in _TERMINAL_ATTEMPT_STATES:
-        attempt.completed_at = attempt.completed_at or provider_update_time
+        bounded_completed_at = (
+            _clock_skew_bounded_timestamp(attempt.completed_at, observed_at=controller_time)
+            if attempt.completed_at is not None
+            else None
+        )
+        attempt.completed_at = bounded_completed_at or provider_update_time
     attempt.lock_version += 1
 
+    near_black_retry_granted: bool | None = None
     if current_attempt and target_state == GenerationAttemptState.FAILED:
-        await grant_infrastructure_retry(
-            session,
-            attempt=attempt,
-            job=job,
-            source=InfrastructureRetrySource.RECONCILER,
-            actor="salad-controller",
-            retry_at=controller_time,
-            occurred_at=controller_time,
-        )
+        if worker_failure is not None:
+            near_black_retry_granted = (
+                await grant_near_black_output_retry(
+                    session,
+                    attempt=attempt,
+                    job=job,
+                    source=InfrastructureRetrySource.RECONCILER,
+                    actor="salad-controller",
+                    retry_at=controller_time,
+                    occurred_at=controller_time,
+                    failed_output_index=worker_failure.failed_output_index,
+                    uploaded_output_indices=tuple(
+                        output.output_index for output in worker_failure.outputs
+                    ),
+                )
+            ).granted
+        else:
+            await grant_infrastructure_retry(
+                session,
+                attempt=attempt,
+                job=job,
+                source=InfrastructureRetrySource.RECONCILER,
+                actor="salad-controller",
+                retry_at=controller_time,
+                occurred_at=controller_time,
+            )
 
     if current_attempt and job.state not in _TERMINAL_JOB_STATES:
-        job.state = _job_state_for_observation(job, target_state)
+        job.state = (
+            GenerationState.DEAD_LETTER
+            if worker_failure is not None and near_black_retry_granted is False
+            else _job_state_for_observation(job, target_state)
+        )
         job.retry_at = None
         job.last_error_code = failure_error_code
         job.last_error_detail = failure_error_detail
@@ -1408,6 +1710,15 @@ async def apply_salad_job_observation(
             detail={
                 "provider_external_id": remote_id,
                 "provider_status": remote_job.status.value,
+                **(
+                    {
+                        _PROVIDER_RUN_EPOCH_STARTED_AT_METADATA_KEY: (
+                            provider_run_epoch_started_at.isoformat()
+                        )
+                    }
+                    if provider_run_epoch_started_at is not None
+                    else {}
+                ),
                 **(
                     {"worker_output_valid": worker_output_valid}
                     if worker_output_valid is not None
@@ -1432,23 +1743,36 @@ async def apply_salad_job_observation(
     return _observation_result(attempt, job, applied=True, stale=False)
 
 
-async def _valid_worker_success_output(
+async def _validated_worker_output(
     session: AsyncSession,
     *,
     attempt: GenerationAttempt,
     job: GenerationJob,
     output: JSONValue,
-) -> bool:
+) -> GenerateWorkerResponse | None:
     try:
-        response = GenerateResponse.model_validate(output, strict=True)
+        if isinstance(output, dict) and output.get("status") == "failed":
+            response: GenerateWorkerResponse = GenerateFailureResponse.model_validate(
+                output,
+                strict=True,
+            )
+        else:
+            response = GenerateResponse.model_validate(output, strict=True)
     except (TypeError, ValueError, ValidationError):
-        return False
+        return None
     if response.job_id != str(job.id) or response.attempt_id != str(attempt.id):
-        return False
-    if len(response.outputs) != job.expected_output_count:
-        return False
-    if [item.output_index for item in response.outputs] != list(range(job.expected_output_count)):
-        return False
+        return None
+    if isinstance(response, GenerateFailureResponse):
+        failure_output_indices = [item.output_index for item in response.outputs]
+        if (
+            response.failed_output_index >= job.expected_output_count
+            or failure_output_indices not in ([], list(range(response.failed_output_index)))
+        ):
+            return None
+    elif len(response.outputs) != job.expected_output_count or [
+        item.output_index for item in response.outputs
+    ] != list(range(job.expected_output_count)):
+        return None
 
     assets = list(
         (
@@ -1463,8 +1787,12 @@ async def _valid_worker_success_output(
         ).all()
     )
     if len(assets) != job.expected_output_count:
-        return False
-    for response_output, asset in zip(response.outputs, assets, strict=True):
+        return None
+    assets_by_index = {asset.output_index: asset for asset in assets}
+    for response_output in response.outputs:
+        asset = assets_by_index.get(response_output.output_index)
+        if asset is None:
+            return None
         upload_attempt_id = asset.asset_metadata.get("upload_attempt_id")
         if (
             asset.output_index != response_output.output_index
@@ -1472,8 +1800,8 @@ async def _valid_worker_success_output(
             or not isinstance(upload_attempt_id, str)
             or response_output.upload_attempt_id != upload_attempt_id
         ):
-            return False
-    return True
+            return None
+    return response
 
 
 async def reconcile_generation_attempt(
@@ -1484,6 +1812,7 @@ async def reconcile_generation_attempt(
     max_list_pages: int = (_DEFAULT_RECONCILIATION_JOB_SCAN_LIMIT // SALAD_QUEUE_JOB_PAGE_SIZE),
     list_page_size: int = SALAD_QUEUE_JOB_PAGE_SIZE,
     attempt_watchdog_seconds: int | None = None,
+    output_progress_watchdog_seconds: int | None = None,
     now: datetime | None = None,
 ) -> ReconciliationResult:
     """Resolve a provider job by ID, or by stable metadata after an unknown POST."""
@@ -1497,6 +1826,8 @@ async def reconcile_generation_attempt(
         )
     if attempt_watchdog_seconds is not None and attempt_watchdog_seconds <= 0:
         raise SaladServiceValidationError("attempt_watchdog_seconds must be positive")
+    if output_progress_watchdog_seconds is not None and output_progress_watchdog_seconds <= 0:
+        raise SaladServiceValidationError("output_progress_watchdog_seconds must be positive")
 
     attempt, job, deployment = await _load_attempt_context(
         session,
@@ -2273,36 +2604,54 @@ async def reconcile_generation_attempt(
         await session.rollback()
         return result
 
-    if _attempt_watchdog_is_due(
-        attempt,
+    watchdog_decision = await _attempt_watchdog_decision(
+        session,
+        attempt=attempt,
+        job=job,
         remote_job=remote_job,
         reconciled_at=reconciled_at,
-        timeout_seconds=attempt_watchdog_seconds,
-    ):
-        assert attempt_watchdog_seconds is not None
+        runtime_timeout_seconds=attempt_watchdog_seconds,
+        output_progress_timeout_seconds=output_progress_watchdog_seconds,
+        lock_assets=False,
+    )
+    if watchdog_decision is not None:
         queue_name = deployment.queue_name
         attempt, job, deployment = await _load_attempt_context(
             session,
             generation_attempt_id,
             lock=True,
         )
+        operator_stop_requested = await _operator_generation_stop_requested(
+            session,
+            job=job,
+        )
+        locked_watchdog_decision = await _attempt_watchdog_decision(
+            session,
+            attempt=attempt,
+            job=job,
+            remote_job=remote_job,
+            reconciled_at=reconciled_at,
+            runtime_timeout_seconds=attempt_watchdog_seconds,
+            output_progress_timeout_seconds=output_progress_watchdog_seconds,
+            lock_assets=True,
+        )
         if not (
             job.state not in _TERMINAL_JOB_STATES
-            and _active_remote_mutation_still_applies(
+            # Fence provider I/O itself: an observation/webhook committed after
+            # this reconciliation began wins even when Salad's requeued PENDING
+            # snapshot carries an older update_time that is unsafe to compare.
+            and attempt.lock_version == absence_attempt_lock_version
+            and _watchdog_remote_cancel_still_applies(
                 attempt,
                 remote_job=remote_job,
+                observed_at=reconciled_at,
             )
-            and not await _operator_generation_stop_requested(session, job=job)
+            and not operator_stop_requested
             and not _deployment_rollover_cancel_is_due(
                 attempt,
                 deployment=deployment,
             )
-            and _attempt_watchdog_is_due(
-                attempt,
-                remote_job=remote_job,
-                reconciled_at=reconciled_at,
-                timeout_seconds=attempt_watchdog_seconds,
-            )
+            and locked_watchdog_decision is not None
         ):
             return await _stale_reconciliation_result(
                 session,
@@ -2311,13 +2660,14 @@ async def reconcile_generation_attempt(
                 source=source,
                 matched=True,
             )
+        assert locked_watchdog_decision is not None
         applied = _mark_watchdog_cancel_requested(
             session,
             attempt=attempt,
             job=job,
             remote_job=remote_job,
             occurred_at=reconciled_at,
-            timeout_seconds=attempt_watchdog_seconds,
+            decision=locked_watchdog_decision,
         )
         exact_watchdog_intent = (
             attempt.state == GenerationAttemptState.CANCEL_REQUESTED
@@ -2496,6 +2846,70 @@ def _active_remote_mutation_still_applies(
     return _is_forward_transition(attempt.state, _attempt_state(remote_job.status))
 
 
+def _watchdog_remote_cancel_still_applies(
+    attempt: GenerationAttempt,
+    *,
+    remote_job: SaladQueueJob,
+    observed_at: datetime,
+) -> bool:
+    if (
+        remote_job.status not in {SaladJobStatus.PENDING, SaladJobStatus.RUNNING}
+        or attempt.state in _TERMINAL_ATTEMPT_STATES
+    ):
+        return False
+
+    remote_id = str(remote_job.id)
+    if attempt.provider_external_id not in {None, remote_id} or not _remote_metadata_matches(
+        attempt, remote_job
+    ):
+        return False
+
+    # Once exact watchdog intent is durable, DELETE is an idempotent completion
+    # step rather than a new state inference. Salad may requeue to either active
+    # status with an older update clock after the first DELETE transport fails;
+    # exact identity/metadata, the pre-I/O lock revision, and the caller's
+    # stop/rollover/terminal fences are the authority for reissuing it.
+    if (
+        attempt.state == GenerationAttemptState.CANCEL_REQUESTED
+        and attempt.error_code == SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
+        and attempt.provider_external_id == remote_id
+    ):
+        return True
+
+    # Salad can requeue the same exact job after a failed worker execution. The
+    # ordinary observation state machine correctly rejects RUNNING -> SUBMITTED,
+    # but the immutable hard envelope must still cancel that exact provider ID.
+    # Provider update_time is deliberately irrelevant in this one locked branch:
+    # Salad may return the requeued PENDING snapshot with an older provider clock.
+    if (
+        attempt.state == GenerationAttemptState.RUNNING
+        and remote_job.status == SaladJobStatus.PENDING
+        and attempt.provider_external_id == remote_id
+    ):
+        return True
+
+    provider_update_time = _provider_timestamp_at_observation(
+        remote_job.update_time,
+        observed_at=observed_at,
+    )
+    last_observed_at = (
+        _clock_skew_bounded_timestamp(
+            attempt.last_observed_at,
+            observed_at=observed_at,
+        )
+        if attempt.last_observed_at is not None
+        else None
+    )
+    if last_observed_at is not None and provider_update_time < last_observed_at:
+        return False
+    if attempt.state in {
+        GenerationAttemptState.UNKNOWN,
+        GenerationAttemptState.CANCEL_REQUESTED,
+    }:
+        return True
+    return _is_forward_transition(attempt.state, _attempt_state(remote_job.status))
+
+
 def _deployment_rollover_remote_cancel_still_applies(
     *,
     attempt: GenerationAttempt,
@@ -2590,11 +3004,16 @@ def _require_submittable_deployment(deployment: SaladDeployment) -> None:
         raise SaladServiceConflictError("v1 Salad deployment exceeds one replica")
     if not deployment.is_current:
         raise SaladServiceConflictError("Salad deployment is not current")
-    start_pending = (
+    runtime_admission_pending = (
         deployment.state == SaladDeploymentState.PROVISIONING
-        and deployment.last_error_code == "provider_start_pending"
+        and deployment.last_error_code
+        in {
+            "provider_autoscaler_repair_pending",
+            "provider_image_preparation_pending",
+            "provider_start_pending",
+        }
     )
-    if deployment.state != SaladDeploymentState.ACTIVE and not start_pending:
+    if deployment.state != SaladDeploymentState.ACTIVE and not runtime_admission_pending:
         raise SaladServiceConflictError("Salad deployment is not active")
     if deployment.desired_state != DesiredDeploymentState.ACTIVE:
         raise SaladServiceConflictError("Salad deployment is stopped")
@@ -2736,6 +3155,48 @@ def _stored_as_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _watchdog_deadline_at(
+    anchor_at: datetime,
+    timeout_seconds: int,
+    *,
+    observed_at: datetime,
+) -> datetime:
+    try:
+        return anchor_at + timedelta(seconds=timeout_seconds)
+    except OverflowError:
+        # A corrupt timestamp/count must make the exact, fenced attempt due now;
+        # it must never disable recovery by overflowing or producing year 9999.
+        return observed_at
+
+
+def _provider_timestamp_at_observation(
+    value: datetime,
+    *,
+    observed_at: datetime,
+) -> datetime:
+    """Clamp a trusted provider clock to the controller's receipt time."""
+
+    return min(_as_utc(value), observed_at)
+
+
+def _clock_skew_bounded_timestamp(
+    value: datetime,
+    *,
+    observed_at: datetime,
+) -> datetime | None:
+    """Accept small positive skew, clamp it once, and reject far-future poison."""
+
+    normalized = _stored_as_utc(value)
+    skew_limit = _watchdog_deadline_at(
+        observed_at,
+        _PROVIDER_CLOCK_SKEW_SECONDS,
+        observed_at=observed_at,
+    )
+    if normalized > skew_limit:
+        return None
+    return min(normalized, observed_at)
 
 
 def _submission_result(
@@ -3700,6 +4161,258 @@ def _note_operator_stop_cancel_error(
     )
 
 
+def _valid_runtime_admission_metadata(attempt: GenerationAttempt) -> bool:
+    raw = attempt.request_metadata.get(_RUNTIME_ADMISSION_METADATA_KEY)
+    if not isinstance(raw, dict) or set(raw) != {
+        "version",
+        "provider_group_version",
+        "artifact_manifest_sha256",
+    }:
+        return False
+    provider_group_version = raw.get("provider_group_version")
+    manifest_sha256 = raw.get("artifact_manifest_sha256")
+    return (
+        raw.get("version") == _RUNTIME_ADMISSION_METADATA_VERSION
+        and isinstance(provider_group_version, int)
+        and not isinstance(provider_group_version, bool)
+        and provider_group_version > 0
+        and isinstance(manifest_sha256, str)
+        and len(manifest_sha256) == 64
+        and manifest_sha256 == manifest_sha256.lower()
+        and all(character in "0123456789abcdef" for character in manifest_sha256)
+    )
+
+
+def _metadata_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        return _as_utc(parsed)
+    except (ValueError, OverflowError, SaladServiceValidationError):
+        return None
+
+
+def _provider_run_epoch_started_at(
+    attempt: GenerationAttempt,
+    *,
+    remote_job: SaladQueueJob,
+    observed_at: datetime,
+) -> datetime | None:
+    provider_create_time = _provider_timestamp_at_observation(
+        remote_job.create_time,
+        observed_at=observed_at,
+    )
+    provider_update_time = _provider_timestamp_at_observation(
+        remote_job.update_time,
+        observed_at=observed_at,
+    )
+    candidates: list[datetime] = []
+    if attempt.started_at is not None:
+        bounded_started_at = _clock_skew_bounded_timestamp(
+            attempt.started_at,
+            observed_at=observed_at,
+        )
+        if bounded_started_at is not None:
+            candidates.append(bounded_started_at)
+
+    stored_epoch = _metadata_datetime(
+        (attempt.response_metadata or {}).get(_PROVIDER_RUN_EPOCH_STARTED_AT_METADATA_KEY)
+    )
+    if stored_epoch is not None:
+        bounded_stored_epoch = _clock_skew_bounded_timestamp(
+            stored_epoch,
+            observed_at=observed_at,
+        )
+        if bounded_stored_epoch is not None and bounded_stored_epoch >= provider_create_time:
+            candidates.append(bounded_stored_epoch)
+
+    for event in remote_job.events:
+        if event.action != "started":
+            continue
+        event_time = _clock_skew_bounded_timestamp(
+            _as_utc(event.time),
+            observed_at=observed_at,
+        )
+        if event_time is not None and provider_create_time <= event_time <= provider_update_time:
+            candidates.append(event_time)
+    return max(candidates) if candidates else None
+
+
+def _stored_output_progress_watchdog_decision(
+    attempt: GenerationAttempt,
+    *,
+    observed_at: datetime,
+) -> _AttemptWatchdogDecision | None:
+    if (
+        attempt.state != GenerationAttemptState.CANCEL_REQUESTED
+        or attempt.error_code != SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
+    ):
+        return None
+    metadata = attempt.response_metadata or {}
+    if metadata.get("watchdog_reason") != SALAD_OUTPUT_PROGRESS_WATCHDOG_REASON:
+        return None
+    timeout_seconds = metadata.get("watchdog_timeout_seconds")
+    stored_anchor_at = _metadata_datetime(metadata.get("watchdog_anchor_at"))
+    stored_deadline_at = _metadata_datetime(metadata.get("watchdog_deadline_at"))
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds <= 0
+        or stored_anchor_at is None
+        or stored_deadline_at is None
+    ):
+        return None
+    anchor_at = _clock_skew_bounded_timestamp(
+        stored_anchor_at,
+        observed_at=observed_at,
+    )
+    if anchor_at is None:
+        # The DELETE intent is already durable. Corrupt future metadata must not
+        # prevent idempotently reissuing it for the exact provider identity.
+        anchor_at = observed_at
+        deadline_at = observed_at
+    else:
+        deadline_at = _watchdog_deadline_at(
+            anchor_at,
+            timeout_seconds,
+            observed_at=observed_at,
+        )
+    accepted_output_count = metadata.get("accepted_output_count")
+    latest_progress_output_index = metadata.get("latest_progress_output_index")
+    preexisting_output_grace_count = metadata.get("preexisting_output_grace_count", 0)
+    return _AttemptWatchdogDecision(
+        reason=SALAD_OUTPUT_PROGRESS_WATCHDOG_REASON,
+        timeout_seconds=timeout_seconds,
+        anchor_at=anchor_at,
+        deadline_at=deadline_at,
+        accepted_output_count=(
+            accepted_output_count
+            if isinstance(accepted_output_count, int)
+            and not isinstance(accepted_output_count, bool)
+            and accepted_output_count >= 0
+            else None
+        ),
+        latest_progress_output_index=(
+            latest_progress_output_index
+            if isinstance(latest_progress_output_index, int)
+            and not isinstance(latest_progress_output_index, bool)
+            and latest_progress_output_index >= 0
+            else None
+        ),
+        preexisting_output_grace_count=(
+            preexisting_output_grace_count
+            if isinstance(preexisting_output_grace_count, int)
+            and not isinstance(preexisting_output_grace_count, bool)
+            and preexisting_output_grace_count >= 0
+            else 0
+        ),
+    )
+
+
+def _runtime_envelope_watchdog_decision(
+    attempt: GenerationAttempt,
+    *,
+    remote_job: SaladQueueJob,
+    reconciled_at: datetime,
+    timeout_seconds: int | None,
+) -> _AttemptWatchdogDecision | None:
+    if timeout_seconds is None or remote_job.status not in {
+        SaladJobStatus.PENDING,
+        SaladJobStatus.RUNNING,
+    }:
+        return None
+    if attempt.state in _TERMINAL_ATTEMPT_STATES:
+        return None
+    if attempt.state == GenerationAttemptState.CANCEL_REQUESTED:
+        if attempt.error_code != SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE:
+            return None
+        if (
+            _stored_output_progress_watchdog_decision(
+                attempt,
+                observed_at=reconciled_at,
+            )
+            is not None
+        ):
+            return None
+    elif attempt.state not in {
+        GenerationAttemptState.SUBMITTED,
+        GenerationAttemptState.RUNNING,
+        GenerationAttemptState.UNKNOWN,
+    }:
+        return None
+
+    bounded_started_at = (
+        _clock_skew_bounded_timestamp(attempt.started_at, observed_at=reconciled_at)
+        if attempt.started_at is not None
+        else None
+    )
+    fallback_anchors = tuple(
+        bounded
+        for value in (
+            attempt.submit_started_at,
+            attempt.submitted_at,
+            attempt.created_at,
+        )
+        if value is not None
+        and (
+            bounded := _clock_skew_bounded_timestamp(
+                value,
+                observed_at=reconciled_at,
+            )
+        )
+        is not None
+    )
+    provider_create_time = _clock_skew_bounded_timestamp(
+        _as_utc(remote_job.create_time),
+        observed_at=reconciled_at,
+    )
+    anchor_unrecoverable = False
+    if (
+        attempt.state == GenerationAttemptState.CANCEL_REQUESTED
+        and attempt.error_code == SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
+    ):
+        anchor_candidates = (
+            *(() if bounded_started_at is None else (bounded_started_at,)),
+            *fallback_anchors,
+            *(() if provider_create_time is None else (provider_create_time,)),
+        )
+        anchor_unrecoverable = not anchor_candidates
+        anchor_at = anchor_candidates[0] if anchor_candidates else reconciled_at
+    elif bounded_started_at is not None:
+        # Queue time is not execution time. On the first RUNNING observation,
+        # apply_salad_job_observation persists the provider update timestamp as
+        # started_at. A later PENDING requeue keeps this immutable first-run
+        # anchor: only the shorter accepted-output timer receives a new run epoch.
+        anchor_at = bounded_started_at
+    elif remote_job.status == SaladJobStatus.RUNNING and attempt.started_at is None:
+        return None
+    else:
+        anchor_candidates = (
+            *fallback_anchors,
+            *(() if provider_create_time is None else (provider_create_time,)),
+        )
+        anchor_unrecoverable = not anchor_candidates
+        anchor_at = anchor_candidates[0] if anchor_candidates else reconciled_at
+    deadline_at = (
+        reconciled_at
+        if anchor_unrecoverable
+        else _watchdog_deadline_at(
+            anchor_at,
+            timeout_seconds,
+            observed_at=reconciled_at,
+        )
+    )
+    if reconciled_at < deadline_at:
+        return None
+    return _AttemptWatchdogDecision(
+        reason=_RUNTIME_ENVELOPE_WATCHDOG_REASON,
+        timeout_seconds=timeout_seconds,
+        anchor_at=anchor_at,
+        deadline_at=deadline_at,
+    )
+
+
 def _attempt_watchdog_is_due(
     attempt: GenerationAttempt,
     *,
@@ -3707,45 +4420,222 @@ def _attempt_watchdog_is_due(
     reconciled_at: datetime,
     timeout_seconds: int | None,
 ) -> bool:
-    if timeout_seconds is None or remote_job.status not in {
-        SaladJobStatus.PENDING,
-        SaladJobStatus.RUNNING,
-    }:
-        return False
-    if attempt.state in _TERMINAL_ATTEMPT_STATES:
-        return False
-    if attempt.state == GenerationAttemptState.CANCEL_REQUESTED:
-        if attempt.error_code != SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE:
-            return False
-    elif attempt.state not in {
-        GenerationAttemptState.SUBMITTED,
-        GenerationAttemptState.RUNNING,
-        GenerationAttemptState.UNKNOWN,
-    }:
-        return False
+    return (
+        _runtime_envelope_watchdog_decision(
+            attempt,
+            remote_job=remote_job,
+            reconciled_at=reconciled_at,
+            timeout_seconds=timeout_seconds,
+        )
+        is not None
+    )
 
+
+async def _output_progress_watchdog_decision(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    remote_job: SaladQueueJob,
+    reconciled_at: datetime,
+    timeout_seconds: int | None,
+    lock_assets: bool,
+) -> _AttemptWatchdogDecision | None:
+    stored_decision = _stored_output_progress_watchdog_decision(
+        attempt,
+        observed_at=reconciled_at,
+    )
+    if stored_decision is not None:
+        return (
+            stored_decision
+            if remote_job.status in {SaladJobStatus.PENDING, SaladJobStatus.RUNNING}
+            else None
+        )
     if (
-        attempt.state == GenerationAttemptState.CANCEL_REQUESTED
-        and attempt.error_code == SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
+        timeout_seconds is None
+        or remote_job.status != SaladJobStatus.RUNNING
+        or attempt.state != GenerationAttemptState.RUNNING
+        or attempt.started_at is None
+        or not _valid_runtime_admission_metadata(attempt)
     ):
-        envelope_started_at = (
-            attempt.started_at
-            or attempt.submit_started_at
-            or attempt.submitted_at
-            or remote_job.create_time
+        return None
+
+    run_epoch_started_at = _provider_run_epoch_started_at(
+        attempt,
+        remote_job=remote_job,
+        observed_at=reconciled_at,
+    )
+    run_epoch_unrecoverable = run_epoch_started_at is None
+    if run_epoch_unrecoverable:
+        fallback_anchors = tuple(
+            bounded
+            for value in (
+                attempt.submit_started_at,
+                attempt.submitted_at,
+                attempt.created_at,
+            )
+            if value is not None
+            and (
+                bounded := _clock_skew_bounded_timestamp(
+                    value,
+                    observed_at=reconciled_at,
+                )
+            )
+            is not None
         )
-    elif remote_job.status == SaladJobStatus.RUNNING:
-        # Queue time is not execution time. On the first RUNNING observation,
-        # apply_salad_job_observation persists the provider update timestamp as
-        # started_at; later reconciliations measure only the actual run window.
-        if attempt.started_at is None:
-            return False
-        envelope_started_at = attempt.started_at
+        run_epoch_unrecoverable = not fallback_anchors
+        run_epoch_started_at = fallback_anchors[0] if fallback_anchors else reconciled_at
+    assert run_epoch_started_at is not None
+    assets_query = (
+        select(
+            Asset.output_index,
+            Asset.state,
+            Asset.available_at,
+            Asset.asset_metadata,
+        )
+        .where(
+            Asset.generation_job_id == job.id,
+            Asset.kind == AssetKind.RAW_MASTER,
+        )
+        .order_by(Asset.output_index)
+    )
+    if lock_assets:
+        assets_query = assets_query.with_for_update()
+    rows = list(await session.execute(assets_query))
+
+    available_indices: set[int] = set()
+    progress_by_index: dict[int, datetime] = {}
+    for output_index, state, available_at, asset_metadata in rows:
+        if (
+            not isinstance(output_index, int)
+            or isinstance(output_index, bool)
+            or state != AssetState.AVAILABLE
+            or available_at is None
+        ):
+            continue
+        available_indices.add(output_index)
+        normalized_available_at = _clock_skew_bounded_timestamp(
+            available_at,
+            observed_at=reconciled_at,
+        )
+        if normalized_available_at is not None and normalized_available_at >= run_epoch_started_at:
+            progress_by_index[output_index] = normalized_available_at
+        metadata = asset_metadata if isinstance(asset_metadata, dict) else {}
+        if metadata.get("staging_cleanup") == "completed":
+            cleaned_at = _metadata_datetime(metadata.get("staging_cleaned_at"))
+            bounded_cleaned_at = (
+                _clock_skew_bounded_timestamp(
+                    cleaned_at,
+                    observed_at=reconciled_at,
+                )
+                if cleaned_at is not None
+                else None
+            )
+            if bounded_cleaned_at is not None and bounded_cleaned_at >= run_epoch_started_at:
+                previous = progress_by_index.get(output_index)
+                if previous is None or bounded_cleaned_at > previous:
+                    progress_by_index[output_index] = bounded_cleaned_at
+
+    if progress_by_index:
+        latest_progress_output_index, anchor_at = max(
+            progress_by_index.items(),
+            key=lambda item: (item[1], item[0]),
+        )
+        next_output_index = latest_progress_output_index + 1
     else:
-        envelope_started_at = (
-            attempt.submit_started_at or attempt.submitted_at or remote_job.create_time
+        latest_progress_output_index = None
+        anchor_at = run_epoch_started_at
+        next_output_index = 0
+
+    # A retry's workflow is contiguous and regenerates already-published output
+    # indices before it reaches the next missing master. Exact current-intent
+    # cleanup normally produces a heartbeat for each such output. This bounded
+    # fallback prevents a delayed collector from misclassifying legitimate work.
+    preexisting_output_grace_count = 0
+    while (
+        next_output_index < job.expected_output_count
+        and next_output_index in available_indices
+        and next_output_index not in progress_by_index
+    ):
+        preexisting_output_grace_count += 1
+        next_output_index += 1
+
+    effective_timeout_seconds = (
+        timeout_seconds + preexisting_output_grace_count * _PREEXISTING_OUTPUT_GRACE_SECONDS
+    )
+    deadline_at = (
+        reconciled_at
+        if run_epoch_unrecoverable
+        else _watchdog_deadline_at(
+            anchor_at,
+            effective_timeout_seconds,
+            observed_at=reconciled_at,
         )
-    return reconciled_at >= _stored_as_utc(envelope_started_at) + timedelta(seconds=timeout_seconds)
+    )
+    if reconciled_at < deadline_at:
+        return None
+    return _AttemptWatchdogDecision(
+        reason=SALAD_OUTPUT_PROGRESS_WATCHDOG_REASON,
+        timeout_seconds=effective_timeout_seconds,
+        anchor_at=anchor_at,
+        deadline_at=deadline_at,
+        accepted_output_count=len(available_indices),
+        latest_progress_output_index=latest_progress_output_index,
+        preexisting_output_grace_count=preexisting_output_grace_count,
+    )
+
+
+async def _attempt_watchdog_decision(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    remote_job: SaladQueueJob,
+    reconciled_at: datetime,
+    runtime_timeout_seconds: int | None,
+    output_progress_timeout_seconds: int | None,
+    lock_assets: bool,
+) -> _AttemptWatchdogDecision | None:
+    decisions = tuple(
+        decision
+        for decision in (
+            _runtime_envelope_watchdog_decision(
+                attempt,
+                remote_job=remote_job,
+                reconciled_at=reconciled_at,
+                timeout_seconds=runtime_timeout_seconds,
+            ),
+            await _output_progress_watchdog_decision(
+                session,
+                attempt=attempt,
+                job=job,
+                remote_job=remote_job,
+                reconciled_at=reconciled_at,
+                timeout_seconds=output_progress_timeout_seconds,
+                lock_assets=lock_assets,
+            ),
+        )
+        if decision is not None
+    )
+    return min(decisions, key=lambda decision: decision.deadline_at) if decisions else None
+
+
+def _watchdog_failure_detail(
+    reason: object,
+    *,
+    cancellation_requested: bool,
+) -> str:
+    if reason == SALAD_OUTPUT_PROGRESS_WATCHDOG_REASON:
+        return "The manifest-bound Salad attempt stopped producing accepted output progress; " + (
+            "cancellation was requested."
+            if cancellation_requested
+            else "it was cancelled for retry."
+        )
+    return (
+        "The Salad attempt exceeded its runtime envelope; cancellation was requested."
+        if cancellation_requested
+        else "The Salad attempt exceeded its runtime envelope and was cancelled for retry."
+    )
 
 
 def _mark_watchdog_cancel_requested(
@@ -3755,7 +4645,7 @@ def _mark_watchdog_cancel_requested(
     job: GenerationJob,
     remote_job: SaladQueueJob,
     occurred_at: datetime,
-    timeout_seconds: int,
+    decision: _AttemptWatchdogDecision,
 ) -> bool:
     if attempt.state in _TERMINAL_ATTEMPT_STATES:
         return False
@@ -3774,25 +4664,60 @@ def _mark_watchdog_cancel_requested(
     ):
         return False
 
-    provider_update_time = _as_utc(remote_job.update_time)
+    provider_create_time = _provider_timestamp_at_observation(
+        remote_job.create_time,
+        observed_at=occurred_at,
+    )
+    provider_update_time = _provider_timestamp_at_observation(
+        remote_job.update_time,
+        observed_at=occurred_at,
+    )
     attempt.provider_external_id = remote_id
     attempt.provider_state = remote_job.status.value
-    attempt.submitted_at = attempt.submitted_at or _as_utc(remote_job.create_time)
-    if attempt.last_observed_at is None or provider_update_time > _stored_as_utc(
-        attempt.last_observed_at
-    ):
+    bounded_submitted_at = (
+        _clock_skew_bounded_timestamp(attempt.submitted_at, observed_at=occurred_at)
+        if attempt.submitted_at is not None
+        else None
+    )
+    attempt.submitted_at = bounded_submitted_at or provider_create_time
+    bounded_last_observed_at = (
+        _clock_skew_bounded_timestamp(attempt.last_observed_at, observed_at=occurred_at)
+        if attempt.last_observed_at is not None
+        else None
+    )
+    if bounded_last_observed_at is None or provider_update_time > bounded_last_observed_at:
         attempt.last_observed_at = provider_update_time
+    else:
+        attempt.last_observed_at = bounded_last_observed_at
     attempt.response_metadata = {
         "provider_status": remote_job.status.value,
-        "provider_create_time": _as_utc(remote_job.create_time).isoformat(),
+        "provider_create_time": provider_create_time.isoformat(),
         "provider_update_time": provider_update_time.isoformat(),
         "event_count": len(remote_job.events),
-        "watchdog_timeout_seconds": timeout_seconds,
+        "watchdog_reason": decision.reason,
+        "watchdog_timeout_seconds": decision.timeout_seconds,
+        "watchdog_anchor_at": decision.anchor_at.isoformat(),
+        "watchdog_deadline_at": decision.deadline_at.isoformat(),
+        **(
+            {"accepted_output_count": decision.accepted_output_count}
+            if decision.accepted_output_count is not None
+            else {}
+        ),
+        **(
+            {"latest_progress_output_index": decision.latest_progress_output_index}
+            if decision.latest_progress_output_index is not None
+            else {}
+        ),
+        "preexisting_output_grace_count": decision.preexisting_output_grace_count,
+        "preexisting_output_grace_seconds": (
+            decision.preexisting_output_grace_count * _PREEXISTING_OUTPUT_GRACE_SECONDS
+        ),
     }
     attempt.state = GenerationAttemptState.CANCEL_REQUESTED
     attempt.error_code = SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
-    attempt.error_detail = (
-        "The Salad attempt exceeded its runtime envelope; cancellation was requested."
+    attempt.error_detail = _watchdog_failure_detail(
+        decision.reason,
+        cancellation_requested=True,
     )
     attempt.unknown_since = None
     attempt.lock_version += 1
@@ -3803,7 +4728,21 @@ def _mark_watchdog_cancel_requested(
             detail={
                 "provider_external_id": remote_id,
                 "provider_status": remote_job.status.value,
-                "timeout_seconds": timeout_seconds,
+                "reason": decision.reason,
+                "timeout_seconds": decision.timeout_seconds,
+                "anchor_at": decision.anchor_at.isoformat(),
+                "deadline_at": decision.deadline_at.isoformat(),
+                **(
+                    {"accepted_output_count": decision.accepted_output_count}
+                    if decision.accepted_output_count is not None
+                    else {}
+                ),
+                **(
+                    {"latest_progress_output_index": (decision.latest_progress_output_index)}
+                    if decision.latest_progress_output_index is not None
+                    else {}
+                ),
+                "preexisting_output_grace_count": (decision.preexisting_output_grace_count),
             },
             occurred_at=occurred_at,
         )
@@ -3820,6 +4759,7 @@ def _note_watchdog_cancel_error(
 ) -> None:
     if attempt.state in _TERMINAL_ATTEMPT_STATES:
         return
+    watchdog_reason = (attempt.response_metadata or {}).get("watchdog_reason")
     if attempt.error_code != SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE:
         attempt.error_code = _SALAD_ATTEMPT_WATCHDOG_CANCEL_UNAVAILABLE_ERROR_CODE
         attempt.error_detail = "Salad attempt cancellation is temporarily unavailable."
@@ -3830,6 +4770,7 @@ def _note_watchdog_cancel_error(
             attempt=attempt,
             detail={
                 "error_code": _SALAD_ATTEMPT_WATCHDOG_CANCEL_UNAVAILABLE_ERROR_CODE,
+                **({"reason": watchdog_reason} if isinstance(watchdog_reason, str) else {}),
                 **({"provider_status_code": status_code} if status_code is not None else {}),
             },
             occurred_at=occurred_at,

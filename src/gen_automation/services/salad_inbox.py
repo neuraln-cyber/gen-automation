@@ -35,6 +35,7 @@ from gen_automation.services.salad import (
     DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE,
     SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE,
     SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE,
+    SALAD_OUTPUT_PROGRESS_WATCHDOG_REASON,
 )
 
 _TERMINAL_ATTEMPT_STATES = frozenset(
@@ -57,6 +58,7 @@ _SALAD_TERMINAL_TARGETS = {
     SaladJobStatus.FAILED: GenerationAttemptState.FAILED,
     SaladJobStatus.CANCELLED: GenerationAttemptState.CANCELLED,
 }
+_PROVIDER_CLOCK_SKEW_SECONDS = 5 * 60
 
 
 class SaladInboxError(Exception):
@@ -116,6 +118,21 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _bounded_stored_observation_time(
+    value: datetime,
+    *,
+    processed_at: datetime,
+) -> datetime | None:
+    normalized = _as_utc(value)
+    try:
+        skew_limit = processed_at + timedelta(seconds=_PROVIDER_CLOCK_SKEW_SECONDS)
+    except OverflowError:
+        skew_limit = processed_at
+    if normalized > skew_limit:
+        return None
+    return min(normalized, processed_at)
 
 
 def _validate_nonempty(value: str, *, name: str, max_length: int) -> str:
@@ -714,6 +731,11 @@ async def _apply_provider_state(
         previous_attempt_state == GenerationAttemptState.CANCEL_REQUESTED
         and attempt.error_code == SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
     )
+    watchdog_reason = (
+        (attempt.response_metadata or {}).get("watchdog_reason")
+        if watchdog_cancel_requested
+        else None
+    )
     operator_stop_requested = (
         status == SaladJobStatus.CANCELLED
         and await _operator_generation_stop_requested(session, job=job)
@@ -834,7 +856,14 @@ async def _apply_provider_state(
             )
         )
         retry_error_detail = (
-            "The Salad attempt exceeded its runtime envelope and was cancelled for retry."
+            (
+                "The manifest-bound Salad attempt stopped producing accepted output progress; "
+                "it was cancelled for retry."
+                if watchdog_reason == SALAD_OUTPUT_PROGRESS_WATCHDOG_REASON
+                else (
+                    "The Salad attempt exceeded its runtime envelope and was cancelled for retry."
+                )
+            )
             if watchdog_cancel_requested
             else (
                 "The Salad deployment was superseded; the cancelled job will retry on the "
@@ -992,6 +1021,9 @@ async def process_salad_webhook_receipt(
             disposition=InboxDisposition.DEAD_LETTERED,
         )
     provider_status, observed_at = event
+    # The signed provider event remains authoritative for status, but its clock
+    # cannot advance controller-owned attempt timestamps or watchdog anchors.
+    observed_at = min(observed_at, processed_at)
 
     if provider_status in _SALAD_TERMINAL_TARGETS:
         # Budget reservation and submission both use guard -> attempt lock
@@ -1087,7 +1119,12 @@ async def process_salad_webhook_receipt(
         )
 
     last_observed_at = (
-        _as_utc(attempt.last_observed_at) if attempt.last_observed_at is not None else None
+        _bounded_stored_observation_time(
+            attempt.last_observed_at,
+            processed_at=processed_at,
+        )
+        if attempt.last_observed_at is not None
+        else None
     )
     if last_observed_at is not None and observed_at < last_observed_at:
         _complete_receipt(receipt, processed_at=processed_at)

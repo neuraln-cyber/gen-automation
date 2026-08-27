@@ -7,6 +7,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import SecretStr, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,6 +32,10 @@ from gen_automation.domain.generation_limits import (
     referenced_worker_prompt_budget_bytes,
     signed_worker_prompt_budget_bytes,
     utf8_prompt_bytes,
+)
+from gen_automation.domain.near_black_recovery import (
+    NearBlackRecoveryPlanError,
+    apply_near_black_seed_recovery_plan,
 )
 from gen_automation.domain.release_spec import (
     ArtifactSpecification,
@@ -578,6 +583,29 @@ def _resolve_job_parameters(context: SaladJobInputContext) -> _ResolvedJobParame
             raise WorkerInputError("generation output parameters are inconsistent")
         if len({item.seed for item in output_generations}) != len(output_generations):
             raise WorkerInputError("generation output seeds are inconsistent")
+        recovery_plan = context.near_black_seed_recovery_plan
+        if recovery_plan is not None:
+            original_seeds = tuple(item.seed for item in output_generations)
+            try:
+                effective_seeds = apply_near_black_seed_recovery_plan(
+                    recovery_plan,
+                    generation_job_id=context.generation_job_id,
+                    expected_output_count=context.expected_output_count,
+                    original_seeds=original_seeds,
+                    source_grant_audit_event_id=UUID(recovery_plan.source_grant_audit_event_id),
+                    source_generation_attempt_id=UUID(recovery_plan.source_generation_attempt_id),
+                    source_attempt_no=recovery_plan.source_attempt_no,
+                    grant_ordinal=recovery_plan.grant_ordinal,
+                    target_attempt_no=context.generation_attempt_no,
+                )
+            except (NearBlackRecoveryPlanError, ValueError):
+                raise WorkerInputError("near-black recovery plan is invalid") from None
+            output_generations = tuple(
+                item.model_copy(update={"seed": effective_seeds[output_index]})
+                for output_index, item in enumerate(output_generations)
+            )
+            if recovery_plan.failed_output_index == 0:
+                generation = generation.model_copy(update={"seed": effective_seeds[0]})
         output_prompt_values = tuple(
             value
             for item in output_generations
@@ -620,6 +648,8 @@ def _resolve_job_parameters(context: SaladJobInputContext) -> _ResolvedJobParame
         )
         if budgeted_prompt_bytes > prompt_budget_limit:
             raise WorkerInputError("generation prompt text exceeds the worker request budget")
+    elif context.near_black_seed_recovery_plan is not None:
+        raise WorkerInputError("near-black recovery requires immutable per-output seeds")
     return _ResolvedJobParameters(
         worker_request_budget_version=worker_request_budget_version,
         checkpoint=checkpoint,
@@ -1761,6 +1791,8 @@ class SaladWorkerJobInputProvider:
     signing_private_key: SecretStr
     artifact_manifest: ArtifactManifest
     artifact_manifest_sha256: str
+    runtime_admission_id: str
+    runtime_worker_instance_id: str
     signature_ttl_seconds: int = 7200
     upload_grant_ttl_seconds: int = 10800
     upload_content_type: UploadContentType = "image/png"
@@ -1782,6 +1814,17 @@ class SaladWorkerJobInputProvider:
             self.artifact_manifest_sha256,
         ):
             raise ValueError("worker artifact manifest trust anchor does not match")
+        if (
+            len(self.runtime_admission_id) != 32
+            or self.runtime_admission_id != self.runtime_admission_id.lower()
+            or any(character not in "0123456789abcdef" for character in self.runtime_admission_id)
+        ):
+            raise ValueError("worker runtime admission identifier is invalid")
+        if not 1 <= len(self.runtime_worker_instance_id) <= 128 or any(
+            character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-"
+            for character in self.runtime_worker_instance_id
+        ):
+            raise ValueError("worker runtime instance identifier is invalid")
         if not 5 <= self.signature_ttl_seconds <= 7200:
             raise ValueError("worker signature TTL must be between 5 and 7200 seconds")
         if (
@@ -1902,6 +1945,9 @@ class SaladWorkerJobInputProvider:
         payload = GeneratePayload(
             job_id=str(context.generation_job_id),
             attempt_id=str(context.generation_attempt_id),
+            artifact_manifest_sha256=self.artifact_manifest_sha256,
+            runtime_admission_id=self.runtime_admission_id,
+            runtime_worker_instance_id=self.runtime_worker_instance_id,
             workflow=workflow,
             uploads=grants,
         )

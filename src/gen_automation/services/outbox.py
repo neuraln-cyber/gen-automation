@@ -64,6 +64,7 @@ _DEFINITELY_UNSTARTED_EXHAUSTED_DETAIL = (
 _DEFINITELY_UNSTARTED_EXPIRED_DETAIL = (
     "The Salad submission lease expired before any provider request could start."
 )
+_RUNTIME_ADMISSION_METADATA_VERSION = "v1"
 
 
 class ExternalEffect(StrEnum):
@@ -529,7 +530,10 @@ async def _recover_expired_in_transaction(
     dead_lettered = 0
     attempts_marked_unknown = 0
     for event in events:
-        can_replay = event.topic in safe_topics and event.attempts < event.max_attempts
+        runtime_refresh_replay = await _runtime_refresh_replay_is_safe(session, event)
+        can_replay = event.attempts < event.max_attempts and (
+            event.topic in safe_topics or runtime_refresh_replay
+        )
         if can_replay:
             event.status = OutboxStatus.PENDING
             event.available_at = now
@@ -545,8 +549,19 @@ async def _recover_expired_in_transaction(
                 session,
                 event=event,
                 actor=actor,
-                action="outbox.lease_recovered",
-                detail={"attempt": event.attempts},
+                action=(
+                    "outbox.runtime_refresh_lease_recovered"
+                    if runtime_refresh_replay
+                    else "outbox.lease_recovered"
+                ),
+                detail=(
+                    {
+                        "attempt": event.attempts,
+                        "runtime_refresh_replay": True,
+                    }
+                    if runtime_refresh_replay
+                    else {"attempt": event.attempts}
+                ),
                 occurred_at=now,
             )
             continue
@@ -604,6 +619,107 @@ async def _recover_expired_in_transaction(
     )
 
 
+async def _runtime_refresh_replay_is_safe(
+    session: AsyncSession,
+    event: OutboxEvent,
+) -> bool:
+    """Prove an expired Salad claim stopped inside an idempotent runtime rollout.
+
+    The controller persists a version-fenced refresh plan before its first
+    deployment PATCH and replaces that plan with an exact admission target
+    before any queue POST. A CREATED attempt with no budget/submission evidence
+    can therefore replay either phase without duplicating a provider job. All
+    older or malformed submit events retain the conservative dead-letter path.
+    """
+
+    if (
+        event.topic != SALAD_JOB_SUBMIT_TOPIC
+        or event.aggregate_type != GENERATION_ATTEMPT_AGGREGATE
+    ):
+        return False
+    job, attempt = await _lock_salad_job_then_attempt(session, event=event)
+    if job is None or attempt is None or attempt.provider != "salad":
+        return False
+    if (
+        attempt.state != GenerationAttemptState.CREATED
+        or job.state != GenerationState.CLAIMED
+        or job.attempt_count != attempt.attempt_no
+        or attempt.provider_external_id is not None
+        or attempt.submit_started_at is not None
+        or attempt.submitted_at is not None
+        or attempt.started_at is not None
+        or attempt.last_observed_at is not None
+        or attempt.unknown_since is not None
+        or attempt.provider_state is not None
+        or attempt.response_metadata is not None
+        or attempt.cost_reservation_microusd != 0
+        or attempt.reservation_released_at is not None
+    ):
+        return False
+    metadata = attempt.request_metadata
+    return valid_runtime_refresh_plan(metadata.get("runtime_admission_refresh_plan")) or (
+        valid_runtime_admission_target(metadata.get("runtime_admission"))
+    )
+
+
+def valid_runtime_refresh_plan(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "version",
+        "provider_group_version_before_refresh",
+        "artifact_manifest_sha256",
+        "rollout_id",
+    }:
+        return False
+    return bool(
+        value.get("version") == _RUNTIME_ADMISSION_METADATA_VERSION
+        and _positive_int(value.get("provider_group_version_before_refresh"))
+        and _lower_hex(value.get("artifact_manifest_sha256"), length=64)
+        and _lower_hex(value.get("rollout_id"), length=32)
+    )
+
+
+def valid_runtime_admission_target(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "version",
+        "provider_group_version",
+        "artifact_manifest_sha256",
+        "rollout_id",
+        "worker_instance_id",
+    }:
+        return False
+    return bool(
+        value.get("version") == _RUNTIME_ADMISSION_METADATA_VERSION
+        and _positive_int(value.get("provider_group_version"))
+        and _lower_hex(value.get("artifact_manifest_sha256"), length=64)
+        and _lower_hex(value.get("rollout_id"), length=32)
+        and _optional_runtime_worker_instance_id(value.get("worker_instance_id"))
+    )
+
+
+def _positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _lower_hex(value: object, *, length: int) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == length
+        and value == value.lower()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _optional_runtime_worker_instance_id(value: object) -> bool:
+    return value is None or bool(
+        isinstance(value, str)
+        and 1 <= len(value) <= 128
+        and all(
+            character in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-"
+            for character in value
+        )
+    )
+
+
 async def recover_expired_outbox_events(
     session: AsyncSession,
     *,
@@ -615,7 +731,8 @@ async def recover_expired_outbox_events(
     """Recover expired leases without assuming an external call was harmless.
 
     Topics are replayed only when the caller explicitly supplies them as proven
-    replay-safe. Salad job submission is never replayed by this path.
+    replay-safe. Salad job submission is replayed only for the narrower durable
+    runtime-plan/target contract proved by ``_runtime_refresh_replay_is_safe``.
     """
 
     if limit <= 0 or limit > 1_000:
@@ -978,6 +1095,34 @@ async def defer_unstarted_outbox_event(
     )
     await session.commit()
     return TransitionResult(status=OutboxStatus.PENDING, changed=True)
+
+
+async def defer_staged_runtime_admission_outbox_event(
+    session: AsyncSession,
+    *,
+    event_id: UUID,
+    worker_id: str,
+    retry_not_before: datetime,
+    reason_code: str,
+    now: datetime | None = None,
+) -> TransitionResult | None:
+    """Re-defer an interrupted admission phase only with exact no-POST proof."""
+
+    normalized_worker_id = _validate_nonempty(worker_id, name="worker_id", max_length=200)
+    observed_at = _as_utc(now or _now())
+    event = await _locked_event(session, event_id)
+    _require_active_lease(event, worker_id=normalized_worker_id, now=observed_at)
+    if not await _runtime_refresh_replay_is_safe(session, event):
+        await session.rollback()
+        return None
+    return await defer_unstarted_outbox_event(
+        session,
+        event_id=event_id,
+        worker_id=normalized_worker_id,
+        retry_not_before=retry_not_before,
+        reason_code=reason_code,
+        now=observed_at,
+    )
 
 
 async def fail_outbox_event(

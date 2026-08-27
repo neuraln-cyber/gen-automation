@@ -30,6 +30,7 @@ from gen_automation.domain.enums import (
     GenerationState,
     OutboxStatus,
     ReleasePhase,
+    ResourceHealth,
     SaladDeploymentPurpose,
     SaladDeploymentState,
     SpendEntryType,
@@ -39,6 +40,7 @@ from gen_automation.domain.runtime_bindings import (
     SALAD_WORKER_RUNTIME_BINDING_REFERENCES,
     WORKER_MODEL_MANIFEST_JSON_BINDING,
     WORKER_MODEL_MANIFEST_SHA256_BINDING,
+    WORKER_RUNTIME_ADMISSION_ID_BINDING,
 )
 from gen_automation.integrations.salad.errors import (
     SaladAPIError,
@@ -66,6 +68,8 @@ from gen_automation.services.experiment_warm_leases import (
 from gen_automation.services.outbox import (
     GENERATION_ATTEMPT_AGGREGATE,
     SALAD_JOB_SUBMIT_TOPIC,
+    valid_runtime_admission_target,
+    valid_runtime_refresh_plan,
 )
 from gen_automation.services.runtime_secrets import (
     RuntimeSecretResolutionError,
@@ -101,8 +105,16 @@ _WORKER_RESTART_POLICY = "on_failure"
 _SALAD_DEFAULT_SHM_SIZE = 64
 _RUNTIME_REFRESH_CONVERGENCE_TIMEOUT_SECONDS = 60.0
 _RUNTIME_REFRESH_POLL_SECONDS = 1.0
+_RUNTIME_ADMISSION_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _QUEUE_ADMISSION_CONVERGENCE_TIMEOUT_SECONDS = 120.0
 _QUEUE_ADMISSION_POLL_SECONDS = 1.0
+_QUEUE_ADMISSION_TRANSITIONAL_ERROR_CODES = frozenset(
+    {
+        "provider_autoscaler_repair_pending",
+        "provider_image_preparation_pending",
+        "provider_start_pending",
+    }
+)
 _WORKER_STARTUP_PROBE: JSONObject = {
     "http": {
         "headers": [],
@@ -186,6 +198,10 @@ class SaladDeploymentError(Exception):
 
 class SaladDeploymentValidationError(SaladDeploymentError):
     """The durable deployment configuration cannot safely be provisioned."""
+
+
+class SaladRuntimeAdmissionUnavailableError(SaladDeploymentError):
+    """Salad could not provide a conclusive runtime-admission observation."""
 
 
 class SaladDeploymentNotFoundError(SaladDeploymentError):
@@ -589,6 +605,10 @@ async def _reconcile_locked(
         salad_deployment_id=deployment.id,
         now=observed_at,
     )
+    staged_runtime_refresh = await _eligible_runtime_refresh_plan_exists(
+        session,
+        salad_deployment_id=deployment.id,
+    )
     billing_observation = await _refresh_billing_observation(
         session,
         deployment,
@@ -666,6 +686,36 @@ async def _reconcile_locked(
             provider_container_group_id=stop_result.provider_container_group_id,
             metered_microusd=metered,
             error_code=stop_result.error_code,
+        )
+
+    # The submit outbox owns a marker-bound runtime PATCH until it replaces the
+    # refresh plan with an exact provider target. Reconciliation must not repair
+    # either the old min=0 snapshot or the applied min=1 snapshot in that crash
+    # window: doing so can restart the rollout or expose the stale consumer.
+    if staged_runtime_refresh:
+        deployment.state = SaladDeploymentState.ACTIVE
+        deployment.activated_at = deployment.activated_at or observed_at
+        deployment.unknown_since = None
+        _clear_error(deployment)
+        _touch(deployment)
+        _audit(
+            session,
+            deployment,
+            action="salad_deployment.reconciled",
+            detail={
+                "state": deployment.state.value,
+                "observed_replicas": current_replicas,
+                "ready_replicas": group.current_state.running_count,
+                "metered_microusd": metered,
+                "runtime_refresh_plan_pending": True,
+            },
+            occurred_at=observed_at,
+        )
+        await session.flush()
+        return _result(
+            deployment,
+            DeploymentAction.RECONCILED,
+            metered_microusd=metered,
         )
 
     if group.pending_change:
@@ -811,7 +861,9 @@ async def effective_worker_min_replicas(
             GenerationAttempt.state == GenerationAttemptState.CREATED,
             GenerationJob.provider == _PROVIDER,
             GenerationJob.state == GenerationState.CLAIMED,
+            GenerationJob.attempt_count == GenerationAttempt.attempt_no,
             Release.phase.in_(_GENERATION_ACTIVE_RELEASE_PHASES),
+            Release.health == ResourceHealth.HEALTHY,
             Release.current_version_no == ReleaseVersion.version_no,
             ~stop_marker,
         )
@@ -819,6 +871,46 @@ async def effective_worker_min_replicas(
         .limit(1)
     )
     if claimed_admission_id is not None:
+        return 1
+
+    # Once the exact post-refresh target is durable, the PENDING submit event
+    # itself owns the warm worker until POST or terminalization. A refresh plan
+    # is deliberately excluded: starting that pre-refresh runtime could expose
+    # an old consumer. PROCESSING rows remain eligible across lease expiry so a
+    # controller crash cannot briefly drop the autoscaler floor.
+    staged_target_metadata = (
+        await session.scalars(
+            select(GenerationAttempt.request_metadata)
+            .join(GenerationJob, GenerationJob.id == GenerationAttempt.job_id)
+            .join(ReleaseVersion, ReleaseVersion.id == GenerationJob.release_version_id)
+            .join(Release, Release.id == ReleaseVersion.release_id)
+            .join(
+                OutboxEvent,
+                OutboxEvent.aggregate_id == GenerationAttempt.id,
+            )
+            .where(
+                OutboxEvent.topic == SALAD_JOB_SUBMIT_TOPIC,
+                OutboxEvent.aggregate_type == GENERATION_ATTEMPT_AGGREGATE,
+                OutboxEvent.status.in_((OutboxStatus.PENDING, OutboxStatus.PROCESSING)),
+                OutboxEvent.attempts < OutboxEvent.max_attempts,
+                GenerationAttempt.salad_deployment_id == salad_deployment_id,
+                GenerationAttempt.provider == _PROVIDER,
+                GenerationAttempt.state == GenerationAttemptState.CREATED,
+                GenerationJob.provider == _PROVIDER,
+                GenerationJob.state == GenerationState.CLAIMED,
+                GenerationJob.attempt_count == GenerationAttempt.attempt_no,
+                Release.phase.in_(_GENERATION_ACTIVE_RELEASE_PHASES),
+                Release.health == ResourceHealth.HEALTHY,
+                Release.current_version_no == ReleaseVersion.version_no,
+                ~stop_marker,
+            )
+            .order_by(OutboxEvent.created_at, OutboxEvent.id)
+        )
+    ).all()
+    if any(
+        valid_runtime_admission_target(metadata.get("runtime_admission"))
+        for metadata in staged_target_metadata
+    ):
         return 1
 
     # After the provider POST is durably recorded, the attempt itself becomes
@@ -843,6 +935,48 @@ async def effective_worker_min_replicas(
         .limit(1)
     )
     return 1 if active_attempt_id is not None else 0
+
+
+async def _eligible_runtime_refresh_plan_exists(
+    session: AsyncSession,
+    *,
+    salad_deployment_id: UUID,
+) -> bool:
+    metadata_rows = (
+        await session.scalars(
+            select(GenerationAttempt.request_metadata)
+            .join(GenerationJob, GenerationJob.id == GenerationAttempt.job_id)
+            .join(ReleaseVersion, ReleaseVersion.id == GenerationJob.release_version_id)
+            .join(Release, Release.id == ReleaseVersion.release_id)
+            .join(OutboxEvent, OutboxEvent.aggregate_id == GenerationAttempt.id)
+            .where(
+                OutboxEvent.topic == SALAD_JOB_SUBMIT_TOPIC,
+                OutboxEvent.aggregate_type == GENERATION_ATTEMPT_AGGREGATE,
+                OutboxEvent.status.in_((OutboxStatus.PENDING, OutboxStatus.PROCESSING)),
+                OutboxEvent.attempts < OutboxEvent.max_attempts,
+                GenerationAttempt.salad_deployment_id == salad_deployment_id,
+                GenerationAttempt.provider == _PROVIDER,
+                GenerationAttempt.state == GenerationAttemptState.CREATED,
+                GenerationJob.provider == _PROVIDER,
+                GenerationJob.state == GenerationState.CLAIMED,
+                GenerationJob.attempt_count == GenerationAttempt.attempt_no,
+                Release.phase.in_(_GENERATION_ACTIVE_RELEASE_PHASES),
+                Release.health == ResourceHealth.HEALTHY,
+                Release.current_version_no == ReleaseVersion.version_no,
+                ~exists(
+                    select(AuditEvent.id).where(
+                        AuditEvent.resource_type == "release",
+                        AuditEvent.resource_id == Release.id,
+                        AuditEvent.action == _GENERATION_STOP_REQUESTED_ACTION,
+                    )
+                ),
+            )
+        )
+    ).all()
+    return any(
+        valid_runtime_refresh_plan(metadata.get("runtime_admission_refresh_plan"))
+        for metadata in metadata_rows
+    )
 
 
 async def _request_active_contract_repair(
@@ -1379,6 +1513,7 @@ async def _container_group_payload(
     resolver: RuntimeSecretResolver | None,
     *,
     environment_overrides: Mapping[str, str] | None = None,
+    effective_min_replicas: int | None = None,
 ) -> JSONObject:
     configuration = deepcopy(deployment.provider_configuration)
     if not isinstance(configuration, dict) or not all(
@@ -1480,6 +1615,11 @@ async def _container_group_payload(
         ):
             raise SaladDeploymentValidationError(f"queue_autoscaler.{key} conflicts")
         autoscaler[key] = expected
+    if effective_min_replicas is not None:
+        autoscaler["min_replicas"] = _desired_queue_autoscaler(
+            deployment,
+            min_replicas=effective_min_replicas,
+        )["min_replicas"]
 
     binding_references = {binding.name: binding.reference for binding in bindings}
     environment: dict[str, JSONValue] = {}
@@ -1499,16 +1639,22 @@ async def _container_group_payload(
             environment[name] = value
 
     overrides = dict(environment_overrides or {})
-    allowed_overrides = {
+    manifest_overrides = {
         WORKER_MODEL_MANIFEST_JSON_BINDING,
         WORKER_MODEL_MANIFEST_SHA256_BINDING,
     }
+    allowed_overrides = manifest_overrides | {WORKER_RUNTIME_ADMISSION_ID_BINDING}
     if not set(overrides).issubset(allowed_overrides) or any(
         not isinstance(value, str) or not value for value in overrides.values()
     ):
         raise SaladDeploymentValidationError("runtime environment override is invalid")
-    if bool(overrides) and set(overrides) != allowed_overrides:
+    if bool(overrides) and not manifest_overrides.issubset(overrides):
         raise SaladDeploymentValidationError("runtime manifest override is incomplete")
+    runtime_admission_id = overrides.get(WORKER_RUNTIME_ADMISSION_ID_BINDING)
+    if runtime_admission_id is not None and not _RUNTIME_ADMISSION_ID_PATTERN.fullmatch(
+        runtime_admission_id
+    ):
+        raise SaladDeploymentValidationError("runtime admission id override is invalid")
     environment.update(overrides)
 
     container["image"] = deployment.worker_image_digest
@@ -1534,6 +1680,9 @@ async def refresh_container_group_runtime(
     resolver: RuntimeSecretResolver | None,
     *,
     environment_overrides: Mapping[str, str] | None = None,
+    expected_provider_version: int | None = None,
+    runtime_admission_id: str | None = None,
+    effective_min_replicas: int | None = None,
     convergence_timeout_seconds: float = _RUNTIME_REFRESH_CONVERGENCE_TIMEOUT_SECONDS,
     poll_interval_seconds: float = _RUNTIME_REFRESH_POLL_SECONDS,
 ) -> SaladContainerGroup:
@@ -1543,24 +1692,101 @@ async def refresh_container_group_runtime(
         raise SaladDeploymentValidationError("container group is not provisioned")
     if (
         not deployment.is_current
-        or deployment.state != SaladDeploymentState.ACTIVE
+        or (
+            deployment.state != SaladDeploymentState.ACTIVE
+            and not (
+                deployment.state == SaladDeploymentState.PROVISIONING
+                and deployment.last_error_code in _QUEUE_ADMISSION_TRANSITIONAL_ERROR_CODES
+            )
+        )
         or deployment.desired_state != DesiredDeploymentState.ACTIVE
     ):
         raise SaladDeploymentValidationError("deployment is not active")
+    planned_refresh = expected_provider_version is not None or runtime_admission_id is not None
+    if planned_refresh and (
+        expected_provider_version is None
+        or expected_provider_version <= 0
+        or runtime_admission_id is None
+        or not _RUNTIME_ADMISSION_ID_PATTERN.fullmatch(runtime_admission_id)
+        or environment_overrides is None
+        or environment_overrides.get(WORKER_RUNTIME_ADMISSION_ID_BINDING) != runtime_admission_id
+    ):
+        raise SaladDeploymentValidationError("runtime refresh plan is invalid")
     try:
         preflight = await client.get_container_group(deployment.container_group_name)
+        _validate_runtime_group(deployment, preflight)
+        if planned_refresh and preflight.pending_change:
+            async with asyncio.timeout(convergence_timeout_seconds):
+                while preflight.pending_change:
+                    await asyncio.sleep(poll_interval_seconds)
+                    preflight = await client.get_container_group(deployment.container_group_name)
+                    _validate_runtime_group(deployment, preflight)
+                    assert expected_provider_version is not None
+                    assert runtime_admission_id is not None
+                    if preflight.version < expected_provider_version:
+                        raise SaladDeploymentValidationError(
+                            "container group runtime version regressed before planned update"
+                        )
+                    if (
+                        preflight.version > expected_provider_version
+                        and not preflight.pending_change
+                        and _runtime_admission_id(preflight) != runtime_admission_id
+                    ):
+                        raise SaladDeploymentValidationError(
+                            "container group runtime advanced outside the planned update"
+                        )
+    except SaladDeploymentValidationError:
+        raise
+    except TimeoutError:
+        if planned_refresh:
+            raise SaladRuntimeAdmissionUnavailableError(
+                "container group runtime refresh convergence is unavailable"
+            ) from None
+        raise SaladDeploymentValidationError(
+            "container group preflight could not be verified"
+        ) from None
+    except (SaladAPIError, SaladProtocolError, SaladTransportError):
+        if planned_refresh:
+            raise SaladRuntimeAdmissionUnavailableError(
+                "container group runtime refresh observation is unavailable"
+            ) from None
+        raise SaladDeploymentValidationError(
+            "container group preflight could not be verified"
+        ) from None
     except Exception:
         raise SaladDeploymentValidationError(
             "container group preflight could not be verified"
         ) from None
-    _validate_runtime_group(deployment, preflight)
-    if preflight.pending_change:
+
+    preflight_admission_id = _runtime_admission_id(preflight)
+    already_applied = False
+    if planned_refresh:
+        assert expected_provider_version is not None
+        assert runtime_admission_id is not None
+        if preflight.version < expected_provider_version:
+            raise SaladDeploymentValidationError(
+                "container group runtime version regressed before planned update"
+            )
+        if preflight.version > expected_provider_version:
+            if preflight_admission_id != runtime_admission_id:
+                raise SaladDeploymentValidationError(
+                    "container group runtime advanced outside the planned update"
+                )
+            already_applied = True
+        elif preflight_admission_id == runtime_admission_id:
+            raise SaladDeploymentValidationError(
+                "container group runtime marker changed without a new version"
+            )
+        elif preflight.pending_change:
+            raise SaladDeploymentValidationError("container group has an unrelated pending change")
+    elif preflight.pending_change:
         raise SaladDeploymentValidationError("container group has a pending change")
 
     payload = await _container_group_payload(
         deployment,
         resolver,
         environment_overrides=environment_overrides,
+        effective_min_replicas=effective_min_replicas,
     )
     container = payload.get("container")
     if not isinstance(container, dict):
@@ -1568,30 +1794,210 @@ async def refresh_container_group_runtime(
     environment = container.get("environment_variables")
     if not isinstance(environment, dict) or not environment:
         raise SaladDeploymentValidationError("runtime binding could not be resolved")
+    update_patch: JSONObject = {"container": container}
+    if effective_min_replicas is not None:
+        queue_autoscaler = payload.get("queue_autoscaler")
+        if not isinstance(queue_autoscaler, dict):
+            raise SaladDeploymentValidationError("provider queue_autoscaler is required")
+        update_patch["queue_autoscaler"] = queue_autoscaler
     try:
-        updated = await client.update_container_group(
-            deployment.container_group_name,
-            {"container": container},
-        )
-        _validate_runtime_group(deployment, updated)
-        if updated.version < preflight.version:
-            raise SaladDeploymentValidationError("container group runtime update was not accepted")
-        target_version = max(preflight.version + 1, updated.version)
+        if already_applied:
+            updated = preflight
+            target_version = preflight.version
+        else:
+            updated = await client.update_container_group(
+                deployment.container_group_name,
+                update_patch,
+            )
+            _validate_runtime_group(deployment, updated)
+            if not updated.pending_change:
+                _validate_runtime_group(
+                    deployment,
+                    updated,
+                    effective_min_replicas=effective_min_replicas,
+                )
+            if updated.version < preflight.version:
+                raise SaladDeploymentValidationError(
+                    "container group runtime update was not accepted"
+                )
+            target_version = max(preflight.version + 1, updated.version)
         async with asyncio.timeout(convergence_timeout_seconds):
             while True:
                 observed = await client.get_container_group(deployment.container_group_name)
                 _validate_runtime_group(deployment, observed)
-                if observed.version >= target_version and not observed.pending_change:
+                if observed.version > target_version:
+                    raise SaladDeploymentValidationError(
+                        "container group runtime version advanced during update"
+                    )
+                if not observed.pending_change:
+                    _validate_runtime_group(
+                        deployment,
+                        observed,
+                        effective_min_replicas=effective_min_replicas,
+                    )
+                if (
+                    planned_refresh
+                    and observed.version >= target_version
+                    and not observed.pending_change
+                ):
+                    if _runtime_admission_id(observed) != runtime_admission_id:
+                        raise SaladDeploymentValidationError(
+                            "container group runtime marker changed during update"
+                        )
+                if observed.version == target_version and not observed.pending_change:
                     return observed
                 await asyncio.sleep(poll_interval_seconds)
     except SaladDeploymentValidationError:
         raise
     except TimeoutError:
+        if planned_refresh:
+            raise SaladRuntimeAdmissionUnavailableError(
+                "container group runtime refresh convergence is unavailable"
+            ) from None
         raise SaladDeploymentValidationError(
             "container group runtime update did not converge"
         ) from None
+    except (SaladAPIError, SaladProtocolError, SaladTransportError):
+        if planned_refresh:
+            raise SaladRuntimeAdmissionUnavailableError(
+                "container group runtime refresh observation is unavailable"
+            ) from None
+        raise SaladDeploymentValidationError("container group runtime update failed") from None
     except Exception:
         raise SaladDeploymentValidationError("container group runtime update failed") from None
+
+
+async def preflight_container_group_runtime_refresh(
+    deployment: SaladDeployment,
+    client: SaladDeploymentClient,
+) -> SaladContainerGroup:
+    """Read the exact provider version before durably planning a runtime PATCH."""
+
+    if deployment.provider_container_group_id is None:
+        raise SaladDeploymentValidationError("container group is not provisioned")
+    if (
+        deployment.is_current
+        and deployment.state == SaladDeploymentState.PROVISIONING
+        and deployment.last_error_code in _QUEUE_ADMISSION_TRANSITIONAL_ERROR_CODES
+        and deployment.desired_state == DesiredDeploymentState.ACTIVE
+    ):
+        raise SaladRuntimeAdmissionUnavailableError(
+            "container group runtime refresh preflight is waiting for provider convergence"
+        )
+    if (
+        not deployment.is_current
+        or deployment.state != SaladDeploymentState.ACTIVE
+        or deployment.desired_state != DesiredDeploymentState.ACTIVE
+    ):
+        raise SaladDeploymentValidationError("deployment is not active")
+    try:
+        group = await client.get_container_group(deployment.container_group_name)
+        _validate_runtime_group(deployment, group)
+        if group.pending_change:
+            raise SaladRuntimeAdmissionUnavailableError(
+                "container group runtime refresh preflight has a pending provider change"
+            )
+        return group
+    except SaladRuntimeAdmissionUnavailableError:
+        raise
+    except SaladDeploymentValidationError:
+        raise
+    except (SaladAPIError, SaladProtocolError, SaladTransportError):
+        raise SaladRuntimeAdmissionUnavailableError(
+            "container group runtime refresh preflight is unavailable"
+        ) from None
+    except Exception:
+        raise SaladDeploymentValidationError(
+            "container group runtime refresh preflight could not be verified"
+        ) from None
+
+
+def _runtime_admission_id(group: SaladContainerGroup) -> str | None:
+    container = group.raw.get("container")
+    environment = container.get("environment_variables") if isinstance(container, dict) else None
+    if not isinstance(environment, dict):
+        return None
+    value = environment.get(WORKER_RUNTIME_ADMISSION_ID_BINDING)
+    return value if isinstance(value, str) else None
+
+
+def _validate_group_runtime_admission_identity(
+    group: SaladContainerGroup,
+    *,
+    artifact_manifest_sha256: str,
+    runtime_admission_id: str,
+) -> None:
+    if (
+        len(artifact_manifest_sha256) != 64
+        or artifact_manifest_sha256 != artifact_manifest_sha256.lower()
+        or any(character not in "0123456789abcdef" for character in artifact_manifest_sha256)
+    ):
+        raise SaladDeploymentValidationError("runtime admission manifest is invalid")
+    if _RUNTIME_ADMISSION_ID_PATTERN.fullmatch(runtime_admission_id) is None:
+        raise SaladDeploymentValidationError("runtime admission identifier is invalid")
+    container = group.raw.get("container")
+    environment = container.get("environment_variables") if isinstance(container, dict) else None
+    if not isinstance(environment, dict):
+        raise SaladDeploymentValidationError("container group runtime admission identity changed")
+    if environment.get(WORKER_MODEL_MANIFEST_SHA256_BINDING) != artifact_manifest_sha256:
+        raise SaladDeploymentValidationError("container group runtime admission manifest changed")
+    if environment.get(WORKER_RUNTIME_ADMISSION_ID_BINDING) != runtime_admission_id:
+        raise SaladDeploymentValidationError("container group runtime admission identifier changed")
+
+
+async def read_container_group_runtime_admission_identity(
+    deployment: SaladDeployment,
+    client: SaladDeploymentClient,
+    *,
+    minimum_provider_version: int,
+    artifact_manifest_sha256: str,
+) -> tuple[int, str] | None:
+    """Read marker-bearing warm-runtime provenance without trusting readiness."""
+
+    if minimum_provider_version <= 0:
+        raise SaladDeploymentValidationError("runtime admission version is invalid")
+    if (
+        len(artifact_manifest_sha256) != 64
+        or artifact_manifest_sha256 != artifact_manifest_sha256.lower()
+        or any(character not in "0123456789abcdef" for character in artifact_manifest_sha256)
+    ):
+        raise SaladDeploymentValidationError("runtime admission manifest is invalid")
+    try:
+        group = await client.get_container_group(deployment.container_group_name)
+        _validate_runtime_group(deployment, group)
+        if group.version < minimum_provider_version:
+            raise SaladDeploymentValidationError(
+                "container group runtime admission version regressed"
+            )
+        container = group.raw.get("container")
+        environment = (
+            container.get("environment_variables") if isinstance(container, dict) else None
+        )
+        if (
+            not isinstance(environment, dict)
+            or environment.get(WORKER_MODEL_MANIFEST_SHA256_BINDING) != artifact_manifest_sha256
+        ):
+            raise SaladDeploymentValidationError(
+                "container group runtime admission manifest changed"
+            )
+        runtime_admission_id = _runtime_admission_id(group)
+        if runtime_admission_id is None:
+            return None
+        if _RUNTIME_ADMISSION_ID_PATTERN.fullmatch(runtime_admission_id) is None:
+            raise SaladDeploymentValidationError(
+                "container group runtime admission identifier changed"
+            )
+        return group.version, runtime_admission_id
+    except SaladDeploymentValidationError:
+        raise
+    except (SaladAPIError, SaladProtocolError, SaladTransportError):
+        raise SaladRuntimeAdmissionUnavailableError(
+            "container group runtime admission identity is unavailable"
+        ) from None
+    except Exception:
+        raise SaladDeploymentValidationError(
+            "container group runtime admission identity could not be verified"
+        ) from None
 
 
 async def ensure_container_group_queue_admission(
@@ -1599,47 +2005,82 @@ async def ensure_container_group_queue_admission(
     client: SaladDeploymentClient,
     *,
     effective_min_replicas: int,
+    artifact_manifest_sha256: str | None = None,
+    runtime_admission_id: str | None = None,
     convergence_timeout_seconds: float = _QUEUE_ADMISSION_CONVERGENCE_TIMEOUT_SECONDS,
     poll_interval_seconds: float = _QUEUE_ADMISSION_POLL_SECONDS,
 ) -> SaladContainerGroup:
     """Hold one exact worker and request its start before a durable queue POST.
 
-    Salad only exposes a group in ``queue.container_groups`` after the worker
-    has progressed far enough to attach. A cold image download can take much
-    longer than the controller submission lease, while the queue itself is
-    already durable and able to retain the job. Validate the immutable group
-    and queue identities, raise the autoscaler floor, and require Salad to
-    accept the start request; worker readiness is observed asynchronously
-    after the provider job has been persisted.
+    A cold image download can take much longer than the controller submission
+    lease, while the queue itself is already durable and able to retain the
+    job. Validate the immutable group and queue identities, raise the autoscaler
+    floor, and require Salad to accept the start request. Runtime admission
+    separately fences every prior-version consumer before a provider job is
+    persisted.
     """
 
     if (
         deployment.provider_queue_id is None
         or deployment.provider_container_group_id is None
         or not deployment.is_current
-        or deployment.state != SaladDeploymentState.ACTIVE
+        or (
+            deployment.state != SaladDeploymentState.ACTIVE
+            and not (
+                deployment.state == SaladDeploymentState.PROVISIONING
+                and deployment.last_error_code in _QUEUE_ADMISSION_TRANSITIONAL_ERROR_CODES
+            )
+        )
         or deployment.desired_state != DesiredDeploymentState.ACTIVE
     ):
         raise SaladDeploymentValidationError("deployment is not ready for queue admission")
     if effective_min_replicas != 1:
         raise SaladDeploymentValidationError("durable queue admission demand is required")
+    if (artifact_manifest_sha256 is None) != (runtime_admission_id is None):
+        raise SaladDeploymentValidationError("queue admission runtime identity is incomplete")
+
+    def validate_runtime_identity(group: SaladContainerGroup) -> None:
+        if artifact_manifest_sha256 is not None and runtime_admission_id is not None:
+            _validate_group_runtime_admission_identity(
+                group,
+                artifact_manifest_sha256=artifact_manifest_sha256,
+                runtime_admission_id=runtime_admission_id,
+            )
+
     try:
         initial = await client.get_container_group(deployment.container_group_name)
         queue = await client.get_queue(deployment.queue_name)
         if str(queue.id) != deployment.provider_queue_id or queue.name != deployment.queue_name:
             raise SaladDeploymentValidationError("queue identity does not match deployment")
+        # A provider PATCH can expose either the old min=0 or target min=1
+        # snapshot while pending. Validate every immutable/runtime identity but
+        # never issue a second mutation against that in-flight transition.
+        _validate_runtime_group(deployment, initial)
+        validate_runtime_identity(initial)
+        if initial.pending_change:
+            raise SaladRuntimeAdmissionUnavailableError(
+                "container group queue admission has a pending provider change"
+            )
         try:
             _validate_runtime_group(
                 deployment,
                 initial,
                 effective_min_replicas=effective_min_replicas,
             )
+            validate_runtime_identity(initial)
         except SaladDeploymentValidationError:
+            if artifact_manifest_sha256 is not None:
+                # Marker-bearing refreshes atomically install min=1. A later
+                # autoscaler repair under the same marker could recycle a live
+                # consumer without changing the worker-verifiable identity, so
+                # target admission never performs that mutation in place.
+                raise
             # A stopped idle group is expected to retain the configured zero
             # minimum until a submit event is durably claimed. Accept only that
             # exact zero-minimum contract before raising it for this admission;
             # every other drift remains fatal.
             _validate_runtime_group(deployment, initial, effective_min_replicas=0)
+            validate_runtime_identity(initial)
             updated = await client.update_container_group(
                 deployment.container_group_name,
                 {
@@ -1649,11 +2090,14 @@ async def ensure_container_group_queue_admission(
                     )
                 },
             )
-            _validate_runtime_group(
-                deployment,
-                updated,
-                effective_min_replicas=effective_min_replicas,
-            )
+            _validate_runtime_group(deployment, updated)
+            validate_runtime_identity(updated)
+            if not updated.pending_change:
+                _validate_runtime_group(
+                    deployment,
+                    updated,
+                    effective_min_replicas=effective_min_replicas,
+                )
             if updated.version < initial.version:
                 raise SaladDeploymentValidationError(
                     "queue admission autoscaler update was not accepted"
@@ -1665,30 +2109,155 @@ async def ensure_container_group_queue_admission(
             async with asyncio.timeout(convergence_timeout_seconds):
                 while True:
                     initial = await client.get_container_group(deployment.container_group_name)
+                    _validate_runtime_group(deployment, initial)
+                    validate_runtime_identity(initial)
+                    if initial.pending_change:
+                        await asyncio.sleep(poll_interval_seconds)
+                        continue
                     _validate_runtime_group(
                         deployment,
                         initial,
                         effective_min_replicas=effective_min_replicas,
                     )
-                    if initial.version >= target_version and not initial.pending_change:
+                    if initial.version >= target_version:
                         break
                     await asyncio.sleep(poll_interval_seconds)
         if initial.pending_change:
-            raise SaladDeploymentValidationError("container group has a pending change")
+            raise SaladRuntimeAdmissionUnavailableError(
+                "container group queue admission has a pending provider change"
+            )
         if initial.status.strip().lower() == "failed":
             raise SaladDeploymentValidationError("container group failed before admission")
         if _is_authoritatively_stopped(initial):
+            pre_start_version = initial.version
             await client.start_container_group(deployment.container_group_name)
+            # A lifecycle start can advance the provider group version after
+            # the start endpoint has returned. Never persist the pre-start
+            # version as runtime admission provenance: wait for an exact,
+            # stable post-start readback instead.
+            async with asyncio.timeout(convergence_timeout_seconds):
+                while True:
+                    observed = await client.get_container_group(deployment.container_group_name)
+                    _validate_runtime_group(
+                        deployment,
+                        observed,
+                        effective_min_replicas=effective_min_replicas,
+                    )
+                    validate_runtime_identity(observed)
+                    if observed.version < pre_start_version:
+                        raise SaladDeploymentValidationError(
+                            "container group version regressed after start"
+                        )
+                    if not observed.pending_change and (
+                        observed.version > pre_start_version
+                        or not _is_authoritatively_stopped(observed)
+                    ):
+                        initial = observed
+                        break
+                    await asyncio.sleep(poll_interval_seconds)
         return initial
+    except SaladRuntimeAdmissionUnavailableError:
+        raise
     except SaladDeploymentValidationError:
         raise
     except TimeoutError:
-        raise SaladDeploymentValidationError(
-            "queue admission autoscaler update did not converge"
+        raise SaladRuntimeAdmissionUnavailableError(
+            "container group queue admission observation did not converge"
+        ) from None
+    except (SaladAPIError, SaladProtocolError, SaladTransportError):
+        raise SaladRuntimeAdmissionUnavailableError(
+            "container group queue admission observation is unavailable"
         ) from None
     except Exception:
         raise SaladDeploymentValidationError(
             "container group queue admission could not be verified"
+        ) from None
+
+
+async def container_group_runtime_admission_ready(
+    deployment: SaladDeployment,
+    client: SaladDeploymentClient,
+    *,
+    provider_version: int,
+    artifact_manifest_sha256: str,
+    runtime_admission_id: str,
+) -> str | None:
+    """Prove that only the exact refreshed worker can consume a queued job.
+
+    A container-group PATCH can report its new version before Salad has drained
+    the old queue consumer. The worker starts its queue child only after the
+    manifest-bound application and Comfy runtime are ready. One sole exact
+    target-version instance therefore proves that no old consumer can claim the
+    durable job; the new consumer may attach later and the POST can wait safely
+    in the durable queue.
+    Salad's instance ``ready`` flag is not dependable for queue workers and is
+    deliberately not part of this contract.
+    """
+
+    if provider_version <= 0:
+        raise SaladDeploymentValidationError("runtime admission version is invalid")
+    if (
+        len(artifact_manifest_sha256) != 64
+        or artifact_manifest_sha256 != artifact_manifest_sha256.lower()
+        or any(character not in "0123456789abcdef" for character in artifact_manifest_sha256)
+    ):
+        raise SaladDeploymentValidationError("runtime admission manifest is invalid")
+    if _RUNTIME_ADMISSION_ID_PATTERN.fullmatch(runtime_admission_id) is None:
+        raise SaladDeploymentValidationError("runtime admission identifier is invalid")
+    try:
+        group = await client.get_container_group(deployment.container_group_name)
+        _validate_runtime_group(deployment, group)
+        if group.version != provider_version:
+            raise SaladDeploymentValidationError(
+                "container group runtime admission version changed"
+            )
+        _validate_group_runtime_admission_identity(
+            group,
+            artifact_manifest_sha256=artifact_manifest_sha256,
+            runtime_admission_id=runtime_admission_id,
+        )
+        queue = await client.get_queue(deployment.queue_name)
+        if queue.name != deployment.queue_name or str(queue.id) != deployment.provider_queue_id:
+            raise SaladDeploymentValidationError(
+                "container group runtime admission queue identity changed"
+            )
+        page = await client.list_container_group_instances(deployment.container_group_name)
+        instances = page.instances
+        if any(instance.version > provider_version for instance in instances):
+            raise SaladDeploymentValidationError(
+                "container group instance version advanced during runtime admission"
+            )
+        if (
+            group.pending_change
+            or group.replicas != 1
+            or group.status.strip().lower() != "running"
+            or group.current_state.allocating_count != 0
+            or group.current_state.creating_count != 0
+            or group.current_state.running_count != 1
+            or group.current_state.stopping_count != 0
+            or len(instances) != 1
+        ):
+            return None
+        instance = instances[0]
+        if (
+            instance.version != provider_version
+            or instance.state != SaladContainerGroupInstanceState.RUNNING
+            or instance.started is not True
+        ):
+            return None
+        return instance.id
+    except SaladDeploymentValidationError:
+        raise
+    except (SaladAPIError, SaladProtocolError, SaladTransportError):
+        # GET/list failures do not prove drift and occur before any queue POST.
+        # Keep the durable CREATED attempt waiting without consuming a retry;
+        # explicit identity/version/manifest conflicts above still fail closed.
+        raise SaladRuntimeAdmissionUnavailableError(
+            "container group runtime admission observation is unavailable"
+        ) from None
+    except Exception:
+        raise SaladDeploymentValidationError(
+            "container group runtime admission could not be verified"
         ) from None
 
 

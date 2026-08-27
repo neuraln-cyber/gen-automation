@@ -15,7 +15,7 @@ import boto3
 from anyio import to_thread
 from botocore.client import Config
 from botocore.exceptions import BotoCoreError, ClientError
-from pydantic import AnyHttpUrl, Field, SecretStr, ValidationError, model_validator
+from pydantic import AliasChoices, AnyHttpUrl, Field, SecretStr, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from gen_automation.domain.generation_limits import MAX_OUTPUTS_PER_GENERATION_JOB
@@ -32,6 +32,8 @@ from gen_automation.gpu_worker.artifacts import (
 )
 from gen_automation.gpu_worker.models import (
     DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES,
+    RuntimeAdmissionId,
+    RuntimeWorkerInstanceId,
     WorkerEnvironment,
     WorkerSettings,
 )
@@ -85,6 +87,10 @@ class WorkerRuntimeSettings(BaseSettings):
     allowed_upload_origin: str
     model_manifest_json: SecretStr
     model_manifest_sha256: Sha256
+    runtime_admission_id: RuntimeAdmissionId
+    runtime_worker_instance_id: RuntimeWorkerInstanceId = Field(
+        validation_alias=AliasChoices("SALAD_INSTANCE_ID", "runtime_worker_instance_id")
+    )
     checkpoint_root: Path = Path("/opt/comfyui/models/checkpoints")
     lora_root: Path = Path("/opt/comfyui/models/loras")
     detector_root: Path = Path("/opt/comfyui/models/ultralytics/bbox")
@@ -132,7 +138,10 @@ class WorkerRuntimeSettings(BaseSettings):
     comfy_execution_timeout_seconds: float = Field(default=3600.0, ge=30.0, le=7200.0)
     salad_queue_worker_enabled: bool = True
     salad_queue_worker_path: Path = Path("/usr/local/bin/salad-http-job-queue-worker")
-    salad_queue_worker_log_level: str = "error"
+    # WARN exposes only job IDs, HTTP status/errors, and fixed reallocation
+    # reasons in the pinned queue worker. It is the minimum level that records
+    # whether a provider retry followed a local 5xx or a queue-worker failure.
+    salad_queue_worker_log_level: str = "warn"
     worker_host: str = _WORKER_BIND_HOST
     worker_port: int = Field(default=8000, ge=1024, le=65535)
     worker_log_level: str = "info"
@@ -223,6 +232,9 @@ class WorkerRuntimeSettings(BaseSettings):
             environment=self.environment,
             verification_keys=self.verification_keys,
             allowed_upload_origin=self.allowed_upload_origin,
+            artifact_manifest_sha256=self.model_manifest_sha256,
+            runtime_admission_id=self.runtime_admission_id,
+            runtime_worker_instance_id=self.runtime_worker_instance_id,
             max_body_bytes=self.max_body_bytes,
             max_signature_ttl_seconds=self.max_signature_ttl_seconds,
             clock_skew_seconds=self.clock_skew_seconds,

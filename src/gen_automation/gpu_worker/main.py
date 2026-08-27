@@ -25,6 +25,7 @@ from gen_automation.gpu_worker.artifacts import (
     ArtifactBootstrapError,
     ArtifactBootstrapResult,
     ArtifactKind,
+    MaterializedArtifact,
     bootstrap_artifacts,
 )
 from gen_automation.gpu_worker.bootstrap import (
@@ -42,10 +43,16 @@ from gen_automation.gpu_worker.models import WorkerEnvironment, WorkerSettings
 COMFY_SHUTDOWN_GRACE_SECONDS = 20.0
 COMFY_MONITOR_INTERVAL_SECONDS = 1.0
 COMFY_HEALTH_CHECK_TIMEOUT_SECONDS = 5.0
+COMFY_STARTUP_TIMEOUT_SECONDS = 300.0
+COMFY_STARTUP_POLL_SECONDS = 1.0
+COMFY_RECYCLE_MAX_CONSECUTIVE = 1
+COMFY_RECYCLE_BUDGET_RESET_SECONDS = 600.0
 QUEUE_WORKER_MAX_CONSECUTIVE_RESTARTS = 3
 QUEUE_WORKER_RESTART_BACKOFF_BASE_SECONDS = 1.0
 QUEUE_WORKER_RESTART_BACKOFF_MAX_SECONDS = 4.0
 QUEUE_WORKER_RESTART_BUDGET_RESET_SECONDS = 300.0
+QUEUE_WORKER_UNSAFE_REQUEST_DRAIN_SECONDS = 5.0
+QUEUE_WORKER_UNSAFE_REQUEST_DRAIN_POLL_SECONDS = 0.05
 WORKER_SERVER_START_TIMEOUT_SECONDS = 10.0
 _PR_SET_DUMPABLE = 4
 _PR_SET_NO_NEW_PRIVS = 38
@@ -113,6 +120,34 @@ class _QueueWorkerLaunchSettings:
         )
 
 
+@dataclass(frozen=True)
+class _ComfyLaunchSettings:
+    comfy_base_url: str
+    comfy_python: Path
+    comfy_main: Path
+    comfy_runtime_root: Path
+    checkpoint_root: Path
+    worker_log_level: str
+    fp32_vae: bool
+
+    @classmethod
+    def from_runtime_settings(
+        cls,
+        settings: WorkerRuntimeSettings,
+        *,
+        fp32_vae: bool,
+    ) -> "_ComfyLaunchSettings":
+        return cls(
+            comfy_base_url=settings.comfy_base_url,
+            comfy_python=settings.comfy_python,
+            comfy_main=settings.comfy_main,
+            comfy_runtime_root=settings.comfy_runtime_root,
+            checkpoint_root=settings.checkpoint_root,
+            worker_log_level=settings.worker_log_level,
+            fp32_vae=fp32_vae,
+        )
+
+
 @dataclass
 class _ManagedChild:
     role: str
@@ -124,6 +159,30 @@ class _ManagedChild:
 class _ManagedChildren:
     comfy: _ManagedChild
     queue_worker: _ManagedChild | None
+
+
+def _manifest_requires_fp32_vae(
+    artifacts: tuple[MaterializedArtifact, ...],
+) -> bool:
+    """Enable decode-only precision for the exact Anima/Qwen split stack."""
+
+    def identifies(artifact: MaterializedArtifact, token: str) -> bool:
+        return token in artifact.logical_name.lower() or token in artifact.target_filename.lower()
+
+    return bool(
+        any(
+            artifact.kind == ArtifactKind.DIFFUSION_MODEL and identifies(artifact, "anima")
+            for artifact in artifacts
+        )
+        and any(
+            artifact.kind == ArtifactKind.TEXT_ENCODER and identifies(artifact, "qwen")
+            for artifact in artifacts
+        )
+        and any(
+            artifact.kind == ArtifactKind.VAE and identifies(artifact, "qwen")
+            for artifact in artifacts
+        )
+    )
 
 
 def _apply_linux_process_hardening() -> None:
@@ -231,7 +290,9 @@ def write_verified_detector_whitelist(
             os.close(descriptor)
 
 
-def _comfy_origin(settings: WorkerRuntimeSettings) -> tuple[str, int]:
+def _comfy_origin(
+    settings: WorkerRuntimeSettings | _ComfyLaunchSettings,
+) -> tuple[str, int]:
     try:
         parsed: SplitResult = urlsplit(settings.comfy_base_url)
         address = ipaddress.ip_address(parsed.hostname or "")
@@ -254,10 +315,12 @@ def _comfy_origin(settings: WorkerRuntimeSettings) -> tuple[str, int]:
     return address.compressed, port
 
 
-def build_comfy_command(settings: WorkerRuntimeSettings) -> tuple[str, ...]:
+def build_comfy_command(
+    settings: WorkerRuntimeSettings | _ComfyLaunchSettings,
+) -> tuple[str, ...]:
     address, port = _comfy_origin(settings)
     runtime_root = settings.comfy_runtime_root
-    return (
+    command = (
         settings.comfy_python.as_posix(),
         settings.comfy_main.as_posix(),
         "--listen",
@@ -289,6 +352,9 @@ def build_comfy_command(settings: WorkerRuntimeSettings) -> tuple[str, ...]:
         settings.worker_log_level.upper(),
         "--log-stdout",
     )
+    if isinstance(settings, _ComfyLaunchSettings) and settings.fp32_vae:
+        return (*command, "--fp32-vae")
+    return command
 
 
 def build_comfy_environment(source: Mapping[str, str]) -> dict[str, str]:
@@ -359,7 +425,7 @@ async def bootstrap_worker_models(
 
 
 def start_comfy(
-    settings: WorkerRuntimeSettings,
+    settings: WorkerRuntimeSettings | _ComfyLaunchSettings,
 ) -> subprocess.Popen[bytes]:
     command = build_comfy_command(settings)
     environment = build_comfy_environment(os.environ)
@@ -544,11 +610,203 @@ async def _bounded_comfy_health_check(health_check: Callable[[], bool]) -> bool:
         return False
 
 
+async def _wait_for_comfy_ready(
+    process: subprocess.Popen[bytes],
+    health_check: Callable[[], bool],
+    *,
+    server_task: asyncio.Task[None] | None = None,
+    timeout_seconds: float = COMFY_STARTUP_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = COMFY_STARTUP_POLL_SECONDS,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Keep the queue detached until the manifest-bound app can execute."""
+
+    deadline = monotonic() + timeout_seconds
+    while True:
+        if process.poll() is not None or (server_task is not None and server_task.done()):
+            raise WorkerBootstrapConfigurationError("worker bootstrap configuration is invalid")
+        if await _bounded_comfy_health_check(health_check):
+            return
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise WorkerBootstrapConfigurationError("worker bootstrap configuration is invalid")
+        await sleep(min(poll_interval_seconds, remaining))
+
+
+async def _wait_for_unsafe_request_drain(
+    unsafe_request_active: Callable[[], bool],
+    *,
+    timeout_seconds: float = QUEUE_WORKER_UNSAFE_REQUEST_DRAIN_SECONDS,
+    poll_interval_seconds: float = QUEUE_WORKER_UNSAFE_REQUEST_DRAIN_POLL_SECONDS,
+) -> bool:
+    """Let a response-bound request unwind before deciding child recovery."""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, timeout_seconds)
+    while unsafe_request_active():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(max(0.0, poll_interval_seconds), remaining))
+    return True
+
+
+async def _recover_comfy_in_place(
+    children: _ManagedChildren,
+    server: uvicorn.Server,
+    worker_restart_event: asyncio.Event,
+    worker_recycle_event: asyncio.Event,
+    *,
+    recovery_reason: str,
+    consecutive_recycles: int,
+    start_comfy_process: Callable[[], subprocess.Popen[bytes]] | None,
+    start_queue_worker: Callable[[], subprocess.Popen[bytes] | None] | None,
+    unsafe_request_active: Callable[[], bool],
+    comfy_health_check: Callable[[], bool] | None,
+    monotonic: Callable[[], float],
+    stop_child: Callable[[subprocess.Popen[bytes]], None],
+    wait_for_comfy_ready: Callable[[subprocess.Popen[bytes], Callable[[], bool]], Awaitable[None]],
+    unsafe_request_drain_seconds: float,
+    unsafe_request_drain_poll_seconds: float,
+) -> bool:
+    """Recycle Comfy in-place after fatal output or a child exit."""
+
+    if unsafe_request_active():
+        drained = await _wait_for_unsafe_request_drain(
+            unsafe_request_active,
+            timeout_seconds=unsafe_request_drain_seconds,
+            poll_interval_seconds=unsafe_request_drain_poll_seconds,
+        )
+        if server.should_exit:
+            return False
+        if not drained:
+            _request_controlled_worker_restart(
+                server,
+                worker_restart_event,
+                role="comfy",
+                reason=f"{recovery_reason}_request_did_not_drain",
+                consecutive_restarts=consecutive_recycles,
+            )
+            return False
+
+    if consecutive_recycles >= COMFY_RECYCLE_MAX_CONSECUTIVE:
+        _request_controlled_worker_restart(
+            server,
+            worker_restart_event,
+            role="comfy",
+            reason=f"{recovery_reason}_recycle_budget_exhausted",
+            consecutive_restarts=consecutive_recycles,
+        )
+        return False
+    if start_comfy_process is None or start_queue_worker is None or comfy_health_check is None:
+        _request_controlled_worker_restart(
+            server,
+            worker_restart_event,
+            role="comfy",
+            reason=f"{recovery_reason}_recovery_unavailable",
+            consecutive_restarts=consecutive_recycles,
+        )
+        return False
+
+    queue_child = children.queue_worker
+    if queue_child is not None:
+        queue_returncode = queue_child.process.poll()
+        if queue_returncode is not None:
+            _log_child_exit(queue_child, queue_returncode, now=monotonic())
+        else:
+            await asyncio.to_thread(stop_child, queue_child.process)
+        children.queue_worker = None
+
+    comfy_child = children.comfy
+    comfy_returncode = comfy_child.process.poll()
+    if comfy_returncode is not None:
+        _log_child_exit(comfy_child, comfy_returncode, now=monotonic())
+    else:
+        await asyncio.to_thread(stop_child, comfy_child.process)
+    try:
+        replacement_comfy = start_comfy_process()
+    except (OSError, WorkerBootstrapConfigurationError):
+        replacement_comfy = None
+    if replacement_comfy is None:
+        _request_controlled_worker_restart(
+            server,
+            worker_restart_event,
+            role="comfy",
+            reason=f"{recovery_reason}_recycle_start_failed",
+            consecutive_restarts=consecutive_recycles,
+        )
+        return False
+
+    replacement_started_at = monotonic()
+    children.comfy = _ManagedChild("comfy", replacement_comfy, replacement_started_at)
+    try:
+        await wait_for_comfy_ready(replacement_comfy, comfy_health_check)
+    except (OSError, TimeoutError, WorkerBootstrapConfigurationError):
+        await asyncio.to_thread(stop_child, replacement_comfy)
+        _request_controlled_worker_restart(
+            server,
+            worker_restart_event,
+            role="comfy",
+            reason=f"{recovery_reason}_recycle_readiness_failed",
+            consecutive_restarts=consecutive_recycles,
+        )
+        return False
+    if server.should_exit or replacement_comfy.poll() is not None:
+        await asyncio.to_thread(stop_child, replacement_comfy)
+        _request_controlled_worker_restart(
+            server,
+            worker_restart_event,
+            role="comfy",
+            reason=f"{recovery_reason}_recycle_child_exited",
+            consecutive_restarts=consecutive_recycles,
+        )
+        return False
+
+    # No queue consumer exists at this point, so clearing the application gate
+    # after exact Comfy readiness cannot admit work early. Clear it before
+    # spawning the queue child so the child's first claim cannot race a stale
+    # recovery-in-progress 503.
+    worker_recycle_event.clear()
+    try:
+        replacement_queue = start_queue_worker()
+    except (OSError, WorkerBootstrapConfigurationError):
+        replacement_queue = None
+    if replacement_queue is None:
+        worker_recycle_event.set()
+        await asyncio.to_thread(stop_child, replacement_comfy)
+        _request_controlled_worker_restart(
+            server,
+            worker_restart_event,
+            role="salad_queue_worker",
+            reason=f"{recovery_reason}_recycle_queue_start_failed",
+            consecutive_restarts=consecutive_recycles,
+        )
+        return False
+
+    children.queue_worker = _ManagedChild(
+        "salad_queue_worker",
+        replacement_queue,
+        monotonic(),
+    )
+    print(
+        "GPU worker Comfy recovery completed: "
+        f"reason={recovery_reason} "
+        f"comfy_pid={replacement_comfy.pid} queue_pid={replacement_queue.pid} "
+        f"recycle_ordinal={consecutive_recycles + 1}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return True
+
+
 async def _monitor_comfy_impl(
     children: _ManagedChildren,
     server: uvicorn.Server,
     worker_restart_event: asyncio.Event,
     *,
+    worker_recycle_event: asyncio.Event | None = None,
+    start_comfy_process: Callable[[], subprocess.Popen[bytes]] | None = None,
     start_queue_worker: Callable[[], subprocess.Popen[bytes] | None] | None = None,
     unsafe_request_active: Callable[[], bool] = lambda: False,
     comfy_health_check: Callable[[], bool] | None = None,
@@ -556,21 +814,80 @@ async def _monitor_comfy_impl(
     wait_for_event: Callable[[asyncio.Event, float], Awaitable[bool]] = (
         _wait_for_event_or_timeout
     ),
+    unsafe_request_drain_seconds: float = QUEUE_WORKER_UNSAFE_REQUEST_DRAIN_SECONDS,
+    unsafe_request_drain_poll_seconds: float = (QUEUE_WORKER_UNSAFE_REQUEST_DRAIN_POLL_SECONDS),
+    stop_child: Callable[[subprocess.Popen[bytes]], None] = stop_comfy,
+    wait_for_comfy_ready: Callable[
+        [subprocess.Popen[bytes], Callable[[], bool]], Awaitable[None]
+    ] = _wait_for_comfy_ready,
 ) -> None:
     consecutive_queue_restarts = 0
+    consecutive_comfy_recycles = 0
     while not server.should_exit:
         now = monotonic()
-        comfy_returncode = children.comfy.process.poll()
-        if comfy_returncode is not None:
-            _log_child_exit(children.comfy, comfy_returncode, now=now)
-            _request_controlled_worker_restart(
+        if (
+            consecutive_comfy_recycles > 0
+            and now - children.comfy.started_at >= COMFY_RECYCLE_BUDGET_RESET_SECONDS
+        ):
+            consecutive_comfy_recycles = 0
+        if worker_recycle_event is not None and worker_recycle_event.is_set():
+            recovered = await _recover_comfy_in_place(
+                children,
                 server,
                 worker_restart_event,
-                role=children.comfy.role,
-                reason="child_exited",
-                consecutive_restarts=consecutive_queue_restarts,
+                worker_recycle_event,
+                recovery_reason="fatal_output",
+                consecutive_recycles=consecutive_comfy_recycles,
+                start_comfy_process=start_comfy_process,
+                start_queue_worker=start_queue_worker,
+                unsafe_request_active=unsafe_request_active,
+                comfy_health_check=comfy_health_check,
+                monotonic=monotonic,
+                stop_child=stop_child,
+                wait_for_comfy_ready=wait_for_comfy_ready,
+                unsafe_request_drain_seconds=unsafe_request_drain_seconds,
+                unsafe_request_drain_poll_seconds=unsafe_request_drain_poll_seconds,
             )
-            return
+            if not recovered:
+                return
+            consecutive_comfy_recycles += 1
+            consecutive_queue_restarts = 0
+            continue
+        comfy_returncode = children.comfy.process.poll()
+        if comfy_returncode is not None:
+            if worker_recycle_event is None:
+                _log_child_exit(children.comfy, comfy_returncode, now=now)
+                _request_controlled_worker_restart(
+                    server,
+                    worker_restart_event,
+                    role=children.comfy.role,
+                    reason="child_exited",
+                    consecutive_restarts=consecutive_queue_restarts,
+                )
+                return
+            worker_recycle_event.set()
+            recovered = await _recover_comfy_in_place(
+                children,
+                server,
+                worker_restart_event,
+                worker_recycle_event,
+                recovery_reason="comfy_child_exit",
+                consecutive_recycles=consecutive_comfy_recycles,
+                start_comfy_process=start_comfy_process,
+                start_queue_worker=start_queue_worker,
+                unsafe_request_active=unsafe_request_active,
+                comfy_health_check=comfy_health_check,
+                monotonic=monotonic,
+                stop_child=stop_child,
+                wait_for_comfy_ready=wait_for_comfy_ready,
+                unsafe_request_drain_seconds=unsafe_request_drain_seconds,
+                unsafe_request_drain_poll_seconds=unsafe_request_drain_poll_seconds,
+            )
+            if not recovered:
+                return
+            consecutive_comfy_recycles += 1
+            consecutive_queue_restarts = 0
+            continue
 
         queue_child = children.queue_worker
         if (
@@ -591,18 +908,48 @@ async def _monitor_comfy_impl(
                 consecutive_queue_restarts = 0
             children.queue_worker = None
 
+            if unsafe_request_active():
+                drained = await _wait_for_unsafe_request_drain(
+                    unsafe_request_active,
+                    timeout_seconds=unsafe_request_drain_seconds,
+                    poll_interval_seconds=unsafe_request_drain_poll_seconds,
+                )
+                if worker_restart_event.is_set():
+                    _stop_for_requested_worker_restart(
+                        server,
+                        consecutive_restarts=consecutive_queue_restarts,
+                    )
+                    return
+                if not drained:
+                    _request_controlled_worker_restart(
+                        server,
+                        worker_restart_event,
+                        role=queue_child.role,
+                        reason="unsafe_active_request",
+                        consecutive_restarts=consecutive_queue_restarts,
+                    )
+                    return
+                if worker_recycle_event is not None and worker_recycle_event.is_set():
+                    # The response has unwound and the queue child is detached.
+                    # The next monitor iteration performs the bounded Comfy
+                    # recycle before any new queue consumer is started.
+                    continue
+                if server.should_exit:
+                    return
             if worker_restart_event.is_set():
                 _stop_for_requested_worker_restart(
                     server,
                     consecutive_restarts=consecutive_queue_restarts,
                 )
                 return
-            if unsafe_request_active():
+            comfy_returncode = children.comfy.process.poll()
+            if comfy_returncode is not None:
+                _log_child_exit(children.comfy, comfy_returncode, now=monotonic())
                 _request_controlled_worker_restart(
                     server,
                     worker_restart_event,
-                    role=queue_child.role,
-                    reason="unsafe_active_request",
+                    role=children.comfy.role,
+                    reason="child_exited",
                     consecutive_restarts=consecutive_queue_restarts,
                 )
                 return
@@ -638,6 +985,8 @@ async def _monitor_comfy_impl(
                         consecutive_restarts=consecutive_queue_restarts,
                     )
                     return
+                if worker_recycle_event is not None and worker_recycle_event.is_set():
+                    break
                 if server.should_exit:
                     return
                 if unsafe_request_active():
@@ -724,6 +1073,8 @@ async def _monitor_comfy_impl(
                     flush=True,
                 )
                 break
+            if worker_recycle_event is not None and worker_recycle_event.is_set():
+                continue
             continue
 
         if worker_restart_event.is_set():
@@ -748,6 +1099,8 @@ async def _monitor_comfy(
     server: uvicorn.Server,
     worker_restart_event: asyncio.Event,
     *,
+    worker_recycle_event: asyncio.Event | None = None,
+    start_comfy_process: Callable[[], subprocess.Popen[bytes]] | None = None,
     start_queue_worker: Callable[[], subprocess.Popen[bytes] | None] | None = None,
     unsafe_request_active: Callable[[], bool] = lambda: False,
     comfy_health_check: Callable[[], bool] | None = None,
@@ -755,6 +1108,12 @@ async def _monitor_comfy(
     wait_for_event: Callable[[asyncio.Event, float], Awaitable[bool]] = (
         _wait_for_event_or_timeout
     ),
+    unsafe_request_drain_seconds: float = QUEUE_WORKER_UNSAFE_REQUEST_DRAIN_SECONDS,
+    unsafe_request_drain_poll_seconds: float = (QUEUE_WORKER_UNSAFE_REQUEST_DRAIN_POLL_SECONDS),
+    stop_child: Callable[[subprocess.Popen[bytes]], None] = stop_comfy,
+    wait_for_comfy_ready: Callable[
+        [subprocess.Popen[bytes], Callable[[], bool]], Awaitable[None]
+    ] = _wait_for_comfy_ready,
 ) -> None:
     try:
         if isinstance(children, tuple):
@@ -773,11 +1132,17 @@ async def _monitor_comfy(
             children,
             server,
             worker_restart_event,
+            worker_recycle_event=worker_recycle_event,
+            start_comfy_process=start_comfy_process,
             start_queue_worker=start_queue_worker,
             unsafe_request_active=unsafe_request_active,
             comfy_health_check=comfy_health_check,
             monotonic=monotonic,
             wait_for_event=wait_for_event,
+            unsafe_request_drain_seconds=unsafe_request_drain_seconds,
+            unsafe_request_drain_poll_seconds=unsafe_request_drain_poll_seconds,
+            stop_child=stop_child,
+            wait_for_comfy_ready=wait_for_comfy_ready,
         )
     except Exception as error:
         print(
@@ -980,6 +1345,7 @@ async def _serve_worker_lifecycle(
     worker_lifespan: Any | None = None
     worker_lifespan_started = False
     worker_restart_event = asyncio.Event()
+    worker_recycle_event = asyncio.Event()
     try:
         startup_stage[0] = "bootstrap_probe_server"
         await _wait_for_server_start(server, server_task)
@@ -1028,9 +1394,52 @@ async def _serve_worker_lifecycle(
             max_total_output_bytes=settings.max_total_output_bytes,
             approved_node_classes=settings.approved_workflow_node_classes,
         )
+        comfy_launch_settings = _ComfyLaunchSettings.from_runtime_settings(
+            settings,
+            fp32_vae=_manifest_requires_fp32_vae(bootstrap_result.artifacts),
+        )
         startup_stage[0] = "comfy_start"
-        process = start_comfy(settings)
+        process = start_comfy(comfy_launch_settings)
         comfy_started_at = time.monotonic()
+        startup_stage[0] = "worker_settings"
+        worker_settings = settings.to_worker_settings()
+        application = create_worker_app(
+            settings=worker_settings,
+            executor=executor,
+            worker_restart_event=worker_restart_event,
+            worker_recycle_event=worker_recycle_event,
+        )
+        worker_lifespan = application.router.lifespan_context(application)
+        await worker_lifespan.__aenter__()
+        worker_lifespan_started = True
+        router.activate(cast(ASGIApp, application))
+        _startup_progress(
+            "worker_application",
+            "active",
+            elapsed_seconds=time.monotonic() - startup_started_at,
+        )
+        startup_stage[0] = "comfy_readiness"
+        comfy_readiness_started_at = time.monotonic()
+        _startup_progress(
+            startup_stage[0],
+            "started",
+            elapsed_seconds=comfy_readiness_started_at - startup_started_at,
+        )
+        await _wait_for_comfy_ready(
+            process,
+            executor.is_ready,
+            server_task=server_task,
+        )
+        _startup_progress(
+            startup_stage[0],
+            "completed",
+            elapsed_seconds=time.monotonic() - startup_started_at,
+            duration_seconds=time.monotonic() - comfy_readiness_started_at,
+        )
+
+        # No queue consumer may exist until the real manifest-bound app and
+        # Comfy readiness are active. This startup invariant makes it safe for
+        # the controller to enqueue durably once every old instance is gone.
         startup_stage[0] = "queue_worker_start"
         queue_launch_settings = _QueueWorkerLaunchSettings.from_runtime_settings(settings)
         queue_process = start_salad_queue_worker(queue_launch_settings)
@@ -1043,22 +1452,6 @@ async def _serve_worker_lifecycle(
                 else None
             ),
         )
-        startup_stage[0] = "worker_settings"
-        worker_settings = settings.to_worker_settings()
-        application = create_worker_app(
-            settings=worker_settings,
-            executor=executor,
-            worker_restart_event=worker_restart_event,
-        )
-        worker_lifespan = application.router.lifespan_context(application)
-        await worker_lifespan.__aenter__()
-        worker_lifespan_started = True
-        router.activate(cast(ASGIApp, application))
-        _startup_progress(
-            "worker_application",
-            "active",
-            elapsed_seconds=time.monotonic() - startup_started_at,
-        )
         del settings
         gc.collect()
 
@@ -1067,6 +1460,8 @@ async def _serve_worker_lifecycle(
                 managed_children,
                 server,
                 worker_restart_event,
+                worker_recycle_event=worker_recycle_event,
+                start_comfy_process=lambda: start_comfy(comfy_launch_settings),
                 start_queue_worker=lambda: start_salad_queue_worker(queue_launch_settings),
                 unsafe_request_active=router.has_unsafe_active_request,
                 comfy_health_check=executor.is_ready,

@@ -38,6 +38,7 @@ from gen_automation.services.salad import (
     DEPLOYMENT_ROLLOVER_RETRY_ERROR_CODE,
     SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE,
     SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE,
+    SALAD_OUTPUT_PROGRESS_WATCHDOG_REASON,
 )
 from gen_automation.services.salad_inbox import (
     InboxDisposition,
@@ -496,6 +497,9 @@ async def test_watchdog_cancel_confirmation_retries_generation_job(
         assert attempt is not None
         attempt.error_code = SALAD_ATTEMPT_WATCHDOG_CANCEL_REQUESTED_ERROR_CODE
         attempt.error_detail = "watchdog cancellation pending"
+        attempt.response_metadata = {
+            "watchdog_reason": SALAD_OUTPUT_PROGRESS_WATCHDOG_REASON,
+        }
         await session.commit()
     await _claim_one(database)
 
@@ -516,8 +520,13 @@ async def test_watchdog_cancel_confirmation_retries_generation_job(
         assert attempt is not None
         assert job is not None
         assert attempt.error_code == SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE
+        assert attempt.error_detail == (
+            "The manifest-bound Salad attempt stopped producing accepted output progress; "
+            "it was cancelled for retry."
+        )
         assert attempt.reservation_released_at is not None
         assert job.last_error_code == SALAD_ATTEMPT_WATCHDOG_EXPIRED_ERROR_CODE
+        assert job.last_error_detail == attempt.error_detail
         assert job.retry_at is not None
         assert job.retry_at.replace(tzinfo=UTC) == NOW + timedelta(seconds=91)
 
@@ -668,6 +677,40 @@ async def test_stale_and_regressive_callbacks_cannot_move_state_backwards(
             ).all()
         )
         assert all(item.reservation_released_at is None for item in attempts)
+
+
+async def test_future_provider_event_and_stored_observation_are_controller_bounded(
+    database: Database,
+) -> None:
+    far_future = datetime.max.replace(tzinfo=UTC)
+    context = await _seed(
+        database,
+        provider_status="running",
+        attempt_state=GenerationAttemptState.SUBMITTED,
+        last_observed_at=far_future,
+        event_metadata={
+            "job_status": "running",
+            "job_update_time": far_future.isoformat(),
+        },
+    )
+    await _claim_one(database)
+    processed_at = NOW + timedelta(seconds=1)
+
+    async with database.sessions() as session:
+        result = await process_salad_webhook_receipt(
+            session,
+            receipt_id=context.receipt_id,
+            worker_id="inbox-worker",
+            now=processed_at,
+        )
+        attempt = await session.get(GenerationAttempt, context.attempt_id)
+
+    assert result.disposition == InboxDisposition.APPLIED
+    assert attempt is not None
+    assert attempt.last_observed_at is not None
+    assert attempt.last_observed_at.replace(tzinfo=UTC) == processed_at
+    assert attempt.started_at is not None
+    assert attempt.started_at.replace(tzinfo=UTC) == processed_at
 
 
 async def test_conflicting_terminal_callback_is_dead_lettered_without_regression(

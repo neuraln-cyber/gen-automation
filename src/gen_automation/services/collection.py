@@ -212,6 +212,10 @@ async def _touch_missing_progressive_candidates(
                             Asset.verification_lease_expires_at <= checked_at,
                         )
                     ),
+                    (
+                        (Asset.state == AssetState.AVAILABLE)
+                        & (Asset.asset_metadata["staging_cleanup"].as_string() == "not_started")
+                    ),
                 ),
             )
             .values(updated_at=checked_at)
@@ -268,6 +272,18 @@ async def collect_next_ready_running_asset(
                 Asset.verification_lease_expires_at.is_(None),
                 Asset.verification_lease_expires_at <= collected_at,
             )
+        ),
+        # A retry re-signs every output, including an already-published master,
+        # because the worker response contract remains a complete contiguous
+        # batch. Scan the exact replacement staging intent while the provider is
+        # active. ``finalize_raw_master`` keeps the immutable master, validates
+        # the exact staging metadata, and records ``staging_cleaned_at``. That
+        # fenced cleanup is durable evidence that the active worker is still
+        # moving through a partially completed batch.
+        (
+            GenerationJob.state.in_(_PROGRESSIVE_GENERATION_STATES)
+            & (Asset.state == AssetState.AVAILABLE)
+            & (Asset.asset_metadata["staging_cleanup"].as_string() == "not_started")
         ),
     )
     candidates = list(

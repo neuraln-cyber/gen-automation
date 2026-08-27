@@ -17,8 +17,10 @@ from gen_automation.domain.signing import derive_public_key, encode_base64url
 from gen_automation.gpu_worker.app import create_worker_app
 from gen_automation.gpu_worker.models import (
     GenerateEnvelope,
+    GenerateFailureResponse,
     GeneratePayloadReference,
     ReferencedGenerateEnvelope,
+    UploadedOutput,
     UploadGrant,
     WorkerEnvironment,
     WorkerSettings,
@@ -38,6 +40,43 @@ TEST_PUBLIC_KEY = derive_public_key(TEST_PRIVATE_KEY)
 OTHER_PRIVATE_KEY = encode_base64url(bytes(range(33, 65)))
 OTHER_PUBLIC_KEY = derive_public_key(OTHER_PRIVATE_KEY)
 UPLOAD_ORIGIN = "https://uploads.example.test"
+ARTIFACT_MANIFEST_SHA256 = "f" * 64
+RUNTIME_ADMISSION_ID = "1" * 32
+
+
+def test_near_black_failure_contract_allows_only_batched_or_exact_progressive_prefix() -> None:
+    def uploaded(index: int) -> UploadedOutput:
+        return UploadedOutput(
+            asset_id=f"asset-{index}",
+            upload_attempt_id=f"upload-{index}",
+            output_index=index,
+        )
+
+    assert (
+        GenerateFailureResponse(
+            job_id="job",
+            attempt_id="attempt",
+            failed_output_index=2,
+            outputs=[],
+        ).outputs
+        == []
+    )
+    assert [
+        output.output_index
+        for output in GenerateFailureResponse(
+            job_id="job",
+            attempt_id="attempt",
+            failed_output_index=2,
+            outputs=[uploaded(0), uploaded(1)],
+        ).outputs
+    ] == [0, 1]
+    with pytest.raises(ValidationError, match="failure response outputs are invalid"):
+        GenerateFailureResponse(
+            job_id="job",
+            attempt_id="attempt",
+            failed_output_index=3,
+            outputs=[uploaded(0), uploaded(2)],
+        )
 
 
 def _image_bytes(media_type: str = "image/png") -> bytes:
@@ -137,6 +176,9 @@ def _settings(**overrides: object) -> WorkerSettings:
         "environment": WorkerEnvironment.TEST,
         "verification_keys": {"worker-key-1": TEST_PUBLIC_KEY},
         "allowed_upload_origin": UPLOAD_ORIGIN,
+        "artifact_manifest_sha256": ARTIFACT_MANIFEST_SHA256,
+        "runtime_admission_id": RUNTIME_ADMISSION_ID,
+        "runtime_worker_instance_id": "instance-creator-1",
     }
     values.update(overrides)
     return WorkerSettings.model_validate(values)
@@ -175,6 +217,9 @@ def _unsigned_request(
         "payload": {
             "job_id": job_id,
             "attempt_id": attempt_id,
+            "artifact_manifest_sha256": ARTIFACT_MANIFEST_SHA256,
+            "runtime_admission_id": RUNTIME_ADMISSION_ID,
+            "runtime_worker_instance_id": "instance-creator-1",
             "workflow": {
                 "1": {
                     "class_type": "CLIPTextEncode",
@@ -380,6 +425,34 @@ def test_unapproved_workflow_node_is_rejected_before_executor_submission() -> No
     assert response.status_code == 400
     assert response.json() == {"detail": "invalid request"}
     assert private_node_class not in response.text
+    assert executor.workflows == []
+    assert uploader.uploads == []
+
+
+def test_signed_payload_for_another_manifest_is_rejected_before_execution() -> None:
+    request = _unsigned_request()
+    request["payload"]["artifact_manifest_sha256"] = "e" * 64
+    client, executor, uploader = _client()
+
+    with client:
+        response = client.post("/jobs/generate", json=_sign_request(request))
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "invalid request"}
+    assert executor.workflows == []
+    assert uploader.uploads == []
+
+
+def test_signed_payload_for_another_salad_instance_is_rejected_before_execution() -> None:
+    request = _unsigned_request()
+    request["payload"]["runtime_worker_instance_id"] = "instance-creator-2"
+    client, executor, uploader = _client()
+
+    with client:
+        response = client.post("/jobs/generate", json=_sign_request(request))
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "invalid request"}
     assert executor.workflows == []
     assert uploader.uploads == []
 
@@ -1047,25 +1120,41 @@ def test_decoded_output_size_is_bounded() -> None:
     assert uploader.uploads == []
 
 
-def test_near_black_output_requests_restart_before_upload() -> None:
-    restart_event = asyncio.Event()
+def test_near_black_output_requests_recycle_and_blocks_next_request(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    recycle_event = asyncio.Event()
     executor = FakeExecutor(outputs=[_output_for_content(_solid_image_bytes((4, 4, 4)))])
     uploader = FakeUploader()
     app = create_worker_app(
         settings=_settings(),
         executor=executor,
         uploader=uploader,
-        worker_restart_event=restart_event,
+        worker_recycle_event=recycle_event,
         now=lambda: NOW,
     )
+    signed_request = _signed_request()
 
     with TestClient(app) as client:
-        response = client.post("/jobs/generate", json=_signed_request())
+        response = client.post("/jobs/generate", json=signed_request)
+        blocked = client.post("/jobs/generate", json=signed_request)
+        recycle_event.clear()
+        replayed = client.post("/jobs/generate", json=signed_request)
 
-    assert response.status_code == 502
-    assert response.json() == {"detail": "generation output invalid"}
-    assert restart_event.is_set()
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    assert response.json()["code"] == "near_black_output"
+    assert response.json()["failed_output_index"] == 0
+    assert response.json()["outputs"] == []
+    assert blocked.status_code == 503
+    assert blocked.json() == {"detail": "worker recovery in progress"}
+    assert replayed.json() == response.json()
+    assert len(executor.workflows) == 1
+    assert not recycle_event.is_set()
     assert uploader.uploads == []
+    stderr = capsys.readouterr().err
+    assert "reason=near_black output_index=0" in stderr
+    assert "rgb_extrema=((4, 4), (4, 4), (4, 4))" in stderr
 
 
 def test_dark_nonblank_output_is_accepted_without_restart() -> None:
@@ -1120,8 +1209,11 @@ def test_progressive_job_stops_after_near_black_output_and_requests_restart() ->
     with TestClient(app) as client:
         response = client.post("/jobs/generate", json=_sign_request(request))
 
-    assert response.status_code == 502
-    assert response.json() == {"detail": "generation output invalid"}
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    assert response.json()["code"] == "near_black_output"
+    assert response.json()["failed_output_index"] == 1
+    assert [output["output_index"] for output in response.json()["outputs"]] == [0]
     assert restart_event.is_set()
     assert len(executor.workflows) == 2
     assert [upload.grant.output_index for upload in uploader.uploads] == [0]

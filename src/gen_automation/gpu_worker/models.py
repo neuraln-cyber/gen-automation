@@ -65,6 +65,12 @@ BoundedId = Annotated[
     str, StringConstraints(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
 ]
 Base64Text = Annotated[str, StringConstraints(min_length=4, max_length=MAX_HARD_BASE64_CHARACTERS)]
+Sha256Text = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+RuntimeAdmissionId = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{32}$")]
+RuntimeWorkerInstanceId = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$"),
+]
 
 
 class WorkerEnvironment(StrEnum):
@@ -111,6 +117,9 @@ class WorkerSettings(BaseModel):
     environment: WorkerEnvironment = WorkerEnvironment.PRODUCTION
     verification_keys: dict[str, str]
     allowed_upload_origin: str
+    artifact_manifest_sha256: Sha256Text
+    runtime_admission_id: RuntimeAdmissionId
+    runtime_worker_instance_id: RuntimeWorkerInstanceId
     max_body_bytes: int = Field(default=256 * 1024, ge=1024, le=MAX_HARD_BODY_BYTES)
     max_signature_ttl_seconds: int = Field(default=7200, ge=5, le=7200)
     clock_skew_seconds: int = Field(default=15, ge=0, le=60)
@@ -203,6 +212,9 @@ class GeneratePayload(BaseModel):
 
     job_id: BoundedId
     attempt_id: BoundedId
+    artifact_manifest_sha256: Sha256Text
+    runtime_admission_id: RuntimeAdmissionId
+    runtime_worker_instance_id: RuntimeWorkerInstanceId
     workflow: JsonObject
     uploads: list[UploadGrant] = Field(min_length=1, max_length=MAX_HARD_OUTPUTS)
 
@@ -295,6 +307,31 @@ class GenerateResponse(BaseModel):
     attempt_id: str
     status: Literal["succeeded"] = "succeeded"
     outputs: list[UploadedOutput]
+
+
+class GenerateFailureResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: Literal["v1"] = "v1"
+    job_id: str
+    attempt_id: str
+    status: Literal["failed"] = "failed"
+    code: Literal["near_black_output"] = "near_black_output"
+    failed_output_index: int = Field(ge=0, le=MAX_HARD_OUTPUTS - 1)
+    outputs: list[UploadedOutput] = Field(max_length=MAX_HARD_OUTPUTS)
+
+    @model_validator(mode="after")
+    def validate_prior_outputs(self) -> "GenerateFailureResponse":
+        indices = [output.output_index for output in self.outputs]
+        # Progressive graphs upload every earlier branch before advancing;
+        # legacy batched graphs decode the whole batch before any upload.
+        # Those are the only two valid failure shapes.
+        if indices not in ([], list(range(self.failed_output_index))):
+            raise ValueError("failure response outputs are invalid")
+        return self
+
+
+type GenerateWorkerResponse = GenerateResponse | GenerateFailureResponse
 
 
 def validate_upload_url(url: str, allowed_origin: tuple[str, int]) -> None:
