@@ -69,20 +69,30 @@ from gen_automation.services.budgets import (
 from gen_automation.services.generation_control import GENERATION_STOP_REQUESTED_ACTION
 from gen_automation.services.generation_recovery import (
     NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION,
+    RUNTIME_INSTANCE_TURNOVER_RETRY_GRANT_ACTION,
     SALAD_JOB_FAILED_ERROR_CODE,
     SALAD_PROVIDER_CANCELLED_ERROR_CODE,
     SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE,
     SALAD_RATE_LIMITED_ERROR_CODE,
     SALAD_WORKER_NEAR_BLACK_OUTPUT_ERROR_CODE,
     InfrastructureRetrySource,
+    RuntimeInstanceTurnoverEvidence,
     grant_infrastructure_retry,
     grant_near_black_output_retry,
+    grant_runtime_instance_turnover_retry,
     require_near_black_original_output_seeds,
 )
 from gen_automation.services.outbox import (
     GENERATION_ATTEMPT_AGGREGATE,
     SALAD_JOB_SUBMIT_TOPIC,
     enqueue_outbox_event,
+    valid_runtime_admission_target,
+)
+from gen_automation.services.salad_deployments import (
+    SaladDeploymentClient,
+    SaladDeploymentValidationError,
+    SaladRuntimeAdmissionUnavailableError,
+    container_group_runtime_admission_ready,
 )
 
 _PROVIDER = "salad"
@@ -123,10 +133,17 @@ _OPERATOR_STOP_ABSENCE_TRACKER_KEY = "operator_stop_absence_confirmation"
 _DEFAULT_JOB_INPUT_DEFER_SECONDS = 30
 _MAX_JOB_INPUT_DEFER_SECONDS = 3600
 _JOB_INPUT_DEFERRED_ERROR_CODE = "salad_job_input_deferred"
+_RUNTIME_INSTANCE_TURNOVER_PENDING_ERROR_CODE = (
+    "salad_runtime_instance_turnover_reconciliation_pending"
+)
+_RUNTIME_INSTANCE_TURNOVER_DEFERRED_ACTION = (
+    "generation_attempt.runtime_instance_turnover_reconciliation_deferred"
+)
 SALAD_OUTPUT_PROGRESS_WATCHDOG_REASON = "accepted_output_progress_stalled"
 _RUNTIME_ENVELOPE_WATCHDOG_REASON = "runtime_envelope_expired"
 _RUNTIME_ADMISSION_METADATA_KEY = "runtime_admission"
 _RUNTIME_ADMISSION_METADATA_VERSION = "v1"
+_RUNTIME_TURNOVER_INHERITANCE_SKIPPED_METADATA_KEY = "runtime_turnover_inheritance_skipped"
 _NEAR_BLACK_RECOVERY_PLAN_SHA256_REQUEST_KEY = "near_black_seed_recovery_plan_sha256"
 _PROVIDER_RUN_EPOCH_STARTED_AT_METADATA_KEY = "provider_run_epoch_started_at"
 _PROVIDER_CLOCK_SKEW_SECONDS = 5 * 60
@@ -264,6 +281,20 @@ class ReconciliationSource(StrEnum):
     LIST = "list"
 
 
+class _RuntimeInstanceTurnoverDisposition(StrEnum):
+    NORMAL_TERMINAL = "normal_terminal"
+    DEFER = "defer"
+    TURNOVER = "turnover"
+
+
+@dataclass(frozen=True)
+class _RuntimeInstanceTurnoverAssessment:
+    disposition: _RuntimeInstanceTurnoverDisposition
+    admission: Mapping[str, object] | None = None
+    defer_reason: str | None = None
+    evidence: RuntimeInstanceTurnoverEvidence | None = None
+
+
 @dataclass(frozen=True)
 class _AttemptWatchdogDecision:
     reason: str
@@ -399,6 +430,10 @@ class SaladQueueClient(Protocol):
     ) -> SaladQueueJobPage: ...
 
     async def cancel_job(self, queue_name: str, job_id: UUID | str) -> None: ...
+
+
+class SaladReconciliationClient(SaladQueueClient, SaladDeploymentClient, Protocol):
+    pass
 
 
 @dataclass(frozen=True)
@@ -689,6 +724,166 @@ async def _new_attempt_recovery_plan(
     )
 
 
+_MISSING_RUNTIME_ADMISSION = object()
+
+
+@dataclass(frozen=True)
+class _RuntimeTurnoverRetryInheritance:
+    target: dict[str, object] | None = None
+    skipped_marker: dict[str, object] | None = None
+
+
+def _valid_optional_runtime_manifest(value: object) -> bool:
+    return value is None or bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.lower()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+async def _runtime_turnover_retry_target(
+    session: AsyncSession,
+    *,
+    job: GenerationJob,
+    deployment: SaladDeployment,
+    target_attempt_no: int,
+    stored_target: object = _MISSING_RUNTIME_ADMISSION,
+    stored_skipped_marker: object = _MISSING_RUNTIME_ADMISSION,
+    existing_attempt: bool = False,
+) -> _RuntimeTurnoverRetryInheritance:
+    rows = list(
+        (
+            await session.execute(
+                select(AuditEvent, GenerationAttempt)
+                .join(GenerationAttempt, GenerationAttempt.id == AuditEvent.resource_id)
+                .where(
+                    AuditEvent.resource_type == "generation_attempt",
+                    AuditEvent.action == RUNTIME_INSTANCE_TURNOVER_RETRY_GRANT_ACTION,
+                    GenerationAttempt.job_id == job.id,
+                    GenerationAttempt.attempt_no == target_attempt_no - 1,
+                )
+                .order_by(AuditEvent.occurred_at, AuditEvent.id)
+                .limit(2)
+            )
+        ).all()
+    )
+    if len(rows) > 1:
+        raise SaladServiceConflictError("generation attempt has conflicting turnover grants")
+    if not rows:
+        if stored_skipped_marker is not _MISSING_RUNTIME_ADMISSION:
+            raise SaladServiceConflictError("runtime turnover skip marker has no source grant")
+        return _RuntimeTurnoverRetryInheritance()
+    grant, source_attempt = rows[0]
+    detail = grant.detail
+    source_admission = source_attempt.request_metadata.get(_RUNTIME_ADMISSION_METADATA_KEY)
+    expected_source_admission = {
+        "version": _RUNTIME_ADMISSION_METADATA_VERSION,
+        "provider_group_version": detail.get("provider_group_version"),
+        "artifact_manifest_sha256": detail.get("artifact_manifest_sha256"),
+        "rollout_id": detail.get("rollout_id"),
+        "worker_instance_id": detail.get("previous_worker_instance_id"),
+    }
+    expected_target = {
+        **expected_source_admission,
+        "worker_instance_id": detail.get("current_worker_instance_id"),
+    }
+    if (
+        target_attempt_no != source_attempt.attempt_no + 1
+        or source_attempt.job_id != job.id
+        or source_attempt.state != GenerationAttemptState.FAILED
+        or source_attempt.completed_at is None
+        or source_attempt.provider_state != SaladJobStatus.FAILED.value
+        or detail.get("generation_job_id") != str(job.id)
+        or detail.get("attempt_no") != source_attempt.attempt_no
+        or detail.get("failure_code") != source_attempt.error_code
+        or detail.get("provider_external_id") != source_attempt.provider_external_id
+        or detail.get("salad_deployment_id") != str(source_attempt.salad_deployment_id)
+        or detail.get("retry_class") != "runtime_instance_turnover"
+        or source_admission != expected_source_admission
+        or not valid_runtime_admission_target(expected_source_admission)
+        or not valid_runtime_admission_target(expected_target)
+        or expected_source_admission["worker_instance_id"] == expected_target["worker_instance_id"]
+    ):
+        raise SaladServiceConflictError("runtime turnover retry provenance is invalid")
+
+    marker_source = {
+        "version": _RUNTIME_ADMISSION_METADATA_VERSION,
+        "source_attempt_id": str(source_attempt.id),
+        "grant_audit_id": str(grant.id),
+        "source_deployment_id": str(source_attempt.salad_deployment_id),
+        "source_provider_group_version": detail["provider_group_version"],
+        "source_artifact_manifest_sha256": detail["artifact_manifest_sha256"],
+        "source_rollout_id": detail["rollout_id"],
+        "previous_worker_instance_id": detail["previous_worker_instance_id"],
+        "current_worker_instance_id": detail["current_worker_instance_id"],
+        "selected_deployment_id": str(deployment.id),
+        "target_attempt_no": target_attempt_no,
+    }
+    if existing_attempt and stored_skipped_marker is not _MISSING_RUNTIME_ADMISSION:
+        if stored_target is not _MISSING_RUNTIME_ADMISSION and not valid_runtime_admission_target(
+            stored_target
+        ):
+            raise SaladServiceConflictError("fresh runtime turnover target is invalid")
+        if (
+            not isinstance(stored_skipped_marker, dict)
+            or set(stored_skipped_marker) != {*marker_source, "selected_artifact_manifest_sha256"}
+            or any(stored_skipped_marker.get(key) != value for key, value in marker_source.items())
+        ):
+            raise SaladServiceConflictError("runtime turnover skip marker is invalid")
+        selected_manifest = stored_skipped_marker.get("selected_artifact_manifest_sha256")
+        if not _valid_optional_runtime_manifest(selected_manifest):
+            raise SaladServiceConflictError("runtime turnover skip marker manifest is invalid")
+        if (
+            stored_skipped_marker["source_deployment_id"]
+            == stored_skipped_marker["selected_deployment_id"]
+            and selected_manifest == stored_skipped_marker["source_artifact_manifest_sha256"]
+        ):
+            raise SaladServiceConflictError("runtime turnover skip marker is not stale")
+        return _RuntimeTurnoverRetryInheritance(
+            target=(dict(stored_target) if isinstance(stored_target, dict) else None),
+            skipped_marker=dict(stored_skipped_marker),
+        )
+
+    selected_context_is_stale = (
+        source_attempt.salad_deployment_id != deployment.id
+        or deployment.runtime_artifact_manifest_sha256
+        != expected_target["artifact_manifest_sha256"]
+    )
+    if not existing_attempt and selected_context_is_stale:
+        if not _valid_optional_runtime_manifest(deployment.runtime_artifact_manifest_sha256):
+            raise SaladServiceConflictError("selected runtime manifest is invalid")
+        return _RuntimeTurnoverRetryInheritance(
+            skipped_marker={
+                **marker_source,
+                "selected_artifact_manifest_sha256": (deployment.runtime_artifact_manifest_sha256),
+            }
+        )
+    if stored_skipped_marker is not _MISSING_RUNTIME_ADMISSION or selected_context_is_stale:
+        raise SaladServiceConflictError("runtime turnover retry context changed")
+    if existing_attempt and stored_target is _MISSING_RUNTIME_ADMISSION:
+        raise SaladServiceConflictError("runtime turnover retry is missing its target")
+    if stored_target is not _MISSING_RUNTIME_ADMISSION:
+        if not valid_runtime_admission_target(stored_target):
+            raise SaladServiceConflictError("runtime turnover target is invalid")
+        assert isinstance(stored_target, dict)
+        stored_provider_group_version = stored_target.get("provider_group_version")
+        if any(
+            stored_target.get(key) != expected_target[key]
+            for key in (
+                "version",
+                "artifact_manifest_sha256",
+                "rollout_id",
+            )
+        ) or not (
+            isinstance(stored_provider_group_version, int)
+            and not isinstance(stored_provider_group_version, bool)
+            and stored_provider_group_version >= detail.get("provider_group_version", 0)
+        ):
+            raise SaladServiceConflictError("runtime turnover target differs from its grant")
+    return _RuntimeTurnoverRetryInheritance(target=expected_target)
+
+
 async def prepare_generation_attempt(
     session: AsyncSession,
     *,
@@ -740,6 +935,21 @@ async def prepare_generation_attempt(
     if existing is not None:
         if existing.job_id != job.id or existing.salad_deployment_id != deployment.id:
             raise SaladServiceConflictError("attempt idempotency key conflicts with stored request")
+        await _runtime_turnover_retry_target(
+            session,
+            job=job,
+            deployment=deployment,
+            target_attempt_no=existing.attempt_no,
+            stored_target=existing.request_metadata.get(
+                _RUNTIME_ADMISSION_METADATA_KEY,
+                _MISSING_RUNTIME_ADMISSION,
+            ),
+            stored_skipped_marker=existing.request_metadata.get(
+                _RUNTIME_TURNOVER_INHERITANCE_SKIPPED_METADATA_KEY,
+                _MISSING_RUNTIME_ADMISSION,
+            ),
+            existing_attempt=True,
+        )
         recovery_plan = await _existing_attempt_recovery_plan(
             session,
             job=job,
@@ -792,6 +1002,12 @@ async def prepare_generation_attempt(
         job=job,
         target_attempt_no=attempt_no,
     )
+    runtime_turnover_inheritance = await _runtime_turnover_retry_target(
+        session,
+        job=job,
+        deployment=deployment,
+        target_attempt_no=attempt_no,
+    )
     request_sha256 = _generation_attempt_request_sha256(
         job=job,
         deployment=deployment,
@@ -808,6 +1024,12 @@ async def prepare_generation_attempt(
     if recovery_plan is not None:
         request_metadata[NEAR_BLACK_SEED_RECOVERY_METADATA_KEY] = recovery_plan.model_dump(
             mode="json"
+        )
+    if runtime_turnover_inheritance.target is not None:
+        request_metadata[_RUNTIME_ADMISSION_METADATA_KEY] = runtime_turnover_inheritance.target
+    if runtime_turnover_inheritance.skipped_marker is not None:
+        request_metadata[_RUNTIME_TURNOVER_INHERITANCE_SKIPPED_METADATA_KEY] = (
+            runtime_turnover_inheritance.skipped_marker
         )
 
     attempt = GenerationAttempt(
@@ -1447,11 +1669,12 @@ async def apply_salad_job_observation(
     generation_attempt_id: UUID,
     remote_job: SaladQueueJob,
     observed_at: datetime | None = None,
+    runtime_instance_turnover_evidence: RuntimeInstanceTurnoverEvidence | None = None,
 ) -> ObservationResult:
     """Apply one trusted Salad observation without committing the caller's transaction."""
 
     controller_time = _as_utc(observed_at or datetime.now(UTC))
-    attempt, job, _ = await _load_attempt_context(
+    attempt, job, deployment = await _load_attempt_context(
         session,
         generation_attempt_id,
         lock=True,
@@ -1682,15 +1905,31 @@ async def apply_salad_job_observation(
                 )
             ).granted
         else:
-            await grant_infrastructure_retry(
-                session,
-                attempt=attempt,
-                job=job,
-                source=InfrastructureRetrySource.RECONCILER,
-                actor="salad-controller",
-                retry_at=controller_time,
-                occurred_at=controller_time,
-            )
+            turnover_retry_granted = False
+            if runtime_instance_turnover_evidence is not None:
+                turnover_retry_granted = (
+                    await grant_runtime_instance_turnover_retry(
+                        session,
+                        attempt=attempt,
+                        job=job,
+                        deployment=deployment,
+                        evidence=runtime_instance_turnover_evidence,
+                        source=InfrastructureRetrySource.RECONCILER,
+                        actor="salad-controller",
+                        retry_at=controller_time,
+                        occurred_at=controller_time,
+                    )
+                ).granted
+            if not turnover_retry_granted:
+                await grant_infrastructure_retry(
+                    session,
+                    attempt=attempt,
+                    job=job,
+                    source=InfrastructureRetrySource.RECONCILER,
+                    actor="salad-controller",
+                    retry_at=controller_time,
+                    occurred_at=controller_time,
+                )
 
     if current_attempt and job.state not in _TERMINAL_JOB_STATES:
         job.state = (
@@ -1804,9 +2043,200 @@ async def _validated_worker_output(
     return response
 
 
+def _runtime_instance_turnover_admission(
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    deployment: SaladDeployment,
+    remote_job: SaladQueueJob,
+) -> dict[str, object] | None:
+    raw_admission = attempt.request_metadata.get(_RUNTIME_ADMISSION_METADATA_KEY)
+    if (
+        remote_job.status != SaladJobStatus.FAILED
+        or attempt.state in _TERMINAL_ATTEMPT_STATES
+        or job.state in _TERMINAL_JOB_STATES
+        or attempt.attempt_no != job.attempt_count
+        or attempt.provider_external_id != str(remote_job.id)
+        or deployment.provider_queue_id is None
+        or deployment.provider_container_group_id is None
+        or deployment.administrative_stop_reason is not None
+        or not valid_runtime_admission_target(raw_admission)
+    ):
+        return None
+    assert isinstance(raw_admission, dict)
+    if not isinstance(raw_admission.get("worker_instance_id"), str):
+        return None
+    try:
+        _require_attempt_deployment(attempt, deployment)
+        _require_submittable_deployment(deployment)
+    except SaladServiceConflictError:
+        return None
+    if deployment.runtime_artifact_manifest_sha256 != raw_admission.get("artifact_manifest_sha256"):
+        return None
+    return dict(raw_admission)
+
+
+async def _assess_runtime_instance_turnover(
+    client: SaladDeploymentClient,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    deployment: SaladDeployment,
+    remote_job: SaladQueueJob,
+) -> _RuntimeInstanceTurnoverAssessment:
+    """Classify an exact failed runtime admission without collapsing booting into failure."""
+
+    admission = _runtime_instance_turnover_admission(
+        attempt=attempt,
+        job=job,
+        deployment=deployment,
+        remote_job=remote_job,
+    )
+    if admission is None:
+        return _RuntimeInstanceTurnoverAssessment(
+            disposition=_RuntimeInstanceTurnoverDisposition.NORMAL_TERMINAL
+        )
+    provider_group_version = admission["provider_group_version"]
+    artifact_manifest_sha256 = admission["artifact_manifest_sha256"]
+    rollout_id = admission["rollout_id"]
+    previous_worker_instance_id = admission["worker_instance_id"]
+    assert isinstance(provider_group_version, int)
+    assert isinstance(artifact_manifest_sha256, str)
+    assert isinstance(rollout_id, str)
+    assert isinstance(previous_worker_instance_id, str)
+    try:
+        current_worker_instance_id = await container_group_runtime_admission_ready(
+            deployment,
+            client,
+            provider_version=provider_group_version,
+            artifact_manifest_sha256=artifact_manifest_sha256,
+            runtime_admission_id=rollout_id,
+        )
+    except SaladRuntimeAdmissionUnavailableError:
+        return _RuntimeInstanceTurnoverAssessment(
+            disposition=_RuntimeInstanceTurnoverDisposition.DEFER,
+            admission=admission,
+            defer_reason="runtime_admission_unavailable",
+        )
+    except SaladDeploymentValidationError:
+        return _RuntimeInstanceTurnoverAssessment(
+            disposition=_RuntimeInstanceTurnoverDisposition.NORMAL_TERMINAL
+        )
+    if current_worker_instance_id is None:
+        return _RuntimeInstanceTurnoverAssessment(
+            disposition=_RuntimeInstanceTurnoverDisposition.DEFER,
+            admission=admission,
+            defer_reason="replacement_instance_not_ready",
+        )
+    if current_worker_instance_id == previous_worker_instance_id:
+        return _RuntimeInstanceTurnoverAssessment(
+            disposition=_RuntimeInstanceTurnoverDisposition.NORMAL_TERMINAL
+        )
+    return _RuntimeInstanceTurnoverAssessment(
+        disposition=_RuntimeInstanceTurnoverDisposition.TURNOVER,
+        admission=admission,
+        evidence=RuntimeInstanceTurnoverEvidence(
+            provider_external_id=str(remote_job.id),
+            provider_group_version=provider_group_version,
+            artifact_manifest_sha256=artifact_manifest_sha256,
+            rollout_id=rollout_id,
+            previous_worker_instance_id=previous_worker_instance_id,
+            current_worker_instance_id=current_worker_instance_id,
+        ),
+    )
+
+
+async def _runtime_instance_turnover_deferral_still_applies(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    deployment: SaladDeployment,
+    remote_job: SaladQueueJob,
+    expected_admission: Mapping[str, object],
+    observed_at: datetime,
+) -> bool:
+    current_admission = _runtime_instance_turnover_admission(
+        attempt=attempt,
+        job=job,
+        deployment=deployment,
+        remote_job=remote_job,
+    )
+    if current_admission != expected_admission:
+        return False
+    provider_update_time = _provider_timestamp_at_observation(
+        remote_job.update_time,
+        observed_at=observed_at,
+    )
+    last_observed_at = (
+        _clock_skew_bounded_timestamp(attempt.last_observed_at, observed_at=observed_at)
+        if attempt.last_observed_at is not None
+        else None
+    )
+    if last_observed_at is not None and provider_update_time < last_observed_at:
+        return False
+    lifecycle = (
+        await session.execute(
+            select(ReleaseVersion, Release)
+            .join(Release, Release.id == ReleaseVersion.release_id)
+            .where(ReleaseVersion.id == job.release_version_id)
+        )
+    ).one_or_none()
+    if lifecycle is None:
+        return False
+    version, release = lifecycle
+    return bool(
+        release.current_version_no == version.version_no
+        and release.health == ResourceHealth.HEALTHY
+        and release.phase in _SUBMITTABLE_RELEASE_PHASES
+        and not await _operator_generation_stop_requested(session, job=job)
+    )
+
+
+async def _audit_runtime_instance_turnover_deferral(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    remote_job: SaladQueueJob,
+    assessment: _RuntimeInstanceTurnoverAssessment,
+    occurred_at: datetime,
+) -> None:
+    if assessment.admission is None or assessment.defer_reason is None:
+        raise SaladServiceConflictError("runtime turnover deferral is incomplete")
+    existing_marker = await session.scalar(
+        select(AuditEvent.id)
+        .where(
+            AuditEvent.resource_type == "generation_attempt",
+            AuditEvent.resource_id == attempt.id,
+            AuditEvent.action == _RUNTIME_INSTANCE_TURNOVER_DEFERRED_ACTION,
+        )
+        .limit(1)
+    )
+    if existing_marker is not None:
+        return
+    session.add(
+        _audit(
+            action=_RUNTIME_INSTANCE_TURNOVER_DEFERRED_ACTION,
+            attempt=attempt,
+            detail={
+                "provider_external_id": str(remote_job.id),
+                "provider_status": remote_job.status.value,
+                "reason": assessment.defer_reason,
+                "provider_group_version": assessment.admission["provider_group_version"],
+                "artifact_manifest_sha256": assessment.admission["artifact_manifest_sha256"],
+                "rollout_id": assessment.admission["rollout_id"],
+                "previous_worker_instance_id": assessment.admission["worker_instance_id"],
+                "assets_retained": True,
+            },
+            occurred_at=occurred_at,
+        )
+    )
+    await session.flush()
+
+
 async def reconcile_generation_attempt(
     session: AsyncSession,
-    client: SaladQueueClient,
+    client: SaladReconciliationClient,
     *,
     generation_attempt_id: UUID,
     max_list_pages: int = (_DEFAULT_RECONCILIATION_JOB_SCAN_LIMIT // SALAD_QUEUE_JOB_PAGE_SIZE),
@@ -2752,11 +3182,62 @@ async def reconcile_generation_attempt(
             ),
         )
 
+    turnover_assessment = await _assess_runtime_instance_turnover(
+        client,
+        attempt=attempt,
+        job=job,
+        deployment=deployment,
+        remote_job=remote_job,
+    )
+    if turnover_assessment.disposition == _RuntimeInstanceTurnoverDisposition.DEFER:
+        assert turnover_assessment.admission is not None
+        attempt, job, deployment = await _load_attempt_context(
+            session,
+            generation_attempt_id,
+            lock=True,
+        )
+        if attempt.lock_version != absence_attempt_lock_version:
+            return await _stale_reconciliation_result(
+                session,
+                attempt=attempt,
+                job=job,
+                source=source,
+                matched=True,
+            )
+        if await _runtime_instance_turnover_deferral_still_applies(
+            session,
+            attempt=attempt,
+            job=job,
+            deployment=deployment,
+            remote_job=remote_job,
+            expected_admission=turnover_assessment.admission,
+            observed_at=reconciled_at,
+        ):
+            await _audit_runtime_instance_turnover_deferral(
+                session,
+                attempt=attempt,
+                remote_job=remote_job,
+                assessment=turnover_assessment,
+                occurred_at=reconciled_at,
+            )
+            await session.commit()
+            return ReconciliationResult(
+                observation=_observation_result(
+                    attempt,
+                    job,
+                    applied=False,
+                    stale=False,
+                ),
+                source=source,
+                matched=True,
+                error_code=_RUNTIME_INSTANCE_TURNOVER_PENDING_ERROR_CODE,
+            )
     observation = await apply_salad_job_observation(
         session,
         generation_attempt_id=generation_attempt_id,
         remote_job=remote_job,
         observed_at=reconciled_at,
+        runtime_instance_turnover_evidence=turnover_assessment.evidence,
     )
     await session.commit()
     return ReconciliationResult(

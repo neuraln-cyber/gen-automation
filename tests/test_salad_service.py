@@ -55,17 +55,21 @@ from gen_automation.integrations.salad.models import (
     SaladQueueJob,
     SaladQueueJobPage,
 )
+from gen_automation.services import salad as salad_service
 from gen_automation.services.budgets import ensure_budget_guard, reserve_attempt_budget
 from gen_automation.services.generation_recovery import (
     INFRASTRUCTURE_RETRY_GRANT_ACTION,
     NEAR_BLACK_OUTPUT_RETRY_GRANT_ACTION,
+    RUNTIME_INSTANCE_TURNOVER_RETRY_GRANT_ACTION,
     SALAD_JOB_FAILED_ERROR_CODE,
     SALAD_PROVIDER_CANCELLED_ERROR_CODE,
     SALAD_PROVIDER_JOB_ABSENT_ERROR_CODE,
     SALAD_WORKER_NEAR_BLACK_OUTPUT_ERROR_CODE,
     InfrastructureRetrySource,
+    RuntimeInstanceTurnoverEvidence,
     grant_infrastructure_retry,
     grant_near_black_output_retry,
+    grant_runtime_instance_turnover_retry,
 )
 from gen_automation.services.outbox import (
     SALAD_JOB_SUBMIT_TOPIC,
@@ -330,6 +334,23 @@ def enable_runtime_admission(attempt: GenerationAttempt) -> None:
         "version": "v1",
         "provider_group_version": 7,
         "artifact_manifest_sha256": "7" * 64,
+    }
+    attempt.request_metadata = request_metadata
+    attempt.lock_version += 1
+
+
+def enable_exact_runtime_admission(
+    attempt: GenerationAttempt,
+    *,
+    worker_instance_id: str = "instance-old-44d8",
+) -> None:
+    request_metadata = dict(attempt.request_metadata)
+    request_metadata["runtime_admission"] = {
+        "version": "v1",
+        "provider_group_version": 3,
+        "artifact_manifest_sha256": "7" * 64,
+        "rollout_id": "1" * 32,
+        "worker_instance_id": worker_instance_id,
     }
     attempt.request_metadata = request_metadata
     attempt.lock_version += 1
@@ -4171,6 +4192,651 @@ async def test_later_infrastructure_attempt_inherits_the_exact_near_black_plan(
     assert third_attempt is not None
     assert third_attempt.request_metadata[NEAR_BLACK_SEED_RECOVERY_METADATA_KEY] == inherited_plan
     assert third_attempt.request_sha256 == second.request_sha256
+
+
+def add_exhausted_generic_infrastructure_grants(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+) -> None:
+    for ordinal in (1, 2):
+        session.add(
+            AuditEvent(
+                actor="test",
+                action=INFRASTRUCTURE_RETRY_GRANT_ACTION,
+                resource_type="generation_attempt",
+                resource_id=attempt.id,
+                correlation_id=str(attempt.id),
+                detail={"grant_ordinal": ordinal, "test_fixture": True},
+                occurred_at=NOW - timedelta(minutes=ordinal),
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_exact_runtime_instance_turnover_has_distinct_idempotent_retry_budget(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_instance_id = "instance-old-44d8"
+    current_instance_id = "instance-current-7c99"
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        job = await session.get(GenerationJob, context.job_id)
+        deployment = await session.get(SaladDeployment, context.deployment_id)
+        assert job is not None
+        assert deployment is not None
+        job.max_attempts = 1
+        deployment.runtime_artifact_manifest_sha256 = "7" * 64
+        await session.commit()
+
+        attempt_id = await prepared_attempt(session, context)
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        enable_exact_runtime_admission(attempt, worker_instance_id=old_instance_id)
+        add_exhausted_generic_infrastructure_grants(session, attempt=attempt)
+        await session.commit()
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        failed = remote_job(
+            status=SaladJobStatus.FAILED,
+            metadata={},
+            update_time=NOW + timedelta(minutes=1),
+            job_id=UUID(str(attempt.provider_external_id)),
+        )
+
+        observed_targets: list[tuple[int, str, str]] = []
+
+        async def observe_current_instance(
+            _deployment: SaladDeployment,
+            _client: object,
+            *,
+            provider_version: int,
+            artifact_manifest_sha256: str,
+            runtime_admission_id: str,
+        ) -> str:
+            observed_targets.append(
+                (provider_version, artifact_manifest_sha256, runtime_admission_id)
+            )
+            return current_instance_id
+
+        monkeypatch.setattr(
+            salad_service,
+            "container_group_runtime_admission_ready",
+            observe_current_instance,
+        )
+        result = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(get_result=failed),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=2),
+        )
+        replay = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(get_result=failed),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=3),
+        )
+        job = await session.get(GenerationJob, context.job_id)
+        assert job is not None
+        grant = await session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.action == RUNTIME_INSTANCE_TURNOVER_RETRY_GRANT_ACTION,
+                AuditEvent.resource_id == attempt_id,
+            )
+        )
+        turnover_grants = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action == RUNTIME_INSTANCE_TURNOVER_RETRY_GRANT_ACTION
+                )
+            )
+            or 0
+        )
+        generic_grants = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action == INFRASTRUCTURE_RETRY_GRANT_ACTION
+                )
+            )
+            or 0
+        )
+        retry = await prepare_generation_attempt(
+            session,
+            generation_job_id=context.job_id,
+            salad_deployment_id=context.deployment_id,
+            idempotency_key="runtime-turnover-retry",
+            now=NOW + timedelta(minutes=4),
+        )
+        await session.commit()
+        retry_attempt = await session.get(GenerationAttempt, retry.generation_attempt_id)
+
+    assert result.observation.generation_job_state == GenerationState.RETRY_WAIT
+    assert replay.observation.applied is False
+    assert observed_targets == [(3, "7" * 64, "1" * 32)]
+    assert job.max_attempts == 2
+    assert turnover_grants == 1
+    assert generic_grants == 2
+    assert grant is not None
+    assert grant.detail["previous_worker_instance_id"] == old_instance_id
+    assert grant.detail["current_worker_instance_id"] == current_instance_id
+    assert grant.detail["provider_group_version"] == 3
+    assert grant.detail["artifact_manifest_sha256"] == "7" * 64
+    assert grant.detail["rollout_id"] == "1" * 32
+    assert grant.detail["assets_retained"] is True
+    assert retry_attempt is not None
+    assert retry_attempt.attempt_no == 2
+    assert retry_attempt.request_metadata["runtime_admission"] == {
+        "version": "v1",
+        "provider_group_version": 3,
+        "artifact_manifest_sha256": "7" * 64,
+        "rollout_id": "1" * 32,
+        "worker_instance_id": current_instance_id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_runtime_turnover_waits_through_replacement_boot_and_transient_read(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_instance_id = "instance-old-44d8"
+    current_instance_id = "instance-current-7c99"
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        job = await session.get(GenerationJob, context.job_id)
+        deployment = await session.get(SaladDeployment, context.deployment_id)
+        assert job is not None
+        assert deployment is not None
+        job.max_attempts = 1
+        deployment.runtime_artifact_manifest_sha256 = "7" * 64
+        await session.commit()
+
+        attempt_id = await prepared_attempt(session, context)
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        enable_exact_runtime_admission(attempt, worker_instance_id=old_instance_id)
+        await session.commit()
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        initial_state = attempt.state
+        initial_provider_state = attempt.provider_state
+        initial_last_observed_at = attempt.last_observed_at
+        failed = remote_job(
+            status=SaladJobStatus.FAILED,
+            metadata={},
+            update_time=NOW + timedelta(minutes=1),
+            job_id=UUID(str(attempt.provider_external_id)),
+        )
+
+        observations: list[str | None] = [None, "unavailable", current_instance_id]
+
+        async def observe_replacement_boot(
+            *_args: object,
+            **_kwargs: object,
+        ) -> str | None:
+            result = observations.pop(0)
+            if result == "unavailable":
+                raise salad_service.SaladRuntimeAdmissionUnavailableError(
+                    "runtime admission read unavailable"
+                )
+            return result
+
+        monkeypatch.setattr(
+            salad_service,
+            "container_group_runtime_admission_ready",
+            observe_replacement_boot,
+        )
+        not_ready = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(get_result=failed),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=2),
+        )
+        unavailable = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(get_result=failed),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=3),
+        )
+        deferred_attempt = await session.get(GenerationAttempt, attempt_id)
+        deferred_job = await session.get(GenerationJob, context.job_id)
+        assert deferred_attempt is not None
+        assert deferred_job is not None
+        deferred_attempt_state = deferred_attempt.state
+        deferred_provider_state = deferred_attempt.provider_state
+        deferred_last_observed_at = deferred_attempt.last_observed_at
+        deferred_job_state = deferred_job.state
+        deferred_job_max_attempts = deferred_job.max_attempts
+        deferred_audits = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action
+                    == "generation_attempt.runtime_instance_turnover_reconciliation_deferred",
+                    AuditEvent.resource_id == attempt_id,
+                )
+            )
+            or 0
+        )
+
+        ready = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(get_result=failed),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=4),
+        )
+        replay = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(get_result=failed),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=5),
+        )
+        turnover_grants = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action == RUNTIME_INSTANCE_TURNOVER_RETRY_GRANT_ACTION,
+                    AuditEvent.resource_id == attempt_id,
+                )
+            )
+            or 0
+        )
+
+    assert not_ready.error_code == ("salad_runtime_instance_turnover_reconciliation_pending")
+    assert unavailable.error_code == ("salad_runtime_instance_turnover_reconciliation_pending")
+    assert not_ready.observation.applied is False
+    assert unavailable.observation.applied is False
+    assert deferred_attempt_state == initial_state
+    assert deferred_provider_state == initial_provider_state
+    assert deferred_last_observed_at is not None
+    assert initial_last_observed_at is not None
+    assert deferred_last_observed_at.replace(tzinfo=UTC) == initial_last_observed_at
+    assert deferred_job_state == GenerationState.RUNNING
+    assert deferred_job_max_attempts == 1
+    assert deferred_audits == 1
+    assert ready.observation.generation_job_state == GenerationState.RETRY_WAIT
+    assert replay.observation.applied is False
+    assert turnover_grants == 1
+    assert observations == []
+
+
+async def grant_direct_runtime_turnover_retry(
+    session: AsyncSession,
+    *,
+    context: SeededContext,
+) -> GenerationAttempt:
+    job = await session.get(GenerationJob, context.job_id)
+    deployment = await session.get(SaladDeployment, context.deployment_id)
+    assert job is not None
+    assert deployment is not None
+    job.max_attempts = 1
+    deployment.runtime_artifact_manifest_sha256 = "7" * 64
+    await session.commit()
+
+    prepared = await prepare_generation_attempt(
+        session,
+        generation_job_id=context.job_id,
+        salad_deployment_id=context.deployment_id,
+        idempotency_key="turnover-source",
+        now=NOW,
+    )
+    attempt = await session.get(GenerationAttempt, prepared.generation_attempt_id)
+    assert attempt is not None
+    enable_exact_runtime_admission(attempt)
+    attempt.state = GenerationAttemptState.FAILED
+    attempt.completed_at = NOW + timedelta(seconds=1)
+    attempt.error_code = SALAD_JOB_FAILED_ERROR_CODE
+    attempt.error_detail = "provider failed after worker turnover"
+    attempt.provider_external_id = "provider-job-turnover-source"
+    attempt.provider_state = SaladJobStatus.FAILED.value
+    grant = await grant_runtime_instance_turnover_retry(
+        session,
+        attempt=attempt,
+        job=job,
+        deployment=deployment,
+        evidence=RuntimeInstanceTurnoverEvidence(
+            provider_external_id=attempt.provider_external_id,
+            provider_group_version=3,
+            artifact_manifest_sha256="7" * 64,
+            rollout_id="1" * 32,
+            previous_worker_instance_id="instance-old-44d8",
+            current_worker_instance_id="instance-current-7c99",
+        ),
+        source=InfrastructureRetrySource.RECONCILER,
+        actor="test",
+        retry_at=NOW + timedelta(seconds=2),
+        occurred_at=NOW + timedelta(seconds=2),
+    )
+    assert grant.granted is True
+    await session.commit()
+    return attempt
+
+
+@pytest.mark.asyncio
+async def test_turnover_retry_prepares_fresh_after_deployment_supersession(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        source_attempt = await grant_direct_runtime_turnover_retry(
+            session,
+            context=context,
+        )
+        old_deployment = await session.get(SaladDeployment, context.deployment_id)
+        assert old_deployment is not None
+        old_deployment.is_current = False
+        old_deployment.desired_state = DesiredDeploymentState.STOPPED
+        old_deployment.state = SaladDeploymentState.STOPPED
+        current_deployment = SaladDeployment(
+            version_no=2,
+            config_sha256="c" * 64,
+            worker_image_digest=IMAGE_DIGEST,
+            organization_name="creator-org",
+            project_name="production",
+            queue_name="generation-v2",
+            provider_queue_id="provider-queue-v2",
+            container_group_name="worker-v2",
+            provider_container_group_id="provider-group-v2",
+            state=SaladDeploymentState.ACTIVE,
+            desired_state=DesiredDeploymentState.ACTIVE,
+            is_current=True,
+            min_replicas=0,
+            max_replicas=1,
+            desired_queue_length=1,
+            max_hourly_cost_microusd=2_000_000,
+            runtime_artifact_manifest_sha256="8" * 64,
+            lock_version=1,
+        )
+        session.add(current_deployment)
+        await session.commit()
+
+        prepared = await prepare_generation_attempt(
+            session,
+            generation_job_id=context.job_id,
+            salad_deployment_id=current_deployment.id,
+            idempotency_key="turnover-fresh-deployment",
+            now=NOW + timedelta(minutes=1),
+        )
+        await session.commit()
+        retry_attempt = await session.get(GenerationAttempt, prepared.generation_attempt_id)
+        replay = await prepare_generation_attempt(
+            session,
+            generation_job_id=context.job_id,
+            salad_deployment_id=current_deployment.id,
+            idempotency_key="turnover-fresh-deployment",
+            now=NOW + timedelta(minutes=2),
+        )
+
+    assert replay.replayed is True
+    assert replay.generation_attempt_id == prepared.generation_attempt_id
+    assert retry_attempt is not None
+    assert retry_attempt.salad_deployment_id == current_deployment.id
+    assert "runtime_admission" not in retry_attempt.request_metadata
+    marker = retry_attempt.request_metadata["runtime_turnover_inheritance_skipped"]
+    assert isinstance(marker, dict)
+    assert marker["source_attempt_id"] == str(source_attempt.id)
+    assert marker["source_deployment_id"] == str(old_deployment.id)
+    assert marker["source_artifact_manifest_sha256"] == "7" * 64
+    assert marker["selected_deployment_id"] == str(current_deployment.id)
+    assert marker["selected_artifact_manifest_sha256"] == "8" * 64
+    assert marker["target_attempt_no"] == 2
+
+
+@pytest.mark.asyncio
+async def test_turnover_retry_manifest_refresh_prepares_and_replays_fresh_admission(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        source_attempt = await grant_direct_runtime_turnover_retry(
+            session,
+            context=context,
+        )
+        deployment = await session.get(SaladDeployment, context.deployment_id)
+        assert deployment is not None
+        deployment.runtime_artifact_manifest_sha256 = "8" * 64
+        await session.commit()
+
+        prepared = await prepare_generation_attempt(
+            session,
+            generation_job_id=context.job_id,
+            salad_deployment_id=context.deployment_id,
+            idempotency_key="turnover-fresh-manifest",
+            now=NOW + timedelta(minutes=1),
+        )
+        await session.commit()
+        retry_attempt = await session.get(GenerationAttempt, prepared.generation_attempt_id)
+        assert retry_attempt is not None
+        deployment.runtime_artifact_manifest_sha256 = "9" * 64
+        fresh_request_metadata = dict(retry_attempt.request_metadata)
+        fresh_request_metadata["runtime_admission"] = {
+            "version": "v1",
+            "provider_group_version": 4,
+            "artifact_manifest_sha256": "9" * 64,
+            "rollout_id": "2" * 32,
+            "worker_instance_id": "instance-fresh-admission",
+        }
+        retry_attempt.request_metadata = fresh_request_metadata
+        await session.commit()
+
+        replay = await prepare_generation_attempt(
+            session,
+            generation_job_id=context.job_id,
+            salad_deployment_id=context.deployment_id,
+            idempotency_key="turnover-fresh-manifest",
+            now=NOW + timedelta(minutes=2),
+        )
+
+    assert replay.replayed is True
+    assert replay.generation_attempt_id == prepared.generation_attempt_id
+    assert retry_attempt.request_metadata["runtime_admission"] == {
+        "version": "v1",
+        "provider_group_version": 4,
+        "artifact_manifest_sha256": "9" * 64,
+        "rollout_id": "2" * 32,
+        "worker_instance_id": "instance-fresh-admission",
+    }
+    marker = retry_attempt.request_metadata["runtime_turnover_inheritance_skipped"]
+    assert isinstance(marker, dict)
+    assert marker["source_attempt_id"] == str(source_attempt.id)
+    assert marker["source_deployment_id"] == str(deployment.id)
+    assert marker["source_artifact_manifest_sha256"] == "7" * 64
+    assert marker["selected_deployment_id"] == str(deployment.id)
+    assert marker["selected_artifact_manifest_sha256"] == "8" * 64
+    assert marker["target_attempt_no"] == 2
+
+
+@pytest.mark.asyncio
+async def test_runtime_instance_turnover_retry_has_two_slot_cap_and_per_attempt_idempotency(
+    database: Database,
+) -> None:
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        job = await session.get(GenerationJob, context.job_id)
+        deployment = await session.get(SaladDeployment, context.deployment_id)
+        assert job is not None
+        assert deployment is not None
+        job.max_attempts = 1
+        deployment.runtime_artifact_manifest_sha256 = "7" * 64
+        await session.commit()
+
+        grants: list[bool] = []
+        replay_grants: list[bool] = []
+        for attempt_no in range(1, 4):
+            prepared = await prepare_generation_attempt(
+                session,
+                generation_job_id=context.job_id,
+                salad_deployment_id=context.deployment_id,
+                idempotency_key=f"turnover-cap-{attempt_no}",
+                now=NOW + timedelta(minutes=attempt_no),
+            )
+            attempt = await session.get(GenerationAttempt, prepared.generation_attempt_id)
+            assert attempt is not None
+            old_instance_id = f"instance-old-{attempt_no}"
+            current_instance_id = f"instance-current-{attempt_no}"
+            enable_exact_runtime_admission(attempt, worker_instance_id=old_instance_id)
+            attempt.state = GenerationAttemptState.FAILED
+            attempt.completed_at = NOW + timedelta(minutes=attempt_no, seconds=1)
+            attempt.error_code = SALAD_JOB_FAILED_ERROR_CODE
+            attempt.error_detail = "provider failed after worker turnover"
+            attempt.provider_external_id = f"provider-job-{attempt_no}"
+            attempt.provider_state = "failed"
+            evidence = RuntimeInstanceTurnoverEvidence(
+                provider_external_id=attempt.provider_external_id,
+                provider_group_version=3,
+                artifact_manifest_sha256="7" * 64,
+                rollout_id="1" * 32,
+                previous_worker_instance_id=old_instance_id,
+                current_worker_instance_id=current_instance_id,
+            )
+            grant = await grant_runtime_instance_turnover_retry(
+                session,
+                attempt=attempt,
+                job=job,
+                deployment=deployment,
+                evidence=evidence,
+                source=InfrastructureRetrySource.RECONCILER,
+                actor="test",
+                retry_at=NOW + timedelta(minutes=attempt_no, seconds=2),
+                occurred_at=NOW + timedelta(minutes=attempt_no, seconds=2),
+            )
+            replay = await grant_runtime_instance_turnover_retry(
+                session,
+                attempt=attempt,
+                job=job,
+                deployment=deployment,
+                evidence=evidence,
+                source=InfrastructureRetrySource.RECONCILER,
+                actor="test",
+                retry_at=NOW + timedelta(minutes=attempt_no, seconds=3),
+                occurred_at=NOW + timedelta(minutes=attempt_no, seconds=3),
+            )
+            grants.append(grant.granted)
+            replay_grants.append(replay.granted)
+            await session.commit()
+
+        grant_count = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action == RUNTIME_INSTANCE_TURNOVER_RETRY_GRANT_ACTION
+                )
+            )
+            or 0
+        )
+
+    assert grants == [True, True, False]
+    assert replay_grants == [False, False, False]
+    assert grant_count == 2
+    assert job.max_attempts == 3
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ("same_instance", "provider_drift", "manifest_drift", "stopped", "superseded"),
+)
+@pytest.mark.asyncio
+async def test_runtime_turnover_retry_fails_closed_without_exact_current_identity(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    old_instance_id = "instance-old-44d8"
+    async with database.sessions() as session:
+        context = await seed_context(session)
+        job = await session.get(GenerationJob, context.job_id)
+        deployment = await session.get(SaladDeployment, context.deployment_id)
+        assert job is not None
+        assert deployment is not None
+        job.max_attempts = 1
+        deployment.runtime_artifact_manifest_sha256 = "7" * 64
+        await session.commit()
+
+        attempt_id = await prepared_attempt(session, context)
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+        enable_exact_runtime_admission(attempt, worker_instance_id=old_instance_id)
+        add_exhausted_generic_infrastructure_grants(session, attempt=attempt)
+        await session.commit()
+        await submit_prepared_attempt(
+            session,
+            FakeSaladClient(),
+            FakeUploadIntentProvider(),
+            generation_attempt_id=attempt_id,
+            webhook_url="https://controller.example.test/webhooks/salad",
+            reservation_microusd=500_000,
+            now=NOW,
+        )
+        attempt = await session.get(GenerationAttempt, attempt_id)
+        assert attempt is not None
+
+        async def observe_current_instance(
+            *_args: object,
+            **_kwargs: object,
+        ) -> str | None:
+            if scenario == "provider_drift":
+                raise salad_service.SaladDeploymentValidationError("identity drift")
+            if scenario == "same_instance":
+                return old_instance_id
+            return "instance-current-7c99"
+
+        monkeypatch.setattr(
+            salad_service,
+            "container_group_runtime_admission_ready",
+            observe_current_instance,
+        )
+        if scenario == "manifest_drift":
+            deployment.runtime_artifact_manifest_sha256 = "8" * 64
+        elif scenario == "stopped":
+            deployment.desired_state = DesiredDeploymentState.STOPPED
+        elif scenario == "superseded":
+            version = await session.get(ReleaseVersion, job.release_version_id)
+            assert version is not None
+            release = await session.get(Release, version.release_id)
+            assert release is not None
+            release.current_version_no = version.version_no + 1
+        await session.commit()
+
+        result = await reconcile_generation_attempt(
+            session,
+            FakeSaladClient(
+                get_result=remote_job(
+                    status=SaladJobStatus.FAILED,
+                    metadata={},
+                    update_time=NOW + timedelta(minutes=1),
+                    job_id=UUID(str(attempt.provider_external_id)),
+                )
+            ),
+            generation_attempt_id=attempt_id,
+            now=NOW + timedelta(minutes=2),
+        )
+        grants = int(
+            await session.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action == RUNTIME_INSTANCE_TURNOVER_RETRY_GRANT_ACTION
+                )
+            )
+            or 0
+        )
+
+    assert result.observation.generation_job_state == GenerationState.DEAD_LETTER
+    assert grants == 0
 
 
 @pytest.mark.asyncio

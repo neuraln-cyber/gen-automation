@@ -29,6 +29,7 @@ from gen_automation.services.generation_recovery import (
     InfrastructureRetrySource,
     grant_infrastructure_retry,
 )
+from gen_automation.services.outbox import valid_runtime_admission_target
 from gen_automation.services.salad import (
     DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_ERROR_CODE,
     DEPLOYMENT_ROLLOVER_CANCEL_REQUESTED_METADATA_KEY,
@@ -971,6 +972,20 @@ async def _operator_generation_stop_requested(
     return marker_id is not None
 
 
+def _failed_runtime_admission_requires_reconciliation(
+    attempt: GenerationAttempt,
+    *,
+    provider_status: SaladJobStatus,
+) -> bool:
+    admission = attempt.request_metadata.get("runtime_admission")
+    return bool(
+        provider_status == SaladJobStatus.FAILED
+        and valid_runtime_admission_target(admission)
+        and isinstance(admission, dict)
+        and admission["worker_instance_id"] is not None
+    )
+
+
 async def process_salad_webhook_receipt(
     session: AsyncSession,
     *,
@@ -1265,6 +1280,35 @@ async def process_salad_webhook_receipt(
         return _result(
             receipt=receipt,
             disposition=InboxDisposition.TERMINAL_CONFLICT,
+            attempt=attempt,
+            job=job,
+        )
+
+    if job.state not in _TERMINAL_JOB_STATES and _failed_runtime_admission_requires_reconciliation(
+        attempt,
+        provider_status=provider_status,
+    ):
+        # A signed failure callback cannot prove whether Salad rotated the sole
+        # manifest-bound worker after this job was admitted. Leave the current
+        # attempt nonterminal so reconciliation can atomically compare the
+        # failed provider job with the exact live group/rollout/instance tuple.
+        _complete_receipt(receipt, processed_at=processed_at)
+        _audit(
+            session,
+            receipt=receipt,
+            actor=normalized_worker_id,
+            action="salad.webhook.runtime_failure_deferred_to_reconciler",
+            detail={
+                "generation_attempt_id": str(attempt.id),
+                "provider_status": provider_status.value,
+                "provider_external_id": receipt.provider_external_job_id,
+            },
+            occurred_at=processed_at,
+        )
+        await session.commit()
+        return _result(
+            receipt=receipt,
+            disposition=InboxDisposition.NO_CHANGE,
             attempt=attempt,
             job=job,
         )
