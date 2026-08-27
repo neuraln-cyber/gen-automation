@@ -2134,9 +2134,9 @@ async def ensure_container_group_queue_admission(
                     if initial.version >= target_version:
                         break
                     await asyncio.sleep(poll_interval_seconds)
-        if initial.replicas == 0:
-            # Salad can accept min_replicas=1 while retaining a zero desired
-            # replica count indefinitely. The exact demand/queue/runtime
+        if initial.replicas < effective_min_replicas:
+            # Salad can accept an autoscaler minimum while retaining a lower
+            # desired replica count indefinitely. The exact demand/queue/runtime
             # identity above is durable before this one-field mutation. A
             # replay reads replicas first and therefore does not repeat an
             # accepted update whose response was lost.
@@ -2168,7 +2168,7 @@ async def ensure_container_group_queue_admission(
                         raise SaladDeploymentValidationError(
                             "container group version regressed after replica update"
                         )
-                    if not observed.pending_change and observed.replicas == 1:
+                    if not observed.pending_change and observed.replicas >= effective_min_replicas:
                         initial = observed
                         break
                     await asyncio.sleep(poll_interval_seconds)

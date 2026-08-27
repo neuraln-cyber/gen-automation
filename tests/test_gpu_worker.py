@@ -1120,9 +1120,7 @@ def test_decoded_output_size_is_bounded() -> None:
     assert uploader.uploads == []
 
 
-def test_near_black_output_is_replayed_without_recycle_and_worker_keeps_serving(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
+def test_near_black_output_is_uploaded_for_human_review_and_worker_keeps_serving() -> None:
     recycle_event = asyncio.Event()
     executor = FakeExecutor(outputs=[_output_for_content(_solid_image_bytes((4, 4, 4)))])
     uploader = FakeUploader()
@@ -1144,20 +1142,13 @@ def test_near_black_output_is_replayed_without_recycle_and_worker_keeps_serving(
         )
 
     assert response.status_code == 200
-    assert response.json()["status"] == "failed"
-    assert response.json()["code"] == "near_black_output"
-    assert response.json()["failed_output_index"] == 0
-    assert response.json()["outputs"] == []
+    assert response.json()["status"] == "succeeded"
     assert replayed.json() == response.json()
     assert next_attempt.status_code == 200
-    assert next_attempt.json()["code"] == "near_black_output"
+    assert next_attempt.json()["status"] == "succeeded"
     assert len(executor.workflows) == 2
     assert not recycle_event.is_set()
-    assert uploader.uploads == []
-    stderr = capsys.readouterr().err
-    assert "reason=near_black output_index=0" in stderr
-    assert "rgb_extrema=((4, 4), (4, 4), (4, 4))" in stderr
-    assert "action=seed_retry_no_recycle" in stderr
+    assert len(uploader.uploads) == 2
 
 
 def test_dark_nonblank_output_is_accepted_without_restart() -> None:
@@ -1180,7 +1171,7 @@ def test_dark_nonblank_output_is_accepted_without_restart() -> None:
     assert len(uploader.uploads) == 1
 
 
-def test_progressive_job_stops_after_near_black_output_without_requesting_restart() -> None:
+def test_progressive_job_uploads_near_black_output_for_human_review() -> None:
     @dataclass
     class SequentialExecutor(FakeExecutor):
         generated_outputs: list[dict[str, object]] = field(default_factory=list)
@@ -1213,13 +1204,11 @@ def test_progressive_job_stops_after_near_black_output_without_requesting_restar
         response = client.post("/jobs/generate", json=_sign_request(request))
 
     assert response.status_code == 200
-    assert response.json()["status"] == "failed"
-    assert response.json()["code"] == "near_black_output"
-    assert response.json()["failed_output_index"] == 1
-    assert [output["output_index"] for output in response.json()["outputs"]] == [0]
+    assert response.json()["status"] == "succeeded"
+    assert [output["output_index"] for output in response.json()["outputs"]] == [0, 1, 2]
     assert not restart_event.is_set()
-    assert len(executor.workflows) == 2
-    assert [upload.grant.output_index for upload in uploader.uploads] == [0]
+    assert len(executor.workflows) == 3
+    assert [upload.grant.output_index for upload in uploader.uploads] == [0, 1, 2]
 
 
 def test_executor_and_upload_failures_are_redacted() -> None:
