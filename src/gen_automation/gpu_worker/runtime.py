@@ -12,6 +12,8 @@ class ComfyExecutor(Protocol):
 
     def execute(self, workflow: JsonObject) -> object: ...
 
+    def reset_model_and_node_cache(self, barrier_workflow: JsonObject) -> None: ...
+
 
 class MultipartUploader(Protocol):
     async def upload(

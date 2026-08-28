@@ -7,6 +7,7 @@ import io
 import json
 import math
 import re
+import sys
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -237,7 +238,7 @@ def _decode_and_verify_outputs(
     max_total_output_bytes: int,
     max_image_dimension: int,
     max_image_pixels: int,
-) -> list[tuple[ComfyOutput, bytes]]:
+) -> list[tuple[ComfyOutput, bytes, bool]]:
     try:
         outputs = _OUTPUTS_ADAPTER.validate_python(raw_outputs, strict=True)
     except ValidationError:
@@ -249,7 +250,7 @@ def _decode_and_verify_outputs(
     if len(indices) != len(set(indices)) or set(indices) != set(range(expected_count)):
         raise WorkerOutputError("generation output invalid")
 
-    decoded: list[tuple[ComfyOutput, bytes]] = []
+    decoded: list[tuple[ComfyOutput, bytes, bool]] = []
     total_bytes = 0
     for output in outputs:
         maximum_encoded = ((max_output_bytes + 2) // 3) * 4
@@ -278,6 +279,8 @@ def _decode_and_verify_outputs(
                 ):
                     raise WorkerOutputError("generation output invalid")
                 image.load()
+                with image.convert("RGB") as rgb_image:
+                    exact_zero = rgb_image.getbbox() is None
         except WorkerOutputError:
             raise
         except (
@@ -288,7 +291,7 @@ def _decode_and_verify_outputs(
             SyntaxError,
         ):
             raise WorkerOutputError("generation output invalid") from None
-        decoded.append((output, content))
+        decoded.append((output, content, exact_zero))
     return decoded
 
 
@@ -474,6 +477,7 @@ def create_worker_app(
             grants_by_index = {grant.output_index: grant for grant in payload.uploads}
             uploaded: list[UploadedOutput] = []
             total_output_bytes = 0
+            cache_reset_attempted = False
             for branch_output_index, workflow in progressive_workflows:
                 try:
                     raw_outputs = await loop.run_in_executor(
@@ -509,7 +513,11 @@ def create_worker_app(
                         detail="generation output invalid",
                     ) from None
 
-                for output, content in sorted(outputs, key=lambda item: item[0].output_index):
+                exact_zero_output_indices: list[int] = []
+                for output, content, exact_zero in sorted(
+                    outputs,
+                    key=lambda item: item[0].output_index,
+                ):
                     output_index = (
                         output.output_index if branch_output_index is None else branch_output_index
                     )
@@ -537,6 +545,35 @@ def create_worker_app(
                             output_index=output_index,
                         )
                     )
+                    if exact_zero:
+                        exact_zero_output_indices.append(output_index)
+
+                if exact_zero_output_indices and not cache_reset_attempted:
+                    cache_reset_attempted = True
+                    try:
+                        await loop.run_in_executor(
+                            execution_pool,
+                            executor.reset_model_and_node_cache,
+                            workflow,
+                        )
+                    except Exception:
+                        print(
+                            "GPU worker exact-zero output observed: "
+                            f"attempt_id={payload.attempt_id} "
+                            f"output_indices={exact_zero_output_indices} "
+                            "action=local_comfy_cache_reset_failed_continue",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "GPU worker exact-zero output observed: "
+                            f"attempt_id={payload.attempt_id} "
+                            f"output_indices={exact_zero_output_indices} "
+                            "action=local_comfy_cache_reset_completed_continue",
+                            file=sys.stderr,
+                            flush=True,
+                        )
 
             response = GenerateResponse(
                 job_id=payload.job_id,
