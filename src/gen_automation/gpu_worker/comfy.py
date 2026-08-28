@@ -197,6 +197,38 @@ class ComfyExecutor:
         if not self._execution_lock.acquire(blocking=False):
             raise ComfyUnavailableError("Comfy is unavailable")
 
+        try:
+            return self._execute_locked(workflow)
+        finally:
+            self._execution_lock.release()
+
+    def reset_model_and_node_cache(self, barrier_workflow: JsonObject) -> None:
+        """Reset Comfy state without restarting the worker or changing its identity."""
+
+        if self._closed:
+            raise ComfyUnavailableError("Comfy is unavailable")
+        if not self._execution_lock.acquire(blocking=False):
+            raise ComfyUnavailableError("Comfy is unavailable")
+
+        try:
+            self._request_bytes(
+                "POST",
+                "/free",
+                content=b'{"unload_models":true,"free_memory":true}',
+                content_type="application/json",
+                limit=64 * 1024,
+                expected_statuses=frozenset({200, 204}),
+                timeout_seconds=min(self._request_timeout_seconds, 5.0),
+            )
+            # Comfy consumes /free flags after a prompt. Replaying the already
+            # approved workflow as an internal barrier guarantees the reset is
+            # applied before the next real output without restarting the
+            # container or creating another provider job.
+            self._execute_locked(barrier_workflow)
+        finally:
+            self._execution_lock.release()
+
+    def _execute_locked(self, workflow: JsonObject) -> object:
         prompt_id: str | None = None
         try:
             workflow_body, selected_nodes = self._prepare_workflow(workflow)
@@ -209,8 +241,6 @@ class ComfyExecutor:
             if prompt_id is not None and self._interrupt_on_timeout:
                 self._best_effort_interrupt()
             raise
-        finally:
-            self._execution_lock.release()
 
     def _prepare_workflow(self, workflow: JsonObject) -> tuple[bytes, tuple[str, ...]]:
         try:

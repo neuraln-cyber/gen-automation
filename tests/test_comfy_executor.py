@@ -88,6 +88,12 @@ def _success_handler(
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         requests.append(request)
+        if request.url.path == "/free":
+            assert json.loads(request.content) == {
+                "unload_models": True,
+                "free_memory": True,
+            }
+            return httpx2.Response(200)
         if request.url.path == "/system_stats":
             return _json_response({"system": {}, "devices": []})
         if request.url.path == "/prompt":
@@ -211,6 +217,20 @@ def test_outputs_are_selected_from_save_nodes_and_ordered_deterministically() ->
         "two.png",
         "ten.webp",
     ]
+
+
+def test_model_cache_reset_posts_free_then_executes_approved_barrier() -> None:
+    handler, requests = _success_handler()
+    executor = ComfyExecutor(transport=httpx2.MockTransport(handler))
+    try:
+        executor.reset_model_and_node_cache(_workflow())
+    finally:
+        executor.close()
+
+    paths = [request.url.path for request in requests]
+    assert paths[0:3] == ["/free", "/prompt", f"/history/{PROMPT_ID}"]
+    assert paths.count("/prompt") == 1
+    assert paths.count("/view") == 2
 
 
 def test_download_media_type_is_identified_from_bytes_not_header_or_extension() -> None:

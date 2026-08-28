@@ -1,0 +1,68 @@
+diff --git a/internal/workers/workers.go b/internal/workers/workers.go
+index 5e183b5..f9c6002 100644
+--- a/internal/workers/workers.go
++++ b/internal/workers/workers.go
+@@ -27,6 +27,13 @@ var errWorkloadTokenUnavailable = errors.New("workload token unavailable")
+ var errJobNotFound = errors.New("job not found")
+ var errOutputInvalid = errors.New("job output invalid")
+ 
++const jobStreamSilenceTimeout = 2 * time.Minute
++
++type jobStreamReceiveResult struct {
++	response *queues_api.AcceptJobsResponse
++	err      error
++}
++
+ func Run(ctx context.Context, config config.Config, executor jobs.HTTPJobExecutor, version string) error {
+ 	logger := log.FromContext(ctx)
+ 	workerCtx, cancelWorker := context.WithCancelCause(ctx)
+@@ -384,7 +391,8 @@ func (p *jobPoller) poll(ctx context.Context) error {
+ 			// The client will automatically retry several times on network
+ 			// errors and invalid responses using a short, exponential backoff
+ 			// algorithm. Eventually, it will give up and return the last error.
+-			stream, err := client.AcceptJobs(authCtx, &queues_api.AcceptJobsRequest{
++			streamCtx, cancelStream := context.WithCancel(authCtx)
++			stream, err := client.AcceptJobs(streamCtx, &queues_api.AcceptJobsRequest{
+ 				CurrentJobId: currentJobId,
+ 			})
+ 			stat, ok := status.FromError(err)
+@@ -409,7 +417,30 @@ func (p *jobPoller) poll(ctx context.Context) error {
+ 			case codes.OK:
+ 			ReceiveLoop:
+ 				for {
+-					resp, err := stream.Recv()
++					receiveStream := stream
++					received := make(chan jobStreamReceiveResult, 1)
++					go func() {
++						resp, receiveErr := receiveStream.Recv()
++						select {
++						case received <- jobStreamReceiveResult{response: resp, err: receiveErr}:
++						case <-streamCtx.Done():
++						}
++					}()
++					silenceTimer := time.NewTimer(jobStreamSilenceTimeout)
++					var result jobStreamReceiveResult
++					select {
++					case <-ctx.Done():
++						silenceTimer.Stop()
++						cancelStream()
++						return ctx.Err()
++					case <-silenceTimer.C:
++						logger.Warn("job stream heartbeat timed out")
++						cancelStream()
++						break ReceiveLoop
++					case result = <-received:
++						silenceTimer.Stop()
++					}
++					resp, err := result.response, result.err
+ 					if err == nil {
+ 						switch msg := resp.Message.(type) {
+ 						case *queues_api.AcceptJobsResponse_Heartbeat:
+@@ -466,6 +497,7 @@ func (p *jobPoller) poll(ctx context.Context) error {
+ 					continue
+ 				}
+ 			}
++			cancelStream()
+ 
+ 			if reauth {
+ 				logger.Info("token expired", "token", token)

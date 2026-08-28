@@ -120,7 +120,9 @@ class FakeExecutor:
     ready: bool = True
     ready_error: Exception | None = None
     execute_error: Exception | None = None
+    reset_error: Exception | None = None
     workflows: list[dict[str, object]] = field(default_factory=list)
+    reset_workflows: list[dict[str, object]] = field(default_factory=list)
 
     def is_ready(self) -> bool:
         if self.ready_error is not None:
@@ -132,6 +134,11 @@ class FakeExecutor:
         if self.execute_error is not None:
             raise self.execute_error
         return self.outputs
+
+    def reset_model_and_node_cache(self, barrier_workflow: dict[str, object]) -> None:
+        self.reset_workflows.append(barrier_workflow)
+        if self.reset_error is not None:
+            raise self.reset_error
 
 
 @dataclass
@@ -1147,8 +1154,33 @@ def test_near_black_output_is_uploaded_for_human_review_and_worker_keeps_serving
     assert next_attempt.status_code == 200
     assert next_attempt.json()["status"] == "succeeded"
     assert len(executor.workflows) == 2
+    assert executor.reset_workflows == []
     assert not recycle_event.is_set()
     assert len(uploader.uploads) == 2
+
+
+@pytest.mark.parametrize("reset_error", [None, RuntimeError("private reset detail")])
+def test_exact_zero_output_is_uploaded_and_requests_one_nonfatal_cache_reset(
+    reset_error: Exception | None,
+) -> None:
+    executor = FakeExecutor(
+        outputs=[_output_for_content(_solid_image_bytes((0, 0, 0)))],
+        reset_error=reset_error,
+    )
+    uploader = FakeUploader()
+    client, executor, uploader = _client(executor=executor, uploader=uploader)
+    signed_request = _signed_request()
+
+    with client:
+        response = client.post("/jobs/generate", json=signed_request)
+        replayed = client.post("/jobs/generate", json=signed_request)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "succeeded"
+    assert replayed.json() == response.json()
+    assert len(uploader.uploads) == 1
+    assert len(executor.workflows) == 1
+    assert executor.reset_workflows == executor.workflows
 
 
 def test_dark_nonblank_output_is_accepted_without_restart() -> None:
@@ -1168,6 +1200,7 @@ def test_dark_nonblank_output_is_accepted_without_restart() -> None:
 
     assert response.status_code == 200
     assert not restart_event.is_set()
+    assert executor.reset_workflows == []
     assert len(uploader.uploads) == 1
 
 
@@ -1208,6 +1241,7 @@ def test_progressive_job_uploads_near_black_output_for_human_review() -> None:
     assert [output["output_index"] for output in response.json()["outputs"]] == [0, 1, 2]
     assert not restart_event.is_set()
     assert len(executor.workflows) == 3
+    assert executor.reset_workflows == [executor.workflows[1]]
     assert [upload.grant.output_index for upload in uploader.uploads] == [0, 1, 2]
 
 
