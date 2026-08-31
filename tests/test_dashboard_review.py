@@ -389,8 +389,8 @@ def test_csp_allows_http_images_only_in_local_and_test() -> None:
         .split(";", maxsplit=1)[0]
         .split()
     )
-    assert test_sources == ["'self'", "https:", "http:"]
-    assert production_sources == ["'self'", "https:"]
+    assert test_sources == ["'self'", "https:", "blob:", "http:"]
+    assert production_sources == ["'self'", "https:", "blob:"]
 
 
 def test_csp_allows_dashboard_to_fetch_clean_asset_copies() -> None:

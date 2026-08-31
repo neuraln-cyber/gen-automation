@@ -68,7 +68,7 @@ def content_security_policy(
     asset_connect_source: str | None = None,
     model_artifact_connect_source: str | None = None,
 ) -> str:
-    image_sources = "'self' https:"
+    image_sources = "'self' https: blob:"
     connect_sources = ["'self'"]
     media_sources = ["'self'"]
     if environment in {Environment.LOCAL, Environment.TEST}:

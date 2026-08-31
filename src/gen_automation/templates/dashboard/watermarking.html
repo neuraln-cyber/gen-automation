@@ -1,0 +1,137 @@
+{% extends "dashboard/base.html" %}
+
+{% block content %}
+  <header class="page-header batch-watermark-header">
+    <div class="page-header-copy">
+      <p class="page-kicker">Publishing utility</p>
+      <h1>Batch watermarking</h1>
+      <p class="lede">
+        Add local images, review them one at a time, and choose a watermark corner for each.
+        Nothing is saved to the library.
+      </p>
+    </div>
+  </header>
+
+  <form
+    class="batch-watermark-form"
+    action="/dashboard/watermarking:download"
+    method="post"
+    enctype="multipart/form-data"
+    data-batch-watermark-form
+    data-max-files="{{ max_batch_files }}"
+  >
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="watermark_placements" value="[]" data-batch-watermark-placements>
+    <input type="hidden" name="archive_kind" value="both" data-batch-watermark-archive-kind>
+
+    <section class="panel panel-accent batch-watermark-setup" aria-labelledby="batch-watermark-setup-title">
+      <div class="panel-heading">
+        <div>
+          <p class="page-kicker">1 · Select</p>
+          <h2 id="batch-watermark-setup-title">Choose images and a saved watermark</h2>
+        </div>
+        <span class="status status-neutral" data-batch-watermark-count>0 images</span>
+      </div>
+
+      <div class="batch-watermark-inputs">
+        <label class="batch-watermark-upload">
+          <span>Images from this computer</span>
+          <input
+            type="file"
+            name="images"
+            accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
+            multiple
+            data-batch-watermark-files
+          >
+          <small>JPEG, PNG, or WebP · up to {{ max_batch_files }} images · originals remain unchanged.</small>
+        </label>
+
+        <label>
+          <span>Saved watermark</span>
+          <select name="watermark_asset_id" data-batch-watermark-asset>
+            <option value="">Choose a registered watermark</option>
+            {% for watermark in watermarks %}
+              <option
+                value="{{ watermark.asset_id }}"
+                data-watermark-preview-url="{{ watermark.preview_url }}"
+              >{{ watermark.display_name }} · {{ watermark.width }}×{{ watermark.height }}</option>
+            {% endfor %}
+          </select>
+          <small>The same size and inset as the X watermark workflow are used.</small>
+        </label>
+      </div>
+
+      {% if storage_error %}
+        <p class="notice notice-warning">{{ storage_error }}</p>
+      {% elif not watermarks %}
+        <p class="notice notice-warning">
+          No saved watermark is available yet. Register one from a completed set’s delivery page.
+        </p>
+      {% endif %}
+    </section>
+
+    <section class="panel batch-watermark-review" data-batch-watermark-review hidden aria-labelledby="batch-watermark-review-title">
+      <div class="panel-heading">
+        <div>
+          <p class="page-kicker">2 · Place</p>
+          <h2 id="batch-watermark-review-title">Review every image</h2>
+        </div>
+        <span class="status status-neutral" data-batch-watermark-ready>0 placements ready</span>
+      </div>
+
+      <div
+        class="x-watermark-composer batch-watermark-composer"
+        data-batch-watermark-composer
+        data-watermark-width="264000"
+        data-watermark-margin="12000"
+        tabindex="0"
+        aria-label="Batch watermark placement editor"
+      >
+        <div class="x-watermark-progress-row">
+          <strong data-batch-watermark-step>Image 1 of 1</strong>
+          <span class="muted">Use ← and → to move through the batch</span>
+        </div>
+        <div class="x-watermark-slides" data-batch-watermark-slides></div>
+        <div class="x-watermark-navigation">
+          <button class="secondary-button" type="button" data-batch-watermark-previous>Previous</button>
+          <div class="x-watermark-filmstrip" data-batch-watermark-filmstrip aria-label="Batch images"></div>
+          <button class="secondary-button" type="button" data-batch-watermark-next>Next</button>
+        </div>
+        <div class="batch-watermark-bulk-placement">
+          <button class="secondary-button" type="button" data-batch-watermark-apply-all>
+            Apply this corner to all images
+          </button>
+        </div>
+        <p class="x-watermark-render-status muted" data-batch-watermark-render-status aria-live="polite">
+          Choose a saved watermark to see the final placement.
+        </p>
+      </div>
+    </section>
+
+    <section class="panel batch-watermark-downloads" data-batch-watermark-downloads hidden aria-labelledby="batch-watermark-download-title">
+      <div class="panel-heading">
+        <div>
+          <p class="page-kicker">3 · Download</p>
+          <h2 id="batch-watermark-download-title">Export the batch</h2>
+        </div>
+      </div>
+      <p class="muted batch-watermark-download-note">
+        Watermarked copies keep the full source dimensions. Originals are placed in the ZIP byte-for-byte.
+      </p>
+      <div class="batch-watermark-download-actions">
+        <button class="primary-button" type="button" data-batch-watermark-download="both">
+          Download both versions
+        </button>
+        <button class="secondary-button" type="button" data-batch-watermark-download="watermarked">
+          Watermarked only
+        </button>
+        <button class="secondary-button" type="button" data-batch-watermark-download="originals">
+          Originals only
+        </button>
+      </div>
+      <p class="batch-watermark-status muted" data-batch-watermark-status aria-live="polite">
+        Select images to begin.
+      </p>
+    </section>
+  </form>
+{% endblock %}

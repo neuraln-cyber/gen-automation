@@ -1357,6 +1357,11 @@
           {% if principal.role.value == "owner" %}
             <a
               class="nav-link"
+              href="/dashboard/watermarking"
+              {% if request.url.path.startswith("/dashboard/watermarking") %}aria-current="page"{% endif %}
+            >Watermark</a>
+            <a
+              class="nav-link"
               href="/dashboard/anatomy-learning"
               {% if request.url.path.startswith("/dashboard/anatomy-learning") %}aria-current="page"{% endif %}
             >Anatomy learning</a>
