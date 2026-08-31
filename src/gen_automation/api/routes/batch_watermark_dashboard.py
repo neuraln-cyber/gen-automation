@@ -196,9 +196,14 @@ async def dashboard_batch_watermark_download(
     form: FormData | None = None
     archive: SpooledTemporaryFile[bytes] | None = None
     try:
-        form, uploads, csrf_token, watermark_asset_id, placements, archive_kind = (
-            await _read_batch_form(request)
-        )
+        (
+            form,
+            uploads,
+            csrf_token,
+            watermark_asset_id,
+            placements,
+            archive_kind,
+        ) = await _read_batch_form(request)
         await _verified_mutation_owner(request, session, principal, csrf_token)
         watermark_png: bytes | None = None
         if archive_kind != "originals":

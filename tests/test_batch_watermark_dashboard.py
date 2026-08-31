@@ -51,10 +51,7 @@ def _form(
         "csrf_token": csrf_token,
         "watermark_asset_id": watermark_asset_id,
         "watermark_placements": json.dumps(
-            [
-                {"index": index, "position": position}
-                for index, position in enumerate(positions)
-            ]
+            [{"index": index, "position": position} for index, position in enumerate(positions)]
         ),
         "archive_kind": archive_kind,
     }
@@ -66,7 +63,7 @@ def test_owner_can_open_transient_batch_watermark_workspace(client: TestClient) 
     assert response.status_code == 200
     assert "Batch watermarking" in response.text
     assert "data-batch-watermark-files" in response.text
-    assert "data-batch-watermark-download=\"both\"" in response.text
+    assert 'data-batch-watermark-download="both"' in response.text
     assert "Nothing is saved to the library" in response.text
     assert 'href="/dashboard/watermarking"' in response.text
     assert "blob:" in response.headers["content-security-policy"]
