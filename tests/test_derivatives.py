@@ -28,6 +28,7 @@ from gen_automation.services.derivatives import (
     DerivativeSafetyLimits,
     DerivativeTarget,
     FullDerivativeSpec,
+    FullResolutionWatermarkedImage,
     JpegEncoding,
     MosaicCensor,
     OutputFormat,
@@ -40,6 +41,7 @@ from gen_automation.services.derivatives import (
     XTeaserSpec,
     derivative_recipe_sha256,
     estimate_derivative_peak_working_set_bytes,
+    render_full_resolution_watermark,
     render_platform_derivatives,
 )
 
@@ -92,6 +94,65 @@ def _decoded(payload: bytes) -> Image.Image:
     image = Image.open(BytesIO(payload))
     image.load()
     return image
+
+
+@pytest.mark.parametrize(
+    ("source_format", "expected_format", "expected_extension"),
+    (("PNG", "PNG", "png"), ("JPEG", "JPEG", "jpg"), ("WEBP", "WEBP", "webp")),
+)
+def test_full_resolution_watermark_preserves_dimensions_and_source_format(
+    source_format: str,
+    expected_format: str,
+    expected_extension: str,
+) -> None:
+    image = _pattern((180, 120))
+    try:
+        source = _encode(image, image_format=source_format)
+    finally:
+        image.close()
+
+    result = render_full_resolution_watermark(
+        source,
+        _watermark(),
+        WatermarkPosition.BOTTOM_RIGHT,
+    )
+
+    assert isinstance(result, FullResolutionWatermarkedImage)
+    assert (result.width, result.height) == (180, 120)
+    assert result.image_format == expected_format
+    assert result.extension == expected_extension
+    assert result.byte_size == len(result.data)
+    assert result.sha256 == hashlib.sha256(result.data).hexdigest()
+    with _decoded(result.data) as rendered:
+        assert rendered.size == (180, 120)
+        assert not rendered.info.get("exif")
+
+
+def test_full_resolution_watermark_honors_each_corner() -> None:
+    source_image = Image.new("RGB", (200, 100), (10, 40, 180))
+    try:
+        source = _encode(source_image)
+    finally:
+        source_image.close()
+
+    top_left = render_full_resolution_watermark(
+        source,
+        _watermark(),
+        WatermarkPosition.TOP_LEFT,
+    )
+    bottom_right = render_full_resolution_watermark(
+        source,
+        _watermark(),
+        WatermarkPosition.BOTTOM_RIGHT,
+    )
+    with _decoded(top_left.data) as first, _decoded(bottom_right.data) as second:
+        difference = ImageChops.difference(first, second)
+        try:
+            assert difference.getbbox() is not None
+            assert first.getpixel((5, 5)) != second.getpixel((5, 5))
+            assert first.getpixel((194, 94)) != second.getpixel((194, 94))
+        finally:
+            difference.close()
 
 
 def _png_recipe(

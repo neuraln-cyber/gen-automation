@@ -177,7 +177,7 @@ def test_x_watermark_composer_previews_each_image_and_preserves_individual_corne
     template = DELIVERY_TEMPLATE.read_text(encoding="utf-8")
     script = SCRIPT.read_text(encoding="utf-8")
     handler = script.split("function initializeWatermarkComposers()", maxsplit=1)[1]
-    handler = handler.split("function initializeXPublishingControls()", maxsplit=1)[0]
+    handler = handler.split("function initializeBatchWatermarkTool()", maxsplit=1)[0]
 
     assert "Upload once and it stays securely available for future sets." in template
     assert "data-watermark-composer" in template

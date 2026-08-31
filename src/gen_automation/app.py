@@ -14,6 +14,9 @@ from gen_automation.api.router import api_router
 from gen_automation.api.routes.anatomy_learning_dashboard import (
     router as anatomy_learning_dashboard_router,
 )
+from gen_automation.api.routes.batch_watermark_dashboard import (
+    router as batch_watermark_dashboard_router,
+)
 from gen_automation.api.routes.browser_authentication import (
     router as browser_authentication_router,
 )
@@ -467,6 +470,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(browser_authentication_router)
     application.include_router(dashboard_router)
     application.include_router(anatomy_learning_dashboard_router)
+    application.include_router(batch_watermark_dashboard_router)
     application.include_router(delivery_dashboard_router)
     application.include_router(new_set_dashboard_router)
     application.include_router(experiment_dashboard_router)

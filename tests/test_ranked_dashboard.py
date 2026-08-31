@@ -649,7 +649,7 @@ def test_ranked_dashboard_orders_assets_and_uses_stable_private_routes(
     assert "default-src &#39;none&#39;" not in detail.text
     assert "no-store" in detail.headers["cache-control"]
     assert "script-src 'self'" in detail.headers["content-security-policy"]
-    assert "img-src 'self' https: http:" in detail.headers["content-security-policy"]
+    assert "img-src 'self' https: blob: http:" in detail.headers["content-security-policy"]
 
     assert store.calls == []
     for asset_id, digest_character in (

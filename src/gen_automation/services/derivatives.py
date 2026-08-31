@@ -448,6 +448,18 @@ class VerifiedWatermark:
 
 
 @dataclass(frozen=True, slots=True)
+class FullResolutionWatermarkedImage:
+    data: bytes
+    sha256: str
+    byte_size: int
+    image_format: str
+    content_type: str
+    extension: str
+    width: int
+    height: int
+
+
+@dataclass(frozen=True, slots=True)
 class _SourceMetadata:
     sha256: str
     byte_size: int
@@ -498,6 +510,84 @@ def verify_watermark_png(
         )
     finally:
         watermark.close()
+
+
+def render_full_resolution_watermark(
+    raw_master: ImageBytes,
+    watermark_png: ImageBytes,
+    position: WatermarkPosition | str,
+    *,
+    limits: DerivativeSafetyLimits | None = None,
+) -> FullResolutionWatermarkedImage:
+    """Apply the X watermark geometry without resizing the source image.
+
+    Production callers must invoke this synchronous renderer through a one-shot
+    process boundary because both image inputs are untrusted.
+    """
+
+    selected_limits = limits or BATCH_WATERMARK_DERIVATIVE_LIMITS
+    if not isinstance(selected_limits, DerivativeSafetyLimits):
+        raise DerivativeRecipeError("derivative safety limits are invalid")
+    try:
+        normalized_position = WatermarkPosition(position)
+    except ValueError:
+        raise DerivativeRecipeError("watermark position is invalid") from None
+    master_payload = _bounded_bytes(
+        raw_master,
+        maximum=selected_limits.max_master_bytes,
+        label="raw master",
+    )
+    watermark_payload = _bounded_bytes(
+        watermark_png,
+        maximum=selected_limits.max_watermark_bytes,
+        label="watermark",
+    )
+    recipe = DerivativeRecipe(
+        version="batch-watermark-v1",
+        full=FullDerivativeSpec(
+            output_filename="watermarked.jpg",
+            max_width=selected_limits.max_output_width,
+            max_height=selected_limits.max_output_height,
+        ),
+        watermark=WatermarkSpec(position=normalized_position),
+    )
+    _validate_recipe_against_limits(recipe, selected_limits)
+    normalized, source = _decode_master(
+        master_payload,
+        recipe,
+        selected_limits,
+        watermark_byte_size=len(watermark_payload),
+    )
+    watermark = _decode_watermark(watermark_payload, selected_limits)
+    try:
+        rendered = _apply_watermark(
+            normalized,
+            watermark=watermark,
+            spec=recipe.watermark,
+            renderer_version=DERIVATIVE_RENDERER_VERSION,
+        )
+    finally:
+        normalized.close()
+        watermark.close()
+    try:
+        _assert_output_geometry(rendered.size, selected_limits)
+        encoded, output_format, content_type, extension = _encode_batch_watermark(
+            rendered,
+            source_format=source.image_format,
+            maximum_bytes=selected_limits.max_output_bytes,
+        )
+        return FullResolutionWatermarkedImage(
+            data=encoded,
+            sha256=hashlib.sha256(encoded).hexdigest(),
+            byte_size=len(encoded),
+            image_format=output_format,
+            content_type=content_type,
+            extension=extension,
+            width=rendered.width,
+            height=rendered.height,
+        )
+    finally:
+        rendered.close()
 
 
 def estimate_derivative_peak_working_set_bytes(
@@ -1533,6 +1623,53 @@ def _try_encode_image(
         output.close()
 
 
+def _encode_batch_watermark(
+    image: Image.Image,
+    *,
+    source_format: str,
+    maximum_bytes: int,
+) -> tuple[bytes, str, str, str]:
+    if source_format == "PNG":
+        return (
+            _encode_image(image, PngEncoding(compress_level=9), maximum_bytes=maximum_bytes),
+            "PNG",
+            "image/png",
+            "png",
+        )
+    if source_format == "JPEG":
+        return (
+            _encode_image(image, JpegEncoding(quality=95), maximum_bytes=maximum_bytes),
+            "JPEG",
+            "image/jpeg",
+            "jpg",
+        )
+    if source_format != "WEBP":
+        raise DerivativeRenderError("watermarked image format is unsupported")
+
+    clean = Image.new("RGB", image.size)
+    clean.paste(image)
+    output = _BoundedOutput(maximum_bytes)
+    try:
+        clean.save(
+            output,
+            format="WEBP",
+            quality=95,
+            method=6,
+            exif=b"",
+            icc_profile=None,
+        )
+        return output.getvalue(), "WEBP", "image/webp", "webp"
+    except _OutputLimitExceededError:
+        raise DerivativeRenderError(
+            "encoded watermarked image exceeds the output byte limit"
+        ) from None
+    except (MemoryError, OSError, OverflowError, ValueError):
+        raise DerivativeRenderError("watermarked image encoding failed") from None
+    finally:
+        clean.close()
+        output.close()
+
+
 def _region_pixels(
     region: RelativeRegion,
     size: tuple[int, int],
@@ -1691,3 +1828,7 @@ def _strict_int(
 
 
 DEFAULT_DERIVATIVE_LIMITS = DerivativeSafetyLimits()
+BATCH_WATERMARK_DERIVATIVE_LIMITS = DerivativeSafetyLimits(
+    max_output_bytes=64 * 1024 * 1024,
+    max_full_output_bytes=64 * 1024 * 1024,
+)
