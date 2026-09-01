@@ -207,6 +207,10 @@ def test_loopback_nginx_request_guards_and_assertions_are_enforced() -> None:
     assert "location = /login" in nginx
     assert "location ^~ /api/v1/auth/" in nginx
     assert "client_max_body_size 8m" in nginx
+    assert "location = /dashboard/watermarking:download" in nginx
+    assert "client_max_body_size 2g" in nginx
+    assert "client_body_timeout 30m" in nginx
+    assert "proxy_request_buffering off" in nginx
     for temporary_path in ("fastcgi", "proxy", "scgi", "uwsgi"):
         assert f"{temporary_path}_temp_path /tmp/{temporary_path}" in nginx
     assert "large_client_header_buffers 4 8k" in nginx
@@ -218,7 +222,7 @@ def test_loopback_nginx_request_guards_and_assertions_are_enforced() -> None:
     ):
         assert timeout in nginx
     assert "max_header_size 32KB" in caddyfile
-    for timeout in ("read_header 10s", "read_body 30s", "write 60s", "idle 2m"):
+    for timeout in ("read_header 10s", "read_body 30m", "write 30m", "idle 2m"):
         assert timeout in caddyfile
     for header in (
         "Forwarded",

@@ -1,6 +1,7 @@
 import json
 import re
 from io import BytesIO
+from pathlib import Path
 from uuid import uuid4
 from zipfile import ZipFile
 
@@ -10,6 +11,8 @@ from PIL import Image, ImageDraw
 from gen_automation.api.routes import batch_watermark_dashboard as batch_routes
 from gen_automation.services.watermarks import RegisteredWatermarkPayload
 from gen_automation.storage.memory import MemoryObjectStore
+
+DASHBOARD_SCRIPT = Path(__file__).parents[1] / "src" / "gen_automation" / "static" / "dashboard.js"
 
 
 def _png(color: tuple[int, int, int], size: tuple[int, int]) -> bytes:
@@ -89,6 +92,7 @@ def test_original_only_zip_keeps_exact_uploaded_bytes(client: TestClient) -> Non
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/zip"
+    assert response.headers["x-accel-buffering"] == "no"
     with ZipFile(BytesIO(response.content)) as archive:
         assert archive.namelist() == [
             "originals/001-first-image.png",
@@ -157,3 +161,31 @@ def test_batch_rejects_missing_per_image_placement(client: TestClient) -> None:
 
     assert response.status_code == 422
     assert response.json() == {"detail": "Choose a watermark corner for every image."}
+
+
+def test_batch_download_uses_native_streaming_instead_of_buffering_a_blob() -> None:
+    script = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
+    start = script.index("const downloadBatch = (archiveKind) =>")
+    end = script.index("fileInput.addEventListener", start)
+    download = script[start:end]
+
+    assert "form.requestSubmit()" in download
+    assert "response.blob()" not in download
+    assert "new FormData()" not in download
+
+
+def test_streaming_zip_buffer_drains_entries_before_archive_closes() -> None:
+    sink = batch_routes._StreamingZipBuffer()
+    with ZipFile(sink, mode="w") as archive:
+        archive.writestr("first.txt", b"first")
+        first_chunk = sink.take()
+        archive.writestr("second.txt", b"second")
+        second_chunk = sink.take()
+    final_chunk = sink.take()
+    sink.close()
+
+    assert first_chunk.startswith(b"PK\x03\x04")
+    assert second_chunk.startswith(b"PK\x03\x04")
+    with ZipFile(BytesIO(first_chunk + second_chunk + final_chunk)) as archive:
+        assert archive.read("first.txt") == b"first"
+        assert archive.read("second.txt") == b"second"

@@ -1631,7 +1631,7 @@ def _encode_batch_watermark(
 ) -> tuple[bytes, str, str, str]:
     if source_format == "PNG":
         return (
-            _encode_image(image, PngEncoding(compress_level=9), maximum_bytes=maximum_bytes),
+            _encode_image(image, PngEncoding(compress_level=3), maximum_bytes=maximum_bytes),
             "PNG",
             "image/png",
             "png",

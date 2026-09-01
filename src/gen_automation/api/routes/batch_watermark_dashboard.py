@@ -5,15 +5,15 @@ from __future__ import annotations
 import hmac
 import json
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Buffer
 from datetime import UTC, datetime
+from io import RawIOBase
 from pathlib import Path, PurePath
-from tempfile import SpooledTemporaryFile
 from typing import Annotated, cast
 from uuid import UUID
 from zipfile import ZIP_STORED, ZipFile
 
-from anyio import fail_after, to_process, to_thread
+from anyio import fail_after, to_process
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
@@ -57,8 +57,6 @@ Session = Annotated[AsyncSession, Depends(get_session)]
 MAX_BATCH_FILES = 300
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_BATCH_BODY_BYTES = 2 * 1024 * 1024 * 1024
-_ARCHIVE_SPOOL_BYTES = 64 * 1024 * 1024
-_STREAM_CHUNK_BYTES = 1024 * 1024
 _SAFE_STEM = re.compile(r"[^A-Za-z0-9._-]+")
 _ARCHIVE_KINDS = frozenset({"both", "watermarked", "originals"})
 _FORM_FIELDS = frozenset(
@@ -194,7 +192,6 @@ async def dashboard_batch_watermark_download(
     principal: PublicationReader,
 ) -> Response:
     form: FormData | None = None
-    archive: SpooledTemporaryFile[bytes] | None = None
     try:
         (
             form,
@@ -238,70 +235,26 @@ async def dashboard_batch_watermark_download(
                 ) from None
             watermark_png = watermark.data
 
-        archive = SpooledTemporaryFile(max_size=_ARCHIVE_SPOOL_BYTES, mode="w+b")
-        total_image_bytes = 0
-        with ZipFile(archive, mode="w", compression=ZIP_STORED, allowZip64=True) as bundle:
-            for index, upload in enumerate(uploads, start=1):
-                source = await upload.read(MAX_IMAGE_BYTES + 1)
-                if not source:
-                    raise _BatchFormError(
-                        status.HTTP_422_UNPROCESSABLE_CONTENT,
-                        f"Image {index} is empty.",
-                    )
-                if len(source) > MAX_IMAGE_BYTES:
-                    raise _BatchFormError(
-                        status.HTTP_413_CONTENT_TOO_LARGE,
-                        f"Image {index} exceeds 32 MiB.",
-                    )
-                total_image_bytes += len(source)
-                if total_image_bytes > MAX_BATCH_BODY_BYTES:
-                    raise _BatchFormError(
-                        status.HTTP_413_CONTENT_TOO_LARGE,
-                        "The selected batch is too large.",
-                    )
-
-                if archive_kind == "originals":
-                    verified = await _verify_image(source)
-                    original_extension = verified.extension
-                else:
-                    assert watermark_png is not None
-                    rendered = await _render_watermarked(
-                        source,
-                        watermark_png,
-                        placements[index - 1],
-                    )
-                    original_extension = _source_extension(source, rendered)
-                    watermarked_name = _archive_name(
-                        index,
-                        upload.filename,
-                        rendered.extension,
-                        watermarked=True,
-                    )
-                    bundle.writestr(f"watermarked/{watermarked_name}", rendered.data)
-
-                if archive_kind != "watermarked":
-                    original_name = _archive_name(
-                        index,
-                        upload.filename,
-                        original_extension,
-                        watermarked=False,
-                    )
-                    bundle.writestr(f"originals/{original_name}", source)
-
-        archive.seek(0)
         timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         response = StreamingResponse(
-            _stream_archive(archive),
+            _stream_batch_archive(
+                form,
+                uploads,
+                watermark_png=watermark_png,
+                placements=placements,
+                archive_kind=archive_kind,
+            ),
             media_type="application/zip",
             headers={
                 "Content-Disposition": f'attachment; filename="watermark-batch-{timestamp}.zip"',
                 "X-Content-Type-Options": "nosniff",
+                "X-Accel-Buffering": "no",
                 "Cross-Origin-Resource-Policy": "same-origin",
                 "Referrer-Policy": "no-referrer",
                 "Vary": "Cookie",
             },
         )
-        archive = None
+        form = None
         return _secure(request, response)
     except _BatchFormError as error:
         return _json_error(request, error.status_code, error.message)
@@ -321,8 +274,6 @@ async def dashboard_batch_watermark_download(
             "An image took too long to watermark. Try a smaller batch.",
         )
     finally:
-        if archive is not None:
-            archive.close()
         if form is not None:
             await form.close()
 
@@ -377,6 +328,22 @@ async def _read_batch_form(
         ):
             raise _BatchFormError(status.HTTP_400_BAD_REQUEST, "The upload form is invalid.")
         typed_uploads = cast(tuple[UploadFile, ...], uploads)
+        declared_sizes = tuple(item.size for item in typed_uploads)
+        if any(size is not None and size <= 0 for size in declared_sizes):
+            raise _BatchFormError(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "One of the selected images is empty.",
+            )
+        if any(size is not None and size > MAX_IMAGE_BYTES for size in declared_sizes):
+            raise _BatchFormError(
+                status.HTTP_413_CONTENT_TOO_LARGE,
+                "One of the selected images exceeds 32 MiB.",
+            )
+        if sum(size or 0 for size in declared_sizes) > MAX_BATCH_BODY_BYTES:
+            raise _BatchFormError(
+                status.HTTP_413_CONTENT_TOO_LARGE,
+                "The selected batch is too large.",
+            )
         csrf_token = _form_text(form.get("csrf_token"), 200, "CSRF token")
         archive_kind = _form_text(form.get("archive_kind"), 20, "archive kind")
         if archive_kind not in _ARCHIVE_KINDS:
@@ -504,12 +471,101 @@ def _archive_name(
     return f"{index:03d}-{stem}{suffix}.{extension}"
 
 
-async def _stream_archive(archive: SpooledTemporaryFile[bytes]) -> AsyncIterator[bytes]:
+class _StreamingZipBuffer(RawIOBase):
+    """Unseekable ZIP sink whose completed bytes can be drained incrementally."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._buffer = bytearray()
+        self._position = 0
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
+
+    def write(self, data: Buffer) -> int:
+        chunk = bytes(data)
+        self._buffer.extend(chunk)
+        self._position += len(chunk)
+        return len(chunk)
+
+    def tell(self) -> int:
+        return self._position
+
+    def take(self) -> bytes:
+        chunk = bytes(self._buffer)
+        self._buffer.clear()
+        return chunk
+
+
+async def _stream_batch_archive(
+    form: FormData,
+    uploads: tuple[UploadFile, ...],
+    *,
+    watermark_png: bytes | None,
+    placements: tuple[str, ...],
+    archive_kind: str,
+) -> AsyncIterator[bytes]:
+    sink = _StreamingZipBuffer()
+    total_image_bytes = 0
     try:
-        while chunk := await to_thread.run_sync(archive.read, _STREAM_CHUNK_BYTES):
+        with ZipFile(sink, mode="w", compression=ZIP_STORED, allowZip64=True) as bundle:
+            for index, upload in enumerate(uploads, start=1):
+                source = await upload.read(MAX_IMAGE_BYTES + 1)
+                if not source:
+                    raise _BatchFormError(
+                        status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        f"Image {index} is empty.",
+                    )
+                if len(source) > MAX_IMAGE_BYTES:
+                    raise _BatchFormError(
+                        status.HTTP_413_CONTENT_TOO_LARGE,
+                        f"Image {index} exceeds 32 MiB.",
+                    )
+                total_image_bytes += len(source)
+                if total_image_bytes > MAX_BATCH_BODY_BYTES:
+                    raise _BatchFormError(
+                        status.HTTP_413_CONTENT_TOO_LARGE,
+                        "The selected batch is too large.",
+                    )
+
+                if archive_kind == "originals":
+                    verified = await _verify_image(source)
+                    original_extension = verified.extension
+                else:
+                    assert watermark_png is not None
+                    rendered = await _render_watermarked(
+                        source,
+                        watermark_png,
+                        placements[index - 1],
+                    )
+                    original_extension = _source_extension(source, rendered)
+                    watermarked_name = _archive_name(
+                        index,
+                        upload.filename,
+                        rendered.extension,
+                        watermarked=True,
+                    )
+                    bundle.writestr(f"watermarked/{watermarked_name}", rendered.data)
+
+                if archive_kind != "watermarked":
+                    original_name = _archive_name(
+                        index,
+                        upload.filename,
+                        original_extension,
+                        watermarked=False,
+                    )
+                    bundle.writestr(f"originals/{original_name}", source)
+
+                if chunk := sink.take():
+                    yield chunk
+        if chunk := sink.take():
             yield chunk
     finally:
-        archive.close()
+        sink.close()
+        await form.close()
 
 
 async def _verified_mutation_owner(
