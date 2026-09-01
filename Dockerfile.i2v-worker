@@ -22,19 +22,19 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-ADD --checksum=sha256:012096056b97abf1f68c46b7146bd2cbd68c1be762340b4f5dad4fbbe99177bc \
+ADD --checksum=sha256:4747b2d6a8336f52343bceb8a1ebf41a9e6e665b9d2e3f989972de53a310599e \
     --chmod=0444 \
-    https://conda.anaconda.org/conda-forge/linux-64/openssl-3.6.3-h35e630c_1.conda \
-    /tmp/openssl-3.6.3-h35e630c_1.conda
+    https://conda.anaconda.org/conda-forge/linux-64/openssl-3.6.4-h781a0a9_0.conda \
+    /tmp/openssl-3.6.4-h781a0a9_0.conda
 
 RUN /opt/conda/bin/conda install \
         --yes \
         --offline \
         --no-deps \
-        /tmp/openssl-3.6.3-h35e630c_1.conda \
-    && test "$(/opt/conda/bin/openssl version | awk '{print $2}')" = "3.6.3" \
+        /tmp/openssl-3.6.4-h781a0a9_0.conda \
+    && test "$(/opt/conda/bin/openssl version | awk '{print $2}')" = "3.6.4" \
     && /opt/conda/bin/conda clean --all --yes \
-    && rm -f /tmp/openssl-3.6.3-h35e630c_1.conda
+    && rm -f /tmp/openssl-3.6.4-h781a0a9_0.conda
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
