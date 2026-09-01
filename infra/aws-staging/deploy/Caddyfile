@@ -5,8 +5,8 @@
 		protocols h1 h2
 		timeouts {
 			read_header 10s
-			read_body 30s
-			write 60s
+			read_body 30m
+			write 30m
 			idle 2m
 		}
 		max_header_size 32KB

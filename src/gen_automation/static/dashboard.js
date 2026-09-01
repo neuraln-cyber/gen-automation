@@ -8625,8 +8625,6 @@
     const setBusy = (value) => {
       busy = value;
       form.setAttribute("aria-busy", String(value));
-      fileInput.disabled = value;
-      assetSelect.disabled = value;
       applyAll.disabled = value;
       form.querySelectorAll("[data-batch-watermark-corner]").forEach((input) => {
         if (input instanceof HTMLInputElement) input.disabled = value;
@@ -8924,7 +8922,7 @@
       setDownloadStatus("Review the placements, then choose a download.");
     };
 
-    const downloadBatch = async (archiveKind) => {
+    const downloadBatch = (archiveKind) => {
       if (busy || !entries.length) return;
       if (archiveKind !== "originals" && !assetSelect.value) {
         assetSelect.focus();
@@ -8935,55 +8933,16 @@
       updatePlacementPayload();
       const csrfField = form.querySelector('input[name="csrf_token"]');
       if (!(csrfField instanceof HTMLInputElement)) return;
-      const payload = new FormData();
-      payload.append("csrf_token", csrfField.value);
-      payload.append("watermark_asset_id", assetSelect.value);
-      payload.append("watermark_placements", placementsField.value);
-      payload.append("archive_kind", archiveKind);
-      entries.forEach((entry) => payload.append("images", entry.file, entry.file.name));
       setBusy(true);
       setDownloadStatus(
-        `Preparing ${entries.length.toLocaleString()} images at full resolution… keep this page open.`,
+        `Starting a streamed ZIP for ${entries.length.toLocaleString()} images…`,
       );
-      try {
-        const response = await fetch(form.action, {
-          method: "POST",
-          credentials: "same-origin",
-          headers: { "X-CSRF-Token": csrfField.value },
-          body: payload,
-        });
-        if (!response.ok) {
-          let message = "The batch could not be exported.";
-          try {
-            const error = await response.json();
-            if (typeof error.detail === "string" && error.detail) message = error.detail;
-          } catch (_error) {
-            // Preserve the safe fallback when an intermediary returns a non-JSON error.
-          }
-          throw new Error(message);
-        }
-        const blob = await response.blob();
-        const disposition = response.headers.get("Content-Disposition") || "";
-        const filenameMatch = /filename="?([^";]+)"?/i.exec(disposition);
-        const filename = filenameMatch?.[1] || "watermark-batch.zip";
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = filename;
-        document.body.append(link);
-        link.click();
-        link.remove();
-        window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-        setDownloadStatus("ZIP ready. Your browser download has started.", "good");
-      } catch (error) {
-        setDownloadStatus(
-          error instanceof Error ? error.message : "The batch could not be exported.",
-          "danger",
-        );
-      } finally {
+      form.requestSubmit();
+      window.setTimeout(() => {
         setBusy(false);
         showSlide(currentIndex);
-      }
+        setDownloadStatus("Download started. Progress is shown by your browser.", "good");
+      }, 1500);
     };
 
     fileInput.addEventListener("change", loadFiles);
