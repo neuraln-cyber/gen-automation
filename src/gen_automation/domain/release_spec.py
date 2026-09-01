@@ -33,6 +33,7 @@ from gen_automation.domain.generation_limits import (
     signed_worker_prompt_budget_bytes,
     utf8_prompt_bytes,
 )
+from gen_automation.domain.lora_limits import MAX_GENERATION_LORAS
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 Slug = Annotated[
@@ -294,7 +295,10 @@ class ReleaseSpecification(StrictModel):
     )
     subjects: list[SubjectSpecification] = Field(min_length=1, max_length=20)
     checkpoint: ArtifactSpecification
-    loras: list[LoraSpecification] = Field(default_factory=list, max_length=8)
+    loras: list[LoraSpecification] = Field(
+        default_factory=list,
+        max_length=MAX_GENERATION_LORAS,
+    )
     workflow: WorkflowSpecification
     generation: GenerationParameters
     planned_job_count: int = Field(ge=1, le=10000)

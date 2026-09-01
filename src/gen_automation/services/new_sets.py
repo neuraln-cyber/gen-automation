@@ -61,6 +61,10 @@ from gen_automation.domain.generation_limits import (
     MAX_OUTPUTS_PER_GENERATION_JOB,
     effective_outputs_per_generation_job,
 )
+from gen_automation.domain.lora_limits import (
+    MAX_GENERATION_LORAS,
+    max_loras_for_model_family,
+)
 from gen_automation.domain.release_spec import (
     ArtifactSpecification,
     GenerationBatchSpecification,
@@ -209,7 +213,10 @@ class NewSetSubmission(BaseModel):
     duo_isolation_mode: DuoIsolationMode = DuoIsolationMode.BALANCED
     duo_quality_mode: DuoQualityMode = DuoQualityMode.STANDARD
     checkpoint_approval_id: UUID
-    loras: tuple[NewSetLoraSelection, ...] = Field(default=(), max_length=8)
+    loras: tuple[NewSetLoraSelection, ...] = Field(
+        default=(),
+        max_length=MAX_GENERATION_LORAS,
+    )
     workflow_approval_id: UUID
     prompt: str = Field(default="", max_length=20_000)
     negative_prompt: str = Field(default="", max_length=20_000)
@@ -764,6 +771,11 @@ async def create_and_approve_new_set(
         lora.model_family != model_family for lora in lora_rows
     ):
         raise NewSetInputError("checkpoint, workflow, and LoRAs must use the same model family")
+    maximum_loras = max_loras_for_model_family(model_family)
+    if len(lora_rows) > maximum_loras:
+        raise NewSetInputError(
+            f"{model_family.value.title()} generation supports at most {maximum_loras} LoRAs"
+        )
     workflow_capabilities = effective_workflow_capabilities(
         workflow.capabilities or (),
         reviewed_node_classes=workflow.reviewed_node_classes,

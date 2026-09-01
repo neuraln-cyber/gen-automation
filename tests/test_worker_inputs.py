@@ -1144,15 +1144,16 @@ async def test_legacy_oversized_exact_envelope_rolls_back_all_upload_intents(
     assert asset_count == 0
 
 
-@pytest.mark.asyncio
-async def test_runtime_expands_eight_ordered_loras(
-    worker_input_context: WorkerInputContext,
-) -> None:
-    parameters = dict(worker_input_context.job_context.parameters)
+def _many_lora_context(
+    context: WorkerInputContext,
+    *,
+    count: int,
+) -> WorkerInputContext:
+    parameters = dict(context.job_context.parameters)
     lora_parameters: list[dict[str, object]] = []
     lora_artifacts: list[ModelArtifactSpec] = []
-    for index in range(1, 9):
-        digest = f"{index:x}" * 64
+    for index in range(1, count + 1):
+        digest = f"{index:064x}"
         storage_key = f"loras/style-{index}.safetensors"
         target_filename = f"style-{index}-runtime.safetensors"
         lora_parameters.append(
@@ -1181,29 +1182,60 @@ async def test_runtime_expands_eight_ordered_loras(
     parameters["loras"] = lora_parameters
     job_context = SaladJobInputContext(
         **{
-            **worker_input_context.job_context.__dict__,
+            **context.job_context.__dict__,
             "parameters": parameters,
             "parameters_sha256": canonical_sha256(parameters),
         }
     )
-    checkpoint = worker_input_context.artifact_manifest.artifacts[0]
-    artifacts = (checkpoint, *lora_artifacts)
-    manifest = ArtifactManifest(
-        version="v1",
-        artifacts=artifacts,
-        manifest_sha256=calculate_manifest_sha256(artifacts),
+    runtime_artifacts = tuple(
+        artifact
+        for artifact in context.artifact_manifest.artifacts
+        if artifact.kind != ArtifactKind.LORA
     )
-    context = replace(
-        worker_input_context,
+    artifacts = (*runtime_artifacts, *lora_artifacts)
+    manifest = create_artifact_manifest(artifacts)
+    return replace(
+        context,
         job_context=job_context,
         artifact_manifest=manifest,
     )
 
+
+@pytest.mark.asyncio
+async def test_runtime_expands_eight_ordered_loras(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _many_lora_context(worker_input_context, count=8)
     envelope = GenerateEnvelope.model_validate(await _build(context), strict=True)
     workflow = envelope.payload.workflow
     assert all(f"2-lora-{index}" in workflow for index in range(1, 9))
     assert workflow["9"]["inputs"]["model"] == ["2-lora-8", 0]
     assert workflow["3"]["inputs"]["clip"] == ["2-lora-8", 1]
+
+
+@pytest.mark.asyncio
+async def test_anima_runtime_expands_sixteen_ordered_loras(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    anima_context = _anima_context(worker_input_context)
+    context = _many_lora_context(anima_context, count=16)
+
+    envelope = GenerateEnvelope.model_validate(await _build(context), strict=True)
+    workflow = envelope.payload.workflow
+    assert all(f"2-lora-{index}" in workflow for index in range(1, 17))
+    assert workflow["2-lora-16"]["class_type"] == "LoraLoaderModelOnly"
+    assert workflow["2-lora-16"]["inputs"]["model"] == ["2-lora-15", 0]
+    assert workflow["8"]["inputs"]["model"] == ["2-lora-16", 0]
+
+
+@pytest.mark.asyncio
+async def test_illustrious_runtime_rejects_more_than_eight_loras(
+    worker_input_context: WorkerInputContext,
+) -> None:
+    context = _many_lora_context(worker_input_context, count=9)
+
+    with pytest.raises(WorkerInputError, match="at most 8 LoRAs"):
+        await _build(context)
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,7 @@ from gen_automation.db.models import Asset, GenerationJob, ReleaseVersion, Workf
 from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import AssetKind, AssetState
 from gen_automation.domain.generation_limits import MAX_OUTPUTS_PER_GENERATION_JOB
+from gen_automation.domain.lora_limits import MAX_GENERATION_LORAS
 from gen_automation.domain.release_spec import (
     ArtifactSpecification,
     GenerationParameters,
@@ -335,7 +336,7 @@ class _GenerationJobParametersV2(_FrozenModel):
     ordinal: int = Field(ge=0)
     subjects: list[_SubjectSnapshot] = Field(min_length=1, max_length=20)
     checkpoint: ArtifactSpecification
-    loras: list[LoraSpecification] = Field(max_length=8)
+    loras: list[LoraSpecification] = Field(max_length=MAX_GENERATION_LORAS)
     workflow: WorkflowSpecification
     generation: GenerationParameters
     prompt_resolution: _PromptResolution

@@ -8,6 +8,7 @@ from uuid import UUID
 from fastapi import Request, status
 from pydantic import ValidationError
 
+from gen_automation.domain.lora_limits import MAX_GENERATION_LORAS
 from gen_automation.services.experiments import (
     ExperimentSubmission,
     ExperimentVariantSubmission,
@@ -71,7 +72,11 @@ _EDITOR_FIELDS = frozenset(
         "detailer_bbox_dilation",
         "detailer_bbox_crop_factor",
         "detailer_feather",
-        *(f"lora_{slot}_{suffix}" for slot in range(1, 9) for suffix in ("id", "weight")),
+        *(
+            f"lora_{slot}_{suffix}"
+            for slot in range(1, MAX_GENERATION_LORAS + 1)
+            for suffix in ("id", "weight")
+        ),
     }
 )
 _LEGACY_VARIANT_KEYS = frozenset(
@@ -284,7 +289,7 @@ def _decode_variant_plan(
         }:
             raise _unprocessable(f"Variant {index + 1} has invalid fields.")
         loras_value = item["loras"]
-        if not isinstance(loras_value, list) or len(loras_value) > 8:
+        if not isinstance(loras_value, list) or len(loras_value) > MAX_GENERATION_LORAS:
             raise _unprocessable(f"Variant {index + 1} has an invalid LoRA stack.")
         loras: list[NewSetLoraSelection] = []
         for lora_index, lora in enumerate(loras_value):

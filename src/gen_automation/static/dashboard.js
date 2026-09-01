@@ -1030,10 +1030,22 @@
     const summary = document.querySelector("[data-lora-summary]");
     const feedback = picker.querySelector("[data-lora-feedback]");
     const clearButton = picker.querySelector("[data-lora-clear]");
-    const maximum = Math.min(
-      nativeSlots.length,
-      Math.max(1, integerValue(picker.dataset.maxSelections, nativeSlots.length)),
-    );
+    const maximumForCurrentFamily = () => {
+      const familyLimit = form.dataset.modelFamily === "anima"
+        ? picker.dataset.maxSelectionsAnima
+        : picker.dataset.maxSelectionsIllustrious;
+      return Math.min(
+        nativeSlots.length,
+        Math.max(
+          1,
+          integerValue(
+            familyLimit,
+            integerValue(picker.dataset.maxSelections, nativeSlots.length),
+          ),
+        ),
+      );
+    };
+    let maximum = maximumForCurrentFamily();
     const optionById = new Map(
       catalogOptions.map((button) => [button.dataset.loraId, button]),
     );
@@ -1308,6 +1320,7 @@
 
     form.addEventListener("gen-automation:model-family-changed", (event) => {
       const family = event.detail?.modelFamily || "";
+      maximum = maximumForCurrentFamily();
       const kept = selections.filter((selection) => (
         optionById.get(selection.id)?.dataset.modelFamily === family
       ));
