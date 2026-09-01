@@ -121,6 +121,47 @@ async def _seed_anima_approvals(
     return checkpoint, lora, workflow
 
 
+async def _seed_lora_stack(
+    session: AsyncSession,
+    *,
+    owner: AdminUser,
+    model_family: GenerationModelFamily,
+    count: int,
+    prefix: str,
+) -> tuple[ModelArtifactApproval, ...]:
+    now = datetime.now(UTC)
+    approvals: list[ModelArtifactApproval] = []
+    for index in range(1, count + 1):
+        evidence = {"review": f"{prefix} LoRA {index} approval"}
+        approvals.append(
+            ModelArtifactApproval(
+                artifact_sha256=canonical_sha256(
+                    {"family": model_family.value, "prefix": prefix, "index": index}
+                ),
+                name=f"{prefix} LoRA {index}",
+                kind=ModelArtifactKind.LORA,
+                model_family=model_family,
+                source_url=f"https://models.example.test/{prefix.lower()}-{index}",
+                storage_key=f"models/{prefix.lower()}-{index}.safetensors",
+                license_url=f"https://models.example.test/{prefix.lower()}-{index}/license",
+                commercial_use_approved=model_family == GenerationModelFamily.ILLUSTRIOUS,
+                experiment_only=model_family == GenerationModelFamily.ANIMA,
+                adult_use_approved=True,
+                safetensors_verified=True,
+                evidence=evidence,
+                evidence_sha256=canonical_sha256(evidence),
+                status=ApprovalStatus.APPROVED,
+                is_current=True,
+                approval_version=1,
+                approved_by_user_id=owner.id,
+                approved_at=now,
+            )
+        )
+    session.add_all(approvals)
+    await session.commit()
+    return tuple(approvals)
+
+
 def _selected_option_value(page: str, select_name: str) -> str:
     select_match = re.search(
         rf'<select\b[^>]*\bname="{re.escape(select_name)}"[^>]*>(.*?)</select>',
@@ -304,6 +345,94 @@ async def test_all_model_families_are_available_in_new_set(tmp_path: Path) -> No
         await database.dispose()
 
 
+@pytest.mark.asyncio
+async def test_new_set_enforces_family_specific_lora_limits(tmp_path: Path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'lora-limits.db').as_posix()}")
+    await database.create_schema()
+    try:
+        async with database.sessions() as session:
+            owner = await seed_release_approvals(session, valid_release_payload())
+            anima_checkpoint, _, anima_workflow = await _seed_anima_approvals(
+                session,
+                owner=owner,
+            )
+            anima_loras = await _seed_lora_stack(
+                session,
+                owner=owner,
+                model_family=GenerationModelFamily.ANIMA,
+                count=16,
+                prefix="AnimaStack",
+            )
+            illustrious_loras = await _seed_lora_stack(
+                session,
+                owner=owner,
+                model_family=GenerationModelFamily.ILLUSTRIOUS,
+                count=9,
+                prefix="IllustriousStack",
+            )
+            options = await list_new_set_options(session, experiment_mode=True)
+
+        illustrious_checkpoint = next(
+            option
+            for option in options.checkpoints
+            if option.model_family == GenerationModelFamily.ILLUSTRIOUS
+        )
+        illustrious_workflow = next(
+            option
+            for option in options.workflows
+            if option.model_family == GenerationModelFamily.ILLUSTRIOUS
+        )
+        subject_id = options.subjects[0].approval_id
+        anima_command = _command(
+            subject_id=subject_id,
+            checkpoint_id=anima_checkpoint.id,
+            workflow_id=anima_workflow.id,
+            slug="anima-sixteen-loras",
+        ).model_copy(
+            update={
+                "loras": tuple(
+                    NewSetLoraSelection(approval_id=lora.id, weight=0.5) for lora in anima_loras
+                )
+            }
+        )
+        async with database.sessions() as session:
+            result = await create_and_approve_new_set(
+                session,
+                command=anima_command,
+                idempotency_key="anima-sixteen-loras",
+                settings=Settings(),
+                actor="fixture-owner",
+                experiment_mode=True,
+            )
+        assert result.release.slug == "anima-sixteen-loras"
+
+        illustrious_command = _command(
+            subject_id=subject_id,
+            checkpoint_id=illustrious_checkpoint.approval_id,
+            workflow_id=illustrious_workflow.approval_id,
+            slug="illustrious-nine-loras",
+        ).model_copy(
+            update={
+                "loras": tuple(
+                    NewSetLoraSelection(approval_id=lora.id, weight=0.5)
+                    for lora in illustrious_loras
+                )
+            }
+        )
+        async with database.sessions() as session:
+            with pytest.raises(NewSetInputError, match=r"Illustrious.*at most 8 LoRAs"):
+                await create_and_approve_new_set(
+                    session,
+                    command=illustrious_command,
+                    idempotency_key="illustrious-nine-loras",
+                    settings=Settings(),
+                    actor="fixture-owner",
+                    experiment_mode=True,
+                )
+    finally:
+        await database.dispose()
+
+
 def test_shared_new_set_page_exposes_anima_in_normal_and_experiment_modes(
     client: TestClient,
 ) -> None:
@@ -334,6 +463,8 @@ def test_shared_new_set_page_exposes_anima_in_normal_and_experiment_modes(
     assert "explicit warm-session controls" in experiment.text
     assert "initializeModelFamilyPicker" in script.text
     assert "gen-automation:model-family-changed" in script.text
+    assert "picker.dataset.maxSelectionsAnima" in script.text
+    assert "picker.dataset.maxSelectionsIllustrious" in script.text
     assert 'width: "896"' in script.text
     assert 'height: "1152"' in script.text
     assert 'cfg: "4.5"' in script.text

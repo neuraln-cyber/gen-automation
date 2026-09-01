@@ -853,7 +853,7 @@ def test_browser_new_set_accepts_the_optional_batch_plan_json_field(
             ]
         ),
     }
-    for slot in range(1, 9):
+    for slot in range(1, 17):
         form[f"lora_{slot}_id"] = ""
         form[f"lora_{slot}_weight"] = ""
 

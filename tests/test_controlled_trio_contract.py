@@ -418,7 +418,7 @@ async def test_browser_form_parses_controlled_trio_fields() -> None:
         "detailer_feather": "4",
         "planned_job_count": "1",
         "desired_accepted_count": "1",
-        **{key: "" for slot in range(1, 9) for key in (f"lora_{slot}_id", f"lora_{slot}_weight")},
+        **{key: "" for slot in range(1, 17) for key in (f"lora_{slot}_id", f"lora_{slot}_weight")},
     }
     parsed = await read_new_set_form(_form_request(values))
     assert parsed.command.composition_mode == "trio"

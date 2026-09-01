@@ -181,7 +181,7 @@ def _automation_form(
             min(sum(int(batch["image_count"]) for batch in batches), 500)
         ),
     }
-    for slot in range(1, 9):
+    for slot in range(1, 17):
         form[f"lora_{slot}_id"] = ""
         form[f"lora_{slot}_weight"] = ""
     return form

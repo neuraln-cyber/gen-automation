@@ -12,6 +12,7 @@ from fastapi import Request, status
 from pydantic import ValidationError
 
 from gen_automation.config import Settings
+from gen_automation.domain.lora_limits import MAX_GENERATION_LORAS
 from gen_automation.services.new_sets import NewSetLoraSelection, NewSetSubmission
 
 _FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
@@ -19,7 +20,7 @@ _MAX_FORM_BODY_BYTES = 512 * 1024
 _MAX_STOP_FORM_BODY_BYTES = 4 * 1024
 _FORM_KEY = re.compile(r"web-new-set-[0-9a-f]{64}")
 _HEX = frozenset("0123456789abcdefABCDEF")
-_LORA_SLOTS = range(1, 9)
+_LORA_SLOTS = range(1, MAX_GENERATION_LORAS + 1)
 _STOP_FIELDS = frozenset({"csrf_token", "idempotency_key"})
 _FIELDS = frozenset(
     {

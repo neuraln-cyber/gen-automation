@@ -35,6 +35,11 @@ from gen_automation.domain.generation_limits import (
     MAX_OUTPUTS_PER_GENERATION_JOB,
     MAX_SAFE_OUTPUTS_PER_SIGNED_GENERATION_JOB,
 )
+from gen_automation.domain.lora_limits import (
+    MAX_ANIMA_LORAS,
+    MAX_GENERATION_LORAS,
+    MAX_ILLUSTRIOUS_LORAS,
+)
 from gen_automation.middleware import content_security_policy
 from gen_automation.services.authentication import (
     AuthenticatedPrincipal,
@@ -660,6 +665,9 @@ def new_set_form_response(
                     MAX_SAFE_OUTPUTS_PER_SIGNED_GENERATION_JOB
                 ),
                 "max_accepted_images_per_release": MAX_ACCEPTED_IMAGES_PER_RELEASE,
+                "max_anima_loras": MAX_ANIMA_LORAS,
+                "max_generation_loras": MAX_GENERATION_LORAS,
+                "max_illustrious_loras": MAX_ILLUSTRIOUS_LORAS,
                 "experiment_mode": resolved_experiment_mode,
                 "experiment_release": (experiment_release if resolved_experiment_mode else None),
                 "warm_unavailable": (
@@ -727,7 +735,7 @@ def _default_values(options: NewSetOptions) -> dict[str, str]:
         "detailer_feather": "4",
         "planned_job_count": "1",
     }
-    for slot in range(1, 9):
+    for slot in range(1, MAX_GENERATION_LORAS + 1):
         values[f"lora_{slot}_id"] = ""
         values[f"lora_{slot}_weight"] = ""
     return values

@@ -237,8 +237,10 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
     ) in batch_template
     assert "Saved on this device" in page.text
     assert page.text.count("data-lora-option\n") == 2
-    assert page.text.count("data-lora-native-slot>") == 8
-    for slot in range(1, 9):
+    assert page.text.count("data-lora-native-slot>") == 16
+    assert 'data-max-selections-illustrious="8"' in page.text
+    assert 'data-max-selections-anima="16"' in page.text
+    for slot in range(1, 17):
         assert page.text.count(f'name="lora_{slot}_id"') == 1
         assert page.text.count(f'name="lora_{slot}_weight"') == 1
     assert 'class="mobile-queue-dock"' in page.text
@@ -256,18 +258,7 @@ def test_new_set_form_freezes_and_queues_an_idempotent_plan(client: TestClient) 
         "lora_1_weight": "0.75",
         "lora_2_id": str(options.loras[1].approval_id),
         "lora_2_weight": "0.4",
-        "lora_3_id": "",
-        "lora_3_weight": "",
-        "lora_4_id": "",
-        "lora_4_weight": "",
-        "lora_5_id": "",
-        "lora_5_weight": "",
-        "lora_6_id": "",
-        "lora_6_weight": "",
-        "lora_7_id": "",
-        "lora_7_weight": "",
-        "lora_8_id": "",
-        "lora_8_weight": "",
+        **{key: "" for slot in range(3, 17) for key in (f"lora_{slot}_id", f"lora_{slot}_weight")},
         "prompt": "__poses__, detailed portrait",
         "negative_prompt": "low quality",
         "detailer_prompt": "expressive face",

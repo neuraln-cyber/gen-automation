@@ -685,9 +685,16 @@
           </div>
 
           <details class="form-disclosure"{% if experiment_mode %} open{% endif %}>
-            <summary>LoRA stack <span data-lora-summary>Optional &middot; up to 8</span></summary>
+            <summary>LoRA stack <span data-lora-summary>Optional &middot; up to {{ max_illustrious_loras }}</span></summary>
             <div class="disclosure-body">
-              <section class="lora-picker" data-lora-picker data-max-selections="8" hidden>
+              <section
+                class="lora-picker"
+                data-lora-picker
+                data-max-selections="{{ max_illustrious_loras }}"
+                data-max-selections-illustrious="{{ max_illustrious_loras }}"
+                data-max-selections-anima="{{ max_anima_loras }}"
+                hidden
+              >
                 <div class="lora-picker-toolbar">
                   <label>
                     Find a LoRA
@@ -700,7 +707,7 @@
                     >
                   </label>
                   <div class="lora-picker-status">
-                    <output data-lora-selection-count aria-live="polite">0 of 8 selected</output>
+                    <output data-lora-selection-count aria-live="polite">0 of {{ max_illustrious_loras }} selected</output>
                     <button class="secondary-button" type="button" data-lora-clear disabled>
                       Clear stack
                     </button>
@@ -758,7 +765,7 @@
               </section>
 
               <div class="lora-native-slots" data-lora-native-slots>
-                {% for slot in range(1, 9) %}
+                {% for slot in range(1, max_generation_loras + 1) %}
                   <div class="lora-row" data-lora-native-slot>
                     <label>
                       LoRA {{ slot }}

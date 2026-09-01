@@ -86,31 +86,31 @@ def test_new_release_marks_current_worker_request_budget() -> None:
     assert "worker_request_budget_version" not in legacy.model_dump(mode="json")
 
 
-def test_release_supports_up_to_eight_loras() -> None:
+def test_release_supports_up_to_sixteen_loras() -> None:
     payload = valid_release_payload()
     checkpoint = payload["specification"]["checkpoint"]  # type: ignore[index]
     loras: list[dict[str, object]] = []
-    for index in range(8):
+    for index in range(16):
         lora = deepcopy(checkpoint)
         lora.update(
             {
                 "name": f"LoRA {index + 1}",
                 "storage_key": f"models/lora-{index + 1}.safetensors",
-                "sha256": f"{index + 1:x}" * 64,
+                "sha256": f"{index + 1:064x}",
                 "weight": 0.5,
             }
         )
         loras.append(lora)
     payload["specification"]["loras"] = loras  # type: ignore[index]
 
-    assert len(ReleaseCreate.model_validate(payload).specification.loras) == 8
+    assert len(ReleaseCreate.model_validate(payload).specification.loras) == 16
 
-    ninth = deepcopy(loras[0])
-    ninth["name"] = "LoRA 9"
-    ninth["storage_key"] = "models/lora-9.safetensors"
-    ninth["sha256"] = "9" * 64
-    loras.append(ninth)
-    with pytest.raises(ValidationError, match="at most 8"):
+    seventeenth = deepcopy(loras[0])
+    seventeenth["name"] = "LoRA 17"
+    seventeenth["storage_key"] = "models/lora-17.safetensors"
+    seventeenth["sha256"] = "a1" * 32
+    loras.append(seventeenth)
+    with pytest.raises(ValidationError, match="at most 16"):
         ReleaseCreate.model_validate(payload)
 
 

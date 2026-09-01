@@ -33,6 +33,7 @@ from gen_automation.domain.generation_limits import (
     signed_worker_prompt_budget_bytes,
     utf8_prompt_bytes,
 )
+from gen_automation.domain.lora_limits import MAX_ANIMA_LORAS, MAX_ILLUSTRIOUS_LORAS
 from gen_automation.domain.near_black_recovery import (
     NearBlackRecoveryPlanError,
     apply_near_black_seed_recovery_plan,
@@ -87,7 +88,6 @@ REFERENCED_PAYLOAD_PREFIX = "staging/worker-requests"
 MAX_JSON_DEPTH = 64
 MAX_JSON_ITEMS = 50_000
 MIN_POST_ACCEPTANCE_UPLOAD_SECONDS = 3600
-MAX_RUNTIME_LORAS = 8
 LORA_CHAIN_NODE_CLASS = "GenAutomationLoraChain"
 CONTROLLED_DUO_MARKER_NODE_CLASS = "GenAutomationControlledDuoV2"
 MULTI_PROMPT_SHARED_NODE_CLASSES = frozenset(
@@ -437,8 +437,6 @@ def _resolve_runtime_artifacts(
     resolved: _ResolvedJobParameters,
     manifest: ArtifactManifest,
 ) -> _RuntimeArtifactBindings:
-    if len(resolved.loras) > MAX_RUNTIME_LORAS:
-        raise WorkerInputError("generation supports at most eight LoRAs")
     if len({lora.sha256 for lora in resolved.loras}) != len(resolved.loras):
         raise WorkerInputError("generation artifacts do not match the worker manifest")
 
@@ -456,6 +454,15 @@ def _resolve_runtime_artifacts(
         and checkpoint.source_object_id != resolved.checkpoint.storage_key
     ):
         raise WorkerInputError("generation artifacts do not match the worker manifest")
+    maximum_loras = (
+        MAX_ANIMA_LORAS
+        if checkpoint.kind == ArtifactKind.DIFFUSION_MODEL
+        else MAX_ILLUSTRIOUS_LORAS
+    )
+    if len(resolved.loras) > maximum_loras:
+        raise WorkerInputError(
+            f"generation supports at most {maximum_loras} LoRAs for this model family"
+        )
     loras = tuple(
         _resolve_manifest_artifact(manifest, lora, kind=ArtifactKind.LORA)
         for lora in resolved.loras
