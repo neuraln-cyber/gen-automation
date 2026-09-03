@@ -257,11 +257,7 @@ async def ensure_next_mega_set_delivery(
         raise MegaSetDeliveryContractError("finished-set manifest identity is invalid")
     remote_folder = _remote_folder(
         normalized_root,
-        set_name=(
-            f"{release_title} (PNG)"
-            if archive.media_profile == _PUBLIC_MEDIA_PROFILE
-            else release_title
-        ),
+        set_name=release_title,
     )
     if archive.media_profile != _PUBLIC_MEDIA_PROFILE:
         raise MegaSetDeliveryContractError(

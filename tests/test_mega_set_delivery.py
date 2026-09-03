@@ -30,6 +30,7 @@ from gen_automation.db.models import (
     MegaSetDeliveryItem,
     PublicationIntent,
     PublicationPackage,
+    Release,
     ReleaseSelection,
 )
 from gen_automation.domain.canonical import canonical_json_bytes
@@ -839,8 +840,8 @@ async def test_public_png_archive_reaches_mega_exactly_without_full_jpeg(
     assert mega.upload_files_calls == [("001.png", "002.png")]
 
     image_paths = (
-        "/sets/Derivative release (PNG)/001.png",
-        "/sets/Derivative release (PNG)/002.png",
+        "/sets/Derivative release/001.png",
+        "/sets/Derivative release/002.png",
     )
     delivered_pngs = tuple(mega.remote[path] for path in image_paths)
     assert delivered_pngs != approved.raw_payloads
@@ -930,7 +931,7 @@ async def test_provider_independent_multipart_upload_preserves_bytes_order_and_s
     assert publication_intents == 0
     assert publication_packages == 0
     assert delivery.finished_set_archive_id == archive.archive_id
-    assert delivery.remote_folder == "/sets/Derivative release (PNG)"
+    assert delivery.remote_folder == "/sets/Derivative release"
     assert delivery.manifest_sha256 == archive.manifest_sha256
     assert delivery.state == MegaDeliveryState.SUCCEEDED
     assert delivery.total_item_count == 2
@@ -1029,9 +1030,75 @@ async def test_ambiguous_partial_batch_is_adopted_without_duplicate_uploads(
     assert all(mega.write_counts[item.remote_path] == 1 for item in items)
 
 
+@pytest.mark.parametrize("set_title", ["Yamato", "Yamato - One Piece (SFW)", "My set (PNG)"])
+@pytest.mark.asyncio
+async def test_new_mega_folder_uses_set_title_without_automatic_suffix(
+    derivative_approved_context: ApprovedContext,
+    set_title: str,
+) -> None:
+    approved = derivative_approved_context
+    store, _archive = await _prepare_archive(approved, part_sizes=(2,))
+    async with approved.database.sessions() as session:
+        release = await session.get(Release, approved.release_id)
+        assert release is not None
+        release.title = set_title
+        await session.commit()
+
+    mega = _RecordingMegaClient()
+    assert (await _cycle_mega(approved, store, mega)).created_delivery
+    assert (await _cycle_mega(approved, store, mega)).completed_delivery
+    async with approved.database.sessions() as session:
+        delivery = await session.scalar(select(MegaSetDelivery))
+        assert delivery is not None
+        assert delivery.remote_folder == f"{_REMOTE_ROOT}/{set_title}"
+    assert set(mega.remote) == {
+        f"{_REMOTE_ROOT}/{set_title}/001.png",
+        f"{_REMOTE_ROOT}/{set_title}/002.png",
+    }
+
+
+@pytest.mark.asyncio
+async def test_existing_png_suffixed_delivery_keeps_its_stored_destination(
+    derivative_approved_context: ApprovedContext,
+) -> None:
+    approved = derivative_approved_context
+    store, archive = await _prepare_archive(approved, part_sizes=(2,))
+    mega = _RecordingMegaClient()
+
+    # Simulate a persisted delivery created before the naming change.
+    historical_folder = f"{_REMOTE_ROOT}/Derivative release (PNG)"
+    async with approved.database.sessions() as session:
+        delivery = MegaSetDelivery(
+            finished_set_archive_id=archive.archive_id,
+            remote_root=_REMOTE_ROOT,
+            remote_folder=historical_folder,
+            manifest_sha256=archive.manifest_sha256,
+            total_item_count=2,
+            available_at=RUN_AT,
+            created_at=RUN_AT,
+            updated_at=RUN_AT,
+        )
+        session.add(delivery)
+        await session.commit()
+        delivery_id = delivery.id
+
+    assert (await _cycle_mega(approved, store, mega)).completed_delivery
+    async with approved.database.sessions() as session:
+        delivery = await session.get(MegaSetDelivery, delivery_id)
+        assert delivery is not None
+        assert delivery.remote_folder == historical_folder
+        assert await session.scalar(select(func.count(MegaSetDelivery.id))) == 1
+    assert set(mega.remote) == {
+        f"{historical_folder}/001.png",
+        f"{historical_folder}/002.png",
+    }
+
+
+@pytest.mark.parametrize("existing_filename", ["existing-file.txt", "001.jpg"])
 @pytest.mark.asyncio
 async def test_existing_named_set_folder_is_not_mixed_or_overwritten(
     derivative_approved_context: ApprovedContext,
+    existing_filename: str,
 ) -> None:
     approved = derivative_approved_context
     store, _archive = await _prepare_archive(approved, part_sizes=(2,))
@@ -1041,7 +1108,8 @@ async def test_existing_named_set_folder_is_not_mixed_or_overwritten(
     async with approved.database.sessions() as session:
         delivery = await session.scalar(select(MegaSetDelivery))
         assert delivery is not None
-        mega.remote[f"{delivery.remote_folder}/existing-file.txt"] = b"owned elsewhere"
+        assert delivery.remote_folder == "/sets/Derivative release"
+        mega.remote[f"{delivery.remote_folder}/{existing_filename}"] = b"owned elsewhere"
 
     result = await _cycle_mega(approved, store, mega)
 

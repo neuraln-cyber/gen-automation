@@ -156,14 +156,15 @@ with separate source Asset and readiness derivative provenance.
 
 Ready pre-profile archives remain immutable and readable as
 `legacy-full-derivative-v1`. A completed review can also create a new public
-PNG archive without replacing its legacy JPEG archive. MEGA sends the PNG
-profile to a distinct `<set-name> (PNG)` folder, preventing collision with a
-historical unsuffixed delivery.
+PNG archive without replacing its legacy JPEG archive. New MEGA deliveries use
+`<set-name>` without an automatic format suffix. Existing delivery paths remain
+unchanged, and collisions with historical exports fail closed instead of
+mixing or overwriting their files.
 
 The `public-png-v1` recipe, renderer, Pillow version, encoder, and byte ceiling
 are immutable together. After in-flight work drains, any change requires a new
-media profile and a new MEGA folder suffix; the existing profile identity is
-never redefined in place.
+media profile and a non-colliding MEGA destination; the existing profile
+identity is never redefined in place.
 
 Destination-specific Patreon package parts remain private and separate:
 

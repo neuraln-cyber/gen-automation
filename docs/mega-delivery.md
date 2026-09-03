@@ -13,7 +13,7 @@ The source archive already freezes the accepted set in generation-queue order.
 The MEGA folder preserves that order with zero-padded filenames:
 
 ```text
-<remote-root>/<set-name> (PNG)/
+<remote-root>/<set-name>/
   001.png
   002.png
   ...
@@ -21,10 +21,13 @@ The MEGA folder preserves that order with zero-padded filenames:
 
 `<set-name>` is the set's visible title (trimmed only), so a title such as
 `Yoruichi - Bleach` is delivered directly to
-`/Future/Yoruichi - Bleach (PNG)/` when `/Future` is configured as the remote
+`/Future/Yoruichi - Bleach/` when `/Future` is configured as the remote
 root.
-No project, version, or hash folders are inserted. A set folder must be empty or
-already belong to that exact in-progress delivery. Unexpected, duplicate, or
+No format suffix, project, version, or hash folders are inserted. Existing
+deliveries retain their stored destination, including historical `(PNG)`
+suffixes; retries and in-progress uploads are never renamed or retargeted.
+A set folder must be empty or already belong to that exact in-progress
+delivery. Unexpected, duplicate, or
 mismatched files stop the delivery for attention instead of being mixed,
 renamed, or overwritten; use a unique set name for a later replacement.
 
@@ -71,16 +74,18 @@ bytes. It does not duplicate images per destination.
 `public-png-v1` is an immutable operational contract. Any change to its PNG
 recipe, renderer, Pillow version, encoder behavior, or byte ceiling **must**
 wait for in-flight profile work to drain and ship as a new `media_profile`.
-That profile must also use a new, non-colliding MEGA folder suffix. Never change
+That profile must also use a non-colliding MEGA destination. Never change
 the render identity behind `public-png-v1` in place; doing so would make archive
 resume and cache adoption depend on deployment timing.
 
 Archives created before this profile are backfilled as
 `legacy-full-derivative-v1`. Ready legacy JPEG archives and their MEGA records
 remain immutable, downloadable, and readable. They keep their historical
-unsuffixed folder. The same completed review can create a separate
-`public-png-v1` archive and MEGA delivery in the `(PNG)` folder without deleting
-or overwriting the legacy delivery.
+unsuffixed folder. Historical `public-png-v1` deliveries keep their stored
+`(PNG)` folder. Newly created deliveries use only the visible set title. If
+that unsuffixed folder contains a legacy export, delivery stops with a conflict
+without deleting or overwriting it; a new export needs a unique set name or
+destination root.
 
 ## Efficient transfer path
 
