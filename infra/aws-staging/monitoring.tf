@@ -7,6 +7,21 @@ resource "aws_cloudwatch_log_group" "staging" {
   }
 }
 
+# RDS otherwise creates these export groups with indefinite retention. Existing
+# groups must be imported before applying; see README.md. Derive their names
+# without referencing the DB resource so new databases can depend on them.
+resource "aws_cloudwatch_log_group" "postgresql" {
+  for_each = toset(["postgresql", "upgrade"])
+
+  name              = "/aws/rds/instance/${local.name}-postgresql/${each.value}"
+  retention_in_days = var.log_retention_days
+  skip_destroy      = true
+
+  tags = {
+    Name = "${local.name}-postgresql-${each.value}-logs"
+  }
+}
+
 resource "aws_sns_topic" "alerts" {
   name = local.alert_topic_name
 }

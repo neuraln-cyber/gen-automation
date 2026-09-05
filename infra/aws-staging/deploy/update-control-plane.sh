@@ -18,6 +18,7 @@ backup_env=""
 rollback_armed=0
 rollback_mode="restart"
 external_lock_held=0
+check_idle_only=0
 
 fail() {
   printf '%s\n' "control-plane update failed: $*" >&2
@@ -92,6 +93,98 @@ verify_pulled_image() {
   [ "$operating_system" = "linux" ] || fail "image operating system must be linux"
 }
 
+assert_image_work_idle() {
+  # Use the reviewed, currently installed image for its database libraries, not
+  # a new application module that is unavailable before the first rollout.
+  # This is a bounded read-only preflight, not an atomic admission/drain lock.
+  timeout --signal=TERM --kill-after=5s 45s \
+    /usr/bin/docker run --rm --interactive \
+      --network bridge --user 10001:10001 --read-only \
+      --env-file "$config_root/migration.env" \
+      --mount "type=bind,src=$config_root/rds-global-bundle.pem,dst=/run/gen-automation/rds-global-bundle.pem,readonly" \
+      --cap-drop ALL --security-opt no-new-privileges:true \
+      --entrypoint python3.12 "$old_image" - <<'IMAGE_WORK_PREFLIGHT' ||
+import os
+import sys
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.pool import NullPool
+
+IMAGE_WORK_QUERY = """
+SELECT
+  EXISTS (
+    SELECT 1 FROM generation_jobs
+    WHERE provider = 'salad'
+      AND state IN ('claimed', 'submitting', 'running', 'collecting', 'verifying',
+                    'unknown', 'cancel_requested')
+  ) AS active_jobs,
+  EXISTS (
+    SELECT 1 FROM generation_attempts
+    WHERE provider = 'salad'
+      AND state IN ('created', 'submitting', 'submitted', 'running',
+                    'unknown', 'cancel_requested')
+  ) AS active_attempts,
+  EXISTS (
+    SELECT 1 FROM generation_jobs AS j
+    JOIN release_versions AS v ON v.id = j.release_version_id
+    JOIN releases AS r ON r.id = v.release_id
+    WHERE j.provider = 'salad' AND j.state IN ('queued', 'retry_wait')
+      AND r.current_version_no = v.version_no
+      AND r.phase IN ('ready', 'generating', 'paused')
+  ) AS queued_jobs
+"""
+
+
+def image_work_snapshot(connection):
+    return dict(connection.execute(text(IMAGE_WORK_QUERY)).mappings().one())
+
+
+def main():
+    engine = None
+    try:
+        url = make_url(os.environ["GEN_AUTOMATION_DATABASE_URL"])
+        if url.drivername != "postgresql+psycopg":
+            raise ValueError("unexpected database driver")
+        engine = create_engine(
+            url, connect_args={"connect_timeout": 5}, poolclass=NullPool,
+            hide_parameters=True,
+        )
+        with engine.connect() as connection:
+            connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+            connection.exec_driver_sql("SET LOCAL statement_timeout = '10s'")
+            connection.exec_driver_sql("SET LOCAL lock_timeout = '2s'")
+            snapshot = image_work_snapshot(connection)
+            connection.rollback()
+        if any(snapshot.values()):
+            print(
+                "Image-work preflight refused: "
+                + " ".join(f"{key}={int(bool(snapshot[key]))}" for key in (
+                    "active_jobs", "active_attempts", "queued_jobs"
+                )),
+                file=sys.stderr,
+            )
+            return 3
+        print("Image-work preflight passed: no active or accepted queued image work.")
+        return 0
+    except Exception:
+        # Do not print database URLs, credentials, row contents, or exceptions.
+        print("Image-work preflight failed: could not verify idle image work.", file=sys.stderr)
+        return 2
+    finally:
+        if engine is not None:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+IMAGE_WORK_PREFLIGHT
+    fail "active image work exists or the read-only idle check was unavailable; deployment refused"
+}
+
 restore_previous_deployment() {
   local rollback_status=0
 
@@ -147,8 +240,8 @@ cleanup() {
 trap cleanup EXIT
 
 [ "$(id -u)" -eq 0 ] || fail "run as root through AWS Systems Manager"
-[ "$#" -ge 4 ] && [ "$#" -le 7 ] ||
-  fail "usage: $0 --image <immutable-image> --revision <40-hex-sha> [--rollback-mode restart|leave-stopped] [--external-lock-held]"
+[ "$#" -ge 4 ] && [ "$#" -le 8 ] ||
+  fail "usage: $0 --image <immutable-image> --revision <40-hex-sha> [--rollback-mode restart|leave-stopped] [--external-lock-held] [--check-idle-only]"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --image)
@@ -165,6 +258,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --external-lock-held)
       external_lock_held=1
+      shift
+      ;;
+    --check-idle-only)
+      check_idle_only=1
       shift
       ;;
     *) fail "unknown argument: $1" ;;
@@ -190,6 +287,10 @@ old_image="$(env_value "$image_key" "$deploy_env")"
   fail "currently configured control-plane image is not an approved immutable reference"
 
 verify_pulled_image "$new_image" "$source_revision"
+if [ "$check_idle_only" -eq 1 ]; then
+  assert_image_work_idle
+  exit 0
+fi
 if [ "$new_image" = "$old_image" ]; then
   systemctl start --no-block "$service_name"
   wait_for_control_plane "$new_image" ||
@@ -198,6 +299,7 @@ if [ "$new_image" = "$old_image" ]; then
   exit 0
 fi
 
+assert_image_work_idle
 backup_env="$(mktemp "$config_root/.deploy.env.rollback.XXXXXX")"
 temporary_env="$(mktemp "$config_root/.deploy.env.update.XXXXXX")"
 install -o root -g root -m 0600 "$deploy_env" "$backup_env"

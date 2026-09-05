@@ -57,6 +57,47 @@ available to the application and operator.
 Use the operational sequence and acceptance gates in
 [the AWS staging runbook](../../docs/aws-staging-runbook.md).
 
+## Adopting existing RDS log groups
+
+Application/bootstrap logs and the RDS `postgresql` and `upgrade` export groups
+use `log_retention_days` (30 days by default). New installations create the
+export groups before RDS. Existing installations must adopt the exact groups
+RDS already created before applying this change, or creation will conflict.
+
+First verify the AWS account/Region, database identifier, current retention,
+and stored bytes for each exact group with a read-only CloudWatch inventory.
+Preserve a recoverable infrastructure-state snapshot and export any required
+older diagnostics before shortening retention: raising retention afterward
+does not recover expired events. RDS backups and database snapshots do not
+preserve CloudWatch log events.
+
+Import only groups that already exist and are not already in this state. For
+the default `name_prefix`, the temporary configuration-driven import blocks
+are below. Put only applicable blocks in a local `rds-log-imports.tf`; adjust
+the exact IDs if the reviewed prefix differs. Do not import a missing group
+or a group owned by another infrastructure state.
+
+```hcl
+import {
+  to = aws_cloudwatch_log_group.postgresql["postgresql"]
+  id = "/aws/rds/instance/gen-automation-staging-postgresql/postgresql"
+}
+
+import {
+  to = aws_cloudwatch_log_group.postgresql["upgrade"]
+  id = "/aws/rds/instance/gen-automation-staging-postgresql/upgrade"
+}
+```
+
+Run `tofu plan -out=staging.tfplan` with the normal reviewed backend and inputs.
+The retention rollout must show only applicable log-group imports, in-place
+retention/tag updates, and creation of genuinely missing log groups, with
+no database or EC2 replacement and no log-group deletion. Stop and investigate
+any unrelated change. Apply only that reviewed plan after approval, verify
+both groups' retention, and remove the temporary import file after successful
+adoption. `skip_destroy = true` retains these diagnostic groups if they are
+later removed from state; it does not disable event retention.
+
 ## Version policy
 
 The root supports OpenTofu/Terraform `>= 1.10, < 2.0` and constrains the AWS

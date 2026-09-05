@@ -284,6 +284,22 @@ class OutboxEvent(UuidPrimaryKeyMixin, Base):
             "lease_expires_at",
             "created_at",
         ),
+        Index(
+            "ix_outbox_topic_claim",
+            "topic",
+            "status",
+            "available_at",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "ix_outbox_exhausted_claim",
+            "status",
+            "created_at",
+            "id",
+            postgresql_where=text("attempts >= max_attempts"),
+            sqlite_where=text("attempts >= max_attempts"),
+        ),
     )
 
     topic: Mapped[str] = mapped_column(String(200), nullable=False)

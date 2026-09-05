@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import SecretStr
@@ -21,6 +21,7 @@ from gen_automation.i2v_worker.models import ModelObject
 from gen_automation.services.i2v_environment import (
     _worker_model_objects,
     i2v_runtime_config_from_settings,
+    i2v_salad_runtime_config_from_settings,
     i2v_worker_model_objects,
 )
 from gen_automation.services.i2v_media import I2VRunPodGrantBuilder
@@ -251,6 +252,34 @@ async def test_routine_deploy_ignores_live_legacy_lora_roles_when_worker_is_off(
         "text_encoder",
         "vae",
     ]
+
+
+@pytest.mark.parametrize("idle_seconds", (900, 36_000, None))
+def test_salad_rollback_config_preserves_ready_idle_policy(idle_seconds: int | None) -> None:
+    settings = _settings().model_copy(
+        update={
+            "i2v_runpod_enabled": False,
+            "i2v_salad_gpu_class_id": UUID("11111111-1111-4111-8111-111111111111"),
+            "i2v_warm_idle_seconds": idle_seconds,
+        }
+    )
+
+    config = i2v_salad_runtime_config_from_settings(settings)
+
+    assert config.salad.warm_idle_seconds == idle_seconds
+    assert config.salad.gpu_class_name == "RTX 5090 (32 GB)"
+    assert config.salad.max_replicas == 1
+
+
+def test_salad_rollback_config_uses_the_default_ready_idle_window() -> None:
+    settings = _settings().model_copy(
+        update={
+            "i2v_runpod_enabled": False,
+            "i2v_salad_gpu_class_id": UUID("11111111-1111-4111-8111-111111111111"),
+        }
+    )
+
+    assert i2v_salad_runtime_config_from_settings(settings).salad.warm_idle_seconds == 900
 
 
 def test_runtime_config_is_single_flight_and_exactly_bound_to_runpod() -> None:

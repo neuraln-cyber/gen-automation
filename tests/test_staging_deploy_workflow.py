@@ -402,7 +402,7 @@ def test_ssm_command_contains_only_public_immutable_coordinates() -> None:
     assert "--cap-drop ALL" in command_block
     assert "--security-opt no-new-privileges:true" in command_block
     assert "python3.12 -m alembic upgrade head" in command_block
-    assert command_block.index("python3.12 -m alembic upgrade head") < command_block.index(
+    assert command_block.index("python3.12 -m alembic upgrade head") < command_block.rindex(
         "gen-automation-update-control-plane"
     )
     assert command_block.index(

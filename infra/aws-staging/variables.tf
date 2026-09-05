@@ -390,7 +390,7 @@ variable "abandoned_staging_retention_days" {
 }
 
 variable "log_retention_days" {
-  description = "CloudWatch application/bootstrap log retention."
+  description = "CloudWatch application/bootstrap and RDS export log retention."
   type        = number
   default     = 30
 }

@@ -15,6 +15,7 @@ from gen_automation.gpu_worker.comfy import (
     ComfyExecutor,
     ComfyOutputError,
     ComfyProtocolError,
+    ComfyUnavailableError,
 )
 
 PROMPT_ID = "57ecf4dd-a951-4e3b-a0e5-47ac72a783bf"
@@ -383,6 +384,97 @@ def test_timeout_best_effort_interrupts_and_remains_redacted() -> None:
     assert paths.count(f"/history/{PROMPT_ID}") == 2
     assert paths[-1] == "/interrupt"
     assert str(captured.value) == "Comfy execution timed out"
+
+
+def test_transient_history_failure_recovers_without_resubmission() -> None:
+    clock = _FakeClock()
+    success_handler, requests = _success_handler()
+    failed_once = False
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        nonlocal failed_once
+        if request.url.path.startswith("/history/") and not failed_once:
+            failed_once = True
+            raise httpx2.ReadTimeout("private transport detail", request=request)
+        return success_handler(request)
+
+    with ComfyExecutor(
+        transport=httpx2.MockTransport(handler),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    ) as executor:
+        outputs = executor.execute(_workflow())
+
+    assert isinstance(outputs, list) and len(outputs) == 2
+    assert failed_once
+    assert sum(request.url.path == "/prompt" for request in requests) == 1
+    assert all(request.url.path != "/interrupt" for request in requests)
+
+
+def test_persistent_history_failure_is_bounded_and_interrupts() -> None:
+    clock = _FakeClock()
+    paths: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/prompt":
+            return _json_response({"prompt_id": PROMPT_ID, "node_errors": {}})
+        if request.url.path == "/interrupt":
+            return httpx2.Response(204)
+        raise httpx2.ReadTimeout("private transport detail", request=request)
+
+    with ComfyExecutor(
+        transport=httpx2.MockTransport(handler),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    ) as executor:
+        with pytest.raises(ComfyUnavailableError, match=r"^Comfy is unavailable$"):
+            executor.execute(_workflow())
+
+    assert paths.count(f"/history/{PROMPT_ID}") == 3
+    assert paths.count("/prompt") == 1
+    assert paths[-1] == "/interrupt"
+
+
+def test_history_recovery_remains_within_execution_deadline() -> None:
+    clock = _FakeClock()
+    paths: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/prompt":
+            return _json_response({"prompt_id": PROMPT_ID, "node_errors": {}})
+        if request.url.path == "/interrupt":
+            return httpx2.Response(204)
+        raise httpx2.ReadTimeout("private transport detail", request=request)
+
+    with ComfyExecutor(
+        transport=httpx2.MockTransport(handler),
+        execution_timeout_seconds=1,
+        poll_interval_seconds=1,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    ) as executor:
+        with pytest.raises(ComfyExecutionTimeoutError):
+            executor.execute(_workflow())
+
+    assert paths.count(f"/history/{PROMPT_ID}") == 1
+    assert paths[-1] == "/interrupt"
+
+
+def test_output_download_failure_does_not_interrupt_completed_execution() -> None:
+    success_handler, requests = _success_handler()
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == "/view":
+            raise httpx2.ReadTimeout("private transport detail", request=request)
+        return success_handler(request)
+
+    with ComfyExecutor(transport=httpx2.MockTransport(handler)) as executor:
+        with pytest.raises(ComfyUnavailableError):
+            executor.execute(_workflow())
+
+    assert all(request.url.path != "/interrupt" for request in requests)
 
 
 def test_output_download_enforces_declared_and_streamed_byte_caps() -> None:

@@ -264,6 +264,12 @@ def test_i2v_salad_config_has_no_small_limits_but_requires_exact_pinning() -> No
         _config(worker_image="ghcr.io/example/i2v:latest")
 
 
+def test_i2v_salad_ready_idle_defaults_to_fifteen_minutes_with_explicit_override() -> None:
+    assert _config().warm_idle_seconds == 900
+    assert _config(warm_idle_seconds=36_000).warm_idle_seconds == 36_000
+    assert _config(warm_idle_seconds=None).warm_idle_seconds is None
+
+
 async def test_infrastructure_reconcile_performs_only_one_mutation_and_recovers_create() -> None:
     client = FakeSalad()
     client.queue = None

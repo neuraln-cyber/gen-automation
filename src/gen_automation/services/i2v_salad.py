@@ -63,7 +63,7 @@ class I2VSaladConfig:
     gpu_class_name: str = I2V_SALAD_GPU_CLASS_NAME
     prefetch: int = 3
     worker_lease_seconds: int = 86_400
-    warm_idle_seconds: int | None = 1_800
+    warm_idle_seconds: int | None = 900
     cpu: int = 8
     memory_mb: int = 32_768
     storage_bytes: int = 268_435_456_000

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -48,7 +48,10 @@ from gen_automation.integrations.salad.models import (
 )
 from gen_automation.services import salad_deployments as deployment_service
 from gen_automation.services.budgets import BudgetError, ensure_budget_guard, record_spend_entry
-from gen_automation.services.runtime_secrets import RuntimeSecretResolver
+from gen_automation.services.runtime_secrets import (
+    RuntimeSecretResolutionError,
+    RuntimeSecretResolver,
+)
 from gen_automation.services.salad_deployments import (
     DeploymentAction,
     SaladDeploymentNotFoundError,
@@ -902,8 +905,13 @@ async def test_refresh_fails_closed_when_pending_group_never_applies() -> None:
 
 
 @pytest.mark.asyncio
-async def test_planned_runtime_refresh_adopts_matching_advanced_marker_without_repatch() -> None:
-    deployment = unpersisted_deployment(provider_configuration())
+@pytest.mark.parametrize(
+    "drift", [None, "identity", "configuration", "manifest", "override", "local_configuration"]
+)
+async def test_planned_runtime_refresh_adopts_verified_rollout_without_resolving_or_repatching(
+    drift: str | None,
+) -> None:
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
     deployment.provider_container_group_id = str(GROUP_ID)
     deployment.state = SaladDeploymentState.ACTIVE
     runtime_admission_id = "1" * 32
@@ -931,6 +939,25 @@ async def test_planned_runtime_refresh_adopts_matching_advanced_marker_without_r
             "polling_period": 30,
         },
     )
+    if drift == "identity":
+        applied = replace(applied, id=uuid4())
+    elif drift == "configuration":
+        applied = replace(applied, raw={**applied.raw, "restart_policy": "always"})
+    elif drift == "manifest":
+        raw = deepcopy(applied.raw)
+        container = raw["container"]
+        assert isinstance(container, dict)
+        remote_environment = container["environment_variables"]
+        assert isinstance(remote_environment, dict)
+        remote_environment[WORKER_MODEL_MANIFEST_SHA256_BINDING] = "e" * 64
+        applied = replace(applied, raw=raw)
+    elif drift == "override":
+        environment["UNSUPPORTED_OVERRIDE"] = "invalid"
+    elif drift == "local_configuration":
+        deployment.provider_configuration = {
+            **deployment.provider_configuration,
+            "runtime_bindings": [{"name": "INVALID_BINDING", "reference": "invalid"}],
+        }
     client = FakeClient()
     client.groups[deployment.container_group_name] = applied
     # This is the crash window: the PATCH was accepted, but its first readback
@@ -938,19 +965,32 @@ async def test_planned_runtime_refresh_adopts_matching_advanced_marker_without_r
     # the uniquely marked v2, and must never issue a second PATCH.
     client.get_group_results = [pending, applied, applied]
 
-    result = await refresh_container_group_runtime(
-        deployment,
-        client,
-        None,
-        environment_overrides=environment,
-        expected_provider_version=1,
-        runtime_admission_id=runtime_admission_id,
-        effective_min_replicas=1,
-        convergence_timeout_seconds=1,
-        poll_interval_seconds=0,
-    )
+    class UnavailableResolver(FakeResolver):
+        async def resolve_many(self, bindings: Mapping[str, str]) -> Mapping[str, str]:
+            self.requests.append(tuple(bindings))
+            raise RuntimeSecretResolutionError("runtime binding could not be resolved")
 
-    assert result is applied
+    resolver = UnavailableResolver({})
+
+    async def replay() -> SaladContainerGroup:
+        return await refresh_container_group_runtime(
+            deployment,
+            client,
+            resolver,
+            environment_overrides=environment,
+            expected_provider_version=1,
+            runtime_admission_id=runtime_admission_id,
+            effective_min_replicas=1,
+            convergence_timeout_seconds=1,
+            poll_interval_seconds=0,
+        )
+
+    if drift is None:
+        assert await replay() is applied
+    else:
+        with pytest.raises(SaladDeploymentValidationError):
+            await replay()
+    assert resolver.requests == []
     assert client.updated_group_patches == []
 
 

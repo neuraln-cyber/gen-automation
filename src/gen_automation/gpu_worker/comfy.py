@@ -46,6 +46,7 @@ _ERROR_STATUS_NAMES = frozenset(
 _ERROR_MESSAGE_NAMES = frozenset(
     {"execution_error", "execution_interrupted", "execution_cached_error"}
 )
+_MAX_CONSECUTIVE_HISTORY_FAILURES = 3
 
 
 class ComfyExecutorError(Exception):
@@ -230,15 +231,20 @@ class ComfyExecutor:
 
     def _execute_locked(self, workflow: JsonObject) -> object:
         prompt_id: str | None = None
+        history_completed = False
         try:
             workflow_body, selected_nodes = self._prepare_workflow(workflow)
             prompt_id = self._submit_workflow(workflow_body)
             deadline = self._monotonic() + self._execution_timeout_seconds
             history_entry = self._wait_for_history(prompt_id, deadline)
+            history_completed = True
             metadata = self._extract_output_metadata(history_entry, selected_nodes)
             return self._download_outputs(metadata)
-        except ComfyExecutionTimeoutError:
-            if prompt_id is not None and self._interrupt_on_timeout:
+        except (ComfyExecutionTimeoutError, ComfyUnavailableError, ComfyProtocolError):
+            # A failed history read does not prove the submitted graph stopped.
+            # Clean up while still owning the execution lane, but never interrupt
+            # a completed graph just because its output download failed.
+            if prompt_id is not None and not history_completed and self._interrupt_on_timeout:
                 self._best_effort_interrupt()
             raise
 
@@ -302,16 +308,25 @@ class ComfyExecutor:
         return prompt_id
 
     def _wait_for_history(self, prompt_id: str, deadline: float) -> dict[str, object]:
+        consecutive_failures = 0
         while True:
             remaining = deadline - self._monotonic()
             if remaining <= 0:
                 raise ComfyExecutionTimeoutError("Comfy execution timed out")
 
-            response = self._request_json(
-                "GET",
-                f"/history/{prompt_id}",
-                timeout_seconds=min(self._request_timeout_seconds, remaining),
-            )
+            try:
+                response = self._request_json(
+                    "GET",
+                    f"/history/{prompt_id}",
+                    timeout_seconds=min(self._request_timeout_seconds, remaining),
+                )
+            except ComfyUnavailableError:
+                consecutive_failures += 1
+                if consecutive_failures >= _MAX_CONSECUTIVE_HISTORY_FAILURES:
+                    raise
+                response = {}
+            else:
+                consecutive_failures = 0
             if response:
                 if set(response) != {prompt_id}:
                     raise ComfyProtocolError("invalid Comfy response")

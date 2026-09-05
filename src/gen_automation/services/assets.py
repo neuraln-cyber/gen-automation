@@ -63,6 +63,10 @@ class AssetStorageUnavailableError(AssetServiceError):
     pass
 
 
+class AssetVerificationUnavailableError(AssetStorageUnavailableError):
+    """Retryable decoder failure using the existing asset-availability retry contract."""
+
+
 class AssetQuarantinedError(AssetServiceError):
     pass
 
@@ -657,6 +661,13 @@ def _existing_master_matches(
     )
 
 
+async def _verify_master_bytes(data: bytes) -> VerifiedImage:
+    try:
+        return await verify_image_bytes_isolated(data)
+    except TimeoutError:
+        raise AssetVerificationUnavailableError("image verification timed out") from None
+
+
 async def _promote_master(
     store: ObjectStore,
     *,
@@ -693,7 +704,7 @@ async def _promote_master(
             version_id=existing.version_id,
             etag=existing.etag,
         )
-        existing_verified = await verify_image_bytes_isolated(existing_bytes)
+        existing_verified = await _verify_master_bytes(existing_bytes)
         if existing_verified != verified:
             raise ImageVerificationError(
                 "immutable master destination contains conflicting bytes"
@@ -1005,7 +1016,7 @@ async def finalize_raw_master(
         )
         if len(data) != staging.byte_size:
             raise ImageVerificationError("staging object size changed during verification")
-        verified = await verify_image_bytes_isolated(data)
+        verified = await _verify_master_bytes(data)
         if verified.content_type != staging.content_type:
             raise ImageVerificationError("image signature does not match its content type")
         if normalized_reported_sha256 is not None and verified.sha256 != normalized_reported_sha256:
@@ -1019,6 +1030,15 @@ async def finalize_raw_master(
         )
         if promoted.version_id is None:
             raise ObjectStoreError("promoted master has no version ID")
+    except AssetVerificationUnavailableError:
+        await _release_verification_claim(
+            session,
+            asset=asset,
+            lease_owner=lease_owner,
+            error_code="image_verification_timeout",
+            actor=actor,
+        )
+        raise
     except ObjectNotFoundError:
         await _release_verification_claim(
             session,

@@ -141,7 +141,7 @@ class WorkerSettings(BaseModel):
     max_image_dimension: int = Field(default=16_384, ge=64, le=65_536)
     max_image_pixels: int = Field(default=64_000_000, ge=4_096, le=256_000_000)
     max_replay_entries: int = Field(default=256, ge=1, le=1024)
-    upload_timeout_seconds: float = Field(default=60.0, ge=1.0, le=300.0)
+    upload_timeout_seconds: float = Field(default=60.0, ge=1.0, le=600.0)
     readiness_timeout_seconds: float = Field(default=1.0, ge=0.05, le=5.0)
     approved_workflow_node_classes: frozenset[str] = Field(
         default=DEFAULT_APPROVED_WORKFLOW_NODE_CLASSES,

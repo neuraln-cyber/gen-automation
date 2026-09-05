@@ -70,4 +70,7 @@ resource "aws_db_instance" "postgresql" {
     Name               = "${local.name}-postgresql"
     DataClassification = "private-application-state"
   }
+
+  # Create export groups before RDS can auto-create unbounded copies.
+  depends_on = [aws_cloudwatch_log_group.postgresql]
 }

@@ -92,6 +92,12 @@ def _settings(**changes: object) -> WorkerRuntimeSettings:
     return WorkerRuntimeSettings.model_validate(values)
 
 
+@pytest.mark.parametrize("timeout_seconds", [300.0, 301.0, 600.0])
+def test_runtime_upload_timeout_remains_valid_in_worker_settings(timeout_seconds: float) -> None:
+    settings = _settings(upload_timeout_seconds=timeout_seconds)
+    assert settings.to_worker_settings().upload_timeout_seconds == timeout_seconds
+
+
 def test_load_artifact_manifest_accepts_canonical_manifest() -> None:
     manifest = load_artifact_manifest(_manifest_json())
 

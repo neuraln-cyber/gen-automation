@@ -13,6 +13,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from functools import partial
 from typing import Any
 
@@ -69,6 +70,17 @@ class WorkerOutputError(Exception):
 
 class WorkerNotReadyError(Exception):
     pass
+
+
+@dataclass
+class _AttemptProgress:
+    expires_at: int
+    signature: str
+    uploaded: list[UploadedOutput] = field(default_factory=list)
+    total_output_bytes: int = 0
+    exact_zero_output_indices: list[int] = field(default_factory=list)
+    cache_reset_attempted: bool = False
+    response: GenerateWorkerResponse | None = None
 
 
 def _progressive_workflows(
@@ -312,7 +324,7 @@ def create_worker_app(
     execution_lock = asyncio.Lock()
     execution_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu-work")
     readiness_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu-ready")
-    replay_cache: OrderedDict[str, tuple[int, str, GenerateWorkerResponse]] = OrderedDict()
+    replay_cache: OrderedDict[str, _AttemptProgress] = OrderedDict()
     recovery_event = worker_recycle_event or worker_restart_event
     resolved_uploader = uploader
     resolved_payload_downloader = payload_downloader
@@ -450,35 +462,48 @@ def create_worker_app(
             raise HTTPException(status_code=400, detail="invalid request") from None
 
         # One worker owns one GPU execution lane. Serializing here also makes the
-        # bounded replay cache race-free: an identical successful Salad retry
-        # returns the prior stable response without regenerating or reuploading.
+        # bounded replay cache race-free. Retain acknowledged uploads even if a
+        # later branch fails, so an identical retry can resume progressive work.
+        # Only response metadata is cached, never generated image bytes.
         async with execution_lock:
             current_time = int(now())
             expired = [
                 attempt_id
-                for attempt_id, (cache_expires_at, _signature, _response) in replay_cache.items()
-                if cache_expires_at < current_time
+                for attempt_id, progress in replay_cache.items()
+                if progress.expires_at < current_time
             ]
             for attempt_id in expired:
                 replay_cache.pop(attempt_id, None)
 
-            cached = replay_cache.get(payload.attempt_id)
-            if cached is not None:
-                _cache_expires_at, cached_signature, cached_response = cached
-                if cached_signature != envelope.signature:
+            progress = replay_cache.get(payload.attempt_id)
+            if progress is not None:
+                if progress.signature != envelope.signature:
                     raise HTTPException(
                         status_code=409,
-                        detail="request conflicts with completed attempt",
+                        detail=(
+                            "request conflicts with completed attempt"
+                            if progress.response is not None
+                            else "request conflicts with existing attempt"
+                        ),
                     )
                 replay_cache.move_to_end(payload.attempt_id)
-                return cached_response
+                if progress.response is not None:
+                    return progress.response
+            else:
+                while len(replay_cache) >= settings.max_replay_entries:
+                    replay_cache.popitem(last=False)
+                progress = _AttemptProgress(
+                    expires_at=envelope.expires_at + settings.clock_skew_seconds,
+                    signature=envelope.signature,
+                )
+                replay_cache[payload.attempt_id] = progress
 
             loop = asyncio.get_running_loop()
             grants_by_index = {grant.output_index: grant for grant in payload.uploads}
-            uploaded: list[UploadedOutput] = []
-            total_output_bytes = 0
-            cache_reset_attempted = False
+            uploaded_indices = {output.output_index for output in progress.uploaded}
             for branch_output_index, workflow in progressive_workflows:
+                if branch_output_index is not None and branch_output_index in uploaded_indices:
+                    continue
                 try:
                     raw_outputs = await loop.run_in_executor(
                         execution_pool,
@@ -501,7 +526,9 @@ def create_worker_app(
                             expected_count=expected_branch_count,
                             max_output_bytes=settings.max_output_bytes,
                             max_total_output_bytes=(
-                                settings.max_total_output_bytes - total_output_bytes
+                                settings.max_total_output_bytes
+                                if branch_output_index is None
+                                else settings.max_total_output_bytes - progress.total_output_bytes
                             ),
                             max_image_dimension=settings.max_image_dimension,
                             max_image_pixels=settings.max_image_pixels,
@@ -513,7 +540,6 @@ def create_worker_app(
                         detail="generation output invalid",
                     ) from None
 
-                exact_zero_output_indices: list[int] = []
                 for output, content, exact_zero in sorted(
                     outputs,
                     key=lambda item: item[0].output_index,
@@ -521,8 +547,14 @@ def create_worker_app(
                     output_index = (
                         output.output_index if branch_output_index is None else branch_output_index
                     )
+                    if output_index in uploaded_indices:
+                        continue
                     grant = grants_by_index[output_index]
-                    if output.media_type != grant.content_type:
+                    if (
+                        output.media_type != grant.content_type
+                        or progress.total_output_bytes + len(content)
+                        > settings.max_total_output_bytes
+                    ):
                         raise HTTPException(
                             status_code=502,
                             detail="generation output invalid",
@@ -537,19 +569,20 @@ def create_worker_app(
                         raise HTTPException(status_code=502, detail="upload failed") from None
                     except Exception:
                         raise HTTPException(status_code=502, detail="upload failed") from None
-                    total_output_bytes += len(content)
-                    uploaded.append(
+                    progress.total_output_bytes += len(content)
+                    progress.uploaded.append(
                         UploadedOutput(
                             asset_id=grant.asset_id,
                             upload_attempt_id=grant.upload_attempt_id,
                             output_index=output_index,
                         )
                     )
+                    uploaded_indices.add(output_index)
                     if exact_zero:
-                        exact_zero_output_indices.append(output_index)
+                        progress.exact_zero_output_indices.append(output_index)
 
-                if exact_zero_output_indices and not cache_reset_attempted:
-                    cache_reset_attempted = True
+                if progress.exact_zero_output_indices and not progress.cache_reset_attempted:
+                    progress.cache_reset_attempted = True
                     try:
                         await loop.run_in_executor(
                             execution_pool,
@@ -560,7 +593,7 @@ def create_worker_app(
                         print(
                             "GPU worker exact-zero output observed: "
                             f"attempt_id={payload.attempt_id} "
-                            f"output_indices={exact_zero_output_indices} "
+                            f"output_indices={progress.exact_zero_output_indices} "
                             "action=local_comfy_cache_reset_failed_continue",
                             file=sys.stderr,
                             flush=True,
@@ -569,7 +602,7 @@ def create_worker_app(
                         print(
                             "GPU worker exact-zero output observed: "
                             f"attempt_id={payload.attempt_id} "
-                            f"output_indices={exact_zero_output_indices} "
+                            f"output_indices={progress.exact_zero_output_indices} "
                             "action=local_comfy_cache_reset_completed_continue",
                             file=sys.stderr,
                             flush=True,
@@ -578,15 +611,9 @@ def create_worker_app(
             response = GenerateResponse(
                 job_id=payload.job_id,
                 attempt_id=payload.attempt_id,
-                outputs=uploaded,
+                outputs=progress.uploaded,
             )
-            while len(replay_cache) >= settings.max_replay_entries:
-                replay_cache.popitem(last=False)
-            replay_cache[payload.attempt_id] = (
-                envelope.expires_at + settings.clock_skew_seconds,
-                envelope.signature,
-                response,
-            )
+            progress.response = response
             return response
 
     return app

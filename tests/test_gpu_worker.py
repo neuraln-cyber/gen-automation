@@ -881,6 +881,159 @@ def test_worker_rejects_twenty_six_outputs_before_generation() -> None:
     assert uploader.uploads == []
 
 
+@pytest.mark.parametrize("failure_stage", ["execution", "upload"])
+@pytest.mark.parametrize("referenced", [False, True])
+@pytest.mark.parametrize("exact_zero", [False, True])
+def test_progressive_retry_resumes_acknowledged_outputs_and_rejects_conflict(
+    failure_stage: str,
+    referenced: bool,
+    exact_zero: bool,
+) -> None:
+    failed_once = False
+    executed_indices: list[int] = []
+
+    class FailingExecutor(FakeExecutor):
+        def execute(self, workflow: dict[str, object]) -> object:
+            nonlocal failed_once
+            output_index = int(next(iter(workflow)).split("-")[1])
+            executed_indices.append(output_index)
+            if failure_stage == "execution" and output_index == 1 and not failed_once:
+                failed_once = True
+                raise RuntimeError("private execution detail")
+            return super().execute(workflow)
+
+    class FailingUploader(FakeUploader):
+        async def upload(self, *, grant: UploadGrant, content: bytes, media_type: str) -> None:
+            nonlocal failed_once
+            if failure_stage == "upload" and grant.output_index == 1 and not failed_once:
+                failed_once = True
+                raise WorkerUploadError("private upload detail")
+            await super().upload(grant=grant, content=content, media_type=media_type)
+
+    request = _unsigned_request(uploads=3)
+    request["payload"]["workflow"] = _progressive_workflow(3)
+    request = _sign_request(request)
+    conflict = json.loads(json.dumps(request))
+    conflict["payload"]["workflow"]["output-00-2"]["inputs"]["steps"] = 21
+    conflict = _sign_request(conflict)
+    payload_downloader = None
+    body = conflict_body = b""
+    if referenced:
+        request, body = _signed_referenced_request(request["payload"])
+        conflict, conflict_body = _signed_referenced_request(conflict["payload"])
+        payload_downloader = FakePayloadDownloader(body=body)
+    output = _output_for_content(_solid_image_bytes((0, 0, 0))) if exact_zero else _output()
+    client, executor, uploader = _client(
+        executor=FailingExecutor(outputs=[output]),
+        uploader=FailingUploader(),
+        payload_downloader=payload_downloader,
+    )
+
+    with client:
+        failed = client.post("/jobs/generate", json=request)
+        if payload_downloader is not None:
+            payload_downloader.body = conflict_body
+        rejected = client.post("/jobs/generate", json=conflict)
+        if payload_downloader is not None:
+            payload_downloader.body = body
+        resumed = client.post("/jobs/generate", json=request)
+        replayed = client.post("/jobs/generate", json=request)
+
+    assert failed.status_code == 502
+    assert rejected.status_code == 409
+    assert resumed.status_code == replayed.status_code == 200
+    assert resumed.json() == replayed.json()
+    assert executed_indices == [0, 1, 1, 2]
+    assert [upload.grant.output_index for upload in uploader.uploads] == [0, 1, 2]
+    assert [output["output_index"] for output in resumed.json()["outputs"]] == [0, 1, 2]
+    assert len(executor.reset_workflows) == int(exact_zero)
+
+
+def test_partial_progress_cache_remains_bounded() -> None:
+    client, executor, uploader = _client(settings=_settings(max_replay_entries=1))
+    uploader.error = WorkerUploadError("upload failed")
+    first = _signed_request(attempt_id="attempt-1")
+    second = _signed_request(attempt_id="attempt-2")
+
+    with client:
+        assert client.post("/jobs/generate", json=first).status_code == 502
+        assert client.post("/jobs/generate", json=second).status_code == 502
+        changed_first = _unsigned_request(attempt_id="attempt-1")
+        changed_first["payload"]["workflow"]["2"]["inputs"]["steps"] = 21
+        uploader.error = None
+        assert client.post("/jobs/generate", json=_sign_request(changed_first)).status_code == 200
+
+    assert len(executor.workflows) == 3
+
+
+def test_progressive_retry_retains_total_output_byte_budget() -> None:
+    output = _output()
+    output["data_base64"] = base64.b64encode(_image_bytes() + b"\x00" * 500).decode()
+    client, executor, uploader = _client(
+        settings=_settings(max_output_bytes=1024, max_total_output_bytes=1024),
+        executor=FakeExecutor(outputs=[output]),
+    )
+    request = _unsigned_request(uploads=2)
+    request["payload"]["workflow"] = _progressive_workflow(2)
+    request = _sign_request(request)
+
+    with client:
+        assert client.post("/jobs/generate", json=request).status_code == 502
+        assert client.post("/jobs/generate", json=request).status_code == 502
+
+    assert len(executor.workflows) == 3
+    assert [upload.grant.output_index for upload in uploader.uploads] == [0]
+
+
+def test_expired_partial_progress_does_not_block_new_authorization() -> None:
+    current_time = NOW
+    executor = FakeExecutor()
+    uploader = FakeUploader(error=WorkerUploadError("upload failed"))
+    app = create_worker_app(
+        settings=_settings(),
+        executor=executor,
+        uploader=uploader,
+        now=lambda: current_time,
+    )
+    with TestClient(app) as client:
+        assert client.post("/jobs/generate", json=_signed_request()).status_code == 502
+        current_time += 100
+        uploader.error = None
+        renewed = _signed_request(issued_at=current_time, expires_at=current_time + 60)
+        assert client.post("/jobs/generate", json=renewed).status_code == 200
+
+    assert len(executor.workflows) == 2
+
+
+@pytest.mark.parametrize("exact_zero", [False, True])
+def test_legacy_retry_does_not_reupload_acknowledged_outputs(exact_zero: bool) -> None:
+    failed_once = False
+
+    class FailingUploader(FakeUploader):
+        async def upload(self, *, grant: UploadGrant, content: bytes, media_type: str) -> None:
+            nonlocal failed_once
+            if grant.output_index == 1 and not failed_once:
+                failed_once = True
+                raise WorkerUploadError("upload failed")
+            await super().upload(grant=grant, content=content, media_type=media_type)
+
+    first_output = _output_for_content(_solid_image_bytes((0, 0, 0))) if exact_zero else _output(0)
+    client, executor, uploader = _client(
+        executor=FakeExecutor(outputs=[first_output, _output(1)]),
+        uploader=FailingUploader(),
+    )
+    request = _signed_request(uploads=2)
+    with client:
+        assert client.post("/jobs/generate", json=request).status_code == 502
+        assert client.post("/jobs/generate", json=request).status_code == 200
+
+    # Legacy graphs cannot skip computation, but successful uploads are retained.
+    assert len(executor.workflows) == 2
+    assert [upload.grant.output_index for upload in uploader.uploads] == [0, 1]
+    # A zero output uploaded before the failure still gets its one bounded reset.
+    assert len(executor.reset_workflows) == int(exact_zero)
+
+
 def test_ed25519_authenticates_the_payload_and_upload_grants() -> None:
     request = _signed_request()
     request["payload"]["workflow"]["2"]["inputs"]["steps"] = 21

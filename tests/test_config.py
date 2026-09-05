@@ -50,6 +50,21 @@ def test_hires_i2v_profile_defaults_closed_until_matching_worker_rollout() -> No
         )
 
 
+def test_i2v_ready_idle_default_is_bounded_but_long_sessions_remain_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GEN_AUTOMATION_I2V_WARM_IDLE_SECONDS", raising=False)
+    assert Settings(_env_file=None).i2v_warm_idle_seconds == 900
+    assert Settings(_env_file=None).i2v_worker_lease_seconds == 86_400
+    monkeypatch.setenv("GEN_AUTOMATION_I2V_WARM_IDLE_SECONDS", "36000")
+    assert Settings(_env_file=None).i2v_warm_idle_seconds == 36_000
+    monkeypatch.setenv("GEN_AUTOMATION_I2V_WARM_IDLE_SECONDS", "")
+    assert Settings(_env_file=None).i2v_warm_idle_seconds == 900
+    assert Settings(_env_file=None, i2v_warm_idle_seconds=None).i2v_warm_idle_seconds is None
+    example = (Path(__file__).resolve().parents[1] / ".env.example").read_text(encoding="utf-8")
+    assert "GEN_AUTOMATION_I2V_WARM_IDLE_SECONDS=900" in example
+
+
 def test_production_configuration_fails_closed() -> None:
     with pytest.raises(ValidationError):
         Settings(environment=Environment.PRODUCTION)

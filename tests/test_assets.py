@@ -27,7 +27,9 @@ from gen_automation.services.assets import (
     AssetBusyError,
     AssetConflictError,
     AssetQuarantinedError,
+    AssetStorageUnavailableError,
     AssetUploadSalvageRequiredError,
+    AssetVerificationUnavailableError,
     UploadIntent,
     UploadNotReadyError,
     create_raw_master_upload_intents,
@@ -35,7 +37,7 @@ from gen_automation.services.assets import (
     presign_asset_download,
 )
 from gen_automation.storage.base import ObjectNotFoundError, ObjectStoreError, PresignedUpload
-from gen_automation.storage.images import verify_image_bytes
+from gen_automation.storage.images import VerifiedImage, verify_image_bytes
 from gen_automation.storage.memory import MemoryObjectStore
 
 
@@ -616,6 +618,83 @@ async def test_missing_upload_is_retryable(asset_context: AssetContext) -> None:
     assert asset is not None
     assert asset.state == AssetState.UPLOADING
     assert asset.verification_error_code == "staging_not_found"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout_on_call", [1, 2])
+async def test_decoder_timeout_releases_claim_and_preserves_upload_for_retry(
+    asset_context: AssetContext,
+    monkeypatch: pytest.MonkeyPatch,
+    timeout_on_call: int,
+) -> None:
+    store = MemoryObjectStore()
+    intent = (await create_intents(asset_context, store))[0]
+    original = png_bytes()
+    stage_upload(store, intent, original)
+    if timeout_on_call == 2:
+        verified = verify_image_bytes(original)
+        master_key = f"masters/{asset_context.release_id}/{intent.asset_id}/{verified.sha256}.png"
+        store.put_for_test(
+            master_key,
+            original,
+            content_type="image/png",
+            metadata={
+                "asset-id": str(intent.asset_id),
+                "generation-job-id": str(asset_context.job_id),
+                "output-index": "0",
+                "sha256": verified.sha256,
+            },
+        )
+    preserved_objects = dict(store.objects)
+    decode_calls = 0
+
+    async def timeout_once(data: bytes) -> VerifiedImage:
+        nonlocal decode_calls
+        decode_calls += 1
+        if decode_calls == timeout_on_call:
+            raise TimeoutError("simulated isolated decoder timeout")
+        return verify_image_bytes(data)
+
+    monkeypatch.setattr("gen_automation.services.assets.verify_image_bytes_isolated", timeout_once)
+    async with asset_context.database.sessions() as session:
+        with pytest.raises(
+            AssetVerificationUnavailableError, match="verification timed out"
+        ) as error:
+            await finalize_raw_master(
+                session,
+                store,
+                asset_id=intent.asset_id,
+                max_bytes=1_000_000,
+            )
+        # Existing collection and API handlers must classify this as retryable.
+        assert isinstance(error.value, AssetStorageUnavailableError)
+
+    async with asset_context.database.sessions() as session:
+        asset = await session.get(Asset, intent.asset_id)
+        assert asset is not None
+        assert asset.state == AssetState.UPLOADING
+        assert asset.verification_lease_owner is None
+        assert asset.verification_lease_expires_at is None
+        assert asset.verification_error_code == "image_verification_timeout"
+        assert asset.object_key is None
+        assert await session.scalar(select(func.count()).select_from(OutboxEvent)) == 0
+    assert store.objects == preserved_objects
+
+    async with asset_context.database.sessions() as session:
+        finalized = await finalize_raw_master(
+            session,
+            store,
+            asset_id=intent.asset_id,
+            max_bytes=1_000_000,
+        )
+        asset = await session.get(Asset, intent.asset_id)
+        assert asset is not None
+        assert asset.state == AssetState.AVAILABLE
+        assert asset.verification_error_code is None
+    assert decode_calls == 2 * timeout_on_call
+    assert finalized.replayed is False
+    assert store.objects[finalized.object_key].body == original
+    assert intent.staging_key not in store.objects
 
 
 @pytest.mark.asyncio

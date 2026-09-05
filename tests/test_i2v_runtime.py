@@ -825,14 +825,16 @@ async def test_cancel_requested_provider_success_settles_as_cancelled(
     assert "cancel_job" not in client.provider_mutations
 
 
+@pytest.mark.parametrize("warm_idle_seconds", (900, 1800))
 async def test_warm_idle_can_stop_or_remain_manual_unbounded(
     runtime_database: tuple[Database, UUID, UUID],
+    warm_idle_seconds: int,
 ) -> None:
     database, _owner_id, _input_id = runtime_database
     client = FakeRuntimeSalad()
-    runtime = _runtime(database, client, warm_idle_seconds=1800)
+    runtime = _runtime(database, client, warm_idle_seconds=warm_idle_seconds)
     assert (await runtime.run_cycle(now=_NOW)).action == "deployment_observed"
-    stopped = await runtime.run_cycle(now=_NOW + timedelta(seconds=1801))
+    stopped = await runtime.run_cycle(now=_NOW + timedelta(seconds=warm_idle_seconds))
     assert stopped.action == "group_stop_requested"
     assert client.provider_mutations == ["stop_group"]
     assert client.stopped_group_names == ["i2v-dasiwa-5090-v1"]
@@ -882,12 +884,14 @@ async def test_new_ready_worker_identity_earns_a_fresh_warm_idle_window(
     assert client.stopped_group_names == ["i2v-dasiwa-5090-v1"]
 
 
+@pytest.mark.parametrize("warm_idle_seconds", (900, 1800))
 async def test_nonready_to_ready_transition_earns_a_fresh_warm_idle_window(
     runtime_database: tuple[Database, UUID, UUID],
+    warm_idle_seconds: int,
 ) -> None:
     database, _owner_id, _input_id = runtime_database
     client = FakeRuntimeSalad()
-    runtime = _runtime(database, client, warm_idle_seconds=1800)
+    runtime = _runtime(database, client, warm_idle_seconds=warm_idle_seconds)
     assert (await runtime.run_cycle(now=_NOW)).action == "deployment_observed"
 
     client.instances = (
@@ -915,10 +919,12 @@ async def test_nonready_to_ready_transition_earns_a_fresh_warm_idle_window(
         assert deployment is not None
         assert deployment.deployment_metadata["idle_since"] == ready_at.isoformat()
 
-    assert (await runtime.run_cycle(now=ready_at + timedelta(seconds=1799))).action == "idle"
+    assert (
+        await runtime.run_cycle(now=ready_at + timedelta(seconds=warm_idle_seconds - 1))
+    ).action == "idle"
     assert client.provider_mutations == []
     assert (
-        await runtime.run_cycle(now=ready_at + timedelta(seconds=1800))
+        await runtime.run_cycle(now=ready_at + timedelta(seconds=warm_idle_seconds))
     ).action == "group_stop_requested"
     assert client.provider_mutations == ["stop_group"]
     assert client.stopped_group_names == ["i2v-dasiwa-5090-v1"]
@@ -1001,12 +1007,14 @@ async def test_invalid_idle_timestamp_cannot_end_or_extend_a_ready_epoch(
         assert deployment.deployment_metadata["idle_since"] == reset_at.isoformat()
 
 
+@pytest.mark.parametrize("warm_idle_seconds", (900, 1800))
 async def test_queued_and_active_work_clear_a_stale_warm_idle_epoch(
     runtime_database: tuple[Database, UUID, UUID],
+    warm_idle_seconds: int,
 ) -> None:
     database, owner_id, input_id = runtime_database
     client = FakeRuntimeSalad()
-    runtime = _runtime(database, client, warm_idle_seconds=1800)
+    runtime = _runtime(database, client, warm_idle_seconds=warm_idle_seconds)
     assert (await runtime.run_cycle(now=_NOW)).action == "deployment_observed"
     await _queue_job(database, owner_id=owner_id, input_id=input_id)
 

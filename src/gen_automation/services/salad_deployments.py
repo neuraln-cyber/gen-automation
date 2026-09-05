@@ -1532,6 +1532,7 @@ async def _container_group_payload(
     *,
     environment_overrides: Mapping[str, str] | None = None,
     effective_min_replicas: int | None = None,
+    resolve_runtime_bindings: bool = True,
 ) -> JSONObject:
     configuration = deepcopy(deployment.provider_configuration)
     if not isinstance(configuration, dict) or not all(
@@ -1641,7 +1642,11 @@ async def _container_group_payload(
 
     binding_references = {binding.name: binding.reference for binding in bindings}
     environment: dict[str, JSONValue] = {}
-    if resolver is None:
+    if not resolve_runtime_bindings:
+        # An already-applied, identity-verified rollout needs only the same
+        # local contract validation, not a new set of unused credentials.
+        pass
+    elif resolver is None:
         if bindings:
             raise SaladDeploymentValidationError("runtime bindings require a secret resolver")
     else:
@@ -1787,6 +1792,14 @@ async def refresh_container_group_runtime(
                 raise SaladDeploymentValidationError(
                     "container group runtime advanced outside the planned update"
                 )
+            assert environment_overrides is not None
+            _validate_group_runtime_admission_identity(
+                preflight,
+                artifact_manifest_sha256=environment_overrides.get(
+                    WORKER_MODEL_MANIFEST_SHA256_BINDING, ""
+                ),
+                runtime_admission_id=runtime_admission_id,
+            )
             already_applied = True
         elif preflight_admission_id == runtime_admission_id:
             raise SaladDeploymentValidationError(
@@ -1802,6 +1815,7 @@ async def refresh_container_group_runtime(
         resolver,
         environment_overrides=environment_overrides,
         effective_min_replicas=effective_min_replicas,
+        resolve_runtime_bindings=not already_applied,
     )
     container = payload.get("container")
     if not isinstance(container, dict):

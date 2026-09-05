@@ -598,8 +598,12 @@ class Settings(BaseSettings):
     i2v_salad_gpu_class_id: UUID | None = None
     i2v_salad_gpu_class_name: str = "RTX 5090 (32 GB)"
     i2v_salad_prefetch: int = Field(default=3, gt=0)
+    # Crash-recovery ownership, renewed while provider work remains active;
+    # this is not an execution deadline or a provider spending cap.
     i2v_worker_lease_seconds: int = Field(default=24 * 60 * 60, gt=0)
-    i2v_warm_idle_seconds: int | None = Field(default=10 * 60 * 60, gt=0)
+    # Legacy Salad fallback only, not RunPod: count ready time without queued
+    # or active work. Explicitly retain a longer window if cold downloads cost more.
+    i2v_warm_idle_seconds: int | None = Field(default=15 * 60, gt=0)
     i2v_salad_cpu: int = Field(default=8, gt=0)
     i2v_salad_memory_mb: int = Field(default=32 * 1024, gt=0)
     i2v_salad_storage_bytes: int = Field(default=250 * 1024 * 1024 * 1024, gt=0)

@@ -201,6 +201,42 @@ idle worker when the selected stack is not already resident. The ordinary
 Automation safety bounds still apply, including provider-job chunking, the
 single-replica contract, artifact capacity, and budget kill switches.
 
+### Legacy I2V Salad fallback cost policy
+
+Current I2V selects RunPod when `GEN_AUTOMATION_I2V_RUNPOD_ENABLED=true`.
+The separate Salad I2V adapter remains available for explicit fallback with
+I2V enabled and RunPod disabled. It is not the image/Experiment Lab deployment
+above, and its idle setting does not configure RunPod workers or volumes.
+No provider mode, live environment override, or RunPod timeout is changed by
+the following source default.
+
+The Salad fallback now defaults to
+`GEN_AUTOMATION_I2V_WARM_IDLE_SECONDS=900`: stop after 15 minutes continuously
+READY with no dispatchable queued or active work. Downloading/non-ready time
+is excluded. New readiness/worker identity and completed work receive a fresh
+idle window; active work is not terminated by this timer. Set a longer positive
+value explicitly for intentional reuse, such as the former `36000` seconds.
+Empty/unset environment values use 900 seconds, including on upgrade;
+programmatic `None` still means manual-stop-only. Inspect actual live settings
+first: a shorter window can stop an already-ready idle group on the next cycle.
+
+Compared with the former ten-hour default, this avoids up to 9.75 paid idle
+hours after an abandoned session, but shorter gaps can become more expensive.
+A fresh baseline model cache miss downloads 36,047,286,759 bytes (33.57 GiB)
+from private S3, before optional LoRAs. Compare full cold-start transfer/runtime
+cost with saved idle hours times the actual provider rate; preserve exact
+version/checksum checks. See [AWS S3 transfer pricing](https://aws.amazon.com/s3/pricing/).
+
+The Salad fallback's 24-hour worker lease is renewable crash-recovery
+bookkeeping, not a runtime cap. Its pending/running observations renew that
+lease indefinitely, and it is not connected to the image `ProviderBudgetGuard`
+or image allocation kill-switch path. Controller-enforced ready-idle expiry
+cannot bound hung active jobs or controller outages. Verify every exact Salad
+I2V group separately before control-plane maintenance. These legacy limitations
+must not be confused with the newer RunPod execution, queue, and claim timeouts.
+
+### Image worker execution
+
 The worker image pins ComfyUI and embeds the pinned Salad HTTP Job Queue worker.
 The runtime supervises ComfyUI, the embedded queue forwarder, and the worker HTTP
 API as one failure domain. The Salad container-group queue connection must

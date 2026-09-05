@@ -69,6 +69,32 @@ def test_budget_notifies_before_and_at_the_limit() -> None:
     )
 
 
+def test_rds_log_exports_use_managed_retention_without_a_database_dependency_cycle() -> None:
+    monitoring = (INFRA / "monitoring.tf").read_text(encoding="utf-8")
+    database = (INFRA / "database.tf").read_text(encoding="utf-8")
+    variables = (INFRA / "variables.tf").read_text(encoding="utf-8")
+    readme = (INFRA / "README.md").read_text(encoding="utf-8")
+    log_groups = monitoring.split('resource "aws_cloudwatch_log_group" "postgresql" {', maxsplit=1)[
+        1
+    ].split('resource "aws_sns_topic" "alerts"', maxsplit=1)[0]
+
+    assert 'for_each = toset(["postgresql", "upgrade"])' in log_groups
+    assert '"/aws/rds/instance/${local.name}-postgresql/${each.value}"' in log_groups
+    assert re.search(r"retention_in_days\s*=\s*var.log_retention_days", log_groups)
+    assert re.search(r"skip_destroy\s*=\s*true", log_groups)
+    assert "aws_db_instance" not in log_groups
+    assert 'identifier = "${local.name}-postgresql"' in database
+    assert 'enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]' in database
+    assert "depends_on = [aws_cloudwatch_log_group.postgresql]" in database
+    assert re.search(r'variable "log_retention_days"\s*\{.*?default\s*=\s*30', variables, re.DOTALL)
+    for log_type in ("postgresql", "upgrade"):
+        assert f'aws_cloudwatch_log_group.postgresql["{log_type}"]' in readme
+        assert f"/aws/rds/instance/gen-automation-staging-postgresql/{log_type}" in readme
+    assert "Import only groups that already exist" in readme
+    assert "no database or EC2 replacement" in readme
+    assert "does not recover expired events" in readme
+
+
 def test_aws_staging_has_no_ssh_or_secret_value_resources() -> None:
     source = _terraform_source()
     cloud_init = (INFRA / "cloud-init.yaml.tftpl").read_text(encoding="utf-8")

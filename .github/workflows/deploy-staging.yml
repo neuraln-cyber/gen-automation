@@ -509,6 +509,11 @@ jobs:
               "sudo /usr/local/libexec/"
               "gen-automation-validate-migration-environment"
           )
+          image_work_preflight = (
+              "sudo /usr/local/sbin/gen-automation-update-control-plane"
+              f" --image {shlex.quote(image)} --revision {shlex.quote(revision)}"
+              " --check-idle-only --external-lock-held"
+          )
           stop_control_plane = (
               "sudo /usr/bin/systemctl stop gen-automation-staging.service"
               " && ! sudo /usr/bin/systemctl is-active --quiet"
@@ -536,6 +541,7 @@ jobs:
           )
           unlocked_command = (
               f"{migration_preflight} && {refresh_host_bootstrap} && "
+              f"{image_work_preflight} && "
               f"{backup_runtime_env} && "
               f"( if {stop_control_plane} && {update_worker_references}; then "
               f"if {migration_command}; then "
