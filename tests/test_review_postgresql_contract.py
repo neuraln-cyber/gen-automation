@@ -1,4 +1,5 @@
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -25,15 +26,16 @@ from tests.test_review_api import _raw_asset, _seed_review_api, _settings
 POSTGRESQL_URL = os.getenv("GEN_AUTOMATION_DATABASE_URL", "")
 
 
-@pytest.mark.skipif(
-    not POSTGRESQL_URL.startswith("postgresql"),
-    reason="requires the PostgreSQL contract database",
-)
 @pytest.mark.asyncio
-async def test_manual_review_freezes_without_analysis_on_migrated_postgresql() -> None:
+async def test_manual_review_freezes_without_analysis(tmp_path: Path) -> None:
     from gen_automation.db.models import ScoringRun
 
-    database = Database(POSTGRESQL_URL)
+    postgres = POSTGRESQL_URL.startswith("postgresql")
+    database = Database(
+        POSTGRESQL_URL if postgres else f"sqlite+aiosqlite:///{(tmp_path / 'manual.db').as_posix()}"
+    )
+    if not postgres:
+        await database.create_schema()
     try:
         async with database.sessions() as session:
             project = Project(slug="manual-contract", name="Manual contract")
@@ -55,6 +57,7 @@ async def test_manual_review_freezes_without_analysis_on_migrated_postgresql() -
                 specification={},
                 specification_sha256="a" * 64,
                 created_by="test",
+                created_at=datetime.now(UTC),
             )
             session.add(version)
             await session.flush()
