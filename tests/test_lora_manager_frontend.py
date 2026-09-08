@@ -52,7 +52,12 @@ def _render_manager() -> str:
         "updated_at": "2026-08-09T12:00:00Z",
     }
     return template.render(
-        request=SimpleNamespace(url=SimpleNamespace(path="/dashboard/loras")),
+        request=SimpleNamespace(
+            url=SimpleNamespace(path="/dashboard/loras"),
+            app=SimpleNamespace(
+                state=SimpleNamespace(settings=SimpleNamespace(semantic_learning_enabled=False))
+            ),
+        ),
         page_title="LoRA manager",
         principal=principal,
         csrf_token=principal.user_id,
