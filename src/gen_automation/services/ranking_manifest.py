@@ -15,6 +15,7 @@ from gen_automation.domain.enums import AssetScoreState, ScoringRunState
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _FROZEN_SCORE_STATES = frozenset(
     {
+        AssetScoreState.SKIPPED,
         AssetScoreState.SCORED,
         AssetScoreState.FLAGGED_BLANK,
         AssetScoreState.FLAGGED_CORRUPT,

@@ -36,6 +36,14 @@ def _principal(role: AdminRole) -> AuthenticatedPrincipal:
     )
 
 
+def test_suspended_learning_hides_navigation_and_blocks_all_routes(client: TestClient) -> None:
+    client.app.state.settings.semantic_learning_enabled = False
+    assert client.get("/dashboard/anatomy-learning").status_code == 404
+    assert client.post("/dashboard/anatomy-learning/policy").status_code == 404
+    assert client.post("/dashboard/anatomy-learning/train").status_code == 404
+    assert 'href="/dashboard/anatomy-learning"' not in client.get("/dashboard").text
+
+
 def _seed_development_owner(client: TestClient) -> None:
     now = datetime.now(UTC)
 

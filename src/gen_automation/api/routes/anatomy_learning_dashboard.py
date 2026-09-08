@@ -49,6 +49,14 @@ from gen_automation.services.semantic_learning_readiness import (
 )
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"], include_in_schema=False)
+
+
+def require_learning_enabled(request: Request) -> None:
+    if not request.app.state.settings.semantic_learning_enabled:
+        raise HTTPException(status_code=404, detail="Anatomy learning is suspended")
+
+
+router.dependencies.append(Depends(require_learning_enabled))
 templates = Jinja2Templates(directory=str(Path(__file__).parents[2] / "templates"))
 Session = Annotated[AsyncSession, Depends(get_session)]
 _RECENT_HISTORY_LIMIT = 20

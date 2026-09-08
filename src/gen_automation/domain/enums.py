@@ -137,6 +137,7 @@ class ScoringRunState(StrEnum):
 
 
 class AssetScoreState(StrEnum):
+    SKIPPED = "skipped"
     PENDING = "pending"
     PROCESSING = "processing"
     RETRY_WAIT = "retry_wait"

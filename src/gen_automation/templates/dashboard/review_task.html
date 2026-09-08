@@ -43,6 +43,7 @@
     </form>
   {% endif %}
 
+  {% if semantic_mode != "off" %}
   <aside
     class="anatomy-mode-banner mode-{{ semantic_mode }}"
     data-semantic-mode="{{ semantic_mode }}"
@@ -264,6 +265,7 @@
       </details>
     {% endif %}
   </aside>
+  {% endif %}
 
   {% set final_set_goal = summary.desired_accepted_count %}
   {% set optional_slots_remaining = [final_set_goal - summary.accepted_count, 0] | max %}

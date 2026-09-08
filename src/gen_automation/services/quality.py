@@ -50,6 +50,7 @@ from gen_automation.services.ranking_manifest import (
 
 _ERROR_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,99}")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+MANUAL_REVIEW_VERSION = "manual-review-v1"
 _TERMINAL_SCORE_STATES = frozenset(
     {
         AssetScoreState.SCORED,
@@ -156,6 +157,108 @@ class _PreparedScore:
     aggregate_score_micros: int
     signal_detail: dict[str, Any]
     result: QualityResult | None
+
+
+async def create_manual_review_run(
+    session: AsyncSession,
+    *,
+    release_version_id: UUID,
+    now: datetime | None = None,
+) -> ScoringRunResult:
+    """Freeze an unscored review list from verified metadata, without reading image bytes.
+
+    The existing manifest is retained for review/export integrity. SKIPPED rows
+    carry no measured quality signals; the required aggregate is a neutral sort
+    placeholder, never a quality estimate. Existing completed rankings win.
+    """
+    created_at = _as_utc(now or datetime.now(UTC))
+    candidates = await _load_candidates_locked(session, release_version_id)
+    _validate_candidate_batch(candidates, DEFAULT_QUALITY_CONFIG)
+    existing = await session.scalar(
+        select(ScoringRun)
+        .where(
+            ScoringRun.release_version_id == release_version_id,
+            ScoringRun.state == ScoringRunState.COMPLETED,
+        )
+        .order_by(ScoringRun.created_at.desc(), ScoringRun.id.desc())
+        .limit(1)
+    )
+    if existing is not None:
+        existing_rows = await load_ranking_manifest_rows(session, existing.id)
+        validate_completed_ranking_manifest(existing, existing_rows)
+        result = _run_result(existing, replayed=True)
+        await session.rollback()
+        return result
+    order = list(
+        (
+            await session.scalars(
+                select(Asset.id)
+                .join(GenerationJob, GenerationJob.id == Asset.generation_job_id)
+                .where(GenerationJob.release_version_id == release_version_id)
+                .order_by(GenerationJob.created_at, GenerationJob.id, Asset.output_index, Asset.id)
+            )
+        ).all()
+    )
+    positions = {asset_id: index for index, asset_id in enumerate(order)}
+    candidates.sort(key=lambda candidate: positions[candidate.asset_id])
+    configuration = {"mode": "manual_review", "order": "generation", "analysis_performed": False}
+    config_sha256 = canonical_sha256(configuration)
+    run = ScoringRun(
+        id=uuid7(),
+        release_version_id=release_version_id,
+        configuration=configuration,
+        config_sha256=config_sha256,
+        input_manifest_sha256=_manifest_sha256(release_version_id, candidates),
+        scorer_version=MANUAL_REVIEW_VERSION,
+        pillow_version="not-used",
+        state=ScoringRunState.RUNNING,
+        asset_count=len(candidates),
+        max_attempts=1,
+        created_at=created_at,
+        started_at=created_at,
+    )
+    session.add(run)
+    await session.flush()
+    rows: list[tuple[AssetRanking, AssetScore]] = []
+    for rank, candidate in enumerate(candidates, start=1):
+        score = _new_asset_score(
+            run_id=run.id,
+            candidate=candidate,
+            max_attempts=1,
+            created_at=created_at,
+            config_sha256=config_sha256,
+        )
+        score.state = AssetScoreState.SKIPPED
+        score.completed_at = created_at
+        score.aggregate_score_micros = 0
+        score.scorer_version = MANUAL_REVIEW_VERSION
+        score.pillow_version = "not-used"
+        score.signal_detail = {"analysis_performed": False, "reason": "scoring_disabled"}
+        ranking = AssetRanking(
+            id=uuid7(),
+            scoring_run_id=run.id,
+            asset_score_id=score.id,
+            asset_id=score.asset_id,
+            rank=rank,
+            aggregate_score_micros=0,
+            disposition=RankingDisposition.REVIEW_CANDIDATE,
+            explanation={"quality_state": "not_scored", "analysis_performed": False},
+            is_duplicate_representative=False,
+            scorer_version=MANUAL_REVIEW_VERSION,
+            pillow_version="not-used",
+            config_sha256=config_sha256,
+            frozen_at=created_at,
+        )
+        session.add(score)
+        rows.append((ranking, score))
+    await session.flush()
+    session.add_all(ranking for ranking, _ in rows)
+    await session.flush()
+    run.ranking_manifest_sha256 = ranking_manifest_sha256(run, rows)
+    run.state = ScoringRunState.COMPLETED
+    run.completed_at = created_at
+    await session.commit()
+    return _run_result(run, replayed=False)
 
 
 async def create_scoring_run(

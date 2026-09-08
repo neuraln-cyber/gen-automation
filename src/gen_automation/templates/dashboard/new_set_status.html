@@ -132,7 +132,7 @@
         class="pipeline-step{% if release.stage.step > 4 %} completed{% elif release.stage.step == 4 %} active{% endif %}"
         data-pipeline-stage="scoring"
         {% if release.stage.step == 4 %}aria-current="step"{% endif %}
-      >Scoring</li>
+      >{{ 'Scoring' if request.app.state.settings.quality_scoring_enabled else 'Prepare review' }}</li>
       <li
         class="pipeline-step{% if release.stage.step == 5 %} active{% endif %}"
         data-pipeline-stage="review"
@@ -194,8 +194,10 @@
       </div>
       <div>
         <dt>Quality scoring</dt>
-        <dd data-progress-scoring-count>
-          {% if release.scoring %}
+        <dd{% if request.app.state.settings.quality_scoring_enabled %} data-progress-scoring-count{% endif %}>
+          {% if not request.app.state.settings.quality_scoring_enabled %}
+            Suspended
+          {% elif release.scoring %}
             {{ release.scoring.completed }} / {{ release.scoring.total }}
           {% else %}
             Not started

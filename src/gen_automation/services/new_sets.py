@@ -1037,6 +1037,7 @@ async def load_new_set_status(
     *,
     release_id: UUID,
     gpu_billing_snapshot: GpuBillingSnapshot | None = None,
+    quality_scoring_enabled: bool = True,
 ) -> NewSetStatus:
     row = (
         await session.execute(
@@ -1234,6 +1235,7 @@ async def load_new_set_status(
         ready_for_review=ready_for_review,
         failed_jobs=failed_jobs,
         stop_requested=stop_requested,
+        quality_scoring_enabled=quality_scoring_enabled,
     )
     status_now = datetime.now(UTC)
     if stage.key in {GenerationProgressStage.QUEUED, GenerationProgressStage.GPU_STARTING}:
@@ -1385,6 +1387,7 @@ def _generation_progress_stage(
     ready_for_review: bool,
     failed_jobs: int,
     stop_requested: bool = False,
+    quality_scoring_enabled: bool = True,
 ) -> tuple[GenerationProgressStageView, GenerationProgressError | None]:
     release_unhealthy = release.health == ResourceHealth.BLOCKED or (
         stop_requested and release.health != ResourceHealth.HEALTHY
@@ -1506,7 +1509,7 @@ def _generation_progress_stage(
                 GenerationProgressStage.ERROR,
                 step=4,
                 label="Ranking needs attention",
-                detail="Quality scoring finished, but the ranked snapshot is incomplete.",
+                detail="Review preparation finished, but the frozen image list is incomplete.",
             ),
             GenerationProgressError(
                 code="ranking_incomplete",
@@ -1521,8 +1524,12 @@ def _generation_progress_stage(
             _stage(
                 GenerationProgressStage.SCORING,
                 step=4,
-                label="Scoring image quality",
-                detail=f"{scored} of {total} images have completed quality scoring.",
+                label="Scoring image quality" if quality_scoring_enabled else "Preparing review",
+                detail=(
+                    f"{scored} of {total} images have completed quality scoring."
+                    if quality_scoring_enabled
+                    else "Preparing your images for manual review. Automatic scoring is suspended."
+                ),
             ),
             None,
         )

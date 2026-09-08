@@ -5,8 +5,14 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.dialects import postgresql
 
+from gen_automation.db.models import GenerationJob, Project, Release, ReleaseVersion
 from gen_automation.db.session import Database
-from gen_automation.domain.enums import AdminRole, ReviewBulkAction
+from gen_automation.domain.enums import AdminRole, GenerationState, ReleasePhase, ReviewBulkAction
+from gen_automation.services.quality import create_manual_review_run
+from gen_automation.services.ranking_manifest import (
+    load_ranking_manifest_rows,
+    validate_completed_ranking_manifest,
+)
 from gen_automation.services.review import (
     _accepted_release_selection_sources_statement,
     _latest_review_decisions_for_update_statement,
@@ -14,9 +20,78 @@ from gen_automation.services.review import (
     create_review_task,
     get_review_summary,
 )
-from tests.test_review_api import _seed_review_api, _settings
+from tests.test_review_api import _raw_asset, _seed_review_api, _settings
 
 POSTGRESQL_URL = os.getenv("GEN_AUTOMATION_DATABASE_URL", "")
+
+
+@pytest.mark.skipif(
+    not POSTGRESQL_URL.startswith("postgresql"),
+    reason="requires the PostgreSQL contract database",
+)
+@pytest.mark.asyncio
+async def test_manual_review_freezes_without_analysis_on_migrated_postgresql() -> None:
+    from gen_automation.db.models import ScoringRun
+
+    database = Database(POSTGRESQL_URL)
+    try:
+        async with database.sessions() as session:
+            project = Project(slug="manual-contract", name="Manual contract")
+            session.add(project)
+            await session.flush()
+            release = Release(
+                project_id=project.id,
+                slug="manual",
+                title="Manual",
+                phase=ReleasePhase.REVIEWING,
+                current_version_no=1,
+                desired_accepted_count=1,
+            )
+            session.add(release)
+            await session.flush()
+            version = ReleaseVersion(
+                release_id=release.id,
+                version_no=1,
+                specification={},
+                specification_sha256="a" * 64,
+                created_by="test",
+            )
+            session.add(version)
+            await session.flush()
+            job = GenerationJob(
+                release_version_id=version.id,
+                logical_key="b" * 64,
+                parameters={},
+                parameters_sha256="c" * 64,
+                state=GenerationState.SUCCEEDED,
+                expected_output_count=1,
+            )
+            session.add(job)
+            await session.flush()
+            session.add(
+                _raw_asset(
+                    asset_id=uuid4(),
+                    release_id=release.id,
+                    job_id=job.id,
+                    output_index=0,
+                )
+            )
+            await session.commit()
+            result = await create_manual_review_run(session, release_version_id=version.id)
+            run = await session.get(ScoringRun, result.run_id)
+            rows = await load_ranking_manifest_rows(session, result.run_id)
+            assert run is not None
+            validate_completed_ranking_manifest(run, rows)
+            assert rows[0][1].state.value == "skipped"
+            assert rows[0][1].dhash_hex is None
+            assert (
+                await create_manual_review_run(
+                    session,
+                    release_version_id=version.id,
+                )
+            ).replayed
+    finally:
+        await database.dispose()
 
 
 def test_release_selection_lock_is_scoped_away_from_grouped_subquery() -> None:

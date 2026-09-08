@@ -34,6 +34,7 @@ _SAFE_IMAGE_FORMAT = re.compile(r"^[a-zA-Z0-9]{1,10}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RANKABLE_SCORE_STATES = frozenset(
     {
+        AssetScoreState.SKIPPED,
         AssetScoreState.SCORED,
         AssetScoreState.FLAGGED_BLANK,
         AssetScoreState.FLAGGED_CORRUPT,
@@ -519,7 +520,11 @@ def _ranked_master(
         asset_id=ranking.asset_id,
         rank=ranking.rank,
         aggregate_score_micros=ranking.aggregate_score_micros,
-        score_percent=f"{ranking.aggregate_score_micros / 10_000:.1f}%",
+        score_percent=(
+            "Not scored"
+            if score.state == AssetScoreState.SKIPPED
+            else f"{ranking.aggregate_score_micros / 10_000:.1f}%"
+        ),
         disposition=ranking.disposition.value,
         explanation=MappingProxyType(explanation),
         explanation_summary=_explanation_summary(explanation),

@@ -26,6 +26,7 @@ from gen_automation.db.models import (
     Release,
     ReleaseVersion,
     SaladDeployment,
+    ScoringRun,
 )
 from gen_automation.domain.enums import (
     BudgetState,
@@ -38,6 +39,7 @@ from gen_automation.domain.enums import (
     ResourceHealth,
     SaladDeploymentPurpose,
     SaladDeploymentState,
+    ScoringRunState,
 )
 from gen_automation.domain.runtime_bindings import (
     WORKER_MODEL_MANIFEST_JSON_BINDING,
@@ -114,6 +116,7 @@ from gen_automation.services.publication_runtime import (
     XOAuthProvider,
     run_publication_cycle,
 )
+from gen_automation.services.quality import create_manual_review_run
 from gen_automation.services.quality_isolation import QualityIsolationPolicy
 from gen_automation.services.quality_runtime import run_quality_cycle
 from gen_automation.services.runtime_secrets import (
@@ -1910,6 +1913,32 @@ class ControllerWorkloads:
             raise
         return True
 
+    async def manual_review_once(self) -> bool:
+        if self.object_store is None or self.settings.quality_scoring_enabled:
+            return False
+        async with self.sessions() as session:
+            version_id = await session.scalar(
+                select(ReleaseVersion.id)
+                .join(Release, Release.id == ReleaseVersion.release_id)
+                .where(
+                    Release.phase == ReleasePhase.REVIEWING,
+                    Release.current_version_no == ReleaseVersion.version_no,
+                    ~exists(
+                        select(ScoringRun.id).where(
+                            ScoringRun.release_version_id == ReleaseVersion.id,
+                            ScoringRun.state == ScoringRunState.COMPLETED,
+                        )
+                    ),
+                )
+                .order_by(Release.created_at, Release.id)
+                .limit(1)
+            )
+            if version_id is None:
+                await session.rollback()
+                return False
+            result = await create_manual_review_run(session, release_version_id=version_id)
+            return not result.replayed
+
     async def quality_once(self) -> bool:
         if self.object_store is None or not self.settings.quality_scoring_enabled:
             return False
@@ -3121,6 +3150,15 @@ def build_controller_runtime(
                     cycle=workloads.quality_once,
                     idle_interval_seconds=poll,
                     timeout_seconds=settings.background_quality_timeout_seconds + 5,
+                )
+            )
+        else:
+            loops.append(
+                LoopSpec(
+                    name="manual-review-preparation",
+                    cycle=workloads.manual_review_once,
+                    idle_interval_seconds=max(poll, 30),
+                    timeout_seconds=30,
                 )
             )
         if settings.semantic_anatomy_enabled:

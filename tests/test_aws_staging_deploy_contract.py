@@ -282,7 +282,8 @@ def test_containers_are_ordered_health_checked_and_not_privileged() -> None:
     assert "no-new-privileges:true" not in caddy
     assert "cap_add:\n      - NET_BIND_SERVICE" in caddy
     assert "patreon-browser:\n        condition: service_healthy" in controller
-    assert "semantic-gateway:\n        condition: service_healthy" in controller
+    assert 'profiles: ["anatomy"]' in semantic
+    assert "semantic-gateway:\n        condition: service_healthy" not in controller
     assert "control-plane-mega:\n        condition: service_healthy" in ingress
     assert "ingress-guard:\n        condition: service_healthy" in caddy
     assert "restart: true" in controller

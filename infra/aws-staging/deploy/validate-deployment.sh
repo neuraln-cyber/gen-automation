@@ -171,6 +171,13 @@ esac
   fail "control-plane Patreon sidecar URL must remain loopback-only"
 [ "$(env_value GEN_AUTOMATION_SEMANTIC_ANATOMY_ENDPOINT_URL "$config_root/control-plane.env")" = "http://127.0.0.1:8091/v1/anatomy/assess" ] ||
   fail "control-plane semantic gateway URL must remain loopback-only"
+if [ "$(env_value GEN_AUTOMATION_SEMANTIC_ANATOMY_ENABLED "$config_root/control-plane.env")" = "true" ]; then
+  compose_profiles="$(env_value COMPOSE_PROFILES "$config_root/deploy.env")"
+  case ",${compose_profiles}," in
+    *,anatomy,*) ;;
+    *) fail "enabled anatomy requires COMPOSE_PROFILES to include anatomy" ;;
+  esac
+fi
 [ "$(env_value GEN_AUTOMATION_SEMANTIC_ANATOMY_MODEL "$config_root/control-plane.env")" = "$(env_value GEN_AUTOMATION_SEMANTIC_GATEWAY_MODEL "$config_root/semantic-gateway.env")" ] ||
   fail "control-plane and semantic gateway model identifiers must match"
 [ "$(env_value GEN_AUTOMATION_SEMANTIC_ANATOMY_MODEL_REVISION "$config_root/control-plane.env")" = "$(env_value GEN_AUTOMATION_SEMANTIC_GATEWAY_MODEL_REVISION "$config_root/semantic-gateway.env")" ] ||

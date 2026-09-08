@@ -602,10 +602,14 @@ async def dashboard_review_task(
             scoring_run_id=navigation.scoring_run_id,
             expires_in=min(settings.storage_presign_ttl_seconds, 900),
         )
-        semantic_assessments = await load_semantic_review_assessments(
-            session,
-            scoring_run_id=navigation.scoring_run_id,
-            profile_sha256=semantic_profile,
+        semantic_assessments = (
+            await load_semantic_review_assessments(
+                session,
+                scoring_run_id=navigation.scoring_run_id,
+                profile_sha256=semantic_profile,
+            )
+            if semantic_profile is not None
+            else {}
         )
         semantic_meta_advisories: dict[UUID, SemanticMetaAdvisory] = {}
         if principal.role == AdminRole.OWNER and semantic_profile is not None:
@@ -635,7 +639,7 @@ async def dashboard_review_task(
         semantic_calibration: SemanticCalibrationArtifactResult | None = (
             active_semantic_calibration if principal.role == AdminRole.OWNER else None
         )
-        if principal.role == AdminRole.OWNER:
+        if principal.role == AdminRole.OWNER and semantic_profile is not None:
             semantic_feedback = await load_semantic_anatomy_feedback(
                 session,
                 assessment_ids=tuple(

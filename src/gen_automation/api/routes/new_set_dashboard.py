@@ -311,7 +311,11 @@ async def dashboard_release_status(
     principal: ReleaseReader,
 ) -> Response:
     try:
-        release_status = await load_new_set_status(session, release_id=release_id)
+        release_status = await load_new_set_status(
+            session,
+            release_id=release_id,
+            quality_scoring_enabled=request.app.state.settings.quality_scoring_enabled,
+        )
     except NewSetNotFoundError:
         return _error_response(
             request,
@@ -378,7 +382,11 @@ async def dashboard_release_progress(
     _principal: ReleaseReader,
 ) -> Response:
     try:
-        release_status = await load_new_set_status(session, release_id=release_id)
+        release_status = await load_new_set_status(
+            session,
+            release_id=release_id,
+            quality_scoring_enabled=request.app.state.settings.quality_scoring_enabled,
+        )
     except NewSetNotFoundError:
         return _secure_response(
             request,
@@ -444,7 +452,11 @@ async def dashboard_stop_release_generation(
             actor=f"admin:{manager.user_id}",
             correlation_id=form.idempotency_key,
         )
-        release_status = await load_new_set_status(session, release_id=release_id)
+        release_status = await load_new_set_status(
+            session,
+            release_id=release_id,
+            quality_scoring_enabled=request.app.state.settings.quality_scoring_enabled,
+        )
     except BrowserNewSetFormError as error:
         await session.rollback()
         return _generation_stop_error_response(

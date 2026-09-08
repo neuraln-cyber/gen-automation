@@ -81,3 +81,25 @@ def test_controller_registers_bounded_quality_loop(tmp_path: Path) -> None:
     assert specs["quality-scoring"].timeout_seconds == (
         settings.background_quality_timeout_seconds + 5
     )
+
+
+def test_suspended_scoring_registers_only_metadata_preparation(tmp_path: Path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'manual.db').as_posix()}")
+    settings = Settings(
+        environment=Environment.TEST,
+        background_runtime_enabled=True,
+        quality_scoring_enabled=False,
+        semantic_anatomy_enabled=False,
+        semantic_learning_enabled=False,
+        storage_enabled=True,
+        storage_bucket="quality",
+    )
+    runtime = build_controller_runtime(
+        settings=settings,
+        sessions=database.sessions,
+        salad_client=None,
+        object_store=MemoryObjectStore(bucket="quality"),
+    )
+    names = {spec.name for spec in runtime._loop_specs}
+    assert "manual-review-preparation" in names
+    assert not names & {"quality-scoring", "semantic-anatomy-qc", "semantic-learning"}

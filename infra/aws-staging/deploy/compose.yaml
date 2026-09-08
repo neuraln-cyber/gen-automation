@@ -44,6 +44,7 @@ services:
       retries: 5
 
   semantic-gateway:
+    profiles: ["anatomy"]
     image: "${GEN_AUTOMATION_SEMANTIC_GATEWAY_IMAGE:?set a repository@sha256:64-hex digest}"
     user: "10001:10001"
     init: true
@@ -92,9 +93,6 @@ services:
       GEN_AUTOMATION_SEMANTIC_ANATOMY_ENDPOINT_URL: http://127.0.0.1:8091/v1/anatomy/assess
     depends_on:
       patreon-browser:
-        condition: service_healthy
-        restart: true
-      semantic-gateway:
         condition: service_healthy
         restart: true
     command:

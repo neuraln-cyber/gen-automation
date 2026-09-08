@@ -1104,7 +1104,7 @@ class AssetScore(UuidPrimaryKeyMixin, Base):
         ),
         CheckConstraint(
             "state NOT IN "
-            "('scored', 'flagged_blank', 'flagged_corrupt', 'dead_letter') "
+            "('scored', 'flagged_blank', 'flagged_corrupt', 'dead_letter', 'skipped') "
             "OR completed_at IS NOT NULL",
             name="terminal_is_completed",
         ),
@@ -1120,6 +1120,15 @@ class AssetScore(UuidPrimaryKeyMixin, Base):
             "AND aggregate_score_micros IS NOT NULL "
             "AND score_breakdown IS NOT NULL)",
             name="scored_signal_complete",
+        ),
+        CheckConstraint(
+            "state <> 'skipped' OR (scorer_version = 'manual-review-v1' "
+            "AND aggregate_score_micros = 0 "
+            "AND luminance_mean_micros IS NULL AND luminance_std_micros IS NULL "
+            "AND dynamic_range_micros IS NULL AND entropy_bits_micros IS NULL "
+            "AND entropy_normalized_micros IS NULL AND sharpness_micros IS NULL "
+            "AND dhash_hex IS NULL AND score_breakdown IS NULL)",
+            name="skipped_has_no_measurements",
         ),
         CheckConstraint(
             "luminance_mean_micros IS NULL OR luminance_mean_micros BETWEEN 0 AND 1000000",
@@ -5209,7 +5218,7 @@ event.listen(
         "AND score.asset_id = ranking.asset_id "
         "WHERE ranking.scoring_run_id = NEW.id "
         "AND (score.id IS NULL "
-        "OR score.state NOT IN ('scored', 'flagged_blank', 'flagged_corrupt') "
+        "OR score.state NOT IN ('scored', 'flagged_blank', 'flagged_corrupt', 'skipped') "
         "OR score.completed_at IS NULL "
         "OR score.aggregate_score_micros IS NULL "
         "OR score.aggregate_score_micros <> ranking.aggregate_score_micros "
@@ -5230,7 +5239,8 @@ event.listen(
     _ddl(
         "CREATE TRIGGER asset_scores_guard_frozen_update "
         "BEFORE UPDATE ON asset_scores "
-        "WHEN OLD.state IN ('scored', 'flagged_blank', 'flagged_corrupt', 'dead_letter') "
+        "WHEN OLD.state IN "
+        "('scored', 'flagged_blank', 'flagged_corrupt', 'dead_letter', 'skipped') "
         "OR EXISTS (SELECT 1 FROM scoring_runs "
         "WHERE id = OLD.scoring_run_id AND state = 'completed') "
         "BEGIN "
@@ -5244,7 +5254,8 @@ event.listen(
     _ddl(
         "CREATE TRIGGER asset_scores_guard_frozen_delete "
         "BEFORE DELETE ON asset_scores "
-        "WHEN OLD.state IN ('scored', 'flagged_blank', 'flagged_corrupt', 'dead_letter') "
+        "WHEN OLD.state IN "
+        "('scored', 'flagged_blank', 'flagged_corrupt', 'dead_letter', 'skipped') "
         "OR EXISTS (SELECT 1 FROM scoring_runs "
         "WHERE id = OLD.scoring_run_id AND state = 'completed') "
         "BEGIN "
@@ -5331,7 +5342,7 @@ event.listen(
         "AND score.asset_id = ranking.asset_id "
         "WHERE ranking.scoring_run_id = NEW.id "
         "AND (score.id IS NULL "
-        "OR score.state NOT IN ('scored', 'flagged_blank', 'flagged_corrupt') "
+        "OR score.state NOT IN ('scored', 'flagged_blank', 'flagged_corrupt', 'skipped') "
         "OR score.completed_at IS NULL "
         "OR score.aggregate_score_micros IS NULL "
         "OR score.aggregate_score_micros <> ranking.aggregate_score_micros "
@@ -5373,7 +5384,7 @@ event.listen(
         "END IF; "
         "RETURN NEW; "
         "END IF; "
-        "IF OLD.state IN ('scored', 'flagged_blank', 'flagged_corrupt', 'dead_letter') "
+        "IF OLD.state IN ('scored', 'flagged_blank', 'flagged_corrupt', 'dead_letter', 'skipped') "
         "OR EXISTS (SELECT 1 FROM scoring_runs "
         "WHERE id = OLD.scoring_run_id AND state = 'completed') THEN "
         "RAISE EXCEPTION 'terminal asset scores are immutable'; "

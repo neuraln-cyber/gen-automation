@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw
 from sqlalchemy import func, select
 
 from gen_automation.db.models import (
+    AdminUser,
     Asset,
     AssetRanking,
     AssetScore,
@@ -22,6 +23,7 @@ from gen_automation.db.models import (
 )
 from gen_automation.db.session import Database
 from gen_automation.domain.enums import (
+    AdminRole,
     AssetKind,
     AssetScoreState,
     AssetState,
@@ -35,9 +37,17 @@ from gen_automation.services.quality import (
     CorruptAssetSignal,
     QualityConflictError,
     QualityInputError,
+    create_manual_review_run,
     create_scoring_run,
     freeze_scoring_run,
 )
+from gen_automation.services.ranked_dashboard import load_ranked_scoring_run
+from gen_automation.services.ranking_manifest import (
+    load_ranking_manifest_rows,
+    validate_completed_ranking_manifest,
+)
+from gen_automation.services.review import create_review_task, get_review_summary
+from gen_automation.storage.memory import MemoryObjectStore
 
 
 @dataclass(frozen=True)
@@ -46,6 +56,79 @@ class QualityContext:
     release_version_id: UUID
     asset_ids: tuple[UUID, ...]
     payloads: dict[UUID, bytes]
+
+
+@pytest.mark.asyncio
+async def test_manual_review_snapshot_needs_no_image_reads_and_supports_review(
+    quality_context: QualityContext,
+) -> None:
+    async with quality_context.database.sessions() as session:
+        result = await create_manual_review_run(
+            session, release_version_id=quality_context.release_version_id
+        )
+        assert not result.replayed
+        run = await session.get(ScoringRun, result.run_id)
+        assert run is not None
+        rows = await load_ranking_manifest_rows(session, result.run_id)
+        assert validate_completed_ranking_manifest(run, rows)
+        assert [r.asset_id for r, _ in rows] == list(quality_context.asset_ids)
+        assert all(s.state == AssetScoreState.SKIPPED for _, s in rows)
+        assert all(
+            s.luminance_mean_micros is None and s.dhash_hex is None and s.score_breakdown is None
+            for _, s in rows
+        )
+        assert all(
+            s.attempts == 0 and s.signal_detail["analysis_performed"] is False for _, s in rows
+        )
+        store = MemoryObjectStore(bucket="quality-test")
+        store.backend = "s3"
+        # Empty storage proves list preparation and rendering never read full-resolution images.
+        view = await load_ranked_scoring_run(
+            session, store=store, scoring_run_id=result.run_id, expires_in=300
+        )
+        assert all(a.score_percent == "Not scored" for a in view.assets)
+        owner = AdminUser(
+            username_normalized="manual-owner",
+            display_name="Owner",
+            password_hash="disabled-test-hash",  # noqa: S106
+            role=AdminRole.OWNER,
+            is_active=True,
+            failed_login_count=0,
+            password_changed_at=datetime.now(UTC),
+            credential_version=1,
+            lock_version=1,
+        )
+        session.add(owner)
+        await session.commit()
+        review = await create_review_task(
+            session,
+            scoring_run_id=result.run_id,
+            created_by_user_id=owner.id,
+            idempotency_key="manual-review",
+        )
+        summary = await get_review_summary(session, review_task_id=review.task_id)
+        assert summary.ranked_asset_count == len(quality_context.asset_ids)
+        assert not summary.semantic_gate.enabled
+        replay = await create_manual_review_run(
+            session, release_version_id=quality_context.release_version_id
+        )
+        assert replay.replayed and replay.run_id == result.run_id
+
+
+@pytest.mark.asyncio
+async def test_manual_review_preserves_existing_quality_ranking(
+    quality_context: QualityContext,
+) -> None:
+    async with quality_context.database.sessions() as session:
+        result = await create_scoring_run(
+            session, release_version_id=quality_context.release_version_id
+        )
+        analyses = {asset_id: CorruptAssetSignal() for asset_id in quality_context.asset_ids}
+        await freeze_scoring_run(session, scoring_run_id=result.run_id, analyses=analyses)
+        replay = await create_manual_review_run(
+            session, release_version_id=quality_context.release_version_id
+        )
+        assert replay.replayed and replay.run_id == result.run_id
 
 
 def _png(*, blank: bool = False) -> bytes:
