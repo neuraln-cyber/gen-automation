@@ -71,14 +71,14 @@ async def test_manual_review_freezes_without_analysis(tmp_path: Path) -> None:
             )
             session.add(job)
             await session.flush()
-            session.add(
-                _raw_asset(
-                    asset_id=uuid4(),
-                    release_id=release.id,
-                    job_id=job.id,
-                    output_index=0,
-                )
+            asset = _raw_asset(
+                asset_id=uuid4(),
+                release_id=release.id,
+                job_id=job.id,
+                output_index=0,
             )
+            asset.object_key = f"manual-contract/{asset.id}.png"
+            session.add(asset)
             await session.commit()
             result = await create_manual_review_run(session, release_version_id=version.id)
             run = await session.get(ScoringRun, result.run_id)

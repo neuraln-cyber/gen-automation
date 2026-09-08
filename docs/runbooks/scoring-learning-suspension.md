@@ -47,6 +47,8 @@ Preferred restoration is configuration-only on the current compatible code:
    Start the gateway and verify readiness before enabling anatomy requests.
 3. Turn on the desired flags above and recreate the control plane using the normal
    idle-checked deployment procedure. Restore learning policy only if desired.
+   Re-enabling quality scoring may score still-open, previously unscored sets;
+   review that backlog before resuming it too.
 4. Verify only the requested loops resume and check provider billing/queue health.
 
 Migration `20260909_0042` adds the explicit unscored state and preserves the frozen
