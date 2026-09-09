@@ -316,6 +316,7 @@
             </details>
             <output class="settings-preset-status" data-automation-preset-status aria-live="polite" aria-atomic="true"></output>
           </section>
+          {% include "dashboard/_prompt_variables.html" %}
           {% set trio_available = options.workflows | selectattr('supports_controlled_trio_v1') | list | length > 0 %}
           <section class="composition-builder" data-composition-builder data-new-set-composition data-controlled-duo-builder data-trio-available="{{ 'true' if trio_available else 'false' }}">
             <div class="composition-heading">

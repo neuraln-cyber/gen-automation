@@ -234,7 +234,7 @@ async def submit_dashboard_new_set(
             principal=principal,
             form=form,
             status_code=status.HTTP_409_CONFLICT,
-            message=str(error).capitalize() + ".",
+            message=str(error)[:1].upper() + str(error)[1:] + ".",
         )
     except ConflictError as error:
         await session.rollback()
@@ -726,6 +726,7 @@ def _default_values(options: NewSetOptions) -> dict[str, str]:
         "detailer_prompt": "sexy, expressive, ",
         "detailer_negative_prompt": "closed eyes, ",
         "batch_plan": "",
+        "prompt_variables": "{}",
         "seed": "-1",
         "width": "1144",
         "height": "1480",

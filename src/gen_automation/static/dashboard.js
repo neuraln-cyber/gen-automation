@@ -122,6 +122,7 @@
     "negative_prompt",
     "detailer_prompt",
     "detailer_negative_prompt",
+    "prompt_variables",
     "width",
     "height",
     "cfg",
@@ -157,6 +158,171 @@
     target.focus();
     target.dispatchEvent(new Event("input", { bubbles: true }));
   };
+
+  const promptVariableEntries = (raw) => {
+    const parsed = JSON.parse(raw || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Variables must be a name/value object.");
+    }
+    const entries = Object.entries(parsed);
+    if (entries.length > 50 || entries.some(([, value]) => typeof value !== "string")) {
+      throw new Error("Use at most 50 variables with text values.");
+    }
+    return entries;
+  };
+
+  const validatePromptVariableRows = (entries) => {
+    const seen = new Set();
+    let total = 0;
+    return entries.map(([rawName, value]) => {
+      const name = rawName.trim();
+      if (!name && !value) return { name, value, ignored: true, nameError: "", valueError: "" };
+      let nameError = "";
+      if (!/^[A-Za-z][A-Za-z0-9_ -]{0,63}$/.test(name)) {
+        nameError = "Start with a letter; use up to 64 letters, numbers, spaces, underscores, or hyphens.";
+      } else if (seen.has(name)) {
+        nameError = `The variable ${name} is already defined.`;
+      }
+      seen.add(name);
+      total += value.length;
+      const valueError = value.length > 20_000
+        ? "Keep each variable value within 20,000 characters."
+        : total > 100_000 ? "Keep all variable values within 100,000 characters in total." : "";
+      return { name, value, ignored: false, nameError, valueError };
+    });
+  };
+
+  function initializePromptVariables() {
+    const form = document.querySelector("[data-automation-form]");
+    const manager = form?.querySelector("[data-prompt-variables]");
+    const data = manager?.querySelector("[data-prompt-variables-data]");
+    const list = manager?.querySelector("[data-prompt-variable-list]");
+    const template = manager?.querySelector("[data-prompt-variable-template]");
+    const add = manager?.querySelector("[data-prompt-variable-add]");
+    const empty = manager?.querySelector("[data-prompt-variables-empty]");
+    const status = manager?.querySelector("[data-prompt-variables-status]");
+    const reset = manager?.querySelector("[data-prompt-variables-reset]");
+    if (!(form instanceof HTMLFormElement) || !(data instanceof HTMLTextAreaElement)
+        || !(list instanceof HTMLElement) || !(template instanceof HTMLTemplateElement)
+        || !(add instanceof HTMLButtonElement)) return;
+
+    let lastPrompt = null;
+    let parseError = "";
+    const rows = () => Array.from(list.querySelectorAll("[data-prompt-variable-row]"));
+    const showStatus = (text, invalid = false) => {
+      if (!status) return;
+      status.textContent = text;
+      status.classList.toggle("warning", invalid);
+    };
+    const sync = () => {
+      if (parseError) return false;
+      const currentRows = rows();
+      const validated = validatePromptVariableRows(currentRows.map((row) => [
+        row.querySelector("[data-prompt-variable-name]").value,
+        row.querySelector("[data-prompt-variable-value]").value,
+      ]));
+      let firstError = "";
+      validated.forEach((entry, index) => {
+        const row = currentRows[index];
+        const name = row.querySelector("[data-prompt-variable-name]");
+        const value = row.querySelector("[data-prompt-variable-value]");
+        const insert = row.querySelector("[data-prompt-variable-insert]");
+        name.setCustomValidity(entry.nameError);
+        value.setCustomValidity(entry.valueError);
+        name.setAttribute("aria-invalid", String(Boolean(entry.nameError)));
+        value.setAttribute("aria-invalid", String(Boolean(entry.valueError)));
+        insert.textContent = entry.name ? `Insert *${entry.name}*` : "Insert token";
+        insert.disabled = entry.ignored || Boolean(entry.nameError);
+        firstError ||= entry.nameError || entry.valueError;
+      });
+      add.disabled = currentRows.length >= 50;
+      if (empty) empty.hidden = currentRows.length > 0;
+      if (!firstError) {
+        data.value = JSON.stringify(Object.fromEntries(validated
+          .filter((entry) => !entry.ignored).map(({ name, value }) => [name, value])));
+      }
+      manager.dataset.promptVariablesInvalid = String(Boolean(firstError));
+      showStatus(firstError || (currentRows.length ? "Insert adds the token to your last focused prompt. You can also type it directly." : ""), Boolean(firstError));
+      return !firstError;
+    };
+    const appendRow = (name = "", value = "") => {
+      const fragment = template.content.cloneNode(true);
+      fragment.querySelector("[data-prompt-variable-name]").value = name;
+      fragment.querySelector("[data-prompt-variable-value]").value = value;
+      list.append(fragment);
+    };
+    const restore = () => {
+      list.replaceChildren();
+      parseError = "";
+      try {
+        promptVariableEntries(data.value).forEach(([name, value]) => appendRow(name, value));
+      } catch (error) {
+        parseError = error.message || "Saved variables could not be read.";
+      }
+      if (reset) reset.hidden = !parseError;
+      if (parseError) {
+        manager.dataset.promptVariablesInvalid = "true";
+        add.disabled = true;
+        if (empty) empty.hidden = true;
+        showStatus(`${parseError} Clear invalid variables to continue.`, true);
+      } else {
+        sync();
+      }
+    };
+    const notifyChange = () => data.dispatchEvent(new Event("input", { bubbles: true }));
+    add.addEventListener("click", () => {
+      if (rows().length >= 50 || parseError) return;
+      appendRow();
+      sync();
+      rows().at(-1)?.querySelector("[data-prompt-variable-name]").focus();
+      notifyChange();
+    });
+    list.addEventListener("input", sync);
+    list.addEventListener("click", (event) => {
+      if (!(event.target instanceof Element)) return;
+      const row = event.target.closest("[data-prompt-variable-row]");
+      if (!row) return;
+      if (event.target.closest("[data-prompt-variable-remove]")) {
+        row.remove();
+        sync();
+        notifyChange();
+      } else if (event.target.closest("[data-prompt-variable-insert]")) {
+        const name = row.querySelector("[data-prompt-variable-name]");
+        if (!name.checkValidity() || !name.value.trim()) return;
+        const target = lastPrompt?.isConnected && !lastPrompt.disabled
+          ? lastPrompt : namedControl(form, "prompt");
+        if (!(target instanceof HTMLTextAreaElement)) return;
+        const token = `*${name.value.trim()}*`;
+        if (target.maxLength > 0 && target.value.length + token.length + 4 > target.maxLength) {
+          showStatus("This prompt is too long to insert the variable token.", true);
+          return;
+        }
+        insertPromptToken(target, token);
+      }
+    });
+    form.addEventListener("focusin", (event) => {
+      if (event.target instanceof HTMLTextAreaElement
+          && event.target.matches("[data-danbooru-autocomplete]")
+          && !manager.contains(event.target)) lastPrompt = event.target;
+    });
+    form.addEventListener("gen-automation:restore-prompt-variables", restore);
+    form.addEventListener("submit", (event) => {
+      if (sync()) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      const invalid = list.querySelector('[aria-invalid="true"]');
+      if (invalid) {
+        invalid.focus();
+        invalid.reportValidity();
+      } else if (reset) reset.focus();
+    }, { capture: true });
+    reset?.addEventListener("click", () => {
+      data.value = "{}";
+      restore();
+      notifyChange();
+    });
+    restore();
+  }
 
   const CONTROLLED_DUO_PRESETS = Object.freeze({
     flexible: Object.freeze({
@@ -496,8 +662,15 @@
 
   const applyAutomationProfile = (form, profile) => {
     if (!profile || typeof profile !== "object") return { applied: false, missing: [] };
-    form.dataset.applyingAutomationProfile = "true";
     const fields = profile.fields && typeof profile.fields === "object" ? profile.fields : {};
+    const variablePayload = fields.prompt_variables ?? "{}";
+    try {
+      if (typeof variablePayload !== "string") throw new Error("Invalid saved variables.");
+      promptVariableEntries(variablePayload);
+    } catch (_error) {
+      return { applied: false, missing: ["Saved prompt variables are invalid."] };
+    }
+    form.dataset.applyingAutomationProfile = "true";
     const missing = [];
     const matchedSelects = new Set([
       "subject_id",
@@ -509,7 +682,8 @@
     ]);
     AUTOMATION_PRESET_FIELDS.forEach((name) => {
       if (matchedSelects.has(name)) return;
-      const value = fields[name];
+      // Older presets must not keep variables from the previously selected set.
+      const value = name === "prompt_variables" ? (fields[name] ?? "{}") : fields[name];
       const control = namedControl(form, name);
       if (typeof value !== "string") return;
       if (!(control instanceof HTMLInputElement)
@@ -522,6 +696,8 @@
       }
       control.value = value;
     });
+
+    form.dispatchEvent(new CustomEvent("gen-automation:restore-prompt-variables"));
 
     const matches = profile.matches && typeof profile.matches === "object" ? profile.matches : {};
     const matchRequiredSelect = (name, matchers, description) => {
@@ -2819,7 +2995,10 @@
         ? visibleLoraWeights
         : Array.from(form.querySelectorAll("[data-lora-native-weight]"));
       const batchControls = Array.from(form.querySelectorAll("[data-batch-field]"));
-      return [...controls, ...loraWeights, ...batchControls]
+      const variableControls = Array.from(form.querySelectorAll(
+        "[data-prompt-variable-name], [data-prompt-variable-value]",
+      ));
+      return [...variableControls, ...controls, ...loraWeights, ...batchControls]
         .find((control) => !control.checkValidity());
     };
     const revealInvalidPresetControl = (control) => {
@@ -2871,6 +3050,12 @@
       if (!name) {
         nameInput.focus();
         setStatus("Enter a preset name first.", "warning");
+        return;
+      }
+      if (form.querySelector('[data-prompt-variables-invalid="true"]')) {
+        setStatus("Fix prompt variables before saving this preset.", "warning");
+        const invalidVariable = firstInvalidPresetControl();
+        if (invalidVariable) revealInvalidPresetControl(invalidVariable);
         return;
       }
       const invalidControl = firstInvalidPresetControl();
@@ -9057,6 +9242,7 @@
   if (!reusedImageSettings && !experimentFormPresent) restoreAutomationDraft();
   initializeSamePageScrollPreservation();
   initializeLoraPicker();
+  initializePromptVariables();
   initializeAutomationBuilder();
   initializePromptWildcardPickers();
   initializeWorkflowRefinement();

@@ -1,0 +1,31 @@
+<section class="prompt-variables" data-prompt-variables aria-labelledby="prompt-variables-heading">
+  <div class="prompt-variables-heading">
+    <div>
+      <strong id="prompt-variables-heading">Prompt variables</strong>
+      <p class="muted">Write <code>*character*</code>, <code>*outfit*</code>, or any name in your batch prompts. Edit its value once for every batch.</p>
+    </div>
+    <button type="button" class="secondary-button" data-prompt-variable-add>Add variable</button>
+  </div>
+  <p class="prompt-variables-help muted">Saved with presets. Values can contain text and TXT wildcards such as <code>__outfits__</code>. Names are case-sensitive.</p>
+  <textarea name="prompt_variables" data-prompt-variables-data hidden>{{ form_values.get('prompt_variables', '{}') }}</textarea>
+  <div class="prompt-variable-list" data-prompt-variable-list></div>
+  <p class="muted prompt-variables-empty" data-prompt-variables-empty>No variables yet. Your existing prompts work unchanged.</p>
+  <output class="prompt-variables-status" data-prompt-variables-status aria-live="polite"></output>
+  <button type="button" class="text-button danger" data-prompt-variables-reset hidden>Clear invalid variables</button>
+  <template data-prompt-variable-template>
+    <div class="prompt-variable-row" data-prompt-variable-row>
+      <label class="prompt-variable-name-label">
+        Name
+        <input type="text" maxlength="64" placeholder="character" autocomplete="off" spellcheck="false" data-prompt-variable-name>
+      </label>
+      <label class="prompt-variable-value-label">
+        Value
+        <textarea rows="2" maxlength="20000" spellcheck="false" placeholder="Prompt text or __wildcard__" data-prompt-variable-value data-danbooru-autocomplete></textarea>
+      </label>
+      <div class="prompt-variable-actions">
+        <button type="button" class="secondary-button" data-prompt-variable-insert title="Insert into the last focused prompt, or the default positive prompt">Insert token</button>
+        <button type="button" class="text-button danger" data-prompt-variable-remove aria-label="Remove variable">Remove</button>
+      </div>
+    </div>
+  </template>
+</section>

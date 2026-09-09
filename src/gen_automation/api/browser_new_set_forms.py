@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from gen_automation.config import Settings
 from gen_automation.domain.lora_limits import MAX_GENERATION_LORAS
+from gen_automation.domain.prompt_variables import decode_prompt_variables
 from gen_automation.services.new_sets import NewSetLoraSelection, NewSetSubmission
 
 _FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
@@ -66,6 +67,7 @@ _OPTIONAL_FIELDS = frozenset(
         # The submitted value is ignored; the server derives the target from the plan.
         "desired_accepted_count",
         "batch_plan",
+        "prompt_variables",
         "subject_2_id",
         "subject_3_id",
         "composition_mode",
@@ -188,6 +190,7 @@ async def read_new_set_form(request: Request) -> BrowserNewSetForm:
             loras=tuple(loras),
             workflow_approval_id=_uuid(values["workflow_id"], label="Workflow profile"),
             prompt=values["prompt"],
+            prompt_variables=_decode_prompt_variables(values.get("prompt_variables", "")),
             negative_prompt=values["negative_prompt"],
             detailer_prompt=values["detailer_prompt"],
             detailer_negative_prompt=values["detailer_negative_prompt"],
@@ -403,6 +406,13 @@ async def _read_exact_form(
     return {field: items[0] for field, items in parsed.items()}
 
 
+def _decode_prompt_variables(value: str) -> dict[str, str]:
+    try:
+        return decode_prompt_variables(value)
+    except ValueError as error:
+        raise _unprocessable(str(error)) from None
+
+
 def _decode_batch_plan(value: str) -> object:
     if not value:
         return ()
@@ -486,6 +496,7 @@ def _validation_message(error: ValidationError) -> str:
     first = error.errors(include_url=False, include_input=False)[0]
     location = first["loc"]
     labels = {
+        "prompt_variables": "Prompt variables",
         "slug": "Set slug",
         "title": "Set title",
         "secondary_subject_approval_id": "Second subject",

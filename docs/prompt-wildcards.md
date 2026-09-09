@@ -1,5 +1,9 @@
 # Prompt wildcard libraries
 
+For reusable non-random text such as a character, outfit, or setting, use
+[prompt variables](prompt-variables.md). Their values can include these wildcard
+tokens; variable expansion happens before the normal wildcard freeze.
+
 Operators can manage Forge/Stable-Diffusion-style prompt wildcards without
 editing a GPU-worker filesystem. Open `/dashboard/wildcards`, paste one entry
 per line from an existing wildcard text file, and give the library a name such

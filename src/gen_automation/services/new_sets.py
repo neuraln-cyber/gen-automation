@@ -65,6 +65,11 @@ from gen_automation.domain.lora_limits import (
     MAX_GENERATION_LORAS,
     max_loras_for_model_family,
 )
+from gen_automation.domain.prompt_variables import (
+    PROMPT_VARIABLE_FIELDS,
+    PromptVariableResolver,
+    validate_prompt_variables,
+)
 from gen_automation.domain.release_spec import (
     ArtifactSpecification,
     GenerationBatchSpecification,
@@ -218,6 +223,7 @@ class NewSetSubmission(BaseModel):
         max_length=MAX_GENERATION_LORAS,
     )
     workflow_approval_id: UUID
+    prompt_variables: dict[str, str] = Field(default_factory=dict)
     prompt: str = Field(default="", max_length=20_000)
     negative_prompt: str = Field(default="", max_length=20_000)
     detailer_prompt: str = Field(default="", max_length=20_000)
@@ -267,6 +273,11 @@ class NewSetSubmission(BaseModel):
         if value != value.strip():
             raise ValueError("value must be trimmed")
         return value
+
+    @field_validator("prompt_variables", mode="before")
+    @classmethod
+    def require_prompt_variables(cls, value: object) -> dict[str, str]:
+        return validate_prompt_variables(value)
 
     @model_validator(mode="after")
     def validate_plan(self) -> "NewSetSubmission":
@@ -725,6 +736,31 @@ async def list_new_set_options(
     )
 
 
+def resolve_new_set_prompt_variables(command: NewSetSubmission) -> NewSetSubmission:
+    """Resolve into a separate validated command; keep the editor templates intact."""
+    resolver = PromptVariableResolver(command.prompt_variables)
+    values = command.model_dump(mode="python")
+    for field_name in PROMPT_VARIABLE_FIELDS:
+        values[field_name] = resolver.expand(
+            getattr(command, field_name), label=field_name.replace("_", " ").capitalize()
+        )
+    batches = []
+    for index, batch in enumerate(command.batches, start=1):
+        batch_values = batch.model_dump(mode="python")
+        for field_name in PROMPT_VARIABLE_FIELDS:
+            text = getattr(batch, field_name)
+            if text is not None:
+                batch_values[field_name] = resolver.expand(
+                    text, label=f"Batch {index} {field_name.replace('_', ' ')}"
+                )
+        batches.append(batch_values)
+    values["batches"] = batches
+    # The immutable release receives expanded text; wildcard tokens are left
+    # untouched for the existing version-freeze/per-image resolution pipeline.
+    values["prompt_variables"] = {}
+    return NewSetSubmission.model_validate(values)
+
+
 async def create_and_approve_new_set(
     session: AsyncSession,
     *,
@@ -738,6 +774,14 @@ async def create_and_approve_new_set(
         character.isspace() or ord(character) < 32 for character in idempotency_key
     ):
         raise NewSetInputError("the submission idempotency key is invalid")
+
+    try:
+        command = resolve_new_set_prompt_variables(command)
+    except ValidationError as error:
+        detail = error.errors(include_url=False, include_input=False)[0]["msg"]
+        raise NewSetInputError(f"Expanded prompt variables: {detail}") from None
+    except ValueError as error:
+        raise NewSetInputError(str(error)) from None
 
     subject = await _approved_subject(session, command.subject_approval_id)
     secondary_subject = (

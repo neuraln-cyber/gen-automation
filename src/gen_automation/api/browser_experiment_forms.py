@@ -9,6 +9,7 @@ from fastapi import Request, status
 from pydantic import ValidationError
 
 from gen_automation.domain.lora_limits import MAX_GENERATION_LORAS
+from gen_automation.domain.prompt_variables import decode_prompt_variables
 from gen_automation.services.experiments import (
     ExperimentSubmission,
     ExperimentVariantSubmission,
@@ -32,7 +33,7 @@ _REQUIRED_FIELDS = frozenset(
         "variant_plan",
     }
 )
-_OPTIONAL_FIELDS = frozenset({"keep_warm"})
+_OPTIONAL_FIELDS = frozenset({"keep_warm", "prompt_variables"})
 _EDITOR_FIELDS = frozenset(
     {
         "subject_id",
@@ -159,11 +160,16 @@ async def read_experiment_form(request: Request) -> BrowserExperimentForm:
         if _FORM_KEY.fullmatch(idempotency_key) is None:
             raise _bad_request("The form expired or was changed. Reload Experiment Lab.")
         outputs = _integer(values["outputs_per_variant"], label="Images per variant")
+        try:
+            prompt_variables = decode_prompt_variables(values.get("prompt_variables", ""))
+        except ValueError as error:
+            raise _unprocessable(str(error)) from None
         variants = _decode_variant_plan(
             values["variant_plan"],
             group_slug=values["group_slug"],
             title=values["experiment_title"],
             outputs_per_variant=outputs,
+            prompt_variables=prompt_variables,
         )
         command = ExperimentSubmission(
             group_slug=values["group_slug"],
@@ -256,6 +262,7 @@ def _decode_variant_plan(
     group_slug: str,
     title: str,
     outputs_per_variant: int,
+    prompt_variables: dict[str, str] | None = None,
 ) -> tuple[ExperimentVariantSubmission, ...]:
     if not value or len(value) > 480_000:
         raise _unprocessable("Add between 2 and 12 variants before starting the experiment.")
@@ -352,6 +359,7 @@ def _decode_variant_plan(
             loras=tuple(loras),
             workflow_approval_id=_uuid_string(item["workflow_id"], label="Workflow"),
             prompt=_string(item["prompt"], label="Prompt"),
+            prompt_variables=prompt_variables or {},
             negative_prompt=_string(item["negative_prompt"], label="Negative prompt"),
             detailer_prompt=_string(item["detailer_prompt"], label="Detailer prompt"),
             detailer_negative_prompt=_string(
