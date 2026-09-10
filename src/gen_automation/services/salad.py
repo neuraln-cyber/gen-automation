@@ -4651,6 +4651,11 @@ def _note_operator_stop_cancel_error(
 
 def _valid_runtime_admission_metadata(attempt: GenerationAttempt) -> bool:
     raw = attempt.request_metadata.get(_RUNTIME_ADMISSION_METADATA_KEY)
+    # Current submissions also bind the rollout and exact worker instance. Use
+    # the shared validator so adding those fences does not disable the shorter
+    # progress watchdog. Retain support for already-submitted legacy v1 jobs.
+    if valid_runtime_admission_target(raw):
+        return True
     if not isinstance(raw, dict) or set(raw) != {
         "version",
         "provider_group_version",

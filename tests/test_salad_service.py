@@ -2671,8 +2671,10 @@ async def test_hard_watchdog_deadline_overflow_fails_closed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exact_admission", [False, True])
 async def test_output_progress_watchdog_recovers_orphaned_running_provider_job_without_asset_loss(
     database: Database,
+    exact_admission: bool,
 ) -> None:
     async with database.sessions() as session:
         context = await seed_context(session)
@@ -2688,7 +2690,10 @@ async def test_output_progress_watchdog_recovers_orphaned_running_provider_job_w
         )
         attempt = await session.get(GenerationAttempt, attempt_id)
         assert attempt is not None
-        enable_runtime_admission(attempt)
+        if exact_admission:
+            enable_exact_runtime_admission(attempt)
+        else:
+            enable_runtime_admission(attempt)
         retained_asset_id, staged_asset_id = await add_progress_watchdog_assets(
             session,
             context,
@@ -2844,8 +2849,10 @@ async def test_output_progress_watchdog_recovers_orphaned_running_provider_job_w
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exact_admission", [False, True])
 async def test_output_progress_watchdog_allows_slow_first_output(
     database: Database,
+    exact_admission: bool,
 ) -> None:
     async with database.sessions() as session:
         context = await seed_context(session)
@@ -2861,7 +2868,10 @@ async def test_output_progress_watchdog_allows_slow_first_output(
         )
         attempt = await session.get(GenerationAttempt, attempt_id)
         assert attempt is not None
-        enable_runtime_admission(attempt)
+        if exact_admission:
+            enable_exact_runtime_admission(attempt)
+        else:
+            enable_runtime_admission(attempt)
         await session.commit()
         provider_metadata: JSONObject = {
             "generation_attempt_id": str(attempt.id),
