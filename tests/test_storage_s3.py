@@ -1,12 +1,16 @@
+import asyncio
 import base64
 import hashlib
 import json
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
 
 import pytest
-from botocore.exceptions import ClientError
+from botocore.credentials import RefreshableCredentials
+from botocore.exceptions import ClientError, CredentialRetrievalError
 
 from gen_automation.config import Environment, Settings
 from gen_automation.storage.base import (
@@ -14,6 +18,7 @@ from gen_automation.storage.base import (
     ObjectConflictError,
     ObjectNotFoundError,
     ObjectStoreError,
+    ObjectStoreSigningDeferredError,
     ObjectTooLargeError,
 )
 from gen_automation.storage.s3 import (
@@ -30,6 +35,160 @@ def s3_store() -> S3ObjectStore:
         access_key_id="test-access-key",
         secret_access_key="test-secret-key",  # noqa: S106
     )
+
+
+def temporary_credentials(seconds: int) -> RefreshableCredentials:
+    now = datetime.now(UTC)
+    metadata = {
+        "access_key": "temporary-test-key",
+        "secret_key": "temporary-test-secret",
+        "token": "temporary-test-token",
+        "expiry_time": (now + timedelta(seconds=seconds)).isoformat(),
+    }
+    return RefreshableCredentials.create_from_metadata(
+        metadata=metadata,
+        refresh_using=lambda: metadata,
+        method="iam-role",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["presign_download", "presign_upload", "presign_put"])
+async def test_signing_refreshes_credentials_before_the_full_grant_window(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+) -> None:
+    original = s3_store().client
+    fresh = s3_store().client
+    original._request_signer._credentials = temporary_credentials(1800)
+    fresh._request_signer._credentials = temporary_credentials(7200)
+    monkeypatch.setattr("gen_automation.storage.s3.boto3.client", lambda **_: original)
+    refreshed_arguments: list[dict[str, Any]] = []
+
+    def refresh(**kwargs: Any) -> Any:
+        refreshed_arguments.append(kwargs)
+        return fresh
+
+    monkeypatch.setattr(
+        "gen_automation.storage.s3.boto3.Session", lambda: SimpleNamespace(client=refresh)
+    )
+    store = S3ObjectStore(bucket="private-assets", region="eu-central-1")
+    kwargs: dict[str, Any] = {"key": "test-object", "expires_in": 3600}
+    if method != "presign_download":
+        kwargs.update(content_type="image/png", metadata={})
+    if method == "presign_upload":
+        kwargs["max_bytes"] = 1024
+    try:
+        # All concurrent signers share one refresh, off the async event loop.
+        results = await asyncio.gather(*(getattr(store, method)(**kwargs) for _ in range(8)))
+        assert all(results)
+        assert len(refreshed_arguments) == 1
+        assert refreshed_arguments[0]["region_name"] == "eu-central-1"
+        assert not any(key.startswith("aws_") for key in refreshed_arguments[0])
+        assert store.client is original  # In-flight storage connections untouched.
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_short_refresh_defers_without_signing_and_recovers_after_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = s3_store().client
+    fresh = s3_store().client
+    recovered = s3_store().client
+    original._request_signer._credentials = temporary_credentials(1800)
+    fresh._request_signer._credentials = temporary_credentials(1800)
+    recovered._request_signer._credentials = temporary_credentials(7200)
+    monkeypatch.setattr("gen_automation.storage.s3.boto3.client", lambda **_: original)
+    calls: list[object] = []
+    clock = [100.0]
+    monkeypatch.setattr("gen_automation.storage.s3.monotonic", lambda: clock[0])
+
+    def refresh(**_: Any) -> Any:
+        calls.append(None)
+        return fresh if len(calls) == 1 else recovered
+
+    monkeypatch.setattr(
+        "gen_automation.storage.s3.boto3.Session", lambda: SimpleNamespace(client=refresh)
+    )
+    signed: list[object] = []
+    monkeypatch.setattr(
+        fresh, "generate_presigned_url", lambda **_: signed.append(None) or "signed"
+    )
+    monkeypatch.setattr(
+        recovered, "generate_presigned_url", lambda **_: signed.append(None) or "signed"
+    )
+    store = S3ObjectStore(bucket="private-assets", region="us-east-1")
+    try:
+        for _ in range(3):
+            with pytest.raises(ObjectStoreSigningDeferredError) as error:
+                await store.presign_download(key="test-object", expires_in=3600)
+            assert "temporary-test-token" not in str(error.value)
+        assert len(calls) == 1
+        assert not signed
+        clock[0] += 61
+        assert await store.presign_download(key="test-object", expires_in=3600) == "signed"
+        assert len(calls) == 2
+        assert len(signed) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_signing_refresh_defers_without_exposing_provider_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = s3_store()
+    store.client._request_signer._credentials = temporary_credentials(1800)
+
+    def unavailable(**_: Any) -> Any:
+        raise CredentialRetrievalError(provider="iam-role", error_msg="sensitive provider detail")
+
+    monkeypatch.setattr(
+        "gen_automation.storage.s3.boto3.Session", lambda: SimpleNamespace(client=unavailable)
+    )
+    try:
+        with pytest.raises(ObjectStoreSigningDeferredError) as error:
+            await store.presign_download(key="test-object", expires_in=3600)
+        assert "sensitive provider detail" not in str(error.value)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_signing_rejects_credentials_that_shorten_during_signing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = s3_store()
+    store.client._request_signer._credentials = temporary_credentials(7200)
+
+    def sign(**_: Any) -> str:
+        store.client._request_signer._credentials = temporary_credentials(1800)
+        return "must-not-escape"
+
+    monkeypatch.setattr(store.client, "generate_presigned_url", sign)
+    try:
+        with pytest.raises(ObjectStoreSigningDeferredError, match="changed during signing"):
+            await store.presign_download(key="test-object", expires_in=3600)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_opaque_temporary_credentials_cannot_promise_an_unknown_lifetime() -> None:
+    store = S3ObjectStore(
+        bucket="private-assets",
+        region="us-east-1",
+        access_key_id="test-key",
+        secret_access_key="test-secret",  # noqa: S106
+        session_token="test-token",  # noqa: S106
+    )
+    try:
+        with pytest.raises(ObjectStoreError, match="expiry metadata"):
+            await store.presign_download(key="test-object", expires_in=3600)
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio
@@ -159,10 +318,10 @@ class FakeS3Client:
 
     def generate_presigned_url(
         self,
-        operation: str,
+        ClientMethod: str,  # noqa: N803 - boto3 public parameter name
         **parameters: Any,
     ) -> str:
-        self.calls.append({"operation": operation, **parameters})
+        self.calls.append({"operation": ClientMethod, **parameters})
         if self.signing_error is not None:
             raise self.signing_error
         return "https://signed.example/download"

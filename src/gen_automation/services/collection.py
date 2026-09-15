@@ -31,7 +31,11 @@ from gen_automation.services.assets import (
     create_raw_master_upload_intents,
     finalize_raw_master,
 )
-from gen_automation.storage.base import ObjectStore, ObjectStoreError
+from gen_automation.storage.base import (
+    ObjectStore,
+    ObjectStoreError,
+    ObjectStoreSigningDeferredError,
+)
 
 
 class CollectionError(Exception):
@@ -179,6 +183,10 @@ async def create_retry_safe_raw_master_upload_intents(
             raise RetryUploadSalvageDeferredError(
                 "raw-master verification is still in progress"
             ) from error
+        except ObjectStoreSigningDeferredError:
+            # Preserve the signing-specific reason and roll back partial grants.
+            await session.rollback()
+            raise
         except ObjectStoreError as error:
             # A failed HEAD or presign may occur after earlier rows were changed
             # in this transaction.  Roll the whole rotation attempt back so an

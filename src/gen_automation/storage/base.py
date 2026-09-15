@@ -6,6 +6,10 @@ class ObjectStoreError(Exception):
     """Base error for storage operations."""
 
 
+class ObjectStoreSigningDeferredError(ObjectStoreError):
+    """Fresh temporary credentials cannot yet cover the requested grant lifetime."""
+
+
 class ObjectNotFoundError(ObjectStoreError):
     pass
 

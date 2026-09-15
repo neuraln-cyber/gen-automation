@@ -76,6 +76,7 @@ from gen_automation.storage.base import (
     ObjectConflictError,
     ObjectStore,
     ObjectStoreError,
+    ObjectStoreSigningDeferredError,
 )
 
 MAX_WORKFLOW_BYTES = 192 * 1024
@@ -1785,6 +1786,8 @@ async def _store_referenced_generate_payload(
             expires_in=expires_in,
             version_id=stored.version_id,
         )
+    except ObjectStoreSigningDeferredError:
+        raise
     except ObjectStoreError:
         raise WorkerInputError("worker request payload storage is unavailable") from None
     return url, payload_sha256
@@ -1913,6 +1916,9 @@ class SaladWorkerJobInputProvider:
         except RetryUploadSalvageDeferredError:
             await self.session.rollback()
             raise SaladJobInputDeferredError() from None
+        except ObjectStoreSigningDeferredError:
+            await self.session.rollback()
+            raise SaladJobInputDeferredError(reason="storage_credentials") from None
         if len(intents) != context.expected_output_count:
             await self.session.rollback()
             raise WorkerInputError("worker upload grant count is inconsistent")
@@ -1986,6 +1992,9 @@ class SaladWorkerJobInputProvider:
                     body=payload_bytes,
                     expires_in=self.upload_grant_ttl_seconds,
                 )
+            except ObjectStoreSigningDeferredError:
+                await self.session.rollback()
+                raise SaladJobInputDeferredError(reason="storage_credentials") from None
             except WorkerInputError:
                 await self.session.rollback()
                 raise

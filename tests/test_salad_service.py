@@ -200,6 +200,7 @@ async def seed_context(session: AsyncSession) -> SeededContext:
 class FakeUploadIntentProvider:
     fail: bool = False
     defer_retry_seconds: int | None = None
+    defer_storage_credentials: bool = False
     calls: list[SaladJobInputContext] = field(default_factory=list)
 
     async def build_job_input(self, context: SaladJobInputContext) -> JSONValue:
@@ -207,6 +208,11 @@ class FakeUploadIntentProvider:
         if self.defer_retry_seconds is not None:
             raise SaladJobInputDeferredError(
                 retry_after_seconds=self.defer_retry_seconds,
+                reason=(
+                    "storage_credentials"
+                    if self.defer_storage_credentials
+                    else "asset_verification"
+                ),
             )
         if self.fail:
             raise RuntimeError(f"do not persist {SIGNED_UPLOAD_URL}")
@@ -1049,8 +1055,10 @@ async def test_upload_intent_failure_is_definite_and_releases_reservation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("storage_credentials", [False, True])
 async def test_verifying_asset_defers_and_reuses_the_same_prepared_attempt(
     database: Database,
+    storage_credentials: bool,
 ) -> None:
     retry_delay_seconds = 45
     worker_id = "salad-submit-test"
@@ -1088,6 +1096,7 @@ async def test_verifying_asset_defers_and_reuses_the_same_prepared_attempt(
 
         deferred_uploads = FakeUploadIntentProvider(
             defer_retry_seconds=retry_delay_seconds,
+            defer_storage_credentials=storage_credentials,
         )
         client = FakeSaladClient()
         deferred = await submit_prepared_attempt(
@@ -1108,6 +1117,9 @@ async def test_verifying_asset_defers_and_reuses_the_same_prepared_attempt(
         assert attempt.reservation_released_at is None
         assert attempt.submit_started_at is None
         assert attempt.error_code == "salad_job_input_deferred"
+        if storage_credentials:
+            assert "storage signing credentials" in (attempt.error_detail or "")
+            assert "storage credentials refresh" in (job.last_error_detail or "")
         assert job.state == GenerationState.CLAIMED
         assert job.attempt_count == 1
         assert job.max_attempts == 3

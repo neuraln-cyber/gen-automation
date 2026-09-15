@@ -34,7 +34,7 @@ IMPACT_SUBPACK_COMMIT = "50c7b71a6a224734cc9b21963c6d1926816a97f1"
 SALAD_QUEUE_WORKER_COMMIT = "73d7a3c80a73f26339194e024cb47c8501c67f75"
 SALAD_QUEUE_WORKER_PATCH_SHA256 = "a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae"
 SALAD_QUEUE_WORKER_HEARTBEAT_PATCH_SHA256 = (
-    "e19fcdf5b5f828e3435f027133017dbd68d46c4c0ab0321c2de7198719b06d18"
+    "51d604da546aa076073d971b6839998d3582e34f5f52af64faf4c7c6e8f6f23a"
 )
 
 
@@ -158,6 +158,14 @@ def test_salad_queue_worker_reconnects_a_silent_job_stream() -> None:
     assert '+\t\t\t\t\t\tlogger.Warn("job stream heartbeat timed out")' in patch_text
     assert "+\t\t\t\t\t\tcancelStream()" in patch_text
     assert "CurrentJobId: currentJobId" in patch_text
+    assert "superviseJobPoller(jobPollerCtx, jobPoller.poll, time.Second)" in patch_text
+    assert "openTimer := time.AfterFunc(jobStreamSilenceTimeout, cancelStream)" in patch_text
+    assert "TestJobPollerRestartsWithoutReadinessChange" in patch_text
+    assert "TestJobPollerPreservesTerminalInstanceErrors" in patch_text
+    assert "TestJobPollerCancellationInterruptsBackoff" in patch_text
+    assert (
+        "go test -mod=readonly ./cmd/salad-http-job-queue-worker ./internal/workers" in dockerfile
+    )
 
 
 def test_final_runtime_is_non_root_with_a_writable_non_root_home() -> None:

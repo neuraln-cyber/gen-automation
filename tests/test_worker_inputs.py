@@ -54,7 +54,11 @@ from gen_automation.services.worker_inputs import (
     WorkerInputError,
     _controlled_duo_bindings,
 )
-from gen_automation.storage.base import ObjectStoreError, PresignedUpload
+from gen_automation.storage.base import (
+    ObjectStoreError,
+    ObjectStoreSigningDeferredError,
+    PresignedUpload,
+)
 from gen_automation.storage.memory import MemoryObjectStore
 
 NOW = 2_000_000_000
@@ -1081,6 +1085,34 @@ async def test_current_twenty_five_output_job_uses_a_compact_referenced_payload(
     async with context.database.sessions() as session:
         asset_count = int(await session.scalar(select(func.count(Asset.id))) or 0)
     assert asset_count == 25
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["presign_upload", "presign_download"])
+async def test_short_storage_credentials_defer_and_roll_back_unsigned_job(
+    worker_input_context: WorkerInputContext,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    context, _ = await _legacy_twenty_five_output_context(
+        worker_input_context,
+        current_budget=True,
+    )
+
+    async def short_credentials(**_kwargs: object) -> object:
+        raise ObjectStoreSigningDeferredError("temporary signing lifetime unavailable")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(context.store, operation, short_credentials)
+        with pytest.raises(SaladJobInputDeferredError) as error:
+            await _build(context)
+        assert error.value.reason == "storage_credentials"
+
+    async with context.database.sessions() as session:
+        assert await session.scalar(select(func.count(Asset.id))) == 0
+    # The same attempt is usable when credentials recover; no partial grants
+    # or provider submission escaped the rolled-back preparation.
+    assert (await _build(context))["version"] == "v2"
 
 
 @pytest.mark.asyncio

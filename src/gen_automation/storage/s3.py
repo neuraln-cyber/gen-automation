@@ -1,13 +1,16 @@
 import base64
 import hashlib
 from functools import partial
+from threading import Lock
+from time import monotonic
 from typing import Any, cast
 from urllib.parse import quote
 
 import boto3
 from anyio import to_thread
 from botocore.client import Config
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.credentials import RefreshableCredentials
+from botocore.exceptions import BotoCoreError, ClientError, CredentialRetrievalError
 
 from gen_automation.config import Settings
 from gen_automation.storage.base import (
@@ -20,11 +23,14 @@ from gen_automation.storage.base import (
     ObjectNotFoundError,
     ObjectStore,
     ObjectStoreError,
+    ObjectStoreSigningDeferredError,
     ObjectTooLargeError,
     PresignedUpload,
 )
 
 PRIVATE_NO_STORE_CACHE_CONTROL = "private, no-store, max-age=0"
+SIGNING_CREDENTIAL_MARGIN_SECONDS = 60
+SIGNING_REFRESH_BACKOFF_SECONDS = 60
 
 
 class S3ObjectStore:
@@ -76,6 +82,71 @@ class S3ObjectStore:
             if session_token is not None:
                 client_arguments["aws_session_token"] = session_token
         self.client: Any = boto3.client(**client_arguments)
+        self._client_arguments = client_arguments
+        self._signing_client: Any | None = None
+        self._signing_lock = Lock()
+        self._last_signing_refresh = float("-inf")
+
+    @staticmethod
+    def _credentials_cover(client: Any, expires_in: int) -> bool:
+        # Botocore has no public client API for its signing credentials. Keep
+        # this adapter small and exercise it with real botocore credentials.
+        credentials = getattr(getattr(client, "_request_signer", None), "_credentials", None)
+        if credentials is None:
+            return True  # Normal SDK signing still raises NoCredentialsError.
+        frozen = credentials.get_frozen_credentials()
+        if isinstance(credentials, RefreshableCredentials):
+            return not credentials.refresh_needed(
+                refresh_in=expires_in + SIGNING_CREDENTIAL_MARGIN_SECONDS
+            )
+        if frozen.token:
+            # An explicit session token has no expiry metadata. Do not pretend
+            # its lifetime is known, or silently replace its configured identity.
+            raise ObjectStoreError("S3 signing requires temporary credential expiry metadata")
+        return True
+
+    async def _presign(self, method_name: str, *, expires_in: int, **parameters: Any) -> Any:
+        def sign() -> Any:
+            # A dedicated signer can be refreshed without closing the shared
+            # storage client's connections while other requests use them.
+            with self._signing_lock:
+                client = self._signing_client or self.client
+                if not self._credentials_cover(client, expires_in):
+                    now = monotonic()
+                    if now - self._last_signing_refresh >= SIGNING_REFRESH_BACKOFF_SECONDS:
+                        self._last_signing_refresh = now
+                        # A new session bypasses boto3's cached IAM credentials.
+                        # The ordinary provider chain and exact client settings
+                        # are retained; no new keys, roles, or permissions.
+                        try:
+                            refreshed = boto3.Session().client(**self._client_arguments)
+                        except (BotoCoreError, ClientError):
+                            raise ObjectStoreSigningDeferredError(
+                                "S3 signing credential refresh is temporarily unavailable"
+                            ) from None
+                        previous = self._signing_client
+                        self._signing_client = client = refreshed
+                        if previous is not None:
+                            previous.close()
+                    if not self._credentials_cover(client, expires_in):
+                        raise ObjectStoreSigningDeferredError(
+                            "S3 credentials cannot yet cover the requested signing lifetime"
+                        )
+                result = getattr(client, method_name)(ExpiresIn=expires_in, **parameters)
+                # Never return a grant if credentials changed to a shorter
+                # session during SDK signing.
+                if not self._credentials_cover(client, expires_in):
+                    raise ObjectStoreSigningDeferredError("S3 credentials changed during signing")
+                return result
+
+        try:
+            return await to_thread.run_sync(sign)
+        except CredentialRetrievalError:
+            raise ObjectStoreSigningDeferredError(
+                "S3 signing credential refresh is temporarily unavailable"
+            ) from None
+        except (BotoCoreError, ClientError) as error:
+            raise ObjectStoreError("S3 signing failed") from error
 
     async def _call(self, method_name: str, **parameters: Any) -> Any:
         method = getattr(self.client, method_name)
@@ -110,12 +181,13 @@ class S3ObjectStore:
         ]
         conditions.extend({f"x-amz-meta-{name}": value} for name, value in metadata.items())
         try:
-            response = self.client.generate_presigned_post(
+            response = await self._presign(
+                "generate_presigned_post",
                 Bucket=self.bucket,
                 Key=key,
                 Fields=fields,
                 Conditions=conditions,
-                ExpiresIn=expires_in,
+                expires_in=expires_in,
             )
         except (BotoCoreError, ClientError) as error:
             raise ObjectStoreError("S3 upload signing failed") from error
@@ -149,10 +221,11 @@ class S3ObjectStore:
         try:
             return cast(
                 str,
-                self.client.generate_presigned_url(
-                    "get_object",
+                await self._presign(
+                    "generate_presigned_url",
+                    ClientMethod="get_object",
                     Params=parameters,
-                    ExpiresIn=expires_in,
+                    expires_in=expires_in,
                     HttpMethod="GET",
                 ),
             )
@@ -184,10 +257,11 @@ class S3ObjectStore:
         try:
             url = cast(
                 str,
-                self.client.generate_presigned_url(
-                    "put_object",
+                await self._presign(
+                    "generate_presigned_url",
+                    ClientMethod="put_object",
                     Params=parameters,
-                    ExpiresIn=expires_in,
+                    expires_in=expires_in,
                     HttpMethod="PUT",
                 ),
             )
@@ -700,6 +774,13 @@ class S3ObjectStore:
         await self._call("delete_object", **parameters)
 
     async def close(self) -> None:
+        def close_signer() -> None:
+            with self._signing_lock:
+                if self._signing_client is not None:
+                    self._signing_client.close()
+                    self._signing_client = None
+
+        await to_thread.run_sync(close_signer)
         await to_thread.run_sync(self.client.close)
 
 

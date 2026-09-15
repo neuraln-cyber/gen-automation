@@ -1,8 +1,235 @@
+diff --git a/internal/workers/poller_integration_test.go b/internal/workers/poller_integration_test.go
+new file mode 100644
+index 0000000..3ff9e7f
+--- /dev/null
++++ b/internal/workers/poller_integration_test.go
+@@ -0,0 +1,93 @@
++package workers
++
++import (
++	"context"
++	"errors"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	queues_api "github.com/saladtechnologies/salad-cloud-job-queue-worker/internal/apis/queues"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++type recoveringQueueServer struct {
++	queues_api.UnimplementedJobQueueWorkerServiceServer
++	failure         codes.Code
++	calls           atomic.Int32
++	wrongCurrentJob atomic.Bool
++}
++
++func (s *recoveringQueueServer) AcceptJobs(request *queues_api.AcceptJobsRequest, stream grpc.ServerStreamingServer[queues_api.AcceptJobsResponse]) error {
++	if request.CurrentJobId != "preserved-current-job" {
++		s.wrongCurrentJob.Store(true)
++	}
++	if s.calls.Add(1) == 1 {
++		return status.Error(s.failure, "simulated stream interruption")
++	}
++	if err := stream.Send(&queues_api.AcceptJobsResponse{
++		Message: &queues_api.AcceptJobsResponse_Job{Job: &queues_api.Job{JobId: "next-job"}},
++	}); err != nil {
++		return err
++	}
++	<-stream.Context().Done()
++	return stream.Context().Err()
++}
++
++func TestRealJobStreamRecoversServerErrorsAndPreservesCurrentJob(t *testing.T) {
++	for _, code := range []codes.Code{codes.Canceled, codes.NotFound} {
++		t.Run(code.String(), func(t *testing.T) {
++			metadata := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if r.URL.Path != "/v1/token" {
++					http.NotFound(w, r)
++					return
++				}
++				w.Header().Set("Content-Type", "application/json")
++				_, _ = w.Write([]byte(`{"jwt":"test-token"}`))
++			}))
++			defer metadata.Close()
++			listener, err := net.Listen("tcp", "127.0.0.1:0")
++			if err != nil {
++				t.Fatal(err)
++			}
++			server := grpc.NewServer()
++			service := &recoveringQueueServer{failure: code}
++			queues_api.RegisterJobQueueWorkerServiceServer(server, service)
++			go func() { _ = server.Serve(listener) }()
++			defer server.Stop()
++			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++			defer cancel()
++			conn, err := newQueueConnection(ctx, listener.Addr().String(), false, "test")
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer conn.Close()
++			current := &atomic.Pointer[queues_api.Job]{}
++			preserved := &queues_api.Job{JobId: "preserved-current-job"}
++			current.Store(preserved)
++			poller := newJobPoller(newMetadataClient(metadata.URL), conn, current)
++			done := make(chan error, 1)
++			go func() { done <- superviseJobPoller(ctx, poller.poll, time.Millisecond) }()
++			select {
++			case job := <-poller.next():
++				if job.JobId != "next-job" {
++					t.Fatal("wrong job after reconnect")
++				}
++			case <-ctx.Done():
++				t.Fatal("listener stayed alive but never accepted the next job")
++			}
++			if service.calls.Load() != 2 || current.Load() != preserved || service.wrongCurrentJob.Load() {
++				t.Fatal("recovery changed the executing job or did not reconnect once")
++			}
++			cancel()
++			if err := <-done; !errors.Is(err, context.Canceled) {
++				t.Fatal(err)
++			}
++		})
++	}
++}
+diff --git a/internal/workers/poller_supervisor.go b/internal/workers/poller_supervisor.go
+new file mode 100644
+index 0000000..79554f7
+--- /dev/null
++++ b/internal/workers/poller_supervisor.go
+@@ -0,0 +1,44 @@
++package workers
++
++import (
++	"context"
++	"errors"
++	"time"
++
++	"github.com/saladtechnologies/salad-cloud-job-queue-worker/pkg/log"
++)
++
++// A server-side cancellation may make poll return nil (the parent context is
++// still live). NotFound also used to leave Run holding a non-nil cancel handle
++// for a goroutine that had stopped. Neither case can wait for a readiness edge:
++// an idle, healthy container may stay ready indefinitely.
++// Reconnect without canceling the worker, its HTTP executor, or currentJob.
++func superviseJobPoller(ctx context.Context, poll func(context.Context) error, minimumDelay time.Duration) error {
++	delay := minimumDelay
++	for {
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++		started := time.Now()
++		err := poll(ctx)
++		if ctx.Err() != nil {
++			return ctx.Err()
++		}
++		if errors.Is(err, errWorkloadInstanceNotFound) || errors.Is(err, errWorkloadTokenUnavailable) {
++			return err // Preserve the existing terminal instance/auth handling.
++		}
++		if time.Since(started) >= time.Minute {
++			delay = minimumDelay
++		}
++		// Do not log upstream errors: they can include tokens or job payloads.
++		log.FromContext(ctx).Warn("job poller stopped; reconnecting", "retry_delay", delay)
++		timer := time.NewTimer(delay)
++		select {
++		case <-ctx.Done():
++			timer.Stop()
++			return ctx.Err()
++		case <-timer.C:
++		}
++		delay = min(delay*2, time.Minute)
++	}
++}
+diff --git a/internal/workers/poller_supervisor_test.go b/internal/workers/poller_supervisor_test.go
+new file mode 100644
+index 0000000..d699ca5
+--- /dev/null
++++ b/internal/workers/poller_supervisor_test.go
+@@ -0,0 +1,72 @@
++package workers
++
++import (
++	"context"
++	"errors"
++	"testing"
++	"time"
++)
++
++func TestJobPollerRestartsWithoutReadinessChange(t *testing.T) {
++	for name, stopped := range map[string]error{
++		"server cancellation returns nil": nil,
++		"server cancellation":             context.Canceled,
++		"missing job":                     errJobNotFound,
++		"transport failure":               errors.New("transport failed"),
++	} {
++		t.Run(name, func(t *testing.T) {
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			calls := 0
++			err := superviseJobPoller(ctx, func(pollCtx context.Context) error {
++				calls++
++				if pollCtx.Err() != nil {
++					t.Fatal("live poller context canceled during recovery")
++				}
++				if calls == 3 {
++					cancel() // Two recoveries, then an intentional readiness/stop cancel.
++				}
++				return stopped
++			}, time.Millisecond)
++			if !errors.Is(err, context.Canceled) || calls != 3 {
++				t.Fatalf("error=%v calls=%d", err, calls)
++			}
++		})
++	}
++}
++
++func TestJobPollerPreservesTerminalInstanceErrors(t *testing.T) {
++	for _, terminal := range []error{errWorkloadInstanceNotFound, errWorkloadTokenUnavailable} {
++		calls := 0
++		err := superviseJobPoller(context.Background(), func(context.Context) error {
++			calls++
++			return terminal
++		}, time.Millisecond)
++		if err != terminal || calls != 1 {
++			t.Fatalf("error=%v calls=%d", err, calls)
++		}
++	}
++}
++
++func TestJobPollerCancellationInterruptsBackoff(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	called := make(chan struct{})
++	done := make(chan error, 1)
++	go func() {
++		done <- superviseJobPoller(ctx, func(context.Context) error {
++			close(called)
++			return nil
++		}, time.Hour)
++	}()
++	<-called
++	cancel()
++	select {
++	case err := <-done:
++		if !errors.Is(err, context.Canceled) {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("poller ignored cancellation during backoff")
++	}
++}
 diff --git a/internal/workers/workers.go b/internal/workers/workers.go
-index 5e183b5..f9c6002 100644
+index 5e183b5..82fad57 100644
 --- a/internal/workers/workers.go
 +++ b/internal/workers/workers.go
-@@ -27,6 +27,13 @@ var errWorkloadTokenUnavailable = errors.New("workload token unavailable")
+@@ -27,6 +27,13 @@
  var errJobNotFound = errors.New("job not found")
  var errOutputInvalid = errors.New("job output invalid")
  
@@ -16,17 +243,51 @@ index 5e183b5..f9c6002 100644
  func Run(ctx context.Context, config config.Config, executor jobs.HTTPJobExecutor, version string) error {
  	logger := log.FromContext(ctx)
  	workerCtx, cancelWorker := context.WithCancelCause(ctx)
-@@ -384,7 +391,8 @@ func (p *jobPoller) poll(ctx context.Context) error {
+@@ -89,7 +96,7 @@ func Run(ctx context.Context, config config.Config, executor jobs.HTTPJobExecuto
+ 						var jobPollerCtx context.Context
+ 						jobPollerCtx, cancelJobPoller = context.WithCancel(workerCtx)
+ 						go func() {
+-							err := jobPoller.poll(jobPollerCtx)
++							err := superviseJobPoller(jobPollerCtx, jobPoller.poll, time.Second)
+ 							if err != nil {
+ 								if errors.Is(err, context.Canceled) {
+ 									// Expected on stop.
+@@ -165,7 +172,7 @@ func Run(ctx context.Context, config config.Config, executor jobs.HTTPJobExecuto
+ 						var jobPollerCtx context.Context
+ 						jobPollerCtx, cancelJobPoller = context.WithCancel(workerCtx)
+ 						go func() {
+-							err := jobPoller.poll(jobPollerCtx)
++							err := superviseJobPoller(jobPollerCtx, jobPoller.poll, time.Second)
+ 							if err != nil {
+ 								if errors.Is(err, context.Canceled) {
+ 									// Expected on stop.
+@@ -384,11 +391,16 @@ func (p *jobPoller) poll(ctx context.Context) error {
  			// The client will automatically retry several times on network
  			// errors and invalid responses using a short, exponential backoff
  			// algorithm. Eventually, it will give up and return the last error.
 -			stream, err := client.AcceptJobs(authCtx, &queues_api.AcceptJobsRequest{
 +			streamCtx, cancelStream := context.WithCancel(authCtx)
++			// AcceptJobs itself can block in gRPC wait-for-ready, before Recv.
++			openTimer := time.AfterFunc(jobStreamSilenceTimeout, cancelStream)
 +			stream, err := client.AcceptJobs(streamCtx, &queues_api.AcceptJobsRequest{
  				CurrentJobId: currentJobId,
  			})
++			openTimer.Stop()
  			stat, ok := status.FromError(err)
-@@ -409,7 +417,30 @@ func (p *jobPoller) poll(ctx context.Context) error {
+ 			if !ok {
++				cancelStream()
+ 				logger.Error("failed to open job stream", "error", err)
+ 				delay := time.NewTimer(1 * time.Minute)
+ 				select {
+@@ -403,13 +415,38 @@ func (p *jobPoller) poll(ctx context.Context) error {
+ 			reauth := false
+ 			switch stat.Code() {
+ 			case codes.Canceled:
++				cancelStream()
+ 				return ctx.Err()
+ 			case codes.NotFound:
++				cancelStream()
+ 				return errJobNotFound
  			case codes.OK:
  			ReceiveLoop:
  				for {
@@ -58,7 +319,34 @@ index 5e183b5..f9c6002 100644
  					if err == nil {
  						switch msg := resp.Message.(type) {
  						case *queues_api.AcceptJobsResponse_Heartbeat:
-@@ -466,6 +497,7 @@ func (p *jobPoller) poll(ctx context.Context) error {
+@@ -419,6 +456,7 @@ func (p *jobPoller) poll(ctx context.Context) error {
+ 							logger.Info("received job", "job", msg.Job)
+ 							select {
+ 							case <-ctx.Done():
++								cancelStream()
+ 								return ctx.Err()
+ 							case p.jobs <- msg.Job:
+ 								continue
+@@ -436,8 +474,10 @@ func (p *jobPoller) poll(ctx context.Context) error {
+ 
+ 						switch stat.Code() {
+ 						case codes.Canceled:
++							cancelStream()
+ 							return ctx.Err()
+ 						case codes.NotFound:
++							cancelStream()
+ 							return errJobNotFound
+ 						case codes.PermissionDenied:
+ 							reauth = true
+@@ -457,6 +497,7 @@ func (p *jobPoller) poll(ctx context.Context) error {
+ 				reauth = true
+ 			default:
+ 				logger.Error("failed to open job stream", "error", err)
++				cancelStream()
+ 				delay := time.NewTimer(1 * time.Minute)
+ 				select {
+ 				case <-ctx.Done():
+@@ -466,6 +507,7 @@ func (p *jobPoller) poll(ctx context.Context) error {
  					continue
  				}
  			}

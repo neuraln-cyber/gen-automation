@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from re import fullmatch
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -248,6 +248,7 @@ class SaladJobInputDeferredError(SaladServiceError):
         self,
         *,
         retry_after_seconds: int = _DEFAULT_JOB_INPUT_DEFER_SECONDS,
+        reason: Literal["asset_verification", "storage_credentials"] = "asset_verification",
     ) -> None:
         if (
             not isinstance(retry_after_seconds, int)
@@ -256,6 +257,9 @@ class SaladJobInputDeferredError(SaladServiceError):
         ):
             raise ValueError("retry_after_seconds must be between 1 and 3600")
         self.retry_after_seconds = retry_after_seconds
+        if reason not in {"asset_verification", "storage_credentials"}:
+            raise ValueError("invalid worker input deferral reason")
+        self.reason = reason
         super().__init__("Salad worker input preparation is temporarily deferred")
 
 
@@ -1402,6 +1406,7 @@ async def submit_prepared_attempt(
             job=job,
             retry_at=retry_at,
             occurred_at=submitted_at,
+            reason=error.reason,
         )
         await session.commit()
         return _submission_result(
@@ -3769,6 +3774,7 @@ async def _rearm_deferred_job_input(
     job: GenerationJob,
     retry_at: datetime,
     occurred_at: datetime,
+    reason: Literal["asset_verification", "storage_credentials"] = "asset_verification",
 ) -> None:
     """Release one pre-provider reservation and reuse its exact prepared attempt."""
 
@@ -3799,7 +3805,9 @@ async def _rearm_deferred_job_input(
     attempt.submit_started_at = None
     attempt.error_code = _JOB_INPUT_DEFERRED_ERROR_CODE
     attempt.error_detail = (
-        "Worker input preparation is waiting for an in-progress asset verification."
+        "Worker input preparation is waiting for fresh storage signing credentials."
+        if reason == "storage_credentials"
+        else "Worker input preparation is waiting for an in-progress asset verification."
     )
     attempt.lock_version += 1
 
@@ -3812,7 +3820,9 @@ async def _rearm_deferred_job_input(
     job.lease_expires_at = None
     job.last_error_code = _JOB_INPUT_DEFERRED_ERROR_CODE
     job.last_error_detail = (
-        "Generation will retry the same prepared attempt after asset verification."
+        "Generation will retry the same prepared attempt when storage credentials refresh."
+        if reason == "storage_credentials"
+        else "Generation will retry the same prepared attempt after asset verification."
     )
     job.lock_version += 1
 
@@ -3837,6 +3847,7 @@ async def _rearm_deferred_job_input(
             attempt=attempt,
             detail={
                 "reason_code": _JOB_INPUT_DEFERRED_ERROR_CODE,
+                "deferral_reason": reason,
                 "retry_at": retry_at.isoformat(),
                 "reservation_microusd": reservation_microusd,
                 "provider_contacted": False,
