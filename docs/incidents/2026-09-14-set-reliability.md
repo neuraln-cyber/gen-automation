@@ -84,6 +84,20 @@ loss or remove the cost of replaying saved output slots after a genuine failure.
 Deployment must use immutable images and the normal idle-work preflight. This
 document records the repair design, not a claim that a particular image is live.
 
+The initial repair passed 2,583 Linux CI tests and all six container builds,
+but publication was blocked by newly reported Critical Debian base-package
+findings. The follow-up updates only existing libc6/libc-bin packages to
+2.41-12+deb13u4 and perl-base to 5.40.1-6+deb13u1 in the four Debian images.
+These are pinned Debian 13 maintenance revisions, not a distribution or Python
+migration. Package removal is forbidden. Python, CUDA, PyTorch, ComfyUI, model
+configuration and dependency lockfiles remain unchanged. All available image
+SBOMs are now scanned even if an earlier scan fails, while each failure still
+blocks publication. No severity threshold or exclusion was relaxed.
+
+Debian's fixed-version records:
+https://security-tracker.debian.org/tracker/CVE-2026-5450
+https://security-tracker.debian.org/tracker/CVE-2026-8376
+
 AWS documents that a presigned URL expires with its underlying temporary
 credentials even when the requested URL lifetime is longer:
 https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html

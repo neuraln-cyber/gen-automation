@@ -15,6 +15,15 @@ ENV HOME=/home/app \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src
 
+# Apply only the Debian 13 security revisions required by the image gate.
+# Keep the pinned Python runtime and all application dependencies unchanged.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends --no-remove --only-upgrade \
+        libc6=2.41-12+deb13u4 \
+        libc-bin=2.41-12+deb13u4 \
+        perl-base=5.40.1-6+deb13u1 \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY requirements.lock ./

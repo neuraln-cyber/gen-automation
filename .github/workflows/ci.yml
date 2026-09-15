@@ -281,6 +281,7 @@ jobs:
           upload-artifact: false
           upload-release-assets: false
       - name: Scan control-plane image SBOM
+        if: ${{ !cancelled() && hashFiles('control-plane.spdx.json') != '' }}
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
           sbom: control-plane.spdx.json
@@ -291,6 +292,7 @@ jobs:
           cache-db: false
           only-fixed: true
       - name: Scan GPU worker image SBOM
+        if: ${{ !cancelled() && hashFiles('gpu-worker.spdx.json') != '' }}
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
           sbom: gpu-worker.spdx.json
@@ -301,6 +303,7 @@ jobs:
           cache-db: false
           only-fixed: true
       - name: Scan DaSiWa I2V worker image SBOM
+        if: ${{ !cancelled() && hashFiles('i2v-worker.spdx.json') != '' }}
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
           sbom: i2v-worker.spdx.json
@@ -311,6 +314,7 @@ jobs:
           cache-db: false
           only-fixed: true
       - name: Scan semantic gateway image SBOM
+        if: ${{ !cancelled() && hashFiles('semantic-gateway.spdx.json') != '' }}
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
           sbom: semantic-gateway.spdx.json
@@ -321,6 +325,7 @@ jobs:
           cache-db: false
           only-fixed: true
       - name: Scan MEGA-enabled control-plane image SBOM
+        if: ${{ !cancelled() && hashFiles('control-plane-mega.spdx.json') != '' }}
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
           sbom: control-plane-mega.spdx.json
@@ -331,6 +336,7 @@ jobs:
           cache-db: false
           only-fixed: true
       - name: Scan Patreon browser sidecar image SBOM
+        if: ${{ !cancelled() && hashFiles('patreon-browser.spdx.json') != '' }}
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
           sbom: patreon-browser.spdx.json

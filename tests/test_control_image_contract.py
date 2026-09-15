@@ -45,7 +45,8 @@ def test_control_plane_dependencies_are_hash_locked_binary_wheels() -> None:
     )
     assert "python3.12 -m pip check" in dockerfile
     assert "assert sys.version_info[:2] == (3, 12)" in dockerfile
-    assert "apt-get" not in dockerfile
+    assert "apt-get upgrade" not in dockerfile
+    assert "apt-get dist-upgrade" not in dockerfile
 
 
 def test_control_plane_runs_as_fixed_non_root_user_with_private_home() -> None:
