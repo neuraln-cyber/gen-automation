@@ -208,6 +208,7 @@ def test_worker_publication_is_keyed_only_by_the_exact_worker_inputs() -> None:
         "requirements-worker-base.txt",
         "patches/salad-queue-worker/strict-http-status.patch",
         "patches/salad-queue-worker/job-stream-heartbeat-watchdog.patch",
+        "patches/salad-queue-worker/imds-token-recovery.patch",
         "src/gen_automation/__init__.py",
         "src/gen_automation/gpu_worker",
         "src/gen_automation/domain/__init__.py",

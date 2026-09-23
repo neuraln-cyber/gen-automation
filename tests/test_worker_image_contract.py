@@ -13,6 +13,12 @@ SALAD_QUEUE_WORKER_PATCH_PATH = ROOT / "patches" / "salad-queue-worker" / "stric
 SALAD_QUEUE_WORKER_HEARTBEAT_PATCH_PATH = (
     ROOT / "patches" / "salad-queue-worker" / "job-stream-heartbeat-watchdog.patch"
 )
+SALAD_QUEUE_WORKER_TOKEN_PATCH_PATH = (
+    ROOT / "patches" / "salad-queue-worker" / "imds-token-recovery.patch"
+)
+SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256 = (
+    "916f22c8075481a2924aabc2f1d1b57d891681eb5bd10b6081487df7b57a336d"
+)
 
 DOCKERFILE_FRONTEND = (
     "docker/dockerfile:1.7.1@"
@@ -166,6 +172,37 @@ def test_salad_queue_worker_reconnects_a_silent_job_stream() -> None:
     assert (
         "go test -mod=readonly ./cmd/salad-http-job-queue-worker ./internal/workers" in dockerfile
     )
+
+
+def test_salad_token_recovery_is_pinned_and_shared_by_all_auth_paths() -> None:
+    dockerfile = _logical_lines(_dockerfile())
+    patch = SALAD_QUEUE_WORKER_TOKEN_PATCH_PATH.read_bytes()
+    patch_text = patch.decode("utf-8")
+    assert hashlib.sha256(patch).hexdigest() == SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256
+    assert f"SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256={SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256}" in (
+        dockerfile
+    )
+    assert "git apply --check /tmp/imds-token-recovery.patch" in dockerfile
+    assert "git apply /tmp/imds-token-recovery.patch" in dockerfile
+    assert (
+        "COPY patches/salad-queue-worker/imds-token-recovery.patch "
+        "/tmp/imds-token-recovery.patch" in dockerfile
+    )
+    assert (
+        f'org.opencontainers.image.salad-queue-worker.imds-patch-sha256="'
+        f'{SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256}"' in dockerfile
+    )
+    assert "patches/salad-queue-worker/imds-token-recovery.patch" in (
+        ROOT / ".github/workflows/publish-images.yml"
+    ).read_text(encoding="utf-8")
+    assert patch_text.count("+\t\ttoken, tokenErr := fetchWorkloadToken(") == 3
+    assert "+\tconfig.SetTimeout(30 * time.Second)" in patch_text
+    assert "newJobPoller(tokenClient, conn, currentJobStore)" in patch_text
+    assert "newJobHandler(tokenClient, conn" in patch_text
+    assert "TestTokenRetriesActualSDKFailuresAndRedactsResponses" in patch_text
+    assert "TestTokenFailureBudgetAndMissingInstance" in patch_text
+    assert "TestTokenCancellationStopsRequestAndRetryDelay" in patch_text
+    assert "TestTokenAllowsSlowIssuanceBeyondSDKDefault" in patch_text
 
 
 def test_final_runtime_is_non_root_with_a_writable_non_root_home() -> None:

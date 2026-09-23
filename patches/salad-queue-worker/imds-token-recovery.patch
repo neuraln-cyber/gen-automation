@@ -1,0 +1,470 @@
+diff --git a/internal/workers/http.go b/internal/workers/http.go
+index ceffbfe..2e7889d 100644
+--- a/internal/workers/http.go
++++ b/internal/workers/http.go
+@@ -1,6 +1,8 @@
+ package workers
+ 
+ import (
++	"time"
++
+ 	"github.com/saladtechnologies/salad-cloud-imds-sdk-go/pkg/saladcloudimdssdk"
+ 	"github.com/saladtechnologies/salad-cloud-imds-sdk-go/pkg/saladcloudimdssdkconfig"
+ )
+@@ -11,3 +13,12 @@ func newMetadataClient(addr string) *saladcloudimdssdk.SaladCloudImdsSdk {
+ 	config.SetBaseUrl(addr)
+ 	return saladcloudimdssdk.NewSaladCloudImdsSdk(config)
+ }
++
++// Token issuance may call the provider control plane. Keep its latency budget
++// separate from readiness/reallocation so slow auth cannot delay health probes.
++func newTokenMetadataClient(addr string) *saladcloudimdssdk.SaladCloudImdsSdk {
++	config := saladcloudimdssdkconfig.NewConfig()
++	config.SetBaseUrl(addr)
++	config.SetTimeout(30 * time.Second)
++	return saladcloudimdssdk.NewSaladCloudImdsSdk(config)
++}
+diff --git a/internal/workers/token.go b/internal/workers/token.go
+new file mode 100644
+index 0000000..b805ab9
+--- /dev/null
++++ b/internal/workers/token.go
+@@ -0,0 +1,70 @@
++package workers
++
++import (
++	"context"
++	"net/http"
++	"strings"
++	"time"
++
++	"github.com/saladtechnologies/salad-cloud-imds-sdk-go/pkg/metadata"
++	"github.com/saladtechnologies/salad-cloud-imds-sdk-go/pkg/saladcloudimdssdk"
++	"github.com/saladtechnologies/salad-cloud-job-queue-worker/pkg/log"
++)
++
++const tokenMaxAttempts = 6
++
++// The pinned SDK does NOT retry transport or HTTP errors. Own the retry budget
++// here, including empty/malformed responses, for claim, completion and rejection.
++// Six 30s requests plus 5/10/20/20/20s waits are bounded to 255s, versus the old
++// six 10s requests with 60s gaps (360s). No token means no queue authorization.
++func fetchWorkloadToken(ctx context.Context, client *saladcloudimdssdk.SaladCloudImdsSdk, initialDelay time.Duration) (string, error) {
++	logger := log.FromContext(ctx)
++	delay := initialDelay
++	for attempt := 1; attempt <= tokenMaxAttempts; attempt++ {
++		if ctx.Err() != nil {
++			return "", ctx.Err()
++		}
++		started := time.Now()
++		value := metadata.METADATA_TRUE
++		response, failure := client.Metadata.GetToken(ctx, metadata.GetTokenRequestParams{Metadata: &value})
++		if ctx.Err() != nil {
++			return "", ctx.Err()
++		}
++		status := 0
++		reason := "invalid_response"
++		if failure != nil {
++			status = failure.Metadata.StatusCode
++			reason = "transport"
++			if status != 0 {
++				reason = "http"
++			}
++		} else if response != nil {
++			status = response.Metadata.StatusCode
++			if status == http.StatusOK {
++				if token := response.Data.GetJwt(); token != nil && strings.TrimSpace(*token) != "" {
++					logger.Info("workload instance token acquired", "attempt", attempt, "duration_seconds", time.Since(started).Seconds())
++					return *token, nil
++				}
++			}
++		}
++		// SDK HTTP errors have a nil response; inspect error metadata as well.
++		if status == http.StatusNotFound {
++			return "", errWorkloadInstanceNotFound
++		}
++		// Never log token bodies, headers, or SDK errors containing response data.
++		logger.Warn("failed to fetch workload instance token", "attempt", attempt, "status", status, "reason", reason, "duration_seconds", time.Since(started).Seconds())
++		if attempt == tokenMaxAttempts {
++			logger.Error("workload instance token retry budget exhausted", "attempts", attempt)
++			return "", errWorkloadTokenUnavailable
++		}
++		timer := time.NewTimer(delay)
++		select {
++		case <-ctx.Done():
++			timer.Stop()
++			return "", ctx.Err()
++		case <-timer.C:
++		}
++		delay = min(delay*2, 20*time.Second)
++	}
++	return "", errWorkloadTokenUnavailable
++}
+diff --git a/internal/workers/token_test.go b/internal/workers/token_test.go
+new file mode 100644
+index 0000000..3f3203f
+--- /dev/null
++++ b/internal/workers/token_test.go
+@@ -0,0 +1,122 @@
++package workers
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"log/slog"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/saladtechnologies/salad-cloud-job-queue-worker/pkg/log"
++)
++
++func TestTokenRetriesActualSDKFailuresAndRedactsResponses(t *testing.T) {
++	for _, failure := range []string{"timeout", "http", "empty", "malformed"} {
++		t.Run(failure, func(t *testing.T) {
++			var calls atomic.Int32
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if r.URL.Path != "/v1/token" || r.Header.Get("Metadata") != "true" {
++					t.Error("wrong metadata request")
++				}
++				w.Header().Set("Content-Type", "application/json")
++				if calls.Add(1) == 1 {
++					switch failure {
++					case "timeout":
++						<-r.Context().Done()
++					case "http":
++						w.WriteHeader(http.StatusServiceUnavailable)
++						_, _ = w.Write([]byte("private-response-body"))
++					case "empty":
++						_, _ = w.Write([]byte(`{"jwt":""}`))
++					case "malformed":
++						_, _ = w.Write([]byte("private-invalid-json"))
++					}
++					return
++				}
++				_, _ = w.Write([]byte(`{"jwt":"private-test-token"}`))
++			}))
++			defer server.Close()
++			client := newTokenMetadataClient(server.URL)
++			client.SetTimeout(50 * time.Millisecond)
++			var logs bytes.Buffer
++			ctx := log.WithLogger(context.Background(), slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
++			token, err := fetchWorkloadToken(ctx, client, time.Millisecond)
++			if err != nil || token != "private-test-token" || calls.Load() != 2 {
++				t.Fatalf("error=%v calls=%d", err, calls.Load())
++			}
++			if strings.Contains(logs.String(), "private-") || !strings.Contains(logs.String(), "attempt=1") {
++				t.Fatal("secret logged or safe diagnostic missing")
++			}
++		})
++	}
++}
++
++func TestTokenFailureBudgetAndMissingInstance(t *testing.T) {
++	for _, status := range []int{http.StatusNotFound, http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
++		var calls atomic.Int32
++		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			calls.Add(1)
++			w.WriteHeader(status)
++		}))
++		want := errWorkloadTokenUnavailable
++		wantCalls := int32(tokenMaxAttempts)
++		if status == http.StatusNotFound {
++			want = errWorkloadInstanceNotFound
++			wantCalls = 1
++		}
++		token, err := fetchWorkloadToken(context.Background(), newTokenMetadataClient(server.URL), time.Millisecond)
++		server.Close()
++		if token != "" || !errors.Is(err, want) || calls.Load() != wantCalls {
++			t.Fatalf("status=%d error=%v calls=%d", status, err, calls.Load())
++		}
++	}
++}
++
++func TestTokenCancellationStopsRequestAndRetryDelay(t *testing.T) {
++	for _, blockRequest := range []bool{false, true} {
++		var calls atomic.Int32
++		ctx, cancel := context.WithCancel(context.Background())
++		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			calls.Add(1)
++			time.AfterFunc(20*time.Millisecond, cancel)
++			if blockRequest {
++				<-r.Context().Done()
++			} else {
++				w.WriteHeader(http.StatusServiceUnavailable)
++			}
++		}))
++		started := time.Now()
++		token, err := fetchWorkloadToken(ctx, newTokenMetadataClient(server.URL), time.Hour)
++		cancel()
++		server.Close()
++		if token != "" || !errors.Is(err, context.Canceled) || calls.Load() != 1 || time.Since(started) > time.Second {
++			t.Fatalf("request=%v error=%v calls=%d", blockRequest, err, calls.Load())
++		}
++	}
++}
++
++func TestTokenAllowsSlowIssuanceBeyondSDKDefault(t *testing.T) {
++	if testing.Short() {
++		t.Skip("real 10-second SDK timeout regression")
++	}
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		select {
++		case <-time.After(10500 * time.Millisecond):
++			w.Header().Set("Content-Type", "application/json")
++			_, _ = w.Write([]byte(`{"jwt":"slow-token"}`))
++		case <-r.Context().Done():
++		}
++	}))
++	defer server.Close()
++	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
++	defer cancel()
++	token, err := fetchWorkloadToken(ctx, newTokenMetadataClient(server.URL), time.Millisecond)
++	if err != nil || token != "slow-token" {
++		t.Fatalf("slow but valid token failed: %v", err)
++	}
++}
+diff --git a/internal/workers/workers.go b/internal/workers/workers.go
+index 82fad57..89a85ff 100644
+--- a/internal/workers/workers.go
++++ b/internal/workers/workers.go
+@@ -40,6 +40,7 @@ func Run(ctx context.Context, config config.Config, executor jobs.HTTPJobExecuto
+ 	defer cancelWorker(nil)
+ 
+ 	client := newMetadataClient(config.MetadataURI)
++	tokenClient := newTokenMetadataClient(config.MetadataURI)
+ 	conn, err := newQueueConnection(workerCtx, config.ServiceEndpoint, config.ServiceUseTLS, version)
+ 	if err != nil {
+ 		return err
+@@ -68,7 +69,7 @@ func Run(ctx context.Context, config config.Config, executor jobs.HTTPJobExecuto
+ 	}()
+ 
+ 	currentJobStore := &atomic.Pointer[queues_api.Job]{}
+-	jobPoller := newJobPoller(client, conn, currentJobStore)
++	jobPoller := newJobPoller(tokenClient, conn, currentJobStore)
+ 	var cancelJobPoller context.CancelFunc
+ 
+ 	// Main loop.
+@@ -126,7 +127,7 @@ func Run(ctx context.Context, config config.Config, executor jobs.HTTPJobExecuto
+ 				} else {
+ 					requestURL = fmt.Sprintf("http://localhost:%d/%s", nextJob.Port, nextJob.Path)
+ 				}
+-				handler = newJobHandler(client, conn, jobs.HTTPJob{
++				handler = newJobHandler(tokenClient, conn, jobs.HTTPJob{
+ 					JobId:         nextJob.JobId,
+ 					RequestMethod: http.MethodPost,
+ 					RequestURL:    requestURL,
+@@ -327,57 +328,12 @@ func (p *jobPoller) next() <-chan *queues_api.Job {
+ func (p *jobPoller) poll(ctx context.Context) error {
+ 	logger := log.FromContext(ctx)
+ 	bo := backoff.New(1*time.Minute, 1*time.Second)
+-	token_failures := 0
+ 	for {
+-		// The client will automatically retry several times on network errors,
+-		// invalid responses, 429's, and 5xx's (except 501's) using a short,
+-		// exponential backoff algorithm. Eventually, it will give up and return
+-		// the last error.
+-		metadata_value := metadata.METADATA_TRUE
+-		params := metadata.GetTokenRequestParams{
+-			Metadata: &metadata_value,
+-		}
+-		resp, err := p.client.Metadata.GetToken(ctx, params)
+-		if err != nil {
+-			logger.Error("failed to fetch workload instance token", "error", err)
+-		}
+-
+-		var token string
+-		if resp != nil {
+-			switch resp.Metadata.StatusCode {
+-			case http.StatusOK:
+-				if resp.Data.GetJwt() != nil {
+-					token = *resp.Data.GetJwt()
+-					logger.Debug("fetched workload instance token", "token", token)
+-				} else {
+-					logger.Error("failed to receive JSON response body fetching workload instance token")
+-				}
+-			case http.StatusNotFound:
+-				return errWorkloadInstanceNotFound
+-			default:
+-				logger.Error("failed to fetch workload instance token", "status", resp.Metadata.StatusCode)
+-			}
+-		}
+-
+-		if token == "" {
+-			token_failures++
+-			if token_failures > 5 {
+-				logger.Error("failed to fetch workload instance token after multiple attempts")
+-				return errWorkloadTokenUnavailable
+-			}
+-
+-			delay := time.NewTimer(1 * time.Minute)
+-			select {
+-			case <-ctx.Done():
+-				delay.Stop()
+-				return ctx.Err()
+-			case <-delay.C:
+-				continue
+-			}
++		token, tokenErr := fetchWorkloadToken(ctx, p.client, 5*time.Second)
++		if tokenErr != nil {
++			return tokenErr
+ 		}
+ 
+-		token_failures = 0
+-
+ 		// TODO: Create a new cancelable context with "cause"; start the watchdog timer goroutine with this context.
+ 		authCtx := createAuthorizedContext(ctx, token)
+ 		client := queues_api.NewJobQueueWorkerServiceClient(p.conn)
+@@ -510,7 +466,7 @@ func (p *jobPoller) poll(ctx context.Context) error {
+ 			cancelStream()
+ 
+ 			if reauth {
+-				logger.Info("token expired", "token", token)
++				logger.Info("workload instance token requires refresh")
+ 				break
+ 			} else {
+ 				bo.Reset()
+@@ -578,57 +534,12 @@ func (h *jobHandler) execute(ctx context.Context) error {
+ func (h *jobHandler) complete(ctx context.Context, responseBody []byte) error {
+ 	logger := log.FromContext(ctx)
+ 	bo := backoff.New(1*time.Minute, 1*time.Second)
+-	token_failures := 0
+ 	for {
+-		// The client will automatically retry several times on network errors,
+-		// invalid responses, 429's, and 5xx's (except 501's) using a short,
+-		// exponential backoff algorithm. Eventually, it will give up and return
+-		// the last error.
+-		metadata_value := metadata.METADATA_TRUE
+-		params := metadata.GetTokenRequestParams{
+-			Metadata: &metadata_value,
+-		}
+-		resp, err := h.client.Metadata.GetToken(ctx, params)
+-		if err != nil {
+-			logger.Error("failed to fetch workload instance token", "error", err)
+-		}
+-
+-		var token string
+-		if resp != nil {
+-			switch resp.Metadata.StatusCode {
+-			case http.StatusOK:
+-				if resp.Data.GetJwt() != nil {
+-					token = *resp.Data.GetJwt()
+-					logger.Debug("fetched workload instance token", "token", token)
+-				} else {
+-					logger.Error("failed to receive JSON response body fetching workload instance token")
+-				}
+-			case http.StatusNotFound:
+-				return errWorkloadInstanceNotFound
+-			default:
+-				logger.Error("failed to fetch workload instance token", "status", resp.Metadata.StatusCode)
+-			}
++		token, tokenErr := fetchWorkloadToken(ctx, h.client, 5*time.Second)
++		if tokenErr != nil {
++			return tokenErr
+ 		}
+ 
+-		if token == "" {
+-			token_failures++
+-			if token_failures > 5 {
+-				logger.Error("failed to fetch workload instance token after multiple attempts")
+-				return errWorkloadTokenUnavailable
+-			}
+-
+-			delay := time.NewTimer(1 * time.Minute)
+-			select {
+-			case <-ctx.Done():
+-				delay.Stop()
+-				return ctx.Err()
+-			case <-delay.C:
+-				continue
+-			}
+-		}
+-
+-		token_failures = 0
+-
+ 		authCtx := createAuthorizedContext(ctx, token)
+ 		client := queues_api.NewJobQueueWorkerServiceClient(h.conn)
+ 		for {
+@@ -683,7 +594,7 @@ func (h *jobHandler) complete(ctx context.Context, responseBody []byte) error {
+ 			}
+ 
+ 			if reauth {
+-				logger.Info("token expired", "token", token)
++				logger.Info("workload instance token requires refresh")
+ 				break
+ 			} else {
+ 				bo.Reset()
+@@ -704,57 +615,12 @@ func (h *jobHandler) complete(ctx context.Context, responseBody []byte) error {
+ func (h *jobHandler) reject(ctx context.Context) error {
+ 	logger := log.FromContext(ctx)
+ 	bo := backoff.New(1*time.Minute, 1*time.Second)
+-	token_failures := 0
+ 	for {
+-		// The client will automatically retry several times on network errors,
+-		// invalid responses, 429's, and 5xx's (except 501's) using a short,
+-		// exponential backoff algorithm. Eventually, it will give up and return
+-		// the last error.
+-		metadata_value := metadata.METADATA_TRUE
+-		params := metadata.GetTokenRequestParams{
+-			Metadata: &metadata_value,
+-		}
+-		resp, err := h.client.Metadata.GetToken(ctx, params)
+-		if err != nil {
+-			logger.Error("failed to fetch workload instance token", "error", err)
++		token, tokenErr := fetchWorkloadToken(ctx, h.client, 5*time.Second)
++		if tokenErr != nil {
++			return tokenErr
+ 		}
+ 
+-		var token string
+-		if resp != nil {
+-			switch resp.Metadata.StatusCode {
+-			case http.StatusOK:
+-				if resp.Data.GetJwt() != nil {
+-					token = *resp.Data.GetJwt()
+-					logger.Debug("fetched workload instance token", "token", token)
+-				} else {
+-					logger.Error("failed to receive JSON response body fetching workload instance token")
+-				}
+-			case http.StatusNotFound:
+-				return errWorkloadInstanceNotFound
+-			default:
+-				logger.Error("failed to fetch workload instance token", "status", resp.Metadata.StatusCode)
+-			}
+-		}
+-
+-		if token == "" {
+-			token_failures++
+-			if token_failures > 5 {
+-				logger.Error("failed to fetch workload instance token after multiple attempts")
+-				return errWorkloadTokenUnavailable
+-			}
+-
+-			delay := time.NewTimer(1 * time.Minute)
+-			select {
+-			case <-ctx.Done():
+-				delay.Stop()
+-				return ctx.Err()
+-			case <-delay.C:
+-				continue
+-			}
+-		}
+-
+-		token_failures = 0
+-
+ 		authCtx := createAuthorizedContext(ctx, token)
+ 		client := queues_api.NewJobQueueWorkerServiceClient(h.conn)
+ 		for {
+@@ -804,7 +670,7 @@ func (h *jobHandler) reject(ctx context.Context) error {
+ 			}
+ 
+ 			if reauth {
+-				logger.Info("token expired", "token", token)
++				logger.Info("workload instance token requires refresh")
+ 				break
+ 			} else {
+ 				bo.Reset()
