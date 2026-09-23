@@ -1,4 +1,5 @@
 import re
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,11 +66,11 @@ def test_secret_scan_is_fail_closed_redacted_and_bounded() -> None:
     assert "continue-on-error" not in job
 
 
-def test_secret_scanner_extends_defaults_with_only_narrow_fixture_exceptions() -> None:
+def test_secret_scanner_extends_defaults_with_only_narrow_non_secret_exceptions() -> None:
     config = CONFIG_PATH.read_text(encoding="utf-8")
 
     assert "useDefault = true" in config
-    assert config.count("[[rules.allowlists]]") == 2
+    assert config.count("[[rules.allowlists]]") == 3
     assert 'id = "generic-api-key"' in config
     assert 'condition = "AND"' in config
     assert 'regexTarget = "line"' in config
@@ -93,6 +94,47 @@ def test_secret_scanner_extends_defaults_with_only_narrow_fixture_exceptions() -
     ):
         assert fixture in config
     assert "[[allowlists]]" not in config
+
+
+def test_historical_patch_checksum_exception_rejects_other_files_and_values() -> None:
+    config = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    rules = config["rules"]
+    assert len(rules) == 1
+    assert rules[0]["id"] == "generic-api-key"
+    allowlists = rules[0]["allowlists"]
+    assert len(allowlists) == 3
+    for allowlist in allowlists:
+        assert allowlist["condition"] == "AND"
+        assert allowlist["regexTarget"] == "line"
+    checksum_exception = allowlists[2]
+    assert set(checksum_exception) == {
+        "description",
+        "condition",
+        "regexTarget",
+        "paths",
+        "regexes",
+    }
+    assert checksum_exception["paths"] == [r"(^|/)Dockerfile\.worker$"]
+    assert len(checksum_exception["regexes"]) == 2
+
+    def matches(path: str, line: str) -> bool:
+        return any(re.search(pattern, path) for pattern in checksum_exception["paths"]) and any(
+            re.search(pattern, line) for pattern in checksum_exception["regexes"]
+        )
+
+    checksum = "916f22c8075481a2924aabc2f1d1b57d891681eb5bd10b6081487df7b57a336d"
+    for line in (
+        f"SALAD_QUEUE_WORKER_TOKEN_PATCH_SHA256={checksum}",
+        f'org.opencontainers.image.salad-queue-worker.token-patch-sha256="{checksum}"',
+    ):
+        assert matches("Dockerfile.worker", line)
+        assert matches("project/Dockerfile.worker", f"  {line}  ")
+        for path in ("Dockerfile", "Dockerfile.worker.bak", "OtherDockerfile.worker"):
+            assert not matches(path, line)
+        assert not matches("Dockerfile.worker", line.replace(checksum, "0" * 64))
+        assert not matches("Dockerfile.worker", f"{line} extra-secret")
+        assert not matches("Dockerfile.worker", f"other-secret {line}")
+    assert not matches("Dockerfile.worker", f"API_TOKEN={checksum}")
 
 
 def test_ci_executes_the_complete_migration_path_on_postgresql() -> None:
