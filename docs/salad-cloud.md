@@ -272,6 +272,22 @@ bootstrap and managed-child startup, the same listening server hands requests to
 the real worker application without a port-close/rebind race. `GET /ready` then
 returns success only when the loopback ComfyUI executor is ready.
 
+### Identity-token recovery
+
+The pinned queue SDK defaults to a 10-second HTTP timeout and returns transport
+and HTTP errors without the retries its caller previously assumed. Token
+issuance uses a separate client with a 30-second limit; status and reallocation
+keep their original timeout. Claim, completion, and rejection share six bounded
+attempts with cancellable 5/10/20/20/20-second waits (at most 255 seconds for
+six timeouts, previously 360). A real 404 remains terminal, including when the
+SDK carries it in error metadata. Exhaustion retains the existing provider
+reallocation path; it never authorizes a queue request without a token.
+
+Diagnostics record attempt, HTTP status, elapsed time and a fixed failure class,
+never tokens, headers or raw SDK response bodies. No executor, model, sampler,
+job-ownership, or private-delivery behavior changes. This mitigates transient
+metadata failures and shortens recovery; it cannot prevent a Salad node outage.
+
 ## GPU worker runtime settings
 
 `WorkerRuntimeSettings` reads only the `GEN_WORKER_` prefix. JSON-valued settings
