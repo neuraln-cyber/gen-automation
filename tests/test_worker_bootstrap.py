@@ -2,10 +2,13 @@ import hashlib
 import io
 import json
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from botocore.awsrequest import AWSResponse
 from pydantic import ValidationError
 
 import gen_automation.gpu_worker.bootstrap as worker_bootstrap
@@ -28,6 +31,78 @@ from gen_automation.gpu_worker.models import WorkerEnvironment
 
 WORKER_SIGNING_PRIVATE_KEY = encode_base64url(bytes(range(1, 33)))
 WORKER_VERIFICATION_PUBLIC_KEY = derive_public_key(WORKER_SIGNING_PRIVATE_KEY)
+
+
+@pytest.mark.asyncio
+async def test_delivery_keeps_s3_signatures_ranges_versions_and_sdk_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "botocore.auth.get_current_datetime", lambda: datetime(2026, 9, 23, tzinfo=UTC)
+    )
+    monkeypatch.setattr("botocore.endpoint.time.sleep", lambda _: None)
+    captured: list[tuple[str, dict[str, bytes | str]]] = []
+    calls = 0
+
+    def send(request: Any) -> AWSResponse:
+        nonlocal calls
+        calls += 1
+        captured.append((request.url, dict(request.headers)))
+        status = 503 if calls == 2 else 206
+        body = b"<Error><Code>SlowDown</Code></Error>" if status == 503 else b"abc"
+        headers = {
+            "content-length": str(len(body)),
+            "content-range": "bytes 0-2/9",
+            "x-amz-version-id": "exact-version",
+        }
+        raw = SimpleNamespace(
+            stream=lambda: iter([body]), read=io.BytesIO(body).read, close=lambda: None
+        )
+        return AWSResponse(request.url, status, headers, raw)
+
+    for domain in (None, "d123example.cloudfront.net"):
+        downloader = worker_bootstrap.build_artifact_downloader(
+            _settings(
+                artifact_region="eu-central-1",
+                artifact_delivery_domain=domain,
+                artifact_access_key_id="test-key",
+                artifact_secret_access_key="test-secret",  # noqa: S106
+                artifact_session_token="test-session",  # noqa: S106
+            )
+        )
+        monkeypatch.setattr(downloader._client._endpoint.http_session, "send", send)
+        try:
+            result = downloader._client.get_object(
+                Bucket="models-private",
+                Key="folder/test file+.bin",
+                VersionId="exact-version",
+                Range="bytes=0-2",
+            )
+            assert result["Body"].read() == b"abc"
+            result["Body"].close()
+            assert result["VersionId"] == "exact-version"
+        finally:
+            await downloader.close()
+    assert len(captured) == 3
+    direct_url, direct_headers = captured[0]
+    assert direct_url.startswith("https://models-private.s3.eu-central-1.amazonaws.com/")
+    for url, headers in captured[1:]:
+        assert (
+            url
+            == "https://d123example.cloudfront.net/models/folder/test%20file%2B.bin?versionId=exact-version"
+        )
+        assert headers["Host"] == "d123example.cloudfront.net"
+        assert headers["Authorization"] == direct_headers["Authorization"]
+        assert headers["Range"] == b"bytes=0-2"
+        assert headers["X-Amz-Security-Token"] == b"test-session"
+
+
+def test_worker_delivery_rejects_custom_endpoint() -> None:
+    with pytest.raises(ValidationError, match="custom artifact endpoint"):
+        _settings(
+            artifact_delivery_domain="d123example.cloudfront.net",
+            artifact_endpoint_url="https://custom.example.test",
+        )
 
 
 def _safetensors() -> bytes:

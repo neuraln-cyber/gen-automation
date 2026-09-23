@@ -208,6 +208,7 @@ COPY src/gen_automation/domain/__init__.py ./src/gen_automation/domain/__init__.
 COPY src/gen_automation/domain/controlled_duo.py ./src/gen_automation/domain/controlled_duo.py
 COPY src/gen_automation/domain/deliverability.py ./src/gen_automation/domain/deliverability.py
 COPY src/gen_automation/domain/generation_limits.py ./src/gen_automation/domain/generation_limits.py
+COPY src/gen_automation/domain/private_delivery.py ./src/gen_automation/domain/private_delivery.py
 COPY src/gen_automation/domain/signing.py ./src/gen_automation/domain/signing.py
 COPY --from=salad-queue-worker-builder --chmod=0555 \
     /out/salad-http-job-queue-worker \

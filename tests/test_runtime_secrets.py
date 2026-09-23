@@ -103,6 +103,28 @@ def test_local_and_test_configuration_remain_worker_credential_free() -> None:
     assert build_runtime_secret_resolver(test) is None
 
 
+@pytest.mark.asyncio
+async def test_private_delivery_is_an_optional_resolved_runtime_binding() -> None:
+    values = _protected_gpu_values()
+    settings = Settings(**values)
+    binding = "GEN_WORKER_ARTIFACT_DELIVERY_DOMAIN"
+    assert binding not in configured_runtime_binding_references(settings)
+    values["salad_worker_artifact_delivery_domain"] = "d123example.cloudfront.net"
+    # Use the configured resolver here; the existing STS tests cover identity minting.
+    values["gpu_allocation_enabled"] = False
+    values["salad_worker_artifact_role_arn"] = None
+    settings = Settings(**values)
+    references = configured_runtime_binding_references(settings)
+    assert references[binding] == "deployment-config://salad-worker/artifact-delivery-domain"
+    resolver = build_runtime_secret_resolver(settings)
+    assert resolver is not None
+    try:
+        resolved = await resolver.resolve_many({binding: references[binding]})
+        assert resolved[binding] == "d123example.cloudfront.net"
+    finally:
+        await resolver.aclose()
+
+
 def test_deployment_environment_values_are_loaded_as_secret_strings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

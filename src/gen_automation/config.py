@@ -15,6 +15,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from gen_automation.auth.security import SecretEncryptionError, TotpSecretCipher
 from gen_automation.domain.deliverability import PATREON_MAX_ARCHIVE_BYTES
 from gen_automation.domain.enums import SemanticEnforcementMode
+from gen_automation.domain.private_delivery import PrivateDeliveryRoute
 from gen_automation.domain.runtime_bindings import (
     WORKER_ALLOWED_UPLOAD_ORIGIN_BINDING,
     WORKER_ARTIFACT_BUCKET_BINDING,
@@ -495,6 +496,7 @@ class Settings(BaseSettings):
     salad_worker_artifact_bucket: SecretStr | None = None
     salad_worker_artifact_region: SecretStr | None = None
     salad_worker_artifact_endpoint_url: SecretStr | None = None
+    salad_worker_artifact_delivery_domain: SecretStr | None = None
     salad_worker_artifact_role_arn: str | None = Field(
         default=None,
         pattern=AWS_IAM_ROLE_ARN_PATTERN,
@@ -625,6 +627,7 @@ class Settings(BaseSettings):
     )
     storage_enabled: bool = False
     storage_endpoint_url: AnyHttpUrl | None = None
+    storage_delivery_domain: str | None = None
     storage_region: str = "us-east-1"
     storage_bucket: str | None = None
     storage_access_key_id: SecretStr | None = None
@@ -718,6 +721,34 @@ class Settings(BaseSettings):
 
         if self.storage_enabled and not self.storage_bucket:
             errors.append("enabled object storage requires a bucket")
+        for domain, bucket, region, endpoint, prefix in (
+            (
+                self.storage_delivery_domain,
+                self.storage_bucket,
+                self.storage_region,
+                self.storage_endpoint_url,
+                "assets",
+            ),
+            (
+                _secret_value(self.salad_worker_artifact_delivery_domain),
+                _secret_value(self.salad_worker_artifact_bucket),
+                _secret_value(self.salad_worker_artifact_region),
+                self.salad_worker_artifact_endpoint_url,
+                "models",
+            ),
+        ):
+            if domain is not None:
+                if endpoint is not None:
+                    errors.append("private delivery cannot use a custom storage endpoint")
+                try:
+                    PrivateDeliveryRoute(
+                        domain,
+                        bucket or "",
+                        region or "",
+                        "assets" if prefix == "assets" else "models",
+                    )
+                except ValueError as error:
+                    errors.append(str(error))
         storage_access_key_configured = self.storage_access_key_id is not None
         storage_secret_key_configured = self.storage_secret_access_key is not None
         storage_session_token_configured = self.storage_session_token is not None

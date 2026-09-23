@@ -32,7 +32,7 @@ def asset_connection_source(settings: Settings) -> str | None:
     aws_suffix = "amazonaws.com.cn" if region.startswith("cn-") else "amazonaws.com"
     host = (
         f"{settings.storage_bucket}.s3.{aws_suffix}"
-        if region == "us-east-1"
+        if region == "us-east-1" and settings.storage_delivery_domain is None
         else f"{settings.storage_bucket}.s3.{region}.{aws_suffix}"
     )
     source = f"https://{host}"
@@ -54,7 +54,7 @@ def model_artifact_connection_source(settings: Settings) -> str | None:
     aws_suffix = "amazonaws.com.cn" if region.startswith("cn-") else "amazonaws.com"
     host = (
         f"{bucket}.s3.{aws_suffix}"
-        if region == "us-east-1"
+        if region == "us-east-1" and settings.salad_worker_artifact_delivery_domain is None
         else f"{bucket}.s3.{region}.{aws_suffix}"
     )
     source = f"https://{host}"
@@ -67,6 +67,7 @@ def content_security_policy(
     allow_same_origin_scripts: bool = False,
     asset_connect_source: str | None = None,
     model_artifact_connect_source: str | None = None,
+    asset_delivery_connect_source: str | None = None,
 ) -> str:
     image_sources = "'self' https: blob:"
     connect_sources = ["'self'"]
@@ -76,6 +77,7 @@ def content_security_policy(
     for label, source in (
         ("asset", asset_connect_source),
         ("model artifact", model_artifact_connect_source),
+        ("asset delivery", asset_delivery_connect_source),
     ):
         if source is None:
             continue
@@ -83,7 +85,7 @@ def content_security_policy(
             raise ValueError(f"invalid CSP {label} connection source")
         if source not in connect_sources:
             connect_sources.append(source)
-        if label == "asset" and source not in media_sources:
+        if label in {"asset", "asset delivery"} and source not in media_sources:
             media_sources.append(source)
     script_sources = "'self'" if allow_same_origin_scripts else "'none'"
     return (
@@ -143,6 +145,13 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                     request.url.path == "/dashboard/loras"
                     or request.url.path.startswith("/dashboard/loras/")
                 )
+                else None
+            ),
+            asset_delivery_connect_source=(
+                f"https://{settings.storage_delivery_domain}"
+                if settings.storage_enabled
+                and settings.storage_delivery_domain is not None
+                and (request.url.path == "/dashboard" or request.url.path.startswith("/dashboard/"))
                 else None
             ),
         )

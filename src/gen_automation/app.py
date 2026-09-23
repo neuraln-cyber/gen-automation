@@ -115,6 +115,12 @@ def _build_model_object_store(settings: Settings) -> S3ObjectStore:
         access_key_id=(access_key.get_secret_value() if access_key is not None else None),
         secret_access_key=(secret_key.get_secret_value() if secret_key is not None else None),
         session_token=(session_token.get_secret_value() if session_token is not None else None),
+        delivery_domain=(
+            settings.salad_worker_artifact_delivery_domain.get_secret_value()
+            if settings.salad_worker_artifact_delivery_domain is not None
+            else None
+        ),
+        delivery_prefix="models",
     )
 
 
