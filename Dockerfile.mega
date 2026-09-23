@@ -30,8 +30,8 @@ COPY requirements.lock ./
 
 # Pin an official MEGA Linux repository URL and its independently recorded
 # SHA-256. The credential-bearing profile is mounted only at runtime.
-ARG MEGACMD_DEB_URL=https://mega.nz/linux/repo/Debian_13/amd64/megacmd_2.5.2-1.1_amd64.deb
-ARG MEGACMD_DEB_SHA256=43907f450e13e712b61c87105eeab9c3568338c36895ad6de9599a3facf43659
+ARG MEGACMD_DEB_URL=https://mega.nz/linux/repo/Debian_13/amd64/megacmd_2.6.0-2.1_amd64.deb
+ARG MEGACMD_DEB_SHA256=9fb8c9a31a1c40b57fb54b2e8877988d957a8fcd09b78b3131cff28f0276fd0e
 RUN test -n "${MEGACMD_DEB_URL}" \
     && test -n "${MEGACMD_DEB_SHA256}" \
     && case "${MEGACMD_DEB_URL}" in \
@@ -50,7 +50,7 @@ RUN test -n "${MEGACMD_DEB_URL}" \
         "${MEGACMD_DEB_URL}" \
     && echo "${MEGACMD_DEB_SHA256}  /tmp/megacmd.deb" | sha256sum -c - \
     && test "$(dpkg-deb --field /tmp/megacmd.deb Package)" = "megacmd" \
-    && test "$(dpkg-deb --field /tmp/megacmd.deb Version)" = "2.5.2-1.1" \
+    && test "$(dpkg-deb --field /tmp/megacmd.deb Version)" = "2.6.0-2.1" \
     && test "$(dpkg-deb --field /tmp/megacmd.deb Architecture)" = "amd64" \
     && apt-get install --yes --no-install-recommends /tmp/megacmd.deb \
     && rm -f /etc/apt/sources.list.d/megaio.sources \

@@ -241,6 +241,10 @@ def test_worker_image_copies_only_its_runtime_package_and_direct_domain_imports(
             "COPY src/gen_automation/domain/generation_limits.py "
             "./src/gen_automation/domain/generation_limits.py"
         ),
+        (
+            "COPY src/gen_automation/domain/private_delivery.py "
+            "./src/gen_automation/domain/private_delivery.py"
+        ),
         "COPY src/gen_automation/domain/signing.py ./src/gen_automation/domain/signing.py",
     ]
     assert "COPY src ./src" not in dockerfile
@@ -273,6 +277,7 @@ def test_worker_domain_copy_contract_matches_the_transitive_runtime_import_graph
         "gen_automation.domain.controlled_duo",
         "gen_automation.domain.deliverability",
         "gen_automation.domain.generation_limits",
+        "gen_automation.domain.private_delivery",
         "gen_automation.domain.signing",
     }
     dockerfile = _dockerfile()
