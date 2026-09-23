@@ -8,10 +8,53 @@ from pydantic import ValidationError
 from gen_automation.app import _build_model_object_store
 from gen_automation.config import Environment, Settings
 from gen_automation.domain.private_delivery import PrivateDeliveryRoute
+from gen_automation.gpu_worker.models import validate_upload_url
 from gen_automation.middleware import content_security_policy
 from gen_automation.storage.s3 import S3ObjectStore
 
 DOMAIN = "d123example.cloudfront.net"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("region", ["eu-central-1", "us-east-1"])
+@pytest.mark.parametrize(
+    "key,direct",
+    [
+        ("staging/worker-requests/attempt/payload.json", True),
+        ("staging/worker-requests-lookalike/attempt/payload.json", False),
+        ("staging/worker-requests", False),
+        ("raw/asset.png", False),
+    ],
+)
+async def test_worker_payload_references_preserve_worker_origin_contract(
+    region: str, key: str, direct: bool
+) -> None:
+    store = S3ObjectStore(
+        bucket="private-assets",
+        region=region,
+        access_key_id="test-key",
+        secret_access_key="test-secret",  # noqa: S106
+        delivery_domain=DOMAIN,
+    )
+    try:
+        url = await store.presign_download(key=key, version_id="exact/v1", expires_in=120)
+        origin = f"private-assets.s3.{region}.amazonaws.com"
+        parsed = urlsplit(url)
+        assert parsed.hostname == (origin if direct else DOMAIN)
+        assert parsed.path == ("" if direct else "/assets") + "/" + key
+        query = parse_qs(parsed.query)
+        assert query["versionId"] == ["exact/v1"]
+        assert query["X-Amz-Expires"] == ["120"]
+        assert query["response-cache-control"] == ["private, no-store, max-age=0"]
+        assert "X-Amz-Signature" in query
+        assert "response-content-disposition" not in query
+        if direct:
+            validate_upload_url(url, (origin, 443))
+        else:
+            with pytest.raises(ValueError, match="origin is not allowed"):
+                validate_upload_url(url, (origin, 443))
+    finally:
+        await store.close()
 
 
 def test_infrastructure_never_caches_or_grants_public_origin_access() -> None:

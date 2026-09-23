@@ -243,13 +243,22 @@ class S3ObjectStore:
                 ),
             )
             if self._delivery_route:
-                # CloudFront strips response-content-disposition before S3
-                # verification. Keep named exports on their existing signed
-                # route; never drop a signed parameter or weaken authorization.
-                direct = bool(download_name)
+                # Named exports require signed response-content-disposition.
+                # Referenced GPU job payloads are small control messages whose
+                # worker validator is deliberately pinned to the upload origin.
+                # Keep both on S3; models and ordinary assets still use delivery.
+                worker_request = key.startswith("staging/worker-requests/")
+                direct = bool(download_name) or worker_request
+                route = (
+                    "direct_s3_worker_request"
+                    if worker_request
+                    else "direct_s3_named_download"
+                    if download_name
+                    else "cloudfront"
+                )
                 structlog.get_logger(__name__).info(
                     "private_delivery_download_grant",
-                    route="direct_s3_named_download" if direct else "cloudfront",
+                    route=route,
                     kind=self._delivery_route.prefix,
                 )
                 return url if direct else self._delivery_route.rewrite(url)
