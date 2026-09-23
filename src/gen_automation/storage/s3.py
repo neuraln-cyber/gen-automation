@@ -3,16 +3,18 @@ import hashlib
 from functools import partial
 from threading import Lock
 from time import monotonic
-from typing import Any, cast
+from typing import Any, Literal, cast
 from urllib.parse import quote
 
 import boto3
+import structlog
 from anyio import to_thread
 from botocore.client import Config
 from botocore.credentials import RefreshableCredentials
 from botocore.exceptions import BotoCoreError, ClientError, CredentialRetrievalError
 
 from gen_automation.config import Settings
+from gen_automation.domain.private_delivery import PrivateDeliveryRoute
 from gen_automation.storage.base import (
     MultipartPart,
     MultipartUpload,
@@ -45,7 +47,16 @@ class S3ObjectStore:
         access_key_id: str | None = None,
         secret_access_key: str | None = None,
         session_token: str | None = None,
+        delivery_domain: str | None = None,
+        delivery_prefix: Literal["models", "assets"] = "assets",
     ) -> None:
+        if delivery_domain is not None and endpoint_url is not None:
+            raise ValueError("private delivery cannot use a custom storage endpoint")
+        self._delivery_route = (
+            PrivateDeliveryRoute(delivery_domain, bucket, region, delivery_prefix)
+            if delivery_domain is not None
+            else None
+        )
         for label, value in (
             ("S3 access key ID", access_key_id),
             ("S3 secret access key", secret_access_key),
@@ -64,6 +75,8 @@ class S3ObjectStore:
             raise ValueError("S3 session token requires an access key pair")
         self.bucket = bucket
         s3_config = {"addressing_style": "virtual"} if endpoint_url is None else {}
+        if self._delivery_route is not None:
+            s3_config["us_east_1_regional_endpoint"] = "regional"
         client_arguments: dict[str, Any] = {
             "service_name": "s3",
             "region_name": region,
@@ -219,7 +232,7 @@ class S3ObjectStore:
                 f"attachment; filename*=UTF-8''{encoded_name}"
             )
         try:
-            return cast(
+            url = cast(
                 str,
                 await self._presign(
                     "generate_presigned_url",
@@ -229,6 +242,18 @@ class S3ObjectStore:
                     HttpMethod="GET",
                 ),
             )
+            if self._delivery_route:
+                # CloudFront strips response-content-disposition before S3
+                # verification. Keep named exports on their existing signed
+                # route; never drop a signed parameter or weaken authorization.
+                direct = bool(download_name)
+                structlog.get_logger(__name__).info(
+                    "private_delivery_download_grant",
+                    route="direct_s3_named_download" if direct else "cloudfront",
+                    kind=self._delivery_route.prefix,
+                )
+                return url if direct else self._delivery_route.rewrite(url)
+            return url
         except (BotoCoreError, ClientError) as error:
             raise ObjectStoreError("S3 download signing failed") from error
 
@@ -816,4 +841,5 @@ def build_object_store(settings: Settings) -> ObjectStore | None:
         access_key_id=access_key_id,
         secret_access_key=secret_access_key,
         session_token=session_token,
+        delivery_domain=settings.storage_delivery_domain,
     )

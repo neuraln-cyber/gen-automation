@@ -1,0 +1,109 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Private uncached S3 delivery; origin authorizes every request using existing SigV4 identities.
+Parameters:
+  ModelBucket:
+    Type: String
+    AllowedPattern: '[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]'
+  AssetBucket:
+    Type: String
+    AllowedPattern: '[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]'
+  BucketRegion:
+    Type: String
+    Default: eu-central-1
+    AllowedValues: [eu-central-1]
+Resources:
+  DeliveryWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: gen-automation-private-delivery
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      Rules: []
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: gen-automation-private-delivery
+        SampledRequestsEnabled: false
+  DeliveryPath:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: gen-automation-private-delivery-path
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Strip only the fixed routing prefix; leave signed S3 path and query intact.
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          if (request.uri.indexOf('/models/') !== 0 && request.uri.indexOf('/assets/') !== 0) {
+            return {statusCode: 403, statusDescription: 'Forbidden'};
+          }
+          request.uri = request.uri.substring(7);
+          return request;
+        }
+  DeliveryDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: gen-automation private uncached SigV4 delivery - NEVER enable caching
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_All
+        WebACLId: !GetAtt DeliveryWebAcl.Arn
+        Origins:
+          - Id: models
+            DomainName: !Sub '${ModelBucket}.s3.${BucketRegion}.amazonaws.com'
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - Id: assets
+            DomainName: !Sub '${AssetBucket}.s3.${BucketRegion}.amazonaws.com'
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: models
+          ViewerProtocolPolicy: https-only
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: false
+          # CachingDisabled. Mandatory: the origin must authorize EVERY request.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          # AllViewerExceptHostHeader restores the signed regional S3 host.
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt DeliveryPath.FunctionARN
+        CacheBehaviors:
+          - PathPattern: /assets/*
+            TargetOriginId: assets
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            Compress: false
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            FunctionAssociations:
+              - EventType: viewer-request
+                FunctionARN: !GetAtt DeliveryPath.FunctionARN
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ErrorCachingMinTTL: 0
+  DeliverySubscription:
+    Type: AWS::PricingPlanManager::Subscription
+    Properties:
+      PlanFamily: CloudFront
+      PlanTier: PRO
+      ResourceArns:
+        - !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${DeliveryDistribution}'
+        - !GetAtt DeliveryWebAcl.Arn
+Outputs:
+  DistributionId:
+    Value: !Ref DeliveryDistribution
+  DeliveryDomain:
+    Value: !GetAtt DeliveryDistribution.DomainName
+  SubscriptionArn:
+    Value: !Ref DeliverySubscription

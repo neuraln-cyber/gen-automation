@@ -19,6 +19,7 @@ from pydantic import AliasChoices, AnyHttpUrl, Field, SecretStr, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from gen_automation.domain.generation_limits import MAX_OUTPUTS_PER_GENERATION_JOB
+from gen_automation.domain.private_delivery import PrivateDeliveryRoute
 from gen_automation.gpu_worker.artifacts import (
     MAX_ARTIFACT_PART_DOWNLOAD_ATTEMPTS,
     MAX_PARALLEL_ARTIFACT_PARTS,
@@ -97,6 +98,7 @@ class WorkerRuntimeSettings(BaseSettings):
     artifact_bucket: str
     artifact_region: str = "us-east-1"
     artifact_endpoint_url: AnyHttpUrl | None = None
+    artifact_delivery_domain: str | None = None
     artifact_access_key_id: SecretStr | None = None
     artifact_secret_access_key: SecretStr | None = None
     artifact_session_token: SecretStr | None = None
@@ -153,6 +155,18 @@ class WorkerRuntimeSettings(BaseSettings):
             errors.append("invalid artifact bucket")
         if not self.artifact_region or len(self.artifact_region) > 128:
             errors.append("invalid artifact region")
+        if self.artifact_delivery_domain is not None:
+            if self.artifact_endpoint_url is not None:
+                errors.append("private delivery cannot use a custom artifact endpoint")
+            try:
+                PrivateDeliveryRoute(
+                    self.artifact_delivery_domain,
+                    self.artifact_bucket,
+                    self.artifact_region,
+                    "models",
+                )
+            except ValueError as error:
+                errors.append(str(error))
         if bool(self.artifact_access_key_id) != bool(self.artifact_secret_access_key):
             errors.append("artifact access key ID and secret must be provided together")
         if self.artifact_session_token is not None and self.artifact_access_key_id is None:
@@ -598,6 +612,11 @@ def build_artifact_downloader(settings: WorkerRuntimeSettings) -> S3ArtifactDown
             retries={"mode": "standard", "max_attempts": 4},
             connect_timeout=settings.artifact_connect_timeout_seconds,
             read_timeout=settings.artifact_read_timeout_seconds,
+            s3=(
+                {"addressing_style": "virtual", "us_east_1_regional_endpoint": "regional"}
+                if settings.artifact_delivery_domain is not None
+                else {}
+            ),
         ),
     }
     if settings.artifact_endpoint_url is not None:
@@ -613,6 +632,14 @@ def build_artifact_downloader(settings: WorkerRuntimeSettings) -> S3ArtifactDown
         client_arguments["aws_session_token"] = settings.artifact_session_token.get_secret_value()
     try:
         client = boto3.client(**client_arguments)
+        if settings.artifact_delivery_domain is not None:
+            route = PrivateDeliveryRoute(
+                settings.artifact_delivery_domain,
+                settings.artifact_bucket,
+                settings.artifact_region,
+                "models",
+            )
+            client.meta.events.register("before-send.s3.GetObject", route.before_send)
     except (BotoCoreError, ClientError, ValueError):
         raise WorkerBootstrapConfigurationError(
             "worker bootstrap configuration is invalid"
