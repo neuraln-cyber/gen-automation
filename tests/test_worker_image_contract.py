@@ -179,7 +179,7 @@ def test_salad_token_recovery_is_pinned_and_shared_by_all_auth_paths() -> None:
     patch = SALAD_QUEUE_WORKER_TOKEN_PATCH_PATH.read_bytes()
     patch_text = patch.decode("utf-8")
     assert hashlib.sha256(patch).hexdigest() == SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256
-    assert f"SALAD_QUEUE_WORKER_TOKEN_PATCH_SHA256={SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256}" in (
+    assert f"SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256={SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256}" in (
         dockerfile
     )
     assert "git apply --check /tmp/imds-token-recovery.patch" in dockerfile
@@ -189,7 +189,7 @@ def test_salad_token_recovery_is_pinned_and_shared_by_all_auth_paths() -> None:
         "/tmp/imds-token-recovery.patch" in dockerfile
     )
     assert (
-        f'org.opencontainers.image.salad-queue-worker.token-patch-sha256="'
+        f'org.opencontainers.image.salad-queue-worker.imds-patch-sha256="'
         f'{SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256}"' in dockerfile
     )
     assert "patches/salad-queue-worker/imds-token-recovery.patch" in (

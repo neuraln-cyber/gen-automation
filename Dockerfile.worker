@@ -5,7 +5,7 @@ FROM golang:1.26.2-alpine@sha256:f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739
 ENV SALAD_QUEUE_WORKER_COMMIT=73d7a3c80a73f26339194e024cb47c8501c67f75 \
     SALAD_QUEUE_WORKER_PATCH_SHA256=a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae \
     SALAD_QUEUE_WORKER_HEARTBEAT_PATCH_SHA256=51d604da546aa076073d971b6839998d3582e34f5f52af64faf4c7c6e8f6f23a \
-    SALAD_QUEUE_WORKER_TOKEN_PATCH_SHA256=916f22c8075481a2924aabc2f1d1b57d891681eb5bd10b6081487df7b57a336d
+    SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256=916f22c8075481a2924aabc2f1d1b57d891681eb5bd10b6081487df7b57a336d
 
 RUN apk add --no-cache git \
     && mkdir --parents /src \
@@ -27,7 +27,7 @@ RUN printf '%s  %s\n' \
         /tmp/strict-http-status.patch \
         "${SALAD_QUEUE_WORKER_HEARTBEAT_PATCH_SHA256}" \
         /tmp/job-stream-heartbeat-watchdog.patch \
-        "${SALAD_QUEUE_WORKER_TOKEN_PATCH_SHA256}" \
+        "${SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256}" \
         /tmp/imds-token-recovery.patch \
         | sha256sum -c - \
     && git apply --unidiff-zero --check /tmp/strict-http-status.patch \
@@ -127,7 +127,7 @@ LABEL org.opencontainers.image.title="gen-automation-gpu-worker" \
       org.opencontainers.image.salad-queue-worker.revision="73d7a3c80a73f26339194e024cb47c8501c67f75" \
       org.opencontainers.image.salad-queue-worker.patch-sha256="a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae" \
       org.opencontainers.image.salad-queue-worker.heartbeat-patch-sha256="51d604da546aa076073d971b6839998d3582e34f5f52af64faf4c7c6e8f6f23a" \
-      org.opencontainers.image.salad-queue-worker.token-patch-sha256="916f22c8075481a2924aabc2f1d1b57d891681eb5bd10b6081487df7b57a336d"
+      org.opencontainers.image.salad-queue-worker.imds-patch-sha256="916f22c8075481a2924aabc2f1d1b57d891681eb5bd10b6081487df7b57a336d"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     COMFYUI_COMMIT=700821e1364eaab0e8f21c538a2131719fec57bf \

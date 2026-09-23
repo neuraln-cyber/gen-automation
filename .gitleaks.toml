@@ -38,3 +38,13 @@ regexes = [
   '''^\s*key="x-idempotency-k[12]",\s*$''',
   '''^\s*IdempotencyRecord\.idempotency_key == "x-idempotency-k2",\s*$''',
 ]
+
+[[rules.allowlists]]
+description = "Exact non-secret patch checksum labels in historical commit fb9ab99"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)Dockerfile\.worker$''']
+regexes = [
+  '''^\s*SALAD_QUEUE_WORKER_TOKEN_PATCH_SHA256=916f22c8075481a2924aabc2f1d1b57d891681eb5bd10b6081487df7b57a336d\s*$''',
+  '''^\s*org\.opencontainers\.image\.salad-queue-worker\.token-patch-sha256="916f22c8075481a2924aabc2f1d1b57d891681eb5bd10b6081487df7b57a336d"\s*$''',
+]
