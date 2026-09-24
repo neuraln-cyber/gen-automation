@@ -42,7 +42,7 @@ This is an estimate, not a fixed total-bill guarantee.
 
 No new hard usage, storage or spending caps are enabled. There is no library
 quota, automatic media deletion, monthly cutoff, job-count cap or new hard
-execution deadline is enabled. Optional startup/execution watchdog settings
+execution deadline. Optional startup/execution watchdog settings
 default to unset. Preserve the existing owner-selected idle policy. Technical
 model-shape validation and bounded network retries are not billing quotas.
 
