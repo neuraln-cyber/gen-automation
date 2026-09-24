@@ -1,7 +1,9 @@
 # MiniMax H3: private Salad video rollout
 
-Status: implementation prepared; production activation and a real GPU clip still
-require the rollout checks below. Do not interpret CPU tests as generation proof.
+Status: implementation prepared; production activation requires the non-generating
+rollout checks below. The owner will submit the first video test. Do not queue a
+canary, sample, or other generation on the owner's behalf, and do not interpret
+CPU tests or artifact access checks as proof that GPU generation has succeeded.
 
 ## Scope
 
@@ -73,13 +75,17 @@ model-shape validation and bounded network retries are not billing quotas.
    Configure `i2v_profile=minimax_h3`, private delivery required, the same model
    and asset distribution, exact manifest/source identity, Salad enabled, WAN
    LoRA flags and RunPod disabled. Preserve existing user idle/usage policies.
-5. Use the RTX 5090 profile with sufficient host RAM (64 GiB candidate). Check
-   live availability and exact readiness identity before submitting a clip.
-6. Verify one benign first-frame 124-frame/4-step clip: model load, native nodes,
-   H.264 MP4, audio, playback and CloudFront-only transport. Stop the test worker
-   after the check; do not launch repeated paid tests without a concrete failure.
-7. Open the H3 dashboard only after success. Record actual image digest, manifest
-   identities, measured generation time and any remaining limitations here.
+5. Configure the RTX 5090 profile with sufficient host RAM (64 GiB candidate),
+   matching native workflow and exact artifact-readiness identity. Confirm both
+   application and provider video queues are empty and the video group is stopped.
+   Do not start a GPU simply to check readiness.
+6. Verify the deployed settings, dashboard controls, source-upload/download routes,
+   and exact private artifact access without submitting a generation. Enable the
+   H3 dashboard for the owner's first test; no prior GPU clip is an activation gate.
+7. Hand off with the worker stopped and zero operator-created video jobs. Distinguish
+   "configured for the owner's test" from "GPU generation verified." The owner
+   chooses the image and motion/audio prompt and presses Generate. Confirmed runtime
+   performance and output quality remain unknown until that user-initiated test.
 
 If legacy WAN weights have been removed, reverting code alone is not a functional
 WAN rollback: restoring that lane requires intentionally re-downloading its
