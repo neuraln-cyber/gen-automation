@@ -1,0 +1,41 @@
+{
+  "schema": "gen-automation/i2v-model-sources/v1",
+  "sources": [
+    {
+      "name": "DaSiWa Hybrid Turbo v2 INT8",
+      "role": "diffusion_model",
+      "url": "https://civitai.com/api/download/models/3314686?fileId=3203135",
+      "expected_bytes": 20967669168,
+      "sha256": "37c17fd91971c17e02e60798a05eec48d881e1bb970d6309f58cf134a2d03a6b",
+      "target_filename": "DasiwaMinimaxH3_dasiwaHybridTurboV2_3203135.safetensors",
+      "optional": false
+    },
+    {
+      "name": "MiniMax H3 Qwen3VL 32B NVFP4 AWQ encoder",
+      "role": "text_encoder",
+      "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/bf92c4091e333e69b8ca1998e0a669f15cb0832b/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "expected_bytes": 15687142551,
+      "sha256": "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6",
+      "target_filename": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "optional": false
+    },
+    {
+      "name": "MiniMax H3 INT8 video VAE",
+      "role": "video_vae",
+      "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/bf92c4091e333e69b8ca1998e0a669f15cb0832b/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+      "expected_bytes": 2811065184,
+      "sha256": "52a2c8c73583c86e4f41cdcce3a6ad0ea562987bc0bf3d60a0cef5f5c8e60c0e",
+      "target_filename": "minimax_h3_video_vae_int8_convrot.safetensors",
+      "optional": false
+    },
+    {
+      "name": "MiniMax H3 FP32 audio VAE",
+      "role": "audio_vae",
+      "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/bf92c4091e333e69b8ca1998e0a669f15cb0832b/vae/minimax_h3_audio_vae_fp32.safetensors",
+      "expected_bytes": 605254808,
+      "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48",
+      "target_filename": "minimax_h3_audio_vae_fp32.safetensors",
+      "optional": false
+    }
+  ]
+}

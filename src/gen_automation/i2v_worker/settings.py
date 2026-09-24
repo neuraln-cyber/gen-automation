@@ -8,7 +8,9 @@ from typing import Literal
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from gen_automation.domain.private_delivery import PrivateDeliveryRoute
 from gen_automation.i2v_worker.lora_catalog import REQUIRED_LORA_ROLES
+from gen_automation.i2v_worker.manifest_contract import required_i2v_model_roles
 from gen_automation.i2v_worker.models import ModelObject
 
 
@@ -21,9 +23,12 @@ class I2VWorkerSettings(BaseSettings):
     )
 
     model_objects_json: SecretStr
+    profile: Literal["wan22", "minimax_h3"] = "wan22"
     environment: Literal["production", "test"] = "production"
     aws_region: str = "eu-central-1"
     s3_endpoint_url: str | None = None
+    model_delivery_domain: str | None = None
+    require_private_delivery: bool = False
     comfy_root: Path = Path("/opt/comfyui")
     runtime_root: Path = Path("/opt/i2v/runtime")
     volume_root: Path = Path("/runpod-volume")
@@ -38,6 +43,9 @@ class I2VWorkerSettings(BaseSettings):
     network_timeout_seconds: float = Field(default=120, gt=0)
     network_attempts: int = Field(default=5, gt=0)
     artifact_chunk_bytes: int = Field(default=64 * 1024 * 1024, ge=1024 * 1024)
+    artifact_download_concurrency: int = Field(default=4, ge=1, le=4)
+    startup_timeout_seconds: int | None = Field(default=None, ge=60)
+    execution_timeout_seconds: int | None = Field(default=None, ge=60)
     comfy_poll_seconds: float = Field(default=1, gt=0)
     models_prepared: bool = False
     require_preseeded_volume: bool = False
@@ -63,17 +71,39 @@ class I2VWorkerSettings(BaseSettings):
         if not self.allowed_gpu_names:
             raise ValueError("at least one RunPod GPU name is required")
         objects = self.model_objects
+        if self.require_private_delivery and self.model_delivery_domain is None:
+            raise ValueError("private model delivery is required")
+        if self.model_delivery_domain is not None:
+            if self.s3_endpoint_url is not None or len({item.bucket for item in objects}) != 1:
+                raise ValueError("private model delivery requires one regional S3 origin")
+            PrivateDeliveryRoute(
+                self.model_delivery_domain, objects[0].bucket, self.aws_region, "models"
+            )
         roles = {item.role for item in objects}
-        required = {"diffusion_model_high", "diffusion_model_low", "text_encoder", "vae"}
+        required = set(
+            required_i2v_model_roles(
+                reviewed_loras_enabled=self.lora_worker_enabled, profile=self.profile
+            )
+        )
         if self.lora_worker_enabled:
             if self.source_revision is None or self.private_manifest_source_sha256 is None:
                 raise ValueError(
                     "LoRA worker capability requires immutable manifest and source identity"
                 )
             required.update(REQUIRED_LORA_ROLES)
+        if self.profile == "minimax_h3" and (
+            self.source_revision is None or self.private_manifest_source_sha256 is None
+        ):
+            raise ValueError("MiniMax H3 requires immutable manifest and source identity")
         if roles != required or len(roles) != len(objects):
             raise ValueError("model manifest roles are incomplete or duplicated")
         return self
+
+    @property
+    def effective_workflow_template(self) -> Path:
+        if self.profile == "minimax_h3":
+            return self.workflow_template.parent / "dasiwa-minimax-h3-i2v-v1.api.json"
+        return self.workflow_template
 
     @property
     def model_objects(self) -> tuple[ModelObject, ...]:

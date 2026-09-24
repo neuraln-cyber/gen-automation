@@ -419,6 +419,15 @@ async def test_truthful_instance_states_and_reallocation_summary() -> None:
     assert {item["machine_id"] for item in ready.instances} == {"old-machine", "new-machine"}
 
 
+async def test_stopped_group_retains_desired_replicas_without_being_provisioning() -> None:
+    client = FakeSalad()
+    client.group = _group(status="stopped", replicas=1)
+    client.instances = ()
+    observation = await observe_i2v_provider(client, _config(), active_job_count=0)
+    assert observation.state == I2VWorkerDeploymentState.STOPPED
+    assert not observation.ready
+
+
 async def test_submission_recovery_scans_all_pages_before_resubmit() -> None:
     client = FakeSalad()
     wanted = _job(submission_key="wanted")

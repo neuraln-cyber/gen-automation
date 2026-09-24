@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import stat
 import time
-from collections.abc import Mapping
+from collections import deque
+from collections.abc import Iterator, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -14,6 +17,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
+from gen_automation.domain.private_delivery import PrivateDeliveryRoute
 from gen_automation.i2v_worker.models import ModelObject
 from gen_automation.i2v_worker.settings import I2VWorkerSettings
 
@@ -27,6 +31,7 @@ _AWS_CREDENTIAL_ENV = (
     "AWS_PROFILE",
     "AWS_WEB_IDENTITY_TOKEN_FILE",
 )
+_LOGGER = logging.getLogger(__name__)
 
 
 class ModelBootstrapError(Exception):
@@ -68,11 +73,24 @@ class S3ModelBootstrapper:
                 endpoint_url=settings.s3_endpoint_url,
                 config=Config(
                     signature_version="s3v4",
+                    s3={"addressing_style": "virtual"},
+                    max_pool_connections=settings.artifact_download_concurrency,
                     retries={"mode": "standard", "max_attempts": settings.network_attempts},
                     connect_timeout=min(settings.network_timeout_seconds, 30),
                     read_timeout=settings.network_timeout_seconds,
                 ),
             )
+            if settings.model_delivery_domain is not None:
+                first = settings.model_objects[0]
+                route = PrivateDeliveryRoute(
+                    settings.model_delivery_domain,
+                    first.bucket,
+                    settings.aws_region,
+                    "models",
+                )
+                self.client.meta.events.register("before-send.s3.GetObject", route.before_send)
+            elif settings.require_private_delivery:
+                raise ValueError("private delivery is required")
         except (BotoCoreError, ClientError, ValueError):
             raise ModelBootstrapError("model bootstrap failed") from None
 
@@ -98,6 +116,7 @@ class S3ModelBootstrapper:
         if target.exists():
             size, existing_digest = _hash_file(target)
             if size == model.byte_size and existing_digest == model.sha256:
+                _LOGGER.info("i2v_model_reused role=%s bytes=%d", model.role, size)
                 return target
             raise ModelBootstrapError("model bootstrap failed")
 
@@ -115,18 +134,34 @@ class S3ModelBootstrapper:
             flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0)
             descriptor = os.open(partial_path, flags, 0o600)
+            started = time.monotonic()
+            last_report = started
+            written = resume_at
+            _LOGGER.info(
+                "i2v_model_download role=%s resumed_bytes=%d total_bytes=%d route=%s",
+                model.role,
+                resume_at,
+                model.byte_size,
+                "private_delivery" if self.settings.model_delivery_domain else "direct_s3",
+            )
             with os.fdopen(descriptor, "ab", closefd=True) as output:
-                for start in range(
-                    resume_at,
-                    model.byte_size,
-                    self.settings.artifact_chunk_bytes,
-                ):
-                    end = min(start + self.settings.artifact_chunk_bytes, model.byte_size) - 1
-                    part = self._download_range(model, start, end)
+                for part in self._ordered_ranges(model, resume_at):
                     output.write(part)
                     digest.update(part)
                     output.flush()
                     os.fsync(output.fileno())
+                    written += len(part)
+                    current = time.monotonic()
+                    if current - last_report >= 15 or written == model.byte_size:
+                        _LOGGER.info(
+                            "i2v_model_progress role=%s bytes=%d total_bytes=%d "
+                            "mib_per_second=%.2f",
+                            model.role,
+                            written,
+                            model.byte_size,
+                            (written - resume_at) / max(current - started, 0.001) / (1024 * 1024),
+                        )
+                        last_report = current
             if partial_path.stat().st_size != model.byte_size or digest.hexdigest() != model.sha256:
                 partial_path.unlink()
                 raise ModelBootstrapError("model bootstrap failed")
@@ -137,6 +172,28 @@ class S3ModelBootstrapper:
             raise
         except OSError:
             raise ModelBootstrapError("model bootstrap failed") from None
+
+    def _ordered_ranges(self, model: ModelObject, start: int) -> Iterator[bytes]:
+        """Bound memory/in-flight requests while retaining a contiguous resumable prefix."""
+        starts = iter(range(start, model.byte_size, self.settings.artifact_chunk_bytes))
+        pending: deque[Future[bytes]] = deque()
+        with ThreadPoolExecutor(max_workers=self.settings.artifact_download_concurrency) as pool:
+
+            def submit() -> None:
+                next_start = next(starts, None)
+                if next_start is not None:
+                    end = min(next_start + self.settings.artifact_chunk_bytes, model.byte_size) - 1
+                    pending.append(pool.submit(self._download_range, model, next_start, end))
+
+            for _ in range(self.settings.artifact_download_concurrency):
+                submit()
+            try:
+                while pending:
+                    yield pending.popleft().result()
+                    submit()
+            finally:
+                for future in pending:
+                    future.cancel()
 
     def _download_range(self, model: ModelObject, start: int, end: int) -> bytes:
         expected = end - start + 1

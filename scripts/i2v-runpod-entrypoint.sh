@@ -10,6 +10,16 @@ worker_gid="10002"
   printf '%s\n' "RunPod I2V entrypoint requires its initial root setup." >&2
   exit 1
 }
+if [ "${GEN_I2V_WORKER_PROVIDER:-runpod}" = "salad" ]; then
+  # Salad uses ephemeral container storage and its managed queue HTTP bridge.
+  # Never require or initialize a RunPod network volume on this path.
+  exec setpriv \
+    --reuid "$worker_uid" \
+    --regid "$worker_gid" \
+    --init-groups \
+    --no-new-privs \
+    /opt/i2v-venv/bin/python -m gen_automation.i2v_worker.main
+fi
 [ -d "$volume_root" ] || {
   printf '%s\n' "RunPod network volume is not mounted." >&2
   exit 1

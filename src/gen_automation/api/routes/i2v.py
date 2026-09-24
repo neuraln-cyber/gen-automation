@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import re
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.api.security import ReleaseManager, ReleaseReader
 from gen_automation.config import Settings
-from gen_automation.db.models import I2VJob, I2VPreset
+from gen_automation.db.models import I2VJob, I2VPreset, I2VWorkerDeployment
 from gen_automation.db.session import get_session
 from gen_automation.domain.enums import AdminRole
 from gen_automation.domain.i2v import (
@@ -27,6 +27,7 @@ from gen_automation.domain.i2v import (
     I2VPresetDraft,
     I2VPresetSnapshot,
     I2VWorkerDeploymentSnapshot,
+    I2VWorkerDeploymentState,
 )
 from gen_automation.domain.i2v_loras import (
     I2VLoraPromptError,
@@ -41,6 +42,7 @@ from gen_automation.i2v_worker.lora_catalog import (
     MAX_REVIEWED_LORA_STRENGTH,
     MIN_REVIEWED_LORA_STRENGTH,
 )
+from gen_automation.i2v_worker.models import GenerationSettings
 from gen_automation.services.dashboard_previews import (
     DASHBOARD_PREVIEW_CACHE_CONTROL,
     DASHBOARD_PREVIEW_CONTENT_TYPE,
@@ -165,6 +167,17 @@ class WorkerRead(BaseModel):
     status_available: bool
     message: str
     deployment: I2VWorkerDeploymentSnapshot | None
+    provider: str = "salad"
+    profile: str = "wan22"
+    private_model_delivery: bool = False
+    idle_timeout_seconds: int | None = None
+    cost_guard_reason: str | None = None
+    can_resume: bool = False
+
+
+class WorkerResume(_RequestModel):
+    deployment_id: UUID
+    expected_guard_at: str
 
 
 class ReviewedLoraRead(BaseModel):
@@ -216,6 +229,13 @@ async def reviewed_loras(
     _principal: ReleaseReader,
 ) -> ReviewedLoraCatalogRead:
     enabled = bool(request.app.state.settings.i2v_lora_profile_enabled)
+    if request.app.state.settings.i2v_profile == "minimax_h3":
+        return ReviewedLoraCatalogRead(
+            profile_enabled=False,
+            maximum_selections=0,
+            message="Native H3 uses the selected checkpoint, not WAN motion LoRAs.",
+            loras=(),
+        )
     loras = tuple(
         ReviewedLoraRead(
             catalog_id=entry.catalog_id,
@@ -537,6 +557,7 @@ async def enqueue_jobs(
                 detail="reviewed I2V LoRAs are paused until the matching worker rollout passes",
             )
     effective_prompt = payload.positive_prompt
+    effective_negative = payload.negative_prompt
     effective_settings = dict(normalized_settings or {})
     if payload.preset_id is not None:
         preset = await session.scalar(
@@ -548,6 +569,8 @@ async def enqueue_jobs(
         if preset is not None:
             if effective_prompt is None:
                 effective_prompt = preset.positive_prompt
+            if effective_negative is None:
+                effective_negative = preset.negative_prompt
             merged_settings = dict(preset.settings)
             merged_settings.update(effective_settings)
             effective_settings = _settings_for_profile(
@@ -555,6 +578,11 @@ async def enqueue_jobs(
                 enabled=settings.i2v_lora_profile_enabled,
             )
     _validate_lora_prompt(effective_prompt or "", effective_settings)
+    _validate_generation_profile(settings, effective_settings, effective_negative or "")
+    if settings.i2v_profile == "minimax_h3":
+        normalized_settings = GenerationSettings.model_validate(effective_settings).model_dump(
+            mode="json"
+        )
     created: list[I2VJobSnapshot] = []
     draft = I2VJobDraft(
         input_id=payload.input_id,
@@ -671,14 +699,15 @@ async def retry_job(
     _require_i2v_queue_writes_enabled(request.app.state.settings)
     frozen_job = (
         await session.execute(
-            select(I2VJob.settings_snapshot, I2VJob.positive_prompt).where(
+            select(I2VJob.settings_snapshot, I2VJob.positive_prompt, I2VJob.negative_prompt).where(
                 I2VJob.id == job_id,
                 I2VJob.created_by_user_id == principal.user_id,
             )
         )
     ).one_or_none()
     if frozen_job is not None:
-        job_settings, positive_prompt = frozen_job
+        job_settings, positive_prompt, negative_prompt = frozen_job
+        _validate_generation_profile(request.app.state.settings, job_settings, negative_prompt)
         try:
             normalized_job_settings = normalize_i2v_settings(job_settings)
             validate_i2v_lora_prompt(positive_prompt, normalized_job_settings)
@@ -748,6 +777,9 @@ async def download_output(
             output=output,
             expires_in=min(settings.storage_presign_ttl_seconds, 900),
             attachment=attachment,
+            delivery_domain=(
+                settings.storage_delivery_domain if settings.i2v_require_private_delivery else None
+            ),
         )
     except I2VMediaError as error:
         raise _media_http_error(error) from error
@@ -762,25 +794,139 @@ async def worker_status(
     session: Session,
     _principal: ReleaseReader,
 ) -> WorkerRead:
-    deployment = await get_i2v_worker_deployment(session, deployment_id=None)
-    configured = bool(getattr(request.app.state.settings, "i2v_enabled", False))
+    settings: Settings = request.app.state.settings
+    configured = settings.i2v_enabled
+    provider = "runpod" if settings.i2v_runpod_enabled else "salad"
+    deployment = (
+        await get_i2v_worker_deployment(
+            session,
+            provider=provider,
+            worker_image=settings.i2v_worker_image,
+        )
+        if configured
+        else None
+    )
+    details: dict[str, Any] = {
+        "provider": provider,
+        "profile": settings.i2v_profile,
+        "private_model_delivery": bool(settings.salad_worker_artifact_delivery_domain),
+        "idle_timeout_seconds": settings.i2v_warm_idle_seconds,
+    }
     if deployment is None:
         return WorkerRead(
+            **details,
             configured=configured,
             status_available=False,
             message=(
                 "No worker has been provisioned yet. Queued jobs will wait for a worker."
                 if configured
-                else "Image-to-video worker provisioning is not configured."
+                else "Video generation is disabled. No worker will be started."
             ),
             deployment=None,
         )
+    now = datetime.now(UTC)
+    heartbeat = deployment.last_heartbeat_at
+    fresh = heartbeat is not None and (now - heartbeat.replace(tzinfo=UTC)).total_seconds() <= 120
+    reason = deployment.metadata.get("cost_guard_reason")
     return WorkerRead(
+        **details,
         configured=configured,
-        status_available=True,
-        message=f"Provider reports {deployment.state.value}.",
+        status_available=fresh,
+        message=(
+            f"Paused after {reason.replace('_', ' ')}. Resolve the cause before resuming."
+            if isinstance(reason, str)
+            else f"Last observed: {deployment.state.value}."
+            if fresh
+            else "Worker observation is stale; this is not confirmation of a running worker."
+        ),
         deployment=deployment,
+        cost_guard_reason=reason if isinstance(reason, str) else None,
+        can_resume=bool(reason and fresh and deployment.metadata.get("cost_guard_stopped_at")),
     )
+
+
+@router.post("/worker:resume", status_code=status.HTTP_204_NO_CONTENT)
+async def resume_worker(
+    payload: WorkerResume,
+    request: Request,
+    session: Session,
+    _principal: ReleaseManager,
+) -> Response:
+    settings: Settings = request.app.state.settings
+    if not settings.i2v_enabled or settings.i2v_runpod_enabled:
+        raise HTTPException(status_code=409, detail="The Salad video lane is disabled.")
+    deployment = await session.scalar(
+        select(I2VWorkerDeployment)
+        .where(
+            I2VWorkerDeployment.id == payload.deployment_id,
+            I2VWorkerDeployment.provider == "salad",
+            I2VWorkerDeployment.worker_image_digest == settings.i2v_worker_image,
+        )
+        .with_for_update()
+    )
+    now = datetime.now(UTC)
+    if (
+        deployment is None
+        or deployment.state != I2VWorkerDeploymentState.STOPPED
+        or not deployment.deployment_metadata.get("cost_guard_reason")
+        or not deployment.deployment_metadata.get("cost_guard_stopped_at")
+        or deployment.deployment_metadata.get("cost_guard_at") != payload.expected_guard_at
+        or deployment.last_heartbeat_at is None
+        or (now - deployment.last_heartbeat_at.replace(tzinfo=UTC)).total_seconds() > 120
+    ):
+        raise HTTPException(status_code=409, detail="Wait for a fresh, confirmed stopped worker.")
+    active = await session.scalar(
+        select(I2VJob.id)
+        .where(
+            I2VJob.state.in_(
+                [
+                    I2VJobState.CLAIMED,
+                    I2VJobState.RUNNING,
+                    I2VJobState.CANCEL_REQUESTED,
+                ]
+            )
+        )
+        .limit(1)
+    )
+    if active is not None:
+        raise HTTPException(status_code=409, detail="Wait for active video jobs to reconcile.")
+    deployment.deployment_metadata = {
+        key: value
+        for key, value in deployment.deployment_metadata.items()
+        if key
+        not in {"cost_guard_reason", "cost_guard_at", "cost_guard_stopped_at", "startup_since"}
+    }
+    deployment.updated_at = now
+    await session.commit()
+    return Response(status_code=204)
+
+
+def _validate_generation_profile(
+    settings: Settings,
+    value: dict[str, Any],
+    negative_prompt: str,
+) -> None:
+    if value.get("profile", "wan22") != settings.i2v_profile:
+        raise HTTPException(
+            status_code=409, detail="This preset/job belongs to a different video model."
+        )
+    if settings.i2v_profile != "minimax_h3":
+        return
+    if negative_prompt.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="H3 Turbo uses positive guidance only; clear the negative prompt.",
+        )
+    try:
+        GenerationSettings.model_validate(value)
+    except ValidationError:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Invalid H3 settings: use 17n+5 frames, 24 fps, 4 or 8 steps, "
+                "Euler/simple and CFG 1; no WAN effects."
+            ),
+        ) from None
 
 
 def _preset_draft(

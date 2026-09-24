@@ -108,8 +108,11 @@ class I2VRuntimeEnvironmentProvider(Protocol):
 @dataclass(frozen=True)
 class I2VRuntimeConfig:
     salad: I2VSaladConfig
+    profile: str = "wan22"
     output_prefix: str = "i2v/outputs"
     reviewed_loras_enabled: bool = False
+    startup_timeout_seconds: int | None = None
+    execution_timeout_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -181,6 +184,7 @@ class I2VRuntime:
                 _dispatch_eligible(
                     settings,
                     reviewed_loras_enabled=self.config.reviewed_loras_enabled,
+                    profile=self.config.profile,
                 )
                 for settings in queued_settings
             )
@@ -189,6 +193,11 @@ class I2VRuntime:
             self.config.salad,
             active_job_count=active_count,
         )
+        # A persistent pause survives controller restarts. Never spend another
+        # cold start automatically after a startup guard has tripped.
+        guard = await self._startup_guard(observation, now=timestamp)
+        if guard is not None and guard.action != "cost_guard_paused":
+            return guard
 
         # Reconcile/cancel the oldest active attempt before adding provider work.
         for active in await self._active_attempts():
@@ -198,6 +207,9 @@ class I2VRuntime:
                     action=action,
                     changed=action not in {_RESTART_RECONCILIATION_WAITING, _REVIEWED_LORA_PAUSED},
                 )
+
+        if guard is not None:
+            return guard
 
         if await self._sync_deployment(
             observation,
@@ -236,7 +248,7 @@ class I2VRuntime:
 
         # The durable FIFO is unbounded. Prefetch controls only the number handed
         # to Salad at once, so operators can reorder everything still in PostgreSQL.
-        if not group_stopped and active_count < self.config.salad.prefetch and queued_count > 0:
+        if observation.ready and active_count < self.config.salad.prefetch and queued_count > 0:
             action = await self._claim_and_submit(now=timestamp)
             if action is not None:
                 return I2VRuntimeCycle(action=action, changed=True)
@@ -254,6 +266,56 @@ class I2VRuntime:
             await self.salad_client.stop_container_group(self.config.salad.container_group_name)
             return I2VRuntimeCycle(action="group_stop_requested", changed=True)
         return I2VRuntimeCycle(action="idle", changed=False)
+
+    async def _startup_guard(
+        self, observation: I2VProviderObservation, *, now: datetime
+    ) -> I2VRuntimeCycle | None:
+        async with self.sessions() as session:
+            deployment = await session.scalar(
+                select(I2VWorkerDeployment)
+                .where(
+                    I2VWorkerDeployment.provider == "salad",
+                    I2VWorkerDeployment.provider_group_id == observation.group_id,
+                )
+                .with_for_update()
+            )
+            if deployment is None:
+                return None
+            metadata = dict(deployment.deployment_metadata)
+            reason = metadata.get("cost_guard_reason")
+            started = metadata.get("startup_since")
+            if (
+                self.config.startup_timeout_seconds is not None
+                and not reason
+                and isinstance(started, str)
+                and not observation.ready
+            ):
+                try:
+                    deadline = _as_utc(datetime.fromisoformat(started)) + timedelta(
+                        seconds=self.config.startup_timeout_seconds
+                    )
+                except ValueError:
+                    deadline = now
+                if now >= deadline and observation.state != I2VWorkerDeploymentState.STOPPED:
+                    reason = "startup_timeout"
+                    metadata["cost_guard_reason"] = reason
+                    metadata["cost_guard_at"] = now.isoformat()
+                    deployment.deployment_metadata = metadata
+                    deployment.updated_at = now
+                    await session.commit()
+            if not reason:
+                return None
+            if observation.state == I2VWorkerDeploymentState.STOPPED:
+                metadata["cost_guard_stopped_at"] = now.isoformat()
+                deployment.state = I2VWorkerDeploymentState.STOPPED
+                deployment.last_heartbeat_at = now
+                deployment.deployment_metadata = metadata
+                deployment.updated_at = now
+                await session.commit()
+        if observation.state != I2VWorkerDeploymentState.STOPPED:
+            await self.salad_client.stop_container_group(self.config.salad.container_group_name)
+            return I2VRuntimeCycle(action="cost_guard_stop_requested", changed=True)
+        return I2VRuntimeCycle(action="cost_guard_paused", changed=False)
 
     async def _active_attempts(
         self,
@@ -425,8 +487,8 @@ class I2VRuntime:
             adopted = owner_changed
         if job.lease_expires_at is None or job.lease_expires_at <= now:
             # Provider evidence wins over a stale controller lease. Refresh first,
-            # then apply the provider transition next cycle. There is no execution
-            # deadline for a pending pull or a running inference.
+            # then apply the provider transition next cycle. The execution guard
+            # below uses the original start timestamp, not this refreshed lease.
             await self._record_attempt_metadata(
                 job,
                 attempt,
@@ -503,6 +565,45 @@ class I2VRuntime:
                         now=now,
                     )
                 return "inference_started"
+            if (
+                self.config.execution_timeout_seconds is not None
+                and attempt.started_at is not None
+                and now
+                >= _as_utc(attempt.started_at)
+                + timedelta(seconds=self.config.execution_timeout_seconds)
+            ):
+                await self.salad_client.cancel_job(self.config.salad.queue_name, remote.id)
+                async with self.sessions() as session:
+                    # Persist the pause before failing the attempt: a retry must
+                    # never be dispatched after an over-budget execution.
+                    deployment = await session.scalar(
+                        select(I2VWorkerDeployment)
+                        .where(
+                            I2VWorkerDeployment.provider == "salad",
+                            I2VWorkerDeployment.worker_image_digest
+                            == self.config.salad.worker_image,
+                        )
+                        .order_by(I2VWorkerDeployment.updated_at.desc())
+                        .limit(1)
+                        .with_for_update()
+                    )
+                    if deployment is None:
+                        raise I2VRuntimeError("execution guard has no worker deployment")
+                    deployment.deployment_metadata = {
+                        **deployment.deployment_metadata,
+                        "cost_guard_reason": "execution_timeout",
+                        "cost_guard_at": now.isoformat(),
+                    }
+                    await fail_i2v_attempt(
+                        session,
+                        job_id=job.job_id,
+                        attempt_id=attempt.attempt_id,
+                        worker_id=self.worker_id,
+                        error_code="execution_timeout",
+                        error_detail="Video execution exceeded its time limit; worker paused.",
+                        now=now,
+                    )
+                return "execution_cost_guard_tripped"
             action = await self._observe_nonterminal(job, attempt, remote, now=now)
             return action or ("provider_attempt_adopted" if adopted else None)
         if remote.status == SaladJobStatus.SUCCEEDED:
@@ -564,6 +665,7 @@ class I2VRuntime:
                 lease_duration=timedelta(seconds=self.config.salad.worker_lease_seconds),
                 worker_image_digest=self.config.salad.worker_image,
                 reviewed_loras_enabled=self.config.reviewed_loras_enabled,
+                profile=self.config.profile,
                 now=now,
             )
         if claim is None:
@@ -671,6 +773,7 @@ class I2VRuntime:
         return not _dispatch_eligible(
             job.settings_snapshot,
             reviewed_loras_enabled=self.config.reviewed_loras_enabled,
+            profile=self.config.profile,
         )
 
     async def _mark_submission_unknown(
@@ -853,6 +956,11 @@ class I2VRuntime:
                 "queued_job_count": queued_count,
                 "active_job_count": active_count,
                 "idle_since": idle_since,
+                "startup_since": (
+                    None
+                    if observation.ready or observation.state == I2VWorkerDeploymentState.STOPPED
+                    else existing_metadata.get("startup_since") or now.isoformat()
+                ),
             }
             changed = (
                 existing is None
@@ -864,6 +972,16 @@ class I2VRuntime:
             )
             await session.rollback()
         if not changed:
+            async with self.sessions() as session:
+                deployment = await session.scalar(
+                    select(I2VWorkerDeployment).where(
+                        I2VWorkerDeployment.provider == "salad",
+                        I2VWorkerDeployment.provider_group_id == observation.group_id,
+                    )
+                )
+                if deployment is not None:
+                    deployment.last_heartbeat_at = now
+                    await session.commit()
             return False
         async with self.sessions() as session:
             await record_i2v_worker_deployment(
@@ -1059,7 +1177,10 @@ def _dispatch_eligible(
     value: Mapping[str, object],
     *,
     reviewed_loras_enabled: bool,
+    profile: str = "wan22",
 ) -> bool:
+    if value.get("profile", "wan22") != profile:
+        return False
     kind = classify_i2v_lora_settings(value)
     return kind == I2VLoraSettingsKind.BASELINE or (
         kind == I2VLoraSettingsKind.REVIEWED and reviewed_loras_enabled

@@ -36,7 +36,7 @@ class I2VEnvironmentError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class I2VRuntimeEnvironment:
-    """Legacy Salad bootstrap environment retained only for rollback."""
+    """Private model bootstrap for the Salad video worker."""
 
     settings: Settings
     resolver: RuntimeSecretResolver
@@ -53,15 +53,35 @@ class I2VRuntimeEnvironment:
             raise I2VEnvironmentError("I2V model credentials are unavailable")
         environment = {
             "GEN_I2V_WORKER_ENVIRONMENT": "production",
+            "GEN_I2V_WORKER_PROVIDER": "salad",
+            "GEN_I2V_WORKER_HOST": "0.0.0.0",  # noqa: S104
+            "GEN_I2V_WORKER_PROFILE": self.settings.i2v_profile,
             "GEN_I2V_WORKER_LORA_WORKER_ENABLED": (
                 "true" if self.settings.i2v_lora_worker_enabled else "false"
             ),
             "GEN_I2V_WORKER_AWS_REGION": _artifact_region(self.settings),
+            "GEN_I2V_WORKER_REQUIRE_PRIVATE_DELIVERY": (
+                "true" if self.settings.i2v_require_private_delivery else "false"
+            ),
             "GEN_I2V_WORKER_MODEL_OBJECTS_JSON": _worker_model_objects(self.settings),
             "AWS_ACCESS_KEY_ID": resolved[WORKER_ARTIFACT_ACCESS_KEY_ID_BINDING],
             "AWS_SECRET_ACCESS_KEY": resolved[WORKER_ARTIFACT_SECRET_ACCESS_KEY_BINDING],
             "AWS_SESSION_TOKEN": resolved[WORKER_ARTIFACT_SESSION_TOKEN_BINDING],
         }
+        delivery_domain = self.settings.salad_worker_artifact_delivery_domain
+        for key, value in (
+            ("GEN_I2V_WORKER_STARTUP_TIMEOUT_SECONDS", self.settings.i2v_startup_timeout_seconds),
+            (
+                "GEN_I2V_WORKER_EXECUTION_TIMEOUT_SECONDS",
+                self.settings.i2v_execution_timeout_seconds,
+            ),
+        ):
+            if value is not None:
+                environment[key] = str(value)
+        if delivery_domain:
+            environment["GEN_I2V_WORKER_MODEL_DELIVERY_DOMAIN"] = delivery_domain.get_secret_value()
+        elif self.settings.i2v_require_private_delivery:
+            raise I2VEnvironmentError("I2V private model delivery is required")
         if self.settings.i2v_private_manifest_source_sha256 is not None:
             environment["GEN_I2V_WORKER_PRIVATE_MANIFEST_SOURCE_SHA256"] = (
                 self.settings.i2v_private_manifest_source_sha256
@@ -108,16 +128,16 @@ def i2v_runtime_config_from_settings(settings: Settings) -> I2VRunPodRuntimeConf
 
 
 def i2v_salad_runtime_config_from_settings(settings: Settings) -> I2VRuntimeConfig:
-    """Build the retired provider contract for an explicit rollback only."""
+    """Build the isolated Salad video lane with an immutable readiness contract."""
 
     if (
         not settings.i2v_enabled
         or settings.i2v_worker_image is None
         or settings.i2v_salad_gpu_class_id is None
     ):
-        raise I2VEnvironmentError("validated I2V rollback settings are incomplete")
+        raise I2VEnvironmentError("validated I2V Salad settings are incomplete")
     readiness_probe_path = "/ready"
-    if settings.i2v_lora_worker_enabled:
+    if settings.i2v_lora_worker_enabled or settings.i2v_profile == "minimax_h3":
         source_manifest_sha256 = settings.i2v_private_manifest_source_sha256
         source_revision = settings.i2v_worker_source_revision
         if source_manifest_sha256 is None or source_revision is None:
@@ -128,6 +148,9 @@ def i2v_salad_runtime_config_from_settings(settings: Settings) -> I2VRuntimeConf
             f"{source_revision}"
         )
     return I2VRuntimeConfig(
+        profile=settings.i2v_profile,
+        startup_timeout_seconds=settings.i2v_startup_timeout_seconds,
+        execution_timeout_seconds=settings.i2v_execution_timeout_seconds,
         salad=I2VSaladConfig(
             queue_name=settings.i2v_salad_queue_name,
             container_group_name=settings.i2v_salad_container_group_name,
@@ -214,15 +237,19 @@ def _worker_model_objects(settings: Settings) -> str:
         by_role = validated_i2v_manifest_objects(
             document,
             reviewed_loras_enabled=settings.i2v_lora_worker_enabled,
+            profile=settings.i2v_profile,
         )
     except (KeyError, TypeError, ValueError):
         raise I2VEnvironmentError("I2V private model manifest is invalid") from None
     required_roles = required_i2v_model_roles(
-        reviewed_loras_enabled=settings.i2v_lora_worker_enabled
+        reviewed_loras_enabled=settings.i2v_lora_worker_enabled, profile=settings.i2v_profile
     )
     # Raw private manifests may retain obsolete roles during a coordinated
     # migration. Only selected required roles cross the worker boundary.
     install_directories: dict[str, str] = {
+        "diffusion_model": "models/diffusion_models",
+        "video_vae": "models/vae",
+        "audio_vae": "models/vae",
         "diffusion_model_high": "models/diffusion_models",
         "diffusion_model_low": "models/diffusion_models",
         "text_encoder": "models/text_encoders",

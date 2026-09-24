@@ -4,6 +4,7 @@ import copy
 import json
 import re
 import secrets
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -31,6 +32,24 @@ _EXPECTED_NODE_CLASSES = {
     "13": "VAEDecode",
     "14": "SaveImage",
 }
+_MINIMAX_NODE_CLASSES = {
+    "1": "LoadImage",
+    "2": "UNETLoader",
+    "3": "CLIPLoader",
+    "4": "VAELoader",
+    "5": "VAELoader",
+    "6": "MiniMaxH3ImageToVideo",
+    "7": "MiniMaxH3SigmaShift",
+    "8": "RandomNoise",
+    "9": "BasicGuider",
+    "10": "KSamplerSelect",
+    "11": "BasicScheduler",
+    "12": "SamplerCustomAdvanced",
+    "13": "VAEDecode",
+    "14": "SaveVideo",
+    "15": "VAEDecodeAudio",
+    "16": "CreateVideo",
+}
 
 _FACE_FIDELITY_POSITIVE = (
     "Facial identity and the source facial expression remain consistent throughout. "
@@ -56,14 +75,17 @@ class WorkflowError(Exception):
     pass
 
 
-def load_workflow_template(path: Path) -> dict[str, Any]:
+def load_workflow_template(path: Path, *, profile: str = "wan22") -> dict[str, Any]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         raise WorkflowError("workflow template is invalid") from None
-    if not isinstance(raw, dict) or set(raw) != set(_EXPECTED_NODE_CLASSES):
+    expected = _MINIMAX_NODE_CLASSES if profile == "minimax_h3" else _EXPECTED_NODE_CLASSES
+    if profile not in {"wan22", "minimax_h3"}:
+        raise WorkflowError("workflow profile is invalid")
+    if not isinstance(raw, dict) or set(raw) != set(expected):
         raise WorkflowError("workflow template is invalid")
-    for node_id, class_type in _EXPECTED_NODE_CLASSES.items():
+    for node_id, class_type in expected.items():
         node = raw.get(node_id)
         if not isinstance(node, dict) or node.get("class_type") != class_type:
             raise WorkflowError("workflow template is invalid")
@@ -79,6 +101,7 @@ def render_workflow(
     settings: GenerationSettings,
     job_id: UUID,
     attempt_id: UUID,
+    model_paths: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, Any], int, str]:
     seed = settings.seed if settings.seed >= 0 else secrets.randbelow(2**63)
     frame_prefix = f"i2v/{job_id}/{attempt_id}/frame"
@@ -98,10 +121,19 @@ def render_workflow(
         "sampling.high_shift": settings.high_shift,
         "sampling.low_shift": settings.low_shift,
         "output.frame_prefix": frame_prefix,
+        "generation.fps": settings.fps,
+        "sampling.video_shift": settings.video_shift,
+        "sampling.audio_shift": settings.audio_shift,
     }
+    if settings.profile == "minimax_h3":
+        if not model_paths:
+            raise WorkflowError("MiniMax model bindings are missing")
+        values.update({f"model.{role}": path for role, path in model_paths.items()})
     rendered = _replace(copy.deepcopy(template), values)
     if _contains_placeholder(rendered):
         raise WorkflowError("workflow template contains an unresolved binding")
+    if settings.profile == "minimax_h3":
+        return rendered, seed, frame_prefix
     rendered = _inject_reviewed_loras(rendered, settings)
     if settings.face_fidelity == "stable_expression":
         rendered = _enable_face_fidelity(rendered)

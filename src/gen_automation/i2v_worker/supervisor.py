@@ -65,12 +65,30 @@ class WorkerSupervisor:
 
     async def _run(self) -> None:
         try:
+            async with asyncio.timeout(self.settings.startup_timeout_seconds):
+                await self._bootstrap()
+            self.ready = True
+            while not self._stopping:
+                if self.comfy is None or self.comfy.poll() is not None:
+                    raise WorkerStartupError("worker child process exited")
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            raise
+        except (TimeoutError, ModelBootstrapError, WorkerStartupError, OSError):
+            self.ready = False
+            self.failed = True
+            if self.comfy is not None:
+                await asyncio.to_thread(_stop_process, self.comfy)
+
+    async def _bootstrap(self) -> None:
+        try:
             _ensure_directories(self.settings)
             await asyncio.to_thread(_verify_gpu_runtime, self.settings)
-            self.face_detector = await asyncio.to_thread(
-                preflight_face_stabilizer,
-                device="cpu",
-            )
+            if self.settings.profile == "wan22":
+                self.face_detector = await asyncio.to_thread(
+                    preflight_face_stabilizer,
+                    device="cpu",
+                )
             if not self.settings.models_prepared:
                 await S3ModelBootstrapper(self.settings).bootstrap()
             self.comfy = _start_process(
@@ -83,16 +101,12 @@ class WorkerSupervisor:
                 request_timeout_seconds=self.settings.network_timeout_seconds,
                 network_attempts=self.settings.network_attempts,
                 poll_seconds=self.settings.comfy_poll_seconds,
+                profile=self.settings.profile,
             )
             while not await self.comfy_client.ready():
                 if self.comfy.poll() is not None:
                     raise WorkerStartupError("ComfyUI exited during startup")
                 await asyncio.sleep(2)
-            self.ready = True
-            while not self._stopping:
-                if self.comfy.poll() is not None:
-                    raise WorkerStartupError("worker child process exited")
-                await asyncio.sleep(1)
         except asyncio.CancelledError:
             raise
         except FaceStabilizationError as error:
@@ -107,6 +121,8 @@ class WorkerSupervisor:
             self.ready = False
             self.failed = True
             self.face_detector = None
+        if self.failed:
+            raise WorkerStartupError("worker startup failed")
 
 
 def _ensure_directories(settings: I2VWorkerSettings) -> None:

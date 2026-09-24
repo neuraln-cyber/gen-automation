@@ -6,6 +6,7 @@ from enum import StrEnum
 from functools import lru_cache
 from ipaddress import IPv4Network, IPv6Network, ip_network
 from pathlib import Path, PurePosixPath
+from typing import Literal
 from urllib.parse import SplitResult, urlsplit
 from uuid import UUID
 
@@ -546,6 +547,13 @@ class Settings(BaseSettings):
     # the retired VIDEO lane so the new DaSiWa worker can be deployed and reasoned
     # about as one self-contained system.
     i2v_enabled: bool = False
+    i2v_profile: Literal["wan22", "minimax_h3"] = "wan22"
+    # No extra delivery subscription: reuse the image lane's private distribution.
+    # Explicitly switch on for the new Salad rollout; old RunPod deployments are unchanged.
+    i2v_require_private_delivery: bool = False
+    # Optional operational watchdogs, not usage or spending caps. Unset by default.
+    i2v_startup_timeout_seconds: int | None = Field(default=None, ge=60)
+    i2v_execution_timeout_seconds: int | None = Field(default=None, ge=60)
     # Keep wire-incompatible dashboard controls closed until the matching
     # immutable worker image is running and ready.
     i2v_hires_profile_enabled: bool = False
@@ -1031,6 +1039,24 @@ class Settings(BaseSettings):
         if self.i2v_lora_profile_enabled and not self.i2v_lora_worker_enabled:
             errors.append("I2V LoRA profile requires a LoRA-capable worker")
         if self.i2v_enabled:
+            if self.i2v_profile == "minimax_h3":
+                if (
+                    self.i2v_worker_source_revision is None
+                    or self.i2v_private_manifest_source_sha256 is None
+                ):
+                    errors.append("MiniMax H3 requires immutable source and manifest identities")
+                if self.i2v_runpod_enabled or self.i2v_lora_worker_enabled:
+                    errors.append("MiniMax H3 requires the native Salad profile without WAN LoRAs")
+                if not self.i2v_require_private_delivery:
+                    errors.append("MiniMax H3 requires the existing private delivery route")
+                if self.storage_delivery_domain != _secret_value(
+                    self.salad_worker_artifact_delivery_domain
+                ):
+                    errors.append(
+                        "MiniMax H3 model and media delivery must share the existing distribution"
+                    )
+            if self.i2v_require_private_delivery and not self.salad_worker_artifact_delivery_domain:
+                errors.append("I2V private delivery requires the existing artifact delivery domain")
             if not self.storage_enabled:
                 errors.append("I2V requires private object storage")
             if not self.background_runtime_enabled:
@@ -1098,6 +1124,7 @@ class Settings(BaseSettings):
                             validated_i2v_manifest_objects(
                                 decoded_manifest,
                                 reviewed_loras_enabled=self.i2v_lora_worker_enabled,
+                                profile=self.i2v_profile,
                             )
                         except ValueError:
                             errors.append(
