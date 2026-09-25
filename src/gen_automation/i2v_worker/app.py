@@ -12,7 +12,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from gen_automation.i2v_worker.comfy import ComfyError
+from gen_automation.i2v_worker.artifacts import ModelBootstrapError
+from gen_automation.i2v_worker.comfy import ComfyError, ComfyLoraError
 from gen_automation.i2v_worker.face_stabilizer import (
     FaceDetector,
     FaceStabilizationError,
@@ -22,6 +23,7 @@ from gen_automation.i2v_worker.face_stabilizer import (
     preflight_source_face,
     stabilize_face_frames,
 )
+from gen_automation.i2v_worker.h3_loras import materialize_h3_lora
 from gen_automation.i2v_worker.media import (
     MediaError,
     download_input,
@@ -122,6 +124,8 @@ def create_i2v_worker_app(
                 "source_revision": settings.source_revision,
                 "face_stabilizer": face_stabilizer_capability(),
             }
+            if settings.profile == "minimax_h3":
+                content["capability"]["managed_h3_loras"] = True  # type: ignore[index]
         return is_ready, content
 
     @app.get("/ready")
@@ -222,7 +226,15 @@ def create_i2v_worker_app(
                         detail="stable-expression face contract failed",
                     ) from None
                 raise HTTPException(status_code=500, detail="generation failed") from None
-            except (ComfyError, MediaError, WorkflowError):
+            except ComfyLoraError:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "A selected LoRA could not be applied. "
+                        "Use H3-compatible model LoRAs or clear the selection."
+                    ),
+                ) from None
+            except (ComfyError, MediaError, WorkflowError, ModelBootstrapError):
                 raise HTTPException(status_code=500, detail="generation failed") from None
 
     app.state.supervisor = resolved_supervisor
@@ -249,6 +261,11 @@ async def _run_job(
     allow_http = settings.environment == "test"
     try:
         job_root.mkdir(parents=True, exist_ok=False, mode=0o700)
+        for selection, grant in zip(
+            job.settings_snapshot.h3_loras, job.h3_lora_grants, strict=True
+        ):
+            if selection.strength != 0:
+                await asyncio.to_thread(materialize_h3_lora, grant, settings)
         await download_input(
             job.input_grant,
             job.input_snapshot,

@@ -20,6 +20,10 @@ class ComfyError(Exception):
     """A redacted ComfyUI failure."""
 
 
+class ComfyLoraError(ComfyError):
+    """A managed H3 loader rejected the selected file before sampling."""
+
+
 class ComfyClient:
     def __init__(
         self,
@@ -44,6 +48,7 @@ class ComfyClient:
                     "MiniMaxH3SigmaShift",
                     "SaveVideo",
                     "VAEDecodeAudio",
+                    "ManagedH3LoraLoader",
                 )
             )
         )
@@ -103,6 +108,16 @@ class ComfyClient:
                 "cancelled",
                 "canceled",
             }:
+                messages = status.get("messages", [])
+                if isinstance(messages, list) and any(
+                    isinstance(message, list)
+                    and len(message) == 2
+                    and message[0] == "execution_error"
+                    and isinstance(message[1], dict)
+                    and message[1].get("node_type") == "ManagedH3LoraLoader"
+                    for message in messages
+                ):
+                    raise ComfyLoraError("selected H3 LoRA could not be applied")
                 raise ComfyError("ComfyUI generation failed")
             outputs = record.get("outputs")
             if isinstance(status, dict) and status.get("completed") is True:

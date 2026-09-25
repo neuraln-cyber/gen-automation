@@ -15,9 +15,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from gen_automation.api.security import ReleaseManager, ReleaseReader
 from gen_automation.config import Settings
-from gen_automation.db.models import I2VJob, I2VPreset, I2VWorkerDeployment
+from gen_automation.db.models import (
+    I2VJob,
+    I2VPreset,
+    I2VWorkerDeployment,
+    ManagedLoraArtifact,
+    ModelArtifactApproval,
+)
 from gen_automation.db.session import get_session
-from gen_automation.domain.enums import AdminRole
+from gen_automation.domain.enums import (
+    AdminRole,
+    ApprovalStatus,
+    ManagedLoraLifecycle,
+    ModelArtifactFamily,
+    ModelArtifactKind,
+)
 from gen_automation.domain.i2v import (
     I2VInputSnapshot,
     I2VJobDraft,
@@ -36,6 +48,7 @@ from gen_automation.domain.i2v_loras import (
     selected_i2v_loras,
     validate_i2v_lora_prompt,
 )
+from gen_automation.domain.lora_catalog import managed_lora_model_family
 from gen_automation.i2v_worker.lora_catalog import (
     LORA_CATALOG,
     MAX_REVIEWED_LORA_SELECTIONS,
@@ -221,6 +234,73 @@ class ReviewedLoraCatalogRead(BaseModel):
     maximum_selections: int
     message: str
     loras: tuple[ReviewedLoraRead, ...]
+
+
+class ManagedH3LoraRead(BaseModel):
+    catalog_id: UUID
+    sha256: str
+    display_name: str
+    trigger_words: list[str]
+    byte_size: int
+    available: bool
+    recommended_initial_strength: float = 1.0
+    minimum_strength: float = -100.0
+    maximum_strength: float = 100.0
+    strength_step: float = 0.01
+
+
+class ManagedH3LoraCatalogRead(BaseModel):
+    profile_enabled: bool
+    maximum_selections: int = 0
+    message: str
+    loras: tuple[ManagedH3LoraRead, ...]
+
+
+@router.get("/h3-loras", response_model=ManagedH3LoraCatalogRead)
+async def managed_h3_loras(
+    request: Request, session: Session, principal: ReleaseReader
+) -> ManagedH3LoraCatalogRead:
+    _require_manager_reader(principal.role)
+    settings: Settings = request.app.state.settings
+    enabled = settings.i2v_profile == "minimax_h3" and settings.i2v_h3_loras_enabled
+    entries = await session.scalars(
+        select(ManagedLoraArtifact)
+        .join(ModelArtifactApproval, ManagedLoraArtifact.approval_id == ModelArtifactApproval.id)
+        .where(
+            ManagedLoraArtifact.registered_by_user_id == principal.user_id,
+            ManagedLoraArtifact.lifecycle == ManagedLoraLifecycle.ACTIVE,
+            ModelArtifactApproval.model_family == ModelArtifactFamily.MINIMAX_H3,
+            ModelArtifactApproval.kind == ModelArtifactKind.LORA,
+            ModelArtifactApproval.status == ApprovalStatus.APPROVED,
+            ModelArtifactApproval.is_current.is_(True),
+            ModelArtifactApproval.safetensors_verified.is_(True),
+            ModelArtifactApproval.artifact_sha256 == ManagedLoraArtifact.artifact_sha256,
+            ModelArtifactApproval.storage_key == ManagedLoraArtifact.object_key,
+        )
+        .order_by(ManagedLoraArtifact.display_name, ManagedLoraArtifact.id)
+    )
+    return ManagedH3LoraCatalogRead(
+        profile_enabled=enabled,
+        message=(
+            "Select your uploaded H3-compatible model LoRAs and set their strengths. "
+            "Only selected files download to the worker; trigger words are manual."
+            if enabled
+            else "H3 LoRA selection is paused until the matching worker is configured."
+        ),
+        loras=tuple(
+            ManagedH3LoraRead(
+                catalog_id=row.id,
+                sha256=row.artifact_sha256,
+                display_name=row.display_name,
+                trigger_words=row.trigger_words,
+                byte_size=row.byte_size,
+                available=enabled,
+            )
+            for row in entries
+            if row.object_version_id
+            and managed_lora_model_family(row.provenance) == ModelArtifactFamily.MINIMAX_H3
+        ),
+    )
 
 
 @router.get("/loras", response_model=ReviewedLoraCatalogRead)
@@ -453,6 +533,7 @@ async def create_preset(
         normalized_settings = _settings_for_profile(
             payload.settings,
             enabled=request.app.state.settings.i2v_lora_profile_enabled,
+            h3_enabled=request.app.state.settings.i2v_h3_loras_enabled,
         )
         _validate_lora_prompt(payload.positive_prompt, normalized_settings)
         return await create_i2v_preset(
@@ -478,6 +559,7 @@ async def update_preset(
         normalized_settings = _settings_for_profile(
             payload.settings,
             enabled=request.app.state.settings.i2v_lora_profile_enabled,
+            h3_enabled=request.app.state.settings.i2v_h3_loras_enabled,
         )
         _validate_lora_prompt(payload.positive_prompt, normalized_settings)
         return await update_i2v_preset(
@@ -536,6 +618,7 @@ async def enqueue_jobs(
         _settings_for_profile(
             payload.settings,
             enabled=settings.i2v_lora_profile_enabled,
+            h3_enabled=settings.i2v_h3_loras_enabled,
         )
         if payload.settings is not None
         else None
@@ -576,6 +659,7 @@ async def enqueue_jobs(
             effective_settings = _settings_for_profile(
                 merged_settings,
                 enabled=settings.i2v_lora_profile_enabled,
+                h3_enabled=settings.i2v_h3_loras_enabled,
             )
     _validate_lora_prompt(effective_prompt or "", effective_settings)
     _validate_generation_profile(settings, effective_settings, effective_negative or "")
@@ -723,6 +807,11 @@ async def retry_job(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="reviewed I2V LoRAs are paused until the matching worker rollout passes",
             )
+        _settings_for_profile(
+            normalized_job_settings,
+            enabled=request.app.state.settings.i2v_lora_profile_enabled,
+            h3_enabled=request.app.state.settings.i2v_h3_loras_enabled,
+        )
     try:
         return await retry_i2v_job(
             session,
@@ -943,7 +1032,9 @@ def _preset_draft(
     )
 
 
-def _settings_for_profile(value: dict[str, Any], *, enabled: bool) -> dict[str, Any]:
+def _settings_for_profile(
+    value: dict[str, Any], *, enabled: bool, h3_enabled: bool = False
+) -> dict[str, Any]:
     try:
         normalized = normalize_i2v_settings(value)
     except I2VLoraSelectionError as error:
@@ -955,6 +1046,10 @@ def _settings_for_profile(value: dict[str, Any], *, enabled: bool) -> dict[str, 
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="reviewed I2V LoRAs are paused until the matching worker rollout passes",
+        )
+    if normalized.get("h3_loras") and not h3_enabled:
+        raise HTTPException(
+            status_code=409, detail="H3 LoRA selection is paused for worker rollout"
         )
     return normalized
 

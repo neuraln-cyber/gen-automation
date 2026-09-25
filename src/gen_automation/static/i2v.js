@@ -80,6 +80,7 @@
   if (isH3) Object.assign(workerSettingDefaults, {
     frame_count: 124, fps: 24, steps: 4, scheduler: "simple",
     face_fidelity: "off", video_shift: 8, audio_shift: 4, match_source_aspect: true,
+    h3_loras: [],
   });
   let saveTimer = null;
 
@@ -345,6 +346,9 @@
 
   function collectSettings() {
     if (loraWriteBlocked()) throw new Error(loraBlockMessage());
+    if ([...loraList.querySelectorAll('input[type="number"]')].some((field) => !field.disabled && !field.validity.valid)) {
+      throw new Error("Enter a valid finite strength for each selected LoRA.");
+    }
     const settings = { ...workerSettingDefaults };
     const numbers = new Set(["frame_count", "fps", "width", "height", "seed", "steps", "high_end_step", "cfg", "high_shift", "low_shift", "loop_count", "video_shift", "audio_shift"]);
     advanced.querySelectorAll("input[name], select[name]").forEach((field) => {
@@ -354,9 +358,15 @@
     });
     const authorization = root.querySelector("#i2v-runpod-authorization");
     settings.runpod_authorization = authorization?.checked ? "written_permission" : "sfw";
-    settings.loras = [...state.loraSelections].map(([catalogId, strength]) => ({
-      catalog_id: catalogId,
-      strength,
+    if (isH3) {
+      settings.loras = [];
+      settings.h3_loras = [...state.loraSelections].map(([artifactId, strength]) => ({
+        artifact_id: artifactId,
+        sha256: state.loraCatalog.find((entry) => entry.catalog_id === artifactId).sha256,
+        strength,
+      }));
+    } else settings.loras = [...state.loraSelections].map(([catalogId, strength]) => ({
+      catalog_id: catalogId, strength,
     }));
     return settings;
   }
@@ -364,7 +374,7 @@
   function applySettings(settings = {}) {
     const resolved = { ...workerSettingDefaults, ...settings };
     Object.entries(resolved).forEach(([name, value]) => {
-      if (name === "loras") return;
+      if (name === "loras" || name === "h3_loras") return;
       if (name === "runpod_authorization") {
         const authorization = root.querySelector("#i2v-runpod-authorization");
         if (authorization) authorization.checked = value === "written_permission";
@@ -375,7 +385,8 @@
       if (field.type === "checkbox") field.checked = Boolean(value);
       else field.value = String(value);
     });
-    setLoraSelections(Array.isArray(resolved.loras) ? resolved.loras : []);
+    const selections = isH3 ? resolved.h3_loras : resolved.loras;
+    setLoraSelections(Array.isArray(selections) ? selections : []);
     syncAspectControls();
     updateDuration();
   }
@@ -414,13 +425,14 @@
   function setLoraSelections(values = []) {
     state.loraSelections.clear();
     values.forEach((selection) => {
-      if (!selection || typeof selection.catalog_id !== "string") return;
+      const identity = isH3 ? selection?.artifact_id : selection?.catalog_id;
+      if (typeof identity !== "string") return;
       const strength = Number(selection.strength);
-      if (Number.isFinite(strength)) state.loraSelections.set(selection.catalog_id, strength);
+      if (Number.isFinite(strength)) state.loraSelections.set(identity, strength);
     });
     if (values.length && state.loraCatalogLoaded && !state.loraProfileEnabled) {
       announce(
-        "This saved item contains reviewed LoRAs that are unavailable on the current profile. Clear them before queueing or saving.",
+        "This saved item contains LoRAs that are unavailable on the current profile. Clear them before queueing or saving.",
         true,
       );
     }
@@ -443,12 +455,13 @@
     }
     if (!available.length) {
       loraList.append(text("p", state.loraProfileEnabled
-        ? "No reviewed LoRAs are installed on this worker profile."
+        ? (isH3 ? "No verified H3 files yet. Upload your file in Manage H3 LoRA files, wait for verification, then refresh here." : "No reviewed LoRAs are installed on this worker profile.")
         : "The current worker remains on the no-LoRA baseline.", "muted"));
       clearLorasButton.disabled = !canManage || state.loraSelections.size === 0;
       return;
     }
-    available.forEach((entry) => {
+    const search = root.querySelector("[data-h3-lora-search]")?.value.trim().toLocaleLowerCase() || "";
+    available.filter((entry) => !search || `${entry.display_name} ${entry.trigger_words.join(" ")}`.toLocaleLowerCase().includes(search)).forEach((entry) => {
       const selectedStrength = state.loraSelections.get(entry.catalog_id);
       const enabled = selectedStrength !== undefined;
       const card = document.createElement("article");
@@ -488,7 +501,7 @@
       strengthLabel.append(strength);
 
       const usage = entry.credit_required ? "Creator credit required." : "Creator credit optional.";
-      const commercial = entry.commercial_use.length
+      const commercial = entry.commercial_use?.length
         ? `Source commercial-use metadata: ${entry.commercial_use.join(", ")}.`
         : "Source metadata records no commercial-use option.";
       const derivatives = entry.derivatives_allowed
@@ -496,25 +509,29 @@
         : "Model derivatives not permitted by recorded source metadata.";
       const attribution = document.createElement("p");
       attribution.className = "i2v-lora-source";
-      attribution.append(document.createTextNode(entry.credit_required
-        ? `Credit ${entry.creator_name}. Source: `
-        : `Creator ${entry.creator_name}. Source: `));
-      const sourceLink = document.createElement("a");
-      sourceLink.href = entry.canonical_source_url;
-      sourceLink.target = "_blank";
-      sourceLink.rel = "noopener noreferrer";
-      sourceLink.textContent = "canonical Civitai model";
-      attribution.append(sourceLink);
-      entry.canonical_version_urls.forEach((versionUrl, index) => {
-        attribution.append(document.createTextNode(index === 0 ? " · exact high version: " : " · exact low version: "));
-        const versionLink = document.createElement("a");
-        versionLink.href = versionUrl;
-        versionLink.target = "_blank";
-        versionLink.rel = "noopener noreferrer";
-        versionLink.textContent = index === 0 ? "high" : "low";
-        attribution.append(versionLink);
-      });
-      const guidance = text("p", [
+      if (!isH3) {
+        attribution.append(document.createTextNode(entry.credit_required
+          ? `Credit ${entry.creator_name}. Source: `
+          : `Creator ${entry.creator_name}. Source: `));
+        const sourceLink = document.createElement("a");
+        sourceLink.href = entry.canonical_source_url;
+        sourceLink.target = "_blank";
+        sourceLink.rel = "noopener noreferrer";
+        sourceLink.textContent = "canonical Civitai model";
+        attribution.append(sourceLink);
+        entry.canonical_version_urls.forEach((versionUrl, index) => {
+          attribution.append(document.createTextNode(index === 0 ? " · exact high version: " : " · exact low version: "));
+          const versionLink = document.createElement("a");
+          versionLink.href = versionUrl;
+          versionLink.target = "_blank";
+          versionLink.rel = "noopener noreferrer";
+          versionLink.textContent = index === 0 ? "high" : "low";
+          attribution.append(versionLink);
+        });
+      }
+      const guidance = text("p", isH3
+        ? `${friendlyBytes(entry.byte_size)} · Model strength: 1 is the default; follow the file's author guidance. Trigger words are optional and added only by you.`
+        : [
         `${entry.strength_guidance}.`,
         `${entry.prompt_behavior}.`,
         entry.usage_notes,
@@ -546,6 +563,19 @@
         scheduleDraftSave();
       });
       card.append(toggleLabel, strengthLabel, guidance, attribution);
+      if (isH3 && entry.trigger_words.length) {
+        const addTriggers = text("button", "Add trigger words", "secondary-button");
+        addTriggers.type = "button";
+        addTriggers.disabled = !canManage || !enabled;
+        addTriggers.addEventListener("click", () => {
+          entry.trigger_words.forEach((trigger) => {
+            form.elements.positive_prompt.value = appendPromptTriggerOnce(form.elements.positive_prompt.value, trigger);
+          });
+          syncLoraPromptPreview();
+          scheduleDraftSave();
+        });
+        card.append(addTriggers);
+      }
       loraList.append(card);
     });
     clearLorasButton.disabled = !canManage || state.loraSelections.size === 0;
@@ -556,7 +586,12 @@
       state.loraSelections.has(entry.catalog_id)
     ));
     loraEffective.hidden = selected.length === 0;
-    if (!selected.length) return;
+    if (!selected.length) { updateSubmitState(); return; }
+    if (isH3) {
+      loraEffectiveText.textContent = selected.map((entry) => `${entry.display_name}: ${state.loraSelections.get(entry.catalog_id)}`).join(" · ");
+      updateSubmitState();
+      return;
+    }
     const triggers = selected.flatMap((entry) => entry.automatic_trigger_words);
     const manual = selected.filter((entry) => (
       entry.automatic_trigger_words.length === 0 && entry.trigger_words.length > 0
@@ -587,6 +622,7 @@
   }
 
   function selectedManualPromptConflicts() {
+    if (isH3) return [];
     const prompt = form.elements.positive_prompt.value.trim();
     return state.loraCatalog.filter((entry) => (
       state.loraSelections.has(entry.catalog_id)
@@ -608,6 +644,11 @@
   }
 
   function loraBlockMessage() {
+    if (isH3) {
+      if (state.loraCatalogError) return "Could not refresh your H3 library. Retry Refresh library before queueing or saving.";
+      if (!state.loraCatalogLoaded) return "Loading your H3 library…";
+      return "A saved H3 LoRA is unavailable. Refresh the library or clear the selection before queueing.";
+    }
     if (state.loraCatalogError) return "The reviewed LoRA catalog could not be verified; queue and preset writes are blocked.";
     if (!state.loraCatalogLoaded) return "Waiting for the reviewed LoRA catalog before queueing or saving.";
     return "Saved LoRA selections are unavailable. Clear them before queueing or saving.";
@@ -638,13 +679,8 @@
   }
 
   async function loadLoraCatalog() {
-    if (isH3) {
-      state.loraCatalogLoaded = true;
-      state.loraProfileEnabled = false;
-      return;
-    }
     try {
-      const catalog = await api("/loras");
+      const catalog = await api(isH3 ? "/h3-loras" : "/loras");
       state.loraProfileEnabled = catalog.profile_enabled;
       state.maximumLoraSelections = Number(catalog.maximum_selections) || 0;
       state.loraCatalog = Array.isArray(catalog.loras) ? catalog.loras : [];
@@ -662,7 +698,7 @@
     } catch (error) {
       state.loraCatalogLoaded = false;
       state.loraCatalogError = true;
-      loraStatus.textContent = "The reviewed LoRA catalog could not be verified. No settings will be silently removed.";
+      loraStatus.textContent = "The LoRA library could not be verified. No settings will be silently removed.";
       renderLoraCatalog();
       updateSubmitState();
       throw error;
@@ -985,6 +1021,10 @@
     renderLoraCatalog();
     syncLoraPromptPreview();
     scheduleDraftSave();
+  });
+  q("[data-h3-lora-search]")?.addEventListener("input", renderLoraCatalog);
+  q("[data-refresh-loras]")?.addEventListener("click", () => {
+    loadLoraCatalog().catch((error) => announce(error.message, true));
   });
   q("[data-refresh-queue]").addEventListener("click", () => loadQueue().catch((error) => announce(error.message, true)));
   q("[data-refresh-outputs]").addEventListener("click", () => loadOutputs().catch((error) => announce(error.message, true)));

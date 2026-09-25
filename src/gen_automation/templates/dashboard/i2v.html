@@ -219,19 +219,26 @@
           </div>
           {% endif %}
 
-          <section class="i2v-loras" aria-labelledby="i2v-lora-heading"{% if video_profile == 'minimax_h3' %} hidden{% endif %}>
+          <section class="i2v-loras" aria-labelledby="i2v-lora-heading">
             <div class="i2v-subheading">
               <div>
-                <h3 id="i2v-lora-heading">Reviewed motion LoRAs</h3>
+                <h3 id="i2v-lora-heading">{{ 'Your H3 LoRAs' if video_profile == 'minimax_h3' else 'Reviewed motion LoRAs' }}</h3>
                 <p data-lora-status>Checking the matching worker catalog...</p>
               </div>
               <button class="secondary-button" type="button" data-clear-loras disabled>Clear all</button>
             </div>
+            {% if video_profile == 'minimax_h3' %}
+            <p class="muted">Choose verified files from your H3 library. Use H3-compatible model LoRAs; Anima and WAN files are not interchangeable. Selections and strengths are saved with each job and preset.</p>
+            <div class="i2v-subheading">
+              <label>Find a LoRA <input type="search" data-h3-lora-search placeholder="Name or trigger words"></label>
+              <button class="secondary-button" type="button" data-refresh-loras>Refresh library</button>
+            </div>
+            {% endif %}
             <div class="i2v-lora-list" data-lora-list aria-live="polite"></div>
             <p class="i2v-lora-effective" data-lora-effective hidden>
               <strong>Effective prompt guidance</strong>
               <span data-lora-effective-text></span>
-              <small>Your written prompt stays unchanged. Where an automatic trigger exists, the worker appends it once in catalog order.</small>
+              <small>{{ 'Your prompt stays unchanged unless you press Add trigger words. Strength 0 disables the effect.' if video_profile == 'minimax_h3' else 'Your written prompt stays unchanged. Where an automatic trigger exists, the worker appends it once in catalog order.' }}</small>
             </p>
           </section>
         </details>

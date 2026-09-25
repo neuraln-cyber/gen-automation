@@ -133,7 +133,7 @@ def render_workflow(
     if _contains_placeholder(rendered):
         raise WorkflowError("workflow template contains an unresolved binding")
     if settings.profile == "minimax_h3":
-        return rendered, seed, frame_prefix
+        return _inject_h3_loras(rendered, settings), seed, frame_prefix
     rendered = _inject_reviewed_loras(rendered, settings)
     if settings.face_fidelity == "stable_expression":
         rendered = _enable_face_fidelity(rendered)
@@ -176,6 +176,8 @@ def effective_negative_prompt(
 
 
 def lora_provenance(settings: GenerationSettings) -> list[dict[str, object]]:
+    if settings.profile == "minimax_h3":
+        return [item.model_dump(mode="json") for item in settings.h3_loras]
     return [
         {
             "catalog_id": selection.catalog_id,
@@ -215,6 +217,25 @@ def lora_provenance(settings: GenerationSettings) -> list[dict[str, object]]:
         for selection in settings.loras
         for entry in (reviewed_lora(selection.catalog_id),)
     ]
+
+
+def _inject_h3_loras(workflow: dict[str, Any], settings: GenerationSettings) -> dict[str, Any]:
+    model: list[object] = ["2", 0]
+    for index, selection in enumerate(settings.h3_loras):
+        if selection.strength == 0:
+            continue
+        node_id = f"h3-lora-{index}"
+        workflow[node_id] = {
+            "class_type": "ManagedH3LoraLoader",
+            "inputs": {
+                "model": model,
+                "lora_name": f"managed-h3/{selection.sha256}.safetensors",
+                "strength_model": selection.strength,
+            },
+        }
+        model = [node_id, 0]
+    workflow["7"]["inputs"]["model"] = model
+    return workflow
 
 
 def _inject_reviewed_loras(

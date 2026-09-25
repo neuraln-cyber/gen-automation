@@ -152,7 +152,7 @@ def test_i2v_dashboard_uses_only_the_backend_reviewed_lora_catalog() -> None:
     )
     script = (root / "src/gen_automation/static/i2v.js").read_text(encoding="utf-8")
 
-    assert 'api("/loras")' in script
+    assert 'api(isH3 ? "/h3-loras" : "/loras")' in script
     assert "entry.catalog_id" in script
     assert "entry.recommended_initial_strength" in script
     assert "entry.trigger_words" in script

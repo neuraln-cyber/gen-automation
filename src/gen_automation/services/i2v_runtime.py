@@ -7,6 +7,7 @@ from typing import Protocol, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -25,6 +26,7 @@ from gen_automation.domain.i2v_loras import (
     I2VLoraSettingsKind,
     classify_i2v_lora_settings,
 )
+from gen_automation.i2v_worker.models import H3LoraGrant, H3LoraSelection
 from gen_automation.integrations.salad.errors import (
     SaladAPIError,
     SaladRateLimitError,
@@ -36,6 +38,7 @@ from gen_automation.integrations.salad.models import (
     SaladJobStatus,
     SaladQueueJob,
 )
+from gen_automation.services.h3_loras import H3LoraUnavailableError
 from gen_automation.services.i2v import (
     acknowledge_i2v_cancellation,
     adopt_validated_i2v_provider_attempt,
@@ -700,7 +703,20 @@ class I2VRuntime:
                 "production I2V submission requires a fresh signed-grant builder"
             )
         submission_key = _submission_key(job, attempt)
-        additions = dict(await self.input_builder.build(job=job, attempt=attempt))
+        try:
+            additions = dict(await self.input_builder.build(job=job, attempt=attempt))
+        except H3LoraUnavailableError:
+            async with self.sessions() as session:
+                await fail_i2v_attempt(
+                    session,
+                    job_id=job.job_id,
+                    attempt_id=attempt.attempt_id,
+                    worker_id=self.worker_id,
+                    error_code="h3_lora_unavailable",
+                    error_detail="A selected H3 LoRA is no longer verified or available.",
+                    now=now,
+                )
+            return "h3_lora_unavailable"
         _validate_fresh_grants(
             additions,
             job=job,
@@ -716,7 +732,7 @@ class I2VRuntime:
             "input_snapshot": cast(JSONValue, _worker_input_snapshot(job.input_snapshot)),
             "positive_prompt": job.positive_prompt,
             "negative_prompt": job.negative_prompt,
-            "settings_snapshot": cast(JSONValue, job.settings_snapshot),
+            "settings_snapshot": cast(JSONValue, _worker_settings_snapshot(job.settings_snapshot)),
             **additions,
         }
         metadata = i2v_submission_metadata(
@@ -1103,6 +1119,14 @@ def _safe_attempt_metadata(
     return cast(dict[str, JSONValue], metadata)
 
 
+def _worker_settings_snapshot(settings: Mapping[str, object]) -> dict[str, object]:
+    """Keep baseline jobs compatible during a control-plane-first worker rollout."""
+    snapshot = dict(settings)
+    if not snapshot.get("h3_loras"):
+        snapshot.pop("h3_loras", None)
+    return snapshot
+
+
 def _validate_fresh_grants(
     additions: Mapping[str, JSONValue],
     *,
@@ -1111,10 +1135,30 @@ def _validate_fresh_grants(
     output_prefix: str,
     now: datetime,
 ) -> None:
-    if set(additions) != {"input_grant", "output_grant"}:
+    expected_fields = {"input_grant", "output_grant"}
+    if job.settings_snapshot.get("h3_loras"):
+        expected_fields.add("h3_lora_grants")
+    if set(additions) != expected_fields:
         raise I2VRuntimeConfigurationError(
-            "I2V input builder must return only fresh input_grant and output_grant"
+            "I2V input builder must return only the expected fresh media and LoRA grants"
         )
+    if "h3_lora_grants" in additions:
+        try:
+            grants = TypeAdapter(list[H3LoraGrant]).validate_python(additions["h3_lora_grants"])
+            selections = TypeAdapter(list[H3LoraSelection]).validate_python(
+                job.settings_snapshot["h3_loras"]
+            )
+        except ValidationError:
+            raise I2VRuntimeConfigurationError("H3 LoRA grants are invalid") from None
+        if [(item.artifact_id, item.sha256) for item in grants] != [
+            (item.artifact_id, item.sha256) for item in selections
+        ] or any(
+            item.download.url.scheme != "https"
+            or item.download.expires_at.tzinfo is None
+            or item.download.expires_at <= now
+            for item in grants
+        ):
+            raise I2VRuntimeConfigurationError("H3 LoRA grants do not match the frozen job")
     input_grant = additions.get("input_grant")
     output_grant = additions.get("output_grant")
     if not isinstance(input_grant, dict) or input_grant.get("method") != "GET":

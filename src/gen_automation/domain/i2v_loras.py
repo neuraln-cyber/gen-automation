@@ -7,6 +7,8 @@ from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any
 
+from pydantic import TypeAdapter, ValidationError
+
 from gen_automation.i2v_worker.lora_catalog import (
     LORA_CATALOG,
     MAX_REVIEWED_LORA_SELECTIONS,
@@ -15,6 +17,7 @@ from gen_automation.i2v_worker.lora_catalog import (
     ReviewedLoraPromptError,
     validate_reviewed_lora_prompt,
 )
+from gen_automation.i2v_worker.models import H3LoraSelection
 
 
 class I2VLoraSelectionError(ValueError):
@@ -39,6 +42,18 @@ def normalize_i2v_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     """
 
     normalized = dict(settings)
+    if "h3_loras" in normalized:
+        try:
+            selections = TypeAdapter(list[H3LoraSelection]).validate_python(normalized["h3_loras"])
+        except ValidationError:
+            raise I2VLoraSelectionError(
+                "H3 LoRAs require artifact_id, sha256 and a finite strength"
+            ) from None
+        if selections and normalized.get("profile") != "minimax_h3":
+            raise I2VLoraSelectionError("H3 LoRAs require the MiniMax H3 profile")
+        if len({item.artifact_id for item in selections}) != len(selections):
+            raise I2VLoraSelectionError("H3 LoRA selections must be unique")
+        normalized["h3_loras"] = [item.model_dump(mode="json") for item in selections]
     authorization = normalized.setdefault("runpod_authorization", "sfw")
     if authorization not in {"sfw", "written_permission"}:
         raise I2VLoraSelectionError(
@@ -104,7 +119,7 @@ def classify_i2v_lora_settings(settings: Mapping[str, Any]) -> I2VLoraSettingsKi
     try:
         return (
             I2VLoraSettingsKind.REVIEWED
-            if selected_i2v_loras(settings)
+            if selected_i2v_loras(settings) or normalize_i2v_settings(settings).get("h3_loras")
             else I2VLoraSettingsKind.BASELINE
         )
     except I2VLoraSelectionError:

@@ -44,6 +44,7 @@ from gen_automation.domain.i2v_loras import (
     validate_i2v_lora_prompt,
 )
 from gen_automation.domain.ids import uuid7
+from gen_automation.services.h3_loras import H3LoraUnavailableError, resolve_h3_loras
 
 
 class I2VError(Exception):
@@ -152,6 +153,7 @@ async def create_i2v_preset(
         created_at=timestamp,
         updated_at=timestamp,
     )
+    await _validate_managed_h3_loras(session, actor_user_id, preset.settings)
     session.add(preset)
     await _commit(session, "a preset with this name already exists")
     return _preset_snapshot(preset)
@@ -174,6 +176,7 @@ async def update_i2v_preset(
     preset.positive_prompt = draft.positive_prompt
     preset.negative_prompt = draft.negative_prompt
     preset.settings = _normalized_settings(draft.settings)
+    await _validate_managed_h3_loras(session, actor_user_id, preset.settings)
     preset.lock_version += 1
     preset.updated_at = _now(now)
     await _commit(session, "the preset update conflicts with existing state")
@@ -236,6 +239,7 @@ async def create_i2v_job(
     if draft.settings is not None:
         settings.update(draft.settings)
     settings = _normalized_settings(settings)
+    await _validate_managed_h3_loras(session, actor_user_id, settings)
     try:
         validate_i2v_lora_prompt(positive_prompt, settings)
     except I2VLoraPromptError as error:
@@ -384,6 +388,7 @@ async def retry_i2v_job(
     if job.state not in {I2VJobState.FAILED, I2VJobState.CANCELLED}:
         raise I2VConflictError("only failed or cancelled I2V jobs can be retried")
     settings = _normalized_settings(dict(job.settings_snapshot))
+    await _validate_managed_h3_loras(session, actor_user_id, settings)
     try:
         validate_i2v_lora_prompt(job.positive_prompt, settings)
     except I2VLoraPromptError as error:
@@ -1196,6 +1201,15 @@ def _normalized_settings(value: dict[str, Any]) -> dict[str, Any]:
         return normalize_i2v_settings(value)
     except I2VLoraSelectionError as error:
         raise I2VInputError(str(error)) from error
+
+
+async def _validate_managed_h3_loras(
+    session: AsyncSession, actor_user_id: UUID, settings: dict[str, Any]
+) -> None:
+    try:
+        await resolve_h3_loras(session, settings, actor_user_id=actor_user_id)
+    except H3LoraUnavailableError as error:
+        raise I2VConflictError(str(error)) from None
 
 
 def _dispatch_eligible(
