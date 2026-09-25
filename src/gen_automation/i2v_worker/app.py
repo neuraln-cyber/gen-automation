@@ -285,6 +285,11 @@ async def _run_job(
             prepared_path,
             width=generation_settings.width,
             height=generation_settings.height,
+            **(
+                {"preserve_source_resolution": True}
+                if generation_settings.match_source_resolution
+                else {}
+            ),
         )
         face_detector: FaceDetector | None = None
         source_face: SourceFaceAnalysis | None = None
@@ -368,6 +373,7 @@ async def _run_job(
             "loop_count": metadata["loop_count"],
             "source_fit": metadata["source_fit"],
             "match_source_aspect": metadata["match_source_aspect"],
+            "match_source_resolution": generation_settings.match_source_resolution,
             "loras": lora_provenance(generation_settings),
             "effective_positive_prompt": resolved_positive_prompt,
             "effective_negative_prompt": resolved_negative_prompt,

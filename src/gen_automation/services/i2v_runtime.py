@@ -1124,6 +1124,8 @@ def _worker_settings_snapshot(settings: Mapping[str, object]) -> dict[str, objec
     snapshot = dict(settings)
     if not snapshot.get("h3_loras"):
         snapshot.pop("h3_loras", None)
+    if not snapshot.get("match_source_resolution"):
+        snapshot.pop("match_source_resolution", None)
     return snapshot
 
 

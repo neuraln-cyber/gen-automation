@@ -171,6 +171,7 @@ class GenerationSettings(_StrictModel):
     width: int = Field(default=576, ge=32)
     height: int = Field(default=1024, ge=32)
     match_source_aspect: bool = False
+    match_source_resolution: bool = False
     seed: int = -1
     steps: int = Field(default=4, ge=2)
     high_end_step: int = Field(default=2, ge=1)
@@ -213,18 +214,21 @@ class GenerationSettings(_StrictModel):
                 or self.cfg != 1
                 or self.width % 32
                 or self.height % 32
-                or self.width * self.height > 768 * 1344
+                or (not self.match_source_resolution and self.width * self.height > 768 * 1344)
                 or max(self.width, self.height) > 2048
             ):
                 raise ValueError(
                     "MiniMax H3 requires 17n+5 frames (124-362), 24 fps, "
-                    "4 or 8 steps, Euler/simple, CFG 1 and a canvas up to 1.03 MP"
+                    "4 or 8 steps, Euler/simple, CFG 1 and 32-aligned dimensions up to 2048; "
+                    "standard mode uses a canvas up to 1.03 MP"
                 )
             if self.loras or self.face_fidelity != "off" or self.loop or self.upscale != "none":
                 raise ValueError(
                     "MiniMax H3 does not use WAN LoRAs, face locking, loops or upscaling"
                 )
             return self
+        if self.match_source_resolution:
+            raise ValueError("original-resolution generation requires MiniMax H3")
         if self.h3_loras:
             raise ValueError("H3 LoRAs require the MiniMax H3 profile")
         if self.scheduler != "linear_quadratic":
@@ -246,6 +250,17 @@ class GenerationSettings(_StrictModel):
         catalog_order = {catalog_id: index for index, catalog_id in enumerate(LORA_CATALOG)}
         self.loras.sort(key=lambda selection: catalog_order[selection.catalog_id])
         return self
+
+
+def source_resolution_canvas(width: int, height: int) -> tuple[int, int]:
+    """Pad, never resample, an H3 source onto the model's 32-pixel grid."""
+    if not (32 <= width <= 2048 and 32 <= height <= 2048):
+        raise ValueError(
+            "Original-resolution H3 images must be between 32 and 2048 pixels per side"
+        )
+    if width % 2 or height % 2:
+        raise ValueError("Exact H.264 output requires an image with even width and height")
+    return ((width + 31) // 32 * 32, (height + 31) // 32 * 32)
 
 
 class I2VJob(_StrictModel):

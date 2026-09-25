@@ -11,6 +11,7 @@
   const initialLoraProfileEnabled = root.dataset.loraProfileEnabled === "true";
   const videoProfile = root.dataset.videoProfile || "wan22";
   const isH3 = videoProfile === "minimax_h3";
+  const sourceResolutionEnabled = root.dataset.sourceResolutionEnabled === "true";
   const maxImageBytes = Number(root.dataset.maxImageBytes || 0);
   const scope = document.body.dataset.automationStorageScope || "operator";
   const draftKey = isH3 ? `i2v-draft-v2:${videoProfile}:${scope}` : `i2v-draft-v1:${scope}`;
@@ -81,6 +82,7 @@
     frame_count: 124, fps: 24, steps: 4, scheduler: "simple",
     face_fidelity: "off", video_shift: 8, audio_shift: 4, match_source_aspect: true,
     h3_loras: [],
+    match_source_resolution: false,
   });
   let saveTimer = null;
 
@@ -160,11 +162,14 @@
     const copies = Math.max(1, Number(form.elements.batch_count.value) || 1);
     const promptConflict = selectedManualPromptConflicts().length > 0;
     const loraBlocked = loraWriteBlocked();
-    enqueueButton.disabled = !hiresProfileEnabled || !canManage || !state.selected || !form.elements.positive_prompt.value.trim() || promptConflict || loraBlocked;
+    const resolutionError = sourceResolutionError();
+    enqueueButton.disabled = !hiresProfileEnabled || !canManage || !state.selected || !form.elements.positive_prompt.value.trim() || promptConflict || loraBlocked || Boolean(resolutionError);
     q("[data-submit-summary]").textContent = !hiresProfileEnabled
       ? "Video generation is paused pending worker and cost checks"
       : loraBlocked
       ? loraBlockMessage()
+      : resolutionError
+      ? resolutionError
       : state.selected
       ? `${copies} ${copies === 1 ? "generation" : "generations"} will be added to the queue`
       : "Select a source to continue";
@@ -350,6 +355,8 @@
       throw new Error("Enter a valid finite strength for each selected LoRA.");
     }
     const settings = { ...workerSettingDefaults };
+    const resolutionError = sourceResolutionError();
+    if (resolutionError) throw new Error(resolutionError);
     const numbers = new Set(["frame_count", "fps", "width", "height", "seed", "steps", "high_end_step", "cfg", "high_shift", "low_shift", "loop_count", "video_shift", "audio_shift"]);
     advanced.querySelectorAll("input[name], select[name]").forEach((field) => {
       if (field.type === "checkbox") settings[field.name] = field.checked;
@@ -359,6 +366,7 @@
     const authorization = root.querySelector("#i2v-runpod-authorization");
     settings.runpod_authorization = authorization?.checked ? "written_permission" : "sfw";
     if (isH3) {
+      if (settings.match_source_resolution) settings.match_source_aspect = false;
       settings.loras = [];
       settings.h3_loras = [...state.loraSelections].map(([artifactId, strength]) => ({
         artifact_id: artifactId,
@@ -409,9 +417,32 @@
   }
 
   function syncAspectControls() {
+    const original = isH3 && Boolean(form.elements.match_source_resolution?.checked);
+    if (isH3) {
+      form.elements.match_source_aspect.disabled = original;
+      if (original) form.elements.match_source_aspect.checked = false;
+    }
+    if (original) {
+      form.elements.width.disabled = true;
+      form.elements.height.disabled = true;
+      const width = state.selected?.sourceWidth;
+      const height = state.selected?.sourceHeight;
+      const error = sourceResolutionError();
+      if (!error && width && height) {
+        form.elements.width.value = String(Math.ceil(width / 32) * 32);
+        form.elements.height.value = String(Math.ceil(height / 32) * 32);
+      }
+      q("[data-resolution-summary]").textContent = error || (width && height
+        ? `Output: ${width} × ${height} · generation canvas: ${form.elements.width.value} × ${form.elements.height.value}. Original pixels are not resized; only added padding is trimmed.`
+        : "Select an image to use its original resolution.");
+      return;
+    }
     const automatic = form.elements.match_source_aspect.checked;
     form.elements.width.disabled = automatic;
     form.elements.height.disabled = automatic;
+    if (isH3) q("[data-resolution-summary]").textContent = automatic
+      ? "Standard-size generation preserves the source aspect, not its pixel resolution."
+      : "Custom canvas; width and height must be divisible by 32, within the standard 1.03 MP profile.";
     if (!automatic) return;
     const dimensions = sourceNativeDimensions(
       state.selected?.sourceWidth,
@@ -420,6 +451,18 @@
     if (!dimensions) return;
     form.elements.width.value = String(dimensions.width);
     form.elements.height.value = String(dimensions.height);
+  }
+
+  function sourceResolutionError() {
+    if (!isH3 || !form.elements.match_source_resolution?.checked) return "";
+    if (!sourceResolutionEnabled) return "Original resolution is waiting for the matching H3 worker update.";
+    if (!state.selected) return "";
+    const width = state.selected.sourceWidth;
+    const height = state.selected.sourceHeight;
+    if (!Number.isInteger(width) || !Number.isInteger(height)) return "Reselect the source image to load its original dimensions.";
+    if (width < 32 || height < 32 || width > 2048 || height > 2048) return "Original-resolution H3 images must be between 32 and 2048 pixels per side.";
+    if (width % 2 || height % 2) return "Exact H.264 output requires an image with even width and height.";
+    return "";
   }
 
   function setLoraSelections(values = []) {
@@ -1010,7 +1053,10 @@
   dropzone.addEventListener("drop", (event) => uploadImage(event.dataTransfer.files[0]));
   form.addEventListener("submit", enqueue);
   form.addEventListener("input", (event) => {
-    if (event.target.name === "match_source_aspect") syncAspectControls();
+    if (event.target.name === "match_source_resolution" && !event.target.checked) {
+      form.elements.match_source_aspect.checked = true;
+    }
+    if (["match_source_aspect", "match_source_resolution"].includes(event.target.name)) syncAspectControls();
     if (["frame_count", "fps", "loop", "loop_count", "face_fidelity"].includes(event.target.name)) updateDuration();
     if (event.target.name === "positive_prompt") syncLoraPromptPreview();
     scheduleDraftSave();

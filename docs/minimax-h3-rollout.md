@@ -13,6 +13,32 @@ creator's optional multi-reference/director extensions. Image generation stays
 unchanged. Salad is the provider; RunPod and the old WAN LoRAs remain disabled.
 Historical WAN settings and outputs remain readable but cannot enter the H3 queue.
 
+## Original image resolution
+
+The H3 dashboard's **Original image resolution · no downsizing** option uses
+the immutable source dimensions, not the preview JPEG dimensions. A 1144 × 1480
+source is padded to a 1152 × 1504 canvas for H3's 32-pixel grid. Input pixels are
+not resized; FFmpeg removes exactly the added border and retains the generated
+audio, producing 1144 × 1480 H.264 video. This is native larger-canvas inference,
+not a standard-size generation enlarged afterward. If no padding is needed,
+the existing video stream-copy path remains in use.
+
+Standard-size settings and previously queued jobs keep their existing behavior.
+Original mode is explicit and saved in drafts/presets/jobs. The backend derives
+the padded dimensions again from the owned source before freezing each job;
+the worker independently checks them. H.264 requires even source dimensions;
+the existing 2048-per-side profile bound remains. Larger canvases can exhaust
+GPU memory and require more GPU time; CPU shape tests do not establish GPU
+performance or output quality. No test generation is submitted automatically.
+
+Deployment: leave `GEN_AUTOMATION_I2V_H3_SOURCE_RESOLUTION_ENABLED=false` until
+the matching immutable video worker is installed at an idle queue boundary.
+Then enable it in the control-plane environment. The dashboard and queue/retry
+API reject the mode while gated off. False/absent mode fields are omitted from
+provider payloads so existing jobs remain compatible with the prior worker.
+Do not roll back to an older worker while original-resolution jobs are active
+or pending. Model artifacts and CloudFront routes do not change.
+
 Exact upstream pins are in
 `i2v-models/dasiwa-minimax-h3-turbo-v2.sources.json`. The four files total
 40,071,131,711 bytes: checkpoint 20,967,669,168; encoder 15,687,142,551;

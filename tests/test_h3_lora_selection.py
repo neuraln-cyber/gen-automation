@@ -413,6 +413,7 @@ const context = vm.createContext({
   advanced: {querySelectorAll: () => [], querySelector: () => null},
   CSS: {escape: x => x}, renderLoraCatalog() {}, syncLoraPromptPreview() {},
   syncAspectControls() {}, updateDuration() {}, announce() {},
+  sourceResolutionError: () => "",
   loraBlockMessage: () => "unavailable",
 });
 vm.runInContext(section("collectSettings", "sourceNativeDimensions") +

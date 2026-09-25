@@ -565,6 +565,8 @@ class Settings(BaseSettings):
     # back without changing its manifest.
     i2v_lora_profile_enabled: bool = False
     i2v_h3_loras_enabled: bool = False
+    # Enable only after the matching original-resolution worker is installed.
+    i2v_h3_source_resolution_enabled: bool = False
     # RunPod is enabled only after its immutable worker and persistent model
     # volume have been verified. The false state keeps cutover/rollback atomic.
     i2v_runpod_enabled: bool = False

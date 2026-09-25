@@ -44,6 +44,7 @@ from gen_automation.domain.i2v_loras import (
     validate_i2v_lora_prompt,
 )
 from gen_automation.domain.ids import uuid7
+from gen_automation.i2v_worker.models import GenerationSettings, source_resolution_canvas
 from gen_automation.services.h3_loras import H3LoraUnavailableError, resolve_h3_loras
 
 
@@ -239,6 +240,14 @@ async def create_i2v_job(
     if draft.settings is not None:
         settings.update(draft.settings)
     settings = _normalized_settings(settings)
+    if settings.get("match_source_resolution"):
+        try:
+            width, height = source_resolution_canvas(input_record.width, input_record.height)
+            settings = GenerationSettings.model_validate(
+                {**settings, "width": width, "height": height}
+            ).model_dump(mode="json")
+        except ValueError as error:
+            raise I2VInputError(str(error)) from None
     await _validate_managed_h3_loras(session, actor_user_id, settings)
     try:
         validate_i2v_lora_prompt(positive_prompt, settings)
