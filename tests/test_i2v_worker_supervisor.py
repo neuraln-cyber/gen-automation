@@ -116,6 +116,7 @@ async def test_supervisor_loads_one_cpu_face_detector_before_bootstrap(
     finally:
         await supervisor.stop()
     assert supervisor.face_detector is None
+    assert supervisor.stage == "ready"
 
 
 @pytest.mark.asyncio
@@ -158,5 +159,69 @@ async def test_face_detector_load_failure_fails_before_model_or_comfy_start(
     assert supervisor.ready is False
     assert supervisor.face_detector is None
     assert calls == {"bootstrap": 0, "start": 0}
-    assert log_calls == [("face stabilizer startup failed: reason_code=%s", ("internal",))]
+    assert log_calls == [
+        ("face stabilizer startup failed: reason_code=%s", ("internal",)),
+        (
+            "i2v_startup_failed stage=%s error_type=%s",
+            ("face_preflight", "WorkerStartupError"),
+        ),
+    ]
     assert "sensitive detector path" not in repr(log_calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["gpu_preflight", "model_download", "comfy_start"])
+async def test_unexpected_startup_exception_fails_health_instead_of_hanging(
+    tmp_path: Path, monkeypatch: Any, caplog: Any, stage: str
+) -> None:
+    import gen_automation.i2v_worker.supervisor as module
+
+    def fail(*_args: Any, **_kwargs: Any) -> None:
+        raise ValueError("https://private.invalid/?token=do-not-log")
+
+    class FailingBootstrapper(_Bootstrapper):
+        async def bootstrap(self) -> None:
+            if stage == "model_download":
+                fail()
+
+    monkeypatch.setattr(
+        module, "_verify_gpu_runtime", fail if stage == "gpu_preflight" else lambda _: None
+    )
+    monkeypatch.setattr(module, "preflight_face_stabilizer", lambda **_: object())
+    monkeypatch.setattr(module, "S3ModelBootstrapper", FailingBootstrapper)
+    monkeypatch.setattr(module, "_start_process", fail)
+    supervisor = WorkerSupervisor(_settings(tmp_path))
+    await supervisor.start()
+    await _wait_for(lambda: supervisor.failed)
+    await supervisor.stop()
+
+    assert supervisor.ready is False
+    assert supervisor.face_detector is None
+    assert supervisor.stage == stage
+    assert supervisor._task is not None and supervisor._task.exception() is None
+    assert f"i2v_startup_failed stage={stage} error_type=ValueError" in caplog.text
+    assert "private.invalid" not in caplog.text
+    assert "do-not-log" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_normal_cancellation_is_not_reported_as_startup_failure(
+    tmp_path: Path, monkeypatch: Any, caplog: Any
+) -> None:
+    import gen_automation.i2v_worker.supervisor as module
+
+    class WaitingBootstrapper(_Bootstrapper):
+        async def bootstrap(self) -> None:
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(module, "_verify_gpu_runtime", lambda _: None)
+    monkeypatch.setattr(module, "preflight_face_stabilizer", lambda **_: object())
+    monkeypatch.setattr(module, "S3ModelBootstrapper", WaitingBootstrapper)
+    supervisor = WorkerSupervisor(_settings(tmp_path))
+    await supervisor.start()
+    await _wait_for(lambda: supervisor.stage == "model_download")
+    await supervisor.stop()
+
+    assert supervisor.failed is False
+    assert supervisor.ready is False
+    assert "i2v_startup_failed" not in caplog.text
