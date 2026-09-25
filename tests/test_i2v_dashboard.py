@@ -15,6 +15,9 @@ class _InputCollector(HTMLParser):
 
 
 def test_i2v_dashboard_exposes_focused_generation_controls(client: TestClient) -> None:
+    client.app.state.settings = client.app.state.settings.model_copy(
+        update={"i2v_runpod_enabled": True}
+    )
     response = client.get("/dashboard/animations")
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
@@ -77,7 +80,7 @@ def test_i2v_dashboard_pauses_enqueue_until_matching_worker_is_enabled(
 
     assert response.status_code == 200
     assert 'data-hires-profile-enabled="false"' in response.text
-    assert "Higher-resolution submissions are paused" in response.text
+    assert "Video submissions are paused" in response.text
     assert ">Animate</a>" in response.text
 
 
@@ -138,7 +141,7 @@ def test_i2v_dashboard_default_submit_controls_are_constraint_valid(
     assert 'face_fidelity: "stable_expression"' in script
     assert 'runpod_authorization: "sfw"' in script
     assert 'root.querySelector("#i2v-runpod-authorization")' in script
-    assert 'authorization.checked ? "written_permission" : "sfw"' in script
+    assert 'authorization?.checked ? "written_permission" : "sfw"' in script
     assert 'authorization.checked = value === "written_permission"' in script
 
 

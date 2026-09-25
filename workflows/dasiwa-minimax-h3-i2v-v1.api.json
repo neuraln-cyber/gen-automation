@@ -1,0 +1,18 @@
+{
+  "1": {"class_type": "LoadImage", "inputs": {"image": {"$i2v": "input.image"}}},
+  "2": {"class_type": "UNETLoader", "inputs": {"unet_name": {"$i2v": "model.diffusion_model"}, "weight_dtype": "default"}},
+  "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": {"$i2v": "model.text_encoder"}, "type": "minimax", "device": "default"}},
+  "4": {"class_type": "VAELoader", "inputs": {"vae_name": {"$i2v": "model.video_vae"}}},
+  "5": {"class_type": "VAELoader", "inputs": {"vae_name": {"$i2v": "model.audio_vae"}}},
+  "6": {"class_type": "MiniMaxH3ImageToVideo", "inputs": {"clip": ["3", 0], "vae": ["4", 0], "first_frame": ["1", 0], "prompt": {"$i2v": "prompt.positive"}, "width": {"$i2v": "generation.width"}, "height": {"$i2v": "generation.height"}, "length": {"$i2v": "generation.frame_count"}}},
+  "7": {"class_type": "MiniMaxH3SigmaShift", "inputs": {"model": ["2", 0], "shift_video": {"$i2v": "sampling.video_shift"}, "shift_audio": {"$i2v": "sampling.audio_shift"}}},
+  "8": {"class_type": "RandomNoise", "inputs": {"noise_seed": {"$i2v": "generation.seed"}}},
+  "9": {"class_type": "BasicGuider", "inputs": {"model": ["7", 0], "conditioning": ["6", 0]}},
+  "10": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": {"$i2v": "sampling.sampler"}}},
+  "11": {"class_type": "BasicScheduler", "inputs": {"model": ["7", 0], "scheduler": {"$i2v": "sampling.scheduler"}, "steps": {"$i2v": "sampling.steps"}, "denoise": 1.0}},
+  "12": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["8", 0], "guider": ["9", 0], "sampler": ["10", 0], "sigmas": ["11", 0], "latent_image": ["6", 1]}},
+  "13": {"class_type": "VAEDecode", "inputs": {"samples": ["12", 0], "vae": ["4", 0]}},
+  "14": {"class_type": "SaveVideo", "inputs": {"video": ["16", 0], "filename_prefix": {"$i2v": "output.frame_prefix"}, "format": "mp4", "codec": "h264", "codec.encoding": "auto"}},
+  "15": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["12", 0], "vae": ["5", 0]}},
+  "16": {"class_type": "CreateVideo", "inputs": {"images": ["13", 0], "audio": ["15", 0], "fps": {"$i2v": "generation.fps"}, "bit_depth": 8}}
+}

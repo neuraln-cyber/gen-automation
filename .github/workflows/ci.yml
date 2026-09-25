@@ -98,6 +98,22 @@ jobs:
           --ignore-glob=tests/test_runpod_i2v*.py
           --cov=gen_automation
           --cov-report=term-missing
+      - name: Video delivery, H3 profile and cost guard contracts
+        run: >-
+          python -m pytest -q
+          tests/test_i2v_h3_readiness.py
+          tests/test_i2v_runtime.py
+          tests/test_i2v_salad.py
+          tests/test_i2v_environment.py
+          tests/test_i2v_worker_artifacts.py
+          tests/test_i2v_worker_contract.py
+          tests/test_i2v_worker_app.py
+          tests/test_i2v_worker_comfy.py
+          tests/test_i2v_worker_supervisor.py
+          tests/test_i2v_worker_media.py
+          tests/test_i2v_api.py
+          tests/test_i2v_dashboard.py
+          tests/test_i2v_service.py
 
   postgresql-migrations:
     name: PostgreSQL migration contract

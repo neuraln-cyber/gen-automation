@@ -34,7 +34,6 @@ from gen_automation.domain.i2v import (
     I2VPresetSnapshot,
     I2VWorkerDeploymentRegistration,
     I2VWorkerDeploymentSnapshot,
-    I2VWorkerDeploymentState,
 )
 from gen_automation.domain.i2v_loras import (
     I2VLoraPromptError,
@@ -411,6 +410,7 @@ async def claim_next_i2v_job(
     worker_deployment_id: UUID | None = None,
     worker_image_digest: str | None = None,
     reviewed_loras_enabled: bool = False,
+    profile: str = "wan22",
     now: datetime | None = None,
 ) -> I2VClaim | None:
     normalized_worker = _nonempty_text(worker_id, "worker id")
@@ -433,6 +433,7 @@ async def claim_next_i2v_job(
             if _dispatch_eligible(
                 queued.settings_snapshot,
                 reviewed_loras_enabled=reviewed_loras_enabled,
+                profile=profile,
             )
         ),
         None,
@@ -470,6 +471,7 @@ async def claim_next_i2v_job(
         _dispatch_eligible(
             queued.settings_snapshot,
             reviewed_loras_enabled=reviewed_loras_enabled,
+            profile=profile,
         )
         for queued in queued_jobs
     ):
@@ -909,17 +911,18 @@ async def get_i2v_worker_deployment(
     session: AsyncSession,
     *,
     deployment_id: UUID | None = None,
+    provider: str | None = None,
+    worker_image: str | None = None,
 ) -> I2VWorkerDeploymentSnapshot | None:
     statement = select(I2VWorkerDeployment)
+    if provider is not None:
+        statement = statement.where(I2VWorkerDeployment.provider == provider)
+    if worker_image is not None:
+        statement = statement.where(I2VWorkerDeployment.worker_image_digest == worker_image)
     if deployment_id is not None:
         statement = statement.where(I2VWorkerDeployment.id == deployment_id)
     else:
         statement = statement.order_by(
-            case(
-                (I2VWorkerDeployment.state == I2VWorkerDeploymentState.BUSY, 0),
-                (I2VWorkerDeployment.state == I2VWorkerDeploymentState.READY, 1),
-                else_=2,
-            ),
             I2VWorkerDeployment.updated_at.desc(),
             I2VWorkerDeployment.id.desc(),
         ).limit(1)
@@ -1199,7 +1202,10 @@ def _dispatch_eligible(
     value: dict[str, Any],
     *,
     reviewed_loras_enabled: bool,
+    profile: str = "wan22",
 ) -> bool:
+    if value.get("profile", "wan22") != profile:
+        return False
     kind = classify_i2v_lora_settings(value)
     return kind == I2VLoraSettingsKind.BASELINE or (
         kind == I2VLoraSettingsKind.REVIEWED and reviewed_loras_enabled

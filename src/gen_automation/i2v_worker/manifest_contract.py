@@ -16,9 +16,18 @@ BASELINE_I2V_MODEL_ROLES = (
     "text_encoder",
     "vae",
 )
+MINIMAX_I2V_MODEL_ROLES = ("diffusion_model", "text_encoder", "video_vae", "audio_vae")
 
 
-def required_i2v_model_roles(*, reviewed_loras_enabled: bool) -> tuple[str, ...]:
+def required_i2v_model_roles(
+    *, reviewed_loras_enabled: bool, profile: str = "wan22"
+) -> tuple[str, ...]:
+    if profile == "minimax_h3":
+        if reviewed_loras_enabled:
+            raise ValueError("WAN LoRAs cannot be installed in a MiniMax profile")
+        return MINIMAX_I2V_MODEL_ROLES
+    if profile != "wan22":
+        raise ValueError("unknown I2V profile")
     return (
         (*BASELINE_I2V_MODEL_ROLES, *REQUIRED_LORA_ROLES)
         if reviewed_loras_enabled
@@ -30,6 +39,7 @@ def validated_i2v_manifest_objects(
     document: object,
     *,
     reviewed_loras_enabled: bool,
+    profile: str = "wan22",
 ) -> dict[str, Mapping[str, Any]]:
     if (
         not isinstance(document, dict)
@@ -47,7 +57,9 @@ def validated_i2v_manifest_objects(
             raise ValueError("I2V private model manifest duplicates a role")
         by_role[role] = value
 
-    required_roles = required_i2v_model_roles(reviewed_loras_enabled=reviewed_loras_enabled)
+    required_roles = required_i2v_model_roles(
+        reviewed_loras_enabled=reviewed_loras_enabled, profile=profile
+    )
     if any(role not in by_role for role in required_roles):
         raise ValueError("I2V private model manifest is incomplete")
     if reviewed_loras_enabled:

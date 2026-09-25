@@ -270,8 +270,9 @@ def encode_video(
             stderr=subprocess.PIPE,
             check=True,
             close_fds=True,
+            timeout=300,
         )
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.SubprocessError):
         raise MediaError("video encoding failed") from None
     metadata = _probe_video(
         output,
@@ -340,6 +341,72 @@ def _output_frame_indices(settings: GenerationSettings) -> tuple[int, ...]:
     return cycle * settings.loop_count
 
 
+def finalize_native_video(
+    paths: tuple[Path, ...],
+    settings: GenerationSettings,
+    job_root: Path,
+    *,
+    source_width: int,
+    source_height: int,
+) -> tuple[Path, dict[str, Any]]:
+    """Keep H3's generated audio/video; normalize MP4 playback without another GPU pass."""
+    del source_width, source_height
+    if len(paths) != 1 or paths[0].suffix.lower() != ".mp4":
+        raise MediaError("native video output is invalid")
+    output = job_root / "video.mp4"
+    try:
+        subprocess.run(  # noqa: S603
+            (  # noqa: S607
+                "ffmpeg",
+                "-nostdin",
+                "-v",
+                "error",
+                "-i",
+                str(paths[0]),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-map_metadata",
+                "-1",
+                "-movflags",
+                "+faststart",
+                str(output),
+            ),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            check=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise MediaError("native video finalization failed") from None
+    metadata = _probe_video(
+        output,
+        settings,
+        width=settings.width,
+        height=settings.height,
+        frame_count=settings.frame_count,
+    )
+    metadata.update(
+        {
+            "native_width": settings.width,
+            "native_height": settings.height,
+            "upscale": "none",
+            "loop_mode": "none",
+            "loop_count": 1,
+            "source_fit": "contain_edge_pad",
+            "match_source_aspect": settings.match_source_aspect,
+        }
+    )
+    return output, metadata
+
+
 def _probe_video(
     path: Path,
     settings: GenerationSettings,
@@ -368,6 +435,7 @@ def _probe_video(
             capture_output=True,
             check=True,
             close_fds=True,
+            timeout=300,
         )
         payload = json.loads(result.stdout)
         stream = payload["streams"][0]
@@ -392,6 +460,7 @@ def _probe_video(
         KeyError,
         IndexError,
         subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
         json.JSONDecodeError,
     ):
         raise MediaError("encoded video contract is invalid") from None

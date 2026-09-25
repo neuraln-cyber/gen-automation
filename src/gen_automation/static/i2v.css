@@ -1,4 +1,6 @@
 .i2v-studio { --i2v-cyan: #72d7ff; --i2v-cyan-soft: rgba(114, 215, 255, .12); }
+.i2v-studio [hidden] { display: none !important; }
+.i2v-advanced > .muted { padding: 0 .9rem .9rem; font-size: .78rem; line-height: 1.5; }
 .i2v-hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(18rem, 25rem); gap: 1rem; align-items: end; margin-bottom: 1.25rem; }
 .i2v-hero-copy { max-width: 54rem; }
 .i2v-worker { padding: 1rem; border: 1px solid var(--border-strong); border-radius: var(--radius); background: rgba(10, 11, 19, .62); }

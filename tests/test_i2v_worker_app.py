@@ -130,6 +130,21 @@ def _job() -> dict[str, object]:
     }
 
 
+def test_private_delivery_rejects_off_route_input_before_inference(tmp_path: Path) -> None:
+    settings = _settings(tmp_path).model_copy(
+        update={
+            "require_private_delivery": True,
+            "model_delivery_domain": "d123abc.cloudfront.net",
+        }
+    )
+    supervisor = _Supervisor()
+    app = create_i2v_worker_app(settings, supervisor=supervisor)  # type: ignore[arg-type]
+    with TestClient(app) as client:
+        response = client.post("/jobs/i2v", json=_job())
+        assert response.status_code == 409
+        assert response.json()["detail"] == "private input delivery is required"
+
+
 def test_health_is_early_but_readiness_waits_for_models_and_comfy(tmp_path: Path) -> None:
     supervisor = _Supervisor(ready=False)
     app = create_i2v_worker_app(_settings(tmp_path), supervisor=supervisor)  # type: ignore[arg-type]
@@ -155,6 +170,7 @@ def test_ready_reports_nonsecret_exact_worker_capability_identity(tmp_path: Path
     capability = response.json()["capability"]
     assert capability == {
         "schema": "gen-automation/i2v-worker-capability/v1",
+        "profile": "wan22",
         "lora_worker_enabled": True,
         "private_manifest_source_sha256": "c" * 64,
         "model_objects_sha256": settings.model_objects_sha256,

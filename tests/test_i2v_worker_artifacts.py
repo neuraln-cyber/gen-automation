@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -153,3 +154,28 @@ async def test_existing_wrong_model_fails_closed_without_overwrite(tmp_path: Pat
     with pytest.raises(ModelBootstrapError):
         await S3ModelBootstrapper(settings, client=_S3(content, model.version_id)).bootstrap()
     assert target.read_bytes() == b"wrong!!"
+
+
+def test_parallel_ranges_keep_order_and_exact_hash(tmp_path: Path) -> None:
+    content = b"a" * (1024 * 1024) + b"b" * (1024 * 1024) + b"c" * (1024 * 1024) + b"d"
+    digest = hashlib.sha256(content).hexdigest()
+    model = ModelObject(
+        role="diffusion_model_high",
+        bucket="models",
+        key=f"worker/i2v/sha256/{digest}",
+        version_id="v1",
+        byte_size=len(content),
+        sha256=digest,
+        install_path="models/diffusion_models/high.safetensors",
+    )
+    barrier = threading.Barrier(4, timeout=5)
+
+    class ParallelS3(_S3):
+        def get_object(self, **kwargs: str) -> dict[str, object]:
+            barrier.wait()
+            return super().get_object(**kwargs)
+
+    client = ParallelS3(content, "v1")
+    bootstrapper = S3ModelBootstrapper(_settings(tmp_path, model), client=client)
+    assert bootstrapper._materialize(model).read_bytes() == content
+    assert len(client.ranges) == 4

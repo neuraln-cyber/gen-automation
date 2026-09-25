@@ -26,6 +26,7 @@ from gen_automation.i2v_worker.media import (
     MediaError,
     download_input,
     encode_video,
+    finalize_native_video,
     prepare_input_image,
     resolve_generation_settings,
     upload_video,
@@ -70,7 +71,9 @@ def create_i2v_worker_app(
 ) -> FastAPI:
     resolved_supervisor = supervisor or WorkerSupervisor(settings)
     execution_lock = asyncio.Lock()
-    workflow = load_workflow_template(settings.workflow_template)
+    workflow = load_workflow_template(
+        settings.effective_workflow_template, profile=settings.profile
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -101,7 +104,7 @@ def create_i2v_worker_app(
         is_ready = bool(
             resolved_supervisor.ready
             and comfy is not None
-            and resolved_supervisor.face_detector is not None
+            and (settings.profile == "minimax_h3" or resolved_supervisor.face_detector is not None)
             and await comfy.ready()
         )
         content: dict[str, object] = {
@@ -111,6 +114,7 @@ def create_i2v_worker_app(
             content["capability"] = {
                 "schema": "gen-automation/i2v-worker-capability/v1",
                 "lora_worker_enabled": settings.lora_worker_enabled,
+                "profile": settings.profile,
                 "private_manifest_source_sha256": (settings.private_manifest_source_sha256),
                 "model_objects_sha256": settings.model_objects_sha256,
                 "artifact_identity_sha256": settings.artifact_identity_sha256,
@@ -135,7 +139,7 @@ def create_i2v_worker_app(
         source_revision: str,
     ) -> JSONResponse:
         if (
-            not settings.lora_worker_enabled
+            (not settings.lora_worker_enabled and settings.profile != "minimax_h3")
             or settings.private_manifest_source_sha256 is None
             or settings.source_revision is None
             or manifest_sha256 != settings.private_manifest_source_sha256
@@ -157,7 +161,7 @@ def create_i2v_worker_app(
         if (
             not resolved_supervisor.ready
             or resolved_supervisor.comfy_client is None
-            or resolved_supervisor.face_detector is None
+            or (settings.profile == "wan22" and resolved_supervisor.face_detector is None)
         ):
             raise HTTPException(status_code=503, detail="worker not ready")
         try:
@@ -165,6 +169,17 @@ def create_i2v_worker_app(
             job = I2VJob.model_validate_json(body, strict=True)
         except (ValidationError, ValueError, json.JSONDecodeError):
             raise HTTPException(status_code=400, detail="invalid request") from None
+        if job.settings_snapshot.profile != settings.profile:
+            raise HTTPException(status_code=409, detail="job requires a different worker profile")
+        if settings.require_private_delivery and (
+            job.input_grant.url.scheme != "https"
+            or job.input_grant.url.host != settings.model_delivery_domain
+        ):
+            raise HTTPException(status_code=409, detail="private input delivery is required")
+        if settings.profile == "minimax_h3" and job.negative_prompt.strip():
+            raise HTTPException(
+                status_code=400, detail="MiniMax H3 uses one positive direction prompt"
+            )
         if job.settings_snapshot.loras and not settings.lora_worker_enabled:
             raise HTTPException(
                 status_code=409,
@@ -177,12 +192,20 @@ def create_i2v_worker_app(
 
         async with execution_lock:
             try:
-                return await _run_job(
-                    job,
-                    settings=settings,
-                    supervisor=resolved_supervisor,
-                    workflow=workflow,
-                )
+                async with asyncio.timeout(settings.execution_timeout_seconds):
+                    return await _run_job(
+                        job,
+                        settings=settings,
+                        supervisor=resolved_supervisor,
+                        workflow=workflow,
+                    )
+            except TimeoutError:
+                # Stop the actual inference process, not just its HTTP waiter.
+                await resolved_supervisor.stop()
+                resolved_supervisor.failed = True
+                raise HTTPException(
+                    status_code=500, detail="generation time limit exceeded"
+                ) from None
             except FaceStabilizationError as error:
                 status_code = 422 if error.is_contract_failure else 500
                 _LOGGER.warning(
@@ -265,6 +288,9 @@ async def _run_job(
             settings=generation_settings,
             job_id=job.job_id,
             attempt_id=job.attempt_id,
+            model_paths={
+                item.role: item.install_path.split("/", 2)[2] for item in settings.model_objects
+            },
         )
         resolved_positive_prompt = effective_positive_prompt(
             job.positive_prompt,
@@ -293,7 +319,7 @@ async def _run_job(
             frames = stabilized.frames
             face_metadata = stabilized.metadata
         video, metadata = await asyncio.to_thread(
-            encode_video,
+            finalize_native_video if generation_settings.profile == "minimax_h3" else encode_video,
             frames,
             generation_settings,
             job_root,
@@ -308,7 +334,12 @@ async def _run_job(
             allow_http=allow_http,
         )
         output_metadata: dict[str, Any] = {
-            "workflow": "dasiwa-wan22-i2v-v1",
+            "workflow": (
+                "dasiwa-minimax-h3-i2v-v1"
+                if settings.profile == "minimax_h3"
+                else "dasiwa-wan22-i2v-v1"
+            ),
+            "audio": settings.profile == "minimax_h3",
             "seed": seed,
             "codec": metadata["codec"],
             "pixel_format": metadata["pixel_format"],

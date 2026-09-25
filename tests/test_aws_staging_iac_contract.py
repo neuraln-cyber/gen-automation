@@ -1,3 +1,4 @@
+import json
 import re
 from pathlib import Path
 
@@ -327,6 +328,17 @@ def test_salad_artifact_reader_is_disabled_and_exact_version_only() -> None:
     assert 'actions   = ["sts:AssumeRole"]' in control_policy
     assert "aws_iam_role.salad_worker_artifact_reader[0].arn" in control_policy
     assert '"${aws_s3_bucket.models.arn}/*"' not in control_policy
+
+
+def test_salad_artifact_reader_retains_exact_compact_diffusion_model_keys() -> None:
+    variables = (INFRA / "variables.tf").read_text(encoding="utf-8")
+    block = variables.split('variable "salad_worker_artifact_object_versions" {', 1)[1]
+    encoded = re.search(r'regex\(\s*("(?:[^"\\]|\\.)*")', block)
+    assert encoded is not None
+    pattern = json.loads(encoded.group(1))
+    assert re.fullmatch(pattern, "w/d/abcdef12.safetensors")
+    for invalid in ("w/d/*.safetensors", "w/d/../../secret", "w/d/abcdef12.bin", "other/x"):
+        assert re.fullmatch(pattern, invalid) is None
 
 
 def test_salad_artifact_reader_hard_blocks_the_rendered_inline_policy_quota() -> None:

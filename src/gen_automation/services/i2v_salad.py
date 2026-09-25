@@ -610,7 +610,9 @@ def _truthful_deployment_state(
         for instance in instances
     ):
         return I2VWorkerDeploymentState.PROVISIONING
-    if status == "stopped" and group.replicas == 0:
+    # `replicas` is the desired count retained across stop/start, not a live
+    # instance count. Salad returns stopped groups with replicas=1.
+    if status == "stopped":
         return I2VWorkerDeploymentState.STOPPED
     # A provider-level running/pending group with no ready instance is not ready.
     return I2VWorkerDeploymentState.PROVISIONING

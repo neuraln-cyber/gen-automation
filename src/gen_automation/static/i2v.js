@@ -9,9 +9,11 @@
   const canManage = root.dataset.canManage === "true";
   const hiresProfileEnabled = root.dataset.hiresProfileEnabled === "true";
   const initialLoraProfileEnabled = root.dataset.loraProfileEnabled === "true";
+  const videoProfile = root.dataset.videoProfile || "wan22";
+  const isH3 = videoProfile === "minimax_h3";
   const maxImageBytes = Number(root.dataset.maxImageBytes || 0);
   const scope = document.body.dataset.automationStorageScope || "operator";
-  const draftKey = `i2v-draft-v1:${scope}`;
+  const draftKey = isH3 ? `i2v-draft-v2:${videoProfile}:${scope}` : `i2v-draft-v1:${scope}`;
   const form = root.querySelector("[data-generation-form]");
   const advanced = root.querySelector("[data-advanced-settings]");
   const sourceLibrary = root.querySelector("[data-source-library]");
@@ -51,6 +53,7 @@
   const maxLoopDurationSeconds = 25;
   const maxLoopCycles = 20;
   const workerSettingDefaults = {
+    profile: videoProfile,
     frame_count: 81,
     fps: 16,
     width: 576,
@@ -74,6 +77,10 @@
     runpod_authorization: "sfw",
     loras: [],
   };
+  if (isH3) Object.assign(workerSettingDefaults, {
+    frame_count: 124, fps: 24, steps: 4, scheduler: "simple",
+    face_fidelity: "off", video_shift: 8, audio_shift: 4, match_source_aspect: true,
+  });
   let saveTimer = null;
 
   const q = (selector) => root.querySelector(selector);
@@ -154,7 +161,7 @@
     const loraBlocked = loraWriteBlocked();
     enqueueButton.disabled = !hiresProfileEnabled || !canManage || !state.selected || !form.elements.positive_prompt.value.trim() || promptConflict || loraBlocked;
     q("[data-submit-summary]").textContent = !hiresProfileEnabled
-      ? "Waiting for the matching high-resolution worker rollout"
+      ? "Video generation is paused pending worker and cost checks"
       : loraBlocked
       ? loraBlockMessage()
       : state.selected
@@ -338,15 +345,15 @@
 
   function collectSettings() {
     if (loraWriteBlocked()) throw new Error(loraBlockMessage());
-    const settings = {};
-    const numbers = new Set(["frame_count", "fps", "width", "height", "seed", "steps", "high_end_step", "cfg", "high_shift", "low_shift", "loop_count"]);
+    const settings = { ...workerSettingDefaults };
+    const numbers = new Set(["frame_count", "fps", "width", "height", "seed", "steps", "high_end_step", "cfg", "high_shift", "low_shift", "loop_count", "video_shift", "audio_shift"]);
     advanced.querySelectorAll("input[name], select[name]").forEach((field) => {
       if (field.type === "checkbox") settings[field.name] = field.checked;
       else if (numbers.has(field.name)) settings[field.name] = Number(field.value);
       else settings[field.name] = field.value;
     });
     const authorization = root.querySelector("#i2v-runpod-authorization");
-    settings.runpod_authorization = authorization.checked ? "written_permission" : "sfw";
+    settings.runpod_authorization = authorization?.checked ? "written_permission" : "sfw";
     settings.loras = [...state.loraSelections].map(([catalogId, strength]) => ({
       catalog_id: catalogId,
       strength,
@@ -360,7 +367,7 @@
       if (name === "loras") return;
       if (name === "runpod_authorization") {
         const authorization = root.querySelector("#i2v-runpod-authorization");
-        authorization.checked = value === "written_permission";
+        if (authorization) authorization.checked = value === "written_permission";
         return;
       }
       const field = advanced.querySelector(`[name="${CSS.escape(name)}"]`);
@@ -631,6 +638,11 @@
   }
 
   async function loadLoraCatalog() {
+    if (isH3) {
+      state.loraCatalogLoaded = true;
+      state.loraProfileEnabled = false;
+      return;
+    }
     try {
       const catalog = await api("/loras");
       state.loraProfileEnabled = catalog.profile_enabled;
@@ -658,6 +670,10 @@
   }
 
   function updateDuration() {
+    if (isH3) {
+      q("[data-duration]").textContent = `${(Number(form.elements.frame_count.value) / 24).toFixed(2)} seconds at 24 fps`;
+      return;
+    }
     const frames = Number(form.elements.frame_count.value) || 0;
     const fps = Number(form.elements.fps.value) || 0;
     const loopToggle = form.elements.loop;
@@ -719,7 +735,7 @@
   }
 
   async function loadPresets() {
-    state.presets = await api("/presets");
+    state.presets = (await api("/presets")).filter((item) => (item.settings.profile || "wan22") === videoProfile);
     const selected = presetSelect.value;
     presetSelect.replaceChildren(new Option("Custom settings", ""));
     state.presets.forEach((item) => presetSelect.add(new Option(item.name, item.preset_id)));
@@ -855,10 +871,24 @@
     try {
       const worker = await api("/worker");
       const deployment = worker.deployment;
-      const workerState = deployment?.state || (worker.configured ? "unknown" : "stopped");
-      q("[data-worker-state]").textContent = deployment ? workerState.replaceAll("_", " ") : "No active worker";
+      const workerState = worker.status_available ? deployment?.state || "unknown" : "unknown";
+      q("[data-worker-state]").textContent = worker.cost_guard_reason ? "Paused by cost guard" : !worker.configured ? "Disabled" : worker.status_available ? workerState.replaceAll("_", " ") : "Awaiting fresh status";
       q("[data-worker-message]").textContent = worker.message;
       q("[data-worker-dot]").className = `i2v-worker-dot ${workerState}`;
+      q("[data-worker-cost]").textContent = `${worker.private_model_delivery ? "Private delivery configured" : "Private delivery not configured"} · Idle shutdown: ${worker.idle_timeout_seconds == null ? "not configured" : `${Math.round(worker.idle_timeout_seconds / 60)} min`}. Salad GPU time is billed separately from delivery.`;
+      const resume = q("[data-worker-resume]");
+      resume.hidden = !worker.can_resume || !canManage;
+      resume.onclick = async () => {
+        if (!window.confirm("Resume the video queue? This may start a paid Salad GPU. Only continue after resolving the timeout cause.")) return;
+        resume.disabled = true;
+        try {
+          await api("/worker:resume", { method: "POST", body: JSON.stringify({
+            deployment_id: deployment.deployment_id, expected_guard_at: deployment.metadata.cost_guard_at,
+          }) });
+          await loadWorker();
+        } catch (error) { announce(error.message, true); }
+        finally { resume.disabled = false; }
+      };
       const facts = q("[data-worker-facts]"); facts.hidden = !deployment;
       if (deployment) {
         q("[data-worker-machine]").textContent = deployment.provider_instance_id || "Provider has not assigned one";
@@ -866,6 +896,7 @@
         q("[data-worker-job]").textContent = deployment.current_job_id ? String(deployment.current_job_id).slice(0, 8) : "None";
       }
     } catch (error) {
+      q("[data-worker-resume]").hidden = true;
       q("[data-worker-state]").textContent = "Status unavailable";
       q("[data-worker-message]").textContent = error.message;
       q("[data-worker-dot]").className = "i2v-worker-dot unknown";
@@ -886,11 +917,33 @@
       heading.append(text("strong", `Video ${String(output.output_id).slice(0, 8)}`), statusChip("succeeded"));
       const facts = text("p", `${output.width} × ${output.height} · ${output.frame_count} frames · ${output.fps} fps · ${(output.duration_ms / 1000).toFixed(2)}s`);
       const actions = document.createElement("div"); actions.className = "i2v-video-actions";
-      const download = document.createElement("a"); download.className = "secondary-button"; download.href = item.download_url; download.textContent = "Download";
+      const download = document.createElement("button"); download.className = "secondary-button"; download.type = "button"; download.textContent = "Download";
+      download.addEventListener("click", async () => {
+        download.disabled = true;
+        download.textContent = "Downloading…";
+        let url;
+        try {
+          // Fetch the playback grant through the private delivery route. Naming
+          // the local Blob avoids an attachment query that bypasses CloudFront.
+          const response = await fetch(item.playback_url, { credentials: "same-origin" });
+          if (!response.ok) throw new Error(`Video download failed (${response.status})`);
+          url = URL.createObjectURL(await response.blob());
+          const link = document.createElement("a");
+          link.href = url; link.download = `video-${output.output_id}.mp4`;
+          document.body.append(link); link.click(); link.remove();
+        } catch (error) { announce(error.message, true); }
+        finally {
+          if (url) setTimeout(() => URL.revokeObjectURL(url), 60000);
+          download.disabled = false; download.textContent = "Download";
+        }
+      });
       const reuse = document.createElement("button"); reuse.className = "secondary-button"; reuse.type = "button"; reuse.textContent = "Use settings";
       reuse.addEventListener("click", () => {
         const job = state.jobs.find((candidate) => candidate.job_id === output.job_id);
         if (!job) { announce("The source job is outside the current history.", true); return; }
+        if ((job.settings_snapshot?.profile || "wan22") !== videoProfile) {
+          announce("This video used a different model. Its settings cannot be applied here.", true); return;
+        }
         form.elements.positive_prompt.value = job.positive_prompt;
         form.elements.negative_prompt.value = job.negative_prompt;
         applySettings(job.settings_snapshot || {}); scheduleDraftSave(); form.scrollIntoView({ behavior: "smooth" });

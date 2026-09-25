@@ -42,6 +42,8 @@ async def dashboard_i2v(request: Request, principal: ReleaseReader) -> Response:
             "max_image_bytes": settings.storage_max_image_bytes,
             "hires_profile_enabled": settings.i2v_hires_profile_enabled,
             "lora_profile_enabled": settings.i2v_lora_profile_enabled,
+            "video_profile": settings.i2v_profile,
+            "video_provider": "RunPod" if settings.i2v_runpod_enabled else "Salad",
         },
     )
     response.headers["Cache-Control"] = "private, no-store"

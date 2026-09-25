@@ -28,11 +28,25 @@ class ComfyClient:
         request_timeout_seconds: float,
         network_attempts: int,
         poll_seconds: float,
+        profile: str = "wan22",
     ) -> None:
         if base_url != "http://127.0.0.1:8188":
             raise ComfyError("ComfyUI endpoint is invalid")
         self.network_attempts = network_attempts
         self.poll_seconds = poll_seconds
+        self.required_nodes = (
+            _REQUIRED_NODES
+            if profile == "wan22"
+            else tuple(
+                (name, f"/object_info/{name}")
+                for name in (
+                    "MiniMaxH3ImageToVideo",
+                    "MiniMaxH3SigmaShift",
+                    "SaveVideo",
+                    "VAEDecodeAudio",
+                )
+            )
+        )
         self.client = httpx2.AsyncClient(
             base_url=base_url,
             follow_redirects=False,
@@ -49,7 +63,7 @@ class ComfyClient:
             response = await self.client.get("/system_stats")
             if response.status_code != 200:
                 return False
-            for node_name, node_path in _REQUIRED_NODES:
+            for node_name, node_path in self.required_nodes:
                 node_response = await self.client.get(node_path)
                 if node_response.status_code != 200:
                     return False

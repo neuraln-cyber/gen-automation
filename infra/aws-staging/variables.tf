@@ -240,7 +240,7 @@ variable "salad_worker_artifact_object_versions" {
       && alltrue([
         for object_key, version_id in var.salad_worker_artifact_object_versions :
         can(regex(
-          "^worker/((checkpoints|diffusion-models|loras|detectors|text-encoders|vae)/[A-Za-z0-9][A-Za-z0-9._/-]*|i2v/sha256/[0-9a-f]{64}|i2v/manifests/sha256/[0-9a-f]{64}\\.json)$",
+          "^(worker/((checkpoints|diffusion-models|loras|detectors|text-encoders|vae)/[A-Za-z0-9][A-Za-z0-9._/-]*|i2v/sha256/[0-9a-f]{64}|i2v/manifests/sha256/[0-9a-f]{64}\\.json)|w/d/[0-9a-f]{8}\\.safetensors)$",
           object_key,
         ))
         && !strcontains(object_key, "..")

@@ -14,25 +14,28 @@
     data-hires-profile-enabled="{{ 'true' if hires_profile_enabled else 'false' }}"
     data-lora-profile-enabled="{{ 'true' if lora_profile_enabled else 'false' }}"
     data-max-image-bytes="{{ max_image_bytes }}"
+    data-video-profile="{{ video_profile }}"
   >
     <header class="i2v-hero">
       <div class="i2v-hero-copy">
-        <p class="page-kicker">DaSiWa Wan 2.2 · queued generation</p>
+        <p class="page-kicker">{{ 'DaSiWa MiniMax H3 Turbo' if video_profile == 'minimax_h3' else 'DaSiWa Wan 2.2' }} · {{ video_provider }}</p>
         <h1>Image to video</h1>
         <p class="lede">
-          Pick a generation or upload an image, describe the motion, and keep the
-          RunPod GPU fed with an ordered queue. Presets preserve every advanced setting.
+          Choose your first frame, describe the scene in motion, and queue your clips.
+          Your draft and presets keep the setup ready for the next session.
         </p>
       </div>
       <aside class="i2v-worker" data-worker-card aria-live="polite">
         <div class="i2v-worker-heading">
           <span class="i2v-worker-dot unknown" data-worker-dot aria-hidden="true"></span>
           <div>
-            <small>RunPod video worker</small>
+            <small>{{ video_provider }} video worker</small>
             <strong data-worker-state>Checking provider state…</strong>
           </div>
         </div>
         <p data-worker-message>Worker state has not been loaded yet.</p>
+        <p class="muted" data-worker-cost>Checking delivery and idle shutdown settings…</p>
+        <button type="button" class="secondary-button" data-worker-resume hidden>Resume paused worker</button>
         <dl class="i2v-worker-facts" data-worker-facts hidden>
           <div><dt>Machine</dt><dd data-worker-machine>—</dd></div>
           <div><dt>Heartbeat</dt><dd data-worker-heartbeat>—</dd></div>
@@ -41,7 +44,7 @@
       </aside>
     </header>
 
-    <output class="i2v-banner" data-global-status aria-live="polite"{% if hires_profile_enabled %} hidden{% endif %}>{% if not hires_profile_enabled %}Higher-resolution submissions are paused while the matching RunPod worker is rolled out.{% endif %}</output>
+    <output class="i2v-banner" data-global-status aria-live="polite"{% if hires_profile_enabled %} hidden{% endif %}>{% if not hires_profile_enabled %}Video submissions are paused until the matching worker and cost checks pass.{% endif %}</output>
 
     <div class="i2v-workspace">
       <section class="panel i2v-source-panel" aria-labelledby="i2v-source-heading">
@@ -135,14 +138,15 @@
         </div>
 
         <label class="i2v-prompt" for="i2v-positive">
-          <span>Positive prompt <small>What moves, how it moves, and what stays stable</small></span>
-          <textarea id="i2v-positive" name="positive_prompt" rows="7" maxlength="100000" required data-positive-prompt placeholder="The subject makes one smooth hip sway… Camera remains locked, face and background remain stable."></textarea>
+          <span>{{ 'Motion & audio direction' if video_profile == 'minimax_h3' else 'Positive prompt' }} <small>Action, camera movement, atmosphere{% if video_profile == 'minimax_h3' %}, and sound{% endif %}</small></span>
+          <textarea id="i2v-positive" name="positive_prompt" rows="7" maxlength="100000" required data-positive-prompt placeholder="A slow camera push toward the cabin. Leaves sway gently. Soft wind and distant birds; no music or dialogue."></textarea>
         </label>
-        <label class="i2v-prompt" for="i2v-negative">
+        <label class="i2v-prompt" for="i2v-negative"{% if video_profile == 'minimax_h3' %} hidden{% endif %}>
           <span>Negative prompt <small>Artifacts and motion to avoid</small></span>
-          <textarea id="i2v-negative" name="negative_prompt" rows="4" maxlength="100000" data-negative-prompt placeholder="camera shake, background drift, identity change, anatomy deformation, flicker, frozen hold"></textarea>
+          <textarea id="i2v-negative" name="negative_prompt" rows="4" maxlength="100000" data-negative-prompt{% if video_profile == 'minimax_h3' %} disabled{% endif %} placeholder="camera shake, background drift, identity change, anatomy deformation, flicker, frozen hold"></textarea>
         </label>
 
+        {% if video_provider == 'RunPod' %}
         <fieldset class="i2v-prompt" id="i2v-runpod-authorization-group">
           <legend>Content authorization <small>Saved with this exact queued video</small></legend>
           <label>
@@ -151,8 +155,29 @@
           </label>
           <small>Leave unchecked for an SFW generation.</small>
         </fieldset>
+        {% endif %}
 
-        <details class="i2v-advanced" data-advanced-settings>
+        <details class="i2v-advanced" data-advanced-settings{% if video_profile == 'minimax_h3' %} open{% endif %}>
+          {% if video_profile == 'minimax_h3' %}
+          <summary><span><strong>Clip settings</strong><small>Native video + audio · no extra upscaling pass</small></span><span aria-hidden="true">⌄</span></summary>
+          <div class="i2v-settings-grid">
+            <label>Clip length <select name="frame_count">
+              <option value="124" selected>5.17 seconds</option>
+              <option value="158">6.58 seconds</option><option value="192">8 seconds</option>
+              <option value="243">10.13 seconds</option><option value="294">12.25 seconds</option>
+              <option value="362">15.08 seconds</option>
+            </select><small>Lengths follow H3's native frame grid.</small></label>
+            <label>Quality <select name="steps"><option value="4" selected>Fast · 4 steps</option><option value="8">Refined · 8 steps</option></select><small>Longer clips and more steps use more GPU time.</small></label>
+            <label>Encoded duration <output data-duration>5.17 seconds at 24 fps</output></label>
+            <label>Native width <input type="number" name="width" value="576" min="32" max="2048" step="32" required></label>
+            <label>Native height <input type="number" name="height" value="1024" min="32" max="2048" step="32" required></label>
+            <label>Seed <input type="number" name="seed" value="-1" step="1"><small>−1 chooses a fresh seed.</small></label>
+            <label>Video shift <input type="number" name="video_shift" value="8" min="6" max="12" step="0.1" required></label>
+            <label>Audio shift <input type="number" name="audio_shift" value="4" min="3" max="5" step="0.1" required></label>
+          </div>
+          <div class="i2v-toggle-row"><label><input type="checkbox" name="match_source_aspect" checked> Match source aspect without cropping</label></div>
+          <p class="muted">Euler / simple · CFG 1 · 24 fps. Describe what you want in one prompt; this Turbo profile does not use negative guidance or WAN motion LoRAs. The first release uses one starting image, not the full multi-reference workflow.</p>
+          {% else %}
           <summary><span><strong>Advanced settings</strong><small>DaSiWa WAN 2.2 baseline · all values are saved with the job</small></span><span aria-hidden="true">⌄</span></summary>
           <div class="i2v-settings-grid">
             <label>Frames <input type="number" name="frame_count" value="81" min="9" step="8" required></label>
@@ -189,8 +214,9 @@
             <label><input type="checkbox" name="color_transfer" disabled> Match source colors (later profile)</label>
             <label><input type="checkbox" name="tiled_vae" disabled> Tiled VAE (not used by baseline)</label>
           </div>
+          {% endif %}
 
-          <section class="i2v-loras" aria-labelledby="i2v-lora-heading">
+          <section class="i2v-loras" aria-labelledby="i2v-lora-heading"{% if video_profile == 'minimax_h3' %} hidden{% endif %}>
             <div class="i2v-subheading">
               <div>
                 <h3 id="i2v-lora-heading">Reviewed motion LoRAs</h3>

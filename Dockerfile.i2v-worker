@@ -3,7 +3,7 @@
 FROM pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime@sha256:7b324d212a4450795b49edba9949b7cdc72429148a64e974334bfe5774d51385
 
 LABEL org.opencontainers.image.title="gen-automation-dasiwa-i2v-worker" \
-      org.opencontainers.image.description="Model-free DaSiWa WAN 2.2 image-to-video worker" \
+      org.opencontainers.image.description="Model-free DaSiWa MiniMax H3 and legacy WAN image-to-video worker" \
       org.opencontainers.image.source="https://github.com/neuraln-cyber/gen-automation" \
       org.opencontainers.image.comfyui.revision="c2bcbecd82ec5ae66594340b395c24ef0217b238" \
       org.opencontainers.image.runpod-sdk.version="1.11.0"
@@ -175,9 +175,12 @@ ENV GEN_I2V_FACE_DETECTOR_YOLO_PATH=/opt/i2v/face-models/yolov3.safetensors \
     HF_HUB_OFFLINE=1
 
 COPY src/gen_automation/__init__.py ./src/gen_automation/__init__.py
+COPY src/gen_automation/domain/__init__.py ./src/gen_automation/domain/__init__.py
+COPY src/gen_automation/domain/private_delivery.py ./src/gen_automation/domain/private_delivery.py
 COPY src/gen_automation/i2v_worker ./src/gen_automation/i2v_worker
 COPY --chmod=0555 scripts/i2v-runpod-entrypoint.sh /opt/i2v/bin/i2v-runpod-entrypoint
 COPY workflows/dasiwa-wan22-i2v-v1.api.json ./workflows/dasiwa-wan22-i2v-v1.api.json
+COPY workflows/dasiwa-minimax-h3-i2v-v1.api.json ./workflows/dasiwa-minimax-h3-i2v-v1.api.json
 
 RUN groupadd --system --gid 10002 i2v-worker \
     && useradd \

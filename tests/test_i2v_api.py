@@ -533,7 +533,7 @@ def test_i2v_worker_endpoint_never_invents_progress(client: TestClient) -> None:
     payload = response.json()
     assert payload["status_available"] is False
     assert payload["deployment"] is None
-    assert "not configured" in payload["message"]
+    assert "disabled" in payload["message"]
 
 
 def test_i2v_queue_is_paused_until_matching_hires_worker_is_enabled(

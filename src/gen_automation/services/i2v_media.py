@@ -488,16 +488,29 @@ async def presign_i2v_output_download(
     output: I2VOutputSnapshot,
     expires_in: int,
     attachment: bool = False,
+    delivery_domain: str | None = None,
 ) -> str:
     if output.storage_backend != store.backend or output.storage_bucket != store.bucket:
         raise I2VMediaConflictError("video belongs to another private store")
     try:
-        return await store.presign_download(
+        signed = await store.presign_download(
             key=output.object_key,
             expires_in=expires_in,
-            download_name=f"i2v-{output.job_id}.mp4" if attachment else None,
+            # CloudFront rejects this signed response override on the current
+            # private route. The dashboard saves a Blob with its local filename;
+            # never silently turn an H3 attachment into paid direct-S3 egress.
+            download_name=f"i2v-{output.job_id}.mp4"
+            if attachment and not delivery_domain
+            else None,
             version_id=output.object_version_id,
         )
+        if delivery_domain:
+            from urllib.parse import urlsplit
+
+            parts = urlsplit(signed)
+            if parts.scheme != "https" or parts.netloc != delivery_domain:
+                raise I2VMediaStorageError("private video delivery is unavailable")
+        return signed
     except (ObjectNotFoundError, ObjectStoreError) as error:
         raise I2VMediaStorageError("video download is temporarily unavailable") from error
 

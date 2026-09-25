@@ -1,4 +1,5 @@
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -271,9 +272,12 @@ def _runtime(
     prefetch: int = 3,
     worker_id: str = I2V_SINGLETON_WORKER_ID,
     reviewed_loras_enabled: bool = False,
+    watchdog_seconds: int | None = None,
 ) -> I2VRuntime:
     return I2VRuntime(
         config=I2VRuntimeConfig(
+            startup_timeout_seconds=watchdog_seconds,
+            execution_timeout_seconds=watchdog_seconds,
             salad=I2VSaladConfig(
                 queue_name="i2v-dasiwa-v1",
                 container_group_name="i2v-dasiwa-5090-v1",
@@ -400,6 +404,64 @@ async def test_pending_pull_never_starts_inference_and_success_completes(
     assert (await runtime.run_cycle(now=_NOW + timedelta(seconds=6))).action == "output_completed"
     job, _attempt = await _durable_job(database, job_id)
     assert job.state == I2VJobState.SUCCEEDED
+
+
+async def test_startup_cost_guard_survives_restart_and_preserves_queue(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, input_id = runtime_database
+    job_id = await _queue_job(database, owner_id=owner_id, input_id=input_id)
+    client = FakeRuntimeSalad()
+    client.instances = (_instance("starting", "machine", ready=False),)
+    runtime = _runtime(database, client, watchdog_seconds=3600)
+    assert (await runtime.run_cycle(now=_NOW)).action == "deployment_observed"
+    await runtime.run_cycle(now=_NOW + timedelta(seconds=3599))
+    assert client.submission_calls == 0
+    assert (
+        await runtime.run_cycle(now=_NOW + timedelta(seconds=3600))
+    ).action == "cost_guard_stop_requested"
+    client.instances = ()
+    client.group = replace(
+        client.group,
+        current_state=replace(
+            client.group.current_state,
+            status="stopped",
+            running_count=0,
+        ),
+    )
+    restarted = _runtime(database, client)
+    assert (
+        await restarted.run_cycle(now=_NOW + timedelta(seconds=3610))
+    ).action == "cost_guard_paused"
+    assert "start_group" not in client.provider_mutations
+    assert (await _durable_job(database, job_id))[0].state == I2VJobState.QUEUED
+    async with database.sessions() as session:
+        deployment = await session.scalar(select(I2VWorkerDeployment))
+        assert deployment is not None
+        assert deployment.deployment_metadata["cost_guard_reason"] == "startup_timeout"
+        assert deployment.deployment_metadata["cost_guard_stopped_at"]
+
+
+async def test_execution_cost_guard_cancels_then_stops_without_retry_spend(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, input_id = runtime_database
+    job_id = await _queue_job(database, owner_id=owner_id, input_id=input_id)
+    client = FakeRuntimeSalad()
+    runtime = _runtime(database, client, prefetch=1, watchdog_seconds=3600)
+    for second in range(3):
+        await runtime.run_cycle(now=_NOW + timedelta(seconds=second))
+    client.set_all_job_status(SaladJobStatus.RUNNING)
+    assert (await runtime.run_cycle(now=_NOW + timedelta(seconds=3))).action == "inference_started"
+    assert (
+        await runtime.run_cycle(now=_NOW + timedelta(seconds=3603))
+    ).action == "execution_cost_guard_tripped"
+    assert "cancel_job" in client.provider_mutations
+    assert (
+        await runtime.run_cycle(now=_NOW + timedelta(seconds=3604))
+    ).action == "cost_guard_stop_requested"
+    assert client.submission_calls == 1
+    assert (await _durable_job(database, job_id))[0].last_error_code == "execution_timeout"
 
 
 async def test_ambiguous_post_is_recovered_before_any_resubmit(

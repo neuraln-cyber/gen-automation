@@ -27,6 +27,9 @@ class _StrictModel(BaseModel):
 
 class ModelObject(_StrictModel):
     role: Literal[
+        "diffusion_model",
+        "video_vae",
+        "audio_vae",
         "diffusion_model_high",
         "diffusion_model_low",
         "text_encoder",
@@ -52,6 +55,9 @@ class ModelObject(_StrictModel):
     @model_validator(mode="after")
     def validate_paths(self) -> ModelObject:
         expected_directory = {
+            "diffusion_model": "models/diffusion_models/",
+            "video_vae": "models/vae/",
+            "audio_vae": "models/vae/",
             "diffusion_model_high": "models/diffusion_models/",
             "diffusion_model_low": "models/diffusion_models/",
             "text_encoder": "models/text_encoders/",
@@ -75,6 +81,8 @@ class ModelObject(_StrictModel):
             or self.install_path.startswith("/")
             or ".." in self.install_path.split("/")
             or "//" in self.install_path
+            or "\\" in self.install_path
+            or any(ord(char) < 32 for char in self.install_path)
             or not self.install_path.endswith(".safetensors")
         ):
             raise ValueError("model object path is invalid")
@@ -136,6 +144,7 @@ class LoraSelection(_StrictModel):
 
 
 class GenerationSettings(_StrictModel):
+    profile: Literal["wan22", "minimax_h3"] = "wan22"
     frame_count: int = Field(default=81, ge=9)
     fps: int = Field(default=16, gt=0)
     width: int = Field(default=576, ge=32)
@@ -148,7 +157,9 @@ class GenerationSettings(_StrictModel):
     high_shift: float = 5.0
     low_shift: float = 5.0
     sampler: Literal["euler"] = "euler"
-    scheduler: Literal["linear_quadratic"] = "linear_quadratic"
+    scheduler: Literal["linear_quadratic", "simple"] = "linear_quadratic"
+    video_shift: float = Field(default=8, ge=6, le=12)
+    audio_shift: float = Field(default=4, ge=3, le=5)
     interpolation: Literal["none"] = "none"
     upscale: Literal["none", "source"] = "none"
     loop: bool = False
@@ -168,6 +179,30 @@ class GenerationSettings(_StrictModel):
 
     @model_validator(mode="after")
     def validate_wan_shape(self) -> GenerationSettings:
+        if self.profile == "minimax_h3":
+            if (
+                self.frame_count % 17 != 5
+                or not 124 <= self.frame_count <= 362
+                or self.fps != 24
+                or self.steps not in {4, 8}
+                or self.scheduler != "simple"
+                or self.cfg != 1
+                or self.width % 32
+                or self.height % 32
+                or self.width * self.height > 768 * 1344
+                or max(self.width, self.height) > 2048
+            ):
+                raise ValueError(
+                    "MiniMax H3 requires 17n+5 frames (124-362), 24 fps, "
+                    "4 or 8 steps, Euler/simple, CFG 1 and a canvas up to 1.03 MP"
+                )
+            if self.loras or self.face_fidelity != "off" or self.loop or self.upscale != "none":
+                raise ValueError(
+                    "MiniMax H3 does not use WAN LoRAs, face locking, loops or upscaling"
+                )
+            return self
+        if self.scheduler != "linear_quadratic":
+            raise ValueError("WAN requires the linear_quadratic scheduler")
         if self.frame_count % 8 != 1:
             raise ValueError("frame count must be 8n+1")
         if self.width % 32 or self.height % 32:
