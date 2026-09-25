@@ -15,7 +15,10 @@ from pydantic import SecretStr, ValidationError
 from gen_automation.config import Settings
 from gen_automation.i2v_worker.app import create_i2v_worker_app
 from gen_automation.i2v_worker.comfy import ComfyClient
-from gen_automation.i2v_worker.comfy_h3_upscale import ManagedH3SourceUpscale
+from gen_automation.i2v_worker.comfy_h3_upscale import (
+    ManagedH3SourceUpscale,
+    h3_refinement_split_params,
+)
 from gen_automation.i2v_worker.h3_upscale import (
     H3_REFINE_DENOISE,
     H3_REFINE_STEPS,
@@ -343,6 +346,22 @@ def test_adapter_separates_video_and_keeps_audio_identity(adapter):
         {"minimax_keyframes": [{"resolved_frame_index": 0, "latent": "high-keyframe"}]},
     )
     mm.unload_all_models.assert_called_once()
+
+
+def test_refiner_uses_only_native_supported_boundary_anchors(adapter):
+    kwargs, _, refine, _, _ = adapter
+    nodes = sys.modules["nodes"].NODE_CLASS_MAPPINGS
+    temporal, spatial = h3_refinement_split_params(nodes)
+    nodes["MMH3TemporalSplitParamsV10"].execute.assert_called_once_with(
+        chunk_frames=56,
+        temporal_overlap_frames=22,
+        anchor_strength=0.999,
+        motion_anchor_frames="0",
+        identity_anchor_frames=0,
+    )
+    ManagedH3SourceUpscale().upscale(**kwargs)
+    assert refine.call_args.kwargs["temporal_split_param"] is temporal
+    assert refine.call_args.kwargs["spatial_split_param"] is spatial
 
 
 @pytest.mark.parametrize("stage", ["upscale", "refine"])
