@@ -732,7 +732,7 @@ class I2VRuntime:
             "input_snapshot": cast(JSONValue, _worker_input_snapshot(job.input_snapshot)),
             "positive_prompt": job.positive_prompt,
             "negative_prompt": job.negative_prompt,
-            "settings_snapshot": cast(JSONValue, job.settings_snapshot),
+            "settings_snapshot": cast(JSONValue, _worker_settings_snapshot(job.settings_snapshot)),
             **additions,
         }
         metadata = i2v_submission_metadata(
@@ -1117,6 +1117,14 @@ def _safe_attempt_metadata(
         }
     )
     return cast(dict[str, JSONValue], metadata)
+
+
+def _worker_settings_snapshot(settings: Mapping[str, object]) -> dict[str, object]:
+    """Keep baseline jobs compatible during a control-plane-first worker rollout."""
+    snapshot = dict(settings)
+    if not snapshot.get("h3_loras"):
+        snapshot.pop("h3_loras", None)
+    return snapshot
 
 
 def _validate_fresh_grants(

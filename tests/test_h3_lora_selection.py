@@ -33,6 +33,7 @@ from gen_automation.services.i2v_media import I2VSignedGrantBuilder
 from gen_automation.services.i2v_runtime import (
     I2VRuntimeConfigurationError,
     _validate_fresh_grants,
+    _worker_settings_snapshot,
 )
 from gen_automation.storage.memory import MemoryObjectStore
 from tests.test_h3_lora_library import _body, _capture, _create, _setup
@@ -244,6 +245,10 @@ def test_worker_requires_exact_grants_and_finite_strengths():
             h3_settings(h3_loras=[{**selected, "strength": strength}])
     with pytest.raises(ValidationError, match="unique"):
         h3_settings(h3_loras=[selected, selected])
+    baseline = h3_settings().model_dump(mode="json")
+    assert "h3_loras" not in _worker_settings_snapshot(baseline)
+    assert baseline["h3_loras"] == []  # durable settings are never mutated
+    assert _worker_settings_snapshot({"h3_loras": [selected]})["h3_loras"] == [selected]
 
 
 def _download_fixture(tmp_path, monkeypatch, *, corrupt=False, resume=False):
