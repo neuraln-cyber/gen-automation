@@ -73,6 +73,9 @@ class WorkerSupervisor:
             while not self._stopping:
                 if self.comfy is None or self.comfy.poll() is not None:
                     raise WorkerStartupError("worker child process exited")
+                if not self.queue_ready:
+                    self._set_stage("queue_consumer_exited")
+                    raise WorkerStartupError("queue consumer exited")
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
             raise
@@ -88,8 +91,15 @@ class WorkerSupervisor:
             self.ready = False
             self.failed = True
             self.face_detector = None
-            if self.comfy is not None:
-                await asyncio.to_thread(_stop_process, self.comfy)
+            for process in (self.queue_worker, self.comfy):
+                if process is not None:
+                    await asyncio.to_thread(_stop_process, process)
+
+    @property
+    def queue_ready(self) -> bool:
+        return not self.settings.queue_worker_enabled or (
+            self.queue_worker is not None and self.queue_worker.poll() is None
+        )
 
     def _set_stage(self, stage: str) -> None:
         self.stage = stage
@@ -131,6 +141,15 @@ class WorkerSupervisor:
                 if self.comfy.poll() is not None:
                     raise WorkerStartupError("ComfyUI exited during startup")
                 await asyncio.sleep(2)
+            if self.settings.queue_worker_enabled:
+                self._set_stage("queue_consumer_start")
+                self.queue_worker = _start_process(
+                    (self.settings.queue_worker_path.as_posix(),),
+                    cwd=self.settings.runtime_root,
+                    environment=_queue_environment(),
+                )
+                if not self.queue_ready:
+                    raise WorkerStartupError("queue consumer exited during startup")
         except asyncio.CancelledError:
             raise
         except FaceStabilizationError as error:
@@ -243,6 +262,18 @@ def _child_environment() -> dict[str, str]:
             "NO_PROXY": "127.0.0.1,localhost,::1",
         }
     )
+    return environment
+
+
+def _queue_environment() -> dict[str, str]:
+    # The SDK discovers its queue/configuration through Salad IMDS. It must not
+    # inherit model grants, AWS credentials, or arbitrary proxy configuration.
+    allowed = {"HOME", "LANG", "LC_ALL", "PATH", "SSL_CERT_DIR", "SSL_CERT_FILE"}
+    environment = {
+        key: value for key, value in os.environ.items() if key in allowed and "\x00" not in value
+    }
+    environment.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    environment["SALAD_LOG_LEVEL"] = "info"
     return environment
 
 

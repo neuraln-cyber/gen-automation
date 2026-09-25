@@ -302,6 +302,9 @@ jobs:
             requirements-i2v-face.lock
             requirements-i2v-worker.lock
             patches/comfyui-nag/chroma-stream-blocks.patch
+            patches/salad-queue-worker/strict-http-status.patch
+            patches/salad-queue-worker/job-stream-heartbeat-watchdog.patch
+            patches/salad-queue-worker/imds-token-recovery.patch
             src/gen_automation/__init__.py
             src/gen_automation/i2v_worker
             src/gen_automation/domain/__init__.py

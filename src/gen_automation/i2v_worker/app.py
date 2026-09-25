@@ -105,6 +105,7 @@ def create_i2v_worker_app(
         comfy = resolved_supervisor.comfy_client
         is_ready = bool(
             resolved_supervisor.ready
+            and (not settings.queue_worker_enabled or resolved_supervisor.queue_ready)
             and comfy is not None
             and (settings.profile == "minimax_h3" or resolved_supervisor.face_detector is not None)
             and await comfy.ready()

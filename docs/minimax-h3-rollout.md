@@ -87,6 +87,24 @@ dimensions and the existing 2048-per-side technical bound remain.
 False/absent mode fields are omitted from provider payloads for compatibility.
 No budget quota, deletion policy, hard execution deadline or new provider is added.
 
+### September 25: jobs reserved but never dispatched
+
+The two owner-cancelled attempts remained Salad `pending`, with no `started_at`.
+ComfyUI finished startup but never received a prompt. The video image omitted the
+Salad queue-consumer binary and its supervisor never started a consumer; the
+platform does not inject this process. This was a dispatch failure, not evidence
+that H3 inference or high-resolution refinement ran out of memory.
+
+The video image now builds the same pinned SDK and verified strict-HTTP,
+stream-heartbeat and IMDS-recovery patches as the image worker. The supervisor
+starts it only after ComfyUI readiness, strips model/AWS credentials from its
+environment, and fails readiness/health if it exits. Salad configuration cannot
+disable the consumer. Startup stages and sanitized failures are logged. The UI
+labels the existing `claimed` state **Waiting for worker**, not generation progress.
+Cancelled jobs stay cancelled; deployment must not start a GPU or enqueue a test.
+
+See [Salad queue-worker integration](https://docs.salad.com/container-engine/how-to-guides/job-processing/queue-worker).
+
 Sources: [community implementation](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler/tree/40316cf008b2fd8663263270669eb4da23f89d2c),
 [pinned upscaler weights](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/tree/3f941d5d182014dd5c0a5e16330420ee2d4aa0c6).
 

@@ -26,6 +26,9 @@ class I2VWorkerSettings(BaseSettings):
     model_objects_json: SecretStr
     profile: Literal["wan22", "minimax_h3"] = "wan22"
     environment: Literal["production", "test"] = "production"
+    provider: Literal["runpod", "salad"] = "runpod"
+    queue_worker_enabled: bool = False
+    queue_worker_path: Path = Path("/usr/local/bin/salad-http-job-queue-worker")
     aws_region: str = "eu-central-1"
     s3_endpoint_url: str | None = None
     model_delivery_domain: str | None = None
@@ -61,6 +64,10 @@ class I2VWorkerSettings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_configuration(self) -> I2VWorkerSettings:
+        if self.provider == "salad" and not self.queue_worker_enabled:
+            raise ValueError("Salad requires the queue consumer")
+        if not _is_container_absolute(self.queue_worker_path):
+            raise ValueError("queue worker path must be absolute")
         if self.comfy_base_url != "http://127.0.0.1:8188":
             raise ValueError("ComfyUI must be loopback only")
         if (

@@ -893,8 +893,13 @@
     finally { enqueueButton.textContent = "Queue generation"; updateSubmitState(); }
   }
 
+  function jobStatusLabel(value) {
+    return value === "claimed" ? "Waiting for worker" : value.replaceAll("_", " ");
+  }
+
   function statusChip(value) {
-    const chip = text("span", value.replaceAll("_", " "), `status ${value}`);
+    const chip = text("span", jobStatusLabel(value), `status ${value}`);
+    if (value === "claimed") chip.title = "Reserved for dispatch; video processing has not started yet.";
     return chip;
   }
 
@@ -930,7 +935,7 @@
     state.jobs.forEach((job) => {
       const item = document.createElement("li"); item.className = "i2v-job"; item.dataset.jobId = job.job_id;
       const head = document.createElement("div"); head.className = "i2v-job-head";
-      const position = job.queue_position == null ? job.state.replaceAll("_", " ") : `Queue #${job.queue_position}`;
+      const position = job.queue_position == null ? jobStatusLabel(job.state) : `Queue #${job.queue_position}`;
       head.append(text("strong", position), statusChip(job.state));
       const prompt = text("p", job.positive_prompt || "No positive prompt");
       const meta = text("div", `${String(job.job_id).slice(0, 8)} · ${friendlyDate(job.created_at)}`, "i2v-job-meta");

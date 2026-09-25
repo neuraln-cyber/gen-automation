@@ -511,7 +511,12 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
         "sha256:7b324d212a4450795b49edba9949b7cdc72429148a64e974334bfe5774d51385"
     )
 
-    assert from_lines == [f"FROM {pytorch_image}"]
+    assert from_lines == [
+        "FROM golang:1.26.2-alpine@sha256:"
+        "f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739500e08c86393a21b1"
+        " AS salad-queue-worker-builder",
+        f"FROM {pytorch_image}",
+    ]
     assert all("@sha256:" in line for line in from_lines)
     assert "c2bcbecd82ec5ae66594340b395c24ef0217b238" in dockerfile
     assert "ef8a641be08983cf5f06669f70719b6eecce3c7f" in dockerfile

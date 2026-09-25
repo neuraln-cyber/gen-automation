@@ -73,6 +73,7 @@ class _Comfy:
 
 
 class _Supervisor:
+    queue_ready = True
     def __init__(self, *, ready: bool = True, face_ready: bool = True) -> None:
         self.ready = ready
         self.failed = False
@@ -86,6 +87,16 @@ class _Supervisor:
 
     async def stop(self) -> None:
         self.stopped = True
+
+
+def test_salad_readiness_rejects_a_dead_consumer(tmp_path: Path) -> None:
+    settings = _settings(tmp_path).model_copy(update={"queue_worker_enabled": True})
+    supervisor = _Supervisor()
+    app = create_i2v_worker_app(settings, supervisor=supervisor)  # type: ignore[arg-type]
+    with TestClient(app) as client:
+        assert client.get("/ready").status_code == 200
+        supervisor.queue_ready = False
+        assert client.get("/ready").status_code == 503
 
 
 def _job() -> dict[str, object]:

@@ -54,6 +54,7 @@ class I2VRuntimeEnvironment:
         environment = {
             "GEN_I2V_WORKER_ENVIRONMENT": "production",
             "GEN_I2V_WORKER_PROVIDER": "salad",
+            "GEN_I2V_WORKER_QUEUE_WORKER_ENABLED": "true",
             "GEN_I2V_WORKER_HOST": "0.0.0.0",  # noqa: S104
             "GEN_I2V_WORKER_PROFILE": self.settings.i2v_profile,
             "GEN_I2V_WORKER_LORA_WORKER_ENABLED": (

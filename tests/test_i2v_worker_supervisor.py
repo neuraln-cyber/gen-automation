@@ -225,3 +225,103 @@ async def test_normal_cancellation_is_not_reported_as_startup_failure(
     assert supervisor.failed is False
     assert supervisor.ready is False
     assert "i2v_startup_failed" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "missing", "exited"])
+async def test_salad_consumer_starts_after_comfy_and_failure_closes_readiness(
+    tmp_path: Path, monkeypatch: Any, failure: str | None
+) -> None:
+    import gen_automation.i2v_worker.supervisor as module
+
+    events: list[str] = []
+    stopped: list[object] = []
+
+    class QueueProcess(_Process):
+        exit_code: int | None = None
+
+        def poll(self) -> Any:
+            return self.exit_code
+
+    queue_process = QueueProcess()
+    comfy_process = _Process()
+
+    class Client(_ComfyClient):
+        async def ready(self) -> bool:
+            events.append("comfy_ready")
+            return True
+
+    def start(command: tuple[str, ...], **kwargs: Any) -> Any:
+        if command[0].endswith("salad-http-job-queue-worker"):
+            assert events == ["comfy_start", "comfy_ready"]
+            events.append("queue_start")
+            assert kwargs["environment"]["SALAD_LOG_LEVEL"] == "info"
+            if failure == "missing":
+                raise FileNotFoundError
+            return queue_process
+        events.append("comfy_start")
+        return comfy_process
+
+    monkeypatch.setattr(module, "_verify_gpu_runtime", lambda _: None)
+    monkeypatch.setattr(module, "preflight_face_stabilizer", lambda **_: object())
+    monkeypatch.setattr(module, "ComfyClient", Client)
+    monkeypatch.setattr(module, "_start_process", start)
+    monkeypatch.setattr(module, "_stop_process", stopped.append)
+    settings = _settings(tmp_path).model_copy(
+        update={"provider": "salad", "queue_worker_enabled": True, "models_prepared": True}
+    )
+    supervisor = WorkerSupervisor(settings)
+    assert not supervisor.queue_ready
+    await supervisor.start()
+    try:
+        await _wait_for(lambda: supervisor.ready or supervisor.failed)
+        if failure == "exited":
+            assert supervisor.queue_ready
+            queue_process.exit_code = 1
+            assert not supervisor.queue_ready
+            await _wait_for(lambda: supervisor.failed)
+        if failure:
+            assert not supervisor.ready and supervisor.failed
+            await _wait_for(lambda: comfy_process in stopped)
+            assert comfy_process in stopped
+        else:
+            assert supervisor.ready and supervisor.queue_ready
+            assert events == ["comfy_start", "comfy_ready", "queue_start"]
+    finally:
+        await supervisor.stop()
+    if failure != "missing":
+        assert queue_process in stopped
+
+
+def test_queue_consumer_environment_excludes_credentials(monkeypatch: Any) -> None:
+    from gen_automation.i2v_worker.supervisor import _queue_environment
+
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "do-not-forward")
+    monkeypatch.setenv("GEN_I2V_WORKER_MODEL_OBJECTS_JSON", "private")
+    monkeypatch.setenv("HTTPS_PROXY", "do-not-forward")
+    monkeypatch.setenv("SALAD_LOG_LEVEL", "debug")
+    environment = _queue_environment()
+    assert set(environment) <= {
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "SALAD_LOG_LEVEL",
+    }
+    assert environment["SALAD_LOG_LEVEL"] == "info"
+
+
+def test_salad_configuration_cannot_disable_consumer(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="Salad requires the queue consumer"):
+        I2VWorkerSettings.model_validate({**_settings(tmp_path).model_dump(), "provider": "salad"})
+
+
+def test_video_image_reuses_the_hardened_image_queue_consumer() -> None:
+    root = Path(__file__).resolve().parents[1]
+    image = (root / "Dockerfile.worker").read_text(encoding="utf-8")
+    video = (root / "Dockerfile.i2v-worker").read_text(encoding="utf-8")
+    assert video.split("FROM pytorch/", 1)[0] == image.split("FROM pytorch/", 1)[0]
+    assert "COPY --from=salad-queue-worker-builder --chmod=0555" in video
+    assert "RUN test -x /usr/local/bin/salad-http-job-queue-worker" in video
