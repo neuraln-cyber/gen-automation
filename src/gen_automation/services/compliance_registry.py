@@ -208,7 +208,7 @@ async def approve_model_artifact(
     approved_at = _as_utc(now or datetime.now(UTC))
     key = _idempotency_key(idempotency_key)
     request_payload = command.model_dump(mode="json")
-    if command.model_family == GenerationModelFamily.ILLUSTRIOUS:
+    if command.model_family.value == GenerationModelFamily.ILLUSTRIOUS.value:
         # Preserve request hashes for pre-family idempotency records.
         request_payload.pop("model_family")
     if not command.experiment_only:

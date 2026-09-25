@@ -45,6 +45,7 @@ from gen_automation.domain.lora_catalog import (
     ManualLoraImportCreate,
     ManualUploadCompletion,
     VerifiedLoraArtifact,
+    lora_model_family,
     validate_lora_durable_metadata,
 )
 
@@ -501,14 +502,21 @@ async def list_lora_import_jobs(
     *,
     actor_user_id: UUID,
     limit: int = 100,
+    h3_library: bool | None = None,
 ) -> tuple[LoraImportJobSnapshot, ...]:
     await _require_actor(session, actor_user_id, lock=False)
     bounded_limit = _limit(limit)
+    statement = select(LoraImportJob)
+    if h3_library is not None:
+        family = LoraImportJob.expected_metadata[LORA_MODEL_FAMILY_METADATA_KEY].as_string()
+        statement = statement.where(
+            family == "minimax_h3" if h3_library else or_(family.is_(None), family != "minimax_h3")
+        )
     rows = (
         await session.scalars(
-            select(LoraImportJob)
-            .order_by(LoraImportJob.created_at.desc(), LoraImportJob.id.desc())
-            .limit(bounded_limit)
+            statement.order_by(LoraImportJob.created_at.desc(), LoraImportJob.id.desc()).limit(
+                bounded_limit
+            )
         )
     ).all()
     return tuple(_job_snapshot(row) for row in rows)
@@ -972,6 +980,8 @@ async def complete_lora_import_job(
             .with_for_update(read=True)
         )
         _validate_managed_duplicate(verified, artifact=existing, approval=approval)
+        if approval is None or _h3_family_conflict(job, approval):
+            raise LoraCatalogConflictError("This file already belongs to a different model family")
         terminal_state = LoraImportJobState.DUPLICATE
 
     job.state = terminal_state
@@ -1060,6 +1070,7 @@ async def complete_static_lora_import_duplicate(
         or not approval.is_current
         or approval.kind != ModelArtifactKind.LORA
         or approval.artifact_sha256 != artifact_sha256
+        or _h3_family_conflict(job, approval)
         or not approval.adult_use_approved
         or not approval.safetensors_verified
         or approval.revoked_at is not None
@@ -1688,6 +1699,14 @@ def _runtime_target_filename(artifact_sha256: str) -> str:
     return f"managed-{artifact_sha256}.safetensors"
 
 
+def _h3_family_conflict(job: LoraImportJob, approval: ModelArtifactApproval) -> bool:
+    # Preserve historical image-family registration semantics. H3 must never
+    # share an approval with, or silently relabel, an image-library artifact.
+    return (approval.model_family.value == "minimax_h3") != (
+        lora_model_family(job.expected_metadata).value == "minimax_h3"
+    )
+
+
 def _validate_lora_approval(
     job: LoraImportJob,
     verified: VerifiedLoraArtifact,
@@ -1698,6 +1717,7 @@ def _validate_lora_approval(
         or approval.status != ApprovalStatus.APPROVED
         or not approval.is_current
         or approval.kind != ModelArtifactKind.LORA
+        or _h3_family_conflict(job, approval)
         or approval.artifact_sha256 != verified.artifact_sha256
         or approval.storage_key != verified.object_key
         or approval.source_url != job.canonical_source_url

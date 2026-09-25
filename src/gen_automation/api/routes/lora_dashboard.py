@@ -1,7 +1,7 @@
 """Browser page for owner/admin managed LoRA onboarding."""
 
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import HTMLResponse, Response
@@ -33,6 +33,7 @@ async def dashboard_loras(
     request: Request,
     session: Session,
     principal: ReleaseReader,
+    library: Literal["image", "h3"] = "image",
 ) -> Response:
     if principal.role not in _MANAGER_ROLES:
         return _secure(
@@ -72,8 +73,9 @@ async def dashboard_loras(
         session,
         actor_user_id=principal.user_id,
         limit=100,
+        h3_library=library == "h3",
     )
-    entries = await _library_entries(session, managed)
+    entries = await _library_entries(session, managed, h3_library=library == "h3")
     csrf_token = (
         request.cookies.get(settings.auth_csrf_cookie_name, "")
         if settings.auth_enabled
@@ -84,7 +86,8 @@ async def dashboard_loras(
             request=request,
             name="dashboard/loras.html",
             context={
-                "page_title": "LoRA manager",
+                "page_title": "H3 LoRA manager" if library == "h3" else "LoRA manager",
+                "h3_library": library == "h3",
                 "principal": principal,
                 "entries": entries,
                 "imports": [_import_read(item) for item in imports],

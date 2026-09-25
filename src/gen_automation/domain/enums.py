@@ -355,6 +355,14 @@ class GenerationModelFamily(StrEnum):
     ANIMA = "anima"
 
 
+class ModelArtifactFamily(StrEnum):
+    """Artifact-library families; video files do not enable a txt2img workflow."""
+
+    ILLUSTRIOUS = "illustrious"
+    ANIMA = "anima"
+    MINIMAX_H3 = "minimax_h3"
+
+
 class ManagedLoraLifecycle(StrEnum):
     """Durable deployment lifecycle for one content-addressed LoRA."""
 

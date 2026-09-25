@@ -24,9 +24,9 @@ from gen_automation.domain.compliance_registry import (
 from gen_automation.domain.enums import (
     ApprovalStatus,
     DesiredDeploymentState,
-    GenerationModelFamily,
     LoraImportSource,
     ManagedLoraLifecycle,
+    ModelArtifactFamily,
     ModelArtifactKind,
     SaladDeploymentPurpose,
     SaladDeploymentState,
@@ -34,6 +34,7 @@ from gen_automation.domain.enums import (
 from gen_automation.domain.lora_catalog import (
     LORA_MODEL_FAMILY_METADATA_KEY,
     VerifiedLoraArtifact,
+    managed_lora_model_family,
 )
 from gen_automation.integrations.civitai import (
     CivitaiAPIError,
@@ -93,14 +94,14 @@ class LoraRuntimeConfigurationError(RuntimeError):
 _PROVIDER_IDLE_FRESHNESS_SECONDS = 120
 
 
-def _import_model_family(metadata: dict[str, object]) -> GenerationModelFamily:
+def _import_model_family(metadata: dict[str, object]) -> ModelArtifactFamily:
     value = metadata.get(LORA_MODEL_FAMILY_METADATA_KEY)
     if value is None:
-        return GenerationModelFamily.ILLUSTRIOUS
+        return ModelArtifactFamily.ILLUSTRIOUS
     if not isinstance(value, str):
         raise ModelArtifactValidationError("LoRA import model family is invalid")
     try:
-        return GenerationModelFamily(value)
+        return ModelArtifactFamily(value)
     except ValueError as error:
         raise ModelArtifactValidationError("LoRA import model family is invalid") from error
 
@@ -549,12 +550,15 @@ class LoraRuntime:
             )
             if artifact is None:
                 return False
-            await effective_artifact_manifest_from_settings(
-                session,
-                settings=self.settings,
-                additional_artifact_ids=(artifact.id,),
-                required_lora_sha256s=(),
-            )
+            if managed_lora_model_family(artifact.provenance) == ModelArtifactFamily.MINIMAX_H3:
+                await self._validate_h3_library_artifact(session, artifact)
+            else:
+                await effective_artifact_manifest_from_settings(
+                    session,
+                    settings=self.settings,
+                    additional_artifact_ids=(artifact.id,),
+                    required_lora_sha256s=(),
+                )
             await mark_managed_lora_active(
                 session,
                 artifact_id=artifact.id,
@@ -563,6 +567,27 @@ class LoraRuntime:
                 idempotency_key=f"lora-runtime-activate:{artifact.id}:{artifact.lock_version}",
             )
             return True
+
+    async def _validate_h3_library_artifact(
+        self, session: AsyncSession, artifact: ManagedLoraArtifact
+    ) -> None:
+        """Validate storage registration only; never alter an image/GPU manifest."""
+        approval = await session.get(ModelArtifactApproval, artifact.approval_id)
+        bucket = self.settings.salad_worker_artifact_bucket
+        if (
+            bucket is None
+            or artifact.storage_bucket != bucket.get_secret_value()
+            or approval is None
+            or approval.model_family != ModelArtifactFamily.MINIMAX_H3
+            or approval.kind != ModelArtifactKind.LORA
+            or approval.status != ApprovalStatus.APPROVED
+            or not approval.is_current
+            or not approval.safetensors_verified
+            or approval.artifact_sha256 != artifact.artifact_sha256
+            or approval.storage_key != artifact.object_key
+            or not artifact.object_version_id
+        ):
+            raise LoraCatalogConflictError("H3 library artifact identity is unavailable")
 
     async def _finish_retirement_if_idle(self, artifact_id: UUID) -> bool:
         async with self.sessions() as session:
@@ -729,6 +754,13 @@ class LoraRuntime:
             await session.rollback()
             return None
         dependencies = await managed_lora_dependency_summary(session, artifact.id)
+        if managed_lora_model_family(artifact.provenance) == ModelArtifactFamily.MINIMAX_H3:
+            # H3 library files are not installed in the image worker. Unrelated
+            # image warm leases must not prevent the owner reclaiming storage.
+            if dependencies.has_dependencies:
+                await session.rollback()
+                return None
+            return artifact
         now = datetime.now(UTC)
         observed_at = (
             deployment.last_observed_at.replace(tzinfo=UTC)

@@ -12,6 +12,7 @@ from gen_automation.db.models import (
     ExperimentWarmLease,
     GenerationAttempt,
     GenerationJob,
+    I2VJob,
     ManagedLoraArtifact,
     ReleaseVersion,
     SaladDeployment,
@@ -21,6 +22,7 @@ from gen_automation.domain.enums import (
     GenerationAttemptState,
     GenerationState,
 )
+from gen_automation.domain.i2v import I2VJobState
 from gen_automation.domain.lora_catalog import LoraDependencySummary
 
 _ACTIVE_JOB_STATES = frozenset(
@@ -129,8 +131,25 @@ async def managed_lora_dependency_summary(
     warm_leases = sum(
         _resident_manifest_references_sha(resident, sha256) for resident in warm_runtime_hashes
     )
+    video_settings = await session.scalars(
+        select(I2VJob.settings_snapshot).where(
+            I2VJob.state.in_(
+                (
+                    I2VJobState.QUEUED,
+                    I2VJobState.CLAIMED,
+                    I2VJobState.RUNNING,
+                    I2VJobState.CANCEL_REQUESTED,
+                )
+            )
+        )
+    )
+    video_dependencies = sum(
+        _parameters_reference_sha(value, sha256)
+        or _loras_reference_sha(value.get("h3_loras"), sha256)
+        for value in video_settings
+    )
     return LoraDependencySummary(
-        queued_generation_jobs=len(matching_job_ids),
+        queued_generation_jobs=len(matching_job_ids) + video_dependencies,
         active_generation_attempts=len(active_attempt_ids),
         warm_experiment_leases=warm_leases,
     )

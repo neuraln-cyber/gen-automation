@@ -122,7 +122,7 @@ def _validate_artifact(
                 "experiment_only": True,
             }
         )
-    if approval.model_family != GenerationModelFamily.ILLUSTRIOUS:
+    if approval.model_family.value != GenerationModelFamily.ILLUSTRIOUS.value:
         evidence["model_family"] = approval.model_family.value
     return evidence
 
@@ -286,7 +286,7 @@ async def validate_release_approvals(
         # comparison explicit for static analysis and future refactors.
         raise ReleaseApprovalError("model-family approvals are unavailable")
     selected_family = checkpoint_approval.model_family
-    if workflow_approval.model_family != selected_family or any(
+    if workflow_approval.model_family.value != selected_family.value or any(
         artifacts_by_hash[lora.sha256].model_family != selected_family
         for lora in specification.loras
     ):
@@ -299,7 +299,7 @@ async def validate_release_approvals(
     }
     if specification.experiment_only:
         artifact_license_gate["experiment_only"] = True
-    if selected_family != GenerationModelFamily.ILLUSTRIOUS:
+    if selected_family.value != GenerationModelFamily.ILLUSTRIOUS.value:
         artifact_license_gate["model_family"] = selected_family.value
     checks: dict[str, dict[str, Any]] = {
         "adult_subject_gate": {

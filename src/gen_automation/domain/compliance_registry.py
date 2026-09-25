@@ -18,6 +18,7 @@ from gen_automation.domain.controlled_duo import (
 from gen_automation.domain.enums import (
     ApprovalStatus,
     GenerationModelFamily,
+    ModelArtifactFamily,
     ModelArtifactKind,
 )
 
@@ -101,7 +102,7 @@ class ModelArtifactApprovalCreate(StrictComplianceModel):
     artifact_sha256: Sha256
     name: str = Field(min_length=1, max_length=200)
     kind: ModelArtifactKind
-    model_family: GenerationModelFamily = GenerationModelFamily.ILLUSTRIOUS
+    model_family: ModelArtifactFamily = ModelArtifactFamily.ILLUSTRIOUS
     source_url: AnyHttpUrl
     storage_key: str = Field(min_length=1, max_length=1_024)
     license_url: AnyHttpUrl
@@ -110,6 +111,15 @@ class ModelArtifactApprovalCreate(StrictComplianceModel):
     safetensors_verified: Literal[True]
     experiment_only: bool = False
     evidence: ApprovalEvidence
+
+    @model_validator(mode="after")
+    def validate_library_family(self) -> "ModelArtifactApprovalCreate":
+        if (
+            self.model_family == ModelArtifactFamily.MINIMAX_H3
+            and self.kind != ModelArtifactKind.LORA
+        ):
+            raise ValueError("H3 library registration supports LoRAs only")
+        return self
 
     @field_validator("name")
     @classmethod

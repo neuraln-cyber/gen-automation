@@ -7,6 +7,8 @@
   const csrfToken = root.dataset.csrfToken || "";
   const canManage = root.dataset.canManage === "true";
   const listUrl = root.dataset.listUrl || "/api/v1/loras";
+  const h3Library = root.dataset.library === "h3";
+  const returnUrl = root.dataset.returnUrl || "/dashboard/loras#lora-imports";
   const terminalImportStatuses = new Set([
     "ready",
     "completed",
@@ -34,6 +36,11 @@
     ["failed", "Needs attention"],
     ["cancelled", "Cancelled"],
   ]);
+  if (h3Library) {
+    importStatusLabels.set("activating", "Registering verified file");
+    importStatusLabels.set("ready", "Stored & verified");
+    importStatusLabels.set("completed", "File verified");
+  }
 
   const stringValue = (value) => (typeof value === "string" ? value.trim() : "");
   const identifierValue = (value) => {
@@ -522,7 +529,7 @@
           idempotencyKey: stableMutationKey(importForm, JSON.stringify(command)),
         });
         setMessage(importStatus, "Transfer queued. Opening its saved progress...", "success");
-        window.setTimeout(() => window.location.assign("/dashboard/loras#lora-imports"), 250);
+        window.setTimeout(() => window.location.assign(returnUrl), 250);
       } catch (error) {
         setMessage(importStatus, error instanceof Error ? error.message : "Could not start this import.", "error");
         if (submitButton instanceof HTMLButtonElement) submitButton.disabled = false;
@@ -612,7 +619,7 @@
             idempotencyKey: pendingCompletion.idempotencyKey,
           });
           pendingManualCompletions.delete(form);
-          window.setTimeout(() => window.location.assign("/dashboard/loras#lora-imports"), 250);
+          window.setTimeout(() => window.location.assign(returnUrl), 250);
           return;
         }
         const normalizedTriggerWords = [];
@@ -661,7 +668,7 @@
           throw new Error("The upload operation was incomplete. Retry it.");
         }
         if (importStatus(operation) !== "awaiting_upload") {
-          window.setTimeout(() => window.location.assign("/dashboard/loras#lora-imports"), 250);
+          window.setTimeout(() => window.location.assign(returnUrl), 250);
           return;
         }
         if (!payload.upload) {
@@ -690,7 +697,7 @@
           idempotencyKey: completion.idempotencyKey,
         });
         pendingManualCompletions.delete(form);
-        window.setTimeout(() => window.location.assign("/dashboard/loras#lora-imports"), 250);
+        window.setTimeout(() => window.location.assign(returnUrl), 250);
       } catch (error) {
         setMessage(status, error instanceof Error ? error.message : "Could not upload this LoRA.", "error");
         if (submitButton instanceof HTMLButtonElement) submitButton.disabled = false;
@@ -761,7 +768,7 @@
       if (empty) empty.hidden = visible !== 0;
       if (emptyCopy) {
         emptyCopy.textContent = cards.length === 0
-          ? "Add one from Civitai or upload a Safetensors file above."
+          ? (h3Library ? "Upload a Safetensors file above." : "Add one from Civitai or upload a Safetensors file above.")
           : "No LoRAs match this search and status filter.";
       }
     };

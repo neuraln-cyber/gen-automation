@@ -24,7 +24,7 @@ from pydantic import (
 )
 
 from gen_automation.domain.canonical import canonical_json_bytes
-from gen_automation.domain.enums import GenerationModelFamily
+from gen_automation.domain.enums import ModelArtifactFamily
 
 MAX_MANAGED_LORA_BYTES = 4 * 1024 * 1024 * 1024
 MAX_LORA_METADATA_BYTES = 16 * 1024
@@ -65,13 +65,25 @@ class StrictLoraCatalogModel(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
 
+def lora_model_family(metadata: dict[str, Any]) -> ModelArtifactFamily:
+    """Old imports predate family metadata and belong to the image library."""
+    return ModelArtifactFamily(metadata.get(LORA_MODEL_FAMILY_METADATA_KEY, "illustrious"))
+
+
+def managed_lora_model_family(provenance: dict[str, Any]) -> ModelArtifactFamily:
+    expected = provenance.get("expected", {})
+    if not isinstance(expected, dict):
+        raise ValueError("LoRA family provenance is invalid")
+    return lora_model_family(expected)
+
+
 class _ImportCreateBase(StrictLoraCatalogModel):
     display_name: VisibleName
     canonical_source_url: AnyHttpUrl
     license_url: AnyHttpUrl
     commercial_use_attested: Literal[True]
     adult_use_attested: Literal[True]
-    model_family: GenerationModelFamily = GenerationModelFamily.ILLUSTRIOUS
+    model_family: ModelArtifactFamily = ModelArtifactFamily.ILLUSTRIOUS
     target_filename: str = Field(min_length=13, max_length=236)
     expected_sha256: Sha256 | None = None
     expected_byte_size: int | None = Field(

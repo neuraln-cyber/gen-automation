@@ -8,7 +8,13 @@
   <section
     class="lora-manager"
     data-lora-manager
+    {% if h3_library %}
+    data-list-url="/api/v1/loras?library=h3"
+    {% else %}
     data-list-url="/api/v1/loras"
+    {% endif %}
+    data-library="{{ 'h3' if h3_library else 'image' }}"
+    data-return-url="/dashboard/loras{{ '?library=h3' if h3_library else '' }}#lora-imports"
     data-resolve-url="/api/v1/loras/civitai:resolve"
     data-manual-import-url="/api/v1/loras/imports/manual"
     data-civitai-import-url="/api/v1/loras/imports/civitai"
@@ -18,11 +24,23 @@
     <header class="lora-manager-hero">
       <div>
         <p class="page-kicker">Private model library</p>
-        <h1>LoRA manager</h1>
+        <h1>{{ 'H3 LoRA manager' if h3_library else 'LoRA manager' }}</h1>
         <p class="lede">
+          {% if h3_library %}
+          Upload and manage your own H3 Safetensors files in private storage.
+          This is a file library: uploads are not automatically applied to generation,
+          and file verification does not certify H3 model compatibility.
+          {% else %}
           Add a LoRA from Civitai or upload a Safetensors file, then use it in New
           Automation and Experiment Lab.
+          {% endif %}
         </p>
+        <nav aria-label="LoRA libraries">
+          <a href="/dashboard/loras"{% if not h3_library %} aria-current="page"{% endif %}>Image LoRAs</a>
+          &middot;
+          <a href="/dashboard/loras?library=h3"{% if h3_library %} aria-current="page"{% endif %}>H3 LoRAs</a>
+          {% if h3_library %}&middot; <a href="/dashboard/animations">Back to image to video</a>{% endif %}
+        </nav>
       </div>
       <div class="lora-gpu-note" aria-label="Import cost behavior">
         <span aria-hidden="true">GPU</span>
@@ -37,7 +55,7 @@
         <dd><output data-lora-library-count>{{ entries | length }}</output> LoRAs</dd>
       </div>
       <div>
-        <dt>Ready</dt>
+        <dt>{{ 'Verified files' if h3_library else 'Ready' }}</dt>
         <dd><output data-lora-ready-count>0</output></dd>
       </div>
       <div>
@@ -55,10 +73,11 @@
         <summary>
           <span>
             <strong>Add a LoRA</strong>
-            <small>Choose a Civitai page or a local .safetensors file</small>
+            <small>{{ 'Choose a local .safetensors file' if h3_library else 'Choose a Civitai page or a local .safetensors file' }}</small>
           </span>
         </summary>
         <div class="lora-onboarding-body">
+          {% if not h3_library %}
           <fieldset class="lora-source-choice" data-lora-source-choice>
             <legend>Where is the LoRA?</legend>
             <label>
@@ -186,7 +205,8 @@
             </form>
           </section>
 
-          <section class="lora-source-panel" data-lora-source-panel="manual" hidden>
+          {% endif %}
+          <section class="lora-source-panel" data-lora-source-panel="manual"{% if not h3_library %} hidden{% endif %}>
             <form class="lora-source-form" data-lora-manual-import-form>
               <div class="lora-upload-grid">
                 <label class="lora-file-input" for="lora-manual-file">
@@ -244,8 +264,12 @@
                 <label>
                   Model family
                   <select name="model_family" required>
+                    {% if h3_library %}
+                    <option value="minimax_h3">MiniMax H3</option>
+                    {% else %}
                     <option value="illustrious">Illustrious</option>
                     <option value="anima">Anima</option>
+                    {% endif %}
                   </select>
                 </label>
               </div>
@@ -253,7 +277,7 @@
                 <legend>Required rights confirmation</legend>
                 <label>
                   <input type="checkbox" name="commercial_use_attested" required>
-                  <span>I confirm this file permits commercial image use.</span>
+                  <span>I confirm this file permits commercial use.</span>
                 </label>
                 <label>
                   <input type="checkbox" name="adult_use_attested" required>
@@ -287,7 +311,7 @@
       <div class="section-heading">
         <div>
           <p class="page-kicker">Background work</p>
-          <h2 id="lora-imports-heading">Transfers and activation</h2>
+          <h2 id="lora-imports-heading">{{ 'Uploads and verification' if h3_library else 'Transfers and activation' }}</h2>
           <p class="muted">You can leave this page. Progress is saved and resumes here.</p>
         </div>
       </div>
@@ -388,7 +412,7 @@
                 <h3>{{ entry.name }}</h3>
                 {% if entry.version_name %}<p class="muted">{{ entry.version_name }}</p>{% endif %}
               </div>
-              <span class="status {{ filter_status }}">{{ readable_status(readiness if readiness != "unknown" else entry_status) }}</span>
+              <span class="status {{ filter_status }}">{{ 'Stored & verified' if h3_library and readiness == 'ready' else readable_status(readiness if readiness != "unknown" else entry_status) }}</span>
             </div>
             <dl class="lora-library-facts">
               <div>
@@ -437,7 +461,7 @@
       <section class="panel lora-library-empty" data-lora-library-empty {% if entries %}hidden{% endif %}>
         <h3>No LoRAs in this view</h3>
         <p class="muted" data-lora-library-empty-copy>
-          Add one from Civitai or upload a Safetensors file above.
+          {{ 'Upload a Safetensors file above.' if h3_library else 'Add one from Civitai or upload a Safetensors file above.' }}
         </p>
       </section>
       <output class="lora-operation-message" data-lora-library-status aria-live="polite"></output>
@@ -452,7 +476,7 @@
             It will disappear from new selections immediately. Stored bytes are purged only after active work and the worker manifest no longer use this exact version.
           </p>
           <p class="muted">
-            Existing generated images remain. Old automations that depend on this LoRA may no longer be rerunnable after storage cleanup.
+            Existing generated images and videos remain. Deleted files cannot be restored after storage cleanup; upload the file again if needed.
           </p>
           <label class="lora-delete-storage-choice">
             <input type="checkbox" name="purge_when_safe" checked>

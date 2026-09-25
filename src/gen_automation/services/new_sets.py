@@ -677,11 +677,11 @@ async def list_new_set_options(
             approval_id=row.id,
             name=row.name,
             sha256=row.artifact_sha256,
-            model_family=row.model_family,
+            model_family=GenerationModelFamily(row.model_family.value),
         )
         for row in artifacts
         if row.kind == ModelArtifactKind.CHECKPOINT
-        and row.model_family in allowed_families
+        and row.model_family.value in {family.value for family in allowed_families}
         and _artifact_available_for_mode(row, experiment_mode=experiment_mode)
     )
     loras = tuple(
@@ -689,11 +689,11 @@ async def list_new_set_options(
             approval_id=row.id,
             name=row.name,
             sha256=row.artifact_sha256,
-            model_family=row.model_family,
+            model_family=GenerationModelFamily(row.model_family.value),
         )
         for row in artifacts
         if row.kind == ModelArtifactKind.LORA
-        and row.model_family in allowed_families
+        and row.model_family.value in {family.value for family in allowed_families}
         and _artifact_available_for_mode(row, experiment_mode=experiment_mode)
         and (
             (
@@ -810,9 +810,12 @@ async def create_and_approve_new_set(
         for selection in command.loras
     ]
     workflow = await _approved_workflow(session, command.workflow_approval_id)
-    model_family = checkpoint.model_family
+    try:
+        model_family = GenerationModelFamily(checkpoint.model_family.value)
+    except ValueError:
+        raise NewSetInputError("This artifact family is not an image-generation model") from None
     if workflow.model_family != model_family or any(
-        lora.model_family != model_family for lora in lora_rows
+        lora.model_family.value != model_family.value for lora in lora_rows
     ):
         raise NewSetInputError("checkpoint, workflow, and LoRAs must use the same model family")
     maximum_loras = max_loras_for_model_family(model_family)
