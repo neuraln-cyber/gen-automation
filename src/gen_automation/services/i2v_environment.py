@@ -248,12 +248,15 @@ def _worker_model_objects(settings: Settings) -> str:
     required_roles = required_i2v_model_roles(
         reviewed_loras_enabled=settings.i2v_lora_worker_enabled, profile=settings.i2v_profile
     )
+    if settings.i2v_profile == "minimax_h3" and "h3_latent_upscaler" in by_role:
+        required_roles = (*required_roles, "h3_latent_upscaler")
     # Raw private manifests may retain obsolete roles during a coordinated
     # migration. Only selected required roles cross the worker boundary.
     install_directories: dict[str, str] = {
         "diffusion_model": "models/diffusion_models",
         "video_vae": "models/vae",
         "audio_vae": "models/vae",
+        "h3_latent_upscaler": "models/latent_upscale_models",
         "diffusion_model_high": "models/diffusion_models",
         "diffusion_model_low": "models/diffusion_models",
         "text_encoder": "models/text_encoders",

@@ -102,6 +102,9 @@ class WorkerSupervisor:
                 network_attempts=self.settings.network_attempts,
                 poll_seconds=self.settings.comfy_poll_seconds,
                 profile=self.settings.profile,
+                source_resolution_enabled=any(
+                    item.role == "h3_latent_upscaler" for item in self.settings.model_objects
+                ),
             )
             while not await self.comfy_client.ready():
                 if self.comfy.poll() is not None:

@@ -1,4 +1,4 @@
-"""Original-pixel sizing contracts; synthetic media, no models or provider jobs."""
+"""Source-size delivery contracts; synthetic media, no models or provider jobs."""
 
 import json
 import shutil
@@ -75,7 +75,7 @@ def test_dashboard_resolution_gate_and_label(client):
     client.app.state.settings.i2v_h3_source_resolution_enabled = True
     page = client.get("/dashboard/animations").text
     assert 'name="match_source_resolution">' in page
-    assert "Original image resolution" in page
+    assert "Match original image size" in page
     assert "data-resolution-summary" in page
 
 
@@ -106,6 +106,8 @@ assert.equal(elements.width.disabled, true);
 assert.equal(elements.match_source_aspect.checked, false);
 assert.match(summary.textContent, /Output: 1144 \u00d7 1480/);
 assert.match(summary.textContent, /1152 \u00d7 1504/);
+assert.match(summary.textContent, /base: 768 \u00d7 992/);
+assert.match(summary.textContent, /AI upscale/);
 state.selected.sourceWidth = 1145;
 assert.match(vm.runInContext("sourceResolutionError()", context), /even width/);
 state.selected.sourceWidth = 1144;
@@ -159,9 +161,9 @@ def test_real_h3_delivery_is_1144_by_1480_and_retains_audio(tmp_path):
         (source,), settings, tmp_path, source_width=1144, source_height=1480
     )
     assert (metadata["width"], metadata["height"]) == (1144, 1480)
-    assert (metadata["native_width"], metadata["native_height"]) == (1152, 1504)
-    assert metadata["upscale"] == "none"
-    assert metadata["source_fit"] == "original_pixels_edge_pad_crop"
+    assert (metadata["native_width"], metadata["native_height"]) == (768, 992)
+    assert metadata["upscale"] == "h3_latent_refine"
+    assert metadata["source_fit"] == "source_keyframe_edge_pad_crop"
     probe = subprocess.run(  # noqa: S603
         [ffprobe, "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", str(output)],
         check=True,

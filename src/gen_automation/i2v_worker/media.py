@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 import httpx2
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from gen_automation.i2v_worker.h3_upscale import h3_base_canvas
 from gen_automation.i2v_worker.models import (
     DownloadGrant,
     GenerationSettings,
@@ -433,15 +434,24 @@ def finalize_native_video(
         height=output_height,
         frame_count=settings.frame_count,
     )
+    base_width, base_height = (
+        h3_base_canvas(settings.width, settings.height)
+        if settings.match_source_resolution
+        else (settings.width, settings.height)
+    )
     metadata.update(
         {
-            "native_width": settings.width,
-            "native_height": settings.height,
-            "upscale": "none",
+            "native_width": base_width,
+            "native_height": base_height,
+            "upscale": (
+                "h3_latent_refine"
+                if (base_width, base_height) != (settings.width, settings.height)
+                else "none"
+            ),
             "loop_mode": "none",
             "loop_count": 1,
             "source_fit": (
-                "original_pixels_edge_pad_crop"
+                "source_keyframe_edge_pad_crop"
                 if settings.match_source_resolution
                 else "contain_edge_pad"
             ),

@@ -416,6 +416,14 @@
     return best;
   }
 
+  function h3BaseDimensions(width, height) {
+    const scale = Math.min(1, 768 / Math.min(width, height), Math.sqrt(768 * 1344 / (width * height)));
+    return {
+      width: Math.max(32, Math.floor(width * scale / 32) * 32),
+      height: Math.max(32, Math.floor(height * scale / 32) * 32),
+    };
+  }
+
   function syncAspectControls() {
     const original = isH3 && Boolean(form.elements.match_source_resolution?.checked);
     if (isH3) {
@@ -432,9 +440,15 @@
         form.elements.width.value = String(Math.ceil(width / 32) * 32);
         form.elements.height.value = String(Math.ceil(height / 32) * 32);
       }
+      const canvasWidth = Number(form.elements.width.value);
+      const canvasHeight = Number(form.elements.height.value);
+      const base = h3BaseDimensions(canvasWidth, canvasHeight);
+      const needsUpscale = base.width !== canvasWidth || base.height !== canvasHeight;
       q("[data-resolution-summary]").textContent = error || (width && height
-        ? `Output: ${width} × ${height} · generation canvas: ${form.elements.width.value} × ${form.elements.height.value}. Original pixels are not resized; only added padding is trimmed.`
-        : "Select an image to use its original resolution.");
+        ? `Output: ${width} × ${height} · base: ${base.width} × ${base.height}` + (needsUpscale
+          ? ` → H3 AI upscale + refinement: ${canvasWidth} × ${canvasHeight}. Only added padding is trimmed; audio is preserved.`
+          : ". This source fits the base canvas; no upscaling pass is needed.")
+        : "Select an image to match its original output size.");
       return;
     }
     const automatic = form.elements.match_source_aspect.checked;

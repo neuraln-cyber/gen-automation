@@ -163,7 +163,7 @@
 
         <details class="i2v-advanced" data-advanced-settings{% if video_profile == 'minimax_h3' %} open{% endif %}>
           {% if video_profile == 'minimax_h3' %}
-          <summary><span><strong>Clip settings</strong><small>Native video + audio · no extra upscaling pass</small></span><span aria-hidden="true">⌄</span></summary>
+          <summary><span><strong>Clip settings</strong><small>H3 video + audio · optional source-size AI refinement</small></span><span aria-hidden="true">⌄</span></summary>
           <div class="i2v-settings-grid">
             <label>Clip length <select name="frame_count">
               <option value="124" selected>5.17 seconds</option>
@@ -173,18 +173,18 @@
             </select><small>Lengths follow H3's native frame grid.</small></label>
             <label>Quality <select name="steps"><option value="4" selected>Fast · 4 steps</option><option value="8">Refined · 8 steps</option></select><small>Longer clips and more steps use more GPU time.</small></label>
             <label>Encoded duration <output data-duration>5.17 seconds at 24 fps</output></label>
-            <label>Generation canvas width <input type="number" name="width" value="576" min="32" max="2048" step="32" required></label>
-            <label>Generation canvas height <input type="number" name="height" value="1024" min="32" max="2048" step="32" required></label>
+            <label>Canvas width <input type="number" name="width" value="576" min="32" max="2048" step="32" required></label>
+            <label>Canvas height <input type="number" name="height" value="1024" min="32" max="2048" step="32" required></label>
             <label>Seed <input type="number" name="seed" value="-1" step="1"><small>−1 chooses a fresh seed.</small></label>
             <label>Video shift <input type="number" name="video_shift" value="8" min="6" max="12" step="0.1" required></label>
             <label>Audio shift <input type="number" name="audio_shift" value="4" min="3" max="5" step="0.1" required></label>
           </div>
           <div class="i2v-toggle-row">
-            <label><input type="checkbox" name="match_source_resolution"{% if not source_resolution_enabled %} disabled{% endif %}> Original image resolution · no downsizing</label>
+            <label><input type="checkbox" name="match_source_resolution"{% if not source_resolution_enabled %} disabled{% endif %}> Match original image size · H3 AI upscale</label>
             <label><input type="checkbox" name="match_source_aspect" checked> Standard size · match source aspect</label>
           </div>
           <p class="muted" data-resolution-summary aria-live="polite">Select an image to see its output dimensions.</p>
-          <p class="muted">Original resolution pads to H3's 32-pixel grid and trims only that padding afterward. Larger canvases need more GPU memory and time and may run out of memory. No upscaling model is used.{% if not source_resolution_enabled %} Original resolution will become available after the matching worker update.{% endif %}</p>
+          <p class="muted">Match original size generates motion at normal H3 resolution, then uses the community H3 latent upscaler and a tiled refinement pass. The original image anchors refinement; your selected LoRAs apply to both passes and audio is preserved. Output matches the source dimensions, not guaranteed original detail. This uses additional Salad GPU time and can still run out of memory; it is not MiniMax's hosted Regenerate-2K service.{% if not source_resolution_enabled %} This option will become available after the matching worker and upscaler update.{% endif %}</p>
           <p class="muted">Euler / simple · CFG 1 · 24 fps. Describe what you want in one prompt; this Turbo profile does not use negative guidance or WAN motion LoRAs. The first release uses one starting image, not the full multi-reference workflow.</p>
           {% else %}
           <summary><span><strong>Advanced settings</strong><small>DaSiWa WAN 2.2 baseline · all values are saved with the job</small></span><span aria-hidden="true">⌄</span></summary>

@@ -1131,11 +1131,18 @@ class Settings(BaseSettings):
                         errors.append("I2V private model manifest must be a JSON object")
                     else:
                         try:
-                            validated_i2v_manifest_objects(
+                            manifest_objects = validated_i2v_manifest_objects(
                                 decoded_manifest,
                                 reviewed_loras_enabled=self.i2v_lora_worker_enabled,
                                 profile=self.i2v_profile,
                             )
+                            if self.i2v_h3_source_resolution_enabled and (
+                                self.i2v_profile != "minimax_h3"
+                                or "h3_latent_upscaler" not in manifest_objects
+                            ):
+                                errors.append(
+                                    "H3 source-resolution delivery requires the pinned upscaler"
+                                )
                         except ValueError:
                             errors.append(
                                 "I2V private model manifest does not match the worker capability"

@@ -13,31 +13,82 @@ creator's optional multi-reference/director extensions. Image generation stays
 unchanged. Salad is the provider; RunPod and the old WAN LoRAs remain disabled.
 Historical WAN settings and outputs remain readable but cannot enter the H3 queue.
 
-## Original image resolution
+## Match original image size: community AI upscale + refinement
 
-The H3 dashboard's **Original image resolution · no downsizing** option uses
-the immutable source dimensions, not the preview JPEG dimensions. A 1144 × 1480
-source is padded to a 1152 × 1504 canvas for H3's 32-pixel grid. Input pixels are
-not resized; FFmpeg removes exactly the added border and retains the generated
-audio, producing 1144 × 1480 H.264 video. This is native larger-canvas inference,
-not a standard-size generation enlarged afterward. If no padding is needed,
-the existing video stream-copy path remains in use.
+The dashboard's **Match original image size · H3 AI upscale** option derives
+the output from the immutable source image, not its preview. It is an opt-in
+two-pass workflow, not native full-resolution motion generation and **not**
+MiniMax's hosted Regenerate-2K service. No additional inference provider is used.
 
-Standard-size settings and previously queued jobs keep their existing behavior.
-Original mode is explicit and saved in drafts/presets/jobs. The backend derives
-the padded dimensions again from the owned source before freezing each job;
-the worker independently checks them. H.264 requires even source dimensions;
-the existing 2048-per-side profile bound remains. Larger canvases can exhaust
-GPU memory and require more GPU time; CPU shape tests do not establish GPU
-performance or output quality. No test generation is submitted automatically.
+For a 1144 × 1480 image:
 
-Deployment: leave `GEN_AUTOMATION_I2V_H3_SOURCE_RESOLUTION_ENABLED=false` until
-the matching immutable video worker is installed at an idle queue boundary.
-Then enable it in the control-plane environment. The dashboard and queue/retry
-API reject the mode while gated off. False/absent mode fields are omitted from
-provider payloads so existing jobs remain compatible with the prior worker.
-Do not roll back to an older worker while original-resolution jobs are active
-or pending. Model artifacts and CloudFront routes do not change.
+1. Edge-pad the original to 1152 × 1504 (H3's 32-pixel grid), retaining its detail
+   for the refinement keyframe.
+2. Generate motion/audio at 768 × 992. The base canvas uses at most 768 pixels
+   on its short edge and the existing 768 × 1344 pixel-area budget.
+3. Separate the native AV latent; upscale **video only** with the learned 3D BF16
+   H3 upscaler to 1152 × 1504. Offload H3 first and unload the upscaler afterward.
+4. Re-encode the original full-size source keyframe; reuse text embeddings and
+   the same LoRA-patched H3 model. Refine with Euler/simple, CFG 1, four steps,
+   denoise 0.35, 1024-pixel tiles (25% overlap / 50% fade) and 56-frame temporal
+   chunks with 22-frame overlap. Use the upstream temporal anchors, color match,
+   and no extra seam-polish pass. These are initial integration defaults, not a
+   claim of officially recommended settings or GPU-verified optimal quality.
+5. Decode video; retain base-pass audio unchanged by refinement. Trim only the
+   added border, delivering 1144 × 1480 H.264/AAC at the original 24 fps/duration.
+
+A 1152 × 1504 source follows the same base/refinement path without final cropping.
+Small sources that already fit the base envelope skip upscaling and refinement.
+Matching dimensions does not guarantee pixel-identical original detail. The
+extra pass consumes additional Salad GPU time; tiling reduces working memory
+but does not guarantee that every clip fits a 5090. There is no silent switch
+to interpolation/Lanczos or a paid API if AI refinement fails.
+
+The new source list `i2v-models/h3-latent-upscaler.sources.json` pins one checkpoint:
+690,592,992 bytes (0.643 GiB), SHA-256
+`4f57821f5837f32f7142b67d815606dbd7550f194e5c769f7d6c3f83b146a5e6`.
+Upstream code is pinned to `40316cf008b2fd8663263270669eb4da23f89d2c` in the worker
+image. The existing four-model source list is unchanged. Five files total
+40,761,724,703 bytes; incremental Standard storage at the price below is about
+$0.016/month before credits/tax, plus requests and larger retained videos.
+This does not promise an unchanged total AWS bill or free Salad compute.
+
+Standard mode and existing queued jobs retain their graph and settings. The
+`match_source_resolution` flag persists in drafts/presets/jobs. Width/height in
+that mode describe the padded **refinement** canvas; output provenance records
+base `native_width`/`native_height`, `upscale=h3_latent_refine`, and final dimensions.
+The backend and worker independently derive sizing from the source. Even source
+dimensions and the existing 2048-per-side technical bound remain.
+
+### Safe activation (do not interrupt the current worker)
+
+1. Leave `GEN_AUTOMATION_I2V_H3_SOURCE_RESOLUTION_ENABLED=false`. Mirror the
+   separate upscaler source through the existing streaming mirror tool. Merge
+   its verified exact-version entry into the private manifest; preserve the four
+   H3 objects and all unrelated image permissions. Extend only its exact-version
+   read authorization. Verify signed CloudFront access; do not add direct-S3
+   fallback or change subscriptions. Do not put weights in the worker image.
+2. Build the matching immutable worker/control-plane artifacts. The worker build
+   imports the actual pinned nodes on CPU and checks their API; local shape,
+   graph, audio identity and synthetic FFmpeg tests are not a GPU quality test.
+3. Only after current jobs finish and both video queues are empty and the Salad
+   group is stopped, install the new worker identity and five-object manifest.
+   Until then leave the live worker, pending jobs and live manifest untouched.
+4. Enable the flag with matching control-plane settings. Configuration rejects
+   enabling without the pinned upscaler; startup verifies all extension nodes;
+   old four-model workers reject source-size jobs before inference. Exact model,
+   source and manifest identities remain part of the existing readiness contract.
+5. Hand over for the owner's test. **Do not queue a test video or start a GPU.**
+   Validate quality, seams, stability and memory on that user-initiated clip
+   before describing performance as verified. Disable the flag for new jobs if
+   rollback is needed; finish/cancel owner-approved source-size jobs before
+   reverting to an older worker. Keep generated media and LoRAs.
+
+False/absent mode fields are omitted from provider payloads for compatibility.
+No budget quota, deletion policy, hard execution deadline or new provider is added.
+
+Sources: [community implementation](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler/tree/40316cf008b2fd8663263270669eb4da23f89d2c),
+[pinned upscaler weights](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/tree/3f941d5d182014dd5c0a5e16330420ee2d4aa0c6).
 
 Exact upstream pins are in
 `i2v-models/dasiwa-minimax-h3-turbo-v2.sources.json`. The four files total

@@ -175,10 +175,28 @@ ENV GEN_I2V_FACE_DETECTOR_YOLO_PATH=/opt/i2v/face-models/yolov3.safetensors \
     HF_HUB_OFFLINE=1
 
 COPY src/gen_automation/__init__.py ./src/gen_automation/__init__.py
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends git \
+    && git init /opt/comfyui/custom_nodes/ComfyUI-H3-Latent-Upscaler \
+    && cd /opt/comfyui/custom_nodes/ComfyUI-H3-Latent-Upscaler \
+    && git remote add origin https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler.git \
+    && git fetch --depth=1 origin 40316cf008b2fd8663263270669eb4da23f89d2c \
+    && git checkout --detach FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "40316cf008b2fd8663263270669eb4da23f89d2c" \
+    && /opt/i2v-venv/bin/python -m compileall -q nodes \
+    && cp LICENSE /opt/i2v/licenses/H3-Latent-Upscaler-MIT.txt \
+    && rm -rf .git \
+    && apt-get purge --yes --auto-remove git \
+    && rm -rf /var/lib/apt/lists/*
+
+LABEL org.opencontainers.image.h3-upscaler.revision="40316cf008b2fd8663263270669eb4da23f89d2c"
+
 COPY src/gen_automation/domain/__init__.py ./src/gen_automation/domain/__init__.py
 COPY src/gen_automation/domain/private_delivery.py ./src/gen_automation/domain/private_delivery.py
 COPY src/gen_automation/i2v_worker ./src/gen_automation/i2v_worker
 COPY src/gen_automation/i2v_worker/comfy_h3_node.py /opt/comfyui/custom_nodes/GenAutomationH3/__init__.py
+COPY scripts/verify-h3-comfy-nodes.py /opt/i2v/bin/verify-h3-comfy-nodes.py
+RUN /opt/i2v-venv/bin/python /opt/i2v/bin/verify-h3-comfy-nodes.py
 COPY --chmod=0555 scripts/i2v-runpod-entrypoint.sh /opt/i2v/bin/i2v-runpod-entrypoint
 COPY workflows/dasiwa-wan22-i2v-v1.api.json ./workflows/dasiwa-wan22-i2v-v1.api.json
 COPY workflows/dasiwa-minimax-h3-i2v-v1.api.json ./workflows/dasiwa-minimax-h3-i2v-v1.api.json
@@ -197,6 +215,7 @@ RUN groupadd --system --gid 10002 i2v-worker \
         /opt/comfyui/models/text_encoders \
         /opt/comfyui/models/vae/Wan \
         /opt/comfyui/models/loras \
+        /opt/comfyui/models/latent_upscale_models \
         /opt/i2v/runtime/input \
         /opt/i2v/runtime/output \
         /opt/i2v/runtime/temp \

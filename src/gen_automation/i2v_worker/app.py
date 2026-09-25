@@ -175,6 +175,10 @@ def create_i2v_worker_app(
             raise HTTPException(status_code=400, detail="invalid request") from None
         if job.settings_snapshot.profile != settings.profile:
             raise HTTPException(status_code=409, detail="job requires a different worker profile")
+        if job.settings_snapshot.match_source_resolution and not any(
+            item.role == "h3_latent_upscaler" for item in settings.model_objects
+        ):
+            raise HTTPException(status_code=409, detail="worker has no H3 source-size upscaler")
         if settings.require_private_delivery and (
             job.input_grant.url.scheme != "https"
             or job.input_grant.url.host != settings.model_delivery_domain

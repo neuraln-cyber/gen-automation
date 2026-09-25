@@ -7,6 +7,12 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
+from gen_automation.i2v_worker.h3_upscale import (
+    H3_UPSCALER_BYTES,
+    H3_UPSCALER_FILENAME,
+    H3_UPSCALER_ROLE,
+    H3_UPSCALER_SHA256,
+)
 from gen_automation.i2v_worker.lora_catalog import (
     LORA_ARTIFACTS_BY_ROLE,
     LORA_CATALOG,
@@ -30,6 +36,7 @@ class ModelObject(_StrictModel):
         "diffusion_model",
         "video_vae",
         "audio_vae",
+        "h3_latent_upscaler",
         "diffusion_model_high",
         "diffusion_model_low",
         "text_encoder",
@@ -58,6 +65,7 @@ class ModelObject(_StrictModel):
             "diffusion_model": "models/diffusion_models/",
             "video_vae": "models/vae/",
             "audio_vae": "models/vae/",
+            "h3_latent_upscaler": "models/latent_upscale_models/",
             "diffusion_model_high": "models/diffusion_models/",
             "diffusion_model_low": "models/diffusion_models/",
             "text_encoder": "models/text_encoders/",
@@ -87,6 +95,12 @@ class ModelObject(_StrictModel):
         ):
             raise ValueError("model object path is invalid")
         reviewed = LORA_ARTIFACTS_BY_ROLE.get(self.role)
+        if self.role == H3_UPSCALER_ROLE and (
+            self.install_path != f"models/latent_upscale_models/{H3_UPSCALER_FILENAME}"
+            or self.byte_size != H3_UPSCALER_BYTES
+            or self.sha256 != H3_UPSCALER_SHA256
+        ):
+            raise ValueError("H3 latent upscaler artifact identity is invalid")
         if reviewed is not None and (
             self.install_path != reviewed.install_path
             or self.byte_size != reviewed.byte_size

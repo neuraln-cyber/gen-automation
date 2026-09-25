@@ -9,6 +9,13 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from gen_automation.i2v_worker.h3_upscale import (
+    H3_REFINE_DENOISE,
+    H3_REFINE_STEPS,
+    H3_UPSCALER_FILENAME,
+    H3_UPSCALER_ROLE,
+    h3_base_canvas,
+)
 from gen_automation.i2v_worker.lora_catalog import (
     ReviewedLoraPromptError,
     reviewed_lora,
@@ -133,7 +140,10 @@ def render_workflow(
     if _contains_placeholder(rendered):
         raise WorkflowError("workflow template contains an unresolved binding")
     if settings.profile == "minimax_h3":
-        return _inject_h3_loras(rendered, settings), seed, frame_prefix
+        rendered = _inject_h3_loras(rendered, settings)
+        if settings.match_source_resolution:
+            rendered = _inject_h3_upscale(rendered, settings, model_paths or {})
+        return rendered, seed, frame_prefix
     rendered = _inject_reviewed_loras(rendered, settings)
     if settings.face_fidelity == "stable_expression":
         rendered = _enable_face_fidelity(rendered)
@@ -235,6 +245,45 @@ def _inject_h3_loras(workflow: dict[str, Any], settings: GenerationSettings) -> 
         }
         model = [node_id, 0]
     workflow["7"]["inputs"]["model"] = model
+    return workflow
+
+
+def _inject_h3_upscale(
+    workflow: dict[str, Any], settings: GenerationSettings, model_paths: Mapping[str, str]
+) -> dict[str, Any]:
+    if model_paths.get(H3_UPSCALER_ROLE) != H3_UPSCALER_FILENAME:
+        raise WorkflowError("source-size H3 delivery requires the pinned latent upscaler")
+    base_width, base_height = h3_base_canvas(settings.width, settings.height)
+    workflow["6"]["inputs"].update(width=base_width, height=base_height)
+    if (base_width, base_height) == (settings.width, settings.height):
+        return workflow
+    workflow["h3-refine-sigmas"] = {
+        "class_type": "BasicScheduler",
+        "inputs": {
+            "model": ["7", 0],
+            "scheduler": "simple",
+            "steps": H3_REFINE_STEPS,
+            "denoise": H3_REFINE_DENOISE,
+        },
+    }
+    workflow["h3-source-upscale"] = {
+        "class_type": "ManagedH3SourceUpscale",
+        "inputs": {
+            "latent": ["12", 0],
+            "conditioning": ["6", 0],
+            "first_frame": ["1", 0],
+            "vae": ["4", 0],
+            "model": ["7", 0],
+            "noise": ["8", 0],
+            "sampler": ["10", 0],
+            "sigmas": ["h3-refine-sigmas", 0],
+            "width": settings.width,
+            "height": settings.height,
+            "model_name": H3_UPSCALER_FILENAME,
+        },
+    }
+    workflow["13"]["inputs"]["samples"] = ["h3-source-upscale", 0]
+    # Audio decode remains connected to the untouched base pass (node 12).
     return workflow
 
 
