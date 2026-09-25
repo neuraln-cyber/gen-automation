@@ -14,6 +14,8 @@ from gen_automation.i2v_worker.lora_catalog import REQUIRED_LORA_ROLES
 from gen_automation.i2v_worker.manifest_contract import required_i2v_model_roles
 from gen_automation.i2v_worker.models import ModelObject
 
+I2V_CUSTOM_NODES = ("ComfyUI-NAG", "GenAutomationH3", "ComfyUI-H3-Latent-Upscaler")
+
 
 class I2VWorkerSettings(BaseSettings):
     model_config = SettingsConfigDict(

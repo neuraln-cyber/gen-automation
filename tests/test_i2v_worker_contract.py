@@ -492,13 +492,15 @@ def test_dream_lora_rejects_multiple_mutually_exclusive_concept_terms() -> None:
         )
 
 
-def test_comfy_command_uses_supported_base_directory_and_only_pinned_nag(tmp_path: Path) -> None:
+def test_comfy_command_uses_supported_base_directory_and_only_pinned_nodes(tmp_path: Path) -> None:
     command = _comfy_command(_settings(tmp_path))
 
     assert command[command.index("--base-directory") + 1] == (tmp_path / "comfy").as_posix()
     assert "--models-directory" not in command
     assert "--disable-all-custom-nodes" in command
-    assert command[command.index("--whitelist-custom-nodes") + 1] == "ComfyUI-NAG"
+    assert command[
+        command.index("--whitelist-custom-nodes") + 1 : command.index("--disable-api-nodes")
+    ] == ("ComfyUI-NAG", "GenAutomationH3", "ComfyUI-H3-Latent-Upscaler")
     assert "--highvram" not in command
     assert command[command.index("--reserve-vram") + 1] == "4"
 

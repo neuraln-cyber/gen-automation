@@ -18,7 +18,7 @@ from gen_automation.i2v_worker.face_stabilizer import (
     FaceStabilizationError,
     preflight_face_stabilizer,
 )
-from gen_automation.i2v_worker.settings import I2VWorkerSettings
+from gen_automation.i2v_worker.settings import I2V_CUSTOM_NODES, I2VWorkerSettings
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -211,8 +211,7 @@ def _comfy_command(settings: I2VWorkerSettings) -> tuple[str, ...]:
         "--disable-auto-launch",
         "--disable-all-custom-nodes",
         "--whitelist-custom-nodes",
-        "ComfyUI-NAG",
-        "GenAutomationH3",
+        *I2V_CUSTOM_NODES,
         "--disable-api-nodes",
         "--disable-metadata",
         "--base-directory",
