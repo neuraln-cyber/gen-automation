@@ -12,6 +12,7 @@ from typing import Protocol
 from uuid import UUID
 
 from gen_automation.domain.i2v import I2VOutputRegistration, I2VWorkerDeploymentState
+from gen_automation.i2v_worker.models import I2V_JOB_SCHEMA, I2V_RESULT_SCHEMA
 from gen_automation.integrations.salad.client import SALAD_QUEUE_JOB_PAGE_SIZE
 from gen_automation.integrations.salad.errors import SaladAPIError, SaladProtocolError
 from gen_automation.integrations.salad.models import (
@@ -30,8 +31,9 @@ from gen_automation.integrations.salad.models import (
 
 I2V_SALAD_GPU_CLASS_NAME = "RTX 5090 (32 GB)"
 I2V_SALAD_SUBMISSION_SCHEMA = "i2v-salad-submission/v1"
-I2V_SALAD_JOB_SCHEMA = "i2v-salad-job/v1"
-I2V_WORKER_OUTPUT_SCHEMA = "i2v-salad-result/v1"
+# Salad forwards the HTTP input unchanged; use the actual worker wire contract.
+I2V_SALAD_JOB_SCHEMA = I2V_JOB_SCHEMA
+I2V_WORKER_OUTPUT_SCHEMA = I2V_RESULT_SCHEMA
 _PINNED_IMAGE_PATTERN = r"[^\s@]+@sha256:[0-9a-f]{64}"
 
 
@@ -462,7 +464,7 @@ def parse_i2v_worker_output(value: JSONValue) -> I2VOutputRegistration:
     if not isinstance(value, dict):
         raise SaladProtocolError("I2V worker output must be an object")
     payload: object = value
-    if value.get("schema") == I2V_WORKER_OUTPUT_SCHEMA:
+    if value.get("schema") in {I2V_WORKER_OUTPUT_SCHEMA, "i2v-salad-result/v1"}:
         payload = value.get("output")
     if not isinstance(payload, dict):
         raise SaladProtocolError("I2V worker output payload must be an object")

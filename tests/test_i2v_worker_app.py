@@ -13,6 +13,7 @@ from pydantic import SecretStr
 from gen_automation.i2v_worker.app import create_i2v_worker_app
 from gen_automation.i2v_worker.lora_catalog import LORA_ARTIFACTS_BY_ROLE
 from gen_automation.i2v_worker.settings import I2VWorkerSettings
+from gen_automation.services.i2v_salad import I2V_SALAD_JOB_SCHEMA, parse_i2v_worker_output
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / "workflows/dasiwa-wan22-i2v-v1.api.json"
@@ -152,7 +153,7 @@ def test_private_delivery_rejects_off_route_input_before_inference(tmp_path: Pat
     supervisor = _Supervisor()
     app = create_i2v_worker_app(settings, supervisor=supervisor)  # type: ignore[arg-type]
     with TestClient(app) as client:
-        response = client.post("/jobs/i2v", json=_job())
+        response = client.post("/jobs/i2v", json={**_job(), "schema": I2V_SALAD_JOB_SCHEMA})
         assert response.status_code == 409
         assert response.json()["detail"] == "private input delivery is required"
 
@@ -286,6 +287,7 @@ def test_generation_returns_exact_wire_result_and_cleans_runtime(
     assert response.status_code == 200, response.text
     result = response.json()
     assert result["schema"] == "i2v-result/v2"
+    assert parse_i2v_worker_output(result).object_version_id == "output-v1"
     assert result["output"]["frame_count"] == 81
     assert result["output"]["metadata"]["codec"] == "h264"
     assert result["output"]["metadata"]["loras"] == []

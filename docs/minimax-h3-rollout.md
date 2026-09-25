@@ -103,6 +103,13 @@ disable the consumer. Startup stages and sanitized failures are logged. The UI
 labels the existing `claimed` state **Waiting for worker**, not generation progress.
 Cancelled jobs stay cancelled; deployment must not start a GPU or enqueue a test.
 
+The same audit found the Salad controller still sent `i2v-salad-job/v1` and
+expected `i2v-salad-result/v1`, while the HTTP worker requires `i2v-job/v2` and
+returns `i2v-result/v2`. Dispatch now shares the worker's schema constants and
+result reconciliation accepts the actual envelope while retaining legacy-result
+compatibility. Tests validate submitted payloads against the actual worker model
+and feed an HTTP worker response into the controller parser.
+
 See [Salad queue-worker integration](https://docs.salad.com/container-engine/how-to-guides/job-processing/queue-worker).
 
 Sources: [community implementation](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler/tree/40316cf008b2fd8663263270669eb4da23f89d2c),

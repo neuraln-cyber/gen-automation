@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Final, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
@@ -23,6 +23,8 @@ from gen_automation.i2v_worker.lora_catalog import (
 )
 
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
+I2V_JOB_SCHEMA: Final = "i2v-job/v2"
+I2V_RESULT_SCHEMA: Final = "i2v-result/v2"
 _SAFE_OBJECT_KEY = re.compile(r"^[^\x00-\x1f\\]{1,1024}$")
 _MAX_LOOP_DURATION_SECONDS = 25
 
@@ -279,7 +281,7 @@ def source_resolution_canvas(width: int, height: int) -> tuple[int, int]:
 
 class I2VJob(_StrictModel):
     schema_version: Literal["i2v-job/v2"] = Field(
-        default="i2v-job/v2",
+        default=I2V_JOB_SCHEMA,
         alias="schema",
         serialization_alias="schema",
     )
@@ -321,7 +323,7 @@ class OutputResult(_StrictModel):
 
 class I2VResult(_StrictModel):
     schema_version: Literal["i2v-result/v2"] = Field(
-        default="i2v-result/v2",
+        default=I2V_RESULT_SCHEMA,
         alias="schema",
         serialization_alias="schema",
     )
