@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Final, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
+from gen_automation.i2v_worker.h3_upscale import (
+    H3_UPSCALER_BYTES,
+    H3_UPSCALER_FILENAME,
+    H3_UPSCALER_ROLE,
+    H3_UPSCALER_SHA256,
+)
 from gen_automation.i2v_worker.lora_catalog import (
     LORA_ARTIFACTS_BY_ROLE,
     LORA_CATALOG,
@@ -17,6 +23,8 @@ from gen_automation.i2v_worker.lora_catalog import (
 )
 
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
+I2V_JOB_SCHEMA: Final = "i2v-job/v2"
+I2V_RESULT_SCHEMA: Final = "i2v-result/v2"
 _SAFE_OBJECT_KEY = re.compile(r"^[^\x00-\x1f\\]{1,1024}$")
 _MAX_LOOP_DURATION_SECONDS = 25
 
@@ -30,6 +38,7 @@ class ModelObject(_StrictModel):
         "diffusion_model",
         "video_vae",
         "audio_vae",
+        "h3_latent_upscaler",
         "diffusion_model_high",
         "diffusion_model_low",
         "text_encoder",
@@ -58,6 +67,7 @@ class ModelObject(_StrictModel):
             "diffusion_model": "models/diffusion_models/",
             "video_vae": "models/vae/",
             "audio_vae": "models/vae/",
+            "h3_latent_upscaler": "models/latent_upscale_models/",
             "diffusion_model_high": "models/diffusion_models/",
             "diffusion_model_low": "models/diffusion_models/",
             "text_encoder": "models/text_encoders/",
@@ -87,6 +97,12 @@ class ModelObject(_StrictModel):
         ):
             raise ValueError("model object path is invalid")
         reviewed = LORA_ARTIFACTS_BY_ROLE.get(self.role)
+        if self.role == H3_UPSCALER_ROLE and (
+            self.install_path != f"models/latent_upscale_models/{H3_UPSCALER_FILENAME}"
+            or self.byte_size != H3_UPSCALER_BYTES
+            or self.sha256 != H3_UPSCALER_SHA256
+        ):
+            raise ValueError("H3 latent upscaler artifact identity is invalid")
         if reviewed is not None and (
             self.install_path != reviewed.install_path
             or self.byte_size != reviewed.byte_size
@@ -171,6 +187,7 @@ class GenerationSettings(_StrictModel):
     width: int = Field(default=576, ge=32)
     height: int = Field(default=1024, ge=32)
     match_source_aspect: bool = False
+    match_source_resolution: bool = False
     seed: int = -1
     steps: int = Field(default=4, ge=2)
     high_end_step: int = Field(default=2, ge=1)
@@ -213,18 +230,21 @@ class GenerationSettings(_StrictModel):
                 or self.cfg != 1
                 or self.width % 32
                 or self.height % 32
-                or self.width * self.height > 768 * 1344
+                or (not self.match_source_resolution and self.width * self.height > 768 * 1344)
                 or max(self.width, self.height) > 2048
             ):
                 raise ValueError(
                     "MiniMax H3 requires 17n+5 frames (124-362), 24 fps, "
-                    "4 or 8 steps, Euler/simple, CFG 1 and a canvas up to 1.03 MP"
+                    "4 or 8 steps, Euler/simple, CFG 1 and 32-aligned dimensions up to 2048; "
+                    "standard mode uses a canvas up to 1.03 MP"
                 )
             if self.loras or self.face_fidelity != "off" or self.loop or self.upscale != "none":
                 raise ValueError(
                     "MiniMax H3 does not use WAN LoRAs, face locking, loops or upscaling"
                 )
             return self
+        if self.match_source_resolution:
+            raise ValueError("original-resolution generation requires MiniMax H3")
         if self.h3_loras:
             raise ValueError("H3 LoRAs require the MiniMax H3 profile")
         if self.scheduler != "linear_quadratic":
@@ -248,9 +268,20 @@ class GenerationSettings(_StrictModel):
         return self
 
 
+def source_resolution_canvas(width: int, height: int) -> tuple[int, int]:
+    """Pad, never resample, an H3 source onto the model's 32-pixel grid."""
+    if not (32 <= width <= 2048 and 32 <= height <= 2048):
+        raise ValueError(
+            "Original-resolution H3 images must be between 32 and 2048 pixels per side"
+        )
+    if width % 2 or height % 2:
+        raise ValueError("Exact H.264 output requires an image with even width and height")
+    return ((width + 31) // 32 * 32, (height + 31) // 32 * 32)
+
+
 class I2VJob(_StrictModel):
     schema_version: Literal["i2v-job/v2"] = Field(
-        default="i2v-job/v2",
+        default=I2V_JOB_SCHEMA,
         alias="schema",
         serialization_alias="schema",
     )
@@ -292,7 +323,7 @@ class OutputResult(_StrictModel):
 
 class I2VResult(_StrictModel):
     schema_version: Literal["i2v-result/v2"] = Field(
-        default="i2v-result/v2",
+        default=I2V_RESULT_SCHEMA,
         alias="schema",
         serialization_alias="schema",
     )

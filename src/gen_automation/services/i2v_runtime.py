@@ -51,6 +51,7 @@ from gen_automation.services.i2v import (
 )
 from gen_automation.services.i2v_salad import (
     I2V_SALAD_JOB_SCHEMA,
+    I2V_WORKER_OUTPUT_SCHEMA,
     I2VInfrastructureMutation,
     I2VProviderObservation,
     I2VSaladClient,
@@ -1088,7 +1089,7 @@ def _validate_worker_result_identity(
 ) -> None:
     if (
         not isinstance(value, dict)
-        or value.get("schema") != "i2v-salad-result/v1"
+        or value.get("schema") not in (I2V_WORKER_OUTPUT_SCHEMA, "i2v-salad-result/v1")
         or value.get("job_id") != str(job.job_id)
         or value.get("attempt_id") != str(attempt.attempt_id)
         or value.get("request_sha256") != job.request_sha256
@@ -1124,6 +1125,8 @@ def _worker_settings_snapshot(settings: Mapping[str, object]) -> dict[str, objec
     snapshot = dict(settings)
     if not snapshot.get("h3_loras"):
         snapshot.pop("h3_loras", None)
+    if not snapshot.get("match_source_resolution"):
+        snapshot.pop("match_source_resolution", None)
     return snapshot
 
 

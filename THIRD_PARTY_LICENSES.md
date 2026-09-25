@@ -1,4 +1,4 @@
-# Third-party notices for I2V face stabilization
+# Third-party notices for I2V extensions
 
 The optional `stable_expression` face stabilizer includes the following pinned
 components in the immutable I2V worker image. The complete license texts shipped
@@ -31,3 +31,18 @@ license texts and copyright notices in
 - Linux wheel SHA-256: `211e581f5a4670acbbe08fff36a35e9946039d2eea28b80394632d036d1be527`
 - License and bundled third-party notices: preserved by the installed wheel in
   its distribution metadata.
+
+## Community MiniMax H3 latent upscaler
+
+- Code: <https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler>
+- Revision: `40316cf008b2fd8663263270669eb4da23f89d2c`
+- Code license: MIT; complete upstream text is retained in the extension and
+  `/opt/i2v/licenses/H3-Latent-Upscaler-MIT.txt` in the worker image.
+- Separate weights: <https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler>
+- Model revision: `3f941d5d182014dd5c0a5e16330420ee2d4aa0c6`
+- Model repository license declaration: Apache-2.0.
+- BF16 3D v1 checkpoint SHA-256:
+  `4f57821f5837f32f7142b67d815606dbd7550f194e5c769f7d6c3f83b146a5e6`.
+
+The image includes code only, not model weights. The private manifest and existing
+CloudFront delivery path provide the checksum-verified checkpoint separately.

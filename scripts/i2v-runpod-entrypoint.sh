@@ -11,7 +11,7 @@ worker_gid="10002"
   exit 1
 }
 if [ "${GEN_I2V_WORKER_PROVIDER:-runpod}" = "salad" ]; then
-  # Salad uses ephemeral container storage and its managed queue HTTP bridge.
+  # The supervisor starts our bundled Salad queue consumer after Comfy is ready.
   # Never require or initialize a RunPod network volume on this path.
   exec setpriv \
     --reuid "$worker_uid" \

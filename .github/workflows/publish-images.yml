@@ -302,11 +302,15 @@ jobs:
             requirements-i2v-face.lock
             requirements-i2v-worker.lock
             patches/comfyui-nag/chroma-stream-blocks.patch
+            patches/salad-queue-worker/strict-http-status.patch
+            patches/salad-queue-worker/job-stream-heartbeat-watchdog.patch
+            patches/salad-queue-worker/imds-token-recovery.patch
             src/gen_automation/__init__.py
             src/gen_automation/i2v_worker
             src/gen_automation/domain/__init__.py
             src/gen_automation/domain/private_delivery.py
             scripts/i2v-runpod-entrypoint.sh
+            scripts/verify-h3-comfy-nodes.py
             workflows/dasiwa-wan22-i2v-v1.api.json
             workflows/dasiwa-minimax-h3-i2v-v1.api.json
           )

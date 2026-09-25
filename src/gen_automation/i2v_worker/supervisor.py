@@ -11,14 +11,14 @@ from contextlib import suppress
 from pathlib import Path
 from typing import cast
 
-from gen_automation.i2v_worker.artifacts import ModelBootstrapError, S3ModelBootstrapper
+from gen_automation.i2v_worker.artifacts import S3ModelBootstrapper
 from gen_automation.i2v_worker.comfy import ComfyClient
 from gen_automation.i2v_worker.face_stabilizer import (
     FaceDetector,
     FaceStabilizationError,
     preflight_face_stabilizer,
 )
-from gen_automation.i2v_worker.settings import I2VWorkerSettings
+from gen_automation.i2v_worker.settings import I2V_CUSTOM_NODES, I2VWorkerSettings
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,6 +41,7 @@ class WorkerSupervisor:
         self.face_detector: FaceDetector | None = None
         self.ready = False
         self.failed = False
+        self.stage = "pending"
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
 
@@ -68,29 +69,58 @@ class WorkerSupervisor:
             async with asyncio.timeout(self.settings.startup_timeout_seconds):
                 await self._bootstrap()
             self.ready = True
+            self._set_stage("ready")
             while not self._stopping:
                 if self.comfy is None or self.comfy.poll() is not None:
                     raise WorkerStartupError("worker child process exited")
+                if not self.queue_ready:
+                    self._set_stage("queue_consumer_exited")
+                    raise WorkerStartupError("queue consumer exited")
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
             raise
-        except (TimeoutError, ModelBootstrapError, WorkerStartupError, OSError):
+        except Exception as error:
+            # This is the background-task boundary. An unhandled exception otherwise
+            # leaves /health green and /ready false forever, hiding the dead task.
+            # Never log exception text/tracebacks: bootstrap errors may include grants.
+            _LOGGER.error(
+                "i2v_startup_failed stage=%s error_type=%s",
+                self.stage,
+                type(error).__name__,
+            )
             self.ready = False
             self.failed = True
-            if self.comfy is not None:
-                await asyncio.to_thread(_stop_process, self.comfy)
+            self.face_detector = None
+            for process in (self.queue_worker, self.comfy):
+                if process is not None:
+                    await asyncio.to_thread(_stop_process, process)
+
+    @property
+    def queue_ready(self) -> bool:
+        return not self.settings.queue_worker_enabled or (
+            self.queue_worker is not None and self.queue_worker.poll() is None
+        )
+
+    def _set_stage(self, stage: str) -> None:
+        self.stage = stage
+        _LOGGER.info("i2v_startup stage=%s", stage)
 
     async def _bootstrap(self) -> None:
         try:
+            self._set_stage("directories")
             _ensure_directories(self.settings)
+            self._set_stage("gpu_preflight")
             await asyncio.to_thread(_verify_gpu_runtime, self.settings)
             if self.settings.profile == "wan22":
+                self._set_stage("face_preflight")
                 self.face_detector = await asyncio.to_thread(
                     preflight_face_stabilizer,
                     device="cpu",
                 )
             if not self.settings.models_prepared:
+                self._set_stage("model_download")
                 await S3ModelBootstrapper(self.settings).bootstrap()
+            self._set_stage("comfy_start")
             self.comfy = _start_process(
                 _comfy_command(self.settings),
                 cwd=self.settings.comfy_root,
@@ -102,11 +132,24 @@ class WorkerSupervisor:
                 network_attempts=self.settings.network_attempts,
                 poll_seconds=self.settings.comfy_poll_seconds,
                 profile=self.settings.profile,
+                source_resolution_enabled=any(
+                    item.role == "h3_latent_upscaler" for item in self.settings.model_objects
+                ),
             )
+            self._set_stage("comfy_readiness")
             while not await self.comfy_client.ready():
                 if self.comfy.poll() is not None:
                     raise WorkerStartupError("ComfyUI exited during startup")
                 await asyncio.sleep(2)
+            if self.settings.queue_worker_enabled:
+                self._set_stage("queue_consumer_start")
+                self.queue_worker = _start_process(
+                    (self.settings.queue_worker_path.as_posix(),),
+                    cwd=self.settings.runtime_root,
+                    environment=_queue_environment(),
+                )
+                if not self.queue_ready:
+                    raise WorkerStartupError("queue consumer exited during startup")
         except asyncio.CancelledError:
             raise
         except FaceStabilizationError as error:
@@ -114,10 +157,6 @@ class WorkerSupervisor:
                 "face stabilizer startup failed: reason_code=%s",
                 error.reason.name.lower(),
             )
-            self.ready = False
-            self.failed = True
-            self.face_detector = None
-        except (ModelBootstrapError, WorkerStartupError, OSError):
             self.ready = False
             self.failed = True
             self.face_detector = None
@@ -172,8 +211,7 @@ def _comfy_command(settings: I2VWorkerSettings) -> tuple[str, ...]:
         "--disable-auto-launch",
         "--disable-all-custom-nodes",
         "--whitelist-custom-nodes",
-        "ComfyUI-NAG",
-        "GenAutomationH3",
+        *I2V_CUSTOM_NODES,
         "--disable-api-nodes",
         "--disable-metadata",
         "--base-directory",
@@ -223,6 +261,18 @@ def _child_environment() -> dict[str, str]:
             "NO_PROXY": "127.0.0.1,localhost,::1",
         }
     )
+    return environment
+
+
+def _queue_environment() -> dict[str, str]:
+    # The SDK discovers its queue/configuration through Salad IMDS. It must not
+    # inherit model grants, AWS credentials, or arbitrary proxy configuration.
+    allowed = {"HOME", "LANG", "LC_ALL", "PATH", "SSL_CERT_DIR", "SSL_CERT_FILE"}
+    environment = {
+        key: value for key, value in os.environ.items() if key in allowed and "\x00" not in value
+    }
+    environment.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    environment["SALAD_LOG_LEVEL"] = "info"
     return environment
 
 

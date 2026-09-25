@@ -17,11 +17,13 @@ from urllib.parse import urlsplit
 import httpx2
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from gen_automation.i2v_worker.h3_upscale import h3_base_canvas
 from gen_automation.i2v_worker.models import (
     DownloadGrant,
     GenerationSettings,
     InputSnapshot,
     UploadGrant,
+    source_resolution_canvas,
 )
 
 
@@ -136,6 +138,14 @@ def resolve_generation_settings(
     source_width: int,
     source_height: int,
 ) -> GenerationSettings:
+    if settings.match_source_resolution:
+        try:
+            width, height = source_resolution_canvas(source_width, source_height)
+            return GenerationSettings.model_validate(
+                {**settings.model_dump(), "width": width, "height": height}
+            )
+        except ValueError as error:
+            raise MediaError(str(error)) from None
     if not settings.match_source_aspect:
         return settings
     width, height = _source_aspect_native_dimensions(source_width, source_height)
@@ -165,15 +175,24 @@ def prepare_input_image(
     *,
     width: int,
     height: int,
+    preserve_source_resolution: bool = False,
 ) -> None:
-    """Contain a verified source in the WAN canvas without discarding pixels."""
+    """Contain a source, or pad its untouched pixels for original-resolution H3."""
 
     try:
         with Image.open(source) as opened:
             image = ImageOps.exif_transpose(opened).convert("RGB")
-        fitted = ImageOps.contain(image, (width, height), Image.Resampling.LANCZOS)
-        left = (width - fitted.width) // 2
-        top = (height - fitted.height) // 2
+        if preserve_source_resolution:
+            if source_resolution_canvas(*image.size) != (width, height):
+                raise MediaError("original-resolution canvas does not match the source")
+            fitted = image
+            # Even offsets match H.264's chroma grid and the delivery crop.
+            left = (width - fitted.width) // 4 * 2
+            top = (height - fitted.height) // 4 * 2
+        else:
+            fitted = ImageOps.contain(image, (width, height), Image.Resampling.LANCZOS)
+            left = (width - fitted.width) // 2
+            top = (height - fitted.height) // 2
         canvas = Image.new("RGB", (width, height))
         canvas.paste(fitted, (left, top))
         right = width - left - fitted.width
@@ -350,9 +369,32 @@ def finalize_native_video(
     source_height: int,
 ) -> tuple[Path, dict[str, Any]]:
     """Keep H3's generated audio/video; normalize MP4 playback without another GPU pass."""
-    del source_width, source_height
     if len(paths) != 1 or paths[0].suffix.lower() != ".mp4":
         raise MediaError("native video output is invalid")
+    output_width, output_height = settings.width, settings.height
+    video_args: tuple[str, ...] = ("-c:v", "copy")
+    if settings.match_source_resolution:
+        if source_resolution_canvas(source_width, source_height) != (
+            settings.width,
+            settings.height,
+        ):
+            raise MediaError("original-resolution output does not match the generation canvas")
+        output_width, output_height = source_width, source_height
+        if (output_width, output_height) != (settings.width, settings.height):
+            left = (settings.width - output_width) // 4 * 2
+            top = (settings.height - output_height) // 4 * 2
+            video_args = (
+                "-vf",
+                f"crop={output_width}:{output_height}:{left}:{top},setsar=1",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+            )
     output = job_root / "video.mp4"
     try:
         subprocess.run(  # noqa: S603
@@ -367,8 +409,7 @@ def finalize_native_video(
                 "0:v:0",
                 "-map",
                 "0:a:0",
-                "-c:v",
-                "copy",
+                *video_args,
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -389,19 +430,33 @@ def finalize_native_video(
     metadata = _probe_video(
         output,
         settings,
-        width=settings.width,
-        height=settings.height,
+        width=output_width,
+        height=output_height,
         frame_count=settings.frame_count,
+    )
+    base_width, base_height = (
+        h3_base_canvas(settings.width, settings.height)
+        if settings.match_source_resolution
+        else (settings.width, settings.height)
     )
     metadata.update(
         {
-            "native_width": settings.width,
-            "native_height": settings.height,
-            "upscale": "none",
+            "native_width": base_width,
+            "native_height": base_height,
+            "upscale": (
+                "h3_latent_refine"
+                if (base_width, base_height) != (settings.width, settings.height)
+                else "none"
+            ),
             "loop_mode": "none",
             "loop_count": 1,
-            "source_fit": "contain_edge_pad",
+            "source_fit": (
+                "source_keyframe_edge_pad_crop"
+                if settings.match_source_resolution
+                else "contain_edge_pad"
+            ),
             "match_source_aspect": settings.match_source_aspect,
+            "match_source_resolution": settings.match_source_resolution,
         }
     )
     return output, metadata

@@ -492,13 +492,15 @@ def test_dream_lora_rejects_multiple_mutually_exclusive_concept_terms() -> None:
         )
 
 
-def test_comfy_command_uses_supported_base_directory_and_only_pinned_nag(tmp_path: Path) -> None:
+def test_comfy_command_uses_supported_base_directory_and_only_pinned_nodes(tmp_path: Path) -> None:
     command = _comfy_command(_settings(tmp_path))
 
     assert command[command.index("--base-directory") + 1] == (tmp_path / "comfy").as_posix()
     assert "--models-directory" not in command
     assert "--disable-all-custom-nodes" in command
-    assert command[command.index("--whitelist-custom-nodes") + 1] == "ComfyUI-NAG"
+    assert command[
+        command.index("--whitelist-custom-nodes") + 1 : command.index("--disable-api-nodes")
+    ] == ("ComfyUI-NAG", "GenAutomationH3", "ComfyUI-H3-Latent-Upscaler")
     assert "--highvram" not in command
     assert command[command.index("--reserve-vram") + 1] == "4"
 
@@ -511,7 +513,12 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
         "sha256:7b324d212a4450795b49edba9949b7cdc72429148a64e974334bfe5774d51385"
     )
 
-    assert from_lines == [f"FROM {pytorch_image}"]
+    assert from_lines == [
+        "FROM golang:1.26.2-alpine@sha256:"
+        "f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739500e08c86393a21b1"
+        " AS salad-queue-worker-builder",
+        f"FROM {pytorch_image}",
+    ]
     assert all("@sha256:" in line for line in from_lines)
     assert "c2bcbecd82ec5ae66594340b395c24ef0217b238" in dockerfile
     assert "ef8a641be08983cf5f06669f70719b6eecce3c7f" in dockerfile
@@ -617,8 +624,8 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
         assert package in lock
     assert "runpod==1.11.0" in lock
     assert "'/opt/i2v-venv/' not in module.__file__" in dockerfile
-    assert "salad-http-job-queue-worker" not in dockerfile
-    assert "strict-http-status.patch" not in dockerfile
+    assert "COPY --from=salad-queue-worker-builder --chmod=0555" in dockerfile
+    assert "strict-http-status.patch" in dockerfile
 
 
 def test_ci_builds_smokes_and_scans_the_model_free_worker() -> None:

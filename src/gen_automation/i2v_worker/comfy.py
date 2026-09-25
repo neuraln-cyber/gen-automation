@@ -33,6 +33,7 @@ class ComfyClient:
         network_attempts: int,
         poll_seconds: float,
         profile: str = "wan22",
+        source_resolution_enabled: bool = False,
     ) -> None:
         if base_url != "http://127.0.0.1:8188":
             raise ComfyError("ComfyUI endpoint is invalid")
@@ -59,6 +60,17 @@ class ComfyClient:
             timeout=httpx2.Timeout(request_timeout_seconds, connect=5),
             limits=httpx2.Limits(max_connections=2, max_keepalive_connections=2),
         )
+        if source_resolution_enabled:
+            self.required_nodes += tuple(
+                (name, f"/object_info/{name}")
+                for name in (
+                    "ManagedH3SourceUpscale",
+                    "MinimaxH3LatentUpscaler3D",
+                    "MMH3SplitUpscale",
+                    "MMH3TemporalSplitParamsV10",
+                    "MMH3SpatialSplitParamsV10",
+                )
+            )
 
     async def close(self) -> None:
         await self.client.aclose()

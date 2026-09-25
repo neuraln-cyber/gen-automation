@@ -88,6 +88,64 @@ def _input_registration(*, object_key: str = "i2v/input.png") -> I2VInputRegistr
     )
 
 
+async def test_h3_original_resolution_freezes_canvas_from_owned_input(i2v_session):
+    session, owner_id = i2v_session
+    source = await register_i2v_input(
+        session,
+        actor_user_id=owner_id,
+        registration=_input_registration().model_copy(update={"width": 1144, "height": 1480}),
+        now=_NOW,
+    )
+    settings = {
+        "profile": "minimax_h3",
+        "frame_count": 124,
+        "fps": 24,
+        "scheduler": "simple",
+        "match_source_resolution": True,
+        "width": 576,
+        "height": 1024,
+    }
+    job = await create_i2v_job(
+        session,
+        actor_user_id=owner_id,
+        draft=I2VJobDraft(
+            input_id=source.input_id, positive_prompt="Leaves sway.", settings=settings
+        ),
+        now=_NOW,
+    )
+    assert job.settings_snapshot["match_source_resolution"]
+    assert (job.settings_snapshot["width"], job.settings_snapshot["height"]) == (1152, 1504)
+    assert (job.input_snapshot["width"], job.input_snapshot["height"]) == (1144, 1480)
+    assert settings["width"] == 576  # neither preset/draft nor source is rewritten
+
+
+async def test_h3_invalid_original_size_rejected_before_job_creation(i2v_session):
+    session, owner_id = i2v_session
+    source = await register_i2v_input(
+        session,
+        actor_user_id=owner_id,
+        registration=_input_registration().model_copy(update={"width": 1145, "height": 1480}),
+        now=_NOW,
+    )
+    with pytest.raises(I2VInputError, match="even width"):
+        await create_i2v_job(
+            session,
+            actor_user_id=owner_id,
+            draft=I2VJobDraft(
+                input_id=source.input_id,
+                settings={
+                    "profile": "minimax_h3",
+                    "frame_count": 124,
+                    "fps": 24,
+                    "scheduler": "simple",
+                    "match_source_resolution": True,
+                },
+            ),
+            now=_NOW,
+        )
+    assert await session.scalar(text("SELECT count(*) FROM i2v_jobs")) == 0
+
+
 async def test_presets_and_jobs_freeze_snapshots_and_support_fifo_reordering(
     i2v_session: tuple[AsyncSession, UUID],
 ) -> None:

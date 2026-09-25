@@ -105,6 +105,7 @@ def create_i2v_worker_app(
         comfy = resolved_supervisor.comfy_client
         is_ready = bool(
             resolved_supervisor.ready
+            and (not settings.queue_worker_enabled or resolved_supervisor.queue_ready)
             and comfy is not None
             and (settings.profile == "minimax_h3" or resolved_supervisor.face_detector is not None)
             and await comfy.ready()
@@ -175,6 +176,10 @@ def create_i2v_worker_app(
             raise HTTPException(status_code=400, detail="invalid request") from None
         if job.settings_snapshot.profile != settings.profile:
             raise HTTPException(status_code=409, detail="job requires a different worker profile")
+        if job.settings_snapshot.match_source_resolution and not any(
+            item.role == "h3_latent_upscaler" for item in settings.model_objects
+        ):
+            raise HTTPException(status_code=409, detail="worker has no H3 source-size upscaler")
         if settings.require_private_delivery and (
             job.input_grant.url.scheme != "https"
             or job.input_grant.url.host != settings.model_delivery_domain
@@ -285,6 +290,11 @@ async def _run_job(
             prepared_path,
             width=generation_settings.width,
             height=generation_settings.height,
+            **(
+                {"preserve_source_resolution": True}
+                if generation_settings.match_source_resolution
+                else {}
+            ),
         )
         face_detector: FaceDetector | None = None
         source_face: SourceFaceAnalysis | None = None
@@ -368,6 +378,7 @@ async def _run_job(
             "loop_count": metadata["loop_count"],
             "source_fit": metadata["source_fit"],
             "match_source_aspect": metadata["match_source_aspect"],
+            "match_source_resolution": generation_settings.match_source_resolution,
             "loras": lora_provenance(generation_settings),
             "effective_positive_prompt": resolved_positive_prompt,
             "effective_negative_prompt": resolved_negative_prompt,

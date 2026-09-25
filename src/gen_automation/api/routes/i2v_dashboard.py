@@ -47,6 +47,7 @@ async def dashboard_i2v(request: Request, principal: ReleaseReader) -> Response:
                 else settings.i2v_lora_profile_enabled
             ),
             "video_profile": settings.i2v_profile,
+            "source_resolution_enabled": settings.i2v_h3_source_resolution_enabled,
             "video_provider": "RunPod" if settings.i2v_runpod_enabled else "Salad",
         },
     )

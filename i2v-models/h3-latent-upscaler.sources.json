@@ -1,0 +1,14 @@
+{
+  "schema": "gen-automation/i2v-model-sources/v1",
+  "sources": [
+    {
+      "name": "LBH H3 3D latent upscaler v1 BF16",
+      "role": "h3_latent_upscaler",
+      "url": "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/resolve/3f941d5d182014dd5c0a5e16330420ee2d4aa0c6/minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors",
+      "expected_bytes": 690592992,
+      "sha256": "4f57821f5837f32f7142b67d815606dbd7550f194e5c769f7d6c3f83b146a5e6",
+      "target_filename": "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors",
+      "optional": false
+    }
+  ]
+}

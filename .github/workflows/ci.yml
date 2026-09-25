@@ -110,6 +110,7 @@ jobs:
           tests/test_i2v_worker_app.py
           tests/test_i2v_worker_comfy.py
           tests/test_i2v_worker_supervisor.py
+          tests/test_i2v_worker_logging.py
           tests/test_i2v_worker_media.py
           tests/test_i2v_api.py
           tests/test_i2v_dashboard.py

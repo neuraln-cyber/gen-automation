@@ -9,9 +9,12 @@ from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from gen_automation.domain.private_delivery import PrivateDeliveryRoute
+from gen_automation.i2v_worker.h3_upscale import H3_UPSCALER_ROLE
 from gen_automation.i2v_worker.lora_catalog import REQUIRED_LORA_ROLES
 from gen_automation.i2v_worker.manifest_contract import required_i2v_model_roles
 from gen_automation.i2v_worker.models import ModelObject
+
+I2V_CUSTOM_NODES = ("ComfyUI-NAG", "GenAutomationH3", "ComfyUI-H3-Latent-Upscaler")
 
 
 class I2VWorkerSettings(BaseSettings):
@@ -25,6 +28,9 @@ class I2VWorkerSettings(BaseSettings):
     model_objects_json: SecretStr
     profile: Literal["wan22", "minimax_h3"] = "wan22"
     environment: Literal["production", "test"] = "production"
+    provider: Literal["runpod", "salad"] = "runpod"
+    queue_worker_enabled: bool = False
+    queue_worker_path: Path = Path("/usr/local/bin/salad-http-job-queue-worker")
     aws_region: str = "eu-central-1"
     s3_endpoint_url: str | None = None
     model_delivery_domain: str | None = None
@@ -60,6 +66,10 @@ class I2VWorkerSettings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_configuration(self) -> I2VWorkerSettings:
+        if self.provider == "salad" and not self.queue_worker_enabled:
+            raise ValueError("Salad requires the queue consumer")
+        if not _is_container_absolute(self.queue_worker_path):
+            raise ValueError("queue worker path must be absolute")
         if self.comfy_base_url != "http://127.0.0.1:8188":
             raise ValueError("ComfyUI must be loopback only")
         if (
@@ -95,6 +105,8 @@ class I2VWorkerSettings(BaseSettings):
             self.source_revision is None or self.private_manifest_source_sha256 is None
         ):
             raise ValueError("MiniMax H3 requires immutable manifest and source identity")
+        if self.profile == "minimax_h3" and H3_UPSCALER_ROLE in roles:
+            required.add(H3_UPSCALER_ROLE)
         if roles != required or len(roles) != len(objects):
             raise ValueError("model manifest roles are incomplete or duplicated")
         return self

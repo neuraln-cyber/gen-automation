@@ -1001,6 +1001,11 @@ def _validate_generation_profile(
         )
     if settings.i2v_profile != "minimax_h3":
         return
+    if value.get("match_source_resolution") and not settings.i2v_h3_source_resolution_enabled:
+        raise HTTPException(
+            status_code=409,
+            detail="Original-resolution generation is waiting for the matching H3 worker update.",
+        )
     if negative_prompt.strip():
         raise HTTPException(
             status_code=422,

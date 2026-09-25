@@ -1,3 +1,4 @@
+import json
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -19,6 +20,8 @@ from gen_automation.domain.i2v import (
     I2VJobSnapshot,
     I2VJobState,
 )
+from gen_automation.i2v_worker.models import I2VJob as WorkerJob
+from gen_automation.i2v_worker.models import I2VResult as WorkerResult
 from gen_automation.integrations.salad.errors import SaladAPIError, SaladTransportError
 from gen_automation.integrations.salad.models import (
     JSONValue,
@@ -116,7 +119,11 @@ class SignedGrantBuilder(I2VJobInputBuilder):
             "output_grant": {
                 "method": "PUT",
                 "url": "https://private.example.test/output?signature=secret",
-                "headers": {"Content-Type": "video/mp4"},
+                "headers": {
+                    "Content-Type": "video/mp4",
+                    "Cache-Control": "private, no-store, max-age=0",
+                    "x-amz-server-side-encryption": "AES256",
+                },
                 "storage_backend": "s3",
                 "storage_bucket": "private-i2v",
                 "object_key": f"i2v/outputs/{job.job_id}/{attempt.attempt_id}.mp4",
@@ -247,6 +254,7 @@ class FakeRuntimeSalad:
                                 f"i2v/outputs/{job.input['job_id']}/{job.input['attempt_id']}.mp4"
                             ),
                             "sha256": "c" * 64,
+                            "object_version_id": "output-v1",
                             "content_type": "video/mp4",
                             "width": 1280,
                             "height": 720,
@@ -380,7 +388,9 @@ async def test_pending_pull_never_starts_inference_and_success_completes(
     ).action == "provider_job_submitted"
     assert client.submission_calls == 1
     assert isinstance(client.last_input, dict)
-    assert client.last_input["schema"] == "i2v-salad-job/v1"
+    assert client.last_input["schema"] == "i2v-job/v2"
+    # Validate the real submitted payload, not a separately maintained fake schema.
+    WorkerJob.model_validate_json(json.dumps(client.last_input), strict=True)
     input_grant = client.last_input["input_grant"]
     assert isinstance(input_grant, dict)
     assert "signature=secret" in str(input_grant["url"])
@@ -401,6 +411,8 @@ async def test_pending_pull_never_starts_inference_and_success_completes(
     assert attempt is not None and _utc(attempt.started_at) == _NOW + timedelta(seconds=5)
 
     client.set_all_job_status(SaladJobStatus.SUCCEEDED)
+    for remote in client.jobs.values():
+        WorkerResult.model_validate_json(json.dumps(remote.output), strict=True)
     assert (await runtime.run_cycle(now=_NOW + timedelta(seconds=6))).action == "output_completed"
     job, _attempt = await _durable_job(database, job_id)
     assert job.state == I2VJobState.SUCCEEDED

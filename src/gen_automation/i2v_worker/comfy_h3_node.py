@@ -9,6 +9,8 @@ from typing import Any
 
 from nodes import LoraLoaderModelOnly  # type: ignore[import-not-found]
 
+from gen_automation.i2v_worker.comfy_h3_upscale import ManagedH3SourceUpscale
+
 
 class ManagedH3LoraLoader(LoraLoaderModelOnly):  # type: ignore[misc]
     def load_lora_model_only(self, model: Any, lora_name: str, strength_model: float) -> tuple[Any]:
@@ -22,4 +24,7 @@ class ManagedH3LoraLoader(LoraLoaderModelOnly):  # type: ignore[misc]
         return (result[0],)
 
 
-NODE_CLASS_MAPPINGS = {"ManagedH3LoraLoader": ManagedH3LoraLoader}
+NODE_CLASS_MAPPINGS = {
+    "ManagedH3LoraLoader": ManagedH3LoraLoader,
+    "ManagedH3SourceUpscale": ManagedH3SourceUpscale,
+}

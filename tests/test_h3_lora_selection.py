@@ -33,8 +33,10 @@ from gen_automation.services.i2v_media import I2VSignedGrantBuilder
 from gen_automation.services.i2v_runtime import (
     I2VRuntimeConfigurationError,
     _validate_fresh_grants,
+    _worker_input_snapshot,
     _worker_settings_snapshot,
 )
+from gen_automation.services.i2v_salad import I2V_SALAD_JOB_SCHEMA
 from gen_automation.storage.memory import MemoryObjectStore
 from tests.test_h3_lora_library import _body, _capture, _create, _setup
 from tests.test_i2v_api import _complete_uploaded_input
@@ -144,6 +146,31 @@ def test_selection_preset_queue_private_grants_and_safe_deletion(client: TestCli
     _validate_fresh_grants(
         additions, job=job, attempt=attempt, output_prefix="i2v/outputs", now=datetime.now(UTC)
     )
+    # The in-memory store models S3 grants but uses its own backend label.
+    wire_additions = {
+        **additions,
+        "output_grant": {**additions["output_grant"], "storage_backend": "s3"},
+    }
+    wire_job = I2VJob.model_validate_json(
+        json.dumps(
+            {
+                "schema": I2V_SALAD_JOB_SCHEMA,
+                "job_id": str(job.job_id),
+                "attempt_id": str(attempt.attempt_id),
+                "request_sha256": job.request_sha256,
+                "input_snapshot": _worker_input_snapshot(
+                    {**job.input_snapshot, "storage_backend": "s3"}
+                ),
+                "settings_snapshot": _worker_settings_snapshot(job.settings_snapshot),
+                "positive_prompt": job.positive_prompt,
+                "negative_prompt": job.negative_prompt,
+                **wire_additions,
+            }
+        ),
+        strict=True,
+    )
+    assert wire_job.settings_snapshot.profile == "minimax_h3"
+    assert str(wire_job.h3_lora_grants[0].artifact_id) == entry["id"]
     grant["sha256"] = "f" * 64
     with pytest.raises(I2VRuntimeConfigurationError, match="frozen job"):
         _validate_fresh_grants(
@@ -413,6 +440,7 @@ const context = vm.createContext({
   advanced: {querySelectorAll: () => [], querySelector: () => null},
   CSS: {escape: x => x}, renderLoraCatalog() {}, syncLoraPromptPreview() {},
   syncAspectControls() {}, updateDuration() {}, announce() {},
+  sourceResolutionError: () => "",
   loraBlockMessage: () => "unavailable",
 });
 vm.runInContext(section("collectSettings", "sourceNativeDimensions") +
