@@ -622,8 +622,8 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
         assert package in lock
     assert "runpod==1.11.0" in lock
     assert "'/opt/i2v-venv/' not in module.__file__" in dockerfile
-    assert "salad-http-job-queue-worker" not in dockerfile
-    assert "strict-http-status.patch" not in dockerfile
+    assert "COPY --from=salad-queue-worker-builder --chmod=0555" in dockerfile
+    assert "strict-http-status.patch" in dockerfile
 
 
 def test_ci_builds_smokes_and_scans_the_model_free_worker() -> None:

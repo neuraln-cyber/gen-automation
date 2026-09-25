@@ -74,6 +74,7 @@ class _Comfy:
 
 class _Supervisor:
     queue_ready = True
+
     def __init__(self, *, ready: bool = True, face_ready: bool = True) -> None:
         self.ready = ready
         self.failed = False
