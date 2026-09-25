@@ -8,7 +8,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
-from gen_automation.domain.enums import LoraImportJobState, LoraImportSource
+from gen_automation.domain.enums import LoraImportJobState, LoraImportSource, ModelArtifactFamily
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
@@ -66,6 +66,7 @@ class CivitaiResolveRead(StrictLoraApiModel):
 
 
 class LoraImportRead(StrictLoraApiModel):
+    model_family: ModelArtifactFamily = ModelArtifactFamily.ILLUSTRIOUS
     id: UUID
     name: str
     source_kind: LoraImportSource
@@ -82,6 +83,7 @@ class LoraImportRead(StrictLoraApiModel):
 
 
 class LoraEntryRead(StrictLoraApiModel):
+    model_family: ModelArtifactFamily = ModelArtifactFamily.ILLUSTRIOUS
     id: UUID | str
     name: str
     status: str

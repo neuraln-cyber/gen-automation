@@ -48,6 +48,7 @@ from gen_automation.domain.enums import (
     LoraImportSource,
     ManagedLoraLifecycle,
     MegaDeliveryState,
+    ModelArtifactFamily,
     ModelArtifactKind,
     OutboxStatus,
     PublicationApprovalAction,
@@ -4328,9 +4329,9 @@ class ModelArtifactApproval(UuidPrimaryKeyMixin, TimestampMixin, Base):
         ),
         nullable=False,
     )
-    model_family: Mapped[GenerationModelFamily] = mapped_column(
+    model_family: Mapped[ModelArtifactFamily] = mapped_column(
         Enum(
-            GenerationModelFamily,
+            ModelArtifactFamily,
             name="generation_model_family",
             native_enum=False,
             create_constraint=True,
@@ -4338,7 +4339,7 @@ class ModelArtifactApproval(UuidPrimaryKeyMixin, TimestampMixin, Base):
             length=20,
         ),
         nullable=False,
-        default=GenerationModelFamily.ILLUSTRIOUS,
+        default=ModelArtifactFamily.ILLUSTRIOUS,
     )
     source_url: Mapped[str] = mapped_column(Text, nullable=False)
     storage_key: Mapped[str] = mapped_column(String(1024), nullable=False)

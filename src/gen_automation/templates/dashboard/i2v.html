@@ -20,6 +20,9 @@
       <div class="i2v-hero-copy">
         <p class="page-kicker">{{ 'DaSiWa MiniMax H3 Turbo' if video_profile == 'minimax_h3' else 'DaSiWa Wan 2.2' }} · {{ video_provider }}</p>
         <h1>Image to video</h1>
+        {% if video_profile == 'minimax_h3' %}
+        <a class="secondary-button" href="/dashboard/loras?library=h3">Manage H3 LoRA files</a>
+        {% endif %}
         <p class="lede">
           Choose your first frame, describe the scene in motion, and queue your clips.
           Your draft and presets keep the setup ready for the next session.

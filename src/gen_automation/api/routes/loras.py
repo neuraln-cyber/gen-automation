@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, cast
+from typing import Annotated, Literal, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
@@ -21,6 +21,7 @@ from gen_automation.domain.enums import (
     LoraImportJobState,
     LoraImportSource,
     ManagedLoraLifecycle,
+    ModelArtifactFamily,
     ModelArtifactKind,
 )
 from gen_automation.domain.lora_api import (
@@ -41,6 +42,8 @@ from gen_automation.domain.lora_catalog import (
     CivitaiLoraImportCreate,
     ManualLoraImportCreate,
     ManualUploadCompletion,
+    lora_model_family,
+    managed_lora_model_family,
 )
 from gen_automation.integrations.civitai import (
     CivitaiClient,
@@ -92,11 +95,14 @@ async def get_lora_library(
     request: Request,
     session: Session,
     principal: ComplianceReader,
+    library: Literal["image", "h3"] = "image",
 ) -> LoraLibraryRead:
     _enabled_settings(request)
     managed = await list_managed_loras(session, actor_user_id=principal.user_id, limit=None)
-    imports = await list_lora_import_jobs(session, actor_user_id=principal.user_id, limit=100)
-    entries = await _library_entries(session, managed)
+    imports = await list_lora_import_jobs(
+        session, actor_user_id=principal.user_id, limit=100, h3_library=library == "h3"
+    )
+    entries = await _library_entries(session, managed, h3_library=library == "h3")
     return LoraLibraryRead(
         entries=entries,
         imports=[_import_read(item) for item in imports],
@@ -539,6 +545,8 @@ async def _artifact_lock_version(
 async def _library_entries(
     session: Session,
     managed: tuple[ManagedLoraArtifactSnapshot, ...],
+    *,
+    h3_library: bool = False,
 ) -> list[LoraEntryRead]:
     historically_referenced = await managed_lora_historical_reference_sha256s(
         session,
@@ -587,6 +595,7 @@ async def _library_entries(
         managed_prefix = approval.storage_key.startswith("worker/managed-loras/sha256/")
         entries.append(
             LoraEntryRead(
+                model_family=approval.model_family,
                 id=f"static-{approval.id}",
                 name=approval.name,
                 status="catalog_error" if managed_prefix else "active",
@@ -614,7 +623,11 @@ async def _library_entries(
         for item in managed
         if item.artifact_id not in seen_managed
     )
-    return entries
+    return [
+        entry
+        for entry in entries
+        if (entry.model_family == ModelArtifactFamily.MINIMAX_H3) == h3_library
+    ]
 
 
 def _managed_entry(
@@ -646,6 +659,7 @@ def _managed_entry(
     if isinstance(raw_version, str):
         version_name = raw_version
     return LoraEntryRead(
+        model_family=managed_lora_model_family(item.provenance),
         id=item.artifact_id,
         name=item.display_name,
         status=item.lifecycle.value,
@@ -693,6 +707,7 @@ def _import_read(item: LoraImportJobSnapshot) -> LoraImportRead:
         LoraImportJobState.FAILED,
     }
     return LoraImportRead(
+        model_family=lora_model_family(item.expected_metadata),
         id=item.job_id,
         name=item.display_name,
         source_kind=item.source_type,

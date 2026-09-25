@@ -24,6 +24,7 @@ from gen_automation.domain.enums import (
     ApprovalStatus,
     GenerationModelFamily,
     ManagedLoraLifecycle,
+    ModelArtifactFamily,
     ModelArtifactKind,
 )
 from gen_automation.domain.runtime_bindings import WORKER_DYNAMIC_MANIFEST_MAX_BYTES
@@ -223,6 +224,7 @@ async def build_effective_artifact_manifest(
         else selected_catalog
     )
     managed_approval_predicates = [
+        ModelArtifactApproval.model_family != ModelArtifactFamily.MINIMAX_H3,
         ModelArtifactApproval.status == ApprovalStatus.APPROVED,
         ModelArtifactApproval.is_current.is_(True),
         ModelArtifactApproval.kind == ModelArtifactKind.LORA,
