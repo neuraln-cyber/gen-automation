@@ -464,7 +464,7 @@ def parse_i2v_worker_output(value: JSONValue) -> I2VOutputRegistration:
     if not isinstance(value, dict):
         raise SaladProtocolError("I2V worker output must be an object")
     payload: object = value
-    if value.get("schema") in {I2V_WORKER_OUTPUT_SCHEMA, "i2v-salad-result/v1"}:
+    if value.get("schema") in (I2V_WORKER_OUTPUT_SCHEMA, "i2v-salad-result/v1"):
         payload = value.get("output")
     if not isinstance(payload, dict):
         raise SaladProtocolError("I2V worker output payload must be an object")
