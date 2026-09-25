@@ -10,6 +10,28 @@ from typing import Any
 from gen_automation.i2v_worker.h3_upscale import H3_UPSCALER_FILENAME
 
 
+def h3_refinement_split_params(nodes: dict[str, Any]) -> tuple[Any, Any]:
+    # Native MiniMax PackedLayout supports only first/last keyframes. The
+    # community refiner's motion/identity anchors inject interior keyframes,
+    # which fail before sampling. Keep its first-frame reanchor and overlaps.
+    temporal = nodes["MMH3TemporalSplitParamsV10"].execute(
+        chunk_frames=56,
+        temporal_overlap_frames=22,
+        anchor_strength=0.999,
+        motion_anchor_frames="0",
+        identity_anchor_frames=0,
+    )[0]
+    spatial = nodes["MMH3SpatialSplitParamsV10"].execute(
+        tile_width=1024,
+        tile_height=1024,
+        overlap_ratio=0.25,
+        fade_ratio=0.5,
+        min_tile_size=256,
+        seam_denoise=1.0,
+    )[0]
+    return temporal, spatial
+
+
 class ManagedH3SourceUpscale:
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:  # noqa: N802
@@ -91,21 +113,7 @@ class ManagedH3SourceUpscale:
             conditioning,
             {"minimax_keyframes": [{"resolved_frame_index": 0, "latent": keyframe}]},
         )
-        temporal = NODE_CLASS_MAPPINGS["MMH3TemporalSplitParamsV10"].execute(
-            chunk_frames=56,
-            temporal_overlap_frames=22,
-            anchor_strength=0.999,
-            motion_anchor_frames="22",
-            identity_anchor_frames=24,
-        )[0]
-        spatial = NODE_CLASS_MAPPINGS["MMH3SpatialSplitParamsV10"].execute(
-            tile_width=1024,
-            tile_height=1024,
-            overlap_ratio=0.25,
-            fade_ratio=0.5,
-            min_tile_size=256,
-            seam_denoise=1.0,
-        )[0]
+        temporal, spatial = h3_refinement_split_params(NODE_CLASS_MAPPINGS)
         refined = (
             NODE_CLASS_MAPPINGS["MMH3SplitUpscale"]
             .execute(
