@@ -13,7 +13,7 @@ class _Result:
         self.row = row
 
     def one_or_none(self) -> object:
-        return self.row
+        return (*self.row, "") if isinstance(self.row, tuple) else self.row
 
 
 class _Session:
@@ -30,6 +30,8 @@ class _Request:
             class _Settings:
                 i2v_hires_profile_enabled = True
                 i2v_lora_profile_enabled = True
+                i2v_profile = "wan22"
+                i2v_h3_loras_enabled = False
 
             settings = _Settings()
 

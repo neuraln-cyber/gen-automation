@@ -143,6 +143,27 @@ class LoraSelection(_StrictModel):
     )
 
 
+class H3LoraSelection(_StrictModel):
+    """Immutable library identity, never a user-supplied filename or URL."""
+
+    artifact_id: UUID
+    sha256: str = Field(pattern=SHA256_PATTERN)
+    strength: float = Field(ge=-100, le=100, allow_inf_nan=False, strict=True)
+
+
+class H3LoraGrant(_StrictModel):
+    artifact_id: UUID
+    sha256: str = Field(pattern=SHA256_PATTERN)
+    byte_size: int = Field(gt=0)
+    download: DownloadGrant
+
+    @model_validator(mode="after")
+    def validate_expiry(self) -> H3LoraGrant:
+        if self.download.expires_at.tzinfo is None:
+            raise ValueError("H3 LoRA grant expiry must include a timezone")
+        return self
+
+
 class GenerationSettings(_StrictModel):
     profile: Literal["wan22", "minimax_h3"] = "wan22"
     frame_count: int = Field(default=81, ge=9)
@@ -176,10 +197,13 @@ class GenerationSettings(_StrictModel):
         default_factory=list,
         max_length=MAX_REVIEWED_LORA_SELECTIONS,
     )
+    h3_loras: list[H3LoraSelection] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_wan_shape(self) -> GenerationSettings:
         if self.profile == "minimax_h3":
+            if len({item.artifact_id for item in self.h3_loras}) != len(self.h3_loras):
+                raise ValueError("H3 LoRA selections must be unique")
             if (
                 self.frame_count % 17 != 5
                 or not 124 <= self.frame_count <= 362
@@ -201,6 +225,8 @@ class GenerationSettings(_StrictModel):
                     "MiniMax H3 does not use WAN LoRAs, face locking, loops or upscaling"
                 )
             return self
+        if self.h3_loras:
+            raise ValueError("H3 LoRAs require the MiniMax H3 profile")
         if self.scheduler != "linear_quadratic":
             raise ValueError("WAN requires the linear_quadratic scheduler")
         if self.frame_count % 8 != 1:
@@ -237,6 +263,15 @@ class I2VJob(_StrictModel):
     settings_snapshot: GenerationSettings
     input_grant: DownloadGrant
     output_grant: UploadGrant
+    h3_lora_grants: list[H3LoraGrant] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_h3_grants(self) -> I2VJob:
+        expected = [(item.artifact_id, item.sha256) for item in self.settings_snapshot.h3_loras]
+        actual = [(item.artifact_id, item.sha256) for item in self.h3_lora_grants]
+        if actual != expected:
+            raise ValueError("H3 LoRA grants must exactly match the frozen selections")
+        return self
 
 
 class OutputResult(_StrictModel):

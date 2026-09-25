@@ -564,6 +564,7 @@ class Settings(BaseSettings):
     # exact artifacts and readiness identity are verified, and can be rolled
     # back without changing its manifest.
     i2v_lora_profile_enabled: bool = False
+    i2v_h3_loras_enabled: bool = False
     # RunPod is enabled only after its immutable worker and persistent model
     # volume have been verified. The false state keeps cutover/rollback atomic.
     i2v_runpod_enabled: bool = False
@@ -1028,6 +1029,13 @@ class Settings(BaseSettings):
                 )
         if self.i2v_lora_profile_enabled and not self.i2v_enabled:
             errors.append("I2V LoRA profile requires I2V")
+        if self.i2v_h3_loras_enabled and (
+            not self.i2v_enabled
+            or self.i2v_profile != "minimax_h3"
+            or not self.lora_manager_enabled
+            or not self.i2v_hires_profile_enabled
+        ):
+            errors.append("Managed H3 LoRAs require the enabled H3 queue and LoRA manager")
         if self.i2v_lora_worker_enabled and not self.i2v_enabled:
             errors.append("I2V LoRA worker capability requires I2V")
         if self.i2v_lora_worker_enabled and self.i2v_worker_source_revision is None:

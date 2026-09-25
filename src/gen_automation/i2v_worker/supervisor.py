@@ -173,6 +173,7 @@ def _comfy_command(settings: I2VWorkerSettings) -> tuple[str, ...]:
         "--disable-all-custom-nodes",
         "--whitelist-custom-nodes",
         "ComfyUI-NAG",
+        "GenAutomationH3",
         "--disable-api-nodes",
         "--disable-metadata",
         "--base-directory",

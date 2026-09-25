@@ -15,7 +15,7 @@ from typing import cast
 from uuid import UUID
 
 from sqlalchemy import desc, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from gen_automation.db.models import Asset, GenerationJob, Release, ReleaseVersion
 from gen_automation.domain.enums import AssetKind, AssetState
@@ -31,6 +31,7 @@ from gen_automation.domain.i2v import (
 from gen_automation.domain.ids import uuid7
 from gen_automation.i2v_worker.models import ModelObject
 from gen_automation.integrations.runpod.models import JSONValue
+from gen_automation.services.h3_loras import H3LoraUnavailableError, resolve_h3_loras
 from gen_automation.services.i2v import register_i2v_input
 from gen_automation.storage.base import (
     ObjectAlreadyExistsError,
@@ -91,6 +92,8 @@ class I2VSignedGrantBuilder:
     store: ObjectStore
     expires_in: int
     output_prefix: str = "i2v/outputs"
+    model_store: ObjectStore | None = None
+    sessions: async_sessionmaker[AsyncSession] | None = None
 
     async def build(
         self,
@@ -128,7 +131,7 @@ class I2VSignedGrantBuilder:
             raise I2VMediaStorageError("private I2V grants could not be issued") from error
         if output.method != "PUT" or output.fields:
             raise I2VMediaStorageError("private store did not issue a direct PUT grant")
-        return {
+        additions: dict[str, JSONValue] = {
             "input_grant": {
                 "method": "GET",
                 "url": input_url,
@@ -144,6 +147,44 @@ class I2VSignedGrantBuilder:
                 "expires_at": expires_at.isoformat(),
             },
         }
+        if job.settings_snapshot.get("h3_loras"):
+            if self.model_store is None or self.sessions is None:
+                raise I2VMediaStorageError("H3 LoRA private storage is unavailable")
+            grants: list[JSONValue] = []
+            try:
+                async with self.sessions() as session:
+                    rows = await resolve_h3_loras(
+                        session,
+                        job.settings_snapshot,
+                        actor_user_id=job.created_by_user_id,
+                        existing_job=True,
+                    )
+                    for row in rows:
+                        if row.storage_bucket != self.model_store.bucket:
+                            raise H3LoraUnavailableError("H3 LoRA storage identity changed")
+                        url = await self.model_store.presign_download(
+                            key=row.object_key,
+                            version_id=row.object_version_id,
+                            expires_in=self.expires_in,
+                        )
+                        grants.append(
+                            {
+                                "artifact_id": str(row.id),
+                                "sha256": row.artifact_sha256,
+                                "byte_size": row.byte_size,
+                                "download": {
+                                    "method": "GET",
+                                    "url": url,
+                                    "expires_at": expires_at.isoformat(),
+                                },
+                            }
+                        )
+            except H3LoraUnavailableError:
+                raise
+            except ObjectStoreError:
+                raise I2VMediaStorageError("private H3 LoRA grants could not be issued") from None
+            additions["h3_lora_grants"] = grants
+        return additions
 
     async def verify_output(
         self,

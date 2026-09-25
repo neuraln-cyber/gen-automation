@@ -168,7 +168,11 @@ def i2v_salad_runtime_config_from_settings(settings: Settings) -> I2VRuntimeConf
             readiness_probe_path=readiness_probe_path,
         ),
         output_prefix=settings.i2v_output_prefix,
-        reviewed_loras_enabled=settings.i2v_lora_worker_enabled,
+        reviewed_loras_enabled=(
+            settings.i2v_h3_loras_enabled
+            if settings.i2v_profile == "minimax_h3"
+            else settings.i2v_lora_worker_enabled
+        ),
     )
 
 

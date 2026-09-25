@@ -1139,6 +1139,8 @@ class ControllerWorkloads:
                         store=object_store,
                         expires_in=settings.i2v_object_grant_ttl_seconds,
                         output_prefix=settings.i2v_output_prefix,
+                        model_store=model_artifact_store.store if model_artifact_store else None,
+                        sessions=sessions,
                     ),
                     environment_provider=I2VRuntimeEnvironment(
                         settings=settings,
