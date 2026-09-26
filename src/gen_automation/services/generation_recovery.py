@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from gen_automation.db.models import (
+    Asset,
     AuditEvent,
     GenerationAttempt,
     GenerationJob,
@@ -17,6 +18,8 @@ from gen_automation.db.models import (
 )
 from gen_automation.domain.canonical import canonical_sha256
 from gen_automation.domain.enums import (
+    AssetKind,
+    AssetState,
     DesiredDeploymentState,
     GenerationAttemptState,
     GenerationState,
@@ -34,6 +37,10 @@ from gen_automation.domain.near_black_recovery import (
 
 INFRASTRUCTURE_RETRY_GRANT_ACTION = "generation_attempt.infrastructure_retry_granted"
 MAX_INFRASTRUCTURE_RETRY_GRANTS = 2
+STALLED_PROGRESS_RETRY_GRANT_ACTION = "generation_attempt.stalled_progress_retry_granted"
+MAX_STALLED_PROGRESS_RETRY_GRANTS = 1
+_PROGRESS_WATCHDOG_ACTION = "generation_attempt.watchdog_cancel_requested"
+_PROGRESS_WATCHDOG_REASON = "accepted_output_progress_stalled"
 RUNTIME_INSTANCE_TURNOVER_RETRY_GRANT_ACTION = (
     "generation_attempt.runtime_instance_turnover_retry_granted"
 )
@@ -421,7 +428,7 @@ async def grant_infrastructure_retry(
             grant_limit=MAX_INFRASTRUCTURE_RETRY_GRANTS,
         )
 
-    return await _grant_bounded_infrastructure_retry(
+    result = await _grant_bounded_infrastructure_retry(
         session,
         attempt=attempt,
         job=job,
@@ -442,6 +449,108 @@ async def grant_infrastructure_retry(
             "provider_external_id": attempt.provider_external_id,
             "salad_deployment_id": str(attempt.salad_deployment_id),
             "assets_retained": True,
+        },
+    )
+    if result.granted or failure_code != SALAD_WATCHDOG_EXPIRED_ERROR_CODE:
+        return result
+    return await _grant_stalled_progress_retry(
+        session,
+        attempt=attempt,
+        job=job,
+        source=source,
+        actor=actor,
+        retry_at=retry_at,
+        occurred_at=occurred_at,
+        generic_result=result,
+    )
+
+
+async def _grant_stalled_progress_retry(
+    session: AsyncSession,
+    *,
+    attempt: GenerationAttempt,
+    job: GenerationJob,
+    source: InfrastructureRetrySource,
+    actor: str,
+    retry_at: datetime,
+    occurred_at: datetime,
+    generic_result: InfrastructureRetryGrant,
+) -> InfrastructureRetryGrant:
+    """One reserve retry for proven partial progress, never a budget reset.
+
+    Called only after the normal infrastructure/lifecycle guards. An earlier
+    unrelated failure must not strand a productive batch when its node stalls.
+    The exact durable watchdog intent and retained masters are both required;
+    generic retries already granted to this attempt must not stack this grant.
+    """
+    if (
+        attempt.error_code != SALAD_WATCHDOG_EXPIRED_ERROR_CODE
+        or attempt.provider_state != "cancelled"
+        or generic_result.grant_ordinal < MAX_INFRASTRUCTURE_RETRY_GRANTS
+        or canonical_sha256(job.parameters) != job.parameters_sha256
+        or await session.scalar(
+            select(AuditEvent.id).where(
+                AuditEvent.resource_type == "generation_attempt",
+                AuditEvent.resource_id == attempt.id,
+                AuditEvent.action == INFRASTRUCTURE_RETRY_GRANT_ACTION,
+            )
+        )
+        is not None
+    ):
+        return generic_result
+    intent = await session.scalar(
+        select(AuditEvent)
+        .where(
+            AuditEvent.resource_type == "generation_attempt",
+            AuditEvent.resource_id == attempt.id,
+            AuditEvent.action == _PROGRESS_WATCHDOG_ACTION,
+        )
+        .order_by(AuditEvent.occurred_at.desc(), AuditEvent.id.desc())
+        .limit(1)
+    )
+    if intent is None:
+        return generic_result
+    accepted_count = intent.detail.get("accepted_output_count")
+    if (
+        intent.detail.get("reason") != _PROGRESS_WATCHDOG_REASON
+        or intent.detail.get("provider_external_id") != attempt.provider_external_id
+        or not isinstance(accepted_count, int)
+        or isinstance(accepted_count, bool)
+        or not 0 < accepted_count < job.expected_output_count
+    ):
+        return generic_result
+    retained_count = int(
+        await session.scalar(
+            select(func.count(Asset.id)).where(
+                Asset.generation_job_id == job.id,
+                Asset.kind == AssetKind.RAW_MASTER,
+                Asset.state == AssetState.AVAILABLE,
+                Asset.available_at.is_not(None),
+            )
+        )
+        or 0
+    )
+    if not accepted_count <= retained_count < job.expected_output_count:
+        return generic_result
+    return await _grant_bounded_infrastructure_retry(
+        session,
+        attempt=attempt,
+        job=job,
+        action=STALLED_PROGRESS_RETRY_GRANT_ACTION,
+        grant_limit=MAX_STALLED_PROGRESS_RETRY_GRANTS,
+        failure_code=SALAD_WATCHDOG_EXPIRED_ERROR_CODE,
+        failure_detail=attempt.error_detail,
+        source=source,
+        actor=actor,
+        retry_at=retry_at,
+        occurred_at=occurred_at,
+        audit_detail={
+            "provider_external_id": attempt.provider_external_id,
+            "watchdog_audit_event_id": str(intent.id),
+            "accepted_output_count": accepted_count,
+            "retained_output_count": retained_count,
+            "assets_retained": True,
+            "retry_class": "stalled_partial_progress",
         },
     )
 
@@ -757,6 +866,48 @@ async def recover_dead_lettered_infrastructure_jobs(
         .correlate(GenerationJob)
         .scalar_subquery()
     )
+    progress_grant_count = (
+        select(func.count(AuditEvent.id))
+        .select_from(AuditEvent)
+        .join(granted_attempt, granted_attempt.id == AuditEvent.resource_id)
+        .where(
+            AuditEvent.resource_type == "generation_attempt",
+            AuditEvent.action == STALLED_PROGRESS_RETRY_GRANT_ACTION,
+            granted_attempt.job_id == GenerationJob.id,
+        )
+        .correlate(GenerationJob)
+        .scalar_subquery()
+    )
+    retained_count = (
+        select(func.count(Asset.id))
+        .where(
+            Asset.generation_job_id == GenerationJob.id,
+            Asset.kind == AssetKind.RAW_MASTER,
+            Asset.state == AssetState.AVAILABLE,
+            Asset.available_at.is_not(None),
+        )
+        .correlate(GenerationJob)
+        .scalar_subquery()
+    )
+    partial_progress_reserve_available = and_(
+        GenerationAttempt.error_code == SALAD_WATCHDOG_EXPIRED_ERROR_CODE,
+        GenerationAttempt.provider_state == "cancelled",
+        progress_grant_count < MAX_STALLED_PROGRESS_RETRY_GRANTS,
+        retained_count > 0,
+        retained_count < GenerationJob.expected_output_count,
+        exists(
+            select(AuditEvent.id).where(
+                AuditEvent.resource_type == "generation_attempt",
+                AuditEvent.resource_id == GenerationAttempt.id,
+                AuditEvent.action == _PROGRESS_WATCHDOG_ACTION,
+                AuditEvent.detail["reason"].as_string() == _PROGRESS_WATCHDOG_REASON,
+                AuditEvent.detail["provider_external_id"].as_string()
+                == GenerationAttempt.provider_external_id,
+                # Validate counts in the grant helper, without SQL integer casts
+                # that could abort the whole sweep on malformed historical JSON.
+            )
+        ),
+    )
     stop_requested = exists(
         select(AuditEvent.id).where(
             AuditEvent.resource_type == "release",
@@ -839,7 +990,10 @@ async def recover_dead_lettered_infrastructure_jobs(
                     Release.phase.in_(_RETRYABLE_RELEASE_PHASES),
                     ~stop_requested,
                     ~exact_attempt_already_granted,
-                    job_grant_count < MAX_INFRASTRUCTURE_RETRY_GRANTS,
+                    or_(
+                        job_grant_count < MAX_INFRASTRUCTURE_RETRY_GRANTS,
+                        partial_progress_reserve_available,
+                    ),
                 )
                 .order_by(GenerationJob.created_at, GenerationJob.id)
                 .limit(limit)
