@@ -7,6 +7,31 @@ CPU tests or artifact access checks as proof that GPU generation has succeeded.
 
 ## Scope
 
+### September 26 memory/recovery correction (prepared, not activated)
+
+The no-LoRA source-size run completed. The following three-LoRA run exhausted
+GPU memory during base sampling (3/4), before refinement. Logs recorded 32,192
+MiB reserved and 28,458 MiB peak allocated. The CUDA error also broke cleanup in
+`unload_all_models()` and killed ComfyUI's prompt thread. HTTP history remained
+empty and GPU statistics kept returning 500, so the application waited forever.
+
+The worker now checks GPU runtime health during empty-history polling. Three
+consecutive failures trigger recovery; healthy slow sampling has no new time
+limit. Explicit CUDA OOM history also triggers recovery. Only the ComfyUI child
+is replaced, preserving the queue consumer and downloaded model/LoRA files.
+The original execution returns an error even when recovery succeeds; there is
+no internal replay or invented output. Existing provider retry policy is
+unchanged. Failed recovery closes readiness and health for provider recovery.
+
+H3 alone uses the native expandable-segment allocator, 8 GiB reserve, 4 GiB
+DynamicVRAM headroom, and no cross-prompt graph cache. This gives activation and
+LoRA patch buffers more room; offloading can trade speed for memory safety.
+Image worker configuration, output dimensions, frame counts, selected LoRAs,
+model artifacts and private delivery routes are unchanged. CPU tests prove
+failure handling and configuration, not that every LoRA combination fits on
+the GPU. Activation requires approval to replace the currently unhealthy worker;
+do not create or retry a test video on the owner's behalf.
+
 The first release animates one source image with a motion/audio direction prompt.
 It uses DaSiWa Hybrid Turbo v2 INT8 with native ComfyUI MiniMax H3 nodes, not the
 creator's optional multi-reference/director extensions. Image generation stays

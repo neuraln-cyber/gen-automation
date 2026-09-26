@@ -325,3 +325,99 @@ def test_video_image_reuses_the_hardened_image_queue_consumer() -> None:
     assert video.split("FROM pytorch/", 1)[0] == image.split("FROM pytorch/", 1)[0]
     assert "COPY --from=salad-queue-worker-builder --chmod=0555" in video
     assert "RUN test -x /usr/local/bin/salad-http-job-queue-worker" in video
+
+
+def test_h3_memory_policy_is_isolated_and_does_not_reduce_generation_settings(
+    tmp_path, monkeypatch
+):
+    from gen_automation.i2v_worker.supervisor import _comfy_command, _comfy_environment
+
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "backend:cudaMallocAsync")
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
+    legacy = _settings(tmp_path)
+    h3 = legacy.model_copy(update={"profile": "minimax_h3"})
+    command = _comfy_command(h3)
+    assert command[command.index("--reserve-vram") + 1] == "8"
+    assert command[command.index("--vram-headroom") + 1] == "4"
+    assert "--disable-cuda-malloc" in command
+    assert "--cache-none" in command
+    assert "--lowvram" not in command  # Do not move text encoding to CPU.
+    environment = _comfy_environment(h3)
+    assert environment["PYTORCH_ALLOC_CONF"] == "backend:native,expandable_segments:True"
+    assert environment["PYTORCH_CUDA_ALLOC_CONF"] == environment["PYTORCH_ALLOC_CONF"]
+    assert "--disable-cuda-malloc" not in _comfy_command(legacy)
+    assert _comfy_environment(legacy)["PYTORCH_ALLOC_CONF"] == "backend:cudaMallocAsync"
+    assert h3.execution_timeout_seconds is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, True])
+async def test_recovery_replaces_only_comfy_without_downloads_or_queue_restart(
+    tmp_path, monkeypatch, caplog, failure
+):
+    import gen_automation.i2v_worker.supervisor as module
+
+    old, new, queue = _Process(), _Process(), _Process()
+    stopped = []
+    starts = []
+    supervisor = WorkerSupervisor(
+        _settings(tmp_path).model_copy(
+            update={
+                "queue_worker_enabled": True,
+                "provider": "salad",
+            }
+        )
+    )
+    supervisor.comfy, supervisor.queue_worker = old, queue
+    supervisor.comfy_client = _ComfyClient()
+    supervisor.ready = True
+
+    def start(command, **kwargs):
+        assert supervisor.ready is False
+        assert supervisor._recovering is True
+        starts.append(command)
+        if failure:
+            raise RuntimeError("private credential must not appear")
+        return new
+
+    async def forbidden_bootstrap():
+        raise AssertionError("must not download/rebootstrap")
+
+    monkeypatch.setattr(supervisor, "_bootstrap", forbidden_bootstrap)
+    monkeypatch.setattr(module, "_start_process", start)
+    monkeypatch.setattr(module, "_stop_process", stopped.append)
+    assert await supervisor.recover_comfy() is (not failure)
+    assert len(starts) == 1
+    assert queue not in stopped and supervisor.queue_worker is queue
+    assert old in stopped
+    assert supervisor.ready is (not failure)
+    assert supervisor.failed is failure
+    assert supervisor._recovering is False
+    assert "private credential" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_supervision_does_not_kill_consumer_while_comfy_is_replaced(tmp_path, monkeypatch):
+    import gen_automation.i2v_worker.supervisor as module
+
+    supervisor = WorkerSupervisor(
+        _settings(tmp_path).model_copy(
+            update={
+                "queue_worker_enabled": True,
+            }
+        )
+    )
+    supervisor.queue_worker = _Process()
+    supervisor._recovering = True
+    stopped = []
+
+    async def bootstrap():
+        pass
+
+    monkeypatch.setattr(supervisor, "_bootstrap", bootstrap)
+    monkeypatch.setattr(module, "_stop_process", stopped.append)
+    await supervisor.start()
+    await _wait_for(lambda: supervisor.stage == "ready")
+    await asyncio.sleep(0.02)
+    assert not supervisor.failed and not stopped
+    await supervisor.stop()

@@ -18,7 +18,11 @@ from gen_automation.i2v_worker.face_stabilizer import (
     FaceStabilizationError,
     preflight_face_stabilizer,
 )
-from gen_automation.i2v_worker.settings import I2V_CUSTOM_NODES, I2VWorkerSettings
+from gen_automation.i2v_worker.settings import (
+    H3_COMFY_MEMORY_ARGS,
+    I2V_CUSTOM_NODES,
+    I2VWorkerSettings,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,6 +48,8 @@ class WorkerSupervisor:
         self.stage = "pending"
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
+        self._recovering = False
+        self._recovery_lock = asyncio.Lock()
 
     async def start(self) -> None:
         if self._task is not None:
@@ -71,6 +77,13 @@ class WorkerSupervisor:
             self.ready = True
             self._set_stage("ready")
             while not self._stopping:
+                # Recovery deliberately replaces only ComfyUI. Keep the queue
+                # consumer alive to receive the failed request's HTTP response.
+                if self.failed:
+                    return
+                if self._recovering:
+                    await asyncio.sleep(1)
+                    continue
                 if self.comfy is None or self.comfy.poll() is not None:
                     raise WorkerStartupError("worker child process exited")
                 if not self.queue_ready:
@@ -105,6 +118,48 @@ class WorkerSupervisor:
         self.stage = stage
         _LOGGER.info("i2v_startup stage=%s", stage)
 
+    async def recover_comfy(self) -> bool:
+        """Reset a poisoned CUDA context without redownloading or replaying a job."""
+        async with self._recovery_lock:
+            if self._stopping or self.failed:
+                return False
+            self._recovering = True
+            self.ready = False
+            self._set_stage("comfy_recovery")
+            try:
+                if self.comfy is not None:
+                    await asyncio.to_thread(_stop_process, self.comfy)
+                # A recovery deadline, not a generation time limit. Downloads
+                # and GPU bootstrap are deliberately not repeated here.
+                async with asyncio.timeout(120):
+                    self.comfy = _start_process(
+                        _comfy_command(self.settings),
+                        cwd=self.settings.comfy_root,
+                        environment=_comfy_environment(self.settings),
+                    )
+                    if self.comfy_client is None:
+                        raise WorkerStartupError("ComfyUI client missing during recovery")
+                    while not await self.comfy_client.ready():
+                        if self.comfy.poll() is not None:
+                            raise WorkerStartupError("ComfyUI exited during recovery")
+                        await asyncio.sleep(2)
+                    if not self.queue_ready:
+                        raise WorkerStartupError("queue consumer exited during recovery")
+                self.ready = True
+                self._set_stage("ready")
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self.failed = True
+                self._set_stage("comfy_recovery_failed")
+                _LOGGER.error("i2v_recovery_failed error_type=%s", type(error).__name__)
+                if self.comfy is not None:
+                    await asyncio.to_thread(_stop_process, self.comfy)
+                return False
+            finally:
+                self._recovering = False
+
     async def _bootstrap(self) -> None:
         try:
             self._set_stage("directories")
@@ -124,7 +179,7 @@ class WorkerSupervisor:
             self.comfy = _start_process(
                 _comfy_command(self.settings),
                 cwd=self.settings.comfy_root,
-                environment=_child_environment(),
+                environment=_comfy_environment(self.settings),
             )
             self.comfy_client = ComfyClient(
                 base_url=self.settings.comfy_base_url,
@@ -228,10 +283,22 @@ def _comfy_command(settings: I2VWorkerSettings) -> tuple[str, ...]:
         f"sqlite:///{(runtime / 'user/comfyui.db').as_posix()}",
         "--preview-method",
         "none",
-        "--reserve-vram",
-        "4",
         "--log-stdout",
+        # H3 + several LoRAs exhausted the async allocator's 32 GB pool. Keep
+        # headroom for activations/patch buffers and discard previous graphs.
+        *(H3_COMFY_MEMORY_ARGS if settings.profile == "minimax_h3" else ("--reserve-vram", "4")),
     )
+
+
+def _comfy_environment(settings: I2VWorkerSettings) -> dict[str, str]:
+    environment = _child_environment()
+    if settings.profile == "minimax_h3":
+        allocator = "backend:native,expandable_segments:True"
+        # Both aliases must agree; an inherited CUDA-async override must not
+        # silently undo the reviewed H3 allocator choice.
+        environment["PYTORCH_ALLOC_CONF"] = allocator
+        environment["PYTORCH_CUDA_ALLOC_CONF"] = allocator
+    return environment
 
 
 def _child_environment() -> dict[str, str]:

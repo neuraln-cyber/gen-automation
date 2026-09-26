@@ -15,6 +15,14 @@ from gen_automation.i2v_worker.manifest_contract import required_i2v_model_roles
 from gen_automation.i2v_worker.models import ModelObject
 
 I2V_CUSTOM_NODES = ("ComfyUI-NAG", "GenAutomationH3", "ComfyUI-H3-Latent-Upscaler")
+H3_COMFY_MEMORY_ARGS = (
+    "--reserve-vram",
+    "8",
+    "--disable-cuda-malloc",
+    "--cache-none",
+    "--vram-headroom",
+    "4",
+)
 
 
 class I2VWorkerSettings(BaseSettings):

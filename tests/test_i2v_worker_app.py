@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
@@ -89,6 +90,38 @@ class _Supervisor:
 
     async def stop(self) -> None:
         self.stopped = True
+
+
+@pytest.mark.parametrize("recovered", [True, False])
+def test_poisoned_inference_is_failed_after_recovery_without_replaying_job(
+    tmp_path, monkeypatch, recovered
+):
+    from gen_automation.i2v_worker.comfy import ComfyUnhealthyError
+
+    supervisor = _Supervisor()
+    calls = []
+
+    async def run(*args, **kwargs):
+        calls.append("execute")
+        raise ComfyUnhealthyError("private runtime detail")
+
+    async def recover():
+        calls.append("recover")
+        supervisor.ready = recovered
+        supervisor.failed = not recovered
+        return recovered
+
+    supervisor.recover_comfy = recover
+    monkeypatch.setattr("gen_automation.i2v_worker.app._run_job", run)
+    app = create_i2v_worker_app(_settings(tmp_path), supervisor=supervisor)
+    with TestClient(app) as client:
+        response = client.post("/jobs/i2v", json=_job())
+        assert response.status_code == 500
+        assert "private" not in response.text
+        assert "recovery attempted" in response.text
+        assert client.get("/health").status_code == (200 if recovered else 503)
+        assert client.get("/ready").status_code == (200 if recovered else 503)
+    assert calls == ["execute", "recover"]
 
 
 def test_salad_readiness_rejects_a_dead_consumer(tmp_path: Path) -> None:
