@@ -49,6 +49,7 @@ def test_deployment_guard_refuses_image_work_without_mutating_rows(
         sa.Column("id", sa.Integer, primary_key=True),
         sa.Column("phase", sa.String),
         sa.Column("current_version_no", sa.Integer),
+        sa.Column("lock_version", sa.Integer, default=1),
     )
     versions = sa.Table(
         "release_versions",
@@ -72,6 +73,15 @@ def test_deployment_guard_refuses_image_work_without_mutating_rows(
         sa.Column("provider", sa.String),
         sa.Column("state", sa.String),
     )
+    sa.Table(
+        "audit_events",
+        metadata,
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("resource_type", sa.String),
+        sa.Column("resource_id", sa.Integer),
+        sa.Column("action", sa.String),
+        sa.Column("correlation_id", sa.String),
+    )
     with engine.begin() as connection:
         metadata.create_all(connection)
         connection.execute(releases.insert(), {"id": 1, "phase": phase, "current_version_no": 1})
@@ -85,6 +95,63 @@ def test_deployment_guard_refuses_image_work_without_mutating_rows(
         snapshot = guard["image_work_snapshot"](connection)
         assert any(snapshot.values()) is blocked
         assert list(connection.execute(sa.select(table))) == before
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("phase", "lock_version", "marker_version", "resumed", "active", "blocked"),
+    [
+        ("paused", 2, 1, False, False, False),
+        ("ready", 2, 1, False, False, True),
+        ("generating", 2, 1, False, False, True),
+        ("paused", 3, 1, False, False, True),
+        ("paused", 2, 2, False, False, True),
+        ("paused", 2, 1, True, False, True),
+        ("paused", 2, 1, False, True, True),
+    ],
+)
+def test_only_exact_unreleased_maintenance_pause_exempts_preserved_queue(
+    phase, lock_version, marker_version, resumed, active, blocked
+) -> None:
+    guard = _guard()
+    engine = sa.create_engine("sqlite://")
+    with engine.begin() as connection:
+        for statement in (
+            "CREATE TABLE releases (id INTEGER, phase TEXT, current_version_no INTEGER, "
+            "lock_version INTEGER)",
+            "CREATE TABLE release_versions (id INTEGER, release_id INTEGER, version_no INTEGER)",
+            "CREATE TABLE generation_jobs (id INTEGER, provider TEXT, state TEXT, "
+            "release_version_id INTEGER)",
+            "CREATE TABLE generation_attempts (id INTEGER, provider TEXT, state TEXT)",
+            "CREATE TABLE audit_events (id INTEGER, resource_type TEXT, resource_id INTEGER, "
+            "action TEXT, correlation_id TEXT)",
+        ):
+            connection.exec_driver_sql(statement)
+        connection.execute(
+            sa.text("INSERT INTO releases VALUES (1, :phase, 1, :lock_version)"),
+            {"phase": phase, "lock_version": lock_version},
+        )
+        connection.exec_driver_sql("INSERT INTO release_versions VALUES (1, 1, 1)")
+        connection.exec_driver_sql("INSERT INTO generation_jobs VALUES (1, 'salad', 'queued', 1)")
+        connection.execute(
+            sa.text(
+                "INSERT INTO audit_events VALUES "
+                "(1, 'release', 1, 'release.generation_maintenance_paused', :correlation)"
+            ),
+            {"correlation": f"image-maintenance:{marker_version}:2"},
+        )
+        if resumed:
+            connection.exec_driver_sql(
+                "INSERT INTO audit_events VALUES "
+                "(2, 'release', 1, 'release.generation_maintenance_resumed', "
+                "'image-maintenance:1:2')"
+            )
+        if active:
+            connection.exec_driver_sql(
+                "INSERT INTO generation_attempts VALUES (1, 'salad', 'running')"
+            )
+        assert any(guard["image_work_snapshot"](connection).values()) is blocked
+        assert connection.scalar(sa.text("SELECT state FROM generation_jobs")) == "queued"
     engine.dispose()
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -239,19 +240,81 @@ def _ensure_directories(settings: I2VWorkerSettings) -> None:
 
 
 def _verify_gpu_runtime(settings: I2VWorkerSettings) -> None:
+    # Only allowlisted hardware facts are logged. Never include exception text,
+    # environment values, paths or tracebacks from the CUDA/Python runtime.
+    check = "torch_import"
+    reason = "runtime_query_failed"
+    torch_version = "unavailable"
+    cuda_version = "unavailable"
+    device_count = -1
+    gpu_name = "unavailable"
+    vram_bytes = -1
     try:
         import torch  # type: ignore[import-not-found]
 
-        if (
-            torch.__version__.split("+", 1)[0] != "2.9.1"
-            or not torch.cuda.is_available()
-            or torch.cuda.device_count() != 1
-            or torch.cuda.get_device_name(0) not in settings.allowed_gpu_names
-            or torch.cuda.get_device_properties(0).total_memory < settings.minimum_gpu_vram_bytes
-        ):
+        check = "torch_version"
+        version = torch.__version__.split("+", 1)[0]
+        torch_version = _gpu_log_token(version, r"[0-9]+\.[0-9]+\.[0-9]+")
+        cuda_version = _gpu_log_token(torch.version.cuda, r"[0-9]+\.[0-9]+")
+        if version != "2.9.1":
+            reason = "torch_version_mismatch"
             raise ValueError
-    except (ImportError, RuntimeError, ValueError):
-        raise WorkerStartupError("supported RunPod GPU runtime is unavailable") from None
+        check = "cuda_available"
+        if not torch.cuda.is_available():
+            reason = "cuda_unavailable"
+            raise ValueError
+        check = "device_count"
+        device_count = torch.cuda.device_count()
+        if device_count != 1:
+            reason = "device_count_mismatch"
+            raise ValueError
+        check = "gpu_name"
+        name = torch.cuda.get_device_name(0)
+        gpu_name = _gpu_log_token(
+            name, r"NVIDIA (?:GeForce )?(?:RTX |Tesla )?[ALVTP]?[0-9]+[A-Z0-9 -]*"
+        )
+        if name not in settings.allowed_gpu_names:
+            reason = "gpu_name_not_allowed"
+            raise ValueError
+        check = "gpu_vram"
+        vram_bytes = torch.cuda.get_device_properties(0).total_memory
+        if vram_bytes < settings.minimum_gpu_vram_bytes:
+            reason = "insufficient_vram"
+            raise ValueError
+    except Exception as error:
+        if check == "torch_import":
+            reason = "torch_import_failed"
+        _LOGGER.error(
+            "i2v_gpu_preflight status=failed reason_code=%s check=%s error_type=%s "
+            "torch_version=%s cuda_version=%s device_count=%d gpu_name=%s "
+            "vram_bytes=%d minimum_vram_bytes=%d",
+            reason,
+            check,
+            type(error).__name__,
+            torch_version,
+            cuda_version,
+            device_count,
+            gpu_name,
+            vram_bytes,
+            settings.minimum_gpu_vram_bytes,
+        )
+        raise WorkerStartupError("supported GPU runtime is unavailable") from None
+    _LOGGER.info(
+        "i2v_gpu_preflight status=passed torch_version=%s cuda_version=%s "
+        "device_count=%d gpu_name=%s vram_bytes=%d minimum_vram_bytes=%d",
+        torch_version,
+        cuda_version,
+        device_count,
+        gpu_name,
+        vram_bytes,
+        settings.minimum_gpu_vram_bytes,
+    )
+
+
+def _gpu_log_token(value: object, pattern: str) -> str:
+    if not isinstance(value, str) or len(value) > 80 or not re.fullmatch(pattern, value):
+        return "unrecognized"
+    return value.replace(" ", "_")
 
 
 def _comfy_command(settings: I2VWorkerSettings) -> tuple[str, ...]:

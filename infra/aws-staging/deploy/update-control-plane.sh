@@ -132,6 +132,21 @@ SELECT
     WHERE j.provider = 'salad' AND j.state IN ('queued', 'retry_wait')
       AND r.current_version_no = v.version_no
       AND r.phase IN ('ready', 'generating', 'paused')
+      AND NOT (
+        r.phase = 'paused' AND EXISTS (
+          SELECT 1 FROM audit_events AS p
+          WHERE p.resource_type = 'release' AND p.resource_id = r.id
+            AND p.action = 'release.generation_maintenance_paused'
+            AND p.correlation_id = 'image-maintenance:' || CAST(v.id AS TEXT)
+                || ':' || CAST(r.lock_version AS TEXT)
+            AND NOT EXISTS (
+              SELECT 1 FROM audit_events AS u
+              WHERE u.resource_type = 'release' AND u.resource_id = r.id
+                AND u.action = 'release.generation_maintenance_resumed'
+                AND u.correlation_id = p.correlation_id
+            )
+        )
+      )
   ) AS queued_jobs
 """
 
@@ -165,7 +180,7 @@ def main():
                 file=sys.stderr,
             )
             return 3
-        print("Image-work preflight passed: no active or accepted queued image work.")
+        print("Image-work preflight passed: no active or unfenced queued image work.")
         return 0
     except Exception:
         # Do not print database URLs, credentials, row contents, or exceptions.
