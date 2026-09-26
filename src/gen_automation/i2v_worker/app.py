@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from gen_automation.i2v_worker.artifacts import ModelBootstrapError
-from gen_automation.i2v_worker.comfy import ComfyError, ComfyLoraError
+from gen_automation.i2v_worker.comfy import ComfyError, ComfyLoraError, ComfyUnhealthyError
 from gen_automation.i2v_worker.face_stabilizer import (
     FaceDetector,
     FaceStabilizationError,
@@ -200,6 +200,8 @@ def create_i2v_worker_app(
             raise HTTPException(status_code=400, detail="invalid reviewed LoRA prompt") from None
 
         async with execution_lock:
+            if not resolved_supervisor.ready or resolved_supervisor.failed:
+                raise HTTPException(status_code=503, detail="worker not ready")
             try:
                 async with asyncio.timeout(settings.execution_timeout_seconds):
                     return await _run_job(
@@ -238,6 +240,19 @@ def create_i2v_worker_app(
                         "A selected LoRA could not be applied. "
                         "Use H3-compatible model LoRAs or clear the selection."
                     ),
+                ) from None
+            except ComfyUnhealthyError as error:
+                _LOGGER.error(
+                    "i2v_inference_unhealthy error_type=%s job_id=%s attempt_id=%s",
+                    type(error).__name__,
+                    job.job_id,
+                    job.attempt_id,
+                )
+                await resolved_supervisor.recover_comfy()
+                # Always fail THIS execution, even if recovery succeeds. No
+                # internal replay, forged output, or changed sampling settings.
+                raise HTTPException(
+                    status_code=500, detail="inference runtime failed; recovery attempted"
                 ) from None
             except (ComfyError, MediaError, WorkflowError, ModelBootstrapError):
                 raise HTTPException(status_code=500, detail="generation failed") from None

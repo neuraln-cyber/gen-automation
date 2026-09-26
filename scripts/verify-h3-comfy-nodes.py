@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from gen_automation.i2v_worker.comfy_h3_upscale import h3_refinement_split_params
-from gen_automation.i2v_worker.settings import I2V_CUSTOM_NODES
+from gen_automation.i2v_worker.settings import H3_COMFY_MEMORY_ARGS, I2V_CUSTOM_NODES
 
 
 def verify_native_refinement_anchors(nodes) -> None:
@@ -103,7 +103,9 @@ def verify_native_refinement_anchors(nodes) -> None:
 
 
 async def main() -> None:
-    sys.argv = ["h3-upscaler-build-check", "--cpu"]
+    # Parse the exact runtime flags against the pinned ComfyUI CLI on CPU.
+    # This verifies compatibility, not GPU memory sufficiency.
+    sys.argv = ["h3-upscaler-build-check", "--cpu", *H3_COMFY_MEMORY_ARGS]
     sys.path.insert(0, "/opt/comfyui")
     import comfy.options  # type: ignore[import-not-found]
 

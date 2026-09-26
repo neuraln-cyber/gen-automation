@@ -8,6 +8,8 @@ from typing import Any
 import httpx2
 
 _PROMPT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_HEALTH_INTERVAL_SECONDS = 10.0
+_HEALTH_FAILURE_LIMIT = 3
 _REQUIRED_NODES = (
     (
         "KSamplerWithNAG (Advanced)",
@@ -22,6 +24,14 @@ class ComfyError(Exception):
 
 class ComfyLoraError(ComfyError):
     """A managed H3 loader rejected the selected file before sampling."""
+
+
+class ComfyUnhealthyError(ComfyError):
+    """The inference process needs recovery, not another indefinite history poll."""
+
+
+class ComfyMemoryError(ComfyUnhealthyError):
+    """GPU memory exhaustion reported by the inference process."""
 
 
 class ComfyClient:
@@ -101,14 +111,29 @@ class ComfyClient:
         if not isinstance(prompt_id, str) or _PROMPT_ID.fullmatch(prompt_id) is None:
             raise ComfyError("ComfyUI returned an invalid prompt identity")
 
+        unhealthy_checks = 0
+        next_health_check = 0.0
         while True:
-            history_response = await self._request("GET", f"/history/{prompt_id}")
+            try:
+                history_response = await self._request("GET", f"/history/{prompt_id}")
+            except ComfyError:
+                raise ComfyUnhealthyError("ComfyUI history is unavailable") from None
             try:
                 history = history_response.json()
             except ValueError:
                 raise ComfyError("ComfyUI returned invalid history") from None
             record = history.get(prompt_id) if isinstance(history, dict) else None
             if record is None:
+                # A CUDA failure can kill ComfyUI's prompt thread while its HTTP
+                # server keeps returning empty history forever. This checks
+                # health, NOT elapsed sampling time: healthy slow jobs have no
+                # new deadline. Require repeated failures, with bounded probes.
+                now = asyncio.get_running_loop().time()
+                if now >= next_health_check:
+                    unhealthy_checks = 0 if await self._runtime_healthy() else unhealthy_checks + 1
+                    if unhealthy_checks >= _HEALTH_FAILURE_LIMIT:
+                        raise ComfyUnhealthyError("ComfyUI runtime health repeatedly failed")
+                    next_health_check = asyncio.get_running_loop().time() + _HEALTH_INTERVAL_SECONDS
                 await asyncio.sleep(self.poll_seconds)
                 continue
             if not isinstance(record, dict):
@@ -121,6 +146,8 @@ class ComfyClient:
                 "canceled",
             }:
                 messages = status.get("messages", [])
+                if _memory_failure(messages):
+                    raise ComfyMemoryError("ComfyUI GPU memory exhausted")
                 if isinstance(messages, list) and any(
                     isinstance(message, list)
                     and len(message) == 2
@@ -138,6 +165,13 @@ class ComfyClient:
                 return _output_paths(outputs, output_root)
             await asyncio.sleep(self.poll_seconds)
 
+    async def _runtime_healthy(self) -> bool:
+        try:
+            response = await self.client.get("/system_stats", timeout=5.0)
+            return response.status_code == 200
+        except httpx2.HTTPError:
+            return False
+
     async def _request(self, method: str, path: str, **kwargs: Any) -> httpx2.Response:
         for attempt in range(self.network_attempts):
             try:
@@ -154,6 +188,24 @@ class ComfyClient:
             if attempt + 1 < self.network_attempts:
                 await asyncio.sleep(min(2**attempt, 16))
         raise ComfyError("ComfyUI is unavailable")
+
+
+def _memory_failure(messages: object) -> bool:
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if (
+            isinstance(message, list)
+            and len(message) == 2
+            and message[0] == "execution_error"
+            and isinstance(message[1], dict)
+        ):
+            # Inspect only the exception summary, never log it or its inputs.
+            kind = str(message[1].get("exception_type", "")).lower()
+            detail = str(message[1].get("exception_message", "")).lower()
+            if "outofmemoryerror" in kind or ("cuda" in detail and "out of memory" in detail):
+                return True
+    return False
 
 
 def _output_paths(value: object, output_root: Path) -> tuple[Path, ...]:
