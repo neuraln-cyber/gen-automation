@@ -10,6 +10,7 @@ import struct
 import subprocess
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -27,8 +28,30 @@ from gen_automation.i2v_worker.models import (
 )
 
 
+class MediaFailureReason(StrEnum):
+    MEDIA = "media_error"
+    FINALIZATION = "native_finalization_failed"
+    PROBE = "video_probe_failed"
+    CODEC = "video_codec_invalid"
+    PIXEL_FORMAT = "video_pixel_format_invalid"
+    DIMENSIONS = "video_dimensions_invalid"
+    PIXEL_ASPECT = "video_pixel_aspect_invalid"
+    FRAME_COUNT = "video_frame_count_invalid"
+    FPS = "video_fps_invalid"
+    DURATION = "video_duration_invalid"
+    FASTSTART = "video_faststart_missing"
+    UPLOAD_EXPIRED = "output_grant_expired"
+    UPLOAD = "output_upload_failed"
+
+
 class MediaError(Exception):
     """A redacted media transfer or verification failure."""
+
+    def __init__(
+        self, message: str, *, reason: MediaFailureReason = MediaFailureReason.MEDIA
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 _WAN_MIN_NATIVE_PIXELS = 520_000
@@ -372,7 +395,16 @@ def finalize_native_video(
     if len(paths) != 1 or paths[0].suffix.lower() != ".mp4":
         raise MediaError("native video output is invalid")
     output_width, output_height = settings.width, settings.height
-    video_args: tuple[str, ...] = ("-c:v", "copy")
+    # Native ComfyUI H264 may omit SAR entirely. Keep the encoded pictures,
+    # but explicitly signal square pixels in the bitstream before validation.
+    # This also covers the diagnostic base clip and exact-canvas final exports;
+    # the cropped/reencoded path below already sets SAR through its filter.
+    video_args: tuple[str, ...] = (
+        "-c:v",
+        "copy",
+        "-bsf:v",
+        "h264_metadata=sample_aspect_ratio=1/1",
+    )
     if settings.match_source_resolution:
         if source_resolution_canvas(source_width, source_height) != (
             settings.width,
@@ -426,7 +458,9 @@ def finalize_native_video(
             timeout=300,
         )
     except (OSError, subprocess.SubprocessError):
-        raise MediaError("native video finalization failed") from None
+        raise MediaError(
+            "native video finalization failed", reason=MediaFailureReason.FINALIZATION
+        ) from None
     metadata = _probe_video(
         output,
         settings,
@@ -497,18 +531,22 @@ def _probe_video(
         duration = float(payload["format"]["duration"])
         numerator, denominator = map(int, stream["avg_frame_rate"].split("/", 1))
         fps = numerator / denominator
-        if (
-            stream["codec_name"] != "h264"
-            or stream["pix_fmt"] != "yuv420p"
-            or int(stream["width"]) != width
-            or int(stream["height"]) != height
-            or stream.get("sample_aspect_ratio") not in {"1:1", "N/A"}
-            or int(stream["nb_read_frames"]) != frame_count
-            or abs(fps - settings.fps) > 0.001
-            or duration <= 0
-            or not _has_faststart(path)
-        ):
-            raise ValueError
+        checks = (
+            (stream["codec_name"] == "h264", MediaFailureReason.CODEC),
+            (stream["pix_fmt"] == "yuv420p", MediaFailureReason.PIXEL_FORMAT),
+            (
+                (int(stream["width"]), int(stream["height"])) == (width, height),
+                MediaFailureReason.DIMENSIONS,
+            ),
+            (stream.get("sample_aspect_ratio") in {"1:1", "N/A"}, MediaFailureReason.PIXEL_ASPECT),
+            (int(stream["nb_read_frames"]) == frame_count, MediaFailureReason.FRAME_COUNT),
+            (abs(fps - settings.fps) <= 0.001, MediaFailureReason.FPS),
+            (duration > 0, MediaFailureReason.DURATION),
+            (_has_faststart(path), MediaFailureReason.FASTSTART),
+        )
+        for valid, reason in checks:
+            if not valid:
+                raise MediaError("encoded video contract is invalid", reason=reason)
     except (
         OSError,
         ValueError,
@@ -518,7 +556,9 @@ def _probe_video(
         subprocess.TimeoutExpired,
         json.JSONDecodeError,
     ):
-        raise MediaError("encoded video contract is invalid") from None
+        raise MediaError(
+            "encoded video contract is invalid", reason=MediaFailureReason.PROBE
+        ) from None
     return {
         "width": width,
         "height": height,
@@ -575,7 +615,7 @@ async def upload_video(
     allow_http: bool,
 ) -> tuple[str | None, int, str]:
     if grant.expires_at.astimezone(UTC) <= datetime.now(UTC):
-        raise MediaError("output grant expired")
+        raise MediaError("output grant expired", reason=MediaFailureReason.UPLOAD_EXPIRED)
     validate_grant_url(str(grant.url), allow_http=allow_http)
     size = (await asyncio.to_thread(path.stat)).st_size
     sha256 = await asyncio.to_thread(_sha256, path)
@@ -595,14 +635,14 @@ async def upload_video(
             if response.status_code in {200, 201, 204}:
                 return response.headers.get("x-amz-version-id"), size, sha256
             if response.status_code not in {408, 425, 429, 500, 502, 503, 504}:
-                raise MediaError("output upload failed")
+                raise MediaError("output upload failed", reason=MediaFailureReason.UPLOAD)
         except MediaError:
             raise
         except (OSError, httpx2.HTTPError):
             pass
         if attempt + 1 < attempts:
             await asyncio.sleep(min(2**attempt, 16))
-    raise MediaError("output upload failed")
+    raise MediaError("output upload failed", reason=MediaFailureReason.UPLOAD)
 
 
 async def _file_chunks(path: Path) -> AsyncIterator[bytes]:

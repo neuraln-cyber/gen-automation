@@ -280,6 +280,7 @@ async def _run_job(
     prepared_name = f"prepared-{job.attempt_id}.png"
     prepared_path = settings.runtime_root / "input" / prepared_name
     allow_http = settings.environment == "test"
+    stage = "input_preparation"
     try:
         job_root.mkdir(parents=True, exist_ok=False, mode=0o700)
         for selection, grant in zip(
@@ -346,9 +347,11 @@ async def _run_job(
         comfy = supervisor.comfy_client
         if comfy is None:
             raise MediaError("worker lost ComfyUI")
+        stage = "inference"
         frames = await comfy.execute(rendered, settings.runtime_root / "output")
         base_result: OutputResult | None = None
         if generation_settings.h3_save_base_video:
+            stage = "base_finalization"
             if len(frames) != 2 or job.base_video_grant is None:
                 raise MediaError("base-video diagnostic output is missing")
             base_width, base_height = h3_base_canvas(
@@ -373,6 +376,7 @@ async def _run_job(
                 source_width=base_width,
                 source_height=base_height,
             )
+            stage = "base_upload"
             base_version, base_bytes, base_sha = await upload_video(
                 base_video,
                 job.base_video_grant,
@@ -409,6 +413,7 @@ async def _run_job(
             )
             frames = stabilized.frames
             face_metadata = stabilized.metadata
+        stage = "final_finalization"
         video, metadata = await asyncio.to_thread(
             finalize_native_video if generation_settings.profile == "minimax_h3" else encode_video,
             frames,
@@ -417,6 +422,7 @@ async def _run_job(
             source_width=job.input_snapshot.width,
             source_height=job.input_snapshot.height,
         )
+        stage = "final_upload"
         version_id, byte_size, sha256 = await upload_video(
             video,
             job.output_grant,
@@ -471,6 +477,16 @@ async def _run_job(
                 metadata=output_metadata,
             ),
         )
+    except MediaError as error:
+        # Never log exception messages, FFmpeg stderr, paths, prompts or grants.
+        _LOGGER.warning(
+            "i2v_media_failed stage=%s reason_code=%s job_id=%s attempt_id=%s",
+            stage,
+            error.reason.value,
+            job.job_id,
+            job.attempt_id,
+        )
+        raise
     finally:
         input_path.unlink(missing_ok=True)
         prepared_path.unlink(missing_ok=True)
