@@ -567,6 +567,8 @@ class Settings(BaseSettings):
     i2v_h3_loras_enabled: bool = False
     # Enable only after the matching original-resolution worker is installed.
     i2v_h3_source_resolution_enabled: bool = False
+    # Closed until the diagnostic-capable worker is installed; never queue a test.
+    i2v_h3_diagnostics_enabled: bool = False
     # RunPod is enabled only after its immutable worker and persistent model
     # volume have been verified. The false state keeps cutover/rollback atomic.
     i2v_runpod_enabled: bool = False

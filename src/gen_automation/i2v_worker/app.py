@@ -24,6 +24,7 @@ from gen_automation.i2v_worker.face_stabilizer import (
     stabilize_face_frames,
 )
 from gen_automation.i2v_worker.h3_loras import materialize_h3_lora
+from gen_automation.i2v_worker.h3_upscale import h3_base_canvas
 from gen_automation.i2v_worker.media import (
     MediaError,
     download_input,
@@ -346,6 +347,54 @@ async def _run_job(
         if comfy is None:
             raise MediaError("worker lost ComfyUI")
         frames = await comfy.execute(rendered, settings.runtime_root / "output")
+        base_result: OutputResult | None = None
+        if generation_settings.h3_save_base_video:
+            if len(frames) != 2 or job.base_video_grant is None:
+                raise MediaError("base-video diagnostic output is missing")
+            base_width, base_height = h3_base_canvas(
+                generation_settings.width, generation_settings.height
+            )
+            base_settings = generation_settings.model_copy(
+                update={
+                    "width": base_width,
+                    "height": base_height,
+                    "match_source_resolution": False,
+                    "match_source_aspect": False,
+                    "h3_save_base_video": False,
+                }
+            )
+            base_root = job_root / "base"
+            base_root.mkdir(mode=0o700)
+            base_video, base_metadata = await asyncio.to_thread(
+                finalize_native_video,
+                (frames[1],),
+                base_settings,
+                base_root,
+                source_width=base_width,
+                source_height=base_height,
+            )
+            base_version, base_bytes, base_sha = await upload_video(
+                base_video,
+                job.base_video_grant,
+                timeout_seconds=settings.network_timeout_seconds,
+                attempts=settings.network_attempts,
+                allow_http=allow_http,
+            )
+            base_result = OutputResult(
+                storage_backend=job.base_video_grant.storage_backend,
+                storage_bucket=job.base_video_grant.storage_bucket,
+                object_key=job.base_video_grant.object_key,
+                object_version_id=base_version,
+                sha256=base_sha,
+                width=base_metadata["width"],
+                height=base_metadata["height"],
+                frame_count=base_metadata["frame_count"],
+                fps=base_metadata["fps"],
+                duration_ms=base_metadata["duration_ms"],
+                byte_size=base_bytes,
+                metadata={"stage": "pre_upscale", "seed": seed},
+            )
+            frames = (frames[0],)
         face_metadata: dict[str, object] | None = None
         if generation_settings.face_fidelity == "stable_expression":
             if face_detector is None or source_face is None:
@@ -401,6 +450,8 @@ async def _run_job(
         }
         if face_metadata is not None:
             output_metadata["face_stabilization"] = face_metadata
+        if base_result is not None:
+            output_metadata["h3_base_video"] = base_result.model_dump(mode="json")
         return I2VResult(
             job_id=job.job_id,
             attempt_id=job.attempt_id,

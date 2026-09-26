@@ -60,6 +60,7 @@ class ComfyClient:
                     "SaveVideo",
                     "VAEDecodeAudio",
                     "ManagedH3LoraLoader",
+                    "ManagedH3DiagnosticDecode",
                 )
             )
         )
@@ -102,6 +103,7 @@ class ComfyClient:
             return False
 
     async def execute(self, workflow: dict[str, Any], output_root: Path) -> tuple[Path, ...]:
+        diagnostic = "h3-base-save" in workflow
         response = await self._request("POST", "/prompt", json={"prompt": workflow})
         try:
             body = response.json()
@@ -160,8 +162,8 @@ class ComfyClient:
                 raise ComfyError("ComfyUI generation failed")
             outputs = record.get("outputs")
             if isinstance(status, dict) and status.get("completed") is True:
-                return _output_paths(outputs, output_root)
-            if isinstance(outputs, dict) and "14" in outputs:
+                return _result_paths(outputs, output_root, diagnostic=diagnostic)
+            if isinstance(outputs, dict) and "14" in outputs and not diagnostic:
                 return _output_paths(outputs, output_root)
             await asyncio.sleep(self.poll_seconds)
 
@@ -208,10 +210,20 @@ def _memory_failure(messages: object) -> bool:
     return False
 
 
-def _output_paths(value: object, output_root: Path) -> tuple[Path, ...]:
+def _result_paths(value: object, output_root: Path, *, diagnostic: bool) -> tuple[Path, ...]:
+    primary = _output_paths(value, output_root)
+    if not diagnostic:
+        return primary
+    base = _output_paths(value, output_root, node_id="h3-base-save")
+    if len(primary) != 1 or len(base) != 1 or primary == base:
+        raise ComfyError("ComfyUI diagnostic outputs are invalid")
+    return primary + base
+
+
+def _output_paths(value: object, output_root: Path, *, node_id: str = "14") -> tuple[Path, ...]:
     if not isinstance(value, dict):
         raise ComfyError("ComfyUI output is missing")
-    node = value.get("14")
+    node = value.get(node_id)
     images = node.get("images") if isinstance(node, dict) else None
     if not isinstance(images, list) or not images:
         raise ComfyError("ComfyUI output is missing")

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import cast
 from uuid import UUID
 
+from pydantic import ValidationError
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -29,7 +30,8 @@ from gen_automation.domain.i2v import (
     I2VOutputSnapshot,
 )
 from gen_automation.domain.ids import uuid7
-from gen_automation.i2v_worker.models import ModelObject
+from gen_automation.i2v_worker.h3_upscale import h3_base_canvas
+from gen_automation.i2v_worker.models import ModelObject, OutputResult, source_resolution_canvas
 from gen_automation.integrations.runpod.models import JSONValue
 from gen_automation.services.h3_loras import H3LoraUnavailableError, resolve_h3_loras
 from gen_automation.services.i2v import register_i2v_input
@@ -147,6 +149,39 @@ class I2VSignedGrantBuilder:
                 "expires_at": expires_at.isoformat(),
             },
         }
+        if job.settings_snapshot.get("h3_save_base_video"):
+            if job.settings_snapshot.get(
+                "profile"
+            ) != "minimax_h3" or not job.settings_snapshot.get("match_source_resolution"):
+                raise I2VMediaConflictError(
+                    "base-video diagnostics require H3 source-size delivery"
+                )
+            base_key = output_key[:-4] + ".base.mp4"
+            try:
+                base = await self.store.presign_put(
+                    key=base_key,
+                    content_type="video/mp4",
+                    metadata={
+                        "i2v-job-id": str(job.job_id),
+                        "i2v-attempt-id": str(attempt.attempt_id),
+                        "request-sha256": job.request_sha256,
+                        "i2v-stage": "pre_upscale",
+                    },
+                    expires_in=self.expires_in,
+                )
+            except ObjectStoreError:
+                raise I2VMediaStorageError("private diagnostic grant could not be issued") from None
+            if base.method != "PUT" or base.fields:
+                raise I2VMediaStorageError("private store did not issue a diagnostic PUT grant")
+            additions["base_video_grant"] = {
+                "method": "PUT",
+                "url": base.url,
+                "headers": cast(JSONValue, base.headers),
+                "storage_backend": self.store.backend,
+                "storage_bucket": self.store.bucket,
+                "object_key": base_key,
+                "expires_at": expires_at.isoformat(),
+            }
         if job.settings_snapshot.get("h3_loras"):
             if self.model_store is None or self.sessions is None:
                 raise I2VMediaStorageError("H3 LoRA private storage is unavailable")
@@ -194,6 +229,42 @@ class I2VSignedGrantBuilder:
         output: I2VOutputRegistration,
     ) -> None:
         expected_key = f"{self.output_prefix}/{job.job_id}/{attempt.attempt_id}.mp4"
+        raw_base = output.metadata.get("h3_base_video")
+        if bool(job.settings_snapshot.get("h3_save_base_video")) != (raw_base is not None):
+            raise I2VMediaConflictError("diagnostic output does not match this job")
+        await self._verify_media(job=job, attempt=attempt, output=output, expected_key=expected_key)
+        if raw_base is not None:
+            try:
+                base = OutputResult.model_validate(raw_base)
+                canvas = source_resolution_canvas(
+                    job.input_snapshot["width"], job.input_snapshot["height"]
+                )
+            except (ValidationError, KeyError, ValueError, TypeError):
+                raise I2VMediaConflictError("diagnostic output contract is invalid") from None
+            if (
+                (base.width, base.height) != h3_base_canvas(*canvas)
+                or base.frame_count != output.frame_count
+                or base.fps != output.fps
+                or base.metadata != {"stage": "pre_upscale", "seed": output.metadata.get("seed")}
+            ):
+                raise I2VMediaConflictError("diagnostic output does not match the generation")
+            await self._verify_media(
+                job=job,
+                attempt=attempt,
+                output=I2VOutputRegistration.model_validate(base.model_dump()),
+                expected_key=expected_key[:-4] + ".base.mp4",
+                stage="pre_upscale",
+            )
+
+    async def _verify_media(
+        self,
+        *,
+        job: I2VJobSnapshot,
+        attempt: I2VAttemptSnapshot,
+        output: I2VOutputRegistration,
+        expected_key: str,
+        stage: str | None = None,
+    ) -> None:
         if (
             output.storage_backend != self.store.backend
             or output.storage_bucket != self.store.bucket
@@ -213,6 +284,8 @@ class I2VSignedGrantBuilder:
                 "i2v-attempt-id": str(attempt.attempt_id),
                 "request-sha256": job.request_sha256,
             }
+            if stage is not None:
+                expected_metadata["i2v-stage"] = stage
             if (
                 metadata.byte_size != output.byte_size
                 or metadata.content_type != "video/mp4"
@@ -521,6 +594,26 @@ async def register_i2v_generation_asset(
             metadata={"source_asset_id": str(asset.id)},
         ),
     )
+
+
+def base_video_snapshot(output: I2VOutputSnapshot) -> I2VOutputSnapshot | None:
+    """Read only a verified companion belonging to this exact final output."""
+    raw = output.metadata.get("h3_base_video")
+    if raw is None:
+        return None
+    try:
+        base = OutputResult.model_validate(raw)
+    except ValidationError:
+        raise I2VMediaConflictError("diagnostic video metadata is invalid") from None
+    if (
+        base.storage_backend != output.storage_backend
+        or base.storage_bucket != output.storage_bucket
+        or base.object_key != output.object_key[:-4] + ".base.mp4"
+        or base.object_version_id is None
+        or base.metadata != {"stage": "pre_upscale", "seed": output.metadata.get("seed")}
+    ):
+        raise I2VMediaConflictError("diagnostic video identity is invalid")
+    return output.model_copy(update=base.model_dump())
 
 
 async def presign_i2v_output_download(
