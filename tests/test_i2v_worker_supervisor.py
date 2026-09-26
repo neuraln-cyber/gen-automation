@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -421,3 +424,135 @@ async def test_supervision_does_not_kill_consumer_while_comfy_is_replaced(tmp_pa
     await asyncio.sleep(0.02)
     assert not supervisor.failed and not stopped
     await supervisor.stop()
+
+
+def _fake_torch(**overrides: Any) -> SimpleNamespace:
+    values = {
+        "version": "2.9.1+cu128",
+        "available": True,
+        "count": 1,
+        "name": "NVIDIA GeForce RTX 5090",
+        "memory": 32 * 1024**3,
+    }
+    values.update(overrides)
+    return SimpleNamespace(
+        __version__=values["version"],
+        version=SimpleNamespace(cuda="12.8"),
+        cuda=SimpleNamespace(
+            is_available=lambda: values["available"],
+            device_count=lambda: values["count"],
+            get_device_name=lambda _: values["name"],
+            get_device_properties=lambda _: SimpleNamespace(total_memory=values["memory"]),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason", "check"),
+    [
+        ({"version": "2.10.0"}, "torch_version_mismatch", "torch_version"),
+        ({"available": False}, "cuda_unavailable", "cuda_available"),
+        ({"count": 0}, "device_count_mismatch", "device_count"),
+        ({"count": 2}, "device_count_mismatch", "device_count"),
+        ({"name": "NVIDIA GeForce RTX 5090 D"}, "gpu_name_not_allowed", "gpu_name"),
+        ({"memory": 31 * 1024**3 - 1}, "insufficient_vram", "gpu_vram"),
+    ],
+)
+def test_gpu_preflight_reports_exact_failed_gate_without_relaxing_it(
+    tmp_path, monkeypatch, caplog, overrides, reason, check
+):
+    from gen_automation.i2v_worker.supervisor import WorkerStartupError, _verify_gpu_runtime
+
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(**overrides))
+    with pytest.raises(WorkerStartupError, match="supported GPU runtime is unavailable"):
+        _verify_gpu_runtime(_settings(tmp_path))
+    assert f"status=failed reason_code={reason} check={check}" in caplog.text
+    assert "status=passed" not in caplog.text
+
+
+@pytest.mark.parametrize("memory", [31 * 1024**3, 32 * 1024**3])
+def test_gpu_preflight_passes_existing_supported_runtime_and_logs_hardware_facts(
+    tmp_path, monkeypatch, caplog, memory
+):
+    from gen_automation.i2v_worker.supervisor import _verify_gpu_runtime
+
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(memory=memory))
+    caplog.set_level(logging.INFO, logger="gen_automation.i2v_worker.supervisor")
+    _verify_gpu_runtime(_settings(tmp_path))
+    assert "status=passed torch_version=2.9.1 cuda_version=12.8 device_count=1" in caplog.text
+    assert "gpu_name=NVIDIA_GeForce_RTX_5090" in caplog.text
+    assert f"vram_bytes={memory}" in caplog.text
+    assert "status=failed" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("method", "check"),
+    [
+        ("is_available", "cuda_available"),
+        ("device_count", "device_count"),
+        ("get_device_name", "gpu_name"),
+        ("get_device_properties", "gpu_vram"),
+    ],
+)
+def test_gpu_query_errors_log_only_safe_check_and_exception_type(
+    tmp_path, monkeypatch, caplog, method, check
+):
+    from gen_automation.i2v_worker.supervisor import WorkerStartupError, _verify_gpu_runtime
+
+    def fail(*_args):
+        raise RuntimeError("https://private.invalid/model?token=do-not-log")
+
+    torch = _fake_torch()
+    setattr(torch.cuda, method, fail)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    with pytest.raises(WorkerStartupError):
+        _verify_gpu_runtime(_settings(tmp_path))
+    assert f"reason_code=runtime_query_failed check={check} error_type=RuntimeError" in caplog.text
+    assert "private.invalid" not in caplog.text and "do-not-log" not in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+def test_gpu_torch_import_failure_is_identifiable(tmp_path, monkeypatch, caplog):
+    from gen_automation.i2v_worker.supervisor import WorkerStartupError, _verify_gpu_runtime
+
+    monkeypatch.setitem(sys.modules, "torch", None)
+    with pytest.raises(WorkerStartupError):
+        _verify_gpu_runtime(_settings(tmp_path))
+    assert "reason_code=torch_import_failed check=torch_import" in caplog.text
+
+
+@pytest.mark.parametrize("field", ["version", "name"])
+def test_gpu_preflight_never_logs_arbitrary_version_or_device_strings(
+    tmp_path, monkeypatch, caplog, field
+):
+    from gen_automation.i2v_worker.supervisor import WorkerStartupError, _verify_gpu_runtime
+
+    monkeypatch.setitem(
+        sys.modules, "torch", _fake_torch(**{field: "private.invalid/?token=do-not-log\nforged"})
+    )
+    with pytest.raises(WorkerStartupError):
+        _verify_gpu_runtime(_settings(tmp_path))
+    assert "unrecognized" in caplog.text
+    assert all(value not in caplog.text for value in ("private.invalid", "do-not-log", "forged"))
+
+
+@pytest.mark.asyncio
+async def test_gpu_failure_keeps_health_failed_and_never_starts_downloads(
+    tmp_path, monkeypatch, caplog
+):
+    import gen_automation.i2v_worker.supervisor as module
+
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(available=False))
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("GPU failure must precede downloads and child processes")
+
+    monkeypatch.setattr(module, "S3ModelBootstrapper", forbidden)
+    monkeypatch.setattr(module, "_start_process", forbidden)
+    supervisor = WorkerSupervisor(_settings(tmp_path))
+    await supervisor.start()
+    await _wait_for(lambda: supervisor.failed)
+    await supervisor.stop()
+    assert not supervisor.ready and supervisor.stage == "gpu_preflight"
+    assert "reason_code=cuda_unavailable" in caplog.text
+    assert "i2v_startup_failed stage=gpu_preflight error_type=WorkerStartupError" in caplog.text
