@@ -143,6 +143,17 @@ def render_workflow(
         rendered = _inject_h3_loras(rendered, settings)
         if settings.match_source_resolution:
             rendered = _inject_h3_upscale(rendered, settings, model_paths or {})
+        if settings.h3_save_base_video:
+            rendered["h3-base-decode"] = {
+                "class_type": "ManagedH3DiagnosticDecode",
+                "inputs": {"samples": ["12", 0], "vae": ["4", 0], "after_refinement": ["13", 0]},
+            }
+            rendered["h3-base-create"] = copy.deepcopy(rendered["16"])
+            rendered["h3-base-create"]["inputs"]["images"] = ["h3-base-decode", 0]
+            rendered["h3-base-save"] = copy.deepcopy(rendered["14"])
+            rendered["h3-base-save"]["inputs"].update(
+                video=["h3-base-create", 0], filename_prefix=frame_prefix + "-base"
+            )
         return rendered, seed, frame_prefix
     rendered = _inject_reviewed_loras(rendered, settings)
     if settings.face_fidelity == "stable_expression":

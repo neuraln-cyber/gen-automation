@@ -188,6 +188,7 @@ class GenerationSettings(_StrictModel):
     height: int = Field(default=1024, ge=32)
     match_source_aspect: bool = False
     match_source_resolution: bool = False
+    h3_save_base_video: bool = False
     seed: int = -1
     steps: int = Field(default=4, ge=2)
     high_end_step: int = Field(default=2, ge=1)
@@ -219,6 +220,8 @@ class GenerationSettings(_StrictModel):
     @model_validator(mode="after")
     def validate_wan_shape(self) -> GenerationSettings:
         if self.profile == "minimax_h3":
+            if self.h3_save_base_video and not self.match_source_resolution:
+                raise ValueError("base-video diagnostics require H3 source-size delivery")
             if len({item.artifact_id for item in self.h3_loras}) != len(self.h3_loras):
                 raise ValueError("H3 LoRA selections must be unique")
             if (
@@ -243,6 +246,8 @@ class GenerationSettings(_StrictModel):
                     "MiniMax H3 does not use WAN LoRAs, face locking, loops or upscaling"
                 )
             return self
+        if self.h3_save_base_video:
+            raise ValueError("base-video diagnostics require MiniMax H3")
         if self.match_source_resolution:
             raise ValueError("original-resolution generation requires MiniMax H3")
         if self.h3_loras:
@@ -294,10 +299,19 @@ class I2VJob(_StrictModel):
     settings_snapshot: GenerationSettings
     input_grant: DownloadGrant
     output_grant: UploadGrant
+    base_video_grant: UploadGrant | None = None
     h3_lora_grants: list[H3LoraGrant] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_h3_grants(self) -> I2VJob:
+        if self.settings_snapshot.h3_save_base_video != (self.base_video_grant is not None):
+            raise ValueError("base-video grant must match the diagnostic selection")
+        if self.base_video_grant is not None and (
+            self.base_video_grant.storage_bucket != self.output_grant.storage_bucket
+            or not self.output_grant.object_key.endswith(".mp4")
+            or self.base_video_grant.object_key != self.output_grant.object_key[:-4] + ".base.mp4"
+        ):
+            raise ValueError("base-video grant is outside this attempt")
         expected = [(item.artifact_id, item.sha256) for item in self.settings_snapshot.h3_loras]
         actual = [(item.artifact_id, item.sha256) for item in self.h3_lora_grants]
         if actual != expected:

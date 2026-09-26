@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -89,6 +89,7 @@ from gen_automation.services.i2v_media import (
     I2VMediaError,
     I2VMediaNotFoundError,
     I2VMediaStorageError,
+    base_video_snapshot,
     complete_i2v_upload,
     create_i2v_upload_intent,
     list_i2v_library_images,
@@ -169,10 +170,18 @@ class QueueMove(_RequestModel):
     after_job_id: UUID | None = None
 
 
+class BaseVideoRead(BaseModel):
+    playback_url: str
+    width: int
+    height: int
+    byte_size: int
+
+
 class OutputRead(BaseModel):
     output: I2VOutputSnapshot
     playback_url: str
     download_url: str
+    base_video: BaseVideoRead | None = None
 
 
 class WorkerRead(BaseModel):
@@ -838,6 +847,7 @@ async def recent_outputs(
             output=item,
             playback_url=f"/api/v1/i2v/outputs/{item.output_id}/download",
             download_url=f"/api/v1/i2v/outputs/{item.output_id}/download?attachment=true",
+            base_video=_base_video_read(item),
         )
         for item in outputs
     )
@@ -850,6 +860,7 @@ async def download_output(
     session: Session,
     principal: ReleaseReader,
     attachment: bool = False,
+    variant: Literal["final", "base"] = "final",
 ) -> RedirectResponse:
     outputs = await list_recent_i2v_outputs(
         session,
@@ -861,6 +872,11 @@ async def download_output(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="video not found")
     settings: Settings = request.app.state.settings
     try:
+        if variant == "base":
+            base = base_video_snapshot(output)
+            if base is None:
+                raise HTTPException(status_code=404, detail="base video was not retained")
+            output = base
         signed = await presign_i2v_output_download(
             _store(request),
             output=output,
@@ -875,6 +891,18 @@ async def download_output(
     response = RedirectResponse(signed, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
     response.headers["Cache-Control"] = "private, no-store"
     return response
+
+
+def _base_video_read(output: I2VOutputSnapshot) -> BaseVideoRead | None:
+    base = base_video_snapshot(output)
+    if base is None:
+        return None
+    return BaseVideoRead(
+        playback_url=f"/api/v1/i2v/outputs/{output.output_id}/download?variant=base",
+        width=base.width,
+        height=base.height,
+        byte_size=base.byte_size,
+    )
 
 
 @router.get("/worker", response_model=WorkerRead)
@@ -1001,6 +1029,10 @@ def _validate_generation_profile(
         )
     if settings.i2v_profile != "minimax_h3":
         return
+    if value.get("h3_save_base_video") and not settings.i2v_h3_diagnostics_enabled:
+        raise HTTPException(
+            status_code=409, detail="Base-video diagnostics await the matching worker update."
+        )
     if value.get("match_source_resolution") and not settings.i2v_h3_source_resolution_enabled:
         raise HTTPException(
             status_code=409,

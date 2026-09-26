@@ -12,6 +12,7 @@
   const videoProfile = root.dataset.videoProfile || "wan22";
   const isH3 = videoProfile === "minimax_h3";
   const sourceResolutionEnabled = root.dataset.sourceResolutionEnabled === "true";
+  const h3DiagnosticsEnabled = root.dataset.h3DiagnosticsEnabled === "true";
   const maxImageBytes = Number(root.dataset.maxImageBytes || 0);
   const scope = document.body.dataset.automationStorageScope || "operator";
   const draftKey = isH3 ? `i2v-draft-v2:${videoProfile}:${scope}` : `i2v-draft-v1:${scope}`;
@@ -83,6 +84,7 @@
     face_fidelity: "off", video_shift: 8, audio_shift: 4, match_source_aspect: true,
     h3_loras: [],
     match_source_resolution: false,
+    h3_save_base_video: false,
   });
   let saveTimer = null;
 
@@ -429,6 +431,11 @@
     if (isH3) {
       form.elements.match_source_aspect.disabled = original;
       if (original) form.elements.match_source_aspect.checked = false;
+      const diagnostic = form.elements.h3_save_base_video;
+      if (diagnostic) {
+        diagnostic.disabled = !original || !h3DiagnosticsEnabled;
+        if (diagnostic.disabled) diagnostic.checked = false;
+      }
     }
     if (original) {
       form.elements.width.disabled = true;
@@ -1007,6 +1014,8 @@
     if (!items.length) { videoGrid.append(text("p", "No completed videos yet. Successful generations will appear here.", "muted")); return; }
     items.forEach((item) => {
       const output = item.output;
+      let playbackUrl = item.playback_url;
+      let downloadSuffix = "";
       const card = document.createElement("article"); card.className = "i2v-video-card";
       const video = document.createElement("video");
       video.src = item.playback_url; video.controls = true; video.preload = "none"; video.playsInline = true;
@@ -1017,17 +1026,19 @@
       const actions = document.createElement("div"); actions.className = "i2v-video-actions";
       const download = document.createElement("button"); download.className = "secondary-button"; download.type = "button"; download.textContent = "Download";
       download.addEventListener("click", async () => {
+        const selectedUrl = playbackUrl;
+        const selectedSuffix = downloadSuffix;
         download.disabled = true;
         download.textContent = "Downloading…";
         let url;
         try {
           // Fetch the playback grant through the private delivery route. Naming
           // the local Blob avoids an attachment query that bypasses CloudFront.
-          const response = await fetch(item.playback_url, { credentials: "same-origin" });
+          const response = await fetch(selectedUrl, { credentials: "same-origin" });
           if (!response.ok) throw new Error(`Video download failed (${response.status})`);
           url = URL.createObjectURL(await response.blob());
           const link = document.createElement("a");
-          link.href = url; link.download = `video-${output.output_id}.mp4`;
+          link.href = url; link.download = `video-${output.output_id}${selectedSuffix}.mp4`;
           document.body.append(link); link.click(); link.remove();
         } catch (error) { announce(error.message, true); }
         finally {
@@ -1047,6 +1058,26 @@
         applySettings(job.settings_snapshot || {}); scheduleDraftSave(); form.scrollIntoView({ behavior: "smooth" });
       });
       actions.append(download, reuse); body.append(heading, facts, actions); card.append(video, body); videoGrid.append(card);
+      if (item.base_video) {
+        const chooser = document.createElement("div"); chooser.className = "i2v-video-actions";
+        const finalButton = text("button", "Final video", "secondary-button"); finalButton.type = "button";
+        const baseButton = text("button", "Before upscale", "secondary-button"); baseButton.type = "button";
+        function choose(base) {
+          video.pause();
+          playbackUrl = base ? item.base_video.playback_url : item.playback_url;
+          downloadSuffix = base ? "-before-upscale" : "";
+          video.src = playbackUrl;
+          const size = base ? item.base_video : output;
+          facts.textContent = `${base ? "Before upscale" : "Final"}: ${size.width} × ${size.height} · ${output.frame_count} frames · ${output.fps} fps · Seed ${output.metadata?.seed ?? "unknown"}`;
+          finalButton.setAttribute("aria-pressed", String(!base));
+          baseButton.setAttribute("aria-pressed", String(base));
+        }
+        finalButton.addEventListener("click", () => choose(false));
+        baseButton.addEventListener("click", () => choose(true));
+        chooser.append(finalButton, baseButton); body.insertBefore(chooser, actions);
+        body.append(text("p", "Same generation and LoRAs. The base clip is smaller; compare distortion and detail, not pixel dimensions alone.", "muted"));
+        choose(false);
+      }
     });
   }
 

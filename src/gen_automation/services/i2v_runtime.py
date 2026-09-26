@@ -1127,6 +1127,8 @@ def _worker_settings_snapshot(settings: Mapping[str, object]) -> dict[str, objec
         snapshot.pop("h3_loras", None)
     if not snapshot.get("match_source_resolution"):
         snapshot.pop("match_source_resolution", None)
+    if not snapshot.get("h3_save_base_video"):
+        snapshot.pop("h3_save_base_video", None)
     return snapshot
 
 
@@ -1139,6 +1141,8 @@ def _validate_fresh_grants(
     now: datetime,
 ) -> None:
     expected_fields = {"input_grant", "output_grant"}
+    if job.settings_snapshot.get("h3_save_base_video"):
+        expected_fields.add("base_video_grant")
     if job.settings_snapshot.get("h3_loras"):
         expected_fields.add("h3_lora_grants")
     if set(additions) != expected_fields:
@@ -1164,6 +1168,23 @@ def _validate_fresh_grants(
             raise I2VRuntimeConfigurationError("H3 LoRA grants do not match the frozen job")
     input_grant = additions.get("input_grant")
     output_grant = additions.get("output_grant")
+    if "base_video_grant" in additions:
+        from gen_automation.i2v_worker.models import UploadGrant
+
+        try:
+            base = UploadGrant.model_validate(additions["base_video_grant"])
+        except ValidationError:
+            raise I2VRuntimeConfigurationError("diagnostic grant is invalid") from None
+        if (
+            not isinstance(output_grant, dict)
+            or base.storage_bucket != output_grant.get("storage_bucket")
+            or base.storage_backend != output_grant.get("storage_backend")
+            or base.object_key != f"{output_prefix}/{job.job_id}/{attempt.attempt_id}.base.mp4"
+            or base.url.scheme != "https"
+            or base.expires_at.tzinfo is None
+            or base.expires_at <= now
+        ):
+            raise I2VRuntimeConfigurationError("diagnostic grant does not match this attempt")
     if not isinstance(input_grant, dict) or input_grant.get("method") != "GET":
         raise I2VRuntimeConfigurationError("I2V input grant must be a GET grant")
     if not isinstance(output_grant, dict) or output_grant.get("method") != "PUT":

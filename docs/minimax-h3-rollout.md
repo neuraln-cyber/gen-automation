@@ -191,6 +191,36 @@ model-shape validation and bounded network retries are not billing quotas.
   therefore use the normal private playback grant; the dashboard downloads a
   Blob and assigns the local filename. Never fall back to a named direct-S3 URL.
 
+## Optional base/final quality comparison
+
+The H3 advanced controls include **Diagnostic · keep video before upscaling**.
+It is off by default and requires original-resolution delivery. For an
+owner-started test, it retains the base-resolution clip and the normal final clip
+from the **same sampling run**, seed, prompt, audio and selected LoRAs. It does
+not lower strengths, run another sampler or automatically queue a comparison.
+
+In completed videos, use **Final video / Before upscale** to switch the player.
+Download saves the selected variant. The base clip is intentionally smaller
+(for example, 768 × 992 for a 1152 × 1504 canvas); compare distortion and detail,
+not pixel dimensions alone. A damaged base points to the base-generation path;
+a clean base with a damaged final points to upscaling/refinement. Neither result
+alone proves that a particular LoRA or its strength is the root cause.
+
+The extra VAE decode runs after refinement and adds some GPU time and one
+private MP4's storage/upload cost, but no extra sampling pass or model storage.
+Both playback/download variants use the existing private CloudFront route.
+Turn the option off after diagnosis. Previously generated clips do not gain a
+base video retroactively. Both outputs must pass attempt-bound identity and
+checksum verification before the diagnostic job is registered as complete.
+
+Deployment: leave `GEN_AUTOMATION_I2V_H3_DIAGNOSTICS_ENABLED=false` until the matching worker
+with `ManagedH3DiagnosticDecode` is installed. Only replace the video worker at
+an owner-approved idle boundary with both application and provider queues empty;
+do not cancel work or start a GPU test to enable this option. Then enable the
+control-plane flag. Ordinary jobs omit the disabled setting in their worker
+payloads for compatibility. On rollback, disable the flag before replacing the
+worker and leave any pending diagnostic jobs untouched for an operator decision.
+
 ## Activation critical path
 
 1. Finish and verify all four private mirror objects and the immutable manifest.

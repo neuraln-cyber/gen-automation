@@ -16,6 +16,7 @@
     data-max-image-bytes="{{ max_image_bytes }}"
     data-video-profile="{{ video_profile }}"
     data-source-resolution-enabled="{{ 'true' if source_resolution_enabled else 'false' }}"
+    data-h3-diagnostics-enabled="{{ 'true' if h3_diagnostics_enabled else 'false' }}"
   >
     <header class="i2v-hero">
       <div class="i2v-hero-copy">
@@ -184,6 +185,8 @@
             <label><input type="checkbox" name="match_source_aspect" checked> Standard size · match source aspect</label>
           </div>
           <p class="muted" data-resolution-summary aria-live="polite">Select an image to see its output dimensions.</p>
+          <label><input type="checkbox" name="h3_save_base_video" disabled> Diagnostic · keep video before upscaling</label>
+          <p class="muted">Optional, with Match original image size. Keeps the base and final clips from the same sampling run, with unchanged seed and LoRA strengths. Adds one video decode/encode and a small private MP4, not a second generation. Compare them in Recent videos; turn this off after testing.{% if not h3_diagnostics_enabled %} Waiting for the matching worker update.{% endif %}</p>
           <p class="muted">Match original size generates motion at normal H3 resolution, then uses the community H3 latent upscaler and a tiled refinement pass. The original image anchors refinement; your selected LoRAs apply to both passes and audio is preserved. Output matches the source dimensions, not guaranteed original detail. This uses additional Salad GPU time and can still run out of memory; it is not MiniMax's hosted Regenerate-2K service.{% if not source_resolution_enabled %} This option will become available after the matching worker and upscaler update.{% endif %}</p>
           <p class="muted">Euler / simple · CFG 1 · 24 fps. Describe what you want in one prompt; this Turbo profile does not use negative guidance or WAN motion LoRAs. The first release uses one starting image, not the full multi-reference workflow.</p>
           {% else %}
