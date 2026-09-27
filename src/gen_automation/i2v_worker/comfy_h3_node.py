@@ -1,26 +1,8 @@
-"""Managed H3 nodes, including non-destructive additive LoRA application."""
+"""Managed H3 output diagnostics and source-resolution refinement only."""
 
-import re
 from typing import Any
 
-from nodes import LoraLoaderModelOnly  # type: ignore[import-not-found]
-
-from gen_automation.i2v_worker.comfy_h3_lora import apply_h3_lora
 from gen_automation.i2v_worker.comfy_h3_upscale import ManagedH3SourceUpscale
-
-
-class ManagedH3LoraLoader(LoraLoaderModelOnly):  # type: ignore[misc]
-    def load_lora_model_only(self, model: Any, lora_name: str, strength_model: float) -> tuple[Any]:
-        if re.fullmatch(r"managed-h3/[0-9a-f]{64}\.safetensors", lora_name) is None:
-            raise ValueError("H3 LoRA filename is outside the managed library")
-        if strength_model == 0:
-            return (model,)
-        import comfy.utils  # type: ignore[import-not-found]
-        import folder_paths  # type: ignore[import-not-found]
-
-        path = folder_paths.get_full_path_or_raise("loras", lora_name)
-        lora = comfy.utils.load_torch_file(path, safe_load=True)
-        return (apply_h3_lora(model, lora, strength_model, lora_name),)
 
 
 class ManagedH3DiagnosticDecode:
@@ -41,7 +23,7 @@ class ManagedH3DiagnosticDecode:
     CATEGORY = "GenAutomation/H3"
 
     def decode(self, samples: Any, vae: Any, after_refinement: Any) -> Any:
-        from nodes import VAEDecode
+        from nodes import VAEDecode  # type: ignore[import-not-found]
 
         # The graph dependency deliberately prevents the extra VAE decode from
         # changing model residency during the sampling/refinement comparison.
@@ -49,7 +31,6 @@ class ManagedH3DiagnosticDecode:
 
 
 NODE_CLASS_MAPPINGS = {
-    "ManagedH3LoraLoader": ManagedH3LoraLoader,
     "ManagedH3DiagnosticDecode": ManagedH3DiagnosticDecode,
     "ManagedH3SourceUpscale": ManagedH3SourceUpscale,
 }

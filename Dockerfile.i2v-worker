@@ -243,14 +243,27 @@ RUN apt-get update \
 
 LABEL org.opencontainers.image.h3-upscaler.revision="40316cf008b2fd8663263270669eb4da23f89d2c"
 
+# The workflow creator's actual loader, not a reimplementation. Only these
+# unchanged upstream modules are needed for the headless Basic MODEL/CLIP stack.
+ADD --checksum=sha256:26954c67c71a547226fdc523566783a33d03ffb2e667fb1d5930386d4cefd2cf --chmod=0444 \
+    https://raw.githubusercontent.com/darksidewalker/ComfyUI-DaSiWa-Nodes/9f5aef4a2748bba9486dda0a7efec7689462d7e0/nodes/nodes_advanced_lora_loader.py \
+    /opt/comfyui/custom_nodes/DaSiWaLoRA/nodes_advanced_lora_loader.py
+ADD --checksum=sha256:a57c3e1c12a0b9365de2517225d199f92c471456be183e5c3729b9a15040ef09 --chmod=0444 \
+    https://raw.githubusercontent.com/darksidewalker/ComfyUI-DaSiWa-Nodes/9f5aef4a2748bba9486dda0a7efec7689462d7e0/nodes/helper_logging.py \
+    /opt/comfyui/custom_nodes/DaSiWaLoRA/helper_logging.py
+ADD --checksum=sha256:ab88772ca7378b05ff8b931ef35c066372146400588946a1eea9470c7f624035 --chmod=0444 \
+    https://raw.githubusercontent.com/darksidewalker/ComfyUI-DaSiWa-Nodes/9f5aef4a2748bba9486dda0a7efec7689462d7e0/LICENSE \
+    /opt/comfyui/custom_nodes/DaSiWaLoRA/LICENSE
+LABEL org.opencontainers.image.dasiwa-lora.revision="9f5aef4a2748bba9486dda0a7efec7689462d7e0"
+
 COPY src/gen_automation/domain/__init__.py ./src/gen_automation/domain/__init__.py
 COPY src/gen_automation/domain/private_delivery.py ./src/gen_automation/domain/private_delivery.py
 COPY src/gen_automation/i2v_worker ./src/gen_automation/i2v_worker
 COPY src/gen_automation/i2v_worker/comfy_h3_node.py /opt/comfyui/custom_nodes/GenAutomationH3/__init__.py
+COPY src/gen_automation/i2v_worker/comfy_dasiwa_node.py /opt/comfyui/custom_nodes/DaSiWaLoRA/__init__.py
 COPY scripts/verify-h3-comfy-nodes.py /opt/i2v/bin/verify-h3-comfy-nodes.py
-COPY scripts/verify-h3-lora-math.py /opt/i2v/bin/verify-h3-lora-math.py
+COPY scripts/verify_h3_creator_lora.py /opt/i2v/bin/verify_h3_creator_lora.py
 RUN /opt/i2v-venv/bin/python /opt/i2v/bin/verify-h3-comfy-nodes.py
-RUN /opt/i2v-venv/bin/python /opt/i2v/bin/verify-h3-lora-math.py
 COPY --chmod=0555 scripts/i2v-runpod-entrypoint.sh /opt/i2v/bin/i2v-runpod-entrypoint
 COPY workflows/dasiwa-wan22-i2v-v1.api.json ./workflows/dasiwa-wan22-i2v-v1.api.json
 COPY workflows/dasiwa-minimax-h3-i2v-v1.api.json ./workflows/dasiwa-minimax-h3-i2v-v1.api.json

@@ -500,7 +500,7 @@ def test_comfy_command_uses_supported_base_directory_and_only_pinned_nodes(tmp_p
     assert "--disable-all-custom-nodes" in command
     assert command[
         command.index("--whitelist-custom-nodes") + 1 : command.index("--disable-api-nodes")
-    ] == ("ComfyUI-NAG", "GenAutomationH3", "ComfyUI-H3-Latent-Upscaler")
+    ] == ("ComfyUI-NAG", "GenAutomationH3", "ComfyUI-H3-Latent-Upscaler", "DaSiWaLoRA")
     assert "--highvram" not in command
     assert command[command.index("--reserve-vram") + 1] == "4"
 

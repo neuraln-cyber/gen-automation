@@ -1,14 +1,11 @@
 """Owner selection through dispatch and worker loading, with synthetic local files only."""
 
 import hashlib
-import importlib.util
 import json
 import shutil
 import subprocess
-import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -215,7 +212,10 @@ def test_catalog_and_validation_fail_closed(client: TestClient):
     client.portal.call(check_unowned)
 
 
-def test_h3_workflow_chains_selected_weights_and_does_not_leak_to_next_job():
+@pytest.mark.parametrize("diagnostic", [False, True])
+def test_h3_workflow_uses_creator_stack_and_does_not_leak_to_next_job(diagnostic):
+    from gen_automation.i2v_worker.h3_upscale import H3_UPSCALER_FILENAME, H3_UPSCALER_ROLE
+
     selected = [
         {"artifact_id": str(uuid4()), "sha256": char * 64, "strength": strength}
         for char, strength in [("a", 0.65), ("b", 0), ("c", -0.2)]
@@ -233,23 +233,53 @@ def test_h3_workflow_chains_selected_weights_and_does_not_leak_to_next_job():
             settings=settings,
             job_id=uuid4(),
             attempt_id=uuid4(),
-            model_paths={
+            model_paths={H3_UPSCALER_ROLE: H3_UPSCALER_FILENAME}
+            | {
                 role: f"{role}.safetensors"
                 for role in ("diffusion_model", "text_encoder", "video_vae", "audio_vae")
             },
         )[0]
 
-    settings = h3_settings(h3_loras=selected)
+    settings = h3_settings(
+        h3_loras=selected,
+        match_source_resolution=diagnostic,
+        h3_save_base_video=diagnostic,
+        width=1152 if diagnostic else 768,
+        height=1504 if diagnostic else 768,
+    )
     graph = render(settings)
-    nodes = [node for node in graph.values() if node["class_type"] == "ManagedH3LoraLoader"]
-    assert [node["inputs"]["strength_model"] for node in nodes] == [0.65, -0.2]
-    assert nodes[0]["inputs"]["model"] == ["2", 0]
-    assert nodes[1]["inputs"]["model"] == ["h3-lora-0", 0]
-    assert graph["7"]["inputs"]["model"] == ["h3-lora-2", 0]
+    nodes = [node for node in graph.values() if node["class_type"] == "DaSiWa_LTX2LoraLoader"]
+    assert len(nodes) == 1
+    inputs = nodes[0]["inputs"]
+    assert inputs["model"] == ["2", 0] and inputs["clip"] == ["3", 0]
+    assert inputs["model_type"] == "Basic" and inputs["use_cache"] is False
+    assert json.loads(inputs["stack_data"]) == [
+        {
+            "on": True,
+            "lora": f"managed-h3/{char * 64}.safetensors",
+            "str": strength,
+            "vs": 1,
+            "as": 1,
+        }
+        for char, strength in (("a", 0.65), ("c", -0.2))
+    ]
+    assert graph["7"]["inputs"]["model"] == ["h3-lora-stack", 0]
+    assert graph["6"]["inputs"]["clip"] == ["h3-lora-stack", 1]
+    assert graph["9"]["inputs"]["model"] == ["7", 0]
+    assert graph["11"]["inputs"]["model"] == ["7", 0]
+    if diagnostic:
+        assert graph["h3-source-upscale"]["inputs"]["model"] == ["7", 0]
+        assert graph["h3-source-upscale"]["inputs"]["conditioning"] == ["6", 0]
+        assert graph["h3-base-decode"]["inputs"]["samples"] == ["12", 0]
     assert lora_provenance(settings) == selected
     baseline = render(h3_settings())
     assert baseline["7"]["inputs"]["model"] == ["2", 0]
-    assert not any(node["class_type"] == "ManagedH3LoraLoader" for node in baseline.values())
+    assert baseline["6"]["inputs"]["clip"] == ["3", 0]
+    assert not any(node["class_type"] == "DaSiWa_LTX2LoraLoader" for node in baseline.values())
+    zero = render(h3_settings(h3_loras=[selected[1]]))
+    assert zero["7"]["inputs"]["model"] == ["2", 0]
+    assert zero["6"]["inputs"]["clip"] == ["3", 0]
+    assert "h3-lora-stack" not in zero
 
 
 def test_worker_requires_exact_grants_and_finite_strengths():
@@ -353,57 +383,20 @@ def test_worker_rejects_corrupt_bytes_off_route_and_naive_expiry(tmp_path, monke
         H3LoraGrant.model_validate(invalid)
 
 
-def test_native_loader_delegates_to_additive_path_and_preserves_zero(monkeypatch):
-    native = ModuleType("nodes")
-    native.LoraLoaderModelOnly = type("Loader", (), {})
-    monkeypatch.setitem(sys.modules, "nodes", native)
-    comfy = ModuleType("comfy")
-    utils = ModuleType("comfy.utils")
-    content = {"synthetic": object()}
-    loaded = []
-
-    def read(path, *, safe_load):
-        loaded.append((path, safe_load))
-        return content
-
-    utils.load_torch_file = read
-    comfy.utils = utils
-    paths = ModuleType("folder_paths")
-    paths.get_full_path_or_raise = lambda kind, name: f"{kind}/{name}"
-    monkeypatch.setitem(sys.modules, "comfy", comfy)
-    monkeypatch.setitem(sys.modules, "comfy.utils", utils)
-    monkeypatch.setitem(sys.modules, "folder_paths", paths)
-    spec = importlib.util.spec_from_file_location(
-        "isolated_h3_loader", ROOT / "src/gen_automation/i2v_worker/comfy_h3_node.py"
+def test_creator_loader_is_pinned_unmodified_and_custom_loader_removed():
+    docker = (ROOT / "Dockerfile.i2v-worker").read_text(encoding="utf-8")
+    registration = (ROOT / "src/gen_automation/i2v_worker/comfy_dasiwa_node.py").read_text(
+        encoding="utf-8"
     )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    loader = module.ManagedH3LoraLoader()
-    name = f"managed-h3/{'a' * 64}.safetensors"
-    source = SimpleNamespace(patches={})
-    result = object()
-    calls = []
-
-    def apply(model, data, strength, identity):
-        calls.append((model, data, strength, identity))
-        return result
-
-    monkeypatch.setattr(module, "apply_h3_lora", apply)
-    assert loader.load_lora_model_only(source, name, 0) == (source,)
-    assert not loaded and not calls
-    assert loader.load_lora_model_only(source, name, 0.65) == (result,)
-    assert calls == [(source, content, 0.65, name)]
-    assert loaded == [(f"loras/{name}", True)]
-    assert source.patches == {}
-
-    def incompatible(*_args):
-        raise ValueError("no compatible model weights")
-
-    monkeypatch.setattr(module, "apply_h3_lora", incompatible)
-    with pytest.raises(ValueError, match="no compatible"):
-        loader.load_lora_model_only(source, name, 0.65)
-    with pytest.raises(ValueError, match="outside"):
-        loader.load_lora_model_only(source, "../other.safetensors", 1)
+    assert "9f5aef4a2748bba9486dda0a7efec7689462d7e0/nodes/nodes_advanced_lora_loader.py" in docker
+    assert "26954c67c71a547226fdc523566783a33d03ffb2e667fb1d5930386d4cefd2cf" in docker
+    assert (
+        'NODE_CLASS_MAPPINGS = {"DaSiWa_LTX2LoraLoader": DaSiWa_AdvancedLoRALoader}' in registration
+    )
+    assert "class " not in registration and "def " not in registration
+    assert not (ROOT / "src/gen_automation/i2v_worker/comfy_h3_lora.py").exists()
+    assert not (ROOT / "scripts/verify-h3-lora-math.py").exists()
+    assert "verify_h3_creator_lora.py" in docker
 
 
 @pytest.mark.asyncio
@@ -423,7 +416,7 @@ async def test_incompatible_file_is_an_actionable_worker_error(tmp_path):
                             [
                                 "execution_error",
                                 {
-                                    "node_type": "ManagedH3LoraLoader",
+                                    "node_type": "DaSiWa_LTX2LoraLoader",
                                     "exception_message": "private details",
                                 },
                             ]
