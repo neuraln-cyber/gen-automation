@@ -248,7 +248,9 @@ COPY src/gen_automation/domain/private_delivery.py ./src/gen_automation/domain/p
 COPY src/gen_automation/i2v_worker ./src/gen_automation/i2v_worker
 COPY src/gen_automation/i2v_worker/comfy_h3_node.py /opt/comfyui/custom_nodes/GenAutomationH3/__init__.py
 COPY scripts/verify-h3-comfy-nodes.py /opt/i2v/bin/verify-h3-comfy-nodes.py
+COPY scripts/verify-h3-lora-math.py /opt/i2v/bin/verify-h3-lora-math.py
 RUN /opt/i2v-venv/bin/python /opt/i2v/bin/verify-h3-comfy-nodes.py
+RUN /opt/i2v-venv/bin/python /opt/i2v/bin/verify-h3-lora-math.py
 COPY --chmod=0555 scripts/i2v-runpod-entrypoint.sh /opt/i2v/bin/i2v-runpod-entrypoint
 COPY workflows/dasiwa-wan22-i2v-v1.api.json ./workflows/dasiwa-wan22-i2v-v1.api.json
 COPY workflows/dasiwa-minimax-h3-i2v-v1.api.json ./workflows/dasiwa-minimax-h3-i2v-v1.api.json
