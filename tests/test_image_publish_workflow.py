@@ -23,6 +23,7 @@ I2V_INPUTS = (
     "src/gen_automation/domain/private_delivery.py",
     "scripts/i2v-runpod-entrypoint.sh",
     "scripts/verify-h3-comfy-nodes.py",
+    "scripts/verify-h3-lora-math.py",
     "workflows/dasiwa-wan22-i2v-v1.api.json",
     "workflows/dasiwa-minimax-h3-i2v-v1.api.json",
 )

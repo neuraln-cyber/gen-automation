@@ -353,18 +353,26 @@ def test_worker_rejects_corrupt_bytes_off_route_and_naive_expiry(tmp_path, monke
         H3LoraGrant.model_validate(invalid)
 
 
-def test_native_loader_rejects_zero_matched_weights(monkeypatch):
+def test_native_loader_delegates_to_additive_path_and_preserves_zero(monkeypatch):
     native = ModuleType("nodes")
-
-    class Loader:
-        def load_lora_model_only(self, model, _name, strength):
-            patches = {key: list(value) for key, value in model.patches.items()}
-            if self.compatible and strength:
-                patches.setdefault("layer", []).append((strength,))
-            return (SimpleNamespace(patches=patches),)
-
-    native.LoraLoaderModelOnly = Loader
+    native.LoraLoaderModelOnly = type("Loader", (), {})
     monkeypatch.setitem(sys.modules, "nodes", native)
+    comfy = ModuleType("comfy")
+    utils = ModuleType("comfy.utils")
+    content = {"synthetic": object()}
+    loaded = []
+
+    def read(path, *, safe_load):
+        loaded.append((path, safe_load))
+        return content
+
+    utils.load_torch_file = read
+    comfy.utils = utils
+    paths = ModuleType("folder_paths")
+    paths.get_full_path_or_raise = lambda kind, name: f"{kind}/{name}"
+    monkeypatch.setitem(sys.modules, "comfy", comfy)
+    monkeypatch.setitem(sys.modules, "comfy.utils", utils)
+    monkeypatch.setitem(sys.modules, "folder_paths", paths)
     spec = importlib.util.spec_from_file_location(
         "isolated_h3_loader", ROOT / "src/gen_automation/i2v_worker/comfy_h3_node.py"
     )
@@ -373,12 +381,27 @@ def test_native_loader_rejects_zero_matched_weights(monkeypatch):
     loader = module.ManagedH3LoraLoader()
     name = f"managed-h3/{'a' * 64}.safetensors"
     source = SimpleNamespace(patches={})
-    loader.compatible = False
+    result = object()
+    calls = []
+
+    def apply(model, data, strength, identity):
+        calls.append((model, data, strength, identity))
+        return result
+
+    monkeypatch.setattr(module, "apply_h3_lora", apply)
+    assert loader.load_lora_model_only(source, name, 0) == (source,)
+    assert not loaded and not calls
+    assert loader.load_lora_model_only(source, name, 0.65) == (result,)
+    assert calls == [(source, content, 0.65, name)]
+    assert loaded == [(f"loras/{name}", True)]
+    assert source.patches == {}
+
+    def incompatible(*_args):
+        raise ValueError("no compatible model weights")
+
+    monkeypatch.setattr(module, "apply_h3_lora", incompatible)
     with pytest.raises(ValueError, match="no compatible"):
         loader.load_lora_model_only(source, name, 0.65)
-    loader.compatible = True
-    assert loader.load_lora_model_only(source, name, 0.65)[0].patches["layer"] == [(0.65,)]
-    assert source.patches == {}
     with pytest.raises(ValueError, match="outside"):
         loader.load_lora_model_only(source, "../other.safetensors", 1)
 
