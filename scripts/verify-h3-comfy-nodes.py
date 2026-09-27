@@ -111,13 +111,18 @@ async def main() -> None:
 
     comfy.options.enable_args_parsing()
     import nodes  # type: ignore[import-not-found]
+    from server import PromptServer  # type: ignore[import-not-found]
+
+    # The upstream loader registers its key-count route during import, exactly
+    # as it does at normal Comfy startup. This does not bind a socket.
+    PromptServer(asyncio.get_running_loop())
 
     # Exercise exactly the allowlist used at runtime, not a separate build list.
     for directory in I2V_CUSTOM_NODES:
         if not await nodes.load_custom_node(f"/opt/comfyui/custom_nodes/{directory}"):
             raise RuntimeError(f"H3 extension failed to import: {directory}")
     for name in (
-        "ManagedH3LoraLoader",
+        "DaSiWa_LTX2LoraLoader",
         "ManagedH3SourceUpscale",
         "MinimaxH3LatentUpscaler3D",
         "MMH3TemporalSplitParamsV10",
@@ -127,6 +132,9 @@ async def main() -> None:
         cls = nodes.NODE_CLASS_MAPPINGS[name]
         assert "required" in cls.INPUT_TYPES(), name
     verify_native_refinement_anchors(nodes)
+    from verify_h3_creator_lora import verify_creator_lora
+
+    verify_creator_lora(nodes)
     print("Pinned H3 upscaler and managed adapter import/API check passed (CPU, no weights).")
 
 

@@ -191,7 +191,8 @@ def test_refinement_reuses_loras_and_base_audio_but_anchors_to_full_source():
         )
     )
     assert (graph["6"]["inputs"]["width"], graph["6"]["inputs"]["height"]) == (768, 992)
-    assert graph["7"]["inputs"]["model"] == ["h3-lora-0", 0]
+    assert graph["7"]["inputs"]["model"] == ["h3-lora-stack", 0]
+    assert graph["6"]["inputs"]["clip"] == ["h3-lora-stack", 1]
     upscale = graph["h3-source-upscale"]["inputs"]
     assert upscale["model"] == graph["9"]["inputs"]["model"] == ["7", 0]
     assert upscale["first_frame"] == ["1", 0] and upscale["conditioning"] == ["6", 0]

@@ -46,3 +46,14 @@ license texts and copyright notices in
 
 The image includes code only, not model weights. The private manifest and existing
 CloudFront delivery path provide the checksum-verified checkpoint separately.
+
+## DaSiWa Advanced LoRA Loader
+
+- Code: <https://github.com/darksidewalker/ComfyUI-DaSiWa-Nodes>
+- Revision: `9f5aef4a2748bba9486dda0a7efec7689462d7e0`
+- License: GPL-3.0; full upstream LICENSE and unmodified Python sources are
+  included in `/opt/comfyui/custom_nodes/DaSiWaLoRA` in the worker image.
+- Only `nodes/nodes_advanced_lora_loader.py` and `nodes/helper_logging.py` are
+  installed, with checksum verification. A separate headless registration module
+  exposes the creator's class unchanged; unrelated extension features are omitted.
+- Loader SHA-256: `26954c67c71a547226fdc523566783a33d03ffb2e667fb1d5930386d4cefd2cf`.

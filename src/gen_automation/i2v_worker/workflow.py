@@ -241,21 +241,33 @@ def lora_provenance(settings: GenerationSettings) -> list[dict[str, object]]:
 
 
 def _inject_h3_loras(workflow: dict[str, Any], settings: GenerationSettings) -> dict[str, Any]:
-    model: list[object] = ["2", 0]
-    for index, selection in enumerate(settings.h3_loras):
-        if selection.strength == 0:
-            continue
-        node_id = f"h3-lora-{index}"
-        workflow[node_id] = {
-            "class_type": "ManagedH3LoraLoader",
+    # C-MMH3 v2.5 node 2678: one Basic stack, unit branch multipliers,
+    # MODEL before SigmaShift and CLIP before conditioning. The creator's
+    # unmodified node handles file metadata and native Comfy patching.
+    stack = [
+        {
+            "on": True,
+            "lora": f"managed-h3/{selection.sha256}.safetensors",
+            "str": selection.strength,
+            "vs": 1.0,
+            "as": 1.0,
+        }
+        for selection in settings.h3_loras
+        if selection.strength != 0
+    ]
+    if stack:
+        workflow["h3-lora-stack"] = {
+            "class_type": "DaSiWa_LTX2LoraLoader",
             "inputs": {
-                "model": model,
-                "lora_name": f"managed-h3/{selection.sha256}.safetensors",
-                "strength_model": selection.strength,
+                "model": ["2", 0],
+                "clip": ["3", 0],
+                "stack_data": json.dumps(stack, separators=(",", ":"), allow_nan=False),
+                "model_type": "Basic",
+                "use_cache": False,
             },
         }
-        model = [node_id, 0]
-    workflow["7"]["inputs"]["model"] = model
+        workflow["7"]["inputs"]["model"] = ["h3-lora-stack", 0]
+        workflow["6"]["inputs"]["clip"] = ["h3-lora-stack", 1]
     return workflow
 
 

@@ -59,7 +59,7 @@ class ComfyClient:
                     "MiniMaxH3SigmaShift",
                     "SaveVideo",
                     "VAEDecodeAudio",
-                    "ManagedH3LoraLoader",
+                    "DaSiWa_LTX2LoraLoader",
                     "ManagedH3DiagnosticDecode",
                 )
             )
@@ -155,7 +155,7 @@ class ComfyClient:
                     and len(message) == 2
                     and message[0] == "execution_error"
                     and isinstance(message[1], dict)
-                    and message[1].get("node_type") == "ManagedH3LoraLoader"
+                    and message[1].get("node_type") == "DaSiWa_LTX2LoraLoader"
                     for message in messages
                 ):
                     raise ComfyLoraError("selected H3 LoRA could not be applied")

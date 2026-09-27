@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -83,7 +84,7 @@ def test_graph_retains_one_sampling_run_and_delays_base_decode_until_after_refin
     }
     assert graph["h3-base-create"]["inputs"]["audio"] == ["15", 0]
     assert graph["8"]["inputs"]["noise_seed"] == 12345
-    assert graph["h3-lora-0"]["inputs"]["strength_model"] == 1.0
+    assert json.loads(graph["h3-lora-stack"]["inputs"]["stack_data"])[0]["str"] == 1.0
 
 
 def _history(tmp_path):
