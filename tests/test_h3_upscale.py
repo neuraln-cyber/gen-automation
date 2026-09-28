@@ -2,10 +2,7 @@
 
 import hashlib
 import json
-import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
@@ -15,10 +12,6 @@ from pydantic import SecretStr, ValidationError
 from gen_automation.config import Settings
 from gen_automation.i2v_worker.app import create_i2v_worker_app
 from gen_automation.i2v_worker.comfy import ComfyClient
-from gen_automation.i2v_worker.comfy_h3_upscale import (
-    ManagedH3SourceUpscale,
-    h3_refinement_split_params,
-)
 from gen_automation.i2v_worker.h3_upscale import (
     H3_REFINE_DENOISE,
     H3_REFINE_STEPS,
@@ -181,7 +174,7 @@ def _workflow(settings, paths=None):
     )[0]
 
 
-def test_refinement_reuses_loras_and_base_audio_but_anchors_to_full_source():
+def test_author_refinement_reuses_pre_shift_loras_conditioning_and_base_audio():
     graph = _workflow(
         h3_settings(
             width=1152,
@@ -190,15 +183,17 @@ def test_refinement_reuses_loras_and_base_audio_but_anchors_to_full_source():
             h3_loras=[{"artifact_id": str(uuid4()), "sha256": "d" * 64, "strength": 0.6}],
         )
     )
-    assert (graph["6"]["inputs"]["width"], graph["6"]["inputs"]["height"]) == (768, 992)
+    assert (graph["1"]["inputs"]["width"], graph["1"]["inputs"]["height"]) == (768, 992)
     assert graph["7"]["inputs"]["model"] == ["h3-lora-stack", 0]
     assert graph["6"]["inputs"]["clip"] == ["h3-lora-stack", 1]
     upscale = graph["h3-source-upscale"]["inputs"]
-    assert upscale["model"] == graph["9"]["inputs"]["model"] == ["7", 0]
-    assert upscale["first_frame"] == ["1", 0] and upscale["conditioning"] == ["6", 0]
-    assert (upscale["width"], upscale["height"]) == (1152, 1504)
+    assert upscale["model"] == ["h3-lora-stack", 0]
+    assert graph["9"]["inputs"]["model"] == ["h3-preview", 0]
+    assert "first_frame" not in upscale and upscale["conditioning"] == ["6", 0]
+    params = graph["h3-upscale-params"]["inputs"]
+    assert (params["width"], params["height"]) == (1152, 1504)
     assert graph["h3-refine-sigmas"]["inputs"] == {
-        "model": ["7", 0],
+        "model": ["h3-lora-stack", 0],
         "scheduler": "simple",
         "steps": H3_REFINE_STEPS,
         "denoise": H3_REFINE_DENOISE,
@@ -210,7 +205,7 @@ def test_refinement_reuses_loras_and_base_audio_but_anchors_to_full_source():
 def test_standard_mode_and_small_originals_do_not_add_a_refinement_pass():
     for settings in [h3_settings(), h3_settings(match_source_resolution=True)]:
         graph = _workflow(settings)
-        assert len(graph) == 16
+        assert len(graph) == 20
         assert graph["13"]["inputs"]["samples"] == ["12", 0]
 
 
@@ -254,124 +249,11 @@ async def test_readiness_requires_all_upscaler_nodes_only_for_enabled_worker():
     new = ComfyClient(**kwargs, source_resolution_enabled=True)
     try:
         assert not any("Upscale" in name for name, _ in old.required_nodes)
-        assert {"ManagedH3SourceUpscale", "MinimaxH3LatentUpscaler3D", "MMH3SplitUpscale"} <= {
-            name for name, _ in new.required_nodes
-        }
+        assert {
+            "MMH3UltimateUpscale",
+            "MMH3LatentUpscaleWithModelParams",
+            "MMH3TemporalSplitParams",
+        } <= {name for name, _ in new.required_nodes}
     finally:
         await old.close()
         await new.close()
-
-
-class _Tensor:
-    def __init__(self, shape):
-        self.shape = shape
-        self.ndim = len(shape)
-
-    def __getitem__(self, _slice):
-        return self
-
-
-class _Nested:
-    def __init__(self, tensors):
-        self.tensors = tensors
-
-
-@pytest.fixture
-def adapter(monkeypatch):
-    mm = ModuleType("comfy.model_management")
-    mm.unload_all_models = Mock()
-    nt = ModuleType("comfy.nested_tensor")
-    nt.NestedTensor = _Nested
-    comfy = ModuleType("comfy")
-    comfy.model_management, comfy.nested_tensor = mm, nt
-    helpers = ModuleType("node_helpers")
-    helpers.conditioning_set_values = Mock(return_value="full-source-conditioning")
-    nodes = ModuleType("nodes")
-    nodes.NODE_CLASS_MAPPINGS = {
-        name: SimpleNamespace(execute=Mock())
-        for name in (
-            "MinimaxH3LatentUpscaler3D",
-            "MMH3TemporalSplitParamsV10",
-            "MMH3SpatialSplitParamsV10",
-            "MMH3SplitUpscale",
-        )
-    }
-    for name, module in {
-        "comfy": comfy,
-        "comfy.model_management": mm,
-        "comfy.nested_tensor": nt,
-        "node_helpers": helpers,
-        "nodes": nodes,
-    }.items():
-        monkeypatch.setitem(sys.modules, name, module)
-    up = nodes.NODE_CLASS_MAPPINGS["MinimaxH3LatentUpscaler3D"].execute
-    refine = nodes.NODE_CLASS_MAPPINGS["MMH3SplitUpscale"].execute
-    high = _Tensor((1, 24, 41, 94, 72))
-    up.return_value = ({"samples": high},)
-    refine.return_value = ({"samples": _Nested((high, "do-not-use-refined-audio"))},)
-    for name in ("MMH3TemporalSplitParamsV10", "MMH3SpatialSplitParamsV10"):
-        nodes.NODE_CLASS_MAPPINGS[name].execute.return_value = ({"test": name},)
-    kwargs = dict(
-        latent={"samples": _Nested((_Tensor((1, 24, 41, 62, 48)), _Tensor((1, 32, 2, 400))))},
-        conditioning="base-conditioning",
-        first_frame=_Tensor((1, 1504, 1152, 3)),
-        vae=SimpleNamespace(encode=Mock(return_value="high-keyframe")),
-        model="patched-h3",
-        noise="seeded-noise",
-        sampler="euler",
-        sigmas="refine-sigmas",
-        width=1152,
-        height=1504,
-        model_name=H3_UPSCALER_FILENAME,
-    )
-    return kwargs, up, refine, helpers, mm
-
-
-def test_adapter_separates_video_and_keeps_audio_identity(adapter):
-    kwargs, up, refine, helpers, mm = adapter
-    result = ManagedH3SourceUpscale().upscale(**kwargs)[0]["samples"]
-    original_video, original_audio = kwargs["latent"]["samples"].tensors
-    assert result.tensors[1] is original_audio
-    assert up.call_args.kwargs["latent"]["samples"] is original_video
-    assert up.call_args.kwargs["force_unload"] is True
-    assert up.call_args.kwargs["mode"] == {
-        "mode": "target dimensions",
-        "width": 1152,
-        "height": 1504,
-    }
-    assert refine.call_args.kwargs["latent"]["samples"].tensors[1] is original_audio
-    assert refine.call_args.kwargs["conditioning"] == "full-source-conditioning"
-    assert refine.call_args.kwargs["model"] == "patched-h3"
-    helpers.conditioning_set_values.assert_called_once_with(
-        "base-conditioning",
-        {"minimax_keyframes": [{"resolved_frame_index": 0, "latent": "high-keyframe"}]},
-    )
-    mm.unload_all_models.assert_called_once()
-
-
-def test_refiner_uses_only_native_supported_boundary_anchors(adapter):
-    kwargs, _, refine, _, _ = adapter
-    nodes = sys.modules["nodes"].NODE_CLASS_MAPPINGS
-    temporal, spatial = h3_refinement_split_params(nodes)
-    nodes["MMH3TemporalSplitParamsV10"].execute.assert_called_once_with(
-        chunk_frames=56,
-        temporal_overlap_frames=22,
-        anchor_strength=0.999,
-        motion_anchor_frames="0",
-        identity_anchor_frames=0,
-    )
-    ManagedH3SourceUpscale().upscale(**kwargs)
-    assert refine.call_args.kwargs["temporal_split_param"] is temporal
-    assert refine.call_args.kwargs["spatial_split_param"] is spatial
-
-
-@pytest.mark.parametrize("stage", ["upscale", "refine"])
-def test_adapter_rejects_changed_duration_or_dimensions(adapter, stage):
-    kwargs, up, refine, _, _ = adapter
-    bad = _Tensor((1, 24, 40, 94, 72))
-    if stage == "upscale":
-        up.return_value = ({"samples": bad},)
-    else:
-        refine.return_value = ({"samples": _Nested((bad, "audio"))},)
-    with pytest.raises(ValueError, match="duration"):
-        ManagedH3SourceUpscale().upscale(**kwargs)

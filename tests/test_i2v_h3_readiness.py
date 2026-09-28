@@ -56,7 +56,7 @@ def test_h3_rejects_unsupported_or_expensive_legacy_settings(changes: dict[str, 
         h3_settings(**changes)
 
 
-def test_h3_binds_native_workflow_without_wan_models_or_custom_nodes() -> None:
+def test_h3_binds_author_workflow_without_wan_models_or_nodes() -> None:
     template = load_workflow_template(
         ROOT / "workflows/dasiwa-minimax-h3-i2v-v1.api.json", profile="minimax_h3"
     )
@@ -75,7 +75,8 @@ def test_h3_binds_native_workflow_without_wan_models_or_custom_nodes() -> None:
     assert "$i2v" not in json.dumps(rendered)
     assert rendered["14"]["class_type"] == "SaveVideo"
     assert rendered["16"]["inputs"]["audio"] == ["15", 0]
-    assert rendered["6"]["inputs"]["length"] == 124
+    assert rendered["1"]["inputs"]["duration"] * 24 == 124
+    assert rendered["6"]["inputs"]["guide"] == ["1", 0]
     assert rendered["11"]["inputs"]["scheduler"] == "simple"
     assert rendered["7"]["inputs"]["shift_video"] == 8
     assert not any("Wan" in node["class_type"] for node in rendered.values())

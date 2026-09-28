@@ -83,7 +83,7 @@ def test_graph_retains_one_sampling_run_and_delays_base_decode_until_after_refin
         "after_refinement": ["13", 0],
     }
     assert graph["h3-base-create"]["inputs"]["audio"] == ["15", 0]
-    assert graph["8"]["inputs"]["noise_seed"] == 12345
+    assert graph["8"]["inputs"]["seed_value"] == 12345
     assert json.loads(graph["h3-lora-stack"]["inputs"]["stack_data"])[0]["str"] == 1.0
 
 

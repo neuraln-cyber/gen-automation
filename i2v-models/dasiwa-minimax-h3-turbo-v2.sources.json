@@ -11,12 +11,12 @@
       "optional": false
     },
     {
-      "name": "MiniMax H3 Qwen3VL 32B NVFP4 AWQ encoder",
+      "name": "Author C-MMH3 v2.3 Qwen3VL 32B INT4 ConvRot encoder",
       "role": "text_encoder",
-      "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/bf92c4091e333e69b8ca1998e0a669f15cb0832b/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
-      "expected_bytes": 15687142551,
-      "sha256": "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6",
-      "target_filename": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "url": "https://huggingface.co/Abiray/MiniMax-H3-GGUF/resolve/9fc3454d3ebe1be1bade862cd4a5011f325a22cb/text_encoders/qwen3vl_32b_minimax_h3_int4_convrot.safetensors",
+      "expected_bytes": 14952506709,
+      "sha256": "21fd2e2f06bc4fc422c6aa20893fe189edbbd9ab3068215f96e7a6cf2f6cb5bb",
+      "target_filename": "qwen3vl_32b_minimax_h3_int4_convrot.safetensors",
       "optional": false
     },
     {

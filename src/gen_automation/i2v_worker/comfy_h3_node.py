@@ -1,8 +1,6 @@
-"""Managed H3 output diagnostics and source-resolution refinement only."""
+"""Output-only diagnostic: all inference nodes come from the author packages."""
 
 from typing import Any
-
-from gen_automation.i2v_worker.comfy_h3_upscale import ManagedH3SourceUpscale
 
 
 class ManagedH3DiagnosticDecode:
@@ -32,5 +30,4 @@ class ManagedH3DiagnosticDecode:
 
 NODE_CLASS_MAPPINGS = {
     "ManagedH3DiagnosticDecode": ManagedH3DiagnosticDecode,
-    "ManagedH3SourceUpscale": ManagedH3SourceUpscale,
 }

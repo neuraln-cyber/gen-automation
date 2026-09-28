@@ -21,6 +21,7 @@ from gen_automation.i2v_worker.face_stabilizer import (
 )
 from gen_automation.i2v_worker.settings import (
     H3_COMFY_MEMORY_ARGS,
+    H3_CUSTOM_NODES,
     I2V_CUSTOM_NODES,
     I2VWorkerSettings,
 )
@@ -329,7 +330,7 @@ def _comfy_command(settings: I2VWorkerSettings) -> tuple[str, ...]:
         "--disable-auto-launch",
         "--disable-all-custom-nodes",
         "--whitelist-custom-nodes",
-        *I2V_CUSTOM_NODES,
+        *(H3_CUSTOM_NODES if settings.profile == "minimax_h3" else I2V_CUSTOM_NODES),
         "--disable-api-nodes",
         "--disable-metadata",
         "--base-directory",
@@ -350,6 +351,8 @@ def _comfy_command(settings: I2VWorkerSettings) -> tuple[str, ...]:
         # H3 + several LoRAs exhausted the async allocator's 32 GB pool. Keep
         # headroom for activations/patch buffers and discard previous graphs.
         *(H3_COMFY_MEMORY_ARGS if settings.profile == "minimax_h3" else ("--reserve-vram", "4")),
+        # Fail closed rather than silently falling back from the author's backend.
+        *(("--use-ck-attention",) if settings.profile == "minimax_h3" else ()),
     )
 
 

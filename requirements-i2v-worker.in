@@ -1,16 +1,16 @@
 # DaSiWa WAN 2.2 I2V worker runtime.
 #
 # ComfyUI dependencies below mirror the upstream requirements file at commit
-# c2bcbecd82ec5ae66594340b395c24ef0217b238. Torch, torchvision, and torchaudio
+# 73c9bad4d21e7addbe1d13bc92eee0f1431b017d (0.37.0). Torch, torchvision, and torchaudio
 # are supplied by the immutable CUDA base image. They remain exact requirements
 # so pip can prove the base is compatible; the system-site venv, no-deps install,
 # and Docker build assertions reject any replacement inside the worker venv.
 torch==2.9.1
 torchvision==0.24.1
 torchaudio==2.9.1
-comfyui-frontend-package==1.48.7
-comfyui-workflow-templates==0.11.39
-comfyui-embedded-docs==0.5.9
+comfyui-frontend-package==1.53.6
+comfyui-workflow-templates==0.11.66
+comfyui-embedded-docs==0.5.12
 torchsde
 # The immutable PyTorch CUDA base is CPython 3.11; newer releases require 3.12.
 numpy>=1.25.0,<2.5
@@ -29,9 +29,9 @@ psutil
 alembic
 sqlalchemy>=2.0.0
 filelock
-av>=16.0.0
-comfy-kitchen==0.2.30
-comfy-aimdo==0.4.13
+av>=18.0.0
+comfy-kitchen==0.2.35
+comfy-aimdo==0.5.5
 requests
 simpleeval>=1.0.0
 blake3
@@ -41,6 +41,16 @@ pydantic~=2.0
 pydantic-settings~=2.0
 pyopengl>=3.1.8
 comfy-angle
+
+# Complete DaSiWa and KJ package imports and the active C-MMH3 I2VA graph.
+# Optional RTX Video SDK / Forge LLM runtimes are lazy upstream features, not
+# used by this graph; they must not download models or add generation services.
+accelerate
+nvidia-ml-py
+color-matcher
+matplotlib
+mss
+opencv-python-headless==4.14.0.94
 
 # HTTP worker, queue integration, and artifact bootstrap dependencies.
 boto3>=1.39,<2

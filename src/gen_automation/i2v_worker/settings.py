@@ -14,7 +14,13 @@ from gen_automation.i2v_worker.lora_catalog import REQUIRED_LORA_ROLES
 from gen_automation.i2v_worker.manifest_contract import required_i2v_model_roles
 from gen_automation.i2v_worker.models import ModelObject
 
-I2V_CUSTOM_NODES = ("ComfyUI-NAG", "GenAutomationH3", "ComfyUI-H3-Latent-Upscaler", "DaSiWaLoRA")
+I2V_CUSTOM_NODES = ("ComfyUI-NAG",)
+H3_CUSTOM_NODES = (
+    "ComfyUI-DaSiWa-Nodes",
+    "ComfyUI-KJNodes",
+    "Comfyui-MMH3-UltimateUpscale",
+    "GenAutomationH3",
+)
 H3_COMFY_MEMORY_ARGS = (
     "--reserve-vram",
     "8",

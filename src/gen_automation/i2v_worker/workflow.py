@@ -40,14 +40,14 @@ _EXPECTED_NODE_CLASSES = {
     "14": "SaveImage",
 }
 _MINIMAX_NODE_CLASSES = {
-    "1": "LoadImage",
+    "1": "MiniMaxH3Director",
     "2": "UNETLoader",
     "3": "CLIPLoader",
     "4": "VAELoader",
     "5": "VAELoader",
-    "6": "MiniMaxH3ImageToVideo",
+    "6": "MiniMaxH3DirectorGuide",
     "7": "MiniMaxH3SigmaShift",
-    "8": "RandomNoise",
+    "8": "DaSiWa_SeedControl",
     "9": "BasicGuider",
     "10": "KSamplerSelect",
     "11": "BasicScheduler",
@@ -56,6 +56,10 @@ _MINIMAX_NODE_CLASSES = {
     "14": "SaveVideo",
     "15": "VAEDecodeAudio",
     "16": "CreateVideo",
+    "h3-attention": "ModelAttentionBackend",
+    "h3-torch-settings": "ModelPatchTorchSettings",
+    "h3-lora-stack": "DaSiWa_LTX2LoraLoader",
+    "h3-preview": "ModelPreviewOverrideKJ",
 }
 
 _FACE_FIDELITY_POSITIVE = (
@@ -120,6 +124,16 @@ def render_workflow(
         "generation.width": settings.width,
         "generation.height": settings.height,
         "generation.frame_count": settings.frame_count,
+        "generation.duration": settings.frame_count / settings.fps,
+        "input.timeline": json.dumps(
+            {
+                "version": 1,
+                "items": [{"type": "image", "slot": 0, "value": input_filename, "enabled": True}],
+                "prompt_blocks": [],
+                "resolution": {"input_scaling": "Off"},
+            },
+            separators=(",", ":"),
+        ),
         "sampling.steps": settings.steps,
         "sampling.high_end_step": settings.high_end_step,
         "sampling.cfg": settings.cfg,
@@ -241,7 +255,7 @@ def lora_provenance(settings: GenerationSettings) -> list[dict[str, object]]:
 
 
 def _inject_h3_loras(workflow: dict[str, Any], settings: GenerationSettings) -> dict[str, Any]:
-    # C-MMH3 v2.5 node 2678: one Basic stack, unit branch multipliers,
+    # C-MMH3 v2.3 node 2678: one Basic stack, unit branch multipliers,
     # MODEL before SigmaShift and CLIP before conditioning. The creator's
     # unmodified node handles file metadata and native Comfy patching.
     stack = [
@@ -255,19 +269,11 @@ def _inject_h3_loras(workflow: dict[str, Any], settings: GenerationSettings) -> 
         for selection in settings.h3_loras
         if selection.strength != 0
     ]
-    if stack:
-        workflow["h3-lora-stack"] = {
-            "class_type": "DaSiWa_LTX2LoraLoader",
-            "inputs": {
-                "model": ["2", 0],
-                "clip": ["3", 0],
-                "stack_data": json.dumps(stack, separators=(",", ":"), allow_nan=False),
-                "model_type": "Basic",
-                "use_cache": False,
-            },
-        }
-        workflow["7"]["inputs"]["model"] = ["h3-lora-stack", 0]
-        workflow["6"]["inputs"]["clip"] = ["h3-lora-stack", 1]
+    # Keep the author's pass-through stack even when empty. Its MODEL input is
+    # the Director-selected, attention/torch-patched model, never raw UNETLoader.
+    workflow["h3-lora-stack"]["inputs"]["stack_data"] = json.dumps(
+        stack, separators=(",", ":"), allow_nan=False
+    )
     return workflow
 
 
@@ -277,32 +283,74 @@ def _inject_h3_upscale(
     if model_paths.get(H3_UPSCALER_ROLE) != H3_UPSCALER_FILENAME:
         raise WorkflowError("source-size H3 delivery requires the pinned latent upscaler")
     base_width, base_height = h3_base_canvas(settings.width, settings.height)
-    workflow["6"]["inputs"].update(width=base_width, height=base_height)
+    workflow["1"]["inputs"].update(
+        width=base_width,
+        height=base_height,
+        external_width_overwrite=base_width,
+        external_height_overwrite=base_height,
+    )
     if (base_width, base_height) == (settings.width, settings.height):
         return workflow
     workflow["h3-refine-sigmas"] = {
         "class_type": "BasicScheduler",
         "inputs": {
-            "model": ["7", 0],
+            "model": ["h3-lora-stack", 0],
             "scheduler": "simple",
             "steps": H3_REFINE_STEPS,
             "denoise": H3_REFINE_DENOISE,
         },
     }
+    workflow["h3-upscale-params"] = {
+        "class_type": "MMH3LatentUpscaleWithModelParams",
+        "inputs": {
+            "model_name": H3_UPSCALER_FILENAME,
+            "width": settings.width,
+            "height": settings.height,
+            "device": "cuda",
+            "precision": "fp16",
+            "offload_model": True,
+        },
+    }
+    workflow["h3-temporal-params"] = {
+        "class_type": "MMH3TemporalSplitParams",
+        "inputs": {"chunk_length": 85, "temporal_overlap": 17, "anchor_strength": 0.999},
+    }
+    workflow["h3-spatial-params"] = {
+        "class_type": "MMH3SpatialSplitParams",
+        "inputs": {
+            "upscale_width": settings.width,
+            "upscale_height": settings.height,
+            "tile_size_mode": "rows_cols",
+            "tile_width": 512,
+            "tile_height": 512,
+            "grid_rows": 2,
+            "grid_cols": 3,
+            "spatial_w_overlap": 128,
+            "spatial_h_overlap": 128,
+            "fade_width": 64,
+            "fade_height": 64,
+            "min_tile_size": 256,
+            "overlap_mode": "later",
+            "overlap_blend": "linear",
+            "masked_area_noise": 0.05,
+            "brightness_match": True,
+            "dynamic_fade": "widening",
+            "dynamic_fade_min": 32,
+        },
+    }
     workflow["h3-source-upscale"] = {
-        "class_type": "ManagedH3SourceUpscale",
+        "class_type": "MMH3UltimateUpscale",
         "inputs": {
             "latent": ["12", 0],
             "conditioning": ["6", 0],
-            "first_frame": ["1", 0],
-            "vae": ["4", 0],
-            "model": ["7", 0],
-            "noise": ["8", 0],
+            "model": ["h3-lora-stack", 0],
+            "noise": ["8", 1],
             "sampler": ["10", 0],
             "sigmas": ["h3-refine-sigmas", 0],
-            "width": settings.width,
-            "height": settings.height,
-            "model_name": H3_UPSCALER_FILENAME,
+            "cfg": 1.0,
+            "latent_upscale_param": ["h3-upscale-params", 0],
+            "temporal_split_param": ["h3-temporal-params", 0],
+            "spatial_split_param": ["h3-spatial-params", 0],
         },
     }
     workflow["13"]["inputs"]["samples"] = ["h3-source-upscale", 0]
