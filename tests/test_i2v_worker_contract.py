@@ -500,7 +500,7 @@ def test_comfy_command_uses_supported_base_directory_and_only_pinned_nodes(tmp_p
     assert "--disable-all-custom-nodes" in command
     assert command[
         command.index("--whitelist-custom-nodes") + 1 : command.index("--disable-api-nodes")
-    ] == ("ComfyUI-NAG", "GenAutomationH3", "ComfyUI-H3-Latent-Upscaler", "DaSiWaLoRA")
+    ] == ("ComfyUI-NAG",)
     assert "--highvram" not in command
     assert command[command.index("--reserve-vram") + 1] == "4"
 
@@ -509,8 +509,8 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
     from_lines = [line for line in dockerfile.splitlines() if line.startswith("FROM ")]
     pytorch_image = (
-        "pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime@"
-        "sha256:7b324d212a4450795b49edba9949b7cdc72429148a64e974334bfe5774d51385"
+        "pytorch/pytorch:2.9.1-cuda13.0-cudnn9-runtime@"
+        "sha256:60f22fb80755fd0b470fb47928dbd55816aa9f847edd95cf43c93253507a9ddf"
     )
 
     assert from_lines == [
@@ -520,7 +520,7 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
         f"FROM {pytorch_image}",
     ]
     assert all("@sha256:" in line for line in from_lines)
-    assert "c2bcbecd82ec5ae66594340b395c24ef0217b238" in dockerfile
+    assert "73c9bad4d21e7addbe1d13bc92eee0f1431b017d" in dockerfile
     assert "ef8a641be08983cf5f06669f70719b6eecce3c7f" in dockerfile
     assert "https://github.com/ChenDarYen/ComfyUI-NAG.git" in dockerfile
     assert "ARG COMFYUI_NAG_COMMIT=ef8a641be08983cf5f06669f70719b6eecce3c7f" in dockerfile
@@ -630,10 +630,10 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
 
 def test_creator_package_is_traversable_and_real_imports_run_as_runtime_user() -> None:
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
-    registration = dockerfile.index("COPY src/gen_automation/i2v_worker/comfy_dasiwa_node.py")
-    permissions = dockerfile.index("RUN chmod 0755 /opt/comfyui/custom_nodes/DaSiWaLoRA")
-    assert permissions > registration
-    assert "chmod 0444 /opt/comfyui/custom_nodes/DaSiWaLoRA/__init__.py" in dockerfile
+    installer = (ROOT / "scripts/install-h3-author-nodes.sh").read_text(encoding="utf-8")
+    assert 'find "$target" -type d -exec chmod 0755 {} +' in installer
+    assert 'find "$target" -type f -exec chmod 0444 {} +' in installer
+    assert "install-h3-author-nodes" in dockerfile
     check = (
         "RUN setpriv --reuid 10002 --regid 10002 --init-groups --no-new-privs \\\n"
         "    /opt/i2v-venv/bin/python /opt/i2v/bin/verify-h3-comfy-nodes.py"

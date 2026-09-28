@@ -34,10 +34,11 @@ license texts and copyright notices in
 
 ## Community MiniMax H3 latent upscaler
 
-- Code: <https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler>
-- Revision: `40316cf008b2fd8663263270669eb4da23f89d2c`
-- Code license: MIT; complete upstream text is retained in the extension and
-  `/opt/i2v/licenses/H3-Latent-Upscaler-MIT.txt` in the worker image.
+- Code: <https://github.com/bbaudio-2025/Comfyui-MMH3-UltimateUpscale>
+- Revision: `fe6658f6d144066f14150d3526247b417683ff2b`
+- Code license: MIT; complete upstream text and sources are retained in
+  `/opt/comfyui/custom_nodes/Comfyui-MMH3-UltimateUpscale` in the worker image.
+  This upstream package includes its credited LBH H3 upscaler implementation.
 - Separate weights: <https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler>
 - Model revision: `3f941d5d182014dd5c0a5e16330420ee2d4aa0c6`
 - Model repository license declaration: Apache-2.0.
@@ -47,13 +48,19 @@ license texts and copyright notices in
 The image includes code only, not model weights. The private manifest and existing
 CloudFront delivery path provide the checksum-verified checkpoint separately.
 
-## DaSiWa Advanced LoRA Loader
+## Complete DaSiWa node pack
 
 - Code: <https://github.com/darksidewalker/ComfyUI-DaSiWa-Nodes>
 - Revision: `9f5aef4a2748bba9486dda0a7efec7689462d7e0`
 - License: GPL-3.0; full upstream LICENSE and unmodified Python sources are
-  included in `/opt/comfyui/custom_nodes/DaSiWaLoRA` in the worker image.
-- Only `nodes/nodes_advanced_lora_loader.py` and `nodes/helper_logging.py` are
-  installed, with checksum verification. A separate headless registration module
-  exposes the creator's class unchanged; unrelated extension features are omitted.
+  included in `/opt/comfyui/custom_nodes/ComfyUI-DaSiWa-Nodes` in the worker image.
+- The complete upstream package is installed at the exact commit, with its own
+  registration code unchanged. No extracted registration shim is used.
 - Loader SHA-256: `26954c67c71a547226fdc523566783a33d03ffb2e667fb1d5930386d4cefd2cf`.
+
+## KJNodes
+
+- Code: <https://github.com/kijai/ComfyUI-KJNodes>
+- Revision: `d3cfe21625e5170126ce06fbfcfe1d88108688c3`
+- License: GPL-3.0; complete upstream LICENSE and unmodified source package are
+  included in `/opt/comfyui/custom_nodes/ComfyUI-KJNodes` in the worker image.

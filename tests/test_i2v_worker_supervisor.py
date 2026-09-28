@@ -16,6 +16,16 @@ from gen_automation.i2v_worker.settings import I2VWorkerSettings
 from gen_automation.i2v_worker.supervisor import WorkerSupervisor
 
 
+@pytest.fixture(autouse=True)
+def _isolate_worker_logger(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Migration tests run Alembic fileConfig, which disables existing loggers.
+    # Restore this test's logger so capture assertions are independent of order;
+    # leave production logging and the exact failure/privacy assertions unchanged.
+    monkeypatch.setattr(
+        logging.getLogger("gen_automation.i2v_worker.supervisor"), "disabled", False
+    )
+
+
 def _settings(tmp_path: Path) -> I2VWorkerSettings:
     sha = "a" * 64
     objects = [

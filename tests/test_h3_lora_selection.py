@@ -251,7 +251,7 @@ def test_h3_workflow_uses_creator_stack_and_does_not_leak_to_next_job(diagnostic
     nodes = [node for node in graph.values() if node["class_type"] == "DaSiWa_LTX2LoraLoader"]
     assert len(nodes) == 1
     inputs = nodes[0]["inputs"]
-    assert inputs["model"] == ["2", 0] and inputs["clip"] == ["3", 0]
+    assert inputs["model"] == ["1", 5] and inputs["clip"] == ["3", 0]
     assert inputs["model_type"] == "Basic" and inputs["use_cache"] is False
     assert json.loads(inputs["stack_data"]) == [
         {
@@ -265,21 +265,22 @@ def test_h3_workflow_uses_creator_stack_and_does_not_leak_to_next_job(diagnostic
     ]
     assert graph["7"]["inputs"]["model"] == ["h3-lora-stack", 0]
     assert graph["6"]["inputs"]["clip"] == ["h3-lora-stack", 1]
-    assert graph["9"]["inputs"]["model"] == ["7", 0]
-    assert graph["11"]["inputs"]["model"] == ["7", 0]
+    assert graph["9"]["inputs"]["model"] == ["h3-preview", 0]
+    assert graph["h3-preview"]["inputs"]["model"] == ["7", 0]
+    assert graph["11"]["inputs"]["model"] == ["h3-lora-stack", 0]
     if diagnostic:
-        assert graph["h3-source-upscale"]["inputs"]["model"] == ["7", 0]
+        assert graph["h3-source-upscale"]["inputs"]["model"] == ["h3-lora-stack", 0]
         assert graph["h3-source-upscale"]["inputs"]["conditioning"] == ["6", 0]
         assert graph["h3-base-decode"]["inputs"]["samples"] == ["12", 0]
     assert lora_provenance(settings) == selected
     baseline = render(h3_settings())
-    assert baseline["7"]["inputs"]["model"] == ["2", 0]
-    assert baseline["6"]["inputs"]["clip"] == ["3", 0]
-    assert not any(node["class_type"] == "DaSiWa_LTX2LoraLoader" for node in baseline.values())
+    assert baseline["7"]["inputs"]["model"] == ["h3-lora-stack", 0]
+    assert baseline["6"]["inputs"]["clip"] == ["h3-lora-stack", 1]
+    assert json.loads(baseline["h3-lora-stack"]["inputs"]["stack_data"]) == []
     zero = render(h3_settings(h3_loras=[selected[1]]))
-    assert zero["7"]["inputs"]["model"] == ["2", 0]
-    assert zero["6"]["inputs"]["clip"] == ["3", 0]
-    assert "h3-lora-stack" not in zero
+    assert zero["7"]["inputs"]["model"] == ["h3-lora-stack", 0]
+    assert zero["6"]["inputs"]["clip"] == ["h3-lora-stack", 1]
+    assert json.loads(zero["h3-lora-stack"]["inputs"]["stack_data"]) == []
 
 
 def test_worker_requires_exact_grants_and_finite_strengths():
@@ -385,15 +386,11 @@ def test_worker_rejects_corrupt_bytes_off_route_and_naive_expiry(tmp_path, monke
 
 def test_creator_loader_is_pinned_unmodified_and_custom_loader_removed():
     docker = (ROOT / "Dockerfile.i2v-worker").read_text(encoding="utf-8")
-    registration = (ROOT / "src/gen_automation/i2v_worker/comfy_dasiwa_node.py").read_text(
-        encoding="utf-8"
-    )
-    assert "9f5aef4a2748bba9486dda0a7efec7689462d7e0/nodes/nodes_advanced_lora_loader.py" in docker
-    assert "26954c67c71a547226fdc523566783a33d03ffb2e667fb1d5930386d4cefd2cf" in docker
-    assert (
-        'NODE_CLASS_MAPPINGS = {"DaSiWa_LTX2LoraLoader": DaSiWa_AdvancedLoRALoader}' in registration
-    )
-    assert "class " not in registration and "def " not in registration
+    installer = (ROOT / "scripts/install-h3-author-nodes.sh").read_text(encoding="utf-8")
+    assert "9f5aef4a2748bba9486dda0a7efec7689462d7e0" in installer
+    assert "https://github.com/darksidewalker/ComfyUI-DaSiWa-Nodes.git" in installer
+    assert 'test -z "$(git -C "$target" status --porcelain)"' in installer
+    assert not (ROOT / "src/gen_automation/i2v_worker/comfy_dasiwa_node.py").exists()
     assert not (ROOT / "src/gen_automation/i2v_worker/comfy_h3_lora.py").exists()
     assert not (ROOT / "scripts/verify-h3-lora-math.py").exists()
     assert "verify_h3_creator_lora.py" in docker

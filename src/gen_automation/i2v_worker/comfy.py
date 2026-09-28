@@ -56,6 +56,13 @@ class ComfyClient:
                 (name, f"/object_info/{name}")
                 for name in (
                     "MiniMaxH3ImageToVideo",
+                    "MiniMaxH3ReferenceToVideo",
+                    "MiniMaxH3Director",
+                    "MiniMaxH3DirectorGuide",
+                    "DaSiWa_SeedControl",
+                    "ModelAttentionBackend",
+                    "ModelPatchTorchSettings",
+                    "ModelPreviewOverrideKJ",
                     "MiniMaxH3SigmaShift",
                     "SaveVideo",
                     "VAEDecodeAudio",
@@ -75,11 +82,10 @@ class ComfyClient:
             self.required_nodes += tuple(
                 (name, f"/object_info/{name}")
                 for name in (
-                    "ManagedH3SourceUpscale",
-                    "MinimaxH3LatentUpscaler3D",
-                    "MMH3SplitUpscale",
-                    "MMH3TemporalSplitParamsV10",
-                    "MMH3SpatialSplitParamsV10",
+                    "MMH3UltimateUpscale",
+                    "MMH3LatentUpscaleWithModelParams",
+                    "MMH3TemporalSplitParams",
+                    "MMH3SpatialSplitParams",
                 )
             )
 
