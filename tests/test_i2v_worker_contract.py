@@ -628,6 +628,36 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
     assert "strict-http-status.patch" in dockerfile
 
 
+def test_creator_package_is_traversable_and_real_imports_run_as_runtime_user() -> None:
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    registration = dockerfile.index("COPY src/gen_automation/i2v_worker/comfy_dasiwa_node.py")
+    permissions = dockerfile.index("RUN chmod 0755 /opt/comfyui/custom_nodes/DaSiWaLoRA")
+    assert permissions > registration
+    assert "chmod 0444 /opt/comfyui/custom_nodes/DaSiWaLoRA/__init__.py" in dockerfile
+    check = (
+        "RUN setpriv --reuid 10002 --regid 10002 --init-groups --no-new-privs \\\n"
+        "    /opt/i2v-venv/bin/python /opt/i2v/bin/verify-h3-comfy-nodes.py"
+    )
+    assert check in dockerfile
+    assert dockerfile.index(check) > dockerfile.index("chmod --recursive go-rwx")
+    assert "RUN /opt/i2v-venv/bin/python /opt/i2v/bin/verify-h3-comfy-nodes.py" not in dockerfile
+
+
+@pytest.mark.parametrize("uid,gid", [(0, 0), (0, 10002), (10002, 0), (10002, 10002)])
+def test_real_import_check_rejects_wrong_runtime_identity(monkeypatch, uid, gid) -> None:
+    import os
+    import runpy
+
+    check = runpy.run_path(str(ROOT / "scripts/verify-h3-comfy-nodes.py"))
+    monkeypatch.setattr(os, "geteuid", lambda: uid, raising=False)
+    monkeypatch.setattr(os, "getegid", lambda: gid, raising=False)
+    if (uid, gid) == (10002, 10002):
+        check["verify_runtime_identity"]()
+    else:
+        with pytest.raises(RuntimeError, match="runtime UID/GID 10002"):
+            check["verify_runtime_identity"]()
+
+
 def test_ci_builds_smokes_and_scans_the_model_free_worker() -> None:
     workflow = CI_WORKFLOW.read_text(encoding="utf-8")
 

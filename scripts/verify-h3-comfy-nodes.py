@@ -2,12 +2,19 @@
 
 import asyncio
 import importlib
+import os
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from gen_automation.i2v_worker.comfy_h3_upscale import h3_refinement_split_params
 from gen_automation.i2v_worker.settings import H3_COMFY_MEMORY_ARGS, I2V_CUSTOM_NODES
+
+
+def verify_runtime_identity() -> None:
+    """Never allow privileged build imports to stand in for the runtime contract."""
+    if os.geteuid() != 10002 or os.getegid() != 10002:
+        raise RuntimeError("H3 import check must run as runtime UID/GID 10002")
 
 
 def verify_native_refinement_anchors(nodes) -> None:
@@ -103,13 +110,35 @@ def verify_native_refinement_anchors(nodes) -> None:
 
 
 async def main() -> None:
+    verify_runtime_identity()
     # Parse the exact runtime flags against the pinned ComfyUI CLI on CPU.
     # This verifies compatibility, not GPU memory sufficiency.
-    sys.argv = ["h3-upscaler-build-check", "--cpu", *H3_COMFY_MEMORY_ARGS]
+    sys.argv = [
+        "h3-upscaler-build-check",
+        "--cpu",
+        "--input-directory",
+        "/opt/i2v/runtime/input",
+        "--output-directory",
+        "/opt/i2v/runtime/output",
+        "--temp-directory",
+        "/opt/i2v/runtime/temp",
+        "--user-directory",
+        "/opt/i2v/runtime/user",
+        *H3_COMFY_MEMORY_ARGS,
+    ]
     sys.path.insert(0, "/opt/comfyui")
     import comfy.options  # type: ignore[import-not-found]
 
     comfy.options.enable_args_parsing()
+    import folder_paths  # type: ignore[import-not-found]
+    from comfy.cli_args import args  # type: ignore[import-not-found]
+
+    # Normal Comfy main applies these CLI paths before constructing the server.
+    # Do the same here instead of letting the import contract write into code dirs.
+    folder_paths.set_input_directory(args.input_directory)
+    folder_paths.set_output_directory(args.output_directory)
+    folder_paths.set_temp_directory(args.temp_directory)
+    folder_paths.set_user_directory(args.user_directory)
     import nodes  # type: ignore[import-not-found]
     from server import PromptServer  # type: ignore[import-not-found]
 
@@ -135,7 +164,7 @@ async def main() -> None:
     from verify_h3_creator_lora import verify_creator_lora
 
     verify_creator_lora(nodes)
-    print("Pinned H3 upscaler and managed adapter import/API check passed (CPU, no weights).")
+    print("Pinned H3 import/API check passed as runtime UID/GID 10002 (CPU, no weights).")
 
 
 if __name__ == "__main__":
