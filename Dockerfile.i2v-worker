@@ -261,9 +261,12 @@ COPY src/gen_automation/domain/private_delivery.py ./src/gen_automation/domain/p
 COPY src/gen_automation/i2v_worker ./src/gen_automation/i2v_worker
 COPY src/gen_automation/i2v_worker/comfy_h3_node.py /opt/comfyui/custom_nodes/GenAutomationH3/__init__.py
 COPY src/gen_automation/i2v_worker/comfy_dasiwa_node.py /opt/comfyui/custom_nodes/DaSiWaLoRA/__init__.py
+# ADD --chmod also affects its newly created destination directory. Keep the
+# creator's code immutable, but allow the runtime user to traverse the package.
+RUN chmod 0755 /opt/comfyui/custom_nodes/DaSiWaLoRA \
+    && chmod 0444 /opt/comfyui/custom_nodes/DaSiWaLoRA/__init__.py
 COPY scripts/verify-h3-comfy-nodes.py /opt/i2v/bin/verify-h3-comfy-nodes.py
 COPY scripts/verify_h3_creator_lora.py /opt/i2v/bin/verify_h3_creator_lora.py
-RUN /opt/i2v-venv/bin/python /opt/i2v/bin/verify-h3-comfy-nodes.py
 COPY --chmod=0555 scripts/i2v-runpod-entrypoint.sh /opt/i2v/bin/i2v-runpod-entrypoint
 COPY workflows/dasiwa-wan22-i2v-v1.api.json ./workflows/dasiwa-wan22-i2v-v1.api.json
 COPY workflows/dasiwa-minimax-h3-i2v-v1.api.json ./workflows/dasiwa-minimax-h3-i2v-v1.api.json
@@ -298,6 +301,11 @@ RUN command -v find \
     && command -v setpriv \
     && test -x /opt/i2v/bin/i2v-runpod-entrypoint \
     && /bin/bash -n /opt/i2v/bin/i2v-runpod-entrypoint
+
+# Exercise the real imports after final filesystem setup, with the same identity
+# and privilege drop as Salad startup. A root-only smoke test hides permission bugs.
+RUN setpriv --reuid 10002 --regid 10002 --init-groups --no-new-privs \
+    /opt/i2v-venv/bin/python /opt/i2v/bin/verify-h3-comfy-nodes.py
 
 USER 0:0
 
