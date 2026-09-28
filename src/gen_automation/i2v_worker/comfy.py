@@ -56,6 +56,7 @@ class ComfyClient:
                 (name, f"/object_info/{name}")
                 for name in (
                     "MiniMaxH3ImageToVideo",
+                    "MiniMaxH3ReferenceToVideo",
                     "MiniMaxH3Director",
                     "MiniMaxH3DirectorGuide",
                     "DaSiWa_SeedControl",

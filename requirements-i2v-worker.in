@@ -42,13 +42,15 @@ pydantic-settings~=2.0
 pyopengl>=3.1.8
 comfy-angle
 
-# Complete DaSiWa and KJ package imports and the active C-MMH3 I2VA graph.
+# Complete DaSiWa and KJ package imports and the active C-MMH3 REF2VA graph.
 # Optional RTX Video SDK / Forge LLM runtimes are lazy upstream features, not
 # used by this graph; they must not download models or add generation services.
 accelerate
 nvidia-ml-py
 color-matcher
 matplotlib
+# Matplotlib's latest contourpy wheel targets Python 3.12+, unlike this image.
+contourpy<1.4
 mss
 opencv-python-headless==4.14.0.94
 

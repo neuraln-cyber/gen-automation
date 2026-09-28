@@ -65,8 +65,9 @@ Headless boundaries are explicit, not hidden claims of exact UI reproduction:
   shifts and optional source-size selection remain job parameters.
 - The app preserves its existing bounded base canvas and source-padding/cropping
   delivery contract; the author's Director receives the resolved canvas.
-- The saved workflow opens in REF2VA; the app previously uses first-frame I2VA.
-  Owner mode selection is required before finalizing this rebuild.
+- The owner explicitly selected the saved workflow's **REF2VA** mode. The input
+  is a reference image, not a frozen first frame; Director's ref2va_model branch
+  and native MiniMaxH3ReferenceToVideo are verified in the real-package contract.
 - SaveVideo/CreateVideo remain the delivery adapter (MP4/SAR/audio contract).
   UI watermark, prompt builder, optional Forge LLM, RTX SDK, interpolation and
   optional pixel upscalers are not activated or given new models. Complete node

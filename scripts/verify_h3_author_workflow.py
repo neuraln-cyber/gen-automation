@@ -113,18 +113,27 @@ def verify_author_workflow(nodes, template_path=None, reference_path=None):
         Image.new("RGB", (64, 64), "blue").save(Path(tmp) / "contract.png")
         with patch.object(folder_paths, "get_input_directory", return_value=tmp):
             params = dict(graph["1"]["inputs"])
-            params["fl2va_model"] = object()
+            assert params["mode"] == "REF2VA" and "fl2va_model" not in params
+            params["ref2va_model"] = object()
             director = nodes.NODE_CLASS_MAPPINGS["MiniMaxH3Director"]().build_guide(**params)
         assert director[1] == settings.frame_count
         assert director[2] == "A test scene."
-        assert director[5] is params["fl2va_model"]
+        assert director[5] is params["ref2va_model"]
+        assert director[0]["mode"] == "REF2VA"
         guide_cls = nodes.NODE_CLASS_MAPPINGS["MiniMaxH3DirectorGuide"]
         native = importlib.import_module("comfy_extras.nodes_minimax_h3")
-        with patch.object(native.MiniMaxH3ImageToVideo, "execute", return_value=([], {})) as call:
+        with patch.object(
+            native.MiniMaxH3ReferenceToVideo, "execute", return_value=([], {})
+        ) as call:
             guide_cls().apply(object(), object(), director[0], audio_vae=object())
         assert call.call_count == 1
         # Keyword contract is native Comfy's; creator code must not be copied or patched.
         args = call.call_args
+        assert set(args.kwargs["ref_images"]) == {"ref_image_1"}
+        assert args.kwargs["ref_images"]["ref_image_1"].shape == (1, 64, 64, 3)
+        assert not args.kwargs["ref_videos"] and not args.kwargs["ref_audios"]
+        assert args.kwargs["ref_image_size"] == "match"
+        assert args.kwargs["length"] == 124
         assert any(value == "A test scene." for value in args.args if isinstance(value, str)) or (
             any(
                 value == "A test scene." for value in args.kwargs.values() if isinstance(value, str)
@@ -157,7 +166,16 @@ def verify_upstream_tile_layout(registry, temporal, spatial):
     conditioning = [
         [
             torch.zeros(1, 2, 8),
-            {"minimax_keyframes": [{"resolved_frame_index": 0, "latent": video[:, :, :1].clone()}]},
+            {
+                "minimax_refs": [
+                    {
+                        "kind": "image",
+                        "latent_h": 8,
+                        "latent_w": 8,
+                        "latent": torch.zeros(1, 24, 1, 8, 8),
+                    }
+                ]
+            },
         ]
     ]
     calls = []
@@ -166,6 +184,9 @@ def verify_upstream_tile_layout(registry, temporal, spatial):
         tile, sound = piece["samples"].tensors
         _, metadata = cond[0]
         anchors = metadata.get("minimax_keyframes", [])
+        refs = metadata.get("minimax_refs", [])
+        assert len(refs) == 1 and refs[0]["kind"] == "image"
+        assert refs[0]["latent"].shape == (1, 24, 1, 8, 8)
         layout = PackedLayout(
             2,
             tile.shape[2],
@@ -177,7 +198,7 @@ def verify_upstream_tile_layout(registry, temporal, spatial):
         )
         expected = sum(
             patchify_video(k["latent"], (1, 2, 2)).shape[0] for k in anchors if "latent" in k
-        )
+        ) + sum(patchify_video(ref["latent"], (1, 2, 2)).shape[0] for ref in refs)
         assert int((~layout.img_update).sum()) == expected
         assert piece["noise_mask"].tensors[1].count_nonzero() == 0
         calls.append(tile.shape)

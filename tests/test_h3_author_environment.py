@@ -78,7 +78,9 @@ def test_author_chain_keeps_one_stack_and_no_hidden_branch_strengths():
         "model": ["h3-attention", 0],
         "enable_fp16_accumulation": True,
     }
-    assert graph["1"]["inputs"]["fl2va_model"] == ["h3-torch-settings", 0]
+    assert graph["1"]["inputs"]["mode"] == "REF2VA"
+    assert graph["1"]["inputs"]["ref2va_model"] == ["h3-torch-settings", 0]
+    assert "fl2va_model" not in graph["1"]["inputs"]
     assert graph["h3-lora-stack"]["inputs"]["model"] == ["1", 5]
     stack = json.loads(graph["h3-lora-stack"]["inputs"]["stack_data"])
     assert [item["str"] for item in stack] == [1.0, -0.5]
