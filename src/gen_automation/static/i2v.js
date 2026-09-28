@@ -11,11 +11,16 @@
   const initialLoraProfileEnabled = root.dataset.loraProfileEnabled === "true";
   const videoProfile = root.dataset.videoProfile || "wan22";
   const isH3 = videoProfile === "minimax_h3";
+  const h3ModelVariant = root.dataset.h3ModelVariant || "turbo_v2";
+  const h3AdvancedSamplingEnabled = root.dataset.h3AdvancedSamplingEnabled === "true";
   const sourceResolutionEnabled = root.dataset.sourceResolutionEnabled === "true";
   const h3DiagnosticsEnabled = root.dataset.h3DiagnosticsEnabled === "true";
   const maxImageBytes = Number(root.dataset.maxImageBytes || 0);
   const scope = document.body.dataset.automationStorageScope || "operator";
-  const draftKey = isH3 ? `i2v-draft-v2:${videoProfile}:${scope}` : `i2v-draft-v1:${scope}`;
+  const legacyDraftKey = `i2v-draft-v2:${videoProfile}:${scope}`;
+  const draftKey = isH3 && h3AdvancedSamplingEnabled
+    ? `i2v-draft-v3:${videoProfile}:${h3ModelVariant}:${scope}`
+    : (isH3 ? legacyDraftKey : `i2v-draft-v1:${scope}`);
   const form = root.querySelector("[data-generation-form]");
   const advanced = root.querySelector("[data-advanced-settings]");
   const sourceLibrary = root.querySelector("[data-source-library]");
@@ -86,6 +91,14 @@
     match_source_resolution: false,
     h3_save_base_video: false,
   });
+  const h3SamplingDefaults = {
+    steps: h3ModelVariant === "hybrid_v2" ? 20 : 4, cfg: 1,
+    sampler: h3ModelVariant === "hybrid_v2" ? "res_multistep" : "euler", scheduler: "simple",
+    video_shift: h3ModelVariant === "hybrid_v2" ? 12 : 8, audio_shift: 4,
+    h3_denoise: 1, h3_refine_steps: 1, h3_refine_cfg: 1, h3_refine_denoise: 0.2,
+    h3_refine_sampler: null, h3_refine_scheduler: "simple",
+  };
+  if (isH3 && h3AdvancedSamplingEnabled) Object.assign(workerSettingDefaults, h3SamplingDefaults);
   let saveTimer = null;
 
   const q = (selector) => root.querySelector(selector);
@@ -359,7 +372,7 @@
     const settings = { ...workerSettingDefaults };
     const resolutionError = sourceResolutionError();
     if (resolutionError) throw new Error(resolutionError);
-    const numbers = new Set(["frame_count", "fps", "width", "height", "seed", "steps", "high_end_step", "cfg", "high_shift", "low_shift", "loop_count", "video_shift", "audio_shift"]);
+    const numbers = new Set(["frame_count", "fps", "width", "height", "seed", "steps", "high_end_step", "cfg", "high_shift", "low_shift", "loop_count", "video_shift", "audio_shift", "h3_denoise", "h3_refine_steps", "h3_refine_cfg", "h3_refine_denoise"]);
     advanced.querySelectorAll("input[name], select[name]").forEach((field) => {
       if (field.type === "checkbox") settings[field.name] = field.checked;
       else if (numbers.has(field.name)) settings[field.name] = Number(field.value);
@@ -368,6 +381,10 @@
     const authorization = root.querySelector("#i2v-runpod-authorization");
     settings.runpod_authorization = authorization?.checked ? "written_permission" : "sfw";
     if (isH3) {
+      if (h3AdvancedSamplingEnabled) {
+        settings.h3_model_variant = h3ModelVariant;
+        settings.h3_refine_sampler = settings.h3_refine_sampler || null;
+      }
       if (settings.match_source_resolution) settings.match_source_aspect = false;
       settings.loras = [];
       settings.h3_loras = [...state.loraSelections].map(([artifactId, strength]) => ({
@@ -393,7 +410,7 @@
       const field = advanced.querySelector(`[name="${CSS.escape(name)}"]`);
       if (!field) return;
       if (field.type === "checkbox") field.checked = Boolean(value);
-      else field.value = String(value);
+      else field.value = value == null ? "" : String(value);
     });
     const selections = isH3 ? resolved.h3_loras : resolved.loras;
     setLoraSelections(Array.isArray(selections) ? selections : []);
@@ -825,17 +842,22 @@
 
   function restoreDraft() {
     try {
-      const draft = JSON.parse(localStorage.getItem(draftKey) || "null");
+      const current = localStorage.getItem(draftKey);
+      const migrating = !current && isH3 && h3AdvancedSamplingEnabled;
+      const draft = JSON.parse(current || (migrating ? localStorage.getItem(legacyDraftKey) : null) || "null");
       if (!draft) return;
       form.elements.positive_prompt.value = draft.positive_prompt || "";
       form.elements.negative_prompt.value = draft.negative_prompt || "";
       form.elements.batch_count.value = draft.batch_count || "1";
-      applySettings(draft.settings || {});
+      const modelChanged = isH3 && (draft.settings?.h3_model_variant || "turbo_v2") !== h3ModelVariant;
+      applySettings(modelChanged ? { ...draft.settings, ...h3SamplingDefaults, h3_model_variant: h3ModelVariant } : (draft.settings || {}));
+      if (modelChanged) draftState.textContent = "New checkpoint: creator sampling defaults loaded. Your prompts and LoRAs were preserved; the old draft remains saved.";
     } catch (_) { localStorage.removeItem(draftKey); }
   }
 
   async function loadPresets() {
-    state.presets = (await api("/presets")).filter((item) => (item.settings.profile || "wan22") === videoProfile);
+    state.presets = (await api("/presets")).filter((item) => (item.settings.profile || "wan22") === videoProfile
+      && (!isH3 || (item.settings.h3_model_variant || "turbo_v2") === h3ModelVariant));
     const selected = presetSelect.value;
     presetSelect.replaceChildren(new Option("Custom settings", ""));
     state.presets.forEach((item) => presetSelect.add(new Option(item.name, item.preset_id)));
@@ -1050,7 +1072,8 @@
       reuse.addEventListener("click", () => {
         const job = state.jobs.find((candidate) => candidate.job_id === output.job_id);
         if (!job) { announce("The source job is outside the current history.", true); return; }
-        if ((job.settings_snapshot?.profile || "wan22") !== videoProfile) {
+        if ((job.settings_snapshot?.profile || "wan22") !== videoProfile
+          || (isH3 && (job.settings_snapshot?.h3_model_variant || "turbo_v2") !== h3ModelVariant)) {
           announce("This video used a different model. Its settings cannot be applied here.", true); return;
         }
         form.elements.positive_prompt.value = job.positive_prompt;
@@ -1102,6 +1125,11 @@
   ["dragleave", "drop"].forEach((name) => dropzone.addEventListener(name, (event) => { event.preventDefault(); dropzone.classList.remove("dragging"); }));
   dropzone.addEventListener("drop", (event) => uploadImage(event.dataTransfer.files[0]));
   form.addEventListener("submit", enqueue);
+  q("[data-h3-defaults]")?.addEventListener("click", () => {
+    applySettings({ ...collectSettings(), ...h3SamplingDefaults });
+    scheduleDraftSave();
+    announce("Creator sampling defaults restored; prompts, LoRAs, seed and dimensions unchanged.");
+  });
   form.addEventListener("input", (event) => {
     if (event.target.name === "match_source_resolution" && !event.target.checked) {
       form.elements.match_source_aspect.checked = true;

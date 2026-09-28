@@ -68,6 +68,11 @@ class ComfyClient:
                     "VAEDecodeAudio",
                     "DaSiWa_LTX2LoraLoader",
                     "ManagedH3DiagnosticDecode",
+                    "BasicGuider",
+                    "CFGGuider",
+                    "CLIPTextEncode",
+                    "KSamplerSelect",
+                    "BasicScheduler",
                 )
             )
         )

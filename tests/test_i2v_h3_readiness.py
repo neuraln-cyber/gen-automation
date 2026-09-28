@@ -41,14 +41,14 @@ def h3_settings(**changes: object) -> GenerationSettings:
     [
         {"frame_count": 81},
         {"fps": 16},
-        {"steps": 6},
-        {"scheduler": "linear_quadratic"},
+        {"steps": 0},
+        {"scheduler": "not_a_native_scheduler"},
         {"width": 1376, "height": 768},
         {"loop": True},
         {"face_fidelity": "stable_expression"},
         {"upscale": "source"},
-        {"video_shift": 13},
-        {"audio_shift": 2},
+        {"video_shift": 0},
+        {"audio_shift": 101},
     ],
 )
 def test_h3_rejects_unsupported_or_expensive_legacy_settings(changes: dict[str, object]) -> None:

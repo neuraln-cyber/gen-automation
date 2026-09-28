@@ -44,6 +44,7 @@ from gen_automation.domain.i2v_loras import (
     validate_i2v_lora_prompt,
 )
 from gen_automation.domain.ids import uuid7
+from gen_automation.i2v_worker.h3_variants import h3_job_matches_variant
 from gen_automation.i2v_worker.models import GenerationSettings, source_resolution_canvas
 from gen_automation.services.h3_loras import H3LoraUnavailableError, resolve_h3_loras
 
@@ -425,6 +426,7 @@ async def claim_next_i2v_job(
     worker_image_digest: str | None = None,
     reviewed_loras_enabled: bool = False,
     profile: str = "wan22",
+    h3_model_variant: str = "turbo_v2",
     now: datetime | None = None,
 ) -> I2VClaim | None:
     normalized_worker = _nonempty_text(worker_id, "worker id")
@@ -448,6 +450,7 @@ async def claim_next_i2v_job(
                 queued.settings_snapshot,
                 reviewed_loras_enabled=reviewed_loras_enabled,
                 profile=profile,
+                h3_model_variant=h3_model_variant,
             )
         ),
         None,
@@ -486,6 +489,7 @@ async def claim_next_i2v_job(
             queued.settings_snapshot,
             reviewed_loras_enabled=reviewed_loras_enabled,
             profile=profile,
+            h3_model_variant=h3_model_variant,
         )
         for queued in queued_jobs
     ):
@@ -1207,8 +1211,14 @@ def _canonical_sha256(value: dict[str, Any]) -> str:
 
 def _normalized_settings(value: dict[str, Any]) -> dict[str, Any]:
     try:
-        return normalize_i2v_settings(value)
-    except I2VLoraSelectionError as error:
+        normalized = normalize_i2v_settings(value)
+        if (
+            normalized.get("profile") == "minimax_h3"
+            and normalized.get("h3_model_variant") == "hybrid_v2"
+        ):
+            return GenerationSettings.model_validate(normalized).model_dump(mode="json")
+        return normalized
+    except (I2VLoraSelectionError, ValueError) as error:
         raise I2VInputError(str(error)) from error
 
 
@@ -1226,8 +1236,11 @@ def _dispatch_eligible(
     *,
     reviewed_loras_enabled: bool,
     profile: str = "wan22",
+    h3_model_variant: str = "turbo_v2",
 ) -> bool:
     if value.get("profile", "wan22") != profile:
+        return False
+    if not h3_job_matches_variant(value, h3_model_variant):
         return False
     kind = classify_i2v_lora_settings(value)
     return kind == I2VLoraSettingsKind.BASELINE or (

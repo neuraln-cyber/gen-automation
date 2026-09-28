@@ -9,6 +9,7 @@ from fastapi.templating import Jinja2Templates
 from gen_automation.api.security import ReleaseReader
 from gen_automation.config import Settings
 from gen_automation.domain.enums import AdminRole
+from gen_automation.i2v_worker.h3_sampling import H3_SAMPLERS, H3_SCHEDULERS
 
 router = APIRouter(
     prefix="/dashboard/animations",
@@ -47,6 +48,10 @@ async def dashboard_i2v(request: Request, principal: ReleaseReader) -> Response:
                 else settings.i2v_lora_profile_enabled
             ),
             "video_profile": settings.i2v_profile,
+            "h3_model_variant": settings.i2v_h3_model_variant,
+            "h3_advanced_sampling_enabled": settings.i2v_h3_advanced_sampling_enabled,
+            "h3_samplers": H3_SAMPLERS,
+            "h3_schedulers": H3_SCHEDULERS,
             "source_resolution_enabled": settings.i2v_h3_source_resolution_enabled,
             "h3_diagnostics_enabled": settings.i2v_h3_diagnostics_enabled,
             "video_provider": "RunPod" if settings.i2v_runpod_enabled else "Salad",

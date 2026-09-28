@@ -1029,6 +1029,11 @@ def _validate_generation_profile(
         )
     if settings.i2v_profile != "minimax_h3":
         return
+    if (value.get("h3_model_variant") or "turbo_v2") != settings.i2v_h3_model_variant:
+        raise HTTPException(
+            status_code=409,
+            detail="This preset/job uses a different H3 checkpoint; select current model settings.",
+        )
     if value.get("h3_save_base_video") and not settings.i2v_h3_diagnostics_enabled:
         raise HTTPException(
             status_code=409, detail="Base-video diagnostics await the matching worker update."
@@ -1038,21 +1043,37 @@ def _validate_generation_profile(
             status_code=409,
             detail="Original-resolution generation is waiting for the matching H3 worker update.",
         )
-    if negative_prompt.strip():
-        raise HTTPException(
-            status_code=422,
-            detail="H3 Turbo uses positive guidance only; clear the negative prompt.",
-        )
     try:
-        GenerationSettings.model_validate(value)
+        parsed = GenerationSettings.model_validate(value)
     except ValidationError:
         raise HTTPException(
             status_code=422,
             detail=(
-                "Invalid H3 settings: use 17n+5 frames, 24 fps, 4 or 8 steps, "
-                "Euler/simple and CFG 1; no WAN effects."
+                "Invalid H3 settings: use native sampler/scheduler names, finite CFG 0-100, "
+                "1-10000 steps, shifts 0.01-100, denoise 0-1, 17n+5 frames and 24 fps. "
+                "No WAN effects. Creator recipes are defaults, not restrictions."
             ),
         ) from None
+    if not settings.i2v_h3_advanced_sampling_enabled:
+        from gen_automation.i2v_worker.h3_sampling import H3_EXPERT_DEFAULTS
+
+        if (
+            parsed.steps not in {4, 8}
+            or parsed.cfg != 1
+            or parsed.sampler != "euler"
+            or parsed.scheduler != "simple"
+            or not 6 <= parsed.video_shift <= 12
+            or not 3 <= parsed.audio_shift <= 5
+            or any(getattr(parsed, name) != default for name, default in H3_EXPERT_DEFAULTS.items())
+        ):
+            raise HTTPException(
+                status_code=409, detail="Custom H3 sampling awaits the matching worker update."
+            )
+    if negative_prompt.strip() and not settings.i2v_h3_advanced_sampling_enabled:
+        raise HTTPException(
+            status_code=422,
+            detail="H3 uses positive guidance only; clear the negative prompt.",
+        )
 
 
 def _preset_draft(

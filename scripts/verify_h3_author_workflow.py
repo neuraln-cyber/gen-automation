@@ -148,8 +148,81 @@ def verify_author_workflow(nodes, template_path=None, reference_path=None):
     assert temporal["chunk_length"] == 85 and temporal["temporal_overlap"] == 17
     assert spatial["tile_width"] > 0 and spatial["tile_height"] > 0
     verify_upstream_tile_layout(registry, temporal, spatial)
+    verify_open_sampling_controls(registry, template, paths)
     assert torch.__version__.split("+")[0] == "2.9.1"
     print("Full author package, Director/Guide, seed and graph API contracts passed (CPU).")
+
+
+def verify_open_sampling_controls(registry, template, paths):
+    """Actual native choices/schedules/CFG wiring, without weights or GPU jobs."""
+    import comfy.samplers
+    import torch
+    from comfy.model_sampling import ModelSamplingAV
+
+    from gen_automation.i2v_worker.h3_sampling import H3_SAMPLERS, H3_SCHEDULERS
+
+    assert tuple(comfy.samplers.SAMPLER_NAMES) == H3_SAMPLERS
+    assert tuple(comfy.samplers.SCHEDULER_NAMES) == H3_SCHEDULERS
+    sampling = ModelSamplingAV(SimpleNamespace(sampling_settings={"shift": 12, "audio_shift": 3}))
+    model = SimpleNamespace(
+        model_options={},
+        is_dynamic=lambda: False,
+        get_model_object=lambda name: sampling if name == "model_sampling" else None,
+    )
+    for sampler, scheduler, steps in (
+        ("res_multistep", "simple", 20),
+        ("euler", "simple", 25),
+        ("er_sde", "beta", 4),
+    ):
+        assert registry["KSamplerSelect"].execute(sampler)[0].sampler_function
+        sigmas = registry["BasicScheduler"].execute(model, scheduler, steps, 1.0)[0]
+        assert len(sigmas) == steps + 1 and torch.isfinite(sigmas).all() and sigmas[-1] == 0
+        settings = GenerationSettings(
+            profile="minimax_h3",
+            h3_model_variant="hybrid_v2",
+            sampler=sampler,
+            scheduler=scheduler,
+            steps=steps,
+            cfg=2.5,
+            match_source_resolution=True,
+            width=1152,
+            height=1504,
+            h3_refine_cfg=1.8,
+            h3_refine_steps=3,
+            h3_refine_sampler="euler",
+            h3_refine_scheduler="beta",
+        )
+        graph, _, _ = render_workflow(
+            template,
+            input_filename="contract.png",
+            positive_prompt="A test scene.",
+            negative_prompt="blur",
+            settings=settings,
+            job_id=UUID(int=1),
+            attempt_id=UUID(int=2),
+            model_paths=paths,
+        )
+        assert graph["h3-negative"]["inputs"]["text"] == "blur"
+        assert graph["9"]["inputs"]["cfg"] == 2.5
+        for node in graph.values():
+            schema = registry[node["class_type"]].INPUT_TYPES()
+            assert set(schema.get("required", {})) <= set(node["inputs"])
+            assert set(node["inputs"]) - set(schema.get("required", {})) - set(
+                schema.get("optional", {})
+            ) <= {"codec.encoding"}
+    positive = [[torch.ones(1, 2, 8), {}]]
+    negative = [[torch.zeros(1, 2, 8), {}]]
+    guider = registry["CFGGuider"].execute(model, positive, negative, 2.5)[0]
+    assert guider.cfg == 2.5 and set(guider.original_conds) == {"positive", "negative"}
+    upstream = importlib.import_module(registry["MMH3UltimateUpscale"].__module__)
+    refine_guider = upstream.build_guider(model, positive, negative, 1.8)
+    assert refine_guider.cfg == 1.8 and "negative" in refine_guider.original_conds
+    for cfg in (0, 1, 2.5):
+        value = comfy.samplers.cfg_function(
+            None, torch.ones(2), torch.zeros(2), cfg, torch.zeros(2), torch.ones(1)
+        )
+        assert torch.equal(value, torch.full((2,), float(cfg)))
+    print("Native sampler registry, V2/expert schedules and effective base/refinement CFG passed.")
 
 
 def verify_upstream_tile_layout(registry, temporal, spatial):

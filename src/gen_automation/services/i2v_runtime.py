@@ -113,6 +113,7 @@ class I2VRuntimeEnvironmentProvider(Protocol):
 class I2VRuntimeConfig:
     salad: I2VSaladConfig
     profile: str = "wan22"
+    h3_model_variant: str = "turbo_v2"
     output_prefix: str = "i2v/outputs"
     reviewed_loras_enabled: bool = False
     startup_timeout_seconds: int | None = None
@@ -189,6 +190,7 @@ class I2VRuntime:
                     settings,
                     reviewed_loras_enabled=self.config.reviewed_loras_enabled,
                     profile=self.config.profile,
+                    h3_model_variant=self.config.h3_model_variant,
                 )
                 for settings in queued_settings
             )
@@ -670,6 +672,7 @@ class I2VRuntime:
                 worker_image_digest=self.config.salad.worker_image,
                 reviewed_loras_enabled=self.config.reviewed_loras_enabled,
                 profile=self.config.profile,
+                h3_model_variant=self.config.h3_model_variant,
                 now=now,
             )
         if claim is None:
@@ -791,6 +794,7 @@ class I2VRuntime:
             job.settings_snapshot,
             reviewed_loras_enabled=self.config.reviewed_loras_enabled,
             profile=self.config.profile,
+            h3_model_variant=self.config.h3_model_variant,
         )
 
     async def _mark_submission_unknown(
@@ -1122,7 +1126,14 @@ def _safe_attempt_metadata(
 
 def _worker_settings_snapshot(settings: Mapping[str, object]) -> dict[str, object]:
     """Keep baseline jobs compatible during a control-plane-first worker rollout."""
+    from gen_automation.i2v_worker.h3_sampling import H3_EXPERT_DEFAULTS
+
     snapshot = dict(settings)
+    if snapshot.get("h3_model_variant") in (None, "turbo_v2"):
+        snapshot.pop("h3_model_variant", None)
+    for name, default in H3_EXPERT_DEFAULTS.items():
+        if snapshot.get(name, default) == default:
+            snapshot.pop(name, None)
     if not snapshot.get("h3_loras"):
         snapshot.pop("h3_loras", None)
     if not snapshot.get("match_source_resolution"):
@@ -1246,8 +1257,13 @@ def _dispatch_eligible(
     *,
     reviewed_loras_enabled: bool,
     profile: str = "wan22",
+    h3_model_variant: str = "turbo_v2",
 ) -> bool:
+    from gen_automation.i2v_worker.h3_variants import h3_job_matches_variant
+
     if value.get("profile", "wan22") != profile:
+        return False
+    if not h3_job_matches_variant(value, h3_model_variant):
         return False
     kind = classify_i2v_lora_settings(value)
     return kind == I2VLoraSettingsKind.BASELINE or (

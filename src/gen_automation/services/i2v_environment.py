@@ -150,6 +150,7 @@ def i2v_salad_runtime_config_from_settings(settings: Settings) -> I2VRuntimeConf
         )
     return I2VRuntimeConfig(
         profile=settings.i2v_profile,
+        h3_model_variant=settings.i2v_h3_model_variant,
         startup_timeout_seconds=settings.i2v_startup_timeout_seconds,
         execution_timeout_seconds=settings.i2v_execution_timeout_seconds,
         salad=I2VSaladConfig(
