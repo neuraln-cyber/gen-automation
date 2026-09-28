@@ -46,6 +46,10 @@ def test_complete_author_packages_and_runtime_are_immutable():
     assert "git apply" not in installer
     assert "verify_h3_author_workflow.py" in docker
     assert "51a20a9e79fb9a505c0bada2e4828f39605738cd98aee327af7cd114f3015bef" in docker
+    publication = (ROOT / ".github/workflows/publish-images.yml").read_text()
+    inputs = publication.split("i2v_inputs=(", 1)[1].split(")", 1)[0]
+    for script in ("install-h3-author-nodes.sh", "verify_h3_author_workflow.py"):
+        assert f"scripts/{script}" in inputs
 
 
 def test_encoder_is_the_exact_file_linked_in_author_workflow_not_a_namesake():
