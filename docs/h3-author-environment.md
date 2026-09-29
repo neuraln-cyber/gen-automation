@@ -34,8 +34,10 @@ diagnostic node are allowed in H3. No custom LoRA math or refinement wrapper rem
 ## Models
 
 Use the effective **outer subgraph widget** model selections, not the unused
-inner loader defaults. Keep Hybrid Turbo v2 and both existing VAEs/upscaler.
-Replace NVFP4-AWQ with the author's linked
+inner loader defaults. The live checkpoint is now normal **Hybrid V2** (version
+3314675), which the creator explicitly lists as REF2VA + FL2VA compatible; see
+[normal V2 provenance/defaults](h3-normal-v2.md). Keep both VAEs/upscaler and
+the author's linked
 `qwen3vl_32b_minimax_h3_int4_convrot.safetensors` from
 `Abiray/MiniMax-H3-GGUF`, revision `9fc3454d3ebe1be1bade862cd4a5011f325a22cb`.
 14952506709 bytes; SHA256
@@ -61,15 +63,22 @@ match and widening fade. Its implementation and anchor handling are upstream.
 
 Headless boundaries are explicit, not hidden claims of exact UI reproduction:
 
-- The owner input, prompt, seed, dimensions, frame count, Turbo sampler/steps/
+- The owner input, prompt, seed, dimensions, frame count, sampler/steps/
   shifts and optional source-size selection remain job parameters.
 - The app preserves its existing bounded base canvas and source-padding/cropping
   delivery contract; the author's Director receives the resolved canvas.
-- The owner explicitly selected the saved workflow's **REF2VA** mode. The input
-  is a reference image, not a frozen first frame; Director's ref2va_model branch
-  and native MiniMaxH3ReferenceToVideo are verified in the real-package contract.
+- The owner switched to **I2VA**, the single-image mode of the FL2VA family.
+  Director's `fl2va_model` branch calls native `MiniMaxH3ImageToVideo` with the
+  uploaded image at frame zero and no last frame. This deliberately supersedes
+  the saved workflow's REF2VA selection, using the creator's mode implementation.
+  Native CLIP receives that image and VAE encodes its first-frame keyframe.
+- Scene/motion text is bound to the actual creator structured builder's `imd`
+  field. Upstream adds the I2VA alignment sentence and official multimodal,
+  soundscape and music sections; no custom prompt builder or external overwrite.
+  No soundscape is invented and music remains the creator's `N/A` default.
+  Existing stored prompts/settings are not rewritten.
 - SaveVideo/CreateVideo remain the delivery adapter (MP4/SAR/audio contract).
-  UI watermark, prompt builder, optional Forge LLM, RTX SDK, interpolation and
+  UI watermark, optional Forge LLM, RTX SDK, interpolation and
   optional pixel upscalers are not activated or given new models. Complete node
   sources are installed; unused lazy optional runtimes are not installed.
 - Preview uses the actual KJ node without a separate tiny-VAE download and with
@@ -81,7 +90,12 @@ Headless boundaries are explicit, not hidden claims of exact UI reproduction:
 
 Unit graph/manifest/isolation checks plus real full-package imports, creator/native
 LoRA integration, Director/Guide/seed/API checks in the Linux image as UID/GID10002.
+The I2VA check executes real native conditioning/AV-latent creation with only
+CLIP/VAE inference substituted. It verifies exactly one first-frame anchor,
+no REF2VA call, structured prompt alignment, and upstream resize/crop/re-anchor
+of the first-frame conditioning through both temporal chunks and all spatial tiles.
 CPU checks are not GPU kernel, memory-sufficiency, performance or visual tests.
 Require full CI, exact publication identity, verified new encoder mirror and a
 fresh safe idle check before cutover. Never replay previous deployment helpers.
-No new jobs, cancellations, retries, worker starts/stops or image-lane changes.
+No new jobs, cancellations, retries or image-lane changes. A fresh idle boundary
+and owner-approved deployment are required before replacing a running worker.

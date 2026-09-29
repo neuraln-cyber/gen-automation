@@ -213,7 +213,7 @@
           <button class="secondary-button" type="button" data-h3-defaults>Restore creator sampling defaults</button>
           <p class="muted">Creator recommendations, not restrictions: {% if h3_model_variant == 'hybrid_v2' %}normal V2 uses RES Multistep/simple or Euler/simple, 20–25 steps, video shift 10–12, audio shift 3–5{% else %}Turbo uses Euler/simple or LCM/simple, 4 or 8 steps, video shift 6–12, audio shift 3–5{% endif %}. CFG defaults to 1. Other native Comfy combinations are experimental; more steps, CFG guidance and refinement may increase GPU time or memory. Settings are frozen per job; changing them does not restart the worker.</p>
           {% else %}<p class="muted">Euler / simple · CFG 1 · 24 fps. Custom sampling controls await the matching worker update.</p>{% endif %}
-          <p class="muted">Creator REF2VA mode with one reference image, native video/audio generation and the creator's Basic LoRA stack. No WAN motion LoRAs.</p>
+          <p class="muted">Creator FL2VA-family I2VA mode: animate your image as the first frame, with no last-frame image. Describe the scene and motion in the positive prompt; the creator's structured builder adds the first-frame alignment. Native video/audio generation and the creator's Basic LoRA stack. No WAN motion LoRAs.</p>
           {% else %}
           <summary><span><strong>Advanced settings</strong><small>DaSiWa WAN 2.2 baseline · all values are saved with the job</small></span><span aria-hidden="true">⌄</span></summary>
           <div class="i2v-settings-grid">

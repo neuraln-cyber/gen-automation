@@ -7,7 +7,7 @@ import tempfile
 from importlib.metadata import version
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import UUID
 
 from gen_automation.i2v_worker.h3_upscale import H3_UPSCALER_FILENAME, H3_UPSCALER_ROLE
@@ -40,7 +40,9 @@ def verify_author_workflow(nodes, template_path=None, reference_path=None):
         profile="minimax_h3",
         fps=24,
         frame_count=124,
-        steps=8,
+        h3_model_variant="hybrid_v2",
+        steps=20,
+        sampler="res_multistep",
         scheduler="simple",
         width=1152,
         height=1504,
@@ -113,32 +115,61 @@ def verify_author_workflow(nodes, template_path=None, reference_path=None):
         Image.new("RGB", (64, 64), "blue").save(Path(tmp) / "contract.png")
         with patch.object(folder_paths, "get_input_directory", return_value=tmp):
             params = dict(graph["1"]["inputs"])
-            assert params["mode"] == "REF2VA" and "fl2va_model" not in params
-            params["ref2va_model"] = object()
+            assert params["mode"] == "I2VA" and "ref2va_model" not in params
+            assert "external_prompt_overwrite" not in params
+            params["fl2va_model"] = object()
             director = nodes.NODE_CLASS_MAPPINGS["MiniMaxH3Director"]().build_guide(**params)
         assert director[1] == settings.frame_count
-        assert director[2] == "A test scene."
-        assert director[5] is params["ref2va_model"]
-        assert director[0]["mode"] == "REF2VA"
+        expected_prompt = (
+            "For the target video, at 0.00 seconds into the target video, "
+            "<Picture 1> (from [Shot 1]) is fully referenced.\n\n"
+            "integrated_multimodal_description: A test scene.\n\n"
+            "overall_soundscape: \n\nnon_diegetic_music: N/A"
+        )
+        assert director[2] == expected_prompt
+        assert director[5] is params["fl2va_model"] and director[6] is True
+        guide = director[0]
+        assert guide["mode"] == "I2VA" and guide["last_frame"] is None
+        assert guide["first_frame"].shape == (1, 64, 64, 3)
+        assert not any(guide[k] for k in ("ref_images", "ref_videos", "ref_audios"))
         guide_cls = nodes.NODE_CLASS_MAPPINGS["MiniMaxH3DirectorGuide"]
         native = importlib.import_module("comfy_extras.nodes_minimax_h3")
-        with patch.object(
-            native.MiniMaxH3ReferenceToVideo, "execute", return_value=([], {})
-        ) as call:
-            guide_cls().apply(object(), object(), director[0], audio_vae=object())
-        assert call.call_count == 1
-        # Keyword contract is native Comfy's; creator code must not be copied or patched.
-        args = call.call_args
-        assert set(args.kwargs["ref_images"]) == {"ref_image_1"}
-        assert args.kwargs["ref_images"]["ref_image_1"].shape == (1, 64, 64, 3)
-        assert not args.kwargs["ref_videos"] and not args.kwargs["ref_audios"]
-        assert args.kwargs["ref_image_size"] == "match"
-        assert args.kwargs["length"] == 124
-        assert any(value == "A test scene." for value in args.args if isinstance(value, str)) or (
-            any(
-                value == "A test scene." for value in args.kwargs.values() if isinstance(value, str)
+        # Execute actual native conditioning, resizing and AV latent construction.
+        # Only heavyweight CLIP/VAE inference is substituted (no weights or GPU).
+        clip = Mock()
+        clip.encode_from_tokens_scheduled.return_value = [[torch.ones(1, 2, 8), {}]]
+        vae = SimpleNamespace(
+            encode=Mock(
+                side_effect=lambda pixels: torch.ones(
+                    1, 24, 1, pixels.shape[1] // 16, pixels.shape[2] // 16
+                )
             )
         )
+        with (
+            patch.object(
+                native.MiniMaxH3ImageToVideo, "execute", wraps=native.MiniMaxH3ImageToVideo.execute
+            ) as call,
+            patch.object(native.MiniMaxH3ReferenceToVideo, "execute") as reference_call,
+        ):
+            positive, latent, _ = guide_cls().apply(clip, vae, guide, audio_vae=object())
+        assert call.call_count == 1
+        reference_call.assert_not_called()
+        assert call.call_args.args[2:6] == (expected_prompt, guide["width"], guide["height"], 124)
+        assert call.call_args.args[6] is guide["first_frame"]
+        assert call.call_args.args[7] is None
+        assert clip.tokenize.call_args.args == (expected_prompt,)
+        images = clip.tokenize.call_args.kwargs["images"]
+        assert len(images) == 1 and images[0].shape == (1, guide["height"], guide["width"], 3)
+        vae.encode.assert_called_once()
+        metadata = positive[0][1]
+        assert "minimax_refs" not in metadata
+        assert len(metadata["minimax_keyframes"]) == 1
+        anchor = metadata["minimax_keyframes"][0]
+        assert anchor["resolved_frame_index"] == 0
+        assert anchor["latent"].shape == (1, 24, 1, guide["height"] // 16, guide["width"] // 16)
+        video, audio = latent["samples"].tensors
+        assert video.shape == (1, 24, 37, guide["height"] // 16, guide["width"] // 16)
+        assert audio.shape == (1, 32, 2, 207)
 
     registry = nodes.NODE_CLASS_MAPPINGS
     temporal = registry["MMH3TemporalSplitParams"].execute(**graph["h3-temporal-params"]["inputs"])[
@@ -148,6 +179,7 @@ def verify_author_workflow(nodes, template_path=None, reference_path=None):
     assert temporal["chunk_length"] == 85 and temporal["temporal_overlap"] == 17
     assert spatial["tile_width"] > 0 and spatial["tile_height"] > 0
     verify_upstream_tile_layout(registry, temporal, spatial)
+    verify_upstream_tile_layout(registry, temporal, spatial, first_frame=True)
     verify_open_sampling_controls(registry, template, paths)
     assert torch.__version__.split("+")[0] == "2.9.1"
     print("Full author package, Director/Guide, seed and graph API contracts passed (CPU).")
@@ -225,7 +257,7 @@ def verify_open_sampling_controls(registry, template, paths):
     print("Native sampler registry, V2/expert schedules and effective base/refinement CFG passed.")
 
 
-def verify_upstream_tile_layout(registry, temporal, spatial):
+def verify_upstream_tile_layout(registry, temporal, spatial, *, first_frame=False):
     """Exercise real split/anchor/packing/stitching; substitute only GPU sampling."""
     import torch
     from comfy.ldm.minimax.model import PackedLayout, patchify_video
@@ -251,6 +283,17 @@ def verify_upstream_tile_layout(registry, temporal, spatial):
             },
         ]
     ]
+    if first_frame:
+        # Base-resolution I2VA keyframe must be resized/cropped by upstream for
+        # target-resolution tiles, not mistaken for an unaligned REF2VA reference.
+        conditioning[0][1] = {
+            "minimax_keyframes": [
+                {
+                    "resolved_frame_index": 0,
+                    "latent": torch.ones(1, 24, 1, 62, 48),
+                }
+            ]
+        }
     calls = []
 
     def sample(piece, cond, model, noise, sampler, sigmas, negative, cfg):
@@ -258,8 +301,15 @@ def verify_upstream_tile_layout(registry, temporal, spatial):
         _, metadata = cond[0]
         anchors = metadata.get("minimax_keyframes", [])
         refs = metadata.get("minimax_refs", [])
-        assert len(refs) == 1 and refs[0]["kind"] == "image"
-        assert refs[0]["latent"].shape == (1, 24, 1, 8, 8)
+        if first_frame:
+            assert not refs and len(anchors) == 1
+            assert anchors[0]["resolved_frame_index"] == 0
+            assert anchors[0]["latent"].shape[3:] == tile.shape[3:]
+            if len(calls) < 6:
+                assert torch.all(anchors[0]["latent"] == 1)
+        else:
+            assert len(refs) == 1 and refs[0]["kind"] == "image"
+            assert refs[0]["latent"].shape == (1, 24, 1, 8, 8)
         layout = PackedLayout(
             2,
             tile.shape[2],
@@ -297,4 +347,6 @@ def verify_upstream_tile_layout(registry, temporal, spatial):
     assert actual_video.shape == video.shape
     assert torch.allclose(actual_audio, audio)
     assert not patcher.model_options
+    if first_frame:
+        assert conditioning[0][1]["minimax_keyframes"][0]["latent"].shape == (1, 24, 1, 62, 48)
     print("Actual upstream temporal/spatial conditioning and native packed-layout contract passed.")
