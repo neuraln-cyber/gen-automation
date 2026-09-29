@@ -30,6 +30,7 @@ from gen_automation.domain.signing import (
     derive_public_key,
     validate_private_key,
 )
+from gen_automation.i2v_worker.h3_variants import H3Variant, h3_manifest_matches_variant
 from gen_automation.i2v_worker.manifest_contract import validated_i2v_manifest_objects
 
 LOCAL_SESSION_SECRET = "local-development-only"  # noqa: S105
@@ -548,6 +549,8 @@ class Settings(BaseSettings):
     # about as one self-contained system.
     i2v_enabled: bool = False
     i2v_profile: Literal["wan22", "minimax_h3"] = "wan22"
+    i2v_h3_model_variant: H3Variant = "turbo_v2"
+    i2v_h3_advanced_sampling_enabled: bool = False
     # No extra delivery subscription: reuse the image lane's private distribution.
     # Explicitly switch on for the new Salad rollout; old RunPod deployments are unchanged.
     i2v_require_private_delivery: bool = False
@@ -1138,6 +1141,10 @@ class Settings(BaseSettings):
                                 reviewed_loras_enabled=self.i2v_lora_worker_enabled,
                                 profile=self.i2v_profile,
                             )
+                            if self.i2v_profile == "minimax_h3" and not h3_manifest_matches_variant(
+                                manifest_objects["diffusion_model"], self.i2v_h3_model_variant
+                            ):
+                                errors.append("H3 recipe variant does not match the pinned model")
                             if self.i2v_h3_source_resolution_enabled and (
                                 self.i2v_profile != "minimax_h3"
                                 or "h3_latent_upscaler" not in manifest_objects

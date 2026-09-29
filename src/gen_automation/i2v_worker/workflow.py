@@ -10,8 +10,6 @@ from typing import Any
 from uuid import UUID
 
 from gen_automation.i2v_worker.h3_upscale import (
-    H3_REFINE_DENOISE,
-    H3_REFINE_STEPS,
     H3_UPSCALER_FILENAME,
     H3_UPSCALER_ROLE,
     h3_base_canvas,
@@ -155,6 +153,22 @@ def render_workflow(
         raise WorkflowError("workflow template contains an unresolved binding")
     if settings.profile == "minimax_h3":
         rendered = _inject_h3_loras(rendered, settings)
+        rendered["11"]["inputs"]["denoise"] = settings.h3_denoise
+        if settings.cfg != 1 or (settings.match_source_resolution and settings.h3_refine_cfg != 1):
+            rendered["h3-negative"] = {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"clip": ["h3-lora-stack", 1], "text": negative_prompt},
+            }
+        if settings.cfg != 1:
+            rendered["9"] = {
+                "class_type": "CFGGuider",
+                "inputs": {
+                    "model": ["h3-preview", 0],
+                    "positive": ["6", 0],
+                    "negative": ["h3-negative", 0],
+                    "cfg": settings.cfg,
+                },
+            }
         if settings.match_source_resolution:
             rendered = _inject_h3_upscale(rendered, settings, model_paths or {})
         if settings.h3_save_base_video:
@@ -295,9 +309,9 @@ def _inject_h3_upscale(
         "class_type": "BasicScheduler",
         "inputs": {
             "model": ["h3-lora-stack", 0],
-            "scheduler": "simple",
-            "steps": H3_REFINE_STEPS,
-            "denoise": H3_REFINE_DENOISE,
+            "scheduler": settings.h3_refine_scheduler,
+            "steps": settings.h3_refine_steps,
+            "denoise": settings.h3_refine_denoise,
         },
     }
     workflow["h3-upscale-params"] = {
@@ -347,12 +361,20 @@ def _inject_h3_upscale(
             "noise": ["8", 1],
             "sampler": ["10", 0],
             "sigmas": ["h3-refine-sigmas", 0],
-            "cfg": 1.0,
+            "cfg": settings.h3_refine_cfg,
             "latent_upscale_param": ["h3-upscale-params", 0],
             "temporal_split_param": ["h3-temporal-params", 0],
             "spatial_split_param": ["h3-spatial-params", 0],
         },
     }
+    if settings.h3_refine_sampler is not None:
+        workflow["h3-refine-sampler"] = {
+            "class_type": "KSamplerSelect",
+            "inputs": {"sampler_name": settings.h3_refine_sampler},
+        }
+        workflow["h3-source-upscale"]["inputs"]["sampler"] = ["h3-refine-sampler", 0]
+    if settings.h3_refine_cfg != 1:
+        workflow["h3-source-upscale"]["inputs"]["negative"] = ["h3-negative", 0]
     workflow["13"]["inputs"]["samples"] = ["h3-source-upscale", 0]
     # Audio decode remains connected to the untouched base pass (node 12).
     return workflow

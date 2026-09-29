@@ -25,6 +25,7 @@ from gen_automation.i2v_worker.face_stabilizer import (
 )
 from gen_automation.i2v_worker.h3_loras import materialize_h3_lora
 from gen_automation.i2v_worker.h3_upscale import h3_base_canvas
+from gen_automation.i2v_worker.h3_variants import h3_job_matches_variant
 from gen_automation.i2v_worker.media import (
     MediaError,
     download_input,
@@ -128,6 +129,7 @@ def create_i2v_worker_app(
             }
             if settings.profile == "minimax_h3":
                 content["capability"]["managed_h3_loras"] = True  # type: ignore[index]
+                content["capability"]["h3_model_variant"] = settings.h3_model_variant  # type: ignore[index]
         return is_ready, content
 
     @app.get("/ready")
@@ -177,6 +179,10 @@ def create_i2v_worker_app(
             raise HTTPException(status_code=400, detail="invalid request") from None
         if job.settings_snapshot.profile != settings.profile:
             raise HTTPException(status_code=409, detail="job requires a different worker profile")
+        if not h3_job_matches_variant(
+            job.settings_snapshot.model_dump(), settings.h3_model_variant
+        ):
+            raise HTTPException(status_code=409, detail="job requires a different H3 checkpoint")
         if job.settings_snapshot.match_source_resolution and not any(
             item.role == "h3_latent_upscaler" for item in settings.model_objects
         ):
@@ -186,10 +192,6 @@ def create_i2v_worker_app(
             or job.input_grant.url.host != settings.model_delivery_domain
         ):
             raise HTTPException(status_code=409, detail="private input delivery is required")
-        if settings.profile == "minimax_h3" and job.negative_prompt.strip():
-            raise HTTPException(
-                status_code=400, detail="MiniMax H3 uses one positive direction prompt"
-            )
         if job.settings_snapshot.loras and not settings.lora_worker_enabled:
             raise HTTPException(
                 status_code=409,

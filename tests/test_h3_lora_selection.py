@@ -431,7 +431,8 @@ async def test_incompatible_file_is_an_actionable_worker_error(tmp_path):
         await client.close()
 
 
-def test_frontend_roundtrips_selection_strengths_and_clear_without_wan_fields():
+@pytest.mark.parametrize("expert", [False, True])
+def test_frontend_roundtrips_selection_strengths_and_clear_without_wan_fields(expert):
     node = shutil.which("node")
     if not node:
         pytest.skip("Node.js is needed for frontend behavior checks")
@@ -447,10 +448,15 @@ const state = {
   loraSelections: new Map(), loraCatalogLoaded: true, loraProfileEnabled: true,
   loraCatalog: [{catalog_id: "owned-id", sha256: "a".repeat(64), available: true}],
 };
+const fields = Object.entries({steps: "4", cfg: "2.5", sampler: "er_sde", scheduler: "beta",
+  h3_refine_steps: "3", h3_refine_cfg: "1.8", h3_refine_denoise: "0.4", h3_refine_sampler: ""})
+  .map(([name, value]) => ({name, value, type: "text"}));
 const context = vm.createContext({
+  h3AdvancedSamplingEnabled: __EXPERT__, h3ModelVariant: "hybrid_v2",
   isH3: true, state, workerSettingDefaults: {profile: "minimax_h3", h3_loras: []},
   loraList: {querySelectorAll: () => []}, root: {querySelector: () => null},
-  advanced: {querySelectorAll: () => [], querySelector: () => null},
+  advanced: {querySelectorAll: () => __EXPERT__ ? fields : [],
+    querySelector: selector => fields.find(f => selector === `[name="${f.name}"]`)},
   CSS: {escape: x => x}, renderLoraCatalog() {}, syncLoraPromptPreview() {},
   syncAspectControls() {}, updateDuration() {}, announce() {},
   sourceResolutionError: () => "",
@@ -464,6 +470,13 @@ vm.runInContext("applySettings(saved)", context);
 let collected = JSON.parse(JSON.stringify(vm.runInContext("collectSettings()", context)));
 assert.deepEqual(collected.h3_loras, context.saved.h3_loras);
 assert.deepEqual(collected.loras, []);
+if (__EXPERT__) {
+  assert.equal(collected.h3_model_variant, "hybrid_v2");
+  assert.equal(collected.steps, 4); assert.equal(collected.cfg, 2.5);
+  assert.equal(collected.sampler, "er_sde"); assert.equal(collected.scheduler, "beta");
+  assert.equal(collected.h3_refine_cfg, 1.8); assert.equal(collected.h3_refine_steps, 3);
+  assert.equal(collected.h3_refine_denoise, 0.4); assert.equal(collected.h3_refine_sampler, null);
+}
 state.loraSelections.set("owned-id", 0);
 assert.equal(vm.runInContext("collectSettings().h3_loras[0].strength", context), 0);
 state.loraSelections.set("missing-id", 1);
@@ -471,6 +484,7 @@ assert.throws(() => vm.runInContext("collectSettings()", context), /unavailable/
 vm.runInContext("applySettings({})", context);
 assert.equal(vm.runInContext("collectSettings().h3_loras.length", context), 0);
 """
+    script = script.replace("__EXPERT__", "true" if expert else "false")
     subprocess.run(  # noqa: S603 - fixed local test script and discovered Node executable
         [node, "-e", script], cwd=ROOT, check=True, capture_output=True, text=True
     )

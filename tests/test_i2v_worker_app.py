@@ -92,6 +92,38 @@ class _Supervisor:
         self.stopped = True
 
 
+@pytest.mark.parametrize("normal_worker", [False, True])
+def test_h3_worker_rejects_wrong_checkpoint_before_execution(tmp_path, monkeypatch, normal_worker):
+    from gen_automation.i2v_worker.h3_variants import H3_NORMAL_V2_SHA256
+    from gen_automation.i2v_worker.models import GenerationSettings
+
+    settings = _settings(tmp_path, lora_worker_enabled=False)
+    objects = json.loads(settings.model_objects_json.get_secret_value())
+    objects[0].update(role="diffusion_model", sha256=H3_NORMAL_V2_SHA256 if normal_worker else SHA)
+    objects[0]["key"] = f"worker/i2v/sha256/{objects[0]['sha256']}"
+    settings = settings.model_copy(
+        update={"profile": "minimax_h3", "model_objects_json": SecretStr(json.dumps(objects))}
+    )
+    assert settings.h3_model_variant == ("hybrid_v2" if normal_worker else "turbo_v2")
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("checkpoint mismatch must not execute a job")
+
+    monkeypatch.setattr("gen_automation.i2v_worker.app._run_job", forbidden)
+    job = _job()
+    job["settings_snapshot"] = GenerationSettings(
+        profile="minimax_h3",
+        h3_model_variant="turbo_v2" if normal_worker else "hybrid_v2",
+        frame_count=124,
+        fps=24,
+        scheduler="simple",
+    ).model_dump()
+    with TestClient(create_i2v_worker_app(settings, supervisor=_Supervisor())) as client:
+        response = client.post("/jobs/i2v", json=job)
+        assert response.status_code == 409
+        assert response.json()["detail"] == "job requires a different H3 checkpoint"
+
+
 @pytest.mark.parametrize("recovered", [True, False])
 def test_poisoned_inference_is_failed_after_recovery_without_replaying_job(
     tmp_path, monkeypatch, recovered

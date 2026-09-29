@@ -119,6 +119,46 @@ async def test_h3_original_resolution_freezes_canvas_from_owned_input(i2v_sessio
     assert settings["width"] == 576  # neither preset/draft nor source is rewritten
 
 
+@pytest.mark.parametrize("variant", ["turbo_v2", "hybrid_v2"])
+async def test_h3_claim_preserves_jobs_for_the_other_checkpoint(i2v_session, variant):
+    session, owner_id = i2v_session
+    source = await register_i2v_input(
+        session, actor_user_id=owner_id, registration=_input_registration(), now=_NOW
+    )
+    jobs = {}
+    for index, model in enumerate(("turbo_v2", "hybrid_v2")):
+        settings = {"profile": "minimax_h3", "fps": 24, "frame_count": 124, "scheduler": "simple"}
+        if model == "hybrid_v2":
+            settings.update(
+                h3_model_variant=model, steps=4, cfg=2.5, sampler="er_sde", scheduler="beta"
+            )
+        jobs[model] = await create_i2v_job(
+            session,
+            actor_user_id=owner_id,
+            draft=I2VJobDraft(input_id=source.input_id, settings=settings),
+            now=_NOW + timedelta(seconds=index),
+        )
+    claim = await claim_next_i2v_job(
+        session,
+        worker_id="checkpoint-specific-worker",
+        lease_duration=timedelta(hours=1),
+        profile="minimax_h3",
+        h3_model_variant=variant,
+        now=_NOW + timedelta(seconds=2),
+    )
+    assert claim is not None and claim.job.job_id == jobs[variant].job_id
+    other = jobs["hybrid_v2" if variant == "turbo_v2" else "turbo_v2"]
+    remaining = await list_i2v_jobs(session, states={I2VJobState.QUEUED})
+    assert len(remaining) == 1
+    assert remaining[0].job_id == other.job_id
+    assert remaining[0].attempt_count == 0
+    assert remaining[0].settings_snapshot == other.settings_snapshot
+    assert remaining[0].request_sha256 == other.request_sha256
+    if variant == "hybrid_v2":
+        assert claim.job.settings_snapshot["steps"] == 4
+        assert claim.job.settings_snapshot["cfg"] == 2.5
+
+
 async def test_h3_invalid_original_size_rejected_before_job_creation(i2v_session):
     session, owner_id = i2v_session
     source = await register_i2v_input(

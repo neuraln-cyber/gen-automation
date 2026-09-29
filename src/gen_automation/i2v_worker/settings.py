@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from gen_automation.domain.private_delivery import PrivateDeliveryRoute
 from gen_automation.i2v_worker.h3_upscale import H3_UPSCALER_ROLE
+from gen_automation.i2v_worker.h3_variants import H3_NORMAL_V2_SHA256, H3Variant
 from gen_automation.i2v_worker.lora_catalog import REQUIRED_LORA_ROLES
 from gen_automation.i2v_worker.manifest_contract import required_i2v_model_roles
 from gen_automation.i2v_worker.models import ModelObject
@@ -124,6 +125,16 @@ class I2VWorkerSettings(BaseSettings):
         if roles != required or len(roles) != len(objects):
             raise ValueError("model manifest roles are incomplete or duplicated")
         return self
+
+    @property
+    def h3_model_variant(self) -> H3Variant:
+        """Derive identity from immutable model bytes, never from a request/default."""
+        if any(
+            item.role == "diffusion_model" and item.sha256 == H3_NORMAL_V2_SHA256
+            for item in self.model_objects
+        ):
+            return "hybrid_v2"
+        return "turbo_v2"
 
     @property
     def effective_workflow_template(self) -> Path:

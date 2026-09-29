@@ -182,6 +182,7 @@ class H3LoraGrant(_StrictModel):
 
 class GenerationSettings(_StrictModel):
     profile: Literal["wan22", "minimax_h3"] = "wan22"
+    h3_model_variant: Literal["turbo_v2", "hybrid_v2"] | None = None
     frame_count: int = Field(default=81, ge=9)
     fps: int = Field(default=16, gt=0)
     width: int = Field(default=576, ge=32)
@@ -190,15 +191,21 @@ class GenerationSettings(_StrictModel):
     match_source_resolution: bool = False
     h3_save_base_video: bool = False
     seed: int = -1
-    steps: int = Field(default=4, ge=2)
+    steps: int = Field(default=4, ge=1)
     high_end_step: int = Field(default=2, ge=1)
-    cfg: float = Field(default=1.0, gt=0)
+    cfg: float = Field(default=1.0, ge=0, allow_inf_nan=False)
     high_shift: float = 5.0
     low_shift: float = 5.0
-    sampler: Literal["euler"] = "euler"
-    scheduler: Literal["linear_quadratic", "simple"] = "linear_quadratic"
-    video_shift: float = Field(default=8, ge=6, le=12)
-    audio_shift: float = Field(default=4, ge=3, le=5)
+    sampler: str = "euler"
+    scheduler: str = "linear_quadratic"
+    video_shift: float = Field(default=8, ge=0.01, le=100, allow_inf_nan=False)
+    audio_shift: float = Field(default=4, ge=0.01, le=100, allow_inf_nan=False)
+    h3_denoise: float = Field(default=1.0, ge=0, le=1, allow_inf_nan=False)
+    h3_refine_steps: int = Field(default=1, ge=1, le=10000)
+    h3_refine_cfg: float = Field(default=1.0, ge=0, le=100, allow_inf_nan=False)
+    h3_refine_denoise: float = Field(default=0.2, ge=0, le=1, allow_inf_nan=False)
+    h3_refine_sampler: str | None = None
+    h3_refine_scheduler: str = "simple"
     interpolation: Literal["none"] = "none"
     upscale: Literal["none", "source"] = "none"
     loop: bool = False
@@ -217,9 +224,40 @@ class GenerationSettings(_StrictModel):
     )
     h3_loras: list[H3LoraSelection] = Field(default_factory=list)
 
+    @model_validator(mode="before")
+    @classmethod
+    def normal_v2_defaults(cls, value: Any) -> Any:
+        if (
+            isinstance(value, dict)
+            and value.get("profile") == "minimax_h3"
+            and value.get("h3_model_variant") == "hybrid_v2"
+        ):
+            return {
+                "steps": 20,
+                "cfg": 1.0,
+                "sampler": "res_multistep",
+                "scheduler": "simple",
+                "video_shift": 12.0,
+                "audio_shift": 4.0,
+                "fps": 24,
+                "frame_count": 124,
+                **value,
+            }
+        return value
+
     @model_validator(mode="after")
     def validate_wan_shape(self) -> GenerationSettings:
         if self.profile == "minimax_h3":
+            from gen_automation.i2v_worker.h3_sampling import H3_SAMPLERS, H3_SCHEDULERS
+
+            if self.steps > 10000 or self.cfg > 100:
+                raise ValueError("H3 steps/CFG exceed native Comfy node bounds")
+            if self.sampler not in H3_SAMPLERS or self.scheduler not in H3_SCHEDULERS:
+                raise ValueError("H3 requires a sampler/scheduler installed in native Comfy")
+            if self.h3_refine_sampler is not None and self.h3_refine_sampler not in H3_SAMPLERS:
+                raise ValueError("Unknown H3 refinement sampler")
+            if self.h3_refine_scheduler not in H3_SCHEDULERS:
+                raise ValueError("Unknown H3 refinement scheduler")
             if self.h3_save_base_video and not self.match_source_resolution:
                 raise ValueError("base-video diagnostics require H3 source-size delivery")
             if len({item.artifact_id for item in self.h3_loras}) != len(self.h3_loras):
@@ -228,9 +266,6 @@ class GenerationSettings(_StrictModel):
                 self.frame_count % 17 != 5
                 or not 124 <= self.frame_count <= 362
                 or self.fps != 24
-                or self.steps not in {4, 8}
-                or self.scheduler != "simple"
-                or self.cfg != 1
                 or self.width % 32
                 or self.height % 32
                 or (not self.match_source_resolution and self.width * self.height > 768 * 1344)
@@ -238,7 +273,7 @@ class GenerationSettings(_StrictModel):
             ):
                 raise ValueError(
                     "MiniMax H3 requires 17n+5 frames (124-362), 24 fps, "
-                    "4 or 8 steps, Euler/simple, CFG 1 and 32-aligned dimensions up to 2048; "
+                    "and 32-aligned dimensions up to 2048; "
                     "standard mode uses a canvas up to 1.03 MP"
                 )
             if self.loras or self.face_fidelity != "off" or self.loop or self.upscale != "none":
@@ -246,14 +281,22 @@ class GenerationSettings(_StrictModel):
                     "MiniMax H3 does not use WAN LoRAs, face locking, loops or upscaling"
                 )
             return self
+        if self.h3_model_variant is not None:
+            raise ValueError("H3 model variants require MiniMax H3")
+        from gen_automation.i2v_worker.h3_sampling import H3_EXPERT_DEFAULTS
+
+        if any(getattr(self, name) != value for name, value in H3_EXPERT_DEFAULTS.items()):
+            raise ValueError("H3 sampling controls require MiniMax H3")
+        if self.cfg <= 0:
+            raise ValueError("WAN CFG must be positive")
         if self.h3_save_base_video:
             raise ValueError("base-video diagnostics require MiniMax H3")
         if self.match_source_resolution:
             raise ValueError("original-resolution generation requires MiniMax H3")
         if self.h3_loras:
             raise ValueError("H3 LoRAs require the MiniMax H3 profile")
-        if self.scheduler != "linear_quadratic":
-            raise ValueError("WAN requires the linear_quadratic scheduler")
+        if self.scheduler != "linear_quadratic" or self.sampler != "euler":
+            raise ValueError("WAN requires Euler with the linear_quadratic scheduler")
         if self.frame_count % 8 != 1:
             raise ValueError("frame count must be 8n+1")
         if self.width % 32 or self.height % 32:
