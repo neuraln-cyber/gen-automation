@@ -136,7 +136,7 @@ def test_cfg_and_independent_refinement_settings_reach_actual_graph():
     assert graph["h3-source-upscale"]["inputs"]["cfg"] == 1.8
     assert graph["h3-source-upscale"]["inputs"]["sampler"] == ["h3-refine-sampler", 0]
     assert graph["h3-refine-sampler"]["inputs"]["sampler_name"] == "euler"
-    assert graph["1"]["inputs"]["mode"] == "REF2VA"
+    assert graph["1"]["inputs"]["mode"] == "I2VA"
     assert graph["15"]["inputs"]["samples"] == ["12", 0]
 
 

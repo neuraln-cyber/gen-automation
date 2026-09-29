@@ -148,6 +148,20 @@ def render_workflow(
         if not model_paths:
             raise WorkflowError("MiniMax model bindings are missing")
         values.update({f"model.{role}": path for role, path in model_paths.items()})
+        # Let the unmodified creator builder produce the I2VA first-frame
+        # alignment and official sections. An external prompt override bypasses
+        # that builder; plain legacy widget text is otherwise migrated to Simple.
+        values["prompt.h3_builder"] = json.dumps(
+            {
+                "version": 1,
+                "mode": "I2VA",
+                "prompt_mode": "structured",
+                "imd": values["prompt.positive"],
+                "soundscape": "",
+                "music": "N/A",
+            },
+            separators=(",", ":"),
+        )
     rendered = _replace(copy.deepcopy(template), values)
     if _contains_placeholder(rendered):
         raise WorkflowError("workflow template contains an unresolved binding")

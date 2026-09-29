@@ -13,9 +13,12 @@ This is the non-Turbo checkpoint, not the separate INT4 download.
 The creator's non-distilled recommendations are RES Multistep/simple or
 Euler/simple, 20–25 steps, video shift10–12 and audio shift3–5. Defaults use
 RES Multistep/simple, 20 steps, video12/audio4; CFG1 retains the author's
-BasicGuider. Keep the existing author REF2VA environment, Basic LoRA stack,
+BasicGuider. Use the creator's single-image **I2VA** mode in the FL2VA family,
+with the existing author environment, Basic LoRA stack,
 exact encoder, both VAEs and latent upscaler. No Turbo distillation LoRA was
 silently added or removed; owner-selected LoRA files/order/strengths are unchanged.
+The version description explicitly identifies this Hybrid checkpoint as
+REF2VA + FL2VA compatible: the mode switch needs no replacement weights.
 
 The [Turbo source manifest](../i2v-models/dasiwa-minimax-h3-turbo-v2.sources.json)
 is retained verbatim for rollback. The normal manifest changes only diffusion.
@@ -38,7 +41,7 @@ combinations can produce poor output, take much longer or run out of memory.
 For CFG !=1, the graph uses native CFGGuider with native CLIPTextEncode for the
 negative prompt, through the same creator-selected CLIP. Blank text is encoded
 as blank negative conditioning, not replaced with the positive embedding. Base
-REF2VA positive conditioning remains the creator DirectorGuide output. The real
+I2VA positive conditioning remains the creator DirectorGuide output. The real
 upstream refiner receives its own CFG and negative conditioning when needed;
 without the negative connection it would silently use CFG1. At CFG1 the original
 BasicGuider path is unchanged and the negative prompt has no effect on that pass.
@@ -72,6 +75,8 @@ activation. Never bypass a failed CDN read by switching delivery to direct S3.
 The operator receipt documents the root-only rollback snapshot. Roll back the
 worker image, private model manifest and recipe flags together at an idle boundary;
 do not restore old provider credentials, overwrite unrelated environment changes,
-or blindly restore a whole IAM policy. Keep normal and Turbo objects/versions and
-exact read grants so either binding remains recoverable. No test jobs or GPU
+or blindly restore a whole IAM policy. The owner subsequently requested deletion
+of stored Turbo weights; its retained provenance does not imply a cached rollback.
+Rolling back the I2VA mode switch uses the previous normal-V2 worker image and
+does not require Turbo. No test jobs or GPU
 start/stop/reallocation is part of numerical/CI validation.
