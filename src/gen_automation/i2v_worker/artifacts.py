@@ -16,6 +16,7 @@ from typing import Any
 import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
+from urllib3.exceptions import SSLError as URLLib3SSLError
 
 from gen_automation.domain.private_delivery import PrivateDeliveryRoute
 from gen_automation.i2v_worker.models import ModelObject
@@ -222,12 +223,30 @@ class S3ModelBootstrapper:
                 return data
             except ModelBootstrapError:
                 raise
-            except (BotoCoreError, ClientError, OSError):
-                if attempt + 1 >= self.settings.network_attempts:
+            except (BotoCoreError, ClientError, OSError, URLLib3SSLError) as error:
+                # StreamingBody only wraps urllib3 timeout/protocol errors. TLS
+                # errors during body.read escape botocore's request retries and
+                # are not OSError subclasses. Retry this exact version/range;
+                # no bytes are yielded/appended until the entire range passes.
+                # Never include exception text: it can contain signed URLs.
+                exhausted = attempt + 1 >= self.settings.network_attempts
+                _LOGGER.warning(
+                    "i2v_model_range_%s role=%s start=%d end=%d "
+                    "attempt=%d attempts=%d error_type=%s",
+                    "failed" if exhausted else "retry",
+                    model.role,
+                    start,
+                    end,
+                    attempt + 1,
+                    self.settings.network_attempts,
+                    type(error).__name__,
+                )
+                if exhausted:
                     raise ModelBootstrapError("model bootstrap failed") from None
-                time.sleep(min(2**attempt, 16))
             finally:
                 if body is not None:
                     with suppress(Exception):
                         body.close()
+            # Release the failed stream/connection before waiting for a retry.
+            time.sleep(min(2**attempt, 16))
         raise ModelBootstrapError("model bootstrap failed")
