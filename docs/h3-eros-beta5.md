@@ -1,6 +1,6 @@
 # Eros Beta 5 deployment contract
 
-Active recipe: `eros_beta5`, native single-image REF2VA. This is a reviewed
+Active recipe: `eros_beta5`, native single-image REF2VA with an optional frame-zero guide. This is a reviewed
 integration of the creator's checkpoint/settings with native Comfy reference
 conditioning, not a claim that an Eros-authored workflow JSON was reproduced.
 
@@ -24,10 +24,24 @@ conditioning, not a claim that an Eros-authored workflow JSON was reproduced.
 
 [Pinned official native REF2VA template](https://github.com/Comfy-Org/workflow_templates/blob/e7cd011d4ded3411c2f481200544f0be6fdc962e/templates/video_minimax_h3_r2v.json)
 defines reference image/VAE/CLIP conditioning and joint video/audio sampling.
-The creator's reference-style advice appears in the historical Beta3 section,
-not as a separately verified Beta5 requirement. Native REF2VA is our conservative
-hybrid integration choice. The image is a reference, **not a forced first frame**.
-Prompt with `<Picture 1>`; there is no hidden prompt-builder rewrite.
+The [creator's clarification](https://huggingface.co/TenStrip/10Eros-Max/discussions/50)
+recommends reference-style prompting even for image-to-video. Prompt with
+`<Picture 1>`; there is no hidden prompt-builder rewrite.
+
+The dashboard's **Animate this image** mode combines this reference conditioning
+with native `MiniMaxH3AddGuide` at frame zero. The reference remains original-size;
+a separate guide contains the whole source fitted to the base canvas with edge
+padding, avoiding AddGuide's implicit center crop. It is a VAE conditioning guide,
+not a pasted first frame or a guarantee of unchanged style in later frames.
+The optional 2D direction button inserts visible, editable positive-prompt text
+only when clicked. Neither this prompt preset nor the combined conditioning mode
+is claimed as an Eros creator-certified recipe or a proven visual-quality fix.
+
+Historical snapshots without `h3_image_mode` remain `reference` (no forced first
+frame). Saved drafts/presets retain that behavior; choose `first_frame` explicitly
+to opt in. Fresh forms default to the guide only after the operator enables
+`GEN_AUTOMATION_I2V_H3_FIRST_FRAME_ENABLED` on the matching worker cutover. The API rejects the
+new mode until then, keeping control-plane-first deployments safe.
 
 - Creator sampling recipe: RES Multistep/simple, 6–9 steps on Civitai (6–8 on HF).
   Default8steps, CFG1, denoise1. Keep native video12/audio3 shifts; these are native
@@ -53,9 +67,16 @@ Off by default. Match-original-size uses the pinned H3 latent upscaler and
 Starting preset4steps/CFG1/denoise0.2/simple, same sampler as generation. This is
 an engineering starting point, **not an Eros creator-certified upscale preset**.
 Reference conditioning retains its own native dimensions across temporal/spatial
-tiles; audio is frozen/preserved. No FILM/interpolation, sharpening postfilter,
-FL2VA keyframe conversion or hidden strength changes. Before/after diagnostics
+tiles; in first-frame mode, the guide is also carried into upstream keyframe
+resize/crop/temporal handling. Audio is frozen/preserved. No FILM/interpolation,
+sharpening postfilter or hidden strength changes. Before/after diagnostics
 remain optional. It cannot guarantee recovering original image detail.
+
+Explicit refinement counts, including one step, survive controller-to-worker
+serialization unchanged. The controller must not omit `1` for Eros, whose missing
+value defaults to `4`. The dashboard shows the actual selected refinement count;
+Restore model sampling defaults restores four without changing prompts or LoRAs.
+Outputs identify the Eros workflow, conditioning mode and effective refine count.
 
 ## Verification and safe cutover
 

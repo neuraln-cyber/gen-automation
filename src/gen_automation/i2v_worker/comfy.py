@@ -57,6 +57,7 @@ class ComfyClient:
                 for name in (
                     "MiniMaxH3ImageToVideo",
                     "MiniMaxH3ReferenceToVideo",
+                    "MiniMaxH3AddGuide",
                     "LoadImage",
                     "UNETLoader",
                     "CLIPLoader",

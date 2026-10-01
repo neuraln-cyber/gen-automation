@@ -1131,7 +1131,13 @@ def _worker_settings_snapshot(settings: Mapping[str, object]) -> dict[str, objec
     snapshot = dict(settings)
     if snapshot.get("h3_model_variant") in (None, "turbo_v2"):
         snapshot.pop("h3_model_variant", None)
+    if snapshot.get("h3_image_mode", "reference") == "reference":
+        snapshot.pop("h3_image_mode", None)
     for name, default in H3_EXPERT_DEFAULTS.items():
+        # Eros fills an omitted refinement count with 4, so dropping an
+        # explicitly requested 1 here would silently change the owner's job.
+        if name == "h3_refine_steps" and snapshot.get("h3_model_variant") == "eros_beta5":
+            continue
         if snapshot.get(name, default) == default:
             snapshot.pop(name, None)
     if not snapshot.get("h3_loras"):

@@ -1,6 +1,7 @@
 """Pinned native Eros REF2VA/LoRA/refinement CPU contract; no model weights/jobs."""
 
 import hashlib
+import itertools
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,10 +46,13 @@ def verify_eros_workflow(nodes, template_path=None, reference_path=None):
     )
     paths = {role: identity[2] for role, identity in H3_EROS_MODELS.items()}
     paths[H3_UPSCALER_ROLE] = H3_UPSCALER_FILENAME
-    for upscale, cfg in ((False, 1), (False, 2.5), (True, 1), (True, 2.5)):
+    for mode, upscale, cfg in itertools.product(
+        ("reference", "first_frame"), (False, True), (1, 2.5)
+    ):
         settings = GenerationSettings(
             profile="minimax_h3",
             h3_model_variant="eros_beta5",
+            h3_image_mode=mode,
             seed=0,
             width=1152 if upscale else 768,
             height=1504 if upscale else 992,
@@ -61,6 +65,7 @@ def verify_eros_workflow(nodes, template_path=None, reference_path=None):
         graph, seed, _ = render_workflow(
             template,
             input_filename="contract.png",
+            guide_filename="guide.png" if mode == "first_frame" else None,
             positive_prompt="<Picture 1> moves.",
             negative_prompt="blur",
             settings=settings,
@@ -74,6 +79,8 @@ def verify_eros_workflow(nodes, template_path=None, reference_path=None):
         assert graph["7"]["inputs"]["model"] == ["h3-lora-0", 0]
         assert graph["11"]["inputs"]["model"] == graph["9"]["inputs"]["model"] == ["7", 0]
         assert graph["11"]["inputs"]["steps"] == 8
+        conditioning = ["h3-first-frame", 0] if mode == "first_frame" else ["6", 0]
+        assert graph["9"]["inputs"]["positive" if cfg != 1 else "conditioning"] == conditioning
         for node in graph.values():
             cls = registry[node["class_type"]]
             spec = cls.INPUT_TYPES()
@@ -91,7 +98,7 @@ def verify_eros_workflow(nodes, template_path=None, reference_path=None):
                     )
         if upscale:
             assert graph["h3-source-upscale"]["inputs"]["model"] == ["7", 0]
-            assert graph["h3-source-upscale"]["inputs"]["conditioning"] == ["6", 0]
+            assert graph["h3-source-upscale"]["inputs"]["conditioning"] == conditioning
             assert graph["h3-refine-sigmas"]["inputs"]["steps"] == 4
             temporal = registry["MMH3TemporalSplitParams"].execute(
                 **graph["h3-temporal-params"]["inputs"]
@@ -99,7 +106,9 @@ def verify_eros_workflow(nodes, template_path=None, reference_path=None):
             spatial = registry["MMH3SpatialSplitParams"].execute(
                 **graph["h3-spatial-params"]["inputs"]
             )[0]
-            verify_upstream_tile_layout(registry, temporal, spatial, first_frame=False)
+            verify_upstream_tile_layout(
+                registry, temporal, spatial, first_frame=mode == "first_frame", keep_reference=True
+            )
     clip = Mock()
     clip.encode_from_tokens_scheduled.return_value = [[torch.ones(1, 2, 8), {}]]
     vae = SimpleNamespace(
@@ -129,6 +138,14 @@ def verify_eros_workflow(nodes, template_path=None, reference_path=None):
         (1, 24, 37, 62, 48),
         (1, 32, 2, 207),
     ]
+    guided = registry["MiniMaxH3AddGuide"].execute(
+        cond, latent, 0, vae=vae, image=torch.full((1, 992, 768, 3), 0.5)
+    )[0]
+    assert "minimax_keyframes" not in cond[0][1]  # input/reference branch unmodified
+    assert guided[0][1]["minimax_refs"] == cond[0][1]["minimax_refs"]
+    anchor = guided[0][1]["minimax_keyframes"]
+    assert len(anchor) == 1 and anchor[0]["resolved_frame_index"] == 0
+    assert anchor[0]["latent"].shape == (1, 24, 1, 62, 48)
     verify_native_lora_and_schedule(nodes)
     print(
         "Eros native REF2VA/schema/AV/LoRA/refinement CPU contracts passed; "

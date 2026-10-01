@@ -121,6 +121,7 @@ def render_workflow(
     template: dict[str, Any],
     *,
     input_filename: str,
+    guide_filename: str | None = None,
     positive_prompt: str,
     negative_prompt: str,
     settings: GenerationSettings,
@@ -219,6 +220,30 @@ def render_workflow(
             }
         if settings.match_source_resolution:
             rendered = _inject_h3_upscale(rendered, settings, model_paths or {})
+        if settings.h3_image_mode == "first_frame":
+            if not guide_filename:
+                raise WorkflowError("first-frame guidance requires the fitted guide image")
+            # Keep native REF2VA text/image conditioning. AddGuide copies that
+            # conditioning and adds a frame-zero VAE guide; it does not replace
+            # refs, paste pixels, change denoise or patch model weights.
+            rendered["h3-guide-image"] = {
+                "class_type": "LoadImage",
+                "inputs": {"image": guide_filename},
+            }
+            rendered["h3-first-frame"] = {
+                "class_type": "MiniMaxH3AddGuide",
+                "inputs": {
+                    "positive": ["6", 0],
+                    "latent": ["6", 1],
+                    "vae": ["4", 0],
+                    "image": ["h3-guide-image", 0],
+                    "frame_idx": 0,
+                },
+            }
+            conditioning_key = "positive" if settings.cfg != 1 else "conditioning"
+            rendered["9"]["inputs"][conditioning_key] = ["h3-first-frame", 0]
+            if "h3-source-upscale" in rendered:
+                rendered["h3-source-upscale"]["inputs"]["conditioning"] = ["h3-first-frame", 0]
         if settings.h3_save_base_video:
             rendered["h3-base-decode"] = {
                 "class_type": "ManagedH3DiagnosticDecode",

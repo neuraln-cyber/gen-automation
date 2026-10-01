@@ -35,12 +35,13 @@ def eros(**updates):
     return GenerationSettings(profile="minimax_h3", h3_model_variant="eros_beta5", **updates)
 
 
-def graph(settings=None, template=TEMPLATE):
+def graph(settings=None, template=TEMPLATE, guide_filename=None):
     paths = {role: value[2] for role, value in H3_EROS_MODELS.items()}
     paths[H3_UPSCALER_ROLE] = H3_UPSCALER_FILENAME
     return render_workflow(
         load_workflow_template(template, profile="minimax_h3"),
         input_filename="image.png",
+        guide_filename=guide_filename,
         positive_prompt="<Picture 1> moves.",
         negative_prompt="blur",
         settings=settings or eros(),
@@ -169,6 +170,91 @@ def test_ref_graph_has_no_first_frame_builder_or_extra_turbo_lora():
     assert not any("DaSiWa" in n["class_type"] or "Lora" in n["class_type"] for n in g.values())
     assert g["2"]["inputs"]["unet_name"] == H3_EROS_MODELS["diffusion_model"][2]
     assert g["11"]["inputs"]["steps"] == 8
+
+
+@pytest.mark.parametrize("cfg", [1, 2.5])
+@pytest.mark.parametrize("upscale", [False, True])
+def test_first_frame_preserves_reference_and_both_passes(cfg, upscale):
+    settings = eros(
+        h3_image_mode="first_frame",
+        cfg=cfg,
+        match_source_resolution=upscale,
+        width=1152 if upscale else 768,
+        height=1504 if upscale else 992,
+        h3_refine_steps=1,
+    )
+    g = graph(settings, guide_filename="guide.png")
+    assert g["1"]["inputs"]["image"] == "image.png"
+    assert g["6"]["inputs"]["ref_images.ref_image_0"] == ["1", 0]
+    assert g["6"]["inputs"]["prompt"] == "<Picture 1> moves."
+    assert g["h3-guide-image"]["inputs"]["image"] == "guide.png"
+    assert g["h3-first-frame"] == {
+        "class_type": "MiniMaxH3AddGuide",
+        "inputs": {
+            "positive": ["6", 0],
+            "latent": ["6", 1],
+            "vae": ["4", 0],
+            "image": ["h3-guide-image", 0],
+            "frame_idx": 0,
+        },
+    }
+    assert g["9"]["inputs"]["positive" if cfg != 1 else "conditioning"] == ["h3-first-frame", 0]
+    assert g["12"]["inputs"]["latent_image"] == ["6", 1]
+    assert g["11"]["inputs"]["denoise"] == 1
+    if upscale:
+        assert g["h3-source-upscale"]["inputs"]["conditioning"] == ["h3-first-frame", 0]
+        assert g["h3-refine-sigmas"]["inputs"]["steps"] == 1
+    else:
+        assert "h3-source-upscale" not in g
+
+
+def test_first_frame_fails_closed_without_prepared_guide():
+    with pytest.raises(WorkflowError, match="fitted guide"):
+        graph(eros(h3_image_mode="first_frame"))
+    for variant in (None, "turbo_v2", "hybrid_v2", "fl2va_int8"):
+        with pytest.raises(ValidationError, match="requires Eros"):
+            GenerationSettings(
+                profile="minimax_h3", h3_model_variant=variant, h3_image_mode="first_frame"
+            )
+
+
+@pytest.mark.parametrize("steps", [1, 4, 9])
+@pytest.mark.parametrize("mode", ["reference", "first_frame"])
+def test_job_snapshot_roundtrip_never_changes_refinement_count_or_image_mode(steps, mode):
+    from gen_automation.services.i2v_runtime import _worker_settings_snapshot
+
+    saved = _normalized_settings(
+        {
+            "profile": "minimax_h3",
+            "h3_model_variant": "eros_beta5",
+            "h3_image_mode": mode,
+            "h3_refine_steps": steps,
+        }
+    )
+    payload = _worker_settings_snapshot(saved)
+    actual = GenerationSettings.model_validate(payload)
+    assert actual.h3_image_mode == mode and actual.h3_refine_steps == steps
+    assert ("h3_image_mode" in payload) == (mode == "first_frame")
+    assert eros().h3_image_mode == "reference"
+
+
+def test_first_frame_gate_requires_worker_activation(client):
+    from fastapi import HTTPException
+
+    from gen_automation.api.routes.i2v import _validate_generation_profile
+
+    config = client.app.state.settings
+    config.i2v_profile = "minimax_h3"
+    config.i2v_h3_model_variant = "eros_beta5"
+    config.i2v_h3_advanced_sampling_enabled = True
+    values = eros(h3_image_mode="first_frame").model_dump(mode="json")
+    with pytest.raises(HTTPException, match="matching Eros worker"):
+        _validate_generation_profile(config, values, "")
+    config.i2v_h3_first_frame_enabled = True
+    _validate_generation_profile(config, values, "")
+    page = client.get("/dashboard/animations").text
+    assert 'value="first_frame" selected' in page
+    assert "data-eros-style-preset" in page
 
 
 def test_loras_once_for_both_passes_with_preserved_strengths_and_ref_conditioning():
