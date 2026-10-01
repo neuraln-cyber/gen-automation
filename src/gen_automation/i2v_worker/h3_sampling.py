@@ -58,6 +58,10 @@ H3_SCHEDULERS = (
     "linear_quadratic",
     "kl_optimal",
 )
+# Eros' published style-preservation recipe. beta57 is NOT stock beta:
+# RES4LYF uses native beta_scheduler(alpha=0.5, beta=0.7). We compose the
+# installed native BetaSamplingScheduler/SplitSigmas nodes; no plugin patch.
+H3_EROS_SCHEDULERS = (*H3_SCHEDULERS, "beta57")
 
 # Omit these unchanged defaults from payloads sent during control-plane-first
 # rollout. Old strict workers must continue accepting their existing Turbo jobs.

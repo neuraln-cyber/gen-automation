@@ -489,6 +489,7 @@ async def _run_job(
             output_metadata["face_stabilization"] = face_metadata
         if generation_settings.h3_model_variant == "eros_beta5":
             output_metadata["h3_image_mode"] = generation_settings.h3_image_mode
+            output_metadata["h3_attention_backend"] = generation_settings.h3_attention_backend
             output_metadata["h3_refine_steps"] = generation_settings.h3_refine_steps
         if base_result is not None:
             output_metadata["h3_base_video"] = base_result.model_dump(mode="json")

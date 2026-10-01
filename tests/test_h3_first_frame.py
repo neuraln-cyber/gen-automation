@@ -130,20 +130,23 @@ def test_visible_prompt_preset_and_legacy_mode_are_not_silent_rewrites():
     script = r"""
 const assert=require("node:assert/strict"), fs=require("node:fs"), vm=require("node:vm");
 const source=fs.readFileSync("src/gen_automation/static/i2v.js", "utf8");
-const fields={h3_image_mode:{},h3_refine_steps:{},seed:{}};
-let selected, handler, saved=0;
-const context=vm.createContext({isH3:true,h3ModelVariant:"eros_beta5",CSS:{escape:s=>s},
+const fields={h3_image_mode:{},h3_attention_backend:{},h3_refine_steps:{},seed:{}};
+let selected, handler, saved=0, errorMessage;
+const context=vm.createContext({window:{},isH3:true,h3ModelVariant:"eros_beta5",CSS:{escape:s=>s},
   workerSettingDefaults:{h3_refine_steps:4,h3_loras:[],seed:-1},
   advanced:{querySelector:s=>fields[s.match(/name="(.+)"/)[1]]},
   setLoraSelections:v=>selected=v,syncAspectControls:()=>{},updateDuration:()=>{},
   q:()=>({addEventListener:(_,fn)=>handler=fn}),
   form:{elements:{positive_prompt:{
-    value:"[integrated_multimodal_description]\nGentle motion.",focus:()=>{}}}},
-  syncLoraPromptPreview:()=>{}, scheduleDraftSave:()=>saved++,announce:()=>{}});
+    value:"Gentle motion.",maxLength:100000,focus:()=>{}}}},
+  syncLoraPromptPreview:()=>{}, scheduleDraftSave:()=>saved++,
+  announce:(text,error)=>{if(error)errorMessage=text;}});
+vm.runInContext(fs.readFileSync("src/gen_automation/static/eros_prompt.js", "utf8"),context);
 vm.runInContext(source.slice(source.indexOf("  function applySettings("),
   source.indexOf("  function sourceNativeDimensions(")),context);
 vm.runInContext('applySettings({h3_refine_steps:1,seed:42,h3_loras:[{strength:0.4}]})',context);
 assert.equal(fields.h3_image_mode.value,"reference");
+assert.equal(fields.h3_attention_backend.value,"default");
 assert.equal(fields.h3_refine_steps.value,"1");assert.equal(fields.seed.value,"42");
 assert.equal(selected[0].strength,0.4);
 vm.runInContext('applySettings({h3_image_mode:"first_frame"})',context);
@@ -153,9 +156,14 @@ const end=source.indexOf('  form.addEventListener("input"',start);
 vm.runInContext(source.slice(start,end),context);
 assert.equal(saved,0);handler();
 const once=context.form.elements.positive_prompt.value;
-assert(once.startsWith("[integrated_multimodal_description]\nPreserve"));
-assert(once.endsWith("Gentle motion."));assert(once.includes("<Picture 1>"));
+assert(once.startsWith("[subject_definitions]"));
+assert(once.includes("Gentle motion."));assert(once.includes("<Picture 1>"));
+assert(once.includes("[detailed_description]"));
 handler();assert.equal(context.form.elements.positive_prompt.value,once);
 assert.equal(saved,2);
+const partial="[integrated_multimodal_description]\nGentle motion.";
+context.form.elements.positive_prompt.value=partial;
+handler();assert.equal(context.form.elements.positive_prompt.value,partial);
+assert.equal(saved,2);assert(errorMessage.includes("not rewritten"));
 """
     subprocess.run([node, "-e", script], cwd=ROOT, check=True, capture_output=True, text=True)  # noqa: S603

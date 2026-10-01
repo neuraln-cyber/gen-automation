@@ -4,6 +4,47 @@ Active recipe: `eros_beta5`, native single-image REF2VA with an optional frame-z
 integration of the creator's checkpoint/settings with native Comfy reference
 conditioning, not a claim that an Eros-authored workflow JSON was reproduced.
 
+## Author evidence reviewed 2026-10-01
+
+- [TenStrip's direct workflow answer](https://civitai.red/models/2851079/h3-eros-max?dialog=commentThread&commentId=1347310&highlight=1347617):
+  he uses the default ComfyUI templates, with comfy-kitchen attention, manual
+  dimensions and input-image cropping for I2V instead of megapixel sizing. He
+  says a workflow for a future FAST VSA version will be added later. That future
+  version is not a dependency or instruction to change this Beta5 deployment.
+- [Current Beta5 description](https://civitai.red/models/2851079/h3-eros-max?modelVersionId=3294059)
+  explicitly favors `er_sde/beta57`, 4–6 steps, for style preservation/reduced
+  drift. `res_multistep/simple`, 6–9, remains another supported motion recipe.
+  Do not mix Beta2/Beta3/Beta4 historical settings into Beta5 defaults.
+- [Author clarification on reference prompts](https://huggingface.co/TenStrip/10Eros-Max/discussions/50)
+  recommends reference prompting including subject definitions even for I2V.
+- Creator examples [142064411](https://civitai.red/images/142064411) and
+  [142066607](https://civitai.red/images/142066607) identify Beta5/reference usage
+  and respectively 6/8 steps. Their visible metadata does not provide a complete
+  graph or sampler/scheduler, so it does not prove our graph is identical.
+- The reviewed release/repository supplies no separate Eros-authored H3 JSON.
+  The workflow found and used is the official Comfy REF2VA template linked below,
+  with the author's explicitly documented checkpoint and sampling substitutions.
+  Community reports of drawn-style drift are observations, not causal proof.
+
+`GEN_AUTOMATION_I2V_H3_EROS_AUTHOR_RECIPE_ENABLED` remains false until the exact
+capable worker is activated. Opening it selects **native REF2VA, er_sde/beta57,
+6 steps, Comfy Kitchen attention** for fresh forms. Six is within the author's
+4–6 range, not a claim he mandates six. Existing explicit settings, jobs and
+drafts remain unchanged; missing historical settings still deserialize to the
+old 8-step/simple/default-attention recipe. The API rejects new capabilities
+before activation. No extra Turbo, model/LoRA inventory or strength change.
+
+The actual scheduler uses native `BetaSamplingScheduler(alpha=0.5, beta=0.7)`:
+the [RES4LYF beta57 implementation](https://github.com/ClownsharkBatwing/RES4LYF/blob/main/sigmas.py)
+calls that same Comfy beta function with those exact parameters, not stock beta's
+0.6/0.6. Partial-denoise schedules use the same integer total-step expansion and
+tail slice via native `SplitSigmas`. Zero denoise remains an empty schedule.
+Real pinned native numerical tests verify exact equality. No RES4LYF monkeypatch
+or additional custom-node package is installed. Kitchen is an explicit native
+`ModelAttentionBackend` selection after the LoRAs and before SigmaShift; the
+worker rejects unavailable Kitchen attention instead of accepting its native
+silent PyTorch fallback. CPU tests do not prove GPU execution or visual quality.
+
 ## Model and runtime
 
 - [Creator model/version](https://civitai.red/models/2851079/h3-eros-max?modelVersionId=3294059):
@@ -28,30 +69,41 @@ The [creator's clarification](https://huggingface.co/TenStrip/10Eros-Max/discuss
 recommends reference-style prompting even for image-to-video. Prompt with
 `<Picture 1>`; there is no hidden prompt-builder rewrite.
 
-The dashboard's **Animate this image** mode combines this reference conditioning
+The dashboard's optional first-frame mode combines this reference conditioning
 with native `MiniMaxH3AddGuide` at frame zero. The reference remains original-size;
 a separate guide contains the whole source fitted to the base canvas with edge
 padding, avoiding AddGuide's implicit center crop. It is a VAE conditioning guide,
 not a pasted first frame or a guarantee of unchanged style in later frames.
-The optional 2D direction button inserts visible, editable positive-prompt text
-only when clicked. Neither this prompt preset nor the combined conditioning mode
-is claimed as an Eros creator-certified recipe or a proven visual-quality fix.
+The editable prompt helper uses the six-section
+[full-reference prompt guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md)
+recommended by the author: subject definitions, summary, retention analysis,
+detailed description, soundscape and music. Style precedes the first shot in
+`detailed_description`, not the base-mode `integrated_multimodal_description`.
+It retains the entered motion text, does not inspect the image or invent details,
+and never silently rewrites a prompt on submission. The owner must complete and
+review the scaffold. Existing structured prompts are kept intact. This is not
+an LLM enhancement or a claim that generic scaffold text guarantees fidelity.
 
 Historical snapshots without `h3_image_mode` remain `reference` (no forced first
 frame). Saved drafts/presets retain that behavior; choose `first_frame` explicitly
-to opt in. Fresh forms default to the guide only after the operator enables
+to opt in. The earlier first-frame release defaulted fresh forms to the guide after enabling
 `GEN_AUTOMATION_I2V_H3_FIRST_FRAME_ENABLED` on the matching worker cutover. The API rejects the
 new mode until then, keeping control-plane-first deployments safe.
+The author-recipe gate supersedes that fresh-form default with reference-only;
+the guide remains a clearly labelled optional native extension, not an Eros
+creator-endorsed fix. No saved first-frame request is silently changed.
 
-- Creator sampling recipe: RES Multistep/simple, 6–9 steps on Civitai (6–8 on HF).
-  Default8steps, CFG1, denoise1. Keep native video12/audio3 shifts; these are native
+- Earlier sampling preset: RES Multistep/simple, 6–9 steps on Civitai (6–8 on HF).
+  Legacy default8steps, CFG1, denoise1. Keep native video12/audio3 shifts; these are native
   model defaults, not independently published Eros shift recommendations.
-- The other suggested `er_sde/beta57` combination is not installed: `beta57` is
-  not silently replaced by native `beta`. All installed choices remain editable.
+- The author style preset exposes exact `er_sde/beta57` after guarded activation.
+  All existing sampling controls remain editable, not clamped to the recipe.
 - 24fps,17n+5frames,default124. Standard auto-aspect uses our 5090 budget of
   768-short-edge/1.03MP,32-grid,max2048. This is an application resource preset,
   not a creator-required resolution. Original reference pixels are passed to
-  native `ref_image_size=match` without FL2VA padding or prior downsampling.
+  native `ref_image_size=match` without FL2VA padding or prior downsampling. The
+  native node then scales reference conditioning to generation resolution; this
+  does not mean the model attends to full original-resolution pixels.
 - Native `LoraLoaderModelOnly` forwards metadata and original ordered strengths.
   The same patched model is reused for generation/refinement; no double loading,
   implicit multiplier, extra Turbo or CLIP adapter. Creator suggests modest

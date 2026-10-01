@@ -220,6 +220,8 @@ def render_workflow(
             }
         if settings.match_source_resolution:
             rendered = _inject_h3_upscale(rendered, settings, model_paths or {})
+        if settings.h3_model_variant == "eros_beta5":
+            _inject_eros_author_sampling(rendered, settings)
         if settings.h3_image_mode == "first_frame":
             if not guide_filename:
                 raise WorkflowError("first-frame guidance requires the fitted guide image")
@@ -384,6 +386,50 @@ def _inject_native_h3_loras(
         model = [node_id, 0]
     workflow["7"]["inputs"]["model"] = model
     return workflow
+
+
+def _inject_eros_author_sampling(workflow: dict[str, Any], settings: GenerationSettings) -> None:
+    """Author-selected backend and exact beta57 using unmodified native nodes."""
+    if settings.h3_attention_backend == "comfy_kitchen":
+        workflow["h3-kitchen"] = {
+            "class_type": "ModelAttentionBackend",
+            "inputs": {
+                "model": workflow["7"]["inputs"]["model"],
+                "attention": "comfy kitchen attention",
+            },
+        }
+        workflow["7"]["inputs"]["model"] = ["h3-kitchen", 0]
+    for node_id, consumer in (("11", "12"), ("h3-refine-sigmas", "h3-source-upscale")):
+        if node_id not in workflow:
+            continue
+        inputs = workflow[node_id]["inputs"]
+        if inputs["scheduler"] != "beta57":
+            continue
+        steps, denoise = inputs["steps"], inputs["denoise"]
+        if denoise <= 0:
+            # Native BasicScheduler returns an empty tensor before looking up
+            # its scheduler when denoise=0. No sampling or beta substitution.
+            inputs["scheduler"] = "simple"
+            continue
+        total_steps = int(steps / denoise) if denoise < 1 else steps
+        workflow[node_id] = {
+            "class_type": "BetaSamplingScheduler",
+            "inputs": {
+                "model": inputs["model"],
+                "steps": total_steps,
+                "alpha": 0.5,
+                "beta": 0.7,
+            },
+        }
+        if total_steps > steps:
+            # Exactly RES4LYF/BasicScheduler's sigmas[-(steps + 1):], not
+            # SplitSigmasDenoise's round(steps * denoise) approximation.
+            tail = f"{node_id}-tail"
+            workflow[tail] = {
+                "class_type": "SplitSigmas",
+                "inputs": {"sigmas": [node_id, 0], "step": total_steps - steps},
+            }
+            workflow[consumer]["inputs"]["sigmas"] = [tail, 1]
 
 
 def _inject_h3_upscale(

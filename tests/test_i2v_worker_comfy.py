@@ -6,7 +6,12 @@ from pathlib import Path
 import httpx2
 import pytest
 
-from gen_automation.i2v_worker.comfy import ComfyClient, ComfyMemoryError, ComfyUnhealthyError
+from gen_automation.i2v_worker.comfy import (
+    ComfyClient,
+    ComfyError,
+    ComfyMemoryError,
+    ComfyUnhealthyError,
+)
 
 
 async def _client(
@@ -26,6 +31,35 @@ async def _client(
         trust_env=False,
     )
     return client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("available", [False, True])
+async def test_eros_kitchen_never_silently_falls_back(tmp_path, available):
+    paths = []
+
+    def handler(request):
+        paths.append(request.url.path)
+        if request.url.path == "/object_info/ModelAttentionBackend":
+            choices = ["pytorch attention"] + (["comfy kitchen attention"] if available else [])
+            return httpx2.Response(
+                200,
+                json={"ModelAttentionBackend": {"input": {"required": {"attention": [choices]}}}},
+            )
+        assert available and request.url.path == "/prompt"
+        # Stop at submission; this is a transport contract, not a generation.
+        return httpx2.Response(200, json={})
+
+    client = await _client(handler)
+    try:
+        with pytest.raises(
+            ComfyError,
+            match="rejected the workflow" if available else "Kitchen attention is unavailable",
+        ):
+            await client.execute({"h3-kitchen": {"class_type": "ModelAttentionBackend"}}, tmp_path)
+    finally:
+        await client.close()
+    assert ("/prompt" in paths) == available
 
 
 @pytest.mark.asyncio

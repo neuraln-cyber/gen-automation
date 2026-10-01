@@ -1050,6 +1050,14 @@ def _validate_generation_profile(
             status_code=409,
             detail="Original-resolution generation is waiting for the matching H3 worker update.",
         )
+    if not settings.i2v_h3_eros_author_recipe_enabled and (
+        value.get("scheduler") == "beta57"
+        or value.get("h3_refine_scheduler") == "beta57"
+        or value.get("h3_attention_backend", "default") != "default"
+    ):
+        raise HTTPException(
+            status_code=409, detail="Eros author recipe awaits the matching worker update."
+        )
     try:
         parsed = GenerationSettings.model_validate(value)
     except ValidationError:
