@@ -207,11 +207,18 @@ class I2VRuntime:
 
         # Reconcile/cancel the oldest active attempt before adding provider work.
         for active in await self._active_attempts():
-            action = await self._advance_attempt(*active, now=timestamp)
+            action = await self._advance_attempt(
+                *active, now=timestamp, allow_submission=guard is None
+            )
             if action is not None:
                 return I2VRuntimeCycle(
                     action=action,
-                    changed=action not in {_RESTART_RECONCILIATION_WAITING, _REVIEWED_LORA_PAUSED},
+                    changed=action
+                    not in {
+                        _RESTART_RECONCILIATION_WAITING,
+                        _REVIEWED_LORA_PAUSED,
+                        "cost_guard_paused",
+                    },
                 )
 
         if guard is not None:
@@ -354,6 +361,7 @@ class I2VRuntime:
         attempt: I2VAttemptSnapshot,
         *,
         now: datetime,
+        allow_submission: bool = True,
     ) -> str | None:
         submission_key = _submission_key(job, attempt)
         remote = None
@@ -402,6 +410,8 @@ class I2VRuntime:
                         return "unsubmitted_cancellation_acknowledged"
                     if self._reviewed_lora_job_is_paused(job):
                         return _REVIEWED_LORA_PAUSED
+                    if not allow_submission:
+                        return "cost_guard_paused"
                     return await self._submit_existing(job, attempt, now=now)
             elif state == "prepared":
                 # A controller may have died after Salad accepted the POST but
@@ -432,6 +442,10 @@ class I2VRuntime:
                         return "unsubmitted_cancellation_acknowledged"
                     if self._reviewed_lora_job_is_paused(job):
                         return _REVIEWED_LORA_PAUSED
+                    # Reconcile the deterministic identity even during a hold,
+                    # but never submit to a worker undergoing replacement.
+                    if not allow_submission:
+                        return "cost_guard_paused"
                     return await self._submit_existing(job, attempt, now=now)
             else:
                 # Legacy/malformed fresh-lane rows fail closed: first persist the

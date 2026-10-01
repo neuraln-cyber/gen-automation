@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Any, Final, Literal
+from typing import Annotated, Any, Final, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, UrlConstraints, model_validator
 
 from gen_automation.i2v_worker.h3_upscale import (
     H3_UPSCALER_BYTES,
@@ -27,6 +27,15 @@ I2V_JOB_SCHEMA: Final = "i2v-job/v2"
 I2V_RESULT_SCHEMA: Final = "i2v-result/v2"
 _SAFE_OBJECT_KEY = re.compile(r"^[^\x00-\x1f\\]{1,1024}$")
 _MAX_LOOP_DURATION_SECONDS = 25
+
+# Temporary AWS credentials can push a valid presigned URL past HttpUrl's
+# browser-era 2083-character cap. Keep a bounded HTTP(S) contract; production
+# grant issuance and transport still enforce HTTPS separately.
+MAX_SIGNED_GRANT_URL_LENGTH: Final = 16_384
+SignedGrantUrl = Annotated[
+    AnyHttpUrl,
+    UrlConstraints(max_length=MAX_SIGNED_GRANT_URL_LENGTH),
+]
 
 
 class _StrictModel(BaseModel):
@@ -126,13 +135,13 @@ class InputSnapshot(_StrictModel):
 
 class DownloadGrant(_StrictModel):
     method: Literal["GET"]
-    url: HttpUrl
+    url: SignedGrantUrl
     expires_at: datetime
 
 
 class UploadGrant(_StrictModel):
     method: Literal["PUT"]
-    url: HttpUrl
+    url: SignedGrantUrl
     headers: dict[str, str]
     storage_backend: Literal["s3"]
     storage_bucket: str
