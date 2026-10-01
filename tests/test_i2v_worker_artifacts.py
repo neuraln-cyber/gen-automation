@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import ssl
 import threading
 from collections.abc import Callable
@@ -20,6 +21,14 @@ from urllib3.response import HTTPResponse
 from gen_automation.i2v_worker.artifacts import ModelBootstrapError, S3ModelBootstrapper
 from gen_automation.i2v_worker.models import ModelObject
 from gen_automation.i2v_worker.settings import I2VWorkerSettings
+
+
+@pytest.fixture(autouse=True)
+def _isolate_artifact_logger(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Alembic's migration test fileConfig disables existing loggers. Keep the
+    # downloader's failure/redaction assertions independent of suite ordering;
+    # production logging and all retry behavior assertions remain unchanged.
+    monkeypatch.setattr(logging.getLogger("gen_automation.i2v_worker.artifacts"), "disabled", False)
 
 
 class _Body(io.BytesIO):

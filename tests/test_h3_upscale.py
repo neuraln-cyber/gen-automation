@@ -22,6 +22,7 @@ from gen_automation.i2v_worker.h3_upscale import (
     H3_UPSCALER_SHA256,
     h3_base_canvas,
 )
+from gen_automation.i2v_worker.h3_variants import H3_TURBO_V2_SHA256
 from gen_automation.i2v_worker.manifest_contract import validated_i2v_manifest_objects
 from gen_automation.i2v_worker.models import ModelObject
 from gen_automation.i2v_worker.settings import I2VWorkerSettings
@@ -67,6 +68,7 @@ def _private_manifest(upscaler=True):
         for role, path in MODEL_PATHS.items()
         if role != H3_UPSCALER_ROLE
     ]
+    objects[0].update(sha256=H3_TURBO_V2_SHA256, key="worker/i2v/sha256/" + H3_TURBO_V2_SHA256)
     if upscaler:
         obj = _upscaler_object()
         obj["bytes"] = obj.pop("byte_size")

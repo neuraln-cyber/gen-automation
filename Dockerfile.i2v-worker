@@ -51,8 +51,8 @@ RUN go mod download \
 
 FROM pytorch/pytorch:2.9.1-cuda13.0-cudnn9-runtime@sha256:60f22fb80755fd0b470fb47928dbd55816aa9f847edd95cf43c93253507a9ddf
 
-LABEL org.opencontainers.image.title="gen-automation-dasiwa-i2v-worker" \
-      org.opencontainers.image.description="Model-free DaSiWa MiniMax H3 and legacy WAN image-to-video worker" \
+LABEL org.opencontainers.image.title="gen-automation-native-h3-i2v-worker" \
+      org.opencontainers.image.description="Model-free native MiniMax H3 Eros and legacy WAN worker" \
       org.opencontainers.image.source="https://github.com/neuraln-cyber/gen-automation" \
       org.opencontainers.image.comfyui.revision="73c9bad4d21e7addbe1d13bc92eee0f1431b017d" \
       org.opencontainers.image.runpod-sdk.version="1.11.0"
@@ -243,9 +243,14 @@ COPY src/gen_automation/i2v_worker ./src/gen_automation/i2v_worker
 COPY src/gen_automation/i2v_worker/comfy_h3_node.py /opt/comfyui/custom_nodes/GenAutomationH3/__init__.py
 COPY scripts/verify-h3-comfy-nodes.py /opt/i2v/bin/verify-h3-comfy-nodes.py
 COPY scripts/verify_h3_native_workflow.py /opt/i2v/bin/verify_h3_native_workflow.py
+COPY scripts/verify_h3_eros_workflow.py /opt/i2v/bin/verify_h3_eros_workflow.py
 COPY --chmod=0555 scripts/i2v-runpod-entrypoint.sh /opt/i2v/bin/i2v-runpod-entrypoint
 COPY workflows/dasiwa-wan22-i2v-v1.api.json ./workflows/dasiwa-wan22-i2v-v1.api.json
 COPY workflows/minimax-h3-native-i2v.api.json ./workflows/minimax-h3-native-i2v.api.json
+COPY workflows/minimax-h3-eros-ref2va.api.json ./workflows/minimax-h3-eros-ref2va.api.json
+ADD --checksum=sha256:afeea99e9fd5a1456df348e0573e289c1243f2f28546fc95c1c963f808d61ddb --chmod=0444 \
+    https://raw.githubusercontent.com/Comfy-Org/workflow_templates/e7cd011d4ded3411c2f481200544f0be6fdc962e/templates/video_minimax_h3_r2v.json \
+    /opt/i2v/reference/h3-native-r2v.json
 ADD --checksum=sha256:34ee39544808fd3b0dc8de9df082940d4d41c3771beb80d3988c1ea5531cec0d --chmod=0444 \
     https://raw.githubusercontent.com/Comfy-Org/workflow_templates/e7cd011d4ded3411c2f481200544f0be6fdc962e/templates/video_minimax_h3_i2v.json \
     /opt/i2v/reference/h3-native-i2v.json

@@ -3,7 +3,11 @@
 from collections.abc import Mapping
 from typing import Literal
 
-H3Variant = Literal["turbo_v2", "hybrid_v2", "fl2va_int8"]
+H3Variant = Literal["turbo_v2", "hybrid_v2", "fl2va_int8", "eros_beta5"]
+H3_TURBO_V2_SHA256 = "37c17fd91971c17e02e60798a05eec48d881e1bb970d6309f58cf134a2d03a6b"
+H3_EROS_SHA256 = "4dd965496e5b1b83cd13c65cbe7a535b8a4d94ae768a7646b4e336d52c4781cf"
+H3_EROS_BYTES = 20970414464
+H3_EROS_FILENAME = "10Eros_Max_h3_TURBO-hybrid_beta5_int8.safetensors"
 H3_NATIVE_SHA256 = "e889202c41dafb67b10d67b97f0d8541508036a6090af23425a5c2615d03c47a"
 H3_NATIVE_BYTES = 20970379616
 H3_NATIVE_FILENAME = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
@@ -27,6 +31,23 @@ H3_NATIVE_MODELS = {
         "minimax_h3_audio_vae_fp32.safetensors",
     ),
 }
+H3_EROS_MODELS = {
+    **H3_NATIVE_MODELS,
+    "diffusion_model": (H3_EROS_SHA256, H3_EROS_BYTES, H3_EROS_FILENAME),
+}
+
+
+def h3_eros_models_match(objects: Mapping[str, Mapping[str, object]]) -> bool:
+    """One reviewed Eros checkpoint, paired with the native H3 encoder and VAEs."""
+    return all(
+        (
+            objects.get(role, {}).get("sha256"),
+            objects.get(role, {}).get("bytes"),
+            objects.get(role, {}).get("target_filename"),
+        )
+        == identity
+        for role, identity in H3_EROS_MODELS.items()
+    )
 
 
 def h3_native_models_match(objects: Mapping[str, Mapping[str, object]]) -> bool:
@@ -50,6 +71,12 @@ def h3_job_matches_variant(settings: Mapping[str, object], variant: str) -> bool
 
 
 def h3_manifest_matches_variant(model: Mapping[str, object], variant: str) -> bool:
+    if variant == "eros_beta5":
+        return (
+            model.get("sha256") == H3_EROS_SHA256
+            and model.get("bytes") == H3_EROS_BYTES
+            and model.get("target_filename") == H3_EROS_FILENAME
+        )
     if variant == "fl2va_int8":
         return (
             model.get("sha256") == H3_NATIVE_SHA256
@@ -62,8 +89,5 @@ def h3_manifest_matches_variant(model: Mapping[str, object], variant: str) -> bo
             and model.get("bytes") == H3_NORMAL_V2_BYTES
             and model.get("target_filename") == H3_NORMAL_V2_FILENAME
         )
-    # Keep pre-existing manifests compatible, but never mistake normal V2 for Turbo.
-    return variant == "turbo_v2" and model.get("sha256") not in {
-        H3_NORMAL_V2_SHA256,
-        H3_NATIVE_SHA256,
-    }
+    # History may retain this legacy recipe, but an unknown model is never Turbo.
+    return variant == "turbo_v2" and model.get("sha256") == H3_TURBO_V2_SHA256

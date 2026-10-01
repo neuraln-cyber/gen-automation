@@ -94,12 +94,14 @@ class _Supervisor:
 
 @pytest.mark.parametrize("normal_worker", [False, True])
 def test_h3_worker_rejects_wrong_checkpoint_before_execution(tmp_path, monkeypatch, normal_worker):
-    from gen_automation.i2v_worker.h3_variants import H3_NORMAL_V2_SHA256
+    from gen_automation.i2v_worker.h3_variants import H3_NORMAL_V2_SHA256, H3_TURBO_V2_SHA256
     from gen_automation.i2v_worker.models import GenerationSettings
 
     settings = _settings(tmp_path, lora_worker_enabled=False)
     objects = json.loads(settings.model_objects_json.get_secret_value())
-    objects[0].update(role="diffusion_model", sha256=H3_NORMAL_V2_SHA256 if normal_worker else SHA)
+    objects[0].update(
+        role="diffusion_model", sha256=H3_NORMAL_V2_SHA256 if normal_worker else H3_TURBO_V2_SHA256
+    )
     objects[0]["key"] = f"worker/i2v/sha256/{objects[0]['sha256']}"
     settings = settings.model_copy(
         update={"profile": "minimax_h3", "model_objects_json": SecretStr(json.dumps(objects))}

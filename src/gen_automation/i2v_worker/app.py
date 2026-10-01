@@ -310,6 +310,12 @@ async def _run_job(
             width=generation_settings.width,
             height=generation_settings.height,
             **(
+                {"reference_image": True}
+                if generation_settings.profile == "minimax_h3"
+                and generation_settings.h3_model_variant == "eros_beta5"
+                else {}
+            ),
+            **(
                 {"preserve_source_resolution": True}
                 if generation_settings.match_source_resolution
                 else {}

@@ -92,14 +92,15 @@
     h3_save_base_video: false,
   });
   const h3SamplingDefaults = {
-    steps: ["hybrid_v2", "fl2va_int8"].includes(h3ModelVariant) ? 20 : 4, cfg: 1,
-    sampler: ["hybrid_v2", "fl2va_int8"].includes(h3ModelVariant) ? "res_multistep" : "euler", scheduler: "simple",
-    video_shift: ["hybrid_v2", "fl2va_int8"].includes(h3ModelVariant) ? 12 : 8,
-    audio_shift: h3ModelVariant === "fl2va_int8" ? 3 : 4,
-    h3_denoise: 1, h3_refine_steps: 1, h3_refine_cfg: 1, h3_refine_denoise: 0.2,
+    steps: h3ModelVariant === "eros_beta5" ? 8 : (["hybrid_v2", "fl2va_int8"].includes(h3ModelVariant) ? 20 : 4), cfg: 1,
+    sampler: ["hybrid_v2", "fl2va_int8", "eros_beta5"].includes(h3ModelVariant) ? "res_multistep" : "euler", scheduler: "simple",
+    video_shift: ["hybrid_v2", "fl2va_int8", "eros_beta5"].includes(h3ModelVariant) ? 12 : 8,
+    audio_shift: ["fl2va_int8", "eros_beta5"].includes(h3ModelVariant) ? 3 : 4,
+    h3_denoise: 1, h3_refine_steps: h3ModelVariant === "eros_beta5" ? 4 : 1, h3_refine_cfg: 1, h3_refine_denoise: 0.2,
     h3_refine_sampler: null, h3_refine_scheduler: "simple",
   };
   if (isH3 && h3AdvancedSamplingEnabled) Object.assign(workerSettingDefaults, h3SamplingDefaults);
+  if (isH3 && h3ModelVariant === "eros_beta5") Object.assign(workerSettingDefaults, {width: 768, height: 1344});
   let saveTimer = null;
 
   const q = (selector) => root.querySelector(selector);
@@ -421,6 +422,10 @@
 
   function sourceNativeDimensions(sourceWidth, sourceHeight) {
     if (!(sourceWidth > 0 && sourceHeight > 0)) return null;
+    if (isH3 && h3ModelVariant === "eros_beta5") {
+      const scale = Math.min(768 / Math.min(sourceWidth, sourceHeight), 2048 / Math.max(sourceWidth, sourceHeight), Math.sqrt(768 * 1344 / (sourceWidth * sourceHeight)));
+      return {width: Math.max(32, Math.floor(sourceWidth * scale / 32) * 32), height: Math.max(32, Math.floor(sourceHeight * scale / 32) * 32)};
+    }
     const sourceRatio = sourceWidth / sourceHeight;
     let best = null;
     for (let width = 32; width <= 1024; width += 32) {
@@ -851,8 +856,12 @@
       form.elements.negative_prompt.value = draft.negative_prompt || "";
       form.elements.batch_count.value = draft.batch_count || "1";
       const modelChanged = isH3 && (draft.settings?.h3_model_variant || "turbo_v2") !== h3ModelVariant;
-      applySettings(modelChanged ? { ...draft.settings, ...h3SamplingDefaults, h3_model_variant: h3ModelVariant } : (draft.settings || {}));
-      if (modelChanged) draftState.textContent = "New checkpoint: creator sampling defaults loaded. Your prompts and LoRAs were preserved; the old draft remains saved.";
+      const cleanEros = modelChanged && h3ModelVariant === "eros_beta5";
+      applySettings(cleanEros ? { ...workerSettingDefaults, h3_model_variant: h3ModelVariant }
+        : modelChanged ? { ...draft.settings, ...h3SamplingDefaults, h3_model_variant: h3ModelVariant } : (draft.settings || {}));
+      if (modelChanged) draftState.textContent = cleanEros
+        ? "Eros defaults loaded. Prompts preserved; select LoRAs explicitly for this model. The old model draft remains saved."
+        : "New checkpoint: creator sampling defaults loaded. Your prompts and LoRAs were preserved; the old draft remains saved.";
     } catch (_) { localStorage.removeItem(draftKey); }
   }
 
