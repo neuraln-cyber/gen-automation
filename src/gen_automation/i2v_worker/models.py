@@ -182,7 +182,7 @@ class H3LoraGrant(_StrictModel):
 
 class GenerationSettings(_StrictModel):
     profile: Literal["wan22", "minimax_h3"] = "wan22"
-    h3_model_variant: Literal["turbo_v2", "hybrid_v2", "fl2va_int8"] | None = None
+    h3_model_variant: Literal["turbo_v2", "hybrid_v2", "fl2va_int8", "eros_beta5"] | None = None
     frame_count: int = Field(default=81, ge=9)
     fps: int = Field(default=16, gt=0)
     width: int = Field(default=576, ge=32)
@@ -227,6 +227,25 @@ class GenerationSettings(_StrictModel):
     @model_validator(mode="before")
     @classmethod
     def normal_v2_defaults(cls, value: Any) -> Any:
+        if (
+            isinstance(value, dict)
+            and value.get("profile") == "minimax_h3"
+            and value.get("h3_model_variant") == "eros_beta5"
+        ):
+            return {
+                "steps": 8,
+                "cfg": 1.0,
+                "sampler": "res_multistep",
+                "scheduler": "simple",
+                "video_shift": 12.0,
+                "audio_shift": 3.0,
+                "fps": 24,
+                "frame_count": 124,
+                "width": 768,
+                "height": 1344,
+                "h3_refine_steps": 4,
+                **value,
+            }
         if (
             isinstance(value, dict)
             and value.get("profile") == "minimax_h3"

@@ -1,0 +1,14 @@
+{
+  "schema": "gen-automation/i2v-model-sources/v1",
+  "sources": [
+    {
+      "name": "H3 Eros Max Beta5 TURBO Hybrid INT8",
+      "role": "diffusion_model",
+      "url": "https://huggingface.co/TenStrip/10Eros-Max/resolve/8a198588c8870ab0d613b3492a3150d091c8c2dd/10Eros_Max_h3_TURBO-hybrid_beta5_int8.safetensors",
+      "expected_bytes": 20970414464,
+      "sha256": "4dd965496e5b1b83cd13c65cbe7a535b8a4d94ae768a7646b4e336d52c4781cf",
+      "target_filename": "10Eros_Max_h3_TURBO-hybrid_beta5_int8.safetensors",
+      "optional": false
+    }
+  ]
+}

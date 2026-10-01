@@ -65,6 +65,7 @@ _NATIVE_H3_NODE_CLASSES = {
     "6": "MiniMaxH3ImageToVideo",
     "8": "RandomNoise",
 }
+_EROS_H3_NODE_CLASSES = {**_NATIVE_H3_NODE_CLASSES, "6": "MiniMaxH3ReferenceToVideo"}
 
 _FACE_FIDELITY_POSITIVE = (
     "Facial identity and the source facial expression remain consistent throughout. "
@@ -103,6 +104,8 @@ def load_workflow_template(path: Path, *, profile: str = "wan22") -> dict[str, A
         and raw.get("1", {}).get("class_type") == "LoadImage"
     ):
         expected = _NATIVE_H3_NODE_CLASSES
+        if raw.get("6", {}).get("class_type") == "MiniMaxH3ReferenceToVideo":
+            expected = _EROS_H3_NODE_CLASSES
     if profile not in {"wan22", "minimax_h3"}:
         raise WorkflowError("workflow profile is invalid")
     if not isinstance(raw, dict) or set(raw) != set(expected):
@@ -125,11 +128,17 @@ def render_workflow(
     attempt_id: UUID,
     model_paths: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, Any], int, str]:
-    native_h3 = settings.profile == "minimax_h3" and settings.h3_model_variant == "fl2va_int8"
-    if settings.profile == "minimax_h3" and native_h3 != (
-        template.get("6", {}).get("class_type") == "MiniMaxH3ImageToVideo"
-    ):
-        raise WorkflowError("H3 workflow does not match the checkpoint variant")
+    native_h3 = settings.profile == "minimax_h3" and settings.h3_model_variant in {
+        "fl2va_int8",
+        "eros_beta5",
+    }
+    if settings.profile == "minimax_h3":
+        expected_conditioning = {
+            "fl2va_int8": "MiniMaxH3ImageToVideo",
+            "eros_beta5": "MiniMaxH3ReferenceToVideo",
+        }.get(settings.h3_model_variant or "turbo_v2", "MiniMaxH3DirectorGuide")
+        if template.get("6", {}).get("class_type") != expected_conditioning:
+            raise WorkflowError("H3 workflow does not match the checkpoint variant")
     seed = settings.seed if settings.seed >= 0 else secrets.randbelow(2**63)
     frame_prefix = f"i2v/{job_id}/{attempt_id}/frame"
     values: dict[str, object] = {
@@ -358,7 +367,7 @@ def _inject_h3_upscale(
     if model_paths.get(H3_UPSCALER_ROLE) != H3_UPSCALER_FILENAME:
         raise WorkflowError("source-size H3 delivery requires the pinned latent upscaler")
     base_width, base_height = h3_base_canvas(settings.width, settings.height)
-    native_h3 = settings.h3_model_variant == "fl2va_int8"
+    native_h3 = settings.h3_model_variant in {"fl2va_int8", "eros_beta5"}
     if native_h3:
         workflow["6"]["inputs"].update(width=base_width, height=base_height)
     else:

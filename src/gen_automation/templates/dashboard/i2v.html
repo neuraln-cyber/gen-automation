@@ -22,7 +22,7 @@
   >
     <header class="i2v-hero">
       <div class="i2v-hero-copy">
-        <p class="page-kicker">{{ ('MiniMax H3 FL2VA · INT8 Pruned' if h3_model_variant == 'fl2va_int8' else ('DaSiWa MiniMax H3 Hybrid V2 · non-Turbo' if h3_model_variant == 'hybrid_v2' else 'DaSiWa MiniMax H3 Turbo')) if video_profile == 'minimax_h3' else 'DaSiWa Wan 2.2' }} · {{ video_provider }}</p>
+        <p class="page-kicker">{{ ('H3 Eros Max Beta 5 · TURBO Hybrid INT8 · REF2VA' if h3_model_variant == 'eros_beta5' else ('MiniMax H3 FL2VA · INT8 Pruned' if h3_model_variant == 'fl2va_int8' else ('DaSiWa MiniMax H3 Hybrid V2 · non-Turbo' if h3_model_variant == 'hybrid_v2' else 'DaSiWa MiniMax H3 Turbo'))) if video_profile == 'minimax_h3' else 'DaSiWa Wan 2.2' }} · {{ video_provider }}</p>
         <h1>Image to video</h1>
         {% if video_profile == 'minimax_h3' %}
         <a class="secondary-button" href="/dashboard/loras?library=h3">Manage H3 LoRA files</a>
@@ -176,20 +176,20 @@
               <option value="362">15.08 seconds</option>
             </select><small>Lengths follow H3's native frame grid.</small></label>
             {% if h3_advanced_sampling_enabled %}
-            <label>Steps <input type="number" name="steps" value="{{ 20 if h3_model_variant in ['hybrid_v2', 'fl2va_int8'] else 4 }}" min="1" max="10000" step="1" required><small>Editable independently of checkpoint or LoRA.</small></label>
+            <label>Steps <input type="number" name="steps" value="{{ 8 if h3_model_variant == 'eros_beta5' else (20 if h3_model_variant in ['hybrid_v2', 'fl2va_int8', 'eros_beta5'] else 4) }}" min="1" max="10000" step="1" required><small>Editable independently of checkpoint or LoRA.</small></label>
             <label>CFG <input type="number" name="cfg" value="1" min="0" max="100" step="any" required></label>
-            <label>Sampler <select name="sampler">{% for sampler in h3_samplers %}<option value="{{ sampler }}"{% if sampler == ('res_multistep' if h3_model_variant in ['hybrid_v2', 'fl2va_int8'] else 'euler') %} selected{% endif %}>{{ sampler }}</option>{% endfor %}</select></label>
+            <label>Sampler <select name="sampler">{% for sampler in h3_samplers %}<option value="{{ sampler }}"{% if sampler == ('res_multistep' if h3_model_variant in ['hybrid_v2', 'fl2va_int8', 'eros_beta5'] else 'euler') %} selected{% endif %}>{{ sampler }}</option>{% endfor %}</select></label>
             <label>Scheduler <select name="scheduler">{% for scheduler in h3_schedulers %}<option value="{{ scheduler }}"{% if scheduler == 'simple' %} selected{% endif %}>{{ scheduler }}</option>{% endfor %}</select></label>
             <label>Denoise <input type="number" name="h3_denoise" value="1" min="0" max="1" step="any" required></label>
             {% else %}
             <label>Quality <select name="steps"><option value="4" selected>Fast · 4 steps</option><option value="8">Refined · 8 steps</option></select><small>Longer clips and more steps use more GPU time.</small></label>
             {% endif %}
             <label>Encoded duration <output data-duration>5.17 seconds at 24 fps</output></label>
-            <label>Canvas width <input type="number" name="width" value="576" min="32" max="2048" step="32" required></label>
-            <label>Canvas height <input type="number" name="height" value="1024" min="32" max="2048" step="32" required></label>
+            <label>Canvas width <input type="number" name="width" value="{{ 768 if h3_model_variant == 'eros_beta5' else 576 }}" min="32" max="2048" step="32" required></label>
+            <label>Canvas height <input type="number" name="height" value="{{ 1344 if h3_model_variant == 'eros_beta5' else 1024 }}" min="32" max="2048" step="32" required></label>
             <label>Seed <input type="number" name="seed" value="-1" step="1"><small>−1 chooses a fresh seed.</small></label>
-            <label>Video shift <input type="number" name="video_shift" value="{{ 12 if h3_model_variant in ['hybrid_v2', 'fl2va_int8'] else 8 }}" min="{{ 0.01 if h3_advanced_sampling_enabled else 6 }}" max="{{ 100 if h3_advanced_sampling_enabled else 12 }}" step="any" required></label>
-            <label>Audio shift <input type="number" name="audio_shift" value="{{ 3 if h3_model_variant == 'fl2va_int8' else 4 }}" min="{{ 0.01 if h3_advanced_sampling_enabled else 3 }}" max="{{ 100 if h3_advanced_sampling_enabled else 5 }}" step="any" required></label>
+            <label>Video shift <input type="number" name="video_shift" value="{{ 12 if h3_model_variant in ['hybrid_v2', 'fl2va_int8', 'eros_beta5'] else 8 }}" min="{{ 0.01 if h3_advanced_sampling_enabled else 6 }}" max="{{ 100 if h3_advanced_sampling_enabled else 12 }}" step="any" required></label>
+            <label>Audio shift <input type="number" name="audio_shift" value="{{ 3 if h3_model_variant in ['fl2va_int8', 'eros_beta5'] else 4 }}" min="{{ 0.01 if h3_advanced_sampling_enabled else 3 }}" max="{{ 100 if h3_advanced_sampling_enabled else 5 }}" step="any" required></label>
           </div>
           <div class="i2v-toggle-row">
             <label><input type="checkbox" name="match_source_resolution"{% if not source_resolution_enabled %} disabled{% endif %}> Match original image size · H3 AI upscale</label>
@@ -202,18 +202,18 @@
           {% if h3_advanced_sampling_enabled %}
           <details><summary>Refinement sampling · independent controls</summary>
             <div class="i2v-settings-grid">
-              <label>Refinement steps <input name="h3_refine_steps" type="number" value="1" min="1" max="10000" step="1" required></label>
+              <label>Refinement steps <input name="h3_refine_steps" type="number" value="{{ 4 if h3_model_variant == 'eros_beta5' else 1 }}" min="1" max="10000" step="1" required></label>
               <label>Refinement CFG <input name="h3_refine_cfg" type="number" value="1" min="0" max="100" step="any" required></label>
               <label>Refinement denoise <input name="h3_refine_denoise" type="number" value="0.2" min="0" max="1" step="any" required></label>
               <label>Refinement sampler <select name="h3_refine_sampler"><option value="" selected>Same as generation</option>{% for sampler in h3_samplers %}<option value="{{ sampler }}">{{ sampler }}</option>{% endfor %}</select></label>
               <label>Refinement scheduler <select name="h3_refine_scheduler">{% for scheduler in h3_schedulers %}<option value="{{ scheduler }}"{% if scheduler == 'simple' %} selected{% endif %}>{{ scheduler }}</option>{% endfor %}</select></label>
             </div>
-            <p class="muted">Used only when Match original image size needs a larger canvas. Creator defaults: one step, simple, CFG 1, denoise 0.2.</p>
+            <p class="muted">Used only when Match original image size needs a larger canvas. {% if h3_model_variant == 'eros_beta5' %}Eros starting preset: 4 steps, simple, CFG 1, denoise 0.2. This optional community refinement is not an Eros creator-certified preset.{% else %}Creator defaults: one step, simple, CFG 1, denoise 0.2.{% endif %}</p>
           </details>
-          <button class="secondary-button" type="button" data-h3-defaults>Restore creator sampling defaults</button>
-          <p class="muted">Recommendations, not restrictions: {% if h3_model_variant == 'fl2va_int8' %}official ComfyUI non-Turbo I2V uses RES Multistep/simple, 20 steps, CFG 1; native model shifts are video 12/audio 3{% elif h3_model_variant == 'hybrid_v2' %}normal V2 uses RES Multistep/simple or Euler/simple, 20–25 steps, video shift 10–12, audio shift 3–5{% else %}Turbo uses Euler/simple or LCM/simple, 4 or 8 steps, video shift 6–12, audio shift 3–5{% endif %}. Other native Comfy combinations are experimental; more steps, CFG guidance and refinement may increase GPU time or memory. Settings are frozen per job; changing them does not restart the worker.</p>
+          <button class="secondary-button" type="button" data-h3-defaults>Restore model sampling defaults</button>
+          <p class="muted">Recommendations, not restrictions: {% if h3_model_variant == 'eros_beta5' %}Eros Beta 5 TURBO Hybrid INT8: creator recommends RES Multistep/simple with 6–9 steps; our default is 8, CFG 1. Native H3 shifts are video 12/audio 3. Turbo is already baked in; do not add another Turbo adapter. The creator suggests modest strengths (typically 0.2–0.6) for extra concept LoRAs; your strengths are not silently changed{% elif h3_model_variant == 'fl2va_int8' %}official ComfyUI non-Turbo I2V uses RES Multistep/simple, 20 steps, CFG 1; native model shifts are video 12/audio 3{% elif h3_model_variant == 'hybrid_v2' %}normal V2 uses RES Multistep/simple or Euler/simple, 20–25 steps, video shift 10–12, audio shift 3–5{% else %}Turbo uses Euler/simple or LCM/simple, 4 or 8 steps, video shift 6–12, audio shift 3–5{% endif %}. Other native Comfy combinations are experimental; more steps, CFG guidance and refinement may increase GPU time or memory. Settings are frozen per job; changing them does not restart the worker.</p>
           {% else %}<p class="muted">Euler / simple · CFG 1 · 24 fps. Custom sampling controls await the matching worker update.</p>{% endif %}
-          {% if h3_model_variant == 'fl2va_int8' %}<p class="muted">Native MiniMax H3 FL2VA: your image anchors the first frame; no last frame is supplied. Describe the scene, motion and sound directly in the positive prompt. Uses ComfyUI's official image-to-video conditioning and model-only LoRA loading, without DaSiWa nodes or prompt rewriting. Source-size refinement is an optional community extension, not part of the official base workflow. No WAN motion LoRAs.</p>{% else %}<p class="muted">Creator FL2VA-family I2VA mode: animate your image as the first frame, with no last-frame image. Describe the scene and motion in the positive prompt; the creator's structured builder adds the first-frame alignment. Native video/audio generation and the creator's Basic LoRA stack. No WAN motion LoRAs.</p>{% endif %}
+          {% if h3_model_variant == 'eros_beta5' %}<p class="muted">Eros Beta 5 · native REF2VA: use &lt;Picture 1&gt; to refer to your image, then describe the scene, motion and sound. The image is a reference, not a forced first frame. Native ComfyUI metadata-aware model-only LoRA loading is reused for both passes. No DaSiWa loader, prompt rewriting, extra Turbo adapter or approximate attention cache. Source-size refinement is optional.</p>{% elif h3_model_variant == 'fl2va_int8' %}<p class="muted">Native MiniMax H3 FL2VA: your image anchors the first frame; no last frame is supplied. Describe the scene, motion and sound directly in the positive prompt. Uses ComfyUI's official image-to-video conditioning and model-only LoRA loading, without DaSiWa nodes or prompt rewriting. Source-size refinement is an optional community extension, not part of the official base workflow. No WAN motion LoRAs.</p>{% else %}<p class="muted">Creator FL2VA-family I2VA mode: animate your image as the first frame, with no last-frame image. Describe the scene and motion in the positive prompt; the creator's structured builder adds the first-frame alignment. Native video/audio generation and the creator's Basic LoRA stack. No WAN motion LoRAs.</p>{% endif %}
           {% else %}
           <summary><span><strong>Advanced settings</strong><small>DaSiWa WAN 2.2 baseline · all values are saved with the job</small></span><span aria-hidden="true">⌄</span></summary>
           <div class="i2v-settings-grid">

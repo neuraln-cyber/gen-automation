@@ -171,8 +171,26 @@ def resolve_generation_settings(
             raise MediaError(str(error)) from None
     if not settings.match_source_aspect:
         return settings
-    width, height = _source_aspect_native_dimensions(source_width, source_height)
+    width, height = (
+        _eros_source_dimensions(source_width, source_height)
+        if settings.profile == "minimax_h3" and settings.h3_model_variant == "eros_beta5"
+        else _source_aspect_native_dimensions(source_width, source_height)
+    )
     return settings.model_copy(update={"width": width, "height": height})
+
+
+def _eros_source_dimensions(source_width: int, source_height: int) -> tuple[int, int]:
+    """Native grid within our 5090 canvas budget, not a creator-mandated resolution."""
+    if min(source_width, source_height) <= 0:
+        raise MediaError("source dimensions are invalid")
+    scale = min(
+        768 / min(source_width, source_height),
+        2048 / max(source_width, source_height),
+        math.sqrt(768 * 1344 / (source_width * source_height)),
+    )
+    return max(32, math.floor(source_width * scale / 32) * 32), max(
+        32, math.floor(source_height * scale / 32) * 32
+    )
 
 
 def _source_aspect_native_dimensions(source_width: int, source_height: int) -> tuple[int, int]:
@@ -199,12 +217,19 @@ def prepare_input_image(
     width: int,
     height: int,
     preserve_source_resolution: bool = False,
+    reference_image: bool = False,
 ) -> None:
     """Contain a source, or pad its untouched pixels for original-resolution H3."""
 
     try:
         with Image.open(source) as opened:
             image = ImageOps.exif_transpose(opened).convert("RGB")
+        if reference_image:
+            # REF2VA owns reference scaling/encoding. Do not inject FL2VA canvas
+            # padding or downscale it twice before native reference conditioning.
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            image.save(destination, format="PNG")
+            return
         if preserve_source_resolution:
             if source_resolution_canvas(*image.size) != (width, height):
                 raise MediaError("original-resolution canvas does not match the source")
@@ -485,7 +510,9 @@ def finalize_native_video(
             "loop_mode": "none",
             "loop_count": 1,
             "source_fit": (
-                "source_keyframe_edge_pad_crop"
+                "native_reference_match"
+                if settings.h3_model_variant == "eros_beta5"
+                else "source_keyframe_edge_pad_crop"
                 if settings.match_source_resolution
                 else "contain_edge_pad"
             ),
