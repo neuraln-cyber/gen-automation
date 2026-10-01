@@ -5,7 +5,7 @@ import itertools
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from uuid import UUID
 
 from verify_h3_native_workflow import verify_native_lora_and_schedule, verify_upstream_tile_layout
@@ -46,13 +46,17 @@ def verify_eros_workflow(nodes, template_path=None, reference_path=None):
     )
     paths = {role: identity[2] for role, identity in H3_EROS_MODELS.items()}
     paths[H3_UPSCALER_ROLE] = H3_UPSCALER_FILENAME
-    for mode, upscale, cfg in itertools.product(
-        ("reference", "first_frame"), (False, True), (1, 2.5)
+    for author_recipe, mode, upscale, cfg in itertools.product(
+        (False, True), ("reference", "first_frame"), (False, True), (1, 2.5)
     ):
         settings = GenerationSettings(
             profile="minimax_h3",
             h3_model_variant="eros_beta5",
             h3_image_mode=mode,
+            h3_attention_backend="comfy_kitchen" if author_recipe else "default",
+            sampler="er_sde" if author_recipe else "res_multistep",
+            scheduler="beta57" if author_recipe else "simple",
+            steps=6 if author_recipe else 8,
             seed=0,
             width=1152 if upscale else 768,
             height=1504 if upscale else 992,
@@ -76,9 +80,12 @@ def verify_eros_workflow(nodes, template_path=None, reference_path=None):
         assert seed == 0 and graph["6"]["inputs"]["prompt"] == "<Picture 1> moves."
         assert graph["6"]["inputs"]["ref_images.ref_image_0"] == ["1", 0]
         assert not {"first_frame", "last_frame"} & graph["6"]["inputs"].keys()
-        assert graph["7"]["inputs"]["model"] == ["h3-lora-0", 0]
+        assert graph["7"]["inputs"]["model"] == ["h3-kitchen" if author_recipe else "h3-lora-0", 0]
+        if author_recipe:
+            assert graph["h3-kitchen"]["inputs"]["model"] == ["h3-lora-0", 0]
+            assert graph["11"]["class_type"] == "BetaSamplingScheduler"
         assert graph["11"]["inputs"]["model"] == graph["9"]["inputs"]["model"] == ["7", 0]
-        assert graph["11"]["inputs"]["steps"] == 8
+        assert graph["11"]["inputs"]["steps"] == (6 if author_recipe else 8)
         conditioning = ["h3-first-frame", 0] if mode == "first_frame" else ["6", 0]
         assert graph["9"]["inputs"]["positive" if cfg != 1 else "conditioning"] == conditioning
         for node in graph.values():
@@ -147,7 +154,43 @@ def verify_eros_workflow(nodes, template_path=None, reference_path=None):
     assert len(anchor) == 1 and anchor[0]["resolved_frame_index"] == 0
     assert anchor[0]["latent"].shape == (1, 24, 1, 62, 48)
     verify_native_lora_and_schedule(nodes)
+    verify_eros_beta57(nodes)
     print(
         "Eros native REF2VA/schema/AV/LoRA/refinement CPU contracts passed; "
         "visual quality untested."
     )
+
+
+def verify_eros_beta57(nodes):
+    """Real native beta/split arithmetic equals the published beta57 definition."""
+    import comfy.ldm.modules.attention
+    import comfy.samplers
+    import torch
+    from comfy.model_sampling import ModelSamplingAV
+
+    sampling = ModelSamplingAV(SimpleNamespace(sampling_settings={"shift": 12, "audio_shift": 3}))
+    model = Mock()
+    model.get_model_object.return_value = sampling
+    registry = nodes.NODE_CLASS_MAPPINGS
+    for steps, denoise in ((4, 1), (6, 1), (8, 0.5), (6, 0.37), (4, 0.2)):
+        total = int(steps / denoise)
+        # RES4LYF's beta57 branch, with its unchanged partial-denoise tail.
+        expected = comfy.samplers.beta_scheduler(sampling, total, alpha=0.5, beta=0.7).cpu()
+        expected = expected[-(steps + 1) :]
+        actual = registry["BetaSamplingScheduler"].execute(model, total, 0.5, 0.7)[0]
+        if total > steps:
+            actual = registry["SplitSigmas"].execute(actual, total - steps)[1]
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    native_beta = comfy.samplers.beta_scheduler(sampling, 6, alpha=0.6, beta=0.6)
+    beta57 = registry["BetaSamplingScheduler"].execute(model, 6, 0.5, 0.7)[0]
+    assert not torch.equal(beta57, native_beta)
+    # Verify the real node requests the explicit backend without performing a
+    # synthetic GPU benchmark. GPU availability is checked before submission.
+    attention_fn = Mock()
+    with patch.object(
+        comfy.ldm.modules.attention, "get_attention_function", return_value=attention_fn
+    ) as lookup:
+        selected = registry["ModelAttentionBackend"].execute(model, "comfy kitchen attention")[0]
+        lookup.assert_called_once_with("comfy_kitchen_int8", None)
+        selected.set_model_optimized_attention.assert_called_once_with(attention_fn)
+    print("Eros beta57 exact native numerical equivalence and Kitchen routing passed.")

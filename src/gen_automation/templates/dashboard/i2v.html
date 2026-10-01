@@ -18,6 +18,7 @@
     data-source-resolution-enabled="{{ 'true' if source_resolution_enabled else 'false' }}"
     data-h3-diagnostics-enabled="{{ 'true' if h3_diagnostics_enabled else 'false' }}"
     data-h3-first-frame-enabled="{{ 'true' if h3_first_frame_enabled else 'false' }}"
+    data-eros-author-recipe="{{ 'true' if eros_author_recipe else 'false' }}"
     data-h3-model-variant="{{ h3_model_variant }}"
     data-h3-advanced-sampling-enabled="{{ 'true' if h3_advanced_sampling_enabled else 'false' }}"
   >
@@ -29,7 +30,7 @@
         <a class="secondary-button" href="/dashboard/loras?library=h3">Manage H3 LoRA files</a>
         {% endif %}
         <p class="lede">
-          Choose your first frame, describe the scene in motion, and queue your clips.
+          Choose your {{ 'reference image' if h3_model_variant == 'eros_beta5' else 'first frame' }}, describe the scene in motion, and queue your clips.
           Your draft and presets keep the setup ready for the next session.
         </p>
       </div>
@@ -59,7 +60,7 @@
         <div class="i2v-panel-heading">
           <div>
             <p class="i2v-step">1 · Source</p>
-            <h2 id="i2v-source-heading">Choose the first frame</h2>
+            <h2 id="i2v-source-heading">Choose the {{ 'reference image' if h3_model_variant == 'eros_beta5' else 'first frame' }}</h2>
           </div>
           <button class="i2v-icon-button" type="button" data-refresh-library title="Refresh library" aria-label="Refresh generated image library">↻</button>
         </div>
@@ -150,8 +151,8 @@
           <textarea id="i2v-positive" name="positive_prompt" rows="7" maxlength="100000" required data-positive-prompt placeholder="A slow camera push toward the cabin. Leaves sway gently. Soft wind and distant birds; no music or dialogue."></textarea>
         </label>
         {% if video_profile == 'minimax_h3' and h3_model_variant == 'eros_beta5' %}
-        <button class="secondary-button" type="button" data-eros-style-preset>Add editable 2D style-preservation direction</button>
-        <p class="muted">Adds visible text to your positive prompt, without replacing it. Review and edit before queueing. This is an application preset, not a guarantee of exact image fidelity.</p>
+        <button class="secondary-button" type="button" data-eros-style-preset>Build editable REF2VA prompt</button>
+        <p class="muted">Uses the six-section reference format recommended by the Eros author, keeping your motion text visible. This scaffold does not inspect your image: describe the subjects, scene, timed actions, sound and music before queueing. Already structured prompts are not overwritten. <a href="https://huggingface.co/TenStrip/10Eros-Max/discussions/50" target="_blank" rel="noopener noreferrer">Author guidance</a> · <a href="https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md" target="_blank" rel="noopener noreferrer">Reference prompt guide</a></p>
         {% endif %}
         <label class="i2v-prompt" for="i2v-negative"{% if video_profile == 'minimax_h3' and not h3_advanced_sampling_enabled %} hidden{% endif %}>
           <span>Negative prompt <small>Artifacts and motion to avoid</small></span>
@@ -181,10 +182,10 @@
               <option value="362">15.08 seconds</option>
             </select><small>Lengths follow H3's native frame grid.</small></label>
             {% if h3_advanced_sampling_enabled %}
-            <label>Steps <input type="number" name="steps" value="{{ 8 if h3_model_variant == 'eros_beta5' else (20 if h3_model_variant in ['hybrid_v2', 'fl2va_int8', 'eros_beta5'] else 4) }}" min="1" max="10000" step="1" required><small>Editable independently of checkpoint or LoRA.</small></label>
+            <label>Steps <input type="number" name="steps" value="{{ 6 if eros_author_recipe else (8 if h3_model_variant == 'eros_beta5' else (20 if h3_model_variant in ['hybrid_v2', 'fl2va_int8'] else 4)) }}" min="1" max="10000" step="1" required><small>Editable independently of checkpoint or LoRA.</small></label>
             <label>CFG <input type="number" name="cfg" value="1" min="0" max="100" step="any" required></label>
-            <label>Sampler <select name="sampler">{% for sampler in h3_samplers %}<option value="{{ sampler }}"{% if sampler == ('res_multistep' if h3_model_variant in ['hybrid_v2', 'fl2va_int8', 'eros_beta5'] else 'euler') %} selected{% endif %}>{{ sampler }}</option>{% endfor %}</select></label>
-            <label>Scheduler <select name="scheduler">{% for scheduler in h3_schedulers %}<option value="{{ scheduler }}"{% if scheduler == 'simple' %} selected{% endif %}>{{ scheduler }}</option>{% endfor %}</select></label>
+            <label>Sampler <select name="sampler">{% for sampler in h3_samplers %}<option value="{{ sampler }}"{% if sampler == ('er_sde' if eros_author_recipe else ('res_multistep' if h3_model_variant in ['hybrid_v2', 'fl2va_int8', 'eros_beta5'] else 'euler')) %} selected{% endif %}>{{ sampler }}</option>{% endfor %}</select></label>
+            <label>Scheduler <select name="scheduler">{% for scheduler in h3_schedulers %}<option value="{{ scheduler }}"{% if scheduler == ('beta57' if eros_author_recipe else 'simple') %} selected{% endif %}>{{ scheduler }}</option>{% endfor %}</select></label>
             <label>Denoise <input type="number" name="h3_denoise" value="1" min="0" max="1" step="any" required></label>
             {% else %}
             <label>Quality <select name="steps"><option value="4" selected>Fast · 4 steps</option><option value="8">Refined · 8 steps</option></select><small>Longer clips and more steps use more GPU time.</small></label>
@@ -201,10 +202,14 @@
             <label><input type="checkbox" name="match_source_aspect" checked> Standard size · match source aspect</label>
           </div>
           {% if h3_model_variant == 'eros_beta5' %}
+          <label>Attention backend <select name="h3_attention_backend"><option value="comfy_kitchen"{% if eros_author_recipe %} selected{% else %} disabled{% endif %}>Comfy Kitchen · author setup{% if not eros_author_recipe %} · awaits worker update{% endif %}</option><option value="default"{% if not eros_author_recipe %} selected{% endif %}>Runtime default · historical setup</option></select></label>
+          {% if eros_author_recipe %}
+          <p class="muted">Eros Beta5 style-preservation preset: er_sde / beta57, 6 steps (author range 4–6). beta57 uses alpha 0.5 / beta 0.7, not stock beta. CFG 1 and shifts 12/3 remain native defaults; the author did not publish new Beta5 shift values. All controls stay editable. Saved drafts/presets keep their settings; Restore model sampling defaults applies this preset without changing prompts or LoRAs.</p>
+          {% endif %}
           <label>Image conditioning
             <select name="h3_image_mode">
-              <option value="first_frame"{% if h3_first_frame_enabled %} selected{% else %} disabled{% endif %}>Animate this image · reference + first-frame guide</option>
-              <option value="reference"{% if not h3_first_frame_enabled %} selected{% endif %}>Reference only · allow reinterpretation</option>
+              <option value="reference"{% if eros_author_recipe or not h3_first_frame_enabled %} selected{% endif %}>Native REF2VA · author template basis</option>
+              <option value="first_frame"{% if h3_first_frame_enabled and not eros_author_recipe %} selected{% elif not h3_first_frame_enabled %} disabled{% endif %}>Reference + first-frame guide · optional extension</option>
             </select>
           </label>
           <p class="muted" data-image-mode-summary aria-live="polite">Existing drafts and presets retain reference-only mode unless you change it. The native first-frame guide strengthens spatial conditioning; it does not freeze every subsequent frame or guarantee exact style.{% if not h3_first_frame_enabled %} First-frame guidance awaits the matching worker update.{% endif %}</p>
@@ -225,9 +230,9 @@
             <p class="muted">Used only when Match original image size needs a larger canvas. {% if h3_model_variant == 'eros_beta5' %}Eros starting preset: 4 steps, simple, CFG 1, denoise 0.2. This optional community refinement is not an Eros creator-certified preset.{% else %}Creator defaults: one step, simple, CFG 1, denoise 0.2.{% endif %}</p>
           </details>
           <button class="secondary-button" type="button" data-h3-defaults>Restore model sampling defaults</button>
-          <p class="muted">Recommendations, not restrictions: {% if h3_model_variant == 'eros_beta5' %}Eros Beta 5 TURBO Hybrid INT8: creator recommends RES Multistep/simple with 6–9 steps; our default is 8, CFG 1. Native H3 shifts are video 12/audio 3. Turbo is already baked in; do not add another Turbo adapter. The creator suggests modest strengths (typically 0.2–0.6) for extra concept LoRAs; your strengths are not silently changed{% elif h3_model_variant == 'fl2va_int8' %}official ComfyUI non-Turbo I2V uses RES Multistep/simple, 20 steps, CFG 1; native model shifts are video 12/audio 3{% elif h3_model_variant == 'hybrid_v2' %}normal V2 uses RES Multistep/simple or Euler/simple, 20–25 steps, video shift 10–12, audio shift 3–5{% else %}Turbo uses Euler/simple or LCM/simple, 4 or 8 steps, video shift 6–12, audio shift 3–5{% endif %}. Other native Comfy combinations are experimental; more steps, CFG guidance and refinement may increase GPU time or memory. Settings are frozen per job; changing them does not restart the worker.</p>
+          <p class="muted">Recommendations, not restrictions: {% if h3_model_variant == 'eros_beta5' %}Eros Beta 5 TURBO Hybrid INT8: {% if eros_author_recipe %}the style preset is er_sde/beta57, 6 steps (author range 4–6). RES Multistep/simple, 6–9 steps, is the author's motion-oriented alternative{% else %}creator recommends RES Multistep/simple with 6–9 steps; the legacy default is 8{% endif %}, CFG 1. Native H3 shifts are video 12/audio 3. Turbo is already baked in; do not add another Turbo adapter. The creator suggests modest strengths (typically 0.2–0.6) for extra concept LoRAs; your strengths are not silently changed{% elif h3_model_variant == 'fl2va_int8' %}official ComfyUI non-Turbo I2V uses RES Multistep/simple, 20 steps, CFG 1; native model shifts are video 12/audio 3{% elif h3_model_variant == 'hybrid_v2' %}normal V2 uses RES Multistep/simple or Euler/simple, 20–25 steps, video shift 10–12, audio shift 3–5{% else %}Turbo uses Euler/simple or LCM/simple, 4 or 8 steps, video shift 6–12, audio shift 3–5{% endif %}. Other native Comfy combinations are experimental; more steps, CFG guidance and refinement may increase GPU time or memory. Settings are frozen per job; changing them does not restart the worker.</p>
           {% else %}<p class="muted">Euler / simple · CFG 1 · 24 fps. Custom sampling controls await the matching worker update.</p>{% endif %}
-          {% if h3_model_variant == 'eros_beta5' %}<p class="muted">Eros Beta 5 · native REF2VA: use &lt;Picture 1&gt; to refer to your image, then describe the scene, motion and sound. Reference-only mode uses the image as a reference, not a forced first frame. Animate this image adds native MiniMaxH3AddGuide at frame zero and carries both kinds of conditioning through refinement. This combined mode is an application integration, not an Eros creator-certified recipe. Native ComfyUI metadata-aware model-only LoRA loading is reused for both passes. No DaSiWa loader, hidden prompt rewriting, extra Turbo adapter or approximate attention cache. Source-size refinement is optional.</p>{% elif h3_model_variant == 'fl2va_int8' %}<p class="muted">Native MiniMax H3 FL2VA: your image anchors the first frame; no last frame is supplied. Describe the scene, motion and sound directly in the positive prompt. Uses ComfyUI's official image-to-video conditioning and model-only LoRA loading, without DaSiWa nodes or prompt rewriting. Source-size refinement is an optional community extension, not part of the official base workflow. No WAN motion LoRAs.</p>{% else %}<p class="muted">Creator FL2VA-family I2VA mode: animate your image as the first frame, with no last-frame image. Describe the scene and motion in the positive prompt; the creator's structured builder adds the first-frame alignment. Native video/audio generation and the creator's Basic LoRA stack. No WAN motion LoRAs.</p>{% endif %}
+          {% if h3_model_variant == 'eros_beta5' %}<p class="muted">Eros Beta 5 · native REF2VA: use &lt;Picture 1&gt; to refer to your image, then describe the scene, motion and sound. Reference-only mode uses the image as a reference, not a forced first frame. The optional first-frame mode adds native MiniMaxH3AddGuide at frame zero and carries both kinds of conditioning through refinement. This combined mode is an application integration, not an Eros creator-certified recipe. Native ComfyUI metadata-aware model-only LoRA loading is reused for both passes. No DaSiWa loader, hidden prompt rewriting, extra Turbo adapter or approximate attention cache. Source-size refinement is optional.</p>{% elif h3_model_variant == 'fl2va_int8' %}<p class="muted">Native MiniMax H3 FL2VA: your image anchors the first frame; no last frame is supplied. Describe the scene, motion and sound directly in the positive prompt. Uses ComfyUI's official image-to-video conditioning and model-only LoRA loading, without DaSiWa nodes or prompt rewriting. Source-size refinement is an optional community extension, not part of the official base workflow. No WAN motion LoRAs.</p>{% else %}<p class="muted">Creator FL2VA-family I2VA mode: animate your image as the first frame, with no last-frame image. Describe the scene and motion in the positive prompt; the creator's structured builder adds the first-frame alignment. Native video/audio generation and the creator's Basic LoRA stack. No WAN motion LoRAs.</p>{% endif %}
           {% else %}
           <summary><span><strong>Advanced settings</strong><small>DaSiWa WAN 2.2 baseline · all values are saved with the job</small></span><span aria-hidden="true">⌄</span></summary>
           <div class="i2v-settings-grid">
@@ -331,5 +336,6 @@
 {% endblock %}
 
 {% block page_scripts %}
+  {% if video_profile == 'minimax_h3' and h3_model_variant == 'eros_beta5' %}<script src="/static/eros_prompt.js" defer></script>{% endif %}
   <script src="/static/i2v.js" defer></script>
 {% endblock %}

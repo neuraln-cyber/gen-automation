@@ -76,6 +76,9 @@ class ComfyClient:
                     "CLIPTextEncode",
                     "KSamplerSelect",
                     "BasicScheduler",
+                    "BetaSamplingScheduler",
+                    "SplitSigmas",
+                    "ModelAttentionBackend",
                 )
             )
         )
@@ -118,6 +121,20 @@ class ComfyClient:
 
     async def execute(self, workflow: dict[str, Any], output_root: Path) -> tuple[Path, ...]:
         diagnostic = "h3-base-save" in workflow
+        if "h3-kitchen" in workflow:
+            # Native ModelAttentionBackend otherwise silently falls back to
+            # PyTorch. An explicit author recipe must not claim that fallback
+            # is the requested Kitchen backend.
+            response = await self._request("GET", "/object_info/ModelAttentionBackend")
+            try:
+                backends = response.json()["ModelAttentionBackend"]["input"]["required"][
+                    "attention"
+                ][0]
+                available = "comfy kitchen attention" in backends
+            except (KeyError, TypeError, ValueError):
+                available = False
+            if not available:
+                raise ComfyError("Requested Eros Comfy Kitchen attention is unavailable")
         response = await self._request("POST", "/prompt", json={"prompt": workflow})
         try:
             body = response.json()

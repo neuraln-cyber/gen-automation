@@ -185,6 +185,8 @@ class GenerationSettings(_StrictModel):
     h3_model_variant: Literal["turbo_v2", "hybrid_v2", "fl2va_int8", "eros_beta5"] | None = None
     # Missing in historical snapshots means reference-only, never a silent migration.
     h3_image_mode: Literal["reference", "first_frame"] = "reference"
+    # Old snapshots keep their attention implementation, not a silent migration.
+    h3_attention_backend: Literal["default", "comfy_kitchen"] = "default"
     frame_count: int = Field(default=81, ge=9)
     fps: int = Field(default=16, gt=0)
     width: int = Field(default=576, ge=32)
@@ -273,16 +275,31 @@ class GenerationSettings(_StrictModel):
         ):
             raise ValueError("first-frame reference guidance requires Eros Beta 5")
         if self.profile == "minimax_h3":
-            from gen_automation.i2v_worker.h3_sampling import H3_SAMPLERS, H3_SCHEDULERS
+            from gen_automation.i2v_worker.h3_sampling import (
+                H3_EROS_SCHEDULERS,
+                H3_SAMPLERS,
+                H3_SCHEDULERS,
+            )
 
+            schedulers = (
+                H3_EROS_SCHEDULERS if self.h3_model_variant == "eros_beta5" else H3_SCHEDULERS
+            )
+            if self.h3_attention_backend != "default" and self.h3_model_variant != "eros_beta5":
+                raise ValueError("Eros attention selection requires Eros Beta 5")
             if self.steps > 10000 or self.cfg > 100:
                 raise ValueError("H3 steps/CFG exceed native Comfy node bounds")
-            if self.sampler not in H3_SAMPLERS or self.scheduler not in H3_SCHEDULERS:
+            if self.sampler not in H3_SAMPLERS or self.scheduler not in schedulers:
                 raise ValueError("H3 requires a sampler/scheduler installed in native Comfy")
             if self.h3_refine_sampler is not None and self.h3_refine_sampler not in H3_SAMPLERS:
                 raise ValueError("Unknown H3 refinement sampler")
-            if self.h3_refine_scheduler not in H3_SCHEDULERS:
+            if self.h3_refine_scheduler not in schedulers:
                 raise ValueError("Unknown H3 refinement scheduler")
+            for scheduler, steps, denoise in (
+                (self.scheduler, self.steps, self.h3_denoise),
+                (self.h3_refine_scheduler, self.h3_refine_steps, self.h3_refine_denoise),
+            ):
+                if scheduler == "beta57" and denoise > 0 and int(steps / denoise) > 10000:
+                    raise ValueError("beta57 total schedule exceeds native node's 10000-step bound")
             if self.h3_save_base_video and not self.match_source_resolution:
                 raise ValueError("base-video diagnostics require H3 source-size delivery")
             if len({item.artifact_id for item in self.h3_loras}) != len(self.h3_loras):
@@ -308,6 +325,8 @@ class GenerationSettings(_StrictModel):
             return self
         if self.h3_model_variant is not None:
             raise ValueError("H3 model variants require MiniMax H3")
+        if self.h3_attention_backend != "default":
+            raise ValueError("Eros attention selection requires Eros Beta 5")
         from gen_automation.i2v_worker.h3_sampling import H3_EXPERT_DEFAULTS
 
         if any(getattr(self, name) != value for name, value in H3_EXPERT_DEFAULTS.items()):
