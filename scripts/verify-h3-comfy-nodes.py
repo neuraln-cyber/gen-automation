@@ -58,9 +58,10 @@ async def main() -> None:
     from verify_h3_native_workflow import verify_native_workflow
 
     verify_native_workflow(nodes)
-    from verify_h3_eros_workflow import verify_eros_workflow
+    from verify_h3_eros_workflow import verify_eros_kitchen_api, verify_eros_workflow
 
     verify_eros_workflow(nodes)
+    await verify_eros_kitchen_api(nodes)
     print("Pinned H3 import/API check passed as runtime UID/GID 10002 (CPU, no weights).")
 
 

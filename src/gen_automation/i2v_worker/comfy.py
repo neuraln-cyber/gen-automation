@@ -115,6 +115,10 @@ class ComfyClient:
                 node_info = node_response.json()
                 if not isinstance(node_info, dict) or set(node_info) != {node_name}:
                     return False
+                # H3 starts ComfyUI with --use-ck-attention. Presence of the
+                # selector node alone does not prove that backend is usable.
+                if node_name == "ModelAttentionBackend" and not _kitchen_available(node_info):
+                    return False
             return True
         except Exception:
             return False
@@ -127,11 +131,8 @@ class ComfyClient:
             # is the requested Kitchen backend.
             response = await self._request("GET", "/object_info/ModelAttentionBackend")
             try:
-                backends = response.json()["ModelAttentionBackend"]["input"]["required"][
-                    "attention"
-                ][0]
-                available = "comfy kitchen attention" in backends
-            except (KeyError, TypeError, ValueError):
+                available = _kitchen_available(response.json())
+            except ValueError:
                 available = False
             if not available:
                 raise ComfyError("Requested Eros Comfy Kitchen attention is unavailable")
@@ -222,6 +223,31 @@ class ComfyClient:
             if attempt + 1 < self.network_attempts:
                 await asyncio.sleep(min(2**attempt, 16))
         raise ComfyError("ComfyUI is unavailable")
+
+
+def _kitchen_available(payload: object) -> bool:
+    """Read both legacy dropdowns and native V3 COMBO options, fail closed."""
+    if not isinstance(payload, dict) or set(payload) != {"ModelAttentionBackend"}:
+        return False
+    try:
+        entry = payload["ModelAttentionBackend"]["input"]["required"]["attention"]
+    except (KeyError, TypeError):
+        return False
+    if not isinstance(entry, list) or not 1 <= len(entry) <= 2:
+        return False
+    if len(entry) == 2 and not isinstance(entry[1], dict):
+        return False
+    if isinstance(entry[0], list):
+        choices = entry[0]
+    elif entry[0] == "COMBO" and len(entry) == 2:
+        choices = entry[1].get("options")
+    else:
+        return False
+    return (
+        isinstance(choices, list)
+        and all(isinstance(choice, str) for choice in choices)
+        and "comfy kitchen attention" in choices
+    )
 
 
 def _memory_failure(messages: object) -> bool:
