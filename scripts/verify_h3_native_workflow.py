@@ -234,7 +234,9 @@ def verify_native_lora_and_schedule(nodes):
         gc.collect()
 
 
-def verify_upstream_tile_layout(registry, temporal, spatial, *, first_frame=False):
+def verify_upstream_tile_layout(
+    registry, temporal, spatial, *, first_frame=False, keep_reference=False
+):
     """Exercise real split/anchor/packing/stitching; substitute only GPU sampling."""
     import torch
     from comfy.ldm.minimax.model import PackedLayout, patchify_video
@@ -263,14 +265,14 @@ def verify_upstream_tile_layout(registry, temporal, spatial, *, first_frame=Fals
     if first_frame:
         # Base-resolution I2VA keyframe must be resized/cropped by upstream for
         # target-resolution tiles, not mistaken for an unaligned REF2VA reference.
-        conditioning[0][1] = {
-            "minimax_keyframes": [
-                {
-                    "resolved_frame_index": 0,
-                    "latent": torch.ones(1, 24, 1, 62, 48),
-                }
-            ]
-        }
+        if not keep_reference:
+            conditioning[0][1] = {}
+        conditioning[0][1]["minimax_keyframes"] = [
+            {
+                "resolved_frame_index": 0,
+                "latent": torch.ones(1, 24, 1, 62, 48),
+            }
+        ]
     calls = []
 
     def sample(piece, cond, model, noise, sampler, sigmas, negative, cfg):
@@ -279,12 +281,12 @@ def verify_upstream_tile_layout(registry, temporal, spatial, *, first_frame=Fals
         anchors = metadata.get("minimax_keyframes", [])
         refs = metadata.get("minimax_refs", [])
         if first_frame:
-            assert not refs and len(anchors) == 1
+            assert bool(refs) == keep_reference and len(anchors) == 1
             assert anchors[0]["resolved_frame_index"] == 0
             assert anchors[0]["latent"].shape[3:] == tile.shape[3:]
             if len(calls) < 6:
                 assert torch.all(anchors[0]["latent"] == 1)
-        else:
+        if not first_frame or keep_reference:
             assert len(refs) == 1 and refs[0]["kind"] == "image"
             assert refs[0]["latent"].shape == (1, 24, 1, 8, 8)
         layout = PackedLayout(

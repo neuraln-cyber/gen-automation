@@ -281,6 +281,8 @@ async def _run_job(
     input_path = settings.runtime_root / "input" / input_name
     prepared_name = f"prepared-{job.attempt_id}.png"
     prepared_path = settings.runtime_root / "input" / prepared_name
+    guide_name = f"guide-{job.attempt_id}.png"
+    guide_path = settings.runtime_root / "input" / guide_name
     allow_http = settings.environment == "test"
     stage = "input_preparation"
     try:
@@ -321,6 +323,19 @@ async def _run_job(
                 else {}
             ),
         )
+        if generation_settings.h3_image_mode == "first_frame":
+            guide_width, guide_height = generation_settings.width, generation_settings.height
+            if generation_settings.match_source_resolution:
+                guide_width, guide_height = h3_base_canvas(guide_width, guide_height)
+            # AddGuide otherwise center-crops internally. Fit the whole source
+            # to its base canvas first; the REF2VA image above stays unmodified.
+            await asyncio.to_thread(
+                prepare_input_image,
+                input_path,
+                guide_path,
+                width=guide_width,
+                height=guide_height,
+            )
         face_detector: FaceDetector | None = None
         source_face: SourceFaceAnalysis | None = None
         if generation_settings.face_fidelity == "stable_expression":
@@ -335,6 +350,9 @@ async def _run_job(
         rendered, seed, _prefix = render_workflow(
             workflow,
             input_filename=prepared_name,
+            guide_filename=(
+                guide_name if generation_settings.h3_image_mode == "first_frame" else None
+            ),
             positive_prompt=job.positive_prompt,
             negative_prompt=job.negative_prompt,
             settings=generation_settings,
@@ -441,9 +459,10 @@ async def _run_job(
         output_metadata: dict[str, Any] = {
             "workflow": (
                 (
-                    "minimax-h3-native-i2v"
-                    if generation_settings.h3_model_variant == "fl2va_int8"
-                    else "dasiwa-minimax-h3-i2v-v1"
+                    {
+                        "fl2va_int8": "minimax-h3-native-i2v",
+                        "eros_beta5": "minimax-h3-eros-ref2va",
+                    }.get(generation_settings.h3_model_variant or "", "dasiwa-minimax-h3-i2v-v1")
                 )
                 if settings.profile == "minimax_h3"
                 else "dasiwa-wan22-i2v-v1"
@@ -468,6 +487,9 @@ async def _run_job(
         }
         if face_metadata is not None:
             output_metadata["face_stabilization"] = face_metadata
+        if generation_settings.h3_model_variant == "eros_beta5":
+            output_metadata["h3_image_mode"] = generation_settings.h3_image_mode
+            output_metadata["h3_refine_steps"] = generation_settings.h3_refine_steps
         if base_result is not None:
             output_metadata["h3_base_video"] = base_result.model_dump(mode="json")
         return I2VResult(
@@ -502,6 +524,7 @@ async def _run_job(
     finally:
         input_path.unlink(missing_ok=True)
         prepared_path.unlink(missing_ok=True)
+        guide_path.unlink(missing_ok=True)
         shutil.rmtree(job_root, ignore_errors=True)
         output_attempt = (
             settings.runtime_root / "output/i2v" / str(job.job_id) / str(job.attempt_id)

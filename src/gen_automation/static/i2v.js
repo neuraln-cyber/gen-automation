@@ -15,6 +15,7 @@
   const h3AdvancedSamplingEnabled = root.dataset.h3AdvancedSamplingEnabled === "true";
   const sourceResolutionEnabled = root.dataset.sourceResolutionEnabled === "true";
   const h3DiagnosticsEnabled = root.dataset.h3DiagnosticsEnabled === "true";
+  const h3FirstFrameEnabled = root.dataset.h3FirstFrameEnabled === "true";
   const maxImageBytes = Number(root.dataset.maxImageBytes || 0);
   const scope = document.body.dataset.automationStorageScope || "operator";
   const legacyDraftKey = `i2v-draft-v2:${videoProfile}:${scope}`;
@@ -402,6 +403,8 @@
 
   function applySettings(settings = {}) {
     const resolved = { ...workerSettingDefaults, ...settings };
+    // Reusing a saved snapshot without the new field keeps its historical mode.
+    if (isH3 && h3ModelVariant === "eros_beta5") resolved.h3_image_mode = settings.h3_image_mode || "reference";
     Object.entries(resolved).forEach(([name, value]) => {
       if (name === "loras" || name === "h3_loras") return;
       if (name === "runpod_authorization") {
@@ -450,6 +453,10 @@
   }
 
   function syncAspectControls() {
+    const modeSummary = q("[data-image-mode-summary]");
+    if (modeSummary) modeSummary.textContent = form.elements.h3_image_mode?.value === "first_frame"
+      ? "Animate this image: reference + frame-zero guide in generation and refinement. Prompts remain exactly as entered; later frames can still change."
+      : "Reference only: the image is not forced as the first frame. Older drafts/presets retain this mode; select Animate this image to add the guide.";
     const original = isH3 && Boolean(form.elements.match_source_resolution?.checked);
     if (isH3) {
       form.elements.match_source_aspect.disabled = original;
@@ -476,7 +483,7 @@
       const needsUpscale = base.width !== canvasWidth || base.height !== canvasHeight;
       q("[data-resolution-summary]").textContent = error || (width && height
         ? `Output: ${width} × ${height} · base: ${base.width} × ${base.height}` + (needsUpscale
-          ? ` → H3 AI upscale + refinement: ${canvasWidth} × ${canvasHeight}. Only added padding is trimmed; audio is preserved.`
+          ? ` → H3 AI upscale + refinement: ${canvasWidth} × ${canvasHeight}; ${form.elements.h3_refine_steps?.value || 1} steps, CFG ${form.elements.h3_refine_cfg?.value || 1}, denoise ${form.elements.h3_refine_denoise?.value || 0.2}. Only added padding is trimmed; audio is preserved.`
           : ". This source fits the base canvas; no upscaling pass is needed.")
         : "Select an image to match its original output size.");
       return;
@@ -1140,11 +1147,25 @@
     scheduleDraftSave();
     announce("Creator sampling defaults restored; prompts, LoRAs, seed and dimensions unchanged.");
   });
+  q("[data-eros-style-preset]")?.addEventListener("click", () => {
+    const direction = "Preserve the original 2D illustration style of <Picture 1>, including its linework, colors, character identity, clothing and scene details. Animate only the described motion; do not reinterpret the artwork as live action, photorealistic or 3D rendering.";
+    const prompt = form.elements.positive_prompt;
+    if (!prompt.value.includes(direction)) {
+      const section = "[integrated_multimodal_description]";
+      prompt.value = prompt.value.includes(section)
+        ? prompt.value.replace(section, `${section}\n${direction}`)
+        : `${prompt.value.trim()}\n\n${direction}`.trim();
+    }
+    syncLoraPromptPreview();
+    scheduleDraftSave();
+    prompt.focus();
+    announce("2D direction added to the visible positive prompt. Review it before queueing; no settings or LoRAs changed.");
+  });
   form.addEventListener("input", (event) => {
     if (event.target.name === "match_source_resolution" && !event.target.checked) {
       form.elements.match_source_aspect.checked = true;
     }
-    if (["match_source_aspect", "match_source_resolution"].includes(event.target.name)) syncAspectControls();
+    if (["match_source_aspect", "match_source_resolution", "h3_image_mode", "h3_refine_steps", "h3_refine_cfg", "h3_refine_denoise"].includes(event.target.name)) syncAspectControls();
     if (["frame_count", "fps", "loop", "loop_count", "face_fidelity"].includes(event.target.name)) updateDuration();
     if (event.target.name === "positive_prompt") syncLoraPromptPreview();
     scheduleDraftSave();
@@ -1207,7 +1228,10 @@
     form.querySelectorAll("input, textarea, select, button").forEach((element) => { element.disabled = true; });
     announce("Your account can view image-to-video activity but cannot change the queue.");
   }
-  restoreDraft(); updateDuration(); updateSubmitState();
+  if (isH3 && h3ModelVariant === "eros_beta5" && form.elements.h3_image_mode) {
+    form.elements.h3_image_mode.value = h3FirstFrameEnabled ? "first_frame" : "reference";
+  }
+  restoreDraft(); syncAspectControls(); updateDuration(); updateSubmitState();
   Promise.allSettled([
     loadSources(),
     loadLoraCatalog(),

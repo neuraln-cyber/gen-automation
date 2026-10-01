@@ -183,6 +183,8 @@ class H3LoraGrant(_StrictModel):
 class GenerationSettings(_StrictModel):
     profile: Literal["wan22", "minimax_h3"] = "wan22"
     h3_model_variant: Literal["turbo_v2", "hybrid_v2", "fl2va_int8", "eros_beta5"] | None = None
+    # Missing in historical snapshots means reference-only, never a silent migration.
+    h3_image_mode: Literal["reference", "first_frame"] = "reference"
     frame_count: int = Field(default=81, ge=9)
     fps: int = Field(default=16, gt=0)
     width: int = Field(default=576, ge=32)
@@ -266,6 +268,10 @@ class GenerationSettings(_StrictModel):
 
     @model_validator(mode="after")
     def validate_wan_shape(self) -> GenerationSettings:
+        if self.h3_image_mode != "reference" and (
+            self.profile != "minimax_h3" or self.h3_model_variant != "eros_beta5"
+        ):
+            raise ValueError("first-frame reference guidance requires Eros Beta 5")
         if self.profile == "minimax_h3":
             from gen_automation.i2v_worker.h3_sampling import H3_SAMPLERS, H3_SCHEDULERS
 
