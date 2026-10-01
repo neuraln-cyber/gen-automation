@@ -10,15 +10,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from gen_automation.domain.private_delivery import PrivateDeliveryRoute
 from gen_automation.i2v_worker.h3_upscale import H3_UPSCALER_ROLE
-from gen_automation.i2v_worker.h3_variants import H3_NORMAL_V2_SHA256, H3Variant
+from gen_automation.i2v_worker.h3_variants import (
+    H3_NATIVE_SHA256,
+    H3_NORMAL_V2_SHA256,
+    H3Variant,
+    h3_native_models_match,
+)
 from gen_automation.i2v_worker.lora_catalog import REQUIRED_LORA_ROLES
 from gen_automation.i2v_worker.manifest_contract import required_i2v_model_roles
 from gen_automation.i2v_worker.models import ModelObject
 
 I2V_CUSTOM_NODES = ("ComfyUI-NAG",)
 H3_CUSTOM_NODES = (
-    "ComfyUI-DaSiWa-Nodes",
-    "ComfyUI-KJNodes",
     "Comfyui-MMH3-UltimateUpscale",
     "GenAutomationH3",
 )
@@ -124,11 +127,27 @@ class I2VWorkerSettings(BaseSettings):
             required.add(H3_UPSCALER_ROLE)
         if roles != required or len(roles) != len(objects):
             raise ValueError("model manifest roles are incomplete or duplicated")
+        if self.profile == "minimax_h3" and self.h3_model_variant == "fl2va_int8":
+            identities: dict[str, dict[str, object]] = {
+                item.role: {
+                    "sha256": item.sha256,
+                    "bytes": item.byte_size,
+                    "target_filename": Path(item.install_path).name,
+                }
+                for item in objects
+            }
+            if not h3_native_models_match(identities):
+                raise ValueError("Native H3 requires the exact official model set")
         return self
 
     @property
     def h3_model_variant(self) -> H3Variant:
         """Derive identity from immutable model bytes, never from a request/default."""
+        if any(
+            item.role == "diffusion_model" and item.sha256 == H3_NATIVE_SHA256
+            for item in self.model_objects
+        ):
+            return "fl2va_int8"
         if any(
             item.role == "diffusion_model" and item.sha256 == H3_NORMAL_V2_SHA256
             for item in self.model_objects
@@ -139,6 +158,8 @@ class I2VWorkerSettings(BaseSettings):
     @property
     def effective_workflow_template(self) -> Path:
         if self.profile == "minimax_h3":
+            if self.h3_model_variant == "fl2va_int8":
+                return self.workflow_template.parent / "minimax-h3-native-i2v.api.json"
             return self.workflow_template.parent / "dasiwa-minimax-h3-i2v-v1.api.json"
         return self.workflow_template
 

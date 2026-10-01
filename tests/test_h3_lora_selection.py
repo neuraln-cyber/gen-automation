@@ -384,16 +384,16 @@ def test_worker_rejects_corrupt_bytes_off_route_and_naive_expiry(tmp_path, monke
         H3LoraGrant.model_validate(invalid)
 
 
-def test_creator_loader_is_pinned_unmodified_and_custom_loader_removed():
+def test_native_loader_replaces_creator_pack_and_custom_loader_stays_removed():
     docker = (ROOT / "Dockerfile.i2v-worker").read_text(encoding="utf-8")
-    installer = (ROOT / "scripts/install-h3-author-nodes.sh").read_text(encoding="utf-8")
-    assert "9f5aef4a2748bba9486dda0a7efec7689462d7e0" in installer
-    assert "https://github.com/darksidewalker/ComfyUI-DaSiWa-Nodes.git" in installer
+    installer = (ROOT / "scripts/install-h3-native-nodes.sh").read_text(encoding="utf-8")
+    assert "DaSiWa" not in installer
     assert 'test -z "$(git -C "$target" status --porcelain)"' in installer
     assert not (ROOT / "src/gen_automation/i2v_worker/comfy_dasiwa_node.py").exists()
     assert not (ROOT / "src/gen_automation/i2v_worker/comfy_h3_lora.py").exists()
     assert not (ROOT / "scripts/verify-h3-lora-math.py").exists()
-    assert "verify_h3_creator_lora.py" in docker
+    assert "verify_h3_native_workflow.py" in docker
+    assert "verify_h3_creator_lora.py" not in docker
 
 
 @pytest.mark.asyncio

@@ -59,6 +59,12 @@ _MINIMAX_NODE_CLASSES = {
     "h3-lora-stack": "DaSiWa_LTX2LoraLoader",
     "h3-preview": "ModelPreviewOverrideKJ",
 }
+_NATIVE_H3_NODE_CLASSES = {
+    **{key: value for key, value in _MINIMAX_NODE_CLASSES.items() if key.isdigit()},
+    "1": "LoadImage",
+    "6": "MiniMaxH3ImageToVideo",
+    "8": "RandomNoise",
+}
 
 _FACE_FIDELITY_POSITIVE = (
     "Facial identity and the source facial expression remain consistent throughout. "
@@ -90,6 +96,13 @@ def load_workflow_template(path: Path, *, profile: str = "wan22") -> dict[str, A
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         raise WorkflowError("workflow template is invalid") from None
     expected = _MINIMAX_NODE_CLASSES if profile == "minimax_h3" else _EXPECTED_NODE_CLASSES
+    if (
+        profile == "minimax_h3"
+        and isinstance(raw, dict)
+        and isinstance(raw.get("1"), dict)
+        and raw.get("1", {}).get("class_type") == "LoadImage"
+    ):
+        expected = _NATIVE_H3_NODE_CLASSES
     if profile not in {"wan22", "minimax_h3"}:
         raise WorkflowError("workflow profile is invalid")
     if not isinstance(raw, dict) or set(raw) != set(expected):
@@ -112,6 +125,11 @@ def render_workflow(
     attempt_id: UUID,
     model_paths: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, Any], int, str]:
+    native_h3 = settings.profile == "minimax_h3" and settings.h3_model_variant == "fl2va_int8"
+    if settings.profile == "minimax_h3" and native_h3 != (
+        template.get("6", {}).get("class_type") == "MiniMaxH3ImageToVideo"
+    ):
+        raise WorkflowError("H3 workflow does not match the checkpoint variant")
     seed = settings.seed if settings.seed >= 0 else secrets.randbelow(2**63)
     frame_prefix = f"i2v/{job_id}/{attempt_id}/frame"
     values: dict[str, object] = {
@@ -166,18 +184,25 @@ def render_workflow(
     if _contains_placeholder(rendered):
         raise WorkflowError("workflow template contains an unresolved binding")
     if settings.profile == "minimax_h3":
-        rendered = _inject_h3_loras(rendered, settings)
+        rendered = (
+            _inject_native_h3_loras(rendered, settings)
+            if native_h3
+            else _inject_h3_loras(rendered, settings)
+        )
         rendered["11"]["inputs"]["denoise"] = settings.h3_denoise
         if settings.cfg != 1 or (settings.match_source_resolution and settings.h3_refine_cfg != 1):
             rendered["h3-negative"] = {
                 "class_type": "CLIPTextEncode",
-                "inputs": {"clip": ["h3-lora-stack", 1], "text": negative_prompt},
+                "inputs": {
+                    "clip": ["3", 0] if native_h3 else ["h3-lora-stack", 1],
+                    "text": negative_prompt,
+                },
             }
         if settings.cfg != 1:
             rendered["9"] = {
                 "class_type": "CFGGuider",
                 "inputs": {
-                    "model": ["h3-preview", 0],
+                    "model": ["7", 0] if native_h3 else ["h3-preview", 0],
                     "positive": ["6", 0],
                     "negative": ["h3-negative", 0],
                     "cfg": settings.cfg,
@@ -305,24 +330,50 @@ def _inject_h3_loras(workflow: dict[str, Any], settings: GenerationSettings) -> 
     return workflow
 
 
+def _inject_native_h3_loras(
+    workflow: dict[str, Any], settings: GenerationSettings
+) -> dict[str, Any]:
+    """Official model-only loader, ordered owner strengths, no custom weight math."""
+    model: list[object] = ["2", 0]
+    for index, selection in enumerate(settings.h3_loras):
+        if selection.strength == 0:
+            continue
+        node_id = f"h3-lora-{index}"
+        workflow[node_id] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {
+                "model": model,
+                "lora_name": f"managed-h3/{selection.sha256}.safetensors",
+                "strength_model": selection.strength,
+            },
+        }
+        model = [node_id, 0]
+    workflow["7"]["inputs"]["model"] = model
+    return workflow
+
+
 def _inject_h3_upscale(
     workflow: dict[str, Any], settings: GenerationSettings, model_paths: Mapping[str, str]
 ) -> dict[str, Any]:
     if model_paths.get(H3_UPSCALER_ROLE) != H3_UPSCALER_FILENAME:
         raise WorkflowError("source-size H3 delivery requires the pinned latent upscaler")
     base_width, base_height = h3_base_canvas(settings.width, settings.height)
-    workflow["1"]["inputs"].update(
-        width=base_width,
-        height=base_height,
-        external_width_overwrite=base_width,
-        external_height_overwrite=base_height,
-    )
+    native_h3 = settings.h3_model_variant == "fl2va_int8"
+    if native_h3:
+        workflow["6"]["inputs"].update(width=base_width, height=base_height)
+    else:
+        workflow["1"]["inputs"].update(
+            width=base_width,
+            height=base_height,
+            external_width_overwrite=base_width,
+            external_height_overwrite=base_height,
+        )
     if (base_width, base_height) == (settings.width, settings.height):
         return workflow
     workflow["h3-refine-sigmas"] = {
         "class_type": "BasicScheduler",
         "inputs": {
-            "model": ["h3-lora-stack", 0],
+            "model": ["7", 0] if native_h3 else ["h3-lora-stack", 0],
             "scheduler": settings.h3_refine_scheduler,
             "steps": settings.h3_refine_steps,
             "denoise": settings.h3_refine_denoise,
@@ -371,8 +422,8 @@ def _inject_h3_upscale(
         "inputs": {
             "latent": ["12", 0],
             "conditioning": ["6", 0],
-            "model": ["h3-lora-stack", 0],
-            "noise": ["8", 1],
+            "model": ["7", 0] if native_h3 else ["h3-lora-stack", 0],
+            "noise": ["8", 0] if native_h3 else ["8", 1],
             "sampler": ["10", 0],
             "sigmas": ["h3-refine-sigmas", 0],
             "cfg": settings.h3_refine_cfg,

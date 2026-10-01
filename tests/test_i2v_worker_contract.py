@@ -630,10 +630,10 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
 
 def test_creator_package_is_traversable_and_real_imports_run_as_runtime_user() -> None:
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
-    installer = (ROOT / "scripts/install-h3-author-nodes.sh").read_text(encoding="utf-8")
+    installer = (ROOT / "scripts/install-h3-native-nodes.sh").read_text(encoding="utf-8")
     assert 'find "$target" -type d -exec chmod 0755 {} +' in installer
     assert 'find "$target" -type f -exec chmod 0444 {} +' in installer
-    assert "install-h3-author-nodes" in dockerfile
+    assert "install-h3-native-nodes" in dockerfile
     check = (
         "RUN setpriv --reuid 10002 --regid 10002 --init-groups --no-new-privs \\\n"
         "    /opt/i2v-venv/bin/python /opt/i2v/bin/verify-h3-comfy-nodes.py"

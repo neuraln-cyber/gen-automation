@@ -182,7 +182,7 @@ class H3LoraGrant(_StrictModel):
 
 class GenerationSettings(_StrictModel):
     profile: Literal["wan22", "minimax_h3"] = "wan22"
-    h3_model_variant: Literal["turbo_v2", "hybrid_v2"] | None = None
+    h3_model_variant: Literal["turbo_v2", "hybrid_v2", "fl2va_int8"] | None = None
     frame_count: int = Field(default=81, ge=9)
     fps: int = Field(default=16, gt=0)
     width: int = Field(default=576, ge=32)
@@ -230,7 +230,7 @@ class GenerationSettings(_StrictModel):
         if (
             isinstance(value, dict)
             and value.get("profile") == "minimax_h3"
-            and value.get("h3_model_variant") == "hybrid_v2"
+            and value.get("h3_model_variant") in {"hybrid_v2", "fl2va_int8"}
         ):
             return {
                 "steps": 20,
@@ -238,7 +238,7 @@ class GenerationSettings(_StrictModel):
                 "sampler": "res_multistep",
                 "scheduler": "simple",
                 "video_shift": 12.0,
-                "audio_shift": 4.0,
+                "audio_shift": 3.0 if value.get("h3_model_variant") == "fl2va_int8" else 4.0,
                 "fps": 24,
                 "frame_count": 124,
                 **value,

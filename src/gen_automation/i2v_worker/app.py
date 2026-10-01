@@ -434,7 +434,11 @@ async def _run_job(
         )
         output_metadata: dict[str, Any] = {
             "workflow": (
-                "dasiwa-minimax-h3-i2v-v1"
+                (
+                    "minimax-h3-native-i2v"
+                    if generation_settings.h3_model_variant == "fl2va_int8"
+                    else "dasiwa-minimax-h3-i2v-v1"
+                )
                 if settings.profile == "minimax_h3"
                 else "dasiwa-wan22-i2v-v1"
             ),

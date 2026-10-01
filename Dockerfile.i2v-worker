@@ -227,30 +227,28 @@ COPY --from=salad-queue-worker-builder --chmod=0555 /out/salad-http-job-queue-wo
 RUN test -x /usr/local/bin/salad-http-job-queue-worker
 
 COPY src/gen_automation/__init__.py ./src/gen_automation/__init__.py
-COPY --chmod=0555 scripts/install-h3-author-nodes.sh /opt/i2v/bin/install-h3-author-nodes
+COPY --chmod=0555 scripts/install-h3-native-nodes.sh /opt/i2v/bin/install-h3-native-nodes
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends git \
-    && /opt/i2v/bin/install-h3-author-nodes \
+    && /opt/i2v/bin/install-h3-native-nodes \
     && apt-get purge --yes --auto-remove git \
     && rm -rf /var/lib/apt/lists/*
 
-LABEL org.opencontainers.image.dasiwa-lora.revision="9f5aef4a2748bba9486dda0a7efec7689462d7e0" \
-      org.opencontainers.image.h3-upscaler.revision="fe6658f6d144066f14150d3526247b417683ff2b" \
-      org.opencontainers.image.kjnodes.revision="d3cfe21625e5170126ce06fbfcfe1d88108688c3"
+LABEL org.opencontainers.image.h3-upscaler.revision="fe6658f6d144066f14150d3526247b417683ff2b" \
+      org.opencontainers.image.h3-workflow.revision="e7cd011d4ded3411c2f481200544f0be6fdc962e"
 
 COPY src/gen_automation/domain/__init__.py ./src/gen_automation/domain/__init__.py
 COPY src/gen_automation/domain/private_delivery.py ./src/gen_automation/domain/private_delivery.py
 COPY src/gen_automation/i2v_worker ./src/gen_automation/i2v_worker
 COPY src/gen_automation/i2v_worker/comfy_h3_node.py /opt/comfyui/custom_nodes/GenAutomationH3/__init__.py
 COPY scripts/verify-h3-comfy-nodes.py /opt/i2v/bin/verify-h3-comfy-nodes.py
-COPY scripts/verify_h3_creator_lora.py /opt/i2v/bin/verify_h3_creator_lora.py
-COPY scripts/verify_h3_author_workflow.py /opt/i2v/bin/verify_h3_author_workflow.py
+COPY scripts/verify_h3_native_workflow.py /opt/i2v/bin/verify_h3_native_workflow.py
 COPY --chmod=0555 scripts/i2v-runpod-entrypoint.sh /opt/i2v/bin/i2v-runpod-entrypoint
 COPY workflows/dasiwa-wan22-i2v-v1.api.json ./workflows/dasiwa-wan22-i2v-v1.api.json
-COPY workflows/dasiwa-minimax-h3-i2v-v1.api.json ./workflows/dasiwa-minimax-h3-i2v-v1.api.json
-ADD --checksum=sha256:51a20a9e79fb9a505c0bada2e4828f39605738cd98aee327af7cd114f3015bef --chmod=0444 \
-    https://raw.githubusercontent.com/darksidewalker/dasiwa-comfyui-workflows/39b3427e6a67ff2e2c98fb5afabc7ce28117dec7/C-MMH3/DaSiWa%20MiniMaxH3%20MythicAlchemy%20C-MMH3-23.json \
-    /opt/i2v/reference/h3-author-v23.json
+COPY workflows/minimax-h3-native-i2v.api.json ./workflows/minimax-h3-native-i2v.api.json
+ADD --checksum=sha256:34ee39544808fd3b0dc8de9df082940d4d41c3771beb80d3988c1ea5531cec0d --chmod=0444 \
+    https://raw.githubusercontent.com/Comfy-Org/workflow_templates/e7cd011d4ded3411c2f481200544f0be6fdc962e/templates/video_minimax_h3_i2v.json \
+    /opt/i2v/reference/h3-native-i2v.json
 RUN chmod 0755 /opt/i2v/reference
 
 RUN groupadd --system --gid 10002 i2v-worker \

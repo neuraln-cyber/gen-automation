@@ -30,7 +30,11 @@ from gen_automation.domain.signing import (
     derive_public_key,
     validate_private_key,
 )
-from gen_automation.i2v_worker.h3_variants import H3Variant, h3_manifest_matches_variant
+from gen_automation.i2v_worker.h3_variants import (
+    H3Variant,
+    h3_manifest_matches_variant,
+    h3_native_models_match,
+)
 from gen_automation.i2v_worker.manifest_contract import validated_i2v_manifest_objects
 
 LOCAL_SESSION_SECRET = "local-development-only"  # noqa: S105
@@ -1145,6 +1149,11 @@ class Settings(BaseSettings):
                                 manifest_objects["diffusion_model"], self.i2v_h3_model_variant
                             ):
                                 errors.append("H3 recipe variant does not match the pinned model")
+                            if self.i2v_profile == "minimax_h3" and (
+                                self.i2v_h3_model_variant == "fl2va_int8"
+                                and not h3_native_models_match(manifest_objects)
+                            ):
+                                errors.append("Native H3 requires the exact official model set")
                             if self.i2v_h3_source_resolution_enabled and (
                                 self.i2v_profile != "minimax_h3"
                                 or "h3_latent_upscaler" not in manifest_objects

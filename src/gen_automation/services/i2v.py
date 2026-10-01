@@ -1212,10 +1212,10 @@ def _canonical_sha256(value: dict[str, Any]) -> str:
 def _normalized_settings(value: dict[str, Any]) -> dict[str, Any]:
     try:
         normalized = normalize_i2v_settings(value)
-        if (
-            normalized.get("profile") == "minimax_h3"
-            and normalized.get("h3_model_variant") == "hybrid_v2"
-        ):
+        if normalized.get("profile") == "minimax_h3" and normalized.get("h3_model_variant") in {
+            "hybrid_v2",
+            "fl2va_int8",
+        }:
             return GenerationSettings.model_validate(normalized).model_dump(mode="json")
         return normalized
     except (I2VLoraSelectionError, ValueError) as error:
