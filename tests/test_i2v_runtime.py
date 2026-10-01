@@ -454,6 +454,84 @@ async def test_startup_cost_guard_survives_restart_and_preserves_queue(
         assert deployment.deployment_metadata["cost_guard_stopped_at"]
 
 
+@pytest.mark.parametrize("submission_state", ["prepared", "submitting", "unknown"])
+async def test_hold_preserves_prepared_attempt_and_resumes_once_after_release(
+    runtime_database: tuple[Database, UUID, UUID],
+    submission_state: str,
+) -> None:
+    database, owner_id, input_id = runtime_database
+    job_id = await _queue_job(database, owner_id=owner_id, input_id=input_id)
+    client = FakeRuntimeSalad()
+    runtime = _runtime(database, client)
+    await runtime.run_cycle(now=_NOW)
+    assert (await runtime.run_cycle(now=_NOW + timedelta(seconds=1))).action == "job_claimed"
+    job_before, attempt_before = await _durable_job(database, job_id)
+    assert attempt_before is not None
+    async with database.sessions() as session:
+        deployment = await session.scalar(select(I2VWorkerDeployment))
+        deployment.deployment_metadata = {
+            **deployment.deployment_metadata,
+            "cost_guard_reason": "owner_approved_maintenance",
+        }
+        attempt = await session.get(I2VAttempt, attempt_before.id)
+        attempt.request_metadata = {
+            **attempt.request_metadata,
+            "submission_state": submission_state,
+        }
+        await session.commit()
+    client.instances = ()
+    client.group = replace(
+        client.group,
+        current_state=replace(client.group.current_state, status="stopped", running_count=0),
+    )
+    restarted = _runtime(database, client)
+    for second in (2, 3):
+        cycle = await restarted.run_cycle(now=_NOW + timedelta(seconds=second))
+        assert cycle.action == "cost_guard_paused" and not cycle.changed
+    after, attempt_after = await _durable_job(database, job_id)
+    assert after.state == job_before.state == I2VJobState.CLAIMED
+    assert after.attempt_count == 1 and attempt_after.id == attempt_before.id
+    assert after.settings_snapshot == job_before.settings_snapshot
+    assert attempt_after.provider_job_id is None and client.submission_calls == 0
+    async with database.sessions() as session:
+        deployment = await session.scalar(select(I2VWorkerDeployment))
+        deployment.deployment_metadata = {}
+        await session.commit()
+    assert (
+        await restarted.run_cycle(now=_NOW + timedelta(seconds=4))
+    ).action == "provider_job_submitted"
+    await restarted.run_cycle(now=_NOW + timedelta(seconds=5))
+    assert client.submission_calls == 1
+    assert (await _durable_job(database, job_id))[1].id == attempt_before.id
+
+
+async def test_hold_still_reconciles_accepted_job_without_duplicate_submission(
+    runtime_database: tuple[Database, UUID, UUID],
+) -> None:
+    database, owner_id, input_id = runtime_database
+    job_id = await _queue_job(database, owner_id=owner_id, input_id=input_id)
+    client = FakeRuntimeSalad()
+    runtime = _runtime(database, client)
+    for second in range(3):
+        await runtime.run_cycle(now=_NOW + timedelta(seconds=second))
+    # Simulate the controller losing the receipt, not the remote job itself.
+    async with database.sessions() as session:
+        attempt = await session.scalar(select(I2VAttempt).where(I2VAttempt.job_id == job_id))
+        attempt.provider_job_id = None
+        attempt.request_metadata = {**attempt.request_metadata, "submission_state": "prepared"}
+        deployment = await session.scalar(select(I2VWorkerDeployment))
+        deployment.deployment_metadata = {"cost_guard_reason": "owner_approved_maintenance"}
+        await session.commit()
+    client.instances = ()
+    client.group = replace(
+        client.group,
+        current_state=replace(client.group.current_state, status="stopped", running_count=0),
+    )
+    await _runtime(database, client).run_cycle(now=_NOW + timedelta(seconds=4))
+    assert (await _durable_job(database, job_id))[1].provider_job_id is not None
+    assert client.submission_calls == 1
+
+
 async def test_execution_cost_guard_cancels_then_stops_without_retry_spend(
     runtime_database: tuple[Database, UUID, UUID],
 ) -> None:
