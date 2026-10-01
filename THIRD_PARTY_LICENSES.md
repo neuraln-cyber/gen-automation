@@ -48,7 +48,10 @@ license texts and copyright notices in
 The image includes code only, not model weights. The private manifest and existing
 CloudFront delivery path provide the checksum-verified checkpoint separately.
 
-## Complete DaSiWa node pack
+## Historical rollback images only — DaSiWa and KJNodes
+
+The native FL2VA image no longer installs or imports either package below. These
+notices describe retained, immutable rollback images, not the active native build.
 
 - Code: <https://github.com/darksidewalker/ComfyUI-DaSiWa-Nodes>
 - Revision: `9f5aef4a2748bba9486dda0a7efec7689462d7e0`
@@ -58,7 +61,7 @@ CloudFront delivery path provide the checksum-verified checkpoint separately.
   registration code unchanged. No extracted registration shim is used.
 - Loader SHA-256: `26954c67c71a547226fdc523566783a33d03ffb2e667fb1d5930386d4cefd2cf`.
 
-## KJNodes
+### KJNodes (historical)
 
 - Code: <https://github.com/kijai/ComfyUI-KJNodes>
 - Revision: `d3cfe21625e5170126ce06fbfcfe1d88108688c3`

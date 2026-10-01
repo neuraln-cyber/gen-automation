@@ -56,17 +56,18 @@ class ComfyClient:
                 (name, f"/object_info/{name}")
                 for name in (
                     "MiniMaxH3ImageToVideo",
-                    "MiniMaxH3ReferenceToVideo",
-                    "MiniMaxH3Director",
-                    "MiniMaxH3DirectorGuide",
-                    "DaSiWa_SeedControl",
-                    "ModelAttentionBackend",
-                    "ModelPatchTorchSettings",
-                    "ModelPreviewOverrideKJ",
+                    "LoadImage",
+                    "UNETLoader",
+                    "CLIPLoader",
+                    "VAELoader",
+                    "RandomNoise",
+                    "SamplerCustomAdvanced",
+                    "VAEDecode",
+                    "CreateVideo",
                     "MiniMaxH3SigmaShift",
                     "SaveVideo",
                     "VAEDecodeAudio",
-                    "DaSiWa_LTX2LoraLoader",
+                    "LoraLoaderModelOnly",
                     "ManagedH3DiagnosticDecode",
                     "BasicGuider",
                     "CFGGuider",
@@ -166,7 +167,8 @@ class ComfyClient:
                     and len(message) == 2
                     and message[0] == "execution_error"
                     and isinstance(message[1], dict)
-                    and message[1].get("node_type") == "DaSiWa_LTX2LoraLoader"
+                    and message[1].get("node_type")
+                    in {"LoraLoaderModelOnly", "DaSiWa_LTX2LoraLoader"}
                     for message in messages
                 ):
                     raise ComfyLoraError("selected H3 LoRA could not be applied")

@@ -28,27 +28,25 @@ def test_h3_process_cannot_import_legacy_or_deleted_inference_nodes(tmp_path):
     assert not (ROOT / "src/gen_automation/i2v_worker/comfy_h3_upscale.py").exists()
 
 
-def test_complete_author_packages_and_runtime_are_immutable():
+def test_native_runtime_and_optional_upscaler_are_immutable():
     docker = (ROOT / "Dockerfile.i2v-worker").read_text()
     requirements = (ROOT / "requirements-i2v-worker.in").read_text()
-    installer = (ROOT / "scripts/install-h3-author-nodes.sh").read_text()
+    installer = (ROOT / "scripts/install-h3-native-nodes.sh").read_text()
     for pin in ("comfyui-frontend-package==1.53.6", "comfy-kitchen==0.2.35", "comfy-aimdo==0.5.5"):
         assert pin in requirements
         assert pin in (ROOT / "requirements-i2v-worker.lock").read_text()
     assert "73c9bad4d21e7addbe1d13bc92eee0f1431b017d" in docker
-    for revision in (
-        "9f5aef4a2748bba9486dda0a7efec7689462d7e0",
-        "d3cfe21625e5170126ce06fbfcfe1d88108688c3",
-        "fe6658f6d144066f14150d3526247b417683ff2b",
-    ):
-        assert revision in installer and revision in docker
+    revision = "fe6658f6d144066f14150d3526247b417683ff2b"
+    assert revision in installer and revision in docker
+    for removed in ("ComfyUI-DaSiWa-Nodes", "ComfyUI-KJNodes"):
+        assert removed not in installer and removed not in H3_CUSTOM_NODES
     assert 'test "$(git -C "$target" rev-parse HEAD)" = "$revision"' in installer
     assert "git apply" not in installer
-    assert "verify_h3_author_workflow.py" in docker
-    assert "51a20a9e79fb9a505c0bada2e4828f39605738cd98aee327af7cd114f3015bef" in docker
+    assert "verify_h3_native_workflow.py" in docker
+    assert "34ee39544808fd3b0dc8de9df082940d4d41c3771beb80d3988c1ea5531cec0d" in docker
     publication = (ROOT / ".github/workflows/publish-images.yml").read_text()
     inputs = publication.split("i2v_inputs=(", 1)[1].split(")", 1)[0]
-    for script in ("install-h3-author-nodes.sh", "verify_h3_author_workflow.py"):
+    for script in ("install-h3-native-nodes.sh", "verify_h3_native_workflow.py"):
         assert f"scripts/{script}" in inputs
 
 

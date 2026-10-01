@@ -92,9 +92,10 @@
     h3_save_base_video: false,
   });
   const h3SamplingDefaults = {
-    steps: h3ModelVariant === "hybrid_v2" ? 20 : 4, cfg: 1,
-    sampler: h3ModelVariant === "hybrid_v2" ? "res_multistep" : "euler", scheduler: "simple",
-    video_shift: h3ModelVariant === "hybrid_v2" ? 12 : 8, audio_shift: 4,
+    steps: ["hybrid_v2", "fl2va_int8"].includes(h3ModelVariant) ? 20 : 4, cfg: 1,
+    sampler: ["hybrid_v2", "fl2va_int8"].includes(h3ModelVariant) ? "res_multistep" : "euler", scheduler: "simple",
+    video_shift: ["hybrid_v2", "fl2va_int8"].includes(h3ModelVariant) ? 12 : 8,
+    audio_shift: h3ModelVariant === "fl2va_int8" ? 3 : 4,
     h3_denoise: 1, h3_refine_steps: 1, h3_refine_cfg: 1, h3_refine_denoise: 0.2,
     h3_refine_sampler: null, h3_refine_scheduler: "simple",
   };

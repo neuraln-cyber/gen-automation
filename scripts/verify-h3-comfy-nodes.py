@@ -47,8 +47,7 @@ async def main() -> None:
     from app.assets.manager import default_asset_manager  # type: ignore[import-not-found]
     from server import PromptServer  # type: ignore[import-not-found]
 
-    # The upstream loader registers its key-count route during import, exactly
-    # as it does at normal Comfy startup. This does not bind a socket.
+    # Built-in/custom route registration matches startup, without binding a socket.
     PromptServer(asyncio.get_running_loop(), default_asset_manager())
 
     # Exercise exactly the allowlist used at runtime, not a separate build list.
@@ -56,12 +55,9 @@ async def main() -> None:
     for directory in H3_CUSTOM_NODES:
         if not await nodes.load_custom_node(f"/opt/comfyui/custom_nodes/{directory}"):
             raise RuntimeError(f"H3 extension failed to import: {directory}")
-    from verify_h3_author_workflow import verify_author_workflow
+    from verify_h3_native_workflow import verify_native_workflow
 
-    verify_author_workflow(nodes)
-    from verify_h3_creator_lora import verify_creator_lora
-
-    verify_creator_lora(nodes)
+    verify_native_workflow(nodes)
     print("Pinned H3 import/API check passed as runtime UID/GID 10002 (CPU, no weights).")
 
 
