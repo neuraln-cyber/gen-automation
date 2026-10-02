@@ -25,8 +25,9 @@ from tests.test_i2v_worker_app import _job
 
 @pytest.mark.parametrize("upscale", [False, True])
 @pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("contrast", [1.0, 0.9])
 async def test_worker_prepares_distinct_whole_image_guide_and_cleans_it(
-    tmp_path, monkeypatch, upscale, fail
+    tmp_path, monkeypatch, upscale, fail, contrast
 ):
     runtime = tmp_path / "runtime"
     items = [
@@ -45,6 +46,7 @@ async def test_worker_prepares_distinct_whole_image_guide_and_cleans_it(
     raw = _job()
     raw["settings_snapshot"] = eros(
         h3_image_mode="first_frame",
+        h3_latent_contrast=contrast,
         match_source_resolution=upscale,
         width=768,
         height=992,
@@ -118,6 +120,7 @@ async def test_worker_prepares_distinct_whole_image_guide_and_cleans_it(
         assert result.output.metadata["workflow"] == "minimax-h3-eros-ref2va"
         assert result.output.metadata["h3_image_mode"] == "first_frame"
         assert result.output.metadata["h3_refine_steps"] == 1
+        assert result.output.metadata["h3_latent_contrast"] == contrast
         assert result.output.metadata["effective_positive_prompt"] == job.positive_prompt
     assert not list((runtime / "input").iterdir())
     assert not (runtime / "jobs" / str(job.attempt_id)).exists()

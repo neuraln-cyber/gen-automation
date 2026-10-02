@@ -221,7 +221,12 @@ async def test_native_readiness_cannot_pass_without_native_loader_and_conditioni
             "SamplerCustomAdvanced",
         } <= names
         assert not any("DaSiWa" in name or "Director" in name for name in names)
-        assert H3_CUSTOM_NODES == ("Comfyui-MMH3-UltimateUpscale", "GenAutomationH3")
+        assert H3_CUSTOM_NODES == (
+            "Comfyui-MMH3-UltimateUpscale",
+            "GenAutomationH3",
+            "GenAutomationH3Contrast",
+        )
+        assert "MiniMaxH3LatentContrast" in names
     finally:
         await client.close()
 

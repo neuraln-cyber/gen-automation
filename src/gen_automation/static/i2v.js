@@ -104,6 +104,7 @@
   if (erosAuthorRecipe) Object.assign(h3SamplingDefaults, {
     steps: 6, sampler: "er_sde", scheduler: "beta57", h3_attention_backend: "comfy_kitchen",
   });
+  if (isH3 && h3ModelVariant === "eros_beta5") h3SamplingDefaults.h3_latent_contrast = 1;
   if (isH3 && h3AdvancedSamplingEnabled) Object.assign(workerSettingDefaults, h3SamplingDefaults);
   if (isH3 && h3ModelVariant === "eros_beta5") Object.assign(workerSettingDefaults, {width: 768, height: 1344});
   let saveTimer = null;
@@ -373,13 +374,20 @@
 
   function collectSettings() {
     if (loraWriteBlocked()) throw new Error(loraBlockMessage());
+    const contrast = advanced.querySelector('[name="h3_latent_contrast"]');
+    if (contrast && (contrast.value.trim() === "" || !Number.isFinite(Number(contrast.value)) || Number(contrast.value) < 0 || Number(contrast.value) > 3)) {
+      throw new Error("Enter a finite Eros latent contrast between 0 and 3 (1 = unchanged).");
+    }
+    if (contrast?.disabled && Number(contrast.value) !== 1) {
+      throw new Error("This saved contrast setting awaits the matching worker update. Set 1 for unchanged output.");
+    }
     if ([...loraList.querySelectorAll('input[type="number"]')].some((field) => !field.disabled && !field.validity.valid)) {
       throw new Error("Enter a valid finite strength for each selected LoRA.");
     }
     const settings = { ...workerSettingDefaults };
     const resolutionError = sourceResolutionError();
     if (resolutionError) throw new Error(resolutionError);
-    const numbers = new Set(["frame_count", "fps", "width", "height", "seed", "steps", "high_end_step", "cfg", "high_shift", "low_shift", "loop_count", "video_shift", "audio_shift", "h3_denoise", "h3_refine_steps", "h3_refine_cfg", "h3_refine_denoise"]);
+    const numbers = new Set(["frame_count", "fps", "width", "height", "seed", "steps", "high_end_step", "cfg", "high_shift", "low_shift", "loop_count", "video_shift", "audio_shift", "h3_denoise", "h3_refine_steps", "h3_refine_cfg", "h3_refine_denoise", "h3_latent_contrast"]);
     advanced.querySelectorAll("input[name], select[name]").forEach((field) => {
       if (field.type === "checkbox") settings[field.name] = field.checked;
       else if (numbers.has(field.name)) settings[field.name] = Number(field.value);
@@ -411,6 +419,7 @@
     if (isH3 && h3ModelVariant === "eros_beta5") {
       resolved.h3_image_mode = settings.h3_image_mode || "reference";
       resolved.h3_attention_backend = settings.h3_attention_backend || "default";
+      resolved.h3_latent_contrast = settings.h3_latent_contrast ?? 1;
     }
     Object.entries(resolved).forEach(([name, value]) => {
       if (name === "loras" || name === "h3_loras") return;
@@ -1153,6 +1162,11 @@
     applySettings({ ...collectSettings(), ...h3SamplingDefaults });
     scheduleDraftSave();
     announce("Creator sampling defaults restored; prompts, LoRAs, seed and dimensions unchanged.");
+  });
+  q("[data-h3-contrast-reset]")?.addEventListener("click", () => {
+    form.elements.h3_latent_contrast.value = "1";
+    scheduleDraftSave();
+    announce("Contrast reset to 1.0 (unchanged output). Other settings are preserved.");
   });
   q("[data-eros-style-preset]")?.addEventListener("click", () => {
     const prompt = form.elements.positive_prompt;

@@ -1038,6 +1038,10 @@ def _validate_generation_profile(
         raise HTTPException(
             status_code=409, detail="Base-video diagnostics await the matching worker update."
         )
+    if value.get("h3_latent_contrast", 1.0) != 1.0 and not settings.i2v_h3_latent_contrast_enabled:
+        raise HTTPException(
+            status_code=409, detail="Eros contrast control awaits the matching worker update."
+        )
     if (
         value.get("h3_image_mode", "reference") != "reference"
         and not settings.i2v_h3_first_frame_enabled

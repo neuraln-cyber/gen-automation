@@ -257,6 +257,23 @@ def render_workflow(
             rendered["h3-base-save"]["inputs"].update(
                 video=["h3-base-create", 0], filename_prefix=frame_prefix + "-base"
             )
+        if settings.h3_latent_contrast != 1.0:
+            # Final, post-refinement video decode only. Never feed the adjusted
+            # latent back to a sampler, reference conditioning or audio decode.
+            for decode_id in ("13", "h3-base-decode"):
+                if decode_id not in rendered:
+                    continue
+                contrast_id = f"{decode_id}-contrast"
+                inputs = rendered[decode_id]["inputs"]
+                rendered[contrast_id] = {
+                    "class_type": "MiniMaxH3LatentContrast",
+                    "inputs": {
+                        "samples": inputs["samples"],
+                        "contrast": settings.h3_latent_contrast,
+                        "preserve_norm": True,
+                    },
+                }
+                inputs["samples"] = [contrast_id, 0]
         return rendered, seed, frame_prefix
     rendered = _inject_reviewed_loras(rendered, settings)
     if settings.face_fidelity == "stable_expression":

@@ -58,7 +58,7 @@ silent PyTorch fallback. CPU tests do not prove GPU execution or visual quality.
 - Comfy0.37.0 at73c9bad4d21e7addbe1d13bc92eee0f1431b017d,
   frontend1.53.6, Torch2.9.1/CUDA13, Kitchen0.2.35, AIMDO0.5.5.
   Native operation requires no DaSiWa/Noda/KJ/SolAttn loader or attention cache.
-  H3 imports only the reviewed upscaler and our export synchronization node.
+  H3 imports only the reviewed upscaler, output-only contrast and our export synchronization node.
   Shared legacy WAN components are not enabled/imported for H3.
 
 ## Workflow and defaults
@@ -129,6 +129,46 @@ serialization unchanged. The controller must not omit `1` for Eros, whose missin
 value defaults to `4`. The dashboard shows the actual selected refinement count;
 Restore model sampling defaults restores four without changing prompts or LoRAs.
 Outputs identify the Eros workflow, conditioning mode and effective refine count.
+
+## Optional output contrast (2026-10-03)
+
+`h3_latent_contrast` defaults to **1.0**, an exact graph no-op; historical jobs,
+drafts and presets remain neutral. The dashboard's **Eros latent contrast**
+number control and **Reset contrast to 1.0** button preserve other settings.
+The [Eros author's contrast advice](https://huggingface.co/TenStrip/10Eros-Max/discussions/47)
+suggests **0.8–0.9 before video VAE decode** for the overcooked look. This is not
+a pure saturation slider, blur/sharpen filter or guarantee of recovered detail.
+
+The actual named node is `MiniMaxH3LatentContrast` from
+[Tr1dae's implementation](https://github.com/Tr1dae/ComfyUI-MiniMaxH3_LatentUpscaler/blob/895e3c471164423f0ea0e8eaf45eb701efe641ae/nodes.py),
+not the LBH upscaler code. Its unmodified contrast operation compresses/stretches
+each video channel around its global mean and uses upstream's default
+`preserve_norm=True`. The API accepts finite numbers 0–3 (upstream bounds), only
+for Eros when non-neutral. Start conservatively; extremes can degrade output.
+
+The node is inserted only on video-decode edges, after any refinement. The same
+factor is used on an optional diagnostic base clip, so its upscale comparison
+is not confounded by different contrast settings. Sampling, reference/guide,
+LoRAs, source images and audio decode remain untouched. There is no additional
+sampler execution. Effective contrast is stored in output metadata.
+
+Only this upstream node is registered by a narrow entrypoint. Its unrelated
+upscalers, checkpoint downloads, stash HTTP routes and web scripts are not
+enabled. No new weights or model manifest changes. Sources and original
+entrypoint are retained for audit; see third-party notices for the upstream's
+missing license declaration, which needs review before redistribution.
+
+Keep `GEN_AUTOMATION_I2V_H3_LATENT_CONTRAST_ENABLED=false` until a separately
+approved safe deployment activates the matching worker. The UI is disabled and
+the API rejects non-neutral jobs before that. Neutral wire snapshots omit the
+new field, keeping old strict workers compatible. Do not open the gate merely
+because the control plane has updated. Close it before rolling the worker back;
+preserve or drain non-neutral queued work rather than rewriting its settings.
+
+`verify_h3_contrast.py` checks real pinned CPU tensors (FP32/FP16/BF16), schema,
+non-mutation, audio preservation and neutral identity. The full native Eros
+schema check covers contrast on/off, both conditioning modes and refinement.
+These are integration checks, not a rendered visual comparison.
 
 ## Verification and safe cutover
 

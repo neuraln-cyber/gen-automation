@@ -62,6 +62,9 @@ async def main() -> None:
 
     verify_eros_workflow(nodes)
     await verify_eros_kitchen_api(nodes)
+    from verify_h3_contrast import verify_contrast
+
+    verify_contrast(nodes)
     print("Pinned H3 import/API check passed as runtime UID/GID 10002 (CPU, no weights).")
 
 

@@ -71,6 +71,7 @@ class ComfyClient:
                     "VAEDecodeAudio",
                     "LoraLoaderModelOnly",
                     "ManagedH3DiagnosticDecode",
+                    "MiniMaxH3LatentContrast",
                     "BasicGuider",
                     "CFGGuider",
                     "CLIPTextEncode",

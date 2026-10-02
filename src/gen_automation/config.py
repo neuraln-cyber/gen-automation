@@ -581,6 +581,8 @@ class Settings(BaseSettings):
     i2v_h3_first_frame_enabled: bool = False
     # Open only after the beta57/Kitchen-capable worker has been activated.
     i2v_h3_eros_author_recipe_enabled: bool = False
+    # Open only after the pinned output-contrast node is active on the worker.
+    i2v_h3_latent_contrast_enabled: bool = False
     # RunPod is enabled only after its immutable worker and persistent model
     # volume have been verified. The false state keeps cutover/rollback atomic.
     i2v_runpod_enabled: bool = False
