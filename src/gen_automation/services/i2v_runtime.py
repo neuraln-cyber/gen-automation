@@ -1149,6 +1149,8 @@ def _worker_settings_snapshot(settings: Mapping[str, object]) -> dict[str, objec
         snapshot.pop("h3_image_mode", None)
     if snapshot.get("h3_attention_backend", "default") == "default":
         snapshot.pop("h3_attention_backend", None)
+    if snapshot.get("h3_latent_contrast", 1.0) == 1.0:
+        snapshot.pop("h3_latent_contrast", None)
     for name, default in H3_EXPERT_DEFAULTS.items():
         # Eros fills an omitted refinement count with 4, so dropping an
         # explicitly requested 1 here would silently change the owner's job.

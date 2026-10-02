@@ -75,6 +75,7 @@
 .i2v-advanced > summary small { color: var(--muted); font-size: .7rem; font-weight: 500; }
 .i2v-advanced[open] > summary { border-bottom: 1px solid var(--border); }
 .i2v-settings-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .75rem; padding: .9rem; }
+.i2v-contrast-controls { grid-template-columns: minmax(0, 1fr) auto; align-items: end; }
 .i2v-settings-grid label > span { display: flex; align-items: center; gap: .35rem; }
 .i2v-settings-grid label > span input { min-width: 0; }
 .i2v-settings-grid output { min-height: 2.7rem; padding: .65rem; border: 1px solid var(--border); border-radius: .65rem; background: rgba(7, 8, 14, .4); color: var(--text); }

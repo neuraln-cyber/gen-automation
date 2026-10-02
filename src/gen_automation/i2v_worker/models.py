@@ -196,6 +196,8 @@ class GenerationSettings(_StrictModel):
     h3_image_mode: Literal["reference", "first_frame"] = "reference"
     # Old snapshots keep their attention implementation, not a silent migration.
     h3_attention_backend: Literal["default", "comfy_kitchen"] = "default"
+    # Output-only; missing in historical snapshots is an exact workflow no-op.
+    h3_latent_contrast: float = Field(default=1.0, ge=0, le=3, allow_inf_nan=False, strict=True)
     frame_count: int = Field(default=81, ge=9)
     fps: int = Field(default=16, gt=0)
     width: int = Field(default=576, ge=32)
@@ -279,6 +281,10 @@ class GenerationSettings(_StrictModel):
 
     @model_validator(mode="after")
     def validate_wan_shape(self) -> GenerationSettings:
+        if self.h3_latent_contrast != 1.0 and (
+            self.profile != "minimax_h3" or self.h3_model_variant != "eros_beta5"
+        ):
+            raise ValueError("latent contrast control requires Eros Beta 5")
         if self.h3_image_mode != "reference" and (
             self.profile != "minimax_h3" or self.h3_model_variant != "eros_beta5"
         ):

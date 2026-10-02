@@ -26,6 +26,7 @@ I2V_INPUTS = (
     "scripts/verify-h3-comfy-nodes.py",
     "scripts/verify_h3_native_workflow.py",
     "scripts/verify_h3_eros_workflow.py",
+    "scripts/verify_h3_contrast.py",
     "workflows/dasiwa-wan22-i2v-v1.api.json",
     "workflows/minimax-h3-native-i2v.api.json",
     "workflows/minimax-h3-eros-ref2va.api.json",

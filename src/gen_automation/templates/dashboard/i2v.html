@@ -202,6 +202,13 @@
             <label><input type="checkbox" name="match_source_aspect" checked> Standard size · match source aspect</label>
           </div>
           {% if h3_model_variant == 'eros_beta5' %}
+          <div class="i2v-settings-grid i2v-contrast-controls">
+            <label for="h3-latent-contrast">Eros latent contrast
+              <input id="h3-latent-contrast" name="h3_latent_contrast" type="number" value="1" min="0" max="3" step="0.05" required aria-describedby="h3-contrast-help"{% if not h3_latent_contrast_enabled %} disabled{% endif %}>
+            </label>
+            <button class="secondary-button" type="button" data-h3-contrast-reset>Reset contrast to 1.0</button>
+          </div>
+          <p id="h3-contrast-help" class="muted">1.0 = unchanged. Try 0.9 for softer contrast; the Eros author suggests 0.8–0.9 for an overcooked look. Applies before video decode, after any refinement, including the diagnostic base clip. Audio, sampling and LoRAs stay unchanged. This is latent contrast, not saturation or sharpening; very low values can lose quality. Saved jobs are not changed.{% if not h3_latent_contrast_enabled %} Awaiting the matching worker update.{% endif %}</p>
           <label>Attention backend <select name="h3_attention_backend"><option value="comfy_kitchen"{% if eros_author_recipe %} selected{% else %} disabled{% endif %}>Comfy Kitchen · author setup{% if not eros_author_recipe %} · awaits worker update{% endif %}</option><option value="default"{% if not eros_author_recipe %} selected{% endif %}>Runtime default · historical setup</option></select></label>
           {% if eros_author_recipe %}
           <p class="muted">Eros Beta5 style-preservation preset: er_sde / beta57, 6 steps (author range 4–6). beta57 uses alpha 0.5 / beta 0.7, not stock beta. CFG 1 and shifts 12/3 remain native defaults; the author did not publish new Beta5 shift values. All controls stay editable. Saved drafts/presets keep their settings; Restore model sampling defaults applies this preset without changing prompts or LoRAs.</p>

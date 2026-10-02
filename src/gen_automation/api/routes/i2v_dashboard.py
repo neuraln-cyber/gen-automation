@@ -62,6 +62,7 @@ async def dashboard_i2v(request: Request, principal: ReleaseReader) -> Response:
             "source_resolution_enabled": settings.i2v_h3_source_resolution_enabled,
             "h3_diagnostics_enabled": settings.i2v_h3_diagnostics_enabled,
             "h3_first_frame_enabled": settings.i2v_h3_first_frame_enabled,
+            "h3_latent_contrast_enabled": settings.i2v_h3_latent_contrast_enabled,
             "video_provider": "RunPod" if settings.i2v_runpod_enabled else "Salad",
         },
     )

@@ -46,13 +46,14 @@ def verify_eros_workflow(nodes, template_path=None, reference_path=None):
     )
     paths = {role: identity[2] for role, identity in H3_EROS_MODELS.items()}
     paths[H3_UPSCALER_ROLE] = H3_UPSCALER_FILENAME
-    for author_recipe, mode, upscale, cfg in itertools.product(
-        (False, True), ("reference", "first_frame"), (False, True), (1, 2.5)
+    for author_recipe, mode, upscale, cfg, contrast in itertools.product(
+        (False, True), ("reference", "first_frame"), (False, True), (1, 2.5), (1.0, 0.9)
     ):
         settings = GenerationSettings(
             profile="minimax_h3",
             h3_model_variant="eros_beta5",
             h3_image_mode=mode,
+            h3_latent_contrast=contrast,
             h3_attention_backend="comfy_kitchen" if author_recipe else "default",
             sampler="er_sde" if author_recipe else "res_multistep",
             scheduler="beta57" if author_recipe else "simple",

@@ -228,6 +228,7 @@ RUN test -x /usr/local/bin/salad-http-job-queue-worker
 
 COPY src/gen_automation/__init__.py ./src/gen_automation/__init__.py
 COPY --chmod=0555 scripts/install-h3-native-nodes.sh /opt/i2v/bin/install-h3-native-nodes
+COPY src/gen_automation/i2v_worker/comfy_h3_contrast_entrypoint.py /opt/i2v/bin/h3-contrast-entrypoint.py
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends git \
     && /opt/i2v/bin/install-h3-native-nodes \
@@ -235,6 +236,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 LABEL org.opencontainers.image.h3-upscaler.revision="fe6658f6d144066f14150d3526247b417683ff2b" \
+      org.opencontainers.image.h3-contrast.revision="895e3c471164423f0ea0e8eaf45eb701efe641ae" \
       org.opencontainers.image.h3-workflow.revision="e7cd011d4ded3411c2f481200544f0be6fdc962e"
 
 COPY src/gen_automation/domain/__init__.py ./src/gen_automation/domain/__init__.py
@@ -244,6 +246,7 @@ COPY src/gen_automation/i2v_worker/comfy_h3_node.py /opt/comfyui/custom_nodes/Ge
 COPY scripts/verify-h3-comfy-nodes.py /opt/i2v/bin/verify-h3-comfy-nodes.py
 COPY scripts/verify_h3_native_workflow.py /opt/i2v/bin/verify_h3_native_workflow.py
 COPY scripts/verify_h3_eros_workflow.py /opt/i2v/bin/verify_h3_eros_workflow.py
+COPY scripts/verify_h3_contrast.py /opt/i2v/bin/verify_h3_contrast.py
 COPY --chmod=0555 scripts/i2v-runpod-entrypoint.sh /opt/i2v/bin/i2v-runpod-entrypoint
 COPY workflows/dasiwa-wan22-i2v-v1.api.json ./workflows/dasiwa-wan22-i2v-v1.api.json
 COPY workflows/minimax-h3-native-i2v.api.json ./workflows/minimax-h3-native-i2v.api.json

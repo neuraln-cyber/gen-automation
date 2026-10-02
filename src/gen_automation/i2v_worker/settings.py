@@ -27,6 +27,7 @@ I2V_CUSTOM_NODES = ("ComfyUI-NAG",)
 H3_CUSTOM_NODES = (
     "Comfyui-MMH3-UltimateUpscale",
     "GenAutomationH3",
+    "GenAutomationH3Contrast",
 )
 H3_COMFY_MEMORY_ARGS = (
     "--reserve-vram",

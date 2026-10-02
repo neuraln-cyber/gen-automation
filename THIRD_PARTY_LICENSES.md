@@ -48,6 +48,17 @@ license texts and copyright notices in
 The image includes code only, not model weights. The private manifest and existing
 CloudFront delivery path provide the checksum-verified checkpoint separately.
 
+## MiniMax H3 latent contrast (output-only)
+
+- Code: <https://github.com/Tr1dae/ComfyUI-MiniMaxH3_LatentUpscaler>
+- Revision: `895e3c471164423f0ea0e8eaf45eb701efe641ae`.
+- No LICENSE file or explicit license declaration was found at this revision;
+  do not describe this dependency as MIT/Apache-licensed.
+- Upstream sources are retained in `GenAutomationH3Contrast`. Only the unchanged
+  `MiniMaxH3LatentContrast` class is registered, using our narrow entrypoint;
+  the original entrypoint is retained as `UPSTREAM_INIT.py` for audit.
+- No new weights, alternative upscaling, stash HTTP routes or web UI are enabled.
+
 ## Historical rollback images only — DaSiWa and KJNodes
 
 The native FL2VA image no longer installs or imports either package below. These
