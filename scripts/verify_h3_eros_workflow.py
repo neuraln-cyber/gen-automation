@@ -194,3 +194,60 @@ def verify_eros_beta57(nodes):
         lookup.assert_called_once_with("comfy_kitchen_int8", None)
         selected.set_model_optimized_attention.assert_called_once_with(attention_fn)
     print("Eros beta57 exact native numerical equivalence and Kitchen routing passed.")
+
+
+async def verify_eros_kitchen_api(nodes):
+    """Exercise the actual pinned /object_info serialization, not a hand-made schema."""
+    import comfy.ldm.modules.attention as attention
+    import httpx2
+
+    from gen_automation.i2v_worker.comfy import ComfyClient, ComfyError
+
+    for available in (False, True):
+        # CPU CI cannot provide a GPU backend. Vary only the availability flag;
+        # the node schema and API serializer are the real pinned ComfyUI code.
+        with patch.object(attention, "COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE", available):
+            info = nodes.NODE_CLASS_MAPPINGS["ModelAttentionBackend"].GET_NODE_INFO_V1()
+        paths = []
+
+        def handler(request, paths=paths, info=info, available=available):
+            paths.append(request.url.path)
+            if request.url.path == "/system_stats":
+                return httpx2.Response(200, json={})
+            if request.url.path.startswith("/object_info/"):
+                name = request.url.path.rsplit("/", 1)[-1]
+                return httpx2.Response(
+                    200, json={name: info if name == "ModelAttentionBackend" else {}}
+                )
+            assert available and request.url.path == "/prompt"
+            # Deliberately stop at the mocked submission boundary: no weights,
+            # GPU execution, real HTTP requests or filesystem outputs.
+            return httpx2.Response(200, json={})
+
+        client = ComfyClient(
+            base_url="http://127.0.0.1:8188",
+            request_timeout_seconds=5,
+            network_attempts=1,
+            poll_seconds=0.01,
+            profile="minimax_h3",
+        )
+        await client.client.aclose()
+        client.client = httpx2.AsyncClient(
+            base_url="http://127.0.0.1:8188", transport=httpx2.MockTransport(handler)
+        )
+        try:
+            assert await client.ready() is available
+            try:
+                await client.execute({"h3-kitchen": {}}, Path("."))
+            except ComfyError as error:
+                assert str(error) == (
+                    "ComfyUI rejected the workflow"
+                    if available
+                    else "Requested Eros Comfy Kitchen attention is unavailable"
+                )
+            else:
+                raise AssertionError("Mock submission must stop before inference")
+            assert ("/prompt" in paths) is available
+        finally:
+            await client.close()
+    print("Eros real native Kitchen API/readiness/submission contract passed (CPU, no jobs).")

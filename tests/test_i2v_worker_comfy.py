@@ -16,12 +16,15 @@ from gen_automation.i2v_worker.comfy import (
 
 async def _client(
     handler: Callable[[httpx2.Request], httpx2.Response],
+    *,
+    profile: str = "wan22",
 ) -> ComfyClient:
     client = ComfyClient(
         base_url="http://127.0.0.1:8188",
         request_timeout_seconds=5,
         network_attempts=1,
         poll_seconds=0.01,
+        profile=profile,
     )
     await client.client.aclose()
     client.client = httpx2.AsyncClient(
@@ -35,16 +38,18 @@ async def _client(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("available", [False, True])
-async def test_eros_kitchen_never_silently_falls_back(tmp_path, available):
+@pytest.mark.parametrize("schema", ["legacy", "native"])
+async def test_eros_kitchen_never_silently_falls_back(tmp_path, available, schema):
     paths = []
 
     def handler(request):
         paths.append(request.url.path)
         if request.url.path == "/object_info/ModelAttentionBackend":
             choices = ["pytorch attention"] + (["comfy kitchen attention"] if available else [])
+            entry = [choices] if schema == "legacy" else ["COMBO", {"options": choices}]
             return httpx2.Response(
                 200,
-                json={"ModelAttentionBackend": {"input": {"required": {"attention": [choices]}}}},
+                json={"ModelAttentionBackend": {"input": {"required": {"attention": entry}}}},
             )
         assert available and request.url.path == "/prompt"
         # Stop at submission; this is a transport contract, not a generation.
@@ -60,6 +65,63 @@ async def test_eros_kitchen_never_silently_falls_back(tmp_path, available):
     finally:
         await client.close()
     assert ("/prompt" in paths) == available
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "entry",
+    [
+        None,
+        [],
+        ["COMBO"],
+        ["COMBO", {}],
+        ["COMBO", None],
+        ["COMBO", {"options": "comfy kitchen attention"}],
+        ["COMBO", {"options": {"comfy kitchen attention": True}}],
+        ["COMBO", {"options": ["comfy kitchen attention", None]}],
+        ["STRING", {"options": ["comfy kitchen attention"]}],
+        ["comfy kitchen attention"],
+        [["comfy kitchen attention unavailable"]],
+        [["comfy kitchen attention"], {}, "unexpected"],
+    ],
+)
+async def test_kitchen_malformed_options_fail_closed_before_submission(tmp_path, entry):
+    def handler(request):
+        assert request.method == "GET"
+        assert request.url.path == "/object_info/ModelAttentionBackend"
+        return httpx2.Response(
+            200,
+            json={"ModelAttentionBackend": {"input": {"required": {"attention": entry}}}},
+        )
+
+    client = await _client(handler)
+    try:
+        with pytest.raises(ComfyError, match="Kitchen attention is unavailable"):
+            await client.execute({"h3-kitchen": {}}, tmp_path)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("available", [False, True])
+@pytest.mark.parametrize("schema", ["legacy", "native"])
+async def test_h3_readiness_checks_kitchen_capability_not_just_node_presence(available, schema):
+    def handler(request):
+        assert request.method == "GET"
+        if request.url.path == "/system_stats":
+            return httpx2.Response(200, json={})
+        name = request.url.path.rsplit("/", 1)[-1]
+        if name == "ModelAttentionBackend":
+            choices = ["pytorch attention"] + (["comfy kitchen attention"] if available else [])
+            entry = [choices] if schema == "legacy" else ["COMBO", {"options": choices}]
+            return httpx2.Response(200, json={name: {"input": {"required": {"attention": entry}}}})
+        return httpx2.Response(200, json={name: {}})
+
+    client = await _client(handler, profile="minimax_h3")
+    try:
+        assert await client.ready() is available
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio
