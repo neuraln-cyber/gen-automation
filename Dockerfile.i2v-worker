@@ -49,7 +49,7 @@ RUN go mod download \
         -o /out/salad-http-job-queue-worker \
         ./cmd/salad-http-job-queue-worker
 
-FROM pytorch/pytorch:2.9.1-cuda13.0-cudnn9-runtime@sha256:60f22fb80755fd0b470fb47928dbd55816aa9f847edd95cf43c93253507a9ddf
+FROM pytorch/pytorch:2.14.1-cuda13.0-cudnn9-runtime@sha256:3c0b174a1339193a5bcc4b37d737c9f5ca3c4782a2293d3888e4271367eddf44
 
 LABEL org.opencontainers.image.title="gen-automation-native-h3-i2v-worker" \
       org.opencontainers.image.description="Model-free native MiniMax H3 Eros and legacy WAN worker" \
