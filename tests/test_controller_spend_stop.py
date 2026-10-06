@@ -2043,9 +2043,11 @@ async def test_pending_runtime_target_ignores_stale_created_demand(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("observation_stage", ["queue_admission", "instance_readiness"])
 async def test_transient_runtime_observation_defers_without_consuming_attempt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    observation_stage: str,
 ) -> None:
     database = Database(
         f"sqlite+aiosqlite:///{(tmp_path / 'runtime-observation-defer.db').as_posix()}"
@@ -2180,7 +2182,9 @@ async def test_transient_runtime_observation_defers_without_consuming_attempt(
 
         monkeypatch.setattr(
             controller_runtime,
-            "container_group_runtime_admission_ready",
+            "ensure_container_group_queue_admission"
+            if observation_stage == "queue_admission"
+            else "container_group_runtime_admission_ready",
             unavailable,
         )
         assert await workloads.submit_once() is True

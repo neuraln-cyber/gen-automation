@@ -4,7 +4,7 @@ import asyncio
 import re
 from collections.abc import Callable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Protocol, cast
@@ -2081,8 +2081,8 @@ async def ensure_container_group_queue_admission(
         # A provider PATCH can expose either the old min=0 or target min=1
         # snapshot while pending. Validate every immutable/runtime identity but
         # never issue a second mutation against that in-flight transition.
-        _validate_runtime_group(deployment, initial)
         validate_runtime_identity(initial)
+        _validate_queue_admission_observation(deployment, initial)
         if initial.pending_change:
             raise SaladRuntimeAdmissionUnavailableError(
                 "container group queue admission has a pending provider change"
@@ -2322,6 +2322,34 @@ async def container_group_runtime_admission_ready(
     except Exception:
         raise SaladDeploymentValidationError(
             "container group runtime admission could not be verified"
+        ) from None
+
+
+def _validate_queue_admission_observation(
+    deployment: SaladDeployment,
+    group: SaladContainerGroup,
+) -> None:
+    """Defer autoscaler repair without admitting work or spending a job attempt.
+
+    Reconciliation already owns autoscaler repair. Its intermediate provider
+    snapshot can reach submission before the local deployment state is updated.
+    Validate every other field even when the autoscaler is missing: replacing
+    it in a temporary comparison object is classification only, never approval
+    or a provider mutation. A later exact readback is still required for POST.
+    """
+    try:
+        _validate_runtime_group(deployment, group)
+    except SaladDeploymentValidationError:
+        comparison = replace(
+            group,
+            raw={
+                **group.raw,
+                "queue_autoscaler": _desired_queue_autoscaler(deployment, min_replicas=1),
+            },
+        )
+        _validate_runtime_group(deployment, comparison, effective_min_replicas=1)
+        raise SaladRuntimeAdmissionUnavailableError(
+            "container group queue autoscaler is awaiting reconciliation"
         ) from None
 
 
