@@ -126,6 +126,18 @@
     "constrains": []
   },
   {
+    "name": "libxcrypt",
+    "version": "4.4.38",
+    "build": "h280c20c_0",
+    "url": "https://conda.anaconda.org/conda-forge/linux-64/libxcrypt-4.4.38-h280c20c_0.conda",
+    "sha256": "f7e9292dd219a6435bbb1223da9586c3e70d66d169c5a92f08db3f2127df04e9",
+    "depends": [
+      "libgcc >=14",
+      "__glibc >=2.17,<3.0.a0"
+    ],
+    "constrains": []
+  },
+  {
     "name": "libzlib",
     "version": "1.3.2",
     "build": "h25fd6f3_3",

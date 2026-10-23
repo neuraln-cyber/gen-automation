@@ -146,10 +146,11 @@ and target wheels under `/usr/local/lib`; distro-owned packages are rejected.
 
 The I2V Python patch uses the exact local archives in
 `scripts/i2v-python-security-lock.json`, with Docker and installer SHA-256
-verification. Installation is offline without dependency solving. Eleven conda-forge
+verification. Installation is offline without dependency solving. Twelve conda-forge
 archives update Python and only its required support libraries, retaining the
 base's GCC, CUDA and ML packages. The cffi binding is rebuilt for the required
-libffi ABI and smoke-tested in the patched interpreter. The lock records the
+libffi ABI and smoke-tested in the patched interpreter. Python's required libxcrypt
+library is pinned and exercised through its native crypt binding. The lock records the
 actual archives' metadata, not potentially different hotfixed channel API bounds. Before installation and
 again in a fresh interpreter, the installer validates forward dependencies,
 optional constraints and reverse edges from retained packages. Protected ML

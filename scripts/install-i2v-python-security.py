@@ -79,6 +79,7 @@ def verify() -> None:
     verify_pins(records, pinned)
     validate_dependency_edges(records, {pin["name"] for pin in pinned}, MatchSpec)
     assert sys.version_info[:3] == (3, 11, 17)
+    import _crypt
     import bz2
     import ctypes
     import lzma
@@ -92,6 +93,7 @@ def verify() -> None:
 
     assert cffi.__version__ == "2.1.1"
     assert cffi.FFI().new("int *", 42)[0] == 42
+    assert _crypt.crypt("runtime-smoke", "ab").startswith("ab")
     assert all((bz2, ctypes, lzma, pyexpat, readline, sqlite3, ssl, zlib))
     print("Pinned CPython 3.11.17 runtime dependency closure verified", flush=True)
 
