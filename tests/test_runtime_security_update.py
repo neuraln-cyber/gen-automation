@@ -271,7 +271,27 @@ def test_cache_removal_refuses_unpatched_installed_python(obsolete_python_cache)
     (prefix / "conda-meta/python-3.11.17.json").write_text(
         json.dumps({"name": "python", "version": "3.11.14", "build": "hd63d673_2_cpython"})
     )
-    with pytest.raises(AssertionError, match="Patched Python must be installed"):
+    with pytest.raises(AssertionError, match="Expected exactly one patched Python record"):
+        module.remove_obsolete_python_cache()
+    assert target.exists()
+
+
+def test_cache_cleanup_selects_exact_package_name_not_python_prefix(obsolete_python_cache):
+    module, prefix, target = obsolete_python_cache
+    unrelated = prefix / "conda-meta/python-gil-3.11.17.json"
+    unrelated.write_text(json.dumps({"name": "python-gil", "version": "3.11.17", "build": "0"}))
+    before = unrelated.read_bytes()
+    module.remove_obsolete_python_cache()
+    assert not target.exists()
+    assert unrelated.read_bytes() == before
+
+
+def test_cache_cleanup_rejects_duplicate_installed_python_records(obsolete_python_cache):
+    module, prefix, target = obsolete_python_cache
+    (prefix / "conda-meta/python-3.11.14.json").write_text(
+        json.dumps({"name": "python", "version": "3.11.14", "build": "hd63d673_2_cpython"})
+    )
+    with pytest.raises(AssertionError, match="Expected exactly one patched Python record"):
         module.remove_obsolete_python_cache()
     assert target.exists()
 

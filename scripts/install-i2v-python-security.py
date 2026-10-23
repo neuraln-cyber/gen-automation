@@ -116,14 +116,17 @@ def remove_obsolete_python_cache() -> None:
         "3.11.14",
         "hd63d673_2_cpython",
     ), "Unexpected obsolete cache identity"
+    # Names such as python-gil also match python-*.json. Select the package
+    # identity, not a filename prefix, without accepting duplicate Python records.
+    records = [json.loads(path.read_text()) for path in (PREFIX / "conda-meta").glob("*.json")]
     installed = [
-        json.loads(path.read_text()) for path in (PREFIX / "conda-meta").glob("python-*.json")
+        (record["name"], record["version"], record["build"])
+        for record in records
+        if record["name"] == "python"
     ]
-    assert len(installed) == 1 and (
-        installed[0]["name"],
-        installed[0]["version"],
-        installed[0]["build"],
-    ) == ("python", "3.11.17", "h5f976f7_1_cpython"), "Patched Python must be installed"
+    assert installed == [("python", "3.11.17", "h5f976f7_1_cpython")], (
+        f"Expected exactly one patched Python record, found {installed!r}"
+    )
 
     def fail_walk(error: OSError) -> None:
         raise error
