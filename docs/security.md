@@ -160,7 +160,10 @@ verification, tests and a readonly module build.
 
 These updates still require the full container builds, native CPU/runtime-user
 contracts and mandatory SBOM security scans. Local tests are not a substitute for
-those Linux build checks. Security dependency remediation is not proof of a cure
+those Linux build checks. CI retains the six build-only SBOMs for seven days,
+including after a scan failure, so remaining installation paths can be diagnosed
+from the actual inventory without suppressing findings. No production data is included.
+Security dependency remediation is not proof of a cure
 for generation failures or of unchanged visual output; no model, recipe, LoRA,
 seed or sampling settings are changed by these build steps.
 

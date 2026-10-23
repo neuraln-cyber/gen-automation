@@ -308,6 +308,26 @@ jobs:
           grype-version: v0.110.0
           cache-db: false
           only-fixed: true
+      - name: Report I2V Python inventory evidence
+        if: ${{ !cancelled() && hashFiles('i2v-worker.spdx.json') != '' }}
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          document = json.loads(Path("i2v-worker.spdx.json").read_text())
+          for package in document["packages"]:
+              if package["name"].lower() in {"python", "libpython"}:
+                  print(json.dumps(package, sort_keys=True))
+          PY
+      - name: Retain build SBOM evidence
+        if: ${{ !cancelled() && hashFiles('*.spdx.json') != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: container-sboms-${{ github.run_id }}
+          path: '*.spdx.json'
+          if-no-files-found: error
+          retention-days: 7
       - name: Scan GPU worker image SBOM
         if: ${{ !cancelled() && hashFiles('gpu-worker.spdx.json') != '' }}
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
