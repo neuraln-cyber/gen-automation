@@ -131,6 +131,30 @@ from the repository and history. Deleting it in a later commit does not remove
 it from earlier commits. Review the pinned scanner and detection rules during
 dependency maintenance; do not replace the exact pin with `latest`.
 
+### Worker runtime security updates
+
+Worker security maintenance preserves the immutable PyTorch/CUDA base and
+model-facing dependency pins. The hash-locked `requirements-worker-security.lock`
+replaces inherited Pillow, certifi and uv packages in the base environment as
+well as updating the application locks. Conda-owned copies are uninstalled by
+Conda before replacement; removing package metadata alone is not remediation.
+The installer hashes the installed PyTorch, torchvision and torchaudio files
+before and after and fails on changes.
+
+The I2V Python patch uses the exact local archives in
+`scripts/i2v-python-security-lock.json`, with Docker and installer SHA-256
+verification. Installation is offline without dependency solving. Its support
+closure excludes ML/CUDA packages, validates the installed dependency constraints,
+and checks protected files and unrelated Conda records. The queue forwarder uses
+a checksum-verified patch restricted to `go.mod` and `go.sum`, followed by module
+verification, tests and a readonly module build.
+
+These updates still require the full container builds, native CPU/runtime-user
+contracts and mandatory SBOM security scans. Local tests are not a substitute for
+those Linux build checks. Security dependency remediation is not proof of a cure
+for generation failures or of unchanged visual output; no model, recipe, LoRA,
+seed or sampling settings are changed by these build steps.
+
 ## Webhooks and callbacks
 
 - Verify provider signatures over the raw request body where supported.

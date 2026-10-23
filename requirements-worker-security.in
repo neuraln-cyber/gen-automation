@@ -1,0 +1,6 @@
+# Security-only replacements for packages inherited from the immutable CUDA
+# bases. Install into the base interpreter before creating either worker venv.
+# Do not resolve or replace torch, torchvision, torchaudio, CUDA or model assets.
+pillow==13.0.0
+certifi==2026.10.19
+uv==0.13.4

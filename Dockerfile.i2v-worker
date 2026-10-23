@@ -1,11 +1,12 @@
 # syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-FROM golang:1.26.2-alpine@sha256:f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739500e08c86393a21b1 AS salad-queue-worker-builder
+FROM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS salad-queue-worker-builder
 
 ENV SALAD_QUEUE_WORKER_COMMIT=73d7a3c80a73f26339194e024cb47c8501c67f75 \
     SALAD_QUEUE_WORKER_PATCH_SHA256=a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae \
     SALAD_QUEUE_WORKER_HEARTBEAT_PATCH_SHA256=51d604da546aa076073d971b6839998d3582e34f5f52af64faf4c7c6e8f6f23a \
-    SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256=916f22c8075481a2924aabc2f1d1b57d891681eb5bd10b6081487df7b57a336d
+    SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256=916f22c8075481a2924aabc2f1d1b57d891681eb5bd10b6081487df7b57a336d \
+    SALAD_QUEUE_WORKER_SECURITY_PATCH_SHA256=0e6850de22e6fd2006833d5ee2b340bf9e4a6d030a3675ee2afe939f406b3159
 
 RUN apk add --no-cache git \
     && mkdir --parents /src \
@@ -21,6 +22,7 @@ WORKDIR /src
 COPY patches/salad-queue-worker/strict-http-status.patch /tmp/strict-http-status.patch
 COPY patches/salad-queue-worker/job-stream-heartbeat-watchdog.patch /tmp/job-stream-heartbeat-watchdog.patch
 COPY patches/salad-queue-worker/imds-token-recovery.patch /tmp/imds-token-recovery.patch
+COPY patches/salad-queue-worker/security-dependencies.patch /tmp/security-dependencies.patch
 
 RUN printf '%s  %s\n' \
         "${SALAD_QUEUE_WORKER_PATCH_SHA256}" \
@@ -29,6 +31,8 @@ RUN printf '%s  %s\n' \
         /tmp/job-stream-heartbeat-watchdog.patch \
         "${SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256}" \
         /tmp/imds-token-recovery.patch \
+        "${SALAD_QUEUE_WORKER_SECURITY_PATCH_SHA256}" \
+        /tmp/security-dependencies.patch \
         | sha256sum -c - \
     && git apply --unidiff-zero --check /tmp/strict-http-status.patch \
     && git apply --unidiff-zero /tmp/strict-http-status.patch \
@@ -36,6 +40,8 @@ RUN printf '%s  %s\n' \
     && git apply /tmp/job-stream-heartbeat-watchdog.patch \
     && git apply --check /tmp/imds-token-recovery.patch \
     && git apply /tmp/imds-token-recovery.patch \
+    && git apply --check /tmp/security-dependencies.patch \
+    && git apply /tmp/security-dependencies.patch \
     && git diff --check
 
 RUN go mod download \
@@ -85,6 +91,98 @@ RUN /opt/conda/bin/conda install \
     && /opt/conda/bin/conda clean --all --yes \
     && rm -f /tmp/openssl-3.6.4-h781a0a9_0.conda
 
+# CPython security patch and its exact support-library closure. The CUDA,
+# torch and model sources remain immutable; the installer verifies preservation.
+ADD --checksum=sha256:fffd5671d70f170924824ae9dc8cab58f72b781ea166745f07daf00c55a54a3d --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/python-3.11.17-hd9cb797_0.conda \
+    /opt/i2v-build-security/python-3.11.17-hd9cb797_0.conda
+ADD --checksum=sha256:d3fa503351a53692866182a3819fb28d105e32c25d177bf6a9444c4153215e0d --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/bzip2-1.0.8-h7b6447c_0.conda \
+    /opt/i2v-build-security/bzip2-1.0.8-h7b6447c_0.conda
+ADD --checksum=sha256:4a4875ab4354d4a1bf1695850efad8787d7063387ed6b5aec5ecb659869e2590 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/ld_impl_linux-64-2.44-h9e0c5a2_3.conda \
+    /opt/i2v-build-security/ld_impl_linux-64-2.44-h9e0c5a2_3.conda
+ADD --checksum=sha256:a922b227a5748f34c628c463c44e9ced7e2543c2fc65dae5555498558c95344b --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/libexpat-2.8.5-h7354ed3_0.conda \
+    /opt/i2v-build-security/libexpat-2.8.5-h7354ed3_0.conda
+ADD --checksum=sha256:e3fbc1100922e09b9e472ae1e92d0b83438e559f4817a55da34288890e56a087 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/libffi-3.4.8-hc5d346e_2.conda \
+    /opt/i2v-build-security/libffi-3.4.8-hc5d346e_2.conda
+ADD --checksum=sha256:dd852f93bfd2203c3d1c52481fec8adcdbf300f67ac0556284b5c8a22fedc259 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/libgcc-14.3.0-h69a1729_4.conda \
+    /opt/i2v-build-security/libgcc-14.3.0-h69a1729_4.conda
+ADD --checksum=sha256:1cab9343a9b842353d2dbd04c4cbb109dd0dda137fd5f89ebbdce0b5b1367588 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/libstdcxx-14.3.0-h39759b7_4.conda \
+    /opt/i2v-build-security/libstdcxx-14.3.0-h39759b7_4.conda
+ADD --checksum=sha256:47de7c943e9823a4c770af1fbb067ef3a5c645e64be32990ef5fb805cc4f6e72 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/libgcc-ng-14.3.0-h166f726_4.conda \
+    /opt/i2v-build-security/libgcc-ng-14.3.0-h166f726_4.conda
+ADD --checksum=sha256:0466771e9ab39b185d0ef81b27f5b0ab5e3822f8d80184b545e0ba6e69d735c0 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/libstdcxx-ng-14.3.0-hc03a8fd_4.conda \
+    /opt/i2v-build-security/libstdcxx-ng-14.3.0-hc03a8fd_4.conda
+ADD --checksum=sha256:3ec4f271474a1e330897fb52d3d97fca41f99170734817ba3818594d25960243 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/libgomp-14.3.0-h4751f2c_4.conda \
+    /opt/i2v-build-security/libgomp-14.3.0-h4751f2c_4.conda
+ADD --checksum=sha256:476626712f60e5ef0fe04c354727152b1ee5285d57ccd3575c7be930122bd051 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/_libgcc_mutex-0.1-main.conda \
+    /opt/i2v-build-security/_libgcc_mutex-0.1-main.conda
+ADD --checksum=sha256:576011048d23f2e03372263493c5529f802286ff53e8426df99a5b11cc2572f3 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/_openmp_mutex-5.1-1_gnu.conda \
+    /opt/i2v-build-security/_openmp_mutex-5.1-1_gnu.conda
+ADD --checksum=sha256:34fbadc1e86ee37b19b98799b4f806d8be205e9c0220bdb76598f0295961812e --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/libnsl-2.0.0-h5eee18b_0.conda \
+    /opt/i2v-build-security/libnsl-2.0.0-h5eee18b_0.conda
+ADD --checksum=sha256:2a401aafabac51b7736cfe12d2ab205d29052640ea8183253c9d0a8e7ed0d49a --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/libuuid-1.41.5-h5eee18b_0.conda \
+    /opt/i2v-build-security/libuuid-1.41.5-h5eee18b_0.conda
+ADD --checksum=sha256:02b0d3bad12d15c668f06a32283907608bcfb49ca40d9d09d3bcfe6bd4765f31 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/libzlib-1.3.2-h47b2149_0.conda \
+    /opt/i2v-build-security/libzlib-1.3.2-h47b2149_0.conda
+ADD --checksum=sha256:4bb61142e8fe22510086c1030e1ff3ad4888ebf9bf0a11e9931594e8549a9d42 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/zlib-1.3.2-h47b2149_0.conda \
+    /opt/i2v-build-security/zlib-1.3.2-h47b2149_0.conda
+ADD --checksum=sha256:a080cfac9b51bb62dcd54823622e602cd8cd8d67406c76cbbdfc0602f9e822b8 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/ncurses-6.6-hfaaeb4e_0.conda \
+    /opt/i2v-build-security/ncurses-6.6-hfaaeb4e_0.conda
+ADD --checksum=sha256:0a438fa74f2776bde137017d6c18214b5da65b557f6a59f877fa4e091582f789 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/readline-8.3-hc2a1206_0.conda \
+    /opt/i2v-build-security/readline-8.3-hc2a1206_0.conda
+ADD --checksum=sha256:839f97490251e076b64ff70521a2437e8835a0a42728d39562e8ede0addcf18f --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/sqlite-3.53.4-h795bf6d_0.conda \
+    /opt/i2v-build-security/sqlite-3.53.4-h795bf6d_0.conda
+ADD --checksum=sha256:a3bcd301ddd0bdb2f52f9bd3274fabe3c33d43ed61e58ee657efeac01b4be157 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/tk-8.6.15-h54e0aa7_0.conda \
+    /opt/i2v-build-security/tk-8.6.15-h54e0aa7_0.conda
+ADD --checksum=sha256:52adc4b0a9cce2ffb8ad319d54b7c940ae7961f7caf7ce6851eec4b3f542c368 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/noarch/tzdata-2026c-he532380_0.conda \
+    /opt/i2v-build-security/tzdata-2026c-he532380_0.conda
+ADD --checksum=sha256:d9383d80b09c9cbb3b1b689f173e84d6e75a4a61ecd4eebee6dae0adc6441793 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/xz-5.8.4-h140a991_0.conda \
+    /opt/i2v-build-security/xz-5.8.4-h140a991_0.conda
+ADD --checksum=sha256:e9e6228687c03d1c1318f6d7434e6c54f1a5e821def15d4926a5ce4c0a01a17e --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/xorg-libx11-1.8.12-h9b100fa_1.conda \
+    /opt/i2v-build-security/xorg-libx11-1.8.12-h9b100fa_1.conda
+ADD --checksum=sha256:f9cd1564fc83261ddba7496404f18143d4f8fda52e42c040005c1b1ad3e47f56 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/libxcb-1.17.0-h9b100fa_0.conda \
+    /opt/i2v-build-security/libxcb-1.17.0-h9b100fa_0.conda
+ADD --checksum=sha256:aa6d3ab9be5b43d3e8ac0c7e23f2a83c3959f8f30ec758e2fcae91f87a9b23b4 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/xorg-xorgproto-2024.1-h5eee18b_1.conda \
+    /opt/i2v-build-security/xorg-xorgproto-2024.1-h5eee18b_1.conda
+ADD --checksum=sha256:68acf87da69a0237d5083798a9cc9b89d2887a84a5323aa740006b53cd5159ef --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/xorg-libxau-1.0.12-h9b100fa_0.conda \
+    /opt/i2v-build-security/xorg-libxau-1.0.12-h9b100fa_0.conda
+ADD --checksum=sha256:459c8497d1c22b020404b481fa12011abeb27d8eefde37dd4ac9f5a443fd5ac7 --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/xorg-libxdmcp-1.1.5-h9b100fa_0.conda \
+    /opt/i2v-build-security/xorg-libxdmcp-1.1.5-h9b100fa_0.conda
+ADD --checksum=sha256:119c5ad43fb92b2f14a25c53276072ee77ff6b40c72e6617b523b9de0eb0822a --chmod=0444 \
+    https://repo.anaconda.com/pkgs/main/linux-64/pthread-stubs-0.3-h0ce48e5_1.conda \
+    /opt/i2v-build-security/pthread-stubs-0.3-h0ce48e5_1.conda
+COPY scripts/i2v-python-security-lock.json /opt/i2v-build-security/lock.json
+COPY scripts/install-i2v-python-security.py /tmp/install-i2v-python-security.py
+RUN /opt/conda/bin/python /tmp/install-i2v-python-security.py \
+    && /opt/conda/bin/conda clean --all --yes \
+    && rm -rf /opt/i2v-build-security /tmp/install-i2v-python-security.py
+
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         ca-certificates \
@@ -104,6 +202,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/i2v
+
+COPY requirements-worker-security.lock /tmp/requirements-worker-security.lock
+COPY scripts/install-worker-security.py /tmp/install-worker-security.py
+RUN /opt/conda/bin/python /tmp/install-worker-security.py /tmp/requirements-worker-security.lock \
+    && /opt/conda/bin/conda clean --all --yes \
+    && rm -f /tmp/install-worker-security.py /tmp/requirements-worker-security.lock
 
 COPY requirements-i2v-worker.lock ./requirements-i2v-worker.lock
 

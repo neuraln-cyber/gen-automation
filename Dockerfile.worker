@@ -1,11 +1,12 @@
 # syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-FROM golang:1.26.2-alpine@sha256:f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739500e08c86393a21b1 AS salad-queue-worker-builder
+FROM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS salad-queue-worker-builder
 
 ENV SALAD_QUEUE_WORKER_COMMIT=73d7a3c80a73f26339194e024cb47c8501c67f75 \
     SALAD_QUEUE_WORKER_PATCH_SHA256=a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae \
     SALAD_QUEUE_WORKER_HEARTBEAT_PATCH_SHA256=51d604da546aa076073d971b6839998d3582e34f5f52af64faf4c7c6e8f6f23a \
-    SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256=916f22c8075481a2924aabc2f1d1b57d891681eb5bd10b6081487df7b57a336d
+    SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256=916f22c8075481a2924aabc2f1d1b57d891681eb5bd10b6081487df7b57a336d \
+    SALAD_QUEUE_WORKER_SECURITY_PATCH_SHA256=0e6850de22e6fd2006833d5ee2b340bf9e4a6d030a3675ee2afe939f406b3159
 
 RUN apk add --no-cache git \
     && mkdir --parents /src \
@@ -21,6 +22,7 @@ WORKDIR /src
 COPY patches/salad-queue-worker/strict-http-status.patch /tmp/strict-http-status.patch
 COPY patches/salad-queue-worker/job-stream-heartbeat-watchdog.patch /tmp/job-stream-heartbeat-watchdog.patch
 COPY patches/salad-queue-worker/imds-token-recovery.patch /tmp/imds-token-recovery.patch
+COPY patches/salad-queue-worker/security-dependencies.patch /tmp/security-dependencies.patch
 
 RUN printf '%s  %s\n' \
         "${SALAD_QUEUE_WORKER_PATCH_SHA256}" \
@@ -29,6 +31,8 @@ RUN printf '%s  %s\n' \
         /tmp/job-stream-heartbeat-watchdog.patch \
         "${SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256}" \
         /tmp/imds-token-recovery.patch \
+        "${SALAD_QUEUE_WORKER_SECURITY_PATCH_SHA256}" \
+        /tmp/security-dependencies.patch \
         | sha256sum -c - \
     && git apply --unidiff-zero --check /tmp/strict-http-status.patch \
     && git apply --unidiff-zero /tmp/strict-http-status.patch \
@@ -36,6 +40,8 @@ RUN printf '%s  %s\n' \
     && git apply /tmp/job-stream-heartbeat-watchdog.patch \
     && git apply --check /tmp/imds-token-recovery.patch \
     && git apply /tmp/imds-token-recovery.patch \
+    && git apply --check /tmp/security-dependencies.patch \
+    && git apply /tmp/security-dependencies.patch \
     && git diff --check
 
 RUN go mod download \
@@ -183,6 +189,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/worker
+
+COPY requirements-worker-security.lock /tmp/requirements-worker-security.lock
+COPY scripts/install-worker-security.py /tmp/install-worker-security.py
+RUN python /tmp/install-worker-security.py /tmp/requirements-worker-security.lock \
+    && rm -f /tmp/install-worker-security.py /tmp/requirements-worker-security.lock
 
 COPY requirements.lock requirements-comfy.lock requirements-worker-base.txt ./
 
