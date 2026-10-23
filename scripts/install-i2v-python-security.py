@@ -5,6 +5,7 @@ import json
 import platform
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 PREFIX = Path("/opt/conda")
@@ -31,9 +32,8 @@ def protected_files(names: set[str]) -> dict[str, str]:
     return result
 
 
-def verify() -> None:
+def runtime_records():
     from conda.core.prefix_data import PrefixData
-    from conda.models.match_spec import MatchSpec
     from conda.models.records import PackageRecord
 
     records = {record.name: record for record in PrefixData(str(PREFIX)).iter_records()}
@@ -42,13 +42,41 @@ def verify() -> None:
     records["__glibc"] = PackageRecord(
         name="__glibc", version=libc_version, build="0", build_number=0
     )
-    for pinned in json.loads(LOCK.read_text()):
-        actual = records[pinned["name"]]
-        assert (actual.version, actual.build) == (pinned["version"], pinned["build"])
-        # Validate the installed artifact's dependencies, not just the copied lock.
-        for requirement in actual.depends:
-            spec = MatchSpec(requirement)
-            assert spec.name in records and spec.match(records[spec.name]), requirement
+    return records
+
+
+def verify_pins(records, pinned) -> None:
+    for pin in pinned:
+        actual = records[pin["name"]]
+        assert (actual.version, actual.build) == (pin["version"], pin["build"])
+        # Channel API/repodata can be hotfixed separately from immutable archives.
+        assert sorted(actual.depends) == sorted(pin["depends"]), actual.name
+        assert sorted(actual.constrains) == sorted(pin["constrains"]), actual.name
+
+
+def validate_dependency_edges(records, names, match_spec) -> None:
+    for record in records.values():
+        for field in ("depends", "constrains"):
+            for requirement in getattr(record, field):
+                spec = match_spec(requirement)
+                # Check every new edge AND reverse edges from retained packages.
+                # Unrelated pre-existing inconsistencies are not silently repaired.
+                if record.name not in names and spec.name not in names:
+                    continue
+                if field == "constrains" and spec.name not in records:
+                    continue  # Optional constraints never require installation.
+                assert spec.name in records and spec.match(records[spec.name]), (
+                    f"{record.name}: {field}: {requirement}"
+                )
+
+
+def verify() -> None:
+    from conda.models.match_spec import MatchSpec
+
+    records = runtime_records()
+    pinned = json.loads(LOCK.read_text())
+    verify_pins(records, pinned)
+    validate_dependency_edges(records, {pin["name"] for pin in pinned}, MatchSpec)
     assert sys.version_info[:3] == (3, 11, 17)
     import bz2
     import ctypes
@@ -64,6 +92,10 @@ def verify() -> None:
 
 
 def install() -> None:
+    from conda.models.match_spec import MatchSpec
+    from conda.models.records import PackageRecord
+    from conda_package_handling.api import extract
+
     assert Path(sys.prefix) == PREFIX
     assert sys.version_info[:2] == (3, 11)
     pinned = json.loads(LOCK.read_text())
@@ -72,10 +104,19 @@ def install() -> None:
     assert not any("torch" in name or "cuda" in name or "cudnn" in name for name in names)
     before = protected_files(names)
     packages = []
-    for record in pinned:
-        package = ARCHIVES / record["url"].rsplit("/", 1)[-1]
-        assert sha256(package) == record["sha256"]
-        packages.append(str(package))
+    proposed = runtime_records()
+    with tempfile.TemporaryDirectory(prefix="i2v-python-security-") as temporary:
+        for pin in pinned:
+            package = ARCHIVES / pin["url"].rsplit("/", 1)[-1]
+            assert sha256(package) == pin["sha256"]
+            destination = Path(temporary) / pin["name"]
+            extract(str(package), dest_dir=str(destination))
+            actual = PackageRecord(**json.loads((destination / "info/index.json").read_text()))
+            assert actual.name == pin["name"]
+            proposed[actual.name] = actual
+            packages.append(str(package))
+    verify_pins(proposed, pinned)
+    validate_dependency_edges(proposed, names, MatchSpec)
     # Exact local package files only: no solver, channel refresh, or ML updates.
     subprocess.run(  # noqa: S603
         [str(PREFIX / "bin/conda"), "install", "--yes", "--offline", "--no-deps", *packages],

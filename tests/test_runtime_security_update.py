@@ -47,19 +47,107 @@ def test_base_security_lock_has_only_the_three_approved_packages() -> None:
 def test_python_support_archives_are_hash_pinned_and_exclude_the_ml_stack() -> None:
     pins = json.loads((ROOT / "scripts/i2v-python-security-lock.json").read_text())
     dockerfile = (ROOT / "Dockerfile.i2v-worker").read_text()
-    assert len(pins) == len({pin["name"] for pin in pins}) == 28
-    assert {p["name"] for p in pins}.isdisjoint({"pytorch", "torch", "cuda", "cudnn"})
+    assert len(pins) == 10
+    assert {p["name"] for p in pins} == {
+        "python",
+        "libpython",
+        "libexpat",
+        "libffi",
+        "liblzma",
+        "libsqlite",
+        "libuuid",
+        "libzlib",
+        "ncurses",
+        "readline",
+    }
     assert next(p for p in pins if p["name"] == "python")["version"] == "3.11.17"
     for pin in pins:
-        assert pin["url"].startswith("https://repo.anaconda.com/pkgs/main/")
+        assert pin["url"].startswith("https://conda.anaconda.org/conda-forge/linux-64/")
         assert re.fullmatch(r"[a-f0-9]{64}", pin["sha256"])
+        assert isinstance(pin["depends"], list) and isinstance(pin["constrains"], list)
         assert f"ADD --checksum=sha256:{pin['sha256']}" in dockerfile
         assert pin["url"] in dockerfile
     installer = (ROOT / "scripts/install-i2v-python-security.py").read_text()
     assert '"--offline", "--no-deps"' in installer
     assert "spec.match(records[spec.name])" in installer
     assert "protected_files(names) == before" in installer
+    assert 'destination / "info/index.json"' in installer
+    assert installer.index("validate_dependency_edges(proposed") < installer.index(
+        '"install", "--yes"'
+    )
     assert "(3, 11, 17)" in installer
+
+
+def test_dependency_edges_enforce_forward_reverse_and_optional_constraints() -> None:
+    from types import SimpleNamespace
+
+    path = ROOT / "scripts/install-i2v-python-security.py"
+    spec = importlib.util.spec_from_file_location("security_edges_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    # Exercise edge selection with an exact-match adapter; real Conda MatchSpec
+    # and actual archive metadata are mandatory in the Linux container build.
+    class ExactSpec:
+        def __init__(self, text):
+            self.name, self.version = text.split()
+
+        def match(self, record):
+            return record.version == self.version
+
+    library = SimpleNamespace(name="library", version="2", depends=[], constrains=[])
+    python = SimpleNamespace(
+        name="python", version="3", depends=["library 2"], constrains=["optional 1"]
+    )
+    retained = SimpleNamespace(name="retained", version="1", depends=["library 2"], constrains=[])
+    records = {r.name: r for r in (library, python, retained)}
+    module.validate_dependency_edges(records, {"python", "library"}, ExactSpec)
+    library.version = "1"
+    with pytest.raises(AssertionError, match="python: depends: library 2"):
+        module.validate_dependency_edges(records, {"python"}, ExactSpec)
+    library.version = "2"
+    retained.depends = ["library 1"]
+    with pytest.raises(AssertionError, match="retained: depends: library 1"):
+        module.validate_dependency_edges(records, {"library"}, ExactSpec)
+    retained.depends = []
+    retained.constrains = ["library 1"]
+    with pytest.raises(AssertionError, match="retained: constrains: library 1"):
+        module.validate_dependency_edges(records, {"library"}, ExactSpec)
+    retained.constrains = []
+    records["optional"] = SimpleNamespace(name="optional", version="2", depends=[], constrains=[])
+    with pytest.raises(AssertionError, match="python: constrains: optional 1"):
+        module.validate_dependency_edges(records, {"python"}, ExactSpec)
+    del records["optional"]
+    del records["library"]
+    with pytest.raises(AssertionError, match="python: depends: library 2"):
+        module.validate_dependency_edges(records, {"python"}, ExactSpec)
+
+
+def test_archive_metadata_must_match_lock_not_hotfixed_api() -> None:
+    from types import SimpleNamespace
+
+    path = ROOT / "scripts/install-i2v-python-security.py"
+    spec = importlib.util.spec_from_file_location("security_pins_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    pin = {
+        "name": "python",
+        "version": "3.11.17",
+        "build": "exact",
+        "depends": [],
+        "constrains": [],
+    }
+    record = SimpleNamespace(**pin)
+    module.verify_pins({"python": record}, [pin])
+    record.depends = ["zlib <1.3"]
+    with pytest.raises(AssertionError, match="python"):
+        module.verify_pins({"python": record}, [pin])
+    record.depends = []
+    record.constrains = ["python_abi 3.11.*"]
+    with pytest.raises(AssertionError, match="python"):
+        module.verify_pins({"python": record}, [pin])
 
 
 def test_publication_fingerprints_every_added_runtime_input() -> None:
