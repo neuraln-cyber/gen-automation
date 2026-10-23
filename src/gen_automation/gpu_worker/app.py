@@ -24,6 +24,7 @@ from PIL import Image, UnidentifiedImageError
 from pydantic import TypeAdapter, ValidationError
 
 from gen_automation.domain.deliverability import require_comfy_workflow_deliverability
+from gen_automation.gpu_worker.diagnostics import log_generation_failure
 from gen_automation.gpu_worker.models import (
     ComfyOutput,
     GenerateEnvelope,
@@ -513,7 +514,14 @@ def create_worker_app(
                     )
                 except WorkerNotReadyError:
                     raise HTTPException(status_code=503, detail="worker not ready") from None
-                except Exception:
+                except Exception as error:
+                    log_generation_failure(
+                        phase="execute",
+                        attempt_id=payload.attempt_id,
+                        output_index=branch_output_index,
+                        uploaded_count=len(progress.uploaded),
+                        error=error,
+                    )
                     raise HTTPException(status_code=502, detail="generation failed") from None
 
                 expected_branch_count = len(payload.uploads) if branch_output_index is None else 1
@@ -535,6 +543,12 @@ def create_worker_app(
                         ),
                     )
                 except WorkerOutputError:
+                    log_generation_failure(
+                        phase="validate_output",
+                        attempt_id=payload.attempt_id,
+                        output_index=branch_output_index,
+                        uploaded_count=len(progress.uploaded),
+                    )
                     raise HTTPException(
                         status_code=502,
                         detail="generation output invalid",
@@ -555,6 +569,12 @@ def create_worker_app(
                         or progress.total_output_bytes + len(content)
                         > settings.max_total_output_bytes
                     ):
+                        log_generation_failure(
+                            phase="validate_output",
+                            attempt_id=payload.attempt_id,
+                            output_index=output_index,
+                            uploaded_count=len(progress.uploaded),
+                        )
                         raise HTTPException(
                             status_code=502,
                             detail="generation output invalid",
@@ -565,9 +585,23 @@ def create_worker_app(
                             content=content,
                             media_type=output.media_type,
                         )
-                    except WorkerUploadError:
+                    except WorkerUploadError as error:
+                        log_generation_failure(
+                            phase="upload",
+                            attempt_id=payload.attempt_id,
+                            output_index=output_index,
+                            uploaded_count=len(progress.uploaded),
+                            error=error,
+                        )
                         raise HTTPException(status_code=502, detail="upload failed") from None
-                    except Exception:
+                    except Exception as error:
+                        log_generation_failure(
+                            phase="upload",
+                            attempt_id=payload.attempt_id,
+                            output_index=output_index,
+                            uploaded_count=len(progress.uploaded),
+                            error=error,
+                        )
                         raise HTTPException(status_code=502, detail="upload failed") from None
                     progress.total_output_bytes += len(content)
                     progress.uploaded.append(
