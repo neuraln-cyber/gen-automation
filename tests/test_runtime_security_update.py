@@ -3,6 +3,7 @@
 import hashlib
 import importlib.util
 import json
+import os
 import re
 from pathlib import Path
 
@@ -209,3 +210,127 @@ def test_managed_python_override_rejects_distro_owned_packages(tmp_path, monkeyp
     with pytest.raises(AssertionError, match="distro-owned"):
         module.system_package_install_flags()
     assert marker.read_text() == "distro managed"
+
+
+@pytest.fixture
+def obsolete_python_cache(tmp_path, monkeypatch):
+    path = ROOT / "scripts/install-i2v-python-security.py"
+    spec = importlib.util.spec_from_file_location("obsolete_python_cache_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    prefix = tmp_path / "conda"
+    target = prefix / "pkgs" / module.OBSOLETE_PYTHON_CACHE
+    (target / "info").mkdir(parents=True)
+    (target / "info/index.json").write_text(
+        json.dumps({"name": "python", "version": "3.11.14", "build": "hd63d673_2_cpython"})
+    )
+    (target / "bin").mkdir()
+    (target / "bin/python3.11").write_bytes(b"old Python executable")
+    (prefix / "conda-meta").mkdir()
+    (prefix / "conda-meta/python-3.11.17.json").write_text(
+        json.dumps({"name": "python", "version": "3.11.17", "build": "h5f976f7_1_cpython"})
+    )
+    monkeypatch.setattr(module, "PREFIX", prefix.resolve())
+    return module, prefix, target
+
+
+def test_only_obsolete_cache_is_removed_and_hardlinked_runtime_survives(obsolete_python_cache):
+    module, prefix, target = obsolete_python_cache
+    retained = prefix / "lib/retained-runtime-file"
+    retained.parent.mkdir()
+    cached = target / "retained-runtime-file"
+    cached.write_bytes(b"unchanged runtime")
+    retained.hardlink_to(cached)
+    unrelated = prefix / "pkgs/retained-package/file"
+    unrelated.parent.mkdir()
+    unrelated.write_bytes(b"unrelated cache")
+    module.remove_obsolete_python_cache()
+    assert not target.exists()
+    assert retained.read_bytes() == b"unchanged runtime"
+    assert unrelated.read_bytes() == b"unrelated cache"
+    assert (prefix / "conda-meta/python-3.11.17.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "field,value", [("name", "torch"), ("version", "3.11.17"), ("build", "other")]
+)
+def test_cache_removal_requires_exact_obsolete_identity(obsolete_python_cache, field, value):
+    module, _, target = obsolete_python_cache
+    metadata = target / "info/index.json"
+    record = json.loads(metadata.read_text())
+    record[field] = value
+    metadata.write_text(json.dumps(record))
+    with pytest.raises(AssertionError, match="Unexpected obsolete cache identity"):
+        module.remove_obsolete_python_cache()
+    assert (target / "bin/python3.11").exists()
+
+
+def test_cache_removal_refuses_unpatched_installed_python(obsolete_python_cache):
+    module, prefix, target = obsolete_python_cache
+    (prefix / "conda-meta/python-3.11.17.json").write_text(
+        json.dumps({"name": "python", "version": "3.11.14", "build": "hd63d673_2_cpython"})
+    )
+    with pytest.raises(AssertionError, match="Patched Python must be installed"):
+        module.remove_obsolete_python_cache()
+    assert target.exists()
+
+
+def fixture_symlink(link, target, directory, monkeypatch):
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as error:
+        if os.name != "nt" or error.winerror != 1314:
+            raise
+        # Unprivileged Windows cannot create symlinks. Exercise the same guard
+        # with a link adapter locally; mandatory Linux CI uses real symlinks.
+        if directory:
+            link.mkdir()
+        else:
+            link.touch()
+        original_is_symlink = Path.is_symlink
+        original_resolve = Path.resolve
+        monkeypatch.setattr(Path, "is_symlink", lambda p: p == link or original_is_symlink(p))
+        monkeypatch.setattr(
+            Path,
+            "resolve",
+            lambda p, **kwargs: (
+                target.resolve(**kwargs) if p == link else original_resolve(p, **kwargs)
+            ),
+        )
+
+
+@pytest.mark.parametrize("directory", [False, True])
+def test_cache_removal_refuses_retained_symlinks(obsolete_python_cache, directory, monkeypatch):
+    module, prefix, target = obsolete_python_cache
+    link = prefix / "runtime-link"
+    fixture_symlink(
+        link, target / "bin" if directory else target / "bin/python3.11", directory, monkeypatch
+    )
+    with pytest.raises(AssertionError, match="Retained symlink references"):
+        module.remove_obsolete_python_cache()
+    assert target.exists() and link.exists()
+
+
+def test_cache_removal_refuses_symlinked_cache_root(obsolete_python_cache, monkeypatch):
+    module, prefix, target = obsolete_python_cache
+    original = prefix / "pkgs"
+    relocated = prefix / "relocated-pkgs"
+    original.rename(relocated)
+    fixture_symlink(original, relocated, True, monkeypatch)
+    with pytest.raises(AssertionError, match="Unexpected cache path"):
+        module.remove_obsolete_python_cache()
+    assert (relocated / target.name / "bin/python3.11").exists()
+
+
+def test_cache_cleanup_is_bracketed_by_native_runtime_verification(monkeypatch):
+    path = ROOT / "scripts/install-i2v-python-security.py"
+    spec = importlib.util.spec_from_file_location("security_cleanup_order_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    calls = []
+    monkeypatch.setattr(module, "verify", lambda: calls.append("verify"))
+    monkeypatch.setattr(module, "remove_obsolete_python_cache", lambda: calls.append("clean"))
+    module.verify_and_clean()
+    assert calls == ["verify", "clean", "verify"]

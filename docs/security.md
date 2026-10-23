@@ -158,6 +158,14 @@ files and unrelated Conda records must remain byte-identical. The queue forwarde
 a checksum-verified patch restricted to `go.mod` and `go.sum`, followed by module
 verification, tests and a readonly module build.
 
+The actual I2V build inventory also identified an obsolete Python 3.11.14
+executable and library in the inherited Conda package cache. After verifying the
+patched interpreter, the installer removes only that exact version/build cache,
+checking its metadata, the installed replacement, resolved directory boundaries,
+and the absence of retained file or directory symlinks into it. Other caches are
+not force-cleaned. Runtime verification and protected-file hashes run again
+after removal; deleting metadata alone or suppressing the finding is not a fix.
+
 These updates still require the full container builds, native CPU/runtime-user
 contracts and mandatory SBOM security scans. Local tests are not a substitute for
 those Linux build checks. CI retains the six build-only SBOMs for seven days,

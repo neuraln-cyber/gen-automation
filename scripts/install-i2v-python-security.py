@@ -2,7 +2,9 @@
 
 import hashlib
 import json
+import os
 import platform
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -11,6 +13,7 @@ from pathlib import Path
 PREFIX = Path("/opt/conda")
 ARCHIVES = Path("/opt/i2v-build-security")
 LOCK = ARCHIVES / "lock.json"
+OBSOLETE_PYTHON_CACHE = "python-3.11.14-hd63d673_2_cpython"
 
 
 def sha256(path: Path) -> str:
@@ -98,6 +101,57 @@ def verify() -> None:
     print("Pinned CPython 3.11.17 runtime dependency closure verified", flush=True)
 
 
+def remove_obsolete_python_cache() -> None:
+    # Actual build SBOM evidence identified this exact inherited binary cache.
+    # Do not force-clean all Conda caches: retained environments may use symlinks.
+    cache_root = PREFIX / "pkgs"
+    target = cache_root / OBSOLETE_PYTHON_CACHE
+    for directory in (PREFIX, cache_root, target):
+        assert directory.is_dir() and not directory.is_symlink(), "Unexpected cache path"
+        assert directory.resolve(strict=True) == directory.absolute(), "Indirect cache path"
+    assert target.parent == cache_root and target != PREFIX
+    metadata = json.loads((target / "info/index.json").read_text())
+    assert (metadata["name"], metadata["version"], metadata["build"]) == (
+        "python",
+        "3.11.14",
+        "hd63d673_2_cpython",
+    ), "Unexpected obsolete cache identity"
+    installed = [
+        json.loads(path.read_text()) for path in (PREFIX / "conda-meta").glob("python-*.json")
+    ]
+    assert len(installed) == 1 and (
+        installed[0]["name"],
+        installed[0]["version"],
+        installed[0]["build"],
+    ) == ("python", "3.11.17", "h5f976f7_1_cpython"), "Patched Python must be installed"
+
+    def fail_walk(error: OSError) -> None:
+        raise error
+
+    for root, directories, files in os.walk(PREFIX, followlinks=False, onerror=fail_walk):
+        current = Path(root)
+        # Exclude only the exact subtree being removed; inspect directory links
+        # as well as file links, and follow link chains when checking references.
+        directories[:] = [name for name in directories if current / name != target]
+        for name in (*directories, *files):
+            path = current / name
+            if path.is_symlink():
+                assert not path.resolve().is_relative_to(target), (
+                    "Retained symlink references obsolete Python cache"
+                )
+    # Unlinking cache hardlinks leaves retained runtime/ML files intact. This
+    # removes the actual old executable/library, not merely scanner metadata.
+    shutil.rmtree(target)
+    assert not target.exists()
+    print("Removed verified obsolete CPython 3.11.14 cache", flush=True)
+
+
+def verify_and_clean() -> None:
+    verify()
+    remove_obsolete_python_cache()
+    verify()
+
+
 def install() -> None:
     from conda.models.match_spec import MatchSpec
     from conda.models.records import PackageRecord
@@ -131,13 +185,16 @@ def install() -> None:
     )
     assert protected_files(names) == before, "Unexpected change outside Python support closure"
     subprocess.run(  # noqa: S603
-        [str(PREFIX / "bin/python"), str(Path(__file__).resolve()), "verify"], check=True
+        [str(PREFIX / "bin/python"), str(Path(__file__).resolve()), "verify-and-clean"], check=True
     )
+    assert protected_files(names) == before, "Unexpected change during obsolete cache removal"
 
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["verify"]:
         verify()
+    elif sys.argv[1:] == ["verify-and-clean"]:
+        verify_and_clean()
     else:
         assert not sys.argv[1:]
         install()
