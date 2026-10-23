@@ -105,6 +105,9 @@ ADD --checksum=sha256:6de73033a7c5f712c9c5a54124e4581e025691029835e5bceaf10a333a
 ADD --checksum=sha256:c8c7583ef063bc3c430f1d48298e5ad24f796a35c22ed5b14183325825a61106 --chmod=0444 \
     https://conda.anaconda.org/conda-forge/linux-64/libffi-3.7.0-h81df57d_1.conda \
     /opt/i2v-build-security/libffi-3.7.0-h81df57d_1.conda
+ADD --checksum=sha256:1f9c8856b629d9c546cd6574345e7d3621f59fdde8c2902b88e00f09764d6295 --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/cffi-2.1.1-py311h904a5e5_3.conda \
+    /opt/i2v-build-security/cffi-2.1.1-py311h904a5e5_3.conda
 ADD --checksum=sha256:9787df8c22a59c9a70d3e5a10db9ad663485e75e9ccc3f09bd092cb7b95e0dab --chmod=0444 \
     https://conda.anaconda.org/conda-forge/linux-64/liblzma-5.8.3-hb03c661_1.conda \
     /opt/i2v-build-security/liblzma-5.8.3-hb03c661_1.conda

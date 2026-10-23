@@ -47,12 +47,13 @@ def test_base_security_lock_has_only_the_three_approved_packages() -> None:
 def test_python_support_archives_are_hash_pinned_and_exclude_the_ml_stack() -> None:
     pins = json.loads((ROOT / "scripts/i2v-python-security-lock.json").read_text())
     dockerfile = (ROOT / "Dockerfile.i2v-worker").read_text()
-    assert len(pins) == 10
+    assert len(pins) == 11
     assert {p["name"] for p in pins} == {
         "python",
         "libpython",
         "libexpat",
         "libffi",
+        "cffi",
         "liblzma",
         "libsqlite",
         "libuuid",
@@ -70,6 +71,7 @@ def test_python_support_archives_are_hash_pinned_and_exclude_the_ml_stack() -> N
     installer = (ROOT / "scripts/install-i2v-python-security.py").read_text()
     assert '"--offline", "--no-deps"' in installer
     assert "spec.match(records[spec.name])" in installer
+    assert 'cffi.FFI().new("int *", 42)[0] == 42' in installer
     assert "protected_files(names) == before" in installer
     assert 'destination / "info/index.json"' in installer
     assert installer.index("validate_dependency_edges(proposed") < installer.index(

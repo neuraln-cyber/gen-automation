@@ -55,6 +55,7 @@ def verify_pins(records, pinned) -> None:
 
 
 def validate_dependency_edges(records, names, match_spec) -> None:
+    failures = []
     for record in records.values():
         for field in ("depends", "constrains"):
             for requirement in getattr(record, field):
@@ -65,9 +66,9 @@ def validate_dependency_edges(records, names, match_spec) -> None:
                     continue
                 if field == "constrains" and spec.name not in records:
                     continue  # Optional constraints never require installation.
-                assert spec.name in records and spec.match(records[spec.name]), (
-                    f"{record.name}: {field}: {requirement}"
-                )
+                if spec.name not in records or not spec.match(records[spec.name]):
+                    failures.append(f"{record.name}: {field}: {requirement}")
+    assert not failures, "; ".join(failures)
 
 
 def verify() -> None:
@@ -87,6 +88,10 @@ def verify() -> None:
     import ssl
     import zlib
 
+    import cffi
+
+    assert cffi.__version__ == "2.1.1"
+    assert cffi.FFI().new("int *", 42)[0] == 42
     assert all((bz2, ctypes, lzma, pyexpat, readline, sqlite3, ssl, zlib))
     print("Pinned CPython 3.11.17 runtime dependency closure verified", flush=True)
 

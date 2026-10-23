@@ -69,6 +69,22 @@
     "constrains": []
   },
   {
+    "name": "cffi",
+    "version": "2.1.1",
+    "build": "py311h904a5e5_3",
+    "url": "https://conda.anaconda.org/conda-forge/linux-64/cffi-2.1.1-py311h904a5e5_3.conda",
+    "sha256": "1f9c8856b629d9c546cd6574345e7d3621f59fdde8c2902b88e00f09764d6295",
+    "depends": [
+      "__glibc >=2.17,<3.0.a0",
+      "libffi >=3.7.0,<3.8.0a0",
+      "libgcc >=15",
+      "pycparser",
+      "python >=3.11,<3.12.0a0",
+      "python_abi 3.11.* *_cp311"
+    ],
+    "constrains": []
+  },
+  {
     "name": "liblzma",
     "version": "5.8.3",
     "build": "hb03c661_1",
