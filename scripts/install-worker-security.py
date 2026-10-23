@@ -5,9 +5,29 @@ import importlib.metadata
 import json
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 EXPECTED = {"pillow": "13.0.0", "certifi": "2026.10.19", "uv": "0.13.4"}
+
+
+def system_package_install_flags() -> list[str]:
+    marker = Path(sysconfig.get_path("stdlib")) / "EXTERNALLY-MANAGED"
+    if not marker.exists():
+        return []
+    # The immutable image-worker base deliberately installs its Python/ML
+    # wheels under /usr/local using the distro interpreter. Replace only those
+    # local wheels; never uninstall a distro-owned package or remove the marker.
+    assert sys.prefix == "/usr" and sys.version_info[:2] == (3, 12)
+    for distribution in importlib.metadata.distributions():
+        if distribution.metadata["Name"].lower() in EXPECTED:
+            location = Path(distribution.locate_file("")).resolve()
+            assert location.is_relative_to(Path("/usr/local/lib").resolve()), (
+                "Refusing to replace a distro-owned package",
+                distribution.metadata["Name"],
+                str(location),
+            )
+    return ["--break-system-packages"]
 
 
 def protected_ml_files() -> dict[str, str]:
@@ -24,6 +44,7 @@ def protected_ml_files() -> dict[str, str]:
 
 def main() -> None:
     lock = Path(sys.argv[1]).resolve(strict=True)
+    install_flags = system_package_install_flags()
     before = protected_ml_files()
     # Conda-owned packages need a real package-manager uninstall before pip
     # replacement, so their files and package inventory both remain accurate.
@@ -53,6 +74,7 @@ def main() -> None:
             "-m",
             "pip",
             "install",
+            *install_flags,
             "--only-binary=:all:",
             "--require-hashes",
             "--no-deps",

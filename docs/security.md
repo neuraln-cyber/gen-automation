@@ -140,6 +140,9 @@ well as updating the application locks. Conda-owned copies are uninstalled by
 Conda before replacement; removing package metadata alone is not remediation.
 The installer hashes the installed PyTorch, torchvision and torchaudio files
 before and after and fails on changes.
+The image-worker base's externally-managed Python marker is retained. A
+build-only pip override is permitted only for its `/usr` Python 3.12 interpreter
+and target wheels under `/usr/local/lib`; distro-owned packages are rejected.
 
 The I2V Python patch uses the exact local archives in
 `scripts/i2v-python-security-lock.json`, with Docker and installer SHA-256

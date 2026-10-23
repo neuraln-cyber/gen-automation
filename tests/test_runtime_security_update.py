@@ -92,3 +92,28 @@ def test_protected_runtime_fingerprint_detects_changes(tmp_path: Path, monkeypat
     assert len(before) == 2
     binary.write_bytes(b"different binary")
     assert module.protected_files({"python"}) != before
+
+
+def test_managed_python_override_rejects_distro_owned_packages(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    path = ROOT / "scripts/install-worker-security.py"
+    spec = importlib.util.spec_from_file_location("base_security_installer_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module.sysconfig, "get_path", lambda name: str(tmp_path))
+    assert module.system_package_install_flags() == []
+    marker = tmp_path / "EXTERNALLY-MANAGED"
+    marker.write_text("distro managed")
+    monkeypatch.setattr(module, "sys", SimpleNamespace(prefix="/usr", version_info=(3, 12)))
+    location = "/usr/local/lib/python3.12/dist-packages"
+    distribution = SimpleNamespace(
+        metadata={"Name": "Pillow"}, locate_file=lambda name: Path(location)
+    )
+    monkeypatch.setattr(module.importlib.metadata, "distributions", lambda: [distribution])
+    assert module.system_package_install_flags() == ["--break-system-packages"]
+    location = "/usr/lib/python3/dist-packages"
+    with pytest.raises(AssertionError, match="distro-owned"):
+        module.system_package_install_flags()
+    assert marker.read_text() == "distro managed"
