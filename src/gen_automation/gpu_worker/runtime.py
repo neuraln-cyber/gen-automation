@@ -1,3 +1,4 @@
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
@@ -36,6 +37,54 @@ class PayloadDownloader(Protocol):
 
 class WorkerUploadError(Exception):
     """A redacted upload failure safe for the worker service layer."""
+
+    def __init__(
+        self,
+        message: str = "upload failed",
+        *,
+        category: str = "upload_failed",
+        status_code: int | None = None,
+        storage_code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = category if category in UPLOAD_FAILURE_CATEGORIES else "upload_failed"
+        self.status_code = (
+            status_code if type(status_code) is int and 100 <= status_code <= 599 else None
+        )
+        self.storage_code = storage_code if storage_code in SAFE_STORAGE_ERROR_CODES else None
+
+
+UPLOAD_FAILURE_CATEGORIES = frozenset(
+    {"upload_failed", "upload_timeout", "upload_transport", "upload_http"}
+)
+SAFE_STORAGE_ERROR_CODES = frozenset(
+    {
+        "AccessDenied",
+        "ExpiredToken",
+        "InvalidToken",
+        "SignatureDoesNotMatch",
+        "RequestTimeTooSkewed",
+        "RequestTimeout",
+        "EntityTooLarge",
+        "EntityTooSmall",
+        "InvalidArgument",
+        "InvalidPolicyDocument",
+        "InternalError",
+        "ServiceUnavailable",
+        "SlowDown",
+        "NoSuchBucket",
+        "MalformedPOSTRequest",
+        "TokenRefreshRequired",
+    }
+)
+
+
+def _safe_storage_error_code(body: bytes) -> str | None:
+    # Inspect only a bounded literal XML Code, never parse entities or retain the
+    # response (which can contain credentials, policy fields and object keys).
+    match = re.search(rb"<Code>([A-Za-z]{1,40})</Code>", body[:8192])
+    code = match.group(1).decode("ascii") if match else None
+    return code if code in SAFE_STORAGE_ERROR_CODES else None
 
 
 class WorkerPayloadDownloadError(Exception):
@@ -115,11 +164,17 @@ class HttpxMultipartUploader:
                 timeout=self.timeout_seconds,
                 follow_redirects=False,
             )
-        except (httpx2.TimeoutException, httpx2.TransportError):
-            raise WorkerUploadError("upload failed") from None
+        except httpx2.TimeoutException:
+            raise WorkerUploadError(category="upload_timeout") from None
+        except httpx2.TransportError:
+            raise WorkerUploadError(category="upload_transport") from None
 
         if response.status_code not in {200, 201, 204}:
-            raise WorkerUploadError("upload failed")
+            raise WorkerUploadError(
+                category="upload_http",
+                status_code=response.status_code,
+                storage_code=_safe_storage_error_code(response.content),
+            )
 
 
 def _copy_fields(fields: Mapping[str, str]) -> dict[str, str]:

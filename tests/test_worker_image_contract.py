@@ -25,7 +25,7 @@ DOCKERFILE_FRONTEND = (
     "sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
 )
 GO_IMAGE = (
-    "golang:1.26.2-alpine@sha256:f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739500e08c86393a21b1"
+    "golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade"
 )
 PYTORCH_IMAGE = (
     "pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime@"

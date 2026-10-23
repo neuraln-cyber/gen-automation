@@ -131,6 +131,50 @@ from the repository and history. Deleting it in a later commit does not remove
 it from earlier commits. Review the pinned scanner and detection rules during
 dependency maintenance; do not replace the exact pin with `latest`.
 
+### Worker runtime security updates
+
+Worker security maintenance preserves the immutable PyTorch/CUDA base and
+model-facing dependency pins. The hash-locked `requirements-worker-security.lock`
+replaces inherited Pillow, certifi and uv packages in the base environment as
+well as updating the application locks. Conda-owned copies are uninstalled by
+Conda before replacement; removing package metadata alone is not remediation.
+The installer hashes the installed PyTorch, torchvision and torchaudio files
+before and after and fails on changes.
+The image-worker base's externally-managed Python marker is retained. A
+build-only pip override is permitted only for its `/usr` Python 3.12 interpreter
+and target wheels under `/usr/local/lib`; distro-owned packages are rejected.
+
+The I2V Python patch uses the exact local archives in
+`scripts/i2v-python-security-lock.json`, with Docker and installer SHA-256
+verification. Installation is offline without dependency solving. Twelve conda-forge
+archives update Python and only its required support libraries, retaining the
+base's GCC, CUDA and ML packages. The cffi binding is rebuilt for the required
+libffi ABI and smoke-tested in the patched interpreter. Python's required libxcrypt
+library is pinned and exercised through its native crypt binding. The lock records the
+actual archives' metadata, not potentially different hotfixed channel API bounds. Before installation and
+again in a fresh interpreter, the installer validates forward dependencies,
+optional constraints and reverse edges from retained packages. Protected ML
+files and unrelated Conda records must remain byte-identical. The queue forwarder uses
+a checksum-verified patch restricted to `go.mod` and `go.sum`, followed by module
+verification, tests and a readonly module build.
+
+The actual I2V build inventory also identified an obsolete Python 3.11.14
+executable and library in the inherited Conda package cache. After verifying the
+patched interpreter, the installer removes only that exact version/build cache,
+checking its metadata, the installed replacement, resolved directory boundaries,
+and the absence of retained file or directory symlinks into it. Other caches are
+not force-cleaned. Runtime verification and protected-file hashes run again
+after removal; deleting metadata alone or suppressing the finding is not a fix.
+
+These updates still require the full container builds, native CPU/runtime-user
+contracts and mandatory SBOM security scans. Local tests are not a substitute for
+those Linux build checks. CI retains the six build-only SBOMs for seven days,
+including after a scan failure, so remaining installation paths can be diagnosed
+from the actual inventory without suppressing findings. No production data is included.
+Security dependency remediation is not proof of a cure
+for generation failures or of unchanged visual output; no model, recipe, LoRA,
+seed or sampling settings are changed by these build steps.
+
 ## Webhooks and callbacks
 
 - Verify provider signatures over the raw request body where supported.

@@ -1,11 +1,12 @@
 # syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-FROM golang:1.26.2-alpine@sha256:f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739500e08c86393a21b1 AS salad-queue-worker-builder
+FROM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS salad-queue-worker-builder
 
 ENV SALAD_QUEUE_WORKER_COMMIT=73d7a3c80a73f26339194e024cb47c8501c67f75 \
     SALAD_QUEUE_WORKER_PATCH_SHA256=a25fa6ca196554eb1e4b6acaabfb22730db69515d07a8e82585015df4213c0ae \
     SALAD_QUEUE_WORKER_HEARTBEAT_PATCH_SHA256=51d604da546aa076073d971b6839998d3582e34f5f52af64faf4c7c6e8f6f23a \
-    SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256=916f22c8075481a2924aabc2f1d1b57d891681eb5bd10b6081487df7b57a336d
+    SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256=916f22c8075481a2924aabc2f1d1b57d891681eb5bd10b6081487df7b57a336d \
+    SALAD_QUEUE_WORKER_SECURITY_PATCH_SHA256=0e6850de22e6fd2006833d5ee2b340bf9e4a6d030a3675ee2afe939f406b3159
 
 RUN apk add --no-cache git \
     && mkdir --parents /src \
@@ -21,6 +22,7 @@ WORKDIR /src
 COPY patches/salad-queue-worker/strict-http-status.patch /tmp/strict-http-status.patch
 COPY patches/salad-queue-worker/job-stream-heartbeat-watchdog.patch /tmp/job-stream-heartbeat-watchdog.patch
 COPY patches/salad-queue-worker/imds-token-recovery.patch /tmp/imds-token-recovery.patch
+COPY patches/salad-queue-worker/security-dependencies.patch /tmp/security-dependencies.patch
 
 RUN printf '%s  %s\n' \
         "${SALAD_QUEUE_WORKER_PATCH_SHA256}" \
@@ -29,6 +31,8 @@ RUN printf '%s  %s\n' \
         /tmp/job-stream-heartbeat-watchdog.patch \
         "${SALAD_QUEUE_WORKER_IMDS_PATCH_SHA256}" \
         /tmp/imds-token-recovery.patch \
+        "${SALAD_QUEUE_WORKER_SECURITY_PATCH_SHA256}" \
+        /tmp/security-dependencies.patch \
         | sha256sum -c - \
     && git apply --unidiff-zero --check /tmp/strict-http-status.patch \
     && git apply --unidiff-zero /tmp/strict-http-status.patch \
@@ -36,6 +40,8 @@ RUN printf '%s  %s\n' \
     && git apply /tmp/job-stream-heartbeat-watchdog.patch \
     && git apply --check /tmp/imds-token-recovery.patch \
     && git apply /tmp/imds-token-recovery.patch \
+    && git apply --check /tmp/security-dependencies.patch \
+    && git apply /tmp/security-dependencies.patch \
     && git diff --check
 
 RUN go mod download \
@@ -85,6 +91,50 @@ RUN /opt/conda/bin/conda install \
     && /opt/conda/bin/conda clean --all --yes \
     && rm -f /tmp/openssl-3.6.4-h781a0a9_0.conda
 
+# CPython security patch and its exact support-library closure. The CUDA,
+# torch and model sources remain immutable; the installer verifies preservation.
+ADD --checksum=sha256:524df25896667b5f7e391c2115495cac5e0077b97967981091af8afcc98fd312 --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/python-3.11.17-h5f976f7_1_cpython.conda \
+    /opt/i2v-build-security/python-3.11.17-h5f976f7_1_cpython.conda
+ADD --checksum=sha256:bad3de581c5b9f193a3b43d634a47df3e90e6fb89ff712b5f6903920640e4a07 --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/libpython-3.11.17-h0c77377_1_cpython.conda \
+    /opt/i2v-build-security/libpython-3.11.17-h0c77377_1_cpython.conda
+ADD --checksum=sha256:6de73033a7c5f712c9c5a54124e4581e025691029835e5bceaf10a333a7e7bc0 --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/libexpat-2.8.5-hd2095e1_0.conda \
+    /opt/i2v-build-security/libexpat-2.8.5-hd2095e1_0.conda
+ADD --checksum=sha256:c8c7583ef063bc3c430f1d48298e5ad24f796a35c22ed5b14183325825a61106 --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/libffi-3.7.0-h81df57d_1.conda \
+    /opt/i2v-build-security/libffi-3.7.0-h81df57d_1.conda
+ADD --checksum=sha256:1f9c8856b629d9c546cd6574345e7d3621f59fdde8c2902b88e00f09764d6295 --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/cffi-2.1.1-py311h904a5e5_3.conda \
+    /opt/i2v-build-security/cffi-2.1.1-py311h904a5e5_3.conda
+ADD --checksum=sha256:9787df8c22a59c9a70d3e5a10db9ad663485e75e9ccc3f09bd092cb7b95e0dab --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/liblzma-5.8.3-hb03c661_1.conda \
+    /opt/i2v-build-security/liblzma-5.8.3-hb03c661_1.conda
+ADD --checksum=sha256:66f4831f4ee3055f0ffe94e01901198cf3601e2c1b4f6b51d05c3f2d8557ce1d --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/libsqlite-3.53.4-h0737f62_103.conda \
+    /opt/i2v-build-security/libsqlite-3.53.4-h0737f62_103.conda
+ADD --checksum=sha256:f34b8d1de9a2bf62476d8608057d9b8a918d97444236dc53a47128f2fae79041 --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/libuuid-2.42.4-hcfc3c73_0.conda \
+    /opt/i2v-build-security/libuuid-2.42.4-hcfc3c73_0.conda
+ADD --checksum=sha256:f7e9292dd219a6435bbb1223da9586c3e70d66d169c5a92f08db3f2127df04e9 --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/libxcrypt-4.4.38-h280c20c_0.conda \
+    /opt/i2v-build-security/libxcrypt-4.4.38-h280c20c_0.conda
+ADD --checksum=sha256:eb8a0db0aa570124f7d2a93d7c7f596e3390df5e047818d873baad32985fc736 --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/libzlib-1.3.2-h25fd6f3_3.conda \
+    /opt/i2v-build-security/libzlib-1.3.2-h25fd6f3_3.conda
+ADD --checksum=sha256:5d46557214ed184381dafe835b7c94a474a1c3b307a08a250b1ea4779b44ffb3 --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/ncurses-6.6-hdb14827_1.conda \
+    /opt/i2v-build-security/ncurses-6.6-hdb14827_1.conda
+ADD --checksum=sha256:01b3fe073a66e321970d09e04b388708f8cbdca5cdfbfcb7c9eeb470ad10383d --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/readline-8.3-hd6e31c0_1.conda \
+    /opt/i2v-build-security/readline-8.3-hd6e31c0_1.conda
+COPY scripts/i2v-python-security-lock.json /opt/i2v-build-security/lock.json
+COPY scripts/install-i2v-python-security.py /tmp/install-i2v-python-security.py
+RUN /opt/conda/bin/python /tmp/install-i2v-python-security.py \
+    && /opt/conda/bin/conda clean --all --yes \
+    && rm -rf /opt/i2v-build-security /tmp/install-i2v-python-security.py
+
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         ca-certificates \
@@ -104,6 +154,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/i2v
+
+COPY requirements-worker-security.lock /tmp/requirements-worker-security.lock
+COPY scripts/install-worker-security.py /tmp/install-worker-security.py
+RUN /opt/conda/bin/python /tmp/install-worker-security.py /tmp/requirements-worker-security.lock \
+    && /opt/conda/bin/conda clean --all --yes \
+    && rm -f /tmp/install-worker-security.py /tmp/requirements-worker-security.lock
 
 COPY requirements-i2v-worker.lock ./requirements-i2v-worker.lock
 

@@ -28,7 +28,7 @@ def test_debian_security_update_is_pinned_and_limited_to_existing_packages(filen
     assert "apt-get upgrade" not in logical
     assert "apt-get dist-upgrade" not in logical
     assert logical.index(security_update) < logical.index("python3.12 -m pip install")
-    assert "python:3.12.14-slim@sha256:" in dockerfile
+    assert "python:3.12.15-slim@sha256:" in dockerfile
 
 
 def test_ci_scans_all_built_images_without_relaxing_the_security_gate() -> None:
@@ -48,3 +48,17 @@ def test_ci_scans_all_built_images_without_relaxing_the_security_gate() -> None:
         assert "severity-cutoff: critical" in scan
         assert "only-fixed: true" in scan
         assert "continue-on-error" not in scan
+
+
+def test_ci_retains_actual_build_inventory_for_failed_scan_diagnosis() -> None:
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    evidence = workflow.split("      - name: Retain build SBOM evidence\n", 1)[1].split(
+        "      - name:", 1
+    )[0]
+    assert "!cancelled() && hashFiles('*.spdx.json') != ''" in evidence
+    assert "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" in evidence
+    assert "path: '*.spdx.json'" in evidence
+    assert "retention-days: 7" in evidence
+    assert "if-no-files-found: error" in evidence
+    assert "continue-on-error" not in evidence
+    assert 'if package["name"].lower() in {"python", "libpython"}:' in workflow

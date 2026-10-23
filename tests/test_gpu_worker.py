@@ -1398,7 +1398,7 @@ def test_progressive_job_uploads_near_black_output_for_human_review() -> None:
     assert [upload.grant.output_index for upload in uploader.uploads] == [0, 1, 2]
 
 
-def test_executor_and_upload_failures_are_redacted() -> None:
+def test_executor_and_upload_failures_are_redacted(capsys: pytest.CaptureFixture[str]) -> None:
     executor = FakeExecutor(execute_error=RuntimeError("private workflow detail"))
     client, _executor, _uploader = _client(executor=executor)
     with client:
@@ -1415,6 +1415,129 @@ def test_executor_and_upload_failures_are_redacted() -> None:
     assert upload_failure.status_code == 502
     assert upload_failure.json() == {"detail": "upload failed"}
     assert "storage" not in upload_failure.text
+    diagnostics = capsys.readouterr().out
+    events = [json.loads(line) for line in diagnostics.splitlines()]
+    assert [event["phase"] for event in events] == ["execute", "upload"]
+    assert all(event["category"] == "unexpected_error" for event in events)
+    assert "private workflow detail" not in diagnostics
+    assert "signed URL and storage response" not in diagnostics
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_code"),
+    [
+        (b"<Error><Code>ExpiredToken</Code><Message>secret</Message></Error>", "ExpiredToken"),
+        (b"<Error><Code>AccessDenied</Code><Key>private-key</Key></Error>", "AccessDenied"),
+        (b"<Error><Code>privateprompt</Code></Error>", None),
+        (b"<Error><Code>&private;</Code></Error>", None),
+        (b"x" * 8192 + b"<Code>ExpiredToken</Code>", None),
+        (b"not xml: signed-url-and-token", None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_upload_failure_reports_only_allowlisted_metadata(
+    body: bytes,
+    expected_code: str | None,
+) -> None:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(403, content=body)
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as client:
+        adapter = HttpxMultipartUploader(client=client)
+        grant = UploadGrant.model_validate(
+            _unsigned_request()["payload"]["uploads"][0], strict=True
+        )
+        with pytest.raises(WorkerUploadError) as caught:
+            await adapter.upload(grant=grant, content=b"image-bytes", media_type="image/png")
+    assert str(caught.value) == "upload failed"
+    assert caught.value.category == "upload_http"
+    assert caught.value.status_code == 403
+    assert caught.value.storage_code == expected_code
+
+
+@pytest.mark.parametrize(
+    ("error", "category"),
+    [
+        (httpx2.ReadTimeout("private-url"), "upload_timeout"),
+        (httpx2.ConnectError("private-url"), "upload_transport"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_upload_transport_diagnostics_keep_existing_no_retry_semantics(
+    error: Exception,
+    category: str,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        nonlocal calls
+        calls += 1
+        raise error
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as client:
+        grant = UploadGrant.model_validate(
+            _unsigned_request()["payload"]["uploads"][0], strict=True
+        )
+        with pytest.raises(WorkerUploadError) as caught:
+            await HttpxMultipartUploader(client=client).upload(
+                grant=grant,
+                content=b"image-bytes",
+                media_type="image/png",
+            )
+    assert calls == 1
+    assert caught.value.category == category
+    assert caught.value.status_code is None
+    assert caught.value.storage_code is None
+    assert "private-url" not in str(caught.value)
+
+
+def test_upload_diagnostic_records_closed_schema_and_replay_stays_valid(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    uploader = FakeUploader(
+        error=WorkerUploadError(
+            "private-secret",
+            category="upload_http",
+            status_code=403,
+            storage_code="ExpiredToken",
+        )
+    )
+    client, _executor, _ = _client(uploader=uploader)
+    request = _signed_request()
+    with client:
+        failed = client.post("/jobs/generate", json=request)
+        uploader.error = None
+        recovered = client.post("/jobs/generate", json=request)
+    assert failed.status_code == 502 and failed.json() == {"detail": "upload failed"}
+    assert recovered.status_code == 200
+    assert len(uploader.uploads) == 1
+    output = capsys.readouterr().out
+    event = json.loads(output)
+    assert event == {
+        "event": "image_worker_failure",
+        "schema": 1,
+        "phase": "upload",
+        "category": "upload_http",
+        "http_status": 403,
+        "storage_code": "ExpiredToken",
+        "output_index": 0,
+        "uploaded_count": 0,
+        "attempt_sha256": hashlib.sha256(request["payload"]["attempt_id"].encode()).hexdigest(),
+    }
+    assert "private-secret" not in output and UPLOAD_ORIGIN not in output
+    assert "private-policy-value" not in output
+
+
+def test_invalid_output_has_separate_safe_diagnostic(capsys: pytest.CaptureFixture[str]) -> None:
+    client, _, uploader = _client(executor=FakeExecutor(outputs=[{"private": "prompt"}]))
+    with client:
+        response = client.post("/jobs/generate", json=_signed_request())
+    assert response.status_code == 502
+    assert uploader.uploads == []
+    output = capsys.readouterr().out
+    event = json.loads(output)
+    assert event["phase"] == "validate_output" and event["category"] == "output_invalid"
+    assert "private" not in output and "prompt" not in output
 
 
 @pytest.mark.asyncio

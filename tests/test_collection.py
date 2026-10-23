@@ -600,23 +600,31 @@ async def test_stopped_terminal_job_salvages_uploaded_master_then_retires_absent
     assert len(retired_events) == 1
 
 
+@pytest.mark.parametrize("missing_is_older", [False, True], ids=["expired-first", "missing-first"])
 @pytest.mark.asyncio
 async def test_stopped_terminal_job_reclaims_expired_verification_lease(
     collection_context: CollectionContext,
+    missing_is_older: bool,
 ) -> None:
     _stage(collection_context.store, collection_context.intents[0], _png("orange"))
     async with collection_context.database.sessions() as session:
         job = await session.get(GenerationJob, collection_context.job_id)
         release = await session.get(Release, collection_context.release_id)
         asset = await session.get(Asset, collection_context.intents[0].asset_id)
-        assert job is not None and release is not None and asset is not None
+        missing = await session.get(Asset, collection_context.intents[1].asset_id)
+        assert job is not None and release is not None and asset is not None and missing is not None
         release_version_id = job.release_version_id
         asset_id = asset.id
+        missing_id = missing.id
         job.state = GenerationState.FAILED
         release.phase = ReleasePhase.PAUSED
         asset.state = AssetState.VERIFYING
         asset.verification_lease_owner = "dead-collector"
         asset.verification_lease_expires_at = NOW - timedelta(seconds=1)
+        # Selection is oldest-touch first, not expired-lease first. Exercise
+        # both orders explicitly instead of relying on wall-clock DB defaults.
+        asset.updated_at = NOW - timedelta(minutes=1 if missing_is_older else 2)
+        missing.updated_at = NOW - timedelta(minutes=2 if missing_is_older else 1)
         session.add(
             AuditEvent(
                 actor="owner",
@@ -634,6 +642,19 @@ async def test_stopped_terminal_job_reclaims_expired_verification_lease(
             session,
             release_version_id=release_version_id,
         )
+        if missing_is_older:
+            retired = await collect_next_ready_running_asset(
+                session,
+                collection_context.store,
+                worker_id="replacement-stop-salvage-collector",
+                max_image_bytes=1_000_000,
+                now=NOW,
+            )
+            assert retired.asset_id == missing_id
+            assert retired.finalized is False
+            retired_asset = await session.get(Asset, missing_id)
+            assert retired_asset is not None and retired_asset.state == AssetState.QUARANTINED
+            assert retired_asset.verification_error_code == "stopped_generation_upload_absent"
         result = await collect_next_ready_running_asset(
             session,
             collection_context.store,

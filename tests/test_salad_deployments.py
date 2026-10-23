@@ -1407,6 +1407,237 @@ async def test_runtime_admission_reports_transient_observation_unavailability(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "deployment_reconcile_transport_error",
+        "deployment_reconcile_rate_limited",
+        "controller_provider_operation_timed_out",
+        "container_group_update_response_unknown",
+    ],
+)
+@pytest.mark.parametrize("stage", ["queue_admission", "preflight", "planned_refresh"])
+async def test_unknown_deployment_runtime_admission_waits_for_reconciliation(
+    error_code: str,
+    stage: str,
+) -> None:
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.UNKNOWN
+    deployment.last_error_code = error_code
+    client = FakeClient()
+
+    # UNKNOWN is not permission to start, repair or even adopt a provider readback.
+    # The deployment reconciler must resolve the ambiguity first.
+    with pytest.raises(SaladRuntimeAdmissionUnavailableError, match="awaiting reconciliation"):
+        if stage == "preflight":
+            await preflight_container_group_runtime_refresh(deployment, client)
+        elif stage == "planned_refresh":
+            await refresh_container_group_runtime(
+                deployment,
+                client,
+                None,
+                expected_provider_version=1,
+                runtime_admission_id=RUNTIME_ADMISSION_ID,
+                environment_overrides={
+                    WORKER_MODEL_MANIFEST_JSON_BINDING: '{"artifacts":[]}',
+                    WORKER_MODEL_MANIFEST_SHA256_BINDING: "d" * 64,
+                    WORKER_RUNTIME_ADMISSION_ID_BINDING: RUNTIME_ADMISSION_ID,
+                },
+                effective_min_replicas=1,
+            )
+        else:
+            await ensure_container_group_queue_admission(
+                deployment,
+                client,
+                effective_min_replicas=1,
+                artifact_manifest_sha256="d" * 64,
+                runtime_admission_id=RUNTIME_ADMISSION_ID,
+            )
+    assert client.calls == []
+    assert deployment.state == SaladDeploymentState.UNKNOWN
+    assert deployment.last_error_code == error_code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid",
+    ["superseded", "stopped", "missing_queue", "missing_group", "no_demand", "partial_identity"],
+)
+async def test_unknown_deployment_does_not_defer_invalid_queue_admission(invalid: str) -> None:
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_queue_id = None if invalid == "missing_queue" else str(QUEUE_ID)
+    deployment.provider_container_group_id = None if invalid == "missing_group" else str(GROUP_ID)
+    deployment.state = SaladDeploymentState.UNKNOWN
+    deployment.is_current = invalid != "superseded"
+    if invalid == "stopped":
+        deployment.desired_state = DesiredDeploymentState.STOPPED
+    client = FakeClient()
+    with pytest.raises(SaladDeploymentValidationError):
+        await ensure_container_group_queue_admission(
+            deployment,
+            client,
+            effective_min_replicas=0 if invalid == "no_demand" else 1,
+            artifact_manifest_sha256="d" * 64,
+            runtime_admission_id=None if invalid == "partial_identity" else RUNTIME_ADMISSION_ID,
+        )
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["preflight", "planned_refresh"])
+@pytest.mark.parametrize("invalid", ["superseded", "stopped", "missing_group"])
+async def test_unknown_deployment_does_not_defer_invalid_runtime_refresh(
+    stage: str, invalid: str
+) -> None:
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_container_group_id = None if invalid == "missing_group" else str(GROUP_ID)
+    deployment.state = SaladDeploymentState.UNKNOWN
+    deployment.is_current = invalid != "superseded"
+    if invalid == "stopped":
+        deployment.desired_state = DesiredDeploymentState.STOPPED
+    client = FakeClient()
+    with pytest.raises(SaladDeploymentValidationError):
+        if stage == "preflight":
+            await preflight_container_group_runtime_refresh(deployment, client)
+        else:
+            await refresh_container_group_runtime(
+                deployment,
+                client,
+                None,
+                expected_provider_version=1,
+                runtime_admission_id=RUNTIME_ADMISSION_ID,
+                environment_overrides={WORKER_RUNTIME_ADMISSION_ID_BINDING: RUNTIME_ADMISSION_ID},
+            )
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected_version", [None, 0])
+async def test_unknown_deployment_does_not_defer_unplanned_or_invalid_refresh(
+    expected_version: int | None,
+) -> None:
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.UNKNOWN
+    client = FakeClient()
+    with pytest.raises(SaladDeploymentValidationError):
+        await refresh_container_group_runtime(
+            deployment, client, None, expected_provider_version=expected_version
+        )
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending_change", [False, True])
+@pytest.mark.parametrize("autoscaler_shape", ["missing", "repairing"])
+async def test_marker_bound_queue_admission_waits_for_autoscaler_repair_without_failed_attempt(
+    pending_change: bool,
+    autoscaler_shape: str,
+) -> None:
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    group = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        replicas=1,
+        pending_change=pending_change,
+        environment={
+            WORKER_MODEL_MANIFEST_SHA256_BINDING: "d" * 64,
+            WORKER_RUNTIME_ADMISSION_ID_BINDING: RUNTIME_ADMISSION_ID,
+        },
+    )
+    if autoscaler_shape == "missing":
+        group.raw.pop("queue_autoscaler")
+    else:
+        group.raw["queue_autoscaler"] = {"min_replicas": 1, "max_replicas": 1}
+    before = deepcopy(group.raw)
+    client = FakeClient()
+    client.groups[deployment.container_group_name] = group
+    client.queues[deployment.queue_name] = make_queue(deployment.queue_name)
+
+    with pytest.raises(SaladRuntimeAdmissionUnavailableError, match=r"autoscaler.*reconciliation"):
+        await ensure_container_group_queue_admission(
+            deployment,
+            client,
+            effective_min_replicas=1,
+            artifact_manifest_sha256="d" * 64,
+            runtime_admission_id=RUNTIME_ADMISSION_ID,
+        )
+    assert group.raw == before
+    assert client.updated_group_patches == []
+    assert client.start_names == []
+
+    # Only exact provider convergence opens admission; reuse the same runtime identity.
+    group.raw["queue_autoscaler"] = {
+        "min_replicas": 1,
+        "max_replicas": 1,
+        "desired_queue_length": 1,
+        "polling_period": 30,
+    }
+    client.groups[deployment.container_group_name] = replace(group, pending_change=False)
+    admitted = await ensure_container_group_queue_admission(
+        deployment,
+        client,
+        effective_min_replicas=1,
+        artifact_manifest_sha256="d" * 64,
+        runtime_admission_id=RUNTIME_ADMISSION_ID,
+    )
+    assert admitted.version == group.version
+    assert client.updated_group_patches == []
+    assert client.start_names == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["image", "priority", "replicas", "queue", "runtime_id"])
+async def test_autoscaler_wait_never_masks_unrelated_worker_drift(drift: str) -> None:
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.ACTIVE
+    group = make_group(
+        deployment.container_group_name,
+        deployment.queue_name,
+        pending_change=True,
+        replicas=2 if drift == "replicas" else 1,
+        image="registry.example.test/wrong@sha256:" + "e" * 64
+        if drift == "image"
+        else IMAGE_DIGEST,
+        environment={
+            WORKER_MODEL_MANIFEST_SHA256_BINDING: "d" * 64,
+            WORKER_RUNTIME_ADMISSION_ID_BINDING: "e" * 32
+            if drift == "runtime_id"
+            else RUNTIME_ADMISSION_ID,
+        },
+    )
+    group.raw.pop("queue_autoscaler")
+    if drift == "priority":
+        group.raw["priority"] = "high"
+    if drift == "queue":
+        group.raw["queue_connection"] = {
+            "queue_name": "wrong",
+            "path": "/jobs/generate",
+            "port": 8000,
+        }
+    client = FakeClient()
+    client.groups[deployment.container_group_name] = group
+    client.queues[deployment.queue_name] = make_queue(deployment.queue_name)
+    with pytest.raises(SaladDeploymentValidationError):
+        await ensure_container_group_queue_admission(
+            deployment,
+            client,
+            effective_min_replicas=1,
+            artifact_manifest_sha256="d" * 64,
+            runtime_admission_id=RUNTIME_ADMISSION_ID,
+        )
+    assert client.updated_group_patches == []
+    assert client.start_names == []
+
+
+@pytest.mark.asyncio
 async def test_marker_bound_queue_admission_defers_pending_minimum_without_repatch() -> None:
     manifest_sha256 = "d" * 64
     deployment = unpersisted_deployment(provider_configuration(with_binding=True))
