@@ -1461,6 +1461,52 @@ async def test_unknown_deployment_runtime_admission_waits_for_reconciliation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["queue_admission", "preflight", "planned_refresh"])
+async def test_rejected_group_start_defers_runtime_admission_without_provider_mutation(
+    stage: str,
+) -> None:
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.DEGRADED
+    deployment.last_error_code = "group_start_rejected"
+    client = FakeClient()
+
+    with pytest.raises(
+        SaladRuntimeAdmissionUnavailableError,
+        match="awaiting deployment reconciliation",
+    ):
+        if stage == "preflight":
+            await preflight_container_group_runtime_refresh(deployment, client)
+        elif stage == "planned_refresh":
+            await refresh_container_group_runtime(
+                deployment,
+                client,
+                None,
+                expected_provider_version=1,
+                runtime_admission_id=RUNTIME_ADMISSION_ID,
+                environment_overrides={
+                    WORKER_MODEL_MANIFEST_JSON_BINDING: '{"artifacts":[]}',
+                    WORKER_MODEL_MANIFEST_SHA256_BINDING: "d" * 64,
+                    WORKER_RUNTIME_ADMISSION_ID_BINDING: RUNTIME_ADMISSION_ID,
+                },
+                effective_min_replicas=1,
+            )
+        else:
+            await ensure_container_group_queue_admission(
+                deployment,
+                client,
+                effective_min_replicas=1,
+                artifact_manifest_sha256="d" * 64,
+                runtime_admission_id=RUNTIME_ADMISSION_ID,
+            )
+
+    assert client.calls == []
+    assert deployment.state == SaladDeploymentState.DEGRADED
+    assert deployment.last_error_code == "group_start_rejected"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "invalid",
     ["superseded", "stopped", "missing_queue", "missing_group", "no_demand", "partial_identity"],
@@ -4083,6 +4129,64 @@ async def test_reconciliation_uses_status_to_start_stopped_active_group_with_dem
     assert deployment.unknown_since.replace(tzinfo=UTC) == observed_at
     assert client.start_names == [group_name]
     assert client.updated_group_patches == []
+
+
+@pytest.mark.asyncio
+async def test_rejected_group_start_backs_off_and_records_only_http_status(
+    deployment_context: DeploymentContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await make_fully_provisioned(deployment_context)
+    client = FakeClient()
+    queue_name, group_name = remote_names()
+    client.queues[queue_name] = make_queue(queue_name)
+    group = make_group(
+        group_name,
+        queue_name,
+        status="stopped",
+        start_time=None,
+        finish_time=NOW,
+        autoscaler={
+            "min_replicas": 1,
+            "max_replicas": 1,
+            "desired_queue_length": 1,
+            "polling_period": 30,
+        },
+    )
+    group.raw["autostart_policy"] = False
+    client.groups[group_name] = group
+    client.start_error = api_error(400)
+
+    async def demand_one_worker(*_args: object, **_kwargs: object) -> int:
+        return 1
+
+    monkeypatch.setattr(deployment_service, "effective_worker_min_replicas", demand_one_worker)
+    observed_at = NOW + timedelta(minutes=1)
+    async with deployment_context.database.sessions() as session:
+        result = await reconcile_deployment(
+            session,
+            deployment_id=deployment_context.deployment_id,
+            client=client,
+            now=observed_at,
+        )
+        await session.commit()
+        deployment = await session.get(SaladDeployment, deployment_context.deployment_id)
+        audit = await session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.resource_id == deployment_context.deployment_id,
+                AuditEvent.action == "salad_deployment.provisioning_failed",
+            )
+        )
+
+    assert result.action == DeploymentAction.FAILED
+    assert result.state == SaladDeploymentState.DEGRADED
+    assert result.error_code == "group_start_rejected"
+    assert deployment is not None
+    assert deployment.reconcile_after is not None
+    assert deployment.reconcile_after.replace(tzinfo=UTC) == observed_at + timedelta(seconds=30)
+    assert audit is not None
+    assert audit.detail == {"error_code": "group_start_rejected", "provider_http_status": 400}
+    assert client.start_names == [group_name]
 
 
 @pytest.mark.asyncio

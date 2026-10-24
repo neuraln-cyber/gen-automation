@@ -2050,10 +2050,19 @@ async def test_pending_runtime_target_ignores_stale_created_demand(tmp_path: Pat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("admission_stage", ["preflight", "planned_refresh", "queue_admission"])
-async def test_unknown_deployment_preserves_controller_attempt(
+@pytest.mark.parametrize(
+    ("deployment_state", "error_code"),
+    [
+        (SaladDeploymentState.UNKNOWN, "deployment_reconcile_transport_error"),
+        (SaladDeploymentState.DEGRADED, "group_start_rejected"),
+    ],
+)
+async def test_unavailable_deployment_preserves_controller_attempt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     admission_stage: str,
+    deployment_state: SaladDeploymentState,
+    error_code: str,
 ) -> None:
     database = Database(f"sqlite+aiosqlite:///{(tmp_path / 'unknown-admission.db').as_posix()}")
     await database.create_schema()
@@ -2068,8 +2077,8 @@ async def test_unknown_deployment_preserves_controller_attempt(
                 **_provider_configuration(),
                 "priority": "batch",
             }
-            deployment.state = SaladDeploymentState.UNKNOWN
-            deployment.last_error_code = "deployment_reconcile_transport_error"
+            deployment.state = deployment_state
+            deployment.last_error_code = error_code
             deployment.unknown_since = datetime.now(UTC)
             deployment.queue_name, deployment.container_group_name = _remote_names()
             attempt.request_metadata = {
@@ -2182,7 +2191,7 @@ async def test_unknown_deployment_preserves_controller_attempt(
         )
 
         # Exercise the real queue-admission service, not a mocked transient
-        # exception. Repeated UNKNOWN observations preserve the same attempt,
+        # exception. Repeated unavailable observations preserve the same attempt,
         # input, retry limits and durable event without even reading the worker.
         for _ in range(3):
             assert await workloads.submit_once() is True
