@@ -1461,6 +1461,52 @@ async def test_unknown_deployment_runtime_admission_waits_for_reconciliation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["queue_admission", "preflight", "planned_refresh"])
+async def test_rejected_group_start_defers_runtime_admission_without_provider_mutation(
+    stage: str,
+) -> None:
+    deployment = unpersisted_deployment(provider_configuration(with_binding=True))
+    deployment.provider_queue_id = str(QUEUE_ID)
+    deployment.provider_container_group_id = str(GROUP_ID)
+    deployment.state = SaladDeploymentState.DEGRADED
+    deployment.last_error_code = "group_start_rejected"
+    client = FakeClient()
+
+    with pytest.raises(
+        SaladRuntimeAdmissionUnavailableError,
+        match="awaiting deployment reconciliation",
+    ):
+        if stage == "preflight":
+            await preflight_container_group_runtime_refresh(deployment, client)
+        elif stage == "planned_refresh":
+            await refresh_container_group_runtime(
+                deployment,
+                client,
+                None,
+                expected_provider_version=1,
+                runtime_admission_id=RUNTIME_ADMISSION_ID,
+                environment_overrides={
+                    WORKER_MODEL_MANIFEST_JSON_BINDING: '{"artifacts":[]}',
+                    WORKER_MODEL_MANIFEST_SHA256_BINDING: "d" * 64,
+                    WORKER_RUNTIME_ADMISSION_ID_BINDING: RUNTIME_ADMISSION_ID,
+                },
+                effective_min_replicas=1,
+            )
+        else:
+            await ensure_container_group_queue_admission(
+                deployment,
+                client,
+                effective_min_replicas=1,
+                artifact_manifest_sha256="d" * 64,
+                runtime_admission_id=RUNTIME_ADMISSION_ID,
+            )
+
+    assert client.calls == []
+    assert deployment.state == SaladDeploymentState.DEGRADED
+    assert deployment.last_error_code == "group_start_rejected"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "invalid",
     ["superseded", "stopped", "missing_queue", "missing_group", "no_demand", "partial_identity"],

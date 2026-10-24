@@ -142,6 +142,15 @@ def _defer_unknown_runtime_observation(deployment: SaladDeployment) -> None:
         raise SaladRuntimeAdmissionUnavailableError(
             "deployment observation is awaiting reconciliation"
         )
+    # A rejected provider start is not a failed generation. Keep the original
+    # attempt/outbox unstarted until deployment reconciliation proves recovery.
+    if (
+        deployment.state == SaladDeploymentState.DEGRADED
+        and deployment.last_error_code == "group_start_rejected"
+    ):
+        raise SaladRuntimeAdmissionUnavailableError(
+            "container group start is awaiting deployment reconciliation"
+        )
 
 
 _WORKER_STARTUP_PROBE: JSONObject = {
