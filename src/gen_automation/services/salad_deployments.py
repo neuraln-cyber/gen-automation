@@ -3236,6 +3236,8 @@ async def _handle_mutation_error(
             deployment,
             error_code=f"{code_prefix}_rejected",
             observed_at=observed_at,
+            retry_after=_RECONCILE_DELAY if code_prefix == "group_start" else None,
+            provider_http_status=(error.status_code if code_prefix == "group_start" else None),
         )
     if isinstance(error, SaladProtocolError):
         error_code = f"{code_prefix}_response_unknown"
@@ -3302,6 +3304,8 @@ async def _mark_failed(
     *,
     error_code: str,
     observed_at: datetime,
+    retry_after: timedelta | None = None,
+    provider_http_status: int | None = None,
 ) -> DeploymentResult:
     deployment.state = (
         SaladDeploymentState.DEGRADED
@@ -3312,13 +3316,20 @@ async def _mark_failed(
     deployment.last_error_detail = (
         "Deployment provisioning failed validation or provider rejection."
     )
-    deployment.reconcile_after = None
+    deployment.reconcile_after = observed_at + retry_after if retry_after is not None else None
     _touch(deployment)
     _audit(
         session,
         deployment,
         action="salad_deployment.provisioning_failed",
-        detail={"error_code": error_code},
+        detail={
+            "error_code": error_code,
+            **(
+                {"provider_http_status": provider_http_status}
+                if provider_http_status is not None
+                else {}
+            ),
+        },
         occurred_at=observed_at,
     )
     await session.flush()
