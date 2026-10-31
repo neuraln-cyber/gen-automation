@@ -5,8 +5,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE_PATH = ROOT / "Dockerfile.mega"
 CI_PATH = ROOT / ".github" / "workflows" / "ci.yml"
 
-MEGACMD_VERSION = "2.6.0-2.1"
-MEGACMD_SHA256 = "9fb8c9a31a1c40b57fb54b2e8877988d957a8fcd09b78b3131cff28f0276fd0e"
+MEGACMD_VERSION = "2.7.0-1.1"
+MEGACMD_SHA256 = "d8c3c77d0417cba498fa6d4b3804fb657721afed072d6472c10e6b0b1b02dab9"
 
 
 def test_mega_image_has_a_reproducible_default_package() -> None:

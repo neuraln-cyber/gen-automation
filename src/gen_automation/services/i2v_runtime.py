@@ -1147,14 +1147,20 @@ def _worker_settings_snapshot(settings: Mapping[str, object]) -> dict[str, objec
         snapshot.pop("h3_model_variant", None)
     if snapshot.get("h3_image_mode", "reference") == "reference":
         snapshot.pop("h3_image_mode", None)
-    if snapshot.get("h3_attention_backend", "default") == "default":
+    beta7 = snapshot.get("h3_model_variant") == "eros_beta7"
+    if not beta7 and snapshot.get("h3_attention_backend", "default") == "default":
         snapshot.pop("h3_attention_backend", None)
     if snapshot.get("h3_latent_contrast", 1.0) == 1.0:
         snapshot.pop("h3_latent_contrast", None)
     for name, default in H3_EXPERT_DEFAULTS.items():
-        # Eros fills an omitted refinement count with 4, so dropping an
-        # explicitly requested 1 here would silently change the owner's job.
-        if name == "h3_refine_steps" and snapshot.get("h3_model_variant") == "eros_beta5":
+        # Variant defaults differ from the legacy defaults. Keep explicit
+        # values so normalization cannot silently change a frozen job.
+        if name == "h3_refine_steps" and snapshot.get("h3_model_variant") in {
+            "eros_beta5",
+            "eros_beta7",
+        }:
+            continue
+        if beta7 and name == "h3_refine_denoise":
             continue
         if snapshot.get(name, default) == default:
             snapshot.pop(name, None)

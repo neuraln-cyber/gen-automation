@@ -189,6 +189,7 @@ class WorkerSupervisor:
                 network_attempts=self.settings.network_attempts,
                 poll_seconds=self.settings.comfy_poll_seconds,
                 profile=self.settings.profile,
+                h3_model_variant=self.settings.h3_model_variant,
                 source_resolution_enabled=any(
                     item.role == "h3_latent_upscaler" for item in self.settings.model_objects
                 ),
@@ -282,6 +283,22 @@ def _verify_gpu_runtime(settings: I2VWorkerSettings) -> None:
         if vram_bytes < settings.minimum_gpu_vram_bytes:
             reason = "insufficient_vram"
             raise ValueError
+        if settings.h3_model_variant == "eros_beta7":
+            check = "vsa_kernel"
+            reason = "vsa_kernel_unavailable"
+            import comfy_kitchen  # type: ignore[import-not-found]
+
+            if not comfy_kitchen.sol_attn_is_available(0):
+                raise ValueError
+            # Check the installed CUDA extension on this device before model
+            # downloads. This tiny synthetic probe loads no model or media.
+            reason = "vsa_kernel_probe_failed"
+            q = torch.zeros((1, 128, 1, 128), device="cuda:0", dtype=torch.bfloat16)
+            sparse = comfy_kitchen.sol_attn(q, q, q, topk_ratio=0.1, tail=False, token_aug=0)
+            if sparse.shape != q.shape or not bool(torch.isfinite(sparse).all().item()):
+                raise ValueError
+            torch.cuda.synchronize(0)
+            del q, sparse
     except Exception as error:
         if check == "torch_import":
             reason = "torch_import_failed"

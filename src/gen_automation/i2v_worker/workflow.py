@@ -132,11 +132,13 @@ def render_workflow(
     native_h3 = settings.profile == "minimax_h3" and settings.h3_model_variant in {
         "fl2va_int8",
         "eros_beta5",
+        "eros_beta7",
     }
     if settings.profile == "minimax_h3":
         expected_conditioning = {
             "fl2va_int8": "MiniMaxH3ImageToVideo",
             "eros_beta5": "MiniMaxH3ReferenceToVideo",
+            "eros_beta7": "MiniMaxH3ReferenceToVideo",
         }.get(settings.h3_model_variant or "turbo_v2", "MiniMaxH3DirectorGuide")
         if template.get("6", {}).get("class_type") != expected_conditioning:
             raise WorkflowError("H3 workflow does not match the checkpoint variant")
@@ -220,8 +222,10 @@ def render_workflow(
             }
         if settings.match_source_resolution:
             rendered = _inject_h3_upscale(rendered, settings, model_paths or {})
-        if settings.h3_model_variant == "eros_beta5":
+        if settings.h3_model_variant in {"eros_beta5", "eros_beta7"}:
             _inject_eros_author_sampling(rendered, settings)
+        if settings.h3_model_variant == "eros_beta7":
+            _inject_eros_beta7_sparse_attention(rendered)
         if settings.h3_image_mode == "first_frame":
             if not guide_filename:
                 raise WorkflowError("first-frame guidance requires the fitted guide image")
@@ -449,13 +453,34 @@ def _inject_eros_author_sampling(workflow: dict[str, Any], settings: GenerationS
             workflow[consumer]["inputs"]["sigmas"] = [tail, 1]
 
 
+def _inject_eros_beta7_sparse_attention(workflow: dict[str, Any]) -> None:
+    """FastH3-Omni Beta 7's trained VSA pattern, for base and refinement passes."""
+    model = workflow["7"]["inputs"]["model"]
+    workflow["h3-eros-beta7-vsa"] = {
+        "class_type": "BlockSparseAttention",
+        "inputs": {
+            "model": model,
+            "selection": "vsa",
+            "selection.keep_percent": 10.0,
+            "start_percent": 0.0,
+            "end_percent": 1.0,
+            "dense_blocks": "0,1",
+            "min_tokens": 12288,
+            "extra_tokens": 0,
+            "sink_conditioning": "exact_kv_and_rows",
+            "verbose": True,
+        },
+    }
+    workflow["7"]["inputs"]["model"] = ["h3-eros-beta7-vsa", 0]
+
+
 def _inject_h3_upscale(
     workflow: dict[str, Any], settings: GenerationSettings, model_paths: Mapping[str, str]
 ) -> dict[str, Any]:
     if model_paths.get(H3_UPSCALER_ROLE) != H3_UPSCALER_FILENAME:
         raise WorkflowError("source-size H3 delivery requires the pinned latent upscaler")
     base_width, base_height = h3_base_canvas(settings.width, settings.height)
-    native_h3 = settings.h3_model_variant in {"fl2va_int8", "eros_beta5"}
+    native_h3 = settings.h3_model_variant in {"fl2va_int8", "eros_beta5", "eros_beta7"}
     if native_h3:
         workflow["6"]["inputs"].update(width=base_width, height=base_height)
     else:

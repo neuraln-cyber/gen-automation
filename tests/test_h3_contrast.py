@@ -100,7 +100,8 @@ def test_gate_and_dashboard_keep_neutral_default(client):
     assert 'name="h3_latent_contrast"' not in client.get("/dashboard/animations").text
 
 
-def test_actual_ui_serializes_restores_and_validates_contrast():
+@pytest.mark.parametrize("variant", ["eros_beta5", "eros_beta7"])
+def test_actual_ui_serializes_restores_and_validates_contrast(variant):
     node = shutil.which("node")
     if not node:
         pytest.skip("Node needed to exercise dashboard functions")
@@ -108,7 +109,9 @@ def test_actual_ui_serializes_restores_and_validates_contrast():
 const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
 const src=fs.readFileSync('src/gen_automation/static/i2v.js','utf8');
 const field={name:'h3_latent_contrast',type:'number',value:'1',disabled:false};
-const ctx=vm.createContext({isH3:true,h3ModelVariant:'eros_beta5',h3AdvancedSamplingEnabled:true,
+const h3ModelVariant='__VARIANT__';
+const ctx=vm.createContext({isH3:true,h3ModelVariant,erosBeta7:h3ModelVariant==='eros_beta7',
+ h3AdvancedSamplingEnabled:true,
  workerSettingDefaults:{profile:'minimax_h3',h3_latent_contrast:1},
  state:{loraSelections:new Map(),loraCatalog:[]},loraWriteBlocked:()=>false,
  loraList:{querySelectorAll:()=>[]},root:{querySelector:()=>null},CSS:{escape:x=>x},
@@ -130,7 +133,11 @@ assert.equal(field.value,'0.9'); // preserve draft, never silently replace by 1
 field.value='1';assert.equal(vm.runInContext('collectSettings()',ctx).h3_latent_contrast,1);
 """
     subprocess.run(  # noqa: S603 - fixed local test; no external input
-        [node, "-e", script], cwd=ROOT, check=True, capture_output=True, text=True
+        [node, "-e", script.replace("__VARIANT__", variant)],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
     )
 
 

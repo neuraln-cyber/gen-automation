@@ -93,12 +93,12 @@ RUN /opt/conda/bin/conda install \
 
 # CPython security patch and its exact support-library closure. The CUDA,
 # torch and model sources remain immutable; the installer verifies preservation.
-ADD --checksum=sha256:524df25896667b5f7e391c2115495cac5e0077b97967981091af8afcc98fd312 --chmod=0444 \
-    https://conda.anaconda.org/conda-forge/linux-64/python-3.11.17-h5f976f7_1_cpython.conda \
-    /opt/i2v-build-security/python-3.11.17-h5f976f7_1_cpython.conda
-ADD --checksum=sha256:bad3de581c5b9f193a3b43d634a47df3e90e6fb89ff712b5f6903920640e4a07 --chmod=0444 \
-    https://conda.anaconda.org/conda-forge/linux-64/libpython-3.11.17-h0c77377_1_cpython.conda \
-    /opt/i2v-build-security/libpython-3.11.17-h0c77377_1_cpython.conda
+ADD --checksum=sha256:eba8fa1b26f90800af3dfda1e1f7626282fe925bb4eeccd64a74f8c90ba32533 --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/python-3.11.18-h5f976f7_0_cpython.conda \
+    /opt/i2v-build-security/python-3.11.18-h5f976f7_0_cpython.conda
+ADD --checksum=sha256:4e478747ecc18101b2bfa2a168bd5368fe901aec66d594a03c1287a453f6bcc7 --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/libpython-3.11.18-ha57cdbe_0_cpython.conda \
+    /opt/i2v-build-security/libpython-3.11.18-ha57cdbe_0_cpython.conda
 ADD --checksum=sha256:6de73033a7c5f712c9c5a54124e4581e025691029835e5bceaf10a333a7e7bc0 --chmod=0444 \
     https://conda.anaconda.org/conda-forge/linux-64/libexpat-2.8.5-hd2095e1_0.conda \
     /opt/i2v-build-security/libexpat-2.8.5-hd2095e1_0.conda
@@ -111,9 +111,9 @@ ADD --checksum=sha256:1f9c8856b629d9c546cd6574345e7d3621f59fdde8c2902b88e00f0976
 ADD --checksum=sha256:9787df8c22a59c9a70d3e5a10db9ad663485e75e9ccc3f09bd092cb7b95e0dab --chmod=0444 \
     https://conda.anaconda.org/conda-forge/linux-64/liblzma-5.8.3-hb03c661_1.conda \
     /opt/i2v-build-security/liblzma-5.8.3-hb03c661_1.conda
-ADD --checksum=sha256:66f4831f4ee3055f0ffe94e01901198cf3601e2c1b4f6b51d05c3f2d8557ce1d --chmod=0444 \
-    https://conda.anaconda.org/conda-forge/linux-64/libsqlite-3.53.4-h0737f62_103.conda \
-    /opt/i2v-build-security/libsqlite-3.53.4-h0737f62_103.conda
+ADD --checksum=sha256:c294029f893d05286f1061bbab85b820f1eea73dd859af4bcc619197bcc34810 --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/libsqlite-3.54.1-h0737f62_101.conda \
+    /opt/i2v-build-security/libsqlite-3.54.1-h0737f62_101.conda
 ADD --checksum=sha256:f34b8d1de9a2bf62476d8608057d9b8a918d97444236dc53a47128f2fae79041 --chmod=0444 \
     https://conda.anaconda.org/conda-forge/linux-64/libuuid-2.42.4-hcfc3c73_0.conda \
     /opt/i2v-build-security/libuuid-2.42.4-hcfc3c73_0.conda
@@ -129,6 +129,9 @@ ADD --checksum=sha256:5d46557214ed184381dafe835b7c94a474a1c3b307a08a250b1ea4779b
 ADD --checksum=sha256:01b3fe073a66e321970d09e04b388708f8cbdca5cdfbfcb7c9eeb470ad10383d --chmod=0444 \
     https://conda.anaconda.org/conda-forge/linux-64/readline-8.3-hd6e31c0_1.conda \
     /opt/i2v-build-security/readline-8.3-hd6e31c0_1.conda
+ADD --checksum=sha256:8dd147ac02fbf7d6213e5e1859096bb606265bce24dab6696c34c543ff93b97f --chmod=0444 \
+    https://conda.anaconda.org/conda-forge/linux-64/brotli-python-1.2.1-py311heb3be6f_0.conda \
+    /opt/i2v-build-security/brotli-python-1.2.1-py311heb3be6f_0.conda
 COPY scripts/i2v-python-security-lock.json /opt/i2v-build-security/lock.json
 COPY scripts/install-i2v-python-security.py /tmp/install-i2v-python-security.py
 RUN /opt/conda/bin/python /tmp/install-i2v-python-security.py \

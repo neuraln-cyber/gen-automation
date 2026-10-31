@@ -216,7 +216,17 @@ jobs:
             --entrypoint python3.12 \
             gen-automation-patreon-browser:test \
             -c '
+          import os
+          import subprocess
+          from pathlib import Path
+          from playwright._impl._driver import compute_driver_executable
           from playwright.sync_api import sync_playwright
+
+          assert os.getuid() == 10001
+          node = compute_driver_executable()[0]
+          assert node == "/opt/patreon-node/bin/node"
+          assert subprocess.check_output([node, "--version"], text=True).strip() == "v24.22.2"
+          assert Path("/usr/local/lib/python3.12/site-packages/playwright/driver/node").resolve() == Path(node)
 
           with sync_playwright() as playwright:
               browser = playwright.chromium.launch(

@@ -17,6 +17,7 @@
   const h3DiagnosticsEnabled = root.dataset.h3DiagnosticsEnabled === "true";
   const h3FirstFrameEnabled = root.dataset.h3FirstFrameEnabled === "true";
   const erosAuthorRecipe = isH3 && h3ModelVariant === "eros_beta5" && root.dataset.erosAuthorRecipe === "true";
+  const erosBeta7 = isH3 && h3ModelVariant === "eros_beta7";
   const maxImageBytes = Number(root.dataset.maxImageBytes || 0);
   const scope = document.body.dataset.automationStorageScope || "operator";
   const legacyDraftKey = `i2v-draft-v2:${videoProfile}:${scope}`;
@@ -94,19 +95,21 @@
     h3_save_base_video: false,
   });
   const h3SamplingDefaults = {
-    steps: h3ModelVariant === "eros_beta5" ? 8 : (["hybrid_v2", "fl2va_int8"].includes(h3ModelVariant) ? 20 : 4), cfg: 1,
-    sampler: ["hybrid_v2", "fl2va_int8", "eros_beta5"].includes(h3ModelVariant) ? "res_multistep" : "euler", scheduler: "simple",
-    video_shift: ["hybrid_v2", "fl2va_int8", "eros_beta5"].includes(h3ModelVariant) ? 12 : 8,
-    audio_shift: ["fl2va_int8", "eros_beta5"].includes(h3ModelVariant) ? 3 : 4,
-    h3_denoise: 1, h3_refine_steps: h3ModelVariant === "eros_beta5" ? 4 : 1, h3_refine_cfg: 1, h3_refine_denoise: 0.2,
+    steps: ["eros_beta5", "eros_beta7"].includes(h3ModelVariant) ? 8 : (["hybrid_v2", "fl2va_int8"].includes(h3ModelVariant) ? 20 : 4), cfg: 1,
+    sampler: erosBeta7 ? "er_sde" : (["hybrid_v2", "fl2va_int8", "eros_beta5"].includes(h3ModelVariant) ? "res_multistep" : "euler"),
+    scheduler: erosBeta7 ? "sgm_uniform" : "simple",
+    video_shift: ["hybrid_v2", "fl2va_int8", "eros_beta5", "eros_beta7"].includes(h3ModelVariant) ? 12 : 8,
+    audio_shift: ["fl2va_int8", "eros_beta5", "eros_beta7"].includes(h3ModelVariant) ? 3 : 4,
+    h3_denoise: 1, h3_refine_steps: erosBeta7 ? 3 : (h3ModelVariant === "eros_beta5" ? 4 : 1), h3_refine_cfg: 1, h3_refine_denoise: erosBeta7 ? 0.3 : 0.2,
     h3_refine_sampler: null, h3_refine_scheduler: "simple",
   };
   if (erosAuthorRecipe) Object.assign(h3SamplingDefaults, {
     steps: 6, sampler: "er_sde", scheduler: "beta57", h3_attention_backend: "comfy_kitchen",
   });
-  if (isH3 && h3ModelVariant === "eros_beta5") h3SamplingDefaults.h3_latent_contrast = 1;
+  if (erosBeta7) h3SamplingDefaults.h3_attention_backend = "comfy_kitchen";
+  if (isH3 && ["eros_beta5", "eros_beta7"].includes(h3ModelVariant)) h3SamplingDefaults.h3_latent_contrast = 1;
   if (isH3 && h3AdvancedSamplingEnabled) Object.assign(workerSettingDefaults, h3SamplingDefaults);
-  if (isH3 && h3ModelVariant === "eros_beta5") Object.assign(workerSettingDefaults, {width: 768, height: 1344});
+  if (isH3 && ["eros_beta5", "eros_beta7"].includes(h3ModelVariant)) Object.assign(workerSettingDefaults, {width: 768, height: 1344});
   let saveTimer = null;
 
   const q = (selector) => root.querySelector(selector);
@@ -416,9 +419,9 @@
   function applySettings(settings = {}) {
     const resolved = { ...workerSettingDefaults, ...settings };
     // Reusing a saved snapshot without the new field keeps its historical mode.
-    if (isH3 && h3ModelVariant === "eros_beta5") {
+    if (isH3 && ["eros_beta5", "eros_beta7"].includes(h3ModelVariant)) {
       resolved.h3_image_mode = settings.h3_image_mode || "reference";
-      resolved.h3_attention_backend = settings.h3_attention_backend || "default";
+      resolved.h3_attention_backend = settings.h3_attention_backend || (erosBeta7 ? "comfy_kitchen" : "default");
       resolved.h3_latent_contrast = settings.h3_latent_contrast ?? 1;
     }
     Object.entries(resolved).forEach(([name, value]) => {
@@ -441,7 +444,7 @@
 
   function sourceNativeDimensions(sourceWidth, sourceHeight) {
     if (!(sourceWidth > 0 && sourceHeight > 0)) return null;
-    if (isH3 && h3ModelVariant === "eros_beta5") {
+    if (isH3 && ["eros_beta5", "eros_beta7"].includes(h3ModelVariant)) {
       const scale = Math.min(768 / Math.min(sourceWidth, sourceHeight), 2048 / Math.max(sourceWidth, sourceHeight), Math.sqrt(768 * 1344 / (sourceWidth * sourceHeight)));
       return {width: Math.max(32, Math.floor(sourceWidth * scale / 32) * 32), height: Math.max(32, Math.floor(sourceHeight * scale / 32) * 32)};
     }
@@ -879,7 +882,7 @@
       form.elements.negative_prompt.value = draft.negative_prompt || "";
       form.elements.batch_count.value = draft.batch_count || "1";
       const modelChanged = isH3 && (draft.settings?.h3_model_variant || "turbo_v2") !== h3ModelVariant;
-      const cleanEros = modelChanged && h3ModelVariant === "eros_beta5";
+      const cleanEros = modelChanged && ["eros_beta5", "eros_beta7"].includes(h3ModelVariant);
       applySettings(cleanEros ? { ...workerSettingDefaults, h3_model_variant: h3ModelVariant }
         : modelChanged ? { ...draft.settings, ...h3SamplingDefaults, h3_model_variant: h3ModelVariant } : (draft.settings || {}));
       if (modelChanged) draftState.textContent = cleanEros
@@ -1250,8 +1253,8 @@
     form.querySelectorAll("input, textarea, select, button").forEach((element) => { element.disabled = true; });
     announce("Your account can view image-to-video activity but cannot change the queue.");
   }
-  if (isH3 && h3ModelVariant === "eros_beta5" && form.elements.h3_image_mode) {
-    form.elements.h3_image_mode.value = erosAuthorRecipe ? "reference" : (h3FirstFrameEnabled ? "first_frame" : "reference");
+  if (isH3 && ["eros_beta5", "eros_beta7"].includes(h3ModelVariant) && form.elements.h3_image_mode) {
+    form.elements.h3_image_mode.value = (erosBeta7 || erosAuthorRecipe) ? "reference" : (h3FirstFrameEnabled ? "first_frame" : "reference");
   }
   restoreDraft(); syncAspectControls(); updateDuration(); updateSubmitState();
   Promise.allSettled([

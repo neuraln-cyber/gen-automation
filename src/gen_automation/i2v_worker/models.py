@@ -191,7 +191,9 @@ class H3LoraGrant(_StrictModel):
 
 class GenerationSettings(_StrictModel):
     profile: Literal["wan22", "minimax_h3"] = "wan22"
-    h3_model_variant: Literal["turbo_v2", "hybrid_v2", "fl2va_int8", "eros_beta5"] | None = None
+    h3_model_variant: (
+        Literal["turbo_v2", "hybrid_v2", "fl2va_int8", "eros_beta5", "eros_beta7"] | None
+    ) = None
     # Missing in historical snapshots means reference-only, never a silent migration.
     h3_image_mode: Literal["reference", "first_frame"] = "reference"
     # Old snapshots keep their attention implementation, not a silent migration.
@@ -245,6 +247,27 @@ class GenerationSettings(_StrictModel):
         if (
             isinstance(value, dict)
             and value.get("profile") == "minimax_h3"
+            and value.get("h3_model_variant") == "eros_beta7"
+        ):
+            return {
+                "steps": 8,
+                "cfg": 1.0,
+                "sampler": "er_sde",
+                "scheduler": "sgm_uniform",
+                "video_shift": 12.0,
+                "audio_shift": 3.0,
+                "fps": 24,
+                "frame_count": 124,
+                "width": 768,
+                "height": 1344,
+                "h3_attention_backend": "comfy_kitchen",
+                "h3_refine_steps": 3,
+                "h3_refine_denoise": 0.3,
+                **value,
+            }
+        if (
+            isinstance(value, dict)
+            and value.get("profile") == "minimax_h3"
             and value.get("h3_model_variant") == "eros_beta5"
         ):
             return {
@@ -282,13 +305,15 @@ class GenerationSettings(_StrictModel):
     @model_validator(mode="after")
     def validate_wan_shape(self) -> GenerationSettings:
         if self.h3_latent_contrast != 1.0 and (
-            self.profile != "minimax_h3" or self.h3_model_variant != "eros_beta5"
+            self.profile != "minimax_h3"
+            or self.h3_model_variant not in {"eros_beta5", "eros_beta7"}
         ):
-            raise ValueError("latent contrast control requires Eros Beta 5")
+            raise ValueError("latent contrast control requires Eros")
         if self.h3_image_mode != "reference" and (
-            self.profile != "minimax_h3" or self.h3_model_variant != "eros_beta5"
+            self.profile != "minimax_h3"
+            or self.h3_model_variant not in {"eros_beta5", "eros_beta7"}
         ):
-            raise ValueError("first-frame reference guidance requires Eros Beta 5")
+            raise ValueError("first-frame reference guidance requires Eros")
         if self.profile == "minimax_h3":
             from gen_automation.i2v_worker.h3_sampling import (
                 H3_EROS_SCHEDULERS,
@@ -299,8 +324,11 @@ class GenerationSettings(_StrictModel):
             schedulers = (
                 H3_EROS_SCHEDULERS if self.h3_model_variant == "eros_beta5" else H3_SCHEDULERS
             )
-            if self.h3_attention_backend != "default" and self.h3_model_variant != "eros_beta5":
-                raise ValueError("Eros attention selection requires Eros Beta 5")
+            if self.h3_attention_backend != "default" and self.h3_model_variant not in {
+                "eros_beta5",
+                "eros_beta7",
+            }:
+                raise ValueError("Eros attention selection requires Eros")
             if self.steps > 10000 or self.cfg > 100:
                 raise ValueError("H3 steps/CFG exceed native Comfy node bounds")
             if self.sampler not in H3_SAMPLERS or self.scheduler not in schedulers:
@@ -341,7 +369,7 @@ class GenerationSettings(_StrictModel):
         if self.h3_model_variant is not None:
             raise ValueError("H3 model variants require MiniMax H3")
         if self.h3_attention_backend != "default":
-            raise ValueError("Eros attention selection requires Eros Beta 5")
+            raise ValueError("Eros attention selection requires Eros")
         from gen_automation.i2v_worker.h3_sampling import H3_EXPERT_DEFAULTS
 
         if any(getattr(self, name) != value for name, value in H3_EXPERT_DEFAULTS.items()):
