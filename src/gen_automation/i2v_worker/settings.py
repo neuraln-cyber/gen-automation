@@ -11,11 +11,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from gen_automation.domain.private_delivery import PrivateDeliveryRoute
 from gen_automation.i2v_worker.h3_upscale import H3_UPSCALER_ROLE
 from gen_automation.i2v_worker.h3_variants import (
+    H3_EROS_BETA7_SHA256,
     H3_EROS_SHA256,
     H3_NATIVE_SHA256,
     H3_NORMAL_V2_SHA256,
     H3_TURBO_V2_SHA256,
     H3Variant,
+    h3_eros_beta7_models_match,
     h3_eros_models_match,
     h3_native_models_match,
 )
@@ -131,7 +133,11 @@ class I2VWorkerSettings(BaseSettings):
             required.add(H3_UPSCALER_ROLE)
         if roles != required or len(roles) != len(objects):
             raise ValueError("model manifest roles are incomplete or duplicated")
-        if self.profile == "minimax_h3" and self.h3_model_variant in {"fl2va_int8", "eros_beta5"}:
+        if self.profile == "minimax_h3" and self.h3_model_variant in {
+            "fl2va_int8",
+            "eros_beta5",
+            "eros_beta7",
+        }:
             identities: dict[str, dict[str, object]] = {
                 item.role: {
                     "sha256": item.sha256,
@@ -142,6 +148,8 @@ class I2VWorkerSettings(BaseSettings):
             }
             if self.h3_model_variant == "eros_beta5" and not h3_eros_models_match(identities):
                 raise ValueError("Eros H3 requires the exact reviewed model set")
+            if self.h3_model_variant == "eros_beta7" and not h3_eros_beta7_models_match(identities):
+                raise ValueError("Eros Beta 7 requires the exact reviewed model set")
             if self.h3_model_variant == "fl2va_int8" and not h3_native_models_match(identities):
                 raise ValueError("Native H3 requires the exact official model set")
         return self
@@ -149,6 +157,11 @@ class I2VWorkerSettings(BaseSettings):
     @property
     def h3_model_variant(self) -> H3Variant:
         """Derive identity from immutable model bytes, never from a request/default."""
+        if any(
+            item.role == "diffusion_model" and item.sha256 == H3_EROS_BETA7_SHA256
+            for item in self.model_objects
+        ):
+            return "eros_beta7"
         if any(
             item.role == "diffusion_model" and item.sha256 == H3_EROS_SHA256
             for item in self.model_objects
@@ -174,7 +187,7 @@ class I2VWorkerSettings(BaseSettings):
     @property
     def effective_workflow_template(self) -> Path:
         if self.profile == "minimax_h3":
-            if self.h3_model_variant == "eros_beta5":
+            if self.h3_model_variant in {"eros_beta5", "eros_beta7"}:
                 return self.workflow_template.parent / "minimax-h3-eros-ref2va.api.json"
             if self.h3_model_variant == "fl2va_int8":
                 return self.workflow_template.parent / "minimax-h3-native-i2v.api.json"

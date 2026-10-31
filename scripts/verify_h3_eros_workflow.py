@@ -11,7 +11,7 @@ from uuid import UUID
 from verify_h3_native_workflow import verify_native_lora_and_schedule, verify_upstream_tile_layout
 
 from gen_automation.i2v_worker.h3_upscale import H3_UPSCALER_FILENAME, H3_UPSCALER_ROLE
-from gen_automation.i2v_worker.h3_variants import H3_EROS_MODELS
+from gen_automation.i2v_worker.h3_variants import H3_EROS_BETA7_MODELS, H3_EROS_MODELS
 from gen_automation.i2v_worker.models import GenerationSettings
 from gen_automation.i2v_worker.workflow import load_workflow_template, render_workflow
 
@@ -156,10 +156,84 @@ def verify_eros_workflow(nodes, template_path=None, reference_path=None):
     assert anchor[0]["latent"].shape == (1, 24, 1, 62, 48)
     verify_native_lora_and_schedule(nodes)
     verify_eros_beta57(nodes)
+    verify_eros_beta7_workflow(nodes, template)
     print(
         "Eros native REF2VA/schema/AV/LoRA/refinement CPU contracts passed; "
         "visual quality untested."
     )
+
+
+def verify_eros_beta7_workflow(nodes, template):
+    """Exercise real pinned V3 sparse-node input expansion without model weights."""
+    from comfy_api.internal import _ComfyNodeInternal
+    from comfy_api.latest import _io
+
+    from gen_automation.i2v_worker.comfy import _vsa_available
+
+    registry = nodes.NODE_CLASS_MAPPINGS
+    sparse = registry["BlockSparseAttention"]
+    assert issubclass(sparse, _ComfyNodeInternal)
+    # The real HTTP response serializes native Python tuples to JSON arrays.
+    info = json.loads(json.dumps({"BlockSparseAttention": sparse.GET_NODE_INFO_V1()}))
+    assert _vsa_available(info)
+    paths = {role: identity[2] for role, identity in H3_EROS_BETA7_MODELS.items()}
+    paths[H3_UPSCALER_ROLE] = H3_UPSCALER_FILENAME
+    for mode, upscale, cfg in itertools.product(
+        ("reference", "first_frame"), (False, True), (1, 2.5)
+    ):
+        settings = GenerationSettings(
+            profile="minimax_h3",
+            h3_model_variant="eros_beta7",
+            h3_image_mode=mode,
+            cfg=cfg,
+            h3_refine_cfg=cfg,
+            h3_loras=[{"artifact_id": UUID(int=3), "sha256": "a" * 64, "strength": 0.4}],
+            match_source_resolution=upscale,
+            width=1152 if upscale else 768,
+            height=1504 if upscale else 992,
+            seed=0,
+        )
+        graph, seed, _ = render_workflow(
+            template,
+            input_filename="contract.png",
+            guide_filename="guide.png" if mode == "first_frame" else None,
+            positive_prompt="<Picture 1> moves; wind rustles the leaves.",
+            negative_prompt="",
+            settings=settings,
+            job_id=UUID(int=1),
+            attempt_id=UUID(int=2),
+            model_paths=paths,
+        )
+        assert seed == 0
+        assert graph["2"]["inputs"]["unet_name"] == H3_EROS_BETA7_MODELS["diffusion_model"][2]
+        assert graph["7"]["inputs"]["model"] == ["h3-eros-beta7-vsa", 0]
+        assert graph["h3-eros-beta7-vsa"]["inputs"]["selection"] == "vsa"
+        assert graph["h3-eros-beta7-vsa"]["inputs"]["selection.keep_percent"] == 10.0
+        assert graph["h3-eros-beta7-vsa"]["inputs"]["start_percent"] == 0.0
+        assert graph["h3-eros-beta7-vsa"]["inputs"]["end_percent"] == 1.0
+        assert graph["h3-eros-beta7-vsa"]["inputs"]["model"] == ["h3-kitchen", 0]
+        assert graph["h3-kitchen"]["inputs"]["model"] == ["h3-lora-0", 0]
+        assert graph["11"]["inputs"]["scheduler"] == "sgm_uniform"
+        conditioning = ["h3-first-frame", 0] if mode == "first_frame" else ["6", 0]
+        assert graph["9"]["inputs"]["positive" if cfg != 1 else "conditioning"] == conditioning
+        if upscale:
+            assert graph["h3-source-upscale"]["inputs"]["model"] == ["7", 0]
+            assert graph["h3-source-upscale"]["inputs"]["conditioning"] == conditioning
+        spec, _, _ = _io.get_finalized_class_inputs(
+            sparse.INPUT_TYPES(), graph["h3-eros-beta7-vsa"]["inputs"]
+        )
+        allowed = spec.get("required", {}) | spec.get("optional", {})
+        assert set(graph["h3-eros-beta7-vsa"]["inputs"]) <= set(allowed)
+        assert set(spec.get("required", {})) <= set(graph["h3-eros-beta7-vsa"]["inputs"])
+        for node in graph.values():
+            cls = registry[node["class_type"]]
+            spec = cls.INPUT_TYPES()
+            if issubclass(cls, _ComfyNodeInternal):
+                spec, _, _ = _io.get_finalized_class_inputs(spec, node["inputs"])
+            allowed = spec.get("required", {}) | spec.get("optional", {})
+            assert set(node["inputs"]) <= set(allowed), node["class_type"]
+            assert set(spec.get("required", {})) <= set(node["inputs"]), node["class_type"]
+    print("Eros Beta 7 native VSA/schema/refinement CPU contract passed; GPU quality untested.")
 
 
 def verify_eros_beta57(nodes):

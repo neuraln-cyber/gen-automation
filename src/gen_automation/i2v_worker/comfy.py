@@ -43,6 +43,7 @@ class ComfyClient:
         network_attempts: int,
         poll_seconds: float,
         profile: str = "wan22",
+        h3_model_variant: str | None = None,
         source_resolution_enabled: bool = False,
     ) -> None:
         if base_url != "http://127.0.0.1:8188":
@@ -100,6 +101,8 @@ class ComfyClient:
                     "MMH3SpatialSplitParams",
                 )
             )
+        if h3_model_variant == "eros_beta7":
+            self.required_nodes += (("BlockSparseAttention", "/object_info/BlockSparseAttention"),)
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -120,6 +123,8 @@ class ComfyClient:
                 # selector node alone does not prove that backend is usable.
                 if node_name == "ModelAttentionBackend" and not _kitchen_available(node_info):
                     return False
+                if node_name == "BlockSparseAttention" and not _vsa_available(node_info):
+                    return False
             return True
         except Exception:
             return False
@@ -137,6 +142,14 @@ class ComfyClient:
                 available = False
             if not available:
                 raise ComfyError("Requested Eros Comfy Kitchen attention is unavailable")
+        if "h3-eros-beta7-vsa" in workflow:
+            response = await self._request("GET", "/object_info/BlockSparseAttention")
+            try:
+                available = _vsa_available(response.json())
+            except ValueError:
+                available = False
+            if not available:
+                raise ComfyError("Eros Beta 7 VSA attention is unavailable")
         response = await self._request("POST", "/prompt", json={"prompt": workflow})
         try:
             body = response.json()
@@ -248,6 +261,29 @@ def _kitchen_available(payload: object) -> bool:
         isinstance(choices, list)
         and all(isinstance(choice, str) for choice in choices)
         and "comfy kitchen attention" in choices
+    )
+
+
+def _vsa_available(payload: object) -> bool:
+    """Require the native sparse node's VSA option before posting a Beta 7 graph."""
+    if not isinstance(payload, dict) or set(payload) != {"BlockSparseAttention"}:
+        return False
+    try:
+        selection = payload["BlockSparseAttention"]["input"]["required"]["selection"]
+    except (KeyError, TypeError):
+        return False
+    if not isinstance(selection, list) or not selection:
+        return False
+    # Comfy V3 advertises a dynamic combo; keep the parser deliberately narrow.
+    choices = (
+        selection[1].get("options")
+        if len(selection) == 2 and isinstance(selection[1], dict)
+        else None
+    )
+    return (
+        selection[0] == "COMFY_DYNAMICCOMBO_V3"
+        and isinstance(choices, list)
+        and any(isinstance(option, dict) and option.get("key") == "vsa" for option in choices)
     )
 
 

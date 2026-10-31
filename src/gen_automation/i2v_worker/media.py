@@ -173,7 +173,8 @@ def resolve_generation_settings(
         return settings
     width, height = (
         _eros_source_dimensions(source_width, source_height)
-        if settings.profile == "minimax_h3" and settings.h3_model_variant == "eros_beta5"
+        if settings.profile == "minimax_h3"
+        and settings.h3_model_variant in {"eros_beta5", "eros_beta7"}
         else _source_aspect_native_dimensions(source_width, source_height)
     )
     return settings.model_copy(update={"width": width, "height": height})
@@ -511,7 +512,7 @@ def finalize_native_video(
             "loop_count": 1,
             "source_fit": (
                 "native_reference_match"
-                if settings.h3_model_variant == "eros_beta5"
+                if settings.h3_model_variant in {"eros_beta5", "eros_beta7"}
                 else "source_keyframe_edge_pad_crop"
                 if settings.match_source_resolution
                 else "contain_edge_pad"

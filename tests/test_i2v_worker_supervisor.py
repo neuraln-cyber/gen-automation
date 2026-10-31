@@ -495,6 +495,48 @@ def test_gpu_preflight_passes_existing_supported_runtime_and_logs_hardware_facts
     assert "status=failed" not in caplog.text
 
 
+@pytest.mark.parametrize("mode", ["unavailable", "broken", "nonfinite", "ok"])
+def test_beta7_requires_a_working_sparse_cuda_kernel(tmp_path, monkeypatch, caplog, mode):
+    from gen_automation.i2v_worker.supervisor import WorkerStartupError, _verify_gpu_runtime
+
+    monkeypatch.setattr(I2VWorkerSettings, "h3_model_variant", property(lambda _: "eros_beta7"))
+    tensor = SimpleNamespace(shape=(1, 128, 1, 128))
+    calls = []
+    torch = _fake_torch()
+    torch.bfloat16 = "bf16"
+    torch.zeros = lambda shape, **kwargs: tensor
+    torch.isfinite = lambda _: SimpleNamespace(
+        all=lambda: SimpleNamespace(item=lambda: mode != "nonfinite")
+    )
+    torch.cuda.synchronize = lambda device: calls.append(("sync", device))
+
+    def kernel(q, k, v, **kwargs):
+        assert q is k is v is tensor
+        assert kwargs == {"topk_ratio": 0.1, "tail": False, "token_aug": 0}
+        calls.append("kernel")
+        if mode == "broken":
+            raise RuntimeError("private details must not escape")
+        return tensor
+
+    kitchen = SimpleNamespace(
+        sol_attn_is_available=lambda _: mode != "unavailable", sol_attn=kernel
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "comfy_kitchen", kitchen)
+    caplog.set_level(logging.INFO, logger="gen_automation.i2v_worker.supervisor")
+    if mode == "ok":
+        _verify_gpu_runtime(_settings(tmp_path))
+        assert calls == ["kernel", ("sync", 0)]
+    else:
+        with pytest.raises(WorkerStartupError):
+            _verify_gpu_runtime(_settings(tmp_path))
+        assert "check=vsa_kernel" in caplog.text
+        assert "status=passed" not in caplog.text
+    if mode == "unavailable":
+        assert calls == []
+    assert "private details" not in caplog.text
+
+
 @pytest.mark.parametrize(
     ("method", "check"),
     [

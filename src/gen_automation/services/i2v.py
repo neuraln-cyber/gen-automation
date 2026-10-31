@@ -1216,6 +1216,7 @@ def _normalized_settings(value: dict[str, Any]) -> dict[str, Any]:
             "hybrid_v2",
             "fl2va_int8",
             "eros_beta5",
+            "eros_beta7",
         }:
             return GenerationSettings.model_validate(normalized).model_dump(mode="json")
         return normalized

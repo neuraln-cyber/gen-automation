@@ -318,6 +318,9 @@ def test_dashboard_eros_defaults_and_isolated_recipe(client):
     assert "already baked in" in page and "not a forced first frame" in page
     script = (ROOT / "src/gen_automation/static/i2v.js").read_text(encoding="utf-8")
     assert "i2v-draft-v3:${videoProfile}:${h3ModelVariant}" in script
-    assert 'const cleanEros = modelChanged && h3ModelVariant === "eros_beta5"' in script
+    assert (
+        'const cleanEros = modelChanged && ["eros_beta5", "eros_beta7"].includes(h3ModelVariant)'
+        in script
+    )
     assert "applySettings(cleanEros ? { ...workerSettingDefaults" in script
     assert 'item.settings.h3_model_variant || "turbo_v2") === h3ModelVariant' in script
