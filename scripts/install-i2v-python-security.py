@@ -1,6 +1,7 @@
 """Build-only, offline CPython patch update; never resolve or replace the ML stack."""
 
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -81,7 +82,7 @@ def verify() -> None:
     pinned = json.loads(LOCK.read_text())
     verify_pins(records, pinned)
     validate_dependency_edges(records, {pin["name"] for pin in pinned}, MatchSpec)
-    assert sys.version_info[:3] == (3, 11, 17)
+    assert sys.version_info[:3] == (3, 11, 18)
     import _crypt
     import bz2
     import ctypes
@@ -92,13 +93,31 @@ def verify() -> None:
     import ssl
     import zlib
 
+    import brotli
     import cffi
 
     assert cffi.__version__ == "2.1.1"
+    verify_brotli()
+    assert (
+        brotli.decompress(brotli.compress(b"security-runtime-smoke")) == b"security-runtime-smoke"
+    )
     assert cffi.FFI().new("int *", 42)[0] == 42
     assert _crypt.crypt("runtime-smoke", "ab").startswith("ab")
     assert all((bz2, ctypes, lzma, pyexpat, readline, sqlite3, ssl, zlib))
-    print("Pinned CPython 3.11.17 runtime dependency closure verified", flush=True)
+    print("Pinned CPython 3.11.18 runtime dependency closure verified", flush=True)
+
+
+def verify_brotli() -> None:
+    import brotli
+
+    versions = [
+        distribution.version
+        for distribution in importlib.metadata.distributions()
+        if distribution.metadata["Name"].lower() == "brotli"
+    ]
+    assert versions == ["1.2.1"], "Unexpected or shadowed Brotli distribution"
+    assert brotli.__version__ == "1.2.1"
+    assert Path(brotli.__file__).resolve().is_relative_to(PREFIX)
 
 
 def remove_obsolete_python_cache() -> None:
@@ -124,7 +143,7 @@ def remove_obsolete_python_cache() -> None:
         for record in records
         if record["name"] == "python"
     ]
-    assert installed == [("python", "3.11.17", "h5f976f7_1_cpython")], (
+    assert installed == [("python", "3.11.18", "h5f976f7_0_cpython")], (
         f"Expected exactly one patched Python record, found {installed!r}"
     )
 

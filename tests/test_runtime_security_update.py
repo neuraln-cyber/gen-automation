@@ -45,10 +45,46 @@ def test_base_security_lock_has_only_the_three_approved_packages() -> None:
         assert "pillow==13.0.0" in value and "certifi==2026.10.19" in value
 
 
+@pytest.mark.parametrize("versions", [["1.2.0"], ["1.2.1", "1.2.0"], [], ["1.2.1"]])
+def test_brotli_verification_rejects_old_or_shadowed_copies(tmp_path, monkeypatch, versions):
+    import sys
+    from types import SimpleNamespace
+
+    spec = importlib.util.spec_from_file_location(
+        "brotli_security_test", ROOT / "scripts/install-i2v-python-security.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "PREFIX", tmp_path.resolve())
+    monkeypatch.setitem(
+        sys.modules,
+        "brotli",
+        SimpleNamespace(__version__="1.2.1", __file__=str(tmp_path / "brotli.py")),
+    )
+    monkeypatch.setattr(
+        module.importlib.metadata,
+        "distributions",
+        lambda: [SimpleNamespace(metadata={"Name": "Brotli"}, version=v) for v in versions],
+    )
+    if versions == ["1.2.1"]:
+        module.verify_brotli()
+    else:
+        with pytest.raises(AssertionError, match="shadowed Brotli"):
+            module.verify_brotli()
+
+
+def test_i2v_brotli_security_patch_pins_both_base_and_application():
+    assert "brotli==1.2.1" in (ROOT / "requirements-i2v-worker.in").read_text()
+    lock = (ROOT / "requirements-i2v-worker.lock").read_text()
+    assert "brotli==1.2.1" in lock and "brotli==1.2.0" not in lock
+    assert "6b3c3d5794212a54434b4856f808f7bdf7ad48eacadaadb5b2346fc9a639365a" in lock
+
+
 def test_python_support_archives_are_hash_pinned_and_exclude_the_ml_stack() -> None:
     pins = json.loads((ROOT / "scripts/i2v-python-security-lock.json").read_text())
     dockerfile = (ROOT / "Dockerfile.i2v-worker").read_text()
-    assert len(pins) == 12
+    assert len(pins) == 13
     assert {p["name"] for p in pins} == {
         "python",
         "libpython",
@@ -62,8 +98,10 @@ def test_python_support_archives_are_hash_pinned_and_exclude_the_ml_stack() -> N
         "libzlib",
         "ncurses",
         "readline",
+        "brotli-python",
     }
-    assert next(p for p in pins if p["name"] == "python")["version"] == "3.11.17"
+    assert next(p for p in pins if p["name"] == "python")["version"] == "3.11.18"
+    assert next(p for p in pins if p["name"] == "brotli-python")["version"] == "1.2.1"
     for pin in pins:
         assert pin["url"].startswith("https://conda.anaconda.org/conda-forge/linux-64/")
         assert re.fullmatch(r"[a-f0-9]{64}", pin["sha256"])
@@ -80,7 +118,7 @@ def test_python_support_archives_are_hash_pinned_and_exclude_the_ml_stack() -> N
     assert installer.index("validate_dependency_edges(proposed") < installer.index(
         '"install", "--yes"'
     )
-    assert "(3, 11, 17)" in installer
+    assert "(3, 11, 18)" in installer
 
 
 def test_dependency_edges_enforce_forward_reverse_and_optional_constraints() -> None:
@@ -139,7 +177,7 @@ def test_archive_metadata_must_match_lock_not_hotfixed_api() -> None:
     spec.loader.exec_module(module)
     pin = {
         "name": "python",
-        "version": "3.11.17",
+        "version": "3.11.18",
         "build": "exact",
         "depends": [],
         "constrains": [],
@@ -228,8 +266,8 @@ def obsolete_python_cache(tmp_path, monkeypatch):
     (target / "bin").mkdir()
     (target / "bin/python3.11").write_bytes(b"old Python executable")
     (prefix / "conda-meta").mkdir()
-    (prefix / "conda-meta/python-3.11.17.json").write_text(
-        json.dumps({"name": "python", "version": "3.11.17", "build": "h5f976f7_1_cpython"})
+    (prefix / "conda-meta/python-3.11.18.json").write_text(
+        json.dumps({"name": "python", "version": "3.11.18", "build": "h5f976f7_0_cpython"})
     )
     monkeypatch.setattr(module, "PREFIX", prefix.resolve())
     return module, prefix, target
@@ -249,11 +287,11 @@ def test_only_obsolete_cache_is_removed_and_hardlinked_runtime_survives(obsolete
     assert not target.exists()
     assert retained.read_bytes() == b"unchanged runtime"
     assert unrelated.read_bytes() == b"unrelated cache"
-    assert (prefix / "conda-meta/python-3.11.17.json").is_file()
+    assert (prefix / "conda-meta/python-3.11.18.json").is_file()
 
 
 @pytest.mark.parametrize(
-    "field,value", [("name", "torch"), ("version", "3.11.17"), ("build", "other")]
+    "field,value", [("name", "torch"), ("version", "3.11.18"), ("build", "other")]
 )
 def test_cache_removal_requires_exact_obsolete_identity(obsolete_python_cache, field, value):
     module, _, target = obsolete_python_cache
@@ -268,7 +306,7 @@ def test_cache_removal_requires_exact_obsolete_identity(obsolete_python_cache, f
 
 def test_cache_removal_refuses_unpatched_installed_python(obsolete_python_cache):
     module, prefix, target = obsolete_python_cache
-    (prefix / "conda-meta/python-3.11.17.json").write_text(
+    (prefix / "conda-meta/python-3.11.18.json").write_text(
         json.dumps({"name": "python", "version": "3.11.14", "build": "hd63d673_2_cpython"})
     )
     with pytest.raises(AssertionError, match="Expected exactly one patched Python record"):
@@ -278,8 +316,8 @@ def test_cache_removal_refuses_unpatched_installed_python(obsolete_python_cache)
 
 def test_cache_cleanup_selects_exact_package_name_not_python_prefix(obsolete_python_cache):
     module, prefix, target = obsolete_python_cache
-    unrelated = prefix / "conda-meta/python-gil-3.11.17.json"
-    unrelated.write_text(json.dumps({"name": "python-gil", "version": "3.11.17", "build": "0"}))
+    unrelated = prefix / "conda-meta/python-gil-3.11.18.json"
+    unrelated.write_text(json.dumps({"name": "python-gil", "version": "3.11.18", "build": "0"}))
     before = unrelated.read_bytes()
     module.remove_obsolete_python_cache()
     assert not target.exists()

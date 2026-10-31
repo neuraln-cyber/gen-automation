@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-FROM python:3.12.15-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704 AS chrome-beta
+FROM python:3.12.16-slim@sha256:8523d6abeb48ceae0b7240d30c5808fc26cb79c1a635bacdf19cf3baecfbec07 AS chrome-beta
 
 ADD --checksum=sha256:810fff32492ecf9519f8b7f513e17c2e05890bd85dbe3139ae80089eb4ee2f0b \
     https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-beta/google-chrome-beta_153.0.8010.12-1_amd64.deb \
@@ -11,7 +11,7 @@ RUN mkdir -p /tmp/chrome-root /opt/google \
     && mv /tmp/chrome-root/opt/google/chrome-beta /opt/google/chrome \
     && rm -rf /tmp/chrome-root /tmp/google-chrome-beta.deb
 
-FROM python:3.12.15-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704
+FROM python:3.12.16-slim@sha256:8523d6abeb48ceae0b7240d30c5808fc26cb79c1a635bacdf19cf3baecfbec07
 
 LABEL org.opencontainers.image.title="gen-automation-patreon-browser" \
       org.opencontainers.image.description="Isolated official-UI Patreon publisher" \
@@ -26,6 +26,7 @@ ENV HOME=/home/app \
     PYTHONNOUSERSITE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src \
+    PLAYWRIGHT_NODEJS_PATH=/opt/patreon-node/bin/node \
     GEN_AUTOMATION_PATREON_BROWSER_PROFILE_ROOT=/profiles \
     GEN_AUTOMATION_PATREON_BROWSER_SPOOL_ROOT=/var/lib/patreon-browser \
     GEN_AUTOMATION_PATREON_BROWSER_STATE_PATH=/state/idempotency.sqlite3
@@ -44,6 +45,12 @@ WORKDIR /app
 COPY --from=chrome-beta /opt/google/chrome /opt/google/chrome
 COPY requirements.lock requirements-patreon-browser.lock ./
 
+# Keep Playwright's pinned JS/API and Chrome; patch its embedded Node runtime.
+ADD --checksum=sha256:48cc0e21e048790e54c0cf5749c2725005313d652651c40b7a21feb9697aaf75 \
+    https://nodejs.org/dist/v24.22.2/node-v24.22.2-linux-x64.tar.xz \
+    /tmp/patreon-node.tar.xz
+COPY scripts/install-patreon-node-security.py /tmp/install-patreon-node-security.py
+
 RUN python3.12 -m pip install \
         --only-binary=:all: \
         --require-hashes \
@@ -55,6 +62,8 @@ RUN python3.12 -m pip install \
         --no-deps \
         -r requirements-patreon-browser.lock \
     && python3.12 -m pip check \
+    && python3.12 /tmp/install-patreon-node-security.py \
+    && rm -f /tmp/patreon-node.tar.xz /tmp/install-patreon-node-security.py \
     && python3.12 -m playwright install-deps chromium \
     && apt-get update \
     && apt-get install --yes --no-install-recommends \

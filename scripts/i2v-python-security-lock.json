@@ -1,10 +1,10 @@
 [
   {
     "name": "python",
-    "version": "3.11.17",
-    "build": "h5f976f7_1_cpython",
-    "url": "https://conda.anaconda.org/conda-forge/linux-64/python-3.11.17-h5f976f7_1_cpython.conda",
-    "sha256": "524df25896667b5f7e391c2115495cac5e0077b97967981091af8afcc98fd312",
+    "version": "3.11.18",
+    "build": "h5f976f7_0_cpython",
+    "url": "https://conda.anaconda.org/conda-forge/linux-64/python-3.11.18-h5f976f7_0_cpython.conda",
+    "sha256": "eba8fa1b26f90800af3dfda1e1f7626282fe925bb4eeccd64a74f8c90ba32533",
     "depends": [
       "__glibc >=2.17,<3.0.a0",
       "bzip2 >=1.0.8,<2.0a0",
@@ -14,8 +14,8 @@
       "libgcc >=15",
       "liblzma >=5.8.3,<6.0a0",
       "libnsl >=2.0.1,<2.1.0a0",
-      "libpython 3.11.17 h0c77377_1_cpython",
-      "libsqlite >=3.53.4,<4.0a0",
+      "libpython 3.11.18 ha57cdbe_0_cpython",
+      "libsqlite >=3.54.1,<4.0a0",
       "libuuid >=2.42.4,<3.0a0",
       "libxcrypt >=4.4.38",
       "libzlib >=1.3.2,<2.0a0",
@@ -31,14 +31,13 @@
   },
   {
     "name": "libpython",
-    "version": "3.11.17",
-    "build": "h0c77377_1_cpython",
-    "url": "https://conda.anaconda.org/conda-forge/linux-64/libpython-3.11.17-h0c77377_1_cpython.conda",
-    "sha256": "bad3de581c5b9f193a3b43d634a47df3e90e6fb89ff712b5f6903920640e4a07",
+    "version": "3.11.18",
+    "build": "ha57cdbe_0_cpython",
+    "url": "https://conda.anaconda.org/conda-forge/linux-64/libpython-3.11.18-ha57cdbe_0_cpython.conda",
+    "sha256": "4e478747ecc18101b2bfa2a168bd5368fe901aec66d594a03c1287a453f6bcc7",
     "depends": [
       "__glibc >=2.17,<3.0.a0",
-      "libgcc >=15",
-      "libstdcxx >=15"
+      "libgcc >=15"
     ],
     "constrains": []
   },
@@ -100,10 +99,10 @@
   },
   {
     "name": "libsqlite",
-    "version": "3.53.4",
-    "build": "h0737f62_103",
-    "url": "https://conda.anaconda.org/conda-forge/linux-64/libsqlite-3.53.4-h0737f62_103.conda",
-    "sha256": "66f4831f4ee3055f0ffe94e01901198cf3601e2c1b4f6b51d05c3f2d8557ce1d",
+    "version": "3.54.1",
+    "build": "h0737f62_101",
+    "url": "https://conda.anaconda.org/conda-forge/linux-64/libsqlite-3.54.1-h0737f62_101.conda",
+    "sha256": "c294029f893d05286f1061bbab85b820f1eea73dd859af4bcc619197bcc34810",
     "depends": [
       "__glibc >=2.17,<3.0.a0",
       "libgcc >=15",
@@ -174,5 +173,22 @@
       "ncurses >=6.6,<7.0a0"
     ],
     "constrains": []
+  },
+  {
+    "name": "brotli-python",
+    "version": "1.2.1",
+    "build": "py311heb3be6f_0",
+    "url": "https://conda.anaconda.org/conda-forge/linux-64/brotli-python-1.2.1-py311heb3be6f_0.conda",
+    "sha256": "8dd147ac02fbf7d6213e5e1859096bb606265bce24dab6696c34c543ff93b97f",
+    "depends": [
+      "__glibc >=2.17,<3.0.a0",
+      "libgcc >=15",
+      "libstdcxx >=15",
+      "python >=3.11,<3.12.0a0",
+      "python_abi 3.11.* *_cp311"
+    ],
+    "constrains": [
+      "libbrotlicommon 1.2.1 h39a168f_0"
+    ]
   }
 ]

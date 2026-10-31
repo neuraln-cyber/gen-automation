@@ -28,7 +28,7 @@ def test_debian_security_update_is_pinned_and_limited_to_existing_packages(filen
     assert "apt-get upgrade" not in logical
     assert "apt-get dist-upgrade" not in logical
     assert logical.index(security_update) < logical.index("python3.12 -m pip install")
-    assert "python:3.12.15-slim@sha256:" in dockerfile
+    assert "python:3.12.16-slim@sha256:" in dockerfile
 
 
 def test_ci_scans_all_built_images_without_relaxing_the_security_gate() -> None:
