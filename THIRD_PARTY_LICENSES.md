@@ -45,6 +45,16 @@ The optional `stable_expression` face stabilizer includes the following pinned
 components in the immutable I2V worker image. The complete license texts shipped
 by `anime-face-detector` are preserved in `/opt/i2v/vendor` inside that image.
 
+## Build-only CUDA native import dependency
+
+The CPU-only native-import build stage also extracts NVIDIA's proprietary
+`cuda-compat-13-0` 580.196.07-1ubuntu1 from its official Ubuntu22.04 repository,
+SHA-256 `b0ee4fb1f439e919ca5c5fd7c5cff3e8b8afdbdb0b5ee38f7c09c047ea41a035`.
+Its original copyright/license files remain in that build stage. It is used
+only through a temporary read-only build mount, not installed, redistributed
+in the final worker or used to override the provider driver. This is real ABI
+import validation without GPU execution, not a hardware compatibility claim.
+
 ## anime-face-detector
 
 - Project: <https://github.com/hysts/anime-face-detector>

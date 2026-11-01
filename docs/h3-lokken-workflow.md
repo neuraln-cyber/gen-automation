@@ -72,6 +72,21 @@ quality or RTX compatibility on the provider's actual device/driver. The owner
 must run a short clip before a large batch. No silent fallback to another
 checkpoint, ordinary resize, dense attention or alternative encoder is allowed.
 
+### Linux import validation versus hardware validation
+
+The VFX wheel's bundled ELF libraries need a search path set **before** Python
+starts; the image sets it explicitly, retaining provider driver paths first.
+CPU build runners have no injected NVIDIA driver. The actual non-root import
+contract therefore temporarily mounts the genuine, checksum-pinned NVIDIA
+`cuda-compat-13-0` 580.196.07 user-mode libraries from a separate build stage.
+These are not fabricated stubs. No GPU is exposed or invoked. The package is
+extracted, never installed, and neither it nor the temporary library path is
+included in the final worker. Post-check assertions enforce that separation.
+Runtime continues to use the provider's injected driver unchanged; this check
+does **not** prove GPU/driver compatibility, speed, VRAM sufficiency or quality.
+See [NVIDIA's library description](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html)
+and [container requirements](https://docs.nvidia.com/maxine/vfx/latest/LinuxVFXSDK/RunSDKinaContainer.html).
+
 ## Rollout boundary
 
 Code changes do not authorize starting hardware or replacing artifacts in

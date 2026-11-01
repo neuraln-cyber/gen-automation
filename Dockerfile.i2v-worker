@@ -55,6 +55,16 @@ RUN go mod download \
         -o /out/salad-http-job-queue-worker \
         ./cmd/salad-http-job-queue-worker
 
+# CPU build validation needs the genuine libcuda ABI used by the VFX extension.
+# Extract (do not install) NVIDIA's pinned user-mode library in a separate stage.
+# It is only mounted read-only for imports; no driver/stub enters the worker.
+FROM pytorch/pytorch:2.9.1-cuda13.0-cudnn9-runtime@sha256:60f22fb80755fd0b470fb47928dbd55816aa9f847edd95cf43c93253507a9ddf AS h3-import-driver
+ADD --checksum=sha256:b0ee4fb1f439e919ca5c5fd7c5cff3e8b8afdbdb0b5ee38f7c09c047ea41a035 --chmod=0444 \
+    https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-compat-13-0_580.196.07-1ubuntu1_amd64.deb \
+    /tmp/h3-import-driver.deb
+RUN dpkg-deb --extract /tmp/h3-import-driver.deb /opt/h3-import-driver-package \
+    && test -r /opt/h3-import-driver-package/usr/local/cuda-13.0/compat/libcuda.so.1
+
 FROM pytorch/pytorch:2.9.1-cuda13.0-cudnn9-runtime@sha256:60f22fb80755fd0b470fb47928dbd55816aa9f847edd95cf43c93253507a9ddf
 
 LABEL org.opencontainers.image.title="gen-automation-native-h3-i2v-worker" \
@@ -293,6 +303,9 @@ COPY src/gen_automation/i2v_worker/comfy_h3_lokken_upscale_entrypoint.py /opt/i2
 COPY requirements-i2v-rtx.lock /opt/i2v/requirements-i2v-rtx.lock
 RUN /opt/i2v-venv/bin/python -m pip install --only-binary=:all: --require-hashes --no-deps \
     -r /opt/i2v/requirements-i2v-rtx.lock
+# glibc reads this at process startup. The wheel's Python-time environment edit
+# cannot resolve its ELF dependencies. Keep injected provider driver paths first.
+ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/opt/i2v-venv/lib/python3.11/site-packages/nvvfx/libs:/opt/i2v-venv/lib/python3.11/site-packages/nvidia_vfx.libs
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends git \
     && /opt/i2v/bin/install-h3-native-nodes \
@@ -364,8 +377,15 @@ RUN command -v find \
 
 # Exercise the real imports after final filesystem setup, with the same identity
 # and privilege drop as Salad startup. A root-only smoke test hides permission bugs.
-RUN setpriv --reuid 10002 --regid 10002 --init-groups --no-new-privs \
+# The real VFX extension is imported, not mocked/skipped. This is an import/API
+# check only: no GPU device, kernel driver, model execution or RTX invocation.
+RUN --mount=type=bind,from=h3-import-driver,source=/opt/h3-import-driver-package/usr/local/cuda-13.0/compat,target=/opt/h3-import-driver,readonly \
+    LD_LIBRARY_PATH="/opt/h3-import-driver:${LD_LIBRARY_PATH}" \
+    setpriv --reuid 10002 --regid 10002 --init-groups --no-new-privs \
     /opt/i2v-venv/bin/python /opt/i2v/bin/verify-h3-comfy-nodes.py
+RUN test ! -e /opt/h3-import-driver/libcuda.so.1 \
+    && test ! -e /opt/h3-import-driver-package \
+    && test ! -e /usr/local/cuda-13.0/compat/libcuda.so.1
 
 USER 0:0
 
