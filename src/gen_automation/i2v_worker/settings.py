@@ -9,6 +9,7 @@ from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from gen_automation.domain.private_delivery import PrivateDeliveryRoute
+from gen_automation.i2v_worker.h3_lokken import LOKKEN_SHA256, LOKKEN_UPSCALER_ROLE
 from gen_automation.i2v_worker.h3_upscale import H3_UPSCALER_ROLE
 from gen_automation.i2v_worker.h3_variants import (
     H3_EROS_BETA7_SHA256,
@@ -19,6 +20,7 @@ from gen_automation.i2v_worker.h3_variants import (
     H3Variant,
     h3_eros_beta7_models_match,
     h3_eros_models_match,
+    h3_lokken_models_match,
     h3_native_models_match,
 )
 from gen_automation.i2v_worker.lora_catalog import REQUIRED_LORA_ROLES
@@ -30,6 +32,11 @@ H3_CUSTOM_NODES = (
     "Comfyui-MMH3-UltimateUpscale",
     "GenAutomationH3",
     "GenAutomationH3Contrast",
+)
+H3_LOKKEN_CUSTOM_NODES = (
+    "GenAutomationH3LokkenUpscale",
+    "ComfyUI_Nvidia_VFX_Nodes",
+    "ComfyUI-Lokken-VideoTools",
 )
 H3_COMFY_MEMORY_ARGS = (
     "--reserve-vram",
@@ -131,12 +138,15 @@ class I2VWorkerSettings(BaseSettings):
             raise ValueError("MiniMax H3 requires immutable manifest and source identity")
         if self.profile == "minimax_h3" and H3_UPSCALER_ROLE in roles:
             required.add(H3_UPSCALER_ROLE)
+        if self.profile == "minimax_h3" and self.h3_model_variant == "eros_beta7_lokken":
+            required.add(LOKKEN_UPSCALER_ROLE)
         if roles != required or len(roles) != len(objects):
             raise ValueError("model manifest roles are incomplete or duplicated")
         if self.profile == "minimax_h3" and self.h3_model_variant in {
             "fl2va_int8",
             "eros_beta5",
             "eros_beta7",
+            "eros_beta7_lokken",
         }:
             identities: dict[str, dict[str, object]] = {
                 item.role: {
@@ -150,6 +160,10 @@ class I2VWorkerSettings(BaseSettings):
                 raise ValueError("Eros H3 requires the exact reviewed model set")
             if self.h3_model_variant == "eros_beta7" and not h3_eros_beta7_models_match(identities):
                 raise ValueError("Eros Beta 7 requires the exact reviewed model set")
+            if self.h3_model_variant == "eros_beta7_lokken" and not h3_lokken_models_match(
+                identities
+            ):
+                raise ValueError("Lokken requires the exact reviewed HQ model set")
             if self.h3_model_variant == "fl2va_int8" and not h3_native_models_match(identities):
                 raise ValueError("Native H3 requires the exact official model set")
         return self
@@ -157,6 +171,11 @@ class I2VWorkerSettings(BaseSettings):
     @property
     def h3_model_variant(self) -> H3Variant:
         """Derive identity from immutable model bytes, never from a request/default."""
+        if any(
+            item.role == "diffusion_model" and item.sha256 == LOKKEN_SHA256
+            for item in self.model_objects
+        ):
+            return "eros_beta7_lokken"
         if any(
             item.role == "diffusion_model" and item.sha256 == H3_EROS_BETA7_SHA256
             for item in self.model_objects
@@ -187,7 +206,7 @@ class I2VWorkerSettings(BaseSettings):
     @property
     def effective_workflow_template(self) -> Path:
         if self.profile == "minimax_h3":
-            if self.h3_model_variant in {"eros_beta5", "eros_beta7"}:
+            if self.h3_model_variant in {"eros_beta5", "eros_beta7", "eros_beta7_lokken"}:
                 return self.workflow_template.parent / "minimax-h3-eros-ref2va.api.json"
             if self.h3_model_variant == "fl2va_int8":
                 return self.workflow_template.parent / "minimax-h3-native-i2v.api.json"

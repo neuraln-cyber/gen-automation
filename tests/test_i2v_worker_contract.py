@@ -520,7 +520,7 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
         f"FROM {pytorch_image}",
     ]
     assert all("@sha256:" in line for line in from_lines)
-    assert "73c9bad4d21e7addbe1d13bc92eee0f1431b017d" in dockerfile
+    assert "6b747c0428c343e1417219641db93a4fb7cb69ae" in dockerfile
     assert "ef8a641be08983cf5f06669f70719b6eecce3c7f" in dockerfile
     assert "https://github.com/ChenDarYen/ComfyUI-NAG.git" in dockerfile
     assert "ARG COMFYUI_NAG_COMMIT=ef8a641be08983cf5f06669f70719b6eecce3c7f" in dockerfile

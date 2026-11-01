@@ -6,6 +6,7 @@ import logging
 import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -23,6 +24,7 @@ from gen_automation.i2v_worker.face_stabilizer import (
     preflight_source_face,
     stabilize_face_frames,
 )
+from gen_automation.i2v_worker.h3_lokken import LOKKEN_RECIPE, lokken_geometry
 from gen_automation.i2v_worker.h3_loras import materialize_h3_lora
 from gen_automation.i2v_worker.h3_upscale import h3_base_canvas
 from gen_automation.i2v_worker.h3_variants import h3_job_matches_variant
@@ -314,7 +316,8 @@ async def _run_job(
             **(
                 {"reference_image": True}
                 if generation_settings.profile == "minimax_h3"
-                and generation_settings.h3_model_variant in {"eros_beta5", "eros_beta7"}
+                and generation_settings.h3_model_variant
+                in {"eros_beta5", "eros_beta7", "eros_beta7_lokken"}
                 else {}
             ),
             **(
@@ -323,7 +326,10 @@ async def _run_job(
                 else {}
             ),
         )
-        if generation_settings.h3_image_mode == "first_frame":
+        if (
+            generation_settings.h3_image_mode == "first_frame"
+            and generation_settings.h3_model_variant != "eros_beta7_lokken"
+        ):
             guide_width, guide_height = generation_settings.width, generation_settings.height
             if generation_settings.match_source_resolution:
                 guide_width, guide_height = h3_base_canvas(guide_width, guide_height)
@@ -351,7 +357,10 @@ async def _run_job(
             workflow,
             input_filename=prepared_name,
             guide_filename=(
-                guide_name if generation_settings.h3_image_mode == "first_frame" else None
+                guide_name
+                if generation_settings.h3_image_mode == "first_frame"
+                and generation_settings.h3_model_variant != "eros_beta7_lokken"
+                else None
             ),
             positive_prompt=job.positive_prompt,
             negative_prompt=job.negative_prompt,
@@ -463,6 +472,7 @@ async def _run_job(
                         "fl2va_int8": "minimax-h3-native-i2v",
                         "eros_beta5": "minimax-h3-eros-ref2va",
                         "eros_beta7": "minimax-h3-eros-beta7-ref2va-vsa",
+                        "eros_beta7_lokken": "lokken-simple-v5-hq-20261101",
                     }.get(generation_settings.h3_model_variant or "", "dasiwa-minimax-h3-i2v-v1")
                 )
                 if settings.profile == "minimax_h3"
@@ -488,15 +498,27 @@ async def _run_job(
         }
         if face_metadata is not None:
             output_metadata["face_stabilization"] = face_metadata
-        if generation_settings.h3_model_variant in {"eros_beta5", "eros_beta7"}:
+        if generation_settings.h3_model_variant in {
+            "eros_beta5",
+            "eros_beta7",
+            "eros_beta7_lokken",
+        }:
             output_metadata["h3_image_mode"] = generation_settings.h3_image_mode
             output_metadata["h3_attention_backend"] = generation_settings.h3_attention_backend
             output_metadata["h3_latent_contrast"] = generation_settings.h3_latent_contrast
             output_metadata["h3_refine_steps"] = generation_settings.h3_refine_steps
-            if generation_settings.h3_model_variant == "eros_beta7":
+            if generation_settings.h3_model_variant in {"eros_beta7", "eros_beta7_lokken"}:
                 output_metadata["h3_sparse_attention_recipe"] = "vsa_10_percent_start_zero"
         if base_result is not None:
             output_metadata["h3_base_video"] = base_result.model_dump(mode="json")
+        if generation_settings.h3_lokken is not None:
+            output_metadata["h3_lokken"] = {
+                "recipe": LOKKEN_RECIPE,
+                "settings": generation_settings.h3_lokken.model_dump(mode="json"),
+                "geometry": asdict(lokken_geometry(generation_settings)),
+                "audio_source": "first_pass_denoised",
+                "grain_seeded": False,
+            }
         return I2VResult(
             job_id=job.job_id,
             attempt_id=job.attempt_id,

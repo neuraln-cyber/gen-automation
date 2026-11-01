@@ -4,9 +4,12 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
+from pydantic import SecretStr
+
 from gen_automation.i2v_worker.comfy_h3_node import NODE_CLASS_MAPPINGS
 from gen_automation.i2v_worker.settings import H3_CUSTOM_NODES, I2V_CUSTOM_NODES
 from gen_automation.i2v_worker.supervisor import _comfy_command
+from tests.test_h3_eros_beta7 import worker_objects
 from tests.test_h3_upscale import _workflow
 from tests.test_i2v_h3_readiness import h3_settings
 from tests.test_i2v_worker_contract import _settings
@@ -15,7 +18,12 @@ ROOT = Path(__file__).parents[1]
 
 
 def test_h3_process_cannot_import_legacy_or_deleted_inference_nodes(tmp_path):
-    settings = _settings(tmp_path).model_copy(update={"profile": "minimax_h3"})
+    settings = _settings(tmp_path).model_copy(
+        update={
+            "profile": "minimax_h3",
+            "model_objects_json": SecretStr(json.dumps(worker_objects())),
+        }
+    )
     command = _comfy_command(settings)
     allowed = command[
         command.index("--whitelist-custom-nodes") + 1 : command.index("--disable-api-nodes")
@@ -32,10 +40,10 @@ def test_native_runtime_and_optional_upscaler_are_immutable():
     docker = (ROOT / "Dockerfile.i2v-worker").read_text()
     requirements = (ROOT / "requirements-i2v-worker.in").read_text()
     installer = (ROOT / "scripts/install-h3-native-nodes.sh").read_text()
-    for pin in ("comfyui-frontend-package==1.53.6", "comfy-kitchen==0.2.35", "comfy-aimdo==0.5.5"):
+    for pin in ("comfyui-frontend-package==1.53.6", "comfy-kitchen==0.2.36", "comfy-aimdo==0.5.5"):
         assert pin in requirements
         assert pin in (ROOT / "requirements-i2v-worker.lock").read_text()
-    assert "73c9bad4d21e7addbe1d13bc92eee0f1431b017d" in docker
+    assert "6b747c0428c343e1417219641db93a4fb7cb69ae" in docker
     revision = "fe6658f6d144066f14150d3526247b417683ff2b"
     assert revision in installer and revision in docker
     for removed in ("ComfyUI-DaSiWa-Nodes", "ComfyUI-KJNodes"):

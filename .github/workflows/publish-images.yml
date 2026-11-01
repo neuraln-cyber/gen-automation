@@ -302,8 +302,10 @@ jobs:
             .gitattributes
             Dockerfile.i2v-worker
             THIRD_PARTY_LICENSES.md
+            licenses/AGPL-3.0-only.txt
             requirements-i2v-face.lock
             requirements-i2v-worker.lock
+            requirements-i2v-rtx.lock
             requirements-worker-security.lock
             scripts/install-worker-security.py
             scripts/install-i2v-python-security.py
@@ -323,6 +325,7 @@ jobs:
             scripts/verify_h3_native_workflow.py
             scripts/verify_h3_eros_workflow.py
             scripts/verify_h3_contrast.py
+            scripts/verify_h3_lokken_workflow.py
             workflows/dasiwa-wan22-i2v-v1.api.json
             workflows/minimax-h3-native-i2v.api.json
             workflows/minimax-h3-eros-ref2va.api.json

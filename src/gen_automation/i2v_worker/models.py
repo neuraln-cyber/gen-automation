@@ -5,8 +5,25 @@ from datetime import datetime
 from typing import Annotated, Any, Final, Literal
 from uuid import UUID
 
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, UrlConstraints, model_validator
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    UrlConstraints,
+    model_serializer,
+    model_validator,
+)
 
+from gen_automation.i2v_worker.h3_lokken import (
+    LOKKEN_UPSCALER_BYTES,
+    LOKKEN_UPSCALER_FILENAME,
+    LOKKEN_UPSCALER_ROLE,
+    LOKKEN_UPSCALER_SHA256,
+    LOKKEN_VARIANT,
+    lokken_geometry,
+)
 from gen_automation.i2v_worker.h3_upscale import (
     H3_UPSCALER_BYTES,
     H3_UPSCALER_FILENAME,
@@ -48,6 +65,7 @@ class ModelObject(_StrictModel):
         "video_vae",
         "audio_vae",
         "h3_latent_upscaler",
+        "h3_lokken_upscaler",
         "diffusion_model_high",
         "diffusion_model_low",
         "text_encoder",
@@ -77,6 +95,7 @@ class ModelObject(_StrictModel):
             "video_vae": "models/vae/",
             "audio_vae": "models/vae/",
             "h3_latent_upscaler": "models/latent_upscale_models/",
+            "h3_lokken_upscaler": "models/latent_upscale_models/",
             "diffusion_model_high": "models/diffusion_models/",
             "diffusion_model_low": "models/diffusion_models/",
             "text_encoder": "models/text_encoders/",
@@ -112,6 +131,12 @@ class ModelObject(_StrictModel):
             or self.sha256 != H3_UPSCALER_SHA256
         ):
             raise ValueError("H3 latent upscaler artifact identity is invalid")
+        if self.role == LOKKEN_UPSCALER_ROLE and (
+            self.install_path != f"models/latent_upscale_models/{LOKKEN_UPSCALER_FILENAME}"
+            or self.byte_size != LOKKEN_UPSCALER_BYTES
+            or self.sha256 != LOKKEN_UPSCALER_SHA256
+        ):
+            raise ValueError("Lokken FP16 upscaler artifact identity is invalid")
         if reviewed is not None and (
             self.install_path != reviewed.install_path
             or self.byte_size != reviewed.byte_size
@@ -189,11 +214,25 @@ class H3LoraGrant(_StrictModel):
         return self
 
 
+class LokkenSettings(_StrictModel):
+    """New jobs only: an explicit, frozen simple-v5 recipe, never a legacy default."""
+
+    base_megapixels: float = Field(default=0.3, ge=0.3, le=0.5, allow_inf_nan=False)
+    target_megapixels: float = Field(default=1.0, ge=1.0, le=1.5, allow_inf_nan=False)
+    rtx_scale: float = Field(default=1.2, ge=1.0, le=1.2, allow_inf_nan=False)
+    grain_strength: float = Field(default=0.005, ge=0, le=0.025, allow_inf_nan=False)
+    encoder_preset: Literal["medium", "slow", "slower", "veryslow"] = "medium"
+
+
 class GenerationSettings(_StrictModel):
     profile: Literal["wan22", "minimax_h3"] = "wan22"
     h3_model_variant: (
-        Literal["turbo_v2", "hybrid_v2", "fl2va_int8", "eros_beta5", "eros_beta7"] | None
+        Literal[
+            "turbo_v2", "hybrid_v2", "fl2va_int8", "eros_beta5", "eros_beta7", "eros_beta7_lokken"
+        ]
+        | None
     ) = None
+    h3_lokken: LokkenSettings | None = None
     # Missing in historical snapshots means reference-only, never a silent migration.
     h3_image_mode: Literal["reference", "first_frame"] = "reference"
     # Old snapshots keep their attention implementation, not a silent migration.
@@ -241,9 +280,41 @@ class GenerationSettings(_StrictModel):
     )
     h3_loras: list[H3LoraSelection] = Field(default_factory=list)
 
+    @model_serializer(mode="wrap")
+    def serialize_without_legacy_lokken_field(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = handler(self)
+        if self.h3_lokken is None:
+            result.pop("h3_lokken", None)
+        return result
+
     @model_validator(mode="before")
     @classmethod
     def normal_v2_defaults(cls, value: Any) -> Any:
+        if (
+            isinstance(value, dict)
+            and value.get("profile") == "minimax_h3"
+            and value.get("h3_model_variant") == LOKKEN_VARIANT
+        ):
+            return {
+                "steps": 8,
+                "cfg": 1.0,
+                "sampler": "er_sde",
+                "scheduler": "sgm_uniform",
+                "video_shift": 12.0,
+                "audio_shift": 3.0,
+                "fps": 24,
+                "frame_count": 124,
+                "width": 768,
+                "height": 1344,
+                "h3_attention_backend": "comfy_kitchen",
+                "h3_image_mode": "first_frame",
+                "h3_refine_steps": 3,
+                "h3_refine_denoise": 0.3,
+                "h3_lokken": {},
+                **value,
+            }
         if (
             isinstance(value, dict)
             and value.get("profile") == "minimax_h3"
@@ -304,14 +375,35 @@ class GenerationSettings(_StrictModel):
 
     @model_validator(mode="after")
     def validate_wan_shape(self) -> GenerationSettings:
+        if self.h3_model_variant == LOKKEN_VARIANT:
+            if (
+                self.profile != "minimax_h3"
+                or self.h3_lokken is None
+                or self.match_source_resolution
+                or self.h3_save_base_video
+                or self.h3_image_mode != "first_frame"
+                or self.h3_attention_backend != "comfy_kitchen"
+                or self.cfg != 1
+                or self.h3_refine_cfg != 1
+                or self.h3_latent_contrast != 1
+                or self.h3_refine_sampler not in (None, self.sampler)
+            ):
+                raise ValueError(
+                    "Lokken full recipe requires both first-frame guides, Kitchen, CFG1, "
+                    "one shared sampler and MP-based output; legacy source-size/diagnostic "
+                    "and contrast modes are separate workflows"
+                )
+            lokken_geometry(self)
+        elif self.h3_lokken is not None:
+            raise ValueError("Lokken settings require the reviewed Lokken checkpoint variant")
         if self.h3_latent_contrast != 1.0 and (
             self.profile != "minimax_h3"
-            or self.h3_model_variant not in {"eros_beta5", "eros_beta7"}
+            or self.h3_model_variant not in {"eros_beta5", "eros_beta7", LOKKEN_VARIANT}
         ):
             raise ValueError("latent contrast control requires Eros")
         if self.h3_image_mode != "reference" and (
             self.profile != "minimax_h3"
-            or self.h3_model_variant not in {"eros_beta5", "eros_beta7"}
+            or self.h3_model_variant not in {"eros_beta5", "eros_beta7", LOKKEN_VARIANT}
         ):
             raise ValueError("first-frame reference guidance requires Eros")
         if self.profile == "minimax_h3":
@@ -327,6 +419,7 @@ class GenerationSettings(_StrictModel):
             if self.h3_attention_backend != "default" and self.h3_model_variant not in {
                 "eros_beta5",
                 "eros_beta7",
+                LOKKEN_VARIANT,
             }:
                 raise ValueError("Eros attention selection requires Eros")
             if self.steps > 10000 or self.cfg > 100:
@@ -347,14 +440,25 @@ class GenerationSettings(_StrictModel):
                 raise ValueError("base-video diagnostics require H3 source-size delivery")
             if len({item.artifact_id for item in self.h3_loras}) != len(self.h3_loras):
                 raise ValueError("H3 LoRA selections must be unique")
+            lokken_aspect = self.h3_model_variant == LOKKEN_VARIANT
+            if lokken_aspect and max(self.width, self.height) > 32768:
+                raise ValueError("Lokken aspect dimensions must be at most 32768")
             if (
                 self.frame_count % 17 != 5
                 or not 124 <= self.frame_count <= 362
                 or self.fps != 24
-                or self.width % 32
-                or self.height % 32
-                or (not self.match_source_resolution and self.width * self.height > 768 * 1344)
-                or max(self.width, self.height) > 2048
+                or (
+                    not lokken_aspect
+                    and (
+                        self.width % 32
+                        or self.height % 32
+                        or (
+                            not self.match_source_resolution
+                            and self.width * self.height > 768 * 1344
+                        )
+                        or max(self.width, self.height) > 2048
+                    )
+                )
             ):
                 raise ValueError(
                     "MiniMax H3 requires 17n+5 frames (124-362), 24 fps, "

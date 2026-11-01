@@ -452,7 +452,7 @@ const fields = Object.entries({steps: "4", cfg: "2.5", sampler: "er_sde", schedu
   h3_refine_steps: "3", h3_refine_cfg: "1.8", h3_refine_denoise: "0.4", h3_refine_sampler: ""})
   .map(([name, value]) => ({name, value, type: "text"}));
 const context = vm.createContext({
-  h3AdvancedSamplingEnabled: __EXPERT__, h3ModelVariant: "hybrid_v2",
+  h3AdvancedSamplingEnabled: __EXPERT__, h3ModelVariant: "hybrid_v2", lokken: false,
   isH3: true, state, workerSettingDefaults: {profile: "minimax_h3", h3_loras: []},
   loraList: {querySelectorAll: () => []}, root: {querySelector: () => null},
   advanced: {querySelectorAll: () => __EXPERT__ ? fields : [],

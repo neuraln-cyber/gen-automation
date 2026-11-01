@@ -91,7 +91,7 @@ class ComfyClient:
             timeout=httpx2.Timeout(request_timeout_seconds, connect=5),
             limits=httpx2.Limits(max_connections=2, max_keepalive_connections=2),
         )
-        if source_resolution_enabled:
+        if source_resolution_enabled and h3_model_variant != "eros_beta7_lokken":
             self.required_nodes += tuple(
                 (name, f"/object_info/{name}")
                 for name in (
@@ -101,8 +101,24 @@ class ComfyClient:
                     "MMH3SpatialSplitParams",
                 )
             )
-        if h3_model_variant == "eros_beta7":
+        if h3_model_variant in {"eros_beta7", "eros_beta7_lokken"}:
             self.required_nodes += (("BlockSparseAttention", "/object_info/BlockSparseAttention"),)
+        if h3_model_variant == "eros_beta7_lokken":
+            self.required_nodes = tuple(
+                binding
+                for binding in self.required_nodes
+                if binding[0] not in {"ManagedH3DiagnosticDecode", "MiniMaxH3LatentContrast"}
+            )
+            self.required_nodes += tuple(
+                (name, f"/object_info/{name}")
+                for name in (
+                    "LTXVSeparateAVLatent",
+                    "LTXVConcatAVLatent",
+                    "MinimaxH3LatentUpscaler3D",
+                    "RTXVideoSuperResolution",
+                    "LokkenVideoPostProcessing",
+                )
+            )
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -131,7 +147,7 @@ class ComfyClient:
 
     async def execute(self, workflow: dict[str, Any], output_root: Path) -> tuple[Path, ...]:
         diagnostic = "h3-base-save" in workflow
-        if "h3-kitchen" in workflow:
+        if "h3-kitchen" in workflow or "lokken-kitchen" in workflow:
             # Native ModelAttentionBackend otherwise silently falls back to
             # PyTorch. An explicit author recipe must not claim that fallback
             # is the requested Kitchen backend.
@@ -142,7 +158,7 @@ class ComfyClient:
                 available = False
             if not available:
                 raise ComfyError("Requested Eros Comfy Kitchen attention is unavailable")
-        if "h3-eros-beta7-vsa" in workflow:
+        if "h3-eros-beta7-vsa" in workflow or "lokken-vsa" in workflow:
             response = await self._request("GET", "/object_info/BlockSparseAttention")
             try:
                 available = _vsa_available(response.json())

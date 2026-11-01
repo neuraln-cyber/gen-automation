@@ -45,6 +45,8 @@ RUN python3.12 -m pip install \
         app
 
 COPY src ./src
+COPY THIRD_PARTY_LICENSES.md ./THIRD_PARTY_LICENSES.md
+COPY licenses/AGPL-3.0-only.txt ./licenses/AGPL-3.0-only.txt
 
 USER 10001:10001
 

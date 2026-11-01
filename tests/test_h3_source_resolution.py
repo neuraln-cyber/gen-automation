@@ -95,7 +95,8 @@ const elements = {
 const summary = {};
 const state = {selected: {sourceWidth: 1144, sourceHeight: 1480}};
 const context = vm.createContext({
-  form: {elements}, isH3: true, sourceResolutionEnabled: true, state, q: () => summary,
+  form: {elements}, isH3: true, lokken: false,
+  sourceResolutionEnabled: true, state, q: () => summary,
 });
 vm.runInContext(source.slice(source.indexOf("  function sourceNativeDimensions("),
   source.indexOf("  function setLoraSelections(")), context);

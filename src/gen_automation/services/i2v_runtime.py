@@ -1143,11 +1143,13 @@ def _worker_settings_snapshot(settings: Mapping[str, object]) -> dict[str, objec
     from gen_automation.i2v_worker.h3_sampling import H3_EXPERT_DEFAULTS
 
     snapshot = dict(settings)
+    if snapshot.get("h3_lokken") is None:
+        snapshot.pop("h3_lokken", None)
     if snapshot.get("h3_model_variant") in (None, "turbo_v2"):
         snapshot.pop("h3_model_variant", None)
     if snapshot.get("h3_image_mode", "reference") == "reference":
         snapshot.pop("h3_image_mode", None)
-    beta7 = snapshot.get("h3_model_variant") == "eros_beta7"
+    beta7 = snapshot.get("h3_model_variant") in {"eros_beta7", "eros_beta7_lokken"}
     if not beta7 and snapshot.get("h3_attention_backend", "default") == "default":
         snapshot.pop("h3_attention_backend", None)
     if snapshot.get("h3_latent_contrast", 1.0) == 1.0:
@@ -1158,6 +1160,7 @@ def _worker_settings_snapshot(settings: Mapping[str, object]) -> dict[str, objec
         if name == "h3_refine_steps" and snapshot.get("h3_model_variant") in {
             "eros_beta5",
             "eros_beta7",
+            "eros_beta7_lokken",
         }:
             continue
         if beta7 and name == "h3_refine_denoise":

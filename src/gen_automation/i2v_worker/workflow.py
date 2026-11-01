@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from gen_automation.i2v_worker.h3_lokken import (
+    LOKKEN_UPSCALER_FILENAME,
+    LOKKEN_UPSCALER_ROLE,
+    LOKKEN_VARIANT,
+    build_lokken_workflow,
+)
 from gen_automation.i2v_worker.h3_upscale import (
     H3_UPSCALER_FILENAME,
     H3_UPSCALER_ROLE,
@@ -133,12 +139,14 @@ def render_workflow(
         "fl2va_int8",
         "eros_beta5",
         "eros_beta7",
+        LOKKEN_VARIANT,
     }
     if settings.profile == "minimax_h3":
         expected_conditioning = {
             "fl2va_int8": "MiniMaxH3ImageToVideo",
             "eros_beta5": "MiniMaxH3ReferenceToVideo",
             "eros_beta7": "MiniMaxH3ReferenceToVideo",
+            LOKKEN_VARIANT: "MiniMaxH3ReferenceToVideo",
         }.get(settings.h3_model_variant or "turbo_v2", "MiniMaxH3DirectorGuide")
         if template.get("6", {}).get("class_type") != expected_conditioning:
             raise WorkflowError("H3 workflow does not match the checkpoint variant")
@@ -201,6 +209,10 @@ def render_workflow(
             if native_h3
             else _inject_h3_loras(rendered, settings)
         )
+        if settings.h3_model_variant == LOKKEN_VARIANT:
+            if (model_paths or {}).get(LOKKEN_UPSCALER_ROLE) != LOKKEN_UPSCALER_FILENAME:
+                raise WorkflowError("Lokken workflow requires the exact FP16 upscaler")
+            return build_lokken_workflow(rendered, settings), seed, frame_prefix
         rendered["11"]["inputs"]["denoise"] = settings.h3_denoise
         if settings.cfg != 1 or (settings.match_source_resolution and settings.h3_refine_cfg != 1):
             rendered["h3-negative"] = {
