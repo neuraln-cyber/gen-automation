@@ -2,6 +2,7 @@
 
 import hashlib
 import importlib
+import inspect
 import json
 import tempfile
 from pathlib import Path
@@ -19,9 +20,22 @@ def verify_lokken_workflow(nodes, template_path=None, reference_path=None):
     import av
     import comfy.quant_ops
     import comfyui_version
+    import nvvfx
     import torch
     from comfy_api.internal import _ComfyNodeInternal
     from comfy_api.latest import _io
+
+    # The startup probe uses this actual pinned native package API. Validate
+    # its shape on CPU; only a real GPU startup can establish effect.load().
+    inspect.signature(nvvfx.VideoSuperRes).bind(
+        quality=nvvfx.QualityLevel.ULTRA,
+        strength=1.0,
+        device=0,
+        image_encoding=nvvfx.ImageEncoding.RGB10A2,
+    )
+    for name in ("output_width", "output_height", "is_loaded"):
+        assert isinstance(getattr(nvvfx.VideoSuperRes, name), property)
+    assert callable(nvvfx.VideoSuperRes.load) and callable(nvvfx.VideoSuperRes.close)
 
     assert comfyui_version.__version__ == "0.38.0"
     assert comfy.quant_ops.QUANT_ALGOS["w6a8_int8"]["comfy_tensor_layout"] == "AsymW4A8Int8Layout"

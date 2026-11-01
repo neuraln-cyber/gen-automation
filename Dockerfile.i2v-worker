@@ -387,6 +387,11 @@ RUN test ! -e /opt/h3-import-driver/libcuda.so.1 \
     && test ! -e /opt/h3-import-driver-package \
     && test ! -e /usr/local/cuda-13.0/compat/libcuda.so.1
 
+# RTX Video Super Resolution uses the driver's NGX library, separately gated
+# from CUDA compute/utility by NVIDIA Container Toolkit. Request the matching
+# host driver library at container creation; never ship a second GPU driver.
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,ngx
+
 USER 0:0
 
 ENTRYPOINT ["/opt/i2v/bin/i2v-runpod-entrypoint"]
