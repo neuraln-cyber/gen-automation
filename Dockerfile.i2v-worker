@@ -55,10 +55,10 @@ RUN go mod download \
         -o /out/salad-http-job-queue-worker \
         ./cmd/salad-http-job-queue-worker
 
+FROM pytorch/pytorch:2.9.1-cuda13.0-cudnn9-runtime@sha256:60f22fb80755fd0b470fb47928dbd55816aa9f847edd95cf43c93253507a9ddf AS h3-import-driver
 # CPU build validation needs the genuine libcuda ABI used by the VFX extension.
 # Extract (do not install) NVIDIA's pinned user-mode library in a separate stage.
 # It is only mounted read-only for imports; no driver/stub enters the worker.
-FROM pytorch/pytorch:2.9.1-cuda13.0-cudnn9-runtime@sha256:60f22fb80755fd0b470fb47928dbd55816aa9f847edd95cf43c93253507a9ddf AS h3-import-driver
 ADD --checksum=sha256:b0ee4fb1f439e919ca5c5fd7c5cff3e8b8afdbdb0b5ee38f7c09c047ea41a035 --chmod=0444 \
     https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-compat-13-0_580.196.07-1ubuntu1_amd64.deb \
     /tmp/h3-import-driver.deb
