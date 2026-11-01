@@ -464,6 +464,61 @@ def _fake_torch(**overrides: Any) -> SimpleNamespace:
     )
 
 
+@pytest.mark.asyncio
+async def test_lokken_rtx_failure_precedes_models_comfy_and_queue(tmp_path, monkeypatch, caplog):
+    import gen_automation.i2v_worker.supervisor as module
+    from gen_automation.i2v_worker.rtx_preflight import RTXStartupError
+
+    monkeypatch.setattr(
+        I2VWorkerSettings, "h3_model_variant", property(lambda _: "eros_beta7_lokken")
+    )
+    monkeypatch.setattr(module, "_verify_gpu_runtime", lambda _: None)
+
+    def fail():
+        raise RTXStartupError("RTX enhancement runtime is unavailable")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("RTX failure must precede model downloads and child processes")
+
+    monkeypatch.setattr(module, "verify_rtx_runtime", fail)
+    monkeypatch.setattr(module, "S3ModelBootstrapper", forbidden)
+    monkeypatch.setattr(module, "_start_process", forbidden)
+    supervisor = WorkerSupervisor(_settings(tmp_path))
+    await supervisor.start()
+    await _wait_for(lambda: supervisor.failed)
+    await supervisor.stop()
+    assert not supervisor.ready and supervisor.stage == "rtx_preflight"
+    assert "i2v_startup_failed stage=rtx_preflight error_type=RTXStartupError" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ["eros_beta7_lokken", "eros_beta7", "legacy"])
+async def test_rtx_preflight_is_lokken_only_and_before_bootstrap(tmp_path, monkeypatch, variant):
+    import gen_automation.i2v_worker.supervisor as module
+
+    monkeypatch.setattr(I2VWorkerSettings, "h3_model_variant", property(lambda _: variant))
+    events = []
+    monkeypatch.setattr(module, "_verify_gpu_runtime", lambda _: events.append("gpu"))
+    monkeypatch.setattr(module, "verify_rtx_runtime", lambda: events.append("rtx"))
+    monkeypatch.setattr(module, "preflight_face_stabilizer", lambda **_: None)
+
+    class Bootstrapper(_Bootstrapper):
+        async def bootstrap(self):
+            events.append("models")
+
+    monkeypatch.setattr(module, "S3ModelBootstrapper", Bootstrapper)
+    monkeypatch.setattr(module, "ComfyClient", _ComfyClient)
+    monkeypatch.setattr(module, "_start_process", lambda *a, **kw: _Process())
+    monkeypatch.setattr(module, "_stop_process", lambda _: None)
+    supervisor = WorkerSupervisor(_settings(tmp_path))
+    await supervisor.start()
+    await _wait_for(lambda: supervisor.ready)
+    await supervisor.stop()
+    assert events == (
+        ["gpu", "rtx", "models"] if variant == "eros_beta7_lokken" else ["gpu", "models"]
+    )
+
+
 @pytest.mark.parametrize(
     ("overrides", "reason", "check"),
     [

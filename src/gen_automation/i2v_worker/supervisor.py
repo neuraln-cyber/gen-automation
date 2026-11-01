@@ -19,6 +19,7 @@ from gen_automation.i2v_worker.face_stabilizer import (
     FaceStabilizationError,
     preflight_face_stabilizer,
 )
+from gen_automation.i2v_worker.rtx_preflight import verify_rtx_runtime
 from gen_automation.i2v_worker.settings import (
     H3_COMFY_MEMORY_ARGS,
     H3_CUSTOM_NODES,
@@ -169,6 +170,9 @@ class WorkerSupervisor:
             _ensure_directories(self.settings)
             self._set_stage("gpu_preflight")
             await asyncio.to_thread(_verify_gpu_runtime, self.settings)
+            if self.settings.h3_model_variant == "eros_beta7_lokken":
+                self._set_stage("rtx_preflight")
+                await asyncio.to_thread(verify_rtx_runtime)
             if self.settings.profile == "wan22":
                 self._set_stage("face_preflight")
                 self.face_detector = await asyncio.to_thread(

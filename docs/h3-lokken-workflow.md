@@ -87,6 +87,25 @@ does **not** prove GPU/driver compatibility, speed, VRAM sufficiency or quality.
 See [NVIDIA's library description](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html)
 and [container requirements](https://docs.nvidia.com/maxine/vfx/latest/LinuxVFXSDK/RunSDKinaContainer.html).
 
+### RTX runtime preflight
+
+The worker explicitly requests `NVIDIA_DRIVER_CAPABILITIES=compute,utility,ngx`.
+The CUDA base image's `compute,utility` default does not request the separate
+NGX library used by RTX enhancement. NVIDIA's
+[capability definitions](https://github.com/NVIDIA/nvidia-container-toolkit/blob/v1.17.8/internal/config/image/capabilities.go)
+and [library selection](https://github.com/NVIDIA/libnvidia-container/blob/main/src/nvc_info.c)
+define that separation. No host driver is installed or bundled in the worker.
+
+On a normal owner-requested Lokken GPU startup, before model downloads or queue
+consumption, the worker checks the injected `libnvidia-ngx.so.1` and calls the
+pinned `VideoSuperRes.load()` with ULTRA / RGB10A2 / strength1. It closes the
+effect without rendering frames. Failure keeps readiness false and reports a
+safe check identifier, not native exception contents. This catches the observed
+`NvVFX_Load` initialization failure before expensive sampling. The CPU/native
+build contract verifies the exact package API but is not a GPU compatibility
+test; successful initialization also does not guarantee sufficient VRAM at all
+owner-selected output sizes. The full recommended processing remains enabled.
+
 ## Rollout boundary
 
 Code changes do not authorize starting hardware or replacing artifacts in
