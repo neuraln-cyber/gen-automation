@@ -289,7 +289,7 @@ def _verify_gpu_runtime(settings: I2VWorkerSettings) -> None:
             reason = "vsa_kernel_unavailable"
             import comfy_kitchen  # type: ignore[import-not-found]
 
-            if not comfy_kitchen.sol_attn_is_available(0):
+            if not comfy_kitchen.sol_attn_is_available(torch.device("cuda:0")):
                 raise ValueError
             # Check the installed CUDA extension on this device before model
             # downloads. This tiny synthetic probe loads no model or media.

@@ -4,6 +4,7 @@ import gc
 import hashlib
 import importlib
 import json
+import logging
 import tempfile
 from importlib.metadata import version
 from pathlib import Path
@@ -32,6 +33,7 @@ def verify_native_workflow(nodes, template_path=None, reference_path=None):
         ("comfy-aimdo", "0.5.5"),
     ):
         assert version(package) == expected, package
+    verify_startup_device_contract()
     registry = nodes.NODE_CLASS_MAPPINGS
     assert not any("DaSiWa" in name or "Director" in name for name in registry)
     assert "ManagedH3LoraLoader" not in registry and "KSamplerWithNAG (Advanced)" not in registry
@@ -159,6 +161,55 @@ def verify_native_workflow(nodes, template_path=None, reference_path=None):
     ]
     verify_native_lora_and_schedule(nodes)
     print("Native H3 graph/first-frame/AV/native LoRA/schedule/upscale CPU contracts passed.")
+
+
+def verify_startup_device_contract():
+    """Call real pinned Kitchen through startup, without executing GPU operations."""
+    import comfy_kitchen
+    import torch
+
+    from gen_automation.i2v_worker.supervisor import WorkerStartupError, _verify_gpu_runtime
+
+    real_available = comfy_kitchen.sol_attn_is_available
+    logger = logging.getLogger("gen_automation.i2v_worker.supervisor")
+    for variant in ("eros_beta7", "eros_beta7_lokken"):
+        observed = []
+
+        def available(device, observed=observed):
+            # Keep the real dependency's argument validation and CPU early return.
+            result = real_available(device)
+            observed.append((device, result))
+            return result
+
+        settings = SimpleNamespace(
+            h3_model_variant=variant,
+            allowed_gpu_names={"NVIDIA GeForce RTX 5090"},
+            minimum_gpu_vram_bytes=31 * 1024**3,
+        )
+        with (
+            patch.object(torch.cuda, "is_available", side_effect=[True, False]),
+            patch.object(torch.cuda, "device_count", return_value=1),
+            patch.object(torch.cuda, "get_device_name", return_value="NVIDIA GeForce RTX 5090"),
+            patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=SimpleNamespace(total_memory=32 * 1024**3),
+            ),
+            patch.object(comfy_kitchen, "sol_attn_is_available", side_effect=available),
+            patch.object(
+                torch, "zeros", side_effect=AssertionError("GPU allocation forbidden")
+            ) as allocation,
+            patch.object(logger, "disabled", True),
+        ):
+            try:
+                _verify_gpu_runtime(settings)
+            except WorkerStartupError:
+                pass
+            else:
+                raise AssertionError("Unavailable kernel must remain a startup failure")
+            assert observed == [(torch.device("cuda:0"), False)]
+            allocation.assert_not_called()
+    print("Real Kitchen/startup device-argument CPU contract passed; no GPU operations.")
 
 
 def verify_native_lora_and_schedule(nodes):
