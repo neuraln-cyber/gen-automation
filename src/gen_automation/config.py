@@ -1178,9 +1178,16 @@ class Settings(BaseSettings):
                                 and not h3_native_models_match(manifest_objects)
                             ):
                                 errors.append("Native H3 requires the exact official model set")
+                            # Preserve this legacy capability flag across recipe switches;
+                            # each recipe must still carry its own exactly validated upscaler.
+                            upscaler_role = (
+                                "h3_lokken_upscaler"
+                                if self.i2v_h3_model_variant == "eros_beta7_lokken"
+                                else "h3_latent_upscaler"
+                            )
                             if self.i2v_h3_source_resolution_enabled and (
                                 self.i2v_profile != "minimax_h3"
-                                or "h3_latent_upscaler" not in manifest_objects
+                                or upscaler_role not in manifest_objects
                             ):
                                 errors.append(
                                     "H3 source-resolution delivery requires the pinned upscaler"
