@@ -502,14 +502,22 @@ def test_gpu_preflight_passes_existing_supported_runtime_and_logs_hardware_facts
     assert "status=failed" not in caplog.text
 
 
-@pytest.mark.parametrize("mode", ["unavailable", "broken", "nonfinite", "ok"])
-def test_beta7_requires_a_working_sparse_cuda_kernel(tmp_path, monkeypatch, caplog, mode):
+@pytest.mark.parametrize("variant", ["eros_beta7", "eros_beta7_lokken"])
+@pytest.mark.parametrize("mode", ["unavailable", "broken", "nonfinite", "wrong_shape", "ok"])
+def test_beta7_requires_a_working_sparse_cuda_kernel(tmp_path, monkeypatch, caplog, mode, variant):
     from gen_automation.i2v_worker.supervisor import WorkerStartupError, _verify_gpu_runtime
 
-    monkeypatch.setattr(I2VWorkerSettings, "h3_model_variant", property(lambda _: "eros_beta7"))
+    monkeypatch.setattr(I2VWorkerSettings, "h3_model_variant", property(lambda _: variant))
     tensor = SimpleNamespace(shape=(1, 128, 1, 128))
     calls = []
     torch = _fake_torch()
+    device = SimpleNamespace(type="cuda", index=0)
+
+    def make_device(value):
+        assert value == "cuda:0"
+        return device
+
+    torch.device = make_device
     torch.bfloat16 = "bf16"
     torch.zeros = lambda shape, **kwargs: tensor
     torch.isfinite = lambda _: SimpleNamespace(
@@ -523,11 +531,17 @@ def test_beta7_requires_a_working_sparse_cuda_kernel(tmp_path, monkeypatch, capl
         calls.append("kernel")
         if mode == "broken":
             raise RuntimeError("private details must not escape")
+        if mode == "wrong_shape":
+            return SimpleNamespace(shape=(1, 64, 1, 128))
         return tensor
 
-    kitchen = SimpleNamespace(
-        sol_attn_is_available=lambda _: mode != "unavailable", sol_attn=kernel
-    )
+    def available(selected_device):
+        # Kitchen 0.2.36 reads device.type; an integer index is not its API.
+        assert selected_device is device
+        assert selected_device.type == "cuda" and selected_device.index == 0
+        return mode != "unavailable"
+
+    kitchen = SimpleNamespace(sol_attn_is_available=available, sol_attn=kernel)
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "comfy_kitchen", kitchen)
     caplog.set_level(logging.INFO, logger="gen_automation.i2v_worker.supervisor")
@@ -541,6 +555,13 @@ def test_beta7_requires_a_working_sparse_cuda_kernel(tmp_path, monkeypatch, capl
         assert "status=passed" not in caplog.text
     if mode == "unavailable":
         assert calls == []
+        assert "reason_code=vsa_kernel_unavailable" in caplog.text
+        assert "error_type=ValueError" in caplog.text
+    elif mode != "ok":
+        assert calls == ["kernel"]
+        assert "reason_code=vsa_kernel_probe_failed" in caplog.text
+        expected_error = "RuntimeError" if mode == "broken" else "ValueError"
+        assert f"error_type={expected_error}" in caplog.text
     assert "private details" not in caplog.text
 
 
