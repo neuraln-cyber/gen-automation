@@ -111,7 +111,7 @@ const src=fs.readFileSync('src/gen_automation/static/i2v.js','utf8');
 const field={name:'h3_latent_contrast',type:'number',value:'1',disabled:false};
 const h3ModelVariant='__VARIANT__';
 const ctx=vm.createContext({isH3:true,h3ModelVariant,erosBeta7:h3ModelVariant==='eros_beta7',
- h3AdvancedSamplingEnabled:true,
+ h3AdvancedSamplingEnabled:true,lokken:false,
  workerSettingDefaults:{profile:'minimax_h3',h3_latent_contrast:1},
  state:{loraSelections:new Map(),loraCatalog:[]},loraWriteBlocked:()=>false,
  loraList:{querySelectorAll:()=>[]},root:{querySelector:()=>null},CSS:{escape:x=>x},

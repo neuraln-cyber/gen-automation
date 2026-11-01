@@ -5,6 +5,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from gen_automation.i2v_worker.h3_lokken import (
+    LOKKEN_UPSCALER_BYTES,
+    LOKKEN_UPSCALER_FILENAME,
+    LOKKEN_UPSCALER_ROLE,
+    LOKKEN_UPSCALER_SHA256,
+)
 from gen_automation.i2v_worker.h3_upscale import (
     H3_UPSCALER_BYTES,
     H3_UPSCALER_FILENAME,
@@ -77,6 +83,15 @@ def validated_i2v_manifest_objects(
             or upscaler.get("key") != f"worker/i2v/sha256/{H3_UPSCALER_SHA256}"
         ):
             raise ValueError("I2V private model manifest has an invalid H3 upscaler")
+    if profile == "minimax_h3" and LOKKEN_UPSCALER_ROLE in by_role:
+        upscaler = by_role[LOKKEN_UPSCALER_ROLE]
+        if (
+            upscaler.get("target_filename") != LOKKEN_UPSCALER_FILENAME
+            or upscaler.get("bytes") != LOKKEN_UPSCALER_BYTES
+            or upscaler.get("sha256") != LOKKEN_UPSCALER_SHA256
+            or upscaler.get("key") != f"worker/i2v/sha256/{LOKKEN_UPSCALER_SHA256}"
+        ):
+            raise ValueError("I2V private model manifest has an invalid Lokken upscaler")
     if reviewed_loras_enabled:
         for role in REQUIRED_LORA_ROLES:
             value = by_role[role]

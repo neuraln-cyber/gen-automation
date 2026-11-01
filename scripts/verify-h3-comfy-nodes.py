@@ -4,7 +4,11 @@ import asyncio
 import os
 import sys
 
-from gen_automation.i2v_worker.settings import H3_COMFY_MEMORY_ARGS, H3_CUSTOM_NODES
+from gen_automation.i2v_worker.settings import (
+    H3_COMFY_MEMORY_ARGS,
+    H3_CUSTOM_NODES,
+    H3_LOKKEN_CUSTOM_NODES,
+)
 
 
 def verify_runtime_identity() -> None:
@@ -50,9 +54,10 @@ async def main() -> None:
     # Built-in/custom route registration matches startup, without binding a socket.
     PromptServer(asyncio.get_running_loop(), default_asset_manager())
 
-    # Exercise exactly the allowlist used at runtime, not a separate build list.
+    # Exercise both exact runtime allowlists. Legacy nodes are not loaded by a
+    # Lokken worker; the build also verifies retained historical recipes.
     await nodes.init_builtin_extra_nodes()
-    for directory in H3_CUSTOM_NODES:
+    for directory in (*H3_CUSTOM_NODES, *H3_LOKKEN_CUSTOM_NODES):
         if not await nodes.load_custom_node(f"/opt/comfyui/custom_nodes/{directory}"):
             raise RuntimeError(f"H3 extension failed to import: {directory}")
     from verify_h3_native_workflow import verify_native_workflow
@@ -65,6 +70,9 @@ async def main() -> None:
     from verify_h3_contrast import verify_contrast
 
     verify_contrast(nodes)
+    from verify_h3_lokken_workflow import verify_lokken_workflow
+
+    verify_lokken_workflow(nodes)
     print("Pinned H3 import/API check passed as runtime UID/GID 10002 (CPU, no weights).")
 
 

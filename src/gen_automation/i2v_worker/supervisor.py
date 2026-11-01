@@ -22,6 +22,7 @@ from gen_automation.i2v_worker.face_stabilizer import (
 from gen_automation.i2v_worker.settings import (
     H3_COMFY_MEMORY_ARGS,
     H3_CUSTOM_NODES,
+    H3_LOKKEN_CUSTOM_NODES,
     I2V_CUSTOM_NODES,
     I2VWorkerSettings,
 )
@@ -283,7 +284,7 @@ def _verify_gpu_runtime(settings: I2VWorkerSettings) -> None:
         if vram_bytes < settings.minimum_gpu_vram_bytes:
             reason = "insufficient_vram"
             raise ValueError
-        if settings.h3_model_variant == "eros_beta7":
+        if settings.h3_model_variant in {"eros_beta7", "eros_beta7_lokken"}:
             check = "vsa_kernel"
             reason = "vsa_kernel_unavailable"
             import comfy_kitchen  # type: ignore[import-not-found]
@@ -347,7 +348,13 @@ def _comfy_command(settings: I2VWorkerSettings) -> tuple[str, ...]:
         "--disable-auto-launch",
         "--disable-all-custom-nodes",
         "--whitelist-custom-nodes",
-        *(H3_CUSTOM_NODES if settings.profile == "minimax_h3" else I2V_CUSTOM_NODES),
+        *(
+            H3_LOKKEN_CUSTOM_NODES
+            if settings.h3_model_variant == "eros_beta7_lokken"
+            else H3_CUSTOM_NODES
+            if settings.profile == "minimax_h3"
+            else I2V_CUSTOM_NODES
+        ),
         "--disable-api-nodes",
         "--disable-metadata",
         "--base-directory",

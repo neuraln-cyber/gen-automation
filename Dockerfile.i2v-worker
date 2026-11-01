@@ -55,16 +55,26 @@ RUN go mod download \
         -o /out/salad-http-job-queue-worker \
         ./cmd/salad-http-job-queue-worker
 
+FROM pytorch/pytorch:2.9.1-cuda13.0-cudnn9-runtime@sha256:60f22fb80755fd0b470fb47928dbd55816aa9f847edd95cf43c93253507a9ddf AS h3-import-driver
+# CPU build validation needs the genuine libcuda ABI used by the VFX extension.
+# Extract (do not install) NVIDIA's pinned user-mode library in a separate stage.
+# It is only mounted read-only for imports; no driver/stub enters the worker.
+ADD --checksum=sha256:b0ee4fb1f439e919ca5c5fd7c5cff3e8b8afdbdb0b5ee38f7c09c047ea41a035 --chmod=0444 \
+    https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-compat-13-0_580.196.07-1ubuntu1_amd64.deb \
+    /tmp/h3-import-driver.deb
+RUN dpkg-deb --extract /tmp/h3-import-driver.deb /opt/h3-import-driver-package \
+    && test -r /opt/h3-import-driver-package/usr/local/cuda-13.0/compat/libcuda.so.1
+
 FROM pytorch/pytorch:2.9.1-cuda13.0-cudnn9-runtime@sha256:60f22fb80755fd0b470fb47928dbd55816aa9f847edd95cf43c93253507a9ddf
 
 LABEL org.opencontainers.image.title="gen-automation-native-h3-i2v-worker" \
       org.opencontainers.image.description="Model-free native MiniMax H3 Eros and legacy WAN worker" \
       org.opencontainers.image.source="https://github.com/neuraln-cyber/gen-automation" \
-      org.opencontainers.image.comfyui.revision="73c9bad4d21e7addbe1d13bc92eee0f1431b017d" \
+      org.opencontainers.image.comfyui.revision="6b747c0428c343e1417219641db93a4fb7cb69ae" \
       org.opencontainers.image.runpod-sdk.version="1.11.0"
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    COMFYUI_COMMIT=73c9bad4d21e7addbe1d13bc92eee0f1431b017d \
+    COMFYUI_COMMIT=6b747c0428c343e1417219641db93a4fb7cb69ae \
     VIRTUAL_ENV=/opt/i2v-venv \
     PATH=/opt/i2v-venv/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/opt/conda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -255,6 +265,7 @@ ADD --checksum=sha256:d041f98f4392370b9df7078023b9ebdaa18da812accbb866e1bcda9621
 
 COPY requirements-i2v-face.lock ./requirements-i2v-face.lock
 COPY THIRD_PARTY_LICENSES.md /opt/i2v/licenses/THIRD_PARTY_LICENSES.md
+COPY licenses/AGPL-3.0-only.txt /opt/i2v/licenses/AGPL-3.0-only.txt
 
 RUN /opt/i2v-venv/bin/python -m pip install \
         --require-hashes \
@@ -288,6 +299,13 @@ RUN test -x /usr/local/bin/salad-http-job-queue-worker
 COPY src/gen_automation/__init__.py ./src/gen_automation/__init__.py
 COPY --chmod=0555 scripts/install-h3-native-nodes.sh /opt/i2v/bin/install-h3-native-nodes
 COPY src/gen_automation/i2v_worker/comfy_h3_contrast_entrypoint.py /opt/i2v/bin/h3-contrast-entrypoint.py
+COPY src/gen_automation/i2v_worker/comfy_h3_lokken_upscale_entrypoint.py /opt/i2v/bin/h3-lokken-upscale-entrypoint.py
+COPY requirements-i2v-rtx.lock /opt/i2v/requirements-i2v-rtx.lock
+RUN /opt/i2v-venv/bin/python -m pip install --only-binary=:all: --require-hashes --no-deps \
+    -r /opt/i2v/requirements-i2v-rtx.lock
+# glibc reads this at process startup. The wheel's Python-time environment edit
+# cannot resolve its ELF dependencies. Keep injected provider driver paths first.
+ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/opt/i2v-venv/lib/python3.11/site-packages/nvvfx/libs:/opt/i2v-venv/lib/python3.11/site-packages/nvidia_vfx.libs
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends git \
     && /opt/i2v/bin/install-h3-native-nodes \
@@ -297,6 +315,10 @@ RUN apt-get update \
 LABEL org.opencontainers.image.h3-upscaler.revision="fe6658f6d144066f14150d3526247b417683ff2b" \
       org.opencontainers.image.h3-contrast.revision="895e3c471164423f0ea0e8eaf45eb701efe641ae" \
       org.opencontainers.image.h3-workflow.revision="e7cd011d4ded3411c2f481200544f0be6fdc962e"
+LABEL org.opencontainers.image.lokken-workflow.revision="f2dd2b315ea27c0a340ba7f3e03ef078e4753c28" \
+      org.opencontainers.image.lokken-upscaler.revision="40316cf008b2fd8663263270669eb4da23f89d2c" \
+      org.opencontainers.image.lokken-postprocessing.revision="0f2eeb3c15e9bf04dff57aa915c8016ef92317ca" \
+      org.opencontainers.image.nvidia-vfx-nodes.revision="38d790ded00650681fa3645362efe28c8560cf40"
 
 COPY src/gen_automation/domain/__init__.py ./src/gen_automation/domain/__init__.py
 COPY src/gen_automation/domain/private_delivery.py ./src/gen_automation/domain/private_delivery.py
@@ -306,6 +328,7 @@ COPY scripts/verify-h3-comfy-nodes.py /opt/i2v/bin/verify-h3-comfy-nodes.py
 COPY scripts/verify_h3_native_workflow.py /opt/i2v/bin/verify_h3_native_workflow.py
 COPY scripts/verify_h3_eros_workflow.py /opt/i2v/bin/verify_h3_eros_workflow.py
 COPY scripts/verify_h3_contrast.py /opt/i2v/bin/verify_h3_contrast.py
+COPY scripts/verify_h3_lokken_workflow.py /opt/i2v/bin/verify_h3_lokken_workflow.py
 COPY --chmod=0555 scripts/i2v-runpod-entrypoint.sh /opt/i2v/bin/i2v-runpod-entrypoint
 COPY workflows/dasiwa-wan22-i2v-v1.api.json ./workflows/dasiwa-wan22-i2v-v1.api.json
 COPY workflows/minimax-h3-native-i2v.api.json ./workflows/minimax-h3-native-i2v.api.json
@@ -317,6 +340,9 @@ ADD --checksum=sha256:34ee39544808fd3b0dc8de9df082940d4d41c3771beb80d3988c1ea553
     https://raw.githubusercontent.com/Comfy-Org/workflow_templates/e7cd011d4ded3411c2f481200544f0be6fdc962e/templates/video_minimax_h3_i2v.json \
     /opt/i2v/reference/h3-native-i2v.json
 RUN chmod 0755 /opt/i2v/reference
+ADD --checksum=sha256:d0273aff260458898adb07d984be701d14aef9892303c98da84e83e362a4623d --chmod=0444 \
+    https://huggingface.co/LokkenJP/TenEros_Max_optimized_learned/resolve/f2dd2b315ea27c0a340ba7f3e03ef078e4753c28/SampleWorkFlowTwoPassOptimized/H3_Turbo_2Pass_ErosMax_b7_simple_v5.json \
+    /opt/i2v/reference/lokken-simple-v5.json
 
 RUN groupadd --system --gid 10002 i2v-worker \
     && useradd \
@@ -351,8 +377,15 @@ RUN command -v find \
 
 # Exercise the real imports after final filesystem setup, with the same identity
 # and privilege drop as Salad startup. A root-only smoke test hides permission bugs.
-RUN setpriv --reuid 10002 --regid 10002 --init-groups --no-new-privs \
+# The real VFX extension is imported, not mocked/skipped. This is an import/API
+# check only: no GPU device, kernel driver, model execution or RTX invocation.
+RUN --mount=type=bind,from=h3-import-driver,source=/opt/h3-import-driver-package/usr/local/cuda-13.0/compat,target=/opt/h3-import-driver,readonly \
+    LD_LIBRARY_PATH="/opt/h3-import-driver:${LD_LIBRARY_PATH}" \
+    setpriv --reuid 10002 --regid 10002 --init-groups --no-new-privs \
     /opt/i2v-venv/bin/python /opt/i2v/bin/verify-h3-comfy-nodes.py
+RUN test ! -e /opt/h3-import-driver/libcuda.so.1 \
+    && test ! -e /opt/h3-import-driver-package \
+    && test ! -e /usr/local/cuda-13.0/compat/libcuda.so.1
 
 USER 0:0
 

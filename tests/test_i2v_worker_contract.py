@@ -517,10 +517,11 @@ def test_image_is_model_free_pinned_and_non_root() -> None:
         "FROM golang:1.26.9-alpine@sha256:"
         "3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade"
         " AS salad-queue-worker-builder",
+        f"FROM {pytorch_image} AS h3-import-driver",
         f"FROM {pytorch_image}",
     ]
     assert all("@sha256:" in line for line in from_lines)
-    assert "73c9bad4d21e7addbe1d13bc92eee0f1431b017d" in dockerfile
+    assert "6b747c0428c343e1417219641db93a4fb7cb69ae" in dockerfile
     assert "ef8a641be08983cf5f06669f70719b6eecce3c7f" in dockerfile
     assert "https://github.com/ChenDarYen/ComfyUI-NAG.git" in dockerfile
     assert "ARG COMFYUI_NAG_COMMIT=ef8a641be08983cf5f06669f70719b6eecce3c7f" in dockerfile
@@ -635,12 +636,40 @@ def test_creator_package_is_traversable_and_real_imports_run_as_runtime_user() -
     assert 'find "$target" -type f -exec chmod 0444 {} +' in installer
     assert "install-h3-native-nodes" in dockerfile
     check = (
-        "RUN setpriv --reuid 10002 --regid 10002 --init-groups --no-new-privs \\\n"
+        "    setpriv --reuid 10002 --regid 10002 --init-groups --no-new-privs \\\n"
         "    /opt/i2v-venv/bin/python /opt/i2v/bin/verify-h3-comfy-nodes.py"
     )
     assert check in dockerfile
     assert dockerfile.index(check) > dockerfile.index("chmod --recursive go-rwx")
     assert "RUN /opt/i2v-venv/bin/python /opt/i2v/bin/verify-h3-comfy-nodes.py" not in dockerfile
+
+
+def test_vfx_uses_vendor_libraries_but_never_ships_the_build_only_driver() -> None:
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    assert (
+        "--checksum=sha256:b0ee4fb1f439e919ca5c5fd7c5cff3e8b8afdbdb0b5ee38f7c09c047ea41a035"
+        in dockerfile
+    )
+    assert "cuda-compat-13-0_580.196.07-1ubuntu1_amd64.deb" in dockerfile
+    assert "dpkg-deb --extract" in dockerfile
+    assert "dpkg --install" not in dockerfile
+    assert "COPY --from=h3-import-driver" not in dockerfile
+    assert "target=/opt/h3-import-driver,readonly" in dockerfile
+    assert 'LD_LIBRARY_PATH="/opt/h3-import-driver:${LD_LIBRARY_PATH}"' in dockerfile
+    runtime_ld = next(
+        line for line in dockerfile.splitlines() if line.startswith("ENV LD_LIBRARY_PATH=")
+    )
+    assert runtime_ld == (
+        "ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:"
+        "/opt/i2v-venv/lib/python3.11/site-packages/nvvfx/libs:"
+        "/opt/i2v-venv/lib/python3.11/site-packages/nvidia_vfx.libs"
+    )
+    assert "RUN test ! -e /opt/h3-import-driver/libcuda.so.1" in dockerfile
+    assert "&& test ! -e /opt/h3-import-driver-package" in dockerfile
+    assert "&& test ! -e /usr/local/cuda-13.0/compat/libcuda.so.1" in dockerfile
+    check = (ROOT / "scripts/verify-h3-comfy-nodes.py").read_text()
+    assert "(*H3_CUSTOM_NODES, *H3_LOKKEN_CUSTOM_NODES)" in check
+    assert 'raise RuntimeError(f"H3 extension failed to import: {directory}")' in check
 
 
 @pytest.mark.parametrize("uid,gid", [(0, 0), (0, 10002), (10002, 0), (10002, 10002)])

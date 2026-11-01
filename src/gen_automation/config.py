@@ -34,6 +34,7 @@ from gen_automation.i2v_worker.h3_variants import (
     H3Variant,
     h3_eros_beta7_models_match,
     h3_eros_models_match,
+    h3_lokken_models_match,
     h3_manifest_matches_variant,
     h3_native_models_match,
 )
@@ -1167,6 +1168,11 @@ class Settings(BaseSettings):
                                 and not h3_eros_beta7_models_match(manifest_objects)
                             ):
                                 errors.append("Eros Beta 7 requires the exact reviewed model set")
+                            if self.i2v_profile == "minimax_h3" and (
+                                self.i2v_h3_model_variant == "eros_beta7_lokken"
+                                and not h3_lokken_models_match(manifest_objects)
+                            ):
+                                errors.append("Lokken requires the exact reviewed HQ model set")
                             if self.i2v_profile == "minimax_h3" and (
                                 self.i2v_h3_model_variant == "fl2va_int8"
                                 and not h3_native_models_match(manifest_objects)

@@ -3,7 +3,23 @@
 from collections.abc import Mapping
 from typing import Literal
 
-H3Variant = Literal["turbo_v2", "hybrid_v2", "fl2va_int8", "eros_beta5", "eros_beta7"]
+from gen_automation.i2v_worker.h3_lokken import (
+    LOKKEN_BYTES,
+    LOKKEN_ENCODER_BYTES,
+    LOKKEN_ENCODER_FILENAME,
+    LOKKEN_ENCODER_SHA256,
+    LOKKEN_FILENAME,
+    LOKKEN_SHA256,
+    LOKKEN_UPSCALER_BYTES,
+    LOKKEN_UPSCALER_FILENAME,
+    LOKKEN_UPSCALER_ROLE,
+    LOKKEN_UPSCALER_SHA256,
+    LOKKEN_VARIANT,
+)
+
+H3Variant = Literal[
+    "turbo_v2", "hybrid_v2", "fl2va_int8", "eros_beta5", "eros_beta7", "eros_beta7_lokken"
+]
 H3_TURBO_V2_SHA256 = "37c17fd91971c17e02e60798a05eec48d881e1bb970d6309f58cf134a2d03a6b"
 H3_EROS_SHA256 = "4dd965496e5b1b83cd13c65cbe7a535b8a4d94ae768a7646b4e336d52c4781cf"
 H3_EROS_BYTES = 20970414464
@@ -42,6 +58,28 @@ H3_EROS_BETA7_MODELS = {
     **H3_NATIVE_MODELS,
     "diffusion_model": (H3_EROS_BETA7_SHA256, H3_EROS_BETA7_BYTES, H3_EROS_BETA7_FILENAME),
 }
+H3_LOKKEN_MODELS = {
+    **H3_NATIVE_MODELS,
+    "diffusion_model": (LOKKEN_SHA256, LOKKEN_BYTES, LOKKEN_FILENAME),
+    "text_encoder": (LOKKEN_ENCODER_SHA256, LOKKEN_ENCODER_BYTES, LOKKEN_ENCODER_FILENAME),
+    LOKKEN_UPSCALER_ROLE: (
+        LOKKEN_UPSCALER_SHA256,
+        LOKKEN_UPSCALER_BYTES,
+        LOKKEN_UPSCALER_FILENAME,
+    ),
+}
+
+
+def h3_lokken_models_match(objects: Mapping[str, Mapping[str, object]]) -> bool:
+    return all(
+        (
+            objects.get(role, {}).get("sha256"),
+            objects.get(role, {}).get("bytes"),
+            objects.get(role, {}).get("target_filename"),
+        )
+        == identity
+        for role, identity in H3_LOKKEN_MODELS.items()
+    )
 
 
 def h3_eros_models_match(objects: Mapping[str, Mapping[str, object]]) -> bool:
@@ -91,6 +129,12 @@ def h3_job_matches_variant(settings: Mapping[str, object], variant: str) -> bool
 
 
 def h3_manifest_matches_variant(model: Mapping[str, object], variant: str) -> bool:
+    if variant == LOKKEN_VARIANT:
+        return (
+            model.get("sha256") == LOKKEN_SHA256
+            and model.get("bytes") == LOKKEN_BYTES
+            and model.get("target_filename") == LOKKEN_FILENAME
+        )
     if variant == "eros_beta7":
         return (
             model.get("sha256") == H3_EROS_BETA7_SHA256

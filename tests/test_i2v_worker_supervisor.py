@@ -348,7 +348,14 @@ def test_h3_memory_policy_is_isolated_and_does_not_reduce_generation_settings(
     monkeypatch.setenv("PYTORCH_ALLOC_CONF", "backend:cudaMallocAsync")
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
     legacy = _settings(tmp_path)
-    h3 = legacy.model_copy(update={"profile": "minimax_h3"})
+    from tests.test_h3_eros_beta7 import worker_objects
+
+    h3 = legacy.model_copy(
+        update={
+            "profile": "minimax_h3",
+            "model_objects_json": SecretStr(json.dumps(worker_objects())),
+        }
+    )
     command = _comfy_command(h3)
     assert command[command.index("--reserve-vram") + 1] == "8"
     assert command[command.index("--vram-headroom") + 1] == "4"

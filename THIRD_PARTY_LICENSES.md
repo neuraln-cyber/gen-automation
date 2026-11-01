@@ -1,8 +1,59 @@
 # Third-party notices for I2V extensions
 
+## Lokken two-pass workflow (new jobs only)
+
+- Workflow and HQ weights: <https://huggingface.co/LokkenJP/TenEros_Max_optimized_learned/tree/f2dd2b315ea27c0a340ba7f3e03ef078e4753c28>.
+  The simple-v5 graph is adapted into the application's API graph. It is not the
+  experimental continuation/refmods workflow and is not a `beta7fixed` release.
+  MiniMax's model terms remain separate from the code licenses.
+- 3D latent upscaler code: LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler,
+  revision `40316cf008b2fd8663263270669eb4da23f89d2c`, MIT. Complete original
+  source and LICENSE remain in `GenAutomationH3LokkenUpscale`; our entrypoint
+  exposes only the unchanged 3D implementation. FP16 weights are delivered by
+  the existing private manifest/CloudFront path, not embedded in the image.
+- RTX nodes: Comfy-Org/ComfyUI_Nvidia_VFX_Nodes,
+  revision `38d790ded00650681fa3645362efe28c8560cf40`, Apache-2.0.
+  The separate `nvidia-vfx==0.2.0.0` runtime is NVIDIA proprietary software,
+  NOT Apache/MIT-licensed. Its software, AI-product, open-model and third-party
+  license texts remain in the wheel's installed distribution metadata.
+- Post-processing: LordLocksley/ComfyUI-Lokken-VideoTools,
+  revision `0f2eeb3c15e9bf04dff57aa915c8016ef92317ca`. The backend is unmodified.
+  GPL-3.0-or-later applies to Elvax-derived/Lokken code; AGPL-3.0-only applies
+  to the Fast Film Grain-derived portion. These are combined obligations,
+  not a choice of permissive license. Full original sources, `LICENSE`,
+  `LICENSE-AGPL-3.0.txt`, `NOTICE.md` and attribution are retained in the image.
+  No RIFE code/weights are bundled or requested: interpolation is disabled.
+
+Corresponding upstream source and notices are available at
+<https://github.com/LordLocksley/ComfyUI-Lokken-VideoTools/tree/0f2eeb3c15e9bf04dff57aa915c8016ef92317ca>.
+The integration, installation scripts and exact dependency locks are available
+in this public repository at the worker's immutable source revision. The studio
+links both sources. Preserve access to these exact sources and all applicable
+license notices when redistributing or hosting this integration. This notice
+does not relicense NVIDIA binaries or model weights under the node licenses.
+
+The new Lokken recipe adapter (`i2v_worker/h3_lokken.py`) and narrow 3D-node
+entrypoint (`i2v_worker/comfy_h3_lokken_upscale_entrypoint.py`) are provided under
+AGPL-3.0-only; the complete terms are in `licenses/AGPL-3.0-only.txt`. They are
+provided without warranty. The upstream grain/encoder implementation is not
+modified. Its original combined GPL/AGPL terms and attribution remain intact.
+This scoped grant does not silently relicense unrelated application code.
+The source link in the studio binds to the configured immutable worker revision,
+including the installation scripts and locks needed to reproduce that build.
+
 The optional `stable_expression` face stabilizer includes the following pinned
 components in the immutable I2V worker image. The complete license texts shipped
 by `anime-face-detector` are preserved in `/opt/i2v/vendor` inside that image.
+
+## Build-only CUDA native import dependency
+
+The CPU-only native-import build stage also extracts NVIDIA's proprietary
+`cuda-compat-13-0` 580.196.07-1ubuntu1 from its official Ubuntu22.04 repository,
+SHA-256 `b0ee4fb1f439e919ca5c5fd7c5cff3e8b8afdbdb0b5ee38f7c09c047ea41a035`.
+Its original copyright/license files remain in that build stage. It is used
+only through a temporary read-only build mount, not installed, redistributed
+in the final worker or used to override the provider driver. This is real ABI
+import validation without GPU execution, not a hardware compatibility claim.
 
 ## anime-face-detector
 

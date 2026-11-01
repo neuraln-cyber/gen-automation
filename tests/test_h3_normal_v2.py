@@ -263,7 +263,7 @@ const saved=new Map([["old",JSON.stringify(old)]]);
 const elements={positive_prompt:{},negative_prompt:{},batch_count:{}};
 let applied;
 const context=vm.createContext({JSON,form:{elements},draftKey:"new",legacyDraftKey:"old",isH3:true,
-  h3AdvancedSamplingEnabled:true,h3ModelVariant:"hybrid_v2",
+  h3AdvancedSamplingEnabled:true,h3ModelVariant:"hybrid_v2",lokken:false,
   h3SamplingDefaults:{steps:20,cfg:1,video_shift:12,sampler:"res_multistep",scheduler:"simple"},
   draftState:{},localStorage:{getItem:k=>saved.get(k),
     removeItem:()=>assert.fail("must preserve draft")},applySettings:v=>applied=v});

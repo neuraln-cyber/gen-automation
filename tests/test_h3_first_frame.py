@@ -135,7 +135,8 @@ const assert=require("node:assert/strict"), fs=require("node:fs"), vm=require("n
 const source=fs.readFileSync("src/gen_automation/static/i2v.js", "utf8");
 const fields={h3_image_mode:{},h3_attention_backend:{},h3_refine_steps:{},seed:{}};
 let selected, handler, saved=0, errorMessage;
-const context=vm.createContext({window:{},isH3:true,h3ModelVariant:"eros_beta5",erosBeta7:false,
+const context=vm.createContext({window:{},isH3:true,h3ModelVariant:"eros_beta5",
+  erosBeta7:false,lokken:false,
   CSS:{escape:s=>s},
   workerSettingDefaults:{h3_refine_steps:4,h3_loras:[],seed:-1},
   advanced:{querySelector:s=>fields[s.match(/name="(.+)"/)[1]]},

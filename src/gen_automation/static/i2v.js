@@ -17,7 +17,9 @@
   const h3DiagnosticsEnabled = root.dataset.h3DiagnosticsEnabled === "true";
   const h3FirstFrameEnabled = root.dataset.h3FirstFrameEnabled === "true";
   const erosAuthorRecipe = isH3 && h3ModelVariant === "eros_beta5" && root.dataset.erosAuthorRecipe === "true";
-  const erosBeta7 = isH3 && h3ModelVariant === "eros_beta7";
+  const lokken = isH3 && h3ModelVariant === "eros_beta7_lokken";
+  const erosBeta7 = isH3 && ["eros_beta7", "eros_beta7_lokken"].includes(h3ModelVariant);
+  const lokkenDefaults = {base_megapixels: 0.3, target_megapixels: 1, rtx_scale: 1.2, grain_strength: 0.005, encoder_preset: "medium"};
   const maxImageBytes = Number(root.dataset.maxImageBytes || 0);
   const scope = document.body.dataset.automationStorageScope || "operator";
   const legacyDraftKey = `i2v-draft-v2:${videoProfile}:${scope}`;
@@ -107,9 +109,16 @@
     steps: 6, sampler: "er_sde", scheduler: "beta57", h3_attention_backend: "comfy_kitchen",
   });
   if (erosBeta7) h3SamplingDefaults.h3_attention_backend = "comfy_kitchen";
+  if (lokken) Object.assign(h3SamplingDefaults, {
+    steps: 8, video_shift: 12, audio_shift: 3, h3_image_mode: "first_frame",
+    h3_latent_contrast: 1, h3_lokken: {...lokkenDefaults},
+  });
   if (isH3 && ["eros_beta5", "eros_beta7"].includes(h3ModelVariant)) h3SamplingDefaults.h3_latent_contrast = 1;
   if (isH3 && h3AdvancedSamplingEnabled) Object.assign(workerSettingDefaults, h3SamplingDefaults);
   if (isH3 && ["eros_beta5", "eros_beta7"].includes(h3ModelVariant)) Object.assign(workerSettingDefaults, {width: 768, height: 1344});
+  if (lokken) Object.assign(workerSettingDefaults, h3SamplingDefaults, {
+    width: 768, height: 1344, h3_model_variant: h3ModelVariant,
+  });
   let saveTimer = null;
 
   const q = (selector) => root.querySelector(selector);
@@ -392,10 +401,17 @@
     if (resolutionError) throw new Error(resolutionError);
     const numbers = new Set(["frame_count", "fps", "width", "height", "seed", "steps", "high_end_step", "cfg", "high_shift", "low_shift", "loop_count", "video_shift", "audio_shift", "h3_denoise", "h3_refine_steps", "h3_refine_cfg", "h3_refine_denoise", "h3_latent_contrast"]);
     advanced.querySelectorAll("input[name], select[name]").forEach((field) => {
+      if (field.name.startsWith("lokken_")) return;
       if (field.type === "checkbox") settings[field.name] = field.checked;
       else if (numbers.has(field.name)) settings[field.name] = Number(field.value);
       else settings[field.name] = field.value;
     });
+    if (lokken) {
+      settings.h3_lokken = Object.fromEntries(Object.keys(lokkenDefaults).map((name) => [
+        name, name === "encoder_preset" ? form.elements[`lokken_${name}`].value
+          : Number(form.elements[`lokken_${name}`].value),
+      ]));
+    }
     const authorization = root.querySelector("#i2v-runpod-authorization");
     settings.runpod_authorization = authorization?.checked ? "written_permission" : "sfw";
     if (isH3) {
@@ -418,6 +434,11 @@
 
   function applySettings(settings = {}) {
     const resolved = { ...workerSettingDefaults, ...settings };
+    if (lokken) {
+      Object.entries({...lokkenDefaults, ...resolved.h3_lokken}).forEach(([name, value]) => {
+        form.elements[`lokken_${name}`].value = String(value);
+      });
+    }
     // Reusing a saved snapshot without the new field keeps its historical mode.
     if (isH3 && ["eros_beta5", "eros_beta7"].includes(h3ModelVariant)) {
       resolved.h3_image_mode = settings.h3_image_mode || "reference";
@@ -472,6 +493,32 @@
   }
 
   function syncAspectControls() {
+    if (lokken) {
+      const automatic = Boolean(form.elements.match_source_aspect.checked);
+      form.elements.width.disabled = automatic;
+      form.elements.height.disabled = automatic;
+      form.elements.match_source_resolution.checked = false;
+      form.elements.match_source_resolution.disabled = true;
+      const w = automatic ? state.selected?.sourceWidth : Number(form.elements.width.value);
+      const h = automatic ? state.selected?.sourceHeight : Number(form.elements.height.value);
+      if (!(w > 0 && h > 0)) return;
+      // Python round/Comfy use ties-to-even, unlike JavaScript Math.round.
+      const evenRound = (v) => v % 1 === 0.5 ? 2 * Math.round(v / 2) : Math.round(v);
+      const canvas = (width, height, mp) => {
+        const th = Math.sqrt(mp * 1024 * 1024 / (width / height));
+        return [Math.max(32, evenRound(th * width / height / 32) * 32), Math.max(32, evenRound(th / 32) * 32)];
+      };
+      const base = canvas(w, h, Number(form.elements.lokken_base_megapixels.value));
+      const refine = canvas(...base, Number(form.elements.lokken_target_megapixels.value));
+      const scale = Number(form.elements.lokken_rtx_scale.value);
+      const out = refine.map((v) => Math.max(8, evenRound(Math.trunc(v * scale) / 8) * 8));
+      if (automatic) {
+        form.elements.width.value = String(w);
+        form.elements.height.value = String(h);
+      }
+      q("[data-resolution-summary]").textContent = `Base ${base.join(" × ")} → 3D upscale/refinement ${refine.join(" × ")} → RTX output ${out.join(" × ")} · first-pass audio, 24 fps.`;
+      return;
+    }
     const modeSummary = q("[data-image-mode-summary]");
     if (modeSummary) modeSummary.textContent = form.elements.h3_image_mode?.value === "first_frame"
       ? "Optional native reference + frame-zero guide. This extension is not an Eros-author recommended recipe; later frames can still change."
@@ -884,7 +931,9 @@
       const modelChanged = isH3 && (draft.settings?.h3_model_variant || "turbo_v2") !== h3ModelVariant;
       const cleanEros = modelChanged && ["eros_beta5", "eros_beta7"].includes(h3ModelVariant);
       applySettings(cleanEros ? { ...workerSettingDefaults, h3_model_variant: h3ModelVariant }
-        : modelChanged ? { ...draft.settings, ...h3SamplingDefaults, h3_model_variant: h3ModelVariant } : (draft.settings || {}));
+        : modelChanged ? { ...draft.settings, ...h3SamplingDefaults, h3_model_variant: h3ModelVariant,
+          ...(lokken ? {match_source_resolution: false, h3_save_base_video: false, h3_refine_sampler: null} : {}),
+        } : (draft.settings || {}));
       if (modelChanged) draftState.textContent = cleanEros
         ? "Eros defaults loaded. Prompts preserved; select LoRAs explicitly for this model. The old model draft remains saved."
         : "New checkpoint: creator sampling defaults loaded. Your prompts and LoRAs were preserved; the old draft remains saved.";
@@ -1164,7 +1213,9 @@
   q("[data-h3-defaults]")?.addEventListener("click", () => {
     applySettings({ ...collectSettings(), ...h3SamplingDefaults });
     scheduleDraftSave();
-    announce("Creator sampling defaults restored; prompts, LoRAs, seed and dimensions unchanged.");
+    announce(lokken
+      ? "Lokken recipe defaults restored, including MP targets and post-processing. Prompts, LoRAs, seed, duration and chosen aspect are unchanged."
+      : "Creator sampling defaults restored; prompts, LoRAs, seed and dimensions unchanged.");
   });
   q("[data-h3-contrast-reset]")?.addEventListener("click", () => {
     form.elements.h3_latent_contrast.value = "1";
@@ -1190,7 +1241,8 @@
     if (event.target.name === "match_source_resolution" && !event.target.checked) {
       form.elements.match_source_aspect.checked = true;
     }
-    if (["match_source_aspect", "match_source_resolution", "h3_image_mode", "h3_refine_steps", "h3_refine_cfg", "h3_refine_denoise"].includes(event.target.name)) syncAspectControls();
+    if (["match_source_aspect", "match_source_resolution", "h3_image_mode", "h3_refine_steps", "h3_refine_cfg", "h3_refine_denoise"].includes(event.target.name)
+      || (lokken && ["width", "height", "lokken_base_megapixels", "lokken_target_megapixels", "lokken_rtx_scale"].includes(event.target.name))) syncAspectControls();
     if (["frame_count", "fps", "loop", "loop_count", "face_fidelity"].includes(event.target.name)) updateDuration();
     if (event.target.name === "positive_prompt") syncLoraPromptPreview();
     scheduleDraftSave();

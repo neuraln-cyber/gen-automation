@@ -49,6 +49,7 @@ async def dashboard_i2v(request: Request, principal: ReleaseReader) -> Response:
             ),
             "video_profile": settings.i2v_profile,
             "h3_model_variant": settings.i2v_h3_model_variant,
+            "worker_source_revision": settings.i2v_worker_source_revision,
             "h3_advanced_sampling_enabled": settings.i2v_h3_advanced_sampling_enabled,
             "h3_samplers": H3_SAMPLERS,
             "h3_schedulers": (

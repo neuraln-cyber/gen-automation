@@ -24,11 +24,11 @@ def verify_native_workflow(nodes, template_path=None, reference_path=None):
     import comfyui_version
     import torch
 
-    assert comfyui_version.__version__ == "0.37.0"
+    assert comfyui_version.__version__ == "0.38.0"
     assert torch.__version__.split("+")[0] == "2.9.1"
     for package, expected in (
         ("comfyui-frontend-package", "1.53.6"),
-        ("comfy-kitchen", "0.2.35"),
+        ("comfy-kitchen", "0.2.36"),
         ("comfy-aimdo", "0.5.5"),
     ):
         assert version(package) == expected, package

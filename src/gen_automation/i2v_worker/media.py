@@ -171,6 +171,14 @@ def resolve_generation_settings(
             raise MediaError(str(error)) from None
     if not settings.match_source_aspect:
         return settings
+    if settings.h3_model_variant == "eros_beta7_lokken":
+        if settings.h3_lokken is None:
+            raise MediaError("Lokken recipe is missing")
+        # These fields describe aspect, not the base tensor size. Rounding to
+        # the MP grid here and again in lokken_geometry changes some aspects.
+        return GenerationSettings.model_validate(
+            {**settings.model_dump(), "width": source_width, "height": source_height}
+        )
     width, height = (
         _eros_source_dimensions(source_width, source_height)
         if settings.profile == "minimax_h3"
@@ -421,6 +429,12 @@ def finalize_native_video(
     if len(paths) != 1 or paths[0].suffix.lower() != ".mp4":
         raise MediaError("native video output is invalid")
     output_width, output_height = settings.width, settings.height
+    lokken = None
+    if settings.h3_model_variant == "eros_beta7_lokken":
+        from gen_automation.i2v_worker.h3_lokken import lokken_geometry
+
+        lokken = lokken_geometry(settings)
+        output_width, output_height = lokken.output_width, lokken.output_height
     # Native ComfyUI H264 may omit SAR entirely. Keep the encoded pictures,
     # but explicitly signal square pixels in the bitstream before validation.
     # This also covers the diagnostic base clip and exact-canvas final exports;
@@ -469,9 +483,7 @@ def finalize_native_video(
                 "0:a:0",
                 *video_args,
                 "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
+                *(("copy",) if lokken is not None else ("aac", "-b:a", "192k")),
                 "-map_metadata",
                 "-1",
                 "-movflags",
@@ -499,19 +511,25 @@ def finalize_native_video(
         if settings.match_source_resolution
         else (settings.width, settings.height)
     )
+    if lokken is not None:
+        base_width, base_height = lokken.base_width, lokken.base_height
     metadata.update(
         {
             "native_width": base_width,
             "native_height": base_height,
             "upscale": (
-                "h3_latent_refine"
+                "lokken_3d_refine_rtx"
+                if lokken is not None
+                else "h3_latent_refine"
                 if (base_width, base_height) != (settings.width, settings.height)
                 else "none"
             ),
             "loop_mode": "none",
             "loop_count": 1,
             "source_fit": (
-                "native_reference_match"
+                "native_reference_and_two_pass_center_crop_guides"
+                if lokken is not None
+                else "native_reference_match"
                 if settings.h3_model_variant in {"eros_beta5", "eros_beta7"}
                 else "source_keyframe_edge_pad_crop"
                 if settings.match_source_resolution

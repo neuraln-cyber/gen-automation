@@ -30,8 +30,15 @@ from gen_automation.domain.i2v import (
     I2VOutputSnapshot,
 )
 from gen_automation.domain.ids import uuid7
+from gen_automation.i2v_worker.h3_lokken import LOKKEN_RECIPE, lokken_geometry
 from gen_automation.i2v_worker.h3_upscale import h3_base_canvas
-from gen_automation.i2v_worker.models import ModelObject, OutputResult, source_resolution_canvas
+from gen_automation.i2v_worker.media import MediaError, resolve_generation_settings
+from gen_automation.i2v_worker.models import (
+    GenerationSettings,
+    ModelObject,
+    OutputResult,
+    source_resolution_canvas,
+)
 from gen_automation.integrations.runpod.models import JSONValue
 from gen_automation.services.h3_loras import H3LoraUnavailableError, resolve_h3_loras
 from gen_automation.services.i2v import register_i2v_input
@@ -229,6 +236,25 @@ class I2VSignedGrantBuilder:
         output: I2VOutputRegistration,
     ) -> None:
         expected_key = f"{self.output_prefix}/{job.job_id}/{attempt.attempt_id}.mp4"
+        if job.settings_snapshot.get("h3_model_variant") == "eros_beta7_lokken":
+            try:
+                recipe_settings = resolve_generation_settings(
+                    GenerationSettings.model_validate(job.settings_snapshot),
+                    source_width=int(job.input_snapshot["width"]),
+                    source_height=int(job.input_snapshot["height"]),
+                )
+                geometry = lokken_geometry(recipe_settings)
+                if (
+                    (output.width, output.height) != (geometry.output_width, geometry.output_height)
+                    or output.frame_count != recipe_settings.frame_count
+                    or output.fps != recipe_settings.fps
+                    or output.metadata.get("workflow") != LOKKEN_RECIPE
+                ):
+                    raise ValueError
+            except (ValueError, KeyError, TypeError, MediaError):
+                raise I2VMediaConflictError(
+                    "Lokken output does not match the frozen recipe"
+                ) from None
         raw_base = output.metadata.get("h3_base_video")
         if bool(job.settings_snapshot.get("h3_save_base_video")) != (raw_base is not None):
             raise I2VMediaConflictError("diagnostic output does not match this job")

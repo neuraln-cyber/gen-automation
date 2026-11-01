@@ -1,0 +1,50 @@
+{
+  "schema": "gen-automation/i2v-model-sources/v1",
+  "sources": [
+    {
+      "name": "Lokken Eros Beta7 learned HQ W6/INT8",
+      "role": "diffusion_model",
+      "url": "https://huggingface.co/LokkenJP/TenEros_Max_optimized_learned/resolve/f2dd2b315ea27c0a340ba7f3e03ef078e4753c28/10Eros_Max_h3_8stepTURBO_beta7_activation_learned_HQ.safetensors",
+      "expected_bytes": 18691644302,
+      "sha256": "01a696efc96708f3edd15ff20fa3f56068974ba08a1b4c5801cef2bd49600ad7",
+      "target_filename": "10Eros_Max_h3_8stepTURBO_beta7_activation_learned_HQ.safetensors",
+      "optional": false
+    },
+    {
+      "name": "Merserk H3 Qwen3VL 32B INT4 ConvRot encoder",
+      "role": "text_encoder",
+      "url": "https://huggingface.co/Merserk/MiniMax-H3-INT4-ConvRot/resolve/3c167bc916cab6cf3b85b9e3769952757ebb2e5d/qwen3vl_32b_minimax_h3_int4_convrot.safetensors",
+      "expected_bytes": 14952506624,
+      "sha256": "4389571ab5db4180bcae33d13d07855319530f60a85ab0f1061379401a8ef66c",
+      "target_filename": "qwen3vl_32b_minimax_h3_int4_convrot.safetensors",
+      "optional": false
+    },
+    {
+      "name": "MiniMax H3 INT8 video VAE (preserved shared artifact)",
+      "role": "video_vae",
+      "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/bf92c4091e333e69b8ca1998e0a669f15cb0832b/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+      "expected_bytes": 2811065184,
+      "sha256": "52a2c8c73583c86e4f41cdcce3a6ad0ea562987bc0bf3d60a0cef5f5c8e60c0e",
+      "target_filename": "minimax_h3_video_vae_int8_convrot.safetensors",
+      "optional": false
+    },
+    {
+      "name": "MiniMax H3 FP32 audio VAE (preserved shared artifact)",
+      "role": "audio_vae",
+      "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/bf92c4091e333e69b8ca1998e0a669f15cb0832b/vae/minimax_h3_audio_vae_fp32.safetensors",
+      "expected_bytes": 605254808,
+      "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48",
+      "target_filename": "minimax_h3_audio_vae_fp32.safetensors",
+      "optional": false
+    },
+    {
+      "name": "LBH MiniMax H3 3D conv v1 FP16 latent upscaler",
+      "role": "h3_lokken_upscaler",
+      "url": "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/resolve/3f941d5d182014dd5c0a5e16330420ee2d4aa0c6/minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors",
+      "expected_bytes": 690592672,
+      "sha256": "043e5a48e161610ef6c3ea974645220354d06fa618abca15f76d084812eb55c2",
+      "target_filename": "minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors",
+      "optional": false
+    }
+  ]
+}
