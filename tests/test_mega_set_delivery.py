@@ -1030,11 +1030,22 @@ async def test_ambiguous_partial_batch_is_adopted_without_duplicate_uploads(
     assert all(mega.write_counts[item.remote_path] == 1 for item in items)
 
 
-@pytest.mark.parametrize("set_title", ["Yamato", "Yamato - One Piece (SFW)", "My set (PNG)"])
+@pytest.mark.parametrize(
+    ("set_title", "folder"),
+    [
+        ("Yamato", "Yamato"),
+        ("Yamato - One Piece (SFW)", "Yamato - One Piece (SFW)"),
+        ("My set (PNG)", "My set (PNG)"),
+        ("K/DA Firestarter Kai'sa", "K-DA Firestarter Kai'sa [d5ad53720aa2]"),
+        ("K?DA Firestarter Kai'sa", "K-DA Firestarter Kai'sa [b37fffc2a8e6]"),
+        ("..", "Set [5ec1f7e700f3]"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_new_mega_folder_uses_set_title_without_automatic_suffix(
+async def test_set_titles_deliver_to_one_safe_mega_folder(
     derivative_approved_context: ApprovedContext,
     set_title: str,
+    folder: str,
 ) -> None:
     approved = derivative_approved_context
     store, _archive = await _prepare_archive(approved, part_sizes=(2,))
@@ -1050,10 +1061,12 @@ async def test_new_mega_folder_uses_set_title_without_automatic_suffix(
     async with approved.database.sessions() as session:
         delivery = await session.scalar(select(MegaSetDelivery))
         assert delivery is not None
-        assert delivery.remote_folder == f"{_REMOTE_ROOT}/{set_title}"
+        assert delivery.remote_folder == f"{_REMOTE_ROOT}/{folder}"
+        release = await session.get(Release, approved.release_id)
+        assert release is not None and release.title == set_title
     assert set(mega.remote) == {
-        f"{_REMOTE_ROOT}/{set_title}/001.png",
-        f"{_REMOTE_ROOT}/{set_title}/002.png",
+        f"{_REMOTE_ROOT}/{folder}/001.png",
+        f"{_REMOTE_ROOT}/{folder}/002.png",
     }
 
 
