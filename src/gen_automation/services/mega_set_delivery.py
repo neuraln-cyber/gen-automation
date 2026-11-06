@@ -1595,20 +1595,19 @@ def _remote_folder(
     set_name: str,
 ) -> str:
     normalized_name = set_name.strip()
-    if (
-        not normalized_name
-        or len(normalized_name) > 300
-        or normalized_name in {".", ".."}
-        or any(
-            character in normalized_name for character in ("/", "\\", "*", "?", "\0", "\r", "\n")
-        )
-    ):
-        raise MegaSetDeliveryContractError("MEGA set name is not a safe folder component")
+    # A release title is display text. Keep the delivery under its requested root
+    # even when that title contains path separators, wildcards or control bytes.
+    folder_name = re.sub(r"[/\\*?\x00-\x1f\x7f]+", "-", normalized_name)
+    if folder_name != normalized_name or folder_name in {"", ".", ".."} or len(folder_name) > 300:
+        # Distinguish titles that would otherwise collapse onto the same folder.
+        suffix = hashlib.sha256(normalized_name.encode("utf-8")).hexdigest()[:12]
+        stem = folder_name[:280].strip(" .-") or "Set"
+        folder_name = f"{stem} [{suffix}]"
     parts = [
         part
         for part in (
             remote_root.strip("/"),
-            normalized_name,
+            folder_name,
         )
         if part
     ]
