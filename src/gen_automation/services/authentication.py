@@ -784,8 +784,7 @@ class AuthenticationService:
                 _as_utc(browser_session.expires_at),
                 observed_at + timedelta(seconds=self.policy.session_idle_seconds),
             )
-            await session.commit()
-        return AuthenticatedPrincipal(
+        principal = AuthenticatedPrincipal(
             session_id=browser_session.id,
             user_id=user.id,
             username=user.username_normalized,
@@ -801,6 +800,13 @@ class AuthenticationService:
                 else None
             ),
         )
+        # Authentication owns this short transaction, not the downstream handler.
+        # The joined FOR UPDATE locks both the browser session and its user. Leaving
+        # those locks open on the usual (no idle-expiry touch) path serializes every
+        # image, preparation and export request from that user behind the slowest one.
+        # Capture the immutable principal before commit also for expiring sessions.
+        await session.commit()
+        return principal
 
     @staticmethod
     def validate_csrf(

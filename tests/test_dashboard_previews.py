@@ -179,6 +179,41 @@ def test_preview_is_small_private_revalidated_and_raw_master_remains_exact(
     assert "no-store" in raw.headers["cache-control"]
 
 
+def test_preview_returns_database_connection_before_storage_and_rendering(
+    client: TestClient,
+) -> None:
+    class PoolCheckingStore(CountingMemoryObjectStore):
+        async def head(self, key: str, *, version_id: str | None = None) -> ObjectMetadata | None:
+            # Cold and cached previews must not retain the API connection during
+            # storage IO or while queued behind the two-renderer limiter.
+            assert client.app.state.database.engine.pool.checkedout() == 0
+            return await super().head(key, version_id=version_id)
+
+        async def read_bytes(
+            self,
+            key: str,
+            *,
+            max_bytes: int,
+            version_id: str | None = None,
+            etag: str | None = None,
+        ) -> bytes:
+            assert client.app.state.database.engine.pool.checkedout() == 0
+            return await super().read_bytes(
+                key, max_bytes=max_bytes, version_id=version_id, etag=etag
+            )
+
+    store = PoolCheckingStore(bucket="preview-pool-private")
+    client.app.state.object_store = store
+    assert client.portal is not None
+    digest = client.portal.call(_seed_preview_asset, client, store, _source_png())
+    url = dashboard_previews.dashboard_preview_url(asset_id=ASSET_ID, source_sha256=digest)
+    first = client.get(url)
+    cached = client.get(url)
+    assert first.status_code == cached.status_code == 200
+    assert first.content == cached.content
+    assert store.read_calls > 0
+
+
 def test_stale_or_malformed_preview_urls_fail_closed_without_cache(
     client: TestClient,
 ) -> None:

@@ -163,6 +163,11 @@ jobs:
           python -m alembic check
       - name: Exercise PostgreSQL review completion query contract
         run: python -m pytest -q tests/test_review_postgresql_contract.py
+      - name: Exercise PostgreSQL dashboard concurrency contract
+        env:
+          GEN_AUTOMATION_TEST_POSTGRESQL_URL: >-
+            postgresql+psycopg://gen_automation_ci:ci-only-postgres-password@127.0.0.1:5432/gen_automation_ci
+        run: python -m pytest -q tests/test_dashboard_concurrency_postgresql.py
 
   container:
     runs-on: ubuntu-24.04
@@ -171,8 +176,35 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # This is a disposable CI runner, not a deployed Docker host. Keep only
+      # one tested image at a time; retain its SBOM for every scan below.
+      - name: Report initial runner resources
+        run: |
+          free -m
+          df -h /
+          docker system df
       - name: Build control-plane image
         run: docker build --tag gen-automation-control-plane:test .
+      - name: Generate control-plane image SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: gen-automation-control-plane:test
+          format: spdx-json
+          output-file: control-plane.spdx.json
+          syft-version: v1.42.3
+          github-token: ""
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Release tested control-plane image and unused build cache
+        run: |
+          set -euo pipefail
+          test -s control-plane.spdx.json
+          docker image rm gen-automation-control-plane:test
+          docker builder prune --all --force
+          free -m
+          df -h /
+          docker system df
       - name: Build digest-pinned GPU worker image
         run: docker build --file Dockerfile.worker --tag gen-automation-gpu-worker:test .
       - name: Smoke-test GPU worker Python runtime
@@ -181,6 +213,26 @@ jobs:
           --entrypoint /opt/worker-venv/bin/python
           gen-automation-gpu-worker:test
           -c 'import gen_automation.gpu_worker.main'
+      - name: Generate GPU worker image SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: gen-automation-gpu-worker:test
+          format: spdx-json
+          output-file: gpu-worker.spdx.json
+          syft-version: v1.42.3
+          github-token: ""
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Release tested gpu-worker image and unused build cache
+        run: |
+          set -euo pipefail
+          test -s gpu-worker.spdx.json
+          docker image rm gen-automation-gpu-worker:test
+          docker builder prune --all --force
+          free -m
+          df -h /
+          docker system df
       - name: Build model-free DaSiWa I2V worker image
         run: >-
           docker build
@@ -193,18 +245,78 @@ jobs:
           --entrypoint /opt/i2v-venv/bin/python
           gen-automation-i2v-worker:test
           -c 'import runpod; import gen_automation.i2v_worker.runpod_handler; import gen_automation.i2v_worker.runpod_pod_api; assert runpod.__version__ == "1.11.0"'
+      - name: Generate DaSiWa I2V worker image SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: gen-automation-i2v-worker:test
+          format: spdx-json
+          output-file: i2v-worker.spdx.json
+          syft-version: v1.42.3
+          github-token: ""
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Release tested i2v-worker image and unused build cache
+        run: |
+          set -euo pipefail
+          test -s i2v-worker.spdx.json
+          docker image rm gen-automation-i2v-worker:test
+          docker builder prune --all --force
+          free -m
+          df -h /
+          docker system df
       - name: Build semantic gateway image
         run: >-
           docker build
           --file Dockerfile.semantic-gateway
           --tag gen-automation-semantic-gateway:test
           .
+      - name: Generate semantic gateway image SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: gen-automation-semantic-gateway:test
+          format: spdx-json
+          output-file: semantic-gateway.spdx.json
+          syft-version: v1.42.3
+          github-token: ""
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Release tested semantic-gateway image and unused build cache
+        run: |
+          set -euo pipefail
+          test -s semantic-gateway.spdx.json
+          docker image rm gen-automation-semantic-gateway:test
+          docker builder prune --all --force
+          free -m
+          df -h /
+          docker system df
       - name: Build MEGA-enabled control-plane image
         run: >-
           docker build
           --file Dockerfile.mega
           --tag gen-automation-control-plane-mega:test
           .
+      - name: Generate MEGA-enabled control-plane image SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: gen-automation-control-plane-mega:test
+          format: spdx-json
+          output-file: control-plane-mega.spdx.json
+          syft-version: v1.42.3
+          github-token: ""
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Release tested control-plane-mega image and unused build cache
+        run: |
+          set -euo pipefail
+          test -s control-plane-mega.spdx.json
+          docker image rm gen-automation-control-plane-mega:test
+          docker builder prune --all --force
+          free -m
+          df -h /
+          docker system df
       - name: Build Patreon browser sidecar image
         run: >-
           docker build
@@ -242,61 +354,6 @@ jobs:
               assert page.title() == "patreon-browser-ready"
               browser.close()
           '
-      - name: Generate control-plane image SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          image: gen-automation-control-plane:test
-          format: spdx-json
-          output-file: control-plane.spdx.json
-          syft-version: v1.42.3
-          github-token: ""
-          dependency-snapshot: false
-          upload-artifact: false
-          upload-release-assets: false
-      - name: Generate GPU worker image SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          image: gen-automation-gpu-worker:test
-          format: spdx-json
-          output-file: gpu-worker.spdx.json
-          syft-version: v1.42.3
-          github-token: ""
-          dependency-snapshot: false
-          upload-artifact: false
-          upload-release-assets: false
-      - name: Generate DaSiWa I2V worker image SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          image: gen-automation-i2v-worker:test
-          format: spdx-json
-          output-file: i2v-worker.spdx.json
-          syft-version: v1.42.3
-          github-token: ""
-          dependency-snapshot: false
-          upload-artifact: false
-          upload-release-assets: false
-      - name: Generate semantic gateway image SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          image: gen-automation-semantic-gateway:test
-          format: spdx-json
-          output-file: semantic-gateway.spdx.json
-          syft-version: v1.42.3
-          github-token: ""
-          dependency-snapshot: false
-          upload-artifact: false
-          upload-release-assets: false
-      - name: Generate MEGA-enabled control-plane image SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          image: gen-automation-control-plane-mega:test
-          format: spdx-json
-          output-file: control-plane-mega.spdx.json
-          syft-version: v1.42.3
-          github-token: ""
-          dependency-snapshot: false
-          upload-artifact: false
-          upload-release-assets: false
       - name: Generate Patreon browser sidecar image SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
@@ -308,6 +365,15 @@ jobs:
           dependency-snapshot: false
           upload-artifact: false
           upload-release-assets: false
+      - name: Release tested patreon-browser image and unused build cache
+        run: |
+          set -euo pipefail
+          test -s patreon-browser.spdx.json
+          docker image rm gen-automation-patreon-browser:test
+          docker builder prune --all --force
+          free -m
+          df -h /
+          docker system df
       - name: Scan control-plane image SBOM
         if: ${{ !cancelled() && hashFiles('control-plane.spdx.json') != '' }}
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
