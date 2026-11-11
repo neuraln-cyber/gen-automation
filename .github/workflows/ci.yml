@@ -163,6 +163,11 @@ jobs:
           python -m alembic check
       - name: Exercise PostgreSQL review completion query contract
         run: python -m pytest -q tests/test_review_postgresql_contract.py
+      - name: Exercise PostgreSQL dashboard concurrency contract
+        env:
+          GEN_AUTOMATION_TEST_POSTGRESQL_URL: >-
+            postgresql+psycopg://gen_automation_ci:ci-only-postgres-password@127.0.0.1:5432/gen_automation_ci
+        run: python -m pytest -q tests/test_dashboard_concurrency_postgresql.py
 
   container:
     runs-on: ubuntu-24.04

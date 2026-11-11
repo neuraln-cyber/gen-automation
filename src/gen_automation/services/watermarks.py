@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from anyio import fail_after, to_process
-from sqlalchemy import select
+from sqlalchemy import literal, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -291,7 +291,10 @@ async def list_registered_watermarks(
                 .where(
                     Asset.kind == AssetKind.DERIVATIVE,
                     Asset.state == AssetState.AVAILABLE,
-                    Asset.object_key.like("watermarks/%"),
+                    # This fixed registry prefix must remain literal even in a
+                    # generic prepared plan so PostgreSQL can use the partial
+                    # registry index. No user input is interpolated into SQL.
+                    Asset.object_key.like(literal("watermarks/%", literal_execute=True)),
                 )
                 .order_by(Asset.available_at.desc(), Asset.id.desc())
                 .limit(limit)

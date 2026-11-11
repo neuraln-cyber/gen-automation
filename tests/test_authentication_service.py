@@ -193,6 +193,40 @@ async def test_login_creates_server_side_session_and_resolves_csrf(
         )
 
 
+@pytest.mark.parametrize("elapsed", [0, 59, 60, 61])
+@pytest.mark.parametrize("expire_on_commit", [False, True])
+async def test_session_resolution_ends_transaction_without_changing_expiry_policy(
+    auth_database: Database, elapsed: int, expire_on_commit: bool
+) -> None:
+    manager = _password_manager()
+    service = _service(manager)
+    _user, secret = await _seed_user(auth_database, password_manager=manager)
+    async with auth_database.sessions() as session:
+        login = await service.login(
+            session,
+            username="owner@example.test",
+            password=VALID_PASSWORD,
+            totp_code=_totp_code(secret, NOW),
+            client_context="192.0.2.1",
+            user_agent=None,
+            correlation_id="transaction-lifetime",
+            now=NOW,
+        )
+    async with auth_database.sessions(expire_on_commit=expire_on_commit) as session:
+        principal = await service.resolve_session(
+            session, session_token=login.session_token, now=NOW + timedelta(seconds=elapsed)
+        )
+        assert not session.in_transaction()
+        assert principal.expires_at == NOW + timedelta(hours=1)
+        touched = elapsed if elapsed >= 60 else 0
+        assert principal.idle_expires_at == NOW + timedelta(minutes=15, seconds=touched)
+        assert principal.mfa_verified_at == principal.reauthenticated_at == NOW
+    async with auth_database.sessions() as session:
+        stored = await session.get(AdminSession, login.session_id)
+        assert stored is not None
+        assert stored.last_seen_at.replace(tzinfo=UTC) == NOW + timedelta(seconds=touched)
+
+
 async def test_reauthentication_refreshes_existing_session_and_audits_outcome(
     auth_database: Database,
 ) -> None:

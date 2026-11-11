@@ -474,6 +474,15 @@ class GenerationAttempt(UuidPrimaryKeyMixin, Base):
 class Asset(UuidPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "assets"
     __table_args__ = (
+        Index(
+            "ix_assets_registered_watermarks",
+            "kind",
+            "state",
+            "available_at",
+            "id",
+            postgresql_where=text("object_key LIKE 'watermarks/%'"),
+            sqlite_where=text("object_key LIKE 'watermarks/%'"),
+        ),
         UniqueConstraint("generation_job_id", "output_index", "kind"),
         UniqueConstraint(
             "storage_backend",

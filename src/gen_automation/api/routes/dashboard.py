@@ -234,6 +234,10 @@ async def dashboard_asset_preview(
             source_token=source_token,
             max_master_bytes=settings.storage_max_image_bytes,
         )
+        # The source is an immutable, validated value object. Return this request's
+        # database connection before waiting for S3 or bounded renderer capacity;
+        # a grid of cold thumbnails must not exhaust the controller/API pool.
+        await session.close()
         headers = {
             "Cache-Control": DASHBOARD_PREVIEW_CACHE_CONTROL,
             "Content-Disposition": "inline",
